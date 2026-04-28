@@ -24,14 +24,14 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 ## Install
 
 ```sh
-git clone git@github.com:micthiesen/wt.git ~/Code/wt
-cd ~/Code/wt && bun install
+git clone https://github.com/micthiesen/wt.git ~/.wt
+cd ~/.wt && bun install
 ```
 
 Add to your shell rc:
 
 ```sh
-alias wt='~/Code/wt/bin/wt'
+alias wt='~/.wt/bin/wt'
 ```
 
 ## Config
