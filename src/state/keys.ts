@@ -1,0 +1,35 @@
+/**
+ * Typed query-key factory. Using `as const` tuples so each key is
+ * narrowly typed — invalidation by prefix is safe (e.g. `qk.wt(slug)._all`
+ * invalidates every query for that slug).
+ */
+export const qk = {
+  /** All worktrees (from `git worktree list`). */
+  worktrees: () => ["worktrees"] as const,
+  /** Origin/main fetch marker; invalidated manually. */
+  fetchOrigin: () => ["fetchOrigin"] as const,
+  /** First-parent SHAs of origin/main; supports branchIsMerged. */
+  mainFirstParents: () => ["mainFirstParents"] as const,
+  /**
+   * Combined GitHub fetch: PR map (one query per listed branch) +
+   * merge-queue entries. Branches are sorted so the key is stable
+   * regardless of worktree list order.
+   */
+  github: (branches: readonly string[]) =>
+    ["github", [...branches].sort()] as const,
+  /** Per-worktree property namespace. */
+  wt: (slug: string) =>
+    ({
+      all: () => ["wt", slug] as const,
+      dirty: () => ["wt", slug, "dirty"] as const,
+      lock: () => ["wt", slug, "lock"] as const,
+      deploy: () => ["wt", slug, "deploy"] as const,
+      merged: () => ["wt", slug, "merged"] as const,
+      gone: () => ["wt", slug, "gone"] as const,
+      sync: () => ["wt", slug, "sync"] as const,
+      claude: () => ["wt", slug, "claude"] as const,
+      gitActivity: () => ["wt", slug, "gitActivity"] as const,
+    }) as const,
+  /** Manually-archived slug set (fs-backed). */
+  archive: () => ["archive"] as const,
+} as const;

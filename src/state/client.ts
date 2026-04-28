@@ -1,0 +1,61 @@
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+import { QueryClient } from "@tanstack/react-query";
+import { persistQueryClient } from "@tanstack/query-persist-client-core";
+
+import { createSqlitePersister } from "./persister.ts";
+
+export const CACHE_DB = join(homedir(), ".cache", "wt", "cache.sqlite");
+
+// Bust the persisted cache when the schema / query shape changes.
+const CACHE_BUSTER = "v1";
+
+/**
+ * Build a QueryClient with TUI-friendly defaults and wire up the
+ * SQLite persister. Returns the client plus a `restored` promise that
+ * resolves once hydration is complete, so callers can decide whether
+ * to render immediately (showing stale data) or wait.
+ */
+export type WtQueryClient = {
+  client: QueryClient;
+  restored: Promise<void>;
+  /** Stop the persister subscription, clear timers, close the db. */
+  shutdown(): void;
+};
+
+export function createWtQueryClient(): WtQueryClient {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: {
+        // Persisted data is reused across runs; we rely on per-query
+        // `staleTime` to drive refetch rather than gcTime-on-unmount.
+        gcTime: 24 * 60 * 60 * 1000,
+        // Retries are annoying in a TUI — the user will hit `r` if
+        // something looks off.
+        retry: false,
+        refetchOnWindowFocus: false,
+        refetchOnReconnect: false,
+      },
+    },
+  });
+
+  const persister = createSqlitePersister(CACHE_DB);
+  const [unsubscribe, restored] = persistQueryClient({
+    queryClient: client,
+    persister,
+    maxAge: 24 * 60 * 60 * 1000,
+    buster: CACHE_BUSTER,
+  });
+
+  return {
+    client,
+    restored,
+    shutdown(): void {
+      unsubscribe();
+      client.getQueryCache().clear();
+      client.unmount();
+      persister.close();
+    },
+  };
+}

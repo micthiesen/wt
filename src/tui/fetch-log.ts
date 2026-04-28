@@ -1,0 +1,46 @@
+import type { QueryCacheNotifyEvent, QueryClient } from "@tanstack/react-query";
+
+import { logDim, logErr } from "./events.ts";
+
+/**
+ * Surface external (network-hitting) query fetches in the event log so
+ * it's obvious when wt is talking to GitHub or the git remote. Local
+ * git/fs queries are omitted — they're fast and would drown everything
+ * else out. Logs start + completion + failure; duration on completion
+ * so slow fetches are visible as slow.
+ */
+const REMOTE_LABELS: Record<string, { source: string; label: string }> = {
+  github: { source: "[gh]", label: "GitHub" },
+  fetchOrigin: { source: "[origin]", label: "git origin" },
+};
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+export function attachFetchLogs(client: QueryClient): () => void {
+  const starts = new Map<string, number>();
+  return client.getQueryCache().subscribe((event: QueryCacheNotifyEvent) => {
+    if (event.type !== "updated") return;
+    const first = event.query.queryKey[0];
+    if (typeof first !== "string") return;
+    const meta = REMOTE_LABELS[first];
+    if (!meta) return;
+    const action = event.action;
+    if (action.type === "fetch") {
+      starts.set(event.query.queryHash, Date.now());
+      logDim(meta.source, `fetching ${meta.label}…`);
+    } else if (action.type === "success") {
+      const start = starts.get(event.query.queryHash);
+      const dur = start ? ` (${formatDuration(Date.now() - start)})` : "";
+      starts.delete(event.query.queryHash);
+      logDim(meta.source, `fetched ${meta.label}${dur}`);
+    } else if (action.type === "error") {
+      starts.delete(event.query.queryHash);
+      const err = action.error;
+      const msg = err instanceof Error ? err.message : String(err);
+      logErr(meta.source, `failed to fetch ${meta.label}: ${msg}`);
+    }
+  });
+}
