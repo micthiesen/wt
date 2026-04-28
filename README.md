@@ -61,3 +61,7 @@ workspace = "your-workspace"
 ```
 
 The loader prints every missing or malformed field at once. See [`src/core/config.ts`](src/core/config.ts) for the full schema, defaults, and the row-ordering knob (`[ui] rows`).
+
+## Usage
+
+`wt` with no arguments launches the TUI. Subcommands (`ls`, `new`, `rm`, `clean`, `doctor`, `stages`, `logs`, `open`) run one-shot CLI ops — see `wt --help` and `wt <cmd> --help`.
