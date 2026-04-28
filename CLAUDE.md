@@ -1,3 +1,11 @@
+<!--
+Maintain this file proactively. When a session surfaces a new trap, a
+shifted contract, or a principle that no longer applies, update this
+file without being asked. The bar is "non-obvious and load-bearing" —
+add sparingly, prune freely. Traps not maps; if something would rot,
+leave it out.
+-->
+
 # wt — for Claude
 
 Personal git-worktree TUI. Single developer, single machine, OSS-published. Bun + React + OpenTUI on top of TanStack Query.
