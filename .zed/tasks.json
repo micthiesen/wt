@@ -1,0 +1,37 @@
+[
+  {
+    "label": "Claude Code",
+    "command": "claude $ZED_WORKTREE_ROOT",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true,
+    "hide": "always",
+    "show_summary": true,
+    "show_command": true
+  },
+  {
+    "label": "Typecheck",
+    "command": "bun",
+    "args": ["run", "typecheck"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "hide": "never",
+    "show_summary": true,
+    "show_command": true
+  },
+  {
+    "label": "Run wt",
+    "command": "bun",
+    "args": ["src/main.ts"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "hide": "never",
+    "show_summary": true,
+    "show_command": true
+  }
+]

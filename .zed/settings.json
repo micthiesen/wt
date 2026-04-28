@@ -1,0 +1,35 @@
+{
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false
+  },
+  "git": {
+    "inline_blame": {
+      "show_commit_summary": true
+    }
+  },
+  "languages": {
+    "TypeScript": {
+      "tab_size": 2,
+      "preferred_line_length": 100,
+      "wrap_guides": [100]
+    },
+    "TSX": {
+      "tab_size": 2,
+      "preferred_line_length": 100,
+      "wrap_guides": [100]
+    },
+    "TOML": {
+      "tab_size": 2
+    },
+    "Markdown": {
+      "tab_size": 2
+    },
+    "JSON": {
+      "tab_size": 2
+    },
+    "JSONC": {
+      "tab_size": 2
+    }
+  }
+}
