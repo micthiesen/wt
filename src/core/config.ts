@@ -241,13 +241,17 @@ function build(raw: Raw, errs: Errors): Config {
   };
 }
 
-function load(): Config {
+function load(): { cfg: Config; path: string } {
   const { path, present } = configPath();
   const errs = new Errors();
   const raw = loadRaw(path, present, errs);
   const cfg = build(raw, errs);
   errs.flush(path);
-  return cfg;
+  return { cfg, path };
 }
 
-export const config: Config = Object.freeze(load()) as Config;
+const loaded = load();
+
+export const config: Config = Object.freeze(loaded.cfg) as Config;
+/** Absolute path of the TOML file the config was loaded from. */
+export const configFilePath: string = loaded.path;

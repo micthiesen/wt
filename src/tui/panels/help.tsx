@@ -35,6 +35,8 @@ const SECTIONS: Section[] = [
       ["c", "clean merged/gone"],
       ["r", "refresh (fetch + recompute)"],
       ["R", "clear all cached data"],
+      [",", "open config in zed"],
+      [".", "open wt source in zed"],
       ["?", "toggle this help"],
       ["q / ^C", "quit"],
     ],

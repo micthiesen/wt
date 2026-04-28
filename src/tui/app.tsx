@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 
+import { configFilePath } from "../core/config.ts";
 import {
   createWorktree,
   parseInput,
@@ -25,7 +26,7 @@ import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
-import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard } from "./helpers.ts";
+import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard, WT_REPO_PATH } from "./helpers.ts";
 import { logDim, logErr, logInfo, logOk, logWarn } from "./events.ts";
 import { theme } from "./theme.ts";
 
@@ -524,6 +525,16 @@ export function App({ onExit }: Props) {
         return;
       }
       setShowCleanConfirm(true);
+      return;
+    }
+    if (k.sequence === ",") {
+      void openInZed(configFilePath);
+      logInfo("config", `opened ${configFilePath}`);
+      return;
+    }
+    if (k.sequence === ".") {
+      void openInZed(WT_REPO_PATH);
+      logInfo("wt", `opened ${WT_REPO_PATH}`);
       return;
     }
 
