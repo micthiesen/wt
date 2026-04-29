@@ -7,6 +7,7 @@
  * Anything new that should read consistently across both panels
  * belongs in `badges.ts` first, not here.
  */
+import { memo } from "react";
 import { TextAttributes } from "@opentui/core";
 
 import { prStateBadge, statusBadge } from "../badges.ts";
@@ -149,7 +150,7 @@ function checkGlyph(row: WorktreeRow): { glyph: string; fg: string } {
   }
 }
 
-function RowView({
+const RowView = memo(function RowView({
   row,
   selected,
   isTailing,
@@ -261,7 +262,7 @@ function RowView({
       ) : null}
     </box>
   );
-}
+});
 
 function Divider({ label, width }: { label: string; width: number }) {
   // Leave room for padding (border+paddingLeft+paddingRight roughly 4
@@ -340,6 +341,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                     row={row}
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
+
                     panelWidth={width}
                   />
                 );

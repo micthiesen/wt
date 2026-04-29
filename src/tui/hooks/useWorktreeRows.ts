@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 
 import type { ClaudeStatus } from "../../core/claude.ts";
@@ -105,6 +106,39 @@ function toFieldState<T>(r: {
   };
 }
 
+/**
+ * Reuse the previous `FieldState` reference when every observable
+ * property is identity-equal. Lets memoized children (and the row-level
+ * identity check below) skip work whenever nothing actually changed.
+ */
+function reuseField<T>(
+  prev: FieldState<T> | undefined,
+  next: FieldState<T>,
+): FieldState<T> {
+  if (
+    prev &&
+    prev.data === next.data &&
+    prev.isStale === next.isStale &&
+    prev.isFetching === next.isFetching &&
+    prev.isLoading === next.isLoading &&
+    prev.error === next.error
+  ) {
+    return prev;
+  }
+  return next;
+}
+
+function statusEq(a: Status, b: Status): boolean {
+  return (
+    a.kind === b.kind &&
+    a.label === b.label &&
+    a.age === b.age &&
+    a.log === b.log &&
+    a.pid === b.pid &&
+    a.op === b.op
+  );
+}
+
 function deriveStatus(
   wt: Worktree,
   fields: WorktreeFields,
@@ -142,6 +176,12 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const github = useGithub();
   const archive = useQuery(archiveQuery());
   const archivedSet = new Set(archive.data ?? []);
+  // Keyed by slug; lets us return the same `WorktreeRow` reference
+  // across renders when nothing observable has changed. Without this,
+  // every poll-driven refresh produces all-new row identities and
+  // forces every downstream `useMemo` / `React.memo` to re-run.
+  const rowCache = useRef<Map<string, WorktreeRow>>(new Map());
+  const rowsRef = useRef<WorktreeRow[]>([]);
 
   const worktrees = (wtList.data ?? []).filter((w) => !w.isMain);
 
@@ -205,17 +245,19 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const unsorted: WorktreeRow[] = worktrees.map((wt, i) => {
     const base = i * FIELD_ORDER.length;
     const fieldArr = FIELD_ORDER.map((_, j) => results[base + j]!);
+    const prev = rowCache.current.get(wt.slug);
     const fields: WorktreeFields = {
-      dirty: toFieldState(fieldArr[0] as FieldState<boolean>),
-      lock: toFieldState(fieldArr[1] as FieldState<Partial<LockMeta> | null>),
-      deploy: toFieldState(fieldArr[2] as FieldState<boolean>),
-      merged: toFieldState(fieldArr[3] as FieldState<boolean>),
-      gone: toFieldState(fieldArr[4] as FieldState<boolean>),
-      sync: toFieldState(fieldArr[5] as FieldState<SyncState>),
-      claude: toFieldState(fieldArr[6] as FieldState<ClaudeStatus>),
-      gitActivity: toFieldState(fieldArr[7] as FieldState<GitActivity>),
+      dirty: reuseField(prev?.fields.dirty, toFieldState(fieldArr[0] as FieldState<boolean>)),
+      lock: reuseField(prev?.fields.lock, toFieldState(fieldArr[1] as FieldState<Partial<LockMeta> | null>)),
+      deploy: reuseField(prev?.fields.deploy, toFieldState(fieldArr[2] as FieldState<boolean>)),
+      merged: reuseField(prev?.fields.merged, toFieldState(fieldArr[3] as FieldState<boolean>)),
+      gone: reuseField(prev?.fields.gone, toFieldState(fieldArr[4] as FieldState<boolean>)),
+      sync: reuseField(prev?.fields.sync, toFieldState(fieldArr[5] as FieldState<SyncState>)),
+      claude: reuseField(prev?.fields.claude, toFieldState(fieldArr[6] as FieldState<ClaudeStatus>)),
+      gitActivity: reuseField(prev?.fields.gitActivity, toFieldState(fieldArr[7] as FieldState<GitActivity>)),
     };
-    const status = deriveStatus(wt, fields);
+    const nextStatus = deriveStatus(wt, fields);
+    const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
     const pr = pickPrForWorktree(wt, github.data?.prs);
     const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
     // Include the combined GitHub fetch that feeds the details pane
@@ -242,15 +284,64 @@ export function useWorktreeRows(): WorktreeRowsResult {
       title = commitTitle;
       titleSource = "commit";
     }
-    return { wt, fields, status, pr, mq, anyFetching, archived, title, titleSource };
+    // After per-field reuse above, identity-equality on each `fields.X`,
+    // `status`, `pr`, `mq` plus primitives is sufficient — anything
+    // observable changing produces a fresh reference at one of those
+    // levels, which falls through to a new row.
+    if (
+      prev &&
+      prev.wt === wt &&
+      prev.fields.dirty === fields.dirty &&
+      prev.fields.lock === fields.lock &&
+      prev.fields.deploy === fields.deploy &&
+      prev.fields.merged === fields.merged &&
+      prev.fields.gone === fields.gone &&
+      prev.fields.sync === fields.sync &&
+      prev.fields.claude === fields.claude &&
+      prev.fields.gitActivity === fields.gitActivity &&
+      prev.status === status &&
+      prev.pr === pr &&
+      prev.mq === mq &&
+      prev.anyFetching === anyFetching &&
+      prev.archived === archived &&
+      prev.title === title &&
+      prev.titleSource === titleSource
+    ) {
+      return prev;
+    }
+    const next: WorktreeRow = { wt, fields, status, pr, mq, anyFetching, archived, title, titleSource };
+    rowCache.current.set(wt.slug, next);
+    return next;
   });
 
+  // Drop cache entries for slugs that no longer exist so the map
+  // doesn't grow unboundedly across the session.
+  if (rowCache.current.size > worktrees.length) {
+    const live = new Set(worktrees.map((w) => w.slug));
+    for (const slug of rowCache.current.keys()) {
+      if (!live.has(slug)) rowCache.current.delete(slug);
+    }
+  }
+
   // Stable partition: active first (preserves git worktree order),
-  // archived second (so `j/k` moves through both seamlessly).
-  const rows: WorktreeRow[] = [
+  // archived second (so `j/k` moves through both seamlessly). Reuse
+  // the prior array reference when every row in order matches —
+  // otherwise consumer memos keyed on `rows` invalidate every render.
+  const nextRows: WorktreeRow[] = [
     ...unsorted.filter((r) => !r.archived),
     ...unsorted.filter((r) => r.archived),
   ];
+  const prevRows = rowsRef.current;
+  let rowsUnchanged = prevRows.length === nextRows.length;
+  if (rowsUnchanged) {
+    for (let i = 0; i < nextRows.length; i++) {
+      if (prevRows[i] !== nextRows[i]) {
+        rowsUnchanged = false;
+        break;
+      }
+    }
+  }
+  const rows = rowsUnchanged ? prevRows : (rowsRef.current = nextRows);
 
   return {
     rows,

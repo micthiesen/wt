@@ -20,6 +20,7 @@
  *   Same-concept-same-glyph between this pane and the row list is
  *   enforced via shared helpers.
  */
+import { memo, useMemo } from "react";
 import { TextAttributes } from "@opentui/core";
 import { useQuery } from "@tanstack/react-query";
 
@@ -206,7 +207,7 @@ function DescriptionBlock({
   return <box marginTop={1}>{body}</box>;
 }
 
-function DetailsBody({ row }: { row: WorktreeRow }) {
+const DetailsBody = memo(function DetailsBody({ row }: { row: WorktreeRow }) {
   // Subscribe to the combined GitHub fetch so per-row indicators
   // reflect its fetch state. Observers dedupe by key — this doesn't
   // trigger an extra fetch, it joins the existing observer in
@@ -235,7 +236,7 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
     enabled: allowFetch && !!diffCtx.data,
   });
 
-  const ctx: RowContext = { row, github };
+  const ctx: RowContext = useMemo(() => ({ row, github }), [row, github]);
 
   // Pick a single user-facing reason when we're suppressing AI work.
   const blockedReason: string | null = !aiEnabled
@@ -270,7 +271,7 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
       />
     </box>
   );
-}
+});
 
 export function Details({ row }: Props) {
   if (!row) {
