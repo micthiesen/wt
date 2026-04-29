@@ -11,6 +11,7 @@ import {
   archiveSlug as archiveOnDisk,
   toggleArchived as toggleArchivedOnDisk,
 } from "../core/archive.ts";
+import type { DiffContext } from "../core/diff/index.ts";
 import { invalidateMainFirstParents } from "../core/git.ts";
 
 import { CACHE_DB } from "./client.ts";
@@ -102,6 +103,25 @@ export function useWtActions() {
     /** Invalidate everything for a single worktree (useful after an action). */
     async invalidateWorktree(slug: string): Promise<void> {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
+    },
+    /**
+     * Force the LM Studio call to re-run for one worktree. Reads the
+     * cached diff context to find the content hash, then invalidates
+     * both the diff-context query (in case the underlying diff drifted)
+     * and the matching `aiSummary` entry so the active details-pane
+     * observer refetches. Returns false when there's no cached context
+     * yet — the caller decides how to message that.
+     */
+    async refreshAiSummary(slug: string): Promise<boolean> {
+      const ctx = qc.getQueryData<DiffContext | null>(
+        qk.wt(slug).diffContext(),
+      );
+      if (!ctx) return false;
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.wt(slug).diffContext() }),
+        qc.invalidateQueries({ queryKey: qk.aiSummary(ctx.hash) }),
+      ]);
+      return true;
     },
     /** Flip the archived flag for a slug and re-query. Returns the new state. */
     toggleArchived(slug: string): { archived: boolean } {

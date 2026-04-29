@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 
-import { configFilePath } from "../core/config.ts";
+import { config, configFilePath } from "../core/config.ts";
 import {
   createWorktree,
   parseInput,
@@ -118,6 +118,7 @@ export function App({ onExit }: Props) {
     refreshStale,
     clearAll,
     invalidateWorktree,
+    refreshAiSummary,
     toggleArchived,
     archive,
   } = useWtActions();
@@ -657,6 +658,23 @@ export function App({ onExit }: Props) {
       const { archived } = toggleArchived(slug);
       rowLog.event.info(archived ? "archived" : "restored from archive");
       toast(archived ? `archived ${slug}` : `restored ${slug}`, theme.info, 2000);
+      return;
+    }
+    if (k.sequence === "T") {
+      if (!config.ai) {
+        toast("AI summary not configured", theme.warn, 2000);
+        return;
+      }
+      if (current.status.kind === StatusKind.Busy) {
+        toast(`${current.wt.slug} is busy`, theme.warn, 2000);
+        return;
+      }
+      const slug = current.wt.slug;
+      void (async () => {
+        const ok = await refreshAiSummary(slug);
+        if (ok) rowLog.event.dim("regenerating AI summary");
+        else toast("no diff context yet", theme.warn, 2000);
+      })();
       return;
     }
   });

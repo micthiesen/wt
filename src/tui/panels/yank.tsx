@@ -1,3 +1,5 @@
+import { linearUrlForSlug } from "../../core/linear.ts";
+import { stageUrl } from "../../core/stage.ts";
 import { theme } from "../theme.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -11,10 +13,15 @@ type Props = { row: WorktreeRow };
  * and the keystroke errors with a "nothing to yank" toast.
  */
 export function yankItemsFor(row: WorktreeRow): Item[] {
+  const stageUrlValue =
+    row.fields.deploy.data === true ? stageUrl(row.wt.stage) : null;
   return [
     { key: "b", label: "branch", value: row.wt.branch || null },
     { key: "s", label: "stage", value: row.wt.stage },
+    { key: "S", label: "stage url", value: stageUrlValue },
     { key: "p", label: "path", value: row.wt.path },
+    { key: "n", label: "slug", value: row.wt.slug },
+    { key: "i", label: "issue url", value: linearUrlForSlug(row.wt.slug) },
   ];
 }
 
@@ -45,7 +52,7 @@ export function YankModal({ row }: Props) {
                 {it.key}
               </text>
             </box>
-            <box width={9} flexShrink={0}>
+            <box width={11} flexShrink={0}>
               <text fg={theme.fg}>{it.label}</text>
             </box>
             <box flexShrink={1} overflow="hidden">
