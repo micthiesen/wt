@@ -1,19 +1,19 @@
-import { BASE_BRANCH, MAIN_CLONE } from "./paths.ts";
+import { config } from "./config.ts";
 import { run, runOk, runQuiet } from "./proc.ts";
 
 export async function git(args: string[], cwd?: string): Promise<string> {
-  return runOk(["git", ...args], { cwd: cwd ?? MAIN_CLONE });
+  return runOk(["git", ...args], { cwd: cwd ?? config.paths.mainClone });
 }
 
 export async function gitQuiet(args: string[], cwd?: string): Promise<boolean> {
-  return runQuiet(["git", ...args], { cwd: cwd ?? MAIN_CLONE });
+  return runQuiet(["git", ...args], { cwd: cwd ?? config.paths.mainClone });
 }
 
 export async function gitRun(
   args: string[],
   cwd?: string,
 ) {
-  return run(["git", ...args], { cwd: cwd ?? MAIN_CLONE });
+  return run(["git", ...args], { cwd: cwd ?? config.paths.mainClone });
 }
 
 export async function branchExists(branch: string): Promise<boolean> {
@@ -30,7 +30,7 @@ export async function branchExists(branch: string): Promise<boolean> {
 export async function branchIsGone(branch: string): Promise<boolean> {
   const r = await run(
     ["git", "for-each-ref", "--format=%(upstream:track)", `refs/heads/${branch}`],
-    { cwd: MAIN_CLONE },
+    { cwd: config.paths.mainClone },
   );
   if (r.exitCode !== 0) return false;
   return r.stdout.trim() === "[gone]";
@@ -53,8 +53,8 @@ export function mainFirstParentShas(): Promise<Set<string>> {
   if (_mainFirstParents) return _mainFirstParents;
   _mainFirstParents = (async () => {
     const r = await run(
-      ["git", "rev-list", "--first-parent", `origin/${BASE_BRANCH}`],
-      { cwd: MAIN_CLONE },
+      ["git", "rev-list", "--first-parent", `origin/${config.branch.base}`],
+      { cwd: config.paths.mainClone },
     );
     return new Set(
       r.exitCode === 0 ? r.stdout.split("\n").filter(Boolean) : [],
@@ -75,7 +75,7 @@ export async function branchIsMerged(branch: string): Promise<boolean> {
       "merge-base",
       "--is-ancestor",
       branch,
-      `origin/${BASE_BRANCH}`,
+      `origin/${config.branch.base}`,
     ]))
   ) {
     return false;
@@ -84,7 +84,7 @@ export async function branchIsMerged(branch: string): Promise<boolean> {
   let mainSha: string;
   try {
     branchSha = await git(["rev-parse", "--verify", branch]);
-    mainSha = await git(["rev-parse", "--verify", `origin/${BASE_BRANCH}`]);
+    mainSha = await git(["rev-parse", "--verify", `origin/${config.branch.base}`]);
   } catch {
     return false;
   }

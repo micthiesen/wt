@@ -40,13 +40,13 @@ const RUNNERS: Record<string, Runner> = {
 
 export async function dispatch(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
-  if (!cmd || cmd === "--help" || cmd === "-h") {
+  if (cmd === "--help" || cmd === "-h") {
     console.log(HELP);
-    return cmd ? 0 : 1;
+    return 0;
   }
-  const run = RUNNERS[cmd];
+  const run = cmd ? RUNNERS[cmd] : undefined;
   if (!run) {
-    console.error(`unknown command: ${cmd}\n`);
+    console.error(`unknown command: ${cmd ?? ""}\n`);
     console.error(HELP);
     return 2;
   }

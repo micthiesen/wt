@@ -48,6 +48,8 @@ export type Config = {
     worktreeRoot: string;
     logDir: string;
     lockDir: string;
+    /** SQLite blob holding the persisted TanStack Query cache. */
+    cacheDb: string;
   };
   branch: {
     prefix: string;
@@ -65,7 +67,6 @@ export type Config = {
   };
   lifecycle: {
     envFilesToCopy: readonly string[];
-    parallelWorkers: number;
   };
   sst: SstConfig | null;
   linear: LinearConfig | null;
@@ -85,11 +86,11 @@ const GENERIC_DEFAULTS = {
   },
   lifecycle: {
     envFilesToCopy: [".env"] as const,
-    parallelWorkers: 8,
   },
   paths: {
     logDir: join(HOME, ".cache", "wt", "logs"),
     lockDir: join(HOME, ".cache", "wt", "locks"),
+    cacheDb: join(HOME, ".cache", "wt", "cache.sqlite"),
   },
   // SST v3 convention: per-stage Pulumi state file lives at
   // `<state_prefix><stage>.json`. The default file regenerated per
@@ -197,6 +198,7 @@ function build(raw: Raw, errs: Errors): Config {
   const worktreeRoot = expandHome(errs.reqStr(paths, "paths", "worktree_root"));
   const logDir = expandHome(errs.optStr(paths, "log_dir", GENERIC_DEFAULTS.paths.logDir));
   const lockDir = expandHome(errs.optStr(paths, "lock_dir", GENERIC_DEFAULTS.paths.lockDir));
+  const cacheDb = expandHome(errs.optStr(paths, "cache_db", GENERIC_DEFAULTS.paths.cacheDb));
 
   // Stage prefix derives from branch.prefix when omitted — the
   // overwhelmingly common shape is `<branch.prefix>-<stage>`. Same
@@ -206,11 +208,6 @@ function build(raw: Raw, errs: Errors): Config {
   const stageDomain = errs.optStrOrNull(stage, "domain");
 
   const envFiles = strArr(lifecycle?.env_files_to_copy, GENERIC_DEFAULTS.lifecycle.envFilesToCopy);
-  const parallelWorkers = errs.optNum(
-    lifecycle,
-    "parallel_workers",
-    GENERIC_DEFAULTS.lifecycle.parallelWorkers,
-  );
 
   // SST and Linear are entirely optional — absence of the section
   // disables the integration. When the section IS present, every
@@ -231,10 +228,10 @@ function build(raw: Raw, errs: Errors): Config {
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   return {
-    paths: { mainClone, worktreeRoot, logDir, lockDir },
+    paths: { mainClone, worktreeRoot, logDir, lockDir, cacheDb },
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
-    lifecycle: { envFilesToCopy: envFiles, parallelWorkers },
+    lifecycle: { envFilesToCopy: envFiles },
     sst,
     linear,
     ui: { rows },
@@ -255,3 +252,15 @@ const loaded = load();
 export const config: Config = Object.freeze(loaded.cfg) as Config;
 /** Absolute path of the TOML file the config was loaded from. */
 export const configFilePath: string = loaded.path;
+
+/**
+ * Assert SST is configured and return its config. Call from code paths
+ * that only make sense with `[deploy.sst]` set (the `wt stages` command,
+ * `core/sst.ts` helpers). Throws a user-readable error if not.
+ */
+export function requireSst(): SstConfig {
+  if (!config.sst) {
+    throw new Error("[deploy.sst] is not configured in config.toml");
+  }
+  return config.sst;
+}

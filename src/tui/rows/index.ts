@@ -1,6 +1,6 @@
 /**
  * Built-in row modules. The set is fixed at compile time; users
- * select a subset and order via `[ui] rows = [...]` in `wt.toml`.
+ * select a subset and order via `[ui] rows = [...]` in `config.toml`.
  *
  * Adding a new row: write the module in this directory and append it
  * to `REGISTRY`. The default order in `config.ts` decides where it

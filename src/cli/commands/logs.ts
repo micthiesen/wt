@@ -1,25 +1,26 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
+import { config } from "../../core/config.ts";
 import { latestLogFor } from "../../core/logs.ts";
-import { LOG_DIR } from "../../core/paths.ts";
 import { listWorktrees } from "../../core/worktree.ts";
 import { dim, red } from "../colors.ts";
 
 /** Newest log across *any* slug — used for `wt logs` with no arg. */
 function mostRecentLog(): string | null {
-  if (!existsSync(LOG_DIR)) return null;
+  const dir = config.paths.logDir;
+  if (!existsSync(dir)) return null;
   let files: string[];
   try {
-    files = readdirSync(LOG_DIR);
+    files = readdirSync(dir);
   } catch {
     return null;
   }
   const matching = files
     .filter((f) => f.endsWith(".log"))
-    .map((f) => ({ name: f, mtime: statSync(join(LOG_DIR, f)).mtimeMs }))
+    .map((f) => ({ name: f, mtime: statSync(join(dir, f)).mtimeMs }))
     .sort((a, b) => b.mtime - a.mtime);
-  return matching[0] ? join(LOG_DIR, matching[0].name) : null;
+  return matching[0] ? join(dir, matching[0].name) : null;
 }
 
 export async function run(argv: string[]): Promise<number> {

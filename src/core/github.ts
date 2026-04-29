@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 
-import { MAIN_CLONE } from "./paths.ts";
+import { config } from "./config.ts";
 import { run } from "./proc.ts";
 import type {
   MergeQueueEntry,
@@ -23,7 +23,7 @@ async function repoSlug(): Promise<string | null> {
   if (_repoSlug !== undefined) return _repoSlug;
   const r = await run(
     ["gh", "repo", "view", "--json", "nameWithOwner"],
-    { cwd: MAIN_CLONE, timeoutMs: 5_000 },
+    { cwd: config.paths.mainClone, timeoutMs: 5_000 },
   );
   if (r.exitCode !== 0) {
     _repoSlug = null;
@@ -238,7 +238,7 @@ export async function fetchGithub(branches: string[]): Promise<GithubData> {
     args.push("-f", `b${i}=${branches[i]}`);
   }
 
-  const r = await run(args, { cwd: MAIN_CLONE, timeoutMs: 15_000 });
+  const r = await run(args, { cwd: config.paths.mainClone, timeoutMs: 15_000 });
   if (r.exitCode !== 0) return empty;
   let parsed: GqlResponse;
   try {

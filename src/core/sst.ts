@@ -1,21 +1,22 @@
-import {
-  AWS_PROFILE,
-  DEFAULT_PERSONAL_STAGE,
-  SST_STATE_BUCKET,
-  SST_STATE_PREFIX,
-  STAGE_PREFIX,
-} from "./paths.ts";
+import { config, requireSst } from "./config.ts";
 import { run } from "./proc.ts";
 import type { SstStage } from "./types.ts";
 
+/**
+ * Run `aws s3 ...` with the configured profile. Throws if SST is not
+ * configured — callers are expected to gate on `config.sst` first
+ * (see `cli/commands/stages.ts` for the user-facing message).
+ */
 export async function awsS3(args: string[]): Promise<{ stdout: string; ok: boolean }> {
-  const r = await run(["aws", "s3", ...args, "--profile", AWS_PROFILE]);
+  const sst = requireSst();
+  const r = await run(["aws", "s3", ...args, "--profile", sst.awsProfile]);
   return { stdout: r.stdout, ok: r.exitCode === 0 };
 }
 
 /** List stages from the SST state bucket. Returns null on failure. */
 export async function listSstStages(): Promise<SstStage[] | null> {
-  const r = await awsS3(["ls", `s3://${SST_STATE_BUCKET}/${SST_STATE_PREFIX}`]);
+  const sst = requireSst();
+  const r = await awsS3(["ls", `s3://${sst.stateBucket}/${sst.statePrefix}`]);
   if (!r.ok) return null;
   const stages: SstStage[] = [];
   for (const line of r.stdout.split("\n")) {
@@ -43,9 +44,10 @@ export async function listSstStages(): Promise<SstStage[] | null> {
  * repeatedly flagged as orphans.
  */
 async function stageHasResources(name: string): Promise<boolean> {
+  const sst = requireSst();
   const r = await awsS3([
     "cp",
-    `s3://${SST_STATE_BUCKET}/${SST_STATE_PREFIX}${name}.json`,
+    `s3://${sst.stateBucket}/${sst.statePrefix}${name}.json`,
     "-",
   ]);
   if (!r.ok) return true; // be conservative on read failure
@@ -66,8 +68,8 @@ export async function categorizeStages(
   const live: SstStage[] = [];
   const orphaned: SstStage[] = [];
   for (const s of stages) {
-    if (s.name === DEFAULT_PERSONAL_STAGE) continue;
-    if (!s.name.startsWith(STAGE_PREFIX)) continue;
+    if (s.name === config.stage.defaultPersonal) continue;
+    if (!s.name.startsWith(config.stage.prefix)) continue;
     if (worktreeStages.has(s.name)) {
       live.push(s);
       continue;

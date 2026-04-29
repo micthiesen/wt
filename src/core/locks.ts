@@ -4,7 +4,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { dlopen, FFIType, suffix } from "bun:ffi";
 
-import { LOCK_DIR } from "./paths.ts";
+import { config } from "./config.ts";
 import type { LockMeta } from "./types.ts";
 
 // flock(2) via libc. Matches Python's fcntl.flock semantics: the
@@ -23,11 +23,11 @@ function flock(fd: number, op: number): number {
 }
 
 function lockPath(slug: string): string {
-  return join(LOCK_DIR, `${slug}.lock`);
+  return join(config.paths.lockDir, `${slug}.lock`);
 }
 
 function ensureLockDir(): void {
-  mkdirSync(LOCK_DIR, { recursive: true });
+  mkdirSync(config.paths.lockDir, { recursive: true });
 }
 
 export function readLockMeta(path: string): Partial<LockMeta> {

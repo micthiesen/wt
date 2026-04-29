@@ -1,12 +1,11 @@
-import { join } from "node:path";
-import { homedir } from "node:os";
-
 import { QueryClient } from "@tanstack/react-query";
 import { persistQueryClient } from "@tanstack/query-persist-client-core";
 
+import { config } from "../core/config.ts";
+
 import { createSqlitePersister } from "./persister.ts";
 
-export const CACHE_DB = join(homedir(), ".cache", "wt", "cache.sqlite");
+export const CACHE_DB = config.paths.cacheDb;
 
 // Bust the persisted cache when the schema / query shape changes.
 const CACHE_BUSTER = "v1";

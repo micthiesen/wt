@@ -1,4 +1,4 @@
-import { MAIN_CLONE } from "./paths.ts";
+import { config } from "./config.ts";
 
 export type RunResult = {
   stdout: string;
@@ -18,7 +18,7 @@ export type RunOptions = {
  * binaries and timeouts surface as `exitCode < 0`.
  */
 export async function run(argv: string[], opts: RunOptions = {}): Promise<RunResult> {
-  const { cwd = MAIN_CLONE, input, timeoutMs, env } = opts;
+  const { cwd = config.paths.mainClone, input, timeoutMs, env } = opts;
   const proc = Bun.spawn(argv, {
     cwd,
     stdin: input !== undefined ? "pipe" : "ignore",

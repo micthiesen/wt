@@ -24,8 +24,7 @@ User config in `~/.config/wt/config.toml` selects + orders rows. A row hides its
 
 These define contracts. Touching them ripples; read them first.
 
-- `src/core/config.ts` — schema, defaults, validation. Loader fails fast at startup with one aggregated error message.
-- `src/core/paths.ts` — compatibility shim re-exporting old constants from config. New code should `import { config }` directly; this file exists so existing call sites don't churn.
+- `src/core/config.ts` — schema, defaults, validation. Loader fails fast at startup with one aggregated error message. Optional sections (`sst`, `linear`) are `null` when absent; `requireSst()` is the typed boundary for SST-only code paths.
 - `src/tui/rows/types.ts` — `RowModule` contract.
 - `src/tui/rows/index.ts` — registry. Adding a row: write the file, append to `REGISTRY`, optionally add to the default `ui.rows` order in `config.ts`.
 - `src/tui/hooks/useWorktreeRows.ts` — per-worktree field aggregator. `FieldState<T>` carries `error`; plumb it through `toFieldState` when adding a field.
@@ -47,7 +46,6 @@ These define contracts. Touching them ripples; read them first.
 
 ## Traps
 
-- **`paths.ts` is not source of truth.** Don't add new constants there. Export from `config.ts` and have call sites import it.
 - **The list panel (`src/tui/panels/list.tsx`) is NOT row-driven.** Different layout (single line of glyphs, no labels), intentionally not wired through `rows/`. Don't try to unify them.
 - **Config loads once at module init.** No hot reload — editing the TOML requires restarting `wt`.
 - **`Bun.TOML.parse` is built in.** No external TOML lib needed; don't add one.

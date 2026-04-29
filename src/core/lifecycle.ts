@@ -2,17 +2,10 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, writeFileSync
 import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
+import { config } from "./config.ts";
 import { branchExists, git, gitQuiet } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
-import { type LockHandle, lockStatus, tryAcquireLock } from "./locks.ts";
-import {
-  BASE_BRANCH,
-  BRANCH_PREFIX,
-  ENV_FILES_TO_COPY,
-  LOG_DIR,
-  MAIN_CLONE,
-  WT_ROOT,
-} from "./paths.ts";
+import { lockStatus, tryAcquireLock } from "./locks.ts";
 import { run, runQuiet, runStreaming } from "./proc.ts";
 import { computeStage, dirSlug, slugify } from "./stage.ts";
 import type { Worktree } from "./types.ts";
@@ -25,9 +18,9 @@ export type CreateResult =
 /**
  * Return branches matching `<prefix>/<issue-id>(-|$)`. When `anyAuthor`
  * is set, `<prefix>` is any single path segment; otherwise it's the
- * user's own `BRANCH_PREFIX`. Results are deduped so `origin/X` and
- * local `X` collapse to a single entry (local preferred implicitly —
- * `git branch -a` lists locals before remotes in typical output).
+ * user's own `config.branch.prefix`. Results are deduped so `origin/X`
+ * and local `X` collapse to a single entry (local preferred implicitly
+ * — `git branch -a` lists locals before remotes in typical output).
  */
 export async function findBranchesForIssue(
   issueLower: string,
@@ -47,7 +40,7 @@ export async function findBranchesForIssue(
         "i",
       )
     : new RegExp(
-        `^(?:origin/)?${escapeRegex(BRANCH_PREFIX)}/${escapeRegex(issueLower)}(?:-|$)`,
+        `^(?:origin/)?${escapeRegex(config.branch.prefix)}/${escapeRegex(issueLower)}(?:-|$)`,
       );
   const seen = new Set<string>();
   const branches: string[] = [];
@@ -107,12 +100,12 @@ export async function parseInput(
       );
     }
     if (opts.slugHint) {
-      return `${BRANCH_PREFIX}/${idLower}-${slugify(opts.slugHint)}`;
+      return `${config.branch.prefix}/${idLower}-${slugify(opts.slugHint)}`;
     }
     if (opts.promptForSlug) {
       const slug = await opts.promptForSlug(id);
       if (!slug) throw new Error(`no slug provided for ${id}`);
-      return `${BRANCH_PREFIX}/${idLower}-${slugify(slug)}`;
+      return `${config.branch.prefix}/${idLower}-${slugify(slug)}`;
     }
     throw new Error(`No branch for ${id}; pass slug or run interactively.`);
   }
@@ -123,7 +116,7 @@ export async function parseInput(
   // `michael/<slug>`. Covers non-standard names without a `/`
   // separator (e.g. `worktree-david+eng-4959-...`).
   if (await branchExists(raw)) return raw;
-  return `${BRANCH_PREFIX}/${slugify(raw)}`;
+  return `${config.branch.prefix}/${slugify(raw)}`;
 }
 
 export type CreateOptions = {
@@ -143,14 +136,14 @@ export async function createWorktree(
   opts: CreateOptions = {},
 ): Promise<CreateResult> {
   const slug = dirSlug(branch);
-  const path = join(WT_ROOT, slug);
+  const path = join(config.paths.worktreeRoot, slug);
   const stage = computeStage(slug);
 
   if (existsSync(path)) {
     return { ok: false, reason: `Path already exists: ${path}` };
   }
 
-  mkdirSync(WT_ROOT, { recursive: true });
+  mkdirSync(config.paths.worktreeRoot, { recursive: true });
 
   const handle = tryAcquireLock(slug, "init", { phase: "preparing" });
   if (!handle) {
@@ -176,14 +169,14 @@ export async function createWorktree(
         await gitQuiet(["branch", "--set-upstream-to", `origin/${branch}`], path);
       }
     } else {
-      const baseRef = opts.base ?? `origin/${BASE_BRANCH}`;
+      const baseRef = opts.base ?? `origin/${config.branch.base}`;
       opts.onLog?.(`new branch ${branch} off ${baseRef}`);
       await git(["worktree", "add", "--no-track", "-b", branch, path, baseRef]);
     }
 
     handle.phase("copying env files");
-    for (const name of ENV_FILES_TO_COPY) {
-      const src = join(MAIN_CLONE, name);
+    for (const name of config.lifecycle.envFilesToCopy) {
+      const src = join(config.paths.mainClone, name);
       const dst = join(path, name);
       if (existsSync(src) && !existsSync(dst)) {
         copyFileSync(src, dst);
@@ -288,7 +281,7 @@ export async function removeWorktree(
     handle.phase("git worktree remove");
     const args = ["worktree", "remove", wt.path];
     if (effectiveForce) args.push("--force");
-    const r = await run(["git", ...args], { cwd: MAIN_CLONE });
+    const r = await run(["git", ...args], { cwd: config.paths.mainClone });
     if (r.exitCode !== 0) {
       await gitQuiet(["worktree", "prune"]);
       if (existsSync(wt.path)) {
@@ -331,8 +324,11 @@ export function spawnBackgroundRemove(slug: string, opts: {
   destroyStage: boolean;
   deleteBranch: boolean;
 }): string {
-  mkdirSync(LOG_DIR, { recursive: true });
-  const logPath = join(LOG_DIR, `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`);
+  mkdirSync(config.paths.logDir, { recursive: true });
+  const logPath = join(
+    config.paths.logDir,
+    `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`,
+  );
   const exe = join(import.meta.dir, "..", "..", "bin", "wt");
   // Open the log file in the parent and pass the fd to the child as
   // stdout+stderr. This captures not only the _destroy process's own
@@ -351,15 +347,11 @@ export function spawnBackgroundRemove(slug: string, opts: {
         String(opts.destroyStage),
         "--delete-branch",
         String(opts.deleteBranch),
-        "--log-path",
-        logPath,
       ],
       {
         stdin: "ignore",
         stdout: fd,
         stderr: fd,
-        env: { ...process.env, WT_LOG_PATH: logPath },
-        // Detached so the parent can exit without killing it.
       },
     );
   } finally {

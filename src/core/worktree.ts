@@ -1,10 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { config } from "./config.ts";
 import { git, branchIsGone, branchIsMerged, gitQuiet, gitRun } from "./git.ts";
 import { lockAge, lockLabel, lockStatus } from "./locks.ts";
 import { latestLogFor } from "./logs.ts";
-import { AUTO_REGEN_PATHS, BASE_BRANCH, MAIN_CLONE } from "./paths.ts";
 import { runOk, runQuiet } from "./proc.ts";
 import { computeStage } from "./stage.ts";
 import { type Status, StatusKind, type Worktree } from "./types.ts";
@@ -19,7 +19,7 @@ export async function listWorktrees(): Promise<Worktree[]> {
       if (block.worktree) {
         const path = block.worktree;
         const branch = (block.branch ?? "").replace(/^refs\/heads\//, "");
-        const isMain = path === MAIN_CLONE;
+        const isMain = path === config.paths.mainClone;
         const slug = isMain ? "main" : path.split("/").pop()!;
         worktrees.push({
           path,
@@ -101,7 +101,7 @@ async function countsFor(
  * upstream. `remote` is null when the branch has never been pushed.
  */
 export async function syncState(wtPath: string): Promise<SyncState> {
-  const main = await countsFor(wtPath, `origin/${BASE_BRANCH}...HEAD`);
+  const main = await countsFor(wtPath, `origin/${config.branch.base}...HEAD`);
   const hasUpstream = await runQuiet(
     ["git", "rev-parse", "--abbrev-ref", "@{u}"],
     { cwd: wtPath },
@@ -133,7 +133,7 @@ export async function unpushedCommits(wtPath: string): Promise<number> {
       ["git", "rev-parse", "--abbrev-ref", "@{u}"],
       { cwd: wtPath },
     );
-    const ref = hasUpstream ? "@{u}..HEAD" : `origin/${BASE_BRANCH}..HEAD`;
+    const ref = hasUpstream ? "@{u}..HEAD" : `origin/${config.branch.base}..HEAD`;
     const ahead = await runOk(["git", "rev-list", "--count", ref], { cwd: wtPath });
     return parseInt(ahead, 10) || 0;
   } catch {
@@ -186,46 +186,48 @@ export async function worktreeStatus(wt: Worktree): Promise<Status> {
  */
 export async function fetchOrigin(opts: { onWarn?: (msg: string) => void } = {}): Promise<void> {
   await gitRun(["fetch", "origin", "--prune"]);
-  const localRef = `refs/heads/${BASE_BRANCH}`;
-  const remoteRef = `origin/${BASE_BRANCH}`;
-  if (!(await gitQuiet(["show-ref", "--verify", "--quiet", localRef], MAIN_CLONE))) {
+  const base = config.branch.base;
+  const main = config.paths.mainClone;
+  const localRef = `refs/heads/${base}`;
+  const remoteRef = `origin/${base}`;
+  if (!(await gitQuiet(["show-ref", "--verify", "--quiet", localRef], main))) {
     return;
   }
   if (
     !(await gitQuiet([
       "merge-base",
       "--is-ancestor",
-      BASE_BRANCH,
+      base,
       remoteRef,
-    ], MAIN_CLONE))
+    ], main))
   ) {
     opts.onWarn?.(
-      `Local ${BASE_BRANCH} has diverged from ${remoteRef}; not updating.`,
+      `Local ${base} has diverged from ${remoteRef}; not updating.`,
     );
     return;
   }
 
   let onMain = false;
-  if (await gitQuiet(["symbolic-ref", "--quiet", "HEAD"], MAIN_CLONE)) {
-    const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], MAIN_CLONE);
-    onMain = head.trim() === BASE_BRANCH;
+  if (await gitQuiet(["symbolic-ref", "--quiet", "HEAD"], main)) {
+    const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], main);
+    onMain = head.trim() === base;
   }
 
   if (onMain) {
-    await restoreAutoRegen(MAIN_CLONE);
-    const status = await runOk(["git", "status", "--porcelain"], { cwd: MAIN_CLONE });
+    await restoreAutoRegen(main);
+    const status = await runOk(["git", "status", "--porcelain"], { cwd: main });
     if (!status.trim()) {
-      await gitRun(["merge", "--ff-only", "--quiet", remoteRef], MAIN_CLONE);
+      await gitRun(["merge", "--ff-only", "--quiet", remoteRef], main);
     }
     // else: genuinely dirty — leave local main behind; origin/main is
     // already up-to-date from the fetch.
   } else {
-    await gitRun(["update-ref", localRef, remoteRef], MAIN_CLONE);
+    await gitRun(["update-ref", localRef, remoteRef], main);
   }
 }
 
 async function restoreAutoRegen(cwd: string): Promise<void> {
-  for (const p of AUTO_REGEN_PATHS) {
+  for (const p of config.sst?.autoRegenPaths ?? []) {
     if (!existsSync(join(cwd, p))) continue;
     const porcelain = await runOk(["git", "status", "--porcelain", "--", p], { cwd });
     if (porcelain) {

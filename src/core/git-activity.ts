@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 
-import { BASE_BRANCH } from "./paths.ts";
+import { config } from "./config.ts";
 import { run } from "./proc.ts";
 
 export type GitActivity = {
@@ -44,7 +44,7 @@ async function diffFor(
 ): Promise<{ files: number; added: number; removed: number } | null> {
   if (!branch) return null;
   const r = await run(
-    ["git", "diff", "--shortstat", `origin/${BASE_BRANCH}...HEAD`],
+    ["git", "diff", "--shortstat", `origin/${config.branch.base}...HEAD`],
     { cwd: path, timeoutMs: TIMEOUT_MS },
   );
   if (r.exitCode !== 0) return null;

@@ -6,7 +6,6 @@ type Parsed = {
   force: boolean;
   destroyStage: boolean;
   deleteBranch: boolean;
-  logPath: string;
 };
 
 function boolArg(v: string | undefined): boolean {
@@ -20,18 +19,16 @@ function parse(argv: string[]): Parsed | { error: string } {
   let force = false;
   let destroyStage = false;
   let deleteBranch = false;
-  let logPath = "";
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--force") force = boolArg(argv[++i]);
     else if (a === "--destroy-stage") destroyStage = boolArg(argv[++i]);
     else if (a === "--delete-branch") deleteBranch = boolArg(argv[++i]);
-    else if (a === "--log-path") logPath = argv[++i] ?? "";
     else if (!slug) slug = a;
     else return { error: `unexpected arg: ${a}` };
   }
   if (!slug) return { error: "missing slug" };
-  return { slug, force, destroyStage, deleteBranch, logPath };
+  return { slug, force, destroyStage, deleteBranch };
 }
 
 /**

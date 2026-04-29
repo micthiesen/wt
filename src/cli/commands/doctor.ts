@@ -1,10 +1,10 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { config } from "../../core/config.ts";
 import { branchIsMerged, gitQuiet } from "../../core/git.ts";
 import { fetchPrs } from "../../core/github.ts";
 import { humanAge, lockAge, lockLabel, lockStatus } from "../../core/locks.ts";
-import { BASE_BRANCH, MAIN_CLONE } from "../../core/paths.ts";
 import { run as sh } from "../../core/proc.ts";
 import { computeStage } from "../../core/stage.ts";
 import type { Check, CheckStatus, Worktree } from "../../core/types.ts";
@@ -57,7 +57,7 @@ async function checkWorkingTree(wt: Worktree): Promise<Check> {
 
 async function checkSync(wt: Worktree): Promise<Check> {
   const r = await sh(
-    ["git", "rev-list", "--left-right", "--count", `origin/${BASE_BRANCH}...HEAD`],
+    ["git", "rev-list", "--left-right", "--count", `origin/${config.branch.base}...HEAD`],
     { cwd: wt.path },
   );
   if (r.exitCode !== 0) return mkCheck("sync", "warn", "cannot compare to origin/main");
@@ -103,7 +103,7 @@ async function checkSstStage(wt: Worktree): Promise<Check> {
   if (!existsSync(stageFile)) return mkCheck("sst stage", "warn", "no .sst/stage pinned");
   let actual = "";
   try {
-    actual = (await Bun.file(stageFile).text()).trim();
+    actual = readFileSync(stageFile, "utf8").trim();
   } catch {
     return mkCheck("sst stage", "warn", "cannot read .sst/stage");
   }
@@ -191,27 +191,29 @@ async function checkPr(wt: Worktree): Promise<Check> {
 }
 
 async function checkMainClone(): Promise<Check> {
+  const main = config.paths.mainClone;
+  const base = config.branch.base;
   const r = await sh(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], {
-    cwd: MAIN_CLONE,
+    cwd: main,
   });
   if (r.exitCode !== 0) {
     return mkCheck(
       "main clone",
       "err",
-      `detached HEAD in ${MAIN_CLONE} — should be on ${BASE_BRANCH}`,
+      `detached HEAD in ${main} — should be on ${base}`,
     );
   }
   const head = r.stdout.trim();
-  if (head !== BASE_BRANCH) {
+  if (head !== base) {
     return mkCheck(
       "main clone",
       "err",
-      `on branch ${JSON.stringify(head)} — should be on ${BASE_BRANCH}. ` +
+      `on branch ${JSON.stringify(head)} — should be on ${base}. ` +
         `Move that work into a worktree (\`wt new ${head}\`) and ` +
-        `\`git -C ${MAIN_CLONE} checkout ${BASE_BRANCH}\`.`,
+        `\`git -C ${main} checkout ${base}\`.`,
     );
   }
-  return mkCheck("main clone", "ok", `on ${BASE_BRANCH}`);
+  return mkCheck("main clone", "ok", `on ${base}`);
 }
 
 async function runAllChecks(wt: Worktree, includePr: boolean): Promise<Check[]> {

@@ -1,4 +1,4 @@
-import { MAIN_CLONE, SST_STATE_BUCKET, STAGE_PREFIX } from "../../core/paths.ts";
+import { config } from "../../core/config.ts";
 import { categorizeStages, humanSize, listSstStages } from "../../core/sst.ts";
 import type { SstStage } from "../../core/types.ts";
 import { listWorktrees } from "../../core/worktree.ts";
@@ -23,6 +23,11 @@ function ageOf(s: SstStage, now: number): string {
 
 export async function run(argv: string[]): Promise<number> {
   const { json, clean, yes } = parseFlags(argv);
+
+  if (!config.sst) {
+    console.error(red("[deploy.sst] is not configured in config.toml; nothing to do."));
+    return 2;
+  }
 
   const stages = await listSstStages();
   if (!stages) {
@@ -49,7 +54,7 @@ export async function run(argv: string[]): Promise<number> {
       ),
     );
   } else if (live.length === 0 && orphaned.length === 0) {
-    console.log(dim(`No \`${STAGE_PREFIX}*\` stages in ${SST_STATE_BUCKET}.`));
+    console.log(dim(`No \`${config.stage.prefix}*\` stages in ${config.sst.stateBucket}.`));
   } else {
     const now = Date.now();
     type Row = { marker: string; stage: SstStage; status: string };
@@ -66,7 +71,7 @@ export async function run(argv: string[]): Promise<number> {
     ]);
     console.log(table);
     console.log(
-      dim(`  ${live.length} live · ${orphaned.length} orphaned · bucket ${SST_STATE_BUCKET}`),
+      dim(`  ${live.length} live · ${orphaned.length} orphaned · bucket ${config.sst.stateBucket}`),
     );
   }
 
@@ -88,7 +93,7 @@ export async function run(argv: string[]): Promise<number> {
     console.log();
     console.log(`--- Destroying ${red(s.name)} ---`);
     const p = Bun.spawn(["pnpm", "sst", "remove", "--stage", s.name], {
-      cwd: MAIN_CLONE,
+      cwd: config.paths.mainClone,
       stdout: "inherit",
       stderr: "inherit",
     });

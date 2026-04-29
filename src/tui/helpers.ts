@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
 export { hideFrontmostAlacritty, openInZed } from "../core/zed.ts";
@@ -11,17 +10,13 @@ export { hideFrontmostAlacritty, openInZed } from "../core/zed.ts";
  */
 export const WT_REPO_PATH: string = resolve(import.meta.dir, "..", "..");
 
-function detached(argv: string[], opts: { cwd?: string } = {}): void {
-  const child = spawn(argv[0]!, argv.slice(1), {
-    cwd: opts.cwd,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
-}
-
+/** Fire-and-forget `open <url>`. The macOS `open` binary returns immediately. */
 export function openUrl(url: string): void {
-  detached(["open", url]);
+  Bun.spawn(["open", url], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
 }
 
 /** Write to the macOS clipboard via pbcopy. Fire-and-forget. */
