@@ -29,13 +29,12 @@ import { useGithub } from "../../state/hooks.ts";
 import {
   aiSummaryQuery,
   wtDiffContextQuery,
-  wtFirstCommitQuery,
 } from "../../state/queries.ts";
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
 import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
-import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = { row?: WorktreeRow };
 
@@ -121,8 +120,6 @@ function RenderedRow({ module: m, ctx }: { module: RowModule; ctx: RowContext })
     </Row>
   );
 }
-
-type TitleSource = "llm" | "pr" | "commit";
 
 /**
  * Title above the row stack. Bold title followed by a muted `(source)`
@@ -223,13 +220,11 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
   const aiEnabled = !!config.ai;
   const allowFetch = aiEnabled && !isBusy;
 
-  // First-commit subject is cheap; pause it during destroys so we're
-  // not racing the worktree's git state, but otherwise let it run.
-  const firstCommit = useQuery({
-    ...wtFirstCommitQuery(row.wt),
-    enabled: !isBusy,
-  });
-
+  // Diff context + summary observers are duplicated with `useWorktreeRows`
+  // (cache-shared, not refetched) so this pane has direct access to the
+  // *description* and the per-fetch state for the spinner / error
+  // gating, neither of which is exposed on `WorktreeRow`. The resolved
+  // title itself comes pre-computed from the row.
   const diffCtx = useQuery({
     ...wtDiffContextQuery(row.wt),
     enabled: allowFetch,
@@ -241,27 +236,6 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
   });
 
   const ctx: RowContext = { row, github };
-
-  // Title hierarchy: LLM-generated wins (most context-aware and
-  // up-to-date with the diff), then PR title, then the oldest commit's
-  // subject as a non-AI fallback. The chosen source is rendered in
-  // muted text next to the title so stale PR titles stand out.
-  const llmTitle = summary.data?.title ?? null;
-  const prTitle =
-    row.wt.branch && github.data?.prs ? github.data.prs[row.wt.branch]?.title : undefined;
-  const commitTitle = firstCommit.data || null;
-  let title: string | null = null;
-  let titleSource: TitleSource | null = null;
-  if (llmTitle) {
-    title = llmTitle;
-    titleSource = "llm";
-  } else if (prTitle) {
-    title = prTitle;
-    titleSource = "pr";
-  } else if (commitTitle) {
-    title = commitTitle;
-    titleSource = "commit";
-  }
 
   // Pick a single user-facing reason when we're suppressing AI work.
   const blockedReason: string | null = !aiEnabled
@@ -283,7 +257,7 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
       padding={1}
       flexDirection="column"
     >
-      <TitleLine title={title} source={titleSource} />
+      <TitleLine title={row.title} source={row.titleSource} />
       {RESOLVED_ROWS.map((m) => (
         <RenderedRow key={m.id} module={m} ctx={ctx} />
       ))}

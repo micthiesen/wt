@@ -12,6 +12,7 @@ import { TextAttributes } from "@opentui/core";
 import { prStateBadge, statusBadge } from "../badges.ts";
 import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
+import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { type MergeQueueState, StatusKind } from "../../core/types.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -76,6 +77,60 @@ function mqGlyph(row: WorktreeRow): string {
 }
 
 /**
+ * Row label text. The resolved title (`row.title`, with `llm > pr >
+ * commit` fallback owned by `useWorktreeRows`) wins over the slug-
+ * derived prettified `rest` so list and details stay in sync. First
+ * char is capitalized to match PR-title convention even when an LLM
+ * emits lowercase. Issue ID, when present, prefixes the label as
+ * `ENG-1234: <text>`. Falls back to the raw slug as a defensive last
+ * resort.
+ */
+function rowLabel(row: WorktreeRow): string {
+  const { id, rest } = slugLabel(row.wt.slug);
+  const text = row.title ? capitalizeFirst(row.title) : rest;
+  if (id && text) return `${id}: ${text}`;
+  return id ?? text ?? row.wt.slug;
+}
+
+/**
+ * End-truncate `s` to fit within `maxWidth` terminal cells, suffixing
+ * `…` when it overflows. OpenTUI's native `truncate` flag does
+ * middle-truncation in the binary; we want trailing ellipsis (label
+ * starts the same way for related branches, so the head is the most
+ * recognizable part), so we shorten ourselves and skip the native flag.
+ */
+function truncateEnd(s: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  if (Bun.stringWidth(s) <= maxWidth) return s;
+  if (maxWidth === 1) return "…";
+  let cut = s;
+  while (cut.length > 0 && Bun.stringWidth(cut) + 1 > maxWidth) {
+    cut = cut.slice(0, -1);
+  }
+  return `${cut}…`;
+}
+
+/**
+ * Cells the badge cluster occupies for a given row. Mirrors the
+ * width-prop layout in the JSX below: 2-cell leading gap + each present
+ * badge's box width. Returns 0 when no badges are rendered so the slug
+ * column reclaims the space.
+ */
+function badgeClusterCells(row: WorktreeRow): number {
+  const isDeployed = row.fields.deploy.data ?? false;
+  const showChecks =
+    !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
+  const hasAnyBadge = !!(row.pr || row.mq || isDeployed);
+  if (!hasAnyBadge) return 0;
+  let cells = 2; // leading gap
+  if (row.pr) cells += 2;
+  if (showChecks) cells += 2;
+  if (row.mq) cells += 4;
+  if (isDeployed) cells += 2;
+  return cells;
+}
+
+/**
  * Tiny CI rollup glyph rendered next to the PR badge. Only shown for
  * live PRs — after merge/close the check state is noise.
  */
@@ -98,10 +153,12 @@ function RowView({
   row,
   selected,
   isTailing,
+  panelWidth,
 }: {
   row: WorktreeRow;
   selected: boolean;
   isTailing: boolean;
+  panelWidth: number;
 }) {
   const marker = statusMarker(row);
   const bg = selected ? theme.rowSelectedBg : undefined;
@@ -157,8 +214,14 @@ function RowView({
         </box>
       </box>
       <box flexGrow={1} flexShrink={1} overflow="hidden">
-        <text fg={slugFg} attributes={slugAttrs} wrapMode="none" truncate>
-          {row.wt.slug}
+        {/* Truncation lives in JS, not opentui's native `truncate`,
+            because the native path middle-clips with `…`. We want the
+            head intact (it's the most distinctive part: "ENG-1234: "
+            and the leading words of the title). Width budget = panel
+            width − borders(2) − row padding(2) − marker+gap(3) − badge
+            cluster. */}
+        <text fg={slugFg} attributes={slugAttrs} wrapMode="none">
+          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row)))}
         </text>
       </box>
       {/* Compact badge cluster: only render present badges, butted up
@@ -261,6 +324,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
               row={row}
               selected={i === selectedIndex}
               isTailing={activeTails.has(row.wt.slug)}
+              panelWidth={width}
             />
           ))}
           {hasArchived ? (
@@ -276,6 +340,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                     row={row}
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
+                    panelWidth={width}
                   />
                 );
               })}

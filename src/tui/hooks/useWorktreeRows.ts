@@ -1,6 +1,7 @@
 import { useQueries, useQuery } from "@tanstack/react-query";
 
 import type { ClaudeStatus } from "../../core/claude.ts";
+import { config } from "../../core/config.ts";
 import type { GitActivity } from "../../core/git-activity.ts";
 import { pickPrForWorktree } from "../../core/github.ts";
 import { lockAge, lockLabel } from "../../core/locks.ts";
@@ -10,17 +11,27 @@ import { StatusKind } from "../../core/types.ts";
 import type { SyncState } from "../../core/worktree.ts";
 import { useGithub } from "../../state/hooks.ts";
 import {
+  aiSummaryQuery,
   archiveQuery,
   worktreesQuery,
   wtClaudeQuery,
   wtDeployQuery,
+  wtDiffContextQuery,
   wtDirtyQuery,
+  wtFirstCommitQuery,
   wtGitActivityQuery,
   wtGoneQuery,
   wtLockQuery,
   wtMergedQuery,
   wtSyncQuery,
 } from "../../state/queries.ts";
+
+/**
+ * Where the row's resolved title came from, in fallback priority. The
+ * details pane renders this as a muted suffix so a stale PR title vs.
+ * a freshly LLM-generated one is obvious at a glance.
+ */
+export type TitleSource = "llm" | "pr" | "commit";
 
 export type FieldState<T> = {
   data: T | undefined;
@@ -50,6 +61,16 @@ export type WorktreeRow = {
   mq?: MergeQueueEntry;
   anyFetching: boolean;
   archived: boolean;
+  /**
+   * Resolved title with `llm > pr > commit` fallback. Both the list
+   * row label and the details-pane title bar read this so they stay in
+   * sync. Null when no source has produced anything yet (AI still
+   * generating, no PR, branch with no commits) — in which case the
+   * list falls back to a slug-derived label and the details pane
+   * shows nothing.
+   */
+  title: string | null;
+  titleSource: TitleSource | null;
 };
 
 const FIELD_ORDER = [
@@ -139,6 +160,48 @@ export function useWorktreeRows(): WorktreeRowsResult {
   // `useQueries` caches identity.
   const results = useQueries({ queries });
 
+  // Diff context + AI summary observers for every worktree, so the list
+  // panel can render LLM-generated titles next to each row. The cache is
+  // content-addressed and persisted, so steady-state these are no-op
+  // hits; only new/changed worktrees trigger an LM Studio call. Gated on
+  // the lock state from the batch above so we don't race a destroying
+  // worktree's git state.
+  const aiEnabled = !!config.ai;
+  const busyByIndex = worktrees.map((_, i) => {
+    const lock = results[i * FIELD_ORDER.length + 1]?.data as
+      | Partial<LockMeta>
+      | null
+      | undefined;
+    return !!(lock && Object.keys(lock).length > 0);
+  });
+
+  const diffResults = useQueries({
+    queries: worktrees.map((wt, i) => ({
+      ...wtDiffContextQuery(wt),
+      enabled: !busyByIndex[i],
+    })),
+  });
+
+  const aiResults = useQueries({
+    queries: worktrees.map((wt, i) => {
+      const ctx = diffResults[i]?.data ?? null;
+      return {
+        ...aiSummaryQuery(wt.slug, ctx),
+        enabled: aiEnabled && !busyByIndex[i] && !!ctx,
+      };
+    }),
+  });
+
+  // First-commit subject — non-AI fallback for the title resolution
+  // chain. Cheap (one `git log`); paused only while busy so we don't
+  // race a destroying worktree's git state.
+  const firstCommitResults = useQueries({
+    queries: worktrees.map((wt, i) => ({
+      ...wtFirstCommitQuery(wt),
+      enabled: !busyByIndex[i],
+    })),
+  });
+
   const unsorted: WorktreeRow[] = worktrees.map((wt, i) => {
     const base = i * FIELD_ORDER.length;
     const fieldArr = FIELD_ORDER.map((_, j) => results[base + j]!);
@@ -164,7 +227,22 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const anyFetching =
       fieldArr.some((r) => r.isFetching) || github.isFetching;
     const archived = archivedSet.has(wt.slug);
-    return { wt, fields, status, pr, mq, anyFetching, archived };
+    const llmTitle = (aiResults[i]?.data?.title as string | undefined) ?? null;
+    const prTitle = pr?.title ?? null;
+    const commitTitle = (firstCommitResults[i]?.data as string | null | undefined) ?? null;
+    let title: string | null = null;
+    let titleSource: TitleSource | null = null;
+    if (llmTitle) {
+      title = llmTitle;
+      titleSource = "llm";
+    } else if (prTitle) {
+      title = prTitle;
+      titleSource = "pr";
+    } else if (commitTitle) {
+      title = commitTitle;
+      titleSource = "commit";
+    }
+    return { wt, fields, status, pr, mq, anyFetching, archived, title, titleSource };
   });
 
   // Stable partition: active first (preserves git worktree order),

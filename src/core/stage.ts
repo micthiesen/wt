@@ -63,3 +63,29 @@ export function slugify(s: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
 }
+
+/**
+ * Decompose a slug into an issue ID (uppercased, e.g. `ENG-1234`) and
+ * the remaining descriptive part with dashes turned into spaces and the
+ * first letter capitalized — `eng-1234-do-foo-and-bar` becomes
+ * `{ id: "ENG-1234", rest: "Do foo and bar" }`. Slugs without an issue
+ * prefix yield `{ id: null, rest: "Do foo and bar" }`. Used by the list
+ * panel as the no-AI fallback label.
+ */
+export function slugLabel(slug: string): { id: string | null; rest: string } {
+  const m = ISSUE_PREFIX_RE.exec(slug);
+  let id: string | null = null;
+  let trimmed = slug;
+  if (m) {
+    id = m[0].replace(/-$/, "").toUpperCase();
+    trimmed = slug.slice(m[0].length);
+  }
+  const words = trimmed.replace(/-/g, " ").trim();
+  const rest = words ? words[0]!.toUpperCase() + words.slice(1) : "";
+  return { id, rest };
+}
+
+export function capitalizeFirst(s: string): string {
+  if (!s) return s;
+  return s[0]!.toUpperCase() + s.slice(1);
+}
