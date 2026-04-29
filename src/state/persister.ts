@@ -4,6 +4,10 @@ import { Database } from "bun:sqlite";
 import type { Persister } from "@tanstack/query-persist-client-core";
 import type { PersistedClient } from "@tanstack/query-persist-client-core";
 
+import { createLogger } from "../core/logger.ts";
+
+const log = createLogger("[cache]");
+
 /**
  * SQLite persister for TanStack Query. Stores the entire dehydrated
  * client as a single JSON blob keyed by `CLIENT_KEY`. Synchronous
@@ -25,8 +29,9 @@ export function clearPersistedCache(dbPath: string): void {
   const db = new Database(dbPath, { readwrite: true, create: false });
   try {
     db.exec("DELETE FROM cache");
-  } catch {
+  } catch (err) {
     // Schema drift between versions shouldn't crash the action.
+    log.error(err instanceof Error ? err : String(err), { dbPath });
   } finally {
     db.close();
   }
@@ -65,7 +70,8 @@ export function createSqlitePersister(dbPath: string): ClosablePersister {
       if (!row) return undefined;
       try {
         return JSON.parse(row.data) as PersistedClient;
-      } catch {
+      } catch (err) {
+        log.error(err instanceof Error ? err : String(err), { stage: "restoreClient" });
         return undefined;
       }
     },

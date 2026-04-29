@@ -122,17 +122,26 @@ function RenderedRow({ module: m, ctx }: { module: RowModule; ctx: RowContext })
   );
 }
 
+type TitleSource = "llm" | "pr" | "commit";
+
 /**
- * Title above the row stack: PR title if there is one (human-authored,
- * always wins), else the oldest commit subject on the branch (the dev's
- * "what is this" framing before a PR exists), else nothing.
+ * Title above the row stack. Bold title followed by a muted `(source)`
+ * tag so it's obvious where the text came from — useful for spotting
+ * stale PR titles vs. fresh LLM-generated ones at a glance.
  */
-function TitleLine({ title }: { title: string | null }) {
+function TitleLine({
+  title,
+  source,
+}: {
+  title: string | null;
+  source: TitleSource | null;
+}) {
   if (!title) return null;
   return (
     <box marginBottom={1}>
-      <text fg={theme.fg} attributes={1} wrapMode="none" truncate>
-        {title}
+      <text wrapMode="none" truncate>
+        <span fg={theme.fg} attributes={1}>{title}</span>
+        {source ? <span fg={theme.fgDim}>{` (${source})`}</span> : null}
       </text>
     </box>
   );
@@ -147,30 +156,33 @@ function TitleLine({ title }: { title: string | null }) {
  */
 function DescriptionBlock({
   summary,
-  isFetching,
+  isLlmRunning,
   hasContext,
   blockedReason,
   error,
 }: {
   summary: string | null;
-  isFetching: boolean;
+  /**
+   * True only while the LM Studio call itself is in flight — *not* for
+   * the cheap diff-context revalidation. Drives the refresh glyph and
+   * the "generating summary…" placeholder. Intentionally narrower than
+   * the per-row staleness glyph elsewhere: a hash-stable cache check
+   * shouldn't make this row look like it's regenerating when it isn't.
+   */
+  isLlmRunning: boolean;
   hasContext: boolean;
   blockedReason: string | null;
   error: Error | null;
 }) {
   // No AI config and no cached value → don't reserve space.
-  if (!summary && !isFetching && !hasContext && !blockedReason && !error) return null;
-  // Match the per-row staleness glyph in the rest of the details
-  // pane: NF.refresh suffix whenever a fetch is in flight, regardless
-  // of whether we already have a cached summary. Same rationale —
-  // "something's happening, the visible text may be stale".
-  const refreshSuffix = isFetching ? ` ${NF.refresh}` : "";
+  if (!summary && !isLlmRunning && !hasContext && !blockedReason && !error) return null;
+  const refreshSuffix = isLlmRunning ? ` ${NF.refresh}` : "";
   let body: React.ReactNode;
   // Errors win over everything except an in-flight retry: while
   // re-fetching after a failure we'd rather show "generating…" than
   // the stale error. Once the retry settles, the error reappears (or
   // gets replaced by the new summary).
-  if (error && !isFetching) {
+  if (error && !isLlmRunning) {
     body = (
       <text fg={theme.err} wrapMode="word">
         {error.message}
@@ -183,7 +195,7 @@ function DescriptionBlock({
         {refreshSuffix}
       </text>
     );
-  } else if (isFetching) {
+  } else if (isLlmRunning) {
     body = (
       <text fg={theme.fgDim} attributes={TextAttributes.ITALIC}>
         generating summary…{refreshSuffix}
@@ -232,11 +244,24 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
 
   // Title hierarchy: LLM-generated wins (most context-aware and
   // up-to-date with the diff), then PR title, then the oldest commit's
-  // subject as a non-AI fallback.
+  // subject as a non-AI fallback. The chosen source is rendered in
+  // muted text next to the title so stale PR titles stand out.
   const llmTitle = summary.data?.title ?? null;
   const prTitle =
     row.wt.branch && github.data?.prs ? github.data.prs[row.wt.branch]?.title : undefined;
-  const title = llmTitle || prTitle || firstCommit.data || null;
+  const commitTitle = firstCommit.data || null;
+  let title: string | null = null;
+  let titleSource: TitleSource | null = null;
+  if (llmTitle) {
+    title = llmTitle;
+    titleSource = "llm";
+  } else if (prTitle) {
+    title = prTitle;
+    titleSource = "pr";
+  } else if (commitTitle) {
+    title = commitTitle;
+    titleSource = "commit";
+  }
 
   // Pick a single user-facing reason when we're suppressing AI work.
   const blockedReason: string | null = !aiEnabled
@@ -258,13 +283,13 @@ function DetailsBody({ row }: { row: WorktreeRow }) {
       padding={1}
       flexDirection="column"
     >
-      <TitleLine title={title} />
+      <TitleLine title={title} source={titleSource} />
       {RESOLVED_ROWS.map((m) => (
         <RenderedRow key={m.id} module={m} ctx={ctx} />
       ))}
       <DescriptionBlock
         summary={summary.data?.description ?? null}
-        isFetching={diffCtx.isFetching || summary.isFetching}
+        isLlmRunning={summary.isFetching}
         hasContext={!!diffCtx.data}
         blockedReason={blockedReason}
         error={summary.error ?? diffCtx.error ?? null}

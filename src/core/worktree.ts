@@ -4,10 +4,13 @@ import { join } from "node:path";
 import { config } from "./config.ts";
 import { git, branchIsGone, branchIsMerged, gitQuiet, gitRun } from "./git.ts";
 import { lockAge, lockLabel, lockStatus } from "./locks.ts";
+import { createLogger } from "./logger.ts";
 import { latestLogFor } from "./logs.ts";
 import { runOk, runQuiet } from "./proc.ts";
 import { computeStage } from "./stage.ts";
 import { type Status, StatusKind, type Worktree } from "./types.ts";
+
+const log = createLogger("[worktree]");
 
 export async function listWorktrees(): Promise<Worktree[]> {
   const out = await git(["worktree", "list", "--porcelain"]);
@@ -136,7 +139,8 @@ export async function unpushedCommits(wtPath: string): Promise<number> {
     const ref = hasUpstream ? "@{u}..HEAD" : `origin/${config.branch.base}..HEAD`;
     const ahead = await runOk(["git", "rev-list", "--count", ref], { cwd: wtPath });
     return parseInt(ahead, 10) || 0;
-  } catch {
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), { wtPath });
     return 0;
   }
 }

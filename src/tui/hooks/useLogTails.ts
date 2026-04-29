@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
+import { createLogger } from "../../core/logger.ts";
 import { latestLogFor } from "../../core/logs.ts";
 import { streamLines } from "../../core/proc.ts";
 import { StatusKind } from "../../core/types.ts";
-import { logDim, logErr, logInfo } from "../events.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 type Tail = {
@@ -38,21 +38,23 @@ export function useLogTails(rows: WorktreeRow[]): Set<string> {
     }
 
     // Start new tails.
-    for (const [slug, log] of wanted) {
+    for (const [slug, logPath] of wanted) {
       if (tails.current.has(slug)) continue;
       const controller = new AbortController();
+      const log = createLogger(slug);
       try {
-        const proc = Bun.spawn(["tail", "-n", "50", "-F", log], {
+        const proc = Bun.spawn(["tail", "-n", "50", "-F", logPath], {
           stdin: "ignore",
           stdout: "pipe",
           stderr: "pipe",
           signal: controller.signal,
         });
         tails.current.set(slug, { proc, controller });
-        logInfo(slug, `tailing ${log}`);
+        log.event.info(`tailing ${logPath}`);
         void pumpTail(proc, slug);
       } catch (err) {
-        logErr(slug, `tail failed: ${err instanceof Error ? err.message : String(err)}`);
+        log.event.err(`tail failed: ${err instanceof Error ? err.message : String(err)}`);
+        log.error(err instanceof Error ? err : String(err));
       }
     }
 
@@ -77,9 +79,10 @@ export function useLogTails(rows: WorktreeRow[]): Set<string> {
 async function pumpTail(proc: Bun.Subprocess, slug: string): Promise<void> {
   const stdout = proc.stdout as ReadableStream<Uint8Array> | undefined;
   if (!stdout) return;
+  const log = createLogger(slug);
   try {
     await streamLines(stdout, (line) => {
-      if (line.trim()) logDim(slug, line);
+      if (line.trim()) log.event.dim(line);
     });
   } catch {
     // tail was aborted via AbortController — normal shutdown path.

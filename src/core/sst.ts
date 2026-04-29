@@ -1,6 +1,9 @@
 import { config, requireSst } from "./config.ts";
+import { createLogger } from "./logger.ts";
 import { run } from "./proc.ts";
 import type { SstStage } from "./types.ts";
+
+const log = createLogger("[sst]");
 
 /**
  * Run `aws s3 ...` with the configured profile. Throws if SST is not
@@ -56,7 +59,8 @@ async function stageHasResources(name: string): Promise<boolean> {
     const resources =
       state?.checkpoint?.latest?.resources ?? [];
     return Array.isArray(resources) && resources.length > 0;
-  } catch {
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), { stage: name });
     return true;
   }
 }

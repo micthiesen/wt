@@ -72,3 +72,7 @@ The loader prints every missing or malformed field at once. See [`src/core/confi
 ## Usage
 
 `wt` with no arguments launches the TUI. Subcommands (`ls`, `new`, `rm`, `clean`, `doctor`, `stages`, `logs`, `open`) run one-shot CLI ops — see `wt --help` and `wt <cmd> --help`.
+
+## Logs
+
+Every action (and every error) goes to a daily file at `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log` for post-hoc debugging — a strict superset of what the activity pane shows. Files older than 14 days are pruned automatically. Per-worktree destroy logs are still at `~/.cache/wt/logs/<slug>-*.log` and `wt logs <slug>` tails the latest one.

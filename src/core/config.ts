@@ -58,6 +58,8 @@ export type Config = {
     mainClone: string;
     worktreeRoot: string;
     logDir: string;
+    /** Daily structured log files written by `core/logger.ts`. Derived from `logDir`. */
+    appLogDir: string;
     lockDir: string;
     /** SQLite blob holding the persisted TanStack Query cache. */
     cacheDb: string;
@@ -217,6 +219,11 @@ function build(raw: Raw, errs: Errors): Config {
   const mainClone = expandHome(errs.reqStr(paths, "paths", "main_clone"));
   const worktreeRoot = expandHome(errs.reqStr(paths, "paths", "worktree_root"));
   const logDir = expandHome(errs.optStr(paths, "log_dir", GENERIC_DEFAULTS.paths.logDir));
+  // Sibling subdir for structured app logs — keeps daily `wt-*.log`
+  // files separate from the per-worktree `<slug>-*.log` destroy logs
+  // that `wt logs <slug>` reads. Not user-configurable; fold into
+  // `log_dir` if the user moved that.
+  const appLogDir = join(logDir, "app");
   const lockDir = expandHome(errs.optStr(paths, "lock_dir", GENERIC_DEFAULTS.paths.lockDir));
   const cacheDb = expandHome(errs.optStr(paths, "cache_db", GENERIC_DEFAULTS.paths.cacheDb));
 
@@ -258,7 +265,7 @@ function build(raw: Raw, errs: Errors): Config {
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   return {
-    paths: { mainClone, worktreeRoot, logDir, lockDir, cacheDb },
+    paths: { mainClone, worktreeRoot, logDir, appLogDir, lockDir, cacheDb },
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
     lifecycle: { envFilesToCopy: envFiles },

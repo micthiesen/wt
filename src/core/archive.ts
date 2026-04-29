@@ -2,7 +2,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { createLogger } from "./logger.ts";
+
 const ARCHIVE_FILE = join(homedir(), ".cache", "wt", "archive.json");
+const log = createLogger("[archive]");
 
 type ArchiveFile = { slugs: string[] };
 
@@ -17,7 +20,8 @@ export function readArchived(): Set<string> {
     const raw = readFileSync(ARCHIVE_FILE, "utf8");
     const data = JSON.parse(raw) as ArchiveFile;
     return new Set(Array.isArray(data?.slugs) ? data.slugs : []);
-  } catch {
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), { file: ARCHIVE_FILE });
     return new Set();
   }
 }

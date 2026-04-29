@@ -30,6 +30,7 @@ These define contracts. Touching them ripples; read them first.
 - `src/tui/hooks/useWorktreeRows.ts` — per-worktree field aggregator. `FieldState<T>` carries `error`; plumb it through `toFieldState` when adding a field.
 - `src/core/diff/` — graceful-degradation diff compactor. `parts.ts` parses, `render.ts` transforms per mode, `fit.ts` runs the priority-aware greedy reducer, `index.ts` is the entry. Modes (`full → tight → hunks → dropped`) and priority tiers are the two knobs worth touching here. Cache keys are SHA-256 prefixes of the *unfiltered* diff so filter tweaks don't invalidate prior summaries.
 - `src/core/ai.ts` — LM Studio / OpenAI-compatible client. One call returns `{title, description}` parsed from a `TITLE: …\nDESCRIPTION: …` line-prefixed response. Parser is lenient — falls back to "everything is the description" when the model ignores structure.
+- `src/core/logger.ts` — structured logger. Two channels per source: file-only `debug/info/warn/error(msg, ctx?)` and `event.{info,ok,warn,err,dim}(text)` which fans out to file *and* the activity pane (when the TUI runtime has registered a sink). Lazy daily file at `<config.paths.appLogDir>/wt-YYYY-MM-DD.log`, 14-day retention, cross-process append-safe. `tui/events.ts` is now just the in-memory store + `useEvents` hook — emit through `createLogger(...)` instead.
 
 ## Working principles
 
@@ -39,6 +40,12 @@ These define contracts. Touching them ripples; read them first.
 - **No client-app defaults in code.** `paths.main_clone`, `paths.worktree_root`, `branch.prefix` are required and the loader refuses to start without them. New required fields go through `Errors.reqStr`; add a derivation when one's natural (see `stage.prefix` defaulting from `branch.prefix`).
 - **Errors render verbatim, gated on retries-exhausted.** `firstError` in `details.tsx` already handles the gate (`error && !isFetching`) — don't duplicate it elsewhere. The same error showing on every row that depends on a broken source is intentional.
 - **Convention over configuration for the niche stuff.** `branch.id_pattern` exists but most users will never set it; the default matches Linear/Jira/Shortcut conventions.
+
+## Logging & debugging
+
+- **Daily app log**: `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log`. Every `createLogger(source)` call writes here, regardless of TUI/CLI. Plaintext header (`<iso-ts> <LEVEL> <source>`) with structured ctx as a trailing JSON blob. Read it when something looked wrong: errors thrown deep in queries, stack traces from caught exceptions, or to recover what the activity pane scrolled past (event lines are tagged `EVENT`, so `grep ' EVENT '` shows exactly what the user saw).
+- **Per-worktree destroy logs** still live one level up at `~/.cache/wt/logs/<slug>-*.log` (separate from the daily app log) and are surfaced via `wt logs <slug>`.
+- **Adding a log call**: `const log = createLogger("[some-source]")` at module top for static sources, or `createLogger(slug)` per call for dynamic ones. Use `log.event.X` when the user should see it in the activity pane; use `log.debug/info/warn/error` for file-only diagnostics. The "errors render verbatim, gated on retries-exhausted" rule still applies — `log.error` does **not** auto-promote to the pane.
 
 ## Tooling
 

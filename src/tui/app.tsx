@@ -10,6 +10,7 @@ import {
 } from "../core/lifecycle.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
+import { createLogger } from "../core/logger.ts";
 import { stageUrl } from "../core/stage.ts";
 import { StatusKind } from "../core/types.ts";
 import { useWtActions } from "../state/index.ts";
@@ -28,8 +29,12 @@ import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
 import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard, WT_REPO_PATH } from "./helpers.ts";
-import { logDim, logErr, logInfo, logOk, logWarn } from "./events.ts";
 import { theme } from "./theme.ts";
+
+const appLog = createLogger("[app]");
+const newLog = createLogger("[new]");
+const configLog = createLogger("config");
+const wtLog = createLogger("wt");
 
 export type TuiExit = { kind: "quit" };
 
@@ -197,6 +202,7 @@ export function App({ onExit }: Props) {
   }
 
   async function doRemove(slug: string): Promise<void> {
+    const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) return;
     // Authoritative busy check via on-disk flock. Beats relying on the
@@ -205,20 +211,19 @@ export function App({ onExit }: Props) {
     const lock = lockStatus(slug);
     if (lock) {
       const label = lockLabel(lock);
-      logWarn(slug, `refused: ${label}`);
+      log.event.warn(`refused: ${label}`);
       toast(`${slug} is ${label}`, theme.warn, 2000);
       return;
     }
     if (row.fields.dirty.data) {
-      logErr(slug, "refused: uncommitted changes — use `wt rm <slug> --force` from shell");
+      log.event.err("refused: uncommitted changes — use `wt rm <slug> --force` from shell");
       toast(`${slug} has uncommitted changes`, theme.err, 3000);
       return;
     }
     const unpushed = row.fields.sync.data?.remote?.ahead ?? 0;
     if (unpushed > 0) {
       const plural = unpushed === 1 ? "" : "s";
-      logErr(
-        slug,
+      log.event.err(
         `refused: ${unpushed} unpushed commit${plural} — use \`wt rm ${slug} --force\` from shell`,
       );
       toast(`${slug} has ${unpushed} unpushed commit${plural}`, theme.err, 3000);
@@ -234,7 +239,7 @@ export function App({ onExit }: Props) {
       destroyStage: row.fields.deploy.data ?? false,
       deleteBranch: true,
     });
-    logInfo(slug, "dispatched destroy");
+    log.event.info("dispatched destroy");
     toast(`dispatched destroy of ${slug}`, theme.info);
     setTimeout(() => void invalidateWorktree(slug), 600);
   }
@@ -242,12 +247,11 @@ export function App({ onExit }: Props) {
   async function doClean(): Promise<void> {
     const candidates = rows.filter((r) => isCleanCandidate(r));
     if (candidates.length === 0) {
-      logDim("[app]", "clean: nothing to clean");
+      appLog.event.dim("clean: nothing to clean");
       toast("nothing to clean", theme.fgDim, 1500);
       return;
     }
-    logInfo(
-      "[app]",
+    appLog.event.info(
       `clean: dispatching ${candidates.length} destroy${candidates.length === 1 ? "" : "s"}`,
     );
     for (const row of candidates) {
@@ -257,7 +261,7 @@ export function App({ onExit }: Props) {
         destroyStage: row.fields.deploy.data ?? false,
         deleteBranch: true,
       });
-      logInfo(row.wt.slug, "dispatched destroy (clean)");
+      createLogger(row.wt.slug).event.info("dispatched destroy (clean)");
     }
     setTimeout(() => void refreshAll(), 600);
   }
@@ -268,30 +272,32 @@ export function App({ onExit }: Props) {
    * label and value so the user-facing message is consistent.
    */
   function doYank(slug: string, label: string, value: string | null): void {
+    const log = createLogger(slug);
     if (!value) {
-      logWarn(slug, `nothing to yank: ${label}`);
+      log.event.warn(`nothing to yank: ${label}`);
       toast(`no ${label} to yank`, theme.warn, 1500);
       return;
     }
     try {
       writeClipboard(value);
     } catch (err) {
-      logErr(slug, `pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
+      log.event.err(`pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
+      log.error(err instanceof Error ? err : String(err));
       return;
     }
-    logInfo(slug, `yanked ${label}: ${value}`);
+    log.event.info(`yanked ${label}: ${value}`);
     toast(`copied ${label}`, theme.info, 1500);
   }
 
   async function doNew(raw: string, defaultBase?: string): Promise<void> {
     const parsed = parseNewInput(raw, defaultBase);
     if ("error" in parsed) {
-      logErr("[new]", parsed.error);
+      newLog.event.err(parsed.error);
       return;
     }
-    logInfo("[new]", `resolving ${parsed.input}`);
-    if (parsed.anyAuthor) logInfo("[new]", "searching all authors (--any)");
-    if (parsed.base) logInfo("[new]", `base: ${parsed.base}`);
+    newLog.event.info(`resolving ${parsed.input}`);
+    if (parsed.anyAuthor) newLog.event.info("searching all authors (--any)");
+    if (parsed.base) newLog.event.info(`base: ${parsed.base}`);
     let branch: string;
     try {
       branch = await parseInput(parsed.input, {
@@ -307,21 +313,22 @@ export function App({ onExit }: Props) {
           }),
       });
     } catch (err) {
-      logErr("[new]", err instanceof Error ? err.message : String(err));
+      newLog.event.err(err instanceof Error ? err.message : String(err));
+      newLog.error(err instanceof Error ? err : String(err));
       return;
     }
-    logInfo("[new]", `branch = ${branch}`);
+    newLog.event.info(`branch = ${branch}`);
     const result = await createWorktree(branch, {
-      onPhase: (p) => logInfo("[new]", `phase: ${p}`),
-      onLog: (line) => logDim("[new]", line),
+      onPhase: (p) => newLog.event.info(`phase: ${p}`),
+      onLog: (line) => newLog.event.dim(line),
       runInstall: true,
       base: parsed.base,
     });
     if (!result.ok) {
-      logErr("[new]", result.reason);
+      newLog.event.err(result.reason);
       return;
     }
-    logOk("[new]", `ready at ${result.path}`);
+    newLog.event.ok(`ready at ${result.path}`);
     openInZed(result.path);
     void refreshAll();
   }
@@ -483,7 +490,7 @@ export function App({ onExit }: Props) {
         if (pending === "d" && current) {
           void doRemove(current.wt.slug);
         } else if (pending === "R") {
-          logWarn("[app]", "cleared all cached data; refetching from scratch");
+          appLog.event.warn("cleared all cached data; refetching from scratch");
           void clearAll();
         }
         return;
@@ -533,7 +540,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "r") {
-      logDim("[app]", "refresh");
+      appLog.event.dim("refresh");
       void refreshAll();
       return;
     }
@@ -546,7 +553,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "n") {
-      logDim("[new]", "tip: --any to match any author, --base <ref> to branch off");
+      newLog.event.dim("tip: --any to match any author, --base <ref> to branch off");
       setFooter({ kind: "input", prompt: "new:", value: "", purpose: "new" });
       return;
     }
@@ -555,7 +562,7 @@ export function App({ onExit }: Props) {
         toast("no branch on selected row", theme.warn, 2000);
         return;
       }
-      logInfo("[new]", `using ${current.wt.branch} as base`);
+      newLog.event.info(`using ${current.wt.branch} as base`);
       setFooter({
         kind: "input",
         prompt: "new:",
@@ -575,56 +582,57 @@ export function App({ onExit }: Props) {
     }
     if (k.sequence === ",") {
       void openInZed(configFilePath);
-      logInfo("config", `opened ${configFilePath}`);
+      configLog.event.info(`opened ${configFilePath}`);
       return;
     }
     if (k.sequence === ".") {
       void openInZed(WT_REPO_PATH);
-      logInfo("wt", `opened ${WT_REPO_PATH}`);
+      wtLog.event.info(`opened ${WT_REPO_PATH}`);
       return;
     }
 
     // Per-row actions.
     if (!current) return;
+    const rowLog = createLogger(current.wt.slug);
     if (k.name === "o") {
       openInZed(current.wt.path);
-      logInfo(current.wt.slug, "opened in zed");
+      rowLog.event.info("opened in zed");
       return;
     }
     if (k.name === "p") {
       if (!current.pr) {
-        logWarn(current.wt.slug, "no PR for this branch");
+        rowLog.event.warn("no PR for this branch");
         return;
       }
       hideFrontmostAlacritty();
       openUrl(current.pr.url);
-      logInfo(current.wt.slug, `opened PR #${current.pr.number}`);
+      rowLog.event.info(`opened PR #${current.pr.number}`);
       return;
     }
     if (k.name === "i") {
       const url = linearUrlForSlug(current.wt.slug);
       if (!url) {
-        logWarn(current.wt.slug, "no linear id in slug");
+        rowLog.event.warn("no linear id in slug");
         return;
       }
       hideFrontmostAlacritty();
       openUrl(url);
-      logInfo(current.wt.slug, "opened linear");
+      rowLog.event.info("opened linear");
       return;
     }
     if (k.name === "s") {
       if (!current.fields.deploy.data) {
-        logWarn(current.wt.slug, "not deployed");
+        rowLog.event.warn("not deployed");
         return;
       }
       const url = stageUrl(current.wt.stage);
       if (!url) {
-        logWarn(current.wt.slug, "no stage domain configured");
+        rowLog.event.warn("no stage domain configured");
         return;
       }
       hideFrontmostAlacritty();
       openUrl(url);
-      logInfo(current.wt.slug, `opened ${current.wt.stage}`);
+      rowLog.event.info(`opened ${current.wt.stage}`);
       return;
     }
     if (k.sequence === "y") {
@@ -647,7 +655,7 @@ export function App({ onExit }: Props) {
     if (k.name === "a") {
       const slug = current.wt.slug;
       const { archived } = toggleArchived(slug);
-      logInfo(slug, archived ? "archived" : "restored from archive");
+      rowLog.event.info(archived ? "archived" : "restored from archive");
       toast(archived ? `archived ${slug}` : `restored ${slug}`, theme.info, 2000);
       return;
     }

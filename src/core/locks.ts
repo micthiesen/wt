@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { dlopen, FFIType, suffix } from "bun:ffi";
 
 import { config } from "./config.ts";
+import { createLogger } from "./logger.ts";
 import type { LockMeta } from "./types.ts";
+
+const log = createLogger("[locks]");
 
 // flock(2) via libc. Matches Python's fcntl.flock semantics: the
 // kernel releases the lock automatically on fd close / process death,
@@ -51,7 +54,8 @@ export function lockStatus(slug: string): Partial<LockMeta> | null {
   let fd: number;
   try {
     fd = openSync(path, "a+");
-  } catch {
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), { slug, path });
     return null;
   }
   try {

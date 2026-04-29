@@ -14,10 +14,12 @@ import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
 import { fetchGithub } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Worktree } from "../core/types.ts";
+import { createLogger } from "../core/logger.ts";
 import { fetchOrigin, isDeployed, listWorktrees, syncState, type SyncState, worktreeIsDirty } from "../core/worktree.ts";
-import { logDim, logErr } from "../tui/events.ts";
 
 import { qk } from "./keys.ts";
+
+const aiLog = createLogger("ai");
 
 // ---------- Stale-time policy ----------
 // Short for cheap fs-backed queries; longer for network/git-heavy ones.
@@ -202,16 +204,15 @@ export const aiSummaryQuery = (
     queryKey: ctx ? qk.aiSummary(ctx.hash) : qk.aiSummary("_pending"),
     queryFn: async (): Promise<AiSummary | null> => {
       if (!ctx) return null;
-      logDim("ai", `calling LM Studio for ${slug} (${ctx.prompt.length} chars)…`);
+      aiLog.event.dim(`calling LM Studio for ${slug} (${ctx.prompt.length} chars)…`);
       const start = Date.now();
       try {
         const out = await summarizeDiff(ctx.prompt);
-        logDim("ai", `called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
+        aiLog.event.dim(`called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
         return out;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logErr(
-          "ai",
+        aiLog.event.err(
           `LM Studio failed for ${slug} (${formatDuration(Date.now() - start)}): ${msg}`,
         );
         throw err;

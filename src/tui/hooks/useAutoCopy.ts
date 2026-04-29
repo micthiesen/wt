@@ -2,8 +2,10 @@ import { useEffect } from "react";
 import { CliRenderEvents } from "@opentui/core";
 import { useRenderer } from "@opentui/react";
 
-import { logErr, logInfo } from "../events.ts";
+import { createLogger } from "../../core/logger.ts";
 import { writeClipboard } from "../helpers.ts";
+
+const log = createLogger("app");
 
 type SelectionLike = { getSelectedText(): string };
 
@@ -38,13 +40,14 @@ export function useAutoCopy(): void {
       try {
         writeClipboard(text);
       } catch (err) {
-        logErr("app", `pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
+        log.event.err(`pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
+        log.error(err instanceof Error ? err : String(err));
         return;
       }
       renderer.clearSelection();
       const lines = text.split("\n").length;
       const suffix = lines > 1 ? ` (${lines} lines)` : "";
-      logInfo("app", `copied ${text.length} chars${suffix}`);
+      log.event.info(`copied ${text.length} chars${suffix}`);
     };
     renderer.on(CliRenderEvents.SELECTION, handler);
     return () => {

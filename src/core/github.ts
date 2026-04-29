@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 
 import { config } from "./config.ts";
+import { createLogger } from "./logger.ts";
 import { run } from "./proc.ts";
 import type {
   MergeQueueEntry,
@@ -11,6 +12,8 @@ import type {
   Worktree,
 } from "./types.ts";
 import { listWorktrees } from "./worktree.ts";
+
+const log = createLogger("[gh]");
 
 async function hasGh(): Promise<boolean> {
   const r = await run(["which", "gh"]);
@@ -32,7 +35,8 @@ async function repoSlug(): Promise<string | null> {
   try {
     const data = JSON.parse(r.stdout) as { nameWithOwner?: string };
     _repoSlug = data.nameWithOwner ?? null;
-  } catch {
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), { stdout: r.stdout.slice(0, 200) });
     _repoSlug = null;
   }
   return _repoSlug;
@@ -246,7 +250,11 @@ export async function fetchGithub(branches: string[]): Promise<GithubData> {
   let parsed: GqlResponse;
   try {
     parsed = JSON.parse(r.stdout);
-  } catch {
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), {
+      stdout: r.stdout.slice(0, 200),
+      branchCount: branches.length,
+    });
     return empty;
   }
   const repo = parsed.data?.repository;

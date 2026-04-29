@@ -1,6 +1,6 @@
 import type { QueryCacheNotifyEvent, QueryClient } from "@tanstack/react-query";
 
-import { logDim, logErr } from "./events.ts";
+import { createLogger } from "../core/logger.ts";
 
 /**
  * Surface external (network-hitting) query fetches in the event log so
@@ -13,6 +13,13 @@ const REMOTE_LABELS: Record<string, { source: string; label: string }> = {
   github: { source: "[gh]", label: "GitHub" },
   fetchOrigin: { source: "[origin]", label: "git origin" },
 };
+
+const ghLog = createLogger("[gh]");
+const originLog = createLogger("[origin]");
+
+function loggerFor(source: string) {
+  return source === "[gh]" ? ghLog : originLog;
+}
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
@@ -27,20 +34,21 @@ export function attachFetchLogs(client: QueryClient): () => void {
     if (typeof first !== "string") return;
     const meta = REMOTE_LABELS[first];
     if (!meta) return;
+    const log = loggerFor(meta.source);
     const action = event.action;
     if (action.type === "fetch") {
       starts.set(event.query.queryHash, Date.now());
-      logDim(meta.source, `fetching ${meta.label}…`);
+      log.event.dim(`fetching ${meta.label}…`);
     } else if (action.type === "success") {
       const start = starts.get(event.query.queryHash);
       const dur = start ? ` (${formatDuration(Date.now() - start)})` : "";
       starts.delete(event.query.queryHash);
-      logDim(meta.source, `fetched ${meta.label}${dur}`);
+      log.event.dim(`fetched ${meta.label}${dur}`);
     } else if (action.type === "error") {
       starts.delete(event.query.queryHash);
       const err = action.error;
       const msg = err instanceof Error ? err.message : String(err);
-      logErr(meta.source, `failed to fetch ${meta.label}: ${msg}`);
+      log.event.err(`failed to fetch ${meta.label}: ${msg}`);
     }
   });
 }

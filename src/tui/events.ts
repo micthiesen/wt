@@ -1,6 +1,8 @@
 import { useSyncExternalStore } from "react";
 
-export type EventLevel = "info" | "ok" | "warn" | "err" | "dim";
+import type { EventKind } from "../core/logger.ts";
+
+export type EventLevel = EventKind;
 
 export type WtEvent = {
   id: number;
@@ -52,16 +54,3 @@ export const events = new EventLog();
 export function useEvents(): readonly WtEvent[] {
   return useSyncExternalStore(events.subscribe, events.getSnapshot, events.getSnapshot);
 }
-
-// Convenience emitters — callers don't think about the level-to-color
-// mapping, they just say what happened.
-export const logInfo = (source: string, text: string) =>
-  events.append({ level: "info", source, text });
-export const logOk = (source: string, text: string) =>
-  events.append({ level: "ok", source, text });
-export const logWarn = (source: string, text: string) =>
-  events.append({ level: "warn", source, text });
-export const logErr = (source: string, text: string) =>
-  events.append({ level: "err", source, text });
-export const logDim = (source: string, text: string) =>
-  events.append({ level: "dim", source, text });
