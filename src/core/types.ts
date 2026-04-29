@@ -48,6 +48,8 @@ export type PullRequest = {
   number: number;
   url: string;
   headRefName: string;
+  /** Human-authored PR title; preferred title source for the details pane. */
+  title: string;
   isDraft: boolean;
   state: "OPEN" | "CLOSED" | "MERGED";
   checks: PrChecks;

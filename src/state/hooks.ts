@@ -90,6 +90,14 @@ export function useWtActions() {
       // clear — kick it off explicitly so the first-parents cache gets
       // repopulated alongside the observed queries.
       void qc.fetchQuery(fetchOriginQuery());
+      // Belt-and-suspenders: qc.clear() removes cache entries but
+      // active observers sitting on `staleTime: Infinity` (notably the
+      // hash-keyed AI summary) don't always re-trigger their queryFn
+      // afterwards — the rebind from `_pending` back to the same hash
+      // can find no entry yet land in a stable empty state. Forcing a
+      // refetch on every active observer makes "R" deterministic for
+      // the AI chain.
+      void qc.refetchQueries({ type: "active" });
     },
     /** Invalidate everything for a single worktree (useful after an action). */
     async invalidateWorktree(slug: string): Promise<void> {

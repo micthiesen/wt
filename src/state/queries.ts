@@ -5,14 +5,17 @@
  */
 import { queryOptions } from "@tanstack/react-query";
 
+import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
-import { branchIsGone, branchIsMerged, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
+import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
+import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
 import { fetchGithub } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Worktree } from "../core/types.ts";
 import { fetchOrigin, isDeployed, listWorktrees, syncState, type SyncState, worktreeIsDirty } from "../core/worktree.ts";
+import { logDim, logErr } from "../tui/events.ts";
 
 import { qk } from "./keys.ts";
 
@@ -151,3 +154,76 @@ export const wtGitActivityQuery = (wt: Pick<Worktree, "slug" | "path" | "branch"
       gitActivity({ path: wt.path, branch: wt.branch }),
     staleTime: STALE.mid,
   });
+
+/**
+ * Subject of the oldest commit on the branch — fallback title when
+ * there's no PR yet. Cheap (one `git log`); short staleTime.
+ */
+export const wtFirstCommitQuery = (wt: Pick<Worktree, "slug" | "path">) =>
+  queryOptions({
+    queryKey: qk.wt(wt.slug).firstCommit(),
+    queryFn: async (): Promise<string | null> => firstCommitSubject(wt.path),
+    staleTime: STALE.mid,
+  });
+
+/**
+ * Diff context + content hash for the AI summary. The hash is the
+ * stable cache key for `aiSummaryQuery`; the prompt body lives only in
+ * memory (not serialised to the cache, since it can be megabytes).
+ * Local + fast — silent in normal operation, like the other per-wt
+ * git queries.
+ */
+export const wtDiffContextQuery = (wt: Pick<Worktree, "slug" | "path">) =>
+  queryOptions({
+    queryKey: qk.wt(wt.slug).diffContext(),
+    queryFn: async (): Promise<DiffContext | null> => buildDiffContext(wt.path),
+    staleTime: STALE.mid,
+  });
+
+/**
+ * AI-generated summary of the diff. Keyed by content hash so equivalent
+ * diffs share a cache entry across rebase / amend / branch rename. The
+ * `prompt` is consumed by the queryFn but not part of the key — it's
+ * fully determined by the hash. Pass `null` when the diff context isn't
+ * ready; the caller is expected to pair this with `enabled: !!ctx`, in
+ * which case the placeholder queryFn never runs.
+ *
+ * Activity-pane logging mirrors the GitHub-fetch pattern (see
+ * `tui/fetch-log.ts`): one start line and one done/failed line per
+ * call. Char count on the start line so slow/large prompts stand out;
+ * duration on the done line so slow models do too. `slug` is for log
+ * attribution only; cache identity is purely content-based.
+ */
+export const aiSummaryQuery = (
+  slug: string,
+  ctx: { hash: string; prompt: string } | null,
+) =>
+  queryOptions({
+    queryKey: ctx ? qk.aiSummary(ctx.hash) : qk.aiSummary("_pending"),
+    queryFn: async (): Promise<AiSummary | null> => {
+      if (!ctx) return null;
+      logDim("ai", `calling LM Studio for ${slug} (${ctx.prompt.length} chars)…`);
+      const start = Date.now();
+      try {
+        const out = await summarizeDiff(ctx.prompt);
+        logDim("ai", `called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
+        return out;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logErr(
+          "ai",
+          `LM Studio failed for ${slug} (${formatDuration(Date.now() - start)}): ${msg}`,
+        );
+        throw err;
+      }
+    },
+    // Content-addressed: once we have a summary for a hash it never
+    // becomes "stale" — only a different diff (different hash, different
+    // queryKey) drives a new fetch.
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: Number.POSITIVE_INFINITY,
+  });
+
+function formatDuration(ms: number): string {
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}

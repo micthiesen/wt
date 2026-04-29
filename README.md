@@ -1,6 +1,6 @@
 # wt
 
-Terminal UI for keeping multiple git worktrees in flight at once. Each row shows live status, PR state, preview deployment, issue link, and Claude Code session activity for one worktree, so the whole pile of in-progress work is visible on one screen.
+Terminal UI for keeping multiple git worktrees in flight at once. Each row shows live status, PR state, preview deployment, issue link, and Claude Code session activity for one worktree, so the whole pile of in-progress work is visible on one screen. The details pane can also pull an AI-generated title and 1–3 sentence description for each branch from a local OpenAI-compatible LLM endpoint (LM Studio etc.).
 
 ![screenshot](docs/screenshot.png)
 
@@ -20,6 +20,7 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 - `zed` CLI — needed for `wt open` and the `o` keybinding.
 - Linear — no CLI; the integration only constructs URLs from issue IDs in your branch slug.
 - Claude Code — no CLI; the integration reads `~/.claude/projects/*` directly to surface live session state.
+- An OpenAI-compatible LLM endpoint (LM Studio, Ollama with the OpenAI bridge, llama.cpp's server, etc.) — needed for the AI title + description in the details pane. `wt` runs a single graceful-degradation diff through `/v1/chat/completions`; results are content-addressed so identical diffs (across rebase / amend / branch rename) share a cached summary.
 
 ## Install
 
@@ -58,6 +59,12 @@ aws_profile  = "default"
 
 [issue_tracker.linear]
 workspace = "your-workspace"
+
+[ai]
+endpoint         = "http://127.0.0.1:1234"   # OpenAI-compatible /v1
+model            = "gemma-3-e4b-it-mlx"      # whatever the endpoint calls it
+max_input_tokens = 8000                       # optional; default 8000
+timeout_ms       = 120000                     # optional; default 120000 (local LLMs cold-start slowly)
 ```
 
 The loader prints every missing or malformed field at once. See [`src/core/config.ts`](src/core/config.ts) for the full schema, defaults, and the row-ordering knob (`[ui] rows`).

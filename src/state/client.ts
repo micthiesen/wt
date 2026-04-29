@@ -8,7 +8,9 @@ import { createSqlitePersister } from "./persister.ts";
 export const CACHE_DB = config.paths.cacheDb;
 
 // Bust the persisted cache when the schema / query shape changes.
-const CACHE_BUSTER = "v1";
+// v2: aiSummaryQuery now returns `{title, description}` instead of a
+// raw string; old entries can't be rehydrated cleanly.
+const CACHE_BUSTER = "v2";
 
 /**
  * Build a QueryClient with TUI-friendly defaults and wire up the
@@ -43,7 +45,11 @@ export function createWtQueryClient(): WtQueryClient {
   const [unsubscribe, restored] = persistQueryClient({
     queryClient: client,
     persister,
-    maxAge: 24 * 60 * 60 * 1000,
+    // Long enough that content-addressed AI summaries (`aiSummaryQuery`)
+    // survive across the lifetime of a typical worktree without forcing
+    // a regen. Other queries restore-then-immediately-refetch on their
+    // own staleTime, so a longer maxAge has no downside for them.
+    maxAge: 30 * 24 * 60 * 60 * 1000,
     buster: CACHE_BUSTER,
   });
 

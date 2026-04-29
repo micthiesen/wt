@@ -21,6 +21,7 @@ import { HelpOverlay } from "./panels/help.tsx";
 import { PickerModal } from "./panels/picker.tsx";
 import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
+import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -119,6 +120,7 @@ export function App({ onExit }: Props) {
   const [footer, setFooter] = useState<FooterMode>({ kind: "legend" });
   const [showHelp, setShowHelp] = useState(false);
   const [showCleanConfirm, setShowCleanConfirm] = useState(false);
+  const [showYank, setShowYank] = useState(false);
   const [filter, setFilter] = useState("");
   // Pending branch picker (populated when `parseInput` has multiple
   // matches for `--any`). The resolver lets the suspended `doNew`
@@ -260,6 +262,27 @@ export function App({ onExit }: Props) {
     setTimeout(() => void refreshAll(), 600);
   }
 
+  /**
+   * Copy `value` to the clipboard, log + toast appropriately. Used by
+   * the yank chord (branch / stage / path); each item picks its own
+   * label and value so the user-facing message is consistent.
+   */
+  function doYank(slug: string, label: string, value: string | null): void {
+    if (!value) {
+      logWarn(slug, `nothing to yank: ${label}`);
+      toast(`no ${label} to yank`, theme.warn, 1500);
+      return;
+    }
+    try {
+      writeClipboard(value);
+    } catch (err) {
+      logErr(slug, `pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    logInfo(slug, `yanked ${label}: ${value}`);
+    toast(`copied ${label}`, theme.info, 1500);
+  }
+
   async function doNew(raw: string, defaultBase?: string): Promise<void> {
     const parsed = parseNewInput(raw, defaultBase);
     if ("error" in parsed) {
@@ -341,6 +364,29 @@ export function App({ onExit }: Props) {
       if (k.name === "escape" || (k.ctrl && k.name === "c")) {
         picker.resolve(null);
         setPicker(null);
+      }
+      return;
+    }
+
+    // Yank chord: `y` opened the menu; the next key picks what to copy.
+    // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
+    // rather than re-entering normal mode, so a stray keystroke can't
+    // accidentally trigger a destructive action.
+    if (showYank) {
+      if (
+        k.name === "escape" ||
+        k.sequence === "y" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setShowYank(false);
+        return;
+      }
+      if (current) {
+        const item = yankItemsFor(current).find((it) => it.key === k.sequence);
+        if (item) {
+          setShowYank(false);
+          doYank(current.wt.slug, item.label, item.value);
+        }
       }
       return;
     }
@@ -582,18 +628,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "y") {
-      if (!current.wt.branch) {
-        logWarn(current.wt.slug, "no branch to yank");
-        return;
-      }
-      try {
-        writeClipboard(current.wt.branch);
-      } catch (err) {
-        logErr(current.wt.slug, `pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
-        return;
-      }
-      logInfo(current.wt.slug, `yanked ${current.wt.branch}`);
-      toast(`copied ${current.wt.branch}`, theme.info, 1500);
+      setShowYank(true);
       return;
     }
     if (k.name === "d") {
@@ -671,6 +706,7 @@ export function App({ onExit }: Props) {
       <Footer mode={footer} hint={footerHint} />
       {showHelp ? <HelpOverlay /> : null}
       {showCleanConfirm ? <CleanConfirmModal candidates={cleanCandidates} /> : null}
+      {showYank && current ? <YankModal row={current} /> : null}
       {picker ? (
         <PickerModal
           title={picker.title}

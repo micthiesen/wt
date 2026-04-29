@@ -22,7 +22,7 @@ const SECTIONS: Section[] = [
       ["p", "open PR in browser"],
       ["i", "open linear issue"],
       ["s", "open deployed app"],
-      ["y", "yank branch name"],
+      ["y", "yank menu (b / s / p)"],
       ["a", "archive / restore"],
       ["d", "remove worktree"],
     ],

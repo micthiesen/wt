@@ -74,6 +74,7 @@ const PR_FRAGMENT = `
 fragment PrFields on PullRequest {
   number
   url
+  title
   headRefName
   isDraft
   state
@@ -142,6 +143,7 @@ type GqlReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | 
 type GqlPrNode = {
   number: number;
   url: string;
+  title: string;
   headRefName: string;
   isDraft: boolean;
   state: PullRequest["state"];
@@ -196,6 +198,7 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
   return {
     number: pr.number,
     url: pr.url,
+    title: pr.title,
     headRefName: pr.headRefName,
     isDraft: pr.isDraft,
     state: pr.state,

@@ -68,6 +68,28 @@ export function invalidateMainFirstParents(): void {
   _mainFirstParents = null;
 }
 
+/**
+ * Subject line of the *oldest* commit on the branch since `origin/main`.
+ * That's the human's "what is this work" framing — captures intent
+ * before a PR exists. Returns null if the branch has no commits ahead
+ * of base, or `git log` fails.
+ */
+export async function firstCommitSubject(wtPath: string): Promise<string | null> {
+  const r = await run(
+    [
+      "git",
+      "log",
+      "--reverse",
+      "--format=%s",
+      `origin/${config.branch.base}..HEAD`,
+    ],
+    { cwd: wtPath, timeoutMs: 5_000 },
+  );
+  if (r.exitCode !== 0) return null;
+  const first = r.stdout.split("\n").find((l) => l.length > 0);
+  return first ?? null;
+}
+
 export async function branchIsMerged(branch: string): Promise<boolean> {
   // Real-divergence gate; FF-aligned branches skip out below.
   if (

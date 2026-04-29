@@ -20,8 +20,17 @@
  *   Same-concept-same-glyph between this pane and the row list is
  *   enforced via shared helpers.
  */
+import { TextAttributes } from "@opentui/core";
+import { useQuery } from "@tanstack/react-query";
+
 import { config } from "../../core/config.ts";
+import { StatusKind } from "../../core/types.ts";
 import { useGithub } from "../../state/hooks.ts";
+import {
+  aiSummaryQuery,
+  wtDiffContextQuery,
+  wtFirstCommitQuery,
+} from "../../state/queries.ts";
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
 import { NF } from "../icons.ts";
@@ -113,14 +122,158 @@ function RenderedRow({ module: m, ctx }: { module: RowModule; ctx: RowContext })
   );
 }
 
-export function Details({ row }: Props) {
+/**
+ * Title above the row stack: PR title if there is one (human-authored,
+ * always wins), else the oldest commit subject on the branch (the dev's
+ * "what is this" framing before a PR exists), else nothing.
+ */
+function TitleLine({ title }: { title: string | null }) {
+  if (!title) return null;
+  return (
+    <box marginBottom={1}>
+      <text fg={theme.fg} attributes={1} wrapMode="none" truncate>
+        {title}
+      </text>
+    </box>
+  );
+}
+
+/**
+ * Multi-line AI summary below the rows. Renders muted text, falls back
+ * to a placeholder while the first generation is in flight, and stays
+ * silent on errors / when the row is dirty-but-uncached (avoid noise).
+ * `null` summary means "AI not configured" and the section is omitted
+ * entirely.
+ */
+function DescriptionBlock({
+  summary,
+  isFetching,
+  hasContext,
+  blockedReason,
+  error,
+}: {
+  summary: string | null;
+  isFetching: boolean;
+  hasContext: boolean;
+  blockedReason: string | null;
+  error: Error | null;
+}) {
+  // No AI config and no cached value → don't reserve space.
+  if (!summary && !isFetching && !hasContext && !blockedReason && !error) return null;
+  // Match the per-row staleness glyph in the rest of the details
+  // pane: NF.refresh suffix whenever a fetch is in flight, regardless
+  // of whether we already have a cached summary. Same rationale —
+  // "something's happening, the visible text may be stale".
+  const refreshSuffix = isFetching ? ` ${NF.refresh}` : "";
+  let body: React.ReactNode;
+  // Errors win over everything except an in-flight retry: while
+  // re-fetching after a failure we'd rather show "generating…" than
+  // the stale error. Once the retry settles, the error reappears (or
+  // gets replaced by the new summary).
+  if (error && !isFetching) {
+    body = (
+      <text fg={theme.err} wrapMode="word">
+        {error.message}
+      </text>
+    );
+  } else if (summary) {
+    body = (
+      <text fg={theme.fgDim} attributes={TextAttributes.ITALIC} wrapMode="word">
+        {summary}
+        {refreshSuffix}
+      </text>
+    );
+  } else if (isFetching) {
+    body = (
+      <text fg={theme.fgDim} attributes={TextAttributes.ITALIC}>
+        generating summary…{refreshSuffix}
+      </text>
+    );
+  } else if (blockedReason) {
+    body = <text fg={theme.fgDim}>{blockedReason}</text>;
+  } else {
+    body = <text fg={theme.fgDim}>no summary yet</text>;
+  }
+  return <box marginTop={1}>{body}</box>;
+}
+
+function DetailsBody({ row }: { row: WorktreeRow }) {
   // Subscribe to the combined GitHub fetch so per-row indicators
   // reflect its fetch state. Observers dedupe by key — this doesn't
   // trigger an extra fetch, it joins the existing observer in
-  // `useWorktreeRows`. Hook order is stable because we always
-  // subscribe regardless of the `row` prop.
+  // `useWorktreeRows`.
   const github = useGithub();
 
+  const isBusy = row.status.kind === StatusKind.Busy;
+  // The diff context is `base..HEAD` only — uncommitted work is never
+  // included, so a dirty tree doesn't change what the AI would see.
+  // Only pause for busy worktrees, where racing the destroy is unsafe.
+  const aiEnabled = !!config.ai;
+  const allowFetch = aiEnabled && !isBusy;
+
+  // First-commit subject is cheap; pause it during destroys so we're
+  // not racing the worktree's git state, but otherwise let it run.
+  const firstCommit = useQuery({
+    ...wtFirstCommitQuery(row.wt),
+    enabled: !isBusy,
+  });
+
+  const diffCtx = useQuery({
+    ...wtDiffContextQuery(row.wt),
+    enabled: allowFetch,
+  });
+
+  const summary = useQuery({
+    ...aiSummaryQuery(row.wt.slug, diffCtx.data ?? null),
+    enabled: allowFetch && !!diffCtx.data,
+  });
+
+  const ctx: RowContext = { row, github };
+
+  // Title hierarchy: LLM-generated wins (most context-aware and
+  // up-to-date with the diff), then PR title, then the oldest commit's
+  // subject as a non-AI fallback.
+  const llmTitle = summary.data?.title ?? null;
+  const prTitle =
+    row.wt.branch && github.data?.prs ? github.data.prs[row.wt.branch]?.title : undefined;
+  const title = llmTitle || prTitle || firstCommit.data || null;
+
+  // Pick a single user-facing reason when we're suppressing AI work.
+  const blockedReason: string | null = !aiEnabled
+    ? null
+    : isBusy
+      ? "summary paused while worktree is busy"
+      : null;
+
+  return (
+    <box
+      flexGrow={1}
+      flexShrink={1}
+      overflow="hidden"
+      border
+      borderStyle="single"
+      borderColor={theme.border}
+      title={` ${row.wt.slug} `}
+      titleAlignment="left"
+      padding={1}
+      flexDirection="column"
+    >
+      <TitleLine title={title} />
+      {RESOLVED_ROWS.map((m) => (
+        <RenderedRow key={m.id} module={m} ctx={ctx} />
+      ))}
+      <DescriptionBlock
+        summary={summary.data?.description ?? null}
+        isFetching={diffCtx.isFetching || summary.isFetching}
+        hasContext={!!diffCtx.data}
+        blockedReason={blockedReason}
+        error={summary.error ?? diffCtx.error ?? null}
+      />
+    </box>
+  );
+}
+
+export function Details({ row }: Props) {
   if (!row) {
     return (
       <box
@@ -136,25 +289,5 @@ export function Details({ row }: Props) {
       </box>
     );
   }
-
-  const ctx: RowContext = { row, github };
-
-  return (
-    <box
-      flexGrow={1}
-      flexShrink={1}
-      overflow="hidden"
-      border
-      borderStyle="single"
-      borderColor={theme.border}
-      title={` ${row.wt.slug} `}
-      titleAlignment="left"
-      padding={1}
-      flexDirection="column"
-    >
-      {RESOLVED_ROWS.map((m) => (
-        <RenderedRow key={m.id} module={m} ctx={ctx} />
-      ))}
-    </box>
-  );
+  return <DetailsBody row={row} />;
 }

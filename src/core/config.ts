@@ -42,6 +42,17 @@ export type LinearConfig = {
   workspace: string;
 };
 
+export type AiConfig = {
+  /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
+  endpoint: string;
+  /** Model id as exposed by the endpoint (LM Studio shows it verbatim). */
+  model: string;
+  /** Soft budget for the prompt; we drop diff hunks largest-first to stay under it. */
+  maxInputTokens: number;
+  /** Per-request timeout in ms. */
+  timeoutMs: number;
+};
+
 export type Config = {
   paths: {
     mainClone: string;
@@ -70,6 +81,7 @@ export type Config = {
   };
   sst: SstConfig | null;
   linear: LinearConfig | null;
+  ai: AiConfig | null;
   ui: {
     /** Detail-pane row order. Unknown ids are ignored, missing ones hidden. */
     rows: readonly string[];
@@ -97,6 +109,14 @@ const GENERIC_DEFAULTS = {
   // stage is `sst-env.d.ts`.
   sst: {
     autoRegenPaths: ["sst-env.d.ts"] as const,
+  },
+  ai: {
+    maxInputTokens: 8000,
+    // Local LLMs running on CPU/Metal can take 30s+ on a cold cache,
+    // and the first request after model load is slower still. 2 min
+    // gives Gemma-class models headroom; users on faster hardware can
+    // dial down via [ai].timeout_ms.
+    timeoutMs: 120_000,
   },
   ui: {
     rows: ["branch", "path", "linear", "stage", "pr", "claude", "git"] as const,
@@ -225,6 +245,16 @@ function build(raw: Raw, errs: Errors): Config {
     ? null
     : { workspace: errs.reqStr(linearRaw, "issue_tracker.linear", "workspace") };
 
+  const aiRaw = obj(raw.ai);
+  const ai: AiConfig | null = aiRaw === null
+    ? null
+    : {
+      endpoint: errs.reqStr(aiRaw, "ai", "endpoint").replace(/\/+$/, ""),
+      model: errs.reqStr(aiRaw, "ai", "model"),
+      maxInputTokens: errs.optNum(aiRaw, "max_input_tokens", GENERIC_DEFAULTS.ai.maxInputTokens),
+      timeoutMs: errs.optNum(aiRaw, "timeout_ms", GENERIC_DEFAULTS.ai.timeoutMs),
+    };
+
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   return {
@@ -234,6 +264,7 @@ function build(raw: Raw, errs: Errors): Config {
     lifecycle: { envFilesToCopy: envFiles },
     sst,
     linear,
+    ai,
     ui: { rows },
   };
 }

@@ -29,7 +29,14 @@ export const qk = {
       sync: () => ["wt", slug, "sync"] as const,
       claude: () => ["wt", slug, "claude"] as const,
       gitActivity: () => ["wt", slug, "gitActivity"] as const,
+      firstCommit: () => ["wt", slug, "firstCommit"] as const,
+      diffContext: () => ["wt", slug, "diffContext"] as const,
     }) as const,
+  /**
+   * AI summary, content-addressed by diff hash. Stable across rebases
+   * and branch renames — equivalent diffs share a cache entry.
+   */
+  aiSummary: (hash: string) => ["aiSummary", hash] as const,
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
 } as const;
