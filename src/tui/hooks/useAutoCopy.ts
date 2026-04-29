@@ -25,9 +25,8 @@ function extractSelection(selection: unknown): string | null {
 /**
  * Auto-copy-on-select. Subscribes to the renderer's `selection` event,
  * which fires once per drag when the user releases the mouse. Copies
- * the selected text to the system clipboard and logs to the activity
- * pane. Selection stays visible until the user clicks elsewhere or
- * presses Esc.
+ * the selected text to the system clipboard, clears the highlight, and
+ * logs to the activity pane.
  */
 export function useAutoCopy(): void {
   const renderer = useRenderer();
@@ -42,6 +41,7 @@ export function useAutoCopy(): void {
         logErr("app", `pbcopy failed: ${err instanceof Error ? err.message : String(err)}`);
         return;
       }
+      renderer.clearSelection();
       const lines = text.split("\n").length;
       const suffix = lines > 1 ? ` (${lines} lines)` : "";
       logInfo("app", `copied ${text.length} chars${suffix}`);
