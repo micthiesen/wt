@@ -15,7 +15,8 @@ import { fetchGithub } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Worktree } from "../core/types.ts";
 import { createLogger } from "../core/logger.ts";
-import { fetchOrigin, isDeployed, listWorktrees, syncState, type SyncState, worktreeIsDirty } from "../core/worktree.ts";
+import { isOurStageDeployed } from "../core/stage-safety.ts";
+import { fetchOrigin, listWorktrees, syncState, type SyncState, worktreeIsDirty } from "../core/worktree.ts";
 
 import { qk } from "./keys.ts";
 
@@ -110,7 +111,7 @@ export const wtLockQuery = (wt: Pick<Worktree, "slug">) =>
 export const wtDeployQuery = (wt: Pick<Worktree, "slug" | "path">) =>
   queryOptions({
     queryKey: qk.wt(wt.slug).deploy(),
-    queryFn: async (): Promise<boolean> => isDeployed(wt.path),
+    queryFn: async (): Promise<boolean> => isOurStageDeployed(wt),
     staleTime: STALE.fast,
   });
 

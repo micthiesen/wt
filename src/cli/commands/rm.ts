@@ -5,9 +5,9 @@ import {
 } from "../../core/lifecycle.ts";
 import { lockAge, lockLabel, lockStatus } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
+import { isOurStageDeployed } from "../../core/stage-safety.ts";
 import type { Worktree } from "../../core/types.ts";
 import {
-  isDeployed,
   listWorktrees,
   unpushedCommits,
   worktreeIsDirty,
@@ -53,7 +53,12 @@ async function decideDestroyStage(
 ): Promise<boolean> {
   if (flag === true) return true;
   if (flag === false) return false;
-  if (!isDeployed(wt.path)) return false;
+  // `isOurStageDeployed` is the strict check — outputs.json must
+  // mention the expected stage, otherwise we treat the worktree as
+  // not-deployed-by-us (a foreign deploy in this directory will not
+  // trigger the prompt). `removeWorktree` re-validates via
+  // `safeStage` before shelling out.
+  if (!isOurStageDeployed(wt)) return false;
   if (yes) return true;
   if (isInteractive()) {
     return confirm(

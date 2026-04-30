@@ -1,9 +1,9 @@
 import { removeWorktree, spawnBackgroundRemove } from "../../core/lifecycle.ts";
+import { isOurStageDeployed } from "../../core/stage-safety.ts";
 import type { Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
 import {
   fetchOrigin,
-  isDeployed,
   listWorktrees,
   worktreeStatus,
 } from "../../core/worktree.ts";
@@ -85,10 +85,14 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   for (const [w] of candidates) {
-    // Resolve destroyStage per worktree using the Python semantics:
-    // explicit flag wins; default is "destroy if deployed".
+    // Explicit flag wins; default is "destroy iff *our* stage is
+    // actually deployed". `isOurStageDeployed` rejects worktrees
+    // whose outputs.json is from a foreign deploy (e.g. someone ran
+    // `deployProductionApp.sh` here), so we never auto-destroy on
+    // those. `removeWorktree` re-checks via `safeStage` before
+    // shelling out — this is the surface-level UX gate.
     const destroy =
-      parsed.destroyStage !== null ? parsed.destroyStage : isDeployed(w.path);
+      parsed.destroyStage !== null ? parsed.destroyStage : isOurStageDeployed(w);
 
     if (parsed.background) {
       const logPath = spawnBackgroundRemove(w.slug, {

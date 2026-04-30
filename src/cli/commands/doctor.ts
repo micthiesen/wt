@@ -7,8 +7,9 @@ import { fetchPrs } from "../../core/github.ts";
 import { humanAge, lockAge, lockLabel, lockStatus } from "../../core/locks.ts";
 import { run as sh } from "../../core/proc.ts";
 import { computeStage } from "../../core/stage.ts";
+import { isOurStageDeployed } from "../../core/stage-safety.ts";
 import type { Check, CheckStatus, Worktree } from "../../core/types.ts";
-import { isDeployed, listWorktrees } from "../../core/worktree.ts";
+import { listWorktrees } from "../../core/worktree.ts";
 import { bold, cyan, dim, green, red, yellow } from "../colors.ts";
 import {
   renderPrCell,
@@ -113,13 +114,9 @@ async function checkSstStage(wt: Worktree): Promise<Check> {
 }
 
 async function checkSstDeploy(wt: Worktree): Promise<Check> {
-  const outputs = join(wt.path, ".sst", "outputs.json");
-  if (!isDeployed(wt.path)) {
-    if (existsSync(outputs)) return mkCheck("sst deploy", "info", "destroyed (outputs.json empty)");
-    return mkCheck("sst deploy", "info", "never deployed");
-  }
+  if (!isOurStageDeployed(wt)) return mkCheck("sst deploy", "info", "not deployed");
   try {
-    const st = statSync(outputs);
+    const st = statSync(join(wt.path, ".sst", "outputs.json"));
     const age = (Date.now() - st.mtimeMs) / 1000;
     return mkCheck("sst deploy", "info", `deployed (${humanAge(age)} ago)`);
   } catch {

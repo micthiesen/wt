@@ -61,17 +61,6 @@ function resolveStage(path: string, slug: string): string {
   return computeStage(slug);
 }
 
-export function isDeployed(wtPath: string): boolean {
-  const outputs = join(wtPath, ".sst", "outputs.json");
-  if (!existsSync(outputs)) return false;
-  try {
-    const data = JSON.parse(readFileSync(outputs, "utf8") || "{}");
-    return typeof data === "object" && data !== null && Object.keys(data).length > 0;
-  } catch {
-    return false;
-  }
-}
-
 export type SyncCounts = { ahead: number; behind: number };
 export type SyncState = {
   /** HEAD vs origin/main — "how far has this branch diverged from base?" */

@@ -1,6 +1,6 @@
 import { pickPrForWorktree } from "../core/github.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
-import { isDeployed } from "../core/worktree.ts";
+import { isOurStageDeployed } from "../core/stage-safety.ts";
 import { stageUrl } from "../core/stage.ts";
 import type { PullRequest, Status, Worktree } from "../core/types.ts";
 import { StatusKind } from "../core/types.ts";
@@ -12,7 +12,7 @@ export function renderSlugCell(wt: Worktree): string {
 }
 
 export function renderStageCell(wt: Worktree): string {
-  if (isDeployed(wt.path)) {
+  if (isOurStageDeployed(wt)) {
     const url = stageUrl(wt.stage);
     return url ? link(wt.stage, url) : wt.stage;
   }

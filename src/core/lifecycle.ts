@@ -8,6 +8,7 @@ import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
 import { lockStatus, tryAcquireLock } from "./locks.ts";
 import { run, runQuiet, runStreaming } from "./proc.ts";
 import { computeStage, dirSlug, slugify } from "./stage.ts";
+import { safeStage } from "./stage-safety.ts";
 import type { Worktree } from "./types.ts";
 import { fetchOrigin } from "./worktree.ts";
 
@@ -258,22 +259,33 @@ export async function removeWorktree(
   let deletedBranch = false;
   try {
     if (destroyStage) {
-      opts.onPhase?.("sst remove");
-      handle.phase("sst remove");
-      opts.onLog?.(`pnpm sst remove --stage ${wt.stage}`);
-      const sstExit = await runStreaming(
-        ["pnpm", "sst", "remove", "--stage", wt.stage],
-        {
-          cwd: wt.path,
-          onLine: (line) => opts.onLog?.(line),
-        },
-      );
-      if (sstExit === 0) {
-        destroyedStage = true;
-        // sst regenerates tracked files; bypass git's dirty check.
-        effectiveForce = true;
+      // Central safety gate. Pass `--stage` from the deterministic
+      // expected name, never from `wt.stage` — defends against an
+      // overwritten `.sst/stage` pointing the destroy at a foreign
+      // (e.g. production) stage.
+      const safe = safeStage(wt);
+      if (!safe.ok) {
+        opts.onPhase?.("sst remove (skipped)");
+        handle.phase("sst remove (skipped)");
+        opts.onLog?.(`refusing sst remove: ${safe.reason}`);
       } else {
-        opts.onLog?.(`sst remove failed (exit ${sstExit})`);
+        opts.onPhase?.("sst remove");
+        handle.phase("sst remove");
+        opts.onLog?.(`pnpm sst remove --stage ${safe.stage}`);
+        const sstExit = await runStreaming(
+          ["pnpm", "sst", "remove", "--stage", safe.stage],
+          {
+            cwd: wt.path,
+            onLine: (line) => opts.onLog?.(line),
+          },
+        );
+        if (sstExit === 0) {
+          destroyedStage = true;
+          // sst regenerates tracked files; bypass git's dirty check.
+          effectiveForce = true;
+        } else {
+          opts.onLog?.(`sst remove failed (exit ${sstExit})`);
+        }
       }
     }
 
