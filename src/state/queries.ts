@@ -204,7 +204,7 @@ export const aiSummaryQuery = (
     queryKey: ctx ? qk.aiSummary(ctx.hash) : qk.aiSummary("_pending"),
     queryFn: async (): Promise<AiSummary | null> => {
       if (!ctx) return null;
-      aiLog.event.dim(`calling LM Studio for ${slug} (${ctx.prompt.length} chars)…`);
+      aiLog.event.dim(`calling LM Studio for ${slug} (${ctx.prompt.length} chars)...`);
       const start = Date.now();
       try {
         const out = await summarizeDiff(ctx.prompt);

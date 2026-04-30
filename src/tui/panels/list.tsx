@@ -12,6 +12,7 @@ import { TextAttributes } from "@opentui/core";
 
 import { prStateBadge, statusBadge } from "../badges.ts";
 import { NF } from "../icons.ts";
+import { ELLIPSIS, ELLIPSIS_WIDTH } from "../text.ts";
 import { theme } from "../theme.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { type MergeQueueState, StatusKind } from "../../core/types.ts";
@@ -95,20 +96,22 @@ function rowLabel(row: WorktreeRow): string {
 
 /**
  * End-truncate `s` to fit within `maxWidth` terminal cells, suffixing
- * `…` when it overflows. OpenTUI's native `truncate` flag does
- * middle-truncation in the binary; we want trailing ellipsis (label
- * starts the same way for related branches, so the head is the most
- * recognizable part), so we shorten ourselves and skip the native flag.
+ * `...` when it overflows. OpenTUI's native `truncate` flag does
+ * middle-truncation in the binary with the same 3-cell ASCII ellipsis;
+ * we want trailing ellipsis (label starts the same way for related
+ * branches, so the head is the most recognizable part), so we shorten
+ * ourselves and skip the native flag — but match its glyph for visual
+ * consistency.
  */
 function truncateEnd(s: string, maxWidth: number): string {
   if (maxWidth <= 0) return "";
   if (Bun.stringWidth(s) <= maxWidth) return s;
-  if (maxWidth === 1) return "…";
+  if (maxWidth < ELLIPSIS_WIDTH) return ELLIPSIS.slice(0, maxWidth);
   let cut = s;
-  while (cut.length > 0 && Bun.stringWidth(cut) + 1 > maxWidth) {
+  while (cut.length > 0 && Bun.stringWidth(cut) + ELLIPSIS_WIDTH > maxWidth) {
     cut = cut.slice(0, -1);
   }
-  return `${cut}…`;
+  return `${cut}${ELLIPSIS}`;
 }
 
 /**
@@ -300,7 +303,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
       {rows.length === 0 ? (
         <box padding={1}>
           {isLoading ? (
-            <text fg={theme.fgDim}>Loading worktrees…</text>
+            <text fg={theme.fgDim}>Loading worktrees...</text>
           ) : filter ? (
             <text fg={theme.fgDim}>
               No matches for <span fg={theme.fg}>/{filter}</span>

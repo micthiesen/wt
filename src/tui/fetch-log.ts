@@ -38,7 +38,7 @@ export function attachFetchLogs(client: QueryClient): () => void {
     const action = event.action;
     if (action.type === "fetch") {
       starts.set(event.query.queryHash, Date.now());
-      log.event.dim(`fetching ${meta.label}…`);
+      log.event.dim(`fetching ${meta.label}...`);
     } else if (action.type === "success") {
       const start = starts.get(event.query.queryHash);
       const dur = start ? ` (${formatDuration(Date.now() - start)})` : "";

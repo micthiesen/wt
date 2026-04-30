@@ -38,7 +38,7 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
 
-  console.log(dim("Fetching origin…"));
+  console.log(dim("Fetching origin..."));
   await fetchOrigin();
 
   const wts = (await listWorktrees()).filter((w) => !w.isMain && w.branch);

@@ -34,15 +34,16 @@ import {
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
 import { NF } from "../icons.ts";
+import { ELLIPSIS } from "../text.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
-type Props = { row?: WorktreeRow };
+type Props = { row?: WorktreeRow; width: number };
 
 const RESOLVED_ROWS: readonly RowModule[] = resolveRows(config.ui.rows);
 
 /**
- * Row staleness glyph aggregated across a module's sources. "…" only
+ * Row staleness glyph aggregated across a module's sources. "..." only
  * before any source has data; the spinner once anything is in flight
  * with cached data behind it; nothing when idle.
  */
@@ -51,7 +52,7 @@ function combinedGlyph(fs: readonly FetchLike[]): string {
   const anyFetching = fs.some((f) => f.isFetching);
   if (!anyFetching) return "";
   const anyHasData = fs.some((f) => f.data !== undefined);
-  return anyHasData ? NF.refresh : "…";
+  return anyHasData ? NF.refresh : ELLIPSIS;
 }
 
 /**
@@ -72,6 +73,15 @@ function Glyph({ text }: { text: string }) {
 }
 
 const LABEL_WIDTH = 8;
+/** Reserved cells for the trailing staleness glyph slot (` ` + 1-cell glyph). Matches `<Glyph>`'s leading space. */
+const GLYPH_SLOT_WIDTH = 2;
+/** Border (1 left + 1 right) + content padding (1 each side). */
+const PANE_CHROME_WIDTH = 4;
+
+/** Compute the row-value cell budget from the pane's outer width. */
+function valueWidthFor(paneWidth: number): number {
+  return Math.max(0, paneWidth - PANE_CHROME_WIDTH - LABEL_WIDTH - GLYPH_SLOT_WIDTH);
+}
 
 /**
  * One detail row: fixed-width label, value sized to content but
@@ -196,7 +206,7 @@ function DescriptionBlock({
   } else if (isLlmRunning) {
     body = (
       <text fg={theme.fgDim} attributes={TextAttributes.ITALIC}>
-        generating summary…{refreshSuffix}
+        generating summary{ELLIPSIS}{refreshSuffix}
       </text>
     );
   } else if (blockedReason) {
@@ -207,7 +217,7 @@ function DescriptionBlock({
   return <box marginTop={1}>{body}</box>;
 }
 
-const DetailsBody = memo(function DetailsBody({ row }: { row: WorktreeRow }) {
+const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow; width: number }) {
   // Subscribe to the combined GitHub fetch so per-row indicators
   // reflect its fetch state. Observers dedupe by key — this doesn't
   // trigger an extra fetch, it joins the existing observer in
@@ -236,7 +246,11 @@ const DetailsBody = memo(function DetailsBody({ row }: { row: WorktreeRow }) {
     enabled: allowFetch && !!diffCtx.data,
   });
 
-  const ctx: RowContext = useMemo(() => ({ row, github }), [row, github]);
+  const valueWidth = valueWidthFor(width);
+  const ctx: RowContext = useMemo(
+    () => ({ row, github, valueWidth }),
+    [row, github, valueWidth],
+  );
 
   // Pick a single user-facing reason when we're suppressing AI work.
   const blockedReason: string | null = !aiEnabled
@@ -273,7 +287,7 @@ const DetailsBody = memo(function DetailsBody({ row }: { row: WorktreeRow }) {
   );
 });
 
-export function Details({ row }: Props) {
+export function Details({ row, width }: Props) {
   if (!row) {
     return (
       <box
@@ -289,5 +303,5 @@ export function Details({ row }: Props) {
       </box>
     );
   }
-  return <DetailsBody row={row} />;
+  return <DetailsBody row={row} width={width} />;
 }

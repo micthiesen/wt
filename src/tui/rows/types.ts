@@ -33,6 +33,13 @@ export type FetchLike = {
 export type RowContext = {
   row: WorktreeRow;
   github: UseQueryResult<GithubData, Error>;
+  /**
+   * Visible cell budget for the row's value column — pane width minus
+   * borders, padding, label, and the reserved trailing-glyph slot.
+   * Rows that compact via `fitSegments` should pass this in; simple
+   * rows (branch/path/linear) can ignore it.
+   */
+  valueWidth: number;
 };
 
 export type RowModule = {

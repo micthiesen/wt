@@ -689,7 +689,7 @@ export function App({ onExit }: Props) {
   const archivedCount = rows.length - activeCount;
   const titleBar = useMemo(() => {
     const suffix = isLoading
-      ? " · loading…"
+      ? " · loading..."
       : fetchingCount > 0
         ? ` · refreshing (${fetchingCount})`
         : "";
@@ -726,7 +726,7 @@ export function App({ onExit }: Props) {
           isLoading={isLoading}
           filter={filter}
         />
-        <Details row={current} />
+        <Details row={current} width={Math.max(0, width - listWidth)} />
       </box>
       <ActivityPane height={activityHeight} />
       <Footer mode={footer} hint={footerHint} />

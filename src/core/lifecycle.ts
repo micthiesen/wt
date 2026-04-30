@@ -192,7 +192,7 @@ export async function createWorktree(
 
     if (opts.runInstall !== false) {
       handle.phase("pnpm install");
-      opts.onLog?.("pnpm install…");
+      opts.onLog?.("pnpm install...");
       const code = await runStreaming(["pnpm", "install"], {
         cwd: path,
         onLine: (line) => opts.onLog?.(line),
