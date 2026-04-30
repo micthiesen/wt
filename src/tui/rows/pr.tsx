@@ -1,31 +1,31 @@
-import type { MergeQueueEntry, MergeQueueState, PrReview, PullRequest } from "../../core/types.ts";
+import { memo, useMemo } from "react";
+
+import type {
+  MergeQueueEntry,
+  MergeQueueState,
+  PrChecks,
+  PrReview,
+  PullRequest,
+  RabbitStatus,
+} from "../../core/types.ts";
 import { prStateBadge } from "../badges.ts";
+import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
+import { fitSegments, type Segment } from "./fit.tsx";
 import type { RowModule } from "./types.ts";
 
-function ChecksBadge({ pr }: { pr: PullRequest }) {
-  if (pr.state !== "OPEN") return null;
-  let body: React.ReactNode;
-  switch (pr.checks) {
+function checksLabel(c: PrChecks): { glyph: string; text: string; fg: string } | null {
+  switch (c) {
     case "pass":
-      body = <span fg={theme.ok}>{NF.checkPass}  checks</span>;
-      break;
+      return { glyph: NF.checkPass, text: "checks", fg: theme.ok };
     case "fail":
-      body = <span fg={theme.err}>{NF.checkFail}  checks</span>;
-      break;
+      return { glyph: NF.checkFail, text: "checks", fg: theme.err };
     case "pending":
-      body = <span fg={theme.warn}>{NF.checkPend}  checks pending</span>;
-      break;
+      return { glyph: NF.checkPend, text: "checks pending", fg: theme.warn };
     default:
       return null;
   }
-  return (
-    <>
-      <span fg={theme.fgDim}> · </span>
-      {body}
-    </>
-  );
 }
 
 function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } | null {
@@ -41,21 +41,24 @@ function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } |
   }
 }
 
-function ReviewBadge({ pr }: { pr: PullRequest }) {
-  if (pr.state !== "OPEN") return null;
-  // Drafts don't expect reviews; suppress to avoid a permanent
-  // "pending" badge on every draft.
-  if (pr.isDraft) return null;
-  const r = reviewLabel(pr.review);
-  if (!r) return null;
-  return (
-    <>
-      <span fg={theme.fgDim}> · </span>
-      <span fg={r.fg}>
-        {r.glyph}  {r.text}
-      </span>
-    </>
-  );
+function rabbitLabel(
+  rb: RabbitStatus,
+): { glyph: string; full: string; tiny: string; fg: string } | null {
+  switch (rb.state) {
+    case "unresolved":
+      return {
+        glyph: NF.checkFail,
+        full: `${rb.unresolved} carrots`,
+        tiny: String(rb.unresolved),
+        fg: theme.warn,
+      };
+    case "pending":
+      return { glyph: NF.checkPend, full: "carrots", tiny: "", fg: theme.warn };
+    case "clean":
+      return { glyph: NF.checkPass, full: "carrots", tiny: "", fg: theme.ok };
+    default:
+      return null;
+  }
 }
 
 function mqStateLabel(state: MergeQueueState): { text: string; fg: string } {
@@ -75,61 +78,169 @@ function mqStateLabel(state: MergeQueueState): { text: string; fg: string } {
   }
 }
 
-function QueueBadge({ mq }: { mq: MergeQueueEntry | undefined }) {
-  if (!mq) return null;
-  const label = mqStateLabel(mq.state);
-  return (
-    <>
-      <span fg={theme.fgDim}> · </span>
-      <span fg={label.fg}>{NF.mergeQueue}  queue #{mq.position} {label.text}</span>
-    </>
-  );
+/**
+ * Build the PR row's segment list. Tiers picked so the PR id is sticky,
+ * the merge-queue state (next action) outranks ambient signals, and
+ * carrots drop first because they're the noisiest line item.
+ */
+function buildPrSegments(pr: PullRequest, mq: MergeQueueEntry | undefined): Segment[] {
+  const segs: Segment[] = [];
+  const badge = prStateBadge(pr);
+  const num = `#${pr.number}`;
+  const numW = Bun.stringWidth(num);
+
+  segs.push({
+    key: "id",
+    tier: 1,
+    modes: [
+      {
+        width: 3 + numW,
+        render: () => (
+          <span fg={badge.fg}>
+            {badge.glyph}  {num}
+          </span>
+        ),
+      },
+      { width: numW, render: () => <span fg={badge.fg}>{num}</span> },
+      { width: 0, render: () => null },
+    ],
+  });
+
+  if (mq) {
+    const label = mqStateLabel(mq.state);
+    const full = `queue #${mq.position} ${label.text}`;
+    const mid = `queue #${mq.position}`;
+    const tiny = `#${mq.position}`;
+    segs.push({
+      key: "queue",
+      tier: 2,
+      modes: [
+        {
+          width: 3 + Bun.stringWidth(full),
+          render: () => (
+            <span fg={label.fg}>
+              {NF.mergeQueue}  {full}
+            </span>
+          ),
+        },
+        {
+          width: 3 + Bun.stringWidth(mid),
+          render: () => (
+            <span fg={label.fg}>
+              {NF.mergeQueue}  {mid}
+            </span>
+          ),
+        },
+        {
+          width: 3 + Bun.stringWidth(tiny),
+          render: () => (
+            <span fg={label.fg}>
+              {NF.mergeQueue}  {tiny}
+            </span>
+          ),
+        },
+        { width: 0, render: () => null },
+      ],
+    });
+  }
+
+  if (pr.state === "OPEN") {
+    const ck = checksLabel(pr.checks);
+    if (ck) {
+      segs.push({
+        key: "checks",
+        tier: 3,
+        modes: [
+          {
+            width: 3 + Bun.stringWidth(ck.text),
+            render: () => (
+              <span fg={ck.fg}>
+                {ck.glyph}  {ck.text}
+              </span>
+            ),
+          },
+          { width: 0, render: () => null },
+        ],
+      });
+    }
+
+    const rb = rabbitLabel(pr.rabbit);
+    if (rb) {
+      const modes = [
+        {
+          width: 3 + Bun.stringWidth(rb.full),
+          render: () => (
+            <span fg={rb.fg}>
+              {rb.glyph}  {rb.full}
+            </span>
+          ),
+        },
+      ];
+      if (rb.tiny) {
+        modes.push({
+          width: 3 + Bun.stringWidth(rb.tiny),
+          render: () => (
+            <span fg={rb.fg}>
+              {rb.glyph}  {rb.tiny}
+            </span>
+          ),
+        });
+      }
+      modes.push({ width: 0, render: () => null });
+      segs.push({ key: "rabbit", tier: 5, modes });
+    }
+
+    if (!pr.isDraft) {
+      const rv = reviewLabel(pr.review);
+      if (rv) {
+        segs.push({
+          key: "review",
+          tier: 4,
+          modes: [
+            {
+              width: 3 + Bun.stringWidth(rv.text),
+              render: () => (
+                <span fg={rv.fg}>
+                  {rv.glyph}  {rv.text}
+                </span>
+              ),
+            },
+            { width: 0, render: () => null },
+          ],
+        });
+      }
+    }
+  }
+
+  return segs;
 }
 
-function RabbitBadge({ pr }: { pr: PullRequest }) {
-  if (pr.state !== "OPEN") return null;
-  let body: React.ReactNode;
-  switch (pr.rabbit.state) {
-    case "unresolved":
-      body = (
-        <span fg={theme.warn}>
-          {NF.checkFail}  rabbit {pr.rabbit.unresolved} unresolved
-        </span>
-      );
-      break;
-    case "pending":
-      body = <span fg={theme.warn}>{NF.checkPend}  rabbit pending</span>;
-      break;
-    case "clean":
-      body = <span fg={theme.ok}>{NF.checkPass}  rabbit</span>;
-      break;
-    default:
-      return null;
-  }
-  return (
-    <>
-      <span fg={theme.fgDim}> · </span>
-      {body}
-    </>
+const PrLine = memo(function PrLine({
+  row,
+  valueWidth,
+}: {
+  row: WorktreeRow;
+  valueWidth: number;
+}) {
+  const segments = useMemo(
+    () => (row.pr ? buildPrSegments(row.pr, row.mq) : null),
+    [row],
   );
-}
+  const fit = useMemo(
+    () => (segments ? fitSegments(segments, valueWidth) : null),
+    [segments, valueWidth],
+  );
+  if (!fit) return <text fg={theme.fgDim}>—</text>;
+  return (
+    <text fg={theme.fg} wrapMode="none" truncate>
+      {fit.rendered}
+    </text>
+  );
+});
 
 export const prRow: RowModule = {
   id: "pr",
   label: "pr",
   sources: ({ github }) => [github],
-  render: ({ row }) => {
-    const { pr, mq } = row;
-    if (!pr) return <text fg={theme.fgDim}>—</text>;
-    const badge = prStateBadge(pr);
-    return (
-      <text fg={theme.fg} wrapMode="none" truncate>
-        <span fg={badge.fg}>{badge.glyph}  #{pr.number}</span>
-        <ChecksBadge pr={pr} />
-        <RabbitBadge pr={pr} />
-        <ReviewBadge pr={pr} />
-        <QueueBadge mq={mq} />
-      </text>
-    );
-  },
+  render: ({ row, valueWidth }) => <PrLine row={row} valueWidth={valueWidth} />,
 };

@@ -33,8 +33,8 @@ import {
 } from "../../state/queries.ts";
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
-import { NF } from "../icons.ts";
 import { ELLIPSIS } from "../text.ts";
+import { useSpinnerFrame } from "../spinner.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -42,17 +42,19 @@ type Props = { row?: WorktreeRow; width: number };
 
 const RESOLVED_ROWS: readonly RowModule[] = resolveRows(config.ui.rows);
 
+type GlyphKind = "spinner" | "ellipsis" | null;
+
 /**
- * Row staleness glyph aggregated across a module's sources. "..." only
- * before any source has data; the spinner once anything is in flight
- * with cached data behind it; nothing when idle.
+ * Row staleness indicator aggregated across a module's sources. Ellipsis
+ * before any source has data (cold load); the animated spinner once
+ * anything is in flight with cached data behind it; nothing when idle.
  */
-function combinedGlyph(fs: readonly FetchLike[]): string {
-  if (fs.length === 0) return "";
+function combinedGlyph(fs: readonly FetchLike[]): GlyphKind {
+  if (fs.length === 0) return null;
   const anyFetching = fs.some((f) => f.isFetching);
-  if (!anyFetching) return "";
+  if (!anyFetching) return null;
   const anyHasData = fs.some((f) => f.data !== undefined);
-  return anyHasData ? NF.refresh : ELLIPSIS;
+  return anyHasData ? "spinner" : "ellipsis";
 }
 
 /**
@@ -67,9 +69,39 @@ function firstError(fs: readonly FetchLike[]): Error | null {
   return null;
 }
 
-function Glyph({ text }: { text: string }) {
-  if (!text) return null;
-  return <text fg={theme.fgDim}> {text}</text>;
+function SpinnerGlyph() {
+  const frame = useSpinnerFrame();
+  return <text fg={theme.fgDim}> {frame}</text>;
+}
+
+function Glyph({ kind }: { kind: GlyphKind }) {
+  if (kind === null) return null;
+  if (kind === "spinner") return <SpinnerGlyph />;
+  return <text fg={theme.fgDim}> {ELLIPSIS}</text>;
+}
+
+/**
+ * Italic summary line with a trailing spinner. Sub-component (rather
+ * than embedding the spinner via `<span>` inside `<text>`) so the
+ * spinner frame ends up as plain text content, which the reconciler
+ * updates reliably.
+ */
+function SummaryWithSpinner({ summary }: { summary: string }) {
+  const frame = useSpinnerFrame();
+  return (
+    <text fg={theme.fgDim} attributes={TextAttributes.ITALIC} wrapMode="word">
+      {summary} {frame}
+    </text>
+  );
+}
+
+function GeneratingLine() {
+  const frame = useSpinnerFrame();
+  return (
+    <text fg={theme.fgDim} attributes={TextAttributes.ITALIC}>
+      generating summary{ELLIPSIS} {frame}
+    </text>
+  );
 }
 
 const LABEL_WIDTH = 8;
@@ -119,7 +151,7 @@ function RenderedRow({ module: m, ctx }: { module: RowModule; ctx: RowContext })
   return (
     <Row
       label={m.label}
-      trailing={glyph ? <Glyph text={glyph} /> : undefined}
+      trailing={glyph ? <Glyph kind={glyph} /> : undefined}
     >
       {err ? (
         <text fg={theme.err} wrapMode="none" truncate>
@@ -185,7 +217,6 @@ function DescriptionBlock({
 }) {
   // No AI config and no cached value → don't reserve space.
   if (!summary && !isLlmRunning && !hasContext && !blockedReason && !error) return null;
-  const refreshSuffix = isLlmRunning ? ` ${NF.refresh}` : "";
   let body: React.ReactNode;
   // Errors win over everything except an in-flight retry: while
   // re-fetching after a failure we'd rather show "generating…" than
@@ -198,18 +229,15 @@ function DescriptionBlock({
       </text>
     );
   } else if (summary) {
-    body = (
+    body = isLlmRunning ? (
+      <SummaryWithSpinner summary={summary} />
+    ) : (
       <text fg={theme.fgDim} attributes={TextAttributes.ITALIC} wrapMode="word">
         {summary}
-        {refreshSuffix}
       </text>
     );
   } else if (isLlmRunning) {
-    body = (
-      <text fg={theme.fgDim} attributes={TextAttributes.ITALIC}>
-        generating summary{ELLIPSIS}{refreshSuffix}
-      </text>
-    );
+    body = <GeneratingLine />;
   } else if (blockedReason) {
     body = <text fg={theme.fgDim}>{blockedReason}</text>;
   } else {
