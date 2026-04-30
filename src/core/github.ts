@@ -9,6 +9,7 @@ import type {
   PrChecks,
   PrReview,
   PullRequest,
+  RabbitStatus,
   Worktree,
 } from "./types.ts";
 import { listWorktrees } from "./worktree.ts";
@@ -43,8 +44,8 @@ async function repoSlug(): Promise<string | null> {
 }
 
 type RawCheck =
-  | { __typename: "CheckRun"; status?: string | null; conclusion?: string | null }
-  | { __typename: "StatusContext"; state?: string | null };
+  | { __typename: "CheckRun"; name?: string | null; status?: string | null; conclusion?: string | null }
+  | { __typename: "StatusContext"; context?: string | null; state?: string | null };
 
 const CHECK_FAIL_CONCLUSIONS = new Set([
   "FAILURE",
@@ -54,11 +55,33 @@ const CHECK_FAIL_CONCLUSIONS = new Set([
   "STARTUP_FAILURE",
 ]);
 
+/** Compile `[github] ignored_checks` (case-insensitive globs, `*` only) into a predicate. */
+function compileIgnore(patterns: readonly string[]): (name: string | null | undefined) => boolean {
+  if (patterns.length === 0) return () => false;
+  const regexes = patterns.map((p) => {
+    const escaped = p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`, "i");
+  });
+  return (name) => {
+    if (!name) return false;
+    return regexes.some((r) => r.test(name));
+  };
+}
+
+const isIgnoredCheck = compileIgnore(config.github.ignoredChecks);
+
+function checkName(c: RawCheck): string | null | undefined {
+  return c.__typename === "CheckRun" ? c.name : c.context;
+}
+
 function rollupChecks(raw: RawCheck[] | null | undefined): PrChecks {
   if (!raw || raw.length === 0) return "none";
   let pending = false;
   let fail = false;
+  let counted = 0;
   for (const c of raw) {
+    if (isIgnoredCheck(checkName(c))) continue;
+    counted++;
     if (c.__typename === "CheckRun") {
       if (c.status && c.status !== "COMPLETED") pending = true;
       else if (c.conclusion && CHECK_FAIL_CONCLUSIONS.has(c.conclusion)) fail = true;
@@ -68,6 +91,7 @@ function rollupChecks(raw: RawCheck[] | null | undefined): PrChecks {
       else if (s === "FAILURE" || s === "ERROR") fail = true;
     }
   }
+  if (counted === 0) return "none";
   if (fail) return "fail";
   if (pending) return "pending";
   return "pass";
@@ -93,15 +117,70 @@ fragment PrFields on PullRequest {
           contexts(first: 50) {
             nodes {
               __typename
-              ... on CheckRun { status conclusion }
-              ... on StatusContext { state }
+              ... on CheckRun { name status conclusion }
+              ... on StatusContext { context state }
             }
           }
         }
       }
     }
   }
+  reviewThreads(first: 50) {
+    nodes {
+      isResolved
+      comments(first: 1) {
+        nodes { author { login } }
+      }
+    }
+  }
 }`;
+
+// CodeRabbit's status-check context name and GraphQL author login. Both
+// are user-facing strings owned by CR, not us — if they change, the
+// rabbit badge silently disappears (state: "none") rather than breaking
+// the whole pane. Hardcoded by design; mirrors `~/.claude/skills/rabbit`.
+const CR_CONTEXT = "CodeRabbit";
+const CR_LOGIN = "coderabbitai";
+
+type GqlReviewThread = {
+  isResolved: boolean;
+  comments: { nodes: Array<{ author: { login: string | null } | null }> };
+};
+
+function rollupRabbit(
+  state: PullRequest["state"],
+  contexts: RawCheck[] | null | undefined,
+  threads: GqlReviewThread[] | null | undefined,
+): RabbitStatus {
+  if (state !== "OPEN") return { state: "none", unresolved: 0 };
+
+  let unresolved = 0;
+  for (const t of threads ?? []) {
+    if (t.isResolved) continue;
+    if (t.comments.nodes[0]?.author?.login === CR_LOGIN) unresolved++;
+  }
+  // Unresolved feedback takes precedence over a fresh re-run — pushes
+  // re-trigger CR routinely and the old threads are still what needs
+  // addressing.
+  if (unresolved > 0) return { state: "unresolved", unresolved };
+
+  // Find CR's status-check context to distinguish "still running" from
+  // "done with no findings" from "never ran / not configured".
+  let crContextState: "pending" | "done" | null = null;
+  for (const c of contexts ?? []) {
+    const name = c.__typename === "CheckRun" ? c.name : c.context;
+    if (name !== CR_CONTEXT) continue;
+    if (c.__typename === "CheckRun") {
+      crContextState = c.status && c.status !== "COMPLETED" ? "pending" : "done";
+    } else {
+      crContextState = c.state === "PENDING" || c.state === "EXPECTED" ? "pending" : "done";
+    }
+    break;
+  }
+  if (crContextState === "pending") return { state: "pending", unresolved: 0 };
+  if (crContextState === "done") return { state: "clean", unresolved: 0 };
+  return { state: "none", unresolved: 0 };
+}
 
 /**
  * Build a graphql doc with one aliased `pullRequests(headRefName:)`
@@ -162,6 +241,7 @@ type GqlPrNode = {
       };
     }>;
   };
+  reviewThreads: { nodes: GqlReviewThread[] } | null;
 };
 
 function rollupReview(state: PullRequest["state"], decision: GqlReviewDecision): PrReview {
@@ -199,6 +279,7 @@ export type GithubData = {
 function nodeToPr(pr: GqlPrNode): PullRequest {
   const contexts =
     pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? null;
+  const threads = pr.reviewThreads?.nodes ?? null;
   return {
     number: pr.number,
     url: pr.url,
@@ -209,6 +290,7 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     checks: rollupChecks(contexts),
     review: rollupReview(pr.state, pr.reviewDecision),
     reviewRequests: pr.reviewRequests?.totalCount ?? 0,
+    rabbit: rollupRabbit(pr.state, contexts, threads),
     mergedAt: pr.mergedAt ?? null,
     closedAt: pr.closedAt ?? null,
   };

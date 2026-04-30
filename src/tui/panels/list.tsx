@@ -79,19 +79,16 @@ function mqGlyph(row: WorktreeRow): string {
 }
 
 /**
- * Row label text. The resolved title (`row.title`, with `llm > pr >
- * commit` fallback owned by `useWorktreeRows`) wins over the slug-
- * derived prettified `rest` so list and details stay in sync. First
- * char is capitalized to match PR-title convention even when an LLM
- * emits lowercase. Issue ID, when present, prefixes the label as
- * `ENG-1234: <text>`. Falls back to the raw slug as a defensive last
- * resort.
+ * Row label text. `row.title` is the resolved title (always non-empty,
+ * `llm > pr > commit > slug` fallback owned by `useWorktreeRows`).
+ * First char is capitalized to match PR-title convention even when an
+ * LLM emits lowercase; harmless on already-capitalized slug fallbacks.
+ * Issue ID, when present, prefixes the label as `ENG-1234: <text>`.
  */
 function rowLabel(row: WorktreeRow): string {
-  const { id, rest } = slugLabel(row.wt.slug);
-  const text = row.title ? capitalizeFirst(row.title) : rest;
-  if (id && text) return `${id}: ${text}`;
-  return id ?? text ?? row.wt.slug;
+  const { id } = slugLabel(row.wt.slug);
+  const text = capitalizeFirst(row.title);
+  return id ? `${id}: ${text}` : text;
 }
 
 /**

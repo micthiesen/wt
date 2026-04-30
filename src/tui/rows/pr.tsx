@@ -86,6 +86,34 @@ function QueueBadge({ mq }: { mq: MergeQueueEntry | undefined }) {
   );
 }
 
+function RabbitBadge({ pr }: { pr: PullRequest }) {
+  if (pr.state !== "OPEN") return null;
+  let body: React.ReactNode;
+  switch (pr.rabbit.state) {
+    case "unresolved":
+      body = (
+        <span fg={theme.warn}>
+          {NF.checkFail}  rabbit {pr.rabbit.unresolved} unresolved
+        </span>
+      );
+      break;
+    case "pending":
+      body = <span fg={theme.warn}>{NF.checkPend}  rabbit pending</span>;
+      break;
+    case "clean":
+      body = <span fg={theme.ok}>{NF.checkPass}  rabbit</span>;
+      break;
+    default:
+      return null;
+  }
+  return (
+    <>
+      <span fg={theme.fgDim}> · </span>
+      {body}
+    </>
+  );
+}
+
 export const prRow: RowModule = {
   id: "pr",
   label: "pr",
@@ -99,6 +127,7 @@ export const prRow: RowModule = {
         <span fg={badge.fg}>{badge.glyph}  #{pr.number}</span>
         <ChecksBadge pr={pr} />
         <ReviewBadge pr={pr} />
+        <RabbitBadge pr={pr} />
         <QueueBadge mq={mq} />
       </text>
     );

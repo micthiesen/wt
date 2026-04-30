@@ -135,21 +135,22 @@ function RenderedRow({ module: m, ctx }: { module: RowModule; ctx: RowContext })
 /**
  * Title above the row stack. Bold title followed by a muted `(source)`
  * tag so it's obvious where the text came from — useful for spotting
- * stale PR titles vs. fresh LLM-generated ones at a glance.
+ * stale PR titles vs. fresh LLM-generated ones at a glance. Always
+ * renders: `useWorktreeRows` guarantees a slug-derived fallback, so
+ * the line count stays stable as the better sources fill in.
  */
 function TitleLine({
   title,
   source,
 }: {
-  title: string | null;
-  source: TitleSource | null;
+  title: string;
+  source: TitleSource;
 }) {
-  if (!title) return null;
   return (
     <box marginBottom={1}>
       <text wrapMode="none" truncate>
         <span fg={theme.fg} attributes={1}>{title}</span>
-        {source ? <span fg={theme.fgDim}>{` (${source})`}</span> : null}
+        <span fg={theme.fgDim}>{` (${source})`}</span>
       </text>
     </box>
   );

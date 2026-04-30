@@ -7,6 +7,7 @@ import type { GitActivity } from "../../core/git-activity.ts";
 import { pickPrForWorktree } from "../../core/github.ts";
 import { lockAge, lockLabel } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
+import { slugLabel } from "../../core/stage.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
 import type { SyncState } from "../../core/worktree.ts";
@@ -30,9 +31,11 @@ import {
 /**
  * Where the row's resolved title came from, in fallback priority. The
  * details pane renders this as a muted suffix so a stale PR title vs.
- * a freshly LLM-generated one is obvious at a glance.
+ * a freshly LLM-generated one is obvious at a glance. `slug` is the
+ * terminal fallback — the prettified slug is always available, so a
+ * row's title field is never empty.
  */
-export type TitleSource = "llm" | "pr" | "commit";
+export type TitleSource = "llm" | "pr" | "commit" | "slug";
 
 export type FieldState<T> = {
   data: T | undefined;
@@ -63,15 +66,14 @@ export type WorktreeRow = {
   anyFetching: boolean;
   archived: boolean;
   /**
-   * Resolved title with `llm > pr > commit` fallback. Both the list
-   * row label and the details-pane title bar read this so they stay in
-   * sync. Null when no source has produced anything yet (AI still
-   * generating, no PR, branch with no commits) — in which case the
-   * list falls back to a slug-derived label and the details pane
-   * shows nothing.
+   * Resolved title with `llm > pr > commit > slug` fallback. Both the
+   * list row label and the details-pane title bar read this so they
+   * stay in sync. Always non-empty — `slugLabel` produces a prettified
+   * fallback for any worktree, so consumers never need to check for
+   * null.
    */
-  title: string | null;
-  titleSource: TitleSource | null;
+  title: string;
+  titleSource: TitleSource;
 };
 
 const FIELD_ORDER = [
@@ -272,8 +274,8 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const llmTitle = (aiResults[i]?.data?.title as string | undefined) ?? null;
     const prTitle = pr?.title ?? null;
     const commitTitle = (firstCommitResults[i]?.data as string | null | undefined) ?? null;
-    let title: string | null = null;
-    let titleSource: TitleSource | null = null;
+    let title: string;
+    let titleSource: TitleSource;
     if (llmTitle) {
       title = llmTitle;
       titleSource = "llm";
@@ -283,6 +285,15 @@ export function useWorktreeRows(): WorktreeRowsResult {
     } else if (commitTitle) {
       title = commitTitle;
       titleSource = "commit";
+    } else {
+      // Slug-derived fallback. `slugLabel(...).rest` is the prettified
+      // tail (issue ID stripped, dashes → spaces, first-letter caps).
+      // Empty rest happens for slugs that are only an issue prefix —
+      // fall back to the id, then the raw slug, so we always render
+      // *something* and the details pane keeps a stable line count.
+      const { id, rest } = slugLabel(wt.slug);
+      title = rest || id || wt.slug;
+      titleSource = "slug";
     }
     // After per-field reuse above, identity-equality on each `fields.X`,
     // `status`, `pr`, `mq` plus primitives is sufficient — anything

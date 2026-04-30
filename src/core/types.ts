@@ -29,6 +29,18 @@ export type PrChecks = "pass" | "fail" | "pending" | "none";
 
 export type PrReview = "approved" | "changes_requested" | "pending" | "none";
 
+/**
+ * CodeRabbit review state, derived from the `CodeRabbit` status check
+ * and CR-authored review threads. Unresolved threads take precedence
+ * over a fresh "pending" — re-runs happen on every push, but old
+ * feedback still needs addressing.
+ */
+export type RabbitStatus = {
+  state: "pending" | "unresolved" | "clean" | "none";
+  /** Count of unresolved CR-authored threads. Only meaningful when state === "unresolved". */
+  unresolved: number;
+};
+
 export type MergeQueueState =
   | "AWAITING_CHECKS"
   | "LOCKED"
@@ -57,6 +69,8 @@ export type PullRequest = {
   review: PrReview;
   /** Outstanding review requests (humans + bots). */
   reviewRequests: number;
+  /** CodeRabbit status — its own track, separate from human reviews. `none` when CR didn't run. */
+  rabbit: RabbitStatus;
   // ISO timestamps. Terminal PRs carry at least one of these; OPEN
   // PRs have neither. Used to dismiss pre-existing merged/closed PRs
   // when a worktree for the same branch is recreated from scratch.

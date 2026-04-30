@@ -42,6 +42,16 @@ export type LinearConfig = {
   workspace: string;
 };
 
+export type GithubConfig = {
+  /**
+   * Glob patterns matched against check context names (CheckRun.name /
+   * StatusContext.context). Matching contexts are dropped from the PR
+   * checks rollup, so non-CI bots like CodeRabbit and Graphite don't
+   * flip the badge. Case-insensitive; `*` is the only wildcard.
+   */
+  ignoredChecks: readonly string[];
+};
+
 export type AiConfig = {
   /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
   endpoint: string;
@@ -84,6 +94,7 @@ export type Config = {
   sst: SstConfig | null;
   linear: LinearConfig | null;
   ai: AiConfig | null;
+  github: GithubConfig;
   ui: {
     /** Detail-pane row order. Unknown ids are ignored, missing ones hidden. */
     rows: readonly string[];
@@ -264,6 +275,11 @@ function build(raw: Raw, errs: Errors): Config {
 
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
+  const githubRaw = obj(raw.github);
+  const github: GithubConfig = {
+    ignoredChecks: strArr(githubRaw?.ignored_checks, []),
+  };
+
   return {
     paths: { mainClone, worktreeRoot, logDir, appLogDir, lockDir, cacheDb },
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen },
@@ -272,6 +288,7 @@ function build(raw: Raw, errs: Errors): Config {
     sst,
     linear,
     ai,
+    github,
     ui: { rows },
   };
 }
