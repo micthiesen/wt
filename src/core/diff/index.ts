@@ -123,9 +123,14 @@ export async function buildDiffContext(wtPath: string): Promise<DiffContext | nu
   };
 }
 
+// Three-dot (`base...HEAD` = `merge-base(base, HEAD)..HEAD`) so the diff
+// reflects only what this branch contributes. Two-dot would show the
+// tree delta between base and HEAD, which on a branch that's purely
+// behind base produces the *inverse* of the commits base has gained —
+// the LLM then summarises those as if they were this branch's work.
 async function diffStat(wtPath: string, base: string): Promise<string> {
   const r = await run(
-    ["git", "diff", "--stat", `${base}..HEAD`, "--", ...STATIC_EXCLUDES],
+    ["git", "diff", "--stat", `${base}...HEAD`, "--", ...STATIC_EXCLUDES],
     { cwd: wtPath, timeoutMs: 10_000 },
   );
   return r.exitCode === 0 ? r.stdout.trim() : "";
@@ -149,7 +154,7 @@ async function fullDiff(wtPath: string, base: string): Promise<string> {
       "--diff-algorithm=patience",
       "--ignore-space-change",
       "--ignore-blank-lines",
-      `${base}..HEAD`,
+      `${base}...HEAD`,
       "--",
       ...STATIC_EXCLUDES,
     ],
