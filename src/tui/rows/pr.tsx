@@ -126,8 +126,8 @@ export const prRow: RowModule = {
       <text fg={theme.fg} wrapMode="none" truncate>
         <span fg={badge.fg}>{badge.glyph}  #{pr.number}</span>
         <ChecksBadge pr={pr} />
-        <ReviewBadge pr={pr} />
         <RabbitBadge pr={pr} />
+        <ReviewBadge pr={pr} />
         <QueueBadge mq={mq} />
       </text>
     );
