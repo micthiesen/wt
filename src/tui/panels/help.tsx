@@ -1,7 +1,11 @@
+import type { ReactNode } from "react";
+
 import { NF } from "../icons.ts";
+import { Spinner } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 
 type Section = { title: string; items: [string, string][] };
+type LegendGlyph = ReactNode;
 
 const SECTIONS: Section[] = [
   {
@@ -44,18 +48,18 @@ const SECTIONS: Section[] = [
   },
 ];
 
-const STATUS_GLYPHS: [string, string, string][] = [
+const STATUS_GLYPHS: [LegendGlyph, string, string][] = [
   [NF.rocket, theme.accent, "busy (init/install)"],
   [NF.trash, theme.err, "busy (removing)"],
   [NF.unlink, theme.err, "missing (path vanished)"],
   [NF.slash, theme.warn, "gone (branch deleted upstream)"],
   [NF.merge, theme.ok, "merged into origin/main"],
   [NF.pencil, theme.warn, "uncommitted changes"],
-  [NF.refresh, theme.fgDim, "refreshing"],
+  [<Spinner key="refresh" fg={theme.fgDim} />, theme.fgDim, "refreshing"],
   ["  ", theme.fgDim, "idle / clean"],
 ];
 
-const BADGES: [string, string, string][] = [
+const BADGES: [LegendGlyph, string, string][] = [
   [NF.prOpen, theme.accentAlt, "PR open"],
   [NF.prDraft, theme.fgDim, "PR draft"],
   [NF.prMerged, theme.info, "PR merged"],
@@ -87,14 +91,14 @@ function GlyphRow({
   color,
   label,
 }: {
-  glyph: string;
+  glyph: LegendGlyph;
   color: string;
   label: string;
 }) {
   return (
     <box flexDirection="row">
       <box width={5} flexShrink={0}>
-        <text fg={color}>{glyph}</text>
+        {typeof glyph === "string" ? <text fg={color}>{glyph}</text> : glyph}
       </box>
       <text fg={theme.fg}>{label}</text>
     </box>

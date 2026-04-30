@@ -16,6 +16,7 @@ import { lockStatus } from "../core/locks.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Worktree } from "../core/types.ts";
 import { createLogger } from "../core/logger.ts";
 import { isOurStageDeployed } from "../core/stage-safety.ts";
+import { pluralize } from "../core/text.ts";
 import { fetchOrigin, listWorktrees, syncState, type SyncState, worktreeIsDirty } from "../core/worktree.ts";
 
 import { qk } from "./keys.ts";
@@ -205,7 +206,7 @@ export const aiSummaryQuery = (
     queryKey: ctx ? qk.aiSummary(ctx.hash) : qk.aiSummary("_pending"),
     queryFn: async (): Promise<AiSummary | null> => {
       if (!ctx) return null;
-      aiLog.event.dim(`calling LM Studio for ${slug} (${ctx.prompt.length} chars)...`);
+      aiLog.event.dim(`calling LM Studio for ${slug} (${pluralize(ctx.prompt.length, "char")})...`);
       const start = Date.now();
       try {
         const out = await summarizeDiff(ctx.prompt);

@@ -3,6 +3,7 @@ import { CliRenderEvents } from "@opentui/core";
 import { useRenderer } from "@opentui/react";
 
 import { createLogger } from "../../core/logger.ts";
+import { pluralize } from "../../core/text.ts";
 import { writeClipboard } from "../helpers.ts";
 
 const log = createLogger("app");
@@ -46,8 +47,8 @@ export function useAutoCopy(): void {
       }
       renderer.clearSelection();
       const lines = text.split("\n").length;
-      const suffix = lines > 1 ? ` (${lines} lines)` : "";
-      log.event.info(`copied ${text.length} chars${suffix}`);
+      const suffix = lines > 1 ? ` (${pluralize(lines, "line")})` : "";
+      log.event.info(`copied ${pluralize(text.length, "char")}${suffix}`);
     };
     renderer.on(CliRenderEvents.SELECTION, handler);
     return () => {

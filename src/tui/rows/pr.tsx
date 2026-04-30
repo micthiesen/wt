@@ -8,6 +8,7 @@ import type {
   PullRequest,
   RabbitStatus,
 } from "../../core/types.ts";
+import { pluralize } from "../../core/text.ts";
 import { prStateBadge } from "../badges.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { NF } from "../icons.ts";
@@ -48,14 +49,14 @@ function rabbitLabel(
     case "unresolved":
       return {
         glyph: NF.checkFail,
-        full: `${rb.unresolved} carrots`,
+        full: pluralize(rb.unresolved, "carrot"),
         tiny: String(rb.unresolved),
         fg: theme.warn,
       };
     case "pending":
-      return { glyph: NF.checkPend, full: "carrots", tiny: "", fg: theme.warn };
+      return { glyph: NF.checkPend, full: "grazing", tiny: "", fg: theme.warn };
     case "clean":
-      return { glyph: NF.checkPass, full: "carrots", tiny: "", fg: theme.ok };
+      return { glyph: NF.checkPass, full: "resting", tiny: "", fg: theme.ok };
     default:
       return null;
   }

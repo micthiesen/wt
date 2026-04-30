@@ -34,7 +34,7 @@ import {
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
 import { ELLIPSIS } from "../text.ts";
-import { useSpinnerFrame } from "../spinner.ts";
+import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -69,15 +69,10 @@ function firstError(fs: readonly FetchLike[]): Error | null {
   return null;
 }
 
-function SpinnerGlyph() {
-  const frame = useSpinnerFrame();
-  return <text fg={theme.fgDim}> {frame}</text>;
-}
-
 function Glyph({ kind }: { kind: GlyphKind }) {
   if (kind === null) return null;
-  if (kind === "spinner") return <SpinnerGlyph />;
-  return <text fg={theme.fgDim}> {ELLIPSIS}</text>;
+  if (kind === "spinner") return <Spinner fg={theme.fgDim} />;
+  return <text fg={theme.fgDim}>{ELLIPSIS}</text>;
 }
 
 /**
@@ -87,7 +82,7 @@ function Glyph({ kind }: { kind: GlyphKind }) {
  * updates reliably.
  */
 function SummaryWithSpinner({ summary }: { summary: string }) {
-  const frame = useSpinnerFrame();
+  const frame = useBouncingBall();
   return (
     <text fg={theme.fgDim} attributes={TextAttributes.ITALIC} wrapMode="word">
       {summary} {frame}
@@ -96,17 +91,17 @@ function SummaryWithSpinner({ summary }: { summary: string }) {
 }
 
 function GeneratingLine() {
-  const frame = useSpinnerFrame();
+  const frame = useBouncingBall();
   return (
     <text fg={theme.fgDim} attributes={TextAttributes.ITALIC}>
-      generating summary{ELLIPSIS} {frame}
+      Generating summary{ELLIPSIS} {frame}
     </text>
   );
 }
 
 const LABEL_WIDTH = 8;
-/** Reserved cells for the trailing staleness glyph slot (` ` + 1-cell glyph). Matches `<Glyph>`'s leading space. */
-const GLYPH_SLOT_WIDTH = 2;
+/** Reserved cells for the trailing staleness glyph slot (1-cell `paddingLeft` + 2-cell spinner). */
+const GLYPH_SLOT_WIDTH = 3;
 /** Border (1 left + 1 right) + content padding (1 each side). */
 const PANE_CHROME_WIDTH = 4;
 
@@ -138,7 +133,7 @@ function Row({
       <box flexShrink={1} overflow="hidden">
         {children}
       </box>
-      {trailing ? <box flexShrink={0}>{trailing}</box> : null}
+      {trailing ? <box flexShrink={0} paddingLeft={1}>{trailing}</box> : null}
     </box>
   );
 }
@@ -241,7 +236,7 @@ function DescriptionBlock({
   } else if (blockedReason) {
     body = <text fg={theme.fgDim}>{blockedReason}</text>;
   } else {
-    body = <text fg={theme.fgDim}>no summary yet</text>;
+    body = <text fg={theme.fgDim}>No summary yet</text>;
   }
   return <box marginTop={1}>{body}</box>;
 }
@@ -285,7 +280,7 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
   const blockedReason: string | null = !aiEnabled
     ? null
     : isBusy
-      ? "summary paused while worktree is busy"
+      ? "Summary paused while worktree is busy"
       : null;
 
   return (

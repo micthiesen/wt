@@ -12,7 +12,6 @@ export const NF = {
   // Row status markers
   rocket: "\u{F427}", // nf-oct-rocket          — busy, non-destructive op
   trash: "\u{F48E}", // nf-oct-trash           — busy, destructive (rm)
-  refresh: "\u{EB37}", // nf-cod-refresh       — refetching data
   unlink: "\u{F529}", // nf-oct-unlink         — worktree path vanished
   slash: "\u{F468}", // nf-oct-circle_slash    — branch gone from remote
   merge: "\u{F419}", // nf-oct-git_merge       — branch merged into main

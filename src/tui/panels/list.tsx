@@ -12,6 +12,7 @@ import { TextAttributes } from "@opentui/core";
 
 import { prStateBadge, statusBadge } from "../badges.ts";
 import { NF } from "../icons.ts";
+import { Spinner } from "../spinner.tsx";
 import { ELLIPSIS, ELLIPSIS_WIDTH } from "../text.ts";
 import { theme } from "../theme.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
@@ -28,18 +29,21 @@ type Props = {
 };
 
 /**
- * One-character status indicator. Priority (high → low): busy,
- * refreshing, steady-state. Busy still wins — a user-initiated op in
- * flight is more urgent than "we're refetching data". Refresh only
- * overrides the *glyph* of a steady-state row; the row's color stays
- * so the eye still reads what the row actually is underneath the
- * refetch (e.g. a merged row going through a refresh stays green).
+ * One-cell status indicator. Priority (high → low): busy, refreshing,
+ * steady-state. Busy still wins — a user-initiated op in flight is
+ * more urgent than "we're refetching data". Refresh only overrides
+ * the *glyph* of a steady-state row; the row's color stays so the
+ * eye still reads what the row actually is underneath the refetch
+ * (e.g. a merged row going through a refresh stays green). Archived
+ * rows render dim regardless.
  */
-function statusMarker(row: WorktreeRow): { glyph: string; fg: string } {
+function StatusMarker({ row }: { row: WorktreeRow }) {
   const base = statusBadge(row.status);
-  if (row.status.kind === StatusKind.Busy) return base;
-  if (row.anyFetching) return { glyph: NF.refresh, fg: base.fg };
-  return base;
+  const fg = row.archived ? theme.fgDim : base.fg;
+  if (row.status.kind !== StatusKind.Busy && row.anyFetching) {
+    return <Spinner fg={fg} />;
+  }
+  return <text fg={fg}>{base.glyph}</text>;
 }
 
 /**
@@ -161,7 +165,6 @@ const RowView = memo(function RowView({
   isTailing: boolean;
   panelWidth: number;
 }) {
-  const marker = statusMarker(row);
   const bg = selected ? theme.rowSelectedBg : undefined;
   // Archived rows render dim (unless selected, where we still want
   // contrast). Badges also render dim so the eye skips over them.
@@ -172,7 +175,6 @@ const RowView = memo(function RowView({
     : selected
       ? theme.fgBright
       : theme.fg;
-  const markerFg = row.archived ? theme.fgDim : marker.fg;
   const prb = row.pr
     ? prStateBadge(row.pr)
     : { glyph: "  ", fg: theme.fgDim };
@@ -208,7 +210,7 @@ const RowView = memo(function RowView({
             then a width=1 box for the gap. Same shape that produces
             tight left-aligned icons over there. */}
         <box width={2} flexShrink={0}>
-          <text fg={markerFg}>{marker.glyph}</text>
+          <StatusMarker row={row} />
         </box>
         <box width={1} flexShrink={0}>
           <text> </text>
