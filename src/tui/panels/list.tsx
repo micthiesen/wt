@@ -29,21 +29,24 @@ type Props = {
 };
 
 /**
- * One-cell status indicator. Priority (high → low): busy, refreshing,
- * steady-state. Busy still wins — a user-initiated op in flight is
- * more urgent than "we're refetching data". Refresh only overrides
- * the *glyph* of a steady-state row; the row's color stays so the
- * eye still reads what the row actually is underneath the refetch
- * (e.g. a merged row going through a refresh stays green). Archived
- * rows render dim regardless.
+ * Status indicator — always reflects the actual worktree status (busy /
+ * missing / gone / merged / dirty / clean). Background refetch state
+ * is hinted via the spinner badge in the right cluster instead, so it
+ * doesn't masquerade as a primary status. Archived rows render dim.
  */
 function StatusMarker({ row }: { row: WorktreeRow }) {
   const base = statusBadge(row.status);
   const fg = row.archived ? theme.fgDim : base.fg;
-  if (row.status.kind !== StatusKind.Busy && row.anyFetching) {
-    return <Spinner fg={fg} />;
-  }
   return <text fg={fg}>{base.glyph}</text>;
+}
+
+/**
+ * Background refetch is in flight. Suppressed during user-initiated busy
+ * ops (those have their own loud status icon and tail in the activity
+ * pane — adding a refresh hint would be redundant noise).
+ */
+function isRefreshing(row: WorktreeRow): boolean {
+  return row.anyFetching && row.status.kind !== StatusKind.Busy;
 }
 
 /**
@@ -119,15 +122,18 @@ function truncateEnd(s: string, maxWidth: number): string {
  * Cells the badge cluster occupies for a given row. Mirrors the
  * width-prop layout in the JSX below: 2-cell leading gap + each present
  * badge's box width. Returns 0 when no badges are rendered so the slug
- * column reclaims the space.
+ * column reclaims the space. The refresh hint, when present, sits as
+ * the leftmost slot inside the cluster.
  */
 function badgeClusterCells(row: WorktreeRow): number {
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
-  const hasAnyBadge = !!(row.pr || row.mq || isDeployed);
+  const refreshing = isRefreshing(row);
+  const hasAnyBadge = refreshing || !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
+  if (refreshing) cells += 2;
   if (row.pr) cells += 2;
   if (showChecks) cells += 2;
   if (row.mq) cells += 4;
@@ -191,7 +197,8 @@ const RowView = memo(function RowView({
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
-  const hasAnyBadge = !!(row.pr || row.mq || isDeployed);
+  const refreshing = isRefreshing(row);
+  const hasAnyBadge = refreshing || !!(row.pr || row.mq || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
   // a row is both selected and being tailed.
@@ -240,6 +247,11 @@ const RowView = memo(function RowView({
       {hasAnyBadge ? (
         <box flexShrink={0} flexDirection="row">
           <text>  </text>
+          {refreshing ? (
+            <box width={2} flexShrink={0}>
+              <Spinner fg={theme.fgDim} />
+            </box>
+          ) : null}
           {row.pr ? (
             <box width={2} flexShrink={0}>
               <text fg={prFg}>{prb.glyph}</text>
