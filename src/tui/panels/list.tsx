@@ -13,7 +13,7 @@ import { TextAttributes } from "@opentui/core";
 import { prStateBadge, statusBadge } from "../badges.ts";
 import { NF } from "../icons.ts";
 import { Spinner } from "../spinner.tsx";
-import { ELLIPSIS, ELLIPSIS_WIDTH } from "../text.ts";
+import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { type MergeQueueState, StatusKind } from "../../core/types.ts";
@@ -96,26 +96,6 @@ function rowLabel(row: WorktreeRow): string {
   const { id } = slugLabel(row.wt.slug);
   const text = capitalizeFirst(row.title);
   return id ? `${id}: ${text}` : text;
-}
-
-/**
- * End-truncate `s` to fit within `maxWidth` terminal cells, suffixing
- * `...` when it overflows. OpenTUI's native `truncate` flag does
- * middle-truncation in the binary with the same 3-cell ASCII ellipsis;
- * we want trailing ellipsis (label starts the same way for related
- * branches, so the head is the most recognizable part), so we shorten
- * ourselves and skip the native flag — but match its glyph for visual
- * consistency.
- */
-function truncateEnd(s: string, maxWidth: number): string {
-  if (maxWidth <= 0) return "";
-  if (Bun.stringWidth(s) <= maxWidth) return s;
-  if (maxWidth < ELLIPSIS_WIDTH) return ELLIPSIS.slice(0, maxWidth);
-  let cut = s;
-  while (cut.length > 0 && Bun.stringWidth(cut) + ELLIPSIS_WIDTH > maxWidth) {
-    cut = cut.slice(0, -1);
-  }
-  return `${cut}${ELLIPSIS}`;
 }
 
 /**

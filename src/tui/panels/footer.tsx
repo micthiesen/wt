@@ -1,3 +1,4 @@
+import { KeyHint, type KeyHintPair } from "../key-hint.tsx";
 import { theme } from "../theme.ts";
 
 export type FooterMode =
@@ -25,7 +26,7 @@ type Props = {
   height?: number;
 };
 
-const LEGEND = [
+const LEGEND: KeyHintPair[] = [
   ["jk", "move"],
   ["o", "zed"],
   ["/", "filter"],
@@ -90,26 +91,5 @@ export function Footer({ mode, hint }: Props) {
 }
 
 function Legend() {
-  const parts: React.ReactNode[] = [];
-  LEGEND.forEach(([key, label], i) => {
-    if (i > 0) {
-      parts.push(
-        <text key={`sep-${i}`} fg={theme.fgDim}>
-          {"  ·  "}
-        </text>,
-      );
-    }
-    parts.push(
-      <text key={`k-${i}`} fg={theme.accent} attributes={1}>
-        {key}
-      </text>,
-    );
-    parts.push(
-      <text key={`l-${i}`} fg={theme.fgDim}>
-        {" "}
-        {label}
-      </text>,
-    );
-  });
-  return <>{parts}</>;
+  return <KeyHint pairs={LEGEND} separator="  ·  " />;
 }

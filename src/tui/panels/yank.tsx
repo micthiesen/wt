@@ -1,5 +1,6 @@
 import { linearUrlForSlug } from "../../core/linear.ts";
 import { stageUrl } from "../../core/stage.ts";
+import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -28,48 +29,32 @@ export function yankItemsFor(row: WorktreeRow): Item[] {
 export function YankModal({ row }: Props) {
   const items = yankItemsFor(row);
   return (
-    <box
-      position="absolute"
-      top="35%"
-      left="20%"
-      right="20%"
-      bottom="40%"
-      zIndex={10}
-      backgroundColor={theme.bg}
-      border
-      borderStyle="double"
-      borderColor={theme.accent}
-      title=" yank · pick what to copy "
-      titleAlignment="left"
-      padding={1}
-      flexDirection="column"
+    <Modal
+      title="yank · pick what to copy"
+      inset={{ top: "35%", right: "20%", bottom: "40%", left: "20%" }}
+      hints={[["esc / q / y", "cancel"]]}
     >
-      <box flexDirection="column" flexGrow={1}>
-        {items.map((it) => (
-          <box key={it.key} flexDirection="row">
-            <box width={3} flexShrink={0}>
-              <text fg={theme.accent} attributes={1}>
-                {it.key}
-              </text>
-            </box>
-            <box width={11} flexShrink={0}>
-              <text fg={theme.fg}>{it.label}</text>
-            </box>
-            <box flexShrink={1} overflow="hidden">
-              <text
-                fg={it.value ? theme.fgDim : theme.warn}
-                wrapMode="none"
-                truncate
-              >
-                {it.value ?? "—"}
-              </text>
-            </box>
+      {items.map((it) => (
+        <box key={it.key} flexDirection="row">
+          <box width={3} flexShrink={0}>
+            <text fg={theme.accent} attributes={1}>
+              {it.key}
+            </text>
           </box>
-        ))}
-      </box>
-      <box flexShrink={0}>
-        <text fg={theme.fgDim}>esc / y cancel</text>
-      </box>
-    </box>
+          <box width={11} flexShrink={0}>
+            <text fg={theme.fg}>{it.label}</text>
+          </box>
+          <box flexShrink={1} overflow="hidden">
+            <text
+              fg={it.value ? theme.fgDim : theme.warn}
+              wrapMode="none"
+              truncate
+            >
+              {it.value ?? "—"}
+            </text>
+          </box>
+        </box>
+      ))}
+    </Modal>
   );
 }

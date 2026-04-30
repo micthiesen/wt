@@ -369,7 +369,11 @@ export function App({ onExit }: Props) {
         setPicker(null);
         return;
       }
-      if (k.name === "escape" || (k.ctrl && k.name === "c")) {
+      if (
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
         picker.resolve(null);
         setPicker(null);
       }
@@ -384,6 +388,7 @@ export function App({ onExit }: Props) {
       if (
         k.name === "escape" ||
         k.sequence === "y" ||
+        k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
         setShowYank(false);
@@ -409,6 +414,7 @@ export function App({ onExit }: Props) {
       if (
         k.name === "n" ||
         k.name === "escape" ||
+        k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
         setShowCleanConfirm(false);

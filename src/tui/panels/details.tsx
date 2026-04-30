@@ -99,7 +99,13 @@ function GeneratingLine() {
   );
 }
 
-const LABEL_WIDTH = 8;
+/**
+ * Right-aligned label column width: longest configured row label plus a
+ * one-cell gap before the value column. Computed at module init from
+ * `RESOLVED_ROWS` so reconfiguring `ui.rows` reclaims unused cells.
+ */
+const LABEL_WIDTH =
+  RESOLVED_ROWS.reduce((m, r) => Math.max(m, r.label.length), 0) + 1;
 /** Reserved cells for the trailing staleness glyph slot (1-cell `paddingLeft` + 2-cell spinner). */
 const GLYPH_SLOT_WIDTH = 3;
 /** Border (1 left + 1 right) + content padding (1 each side). */
@@ -111,10 +117,10 @@ function valueWidthFor(paneWidth: number): number {
 }
 
 /**
- * One detail row: fixed-width label, value sized to content but
- * shrinkable with ellipsis when the pane is too narrow. Optional
- * trailing content (e.g. a staleness glyph) sits directly after the
- * value — not flush-right — and never shrinks.
+ * One detail row: fixed-width right-aligned label, value sized to
+ * content but shrinkable with ellipsis when the pane is too narrow.
+ * Optional trailing content (e.g. a staleness glyph) sits directly
+ * after the value — not flush-right — and never shrinks.
  */
 function Row({
   label,
@@ -127,7 +133,13 @@ function Row({
 }) {
   return (
     <box flexDirection="row">
-      <box width={LABEL_WIDTH} flexShrink={0}>
+      <box
+        width={LABEL_WIDTH}
+        flexShrink={0}
+        flexDirection="row"
+        justifyContent="flex-end"
+        paddingRight={1}
+      >
         <text fg={theme.fgDim}>{label}</text>
       </box>
       <box flexShrink={1} overflow="hidden">

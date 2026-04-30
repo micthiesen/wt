@@ -1,5 +1,6 @@
 import { StatusKind } from "../../core/types.ts";
 import { NF } from "../icons.ts";
+import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -24,26 +25,19 @@ export function CleanConfirmModal({ candidates }: Props) {
   const stageCount = candidates.filter((r) => r.fields.deploy.data).length;
 
   return (
-    <box
-      position="absolute"
-      top="15%"
-      left="15%"
-      right="15%"
-      bottom="15%"
-      zIndex={10}
-      backgroundColor={theme.bg}
-      border
-      borderStyle="double"
+    <Modal
+      title={`clean · ${count} worktree${count === 1 ? "" : "s"}`}
       borderColor={theme.warn}
-      title={` clean · ${count} worktree${count === 1 ? "" : "s"} `}
-      titleAlignment="left"
-      padding={1}
-      flexDirection="column"
+      inset={{ top: "15%", right: "15%", bottom: "15%", left: "15%" }}
+      hints={[
+        ["y", "confirm"],
+        ["n / esc / q", "cancel"],
+      ]}
     >
       <box flexDirection="column" marginBottom={1}>
         <text fg={theme.fg}>
           About to destroy{" "}
-          <span fg={theme.accent} attributes={1}>
+          <span fg={theme.warn} attributes={1}>
             {count}
           </span>{" "}
           worktree{count === 1 ? "" : "s"}
@@ -87,16 +81,6 @@ export function CleanConfirmModal({ candidates }: Props) {
           );
         })}
       </box>
-      <box flexDirection="row" marginTop={1}>
-        <text fg={theme.accent} attributes={1}>
-          y
-        </text>
-        <text fg={theme.fgDim}> confirm · </text>
-        <text fg={theme.accent} attributes={1}>
-          n / esc
-        </text>
-        <text fg={theme.fgDim}> cancel</text>
-      </box>
-    </box>
+    </Modal>
   );
 }

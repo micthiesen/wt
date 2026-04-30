@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import { NF } from "../icons.ts";
+import { Modal } from "../modal.tsx";
 import { Spinner } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 
@@ -107,21 +108,13 @@ function GlyphRow({
 
 export function HelpOverlay() {
   return (
-    <box
-      position="absolute"
-      top="8%"
-      left="10%"
-      right="10%"
-      bottom="8%"
-      zIndex={10}
-      backgroundColor={theme.bg}
-      border
-      borderStyle="double"
-      borderColor={theme.accent}
-      title=" help · press ? or esc to close "
-      titleAlignment="left"
-      padding={1}
-      flexDirection="column"
+    <Modal
+      title="help"
+      inset={{ top: "8%", right: "10%", bottom: "8%", left: "10%" }}
+      hints={[
+        ["?", "toggle"],
+        ["esc / q", "close"],
+      ]}
     >
       <box flexDirection="row" flexGrow={1}>
         <box flexDirection="column" flexGrow={1} flexBasis={0}>
@@ -189,6 +182,6 @@ export function HelpOverlay() {
           </box>
         </box>
       </box>
-    </box>
+    </Modal>
   );
 }
