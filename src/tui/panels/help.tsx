@@ -29,6 +29,7 @@ const SECTIONS: Section[] = [
       ["s", "open deployed app"],
       ["y", "yank menu (b/s/S/p/n/i)"],
       ["T", "regenerate AI summary"],
+      ["m", "merge when ready (open + approved)"],
       ["a", "archive / restore"],
       ["d", "remove worktree"],
     ],
@@ -71,6 +72,7 @@ const BADGES: [LegendGlyph, string, string][] = [
   [`${NF.mergeQueue} N`, theme.ok, "MQ pos N · mergeable"],
   [`${NF.mergeQueue} N`, theme.warn, "MQ pos N · awaiting/queued"],
   [`${NF.mergeQueue} N`, theme.err, "MQ pos N · blocked"],
+  [NF.mergeQueue, theme.info, "auto-merge armed (waiting)"],
   [NF.bolt, theme.warn, "SST stage deployed"],
 ];
 

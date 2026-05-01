@@ -105,6 +105,15 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
     },
     /**
+     * Invalidate the combined PR + merge-queue fetch. Use after an
+     * action that mutates GitHub state (e.g. enabling auto-merge) so
+     * the next render picks up the new server-side state without
+     * waiting for the slow staleTime to expire.
+     */
+    async refreshGithub(): Promise<void> {
+      await qc.invalidateQueries({ queryKey: ["github"] });
+    },
+    /**
      * Force the LM Studio call to re-run for one worktree. Reads the
      * cached diff context to find the content hash, then invalidates
      * both the diff-context query (in case the underlying diff drifted)

@@ -8,6 +8,7 @@ import {
   parseInput,
   spawnBackgroundRemove,
 } from "../core/lifecycle.ts";
+import { enableAutoMerge } from "../core/github.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
@@ -116,6 +117,7 @@ export function App({ onExit }: Props) {
   const {
     refreshAll,
     refreshStale,
+    refreshGithub,
     clearAll,
     invalidateWorktree,
     refreshAiSummary,
@@ -288,6 +290,25 @@ export function App({ onExit }: Props) {
     }
     log.event.info(`yanked ${label}: ${value}`);
     toast(`copied ${label}`, theme.info, 1500);
+  }
+
+  async function doAutoMerge(slug: string): Promise<void> {
+    const log = createLogger(slug);
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row?.pr) {
+      toast("no PR for this row", theme.warn, 2000);
+      return;
+    }
+    const prNumber = row.pr.number;
+    const result = await enableAutoMerge(prNumber);
+    if (!result.ok) {
+      log.event.err(`auto-merge failed for #${prNumber}: ${result.error}`);
+      toast(`auto-merge failed: ${result.error}`, theme.err, 4000);
+      return;
+    }
+    log.event.ok(`auto-merge enabled for #${prNumber}`);
+    toast(`auto-merge enabled for #${prNumber}`, theme.ok, 2500);
+    void refreshGithub();
   }
 
   async function doNew(raw: string, defaultBase?: string): Promise<void> {
@@ -496,6 +517,8 @@ export function App({ onExit }: Props) {
         setFooter({ kind: "legend" });
         if (pending === "d" && current) {
           void doRemove(current.wt.slug);
+        } else if (pending === "m" && current) {
+          void doAutoMerge(current.wt.slug);
         } else if (pending === "R") {
           appLog.event.warn("cleared all cached data; refetching from scratch");
           void clearAll();
@@ -656,6 +679,30 @@ export function App({ onExit }: Props) {
         kind: "confirm",
         message: `remove ${current.wt.slug}? [y/N]`,
         pendingKey: "d",
+      });
+      return;
+    }
+    if (k.name === "m") {
+      if (!current.pr) {
+        toast("no PR for this row", theme.warn, 2000);
+        return;
+      }
+      if (current.pr.state !== "OPEN") {
+        toast("PR is not open", theme.warn, 2000);
+        return;
+      }
+      if (current.pr.autoMerge) {
+        toast(`auto-merge already enabled for #${current.pr.number}`, theme.info, 2000);
+        return;
+      }
+      if (current.pr.review !== "approved") {
+        toast("PR is not approved", theme.warn, 2000);
+        return;
+      }
+      setFooter({
+        kind: "confirm",
+        message: `merge when ready for #${current.pr.number}? [y/N]`,
+        pendingKey: "m",
       });
       return;
     }

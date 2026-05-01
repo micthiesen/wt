@@ -4,6 +4,7 @@ import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { run } from "./proc.ts";
 import type {
+  AutoMergeMethod,
   MergeQueueEntry,
   MergeQueueState,
   PrChecks,
@@ -110,6 +111,10 @@ fragment PrFields on PullRequest {
   closedAt
   reviewDecision
   reviewRequests(first: 1) { totalCount }
+  autoMergeRequest {
+    enabledAt
+    mergeMethod
+  }
   commits(last: 1) {
     nodes {
       commit {
@@ -234,6 +239,7 @@ type GqlPrNode = {
   closedAt: string | null;
   reviewDecision: GqlReviewDecision;
   reviewRequests: { totalCount: number } | null;
+  autoMergeRequest: { enabledAt: string; mergeMethod: AutoMergeMethod } | null;
   commits: {
     nodes: Array<{
       commit: {
@@ -291,6 +297,12 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     review: rollupReview(pr.state, pr.reviewDecision),
     reviewRequests: pr.reviewRequests?.totalCount ?? 0,
     rabbit: rollupRabbit(pr.state, contexts, threads),
+    autoMerge: pr.autoMergeRequest
+      ? {
+          enabledAt: pr.autoMergeRequest.enabledAt,
+          mergeMethod: pr.autoMergeRequest.mergeMethod,
+        }
+      : null,
     mergedAt: pr.mergedAt ?? null,
     closedAt: pr.closedAt ?? null,
   };
@@ -382,6 +394,34 @@ export async function fetchPrs(): Promise<Map<string, PullRequest>> {
     .filter((w) => !w.isMain && w.branch)
     .map((w) => w.branch as string);
   return (await fetchGithub(branches)).prs;
+}
+
+export type EnableAutoMergeResult =
+  | { ok: true }
+  | { ok: false; error: string };
+
+/**
+ * Enable "merge when ready" on a PR via `gh pr merge --auto`. Rebase
+ * is hardcoded to match the repo's merge style; promote to config
+ * when there's a second concrete preference. Runs from the main clone
+ * so gh resolves the right repo. `gh` does the right thing for both
+ * classic auto-merge and merge-queue repos — the same flag enqueues
+ * when a queue is configured.
+ */
+export async function enableAutoMerge(
+  prNumber: number,
+): Promise<EnableAutoMergeResult> {
+  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
+  const r = await run(
+    ["gh", "pr", "merge", String(prNumber), "--auto", "--rebase"],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  );
+  if (r.exitCode !== 0) {
+    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    log.error("auto-merge failed", { prNumber, msg });
+    return { ok: false, error: msg };
+  }
+  return { ok: true };
 }
 
 /**

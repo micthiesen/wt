@@ -143,6 +143,36 @@ function buildPrSegments(pr: PullRequest, mq: MergeQueueEntry | undefined): Segm
         { width: 0, render: () => null },
       ],
     });
+  } else if (pr.autoMerge && pr.state === "OPEN") {
+    // Same slot as the queue segment — mutually exclusive in practice.
+    // Dimmer color than `queue mergeable` since auto-merge is "armed
+    // but idle" (waiting on preconditions) rather than actively
+    // advancing.
+    const full = "auto-merge";
+    const tiny = "auto";
+    segs.push({
+      key: "queue",
+      tier: 2,
+      modes: [
+        {
+          width: 3 + Bun.stringWidth(full),
+          render: () => (
+            <span fg={theme.info}>
+              {NF.mergeQueue}  {full}
+            </span>
+          ),
+        },
+        {
+          width: 3 + Bun.stringWidth(tiny),
+          render: () => (
+            <span fg={theme.info}>
+              {NF.mergeQueue}  {tiny}
+            </span>
+          ),
+        },
+        { width: 0, render: () => null },
+      ],
+    });
   }
 
   if (pr.state === "OPEN") {

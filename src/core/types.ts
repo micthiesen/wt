@@ -41,6 +41,19 @@ export type RabbitStatus = {
   unresolved: number;
 };
 
+export type AutoMergeMethod = "SQUASH" | "MERGE" | "REBASE";
+
+/**
+ * "Merge when ready" state. Populated when someone has enabled
+ * auto-merge on the PR and it's waiting on preconditions (CI, review,
+ * base-behind). Clears automatically once the PR enters the merge
+ * queue or merges. Mutually exclusive in practice with `MergeQueueEntry`.
+ */
+export type AutoMerge = {
+  enabledAt: string;
+  mergeMethod: AutoMergeMethod;
+};
+
 export type MergeQueueState =
   | "AWAITING_CHECKS"
   | "LOCKED"
@@ -71,6 +84,8 @@ export type PullRequest = {
   reviewRequests: number;
   /** CodeRabbit status — its own track, separate from human reviews. `none` when CR didn't run. */
   rabbit: RabbitStatus;
+  /** "Merge when ready" arming state. `null` when not enabled. */
+  autoMerge: AutoMerge | null;
   // ISO timestamps. Terminal PRs carry at least one of these; OPEN
   // PRs have neither. Used to dismiss pre-existing merged/closed PRs
   // when a worktree for the same branch is recreated from scratch.
