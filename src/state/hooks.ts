@@ -14,6 +14,12 @@ import {
 import type { DiffContext } from "../core/diff/index.ts";
 import { invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
+import {
+  placeSlug as placeSlugOnDisk,
+  renameSection as renameSectionOnDisk,
+  setSlugSection as setSlugSectionOnDisk,
+  swapOrders as swapOrdersOnDisk,
+} from "../core/wtstate.ts";
 
 import { CACHE_DB } from "./client.ts";
 import { qk } from "./keys.ts";
@@ -156,10 +162,14 @@ export function useWtActions() {
       ]);
       return true;
     },
-    /** Flip the archived flag for a slug and re-query. Returns the new state. */
-    toggleArchived(slug: string): { archived: boolean } {
+    /**
+     * Flip the archived flag for a slug. Awaits invalidation so the
+     * caller can rely on `useWorktreeRows` having the new state on
+     * the next render — required for cursor-follow logic.
+     */
+    async toggleArchived(slug: string): Promise<{ archived: boolean }> {
       const result = toggleArchivedOnDisk(slug);
-      void qc.invalidateQueries({ queryKey: qk.archive() });
+      await qc.invalidateQueries({ queryKey: qk.archive() });
       return result;
     },
     /**
@@ -170,6 +180,52 @@ export function useWtActions() {
     archive(slug: string): void {
       archiveOnDisk(slug);
       void qc.invalidateQueries({ queryKey: qk.archive() });
+    },
+    /**
+     * Assign (or clear, with `null`) a slug's section. Order is reset
+     * to the bottom of the target group — the picker convention. Awaits
+     * invalidation so cursor-follow can read fresh rows.
+     */
+    async setSection(slug: string, section: string | null): Promise<void> {
+      setSlugSectionOnDisk(slug, section);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Place a slug at the top or bottom of a section. Used by the
+     * unified Shift+J/K cross-section nudge so the moved row lands
+     * adjacent to where it was (top of next section, bottom of prev).
+     */
+    async placeSlug(
+      slug: string,
+      section: string | null,
+      position: "top" | "bottom",
+    ): Promise<void> {
+      placeSlugOnDisk(slug, section, position);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Swap two slugs' order values within a single section bucket.
+     * `bucketDisplay` must be the bucket's current display order — the
+     * write path renormalizes the bucket against this list before
+     * swapping, so any unstated entries get materialized cleanly.
+     */
+    async swapOrder(
+      slugA: string,
+      slugB: string,
+      section: string | null,
+      bucketDisplay: readonly string[],
+    ): Promise<void> {
+      swapOrdersOnDisk(slugA, slugB, section, bucketDisplay);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Rename a section across every slug that references it. Awaits
+     * invalidation so the renamed section and its members are visible
+     * in the next render.
+     */
+    async renameSection(oldName: string, newName: string): Promise<void> {
+      renameSectionOnDisk(oldName, newName);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
     },
   };
 }

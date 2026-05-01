@@ -7,7 +7,7 @@
  * Anything new that should read consistently across both panels
  * belongs in `badges.ts` first, not here.
  */
-import { memo } from "react";
+import { Fragment, memo } from "react";
 import { TextAttributes } from "@opentui/core";
 
 import { prStateBadge, statusBadge } from "../badges.ts";
@@ -313,15 +313,31 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
         </box>
       ) : (
         <>
-          {activeRows.map((row, i) => (
-            <RowView
-              key={row.wt.slug}
-              row={row}
-              selected={i === selectedIndex}
-              isTailing={activeTails.has(row.wt.slug)}
-              panelWidth={width}
-            />
-          ))}
+          {activeRows.map((row, i) => {
+            // Section transition: render an empty spacer row plus a
+            // muted divider (matching the archived divider style) the
+            // first time we see a new named section. Unsectioned rows
+            // at the top get no header — they're the implicit "inbox".
+            const prev = i > 0 ? activeRows[i - 1] : undefined;
+            const sectionChanged = (prev?.section ?? null) !== row.section;
+            const showDivider = sectionChanged && row.section !== null;
+            return (
+              <Fragment key={row.wt.slug}>
+                {showDivider ? (
+                  <>
+                    <box height={1} flexShrink={0} />
+                    <Divider label={row.section!} width={width} />
+                  </>
+                ) : null}
+                <RowView
+                  row={row}
+                  selected={i === selectedIndex}
+                  isTailing={activeTails.has(row.wt.slug)}
+                  panelWidth={width}
+                />
+              </Fragment>
+            );
+          })}
           {hasArchived ? (
             <>
               {/* Pushes the archived section to the bottom of the pane. */}
@@ -335,7 +351,6 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                     row={row}
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
-
                     panelWidth={width}
                   />
                 );

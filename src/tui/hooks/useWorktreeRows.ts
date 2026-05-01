@@ -25,6 +25,7 @@ import {
   wtGoneQuery,
   wtLockQuery,
   wtMergedQuery,
+  wtStateQuery,
   wtSyncQuery,
 } from "../../state/queries.ts";
 
@@ -74,6 +75,13 @@ export type WorktreeRow = {
    */
   title: string;
   titleSource: TitleSource;
+  /**
+   * User-assigned section name from `state.json`, or `null` for the
+   * unsectioned bucket at the top of the list. Persisted across the
+   * archived flag — restoring an archived worktree drops it back into
+   * the same named section it was in before.
+   */
+  section: string | null;
 };
 
 const FIELD_ORDER = [
@@ -177,7 +185,9 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const wtList = useQuery(worktreesQuery());
   const github = useGithub();
   const archive = useQuery(archiveQuery());
+  const wtState = useQuery(wtStateQuery());
   const archivedSet = new Set(archive.data ?? []);
+  const stateSlugs = wtState.data?.slugs ?? {};
   // Keyed by slug; lets us return the same `WorktreeRow` reference
   // across renders when nothing observable has changed. Without this,
   // every poll-driven refresh produces all-new row identities and
@@ -271,6 +281,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const anyFetching =
       fieldArr.some((r) => r.isFetching) || github.isFetching;
     const archived = archivedSet.has(wt.slug);
+    const section = stateSlugs[wt.slug]?.section ?? null;
     const llmTitle = (aiResults[i]?.data?.title as string | undefined) ?? null;
     const prTitle = pr?.title ?? null;
     const commitTitle = (firstCommitResults[i]?.data as string | null | undefined) ?? null;
@@ -316,11 +327,23 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.anyFetching === anyFetching &&
       prev.archived === archived &&
       prev.title === title &&
-      prev.titleSource === titleSource
+      prev.titleSource === titleSource &&
+      prev.section === section
     ) {
       return prev;
     }
-    const next: WorktreeRow = { wt, fields, status, pr, mq, anyFetching, archived, title, titleSource };
+    const next: WorktreeRow = {
+      wt,
+      fields,
+      status,
+      pr,
+      mq,
+      anyFetching,
+      archived,
+      title,
+      titleSource,
+      section,
+    };
     rowCache.current.set(wt.slug, next);
     return next;
   });
@@ -334,14 +357,47 @@ export function useWorktreeRows(): WorktreeRowsResult {
     }
   }
 
-  // Stable partition: active first (preserves git worktree order),
-  // archived second (so `j/k` moves through both seamlessly). Reuse
-  // the prior array reference when every row in order matches —
-  // otherwise consumer memos keyed on `rows` invalidate every render.
-  const nextRows: WorktreeRow[] = [
-    ...unsorted.filter((r) => !r.archived),
-    ...unsorted.filter((r) => r.archived),
-  ];
+  // Section-aware sort. Active rows partition into:
+  //   1. unsectioned (section === null)
+  //   2. named sections, ordered by their position in `sectionsOrder`
+  //      (an explicit array maintained in state.json, appended on
+  //      first encounter and pruned on emptiness).
+  // Within each bucket, rows sort by `state.order` ascending; unstated
+  // entries (no state row yet) float to the top (-Infinity) so brand-
+  // new worktrees always land at the top of the unsectioned list.
+  // Archived rows are flat at the bottom in original list order — the
+  // archive divider is a hard visual break, secondary grouping there
+  // would be noise (and the user explicitly asked for a flat list).
+  const listIndexOf = new Map<string, number>();
+  for (let i = 0; i < unsorted.length; i++) {
+    listIndexOf.set(unsorted[i]!.wt.slug, i);
+  }
+  const sectionsOrder = wtState.data?.sectionsOrder ?? [];
+  const sectionRank = new Map<string, number>();
+  for (let i = 0; i < sectionsOrder.length; i++) {
+    sectionRank.set(sectionsOrder[i]!, i);
+  }
+  const active = unsorted.filter((r) => !r.archived).slice().sort((a, b) => {
+    const bucketA = a.section === null ? 0 : 1;
+    const bucketB = b.section === null ? 0 : 1;
+    if (bucketA !== bucketB) return bucketA - bucketB;
+    if (a.section !== null && b.section !== null && a.section !== b.section) {
+      // Sections not yet in `sectionsOrder` (post-rename quirk, raw
+      // file edit) sort to the end via `Number.MAX_SAFE_INTEGER`,
+      // then alphabetically — keeps display stable until the index
+      // catches up on the next read.
+      const rankA = sectionRank.get(a.section) ?? Number.MAX_SAFE_INTEGER;
+      const rankB = sectionRank.get(b.section) ?? Number.MAX_SAFE_INTEGER;
+      if (rankA !== rankB) return rankA - rankB;
+      return a.section.localeCompare(b.section);
+    }
+    const orderA = stateSlugs[a.wt.slug]?.order ?? -Infinity;
+    const orderB = stateSlugs[b.wt.slug]?.order ?? -Infinity;
+    if (orderA !== orderB) return orderA - orderB;
+    return (listIndexOf.get(a.wt.slug) ?? 0) - (listIndexOf.get(b.wt.slug) ?? 0);
+  });
+  const archived = unsorted.filter((r) => r.archived);
+  const nextRows: WorktreeRow[] = [...active, ...archived];
   const prevRows = rowsRef.current;
   let rowsUnchanged = prevRows.length === nextRows.length;
   if (rowsUnchanged) {

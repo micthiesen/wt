@@ -7,6 +7,7 @@ import { queryOptions } from "@tanstack/react-query";
 
 import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
+import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
@@ -68,6 +69,13 @@ export const archiveQuery = () =>
   queryOptions({
     queryKey: qk.archive(),
     queryFn: async (): Promise<string[]> => [...readArchived()],
+    staleTime: STALE.fast,
+  });
+
+export const wtStateQuery = () =>
+  queryOptions({
+    queryKey: qk.wtState(),
+    queryFn: async (): Promise<WtState> => readWtState(),
     staleTime: STALE.fast,
   });
 

@@ -44,4 +44,6 @@ export const qk = {
   aiSummary: (hash: string) => ["aiSummary", hash] as const,
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
+  /** Per-slug section + manual order (fs-backed). */
+  wtState: () => ["wtState"] as const,
 } as const;

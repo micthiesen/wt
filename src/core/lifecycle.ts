@@ -2,6 +2,7 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, writeFileSync
 import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
+import { clearSlugState } from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
@@ -318,6 +319,7 @@ export async function removeWorktree(
     // Deferred to the end so the row shows its archived styling
     // throughout the destroy instead of flickering non-archived.
     clearArchived(wt.slug);
+    clearSlugState(wt.slug);
 
     return {
       ok: true,

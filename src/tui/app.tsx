@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 
@@ -26,6 +26,10 @@ import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
 import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
+import {
+  SectionPickerModal,
+  type SectionPickerItem,
+} from "./panels/section-picker.tsx";
 import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
@@ -47,6 +51,67 @@ export type TuiExit = { kind: "quit" };
 type Props = {
   onExit: (e: TuiExit) => void;
 };
+
+/**
+ * Match a plain lowercase-letter binding — name equals `letter` and no
+ * modifier keys are held. The naive `k.name === "<letter>"` is a trap:
+ * the parser lowercases letter names and exposes `k.shift` separately,
+ * so without this guard `Shift+L` (and modified variants like Hyper+L)
+ * fire the lowercase action, which is almost always wrong. Action
+ * bindings (open-zed, archive, …) should always go through here.
+ * Navigation arrows are checked separately upstream where Shift+arrow
+ * scrolling is intentional.
+ */
+function isPlainLetter(
+  k: {
+    name: string;
+    shift: boolean;
+    ctrl: boolean;
+    option: boolean;
+    super?: boolean;
+    hyper?: boolean;
+    meta: boolean;
+  },
+  letter: string,
+): boolean {
+  return (
+    k.name === letter &&
+    !k.shift &&
+    !k.ctrl &&
+    !k.option &&
+    !k.super &&
+    !k.hyper &&
+    !k.meta
+  );
+}
+
+/**
+ * Plain Shift+letter guard — shift is the only modifier held. Used
+ * by the section move/rename bindings (J/K/L). Excludes Hyper
+ * explicitly because the kitty keyboard protocol exposes that as a
+ * separate flag and Caps Lock-mapped Hyper layouts include shift in
+ * the four-modifier combo, which would otherwise leak into these.
+ */
+function isShiftedLetter(
+  k: {
+    name: string;
+    shift: boolean;
+    ctrl: boolean;
+    option: boolean;
+    super?: boolean;
+    hyper?: boolean;
+  },
+  letter: string,
+): boolean {
+  return (
+    k.name === letter &&
+    k.shift &&
+    !k.ctrl &&
+    !k.option &&
+    !k.super &&
+    !k.hyper
+  );
+}
 
 /**
  * Filter a key sequence down to printable ASCII so single keypresses
@@ -130,6 +195,10 @@ export function App({ onExit }: Props) {
     refreshAiSummary,
     toggleArchived,
     archive,
+    setSection,
+    swapOrder,
+    placeSlug,
+    renameSection,
   } = useWtActions();
   const [sel, setSel] = useState(0);
   const [footer, setFooter] = useState<FooterMode>({ kind: "legend" });
@@ -159,6 +228,42 @@ export function App({ onExit }: Props) {
     slug: string;
     prNumber: number;
   } | null>(null);
+  // Section picker (mapped to `l`). When `newName !== null` the modal
+  // is in "+ new section" input mode — the keypress handler sends
+  // typing into that string instead of navigating the list.
+  const [sectionPicker, setSectionPicker] = useState<{
+    title: string;
+    slug: string;
+    items: SectionPickerItem[];
+    index: number;
+    newName: string | null;
+  } | null>(null);
+  // Cursor-follow ref. After every move/archive/rename, we want the
+  // cursor to land on the same slug at its new display index. The
+  // tricky part is that `await action()` resolves once the query
+  // refetch settles, but React hasn't re-rendered yet — so reading
+  // the cursor position immediately would land on the *pre-move*
+  // index. Instead we stash {slug, rowsAtDispatch} in a ref and let
+  // a `useEffect` on `filteredRows` consume it once the rows
+  // reference has actually changed (which happens on the
+  // post-invalidation render). The `rowsAtDispatch` comparison
+  // is the gate that prevents a stale-data render from snapping the
+  // cursor to the old position. Ref over state because we don't want
+  // an extra render just to schedule the follow.
+  const followRef = useRef<{
+    slug: string;
+    rowsAtDispatch: WorktreeRow[];
+  } | null>(null);
+  // Last section the user moved a row into. Used to default the
+  // section-picker cursor — the common case is "moving several
+  // adjacent worktrees into the same section", and re-aiming on
+  // every open eats keystrokes. Reset to `null` on rename so the
+  // sticky target doesn't dangle.
+  const [lastMoveTarget, setLastMoveTarget] = useState<string | null>(null);
+  // Section the user is renaming, if any. The footer input prompt is
+  // generic; this lets the submit handler know which section the
+  // typed text applies to.
+  const [pendingRename, setPendingRename] = useState<string | null>(null);
   const toastTimer = useRef<Timer | null>(null);
 
   // Auto-tail every busy worktree so logs surface in the activity pane
@@ -224,6 +329,220 @@ export function App({ onExit }: Props) {
     onExit({ kind: "quit" });
   }
 
+  /**
+   * Mark a slug for cursor-follow on the next post-invalidation
+   * render. Captures the *current* `filteredRows` so the effect can
+   * tell when fresh data has arrived: if the rows reference is still
+   * `rowsAtDispatch` when the effect runs, the refetch hasn't landed
+   * and we wait. Repeated calls (chord-Shift+J) overwrite the ref
+   * with a fresh `rowsAtDispatch` snapshot, so the second move's
+   * effect won't consume a stale capture from the first.
+   */
+  function followAfterMove(slug: string): void {
+    followRef.current = { slug, rowsAtDispatch: filteredRows };
+  }
+
+  /**
+   * Standard error reporter for state-mutation chains. Disk writes
+   * inside `wtstate.ts` can throw on EACCES / ENOSPC; we surface as
+   * an event log line + toast and clear any pending follow so a
+   * failed action doesn't leave the cursor logic stuck.
+   */
+  function reportActionError(label: string, err: unknown): void {
+    followRef.current = null;
+    const msg = err instanceof Error ? err.message : String(err);
+    appLog.event.err(`${label} failed: ${msg}`);
+    toast(`${label} failed: ${msg}`, theme.err, 3000);
+  }
+
+  // Run after every render where `filteredRows` changed. If a follow
+  // is pending and the rows reference has moved off the dispatch
+  // snapshot, find the slug at its new position and snap the cursor.
+  // `setSel` triggers another render, but that render will see
+  // `followRef.current === null` and skip.
+  useEffect(() => {
+    const pending = followRef.current;
+    if (!pending) return;
+    if (filteredRows === pending.rowsAtDispatch) return;
+    const idx = filteredRows.findIndex((r) => r.wt.slug === pending.slug);
+    if (idx >= 0) setSel(idx);
+    followRef.current = null;
+  }, [filteredRows]);
+
+  /**
+   * Build the section-picker item list. Excludes the current row's
+   * section since "move this row to where it already is" is never
+   * useful (the user explicitly asked to drop that as clutter).
+   * "+ new section" sits at the bottom with `l` as its quick chord
+   * trigger so `l l` creates a fresh section in two keystrokes.
+   */
+  function buildSectionItems(currentSection: string | null): SectionPickerItem[] {
+    const items: SectionPickerItem[] = [];
+    if (currentSection !== null) items.push({ kind: "none" });
+    const seen = new Set<string>();
+    for (const r of rows) {
+      if (r.archived) continue;
+      if (r.section === null || seen.has(r.section)) continue;
+      seen.add(r.section);
+      if (r.section === currentSection) continue;
+      items.push({ kind: "section", name: r.section });
+    }
+    items.push({ kind: "create" });
+    return items;
+  }
+
+  /**
+   * Unified Shift+J/K. Walks the active-row list one step in `dir`:
+   *   - Same-section neighbor → swap orders (within-section reorder).
+   *   - Cross-section neighbor → move row to the adjacent edge of the
+   *     target section (top of next on `J`, bottom of prev on `K`),
+   *     so the row visually slides one position the way the user
+   *     expects rather than leaping to the far end of the target.
+   * The archive boundary is hard: rows can't cross into archived via
+   * J/K — that's `a`'s job.
+   */
+  function doShiftMove(dir: -1 | 1): void {
+    if (!current) return;
+    if (current.archived) {
+      toast("archived rows don't reorder, use `a` to restore", theme.fgDim, 1500);
+      return;
+    }
+    if (filter) {
+      toast("clear filter to reorder", theme.warn, 1500);
+      return;
+    }
+    const active = rows.filter((r) => !r.archived);
+    const idx = active.indexOf(current);
+    if (idx < 0) return;
+    const target = active[idx + dir];
+    if (!target) {
+      // Special case: at the top of a named section with nothing
+      // above. The cross-section branch normally handles "leave my
+      // section" by routing through the row above, but when there
+      // are no unsectioned rows and no other section preceding this
+      // one, there's no row above to route through. Manufacture the
+      // move into unsectioned so Shift+K can always escape a
+      // section. (No symmetric Shift+J fix: archived is the boundary
+      // below, and routing into archived via reorder would conflict
+      // with `a` being the only path there.)
+      if (dir < 0 && current.section !== null) {
+        const slug = current.wt.slug;
+        followAfterMove(slug);
+        placeSlug(slug, null, "bottom").then(
+          () => toast("moved to (none)", theme.info, 1200),
+          (err) => reportActionError("move", err),
+        );
+        return;
+      }
+      toast(dir > 0 ? "already at bottom" : "already at top", theme.fgDim, 1500);
+      return;
+    }
+    const slug = current.wt.slug;
+    if (target.section === current.section) {
+      const bucket = active
+        .filter((r) => r.section === current.section)
+        .map((r) => r.wt.slug);
+      followAfterMove(slug);
+      swapOrder(slug, target.wt.slug, current.section, bucket).catch((err) =>
+        reportActionError("reorder", err),
+      );
+      return;
+    }
+    // Cross-section: place at the edge of `target.section` adjacent to
+    // the source section, so the row shifts one visual position.
+    const position: "top" | "bottom" = dir > 0 ? "top" : "bottom";
+    followAfterMove(slug);
+    placeSlug(slug, target.section, position).then(
+      () => {
+        const label = target.section === null ? "(none)" : target.section;
+        toast(`moved to ${label}`, theme.info, 1200);
+      },
+      (err) => reportActionError("move", err),
+    );
+  }
+
+  function openSectionPicker(): void {
+    if (!current) return;
+    if (current.archived) {
+      toast("archived rows don't have a section context, use `a` to restore", theme.fgDim, 2000);
+      return;
+    }
+    if (filter) {
+      toast("clear filter to set section", theme.warn, 1500);
+      return;
+    }
+    const items = buildSectionItems(current.section);
+    // Default cursor: sticky last-move-target if it's still in the
+    // list (and isn't the current section), else the first item.
+    // The user's most common workflow is "move several rows into the
+    // same section", and forcing them to re-aim every time eats keys.
+    let initial = 0;
+    if (lastMoveTarget !== null && lastMoveTarget !== current.section) {
+      const i = items.findIndex(
+        (it) => it.kind === "section" && it.name === lastMoveTarget,
+      );
+      if (i >= 0) initial = i;
+    }
+    setSectionPicker({
+      title: `move ${current.wt.slug} to section`,
+      slug: current.wt.slug,
+      items,
+      index: initial,
+      newName: null,
+    });
+  }
+
+  function commitSectionPick(item: SectionPickerItem, slug: string): void {
+    if (item.kind === "none") {
+      followAfterMove(slug);
+      setSection(slug, null).then(
+        () => toast("moved to (none)", theme.info, 1500),
+        (err) => reportActionError("move", err),
+      );
+      setLastMoveTarget(null);
+      setSectionPicker(null);
+      return;
+    }
+    if (item.kind === "section") {
+      const target = item.name;
+      followAfterMove(slug);
+      setSection(slug, target).then(
+        () => toast(`moved to ${target}`, theme.info, 1500),
+        (err) => reportActionError("move", err),
+      );
+      setLastMoveTarget(target);
+      setSectionPicker(null);
+      return;
+    }
+    // "+ new section" — switch to input mode. Submission lives in the
+    // keyboard handler.
+    setSectionPicker((p) => (p ? { ...p, newName: "" } : null));
+  }
+
+  /**
+   * Open the rename prompt for the current row's section. No-op for
+   * unsectioned and archived rows — there's no nameable section to
+   * rename in those contexts.
+   */
+  function openSectionRename(): void {
+    if (!current || current.archived) return;
+    if (filter) {
+      toast("clear filter to rename", theme.warn, 1500);
+      return;
+    }
+    if (current.section === null) {
+      toast("cursor is in (none), nothing to rename", theme.fgDim, 1500);
+      return;
+    }
+    setPendingRename(current.section);
+    setFooter({
+      kind: "input",
+      prompt: `rename "${current.section}":`,
+      value: current.section,
+      purpose: "rename-section",
+    });
+  }
+
   async function doRemove(slug: string): Promise<void> {
     const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
@@ -239,7 +558,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (row.fields.dirty.data) {
-      log.event.err("refused: uncommitted changes — use `wt rm <slug> --force` from shell");
+      log.event.err("refused: uncommitted changes, use `wt rm <slug> --force` from shell");
       toast(`${slug} has uncommitted changes`, theme.err, 3000);
       return;
     }
@@ -247,7 +566,7 @@ export function App({ onExit }: Props) {
     if (unpushed > 0) {
       const plural = unpushed === 1 ? "" : "s";
       log.event.err(
-        `refused: ${unpushed} unpushed commit${plural} — use \`wt rm ${slug} --force\` from shell`,
+        `refused: ${unpushed} unpushed commit${plural}, use \`wt rm ${slug} --force\` from shell`,
       );
       toast(`${slug} has ${unpushed} unpushed commit${plural}`, theme.err, 3000);
       return;
@@ -566,6 +885,99 @@ export function App({ onExit }: Props) {
       return;
     }
 
+    // Section picker (`l`). Two modes: list mode for picking an
+    // existing section / "(none)" / "+ new section", and input mode
+    // for typing the new section name when the user picks the create
+    // entry. `newName === null` means list mode.
+    if (sectionPicker) {
+      const sp = sectionPicker;
+      if (sp.newName !== null) {
+        if (k.name === "escape") {
+          setSectionPicker({ ...sp, newName: null });
+          return;
+        }
+        if (k.ctrl && k.name === "c") {
+          setSectionPicker(null);
+          return;
+        }
+        if (k.name === "return") {
+          const name = sp.newName.trim();
+          if (!name) {
+            setSectionPicker({ ...sp, newName: null });
+            return;
+          }
+          const slug = sp.slug;
+          followAfterMove(slug);
+          setSection(slug, name).then(
+            () => toast(`moved to ${name}`, theme.info, 1500),
+            (err) => reportActionError("move", err),
+          );
+          setLastMoveTarget(name);
+          setSectionPicker(null);
+          return;
+        }
+        if (k.name === "backspace") {
+          // Backspace on empty input pops back to list mode — matches
+          // the filter / new-worktree input convention.
+          if (sp.newName.length === 0) {
+            setSectionPicker({ ...sp, newName: null });
+            return;
+          }
+          setSectionPicker({ ...sp, newName: sp.newName.slice(0, -1) });
+          return;
+        }
+        const text = printableText(k.sequence);
+        if (text) setSectionPicker({ ...sp, newName: sp.newName + text });
+        return;
+      }
+      if (k.name === "j" || k.name === "down") {
+        setSectionPicker({
+          ...sp,
+          index: Math.min(sp.index + 1, sp.items.length - 1),
+        });
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setSectionPicker({ ...sp, index: Math.max(sp.index - 1, 0) });
+        return;
+      }
+      // `l` inside the picker is the chord trigger for "+ new section"
+      // (so `l l` from normal mode lands you in the create-name
+      // input). Plain `l`, no modifiers — Shift+L doesn't apply here
+      // since rename is only a normal-mode action.
+      if (isPlainLetter(k, "l")) {
+        const createIdx = sp.items.findIndex((it) => it.kind === "create");
+        if (createIdx >= 0) {
+          const item = sp.items[createIdx]!;
+          commitSectionPick(item, sp.slug);
+        }
+        return;
+      }
+      // Quick-pick digits 1..9 jump straight to that item by display
+      // position. Mirrors the digit prefix the modal renders. Ignored
+      // when the position is out of range (so a stray "9" in a list
+      // of three doesn't fire something unintended).
+      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+        const i = parseInt(k.sequence, 10) - 1;
+        const item = sp.items[i];
+        if (item) commitSectionPick(item, sp.slug);
+        return;
+      }
+      if (k.name === "return") {
+        const item = sp.items[sp.index];
+        if (item) commitSectionPick(item, sp.slug);
+        return;
+      }
+      if (
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setSectionPicker(null);
+      }
+      return;
+    }
+
     // Branch-picker modal (for --any multi-match). Swallows input
     // until the user picks or cancels, resolving the promise that
     // `parseInput` is awaiting inside `doNew`.
@@ -677,16 +1089,42 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Input mode: typing into the new-worktree prompt.
+    // Input mode: typing into the new-worktree prompt or the
+    // rename-section prompt — `purpose` discriminates which.
     if (footer.kind === "input") {
       if (k.name === "escape" || (k.ctrl && k.name === "c")) {
         setFooter({ kind: "legend" });
+        setPendingRename(null);
         return;
       }
       if (k.name === "return") {
         const raw = footer.value.trim();
         const base = footer.base;
+        const purpose = footer.purpose;
         setFooter({ kind: "legend" });
+        if (purpose === "rename-section") {
+          const oldName = pendingRename;
+          setPendingRename(null);
+          if (!oldName || !raw || raw === oldName) return;
+          // Capture the slug now — `current` is a closure over this
+          // render and the user could navigate away before the
+          // promise resolves; we want the cursor to track the
+          // worktree whose section we just renamed.
+          const slug = current?.wt.slug;
+          renameSection(oldName, raw).then(
+            () => { if (slug) followAfterMove(slug); },
+            (err) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              appLog.event.err(`rename failed: ${msg}`);
+              toast(`rename failed: ${msg}`, theme.err, 3000);
+            },
+          );
+          // Update sticky last-move-target so a stale name doesn't
+          // dangle as the picker default.
+          setLastMoveTarget((prev) => (prev === oldName ? raw : prev));
+          toast(`renamed "${oldName}" to "${raw}"`, theme.info, 1800);
+          return;
+        }
         if (raw) void doNew(raw, base);
         return;
       }
@@ -739,6 +1177,24 @@ export function App({ onExit }: Props) {
       setSel(0);
       return;
     }
+    // Unified Shift+J/K — moves the current row one position in
+    // display order. Within a section that's a swap; across the
+    // section boundary it's an adjacent-edge placement (top of next,
+    // bottom of prev), so chord-holding J walks the row through the
+    // whole list including unsectioned, never crossing into archived.
+    if (isShiftedLetter(k, "j")) {
+      doShiftMove(1);
+      return;
+    }
+    if (isShiftedLetter(k, "k")) {
+      doShiftMove(-1);
+      return;
+    }
+    // Shift+L renames the current row's section.
+    if (isShiftedLetter(k, "l")) {
+      openSectionRename();
+      return;
+    }
     if (k.name === "j" || k.name === "down") {
       setSel((i) => Math.min(i + 1, Math.max(0, filteredRows.length - 1)));
       return;
@@ -758,7 +1214,7 @@ export function App({ onExit }: Props) {
       setSel(Math.max(0, filteredRows.length - 1));
       return;
     }
-    if (k.name === "q" || (k.ctrl && k.name === "c")) {
+    if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
       quit();
       return;
     }
@@ -803,7 +1259,7 @@ export function App({ onExit }: Props) {
       });
       return;
     }
-    if (k.name === "c") {
+    if (isPlainLetter(k, "c")) {
       if (cleanCandidates.length === 0) {
         toast("nothing to clean", theme.fgDim, 1500);
         return;
@@ -825,12 +1281,12 @@ export function App({ onExit }: Props) {
     // Per-row actions.
     if (!current) return;
     const rowLog = createLogger(current.wt.slug);
-    if (k.name === "o") {
+    if (isPlainLetter(k, "o")) {
       openInZed(current.wt.path);
       rowLog.event.info("opened in zed");
       return;
     }
-    if (k.name === "p") {
+    if (isPlainLetter(k, "p")) {
       if (!current.pr) {
         rowLog.event.warn("no PR for this branch");
         return;
@@ -840,7 +1296,7 @@ export function App({ onExit }: Props) {
       rowLog.event.info(`opened PR #${current.pr.number}`);
       return;
     }
-    if (k.name === "i") {
+    if (isPlainLetter(k, "i")) {
       const url = linearUrlForSlug(current.wt.slug);
       if (!url) {
         rowLog.event.warn("no linear id in slug");
@@ -851,7 +1307,7 @@ export function App({ onExit }: Props) {
       rowLog.event.info("opened linear");
       return;
     }
-    if (k.name === "s") {
+    if (isPlainLetter(k, "s")) {
       if (!current.fields.deploy.data) {
         rowLog.event.warn("not deployed");
         return;
@@ -870,7 +1326,7 @@ export function App({ onExit }: Props) {
       setShowYank(true);
       return;
     }
-    if (k.name === "d") {
+    if (isPlainLetter(k, "d")) {
       if (current.status.kind === StatusKind.Busy) {
         const label = current.status.op ?? current.status.label;
         toast(`${current.wt.slug} is ${label}`, theme.warn, 2000);
@@ -883,11 +1339,11 @@ export function App({ onExit }: Props) {
       });
       return;
     }
-    if (k.name === "v") {
+    if (isPlainLetter(k, "v")) {
       void openReviewerPicker(current.wt.slug);
       return;
     }
-    if (k.name === "e") {
+    if (isPlainLetter(k, "e")) {
       if (!current.pr) {
         toast("no PR for this row", theme.warn, 2000);
         return;
@@ -907,7 +1363,7 @@ export function App({ onExit }: Props) {
       });
       return;
     }
-    if (k.name === "m") {
+    if (isPlainLetter(k, "m")) {
       if (!current.pr) {
         toast("no PR for this row", theme.warn, 2000);
         return;
@@ -932,14 +1388,23 @@ export function App({ onExit }: Props) {
       });
       return;
     }
-    if (k.name === "a") {
+    if (isPlainLetter(k, "a")) {
       const slug = current.wt.slug;
-      const { archived } = toggleArchived(slug);
-      rowLog.event.info(archived ? "archived" : "restored from archive");
-      toast(archived ? `archived ${slug}` : `restored ${slug}`, theme.info, 2000);
+      followAfterMove(slug);
+      toggleArchived(slug).then(
+        ({ archived }) => {
+          rowLog.event.info(archived ? "archived" : "restored from archive");
+          toast(archived ? `archived ${slug}` : `restored ${slug}`, theme.info, 2000);
+        },
+        (err) => reportActionError("archive", err),
+      );
       return;
     }
-    if (k.name === "t") {
+    if (isPlainLetter(k, "l")) {
+      openSectionPicker();
+      return;
+    }
+    if (isPlainLetter(k, "t")) {
       if (!config.ai) {
         toast("AI summary not configured", theme.warn, 2000);
         return;
@@ -1026,6 +1491,14 @@ export function App({ onExit }: Props) {
           selectedIndex={reviewerPicker.index}
           checked={reviewerPicker.checked}
           toggleKey="v"
+        />
+      ) : null}
+      {sectionPicker ? (
+        <SectionPickerModal
+          title={sectionPicker.title}
+          items={sectionPicker.items}
+          selectedIndex={sectionPicker.index}
+          newName={sectionPicker.newName}
         />
       ) : null}
     </box>

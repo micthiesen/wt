@@ -21,6 +21,16 @@ const SECTIONS: Section[] = [
     ],
   },
   {
+    title: "organize",
+    items: [
+      ["l", "set section (picker)"],
+      ["l l", "new section (chord)"],
+      ["L", "rename current section"],
+      ["J / K", "move row · across sections"],
+      ["a", "archive / restore"],
+    ],
+  },
+  {
     title: "worktree",
     items: [
       ["o", "open in zed"],
@@ -32,7 +42,6 @@ const SECTIONS: Section[] = [
       ["m", "merge when ready (toggle)"],
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker)"],
-      ["a", "archive / restore"],
       ["d", "remove worktree"],
     ],
   },

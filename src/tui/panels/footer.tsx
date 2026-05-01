@@ -9,7 +9,7 @@ export type FooterMode =
       kind: "input";
       prompt: string;
       value: string;
-      purpose: "new";
+      purpose: "new" | "rename-section";
       /**
        * Optional default `--base` ref for the new-worktree input (set
        * by the `N` keybinding). Not rendered in the prompt; the event
@@ -29,6 +29,7 @@ type Props = {
 const LEGEND: KeyHintPair[] = [
   ["jk", "move"],
   ["o", "zed"],
+  ["l", "section"],
   ["/", "filter"],
   ["n", "new"],
   ["d", "rm"],
