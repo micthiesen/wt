@@ -1,5 +1,6 @@
 import type { ClaudeStatus } from "../../core/claude.ts";
 import { humanAge } from "../../core/locks.ts";
+import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 import type { RowModule } from "./types.ts";
 
@@ -24,7 +25,9 @@ function ClaudeLine({ data }: { data: ClaudeStatus | undefined }) {
   const convos = count === 1 ? "1 convo" : `${count} convos`;
   return (
     <text fg={theme.fg} wrapMode="none" truncate>
-      <span fg={head.fg}>{head.text}</span>
+      <span fg={head.fg}>
+        {NF.comment}  {head.text}
+      </span>
       <span fg={theme.fgDim}> · {convos}</span>
       {queued > 0 ? (
         <span fg={theme.warn}>

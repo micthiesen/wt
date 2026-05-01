@@ -33,4 +33,5 @@ export const NF = {
   mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — prefix for `⇥N`
   bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed
   boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
+  comment: "\u{F41F}", // nf-oct-comment        — Claude Code session activity
 } as const;
