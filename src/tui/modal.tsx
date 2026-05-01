@@ -38,6 +38,18 @@ type Props = {
   children: ReactNode;
 };
 
+/**
+ * Modal conventions every caller should follow:
+ *
+ *   1. **Toggle dismiss.** The key that opens the modal also closes it
+ *      (e.g. `?` opens & closes help, `y` opens & closes the yank chord,
+ *      `v` opens & closes the reviewer picker). Always accept it
+ *      alongside the universal `esc` / `q` / `ctrl+c` dismiss keys, so
+ *      muscle-memory works in both directions.
+ *   2. **Universal dismiss.** Always accept `esc`, `q`, and `ctrl+c`.
+ *   3. **Hints.** List dismiss keys in the `hints` prop so the user
+ *      sees them along the bottom edge.
+ */
 export function Modal({
   title,
   borderColor = theme.accent,

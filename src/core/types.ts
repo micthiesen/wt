@@ -27,7 +27,12 @@ export type Status = {
 
 export type PrChecks = "pass" | "fail" | "pending" | "none";
 
-export type PrReview = "approved" | "changes_requested" | "pending" | "none";
+export type PrReview =
+  | "approved"
+  | "changes_requested"
+  | "pending"
+  | "unrequested"
+  | "none";
 
 /**
  * CodeRabbit review state, derived from the `CodeRabbit` status check
@@ -39,6 +44,13 @@ export type RabbitStatus = {
   state: "pending" | "unresolved" | "clean" | "none";
   /** Count of unresolved CR-authored threads. Only meaningful when state === "unresolved". */
   unresolved: number;
+};
+
+export type SuggestedReviewer = {
+  /** GitHub login (user). Teams aren't returned by `suggestedReviewers`. */
+  login: string;
+  isAuthor: boolean;
+  isCommenter: boolean;
 };
 
 export type AutoMergeMethod = "SQUASH" | "MERGE" | "REBASE";
@@ -82,6 +94,10 @@ export type PullRequest = {
   review: PrReview;
   /** Outstanding review requests (humans + bots). */
   reviewRequests: number;
+  /** Logins (users) and `org/team` slugs currently requested for review. */
+  requestedReviewers: readonly string[];
+  /** GitHub-suggested reviewers based on file ownership and history. */
+  suggestedReviewers: readonly SuggestedReviewer[];
   /** CodeRabbit status — its own track, separate from human reviews. `none` when CR didn't run. */
   rabbit: RabbitStatus;
   /** "Merge when ready" arming state. `null` when not enabled. */

@@ -110,7 +110,21 @@ fragment PrFields on PullRequest {
   mergedAt
   closedAt
   reviewDecision
-  reviewRequests(first: 1) { totalCount }
+  reviewRequests(first: 20) {
+    totalCount
+    nodes {
+      requestedReviewer {
+        __typename
+        ... on User { login }
+        ... on Team { combinedSlug }
+      }
+    }
+  }
+  suggestedReviewers {
+    reviewer { login }
+    isAuthor
+    isCommenter
+  }
   autoMergeRequest {
     enabledAt
     mergeMethod
@@ -238,7 +252,20 @@ type GqlPrNode = {
   mergedAt: string | null;
   closedAt: string | null;
   reviewDecision: GqlReviewDecision;
-  reviewRequests: { totalCount: number } | null;
+  reviewRequests: {
+    totalCount: number;
+    nodes: Array<{
+      requestedReviewer:
+        | { __typename: "User"; login: string }
+        | { __typename: "Team"; combinedSlug: string }
+        | null;
+    }>;
+  } | null;
+  suggestedReviewers: Array<{
+    reviewer: { login: string } | null;
+    isAuthor: boolean;
+    isCommenter: boolean;
+  }> | null;
   autoMergeRequest: { enabledAt: string; mergeMethod: AutoMergeMethod } | null;
   commits: {
     nodes: Array<{
@@ -250,12 +277,19 @@ type GqlPrNode = {
   reviewThreads: { nodes: GqlReviewThread[] } | null;
 };
 
-function rollupReview(state: PullRequest["state"], decision: GqlReviewDecision): PrReview {
+function rollupReview(
+  state: PullRequest["state"],
+  decision: GqlReviewDecision,
+  outstandingRequests: number,
+): PrReview {
   // Terminal PRs don't carry useful review state; suppress to keep the
   // line uncluttered. The PR badge already conveys merged/closed.
   if (state !== "OPEN") return "none";
   if (decision === "APPROVED") return "approved";
   if (decision === "CHANGES_REQUESTED") return "changes_requested";
+  // Distinguish "nobody asked yet" from "asked, waiting" — the action
+  // for the first is to hit `v`, for the second it's to wait.
+  if (outstandingRequests === 0) return "unrequested";
   return "pending";
 }
 
@@ -282,6 +316,34 @@ export type GithubData = {
   mergeQueue: Map<string, MergeQueueEntry>;
 };
 
+function extractRequestedReviewers(
+  rr: GqlPrNode["reviewRequests"],
+): string[] {
+  const out: string[] = [];
+  for (const node of rr?.nodes ?? []) {
+    const r = node.requestedReviewer;
+    if (!r) continue;
+    if (r.__typename === "User") out.push(r.login);
+    else if (r.__typename === "Team") out.push(r.combinedSlug);
+  }
+  return out;
+}
+
+function extractSuggestedReviewers(
+  sr: GqlPrNode["suggestedReviewers"],
+): import("./types.ts").SuggestedReviewer[] {
+  const out: import("./types.ts").SuggestedReviewer[] = [];
+  for (const s of sr ?? []) {
+    if (!s.reviewer?.login) continue;
+    out.push({
+      login: s.reviewer.login,
+      isAuthor: s.isAuthor,
+      isCommenter: s.isCommenter,
+    });
+  }
+  return out;
+}
+
 function nodeToPr(pr: GqlPrNode): PullRequest {
   const contexts =
     pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? null;
@@ -294,9 +356,15 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     isDraft: pr.isDraft,
     state: pr.state,
     checks: rollupChecks(contexts),
-    review: rollupReview(pr.state, pr.reviewDecision),
+    review: rollupReview(
+      pr.state,
+      pr.reviewDecision,
+      pr.reviewRequests?.totalCount ?? 0,
+    ),
     reviewRequests: pr.reviewRequests?.totalCount ?? 0,
     rabbit: rollupRabbit(pr.state, contexts, threads),
+    requestedReviewers: extractRequestedReviewers(pr.reviewRequests),
+    suggestedReviewers: extractSuggestedReviewers(pr.suggestedReviewers),
     autoMerge: pr.autoMergeRequest
       ? {
           enabledAt: pr.autoMergeRequest.enabledAt,
@@ -396,9 +464,56 @@ export async function fetchPrs(): Promise<Map<string, PullRequest>> {
   return (await fetchGithub(branches)).prs;
 }
 
-export type EnableAutoMergeResult =
-  | { ok: true }
-  | { ok: false; error: string };
+export type GhActionResult = { ok: true } | { ok: false; error: string };
+export type EnableAutoMergeResult = GhActionResult;
+
+/**
+ * Edit a PR's review requests via `gh pr edit`. Both `add` and
+ * `remove` may be passed in the same call — gh accepts both flag
+ * sets at once. Logins are users; team slugs use the `org/team-slug`
+ * form. Empty changes is a no-op.
+ */
+export async function editReviewers(
+  prNumber: number,
+  changes: { add: readonly string[]; remove: readonly string[] },
+): Promise<GhActionResult> {
+  if (changes.add.length === 0 && changes.remove.length === 0) {
+    return { ok: true };
+  }
+  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
+  const argv = ["gh", "pr", "edit", String(prNumber)];
+  for (const l of changes.add) argv.push("--add-reviewer", l);
+  for (const l of changes.remove) argv.push("--remove-reviewer", l);
+  const r = await run(argv, { cwd: config.paths.mainClone, timeoutMs: 15_000 });
+  if (r.exitCode !== 0) {
+    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    log.error("edit reviewers failed", { prNumber, changes, msg });
+    return { ok: false, error: msg };
+  }
+  return { ok: true };
+}
+
+/**
+ * Flip a draft PR to "ready for review" via `gh pr ready`. Notifies
+ * reviewers and triggers any code-owner auto-requests, so callers
+ * should gate on user confirmation. Runs from the main clone so gh
+ * resolves the right repo.
+ */
+export async function markPullRequestReady(
+  prNumber: number,
+): Promise<GhActionResult> {
+  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
+  const r = await run(
+    ["gh", "pr", "ready", String(prNumber)],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  );
+  if (r.exitCode !== 0) {
+    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    log.error("mark ready failed", { prNumber, msg });
+    return { ok: false, error: msg };
+  }
+  return { ok: true };
+}
 
 /**
  * Enable "merge when ready" on a PR via `gh pr merge --auto`. Rebase

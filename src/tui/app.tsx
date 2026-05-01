@@ -8,7 +8,11 @@ import {
   parseInput,
   spawnBackgroundRemove,
 } from "../core/lifecycle.ts";
-import { enableAutoMerge } from "../core/github.ts";
+import {
+  editReviewers,
+  enableAutoMerge,
+  markPullRequestReady,
+} from "../core/github.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
@@ -20,7 +24,7 @@ import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
-import { PickerModal } from "./panels/picker.tsx";
+import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
 import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
@@ -138,6 +142,19 @@ export function App({ onExit }: Props) {
     items: string[];
     index: number;
     resolve: (picked: string | null) => void;
+  } | null>(null);
+  // Multi-select picker (currently used only for "request review"). Kept
+  // separate from `picker` because it doesn't suspend a caller — it just
+  // dispatches an action on submit.
+  const [reviewerPicker, setReviewerPicker] = useState<{
+    title: string;
+    items: MultiPickerItem[];
+    index: number;
+    checked: Set<string>;
+    /** Snapshot of currently-requested logins; diffed on submit. */
+    original: Set<string>;
+    slug: string;
+    prNumber: number;
   } | null>(null);
   const toastTimer = useRef<Timer | null>(null);
 
@@ -292,6 +309,108 @@ export function App({ onExit }: Props) {
     toast(`copied ${label}`, theme.info, 1500);
   }
 
+  function openReviewerPicker(slug: string): void {
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row?.pr) {
+      toast("no PR for this row", theme.warn, 2000);
+      return;
+    }
+    if (row.pr.state !== "OPEN") {
+      toast("PR is not open", theme.warn, 2000);
+      return;
+    }
+    const requested = new Set(row.pr.requestedReviewers);
+    // Suggested first, then any already-requested logins/teams not in
+    // the suggestions list. Already-requested entries start checked so
+    // unchecking maps to a removal on submit.
+    const items: MultiPickerItem[] = [];
+    for (const s of row.pr.suggestedReviewers) {
+      const already = requested.has(s.login);
+      const tags: string[] = [];
+      if (already) tags.push("requested");
+      if (s.isAuthor) tags.push("author");
+      if (s.isCommenter) tags.push("commenter");
+      items.push({
+        key: s.login,
+        label: s.login,
+        hint: tags.length > 0 ? `(${tags.join(", ")})` : undefined,
+      });
+    }
+    for (const login of row.pr.requestedReviewers) {
+      if (items.some((it) => it.key === login)) continue;
+      items.push({
+        key: login,
+        label: login,
+        hint: "(requested)",
+      });
+    }
+    if (items.length === 0) {
+      toast("no reviewer suggestions", theme.warn, 2000);
+      return;
+    }
+    setReviewerPicker({
+      title: `edit reviewers for #${row.pr.number}`,
+      items,
+      index: 0,
+      checked: new Set(requested),
+      original: new Set(requested),
+      slug,
+      prNumber: row.pr.number,
+    });
+  }
+
+  async function submitReviewerPicker(): Promise<void> {
+    if (!reviewerPicker) return;
+    const { slug, prNumber, checked, original } = reviewerPicker;
+    const log = createLogger(slug);
+    const add: string[] = [];
+    const remove: string[] = [];
+    for (const k of checked) if (!original.has(k)) add.push(k);
+    for (const k of original) if (!checked.has(k)) remove.push(k);
+    setReviewerPicker(null);
+    if (add.length === 0 && remove.length === 0) {
+      toast("no changes", theme.fgDim, 1500);
+      return;
+    }
+    const result = await editReviewers(prNumber, { add, remove });
+    if (!result.ok) {
+      log.event.err(`edit reviewers failed for #${prNumber}: ${result.error}`);
+      toast(`edit reviewers failed: ${result.error}`, theme.err, 4000);
+      return;
+    }
+    const parts: string[] = [];
+    if (add.length > 0) parts.push(`+${add.join(", ")}`);
+    if (remove.length > 0) parts.push(`-${remove.join(", ")}`);
+    log.event.ok(`edited reviewers for #${prNumber}: ${parts.join("; ")}`);
+    const summary = [
+      add.length > 0 ? `added ${add.length}` : null,
+      remove.length > 0 ? `removed ${remove.length}` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    toast(summary, theme.ok, 2500);
+    void refreshGithub();
+  }
+
+  async function doMarkReady(slug: string): Promise<void> {
+    const log = createLogger(slug);
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row?.pr) {
+      toast("no PR for this row", theme.warn, 2000);
+      return;
+    }
+    const prNumber = row.pr.number;
+    const result = await markPullRequestReady(prNumber);
+    if (!result.ok) {
+      log.event.err(`mark ready failed for #${prNumber}: ${result.error}`);
+      toast(`mark ready failed: ${result.error}`, theme.err, 4000);
+      return;
+    }
+    log.event.ok(`marked #${prNumber} ready for review`);
+    toast(`marked #${prNumber} ready`, theme.ok, 2500);
+    void refreshGithub();
+  }
+
   async function doAutoMerge(slug: string): Promise<void> {
     const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
@@ -365,6 +484,51 @@ export function App({ onExit }: Props) {
         (k.ctrl && k.name === "c")
       ) {
         setShowHelp(false);
+      }
+      return;
+    }
+
+    // Reviewer multi-picker. Space toggles the cursor item, enter
+    // submits the checked set, esc cancels.
+    if (reviewerPicker) {
+      if (k.name === "j" || k.name === "down") {
+        setReviewerPicker({
+          ...reviewerPicker,
+          index: Math.min(
+            reviewerPicker.index + 1,
+            reviewerPicker.items.length - 1,
+          ),
+        });
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setReviewerPicker({
+          ...reviewerPicker,
+          index: Math.max(reviewerPicker.index - 1, 0),
+        });
+        return;
+      }
+      if (k.name === "space" || k.sequence === " ") {
+        const item = reviewerPicker.items[reviewerPicker.index];
+        if (item && !item.locked) {
+          const next = new Set(reviewerPicker.checked);
+          if (next.has(item.key)) next.delete(item.key);
+          else next.add(item.key);
+          setReviewerPicker({ ...reviewerPicker, checked: next });
+        }
+        return;
+      }
+      if (k.name === "return") {
+        void submitReviewerPicker();
+        return;
+      }
+      if (
+        k.name === "escape" ||
+        k.sequence === "v" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setReviewerPicker(null);
       }
       return;
     }
@@ -519,6 +683,8 @@ export function App({ onExit }: Props) {
           void doRemove(current.wt.slug);
         } else if (pending === "m" && current) {
           void doAutoMerge(current.wt.slug);
+        } else if (pending === "e" && current) {
+          void doMarkReady(current.wt.slug);
         } else if (pending === "R") {
           appLog.event.warn("cleared all cached data; refetching from scratch");
           void clearAll();
@@ -682,6 +848,30 @@ export function App({ onExit }: Props) {
       });
       return;
     }
+    if (k.name === "v") {
+      openReviewerPicker(current.wt.slug);
+      return;
+    }
+    if (k.name === "e") {
+      if (!current.pr) {
+        toast("no PR for this row", theme.warn, 2000);
+        return;
+      }
+      if (current.pr.state !== "OPEN") {
+        toast("PR is not open", theme.warn, 2000);
+        return;
+      }
+      if (!current.pr.isDraft) {
+        toast("PR is already ready", theme.info, 2000);
+        return;
+      }
+      setFooter({
+        kind: "confirm",
+        message: `mark #${current.pr.number} ready for review? [y/N]`,
+        pendingKey: "e",
+      });
+      return;
+    }
     if (k.name === "m") {
       if (!current.pr) {
         toast("no PR for this row", theme.warn, 2000);
@@ -693,10 +883,6 @@ export function App({ onExit }: Props) {
       }
       if (current.pr.autoMerge) {
         toast(`auto-merge already enabled for #${current.pr.number}`, theme.info, 2000);
-        return;
-      }
-      if (current.pr.review !== "approved") {
-        toast("PR is not approved", theme.warn, 2000);
         return;
       }
       setFooter({
@@ -713,7 +899,7 @@ export function App({ onExit }: Props) {
       toast(archived ? `archived ${slug}` : `restored ${slug}`, theme.info, 2000);
       return;
     }
-    if (k.sequence === "T") {
+    if (k.name === "t") {
       if (!config.ai) {
         toast("AI summary not configured", theme.warn, 2000);
         return;
@@ -791,6 +977,15 @@ export function App({ onExit }: Props) {
           title={picker.title}
           items={picker.items}
           selectedIndex={picker.index}
+        />
+      ) : null}
+      {reviewerPicker ? (
+        <MultiPickerModal
+          title={reviewerPicker.title}
+          items={reviewerPicker.items}
+          selectedIndex={reviewerPicker.index}
+          checked={reviewerPicker.checked}
+          toggleKey="v"
         />
       ) : null}
     </box>

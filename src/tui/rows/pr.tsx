@@ -37,6 +37,8 @@ function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } |
       return { glyph: NF.checkFail, text: "changes requested", fg: theme.err };
     case "pending":
       return { glyph: NF.checkPend, text: "review pending", fg: theme.warn };
+    case "unrequested":
+      return { glyph: NF.checkPend, text: "no reviewers", fg: theme.fgDim };
     default:
       return null;
   }
