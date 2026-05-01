@@ -10,7 +10,9 @@ export const CACHE_DB = config.paths.cacheDb;
 // Bust the persisted cache when the schema / query shape changes.
 // v2: aiSummaryQuery now returns `{title, description}` instead of a
 // raw string; old entries can't be rehydrated cleanly.
-const CACHE_BUSTER = "v2";
+// v3: aiSummaryQuery added a required `brief` field; old entries
+// would deserialise without it and break consumers.
+const CACHE_BUSTER = "v3";
 
 /**
  * Build a QueryClient with TUI-friendly defaults and wire up the

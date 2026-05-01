@@ -16,10 +16,12 @@ const SYSTEM_PROMPT = `You summarise git changes for a developer scanning their 
 
 Output format, exactly:
 TITLE: <single line, 5 to 10 words, present-tense action or noun phrase>
+BRIEF: <noun phrase, 2 to 4 words, max 24 characters, no leading verb>
 DESCRIPTION: <1 to 3 sentences of plain prose>
 
 Rules:
 - TITLE: tight and descriptive, like a good PR title. No quotes. No trailing period.
+- BRIEF: ultra-condensed for a narrow list view. Just the *subject* of the change — caveman talk. No verbs ("Add", "Implement", "Fix", "Refactor"...), no articles. Examples: "Auto-merge support" not "Add auto-merge support"; "Diff compactor" not "Refactor the diff compactor"; "Reviewer picker UI" not "Improve reviewer picker UI". Hard cap 24 characters.
 - DESCRIPTION: describe what the change does, not which files it touches. No markdown, no headings, no lists.
 - Skip filler like "This change..." or "The diff shows...". Lead with the action.
 - If the changes feel exploratory or scaffolding, say so.
@@ -34,6 +36,13 @@ type ChatResponse = {
 export type AiSummary = {
   /** LLM-authored title. Null when the model failed to emit a TITLE: line. */
   title: string | null;
+  /**
+   * Ultra-short noun-phrase variant of the title for the worktree list,
+   * where horizontal space after the issue ID and badge cluster can be
+   * as tight as ~20 chars. Always set: parser falls back to the title,
+   * then the description, when the model omits the BRIEF: line.
+   */
+  brief: string;
   /** LLM-authored description. Always set on success — falls back to the whole response if structure was missing. */
   description: string;
 };
@@ -103,40 +112,50 @@ export async function summarizeDiff(prompt: string): Promise<AiSummary> {
 /**
  * Lenient parser for the model's structured output.
  *
- * Cases handled:
- *   - "TITLE: foo\nDESCRIPTION: bar" — happy path, both extracted.
- *   - "TITLE: foo\nbar baz" — no DESCRIPTION marker; everything after
- *     the title line becomes the description.
- *   - "DESCRIPTION: bar" — title null, description extracted.
- *   - "bar baz" — no markers; whole thing becomes the description,
- *     title null. Caller falls back to PR title / first-commit subject.
+ * Markers are extracted independently so the model can emit them in any
+ * order. When DESCRIPTION is missing, the body is whatever follows the
+ * last single-line marker; when no markers are present, the whole
+ * response becomes the description and title/brief fall back through
+ * `brief = title ?? description`.
  *
- * Title cleanup strips wrapping quotes and trailing periods so the
- * output reads cleanly in a terminal even when the model adds them.
+ * Inline cleanup (`cleanInline`) strips wrapping quotes and trailing
+ * periods on TITLE / BRIEF so the output reads cleanly in a terminal
+ * even when the model adds them.
  */
 export function parseTitleDescription(text: string): AiSummary {
   const trimmed = text.trim();
   const titleMatch = trimmed.match(/^TITLE:\s*(.+?)\s*$/m);
-  const rawTitle = titleMatch?.[1]?.trim() ?? null;
-  const title = rawTitle ? cleanTitle(rawTitle) : null;
-
+  const briefMatch = trimmed.match(/^BRIEF:\s*(.+?)\s*$/m);
   const descMatch = trimmed.match(/^DESCRIPTION:\s*([\s\S]+)$/m);
+
+  const rawTitle = titleMatch?.[1]?.trim() ?? null;
+  const title = rawTitle ? cleanInline(rawTitle) || null : null;
+  const rawBrief = briefMatch?.[1]?.trim() ?? null;
+  const parsedBrief = rawBrief ? cleanInline(rawBrief) || null : null;
+
   let description: string;
   if (descMatch) {
     description = descMatch[1]!.trim();
-  } else if (titleMatch) {
-    // Title present but no DESCRIPTION marker — take everything after
-    // the title line as the body.
-    const after = trimmed.slice(titleMatch.index! + titleMatch[0]!.length);
-    description = after.trim();
   } else {
-    // No structure at all; treat the whole response as description.
-    description = trimmed;
+    // No DESCRIPTION marker — take everything after the last single-line
+    // marker as the body. Falls back to the whole response when no
+    // markers were emitted at all.
+    const lastMarkerEnd = Math.max(
+      titleMatch ? titleMatch.index! + titleMatch[0]!.length : -1,
+      briefMatch ? briefMatch.index! + briefMatch[0]!.length : -1,
+    );
+    description = lastMarkerEnd >= 0 ? trimmed.slice(lastMarkerEnd).trim() : trimmed;
   }
-  return { title: title || null, description };
+
+  // Brief is required at the type level; degrade gracefully when the
+  // model skips it. Title is preferred (still a single-line phrase),
+  // then a hard-truncated description tail.
+  const brief = parsedBrief ?? title ?? description.slice(0, 24).trim();
+
+  return { title, brief, description };
 }
 
-function cleanTitle(t: string): string {
+function cleanInline(t: string): string {
   return t
     .replace(/^["'`]+|["'`]+$/g, "")
     .replace(/\.+$/, "")

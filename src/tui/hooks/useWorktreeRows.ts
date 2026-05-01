@@ -76,6 +76,13 @@ export type WorktreeRow = {
   title: string;
   titleSource: TitleSource;
   /**
+   * Ultra-short LLM-authored label for the worktree list, where space
+   * after the issue ID and badge cluster is tight. Null when the AI
+   * source hasn't produced a summary yet; the list panel falls back to
+   * `title` in that case.
+   */
+  brief: string | null;
+  /**
    * User-assigned section name from `state.json`, or `null` for the
    * unsectioned bucket at the top of the list. Persisted across the
    * archived flag — restoring an archived worktree drops it back into
@@ -283,6 +290,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const archived = archivedSet.has(wt.slug);
     const section = stateSlugs[wt.slug]?.section ?? null;
     const llmTitle = (aiResults[i]?.data?.title as string | undefined) ?? null;
+    const llmBrief = (aiResults[i]?.data?.brief as string | undefined) ?? null;
     const prTitle = pr?.title ?? null;
     const commitTitle = (firstCommitResults[i]?.data as string | null | undefined) ?? null;
     let title: string;
@@ -328,6 +336,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.archived === archived &&
       prev.title === title &&
       prev.titleSource === titleSource &&
+      prev.brief === llmBrief &&
       prev.section === section
     ) {
       return prev;
@@ -342,6 +351,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       archived,
       title,
       titleSource,
+      brief: llmBrief,
       section,
     };
     rowCache.current.set(wt.slug, next);

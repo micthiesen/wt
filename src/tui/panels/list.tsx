@@ -86,16 +86,20 @@ function mqGlyph(row: WorktreeRow): string {
 }
 
 /**
- * Row label text. `row.title` is the resolved title (always non-empty,
- * `llm > pr > commit > slug` fallback owned by `useWorktreeRows`).
- * First char is capitalized to match PR-title convention even when an
- * LLM emits lowercase; harmless on already-capitalized slug fallbacks.
- * Issue ID, when present, prefixes the label as `ENG-1234: <text>`.
+ * Row label text. Prefers the LLM-authored `brief` (caveman-talk noun
+ * phrase) over the longer `title`, since the list column is tight —
+ * after the badge cluster on a busy row the slug area can drop to ~20
+ * chars. The issue-tracker prefix is stripped (`ENG-4926` → `4926`)
+ * because it's constant for a given `id_pattern` and pure noise here;
+ * the full ID is preserved in the details pane via the panel title.
+ * First char is capitalized to match PR-title convention even when the
+ * LLM emits lowercase.
  */
 function rowLabel(row: WorktreeRow): string {
   const { id } = slugLabel(row.wt.slug);
-  const text = capitalizeFirst(row.title);
-  return id ? `${id}: ${text}` : text;
+  const numId = id ? id.replace(/^[A-Z]+-/, "") : null;
+  const text = capitalizeFirst(row.brief ?? row.title);
+  return numId ? `${numId}: ${text}` : text;
 }
 
 /**
