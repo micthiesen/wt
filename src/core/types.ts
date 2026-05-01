@@ -53,6 +53,12 @@ export type SuggestedReviewer = {
   isCommenter: boolean;
 };
 
+export type Contributor = {
+  login: string;
+  /** Total commits attributed to this user; the API sorts the list by this. */
+  contributions: number;
+};
+
 export type AutoMergeMethod = "SQUASH" | "MERGE" | "REBASE";
 
 /**

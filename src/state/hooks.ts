@@ -13,11 +13,19 @@ import {
 } from "../core/archive.ts";
 import type { DiffContext } from "../core/diff/index.ts";
 import { invalidateMainFirstParents } from "../core/git.ts";
+import { fetchAuthenticatedLogin } from "../core/github.ts";
 
 import { CACHE_DB } from "./client.ts";
 import { qk } from "./keys.ts";
 import { clearPersistedCache } from "./persister.ts";
-import { fetchOriginQuery, githubQuery, worktreesQuery, type GithubData } from "./queries.ts";
+import {
+  contributorsQuery,
+  fetchOriginQuery,
+  githubQuery,
+  worktreesQuery,
+  type GithubData,
+} from "./queries.ts";
+import type { Contributor } from "../core/types.ts";
 
 /**
  * Observe the combined GitHub query, scoped to the current set of
@@ -103,6 +111,22 @@ export function useWtActions() {
     /** Invalidate everything for a single worktree (useful after an action). */
     async invalidateWorktree(slug: string): Promise<void> {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
+    },
+    /**
+     * Fetch the repo-wide contributor list, hitting the cache when
+     * available. Used by the reviewer picker so we have a fallback
+     * candidate list when GitHub's `suggestedReviewers` is empty.
+     */
+    async fetchContributors(): Promise<readonly Contributor[]> {
+      return await qc.fetchQuery(contributorsQuery());
+    },
+    /**
+     * Currently-authenticated GitHub login (or `null` when gh isn't
+     * usable). Process-cached at the source — see
+     * `fetchAuthenticatedLogin` in `core/github.ts`.
+     */
+    async fetchMe(): Promise<string | null> {
+      return await fetchAuthenticatedLogin();
     },
     /**
      * Invalidate the combined PR + merge-queue fetch. Use after an

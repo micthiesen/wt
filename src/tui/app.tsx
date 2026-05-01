@@ -123,6 +123,8 @@ export function App({ onExit }: Props) {
     refreshAll,
     refreshStale,
     refreshGithub,
+    fetchContributors,
+    fetchMe,
     clearAll,
     invalidateWorktree,
     refreshAiSummary,
@@ -310,7 +312,7 @@ export function App({ onExit }: Props) {
     toast(`copied ${label}`, theme.info, 1500);
   }
 
-  function openReviewerPicker(slug: string): void {
+  async function openReviewerPicker(slug: string): Promise<void> {
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row?.pr) {
       toast("no PR for this row", theme.warn, 2000);
@@ -320,33 +322,58 @@ export function App({ onExit }: Props) {
       toast("PR is not open", theme.warn, 2000);
       return;
     }
+    if (row.pr.isDraft) {
+      toast("PR is a draft (mark ready first)", theme.warn, 2000);
+      return;
+    }
+    const [contributors, me] = await Promise.all([
+      fetchContributors(),
+      fetchMe(),
+    ]);
     const requested = new Set(row.pr.requestedReviewers);
-    // Suggested first, then any already-requested logins/teams not in
-    // the suggestions list. Already-requested entries start checked so
-    // unchecking maps to a removal on submit.
+    // Three-tier candidate list:
+    //   1. PR-scoped suggestions (highest signal — file ownership +
+    //      history). Often empty on small diffs.
+    //   2. Already-requested logins/teams not in (1), so the picker
+    //      doubles as a way to *remove* them.
+    //   3. Repo-wide contributors as the fallback so the picker is
+    //      never empty just because (1) was. Cached for 24h.
     const items: MultiPickerItem[] = [];
+    const seen = new Set<string>();
+    const skipSelf = (login: string) => me !== null && login === me;
     for (const s of row.pr.suggestedReviewers) {
+      if (skipSelf(s.login)) continue;
       const already = requested.has(s.login);
       const tags: string[] = [];
       if (already) tags.push("requested");
+      tags.push("suggested");
       if (s.isAuthor) tags.push("author");
       if (s.isCommenter) tags.push("commenter");
       items.push({
         key: s.login,
         label: s.login,
-        hint: tags.length > 0 ? `(${tags.join(", ")})` : undefined,
+        hint: `(${tags.join(", ")})`,
       });
+      seen.add(s.login);
     }
     for (const login of row.pr.requestedReviewers) {
-      if (items.some((it) => it.key === login)) continue;
+      if (seen.has(login)) continue;
+      if (skipSelf(login)) continue;
+      items.push({ key: login, label: login, hint: "(requested)" });
+      seen.add(login);
+    }
+    for (const c of contributors) {
+      if (seen.has(c.login)) continue;
+      if (skipSelf(c.login)) continue;
       items.push({
-        key: login,
-        label: login,
-        hint: "(requested)",
+        key: c.login,
+        label: c.login,
+        hint: `(${c.contributions} commits)`,
       });
+      seen.add(c.login);
     }
     if (items.length === 0) {
-      toast("no reviewer suggestions", theme.warn, 2000);
+      toast("no reviewer candidates", theme.warn, 2000);
       return;
     }
     setReviewerPicker({
@@ -857,7 +884,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.name === "v") {
-      openReviewerPicker(current.wt.slug);
+      void openReviewerPicker(current.wt.slug);
       return;
     }
     if (k.name === "e") {

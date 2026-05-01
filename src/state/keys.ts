@@ -17,6 +17,11 @@ export const qk = {
    */
   github: (branches: readonly string[]) =>
     ["github", [...branches].sort()] as const,
+  /**
+   * Repo-wide contributor list (sorted by commit count). Sits under
+   * `["github"]` so it clears alongside the PR fetch on `refreshGithub`.
+   */
+  contributors: () => ["github", "contributors"] as const,
   /** Per-worktree property namespace. */
   wt: (slug: string) =>
     ({

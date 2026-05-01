@@ -11,9 +11,15 @@ import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
 import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
-import { fetchGithub } from "../core/github.ts";
+import { fetchGithub, fetchRepoContributors } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
-import type { LockMeta, MergeQueueEntry, PullRequest, Worktree } from "../core/types.ts";
+import type {
+  Contributor,
+  LockMeta,
+  MergeQueueEntry,
+  PullRequest,
+  Worktree,
+} from "../core/types.ts";
 import { createLogger } from "../core/logger.ts";
 import { isOurStageDeployed } from "../core/stage-safety.ts";
 import { pluralize } from "../core/text.ts";
@@ -88,6 +94,20 @@ export const githubQuery = (branches: readonly string[]) =>
       };
     },
     staleTime: STALE.slow,
+  });
+
+/**
+ * Repo-wide contributor list. Fetched lazily on first reviewer-picker
+ * open; the staleTime is generous because the contributor set drifts
+ * slowly. Sits under the `["github"]` prefix so `refreshGithub()`
+ * clears it alongside the PR fetch.
+ */
+export const contributorsQuery = () =>
+  queryOptions({
+    queryKey: qk.contributors(),
+    queryFn: async (): Promise<Contributor[]> => fetchRepoContributors(),
+    staleTime: 24 * 60 * 60 * 1000,
+    gcTime: Number.POSITIVE_INFINITY,
   });
 
 // ---------- Per-worktree queries ----------
