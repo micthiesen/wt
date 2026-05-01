@@ -9,6 +9,7 @@ import {
   spawnBackgroundRemove,
 } from "../core/lifecycle.ts";
 import {
+  disableAutoMerge,
   editReviewers,
   enableAutoMerge,
   markPullRequestReady,
@@ -411,7 +412,7 @@ export function App({ onExit }: Props) {
     void refreshGithub();
   }
 
-  async function doAutoMerge(slug: string): Promise<void> {
+  async function doAutoMerge(slug: string, action: "enable" | "disable"): Promise<void> {
     const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row?.pr) {
@@ -419,14 +420,19 @@ export function App({ onExit }: Props) {
       return;
     }
     const prNumber = row.pr.number;
-    const result = await enableAutoMerge(prNumber);
+    const result =
+      action === "enable"
+        ? await enableAutoMerge(prNumber)
+        : await disableAutoMerge(prNumber);
     if (!result.ok) {
-      log.event.err(`auto-merge failed for #${prNumber}: ${result.error}`);
-      toast(`auto-merge failed: ${result.error}`, theme.err, 4000);
+      const verb = action === "enable" ? "auto-merge" : "disable auto-merge";
+      log.event.err(`${verb} failed for #${prNumber}: ${result.error}`);
+      toast(`${verb} failed: ${result.error}`, theme.err, 4000);
       return;
     }
-    log.event.ok(`auto-merge enabled for #${prNumber}`);
-    toast(`auto-merge enabled for #${prNumber}`, theme.ok, 2500);
+    const past = action === "enable" ? "enabled" : "disabled";
+    log.event.ok(`auto-merge ${past} for #${prNumber}`);
+    toast(`auto-merge ${past} for #${prNumber}`, theme.ok, 2500);
     void refreshGithub();
   }
 
@@ -510,7 +516,7 @@ export function App({ onExit }: Props) {
       }
       if (k.name === "space" || k.sequence === " ") {
         const item = reviewerPicker.items[reviewerPicker.index];
-        if (item && !item.locked) {
+        if (item) {
           const next = new Set(reviewerPicker.checked);
           if (next.has(item.key)) next.delete(item.key);
           else next.add(item.key);
@@ -681,8 +687,10 @@ export function App({ onExit }: Props) {
         setFooter({ kind: "legend" });
         if (pending === "d" && current) {
           void doRemove(current.wt.slug);
-        } else if (pending === "m" && current) {
-          void doAutoMerge(current.wt.slug);
+        } else if (pending === "m+" && current) {
+          void doAutoMerge(current.wt.slug, "enable");
+        } else if (pending === "m-" && current) {
+          void doAutoMerge(current.wt.slug, "disable");
         } else if (pending === "e" && current) {
           void doMarkReady(current.wt.slug);
         } else if (pending === "R") {
@@ -881,14 +889,19 @@ export function App({ onExit }: Props) {
         toast("PR is not open", theme.warn, 2000);
         return;
       }
+      // Toggle: if already armed, the same key prompts to disable.
       if (current.pr.autoMerge) {
-        toast(`auto-merge already enabled for #${current.pr.number}`, theme.info, 2000);
+        setFooter({
+          kind: "confirm",
+          message: `disable auto-merge for #${current.pr.number}? [y/N]`,
+          pendingKey: "m-",
+        });
         return;
       }
       setFooter({
         kind: "confirm",
         message: `merge when ready for #${current.pr.number}? [y/N]`,
-        pendingKey: "m",
+        pendingKey: "m+",
       });
       return;
     }

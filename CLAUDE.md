@@ -34,12 +34,13 @@ These define contracts. Touching them ripples; read them first.
 
 ## Working principles
 
-- **Source fetches stay batched.** The github source is one GraphQL round-trip aliasing PR + checks + review + merge queue per worktree. Never split it into per-row fetches; rate limits and latency are real.
+- **Source fetches stay batched.** The github source is one GraphQL round-trip aliasing every per-worktree PR field (state, checks, reviews, requested + suggested reviewers, auto-merge, merge-queue) plus the repo-level merge queue. Never split it into per-row fetches; rate limits and latency are real. New PR fields go into `PR_FRAGMENT` in `core/github.ts` rather than getting their own query.
 - **AI summary is content-addressed, not slug-addressed.** `aiSummaryQuery`'s key is `["aiSummary", <hash>]` so equivalent diffs share a cache entry across rebases, amends, and branch renames. `slug` is passed in for log attribution only — never bake it into the cache key, or you re-trigger the LLM every time someone renames a branch.
 - **Pluginify reactively.** Built-ins now, plugins only when there's a second concrete implementation that justifies the seam. Don't pre-design for "what if someone wants Jira."
 - **No client-app defaults in code.** `paths.main_clone`, `paths.worktree_root`, `branch.prefix` are required and the loader refuses to start without them. New required fields go through `Errors.reqStr`; add a derivation when one's natural (see `stage.prefix` defaulting from `branch.prefix`).
 - **Errors render verbatim, gated on retries-exhausted.** `firstError` in `details.tsx` already handles the gate (`error && !isFetching`) — don't duplicate it elsewhere. The same error showing on every row that depends on a broken source is intentional.
 - **Convention over configuration for the niche stuff.** `branch.id_pattern` exists but most users will never set it; the default matches Linear/Jira/Shortcut conventions.
+- **Mutating GitHub state? Invalidate `["github"]`, not the worktree.** TUI actions that hit `gh` for a write (auto-merge arm/disable, mark-ready, edit reviewers, …) must call `refreshGithub()` from `state/hooks.ts` so the badge flips immediately. `invalidateWorktree(slug)` looks plausible but the github query is keyed by branch list, not slug — it'll silently miss and the user will see stale state until the slow staleTime expires.
 
 ## Logging & debugging
 

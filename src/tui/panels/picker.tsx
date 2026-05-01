@@ -49,8 +49,6 @@ export type MultiPickerItem = {
   label: string;
   /** Optional dim suffix (e.g. "(requested)"). */
   hint?: string;
-  /** When true, the item is rendered checked and can't be toggled. */
-  locked?: boolean;
 };
 
 type MultiProps = {
@@ -89,15 +87,11 @@ export function MultiPickerModal({
       ) : null}
       {items.map((item, i) => {
         const cursor = i === selectedIndex;
-        const isChecked = item.locked || checked.has(item.key);
+        const isChecked = checked.has(item.key);
         const bg = cursor ? theme.rowSelectedBg : undefined;
         const fg = cursor ? theme.fgBright : theme.fg;
-        const box = item.locked ? "[x]" : isChecked ? "[x]" : "[ ]";
-        const boxFg = item.locked
-          ? theme.fgDim
-          : isChecked
-            ? theme.ok
-            : theme.fgDim;
+        const box = isChecked ? "[x]" : "[ ]";
+        const boxFg = isChecked ? theme.ok : theme.fgDim;
         return (
           <box
             key={item.key}

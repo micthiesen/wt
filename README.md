@@ -15,7 +15,7 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 
 **Optional, per integration**
 
-- `gh` (GitHub CLI, authenticated) — needed for the PR row (PR state, checks, review, merge queue). Also used to derive the repo's `nameWithOwner`.
+- `gh` (GitHub CLI, authenticated) — needed for the PR row (PR state, checks, review, merge queue, auto-merge state, suggested + requested reviewers) and for the in-TUI PR actions (arm/disable auto-merge, mark draft ready, edit reviewers). Also used to derive the repo's `nameWithOwner`.
 - `aws` CLI with a profile that can read your SST state bucket — needed when `[deploy.sst]` is configured (drives the stage row + `wt stages`).
 - `zed` CLI — needed for `wt open` and the `o` keybinding.
 - Linear — no CLI; the integration only constructs URLs from issue IDs in your branch slug.

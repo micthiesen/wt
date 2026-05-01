@@ -468,6 +468,27 @@ export type GhActionResult = { ok: true } | { ok: false; error: string };
 export type EnableAutoMergeResult = GhActionResult;
 
 /**
+ * Cancel a previously-armed "merge when ready" via
+ * `gh pr merge --disable-auto`. No-op on PRs that aren't currently
+ * armed; gh returns an error in that case which we surface verbatim.
+ */
+export async function disableAutoMerge(
+  prNumber: number,
+): Promise<GhActionResult> {
+  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
+  const r = await run(
+    ["gh", "pr", "merge", String(prNumber), "--disable-auto"],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  );
+  if (r.exitCode !== 0) {
+    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    log.error("disable auto-merge failed", { prNumber, msg });
+    return { ok: false, error: msg };
+  }
+  return { ok: true };
+}
+
+/**
  * Edit a PR's review requests via `gh pr edit`. Both `add` and
  * `remove` may be passed in the same call — gh accepts both flag
  * sets at once. Logins are users; team slugs use the `org/team-slug`

@@ -29,7 +29,7 @@ const SECTIONS: Section[] = [
       ["s", "open deployed app"],
       ["y", "yank menu (b/s/S/p/n/i)"],
       ["t", "regenerate AI summary"],
-      ["m", "merge when ready"],
+      ["m", "merge when ready (toggle)"],
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker)"],
       ["a", "archive / restore"],
