@@ -157,13 +157,27 @@ export function useWtActions() {
      * sees the current hash and we get exactly one LM call.
      */
     async refreshAiSummary(slug: string): Promise<boolean> {
-      if (!qc.getQueryData<DiffContext | null>(qk.wt(slug).diffContext())) {
+      // The diffContext key is now per-(slug, base) so a worktree can
+      // have multiple cached entries (trunk, parent A, parent B…) as
+      // its stack relationship evolves. Use prefix-matching to address
+      // every cached entry for this slug at once: the row aggregator
+      // observes only the *current* base, so on next render the live
+      // observer's refetch produces the up-to-date value regardless of
+      // which entries we touched here.
+      const prefix = ["wt", slug, "diffContext"] as const;
+      const existing = qc.getQueriesData<DiffContext | null>({
+        queryKey: prefix,
+      });
+      if (existing.length === 0 || existing.every(([, v]) => !v)) {
         return false;
       }
-      await qc.invalidateQueries({ queryKey: qk.wt(slug).diffContext() });
-      const fresh = qc.getQueryData<DiffContext | null>(
-        qk.wt(slug).diffContext(),
-      );
+      await qc.invalidateQueries({ queryKey: prefix });
+      const refreshed = qc.getQueriesData<DiffContext | null>({
+        queryKey: prefix,
+      });
+      const fresh = refreshed
+        .map(([, v]) => v)
+        .find((v): v is DiffContext => v != null);
       if (!fresh) return false;
       qc.removeQueries({ queryKey: qk.aiSummaryMemo(fresh.hash) });
       await qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });

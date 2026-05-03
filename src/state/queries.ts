@@ -7,6 +7,7 @@ import { type QueryClient, queryOptions } from "@tanstack/react-query";
 
 import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
+import { config } from "../core/config.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
@@ -14,6 +15,7 @@ import { gitActivity, type GitActivity } from "../core/git-activity.ts";
 import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
 import { fetchGithub, fetchRepoContributors } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
+import { detectStacks, type StackMap } from "../core/stack.ts";
 import type {
   Contributor,
   LockMeta,
@@ -160,12 +162,17 @@ export const wtGoneQuery = (wt: Pick<Worktree, "slug" | "branch">) =>
     staleTime: STALE.mid,
   });
 
-export const wtSyncQuery = (wt: Pick<Worktree, "slug" | "path">) =>
-  queryOptions({
-    queryKey: qk.wt(wt.slug).sync(),
-    queryFn: async (): Promise<SyncState> => syncState(wt.path),
+export const wtSyncQuery = (
+  wt: Pick<Worktree, "slug" | "path">,
+  effectiveBase?: string | null,
+) => {
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  return queryOptions({
+    queryKey: qk.wt(wt.slug).sync(base),
+    queryFn: async (): Promise<SyncState> => syncState(wt.path, base),
     staleTime: STALE.mid,
   });
+};
 
 export const wtClaudeQuery = (wt: Pick<Worktree, "slug" | "path">) =>
   queryOptions({
@@ -179,13 +186,18 @@ export const wtClaudeQuery = (wt: Pick<Worktree, "slug" | "path">) =>
     refetchInterval: 5_000,
   });
 
-export const wtGitActivityQuery = (wt: Pick<Worktree, "slug" | "path" | "branch">) =>
-  queryOptions({
-    queryKey: qk.wt(wt.slug).gitActivity(),
+export const wtGitActivityQuery = (
+  wt: Pick<Worktree, "slug" | "path" | "branch">,
+  effectiveBase?: string | null,
+) => {
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  return queryOptions({
+    queryKey: qk.wt(wt.slug).gitActivity(base),
     queryFn: async (): Promise<GitActivity> =>
-      gitActivity({ path: wt.path, branch: wt.branch }),
+      gitActivity({ path: wt.path, branch: wt.branch }, base),
     staleTime: STALE.mid,
   });
+};
 
 /**
  * Subject of the oldest commit on the branch — fallback title when
@@ -204,13 +216,49 @@ export const wtFirstCommitQuery = (wt: Pick<Worktree, "slug" | "path">) =>
  * memory (not serialised to the cache, since it can be megabytes).
  * Local + fast — silent in normal operation, like the other per-wt
  * git queries.
+ *
+ * `effectiveBase` defaults to `origin/<config.branch.base>` (trunk).
+ * For stacked worktrees the row aggregator passes the parent's branch
+ * instead so the diff reflects only this PR's contribution. The query
+ * key includes the base so a base flip triggers a refetch via cache
+ * miss rather than relying on invalidation.
  */
-export const wtDiffContextQuery = (wt: Pick<Worktree, "slug" | "path">) =>
-  queryOptions({
-    queryKey: qk.wt(wt.slug).diffContext(),
-    queryFn: async (): Promise<DiffContext | null> => buildDiffContext(wt.path),
+export const wtDiffContextQuery = (
+  wt: Pick<Worktree, "slug" | "path">,
+  effectiveBase?: string | null,
+) => {
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  return queryOptions({
+    queryKey: qk.wt(wt.slug).diffContext(base),
+    queryFn: async (): Promise<DiffContext | null> =>
+      buildDiffContext(wt.path, base),
     staleTime: STALE.mid,
   });
+};
+
+/**
+ * Cross-worktree stack detection. Walks commit ancestry once for the
+ * full worktree set and returns a map of child-slug → parent {slug,
+ * branch}. Single source of truth for the "is this stacked on another
+ * worktree" question — the row aggregator combines this with the PR's
+ * `baseRefName` (declarative fallback) to produce `stackedOn`.
+ *
+ * Keyed by the sorted branch list (mirrors the github query) so
+ * worktree churn re-triggers detection. SHA drift inside a fixed branch
+ * set is picked up by the `STALE.mid` staleTime — short enough that a
+ * just-pushed commit re-classifies as a parent within ~15s, long enough
+ * to not thrash on every render.
+ */
+export const stackQuery = (worktrees: readonly Worktree[]) => {
+  const branches = worktrees
+    .filter((w) => !w.isMain && w.branch)
+    .map((w) => w.branch);
+  return queryOptions({
+    queryKey: qk.stack(branches),
+    queryFn: async (): Promise<StackMap> => detectStacks(worktrees),
+    staleTime: STALE.mid,
+  });
+};
 
 /**
  * AI summary value as stored in the slug-keyed cache. The hash rides

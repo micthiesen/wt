@@ -274,8 +274,18 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
   // *description* and the per-fetch state for the spinner / error
   // gating, neither of which is exposed on `WorktreeRow`. The resolved
   // title itself comes pre-computed from the row.
+  //
+  // Effective base must match the one `useWorktreeRows` used or the two
+  // observers fight: each writes to a different per-(slug, base) cache
+  // entry, the AI memo lookup hashes differently, and the LM Studio
+  // call would re-run every time the details pane mounts for a stacked
+  // worktree. Only the commit-ancestry signal feeds the diff base —
+  // PR-base alone (via: "pr") doesn't, since it can be stale or
+  // unrebased. Mirrors `effectiveBaseFor` in `useWorktreeRows`.
+  const stackedBase =
+    row.stackedOn?.via === "commits" ? row.stackedOn.branch : null;
   const diffCtx = useQuery({
-    ...wtDiffContextQuery(row.wt),
+    ...wtDiffContextQuery(row.wt, stackedBase),
     enabled: allowFetch,
   });
 

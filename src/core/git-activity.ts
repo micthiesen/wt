@@ -8,9 +8,13 @@ export type GitActivity = {
   createdMs: number | null;
   /** Most recent commit on HEAD (epoch ms). null if no commits / branch detached etc. */
   lastCommitMs: number | null;
-  /** Diff stats vs origin/main: file count + lines added / removed.
-   *  null if the diff command fails (e.g. main branch missing locally,
-   *  worktree path gone). All zero when the branch is identical to main. */
+  /** Diff stats vs the effective base: file count + lines added / removed.
+   *  Effective base is `origin/<config.branch.base>` for trunk-targeted
+   *  branches and the parent worktree's branch for stacked ones — same
+   *  resolution rule as the AI summary diff, so the row reports the
+   *  contribution of *this* PR, not parent + this combined.
+   *  null if the diff command fails (e.g. base branch missing locally,
+   *  worktree path gone). All zero when the branch is identical to base. */
   diff: { files: number; added: number; removed: number } | null;
 };
 
@@ -36,15 +40,18 @@ async function lastCommitMsFor(path: string): Promise<number | null> {
   return secs * 1000;
 }
 
-// Three-dot range: changes on HEAD not on origin/main, ignoring main's own
-// post-branch commits.
+// Three-dot range: changes on HEAD not on `base`, ignoring base's own
+// post-branch commits. `base` is the effective base — trunk for
+// unstacked, parent branch for stacked — so the count reflects this
+// branch's actual contribution.
 async function diffFor(
   path: string,
   branch: string,
+  base: string,
 ): Promise<{ files: number; added: number; removed: number } | null> {
   if (!branch) return null;
   const r = await run(
-    ["git", "diff", "--shortstat", `origin/${config.branch.base}...HEAD`],
+    ["git", "diff", "--shortstat", `${base}...HEAD`],
     { cwd: path, timeoutMs: TIMEOUT_MS },
   );
   if (r.exitCode !== 0) return null;
@@ -60,11 +67,15 @@ async function diffFor(
   };
 }
 
-export async function gitActivity(wt: { path: string; branch: string }): Promise<GitActivity> {
+export async function gitActivity(
+  wt: { path: string; branch: string },
+  effectiveBase?: string | null,
+): Promise<GitActivity> {
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
   const [createdMs, lastCommitMs, diff] = await Promise.all([
     Promise.resolve(createdMsFor(wt.path)),
     lastCommitMsFor(wt.path).catch(() => null),
-    diffFor(wt.path, wt.branch).catch(() => null),
+    diffFor(wt.path, wt.branch, base).catch(() => null),
   ]);
   return { createdMs, lastCommitMs, diff };
 }

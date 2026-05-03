@@ -73,9 +73,22 @@ export type DiffContext = {
   filesTotal: number;
 };
 
-export async function buildDiffContext(wtPath: string): Promise<DiffContext | null> {
+/**
+ * `effectiveBase` lets stacked worktrees diff against their parent
+ * branch instead of trunk, so the LLM summary describes only the
+ * commits this PR adds on top of its parent (not duplicate work the
+ * parent already did). Pass `null`/omit for trunk-based worktrees and
+ * the loader defaults to `origin/<config.branch.base>`. The hash
+ * preimage includes the base, so the AI memo cache stays correct
+ * across base changes — equivalent diffs against different bases hash
+ * to different keys.
+ */
+export async function buildDiffContext(
+  wtPath: string,
+  effectiveBase?: string | null,
+): Promise<DiffContext | null> {
   if (!config.ai) return null;
-  const base = `origin/${config.branch.base}`;
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
 
   const stat = await diffStat(wtPath, base);
   // No committed changes against base means there's nothing for the

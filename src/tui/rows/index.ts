@@ -6,6 +6,7 @@
  * to `REGISTRY`. The default order in `config.ts` decides where it
  * sits when the user hasn't customized `ui.rows`.
  */
+import { baseRow } from "./base.tsx";
 import { branchRow } from "./branch.tsx";
 import { claudeRow } from "./claude.tsx";
 import { gitRow } from "./git.tsx";
@@ -17,6 +18,7 @@ import type { RowModule } from "./types.ts";
 
 const REGISTRY: readonly RowModule[] = [
   branchRow,
+  baseRow,
   pathRow,
   linearRow,
   stageRow,

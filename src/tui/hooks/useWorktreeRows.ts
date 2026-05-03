@@ -16,6 +16,7 @@ import { qk } from "../../state/keys.ts";
 import {
   aiSummaryQuery,
   archiveQuery,
+  stackQuery,
   worktreesQuery,
   wtClaudeQuery,
   wtDeployQuery,
@@ -59,12 +60,36 @@ export type WorktreeFields = {
   gitActivity: FieldState<GitActivity>;
 };
 
+/**
+ * Stack relationship for a worktree. Populated when this worktree is
+ * built on top of another's branch (commit-ancestry signal) or its PR
+ * declares another branch as its base (declarative fallback). `via`
+ * disambiguates the two: commit-signal is ground truth (the work
+ * literally builds on the parent); PR-base fires when GitHub says so
+ * but the local branch isn't actually based on it (rebase pending,
+ * stale PR base, etc.). `slug` is `null` for PR-base hits where the
+ * declared base isn't another worktree in the list — the consumer can
+ * still use `branch` for diffing but has no row to draw a UI hint to.
+ */
+export type StackedOn = {
+  slug: string | null;
+  branch: string;
+  via: "commits" | "pr";
+};
+
 export type WorktreeRow = {
   wt: Worktree;
   fields: WorktreeFields;
   status: Status;
   pr?: PullRequest;
   mq?: MergeQueueEntry;
+  /**
+   * Resolved stack parent. `null` for trunk-targeted worktrees. Drives
+   * the diff base for `wtDiffContextQuery` (so the AI summary describes
+   * only what this PR adds on top of its parent) and the "↑" hint in
+   * the worktree list when the parent is the row immediately above.
+   */
+  stackedOn: StackedOn | null;
   anyFetching: boolean;
   archived: boolean;
   /**
@@ -157,6 +182,12 @@ function statusEq(a: Status, b: Status): boolean {
   );
 }
 
+function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.slug === b.slug && a.branch === b.branch && a.via === b.via;
+}
+
 function deriveStatus(
   wt: Worktree,
   fields: WorktreeFields,
@@ -206,16 +237,44 @@ export function useWorktreeRows(): WorktreeRowsResult {
 
   const worktrees = (wtList.data ?? []).filter((w) => !w.isMain);
 
-  const queries = worktrees.flatMap((wt) => [
-    wtDirtyQuery(wt),
-    wtLockQuery(wt),
-    wtDeployQuery(wt),
-    wtMergedQuery(wt),
-    wtGoneQuery(wt),
-    wtSyncQuery(wt),
-    wtClaudeQuery(wt),
-    wtGitActivityQuery(wt),
-  ]);
+  // Stack detection runs once for the full set; the result is shared
+  // across all per-worktree consumers below (effective diff base, the
+  // `stackedOn` field on rows). Keyed by branch list so worktree churn
+  // re-triggers; SHA drift inside a fixed set is caught by staleTime.
+  const stack = useQuery({
+    ...stackQuery(wtList.data ?? []),
+    enabled: !!wtList.data && wtList.data.length > 0,
+  });
+
+  /**
+   * Resolve the effective diff base for a worktree. Commit-signal
+   * (parent worktree's branch) wins over PR-base (declarative); both
+   * fall through to trunk. Branch names are passed raw to git, which
+   * resolves them as local refs — exactly what we want for stacked
+   * work where the parent's tip may be ahead of any pushed state.
+   */
+  const effectiveBaseFor = (wt: Worktree): string | null => {
+    const fromCommits = stack.data?.[wt.slug];
+    if (fromCommits) return fromCommits.branch;
+    return null;
+  };
+
+  const queries = worktrees.flatMap((wt) => {
+    // Resolve once per worktree so the sync + activity queries land in
+    // the same cache slot (matching base) and `useQueries` doesn't see
+    // identity drift from two unrelated `effectiveBaseFor` calls.
+    const base = effectiveBaseFor(wt);
+    return [
+      wtDirtyQuery(wt),
+      wtLockQuery(wt),
+      wtDeployQuery(wt),
+      wtMergedQuery(wt),
+      wtGoneQuery(wt),
+      wtSyncQuery(wt, base),
+      wtClaudeQuery(wt),
+      wtGitActivityQuery(wt, base),
+    ];
+  });
 
   // `combine` runs on every render with the latest results — cheap since
   // `useQueries` caches identity.
@@ -238,7 +297,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
 
   const diffResults = useQueries({
     queries: worktrees.map((wt, i) => ({
-      ...wtDiffContextQuery(wt),
+      ...wtDiffContextQuery(wt, effectiveBaseFor(wt)),
       enabled: !busyByIndex[i],
     })),
   });
@@ -302,6 +361,29 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
     const pr = pickPrForWorktree(wt, github.data?.prs);
     const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
+    // stackedOn: commit-signal wins, PR base is the fallback when no
+    // local-ancestor parent was found. PR base is ignored when it
+    // matches trunk (the implicit baseline).
+    let stackedOn: StackedOn | null = null;
+    const stackParent = stack.data?.[wt.slug];
+    if (stackParent) {
+      stackedOn = {
+        slug: stackParent.slug,
+        branch: stackParent.branch,
+        via: "commits",
+      };
+    } else if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
+      // The PR declares a non-trunk base. Try to associate it with a
+      // worktree slug so the UI can draw a connector when that
+      // worktree happens to sit immediately above; if no match,
+      // `slug: null` preserves the diff hint without a row anchor.
+      const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
+      stackedOn = {
+        slug: parentWt?.slug ?? null,
+        branch: pr.baseRefName,
+        via: "pr",
+      };
+    }
     // Include the combined GitHub fetch that feeds the details pane
     // so the row glyph lights up whenever anything visible for this
     // worktree is refreshing — not just the per-worktree fields. That
@@ -360,16 +442,23 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.title === title &&
       prev.titleSource === titleSource &&
       prev.brief === llmBrief &&
-      prev.section === section
+      prev.section === section &&
+      stackedOnEq(prev.stackedOn, stackedOn)
     ) {
       return prev;
     }
+    // Reuse prev's stackedOn reference when value-equal so memoized
+    // children downstream skip the work.
+    const stackedOnOut = prev && stackedOnEq(prev.stackedOn, stackedOn)
+      ? prev.stackedOn
+      : stackedOn;
     const next: WorktreeRow = {
       wt,
       fields,
       status,
       pr,
       mq,
+      stackedOn: stackedOnOut,
       anyFetching,
       archived,
       title,

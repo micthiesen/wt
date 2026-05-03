@@ -91,6 +91,12 @@ export type PullRequest = {
   number: number;
   url: string;
   headRefName: string;
+  /**
+   * The branch this PR targets. `config.branch.base` for trunk-targeted PRs;
+   * another worktree's branch for stacked PRs. Used as a fallback signal for
+   * `stackedOn` when commit-walk detection (the stronger signal) finds nothing.
+   */
+  baseRefName: string;
   /** Human-authored PR title; preferred title source for the details pane. */
   title: string;
   isDraft: boolean;

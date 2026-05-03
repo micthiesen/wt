@@ -106,6 +106,7 @@ fragment PrFields on PullRequest {
   url
   title
   headRefName
+  baseRefName
   isDraft
   state
   mergedAt
@@ -248,6 +249,7 @@ type GqlPrNode = {
   url: string;
   title: string;
   headRefName: string;
+  baseRefName: string;
   isDraft: boolean;
   state: PullRequest["state"];
   mergedAt: string | null;
@@ -354,6 +356,7 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     url: pr.url,
     title: pr.title,
     headRefName: pr.headRefName,
+    baseRefName: pr.baseRefName,
     isDraft: pr.isDraft,
     state: pr.state,
     checks: rollupChecks(contexts),

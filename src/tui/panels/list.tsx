@@ -149,11 +149,21 @@ const RowView = memo(function RowView({
   selected,
   isTailing,
   panelWidth,
+  stackParentAbove,
 }: {
   row: WorktreeRow;
   selected: boolean;
   isTailing: boolean;
   panelWidth: number;
+  /**
+   * True when the row immediately above is the worktree this one is
+   * stacked on (commit-signal), in the same section, not archived.
+   * When true, the PR badge slot renders the "↑" angles-up glyph
+   * instead of the usual PR-state icon — a quiet hint that manual
+   * order matches the actual stack. Width and color are unchanged so
+   * the badge cluster stays aligned with rows that show the PR icon.
+   */
+  stackParentAbove: boolean;
 }) {
   const bg = selected ? theme.rowSelectedBg : undefined;
   // Archived rows render dim (unless selected, where we still want
@@ -238,7 +248,9 @@ const RowView = memo(function RowView({
           ) : null}
           {row.pr ? (
             <box width={2} flexShrink={0}>
-              <text fg={prFg}>{prb.glyph}</text>
+              <text fg={prFg}>
+                {stackParentAbove ? NF.anglesUp : prb.glyph}
+              </text>
             </box>
           ) : null}
           {showChecks ? (
@@ -325,6 +337,21 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
             const prev = i > 0 ? activeRows[i - 1] : undefined;
             const sectionChanged = (prev?.section ?? null) !== row.section;
             const showDivider = sectionChanged && row.section !== null;
+            // Stack-parent hint fires only when the row immediately
+            // above is the actual parent worktree, sits in the same
+            // section, and isn't archived. Honors manual ordering
+            // without enforcing it: when the user happens to place a
+            // stack contiguously, the "↑" lights up; otherwise the
+            // normal PR badge stays put. The condition explicitly
+            // requires `row.pr` because the hint replaces the PR
+            // glyph slot — without a PR there's no slot to swap.
+            const stackParentAbove =
+              !!row.pr &&
+              !!row.stackedOn &&
+              !!prev &&
+              !sectionChanged &&
+              !prev.archived &&
+              prev.wt.slug === row.stackedOn.slug;
             return (
               <Fragment key={row.wt.slug}>
                 {showDivider ? (
@@ -338,6 +365,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                   selected={i === selectedIndex}
                   isTailing={activeTails.has(row.wt.slug)}
                   panelWidth={width}
+                  stackParentAbove={stackParentAbove}
                 />
               </Fragment>
             );
@@ -349,6 +377,10 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
               <Divider label="archived" width={width} />
               {archivedRows.map((row, i) => {
                 const globalIndex = activeRows.length + i;
+                // Archived rows never show the stack hint — the
+                // archive block is a flat list with a hard divider
+                // above it, so any "above me" relationship across
+                // that divider would be misleading.
                 return (
                   <RowView
                     key={row.wt.slug}
@@ -356,6 +388,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
                     panelWidth={width}
+                    stackParentAbove={false}
                   />
                 );
               })}

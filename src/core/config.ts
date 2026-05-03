@@ -132,7 +132,7 @@ const GENERIC_DEFAULTS = {
     timeoutMs: 120_000,
   },
   ui: {
-    rows: ["branch", "path", "linear", "stage", "pr", "claude", "git"] as const,
+    rows: ["branch", "base", "linear", "stage", "pr", "claude", "git"] as const,
   },
 };
 

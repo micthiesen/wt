@@ -63,7 +63,12 @@ function resolveStage(path: string, slug: string): string {
 
 export type SyncCounts = { ahead: number; behind: number };
 export type SyncState = {
-  /** HEAD vs origin/main — "how far has this branch diverged from base?" */
+  /**
+   * HEAD vs the effective base. For trunk-targeted branches that's
+   * `origin/<config.branch.base>`; for stacked branches it's the
+   * parent worktree's branch — same resolution as the diff base, so
+   * "behind" reads as "behind your actual base," not "behind trunk."
+   */
   main: SyncCounts;
   /** HEAD vs @{u} — null when the branch has no upstream (never pushed). */
   remote: SyncCounts | null;
@@ -89,11 +94,20 @@ async function countsFor(
 }
 
 /**
- * Ahead/behind of HEAD vs both origin/main and the branch's own
+ * Ahead/behind of HEAD vs both the effective base and the branch's own
  * upstream. `remote` is null when the branch has never been pushed.
+ *
+ * `effectiveBase` defaults to `origin/<config.branch.base>` (trunk).
+ * Stacked worktrees pass the parent's branch instead so the brackets
+ * read as "vs your actual base" rather than "vs main." Mirrors the
+ * effective-base resolution used by the diff context.
  */
-export async function syncState(wtPath: string): Promise<SyncState> {
-  const main = await countsFor(wtPath, `origin/${config.branch.base}...HEAD`);
+export async function syncState(
+  wtPath: string,
+  effectiveBase?: string | null,
+): Promise<SyncState> {
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  const main = await countsFor(wtPath, `${base}...HEAD`);
   const hasUpstream = await runQuiet(
     ["git", "rev-parse", "--abbrev-ref", "@{u}"],
     { cwd: wtPath },
