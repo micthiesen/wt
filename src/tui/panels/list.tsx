@@ -118,6 +118,8 @@ function badgeClusterCells(row: WorktreeRow): number {
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (refreshing) cells += 2;
+  if (rabbitHint(row)) cells += 2;
+  if (reviewHint(row)) cells += 2;
   if (row.pr) cells += 2;
   if (showChecks) cells += 2;
   if (row.mq) cells += 4;
@@ -141,6 +143,54 @@ function checkGlyph(row: WorktreeRow): { glyph: string; fg: string } {
       return { glyph: NF.checkPend, fg: theme.warn };
     default:
       return { glyph: "  ", fg: theme.fgDim };
+  }
+}
+
+/**
+ * Human-review hint. Glyph SHAPE varies by state (thumbs up/down,
+ * hourglass, eye) so the badge is readable without relying on color.
+ * Same gate as `pr.tsx`'s `reviewLabel` + `buildPrSegments`: OPEN,
+ * non-draft, review state non-null. Glyphs match the details pane
+ * exactly so the list teaches itself by reading the details pane once
+ * (per `badges.ts` rule #1).
+ */
+function reviewHint(row: WorktreeRow): { glyph: string; fg: string } | null {
+  const pr = row.pr;
+  if (!pr || pr.state !== "OPEN" || pr.isDraft) return null;
+  switch (pr.review) {
+    case "approved":
+      return { glyph: NF.thumbsUp, fg: theme.ok };
+    case "changes_requested":
+      return { glyph: NF.thumbsDown, fg: theme.err };
+    case "pending":
+      return { glyph: NF.hourglass, fg: theme.warn };
+    case "unrequested":
+      return { glyph: NF.eye, fg: theme.fgDim };
+    default:
+      return null;
+  }
+}
+
+/**
+ * CodeRabbit hint. Single carrot glyph, color-coded by state. Color is
+ * load-bearing here (the deliberate "if possible" exception in
+ * `badges.ts` rule #1) — carrot has no clean state-specific variants. Same gate as review (OPEN, not draft) plus rollup must
+ * report an active state. Draft-hide also sidesteps the "review
+ * skipped" → mis-classified-as-clean issue described in
+ * `rabbitLabel`'s docstring.
+ */
+function rabbitHint(row: WorktreeRow): { glyph: string; fg: string } | null {
+  const pr = row.pr;
+  if (!pr || pr.state !== "OPEN" || pr.isDraft) return null;
+  switch (pr.rabbit.state) {
+    case "unresolved":
+      return { glyph: NF.carrot, fg: theme.warn };
+    case "pending":
+      return { glyph: NF.carrot, fg: theme.warn };
+    case "clean":
+      return { glyph: NF.carrot, fg: theme.ok };
+    default:
+      return null;
   }
 }
 
@@ -192,6 +242,10 @@ const RowView = memo(function RowView({
   const showChecks =
     row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
+  const rabbit = rabbitHint(row);
+  const review = reviewHint(row);
+  const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
+  const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
   const hasAnyBadge = refreshing || !!(row.pr || row.mq || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
@@ -244,6 +298,22 @@ const RowView = memo(function RowView({
           {refreshing ? (
             <box width={2} flexShrink={0}>
               <Spinner fg={theme.fgDim} />
+            </box>
+          ) : null}
+          {/* CR and review hints sit immediately to the left of the
+              PR icon so the eye reads "[cr] [review] [pr]" as a
+              tight cluster of "what's the state of this PR" signals.
+              Each is omitted entirely when its hint helper returns
+              null, so a row with no review activity collapses cleanly
+              instead of leaving dead space. */}
+          {rabbit ? (
+            <box width={2} flexShrink={0}>
+              <text fg={rabbitFg}>{rabbit.glyph}</text>
+            </box>
+          ) : null}
+          {review ? (
+            <box width={2} flexShrink={0}>
+              <text fg={reviewFg}>{review.glyph}</text>
             </box>
           ) : null}
           {row.pr ? (
