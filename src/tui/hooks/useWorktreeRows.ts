@@ -1,5 +1,5 @@
-import { useRef } from "react";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { ClaudeStatus } from "../../core/claude.ts";
 import { config } from "../../core/config.ts";
@@ -12,6 +12,7 @@ import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from ".
 import { StatusKind } from "../../core/types.ts";
 import type { SyncState } from "../../core/worktree.ts";
 import { useGithub } from "../../state/hooks.ts";
+import { qk } from "../../state/keys.ts";
 import {
   aiSummaryQuery,
   archiveQuery,
@@ -189,6 +190,7 @@ function deriveStatus(
  * back into a row per worktree with a derived `Status`.
  */
 export function useWorktreeRows(): WorktreeRowsResult {
+  const qc = useQueryClient();
   const wtList = useQuery(worktreesQuery());
   const github = useGithub();
   const archive = useQuery(archiveQuery());
@@ -245,11 +247,32 @@ export function useWorktreeRows(): WorktreeRowsResult {
     queries: worktrees.map((wt, i) => {
       const ctx = diffResults[i]?.data ?? null;
       return {
-        ...aiSummaryQuery(wt.slug, ctx),
+        ...aiSummaryQuery(qc, wt.slug, ctx),
         enabled: aiEnabled && !busyByIndex[i] && !!ctx,
       };
     }),
   });
+
+  // Slug-keyed cache means the queryFn won't re-run on its own when
+  // the diff changes — the queryKey is unchanged. Detect drift here
+  // and invalidate; the observer's refetch picks up the new closure
+  // (with the new ctx hash) and the queryFn either hits the memo or
+  // calls LM Studio. During the refetch, `data` keeps the prior
+  // summary visible, which is the whole point of slug-keying.
+  const mismatchSig = worktrees
+    .map((wt, i) => {
+      const dataHash = aiResults[i]?.data?.hash;
+      const ctxHash = diffResults[i]?.data?.hash;
+      return dataHash && ctxHash && dataHash !== ctxHash ? wt.slug : "";
+    })
+    .filter(Boolean)
+    .join("|");
+  useEffect(() => {
+    if (!mismatchSig) return;
+    for (const slug of mismatchSig.split("|")) {
+      void qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });
+    }
+  }, [mismatchSig, qc]);
 
   // First-commit subject — non-AI fallback for the title resolution
   // chain. Cheap (one `git log`); paused only while busy so we don't

@@ -12,7 +12,11 @@ export const CACHE_DB = config.paths.cacheDb;
 // raw string; old entries can't be rehydrated cleanly.
 // v3: aiSummaryQuery added a required `brief` field; old entries
 // would deserialise without it and break consumers.
-const CACHE_BUSTER = "v3";
+// v4: aiSummaryQuery moved from hash-keyed to slug-keyed with a
+// separate hash-keyed memo. Old `["aiSummary", <hash>]` entries
+// would never be looked up under the new shape and would just sit
+// dead in the persisted blob.
+const CACHE_BUSTER = "v4";
 
 /**
  * Build a QueryClient with TUI-friendly defaults and wire up the
@@ -43,14 +47,25 @@ export function createWtQueryClient(): WtQueryClient {
     },
   });
 
+  // The content-addressed AI summary memo is written via `setQueryData`
+  // and never observed directly, so it has no inline `queryOptions` to
+  // carry gcTime. Pin the family to `Infinity` here so memo entries
+  // survive across runs and across the (frequent) periods where no
+  // observer references that hash.
+  client.setQueryDefaults(["aiSummaryMemo"], {
+    gcTime: Number.POSITIVE_INFINITY,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+
   const persister = createSqlitePersister(CACHE_DB);
   const [unsubscribe, restored] = persistQueryClient({
     queryClient: client,
     persister,
-    // Long enough that content-addressed AI summaries (`aiSummaryQuery`)
-    // survive across the lifetime of a typical worktree without forcing
-    // a regen. Other queries restore-then-immediately-refetch on their
-    // own staleTime, so a longer maxAge has no downside for them.
+    // Long enough that AI summaries (slug-keyed primary +
+    // content-addressed memo) survive across the lifetime of a typical
+    // worktree without forcing a regen. Other queries
+    // restore-then-immediately-refetch on their own staleTime, so a
+    // longer maxAge has no downside for them.
     maxAge: 30 * 24 * 60 * 60 * 1000,
     buster: CACHE_BUSTER,
   });

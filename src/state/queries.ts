@@ -3,7 +3,7 @@
  * returns a `queryOptions(...)` result, which gives strong type
  * inference from queryKey → queryFn return type at the hook site.
  */
-import { queryOptions } from "@tanstack/react-query";
+import { type QueryClient, queryOptions } from "@tanstack/react-query";
 
 import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
@@ -213,33 +213,60 @@ export const wtDiffContextQuery = (wt: Pick<Worktree, "slug" | "path">) =>
   });
 
 /**
- * AI-generated summary of the diff. Keyed by content hash so equivalent
- * diffs share a cache entry across rebase / amend / branch rename. The
- * `prompt` is consumed by the queryFn but not part of the key — it's
- * fully determined by the hash. Pass `null` when the diff context isn't
- * ready; the caller is expected to pair this with `enabled: !!ctx`, in
- * which case the placeholder queryFn never runs.
+ * AI summary value as stored in the slug-keyed cache. The hash rides
+ * along inside the value so consumers can detect drift (current diff
+ * hash vs. cached summary's hash) and decide when to invalidate.
+ */
+export type AiSummaryWithHash = AiSummary & { hash: string };
+
+/**
+ * AI-generated summary of the diff. Keyed by `slug` so observers keep
+ * showing the previous summary while a refetch is in flight (the
+ * alternative — hashing the queryKey — blanks the brief during the gap
+ * because the new key has no cache entry yet).
  *
- * Activity-pane logging mirrors the GitHub-fetch pattern (see
- * `tui/fetch-log.ts`): one start line and one done/failed line per
- * call. Char count on the start line so slow/large prompts stand out;
- * duration on the done line so slow models do too. `slug` is for log
- * attribution only; cache identity is purely content-based.
+ * Cross-diff sharing comes from a content-addressed memo
+ * (`qk.aiSummaryMemo(hash)`) the queryFn checks before calling LM
+ * Studio: equivalent diffs across rebases / amends / branch renames
+ * reuse the prior result without a new round-trip. The memo is written
+ * after every successful call and never observed directly; it persists
+ * via the standard QueryClient dehydration.
+ *
+ * Pass `null` for `ctx` when the diff context isn't ready; the caller
+ * is expected to pair this with `enabled: !!ctx`, in which case the
+ * queryFn never runs and emits its early `null`.
+ *
+ * Hash-mismatch invalidation lives in the consumer hooks (a small
+ * effect comparing `data.hash` to the live `ctx.hash`) rather than
+ * here — the queryFn doesn't get re-run by react-query just because
+ * its closure changed; it needs an explicit invalidate to pick up a
+ * new hash.
+ *
+ * Activity-pane logging mirrors the GitHub-fetch pattern: one start
+ * line and one done/failed line per call. Memo hits log dim so a
+ * cross-rebase reuse is visible without being noisy.
  */
 export const aiSummaryQuery = (
+  qc: QueryClient,
   slug: string,
   ctx: { hash: string; prompt: string } | null,
 ) =>
   queryOptions({
-    queryKey: ctx ? qk.aiSummary(ctx.hash) : qk.aiSummary("_pending"),
-    queryFn: async (): Promise<AiSummary | null> => {
+    queryKey: qk.aiSummary(slug),
+    queryFn: async (): Promise<AiSummaryWithHash | null> => {
       if (!ctx) return null;
+      const memoed = qc.getQueryData<AiSummary>(qk.aiSummaryMemo(ctx.hash));
+      if (memoed) {
+        aiLog.event.dim(`reused memoed summary for ${slug}`);
+        return { hash: ctx.hash, ...memoed };
+      }
       aiLog.event.dim(`calling LM Studio for ${slug} (${pluralize(ctx.prompt.length, "char")})...`);
       const start = Date.now();
       try {
         const out = await summarizeDiff(ctx.prompt);
         aiLog.event.dim(`called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
-        return out;
+        qc.setQueryData<AiSummary>(qk.aiSummaryMemo(ctx.hash), out);
+        return { hash: ctx.hash, ...out };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         aiLog.event.err(
@@ -248,9 +275,8 @@ export const aiSummaryQuery = (
         throw err;
       }
     },
-    // Content-addressed: once we have a summary for a hash it never
-    // becomes "stale" — only a different diff (different hash, different
-    // queryKey) drives a new fetch.
+    // Slug identity is stable; refetch is driven exclusively by the
+    // hash-mismatch effect in the consumer (or by `refreshAiSummary`).
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: Number.POSITIVE_INFINITY,
   });

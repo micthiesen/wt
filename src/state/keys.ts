@@ -38,10 +38,21 @@ export const qk = {
       diffContext: () => ["wt", slug, "diffContext"] as const,
     }) as const,
   /**
-   * AI summary, content-addressed by diff hash. Stable across rebases
-   * and branch renames — equivalent diffs share a cache entry.
+   * AI summary keyed by worktree slug. Value carries the diff hash
+   * inline (`{hash, title, brief, description}`); cross-diff sharing
+   * lives in the memo below. Slug-stable so observers keep showing
+   * the previous summary while a refetch is in flight after a diff
+   * change — switching to a hash-based key would blank the brief
+   * during the gap.
    */
-  aiSummary: (hash: string) => ["aiSummary", hash] as const,
+  aiSummary: (slug: string) => ["aiSummary", slug] as const,
+  /**
+   * Content-addressed memo of LM Studio responses. Written by
+   * `aiSummaryQuery` after a successful call; never observed directly.
+   * Lets equivalent diffs across rebases / amends / branch renames
+   * reuse the prior result without a new LM Studio round-trip.
+   */
+  aiSummaryMemo: (hash: string) => ["aiSummaryMemo", hash] as const,
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
   /** Per-slug section + manual order (fs-backed). */

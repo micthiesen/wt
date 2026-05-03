@@ -105,13 +105,11 @@ export function useWtActions() {
       // clear — kick it off explicitly so the first-parents cache gets
       // repopulated alongside the observed queries.
       void qc.fetchQuery(fetchOriginQuery());
-      // Belt-and-suspenders: qc.clear() removes cache entries but
-      // active observers sitting on `staleTime: Infinity` (notably the
-      // hash-keyed AI summary) don't always re-trigger their queryFn
-      // afterwards — the rebind from `_pending` back to the same hash
-      // can find no entry yet land in a stable empty state. Forcing a
-      // refetch on every active observer makes "R" deterministic for
-      // the AI chain.
+      // Belt-and-suspenders: `qc.clear()` removes cache entries, but
+      // active observers sitting on `staleTime: Infinity` (notably
+      // the slug-keyed AI summary) don't always re-trigger their
+      // queryFn afterwards. Forcing a refetch on every active
+      // observer makes "R" deterministic for the AI chain.
       void qc.refetchQueries({ type: "active" });
     },
     /** Invalidate everything for a single worktree (useful after an action). */
@@ -144,22 +142,31 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: ["github"] });
     },
     /**
-     * Force the LM Studio call to re-run for one worktree. Reads the
-     * cached diff context to find the content hash, then invalidates
-     * both the diff-context query (in case the underlying diff drifted)
-     * and the matching `aiSummary` entry so the active details-pane
-     * observer refetches. Returns false when there's no cached context
-     * yet — the caller decides how to message that.
+     * Force the LM Studio call to re-run for one worktree. Returns
+     * false when there's no cached diff context yet — the caller
+     * decides how to message that (we don't want the gesture to mean
+     * "warm up cold").
+     *
+     * Sequencing matters: refetch the diff context *first*, then drop
+     * the memo entry for the (now possibly-new) hash, then invalidate
+     * the slug-keyed query. The naive "fire all three in parallel"
+     * shape would let the slug query refetch against its stale
+     * closure (old hash) and burn an LM Studio call on the old
+     * prompt before the mismatch effect drove a second one for the
+     * new diff. Awaiting diffContext first means the slug refetch
+     * sees the current hash and we get exactly one LM call.
      */
     async refreshAiSummary(slug: string): Promise<boolean> {
-      const ctx = qc.getQueryData<DiffContext | null>(
+      if (!qc.getQueryData<DiffContext | null>(qk.wt(slug).diffContext())) {
+        return false;
+      }
+      await qc.invalidateQueries({ queryKey: qk.wt(slug).diffContext() });
+      const fresh = qc.getQueryData<DiffContext | null>(
         qk.wt(slug).diffContext(),
       );
-      if (!ctx) return false;
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: qk.wt(slug).diffContext() }),
-        qc.invalidateQueries({ queryKey: qk.aiSummary(ctx.hash) }),
-      ]);
+      if (!fresh) return false;
+      qc.removeQueries({ queryKey: qk.aiSummaryMemo(fresh.hash) });
+      await qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });
       return true;
     },
     /**
