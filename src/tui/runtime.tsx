@@ -2,6 +2,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 
+import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { listWorktrees } from "../core/worktree.ts";
@@ -86,6 +87,10 @@ export async function runTui(): Promise<TuiExit> {
     detachFetchLogs();
     setEventSink(null);
     wtClient.shutdown();
+    // SIGTERM in-flight `claude -p` actions and await their drains
+    // so we don't strand subprocesses (or truncate their log files)
+    // when main.ts hits process.exit.
+    await actionRegistry.shutdown();
     // Drain queued log writes before main.ts hits process.exit.
     await flushLogger();
   });

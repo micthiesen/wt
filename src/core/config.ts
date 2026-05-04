@@ -63,6 +63,18 @@ export type AiConfig = {
   timeoutMs: number;
 };
 
+/**
+ * Pre-built `claude -p` action surfaced by the `!` modal. When
+ * `[[actions]]` is absent the built-in defaults take effect; when it's
+ * present (even with one entry), the user's list is authoritative —
+ * the way to drop a default is to list everything except it.
+ */
+export type ActionDef = {
+  id: string;
+  name: string;
+  prompt: string;
+};
+
 export type Config = {
   paths: {
     mainClone: string;
@@ -95,6 +107,7 @@ export type Config = {
   linear: LinearConfig | null;
   ai: AiConfig | null;
   github: GithubConfig;
+  actions: readonly ActionDef[];
   ui: {
     /** Detail-pane row order. Unknown ids are ignored, missing ones hidden. */
     rows: readonly string[];
@@ -134,6 +147,20 @@ const GENERIC_DEFAULTS = {
   ui: {
     rows: ["branch", "base", "linear", "stage", "pr", "claude", "git"] as const,
   },
+  actions: [
+    {
+      id: "rebase-main",
+      name: "Rebase on main",
+      prompt:
+        "Please rebase this branch on origin/main and intelligently resolve any conflicts that come up. Push when you're done.",
+    },
+    {
+      id: "address-review",
+      name: "Address PR review",
+      prompt:
+        "Check the requested changes from the review on the PR for this branch and address them. Push the changes, then resolve the review threads (no reply comments). When done, request a re-review from the original reviewers.",
+    },
+  ] as const,
 };
 
 function configPath(): { path: string; present: boolean } {
@@ -280,6 +307,12 @@ function build(raw: Raw, errs: Errors): Config {
     ignoredChecks: strArr(githubRaw?.ignored_checks, []),
   };
 
+  // [[actions]] is fully replaced when the user provides any entries
+  // (even just one) — otherwise the built-in defaults apply. That way
+  // a user can drop a default they don't want simply by listing the
+  // ones they keep.
+  const actions = parseActions(raw.actions, errs);
+
   return {
     paths: { mainClone, worktreeRoot, logDir, appLogDir, lockDir, cacheDb },
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen },
@@ -289,8 +322,38 @@ function build(raw: Raw, errs: Errors): Config {
     linear,
     ai,
     github,
+    actions,
     ui: { rows },
   };
+}
+
+function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
+  if (raw === undefined) return GENERIC_DEFAULTS.actions;
+  if (!Array.isArray(raw)) {
+    errs.add("actions must be a TOML array of [[actions]] tables");
+    return GENERIC_DEFAULTS.actions;
+  }
+  const out: ActionDef[] = [];
+  const seenIds = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const entry = obj(raw[i]);
+    const tag = `actions[${i}]`;
+    if (!entry) {
+      errs.add(`${tag} must be a table`);
+      continue;
+    }
+    const id = errs.reqStr(entry, tag, "id");
+    const name = errs.reqStr(entry, tag, "name");
+    const prompt = errs.reqStr(entry, tag, "prompt");
+    if (!id || !name || !prompt) continue;
+    if (seenIds.has(id)) {
+      errs.add(`${tag}.id "${id}" is duplicated`);
+      continue;
+    }
+    seenIds.add(id);
+    out.push({ id, name, prompt });
+  }
+  return out;
 }
 
 function load(): { cfg: Config; path: string } {

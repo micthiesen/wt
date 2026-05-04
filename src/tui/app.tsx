@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 
+import { actionRegistry, type ActionDef } from "../core/actions.ts";
 import { config, configFilePath } from "../core/config.ts";
 import {
   createWorktree,
@@ -21,10 +22,18 @@ import { stageUrl } from "../core/stage.ts";
 import { StatusKind } from "../core/types.ts";
 import { useWtActions } from "../state/index.ts";
 
+import {
+  ActionEditModal,
+  ActionPickerModal,
+  type ActionPickerState,
+  type PickerItem,
+} from "./panels/action-picker.tsx";
+import { ActionViewer } from "./panels/action-viewer.tsx";
 import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
+import { KillActionConfirmModal } from "./panels/kill-action-confirm.tsx";
 import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
 import {
   SectionPickerModal,
@@ -33,6 +42,7 @@ import {
 import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
+import { useAction, useActionVisible } from "./hooks/useAction.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -124,6 +134,21 @@ function printableText(sequence: string | undefined): string {
   for (let i = 0; i < sequence.length; i++) {
     const ch = sequence[i]!;
     if (ch >= " " && ch <= "~") out += ch;
+  }
+  return out;
+}
+
+/**
+ * Like `printableText`, but preserves `\n` and `\t` so multi-line code
+ * snippets paste cleanly into the action-edit textarea — single-line
+ * filter / new-worktree / rename inputs still use `printableText`.
+ */
+function printableMultiline(sequence: string | undefined): string {
+  if (!sequence) return "";
+  let out = "";
+  for (let i = 0; i < sequence.length; i++) {
+    const ch = sequence[i]!;
+    if (ch === "\n" || ch === "\t" || (ch >= " " && ch <= "~")) out += ch;
   }
   return out;
 }
@@ -260,6 +285,13 @@ export function App({ onExit }: Props) {
   // every open eats keystrokes. Reset to `null` on rename so the
   // sticky target doesn't dangle.
   const [lastMoveTarget, setLastMoveTarget] = useState<string | null>(null);
+  const [actionPicker, setActionPicker] = useState<ActionPickerState | null>(null);
+  // Modal rather than inline `footer.confirm`: killing live work is
+  // intentionally heavier than the y/N row on the footer.
+  const [killActionConfirm, setKillActionConfirm] = useState<{
+    slug: string;
+    actionName: string;
+  } | null>(null);
   // Section the user is renaming, if any. The footer input prompt is
   // generic; this lets the submit handler know which section the
   // typed text applies to.
@@ -287,6 +319,12 @@ export function App({ onExit }: Props) {
   // in legend/toast/confirm modes since paste only makes sense when the
   // user is typing.
   usePaste((text) => {
+    if (actionPicker?.mode === "edit") {
+      const clean = printableMultiline(text);
+      if (!clean) return;
+      setActionPicker({ ...actionPicker, extras: actionPicker.extras + clean });
+      return;
+    }
     const clean = printableText(text);
     if (!clean) return;
     if (footer.kind === "filter") {
@@ -315,6 +353,14 @@ export function App({ onExit }: Props) {
 
   const listWidth = Math.max(32, Math.min(52, Math.floor(width * 0.44)));
   const activityHeight = Math.max(6, Math.min(16, Math.floor(height * 0.35)));
+
+  // Action runtime state for the *selected* worktree. `currentRun`
+  // drives the activity-pane swap (showing the streamed claude output
+  // in place of events) and the `!`-key dispatch (open kill-confirm
+  // when running, open picker otherwise).
+  const currentSlug = current?.wt.slug;
+  const currentRun = useAction(currentSlug);
+  const showActionViewer = useActionVisible(currentSlug);
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -787,6 +833,54 @@ export function App({ onExit }: Props) {
     void refreshGithub();
   }
 
+  function buildActionPickerItems(): PickerItem[] {
+    return [
+      ...config.actions.map((def) => ({ kind: "action" as const, def })),
+      { kind: "custom" as const },
+    ];
+  }
+
+  function openActionPicker(slug: string): void {
+    const items = buildActionPickerItems();
+    setActionPicker({ mode: "list", slug, index: 0, items });
+  }
+
+  function launchAction(
+    slug: string,
+    def: ActionDef | null,
+    extras: string,
+  ): void {
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row) {
+      toast("worktree gone", theme.warn, 1500);
+      return;
+    }
+    if (!def && !extras.trim()) {
+      toast("prompt is empty", theme.warn, 1500);
+      return;
+    }
+    // Refuse if the worktree is mid-destroy / mid-init — claude would
+    // race the cleanup and leave the tree in a confusing state. Mirrors
+    // the `doRemove` / `doNew` busy refusal pattern.
+    const lock = lockStatus(slug);
+    if (lock) {
+      toast(`${slug} is ${lockLabel(lock)}`, theme.warn, 2000);
+      return;
+    }
+    if (row.status.kind === StatusKind.Busy) {
+      toast(`${slug} is busy`, theme.warn, 2000);
+      return;
+    }
+    const result = def
+      ? actionRegistry.start(def, slug, row.wt.path, extras)
+      : actionRegistry.startCustom(slug, row.wt.path, extras);
+    if (!result.ok) {
+      toast(`action: ${result.reason}`, theme.err, 3000);
+      return;
+    }
+    toast(`launched ${result.run.actionName}`, theme.info, 2000);
+  }
+
   async function doNew(raw: string, defaultBase?: string): Promise<void> {
     const parsed = parseNewInput(raw, defaultBase);
     if ("error" in parsed) {
@@ -979,6 +1073,111 @@ export function App({ onExit }: Props) {
         (k.ctrl && k.name === "c")
       ) {
         setSectionPicker(null);
+      }
+      return;
+    }
+
+    // Action picker — list of pre-built actions plus a trailing
+    // "Custom prompt..." entry. Two screens: list mode (j/k + return),
+    // then edit mode where the user types extras / a freeform prompt.
+    if (actionPicker) {
+      const ap = actionPicker;
+      if (ap.mode === "list") {
+        if (k.name === "j" || k.name === "down") {
+          setActionPicker({
+            ...ap,
+            index: Math.min(ap.index + 1, ap.items.length - 1),
+          });
+          return;
+        }
+        if (k.name === "k" || k.name === "up") {
+          setActionPicker({ ...ap, index: Math.max(ap.index - 1, 0) });
+          return;
+        }
+        if (k.name === "return") {
+          const item = ap.items[ap.index];
+          if (!item) return;
+          setActionPicker({
+            mode: "edit",
+            slug: ap.slug,
+            def: item.kind === "action" ? item.def : null,
+            extras: "",
+          });
+          return;
+        }
+        if (
+          k.name === "escape" ||
+          k.sequence === "!" ||
+          k.sequence === "q" ||
+          (k.ctrl && k.name === "c")
+        ) {
+          setActionPicker(null);
+        }
+        return;
+      }
+      // mode === "edit"
+      if (k.ctrl && k.name === "c") {
+        setActionPicker(null);
+        return;
+      }
+      if (k.name === "escape") {
+        // Pre-built path: pop back to the list at the same item the user
+        // selected. Custom path: there's no informative list state to
+        // restore (custom is the only entry there), so esc cancels out.
+        const def = ap.def;
+        if (def) {
+          const items = buildActionPickerItems();
+          const idx = items.findIndex(
+            (it) => it.kind === "action" && it.def.id === def.id,
+          );
+          setActionPicker({
+            mode: "list",
+            slug: ap.slug,
+            index: Math.max(0, idx),
+            items,
+          });
+        } else {
+          setActionPicker(null);
+        }
+        return;
+      }
+      if (k.name === "return") {
+        const { slug, def, extras } = ap;
+        setActionPicker(null);
+        launchAction(slug, def, extras);
+        return;
+      }
+      if (k.name === "backspace") {
+        if (ap.extras.length === 0) return;
+        setActionPicker({ ...ap, extras: ap.extras.slice(0, -1) });
+        return;
+      }
+      const text = printableMultiline(k.sequence);
+      if (text) setActionPicker({ ...ap, extras: ap.extras + text });
+      return;
+    }
+
+    // Kill-confirm for an in-flight `!` action on the selected
+    // worktree. Mirrors the y/N pattern used by clean-confirm; also
+    // accepts `!` (the opening key) per the modal toggle convention.
+    if (killActionConfirm) {
+      if (k.name === "y" || k.name === "return") {
+        const { slug, actionName } = killActionConfirm;
+        setKillActionConfirm(null);
+        const killed = actionRegistry.kill(slug);
+        if (killed) {
+          appLog.event.warn(`killed action "${actionName}" on ${slug}`);
+        }
+        return;
+      }
+      if (
+        k.name === "n" ||
+        k.name === "escape" ||
+        k.sequence === "!" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setKillActionConfirm(null);
       }
       return;
     }
@@ -1272,6 +1471,24 @@ export function App({ onExit }: Props) {
       setShowCleanConfirm(true);
       return;
     }
+    // `!` — open the action picker for the selected worktree, OR
+    // open the kill-confirm if an action is currently running there.
+    // Same key both ways so muscle memory stays consistent regardless
+    // of state.
+    if (k.sequence === "!") {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      const run = actionRegistry.get(slug);
+      if (run?.status === "running") {
+        setKillActionConfirm({ slug, actionName: run.actionName });
+      } else {
+        openActionPicker(slug);
+      }
+      return;
+    }
     if (k.sequence === ",") {
       void openInZed(configFilePath);
       configLog.event.info(`opened ${configFilePath}`);
@@ -1477,7 +1694,11 @@ export function App({ onExit }: Props) {
         />
         <Details row={current} width={Math.max(0, width - listWidth)} />
       </box>
-      <ActivityPane height={activityHeight} />
+      {showActionViewer && currentRun ? (
+        <ActionViewer run={currentRun} height={activityHeight} />
+      ) : (
+        <ActivityPane height={activityHeight} />
+      )}
       <Footer mode={footer} hint={footerHint} />
       {showHelp ? <HelpOverlay /> : null}
       {showCleanConfirm ? <CleanConfirmModal candidates={cleanCandidates} /> : null}
@@ -1504,6 +1725,26 @@ export function App({ onExit }: Props) {
           items={sectionPicker.items}
           selectedIndex={sectionPicker.index}
           newName={sectionPicker.newName}
+        />
+      ) : null}
+      {actionPicker?.mode === "list" ? (
+        <ActionPickerModal
+          slug={actionPicker.slug}
+          items={actionPicker.items}
+          selectedIndex={actionPicker.index}
+        />
+      ) : null}
+      {actionPicker?.mode === "edit" ? (
+        <ActionEditModal
+          slug={actionPicker.slug}
+          def={actionPicker.def}
+          extras={actionPicker.extras}
+        />
+      ) : null}
+      {killActionConfirm ? (
+        <KillActionConfirmModal
+          slug={killActionConfirm.slug}
+          actionName={killActionConfirm.actionName}
         />
       ) : null}
     </box>

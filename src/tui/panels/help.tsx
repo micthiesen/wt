@@ -42,6 +42,7 @@ const SECTIONS: Section[] = [
       ["m", "merge when ready (toggle)"],
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker)"],
+      ["!", "run claude action · kill if running"],
       ["d", "remove worktree"],
     ],
   },
