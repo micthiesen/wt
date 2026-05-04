@@ -268,6 +268,27 @@ export const stackQuery = (worktrees: readonly Worktree[]) => {
 export type AiSummaryWithHash = AiSummary & { hash: string };
 
 /**
+ * One-shot "skip the memo" gate set by `refreshAiSummary` (manual
+ * regen via the `t` keystroke). Any queryFn run for this slug while
+ * the flag is set will bypass the memo lookup and call LM Studio
+ * regardless. The flag is consumed on read so a follow-up refetch —
+ * which the standard `isInvalidated` bookkeeping schedules whenever a
+ * mismatch-effect invalidate races the explicit one inside
+ * `refreshAiSummary` — picks up the just-written memo and
+ * short-circuits without burning a second LM call.
+ *
+ * Module-private; the public surface is `markAiSummaryForceRegen` /
+ * `clearAiSummaryForceRegen`.
+ */
+const aiSummaryForceRegen = new Set<string>();
+export function markAiSummaryForceRegen(slug: string): void {
+  aiSummaryForceRegen.add(slug);
+}
+export function clearAiSummaryForceRegen(slug: string): void {
+  aiSummaryForceRegen.delete(slug);
+}
+
+/**
  * AI-generated summary of the diff. Keyed by `slug` so observers keep
  * showing the previous summary while a refetch is in flight (the
  * alternative — hashing the queryKey — blanks the brief during the gap
@@ -303,10 +324,17 @@ export const aiSummaryQuery = (
     queryKey: qk.aiSummary(slug),
     queryFn: async (): Promise<AiSummaryWithHash | null> => {
       if (!ctx) return null;
-      const memoed = qc.getQueryData<AiSummary>(qk.aiSummaryMemo(ctx.hash));
-      if (memoed) {
-        aiLog.event.dim(`reused memoed summary for ${slug}`);
-        return { hash: ctx.hash, ...memoed };
+      // `Set.delete` returns true iff the entry was present, which
+      // doubles as "consume the flag" — exactly what we want, because
+      // the next queryFn run for this slug should fall through to the
+      // memo lookup again (and find the entry we're about to write).
+      const force = aiSummaryForceRegen.delete(slug);
+      if (!force) {
+        const memoed = qc.getQueryData<AiSummary>(qk.aiSummaryMemo(ctx.hash));
+        if (memoed) {
+          aiLog.event.dim(`reused memoed summary for ${slug}`);
+          return { hash: ctx.hash, ...memoed };
+        }
       }
       aiLog.event.dim(`calling LM Studio for ${slug} (${pluralize(ctx.prompt.length, "char")})...`);
       const start = Date.now();

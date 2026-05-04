@@ -25,9 +25,11 @@ import { CACHE_DB } from "./client.ts";
 import { qk } from "./keys.ts";
 import { clearPersistedCache } from "./persister.ts";
 import {
+  clearAiSummaryForceRegen,
   contributorsQuery,
   fetchOriginQuery,
   githubQuery,
+  markAiSummaryForceRegen,
   worktreesQuery,
   type GithubData,
 } from "./queries.ts";
@@ -147,14 +149,22 @@ export function useWtActions() {
      * decides how to message that (we don't want the gesture to mean
      * "warm up cold").
      *
-     * Sequencing matters: refetch the diff context *first*, then drop
-     * the memo entry for the (now possibly-new) hash, then invalidate
-     * the slug-keyed query. The naive "fire all three in parallel"
-     * shape would let the slug query refetch against its stale
-     * closure (old hash) and burn an LM Studio call on the old
-     * prompt before the mismatch effect drove a second one for the
-     * new diff. Awaiting diffContext first means the slug refetch
-     * sees the current hash and we get exactly one LM call.
+     * `markAiSummaryForceRegen` is what makes the regen unconditional:
+     * the diffContext refetch can drive the row aggregator's
+     * mismatch effect to fire `invalidateQueries(aiSummary)` ahead of
+     * our explicit one, and without the flag that racing queryFn run
+     * finds the (still-present) memo entry and short-circuits. The
+     * flag is consumed on the queryFn's first read, so a follow-up
+     * refetch from `isInvalidated` bookkeeping reuses the just-written
+     * memo and doesn't burn a second LM call.
+     *
+     * We deliberately do NOT `removeQueries({ queryKey: aiSummaryMemo(fresh.hash) })`
+     * here even though earlier versions did. Once the flag exists, the
+     * remove is at best redundant and at worst harmful: if the mismatch
+     * effect's queryFn run completes (writing the memo) before our
+     * post-await sync block lands, the remove would delete the
+     * just-written entry and the subsequent invalidate would re-call
+     * LM Studio. Letting the memo write stand is the correct outcome.
      */
     async refreshAiSummary(slug: string): Promise<boolean> {
       // The diffContext key is now per-(slug, base) so a worktree can
@@ -171,17 +181,26 @@ export function useWtActions() {
       if (existing.length === 0 || existing.every(([, v]) => !v)) {
         return false;
       }
-      await qc.invalidateQueries({ queryKey: prefix });
-      const refreshed = qc.getQueriesData<DiffContext | null>({
-        queryKey: prefix,
-      });
-      const fresh = refreshed
-        .map(([, v]) => v)
-        .find((v): v is DiffContext => v != null);
-      if (!fresh) return false;
-      qc.removeQueries({ queryKey: qk.aiSummaryMemo(fresh.hash) });
-      await qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });
-      return true;
+      markAiSummaryForceRegen(slug);
+      try {
+        await qc.invalidateQueries({ queryKey: prefix });
+        // Confirm the diff context survived the refetch — a worktree
+        // archived/destroyed mid-flight would null out here, in which
+        // case there's nothing to summarise.
+        const refreshed = qc.getQueriesData<DiffContext | null>({
+          queryKey: prefix,
+        });
+        if (refreshed.every(([, v]) => !v)) return false;
+        await qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });
+        return true;
+      } finally {
+        // Idempotent: the queryFn consumes the flag on its first
+        // run, so this is a no-op in the happy path. It only matters
+        // when no observer was active (no queryFn run) — in that
+        // case we'd otherwise leave the flag set and force a stale
+        // skip on the next observe.
+        clearAiSummaryForceRegen(slug);
+      }
     },
     /**
      * Flip the archived flag for a slug. Awaits invalidation so the
