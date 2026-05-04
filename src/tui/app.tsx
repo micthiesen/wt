@@ -42,7 +42,7 @@ import {
 import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
-import { useAction, useActionVisible } from "./hooks/useAction.ts";
+import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -361,6 +361,11 @@ export function App({ onExit }: Props) {
   const currentSlug = current?.wt.slug;
   const currentRun = useAction(currentSlug);
   const showActionViewer = useActionVisible(currentSlug);
+  // Set of slugs whose action is in flight RIGHT NOW (no recent-window
+  // tail). Drives the leftmost cluster glyph in `WorktreeList` so the
+  // user has at-a-glance awareness of what's running on rows they're
+  // not currently viewing.
+  const activeActions = useActiveActions();
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -1689,6 +1694,7 @@ export function App({ onExit }: Props) {
           selectedIndex={effectiveSel}
           width={listWidth}
           activeTails={activeTails}
+          activeActions={activeActions}
           isLoading={isLoading}
           filter={filter}
         />

@@ -24,6 +24,10 @@ type Props = {
   selectedIndex: number;
   width: number;
   activeTails: Set<string>;
+  /** Slugs with an in-flight `claude -p` action. Renders a leftmost
+   *  comment glyph in the badge cluster — only while running, the
+   *  recent-window state is reserved for the activity-pane swap. */
+  activeActions: ReadonlySet<string>;
   isLoading: boolean;
   filter: string;
 };
@@ -106,17 +110,20 @@ function rowLabel(row: WorktreeRow): string {
  * Cells the badge cluster occupies for a given row. Mirrors the
  * width-prop layout in the JSX below: 2-cell leading gap + each present
  * badge's box width. Returns 0 when no badges are rendered so the slug
- * column reclaims the space. The refresh hint, when present, sits as
- * the leftmost slot inside the cluster.
+ * column reclaims the space. The action-running hint, when present,
+ * sits as the leftmost slot inside the cluster, before the refresh
+ * spinner.
  */
-function badgeClusterCells(row: WorktreeRow): number {
+function badgeClusterCells(row: WorktreeRow, actionRunning: boolean): number {
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
-  const hasAnyBadge = refreshing || !!(row.pr || row.mq || isDeployed);
+  const hasAnyBadge =
+    actionRunning || refreshing || !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
+  if (actionRunning) cells += 2;
   if (refreshing) cells += 2;
   if (rabbitHint(row)) cells += 2;
   if (reviewHint(row)) cells += 2;
@@ -198,12 +205,15 @@ const RowView = memo(function RowView({
   row,
   selected,
   isTailing,
+  actionRunning,
   panelWidth,
   stackParentAbove,
 }: {
   row: WorktreeRow;
   selected: boolean;
   isTailing: boolean;
+  /** Whether a `claude -p` action is currently running on this slug. */
+  actionRunning: boolean;
   panelWidth: number;
   /**
    * True when the row immediately above is the worktree this one is
@@ -246,7 +256,11 @@ const RowView = memo(function RowView({
   const review = reviewHint(row);
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
   const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
-  const hasAnyBadge = refreshing || !!(row.pr || row.mq || isDeployed);
+  // Active action keeps its green even on archived rows (an action
+  // running against an archived worktree is unusual and worth seeing).
+  const actionFg = actionRunning ? theme.ok : theme.fgDim;
+  const hasAnyBadge =
+    actionRunning || refreshing || !!(row.pr || row.mq || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
   // a row is both selected and being tailed.
@@ -279,7 +293,7 @@ const RowView = memo(function RowView({
             width − borders(2) − row padding(2) − marker+gap(3) − badge
             cluster. */}
         <text fg={slugFg} attributes={slugAttrs} wrapMode="none">
-          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row)))}
+          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row, actionRunning)))}
         </text>
       </box>
       {/* Compact badge cluster: only render present badges, butted up
@@ -295,6 +309,11 @@ const RowView = memo(function RowView({
       {hasAnyBadge ? (
         <box flexShrink={0} flexDirection="row">
           <text>  </text>
+          {actionRunning ? (
+            <box width={2} flexShrink={0}>
+              <text fg={actionFg}>{NF.comment}</text>
+            </box>
+          ) : null}
           {refreshing ? (
             <box width={2} flexShrink={0}>
               <Spinner fg={theme.fgDim} />
@@ -360,7 +379,7 @@ function Divider({ label, width }: { label: string; width: number }) {
   );
 }
 
-export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoading, filter }: Props) {
+export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -434,6 +453,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                   row={row}
                   selected={i === selectedIndex}
                   isTailing={activeTails.has(row.wt.slug)}
+                  actionRunning={activeActions.has(row.wt.slug)}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
                 />
@@ -457,6 +477,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, isLoadin
                     row={row}
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
+                    actionRunning={activeActions.has(row.wt.slug)}
                     panelWidth={width}
                     stackParentAbove={false}
                   />

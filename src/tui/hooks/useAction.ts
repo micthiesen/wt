@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSyncExternalStore } from "react";
 
 import {
@@ -20,6 +20,30 @@ export function useAction(slug: string | undefined): ActionRun | null {
   );
   if (!slug) return null;
   return map.get(slug) ?? null;
+}
+
+/**
+ * Set of slugs whose action is *currently* running (not the recent
+ * window — that's handled separately by `useActionVisible`). Drives
+ * the per-row glyph in the worktree list. Membership is computed from
+ * the registry snapshot inside `useMemo`, which re-runs whenever the
+ * registry mutates; every run-line append produces a new map identity,
+ * but consumers only care about which slugs are running, not how many
+ * lines they've emitted.
+ */
+export function useActiveActions(): ReadonlySet<string> {
+  const map = useSyncExternalStore(
+    actionRegistry.subscribe,
+    actionRegistry.getSnapshot,
+    actionRegistry.getSnapshot,
+  );
+  return useMemo(() => {
+    const out = new Set<string>();
+    for (const [slug, run] of map) {
+      if (run.status === "running") out.add(slug);
+    }
+    return out;
+  }, [map]);
 }
 
 /**

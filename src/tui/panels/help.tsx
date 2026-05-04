@@ -86,6 +86,7 @@ const BADGES: [LegendGlyph, string, string][] = [
   [`${NF.mergeQueue} N`, theme.err, "MQ pos N · blocked"],
   [NF.mergeQueue, theme.info, "auto-merge armed (waiting)"],
   [NF.bolt, theme.warn, "SST stage deployed"],
+  [NF.comment, theme.ok, "Claude · `!` action running"],
   [NF.comment, theme.accent, "Claude · working"],
   [NF.comment, theme.warn, "Claude · waiting"],
   [NF.comment, theme.fgDim, "Claude · idle"],
