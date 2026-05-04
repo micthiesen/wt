@@ -28,6 +28,7 @@ import {
   contributorsQuery,
   fetchOriginQuery,
   githubQuery,
+  tmuxSessionsQuery,
   worktreesQuery,
   type GithubData,
 } from "./queries.ts";
@@ -140,6 +141,14 @@ export function useWtActions() {
      */
     async refreshGithub(): Promise<void> {
       await qc.invalidateQueries({ queryKey: ["github"] });
+    },
+    /**
+     * Invalidate the tmux-sessions query. Call after entering or
+     * detaching from a session so the per-row indicator flips
+     * immediately rather than waiting for the 2s polling tick.
+     */
+    async refreshTmuxSessions(): Promise<void> {
+      await qc.invalidateQueries({ queryKey: tmuxSessionsQuery().queryKey });
     },
     /**
      * Force the LM Studio call to re-run for one worktree. Returns

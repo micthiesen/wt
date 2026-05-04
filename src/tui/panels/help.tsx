@@ -43,6 +43,7 @@ const SECTIONS: Section[] = [
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker)"],
       ["!", "run claude action · kill if running"],
+      ["^Q", "enter claude session · ^Q again to detach"],
       ["d", "remove worktree"],
     ],
   },
@@ -87,8 +88,8 @@ const BADGES: [LegendGlyph, string, string][] = [
   [NF.mergeQueue, theme.info, "auto-merge armed (waiting)"],
   [NF.bolt, theme.warn, "SST stage deployed"],
   [NF.comment, theme.ok, "Claude · `!` action running"],
-  [NF.comment, theme.accent, "Claude · working"],
-  [NF.comment, theme.warn, "Claude · waiting"],
+  [NF.comment, theme.accent, "Claude · interactive session live"],
+  [NF.comment, theme.warn, "Claude · waiting (details pane)"],
   [NF.comment, theme.fgDim, "Claude · idle"],
 ];
 

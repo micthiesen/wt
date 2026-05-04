@@ -379,5 +379,11 @@ export function Details({ row, width }: Props) {
       </box>
     );
   }
-  return <DetailsBody row={row} width={width} />;
+  // Key by slug so the AI summary observer below resets across
+  // worktree switches. Without this, `placeholderData: keepPreviousData`
+  // bleeds the previous slug's summary into the new slug whenever the
+  // new slug has no cache entry (cold key, or disabled because no diff
+  // context yet) — so navigating A → B parks A's description on B until
+  // B's own fetch lands or the user restarts.
+  return <DetailsBody key={row.wt.slug} row={row} width={width} />;
 }

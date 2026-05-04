@@ -28,6 +28,11 @@ type Props = {
    *  comment glyph in the badge cluster — only while running, the
    *  recent-window state is reserved for the activity-pane swap. */
   activeActions: ReadonlySet<string>;
+  /** Slugs with a live interactive tmux session. Same comment glyph
+   *  slot as `activeActions`, different color (cyan vs green); the
+   *  one-off action wins when both are present, since it's the more
+   *  transient signal. */
+  activeSessions: ReadonlySet<string>;
   isLoading: boolean;
   filter: string;
 };
@@ -114,16 +119,24 @@ function rowLabel(row: WorktreeRow): string {
  * sits as the leftmost slot inside the cluster, before the refresh
  * spinner.
  */
-function badgeClusterCells(row: WorktreeRow, actionRunning: boolean): number {
+function badgeClusterCells(
+  row: WorktreeRow,
+  actionRunning: boolean,
+  sessionActive: boolean,
+): number {
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
+  // Action and session share a single 2-cell slot — only one glyph
+  // renders at a time (action wins). So the cell budget adds 2 if
+  // either is present, not 2+2.
+  const showCommentSlot = actionRunning || sessionActive;
   const hasAnyBadge =
-    actionRunning || refreshing || !!(row.pr || row.mq || isDeployed);
+    showCommentSlot || refreshing || !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
-  if (actionRunning) cells += 2;
+  if (showCommentSlot) cells += 2;
   if (refreshing) cells += 2;
   if (rabbitHint(row)) cells += 2;
   if (reviewHint(row)) cells += 2;
@@ -206,6 +219,7 @@ const RowView = memo(function RowView({
   selected,
   isTailing,
   actionRunning,
+  sessionActive,
   panelWidth,
   stackParentAbove,
 }: {
@@ -214,6 +228,8 @@ const RowView = memo(function RowView({
   isTailing: boolean;
   /** Whether a `claude -p` action is currently running on this slug. */
   actionRunning: boolean;
+  /** Whether a live interactive tmux session exists for this slug. */
+  sessionActive: boolean;
   panelWidth: number;
   /**
    * True when the row immediately above is the worktree this one is
@@ -256,11 +272,16 @@ const RowView = memo(function RowView({
   const review = reviewHint(row);
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
   const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
-  // Active action keeps its green even on archived rows (an action
-  // running against an archived worktree is unusual and worth seeing).
-  const actionFg = actionRunning ? theme.ok : theme.fgDim;
+  // Action and session share a single comment-glyph slot; action wins
+  // when both are present (it's the more transient signal). Color
+  // distinguishes them: green for action, cyan for a quiescent session.
+  // The slot stays lit on archived rows in both cases — running work or
+  // a live session against an archived worktree is unusual and worth
+  // seeing.
+  const showCommentSlot = actionRunning || sessionActive;
+  const commentFg = actionRunning ? theme.ok : theme.accent;
   const hasAnyBadge =
-    actionRunning || refreshing || !!(row.pr || row.mq || isDeployed);
+    showCommentSlot || refreshing || !!(row.pr || row.mq || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
   // a row is both selected and being tailed.
@@ -293,7 +314,7 @@ const RowView = memo(function RowView({
             width − borders(2) − row padding(2) − marker+gap(3) − badge
             cluster. */}
         <text fg={slugFg} attributes={slugAttrs} wrapMode="none">
-          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row, actionRunning)))}
+          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row, actionRunning, sessionActive)))}
         </text>
       </box>
       {/* Compact badge cluster: only render present badges, butted up
@@ -309,14 +330,19 @@ const RowView = memo(function RowView({
       {hasAnyBadge ? (
         <box flexShrink={0} flexDirection="row">
           <text>  </text>
-          {actionRunning ? (
-            <box width={2} flexShrink={0}>
-              <text fg={actionFg}>{NF.comment}</text>
-            </box>
-          ) : null}
+          {/* Refresh spinner is ALWAYS the leftmost slot in the badge
+              cluster. It's the most ephemeral signal (a row's data is
+              actively being refetched), so anchoring it on the left
+              gives it a stable, unmissable position regardless of which
+              other badges happen to be present. Don't reorder. */}
           {refreshing ? (
             <box width={2} flexShrink={0}>
               <Spinner fg={theme.fgDim} />
+            </box>
+          ) : null}
+          {showCommentSlot ? (
+            <box width={2} flexShrink={0}>
+              <text fg={commentFg}>{NF.comment}</text>
             </box>
           ) : null}
           {/* CR and review hints sit immediately to the left of the
@@ -379,7 +405,7 @@ function Divider({ label, width }: { label: string; width: number }) {
   );
 }
 
-export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, isLoading, filter }: Props) {
+export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, activeSessions, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -454,6 +480,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                   selected={i === selectedIndex}
                   isTailing={activeTails.has(row.wt.slug)}
                   actionRunning={activeActions.has(row.wt.slug)}
+                  sessionActive={activeSessions.has(row.wt.slug)}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
                 />
@@ -478,6 +505,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
                     actionRunning={activeActions.has(row.wt.slug)}
+                    sessionActive={activeSessions.has(row.wt.slug)}
                     panelWidth={width}
                     stackParentAbove={false}
                   />

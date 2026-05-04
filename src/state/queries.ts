@@ -16,6 +16,7 @@ import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
 import { fetchGithub, fetchRepoContributors } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
 import { detectStacks, type StackMap } from "../core/stack.ts";
+import { listSessions as listTmuxSessions } from "../core/tmux.ts";
 import type {
   Contributor,
   LockMeta,
@@ -88,6 +89,22 @@ export const wtStateQuery = () =>
     queryKey: qk.wtState(),
     queryFn: async (): Promise<WtState> => readWtState(),
     staleTime: STALE.fast,
+  });
+
+/**
+ * Set of slug names with a live interactive tmux session. One CLI
+ * shell-out per refresh covers every worktree at once — far cheaper
+ * than per-row `has-session` polling. The 2s refetch keeps the
+ * indicator in sync without manual invalidation; explicit invalidation
+ * still happens on enter/detach so the badge flips immediately rather
+ * than waiting up to 2s.
+ */
+export const tmuxSessionsQuery = () =>
+  queryOptions({
+    queryKey: qk.tmuxSessions(),
+    queryFn: async (): Promise<string[]> => [...(await listTmuxSessions())],
+    staleTime: STALE.fast,
+    refetchInterval: 2_000,
   });
 
 export type GithubData = {
@@ -279,6 +296,16 @@ export const stackQuery = (worktrees: readonly Worktree[]) => {
  * behavior is the consumer's job: pair this with
  * `placeholderData: keepPreviousData` so a hash flip (diff changed)
  * doesn't blank the description during the gap.
+ *
+ * Cross-slug hazard: in a `useQuery` consumer (single observer that
+ * survives subject changes), `keepPreviousData` will leak the prior
+ * slug's summary into the new slug whenever the new slug's queryKey
+ * has no cache entry — including the `__noctx__` empty-branch case,
+ * which is `enabled: false` so nothing ever overwrites the placeholder.
+ * Scope the observer to one slug (e.g. `key={slug}` on the consuming
+ * component) so it remounts on slug change. `useQueries` consumers are
+ * safe — `QueriesObserver` matches observers by queryHash, so each
+ * hash gets its own observer regardless of array position.
  *
  * Pass `null` for `ctx` when the diff context isn't ready; pair with
  * `enabled: !!ctx` so the queryFn never runs and the early `null`

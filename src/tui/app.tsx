@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
-import { useKeyboard, useTerminalDimensions } from "@opentui/react";
+import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 
 import { actionRegistry, type ActionDef } from "../core/actions.ts";
 import { config, configFilePath } from "../core/config.ts";
@@ -19,6 +19,7 @@ import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import { stageUrl } from "../core/stage.ts";
+import { killSession } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
 import { useWtActions } from "../state/index.ts";
 
@@ -42,7 +43,9 @@ import {
 import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
+import { enterClaudeSession } from "./claude-session.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
+import { useActiveSessions } from "./hooks/useActiveSessions.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -256,11 +259,13 @@ function isCleanCandidate(row: WorktreeRow): boolean {
 
 export function App({ onExit }: Props) {
   const { width, height } = useTerminalDimensions();
+  const renderer = useRenderer();
   const { rows, isLoading } = useWorktreeRows();
   const {
     refreshAll,
     refreshStale,
     refreshGithub,
+    refreshTmuxSessions,
     fetchContributors,
     fetchMe,
     clearAll,
@@ -393,6 +398,9 @@ export function App({ onExit }: Props) {
   // user has at-a-glance awareness of what's running on rows they're
   // not currently viewing.
   const activeActions = useActiveActions();
+  // Set of slugs with a live interactive tmux session — populates the
+  // same cluster glyph in cyan when no one-off action is masking it.
+  const activeSessions = useActiveSessions();
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -633,6 +641,13 @@ export function App({ onExit }: Props) {
       destroyStage: row.fields.deploy.data ?? false,
       deleteBranch: true,
     });
+    // Also tear down any interactive claude tmux session for the same
+    // slug. Best-effort, idempotent — if no session exists, killSession
+    // exits 0 and we fall through. Ignored failures don't block the
+    // worktree destroy.
+    void killSession(slug)
+      .then(() => void refreshTmuxSessions())
+      .catch(() => {});
     log.event.info("dispatched destroy");
     toast(`dispatched destroy of ${slug}`, theme.info);
     setTimeout(() => void invalidateWorktree(slug), 600);
@@ -655,8 +670,10 @@ export function App({ onExit }: Props) {
         destroyStage: row.fields.deploy.data ?? false,
         deleteBranch: true,
       });
+      void killSession(row.wt.slug).catch(() => {});
       createLogger(row.wt.slug).event.info("dispatched destroy (clean)");
     }
+    void refreshTmuxSessions();
     setTimeout(() => void refreshAll(), 600);
   }
 
@@ -927,7 +944,6 @@ export function App({ onExit }: Props) {
       return;
     }
     newLog.event.ok(`ready at ${result.path}`);
-    openInZed(result.path);
     void refreshAll();
   }
 
@@ -1522,6 +1538,43 @@ export function App({ onExit }: Props) {
       }
       return;
     }
+    // Ctrl+Q — toggle into the selected worktree's interactive claude
+    // session. tmux's `new-session -A` makes this idempotent (creates
+    // or attaches), so the same key works whether the session exists
+    // yet or not. From inside the session, the wt-private tmux config
+    // binds Ctrl+Q to detach-client → the same physical key flips
+    // between contexts. Refuse on busy worktrees so we don't race a
+    // destroy.
+    if (k.ctrl && k.name === "q") {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (current.status.kind === StatusKind.Busy) {
+        toast(`${slug} is busy`, theme.warn, 2000);
+        return;
+      }
+      const cwd = current.wt.path;
+      const sessionLog = createLogger(slug);
+      void (async () => {
+        sessionLog.event.info("entering claude session (Ctrl+Q to detach)");
+        const result = await enterClaudeSession({ renderer, slug, cwd });
+        // Flip the indicator immediately rather than waiting for the
+        // 2s tmux-sessions poll. Cheap one-shot invalidation; the
+        // observer refetches and the badge updates within a frame.
+        void refreshTmuxSessions();
+        if (result.kind === "spawn-failed") {
+          sessionLog.event.err(`claude failed to start: ${result.reason}`);
+          toast(`claude failed: ${result.reason}`, theme.err, 3000);
+        } else if (result.kind === "detached") {
+          sessionLog.event.info(`detached from ${slug}`);
+        } else {
+          sessionLog.event.info(`claude exited (${result.code ?? "?"})`);
+        }
+      })();
+      return;
+    }
     if (k.sequence === ",") {
       void openInZed(configFilePath);
       configLog.event.info(`opened ${configFilePath}`);
@@ -1722,6 +1775,7 @@ export function App({ onExit }: Props) {
           width={listWidth}
           activeTails={activeTails}
           activeActions={activeActions}
+          activeSessions={activeSessions}
           isLoading={isLoading}
           filter={filter}
         />

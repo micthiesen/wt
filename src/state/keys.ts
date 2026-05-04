@@ -7,6 +7,13 @@
 export const qk = {
   /** All worktrees (from `git worktree list`). */
   worktrees: () => ["worktrees"] as const,
+  /**
+   * Set of slug names with a live interactive tmux session on the
+   * wt-private server. One CLI call per refresh regardless of worktree
+   * count — drives the per-row session indicator and the details-pane
+   * "session attached" hint.
+   */
+  tmuxSessions: () => ["tmuxSessions"] as const,
   /** Origin/main fetch marker; invalidated manually. */
   fetchOrigin: () => ["fetchOrigin"] as const,
   /** First-parent SHAs of origin/main; supports branchIsMerged. */

@@ -5,6 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
+import { reapOrphanedSessions } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
@@ -31,6 +32,10 @@ async function reapStartup(): Promise<void> {
     const live = new Set(wts.map((w) => w.slug));
     reapWtState(live);
     reapArchived(live);
+    // Kill any tmux sessions whose slug no longer exists. Covers the
+    // case where a worktree was removed externally (or in a prior wt
+    // run that crashed before the destroy hook fired).
+    await reapOrphanedSessions(live);
   } catch (err) {
     startupLog.warn("reap failed", { err: err instanceof Error ? err.message : String(err) });
   }
