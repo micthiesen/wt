@@ -56,9 +56,9 @@ function configDir(): string {
  *  - Truecolor declared two ways (modern `terminal-features :RGB` +
  *    legacy `terminal-overrides :Tc`) — different tools check
  *    different paths.
- *  - `unbind C-b` + `bind -n C-q detach-client`: kill the tmux prefix
- *    entirely; Ctrl+Q is a single-press detach. Symmetric with the
- *    wt-side `Ctrl+Q` binding that enters the session.
+ *  - `unbind C-b` + `bind -n F12 detach-client`: kill the tmux prefix
+ *    entirely; F12 is a single-press detach. Symmetric with the
+ *    wt-side `F12` binding that enters the session.
  */
 export function buildConfig(): string {
   const outerTerm = process.env.TERM ?? "xterm-256color";
@@ -73,7 +73,7 @@ set -as terminal-features ",${outerTerm}:RGB"
 set -ag terminal-overrides ",${outerTerm}:Tc"
 set -ag update-environment "COLORTERM"
 unbind C-b
-bind-key -n C-q detach-client
+bind-key -n F12 detach-client
 `;
 }
 

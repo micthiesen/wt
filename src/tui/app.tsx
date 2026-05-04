@@ -1538,14 +1538,24 @@ export function App({ onExit }: Props) {
       }
       return;
     }
-    // Ctrl+Q — toggle into the selected worktree's interactive claude
+    // F12 — toggle into the selected worktree's interactive claude
     // session. tmux's `new-session -A` makes this idempotent (creates
     // or attaches), so the same key works whether the session exists
     // yet or not. From inside the session, the wt-private tmux config
-    // binds Ctrl+Q to detach-client → the same physical key flips
+    // binds F12 to detach-client → the same physical key flips
     // between contexts. Refuse on busy worktrees so we don't race a
-    // destroy.
-    if (k.ctrl && k.name === "q") {
+    // destroy. The unmodified-only guard prevents Shift+F12 (which
+    // some terminals emit as a distinct sequence) from accidentally
+    // triggering this.
+    if (
+      k.name === "f12" &&
+      !k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
         return;
@@ -1558,7 +1568,7 @@ export function App({ onExit }: Props) {
       const cwd = current.wt.path;
       const sessionLog = createLogger(slug);
       void (async () => {
-        sessionLog.event.info("entering claude session (Ctrl+Q to detach)");
+        sessionLog.event.info("entering claude session (F12 to detach)");
         const result = await enterClaudeSession({ renderer, slug, cwd });
         // Flip the indicator immediately rather than waiting for the
         // 2s tmux-sessions poll. Cheap one-shot invalidation; the
