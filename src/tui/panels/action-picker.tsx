@@ -32,23 +32,29 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
       title={`action · ${slug}`}
       hints={[
         ["j/k", "move"],
+        ["1-9", "quick pick"],
+        ["!", "custom prompt"],
         ["⏎", "select"],
-        ["! / esc / q", "cancel"],
+        ["esc / q", "cancel"],
       ]}
     >
       {items.map((item, i) => {
         const selected = i === selectedIndex;
         const bg = selected ? theme.rowSelectedBg : undefined;
         const fg = selected ? theme.fgBright : theme.fg;
-        const label =
-          item.kind === "custom" ? "Custom prompt…" : item.def.name;
-        const hint =
-          item.kind === "custom"
-            ? "freeform"
-            : item.def.id;
+        // Custom entry gets the `!` chord prefix (mirrors `l` for "+ new
+        // section"); configured actions get 1..9 quick-pick digits.
+        const isCustom = item.kind === "custom";
+        const actionIndex = isCustom ? -1 : i;
+        const showDigit = !isCustom && actionIndex < 9;
+        const prefix = isCustom ? "!" : showDigit ? `${actionIndex + 1}` : " ";
+        const prefixFg = isCustom ? theme.accent : theme.fgDim;
+        const labelFg = isCustom ? theme.accent : fg;
+        const label = isCustom ? "Custom prompt…" : item.def.name;
+        const hint = isCustom ? "freeform" : item.def.id;
         return (
           <box
-            key={item.kind === "custom" ? "__custom__" : item.def.id}
+            key={isCustom ? "__custom__" : item.def.id}
             flexDirection="row"
             backgroundColor={bg}
             paddingLeft={1}
@@ -57,8 +63,11 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
             <text fg={selected ? theme.accent : theme.fgDim}>
               {selected ? "▸ " : "  "}
             </text>
+            <box width={2} flexShrink={0}>
+              <text fg={prefixFg}>{prefix}</text>
+            </box>
             <box flexGrow={1} flexShrink={1} overflow="hidden">
-              <text fg={fg} wrapMode="none" truncate>
+              <text fg={labelFg} wrapMode="none" truncate>
                 {label}
               </text>
             </box>

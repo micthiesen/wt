@@ -1099,6 +1099,35 @@ export function App({ onExit }: Props) {
           setActionPicker({ ...ap, index: Math.max(ap.index - 1, 0) });
           return;
         }
+        // `!` chord — jumps straight to the custom-prompt entry. Mirrors
+        // the section picker's `l → "+ new section"` chord, so `! !`
+        // from normal mode lands directly in freeform-edit mode.
+        if (k.sequence === "!") {
+          setActionPicker({
+            mode: "edit",
+            slug: ap.slug,
+            def: null,
+            extras: "",
+          });
+          return;
+        }
+        // Quick-pick digits 1..9 jump straight to that *action* item
+        // (the custom entry is reachable via `!`, not a digit). Out-of-
+        // range digits are ignored so a stray "9" in a list of three
+        // doesn't fire something unintended.
+        if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+          const i = parseInt(k.sequence, 10) - 1;
+          const item = ap.items[i];
+          if (item && item.kind === "action") {
+            setActionPicker({
+              mode: "edit",
+              slug: ap.slug,
+              def: item.def,
+              extras: "",
+            });
+          }
+          return;
+        }
         if (k.name === "return") {
           const item = ap.items[ap.index];
           if (!item) return;
@@ -1112,7 +1141,6 @@ export function App({ onExit }: Props) {
         }
         if (
           k.name === "escape" ||
-          k.sequence === "!" ||
           k.sequence === "q" ||
           (k.ctrl && k.name === "c")
         ) {
