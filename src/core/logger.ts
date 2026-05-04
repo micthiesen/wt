@@ -93,16 +93,31 @@ export function createLogger(source: string): Logger {
 }
 
 function emit(kind: EventKind, source: string, text: string): void {
-  appendLine(
-    `${ts()} EVENT ${kind.padEnd(KIND_PAD)} ${source.padEnd(SRC_PAD)} ${text}\n`,
-  );
-  if (sink) {
-    try {
-      sink({ level: kind, source, text });
-    } catch {
-      // Sink errors must not break logging.
+  // Multiline text would corrupt the daily-log line format and overflow
+  // the activity pane's fixed one-row-per-event layout. Split into one
+  // record per line so each gets its own ts/source/kind prefix in both
+  // sinks; preserve leading whitespace so indented blocks stay readable.
+  for (const line of splitEventLines(text)) {
+    appendLine(
+      `${ts()} EVENT ${kind.padEnd(KIND_PAD)} ${source.padEnd(SRC_PAD)} ${line}\n`,
+    );
+    if (sink) {
+      try {
+        sink({ level: kind, source, text: line });
+      } catch {
+        // Sink errors must not break logging.
+      }
     }
   }
+}
+
+function splitEventLines(text: string): string[] {
+  if (!text.includes("\n") && !text.includes("\r")) return [text];
+  // Split on all three line-terminator forms so a bare `\r` (e.g. progress
+  // output from `gh`/`git`) doesn't survive into the pane and reset the
+  // cursor. Empty segments (consecutive separators, leading/trailing) are
+  // dropped — calling `event.X("\n")` legitimately emits nothing.
+  return text.split(/\r\n|\r|\n/).filter((line) => line.length > 0);
 }
 
 function writeFile(level: string, source: string, msg: string, ctx?: object): void {
