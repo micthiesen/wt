@@ -197,6 +197,29 @@ function TitleLine({
 }
 
 /**
+ * Most recent top-level review message, formatted as `@author: body`.
+ * Sits between the row stack and the AI description so it's adjacent to
+ * the review badge above and the LLM-generated context below. Renders
+ * nothing when there's no review or no body — the reviewer hit Approve
+ * without typing anything.
+ */
+function ReviewBlock({
+  review,
+}: {
+  review: { author: string; body: string } | null;
+}) {
+  if (!review) return null;
+  return (
+    <box marginTop={1}>
+      <text fg={theme.fg} wrapMode="word">
+        <span attributes={TextAttributes.BOLD}>@{review.author}</span>
+        {`: ${review.body}`}
+      </text>
+    </box>
+  );
+}
+
+/**
  * Multi-line AI summary below the rows. Renders muted text, falls back
  * to a placeholder while the first generation is in flight, and stays
  * silent on errors / when the row is dirty-but-uncached (avoid noise).
@@ -338,6 +361,7 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
       {RESOLVED_ROWS.map((m) => (
         <RenderedRow key={m.id} module={m} ctx={ctx} />
       ))}
+      <ReviewBlock review={row.pr?.latestReview ?? null} />
       <DescriptionBlock
         summary={summary.data?.description ?? null}
         isLlmRunning={summary.isFetching}

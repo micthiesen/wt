@@ -6,6 +6,7 @@ import { run } from "./proc.ts";
 import type {
   AutoMergeMethod,
   Contributor,
+  LatestReview,
   MergeQueueEntry,
   MergeQueueState,
   PrChecks,
@@ -154,6 +155,13 @@ fragment PrFields on PullRequest {
       }
     }
   }
+  reviews(last: 10) {
+    nodes {
+      author { login }
+      body
+      state
+    }
+  }
 }`;
 
 // CodeRabbit's status-check context name and GraphQL author login. Both
@@ -278,22 +286,78 @@ type GqlPrNode = {
     }>;
   };
   reviewThreads: { nodes: GqlReviewThread[] } | null;
+  reviews: {
+    nodes: Array<{
+      author: { login: string | null } | null;
+      body: string;
+      state: GqlReviewSubmissionState;
+    }>;
+  } | null;
 };
+
+type GqlReviewSubmissionState =
+  | "APPROVED"
+  | "CHANGES_REQUESTED"
+  | "COMMENTED"
+  | "DISMISSED"
+  | "PENDING";
 
 function rollupReview(
   state: PullRequest["state"],
   decision: GqlReviewDecision,
   outstandingRequests: number,
+  hasStaleChangesRequest: boolean,
 ): PrReview {
   // Terminal PRs don't carry useful review state; suppress to keep the
   // line uncluttered. The PR badge already conveys merged/closed.
   if (state !== "OPEN") return "none";
   if (decision === "APPROVED") return "approved";
-  if (decision === "CHANGES_REQUESTED") return "changes_requested";
+  if (decision === "CHANGES_REQUESTED") {
+    // GitHub keeps `reviewDecision` pinned at CHANGES_REQUESTED until
+    // the same reviewer submits a new review or the old one is
+    // dismissed — re-requesting review doesn't clear it. When the
+    // reviewer who CR'd is back in `reviewRequests`, the practical
+    // state is "fixed it, asked again, waiting" so surface that as
+    // pending instead of leaving the stale "changes requested" badge
+    // up.
+    if (hasStaleChangesRequest) return "pending";
+    return "changes_requested";
+  }
   // Distinguish "nobody asked yet" from "asked, waiting" — the action
   // for the first is to hit `v`, for the second it's to wait.
   if (outstandingRequests === 0) return "unrequested";
   return "pending";
+}
+
+/**
+ * True when at least one reviewer whose latest review was
+ * CHANGES_REQUESTED has been re-requested (their login is back in the
+ * currently-requested set). Walks `reviews` newest-to-oldest and only
+ * keeps each author's most recent terminal verdict so a CR followed by
+ * a fresh APPROVED doesn't keep flagging the author.
+ */
+function hasStaleChangesRequest(
+  reviews: GqlPrNode["reviews"],
+  currentlyRequested: readonly string[],
+): boolean {
+  if (currentlyRequested.length === 0) return false;
+  const requested = new Set(currentlyRequested);
+  const seen = new Set<string>();
+  const nodes = reviews?.nodes ?? [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const r = nodes[i];
+    const author = r?.author?.login;
+    if (!author || seen.has(author)) continue;
+    // Only verdict-bearing states reset the author's running state.
+    // COMMENTED and PENDING are non-terminal and should be skipped so
+    // an idle "commented" after a CR doesn't mask the CR.
+    if (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED") {
+      continue;
+    }
+    seen.add(author);
+    if (r.state === "CHANGES_REQUESTED" && requested.has(author)) return true;
+  }
+  return false;
 }
 
 type GqlMqEntry = {
@@ -347,10 +411,33 @@ function extractSuggestedReviewers(
   return out;
 }
 
+/**
+ * Most recent human review with a non-empty body. Walks newest-to-oldest
+ * (graphql `reviews(last:N)` orders ascending, so the freshest entry is
+ * at the end of the array) and skips empties, missing authors, and
+ * CodeRabbit — its activity has its own badge / unresolved-thread count
+ * and would otherwise drown out the human review message.
+ */
+function extractLatestReview(
+  reviews: GqlPrNode["reviews"],
+): LatestReview | null {
+  const nodes = reviews?.nodes ?? [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const r = nodes[i];
+    const body = r?.body?.trim();
+    const author = r?.author?.login;
+    if (!body || !author) continue;
+    if (author === CR_LOGIN) continue;
+    return { author, body };
+  }
+  return null;
+}
+
 function nodeToPr(pr: GqlPrNode): PullRequest {
   const contexts =
     pr.commits.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? null;
   const threads = pr.reviewThreads?.nodes ?? null;
+  const requestedReviewers = extractRequestedReviewers(pr.reviewRequests);
   return {
     number: pr.number,
     url: pr.url,
@@ -364,10 +451,11 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
       pr.state,
       pr.reviewDecision,
       pr.reviewRequests?.totalCount ?? 0,
+      hasStaleChangesRequest(pr.reviews, requestedReviewers),
     ),
     reviewRequests: pr.reviewRequests?.totalCount ?? 0,
     rabbit: rollupRabbit(pr.state, contexts, threads),
-    requestedReviewers: extractRequestedReviewers(pr.reviewRequests),
+    requestedReviewers,
     suggestedReviewers: extractSuggestedReviewers(pr.suggestedReviewers),
     autoMerge: pr.autoMergeRequest
       ? {
@@ -375,6 +463,7 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
           mergeMethod: pr.autoMergeRequest.mergeMethod,
         }
       : null,
+    latestReview: extractLatestReview(pr.reviews),
     mergedAt: pr.mergedAt ?? null,
     closedAt: pr.closedAt ?? null,
   };

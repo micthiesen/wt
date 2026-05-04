@@ -152,6 +152,18 @@ export async function createWorktree(
     return { ok: false, reason: `Another wt process is busy with ${slug}` };
   }
 
+  // Reset any stale archive / state.json entry left over from a prior
+  // destroy of the same slug. Done after lock acquire so a racing
+  // destroy of the same slug (would have failed `tryAcquireLock` above)
+  // can't have its archive entry wiped from under it. We deliberately
+  // don't clean these up at destroy time: clearing archive.json while
+  // the parent TUI's worktreesQuery cache still includes the row makes
+  // the row "un-archive" mid-destroy and flash back into the active
+  // list. Clearing here, paired with the lock guarantee that no
+  // destroy is in flight, is the race-free counterpart.
+  clearArchived(slug);
+  clearSlugState(slug);
+
   try {
     opts.onPhase?.("fetching origin");
     await fetchOrigin();
@@ -314,12 +326,16 @@ export async function removeWorktree(
       }
     }
 
-    // Worktree is fully gone — drop any archived-flag the user set so a
-    // future `wt new <same-slug>` doesn't inherit the stale status.
-    // Deferred to the end so the row shows its archived styling
-    // throughout the destroy instead of flickering non-archived.
-    clearArchived(wt.slug);
-    clearSlugState(wt.slug);
+    // Note: archive.json / state.json entries are NOT cleared here.
+    // Doing so from the child process while the parent TUI's
+    // worktreesQuery cache still includes this slug causes the row to
+    // visibly "un-archive" mid-destroy: the archive query refetches and
+    // sees the slug gone, but the worktrees list still has it, so the
+    // row pops into the active section as merged/gone until the next
+    // worktrees refetch. The fresh-start guarantee for re-creates lives
+    // in createWorktree (which clears both files for the new slug); the
+    // stale-entry sweep for external destroys lives in `reapStartup` so
+    // archive.json/state.json don't accumulate ghosts.
 
     return {
       ok: true,

@@ -59,6 +59,19 @@ export type Contributor = {
   contributions: number;
 };
 
+/**
+ * Top-level body of the most recent submitted review that carried a
+ * non-empty message. Distinct from `reviewThreads` — this is what the
+ * reviewer types into the "Review changes" textarea on the Files tab,
+ * not their inline line-anchored comments.
+ */
+export type LatestReview = {
+  /** GitHub login of the reviewer. */
+  author: string;
+  /** The textarea body — may contain markdown and newlines. */
+  body: string;
+};
+
 export type AutoMergeMethod = "SQUASH" | "MERGE" | "REBASE";
 
 /**
@@ -114,6 +127,12 @@ export type PullRequest = {
   rabbit: RabbitStatus;
   /** "Merge when ready" arming state. `null` when not enabled. */
   autoMerge: AutoMerge | null;
+  /**
+   * Most recent submitted review with a non-empty body. `null` when
+   * nobody has left a top-level review message yet. Comment-only and
+   * empty-body reviews are skipped at parse time.
+   */
+  latestReview: LatestReview | null;
   // ISO timestamps. Terminal PRs carry at least one of these; OPEN
   // PRs have neither. Used to dismiss pre-existing merged/closed PRs
   // when a worktree for the same branch is recreated from scratch.

@@ -2,6 +2,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 
+import { reapArchived } from "../core/archive.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
@@ -14,17 +15,21 @@ import { attachFetchLogs } from "./fetch-log.ts";
 const startupLog = createLogger("[startup]");
 
 /**
- * Drop state.json entries whose slug no longer exists in `git worktree
- * list`. Catches the case where a worktree is removed outside `wt`
- * (manual `git worktree remove`, repo blown away, etc.) — `lifecycle`
- * already reaps on its own destroys, so this is the leak-fixer for
- * external operations. Errors are swallowed; a stale state entry is
- * a worse outcome than blocking startup.
+ * Drop state.json + archive.json entries whose slug no longer exists
+ * in `git worktree list`. Destroys deliberately leave both files alone
+ * (so the row stays visually archived through the destroy without
+ * flicker — see `removeWorktree`); fresh-start on re-create is handled
+ * by `createWorktree`. This sweep is for ghosts left behind by external
+ * removes (`git worktree remove` from the shell, repo blown away) or by
+ * destroys whose target slug never gets re-created. Errors are
+ * swallowed; a stale entry is a worse outcome than blocking startup.
  */
-async function reapState(): Promise<void> {
+async function reapStartup(): Promise<void> {
   try {
     const wts = await listWorktrees();
-    reapWtState(new Set(wts.map((w) => w.slug)));
+    const live = new Set(wts.map((w) => w.slug));
+    reapWtState(live);
+    reapArchived(live);
   } catch (err) {
     startupLog.warn("reap failed", { err: err instanceof Error ? err.message : String(err) });
   }
@@ -50,7 +55,7 @@ export async function runTui(): Promise<TuiExit> {
       wtClient.restored,
       new Promise<void>((r) => setTimeout(r, 150)),
     ]),
-    reapState(),
+    reapStartup(),
   ]);
 
   const renderer = await createCliRenderer({

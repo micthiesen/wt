@@ -55,12 +55,32 @@ export function archiveSlug(slug: string): void {
 }
 
 /**
- * Drop a slug from the archived set. Called after a worktree is fully
- * destroyed so a future `wt new` with the same slug starts fresh. No-op
- * if the slug wasn't archived.
+ * Drop a slug from the archived set. Called by `createWorktree` so a
+ * fresh worktree with a previously-destroyed slug starts un-archived.
+ * No-op if the slug wasn't archived.
  */
 export function clearArchived(slug: string): void {
   const set = readArchived();
   if (!set.delete(slug)) return;
+  writeArchived(set);
+}
+
+/**
+ * Drop archive entries that no longer correspond to a live worktree.
+ * Run at TUI startup to sweep ghosts left behind by destroys (which
+ * intentionally don't touch archive.json — see `removeWorktree`) or by
+ * external operations (`git worktree remove` from the shell). No-op
+ * when nothing to drop, so the common case is a single read.
+ */
+export function reapArchived(liveSlugs: ReadonlySet<string>): void {
+  const set = readArchived();
+  let changed = false;
+  for (const slug of set) {
+    if (!liveSlugs.has(slug)) {
+      set.delete(slug);
+      changed = true;
+    }
+  }
+  if (!changed) return;
   writeArchived(set);
 }

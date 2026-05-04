@@ -573,8 +573,13 @@ export function App({ onExit }: Props) {
     }
     // Tuck the row into the archived section for the duration of the
     // destroy — keeps the active list uncluttered while tail output
-    // spills into the activity pane. `clearArchived` in removeWorktree
-    // drops it again once the worktree is actually gone.
+    // spills into the activity pane. The archive entry intentionally
+    // outlives the destroy: removeWorktree leaves archive.json alone so
+    // the row keeps its archived styling until it actually disappears
+    // from the worktree list (driven by the lock-released → invalidate
+    // worktrees trigger in useWorktreeRows). Stale entries are reaped
+    // at next startup; re-creating the same slug clears the entry via
+    // createWorktree.
     archive(slug);
     spawnBackgroundRemove(slug, {
       force: false,

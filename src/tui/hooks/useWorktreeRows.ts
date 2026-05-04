@@ -295,6 +295,37 @@ export function useWorktreeRows(): WorktreeRowsResult {
     return !!(lock && Object.keys(lock).length > 0);
   });
 
+  // Lock-released → invalidate worktrees. Background `_destroy`
+  // releases its lock once the worktree is fully gone (sst remove + git
+  // worktree remove + branch delete), at which point the
+  // worktreesQuery cache is still showing the slug until staleTime
+  // (15s) expires. Watching for the held→released transition lets us
+  // refetch within ~2s (lock query's polling interval), so a destroyed
+  // row drops out of the list promptly instead of lingering as a stale
+  // merged/gone candidate. JSON-encoded so foreign-author slugs that
+  // happen to contain a delimiter character don't smear set membership.
+  const lockedSlugs = worktrees
+    .filter((_, i) => busyByIndex[i])
+    .map((w) => w.slug)
+    .sort();
+  const lockedSig = JSON.stringify(lockedSlugs);
+  const prevLockedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const curr = new Set<string>(JSON.parse(lockedSig) as string[]);
+    const prev = prevLockedRef.current;
+    let released = false;
+    for (const slug of prev) {
+      if (!curr.has(slug)) {
+        released = true;
+        break;
+      }
+    }
+    prevLockedRef.current = curr;
+    if (released) {
+      void qc.invalidateQueries({ queryKey: qk.worktrees() });
+    }
+  }, [lockedSig, qc]);
+
   const diffResults = useQueries({
     queries: worktrees.map((wt, i) => ({
       ...wtDiffContextQuery(wt, effectiveBaseFor(wt)),
