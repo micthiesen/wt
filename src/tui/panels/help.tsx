@@ -44,6 +44,7 @@ const SECTIONS: Section[] = [
       ["v", "edit reviewers (picker)"],
       ["!", "run claude action · kill if running"],
       ["F12", "enter claude session · F12 again to detach"],
+      ["⇧F12", "kill claude session (preserves history)"],
       ["d", "remove worktree"],
     ],
   },

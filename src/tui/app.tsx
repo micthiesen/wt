@@ -35,6 +35,7 @@ import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
 import { KillActionConfirmModal } from "./panels/kill-action-confirm.tsx";
+import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
 import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
 import {
   SectionPickerModal,
@@ -237,7 +238,8 @@ type Modal =
       newName: string | null;
     }
   | { kind: "actionPicker"; state: ActionPickerState }
-  | { kind: "killActionConfirm"; slug: string; actionName: string };
+  | { kind: "killActionConfirm"; slug: string; actionName: string }
+  | { kind: "killSessionConfirm"; slug: string };
 
 /**
  * A worktree is safe to clean when the branch is finished upstream. We
@@ -636,18 +638,27 @@ export function App({ onExit }: Props) {
     // at next startup; re-creating the same slug clears the entry via
     // createWorktree.
     archive(slug);
+    // Tear down any interactive claude session BEFORE the worktree
+    // removal starts. tmux's session has cwd inside the worktree;
+    // letting the remove race against a live claude can leave it
+    // writing into a half-deleted directory. killSession is idempotent
+    // and fast (it just SIGHUPs tmux's session daemon). Awaited so
+    // spawnBackgroundRemove only starts once the live process is gone.
+    try {
+      await killSession(slug);
+      void refreshTmuxSessions();
+    } catch (err) {
+      log.warn("kill session before remove failed", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      // Don't block the destroy on a kill failure — worst case the
+      // session is already dead, or it'll get reaped on next startup.
+    }
     spawnBackgroundRemove(slug, {
       force: false,
       destroyStage: row.fields.deploy.data ?? false,
       deleteBranch: true,
     });
-    // Also tear down any interactive claude tmux session for the same
-    // slug. Best-effort, idempotent — if no session exists, killSession
-    // exits 0 and we fall through. Ignored failures don't block the
-    // worktree destroy.
-    void killSession(slug)
-      .then(() => void refreshTmuxSessions())
-      .catch(() => {});
     log.event.info("dispatched destroy");
     toast(`dispatched destroy of ${slug}`, theme.info);
     setTimeout(() => void invalidateWorktree(slug), 600);
@@ -663,6 +674,14 @@ export function App({ onExit }: Props) {
     appLog.event.info(
       `clean: dispatching ${candidates.length} destroy${candidates.length === 1 ? "" : "s"}`,
     );
+    // Kill every candidate's tmux session before dispatching any
+    // remove — same rationale as `doRemove`: don't let the remove
+    // race against a live claude with cwd inside the worktree. Done
+    // in parallel since each kill is independent.
+    await Promise.allSettled(
+      candidates.map((row) => killSession(row.wt.slug)),
+    );
+    void refreshTmuxSessions();
     for (const row of candidates) {
       archive(row.wt.slug);
       spawnBackgroundRemove(row.wt.slug, {
@@ -670,10 +689,8 @@ export function App({ onExit }: Props) {
         destroyStage: row.fields.deploy.data ?? false,
         deleteBranch: true,
       });
-      void killSession(row.wt.slug).catch(() => {});
       createLogger(row.wt.slug).event.info("dispatched destroy (clean)");
     }
-    void refreshTmuxSessions();
     setTimeout(() => void refreshAll(), 600);
   }
 
@@ -1234,6 +1251,35 @@ export function App({ onExit }: Props) {
       return;
     }
 
+    // Kill-confirm for an interactive tmux session on the selected
+    // worktree. Mirrors `killActionConfirm`. The conversation jsonl is
+    // preserved — next F12 attaches via --resume to the same UUID.
+    if (modal?.kind === "killSessionConfirm") {
+      if (k.name === "y" || k.name === "return") {
+        const { slug } = modal;
+        setModal(null);
+        void killSession(slug)
+          .then(() => {
+            appLog.event.warn(`killed claude session on ${slug}`);
+            void refreshTmuxSessions();
+          })
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            appLog.event.err(`kill session failed for ${slug}: ${msg}`);
+          });
+        return;
+      }
+      if (
+        k.name === "n" ||
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setModal(null);
+      }
+      return;
+    }
+
     // Branch-picker modal (for --any multi-match). Swallows input
     // until the user picks or cancels, resolving the promise that
     // `parseInput` is awaiting inside `doNew`.
@@ -1538,15 +1584,39 @@ export function App({ onExit }: Props) {
       }
       return;
     }
+    // Shift+F12 — kill-confirm for the selected worktree's interactive
+    // claude session. No-op (with a hint) when there's no session.
+    // Conversation jsonl is preserved; this kills only the live tmux
+    // session + claude process so the next F12 attaches via --resume.
+    if (
+      k.name === "f12" &&
+      k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (!activeSessions.has(slug)) {
+        toast(`no session on ${slug}`, theme.fgDim, 1500);
+        return;
+      }
+      setModal({ kind: "killSessionConfirm", slug });
+      return;
+    }
     // F12 — toggle into the selected worktree's interactive claude
     // session. tmux's `new-session -A` makes this idempotent (creates
     // or attaches), so the same key works whether the session exists
     // yet or not. From inside the session, the wt-private tmux config
     // binds F12 to detach-client → the same physical key flips
     // between contexts. Refuse on busy worktrees so we don't race a
-    // destroy. The unmodified-only guard prevents Shift+F12 (which
-    // some terminals emit as a distinct sequence) from accidentally
-    // triggering this.
+    // destroy. The unmodified-only guard prevents Shift+F12 (handled
+    // above as kill-session) from also entering.
     if (
       k.name === "f12" &&
       !k.shift &&
@@ -1845,6 +1915,9 @@ export function App({ onExit }: Props) {
           slug={modal.slug}
           actionName={modal.actionName}
         />
+      ) : null}
+      {modal?.kind === "killSessionConfirm" ? (
+        <KillSessionConfirmModal slug={modal.slug} />
       ) : null}
     </box>
   );
