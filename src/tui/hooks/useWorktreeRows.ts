@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { ClaudeStatus } from "../../core/claude.ts";
 import { config } from "../../core/config.ts";
@@ -216,6 +216,102 @@ function deriveStatus(
 }
 
 /**
+ * Pick the row title with the `llm > pr > commit > slug` fallback
+ * chain. The slug fallback is what guarantees the title field is
+ * never empty: `slugLabel(...).rest` is the prettified tail (issue
+ * ID stripped, dashes → spaces, first-letter caps); for slugs that
+ * are *only* an issue prefix it falls back to the id and finally the
+ * raw slug, so we always render something and the details pane keeps
+ * a stable line count.
+ */
+function resolveTitle(
+  slug: string,
+  llmTitle: string | null,
+  prTitle: string | null,
+  commitTitle: string | null,
+): { title: string; source: TitleSource } {
+  if (llmTitle) return { title: llmTitle, source: "llm" };
+  if (prTitle) return { title: prTitle, source: "pr" };
+  if (commitTitle) return { title: commitTitle, source: "commit" };
+  const { id, rest } = slugLabel(slug);
+  return { title: rest || id || slug, source: "slug" };
+}
+
+/**
+ * Section-aware sort for the active (non-archived) rows. Active rows
+ * partition into:
+ *   1. unsectioned (section === null) at the top.
+ *   2. named sections in the order they appear in `sectionsOrder`
+ *      (an explicit array maintained in state.json).
+ * Within each bucket, rows sort by `state.order` ascending; unstated
+ * entries float to the top (-Infinity) so brand-new worktrees always
+ * land at the top of the unsectioned list. Sections not yet in
+ * `sectionsOrder` (post-rename quirk, raw file edit) sort to the end
+ * via `Number.MAX_SAFE_INTEGER` then alphabetically — display stays
+ * stable until the index catches up on the next read.
+ *
+ * Returned as a fresh array; the caller is responsible for combining
+ * with the archived rows and any rows-array identity stabilization.
+ */
+function sortActiveRows(
+  active: WorktreeRow[],
+  unsortedIndex: ReadonlyMap<string, number>,
+  stateSlugs: Record<string, { order: number }>,
+  sectionsOrder: readonly string[],
+): WorktreeRow[] {
+  const sectionRank = new Map<string, number>();
+  for (let i = 0; i < sectionsOrder.length; i++) {
+    sectionRank.set(sectionsOrder[i]!, i);
+  }
+  return active.slice().sort((a, b) => {
+    const bucketA = a.section === null ? 0 : 1;
+    const bucketB = b.section === null ? 0 : 1;
+    if (bucketA !== bucketB) return bucketA - bucketB;
+    if (a.section !== null && b.section !== null && a.section !== b.section) {
+      const rankA = sectionRank.get(a.section) ?? Number.MAX_SAFE_INTEGER;
+      const rankB = sectionRank.get(b.section) ?? Number.MAX_SAFE_INTEGER;
+      if (rankA !== rankB) return rankA - rankB;
+      return a.section.localeCompare(b.section);
+    }
+    const orderA = stateSlugs[a.wt.slug]?.order ?? -Infinity;
+    const orderB = stateSlugs[b.wt.slug]?.order ?? -Infinity;
+    if (orderA !== orderB) return orderA - orderB;
+    return (unsortedIndex.get(a.wt.slug) ?? 0) - (unsortedIndex.get(b.wt.slug) ?? 0);
+  });
+}
+
+/**
+ * Watch the set of slugs that currently hold a lock. When a slug
+ * transitions from held → released, invalidate the worktree list so
+ * a destroyed slug drops promptly instead of lingering as a stale
+ * merged/gone candidate until its 15s staleTime expires.
+ *
+ * The signal arrives as a JSON-encoded sorted slug list so React
+ * compares by string identity (cheap, stable). A foreign-author slug
+ * that happens to contain a delimiter character can't smear set
+ * membership because we go through JSON.
+ */
+function useLockReleasedInvalidator(lockedSig: string): void {
+  const qc = useQueryClient();
+  const prevLockedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const curr = new Set<string>(JSON.parse(lockedSig) as string[]);
+    const prev = prevLockedRef.current;
+    let released = false;
+    for (const slug of prev) {
+      if (!curr.has(slug)) {
+        released = true;
+        break;
+      }
+    }
+    prevLockedRef.current = curr;
+    if (released) {
+      void qc.invalidateQueries({ queryKey: qk.worktrees() });
+    }
+  }, [lockedSig, qc]);
+}
+
+/**
  * Fetches the worktree list and, in a single `useQueries` batch, every
  * per-property field for every non-main worktree. Results are stitched
  * back into a row per worktree with a derived `Status`.
@@ -253,28 +349,22 @@ export function useWorktreeRows(): WorktreeRowsResult {
    * resolves them as local refs — exactly what we want for stacked
    * work where the parent's tip may be ahead of any pushed state.
    */
-  const effectiveBaseFor = (wt: Worktree): string | null => {
-    const fromCommits = stack.data?.[wt.slug];
-    if (fromCommits) return fromCommits.branch;
-    return null;
-  };
+  // Resolve the effective base for every worktree once per render and
+  // use the same array everywhere downstream (sync + git-activity +
+  // diffContext queries). Drifting between two independent lookups
+  // would land queries in the wrong cache slot for that base.
+  const bases = worktrees.map((wt) => stack.data?.[wt.slug]?.branch ?? null);
 
-  const queries = worktrees.flatMap((wt) => {
-    // Resolve once per worktree so the sync + activity queries land in
-    // the same cache slot (matching base) and `useQueries` doesn't see
-    // identity drift from two unrelated `effectiveBaseFor` calls.
-    const base = effectiveBaseFor(wt);
-    return [
-      wtDirtyQuery(wt),
-      wtLockQuery(wt),
-      wtDeployQuery(wt),
-      wtMergedQuery(wt),
-      wtGoneQuery(wt),
-      wtSyncQuery(wt, base),
-      wtClaudeQuery(wt),
-      wtGitActivityQuery(wt, base),
-    ];
-  });
+  const queries = worktrees.flatMap((wt, i) => [
+    wtDirtyQuery(wt),
+    wtLockQuery(wt),
+    wtDeployQuery(wt),
+    wtMergedQuery(wt),
+    wtGoneQuery(wt),
+    wtSyncQuery(wt, bases[i]!),
+    wtClaudeQuery(wt),
+    wtGitActivityQuery(wt, bases[i]!),
+  ]);
 
   // `combine` runs on every render with the latest results — cheap since
   // `useQueries` caches identity.
@@ -295,74 +385,36 @@ export function useWorktreeRows(): WorktreeRowsResult {
     return !!(lock && Object.keys(lock).length > 0);
   });
 
-  // Lock-released → invalidate worktrees. Background `_destroy`
-  // releases its lock once the worktree is fully gone (sst remove + git
-  // worktree remove + branch delete), at which point the
-  // worktreesQuery cache is still showing the slug until staleTime
-  // (15s) expires. Watching for the held→released transition lets us
-  // refetch within ~2s (lock query's polling interval), so a destroyed
-  // row drops out of the list promptly instead of lingering as a stale
-  // merged/gone candidate. JSON-encoded so foreign-author slugs that
-  // happen to contain a delimiter character don't smear set membership.
+  // Lock-released → invalidate worktrees. Effect lives in
+  // `useLockReleasedInvalidator`; the body of this hook just produces
+  // the signal.
   const lockedSlugs = worktrees
     .filter((_, i) => busyByIndex[i])
     .map((w) => w.slug)
     .sort();
-  const lockedSig = JSON.stringify(lockedSlugs);
-  const prevLockedRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    const curr = new Set<string>(JSON.parse(lockedSig) as string[]);
-    const prev = prevLockedRef.current;
-    let released = false;
-    for (const slug of prev) {
-      if (!curr.has(slug)) {
-        released = true;
-        break;
-      }
-    }
-    prevLockedRef.current = curr;
-    if (released) {
-      void qc.invalidateQueries({ queryKey: qk.worktrees() });
-    }
-  }, [lockedSig, qc]);
+  useLockReleasedInvalidator(JSON.stringify(lockedSlugs));
 
   const diffResults = useQueries({
     queries: worktrees.map((wt, i) => ({
-      ...wtDiffContextQuery(wt, effectiveBaseFor(wt)),
+      ...wtDiffContextQuery(wt, bases[i]!),
       enabled: !busyByIndex[i],
     })),
   });
 
+  // Hash-keyed AI summary: a diff change re-keys the query, the
+  // observer cache-misses for the new hash, and `keepPreviousData`
+  // keeps the prior summary on screen while the new fetch runs. No
+  // mismatch effect required — the cache key change *is* the trigger.
   const aiResults = useQueries({
     queries: worktrees.map((wt, i) => {
       const ctx = diffResults[i]?.data ?? null;
       return {
-        ...aiSummaryQuery(qc, wt.slug, ctx),
+        ...aiSummaryQuery(wt.slug, ctx),
         enabled: aiEnabled && !busyByIndex[i] && !!ctx,
+        placeholderData: keepPreviousData,
       };
     }),
   });
-
-  // Slug-keyed cache means the queryFn won't re-run on its own when
-  // the diff changes — the queryKey is unchanged. Detect drift here
-  // and invalidate; the observer's refetch picks up the new closure
-  // (with the new ctx hash) and the queryFn either hits the memo or
-  // calls LM Studio. During the refetch, `data` keeps the prior
-  // summary visible, which is the whole point of slug-keying.
-  const mismatchSig = worktrees
-    .map((wt, i) => {
-      const dataHash = aiResults[i]?.data?.hash;
-      const ctxHash = diffResults[i]?.data?.hash;
-      return dataHash && ctxHash && dataHash !== ctxHash ? wt.slug : "";
-    })
-    .filter(Boolean)
-    .join("|");
-  useEffect(() => {
-    if (!mismatchSig) return;
-    for (const slug of mismatchSig.split("|")) {
-      void qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });
-    }
-  }, [mismatchSig, qc]);
 
   // First-commit subject — non-AI fallback for the title resolution
   // chain. Cheap (one `git log`); paused only while busy so we don't
@@ -425,31 +477,16 @@ export function useWorktreeRows(): WorktreeRowsResult {
       fieldArr.some((r) => r.isFetching) || github.isFetching;
     const archived = archivedSet.has(wt.slug);
     const section = stateSlugs[wt.slug]?.section ?? null;
-    const llmTitle = (aiResults[i]?.data?.title as string | undefined) ?? null;
-    const llmBrief = (aiResults[i]?.data?.brief as string | undefined) ?? null;
+    const llmTitle = aiResults[i]?.data?.title ?? null;
+    const llmBrief = aiResults[i]?.data?.brief ?? null;
     const prTitle = pr?.title ?? null;
-    const commitTitle = (firstCommitResults[i]?.data as string | null | undefined) ?? null;
-    let title: string;
-    let titleSource: TitleSource;
-    if (llmTitle) {
-      title = llmTitle;
-      titleSource = "llm";
-    } else if (prTitle) {
-      title = prTitle;
-      titleSource = "pr";
-    } else if (commitTitle) {
-      title = commitTitle;
-      titleSource = "commit";
-    } else {
-      // Slug-derived fallback. `slugLabel(...).rest` is the prettified
-      // tail (issue ID stripped, dashes → spaces, first-letter caps).
-      // Empty rest happens for slugs that are only an issue prefix —
-      // fall back to the id, then the raw slug, so we always render
-      // *something* and the details pane keeps a stable line count.
-      const { id, rest } = slugLabel(wt.slug);
-      title = rest || id || wt.slug;
-      titleSource = "slug";
-    }
+    const commitTitle = firstCommitResults[i]?.data ?? null;
+    const { title, source: titleSource } = resolveTitle(
+      wt.slug,
+      llmTitle,
+      prTitle,
+      commitTitle,
+    );
     // After per-field reuse above, identity-equality on each `fields.X`,
     // `status`, `pr`, `mq` plus primitives is sufficient — anything
     // observable changing produces a fresh reference at one of those
@@ -510,45 +547,20 @@ export function useWorktreeRows(): WorktreeRowsResult {
     }
   }
 
-  // Section-aware sort. Active rows partition into:
-  //   1. unsectioned (section === null)
-  //   2. named sections, ordered by their position in `sectionsOrder`
-  //      (an explicit array maintained in state.json, appended on
-  //      first encounter and pruned on emptiness).
-  // Within each bucket, rows sort by `state.order` ascending; unstated
-  // entries (no state row yet) float to the top (-Infinity) so brand-
-  // new worktrees always land at the top of the unsectioned list.
-  // Archived rows are flat at the bottom in original list order — the
-  // archive divider is a hard visual break, secondary grouping there
-  // would be noise (and the user explicitly asked for a flat list).
+  // Section-aware sort lives in `sortActiveRows`. Archived rows are
+  // flat at the bottom in original list order — the archive divider is
+  // a hard visual break, secondary grouping there would be noise.
   const listIndexOf = new Map<string, number>();
   for (let i = 0; i < unsorted.length; i++) {
     listIndexOf.set(unsorted[i]!.wt.slug, i);
   }
   const sectionsOrder = wtState.data?.sectionsOrder ?? [];
-  const sectionRank = new Map<string, number>();
-  for (let i = 0; i < sectionsOrder.length; i++) {
-    sectionRank.set(sectionsOrder[i]!, i);
-  }
-  const active = unsorted.filter((r) => !r.archived).slice().sort((a, b) => {
-    const bucketA = a.section === null ? 0 : 1;
-    const bucketB = b.section === null ? 0 : 1;
-    if (bucketA !== bucketB) return bucketA - bucketB;
-    if (a.section !== null && b.section !== null && a.section !== b.section) {
-      // Sections not yet in `sectionsOrder` (post-rename quirk, raw
-      // file edit) sort to the end via `Number.MAX_SAFE_INTEGER`,
-      // then alphabetically — keeps display stable until the index
-      // catches up on the next read.
-      const rankA = sectionRank.get(a.section) ?? Number.MAX_SAFE_INTEGER;
-      const rankB = sectionRank.get(b.section) ?? Number.MAX_SAFE_INTEGER;
-      if (rankA !== rankB) return rankA - rankB;
-      return a.section.localeCompare(b.section);
-    }
-    const orderA = stateSlugs[a.wt.slug]?.order ?? -Infinity;
-    const orderB = stateSlugs[b.wt.slug]?.order ?? -Infinity;
-    if (orderA !== orderB) return orderA - orderB;
-    return (listIndexOf.get(a.wt.slug) ?? 0) - (listIndexOf.get(b.wt.slug) ?? 0);
-  });
+  const active = sortActiveRows(
+    unsorted.filter((r) => !r.archived),
+    listIndexOf,
+    stateSlugs,
+    sectionsOrder,
+  );
   const archived = unsorted.filter((r) => r.archived);
   const nextRows: WorktreeRow[] = [...active, ...archived];
   const prevRows = rowsRef.current;

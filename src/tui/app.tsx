@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 
@@ -189,6 +189,54 @@ function parseNewInput(raw: string, defaultBase?: string): NewInput {
 }
 
 /**
+ * Every overlay/modal the TUI can display. Exactly one is active at
+ * a time (or `null`); the keyboard handler dispatches by `kind` and
+ * the JSX renders by `kind`. New overlays should add a variant here
+ * rather than a parallel `useState<boolean>`.
+ *
+ * `branchPicker` suspends a caller (`doNew`'s `parseInput` awaits the
+ * resolver). Everything else is fire-and-forget: opening sets state,
+ * the user picks/cancels, the handler fires the side-effect and
+ * clears `modal`.
+ */
+type Modal =
+  | { kind: "help" }
+  | { kind: "cleanConfirm" }
+  | { kind: "yank" }
+  | {
+      kind: "branchPicker";
+      title: string;
+      items: string[];
+      index: number;
+      resolve: (picked: string | null) => void;
+    }
+  | {
+      kind: "reviewerPicker";
+      title: string;
+      items: MultiPickerItem[];
+      index: number;
+      checked: Set<string>;
+      /** Snapshot of currently-requested logins; diffed on submit. */
+      original: Set<string>;
+      slug: string;
+      prNumber: number;
+    }
+  | {
+      kind: "sectionPicker";
+      title: string;
+      slug: string;
+      items: SectionPickerItem[];
+      index: number;
+      /**
+       * When non-null, the modal is in "+ new section" name-input mode.
+       * Typed characters append here instead of navigating the list.
+       */
+      newName: string | null;
+    }
+  | { kind: "actionPicker"; state: ActionPickerState }
+  | { kind: "killActionConfirm"; slug: string; actionName: string };
+
+/**
  * A worktree is safe to clean when the branch is finished upstream. We
  * accept three signals — local "merged into main", local "[gone]" after
  * a fetch+prune, or the PR itself being merged. The PR check catches
@@ -225,76 +273,33 @@ export function App({ onExit }: Props) {
     placeSlug,
     renameSection,
   } = useWtActions();
-  const [sel, setSel] = useState(0);
+  // Cursor is tracked by slug, not index. Slug identity survives row
+  // moves (archive, section change, manual reorder) without any
+  // explicit "follow this row" plumbing — the visual index falls out
+  // of `filteredRows.findIndex(r.slug === sel)` on each render. When
+  // the selected slug disappears (destroy), `lastIndexRef` snaps the
+  // cursor to the row that took its place rather than jumping to the
+  // top of the list.
+  const [sel, setSel] = useState<string | null>(null);
+  const lastIndexRef = useRef(0);
   const [footer, setFooter] = useState<FooterMode>({ kind: "legend" });
-  const [showHelp, setShowHelp] = useState(false);
-  const [showCleanConfirm, setShowCleanConfirm] = useState(false);
-  const [showYank, setShowYank] = useState(false);
+  // All modal/overlay state collapsed into one discriminated union so
+  // the "only one modal is open at a time" invariant is structural
+  // rather than emergent. Per-modal payload (cursor index, picker
+  // items, slug context) lives on its variant. The keyboard handler
+  // and JSX both `switch` on `modal.kind`.
+  const [modal, setModal] = useState<Modal | null>(null);
   const [filter, setFilter] = useState("");
-  // Pending branch picker (populated when `parseInput` has multiple
-  // matches for `--any`). The resolver lets the suspended `doNew`
-  // promise continue once the user picks or cancels.
-  const [picker, setPicker] = useState<{
-    title: string;
-    items: string[];
-    index: number;
-    resolve: (picked: string | null) => void;
-  } | null>(null);
-  // Multi-select picker (currently used only for "request review"). Kept
-  // separate from `picker` because it doesn't suspend a caller — it just
-  // dispatches an action on submit.
-  const [reviewerPicker, setReviewerPicker] = useState<{
-    title: string;
-    items: MultiPickerItem[];
-    index: number;
-    checked: Set<string>;
-    /** Snapshot of currently-requested logins; diffed on submit. */
-    original: Set<string>;
-    slug: string;
-    prNumber: number;
-  } | null>(null);
-  // Section picker (mapped to `l`). When `newName !== null` the modal
-  // is in "+ new section" input mode — the keypress handler sends
-  // typing into that string instead of navigating the list.
-  const [sectionPicker, setSectionPicker] = useState<{
-    title: string;
-    slug: string;
-    items: SectionPickerItem[];
-    index: number;
-    newName: string | null;
-  } | null>(null);
-  // Cursor-follow ref. After every move/archive/rename, we want the
-  // cursor to land on the same slug at its new display index. The
-  // tricky part is that `await action()` resolves once the query
-  // refetch settles, but React hasn't re-rendered yet — so reading
-  // the cursor position immediately would land on the *pre-move*
-  // index. Instead we stash {slug, rowsAtDispatch} in a ref and let
-  // a `useEffect` on `filteredRows` consume it once the rows
-  // reference has actually changed (which happens on the
-  // post-invalidation render). The `rowsAtDispatch` comparison
-  // is the gate that prevents a stale-data render from snapping the
-  // cursor to the old position. Ref over state because we don't want
-  // an extra render just to schedule the follow.
-  const followRef = useRef<{
-    slug: string;
-    rowsAtDispatch: WorktreeRow[];
-  } | null>(null);
   // Last section the user moved a row into. Used to default the
   // section-picker cursor — the common case is "moving several
   // adjacent worktrees into the same section", and re-aiming on
   // every open eats keystrokes. Reset to `null` on rename so the
   // sticky target doesn't dangle.
   const [lastMoveTarget, setLastMoveTarget] = useState<string | null>(null);
-  const [actionPicker, setActionPicker] = useState<ActionPickerState | null>(null);
-  // Modal rather than inline `footer.confirm`: killing live work is
-  // intentionally heavier than the y/N row on the footer.
-  const [killActionConfirm, setKillActionConfirm] = useState<{
-    slug: string;
-    actionName: string;
-  } | null>(null);
-  // Section the user is renaming, if any. The footer input prompt is
-  // generic; this lets the submit handler know which section the
-  // typed text applies to.
+  // Section the user is renaming, if any. Sits alongside the footer
+  // input mode (footer carries the prompt + value, this carries the
+  // identity of the thing being renamed). Not folded into `modal`
+  // because the rename UX uses the footer, not an overlay.
   const [pendingRename, setPendingRename] = useState<string | null>(null);
   const toastTimer = useRef<Timer | null>(null);
 
@@ -319,10 +324,13 @@ export function App({ onExit }: Props) {
   // in legend/toast/confirm modes since paste only makes sense when the
   // user is typing.
   usePaste((text) => {
-    if (actionPicker?.mode === "edit") {
+    if (modal?.kind === "actionPicker" && modal.state.mode === "edit") {
       const clean = printableMultiline(text);
       if (!clean) return;
-      setActionPicker({ ...actionPicker, extras: actionPicker.extras + clean });
+      setModal({
+        ...modal,
+        state: { ...modal.state, extras: modal.state.extras + clean },
+      });
       return;
     }
     const clean = printableText(text);
@@ -331,7 +339,7 @@ export function App({ onExit }: Props) {
       const next = footer.value + clean;
       setFooter({ kind: "filter", value: next });
       setFilter(next);
-      setSel(0);
+      setSel(null);
     } else if (footer.kind === "input") {
       setFooter({ ...footer, value: footer.value + clean });
     }
@@ -348,8 +356,27 @@ export function App({ onExit }: Props) {
     [rows],
   );
 
-  const effectiveSel = Math.max(0, Math.min(sel, filteredRows.length - 1));
-  const current = filteredRows[effectiveSel];
+  // Resolve the selected slug to a visual index. When the slug isn't
+  // in the current filtered set (destroyed, filtered out, never set),
+  // fall back to the last known visual index, clamped to the new
+  // length. That fallback is what makes "destroy the selected row"
+  // land the cursor on the row that took its place.
+  const lookupIndex =
+    sel === null ? -1 : filteredRows.findIndex((r) => r.wt.slug === sel);
+  const cursorIndex =
+    filteredRows.length === 0
+      ? -1
+      : lookupIndex >= 0
+        ? lookupIndex
+        : Math.min(lastIndexRef.current, filteredRows.length - 1);
+  const current = cursorIndex >= 0 ? filteredRows[cursorIndex] : undefined;
+  // Stash the resolved index so it's available as a fallback the next
+  // time the slug can't be found. Writing during render is safe — the
+  // value is derived purely from this render's inputs, the write is
+  // idempotent, and reading it elsewhere happens in the same render.
+  if (cursorIndex >= 0 && cursorIndex !== lastIndexRef.current) {
+    lastIndexRef.current = cursorIndex;
+  }
 
   const listWidth = Math.max(32, Math.min(52, Math.floor(width * 0.44)));
   const activityHeight = Math.max(6, Math.min(16, Math.floor(height * 0.35)));
@@ -381,44 +408,15 @@ export function App({ onExit }: Props) {
   }
 
   /**
-   * Mark a slug for cursor-follow on the next post-invalidation
-   * render. Captures the *current* `filteredRows` so the effect can
-   * tell when fresh data has arrived: if the rows reference is still
-   * `rowsAtDispatch` when the effect runs, the refetch hasn't landed
-   * and we wait. Repeated calls (chord-Shift+J) overwrite the ref
-   * with a fresh `rowsAtDispatch` snapshot, so the second move's
-   * effect won't consume a stale capture from the first.
-   */
-  function followAfterMove(slug: string): void {
-    followRef.current = { slug, rowsAtDispatch: filteredRows };
-  }
-
-  /**
    * Standard error reporter for state-mutation chains. Disk writes
    * inside `wtstate.ts` can throw on EACCES / ENOSPC; we surface as
-   * an event log line + toast and clear any pending follow so a
-   * failed action doesn't leave the cursor logic stuck.
+   * an event log line + toast.
    */
   function reportActionError(label: string, err: unknown): void {
-    followRef.current = null;
     const msg = err instanceof Error ? err.message : String(err);
     appLog.event.err(`${label} failed: ${msg}`);
     toast(`${label} failed: ${msg}`, theme.err, 3000);
   }
-
-  // Run after every render where `filteredRows` changed. If a follow
-  // is pending and the rows reference has moved off the dispatch
-  // snapshot, find the slug at its new position and snap the cursor.
-  // `setSel` triggers another render, but that render will see
-  // `followRef.current === null` and skip.
-  useEffect(() => {
-    const pending = followRef.current;
-    if (!pending) return;
-    if (filteredRows === pending.rowsAtDispatch) return;
-    const idx = filteredRows.findIndex((r) => r.wt.slug === pending.slug);
-    if (idx >= 0) setSel(idx);
-    followRef.current = null;
-  }, [filteredRows]);
 
   /**
    * Build the section-picker item list. Excludes the current row's
@@ -478,7 +476,6 @@ export function App({ onExit }: Props) {
       // with `a` being the only path there.)
       if (dir < 0 && current.section !== null) {
         const slug = current.wt.slug;
-        followAfterMove(slug);
         placeSlug(slug, null, "bottom").then(
           () => toast("moved to (none)", theme.info, 1200),
           (err) => reportActionError("move", err),
@@ -493,7 +490,6 @@ export function App({ onExit }: Props) {
       const bucket = active
         .filter((r) => r.section === current.section)
         .map((r) => r.wt.slug);
-      followAfterMove(slug);
       swapOrder(slug, target.wt.slug, current.section, bucket).catch((err) =>
         reportActionError("reorder", err),
       );
@@ -502,7 +498,6 @@ export function App({ onExit }: Props) {
     // Cross-section: place at the edge of `target.section` adjacent to
     // the source section, so the row shifts one visual position.
     const position: "top" | "bottom" = dir > 0 ? "top" : "bottom";
-    followAfterMove(slug);
     placeSlug(slug, target.section, position).then(
       () => {
         const label = target.section === null ? "(none)" : target.section;
@@ -534,7 +529,8 @@ export function App({ onExit }: Props) {
       );
       if (i >= 0) initial = i;
     }
-    setSectionPicker({
+    setModal({
+      kind: "sectionPicker",
       title: `move ${current.wt.slug} to section`,
       slug: current.wt.slug,
       items,
@@ -545,29 +541,29 @@ export function App({ onExit }: Props) {
 
   function commitSectionPick(item: SectionPickerItem, slug: string): void {
     if (item.kind === "none") {
-      followAfterMove(slug);
       setSection(slug, null).then(
         () => toast("moved to (none)", theme.info, 1500),
         (err) => reportActionError("move", err),
       );
       setLastMoveTarget(null);
-      setSectionPicker(null);
+      setModal(null);
       return;
     }
     if (item.kind === "section") {
       const target = item.name;
-      followAfterMove(slug);
       setSection(slug, target).then(
         () => toast(`moved to ${target}`, theme.info, 1500),
         (err) => reportActionError("move", err),
       );
       setLastMoveTarget(target);
-      setSectionPicker(null);
+      setModal(null);
       return;
     }
     // "+ new section" — switch to input mode. Submission lives in the
     // keyboard handler.
-    setSectionPicker((p) => (p ? { ...p, newName: "" } : null));
+    setModal((m) =>
+      m?.kind === "sectionPicker" ? { ...m, newName: "" } : m,
+    );
   }
 
   /**
@@ -751,7 +747,8 @@ export function App({ onExit }: Props) {
       toast("no reviewer candidates", theme.warn, 2000);
       return;
     }
-    setReviewerPicker({
+    setModal({
+      kind: "reviewerPicker",
       title: `edit reviewers for #${row.pr.number}`,
       items,
       index: 0,
@@ -763,14 +760,14 @@ export function App({ onExit }: Props) {
   }
 
   async function submitReviewerPicker(): Promise<void> {
-    if (!reviewerPicker) return;
-    const { slug, prNumber, checked, original } = reviewerPicker;
+    if (modal?.kind !== "reviewerPicker") return;
+    const { slug, prNumber, checked, original } = modal;
     const log = createLogger(slug);
     const add: string[] = [];
     const remove: string[] = [];
     for (const k of checked) if (!original.has(k)) add.push(k);
     for (const k of original) if (!checked.has(k)) remove.push(k);
-    setReviewerPicker(null);
+    setModal(null);
     if (add.length === 0 && remove.length === 0) {
       toast("no changes", theme.fgDim, 1500);
       return;
@@ -847,7 +844,10 @@ export function App({ onExit }: Props) {
 
   function openActionPicker(slug: string): void {
     const items = buildActionPickerItems();
-    setActionPicker({ mode: "list", slug, index: 0, items });
+    setModal({
+      kind: "actionPicker",
+      state: { mode: "list", slug, index: 0, items },
+    });
   }
 
   function launchAction(
@@ -901,7 +901,8 @@ export function App({ onExit }: Props) {
         anyAuthor: parsed.anyAuthor,
         promptForChoice: (id, branches) =>
           new Promise<string | null>((resolve) => {
-            setPicker({
+            setModal({
+              kind: "branchPicker",
               title: `multiple branches for ${id}`,
               items: branches,
               index: 0,
@@ -932,45 +933,40 @@ export function App({ onExit }: Props) {
 
   useKeyboard((k) => {
     // Help overlay swallows input while open.
-    if (showHelp) {
+    if (modal?.kind === "help") {
       if (
         k.name === "escape" ||
         k.sequence === "?" ||
         k.name === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        setShowHelp(false);
+        setModal(null);
       }
       return;
     }
 
     // Reviewer multi-picker. Space toggles the cursor item, enter
     // submits the checked set, esc cancels.
-    if (reviewerPicker) {
+    if (modal?.kind === "reviewerPicker") {
+      const rp = modal;
       if (k.name === "j" || k.name === "down") {
-        setReviewerPicker({
-          ...reviewerPicker,
-          index: Math.min(
-            reviewerPicker.index + 1,
-            reviewerPicker.items.length - 1,
-          ),
+        setModal({
+          ...rp,
+          index: Math.min(rp.index + 1, rp.items.length - 1),
         });
         return;
       }
       if (k.name === "k" || k.name === "up") {
-        setReviewerPicker({
-          ...reviewerPicker,
-          index: Math.max(reviewerPicker.index - 1, 0),
-        });
+        setModal({ ...rp, index: Math.max(rp.index - 1, 0) });
         return;
       }
       if (k.name === "space" || k.sequence === " ") {
-        const item = reviewerPicker.items[reviewerPicker.index];
+        const item = rp.items[rp.index];
         if (item) {
-          const next = new Set(reviewerPicker.checked);
+          const next = new Set(rp.checked);
           if (next.has(item.key)) next.delete(item.key);
           else next.add(item.key);
-          setReviewerPicker({ ...reviewerPicker, checked: next });
+          setModal({ ...rp, checked: next });
         }
         return;
       }
@@ -984,7 +980,7 @@ export function App({ onExit }: Props) {
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        setReviewerPicker(null);
+        setModal(null);
       }
       return;
     }
@@ -993,56 +989,55 @@ export function App({ onExit }: Props) {
     // existing section / "(none)" / "+ new section", and input mode
     // for typing the new section name when the user picks the create
     // entry. `newName === null` means list mode.
-    if (sectionPicker) {
-      const sp = sectionPicker;
+    if (modal?.kind === "sectionPicker") {
+      const sp = modal;
       if (sp.newName !== null) {
         if (k.name === "escape") {
-          setSectionPicker({ ...sp, newName: null });
+          setModal({ ...sp, newName: null });
           return;
         }
         if (k.ctrl && k.name === "c") {
-          setSectionPicker(null);
+          setModal(null);
           return;
         }
         if (k.name === "return") {
           const name = sp.newName.trim();
           if (!name) {
-            setSectionPicker({ ...sp, newName: null });
+            setModal({ ...sp, newName: null });
             return;
           }
           const slug = sp.slug;
-          followAfterMove(slug);
           setSection(slug, name).then(
             () => toast(`moved to ${name}`, theme.info, 1500),
             (err) => reportActionError("move", err),
           );
           setLastMoveTarget(name);
-          setSectionPicker(null);
+          setModal(null);
           return;
         }
         if (k.name === "backspace") {
           // Backspace on empty input pops back to list mode — matches
           // the filter / new-worktree input convention.
           if (sp.newName.length === 0) {
-            setSectionPicker({ ...sp, newName: null });
+            setModal({ ...sp, newName: null });
             return;
           }
-          setSectionPicker({ ...sp, newName: sp.newName.slice(0, -1) });
+          setModal({ ...sp, newName: sp.newName.slice(0, -1) });
           return;
         }
         const text = printableText(k.sequence);
-        if (text) setSectionPicker({ ...sp, newName: sp.newName + text });
+        if (text) setModal({ ...sp, newName: sp.newName + text });
         return;
       }
       if (k.name === "j" || k.name === "down") {
-        setSectionPicker({
+        setModal({
           ...sp,
           index: Math.min(sp.index + 1, sp.items.length - 1),
         });
         return;
       }
       if (k.name === "k" || k.name === "up") {
-        setSectionPicker({ ...sp, index: Math.max(sp.index - 1, 0) });
+        setModal({ ...sp, index: Math.max(sp.index - 1, 0) });
         return;
       }
       // `l` inside the picker is the chord trigger for "+ new section"
@@ -1077,7 +1072,7 @@ export function App({ onExit }: Props) {
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        setSectionPicker(null);
+        setModal(null);
       }
       return;
     }
@@ -1085,29 +1080,30 @@ export function App({ onExit }: Props) {
     // Action picker — list of pre-built actions plus a trailing
     // "Custom prompt..." entry. Two screens: list mode (j/k + return),
     // then edit mode where the user types extras / a freeform prompt.
-    if (actionPicker) {
-      const ap = actionPicker;
+    if (modal?.kind === "actionPicker") {
+      const ap = modal.state;
       if (ap.mode === "list") {
         if (k.name === "j" || k.name === "down") {
-          setActionPicker({
-            ...ap,
-            index: Math.min(ap.index + 1, ap.items.length - 1),
+          setModal({
+            kind: "actionPicker",
+            state: { ...ap, index: Math.min(ap.index + 1, ap.items.length - 1) },
           });
           return;
         }
         if (k.name === "k" || k.name === "up") {
-          setActionPicker({ ...ap, index: Math.max(ap.index - 1, 0) });
+          setModal({
+            kind: "actionPicker",
+            state: { ...ap, index: Math.max(ap.index - 1, 0) },
+          });
           return;
         }
         // `!` chord — jumps straight to the custom-prompt entry. Mirrors
         // the section picker's `l → "+ new section"` chord, so `! !`
         // from normal mode lands directly in freeform-edit mode.
         if (k.sequence === "!") {
-          setActionPicker({
-            mode: "edit",
-            slug: ap.slug,
-            def: null,
-            extras: "",
+          setModal({
+            kind: "actionPicker",
+            state: { mode: "edit", slug: ap.slug, def: null, extras: "" },
           });
           return;
         }
@@ -1119,11 +1115,9 @@ export function App({ onExit }: Props) {
           const i = parseInt(k.sequence, 10) - 1;
           const item = ap.items[i];
           if (item && item.kind === "action") {
-            setActionPicker({
-              mode: "edit",
-              slug: ap.slug,
-              def: item.def,
-              extras: "",
+            setModal({
+              kind: "actionPicker",
+              state: { mode: "edit", slug: ap.slug, def: item.def, extras: "" },
             });
           }
           return;
@@ -1131,11 +1125,14 @@ export function App({ onExit }: Props) {
         if (k.name === "return") {
           const item = ap.items[ap.index];
           if (!item) return;
-          setActionPicker({
-            mode: "edit",
-            slug: ap.slug,
-            def: item.kind === "action" ? item.def : null,
-            extras: "",
+          setModal({
+            kind: "actionPicker",
+            state: {
+              mode: "edit",
+              slug: ap.slug,
+              def: item.kind === "action" ? item.def : null,
+              extras: "",
+            },
           });
           return;
         }
@@ -1144,13 +1141,13 @@ export function App({ onExit }: Props) {
           k.sequence === "q" ||
           (k.ctrl && k.name === "c")
         ) {
-          setActionPicker(null);
+          setModal(null);
         }
         return;
       }
       // mode === "edit"
       if (k.ctrl && k.name === "c") {
-        setActionPicker(null);
+        setModal(null);
         return;
       }
       if (k.name === "escape") {
@@ -1163,40 +1160,46 @@ export function App({ onExit }: Props) {
           const idx = items.findIndex(
             (it) => it.kind === "action" && it.def.id === def.id,
           );
-          setActionPicker({
-            mode: "list",
-            slug: ap.slug,
-            index: Math.max(0, idx),
-            items,
+          setModal({
+            kind: "actionPicker",
+            state: { mode: "list", slug: ap.slug, index: Math.max(0, idx), items },
           });
         } else {
-          setActionPicker(null);
+          setModal(null);
         }
         return;
       }
       if (k.name === "return") {
         const { slug, def, extras } = ap;
-        setActionPicker(null);
+        setModal(null);
         launchAction(slug, def, extras);
         return;
       }
       if (k.name === "backspace") {
         if (ap.extras.length === 0) return;
-        setActionPicker({ ...ap, extras: ap.extras.slice(0, -1) });
+        setModal({
+          kind: "actionPicker",
+          state: { ...ap, extras: ap.extras.slice(0, -1) },
+        });
         return;
       }
       const text = printableMultiline(k.sequence);
-      if (text) setActionPicker({ ...ap, extras: ap.extras + text });
+      if (text) {
+        setModal({
+          kind: "actionPicker",
+          state: { ...ap, extras: ap.extras + text },
+        });
+      }
       return;
     }
 
     // Kill-confirm for an in-flight `!` action on the selected
     // worktree. Mirrors the y/N pattern used by clean-confirm; also
     // accepts `!` (the opening key) per the modal toggle convention.
-    if (killActionConfirm) {
+    if (modal?.kind === "killActionConfirm") {
       if (k.name === "y" || k.name === "return") {
-        const { slug, actionName } = killActionConfirm;
-        setKillActionConfirm(null);
+        const { slug, actionName } = modal;
+        setModal(null);
         const killed = actionRegistry.kill(slug);
         if (killed) {
           appLog.event.warn(`killed action "${actionName}" on ${slug}`);
@@ -1210,7 +1213,7 @@ export function App({ onExit }: Props) {
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        setKillActionConfirm(null);
+        setModal(null);
       }
       return;
     }
@@ -1218,22 +1221,23 @@ export function App({ onExit }: Props) {
     // Branch-picker modal (for --any multi-match). Swallows input
     // until the user picks or cancels, resolving the promise that
     // `parseInput` is awaiting inside `doNew`.
-    if (picker) {
+    if (modal?.kind === "branchPicker") {
+      const bp = modal;
       if (k.name === "j" || k.name === "down") {
-        setPicker({
-          ...picker,
-          index: Math.min(picker.index + 1, picker.items.length - 1),
+        setModal({
+          ...bp,
+          index: Math.min(bp.index + 1, bp.items.length - 1),
         });
         return;
       }
       if (k.name === "k" || k.name === "up") {
-        setPicker({ ...picker, index: Math.max(picker.index - 1, 0) });
+        setModal({ ...bp, index: Math.max(bp.index - 1, 0) });
         return;
       }
       if (k.name === "return") {
-        const chosen = picker.items[picker.index]!;
-        picker.resolve(chosen);
-        setPicker(null);
+        const chosen = bp.items[bp.index]!;
+        bp.resolve(chosen);
+        setModal(null);
         return;
       }
       if (
@@ -1241,8 +1245,8 @@ export function App({ onExit }: Props) {
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        picker.resolve(null);
-        setPicker(null);
+        bp.resolve(null);
+        setModal(null);
       }
       return;
     }
@@ -1251,20 +1255,20 @@ export function App({ onExit }: Props) {
     // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
     // rather than re-entering normal mode, so a stray keystroke can't
     // accidentally trigger a destructive action.
-    if (showYank) {
+    if (modal?.kind === "yank") {
       if (
         k.name === "escape" ||
         k.sequence === "y" ||
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        setShowYank(false);
+        setModal(null);
         return;
       }
       if (current) {
         const item = yankItemsFor(current).find((it) => it.key === k.sequence);
         if (item) {
-          setShowYank(false);
+          setModal(null);
           doYank(current.wt.slug, item.label, item.value);
         }
       }
@@ -1272,9 +1276,9 @@ export function App({ onExit }: Props) {
     }
 
     // Clean-confirm modal swallows input while open.
-    if (showCleanConfirm) {
+    if (modal?.kind === "cleanConfirm") {
       if (k.name === "y" || k.name === "return") {
-        setShowCleanConfirm(false);
+        setModal(null);
         void doClean();
         return;
       }
@@ -1284,7 +1288,7 @@ export function App({ onExit }: Props) {
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
-        setShowCleanConfirm(false);
+        setModal(null);
       }
       return;
     }
@@ -1294,7 +1298,7 @@ export function App({ onExit }: Props) {
       if (k.name === "escape" || (k.ctrl && k.name === "c")) {
         setFilter("");
         setFooter({ kind: "legend" });
-        setSel(0);
+        setSel(null);
         return;
       }
       if (k.name === "return") {
@@ -1307,13 +1311,13 @@ export function App({ onExit }: Props) {
         if (footer.value.length === 0) {
           setFilter("");
           setFooter({ kind: "legend" });
-          setSel(0);
+          setSel(null);
           return;
         }
         const next = footer.value.slice(0, -1);
         setFooter({ kind: "filter", value: next });
         setFilter(next);
-        setSel(0);
+        setSel(null);
         return;
       }
       const text = printableText(k.sequence);
@@ -1321,7 +1325,7 @@ export function App({ onExit }: Props) {
         const next = footer.value + text;
         setFooter({ kind: "filter", value: next });
         setFilter(next);
-        setSel(0);
+        setSel(null);
       }
       return;
     }
@@ -1343,19 +1347,11 @@ export function App({ onExit }: Props) {
           const oldName = pendingRename;
           setPendingRename(null);
           if (!oldName || !raw || raw === oldName) return;
-          // Capture the slug now — `current` is a closure over this
-          // render and the user could navigate away before the
-          // promise resolves; we want the cursor to track the
-          // worktree whose section we just renamed.
-          const slug = current?.wt.slug;
-          renameSection(oldName, raw).then(
-            () => { if (slug) followAfterMove(slug); },
-            (err) => {
-              const msg = err instanceof Error ? err.message : String(err);
-              appLog.event.err(`rename failed: ${msg}`);
-              toast(`rename failed: ${msg}`, theme.err, 3000);
-            },
-          );
+          renameSection(oldName, raw).catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            appLog.event.err(`rename failed: ${msg}`);
+            toast(`rename failed: ${msg}`, theme.err, 3000);
+          });
           // Update sticky last-move-target so a stale name doesn't
           // dangle as the picker default.
           setLastMoveTarget((prev) => (prev === oldName ? raw : prev));
@@ -1411,7 +1407,7 @@ export function App({ onExit }: Props) {
     // Normal mode.
     if (k.name === "escape" && filter) {
       setFilter("");
-      setSel(0);
+      setSel(null);
       return;
     }
     // Unified Shift+J/K — moves the current row one position in
@@ -1433,22 +1429,26 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.name === "j" || k.name === "down") {
-      setSel((i) => Math.min(i + 1, Math.max(0, filteredRows.length - 1)));
+      if (filteredRows.length === 0) return;
+      const nextIdx = Math.min(cursorIndex + 1, filteredRows.length - 1);
+      setSel(filteredRows[nextIdx]?.wt.slug ?? null);
       return;
     }
     if (k.name === "k" || k.name === "up") {
-      setSel((i) => Math.max(0, i - 1));
+      if (filteredRows.length === 0) return;
+      const nextIdx = Math.max(0, cursorIndex - 1);
+      setSel(filteredRows[nextIdx]?.wt.slug ?? null);
       return;
     }
     // The raw-stdin keypress parser lowercases `name` for A–Z and sets
     // `shift: true`, so case-sensitive bindings (`g`/`G`, `r`/`R`) have
     // to disambiguate on `sequence` rather than `name`.
     if (k.sequence === "g") {
-      setSel(0);
+      setSel(filteredRows[0]?.wt.slug ?? null);
       return;
     }
     if (k.sequence === "G") {
-      setSel(Math.max(0, filteredRows.length - 1));
+      setSel(filteredRows[filteredRows.length - 1]?.wt.slug ?? null);
       return;
     }
     if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
@@ -1456,7 +1456,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "?") {
-      setShowHelp(true);
+      setModal({ kind: "help" });
       return;
     }
     if (k.sequence === "/") {
@@ -1501,7 +1501,7 @@ export function App({ onExit }: Props) {
         toast("nothing to clean", theme.fgDim, 1500);
         return;
       }
-      setShowCleanConfirm(true);
+      setModal({ kind: "cleanConfirm" });
       return;
     }
     // `!` — open the action picker for the selected worktree, OR
@@ -1516,7 +1516,7 @@ export function App({ onExit }: Props) {
       const slug = current.wt.slug;
       const run = actionRegistry.get(slug);
       if (run?.status === "running") {
-        setKillActionConfirm({ slug, actionName: run.actionName });
+        setModal({ kind: "killActionConfirm", slug, actionName: run.actionName });
       } else {
         openActionPicker(slug);
       }
@@ -1578,7 +1578,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "y") {
-      setShowYank(true);
+      setModal({ kind: "yank" });
       return;
     }
     if (isPlainLetter(k, "d")) {
@@ -1645,7 +1645,6 @@ export function App({ onExit }: Props) {
     }
     if (isPlainLetter(k, "a")) {
       const slug = current.wt.slug;
-      followAfterMove(slug);
       toggleArchived(slug).then(
         ({ archived }) => {
           rowLog.event.info(archived ? "archived" : "restored from archive");
@@ -1719,7 +1718,7 @@ export function App({ onExit }: Props) {
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList
           rows={filteredRows}
-          selectedIndex={effectiveSel}
+          selectedIndex={cursorIndex}
           width={listWidth}
           activeTails={activeTails}
           activeActions={activeActions}
@@ -1734,51 +1733,53 @@ export function App({ onExit }: Props) {
         <ActivityPane height={activityHeight} />
       )}
       <Footer mode={footer} hint={footerHint} />
-      {showHelp ? <HelpOverlay /> : null}
-      {showCleanConfirm ? <CleanConfirmModal candidates={cleanCandidates} /> : null}
-      {showYank && current ? <YankModal row={current} /> : null}
-      {picker ? (
+      {modal?.kind === "help" ? <HelpOverlay /> : null}
+      {modal?.kind === "cleanConfirm" ? (
+        <CleanConfirmModal candidates={cleanCandidates} />
+      ) : null}
+      {modal?.kind === "yank" && current ? <YankModal row={current} /> : null}
+      {modal?.kind === "branchPicker" ? (
         <PickerModal
-          title={picker.title}
-          items={picker.items}
-          selectedIndex={picker.index}
+          title={modal.title}
+          items={modal.items}
+          selectedIndex={modal.index}
         />
       ) : null}
-      {reviewerPicker ? (
+      {modal?.kind === "reviewerPicker" ? (
         <MultiPickerModal
-          title={reviewerPicker.title}
-          items={reviewerPicker.items}
-          selectedIndex={reviewerPicker.index}
-          checked={reviewerPicker.checked}
+          title={modal.title}
+          items={modal.items}
+          selectedIndex={modal.index}
+          checked={modal.checked}
           toggleKey="v"
         />
       ) : null}
-      {sectionPicker ? (
+      {modal?.kind === "sectionPicker" ? (
         <SectionPickerModal
-          title={sectionPicker.title}
-          items={sectionPicker.items}
-          selectedIndex={sectionPicker.index}
-          newName={sectionPicker.newName}
+          title={modal.title}
+          items={modal.items}
+          selectedIndex={modal.index}
+          newName={modal.newName}
         />
       ) : null}
-      {actionPicker?.mode === "list" ? (
+      {modal?.kind === "actionPicker" && modal.state.mode === "list" ? (
         <ActionPickerModal
-          slug={actionPicker.slug}
-          items={actionPicker.items}
-          selectedIndex={actionPicker.index}
+          slug={modal.state.slug}
+          items={modal.state.items}
+          selectedIndex={modal.state.index}
         />
       ) : null}
-      {actionPicker?.mode === "edit" ? (
+      {modal?.kind === "actionPicker" && modal.state.mode === "edit" ? (
         <ActionEditModal
-          slug={actionPicker.slug}
-          def={actionPicker.def}
-          extras={actionPicker.extras}
+          slug={modal.state.slug}
+          def={modal.state.def}
+          extras={modal.state.extras}
         />
       ) : null}
-      {killActionConfirm ? (
+      {modal?.kind === "killActionConfirm" ? (
         <KillActionConfirmModal
-          slug={killActionConfirm.slug}
-          actionName={killActionConfirm.actionName}
+          slug={modal.slug}
+          actionName={modal.actionName}
         />
       ) : null}
     </box>

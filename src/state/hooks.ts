@@ -25,11 +25,9 @@ import { CACHE_DB } from "./client.ts";
 import { qk } from "./keys.ts";
 import { clearPersistedCache } from "./persister.ts";
 import {
-  clearAiSummaryForceRegen,
   contributorsQuery,
   fetchOriginQuery,
   githubQuery,
-  markAiSummaryForceRegen,
   worktreesQuery,
   type GithubData,
 } from "./queries.ts";
@@ -109,9 +107,9 @@ export function useWtActions() {
       void qc.fetchQuery(fetchOriginQuery());
       // Belt-and-suspenders: `qc.clear()` removes cache entries, but
       // active observers sitting on `staleTime: Infinity` (notably
-      // the slug-keyed AI summary) don't always re-trigger their
-      // queryFn afterwards. Forcing a refetch on every active
-      // observer makes "R" deterministic for the AI chain.
+      // the AI summary) don't always re-trigger their queryFn
+      // afterwards. Forcing a refetch on every active observer makes
+      // "R" deterministic for the AI chain.
       void qc.refetchQueries({ type: "active" });
     },
     /** Invalidate everything for a single worktree (useful after an action). */
@@ -149,31 +147,24 @@ export function useWtActions() {
      * decides how to message that (we don't want the gesture to mean
      * "warm up cold").
      *
-     * `markAiSummaryForceRegen` is what makes the regen unconditional:
-     * the diffContext refetch can drive the row aggregator's
-     * mismatch effect to fire `invalidateQueries(aiSummary)` ahead of
-     * our explicit one, and without the flag that racing queryFn run
-     * finds the (still-present) memo entry and short-circuits. The
-     * flag is consumed on the queryFn's first read, so a follow-up
-     * refetch from `isInvalidated` bookkeeping reuses the just-written
-     * memo and doesn't burn a second LM call.
-     *
-     * We deliberately do NOT `removeQueries({ queryKey: aiSummaryMemo(fresh.hash) })`
-     * here even though earlier versions did. Once the flag exists, the
-     * remove is at best redundant and at worst harmful: if the mismatch
-     * effect's queryFn run completes (writing the memo) before our
-     * post-await sync block lands, the remove would delete the
-     * just-written entry and the subsequent invalidate would re-call
-     * LM Studio. Letting the memo write stand is the correct outcome.
+     * `aiSummary` is hash-keyed; force regen refetches the diff
+     * context, then `invalidateQueries` on the AI summary entry for
+     * the resulting hash. The active observer refetches the queryFn
+     * (calling LM Studio), and `placeholderData: keepPreviousData`
+     * keeps the prior summary on screen during the gap. Using
+     * `invalidateQueries` instead of `removeQueries` is deliberate:
+     * deleting the entry blanks the display because the observer's
+     * keepPreviousData fallback only kicks in on a queryKey change,
+     * not on an evicted same-key entry.
      */
     async refreshAiSummary(slug: string): Promise<boolean> {
-      // The diffContext key is now per-(slug, base) so a worktree can
+      // The diffContext key is per-(slug, base) so a worktree can
       // have multiple cached entries (trunk, parent A, parent B…) as
-      // its stack relationship evolves. Use prefix-matching to address
-      // every cached entry for this slug at once: the row aggregator
-      // observes only the *current* base, so on next render the live
-      // observer's refetch produces the up-to-date value regardless of
-      // which entries we touched here.
+      // its stack relationship evolves. Prefix-match to address every
+      // cached entry for this slug; the row aggregator observes only
+      // the *current* base, so on next render the live observer's
+      // refetch produces the up-to-date value regardless of which
+      // entries we touched here.
       const prefix = ["wt", slug, "diffContext"] as const;
       const existing = qc.getQueriesData<DiffContext | null>({
         queryKey: prefix,
@@ -181,26 +172,27 @@ export function useWtActions() {
       if (existing.length === 0 || existing.every(([, v]) => !v)) {
         return false;
       }
-      markAiSummaryForceRegen(slug);
-      try {
-        await qc.invalidateQueries({ queryKey: prefix });
-        // Confirm the diff context survived the refetch — a worktree
-        // archived/destroyed mid-flight would null out here, in which
-        // case there's nothing to summarise.
-        const refreshed = qc.getQueriesData<DiffContext | null>({
-          queryKey: prefix,
-        });
-        if (refreshed.every(([, v]) => !v)) return false;
-        await qc.invalidateQueries({ queryKey: qk.aiSummary(slug) });
-        return true;
-      } finally {
-        // Idempotent: the queryFn consumes the flag on its first
-        // run, so this is a no-op in the happy path. It only matters
-        // when no observer was active (no queryFn run) — in that
-        // case we'd otherwise leave the flag set and force a stale
-        // skip on the next observe.
-        clearAiSummaryForceRegen(slug);
-      }
+      // `invalidateQueries` awaits the refetch of any active observer
+      // (default `refetchType: "active"`), so by the time this resolves
+      // the diff context cache holds the new hash.
+      await qc.invalidateQueries({ queryKey: prefix });
+      const refreshed = qc.getQueriesData<DiffContext | null>({
+        queryKey: prefix,
+      });
+      if (refreshed.every(([, v]) => !v)) return false;
+      // Invalidate (don't remove) the AI summary entry for each
+      // still-present hash. Invalidate triggers an active-observer
+      // refetch even with `staleTime: Infinity`, and the cache entry
+      // stays put so `keepPreviousData` has data to show during the
+      // gap.
+      await Promise.all(
+        refreshed
+          .filter(([, ctx]) => !!ctx)
+          .map(([, ctx]) =>
+            qc.invalidateQueries({ queryKey: qk.aiSummary(ctx!.hash) }),
+          ),
+      );
+      return true;
     },
     /**
      * Flip the archived flag for a slug. Awaits invalidation so the

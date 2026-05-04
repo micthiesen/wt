@@ -1,5 +1,29 @@
 import { config } from "./config.ts";
 
+/**
+ * Forward an external `AbortSignal` to a local handler. Returns a
+ * cleanup function that removes the listener; the listener itself is
+ * `{ once: true }`, so this is a belt-and-suspenders cleanup for the
+ * non-aborted-yet case. When `signal` is already aborted on entry the
+ * handler fires synchronously and no listener is registered.
+ *
+ * Exported so callers that chain external signals into per-call
+ * controllers (LM Studio fetch, subprocess kill) share one
+ * implementation. Without it, the same five-line dance was repeated
+ * in two files with subtly different semantics.
+ */
+export function chainSignal(
+  signal: AbortSignal,
+  onAbort: () => void,
+): () => void {
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
+  signal.addEventListener("abort", onAbort, { once: true });
+  return () => signal.removeEventListener("abort", onAbort);
+}
+
 export type RunResult = {
   stdout: string;
   stderr: string;
@@ -11,6 +35,15 @@ export type RunOptions = {
   input?: string;
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
+  /**
+   * Optional cancellation signal. When the signal aborts the spawned
+   * process is SIGTERM'd; the awaited stdout/stderr drains then unwind
+   * and the function resolves with whatever was captured plus the
+   * signal-induced exit code. Pass the queryFn's `signal` so a
+   * superseded query (worktree list re-keyed, observer unmounted) stops
+   * burning a `gh`/`git` invocation in the background.
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -18,7 +51,7 @@ export type RunOptions = {
  * binaries and timeouts surface as `exitCode < 0`.
  */
 export async function run(argv: string[], opts: RunOptions = {}): Promise<RunResult> {
-  const { cwd = config.paths.mainClone, input, timeoutMs, env } = opts;
+  const { cwd = config.paths.mainClone, input, timeoutMs, env, signal } = opts;
   const proc = Bun.spawn(argv, {
     cwd,
     stdin: input !== undefined ? "pipe" : "ignore",
@@ -36,6 +69,20 @@ export async function run(argv: string[], opts: RunOptions = {}): Promise<RunRes
     timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
   }
 
+  // Abort plumbing: SIGTERM on signal, but let the drains complete so
+  // the caller still gets a structured RunResult instead of an
+  // uncaught rejection. If the signal is already aborted, kill
+  // immediately (the spawn race window is small but real).
+  const cleanupAbort = signal
+    ? chainSignal(signal, () => {
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          // proc may already have exited
+        }
+      })
+    : noop;
+
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -45,8 +92,11 @@ export async function run(argv: string[], opts: RunOptions = {}): Promise<RunRes
     return { stdout, stderr, exitCode };
   } finally {
     if (timer) clearTimeout(timer);
+    cleanupAbort();
   }
 }
+
+const noop = (): void => {};
 
 /**
  * Run and return trimmed stdout. Throws on non-zero exit with a

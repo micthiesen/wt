@@ -20,14 +20,13 @@
  *   Same-concept-same-glyph between this pane and the row list is
  *   enforced via shared helpers.
  */
-import { memo, useEffect, useMemo } from "react";
+import { memo, useMemo } from "react";
 import { TextAttributes } from "@opentui/core";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import { StatusKind } from "../../core/types.ts";
 import { useGithub } from "../../state/hooks.ts";
-import { qk } from "../../state/keys.ts";
 import {
   aiSummaryQuery,
   wtDiffContextQuery,
@@ -278,7 +277,6 @@ function DescriptionBlock({
 }
 
 const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow; width: number }) {
-  const qc = useQueryClient();
   // Subscribe to the combined GitHub fetch so per-row indicators
   // reflect its fetch state. Observers dedupe by key — this doesn't
   // trigger an extra fetch, it joins the existing observer in
@@ -300,36 +298,28 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
   //
   // Effective base must match the one `useWorktreeRows` used or the two
   // observers fight: each writes to a different per-(slug, base) cache
-  // entry, the AI memo lookup hashes differently, and the LM Studio
-  // call would re-run every time the details pane mounts for a stacked
-  // worktree. Only the commit-ancestry signal feeds the diff base —
-  // PR-base alone (via: "pr") doesn't, since it can be stale or
-  // unrebased. Mirrors `effectiveBaseFor` in `useWorktreeRows`.
-  const stackedBase =
+  // entry, hashes differently, and the LM Studio call would re-run
+  // every time the details pane mounts for a stacked worktree. Only
+  // the commit-ancestry signal feeds the diff base — PR-base alone
+  // (via: "pr") doesn't, since it can be stale or unrebased. Mirrors
+  // `effectiveBaseFor` in `useWorktreeRows`.
+  const effectiveBase =
     row.stackedOn?.via === "commits" ? row.stackedOn.branch : null;
   const diffCtx = useQuery({
-    ...wtDiffContextQuery(row.wt, stackedBase),
+    ...wtDiffContextQuery(row.wt, effectiveBase),
     enabled: allowFetch,
   });
 
+  // Hash-keyed AI summary: when the diff hash changes, the queryKey
+  // changes; `keepPreviousData` keeps the prior summary on screen
+  // while the new fetch runs. The mismatch-detect effect that lived
+  // here in the slug-keyed era is gone — the cache key swap *is* the
+  // trigger now.
   const summary = useQuery({
-    ...aiSummaryQuery(qc, row.wt.slug, diffCtx.data ?? null),
+    ...aiSummaryQuery(row.wt.slug, diffCtx.data ?? null),
     enabled: allowFetch && !!diffCtx.data,
+    placeholderData: keepPreviousData,
   });
-
-  // Slug-keyed cache: the queryFn doesn't re-run on diff drift unless
-  // we invalidate. Mirror the effect in `useWorktreeRows` so the
-  // details pane refreshes too — both observers share the same cache
-  // entry, but only the one with the freshest reactive state will
-  // notice the mismatch. `useWorktreeRows` covers list-only renders;
-  // this covers the case where the details pane is the only mount.
-  const dataHash = summary.data?.hash;
-  const ctxHash = diffCtx.data?.hash;
-  useEffect(() => {
-    if (dataHash && ctxHash && dataHash !== ctxHash) {
-      void qc.invalidateQueries({ queryKey: qk.aiSummary(row.wt.slug) });
-    }
-  }, [dataHash, ctxHash, row.wt.slug, qc]);
 
   const valueWidth = valueWidthFor(width);
   const ctx: RowContext = useMemo(

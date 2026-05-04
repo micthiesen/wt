@@ -475,8 +475,16 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
  * TUI treats "no entry" as "not there" rather than surfacing transient
  * errors. Pass the exact worktree branches; anything not on the list
  * is never fetched (the TUI wouldn't display it anyway).
+ *
+ * `signal` (when provided) cascades into the underlying `gh` invocation
+ * so a superseded query — branch list re-keyed before the previous
+ * fetch returned — actually stops the subprocess instead of letting it
+ * burn a graphql round trip on data nobody will read.
  */
-export async function fetchGithub(branches: string[]): Promise<GithubData> {
+export async function fetchGithub(
+  branches: string[],
+  signal?: AbortSignal,
+): Promise<GithubData> {
   const empty: GithubData = { prs: new Map(), mergeQueue: new Map() };
   if (!(await hasGh())) return empty;
   const slug = await repoSlug();
@@ -500,7 +508,7 @@ export async function fetchGithub(branches: string[]): Promise<GithubData> {
     args.push("-f", `b${i}=${branches[i]}`);
   }
 
-  const r = await run(args, { cwd: config.paths.mainClone, timeoutMs: 15_000 });
+  const r = await run(args, { cwd: config.paths.mainClone, timeoutMs: 15_000, signal });
   if (r.exitCode !== 0) return empty;
   let parsed: GqlResponse;
   try {
@@ -555,7 +563,7 @@ const ACTIVE_AUTHORS_MAX_PAGES = 5; // ≈ up to 500 commits
  * empty set on failure; callers should treat empty as "don't filter"
  * rather than "everyone is inactive".
  */
-async function fetchActiveCommitAuthors(): Promise<Set<string>> {
+async function fetchActiveCommitAuthors(signal?: AbortSignal): Promise<Set<string>> {
   const empty = new Set<string>();
   if (!(await hasGh())) return empty;
   const slug = await repoSlug();
@@ -569,7 +577,7 @@ async function fetchActiveCommitAuthors(): Promise<Set<string>> {
         "api",
         `repos/${slug}/commits?since=${since}&per_page=100&page=${page}`,
       ],
-      { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+      { cwd: config.paths.mainClone, timeoutMs: 15_000, signal },
     );
     if (r.exitCode !== 0) {
       log.error("active authors fetch failed", {
@@ -608,7 +616,7 @@ async function fetchActiveCommitAuthors(): Promise<Set<string>> {
  * the recency check fails (but contributors succeeded), we return
  * the unfiltered contributors so the picker isn't empty.
  */
-export async function fetchRepoContributors(): Promise<Contributor[]> {
+export async function fetchRepoContributors(signal?: AbortSignal): Promise<Contributor[]> {
   if (!(await hasGh())) return [];
   const slug = await repoSlug();
   if (!slug) return [];
@@ -616,8 +624,9 @@ export async function fetchRepoContributors(): Promise<Contributor[]> {
     run(["gh", "api", `repos/${slug}/contributors?per_page=100`], {
       cwd: config.paths.mainClone,
       timeoutMs: 15_000,
+      signal,
     }),
-    fetchActiveCommitAuthors(),
+    fetchActiveCommitAuthors(signal),
   ]);
   if (contribRes.exitCode !== 0) {
     log.error("contributors fetch failed", {

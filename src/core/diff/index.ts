@@ -86,17 +86,21 @@ export type DiffContext = {
 export async function buildDiffContext(
   wtPath: string,
   effectiveBase?: string | null,
+  signal?: AbortSignal,
 ): Promise<DiffContext | null> {
   if (!config.ai) return null;
   const base = effectiveBase ?? `origin/${config.branch.base}`;
 
-  const stat = await diffStat(wtPath, base);
-  // No committed changes against base means there's nothing for the
-  // LLM to summarise — bail before doing any more work.
-  if (!stat) return null;
+  // Short-circuit between awaits when the caller has cancelled. Without
+  // these checks the post-stat git invocations still spawn just to be
+  // SIGTERM'd; `fullDiff` in particular can buffer a megabyte of stdout
+  // before its drain unwinds.
+  const stat = await diffStat(wtPath, base, signal);
+  if (!stat || signal?.aborted) return null;
 
-  const log = await commitLog(wtPath, base);
-  const rawDiff = await fullDiff(wtPath, base);
+  const log = await commitLog(wtPath, base, signal);
+  if (signal?.aborted) return null;
+  const rawDiff = await fullDiff(wtPath, base, signal);
 
   // Hash the unfiltered diff so summaries cache by content. Filter
   // tweaks (mode changes, exclude list updates) don't invalidate the
@@ -141,23 +145,23 @@ export async function buildDiffContext(
 // tree delta between base and HEAD, which on a branch that's purely
 // behind base produces the *inverse* of the commits base has gained —
 // the LLM then summarises those as if they were this branch's work.
-async function diffStat(wtPath: string, base: string): Promise<string> {
+async function diffStat(wtPath: string, base: string, signal?: AbortSignal): Promise<string> {
   const r = await run(
     ["git", "diff", "--stat", `${base}...HEAD`, "--", ...STATIC_EXCLUDES],
-    { cwd: wtPath, timeoutMs: 10_000 },
+    { cwd: wtPath, timeoutMs: 10_000, signal },
   );
   return r.exitCode === 0 ? r.stdout.trim() : "";
 }
 
-async function commitLog(wtPath: string, base: string): Promise<string> {
+async function commitLog(wtPath: string, base: string, signal?: AbortSignal): Promise<string> {
   const r = await run(
     ["git", "log", "--reverse", "--format=%s", `${base}..HEAD`],
-    { cwd: wtPath, timeoutMs: 5_000 },
+    { cwd: wtPath, timeoutMs: 5_000, signal },
   );
   return r.exitCode === 0 ? r.stdout.trim() : "";
 }
 
-async function fullDiff(wtPath: string, base: string): Promise<string> {
+async function fullDiff(wtPath: string, base: string, signal?: AbortSignal): Promise<string> {
   const r = await run(
     [
       "git",
@@ -171,7 +175,7 @@ async function fullDiff(wtPath: string, base: string): Promise<string> {
       "--",
       ...STATIC_EXCLUDES,
     ],
-    { cwd: wtPath, timeoutMs: 15_000 },
+    { cwd: wtPath, timeoutMs: 15_000, signal },
   );
   return r.exitCode === 0 ? r.stdout : "";
 }

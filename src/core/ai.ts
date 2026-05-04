@@ -11,6 +11,7 @@
  * shares one round trip and one diff-context build per cache key.
  */
 import { config } from "./config.ts";
+import { chainSignal } from "./proc.ts";
 
 const SYSTEM_PROMPT = `You summarise git changes for a developer scanning their worktrees.
 
@@ -52,13 +53,27 @@ export type AiSummary = {
  * Throws on transport / HTTP / parse errors so react-query surfaces
  * them; the details pane renders errors verbatim once retries are
  * exhausted.
+ *
+ * When `external` is provided (queryFn `signal`), it's chained with
+ * the timeout so observer cancellation aborts the in-flight LM call.
+ * Without this, switching worktrees fast leaves the prior
+ * megabyte-prompt request running to completion against LM Studio,
+ * burning latency on a result nobody sees.
  */
-export async function summarizeDiff(prompt: string): Promise<AiSummary> {
+export async function summarizeDiff(
+  prompt: string,
+  external?: AbortSignal,
+): Promise<AiSummary> {
   if (!config.ai) {
     throw new Error("AI is not configured ([ai] missing in config.toml)");
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), config.ai.timeoutMs);
+  // Forward an external abort (queryFn cancellation) into the same
+  // controller so fetch sees a single signal.
+  const cleanupAbort = external
+    ? chainSignal(external, () => ctrl.abort())
+    : noop;
   let res: Response;
   try {
     res = await fetch(`${config.ai.endpoint}/v1/chat/completions`, {
@@ -84,6 +99,7 @@ export async function summarizeDiff(prompt: string): Promise<AiSummary> {
     );
   } finally {
     clearTimeout(timer);
+    cleanupAbort();
   }
 
   if (!res.ok) {
@@ -154,6 +170,8 @@ export function parseTitleDescription(text: string): AiSummary {
 
   return { title, brief, description };
 }
+
+const noop = (): void => {};
 
 function cleanInline(t: string): string {
   return t

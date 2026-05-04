@@ -1,9 +1,9 @@
 import { QueryClient } from "@tanstack/react-query";
-import { persistQueryClient } from "@tanstack/query-persist-client-core";
+import { experimental_createQueryPersister } from "@tanstack/query-persist-client-core";
 
 import { config } from "../core/config.ts";
 
-import { createSqlitePersister } from "./persister.ts";
+import { createSqliteAsyncStorage } from "./persister.ts";
 
 export const CACHE_DB = config.paths.cacheDb;
 
@@ -16,22 +16,55 @@ export const CACHE_DB = config.paths.cacheDb;
 // separate hash-keyed memo. Old `["aiSummary", <hash>]` entries
 // would never be looked up under the new shape and would just sit
 // dead in the persisted blob.
-const CACHE_BUSTER = "v4";
+// v5: aiSummary is hash-keyed again (no slug indirection, no memo
+// family). The value shed its `hash` field; old slug-keyed entries
+// would never be observed, and old aiSummaryMemo entries are dead
+// weight.
+// v6: switched from whole-blob `persistQueryClient` to the
+// `experimental_createQueryPersister` per-query model. Storage layout
+// changed (one row per query, prefixed `wt-<queryHash>`), and the
+// older single-row `wt.cache.v1` blob will never be read.
+const CACHE_BUSTER = "v6";
+const STORAGE_PREFIX = "wt";
+const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * Build a QueryClient with TUI-friendly defaults and wire up the
- * SQLite persister. Returns the client plus a `restored` promise that
- * resolves once hydration is complete, so callers can decide whether
- * to render immediately (showing stale data) or wait.
+ * per-query SQLite persister. Returns the client plus a `restored`
+ * promise that resolves once every persisted query has been re-hydrated
+ * into the cache, so callers can decide whether to render immediately
+ * (showing stale data) or wait.
  */
 export type WtQueryClient = {
   client: QueryClient;
   restored: Promise<void>;
-  /** Stop the persister subscription, clear timers, close the db. */
+  /** Stop the persister, close the storage handle. */
   shutdown(): void;
 };
 
 export function createWtQueryClient(): WtQueryClient {
+  const storage = createSqliteAsyncStorage(CACHE_DB);
+  const persister = experimental_createQueryPersister<string>({
+    storage,
+    buster: CACHE_BUSTER,
+    maxAge: MAX_CACHE_AGE_MS,
+    prefix: STORAGE_PREFIX,
+    // Persister wraps every queryFn invocation; high-frequency
+    // polling queries (lock: 2s while held, claude: 5s) would
+    // otherwise burn one INSERT OR REPLACE per poll for data with
+    // zero cross-session value. Worse, restoring stale lock state on
+    // startup mis-classifies the worktree as "busy" until the first
+    // refetch lands. Filter them out so they live purely in-memory.
+    filters: {
+      predicate: (query) => {
+        const key = query.queryKey;
+        if (key.length < 3 || key[0] !== "wt") return true;
+        const slot = key[2];
+        return slot !== "lock" && slot !== "claude";
+      },
+    },
+  });
+
   const client = new QueryClient({
     defaultOptions: {
       queries: {
@@ -43,41 +76,29 @@ export function createWtQueryClient(): WtQueryClient {
         retry: false,
         refetchOnWindowFocus: false,
         refetchOnReconnect: false,
+        // Per-query persistence: every queryFn call goes through the
+        // persister wrapper. Restored entries skip the queryFn on first
+        // observe; subsequent calls hit storage on success and retrieve
+        // on cold cache.
+        persister: persister.persisterFn,
       },
     },
   });
 
-  // The content-addressed AI summary memo is written via `setQueryData`
-  // and never observed directly, so it has no inline `queryOptions` to
-  // carry gcTime. Pin the family to `Infinity` here so memo entries
-  // survive across runs and across the (frequent) periods where no
-  // observer references that hash.
-  client.setQueryDefaults(["aiSummaryMemo"], {
-    gcTime: Number.POSITIVE_INFINITY,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-
-  const persister = createSqlitePersister(CACHE_DB);
-  const [unsubscribe, restored] = persistQueryClient({
-    queryClient: client,
-    persister,
-    // Long enough that AI summaries (slug-keyed primary +
-    // content-addressed memo) survive across the lifetime of a typical
-    // worktree without forcing a regen. Other queries
-    // restore-then-immediately-refetch on their own staleTime, so a
-    // longer maxAge has no downside for them.
-    maxAge: 30 * 24 * 60 * 60 * 1000,
-    buster: CACHE_BUSTER,
-  });
+  // Pre-warm: walk every persisted entry and populate the cache before
+  // first paint. Without this, queries would only restore as their
+  // observers mount, and the first frame would show empty placeholders
+  // for everything. The runtime races this against a small budget so a
+  // huge cache doesn't block startup.
+  const restored = persister.restoreQueries(client);
 
   return {
     client,
     restored,
     shutdown(): void {
-      unsubscribe();
       client.getQueryCache().clear();
       client.unmount();
-      persister.close();
+      storage.close();
     },
   };
 }

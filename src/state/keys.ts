@@ -1,7 +1,8 @@
 /**
  * Typed query-key factory. Using `as const` tuples so each key is
- * narrowly typed — invalidation by prefix is safe (e.g. `qk.wt(slug)._all`
- * invalidates every query for that slug).
+ * narrowly typed — invalidation by prefix is safe (e.g.
+ * `qc.invalidateQueries({ queryKey: qk.wt(slug).all() })` invalidates
+ * every query for that slug).
  */
 export const qk = {
   /** All worktrees (from `git worktree list`). */
@@ -58,21 +59,13 @@ export const qk = {
         ["wt", slug, "diffContext", base] as const,
     }) as const,
   /**
-   * AI summary keyed by worktree slug. Value carries the diff hash
-   * inline (`{hash, title, brief, description}`); cross-diff sharing
-   * lives in the memo below. Slug-stable so observers keep showing
-   * the previous summary while a refetch is in flight after a diff
-   * change — switching to a hash-based key would blank the brief
-   * during the gap.
+   * AI summary keyed by content hash of the diff. Equivalent diffs
+   * across rebases / amends / branch renames share a single cache
+   * entry. The "show the previous summary while a new hash fetches"
+   * behavior comes from `placeholderData: keepPreviousData` at the
+   * observer rather than a separate slug-stable layer.
    */
-  aiSummary: (slug: string) => ["aiSummary", slug] as const,
-  /**
-   * Content-addressed memo of LM Studio responses. Written by
-   * `aiSummaryQuery` after a successful call; never observed directly.
-   * Lets equivalent diffs across rebases / amends / branch renames
-   * reuse the prior result without a new LM Studio round-trip.
-   */
-  aiSummaryMemo: (hash: string) => ["aiSummaryMemo", hash] as const,
+  aiSummary: (hash: string) => ["aiSummary", hash] as const,
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
   /** Per-slug section + manual order (fs-backed). */

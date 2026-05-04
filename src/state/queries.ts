@@ -3,7 +3,7 @@
  * returns a `queryOptions(...)` result, which gives strong type
  * inference from queryKey → queryFn return type at the hook site.
  */
-import { type QueryClient, queryOptions } from "@tanstack/react-query";
+import { queryOptions } from "@tanstack/react-query";
 
 import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
@@ -31,6 +31,15 @@ import { fetchOrigin, listWorktrees, syncState, type SyncState, worktreeIsDirty 
 import { qk } from "./keys.ts";
 
 const aiLog = createLogger("ai");
+
+/**
+ * Sentinel hash for `aiSummaryQuery` when the caller hasn't built a
+ * diff context yet. The query is gated by `enabled: !!ctx` so the
+ * queryFn never runs against this key — but the queryKey still has to
+ * be a string. A named constant makes the intent obvious vs. a magic
+ * `"__noctx__"` literal.
+ */
+const NO_CTX_HASH = "__noctx__";
 
 // ---------- Stale-time policy ----------
 // Short for cheap fs-backed queries; longer for network/git-heavy ones.
@@ -96,8 +105,8 @@ export type GithubData = {
 export const githubQuery = (branches: readonly string[]) =>
   queryOptions({
     queryKey: qk.github(branches),
-    queryFn: async (): Promise<GithubData> => {
-      const { prs, mergeQueue } = await fetchGithub([...branches]);
+    queryFn: async ({ signal }): Promise<GithubData> => {
+      const { prs, mergeQueue } = await fetchGithub([...branches], signal);
       return {
         prs: Object.fromEntries(prs),
         mergeQueue: Object.fromEntries(mergeQueue),
@@ -115,7 +124,7 @@ export const githubQuery = (branches: readonly string[]) =>
 export const contributorsQuery = () =>
   queryOptions({
     queryKey: qk.contributors(),
-    queryFn: async (): Promise<Contributor[]> => fetchRepoContributors(),
+    queryFn: async ({ signal }): Promise<Contributor[]> => fetchRepoContributors(signal),
     staleTime: 24 * 60 * 60 * 1000,
     gcTime: Number.POSITIVE_INFINITY,
   });
@@ -230,8 +239,8 @@ export const wtDiffContextQuery = (
   const base = effectiveBase ?? `origin/${config.branch.base}`;
   return queryOptions({
     queryKey: qk.wt(wt.slug).diffContext(base),
-    queryFn: async (): Promise<DiffContext | null> =>
-      buildDiffContext(wt.path, base),
+    queryFn: async ({ signal }): Promise<DiffContext | null> =>
+      buildDiffContext(wt.path, base, signal),
     staleTime: STALE.mid,
   });
 };
@@ -261,88 +270,44 @@ export const stackQuery = (worktrees: readonly Worktree[]) => {
 };
 
 /**
- * AI summary value as stored in the slug-keyed cache. The hash rides
- * along inside the value so consumers can detect drift (current diff
- * hash vs. cached summary's hash) and decide when to invalidate.
- */
-export type AiSummaryWithHash = AiSummary & { hash: string };
-
-/**
- * One-shot "skip the memo" gate set by `refreshAiSummary` (manual
- * regen via the `t` keystroke). Any queryFn run for this slug while
- * the flag is set will bypass the memo lookup and call LM Studio
- * regardless. The flag is consumed on read so a follow-up refetch —
- * which the standard `isInvalidated` bookkeeping schedules whenever a
- * mismatch-effect invalidate races the explicit one inside
- * `refreshAiSummary` — picks up the just-written memo and
- * short-circuits without burning a second LM call.
+ * AI-generated summary of the diff, keyed by the diff's content hash.
+ * Equivalent diffs across rebases / amends / branch renames hit the
+ * same cache entry — that's the whole point of content-addressed
+ * keying.
  *
- * Module-private; the public surface is `markAiSummaryForceRegen` /
- * `clearAiSummaryForceRegen`.
- */
-const aiSummaryForceRegen = new Set<string>();
-export function markAiSummaryForceRegen(slug: string): void {
-  aiSummaryForceRegen.add(slug);
-}
-export function clearAiSummaryForceRegen(slug: string): void {
-  aiSummaryForceRegen.delete(slug);
-}
-
-/**
- * AI-generated summary of the diff. Keyed by `slug` so observers keep
- * showing the previous summary while a refetch is in flight (the
- * alternative — hashing the queryKey — blanks the brief during the gap
- * because the new key has no cache entry yet).
+ * The "keep the previous summary visible while a new hash is loading"
+ * behavior is the consumer's job: pair this with
+ * `placeholderData: keepPreviousData` so a hash flip (diff changed)
+ * doesn't blank the description during the gap.
  *
- * Cross-diff sharing comes from a content-addressed memo
- * (`qk.aiSummaryMemo(hash)`) the queryFn checks before calling LM
- * Studio: equivalent diffs across rebases / amends / branch renames
- * reuse the prior result without a new round-trip. The memo is written
- * after every successful call and never observed directly; it persists
- * via the standard QueryClient dehydration.
- *
- * Pass `null` for `ctx` when the diff context isn't ready; the caller
- * is expected to pair this with `enabled: !!ctx`, in which case the
- * queryFn never runs and emits its early `null`.
- *
- * Hash-mismatch invalidation lives in the consumer hooks (a small
- * effect comparing `data.hash` to the live `ctx.hash`) rather than
- * here — the queryFn doesn't get re-run by react-query just because
- * its closure changed; it needs an explicit invalidate to pick up a
- * new hash.
- *
- * Activity-pane logging mirrors the GitHub-fetch pattern: one start
- * line and one done/failed line per call. Memo hits log dim so a
- * cross-rebase reuse is visible without being noisy.
+ * Pass `null` for `ctx` when the diff context isn't ready; pair with
+ * `enabled: !!ctx` so the queryFn never runs and the early `null`
+ * sentinel is just a type accommodation.
  */
 export const aiSummaryQuery = (
-  qc: QueryClient,
   slug: string,
   ctx: { hash: string; prompt: string } | null,
 ) =>
   queryOptions({
-    queryKey: qk.aiSummary(slug),
-    queryFn: async (): Promise<AiSummaryWithHash | null> => {
-      if (!ctx) return null;
-      // `Set.delete` returns true iff the entry was present, which
-      // doubles as "consume the flag" — exactly what we want, because
-      // the next queryFn run for this slug should fall through to the
-      // memo lookup again (and find the entry we're about to write).
-      const force = aiSummaryForceRegen.delete(slug);
-      if (!force) {
-        const memoed = qc.getQueryData<AiSummary>(qk.aiSummaryMemo(ctx.hash));
-        if (memoed) {
-          aiLog.event.dim(`reused memoed summary for ${slug}`);
-          return { hash: ctx.hash, ...memoed };
-        }
+    // `slug` doesn't participate in the cache key — that's intentional,
+    // it's only here for the activity log line. Two worktrees with
+    // identical diffs share an entry; the log shows whichever slug
+    // triggered the fetch.
+    queryKey: qk.aiSummary(ctx?.hash ?? NO_CTX_HASH),
+    queryFn: async ({ signal }): Promise<AiSummary> => {
+      // The `enabled: !!ctx` guard at the call site makes this branch
+      // unreachable. We throw rather than caching `null` defensively:
+      // a `null` entry under `NO_CTX_HASH` with `staleTime: Infinity`
+      // would be a forever-stuck "no summary" if this ever fired.
+      if (!ctx) {
+        throw new Error("aiSummaryQuery: ctx is null (enabled guard missed)");
       }
       aiLog.event.dim(`calling LM Studio for ${slug} (${pluralize(ctx.prompt.length, "char")})...`);
       const start = Date.now();
       try {
-        const out = await summarizeDiff(ctx.prompt);
+        const out = await summarizeDiff(ctx.prompt, signal);
         aiLog.event.dim(`called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
-        qc.setQueryData<AiSummary>(qk.aiSummaryMemo(ctx.hash), out);
-        return { hash: ctx.hash, ...out };
+        return out;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         aiLog.event.err(
@@ -351,8 +316,9 @@ export const aiSummaryQuery = (
         throw err;
       }
     },
-    // Slug identity is stable; refetch is driven exclusively by the
-    // hash-mismatch effect in the consumer (or by `refreshAiSummary`).
+    // Hash-keyed: a new diff produces a new cache entry. No staleness
+    // policy needed within an entry — the diff content can't change
+    // without producing a different hash.
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: Number.POSITIVE_INFINITY,
   });
