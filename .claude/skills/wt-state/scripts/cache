@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Inspect the wt TanStack Query cache (single-table sqlite). Read-only.
+set -euo pipefail
+
+DB="$HOME/.cache/wt/cache.sqlite"
+
+usage() {
+  cat <<'EOF'
+Usage: cache <subcommand> [args]
+
+  keys [pattern]   list cache IDs with age + size (optional substring filter)
+  get <pattern>    pretty-print data for a matching entry (errors if multiple)
+  summary          counts + bytes grouped by key shape
+EOF
+}
+
+esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+
+human_size() {
+  local b=$1
+  if   (( b < 1024 ));     then printf "%dB" "$b"
+  elif (( b < 1048576 ));  then awk -v b="$b" 'BEGIN{printf "%.1fK", b/1024}'
+  else                          awk -v b="$b" 'BEGIN{printf "%.1fM", b/1048576}'
+  fi
+}
+
+human_age() {
+  local now then_s diff
+  now=$(date +%s)
+  then_s=$(( $1 / 1000 ))
+  diff=$(( now - then_s ))
+  if   (( diff < 60 ));     then printf "%ds" "$diff"
+  elif (( diff < 3600 ));   then printf "%dm" "$(( diff / 60 ))"
+  elif (( diff < 86400 ));  then printf "%dh" "$(( diff / 3600 ))"
+  else                          printf "%dd" "$(( diff / 86400 ))"
+  fi
+}
+
+cmd_keys() {
+  local pat="${1:-}" where=""
+  [[ -n "$pat" ]] && where="WHERE id LIKE '%$(esc "$pat")%'"
+  sqlite3 -separator $'\t' "$DB" \
+    "SELECT id, length(data), updated_at FROM cache $where ORDER BY updated_at DESC" | \
+  while IFS=$'\t' read -r id size ts; do
+    printf "%-6s  %-7s  %s\n" "$(human_age "$ts")" "$(human_size "$size")" "$id"
+  done
+}
+
+cmd_get() {
+  local pat="${1:-}"
+  if [[ -z "$pat" ]]; then echo "get: pattern required" >&2; exit 2; fi
+  local rows count
+  rows="$(sqlite3 "$DB" "SELECT id FROM cache WHERE id LIKE '%$(esc "$pat")%' ORDER BY updated_at DESC")"
+  if [[ -z "$rows" ]]; then echo "no match for: $pat" >&2; exit 1; fi
+  count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  if (( count > 1 )); then
+    {
+      echo "multiple matches; narrow the pattern:"
+      printf '%s\n' "$rows"
+    } >&2
+    exit 1
+  fi
+  local id="$rows" data
+  data="$(sqlite3 "$DB" "SELECT data FROM cache WHERE id = '$(esc "$id")'")"
+  printf "# %s\n" "$id"
+  printf '%s\n' "$data" | jq . 2>/dev/null || printf '%s\n' "$data"
+}
+
+cmd_summary() {
+  sqlite3 -separator $'\t' "$DB" "SELECT id, length(data) FROM cache" | \
+  while IFS=$'\t' read -r id size; do
+    json="${id#wt-}"
+    shape="$(printf '%s' "$json" | jq -r '
+      if .[0] == "wt" then "wt/*/" + (.[2] // "?")
+      elif (length) == 1 then .[0]
+      else .[0] + "/*"
+      end' 2>/dev/null || echo "?")"
+    printf "%s\t%d\n" "$shape" "$size"
+  done | \
+  awk -F'\t' '
+    { count[$1]++; total[$1]+=$2 }
+    END { for (k in count) printf "%-22s  %3d entries  %d bytes\n", k, count[k], total[k] }
+  ' | sort
+}
+
+case "${1:-}" in
+  keys)    shift; cmd_keys "$@" ;;
+  get)     shift; cmd_get "$@" ;;
+  summary) shift; cmd_summary "$@" ;;
+  -h|--help|"") usage ;;
+  *) usage; exit 2 ;;
+esac

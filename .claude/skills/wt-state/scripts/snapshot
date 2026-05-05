@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# One-shot overview of the local wt instance. Read-only.
+set -euo pipefail
+
+WT_REPO="${WT_REPO:-$HOME/.wt}"
+WT_CACHE="$HOME/.cache/wt"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+section() { printf "\n## %s\n" "$1"; }
+
+printf "# wt snapshot — %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+section "worktrees"
+if ( cd "$WT_REPO" && bun src/main.ts ls ) 2>/tmp/wt-state-ls.err; then
+  :
+else
+  echo "(wt ls failed)"
+  cat /tmp/wt-state-ls.err >&2 || true
+fi
+
+section "tmux sessions (-L wt)"
+"$SCRIPT_DIR/tmux"
+
+section "locks"
+shopt -s nullglob
+locks=("$WT_CACHE/locks"/*.lock)
+if (( ${#locks[@]} == 0 )); then
+  echo "(none)"
+else
+  for f in "${locks[@]}"; do
+    slug="$(basename "$f" .lock)"
+    meta="$(cat "$f" 2>/dev/null || true)"
+    [[ -z "$meta" ]] && meta="(empty)"
+    printf "%s  %s\n" "$slug" "$meta"
+  done
+fi
+
+section "archived"
+archive="$WT_CACHE/archive.json"
+if [[ -f "$archive" ]]; then
+  list="$(jq -r '.slugs[]?' "$archive" 2>/dev/null || true)"
+  if [[ -n "$list" ]]; then
+    printf '%s\n' "$list" | sed 's/^/- /'
+  else
+    echo "(none)"
+  fi
+else
+  echo "(none)"
+fi
+
+section "recent events (today)"
+log="$WT_CACHE/logs/app/wt-$(date +%Y-%m-%d).log"
+if [[ -f "$log" ]]; then
+  events="$(grep ' EVENT ' "$log" 2>/dev/null | tail -20 || true)"
+  if [[ -n "$events" ]]; then
+    printf '%s\n' "$events"
+  else
+    echo "(none today)"
+  fi
+else
+  echo "(no log file: $log)"
+fi

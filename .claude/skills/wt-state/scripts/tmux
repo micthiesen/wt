@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# List sessions on the wt-private tmux server (-L wt), classified by kind.
+# "(no server running)" is the steady state before the first F12 — exit 0.
+set -euo pipefail
+
+if ! tmux -L wt list-sessions -F '#{session_name}' >/dev/null 2>&1; then
+  echo "(no server running)"
+  exit 0
+fi
+
+tmux -L wt list-sessions -F '#{session_name}	#{pane_current_path}	#{pane_current_command}' | \
+awk -F'\t' '
+  {
+    name=$1; path=$2; cmd=$3
+    if (name ~ /-diff$/)       { sub(/-diff$/,  "", name); d = d sprintf("  %-50s  %-12s  %s\n", name, cmd, path) }
+    else if (name ~ /-shell$/) { sub(/-shell$/, "", name); s = s sprintf("  %-50s  %-12s  %s\n", name, cmd, path) }
+    else                       {                            c = c sprintf("  %-50s  %-12s  %s\n", name, cmd, path) }
+  }
+  END {
+    print "claude:"; if (c=="") print "  (none)"; else printf "%s", c
+    print "diff:";   if (d=="") print "  (none)"; else printf "%s", d
+    print "shell:";  if (s=="") print "  (none)"; else printf "%s", s
+  }
+'

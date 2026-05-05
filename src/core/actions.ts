@@ -42,7 +42,7 @@ const log = createLogger("[actions]");
  * — it drives both the registry-side `isVisible` predicate and the
  * client-side timer, and they have to stay in lockstep.
  */
-export const RECENT_WINDOW_MS = 30 * 60 * 1000;
+export const RECENT_WINDOW_MS = 10 * 1000;
 /** actionId stamped on runs launched via the picker's "Custom prompt…" entry. */
 export const CUSTOM_ACTION_ID = "__custom__";
 
