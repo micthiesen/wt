@@ -296,15 +296,12 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
   // gating, neither of which is exposed on `WorktreeRow`. The resolved
   // title itself comes pre-computed from the row.
   //
-  // Effective base must match the one `useWorktreeRows` used or the two
-  // observers fight: each writes to a different per-(slug, base) cache
-  // entry, hashes differently, and the LM Studio call would re-run
-  // every time the details pane mounts for a stacked worktree. Only
-  // the commit-ancestry signal feeds the diff base — PR-base alone
-  // (via: "pr") doesn't, since it can be stale or unrebased. Mirrors
-  // `effectiveBaseFor` in `useWorktreeRows`.
-  const effectiveBase =
-    row.stackedOn?.via === "commits" ? row.stackedOn.branch : null;
+  // The diff base is resolved once in `useWorktreeRows` and exposed via
+  // `row.stackedOn.diffBase`. Reading it from there (rather than
+  // re-deriving) keeps the two observers' query keys identical, which
+  // is what lets the cache hit cross-pane and avoids re-running LM
+  // Studio every time the details pane mounts for a stacked worktree.
+  const effectiveBase = row.stackedOn?.diffBase ?? null;
   const diffCtx = useQuery({
     ...wtDiffContextQuery(row.wt, effectiveBase),
     enabled: allowFetch,

@@ -207,47 +207,70 @@ type CherryResult = {
   /**
    * SHA to use as `git diff <diffBase>...HEAD`. The deepest matched
    * (patch-id-equivalent-to-candidate) commit walking from HEAD; commits
-   * above it are the child's unique-from-tip contribution. `null` when
-   * no matched commit was found at or below any unique commits — caller
-   * should skip this candidate.
+   * above it are the child's unique-from-tip contribution.
    */
-  diffBase: string | null;
+  diffBase: string;
 };
+
+async function gitCherry(upstream: string, head: string): Promise<CherryEntry[] | null> {
+  const r = await run(
+    ["git", "cherry", upstream, head],
+    { cwd: config.paths.mainClone, timeoutMs: CHERRY_TIMEOUT_MS },
+  );
+  if (r.exitCode !== 0) return null;
+  return parseCherry(r.stdout);
+}
 
 /**
  * Score a candidate parent against a child by patch-id overlap, and
  * compute the diff base when the unique commits sit contiguously at
  * HEAD.
  *
- * `git cherry` semantics: comparing reachable-from-`merge-base..head`,
- * `+` = unique to head, `-` = patch-id present in upstream. We want the
- * count of `-` (overlap) and the deepest `-` walking from the tip. The
- * deepest one's SHA becomes the diff base, so `<diffBase>..HEAD` covers
- * just the unique-prefix-from-tip — clean for the AI summary even when
- * non-contiguous unique commits sit deeper in history.
+ * `git cherry <upstream> <head>` lists commits in `mergebase..head`:
+ * `+` = patch-id missing from upstream (unique to head), `-` = matched.
+ * For `candidate` to be a *parent* of `child`, two conditions must hold:
+ *
+ *   1. child has at least one unique commit (some `+` in
+ *      `cherry candidate child`) — otherwise child is a peer/subset of
+ *      the candidate, not a descendant.
+ *   2. candidate has zero unique commits relative to child (no `+` in
+ *      `cherry child candidate`) — every candidate commit must
+ *      correspond, by patch-id, to something in child's history.
+ *      Otherwise the candidate has work the child doesn't, which means
+ *      it's a sibling/descendant, not a parent.
+ *
+ * The diff base is the deepest `-` walking from the tip in
+ * `cherry candidate child`, so `<diffBase>..HEAD` covers just the
+ * contiguous-unique-from-tip prefix — clean for the AI summary even
+ * when older commits matched the candidate.
  */
 async function scoreCherry(
   child: Tip,
   candidate: Tip,
 ): Promise<CherryResult | null> {
-  const r = await run(
-    ["git", "cherry", candidate.sha, child.sha],
-    { cwd: config.paths.mainClone, timeoutMs: CHERRY_TIMEOUT_MS },
-  );
-  if (r.exitCode !== 0) return null;
-  const entries = parseCherry(r.stdout);
+  const childEntries = await gitCherry(candidate.sha, child.sha);
+  if (!childEntries) return null;
   let matched = 0;
-  for (const e of entries) if (e.marker === "-") matched++;
-  if (matched === 0) return null;
-  // Walk newest-first; first matched commit is the diff base.
-  let diffBase: string | null = null;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i]!.marker === "-") {
-      diffBase = entries[i]!.sha;
-      break;
+  let childUnique = 0;
+  for (const e of childEntries) {
+    if (e.marker === "-") matched++;
+    else childUnique++;
+  }
+  if (matched === 0 || childUnique === 0) return null;
+
+  const candidateEntries = await gitCherry(child.sha, candidate.sha);
+  if (!candidateEntries) return null;
+  for (const e of candidateEntries) {
+    if (e.marker === "+") return null;
+  }
+
+  // Walk newest-first; first matched commit's SHA is the diff base.
+  for (let i = childEntries.length - 1; i >= 0; i--) {
+    if (childEntries[i]!.marker === "-") {
+      return { matched, diffBase: childEntries[i]!.sha };
     }
   }
-  return { matched, diffBase };
+  return null;
 }
 
 /**
@@ -270,8 +293,7 @@ async function detectByPatchId(
         tips.map(async (cand) => {
           if (cand.slug === child.slug || cand.sha === child.sha) return null;
           const score = await scoreCherry(child, cand);
-          if (!score || !score.diffBase) return null;
-          return { cand, score };
+          return score ? { cand, score } : null;
         }),
       );
       const ranked = scored
@@ -282,7 +304,7 @@ async function detectByPatchId(
             a.cand.slug.localeCompare(b.cand.slug),
         );
       const best = ranked[0];
-      if (best && best.score.diffBase) {
+      if (best) {
         out[child.slug] = {
           slug: best.cand.slug,
           branch: best.cand.branch,

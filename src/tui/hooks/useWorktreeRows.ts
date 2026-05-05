@@ -7,6 +7,7 @@ import type { GitActivity } from "../../core/git-activity.ts";
 import { pickPrForWorktree } from "../../core/github.ts";
 import { lockAge, lockLabel } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
+import type { StackMap } from "../../core/stack.ts";
 import { slugLabel } from "../../core/stage.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
@@ -61,20 +62,36 @@ export type WorktreeFields = {
 };
 
 /**
- * Stack relationship for a worktree. Populated when this worktree is
- * built on top of another's branch (commit-ancestry signal) or its PR
- * declares another branch as its base (declarative fallback). `via`
- * disambiguates the two: commit-signal is ground truth (the work
- * literally builds on the parent); PR-base fires when GitHub says so
- * but the local branch isn't actually based on it (rebase pending,
- * stale PR base, etc.). `slug` is `null` for PR-base hits where the
- * declared base isn't another worktree in the list — the consumer can
- * still use `branch` for diffing but has no row to draw a UI hint to.
+ * Stack relationship for a worktree, with the resolved diff base.
+ * Populated by three signals in priority order:
+ *
+ *   "commits"  — parent's tip is an ancestor of HEAD. Stack is in sync;
+ *                three-dot diff against `branch` covers exactly this
+ *                worktree's unique work. `diffBase === branch`.
+ *   "patch-id" — parent rebased after the child branched, so its tip
+ *                is no longer an ancestor of HEAD, but its commits (by
+ *                patch-id) still appear in HEAD's history under
+ *                different SHAs. `diffBase` is a SHA inside HEAD's
+ *                history that skips the rebased-copy commits.
+ *   "pr"       — neither commit nor patch-id signal fires, but the PR
+ *                declares a non-trunk base. `diffBase === branch`; the
+ *                diff may be inaccurate (no patch-id overlap means the
+ *                two histories aren't actually related) but we honor
+ *                the user's declared intent.
+ *
+ * Anything other than `"commits"` is "out of sync" — the consuming UI
+ * surfaces a muted suffix so the user knows to rebase.
+ *
+ * `slug` is `null` for PR-base hits where the declared base isn't
+ * another worktree in the list; the consumer can still use the diff
+ * base for diffing but has no row to draw a UI hint to.
  */
 export type StackedOn = {
   slug: string | null;
   branch: string;
-  via: "commits" | "pr";
+  via: "commits" | "patch-id" | "pr";
+  /** Ref or SHA to use for `git diff <diffBase>...HEAD`. */
+  diffBase: string;
 };
 
 export type WorktreeRow = {
@@ -185,7 +202,54 @@ function statusEq(a: Status, b: Status): boolean {
 function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  return a.slug === b.slug && a.branch === b.branch && a.via === b.via;
+  return (
+    a.slug === b.slug &&
+    a.branch === b.branch &&
+    a.via === b.via &&
+    a.diffBase === b.diffBase
+  );
+}
+
+/**
+ * Resolve `stackedOn` for a single worktree. Single source of truth for
+ * the priority chain (commits → patch-id → pr → null) and the resolved
+ * diff base — the row aggregator reads this to populate `row.stackedOn`,
+ * and the details pane reads `row.stackedOn?.diffBase` directly so both
+ * sites land queries in the same per-(slug, base) cache slot.
+ *
+ * `worktrees` is the active set; needed only to associate a PR's
+ * declared base branch with a worktree slug for the UI hint.
+ */
+function resolveStackedOn(
+  wt: Worktree,
+  stackData: StackMap | undefined,
+  pr: PullRequest | undefined,
+  worktrees: readonly Worktree[],
+): StackedOn | null {
+  const fromStack = stackData?.[wt.slug];
+  // `via` and `diffBase` are required on `StackParent` since the
+  // patch-id detection landed; older persisted cache entries won't
+  // have them, so fall through to the PR/null fallback when the shape
+  // is incomplete. The next stale-time tick refetches with the new
+  // shape and this branch never fires again.
+  if (fromStack && fromStack.via && fromStack.diffBase) {
+    return {
+      slug: fromStack.slug,
+      branch: fromStack.branch,
+      via: fromStack.via,
+      diffBase: fromStack.diffBase,
+    };
+  }
+  if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
+    const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
+    return {
+      slug: parentWt?.slug ?? null,
+      branch: pr.baseRefName,
+      via: "pr",
+      diffBase: pr.baseRefName,
+    };
+  }
+  return null;
 }
 
 function deriveStatus(
@@ -351,18 +415,23 @@ export function useWorktreeRows(): WorktreeRowsResult {
     enabled: !!wtList.data && wtList.data.length > 0,
   });
 
-  /**
-   * Resolve the effective diff base for a worktree. Commit-signal
-   * (parent worktree's branch) wins over PR-base (declarative); both
-   * fall through to trunk. Branch names are passed raw to git, which
-   * resolves them as local refs — exactly what we want for stacked
-   * work where the parent's tip may be ahead of any pushed state.
-   */
-  // Resolve the effective base for every worktree once per render and
-  // use the same array everywhere downstream (sync + git-activity +
-  // diffContext queries). Drifting between two independent lookups
-  // would land queries in the wrong cache slot for that base.
-  const bases = worktrees.map((wt) => stack.data?.[wt.slug]?.branch ?? null);
+  // Per-worktree PR lookup — used both for `stackedOn` resolution
+  // below and for the row's `pr` field further down. Hoisted so the
+  // GitHub map is only walked once per worktree per render.
+  const prsByIndex = worktrees.map((wt) =>
+    pickPrForWorktree(wt, github.data?.prs),
+  );
+
+  // Resolve `stackedOn` once per render, then derive the diff base from
+  // it. Single source of truth for the commits → patch-id → pr → null
+  // priority chain — every consumer (sync/git-activity/diff-context
+  // queries here, the diff query in `details.tsx`, the row UI hint)
+  // reads through `row.stackedOn`, so they all land queries in the same
+  // per-(slug, base) cache slot.
+  const stackedOnByIndex = worktrees.map((wt, i) =>
+    resolveStackedOn(wt, stack.data, prsByIndex[i], worktrees),
+  );
+  const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
 
   const queries = worktrees.flatMap((wt, i) => [
     wtDirtyQuery(wt),
@@ -451,31 +520,9 @@ export function useWorktreeRows(): WorktreeRowsResult {
     };
     const nextStatus = deriveStatus(wt, fields);
     const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
-    const pr = pickPrForWorktree(wt, github.data?.prs);
+    const pr = prsByIndex[i];
     const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
-    // stackedOn: commit-signal wins, PR base is the fallback when no
-    // local-ancestor parent was found. PR base is ignored when it
-    // matches trunk (the implicit baseline).
-    let stackedOn: StackedOn | null = null;
-    const stackParent = stack.data?.[wt.slug];
-    if (stackParent) {
-      stackedOn = {
-        slug: stackParent.slug,
-        branch: stackParent.branch,
-        via: "commits",
-      };
-    } else if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
-      // The PR declares a non-trunk base. Try to associate it with a
-      // worktree slug so the UI can draw a connector when that
-      // worktree happens to sit immediately above; if no match,
-      // `slug: null` preserves the diff hint without a row anchor.
-      const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
-      stackedOn = {
-        slug: parentWt?.slug ?? null,
-        branch: pr.baseRefName,
-        via: "pr",
-      };
-    }
+    const stackedOn = stackedOnByIndex[i] ?? null;
     // Include the combined GitHub fetch that feeds the details pane
     // so the row glyph lights up whenever anything visible for this
     // worktree is refreshing — not just the per-worktree fields. That
