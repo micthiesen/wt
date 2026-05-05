@@ -37,6 +37,26 @@ export type { ActionLine, ActionLineKind } from "./claude-events.ts";
 const log = createLogger("[actions]");
 
 /**
+ * Per-launch substitution map for action templates. Keys are bare names
+ * (no braces); the renderer wraps them as `{{name}}` when scanning.
+ *
+ * Currently produced at `tui/app.tsx`'s `launchAction` from the row +
+ * config. Kept loose (`Record<string, string>`) so adding a new var is
+ * a one-liner at the callsite — no schema dance.
+ */
+export type ActionVars = Readonly<Record<string, string>>;
+
+/**
+ * Sed-style template renderer. Replaces `{{name}}` with `vars[name]`;
+ * unknown vars pass through unchanged so a typo is visible in the
+ * launched prompt (and in the action log header) rather than silently
+ * collapsing to an empty string.
+ */
+export function applyVars(template: string, vars: ActionVars): string {
+  return template.replaceAll(/\{\{(\w+)\}\}/g, (m, k) => vars[k] ?? m);
+}
+
+/**
  * Window during which a finished run keeps showing in the action
  * viewer. Exported so `useActionVisible` reuses the same constant
  * — it drives both the registry-side `isVisible` predicate and the
@@ -98,6 +118,7 @@ class ActionRegistry {
     slug: string,
     cwd: string,
     extras: string,
+    vars: ActionVars = {},
   ): ActionStartResult {
     const existing = this.runs.get(slug);
     if (existing?.status === "running") {
@@ -116,13 +137,15 @@ class ActionRegistry {
       `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`,
     );
 
+    const renderedExtras = applyVars(extras, vars);
     const userShell = process.env.SHELL || "bash";
     const argv =
       def.kind === "shell"
-        ? [userShell, "-lc", def.shell]
+        ? [userShell, "-lc", applyVars(def.shell, vars)]
         : (() => {
-            const trimmed = extras.trim();
-            const fullPrompt = trimmed ? `${def.prompt}\n\n${trimmed}` : def.prompt;
+            const renderedPrompt = applyVars(def.prompt, vars);
+            const trimmed = renderedExtras.trim();
+            const fullPrompt = trimmed ? `${renderedPrompt}\n\n${trimmed}` : renderedPrompt;
             return [
               "claude",
               "-p",
@@ -136,10 +159,12 @@ class ActionRegistry {
           })();
     const promptForRun =
       def.kind === "shell"
-        ? def.shell
-        : extras.trim()
-          ? `${def.prompt}\n\n${extras.trim()}`
-          : def.prompt;
+        ? applyVars(def.shell, vars)
+        : (() => {
+            const renderedPrompt = applyVars(def.prompt, vars);
+            const trimmed = renderedExtras.trim();
+            return trimmed ? `${renderedPrompt}\n\n${trimmed}` : renderedPrompt;
+          })();
 
     let proc: Bun.Subprocess;
     try {
@@ -202,12 +227,18 @@ class ActionRegistry {
     return { ok: true, run };
   }
 
-  startCustom(slug: string, cwd: string, prompt: string): ActionStartResult {
+  startCustom(
+    slug: string,
+    cwd: string,
+    prompt: string,
+    vars: ActionVars = {},
+  ): ActionStartResult {
     return this.start(
       { kind: "claude", id: CUSTOM_ACTION_ID, name: "Custom prompt", prompt: "" },
       slug,
       cwd,
       prompt,
+      vars,
     );
   }
 

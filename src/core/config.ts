@@ -81,6 +81,11 @@ export type AiConfig = {
  *   - `shell`: launches `$SHELL -lc <shell>` in the worktree path; the
  *     edit modal is skipped and Enter launches directly.
  *
+ * Both `prompt` and `shell` (and the user-typed extras) support
+ * `{{var}}` substitution. Vars are populated per-launch from the row
+ * — see `buildActionVars` in `tui/app.tsx` for the full set. Unknown
+ * vars pass through unchanged so typos surface in the rendered prompt.
+ *
  * When `[[actions]]` is absent the built-in defaults take effect; when
  * it's present (even with one entry), the user's list is authoritative
  * — the way to drop a default is to list everything except it.
@@ -169,9 +174,9 @@ const GENERIC_DEFAULTS = {
     {
       kind: "claude" as const,
       id: "rebase-main",
-      name: "Rebase on main",
+      name: "Rebase on base",
       prompt:
-        "Please rebase this branch on origin/main and intelligently resolve any conflicts that come up. Push when you're done.",
+        "Please rebase this branch on origin/{{base_branch}} and intelligently resolve any conflicts that come up. Push when you're done.",
     },
     {
       kind: "claude" as const,

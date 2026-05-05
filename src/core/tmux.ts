@@ -38,6 +38,15 @@ const log = createLogger("[tmux]");
 export const TMUX_SOCKET = "wt";
 
 /**
+ * Slug for the persistent claude session at the wt source repo (the
+ * `.` keybinding). Reuses `kind: "claude"`, so the tmux session name
+ * is just `wt` and the conversation shows up as `wt` in claude's
+ * `/resume` listings. `runtime.tsx` adds this to `live` so the orphan
+ * reaper doesn't mistake it for a vanished worktree.
+ */
+export const WT_SOURCE_SLUG = "wt";
+
+/**
  * Kinds of session this module manages. `claude` is the persistent
  * F12 conversation; `diff` is the F11 git-diff TUI; `shell` is the
  * F10 plain login shell. Each gets its own tmux session per slug —
@@ -83,6 +92,11 @@ function configDir(): string {
  *  - Truecolor declared two ways (modern `terminal-features :RGB` +
  *    legacy `terminal-overrides :Tc`) — different tools check
  *    different paths.
+ *  - `extended-keys on` + `:extkeys` feature: lets tmux distinguish
+ *    Shift+Enter from plain Enter so claude's newline shortcut works.
+ *    `allow-passthrough on` lets desktop notifications + the progress
+ *    bar reach the outer terminal instead of being swallowed by tmux.
+ *    All three are the official Anthropic-recommended tmux config.
  *  - `unbind C-b` + F10/F11/F12 all bound to detach-client: kill the
  *    tmux prefix entirely; each F-key is a single-press detach.
  *    Symmetric with the wt-side bindings — whichever F-key the user
@@ -103,6 +117,9 @@ set -g default-terminal "tmux-256color"
 set -as terminal-features ",${outerTerm}:RGB"
 set -ag terminal-overrides ",${outerTerm}:Tc"
 set -ag update-environment "COLORTERM"
+set -g allow-passthrough on
+set -s extended-keys on
+set -as terminal-features ",${outerTerm}:extkeys"
 unbind C-b
 bind-key -n F10 detach-client
 bind-key -n F11 detach-client

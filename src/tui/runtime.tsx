@@ -6,7 +6,7 @@ import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
-import { reapOrphanedSessions } from "../core/tmux.ts";
+import { reapOrphanedSessions, WT_SOURCE_SLUG } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
@@ -35,8 +35,13 @@ async function reapStartup(): Promise<void> {
     reapArchived(live);
     // Kill any tmux sessions whose slug no longer exists. Covers the
     // case where a worktree was removed externally (or in a prior wt
-    // run that crashed before the destroy hook fired).
-    await reapOrphanedSessions(live);
+    // run that crashed before the destroy hook fired). The wt-source
+    // shell session (`.` binding) lives on a sentinel slug outside the
+    // worktree namespace, so add it explicitly to keep the reaper from
+    // killing it.
+    const liveWithSource = new Set(live);
+    liveWithSource.add(WT_SOURCE_SLUG);
+    await reapOrphanedSessions(liveWithSource);
   } catch (err) {
     startupLog.warn("reap failed", { err: err instanceof Error ? err.message : String(err) });
   }

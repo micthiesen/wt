@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 
-import { actionRegistry, type ActionDef } from "../core/actions.ts";
+import { actionRegistry, type ActionDef, type ActionVars } from "../core/actions.ts";
 import { config, configFilePath } from "../core/config.ts";
 import {
   createWorktree,
@@ -25,6 +25,7 @@ import {
   killDiffSession,
   killSession,
   killShellSession,
+  WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
 import { useWtActions } from "../state/index.ts";
@@ -273,6 +274,28 @@ function isCleanCandidate(row: WorktreeRow): boolean {
   if (row.status.kind === StatusKind.Gone) return true;
   if (row.pr?.state === "MERGED") return true;
   return false;
+}
+
+/**
+ * Variables exposed to action templates as `{{name}}`. Kept here (not
+ * in `core/actions.ts`) because it depends on `WorktreeRow`, which is
+ * a TUI-layer type — the registry stays UI-agnostic.
+ *
+ * `base` mirrors the details-pane base value (may be a SHA when the
+ * stack signal is `patch-id`); `base_branch` is always a named ref —
+ * the right thing to plug into `git rebase` or a "rebase on X" prompt.
+ */
+function buildActionVars(row: WorktreeRow): ActionVars {
+  const baseBranch = row.stackedOn?.branch ?? config.branch.base;
+  const base = row.stackedOn?.diffBase ?? config.branch.base;
+  return {
+    base,
+    base_branch: baseBranch,
+    branch: row.wt.branch,
+    slug: row.wt.slug,
+    cwd: row.wt.path,
+    pr: row.pr ? String(row.pr.number) : "",
+  };
 }
 
 export function App({ onExit }: Props) {
@@ -949,9 +972,10 @@ export function App({ onExit }: Props) {
       toast(`${slug} is busy`, theme.warn, 2000);
       return;
     }
+    const vars = buildActionVars(row);
     const result = def
-      ? actionRegistry.start(def, slug, row.wt.path, extras)
-      : actionRegistry.startCustom(slug, row.wt.path, extras);
+      ? actionRegistry.start(def, slug, row.wt.path, extras, vars)
+      : actionRegistry.startCustom(slug, row.wt.path, extras, vars);
     if (!result.ok) {
       toast(`action: ${result.reason}`, theme.err, 3000);
       return;
@@ -1850,7 +1874,31 @@ export function App({ onExit }: Props) {
       configLog.event.info(`opened ${configFilePath}`);
       return;
     }
+    // `.` — toggle into a persistent claude session at the wt source
+    // repo. Same model as F12 on a worktree: tmux's `new-session -A`
+    // makes it idempotent, and F10/F11/F12 (bound to detach-client in
+    // the wt-private tmux config) takes the user back out. Slug "wt"
+    // so the tmux session and `/resume` entry both surface as `wt`.
     if (k.sequence === ".") {
+      void (async () => {
+        wtLog.event.info("entering wt claude session (F12 to detach)");
+        const result = await enterClaudeSession({
+          renderer,
+          slug: WT_SOURCE_SLUG,
+          cwd: WT_REPO_PATH,
+        });
+        if (result.kind === "spawn-failed") {
+          wtLog.event.err(`claude failed to start: ${result.reason}`);
+          toast(`claude failed: ${result.reason}`, theme.err, 3000);
+        } else if (result.kind === "detached") {
+          wtLog.event.info("detached from wt claude session");
+        } else {
+          wtLog.event.info(`wt claude session exited (${result.code ?? "?"})`);
+        }
+      })();
+      return;
+    }
+    if (k.sequence === ">") {
       void openInZed(WT_REPO_PATH);
       wtLog.event.info(`opened ${WT_REPO_PATH}`);
       return;
