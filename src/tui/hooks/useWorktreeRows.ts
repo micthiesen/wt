@@ -227,17 +227,17 @@ function resolveStackedOn(
   worktrees: readonly Worktree[],
 ): StackedOn | null {
   const fromStack = stackData?.[wt.slug];
-  // `via` and `diffBase` are required on `StackParent` since the
-  // patch-id detection landed; older persisted cache entries won't
-  // have them, so fall through to the PR/null fallback when the shape
-  // is incomplete. The next stale-time tick refetches with the new
-  // shape and this branch never fires again.
-  if (fromStack && fromStack.via && fromStack.diffBase) {
+  if (fromStack) {
+    // Pre-patch-id cache entries lack `via` / `diffBase` but had a
+    // valid `slug` + `branch`, which described a `"commits"` stack.
+    // Fill the missing fields with that interpretation so a recently
+    // upgraded process doesn't visibly flip stacked rows to "(pr)" or
+    // trunk for one staleTime window.
     return {
       slug: fromStack.slug,
       branch: fromStack.branch,
-      via: fromStack.via,
-      diffBase: fromStack.diffBase,
+      via: fromStack.via ?? "commits",
+      diffBase: fromStack.diffBase ?? fromStack.branch,
     };
   }
   if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {

@@ -228,7 +228,8 @@ async function gitCherry(upstream: string, head: string): Promise<CherryEntry[] 
  *
  * `git cherry <upstream> <head>` lists commits in `mergebase..head`:
  * `+` = patch-id missing from upstream (unique to head), `-` = matched.
- * For `candidate` to be a *parent* of `child`, two conditions must hold:
+ * For `candidate` to be a *parent* of `child`, three conditions must
+ * hold:
  *
  *   1. child has at least one unique commit (some `+` in
  *      `cherry candidate child`) — otherwise child is a peer/subset of
@@ -238,18 +239,36 @@ async function gitCherry(upstream: string, head: string): Promise<CherryEntry[] 
  *      correspond, by patch-id, to something in child's history.
  *      Otherwise the candidate has work the child doesn't, which means
  *      it's a sibling/descendant, not a parent.
+ *   3. child's tip itself must be `+` (unique). If the tip is matched
+ *      it means child cherry-picked the candidate's work onto its own
+ *      tip, leaving its unique commits buried below — there's no
+ *      contiguous-from-tip prefix to summarise, so we'd produce an
+ *      empty diff. Reject and fall back to trunk.
+ *
+ * Caveat: a sibling that cherry-picked all of child's commits and added
+ * nothing of its own would also pass conditions 1 and 2 (zero unique
+ * relative to child, child has work it cherry-picked). Niche enough
+ * that we don't try to disambiguate; the user can override via PR base
+ * if it bites.
  *
  * The diff base is the deepest `-` walking from the tip in
- * `cherry candidate child`, so `<diffBase>..HEAD` covers just the
- * contiguous-unique-from-tip prefix — clean for the AI summary even
- * when older commits matched the candidate.
+ * `cherry candidate child`. Because condition 3 already guarantees the
+ * tip is `+`, the deepest `-` sits at the boundary between unique-from-
+ * tip work (above) and matched-or-older work (below); `<diffBase>..HEAD`
+ * covers exactly the contiguous-unique-from-tip prefix.
  */
 async function scoreCherry(
   child: Tip,
   candidate: Tip,
 ): Promise<CherryResult | null> {
-  const childEntries = await gitCherry(candidate.sha, child.sha);
-  if (!childEntries) return null;
+  // Two independent `git cherry` calls — the patch-id work is
+  // symmetric and the swap doesn't share state, so race them.
+  const [childEntries, candidateEntries] = await Promise.all([
+    gitCherry(candidate.sha, child.sha),
+    gitCherry(child.sha, candidate.sha),
+  ]);
+  if (!childEntries || !candidateEntries) return null;
+
   let matched = 0;
   let childUnique = 0;
   for (const e of childEntries) {
@@ -258,14 +277,15 @@ async function scoreCherry(
   }
   if (matched === 0 || childUnique === 0) return null;
 
-  const candidateEntries = await gitCherry(child.sha, candidate.sha);
-  if (!candidateEntries) return null;
   for (const e of candidateEntries) {
     if (e.marker === "+") return null;
   }
 
-  // Walk newest-first; first matched commit's SHA is the diff base.
-  for (let i = childEntries.length - 1; i >= 0; i--) {
+  // Tip must be unique (condition 3), and we want the deepest `-`
+  // that follows the contiguous run of `+`s from the tip.
+  const tip = childEntries[childEntries.length - 1];
+  if (!tip || tip.marker !== "+") return null;
+  for (let i = childEntries.length - 2; i >= 0; i--) {
     if (childEntries[i]!.marker === "-") {
       return { matched, diffBase: childEntries[i]!.sha };
     }
@@ -275,10 +295,13 @@ async function scoreCherry(
 
 /**
  * Pass 2: for each child without a commit-signal parent, find the
- * candidate with the most patch-id overlap. Skips same-SHA peers (they
- * aren't parent/child) and any candidate that already has a
- * commit-signal parent (we want the *root* of the rebased branch, not
- * one of its descendants). Ties broken by overlap count, then slug.
+ * candidate with the most patch-id overlap. Same-SHA peers are skipped
+ * (they aren't parent/child); the full tip set is otherwise eligible
+ * as a candidate, including tips that already have a pass-1 parent —
+ * `scoreCherry`'s subset constraint (candidate's range must be fully
+ * matched in child's range) ensures we'd only pick such a candidate
+ * when it's a true ancestor by patch-id, in which case it's also the
+ * best parent for the orphan. Ties broken by overlap count, then slug.
  */
 async function detectByPatchId(
   tips: readonly Tip[],
@@ -324,10 +347,12 @@ async function detectByPatchId(
  * out of sync after a parent rebase.
  *
  * Cost model: pass 1 is O(N²) `merge-base --is-ancestor` invocations,
- * each sub-millisecond against a warm object DB. Pass 2 only touches
- * orphans (typically zero or one), and `git cherry` for a small range
- * of commits is fast. For typical N (tens of worktrees) the whole
- * thing finishes in a few hundred ms.
+ * each sub-millisecond against a warm object DB. Pass 2 issues two
+ * paralleled `git cherry` calls per (orphan, candidate) pair; each is
+ * cheap for the small commit ranges typical of stacked worktrees.
+ * Typical N (tens of worktrees, zero or one orphan) finishes in a few
+ * hundred ms; pathological setups (many orphans, deep histories) could
+ * take seconds.
  */
 export async function detectStacks(
   worktrees: readonly Worktree[],

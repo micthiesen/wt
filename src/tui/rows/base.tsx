@@ -19,9 +19,14 @@ import type { RowModule } from "./types.ts";
  *                 back in sync.
  */
 function syncSuffix(s: StackedOn): string | null {
-  if (s.via === "pr") return " (pr)";
-  if (s.via === "patch-id") return " (patch-id)";
-  return null;
+  switch (s.via) {
+    case "commits":
+      return null;
+    case "patch-id":
+      return " (patch-id)";
+    case "pr":
+      return " (pr)";
+  }
 }
 
 /**
