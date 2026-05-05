@@ -96,6 +96,8 @@ export type TmuxSessionsData = {
   claude: string[];
   /** Slugs with a live diff session. */
   diff: string[];
+  /** Slugs with a live shell session. */
+  shell: string[];
 };
 
 /**
@@ -110,8 +112,8 @@ export const tmuxSessionsQuery = () =>
   queryOptions({
     queryKey: qk.tmuxSessions(),
     queryFn: async (): Promise<TmuxSessionsData> => {
-      const { claude, diff } = await listTmuxSessions();
-      return { claude: [...claude], diff: [...diff] };
+      const { claude, diff, shell } = await listTmuxSessions();
+      return { claude: [...claude], diff: [...diff], shell: [...shell] };
     },
     staleTime: STALE.fast,
     refetchInterval: 2_000,

@@ -4,7 +4,7 @@ import { theme } from "../theme.ts";
 type Props = {
   slug: string;
   /** Which session kind is being killed — drives the body copy. */
-  sessionKind: "claude" | "diff";
+  sessionKind: "claude" | "diff" | "shell";
 };
 
 const COPY: Record<Props["sessionKind"], { title: string; body: string }> = {
@@ -22,6 +22,13 @@ const COPY: Record<Props["sessionKind"], { title: string; body: string }> = {
       "The tmux session and the diff TUI are terminated. Next F11 " +
       "opens a fresh session — scroll position and expanded hunks " +
       "won't carry over.",
+  },
+  shell: {
+    title: "Kill the shell session on",
+    body:
+      "The tmux session and the shell — including any background " +
+      "processes you launched in it — are terminated. Next F10 " +
+      "starts a fresh shell.",
   },
 };
 

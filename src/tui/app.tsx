@@ -20,7 +20,12 @@ import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
 import { stageUrl } from "../core/stage.ts";
-import { killAllSessionsFor, killDiffSession, killSession } from "../core/tmux.ts";
+import {
+  killAllSessionsFor,
+  killDiffSession,
+  killSession,
+  killShellSession,
+} from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
 import { useWtActions } from "../state/index.ts";
 
@@ -47,8 +52,13 @@ import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { enterClaudeSession } from "./claude-session.ts";
 import { enterDiffSession } from "./diff-session.ts";
+import { enterShellSession } from "./shell-session.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
-import { useActiveDiffSessions, useActiveSessions } from "./hooks/useActiveSessions.ts";
+import {
+  useActiveDiffSessions,
+  useActiveSessions,
+  useActiveShellSessions,
+} from "./hooks/useActiveSessions.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -244,7 +254,7 @@ type Modal =
   | {
       kind: "killSessionConfirm";
       slug: string;
-      sessionKind: "claude" | "diff";
+      sessionKind: "claude" | "diff" | "shell";
     };
 
 /**
@@ -416,6 +426,8 @@ export function App({ onExit }: Props) {
   // Parallel set for diff sessions — used by the Shift+F11 hint so
   // the kill-confirm only opens when there's something to kill.
   const activeDiffSessions = useActiveDiffSessions();
+  // Same for shell sessions, gating Shift+F10.
+  const activeShellSessions = useActiveShellSessions();
 
   // Reconcile session tailers against the live tmux-session set so the
   // jsonl-watch lifecycle tracks the daemon. Re-runs whenever the live
@@ -1298,7 +1310,12 @@ export function App({ onExit }: Props) {
       if (k.name === "y" || k.name === "return") {
         const { slug, sessionKind } = modal;
         setModal(null);
-        const kill = sessionKind === "diff" ? killDiffSession : killSession;
+        const kill =
+          sessionKind === "diff"
+            ? killDiffSession
+            : sessionKind === "shell"
+              ? killShellSession
+              : killSession;
         void kill(slug)
           .then(() => {
             appLog.event.warn(`killed ${sessionKind} session on ${slug}`);
@@ -1627,6 +1644,44 @@ export function App({ onExit }: Props) {
       }
       return;
     }
+    // F10 — toggle into the selected worktree's plain shell session.
+    // Persistent like F12: detach with F10, reattach to find
+    // scrollback, env, and any background processes still alive.
+    // `exit` / Ctrl+D ends the session.
+    if (
+      k.name === "f10" &&
+      !k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (current.status.kind === StatusKind.Busy) {
+        toast(`${slug} is busy`, theme.warn, 2000);
+        return;
+      }
+      const cwd = current.wt.path;
+      const shellLog = createLogger(slug);
+      void (async () => {
+        shellLog.event.info("entering shell (F10 to detach)");
+        const result = await enterShellSession({ renderer, slug, cwd });
+        if (result.kind === "spawn-failed") {
+          shellLog.event.err(`shell failed to start: ${result.reason}`);
+          toast(`shell failed: ${result.reason}`, theme.err, 3000);
+        } else if (result.kind === "detached") {
+          shellLog.event.info(`detached from shell (${slug})`);
+        } else {
+          shellLog.event.info(`shell exited (${result.code ?? "?"})`);
+        }
+      })();
+      return;
+    }
     // F11 — toggle into the selected worktree's diff TUI
     // (`[diff].command`, default `gitu`). tmux's `new-session -A`
     // makes this idempotent (creates or attaches), and the
@@ -1667,6 +1722,31 @@ export function App({ onExit }: Props) {
           diffLog.event.info(`diff exited (${result.code ?? "?"})`);
         }
       })();
+      return;
+    }
+    // Shift+F10 — kill-confirm for the selected worktree's shell
+    // session. Mirrors Shift+F11/F12. No-op (with a hint) when
+    // there's no session. Killing terminates any background
+    // processes the user launched in the shell.
+    if (
+      k.name === "f10" &&
+      k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (!activeShellSessions.has(slug)) {
+        toast(`no shell session on ${slug}`, theme.fgDim, 1500);
+        return;
+      }
+      setModal({ kind: "killSessionConfirm", slug, sessionKind: "shell" });
       return;
     }
     // Shift+F11 — kill-confirm for the selected worktree's diff

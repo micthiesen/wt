@@ -39,21 +39,28 @@ export const TMUX_SOCKET = "wt";
 
 /**
  * Kinds of session this module manages. `claude` is the persistent
- * F12 conversation; `diff` is the F11 git-diff TUI. Each gets its own
- * tmux session per slug — `<slug>` for claude, `<slug>-diff` for diff
- * — so they coexist without interfering.
+ * F12 conversation; `diff` is the F11 git-diff TUI; `shell` is the
+ * F10 plain login shell. Each gets its own tmux session per slug —
+ * `<slug>` for claude, `<slug>-diff` for diff, `<slug>-shell` for
+ * shell — so they coexist without interfering.
  */
-export type SessionKind = "claude" | "diff";
+export type SessionKind = "claude" | "diff" | "shell";
 
-const DIFF_SUFFIX = "-diff";
+const SUFFIX: Record<Exclude<SessionKind, "claude">, string> = {
+  diff: "-diff",
+  shell: "-shell",
+};
 
 function sessionName(slug: string, kind: SessionKind): string {
-  return kind === "diff" ? `${slug}${DIFF_SUFFIX}` : slug;
+  return kind === "claude" ? slug : `${slug}${SUFFIX[kind]}`;
 }
 
-/** Strip the diff suffix from a session name to recover the bare slug. */
+/** Strip a kind suffix from a session name to recover the bare slug. */
 function bareSlug(name: string): string {
-  return name.endsWith(DIFF_SUFFIX) ? name.slice(0, -DIFF_SUFFIX.length) : name;
+  for (const suffix of Object.values(SUFFIX)) {
+    if (name.endsWith(suffix)) return name.slice(0, -suffix.length);
+  }
+  return name;
 }
 
 /** Path to the generated tmux.conf. */
@@ -76,12 +83,13 @@ function configDir(): string {
  *  - Truecolor declared two ways (modern `terminal-features :RGB` +
  *    legacy `terminal-overrides :Tc`) — different tools check
  *    different paths.
- *  - `unbind C-b` + `bind -n F11 detach-client` + `bind -n F12 detach-client`:
- *    kill the tmux prefix entirely; both F11 and F12 are single-press
- *    detach. Symmetric with the wt-side bindings — whichever F-key the
- *    user pressed to enter (F11 for diff, F12 for claude) takes them
- *    back out. Binding both detach in either context is harmless: an
- *    accidental F11 inside a claude session just exits, same as F12.
+ *  - `unbind C-b` + F10/F11/F12 all bound to detach-client: kill the
+ *    tmux prefix entirely; each F-key is a single-press detach.
+ *    Symmetric with the wt-side bindings — whichever F-key the user
+ *    pressed to enter (F10 shell, F11 diff, F12 claude) takes them
+ *    back out. Binding all three to detach in any context is
+ *    harmless: an accidental F11 inside a claude session just exits,
+ *    same as F12.
  */
 export function buildConfig(): string {
   const outerTerm = process.env.TERM ?? "xterm-256color";
@@ -96,6 +104,7 @@ set -as terminal-features ",${outerTerm}:RGB"
 set -ag terminal-overrides ",${outerTerm}:Tc"
 set -ag update-environment "COLORTERM"
 unbind C-b
+bind-key -n F10 detach-client
 bind-key -n F11 detach-client
 bind-key -n F12 detach-client
 `;
@@ -134,9 +143,9 @@ export async function killServer(): Promise<void> {
 
 /**
  * Kill one worktree's claude session. Idempotent — silently no-ops
- * when the session doesn't exist or the server isn't running. Diff
- * sessions are unaffected; use `killDiffSession` for those, or
- * `killAllSessionsFor` to drop both at once.
+ * when the session doesn't exist or the server isn't running. Other
+ * kinds are unaffected; use `killDiffSession` / `killShellSession`
+ * for those, or `killAllSessionsFor` to drop every kind at once.
  */
 export async function killSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "claude"));
@@ -147,12 +156,22 @@ export async function killDiffSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "diff"));
 }
 
+/** Kill one worktree's shell session. Idempotent. */
+export async function killShellSession(slug: string): Promise<void> {
+  await killByName(sessionName(slug, "shell"));
+}
+
 /**
- * Kill both the claude and diff sessions for a slug. Used by destroy
- * paths so neither lingers with cwd inside a half-deleted worktree.
+ * Kill every kind of session for a slug (claude, diff, shell). Used
+ * by destroy paths so none linger with cwd inside a half-deleted
+ * worktree.
  */
 export async function killAllSessionsFor(slug: string): Promise<void> {
-  await Promise.allSettled([killSession(slug), killDiffSession(slug)]);
+  await Promise.allSettled([
+    killSession(slug),
+    killDiffSession(slug),
+    killShellSession(slug),
+  ]);
 }
 
 async function killByName(name: string): Promise<void> {
@@ -165,8 +184,8 @@ async function killByName(name: string): Promise<void> {
 
 /**
  * Bare slug sets for the live sessions of each kind, partitioned so
- * the indicators and the F11/F12 kill-confirm hints can read each
- * independently. One CLI call regardless of worktree count.
+ * the indicators and the F10/F11/F12 kill-confirm hints can read
+ * each independently. One CLI call regardless of worktree count.
  *
  * Server-not-running exits non-zero with a "no server running"
  * stderr; we map that to empty sets rather than throwing — it's the
@@ -175,18 +194,22 @@ async function killByName(name: string): Promise<void> {
 export async function listSessions(): Promise<{
   claude: Set<string>;
   diff: Set<string>;
+  shell: Set<string>;
 }> {
   const all = await listAllSessionsRaw();
   const claude = new Set<string>();
   const diff = new Set<string>();
+  const shell = new Set<string>();
   for (const name of all) {
-    if (name.endsWith(DIFF_SUFFIX)) {
-      diff.add(name.slice(0, -DIFF_SUFFIX.length));
+    if (name.endsWith(SUFFIX.diff)) {
+      diff.add(name.slice(0, -SUFFIX.diff.length));
+    } else if (name.endsWith(SUFFIX.shell)) {
+      shell.add(name.slice(0, -SUFFIX.shell.length));
     } else {
       claude.add(name);
     }
   }
-  return { claude, diff };
+  return { claude, diff, shell };
 }
 
 /**
@@ -254,13 +277,17 @@ export async function attachOrCreate(opts: {
     // every attach (rather than caching) means an externally-deleted
     // jsonl (claude project purge, manual rm) recovers cleanly: next
     // attach sees the file gone, switches back to --session-id with
-    // the same UUID, and recreates. The diff branch just shells out to
-    // the configured command via the user's login shell so PATH/init
-    // (pyenv, mise, …) apply.
+    // the same UUID, and recreates. The diff branch shells out to the
+    // configured command via the user's login shell so PATH/init
+    // (pyenv, mise, …) apply. The shell branch is just the login
+    // shell with no command — exit (Ctrl+D / `exit`) ends the session.
+    const userShell = process.env.SHELL || "bash";
     const innerArgs =
       kind === "claude"
         ? ["claude", ...wtSessionArgs(cwd)]
-        : [process.env.SHELL || "bash", "-lc", config.diff.command];
+        : kind === "diff"
+          ? [userShell, "-lc", config.diff.command]
+          : [userShell, "-l"];
     proc = Bun.spawn(
       [
         "tmux",

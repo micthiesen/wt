@@ -43,6 +43,8 @@ const SECTIONS: Section[] = [
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker)"],
       ["!", "run claude action · kill if running"],
+      ["F10", "enter shell · F10 again to detach"],
+      ["⇧F10", "kill shell session (ends background procs)"],
       ["F11", "enter diff TUI · F11 again to detach"],
       ["⇧F11", "kill diff session (resets gitu state)"],
       ["F12", "enter claude session · F12 again to detach"],
