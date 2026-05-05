@@ -80,13 +80,15 @@ type Tip = { slug: string; sha: string; branch: string };
  * Resolve each worktree's branch tip to a SHA. Skips the main worktree
  * (which is always trunk and would self-match every other worktree as a
  * "child" of trunk — not interesting). Skips worktrees with empty
- * `branch` defensively. All `git rev-parse` calls run in parallel
- * against the shared object DB.
+ * `branch` defensively. Also drops worktrees whose tip hasn't diverged
+ * past trunk — see {@link isAtOrBeforeTrunk} for why. All `git` calls
+ * run in parallel against the shared object DB.
  */
 async function resolveTips(
   worktrees: readonly Worktree[],
 ): Promise<Map<string, Tip>> {
   const candidates = worktrees.filter((w) => !w.isMain && w.branch);
+  const trunkSha = await resolveTrunkSha();
   const out = new Map<string, Tip>();
   await Promise.all(
     candidates.map(async (w) => {
@@ -96,10 +98,50 @@ async function resolveTips(
       });
       if (r.exitCode !== 0) return;
       const sha = r.stdout.trim();
-      if (sha) out.set(w.slug, { slug: w.slug, sha, branch: w.branch });
+      if (!sha) return;
+      if (trunkSha && (await isAtOrBeforeTrunk(sha, trunkSha))) return;
+      out.set(w.slug, { slug: w.slug, sha, branch: w.branch });
     }),
   );
   return out;
+}
+
+/**
+ * Resolve trunk to a SHA. Prefers `origin/<base>` (matches
+ * `branchIsMerged` semantics elsewhere — what's been pushed defines the
+ * shared trunk) and falls back to the local ref when no remote is
+ * available. Returns null when neither resolves; callers treat that as
+ * "skip the trunk filter" rather than failing the whole detection.
+ */
+async function resolveTrunkSha(): Promise<string | null> {
+  for (const ref of [`origin/${config.branch.base}`, config.branch.base]) {
+    const r = await run(["git", "rev-parse", "--verify", ref], {
+      cwd: config.paths.mainClone,
+      timeoutMs: GIT_TIMEOUT_MS,
+    });
+    if (r.exitCode === 0) {
+      const sha = r.stdout.trim();
+      if (sha) return sha;
+    }
+  }
+  return null;
+}
+
+/**
+ * A branch tip is "at or before trunk" when trunk's history reaches the
+ * tip — i.e. the branch has no unique commits past trunk. Such tips
+ * look like valid ancestors of any feature branch (their SHA literally
+ * sits on trunk's history), so the bare `merge-base --is-ancestor` test
+ * in pass 1 happily picks them as parents. But they aren't real parents
+ * in a stack — they're sibling branches still parked at the fork point,
+ * or branches that fell behind. Filter them out before either pass
+ * runs.
+ */
+async function isAtOrBeforeTrunk(
+  tipSha: string,
+  trunkSha: string,
+): Promise<boolean> {
+  return gitQuiet(["merge-base", "--is-ancestor", tipSha, trunkSha]);
 }
 
 /**
@@ -344,7 +386,11 @@ async function detectByPatchId(
  * For each non-main worktree, identify its stack parent and the diff
  * base to use for `git diff <base>...HEAD`. Pass 1 is the cheap
  * commit-ancestry signal; pass 2 (patch-id) catches stacks that drifted
- * out of sync after a parent rebase.
+ * out of sync after a parent rebase. Tips that haven't diverged past
+ * trunk are filtered out before either pass — they'd otherwise look
+ * like ancestors of every feature branch (since their SHA lies on
+ * trunk's history) and pass 1 would pick the alphabetically-first one
+ * as a false parent.
  *
  * Cost model: pass 1 is O(N²) `merge-base --is-ancestor` invocations,
  * each sub-millisecond against a warm object DB. Pass 2 issues two
