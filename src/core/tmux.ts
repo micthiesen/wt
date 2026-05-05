@@ -260,9 +260,52 @@ async function listAllSessionsRaw(): Promise<Set<string>> {
 }
 
 export type AttachResult =
-  | { kind: "exited"; code: number | null }
+  | { kind: "exited"; code: number | null; stderr: string | null }
   | { kind: "detached" }
   | { kind: "spawn-failed"; reason: string };
+
+/**
+ * Where the per-session stderr capture file lives. Stable name keyed
+ * on the tmux session name so re-attaches share the same file the
+ * original `bash` is still appending to. Created lazily on first attach.
+ */
+function sessionsDir(): string {
+  const dir = join(homedir(), ".cache", "wt", "sessions");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// CSI + OSC + bare ESC sequences. Same regex as core/proc.ts; copied
+// here rather than imported because that module pulls in TanStack
+// Query plumbing we don't want in the tmux layer.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
+const STDERR_TAIL_LIMIT = 2000;
+
+/**
+ * Scrub captured stderr down to something readable in the activity
+ * pane: drop ANSI/control-char noise, collapse whitespace-only lines,
+ * keep only the tail so a long-running session that leaked stderr
+ * doesn't flood the pane on exit.
+ */
+function scrubStderr(raw: string): string | null {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = raw
+    .replace(ANSI_RE, "")
+    .replace(/\r/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  const lines = cleaned
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return null;
+  let out = lines.join("\n");
+  if (out.length > STDERR_TAIL_LIMIT) {
+    out = `…${out.slice(-STDERR_TAIL_LIMIT)}`;
+  }
+  return out;
+}
 
 /**
  * Attach to (or create) the worktree's session and run the configured
@@ -287,6 +330,13 @@ export async function attachOrCreate(opts: {
     log.info("config changed, killing server before attach", { slug, kind });
     await killServer();
   }
+  // Stable per-session-name file for the inner program's stderr.
+  // The bash wrapper below sets this up via `2>` so claude/diff/shell
+  // startup errors (e.g. claude rejecting --session-id when the jsonl
+  // already exists) survive past the tmux pty teardown — without this
+  // they flash to the user's terminal during the spawn-and-die window
+  // and disappear, leaving only "exited (0)" in the activity pane.
+  const stderrPath = join(sessionsDir(), `${name}.err`);
 
   let proc: Bun.Subprocess;
   try {
@@ -324,6 +374,19 @@ export async function attachOrCreate(opts: {
         "TMUX",
         "-u",
         "TMUX_PANE",
+        // Wrap the inner program in a tiny bash that redirects stderr
+        // to `stderrPath` before exec'ing. `exec` keeps the process
+        // tree flat (the inner program inherits bash's PID, no extra
+        // hop). `new-session -A` only runs this command on creation —
+        // subsequent re-attaches share the file the original bash is
+        // still appending to. The redirect target is passed as $1 so
+        // we never have to shell-escape paths. Stdout stays on tmux's
+        // pty so the inner UI renders normally.
+        "bash",
+        "-c",
+        'p="$1"; shift; exec "$@" 2> "$p"',
+        "_wt_wrap",
+        stderrPath,
         ...innerArgs,
       ],
       {
@@ -378,7 +441,19 @@ export async function attachOrCreate(opts: {
   // exited and tmux cleaned up.
   const sessions = await listAllSessionsRaw();
   const stillRunning = sessions.has(name);
-  return stillRunning ? { kind: "detached" } : { kind: "exited", code };
+  if (stillRunning) return { kind: "detached" };
+  // Inner program died. Read whatever it wrote to stderr so the
+  // caller can surface the actual reason instead of just "exited (N)".
+  // ENOENT here just means the bash redirect never produced any
+  // output, which is the steady state for a clean exit.
+  let stderrText: string | null = null;
+  try {
+    const raw = readFileSync(stderrPath, "utf8");
+    stderrText = scrubStderr(raw);
+  } catch {
+    // no stderr file — bash never wrote anything, or it was already swept
+  }
+  return { kind: "exited", code, stderr: stderrText };
 }
 
 /**

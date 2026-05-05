@@ -47,9 +47,9 @@ export function useActiveActions(): ReadonlySet<string> {
 }
 
 /**
- * Whether a finished run for `slug` is still inside the 30-minute
+ * Whether a finished run for `slug` is still inside the `RECENT_WINDOW_MS`
  * "recent" window — drives the activity-pane swap. Returns true while
- * the run is running, true for the 30 minutes after exit, false
+ * the run is running, true for the recent window after exit, false
  * thereafter. Re-evaluates on every registry mutation AND on a
  * dedicated timer that fires once at the window expiry, so the swap
  * unmounts at the right moment without polling every render.

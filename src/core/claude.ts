@@ -52,7 +52,12 @@ const WAITING_MAX_AGE_MS = 30 * 60_000;
 const USER_MARKER = '"type":"user"';
 
 function projectDir(wtPath: string): string {
-  return join(homedir(), ".claude", "projects", wtPath.replace(/\//g, "-"));
+  // Claude Code normalizes both `/` and `.` to `-` when deriving the
+  // project dir name. `/Users/michael/.wt` → `-Users-michael--wt`.
+  // Missing the dot replacement here means existsSync always returns
+  // false for dot-prefixed paths, so we'd hand claude --session-id for
+  // an already-used UUID and it'd exit immediately.
+  return join(homedir(), ".claude", "projects", wtPath.replace(/[/.]/g, "-"));
 }
 
 /**

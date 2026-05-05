@@ -1702,6 +1702,7 @@ export function App({ onExit }: Props) {
           shellLog.event.info(`detached from shell (${slug})`);
         } else {
           shellLog.event.info(`shell exited (${result.code ?? "?"})`);
+          if (result.stderr) shellLog.event.err(result.stderr);
         }
       })();
       return;
@@ -1744,6 +1745,7 @@ export function App({ onExit }: Props) {
           diffLog.event.info(`detached from diff (${slug})`);
         } else {
           diffLog.event.info(`diff exited (${result.code ?? "?"})`);
+          if (result.stderr) diffLog.event.err(result.stderr);
         }
       })();
       return;
@@ -1865,6 +1867,7 @@ export function App({ onExit }: Props) {
           sessionLog.event.info(`detached from ${slug}`);
         } else {
           sessionLog.event.info(`claude exited (${result.code ?? "?"})`);
+          if (result.stderr) sessionLog.event.err(result.stderr);
         }
       })();
       return;
@@ -1894,6 +1897,7 @@ export function App({ onExit }: Props) {
           wtLog.event.info("detached from wt claude session");
         } else {
           wtLog.event.info(`wt claude session exited (${result.code ?? "?"})`);
+          if (result.stderr) wtLog.event.err(result.stderr);
         }
       })();
       return;
