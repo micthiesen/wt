@@ -65,13 +65,11 @@ export type WorktreeFields = {
  * Stack relationship for a worktree, with the resolved diff base.
  * Populated by two signals in priority order:
  *
- *   "stack" — patch-id detection (see `detectStacks`) found a worktree
- *             whose unique-past-trunk commits are all in this branch's
- *             history. `diffBase` is a SHA inside HEAD's history.
- *   "pr"    — no stack signal, but the PR declares a non-trunk base.
- *             `diffBase === branch`; the diff may be inaccurate when
- *             the histories don't actually overlap, but we honor the
- *             declared intent.
+ *   "pr"    — PR declares a non-trunk base. Strongest signal: the
+ *             user told GitHub explicitly. `diffBase === branch`.
+ *   "stack" — `detectStacks` resolved a parent from the branch's
+ *             reflog (reset to / rebased-from / created-from another
+ *             worktree). `diffBase` is the parent's branch ref.
  *
  * `slug` is `null` for PR-base hits where the declared base isn't
  * another worktree in the list; the consumer can still use the diff
@@ -81,7 +79,7 @@ export type StackedOn = {
   slug: string | null;
   branch: string;
   via: "stack" | "pr";
-  /** Ref or SHA to use for `git diff <diffBase>..HEAD`. */
+  /** Ref to use for `git diff <diffBase>...HEAD`. */
   diffBase: string;
 };
 
@@ -203,7 +201,7 @@ function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
 
 /**
  * Resolve `stackedOn` for a single worktree. Single source of truth for
- * the priority chain (stack → pr → null) and the resolved diff base —
+ * the priority chain (pr → stack → null) and the resolved diff base —
  * the row aggregator reads this to populate `row.stackedOn`, and the
  * details pane reads `row.stackedOn?.diffBase` directly so both sites
  * land queries in the same per-(slug, base) cache slot.
@@ -217,15 +215,6 @@ function resolveStackedOn(
   pr: PullRequest | undefined,
   worktrees: readonly Worktree[],
 ): StackedOn | null {
-  const fromStack = stackData?.[wt.slug];
-  if (fromStack) {
-    return {
-      slug: fromStack.slug,
-      branch: fromStack.branch,
-      via: "stack",
-      diffBase: fromStack.diffBase,
-    };
-  }
   if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
     const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
     return {
@@ -233,6 +222,15 @@ function resolveStackedOn(
       branch: pr.baseRefName,
       via: "pr",
       diffBase: pr.baseRefName,
+    };
+  }
+  const fromStack = stackData?.[wt.slug];
+  if (fromStack) {
+    return {
+      slug: fromStack.slug,
+      branch: fromStack.branch,
+      via: "stack",
+      diffBase: fromStack.diffBase,
     };
   }
   return null;
