@@ -136,11 +136,17 @@ export function HelpOverlay() {
       title="help"
       inset={{ top: "8%", right: "10%", bottom: "8%", left: "10%" }}
       hints={[
+        ["j k / ↑ ↓", "scroll"],
         ["?", "toggle"],
         ["esc / q", "close"],
       ]}
     >
-      <box flexDirection="row" flexGrow={1}>
+      <scrollbox
+        focused
+        scrollY
+        flexGrow={1}
+        contentOptions={{ flexDirection: "row" }}
+      >
         <box flexDirection="column" flexGrow={1} flexBasis={0}>
           {SECTIONS.map((sec) => (
             <box key={sec.title} flexDirection="column" marginBottom={1}>
@@ -205,7 +211,7 @@ export function HelpOverlay() {
             <text fg={theme.fg}>drag mouse → auto-copies</text>
           </box>
         </box>
-      </box>
+      </scrollbox>
     </Modal>
   );
 }
