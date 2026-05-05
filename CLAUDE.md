@@ -10,6 +10,10 @@ leave it out.
 
 Personal git-worktree TUI. Single developer, single machine, OSS-published. Bun + React + OpenTUI on top of TanStack Query.
 
+## Workflow
+
+Commit and push directly to `main`. Don't create feature branches, don't open PRs, don't suggest either — unless the user explicitly asks. This is a single-developer repo and the feature-branch dance is pure overhead here. When in doubt, stay on `main`.
+
 ## Architecture
 
 The TUI is split into three layers; respect the boundaries:
