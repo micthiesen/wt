@@ -116,9 +116,10 @@ class ActionRegistry {
       `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`,
     );
 
+    const userShell = process.env.SHELL || "bash";
     const argv =
       def.kind === "shell"
-        ? ["bash", "-lc", def.shell]
+        ? [userShell, "-lc", def.shell]
         : (() => {
             const trimmed = extras.trim();
             const fullPrompt = trimmed ? `${def.prompt}\n\n${trimmed}` : def.prompt;

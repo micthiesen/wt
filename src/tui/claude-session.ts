@@ -37,7 +37,7 @@ export async function enterClaudeSession(opts: {
   renderer.suspend();
   process.stdout.write(CLEAR_SCREEN);
   try {
-    return await attachOrCreate({ slug, cwd });
+    return await attachOrCreate({ slug, cwd, kind: "claude" });
   } finally {
     process.stdout.write(CLEAR_SCREEN);
     renderer.resume();

@@ -29,12 +29,32 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { wtSessionArgs } from "./claude.ts";
+import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 
 const log = createLogger("[tmux]");
 
 /** Socket name (`-L`) for the wt-private tmux server. */
 export const TMUX_SOCKET = "wt";
+
+/**
+ * Kinds of session this module manages. `claude` is the persistent
+ * F12 conversation; `diff` is the F11 git-diff TUI. Each gets its own
+ * tmux session per slug — `<slug>` for claude, `<slug>-diff` for diff
+ * — so they coexist without interfering.
+ */
+export type SessionKind = "claude" | "diff";
+
+const DIFF_SUFFIX = "-diff";
+
+function sessionName(slug: string, kind: SessionKind): string {
+  return kind === "diff" ? `${slug}${DIFF_SUFFIX}` : slug;
+}
+
+/** Strip the diff suffix from a session name to recover the bare slug. */
+function bareSlug(name: string): string {
+  return name.endsWith(DIFF_SUFFIX) ? name.slice(0, -DIFF_SUFFIX.length) : name;
+}
 
 /** Path to the generated tmux.conf. */
 function configDir(): string {
@@ -56,9 +76,12 @@ function configDir(): string {
  *  - Truecolor declared two ways (modern `terminal-features :RGB` +
  *    legacy `terminal-overrides :Tc`) — different tools check
  *    different paths.
- *  - `unbind C-b` + `bind -n F12 detach-client`: kill the tmux prefix
- *    entirely; F12 is a single-press detach. Symmetric with the
- *    wt-side `F12` binding that enters the session.
+ *  - `unbind C-b` + `bind -n F11 detach-client` + `bind -n F12 detach-client`:
+ *    kill the tmux prefix entirely; both F11 and F12 are single-press
+ *    detach. Symmetric with the wt-side bindings — whichever F-key the
+ *    user pressed to enter (F11 for diff, F12 for claude) takes them
+ *    back out. Binding both detach in either context is harmless: an
+ *    accidental F11 inside a claude session just exits, same as F12.
  */
 export function buildConfig(): string {
   const outerTerm = process.env.TERM ?? "xterm-256color";
@@ -73,6 +96,7 @@ set -as terminal-features ",${outerTerm}:RGB"
 set -ag terminal-overrides ",${outerTerm}:Tc"
 set -ag update-environment "COLORTERM"
 unbind C-b
+bind-key -n F11 detach-client
 bind-key -n F12 detach-client
 `;
 }
@@ -109,28 +133,69 @@ export async function killServer(): Promise<void> {
 }
 
 /**
- * Kill one worktree's session. Idempotent — silently no-ops when the
- * session doesn't exist or the server isn't running.
+ * Kill one worktree's claude session. Idempotent — silently no-ops
+ * when the session doesn't exist or the server isn't running. Diff
+ * sessions are unaffected; use `killDiffSession` for those, or
+ * `killAllSessionsFor` to drop both at once.
  */
 export async function killSession(slug: string): Promise<void> {
+  await killByName(sessionName(slug, "claude"));
+}
+
+/** Kill one worktree's diff session. Idempotent. */
+export async function killDiffSession(slug: string): Promise<void> {
+  await killByName(sessionName(slug, "diff"));
+}
+
+/**
+ * Kill both the claude and diff sessions for a slug. Used by destroy
+ * paths so neither lingers with cwd inside a half-deleted worktree.
+ */
+export async function killAllSessionsFor(slug: string): Promise<void> {
+  await Promise.allSettled([killSession(slug), killDiffSession(slug)]);
+}
+
+async function killByName(name: string): Promise<void> {
   const proc = Bun.spawn(
-    ["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${slug}`],
+    ["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${name}`],
     { stdout: "ignore", stderr: "ignore" },
   );
   await proc.exited;
 }
 
 /**
- * Set of slug names with a live tmux session on our private server.
- * One CLI call regardless of worktree count — the indicator hook polls
- * this rather than `has-session` per row.
+ * Bare slug sets for the live sessions of each kind, partitioned so
+ * the indicators and the F11/F12 kill-confirm hints can read each
+ * independently. One CLI call regardless of worktree count.
  *
- * Parses `list-sessions -F '#{session_name}'`. Server-not-running
- * exits non-zero with a "no server running" stderr; we map that to
- * empty set rather than throwing — it's the steady state when no
- * worktree has been entered yet.
+ * Server-not-running exits non-zero with a "no server running"
+ * stderr; we map that to empty sets rather than throwing — it's the
+ * steady state when no worktree has been entered yet.
  */
-export async function listSessions(): Promise<Set<string>> {
+export async function listSessions(): Promise<{
+  claude: Set<string>;
+  diff: Set<string>;
+}> {
+  const all = await listAllSessionsRaw();
+  const claude = new Set<string>();
+  const diff = new Set<string>();
+  for (const name of all) {
+    if (name.endsWith(DIFF_SUFFIX)) {
+      diff.add(name.slice(0, -DIFF_SUFFIX.length));
+    } else {
+      claude.add(name);
+    }
+  }
+  return { claude, diff };
+}
+
+/**
+ * Every session name on our private tmux server, including the
+ * `<slug>-diff` ones. Used by the reaper and by `attachOrCreate`'s
+ * post-detach existence check, which need exact-name matching
+ * regardless of kind.
+ */
+async function listAllSessionsRaw(): Promise<Set<string>> {
   const proc = Bun.spawn(
     [
       "tmux",
@@ -160,9 +225,11 @@ export type AttachResult =
   | { kind: "spawn-failed"; reason: string };
 
 /**
- * Attach to (or create) the worktree's session and run `claude`. Stdio
- * is inherited so tmux owns the user's terminal until they detach
- * (Ctrl+Q) or claude exits. Returns once tmux's client process exits.
+ * Attach to (or create) the worktree's session and run the configured
+ * inner program (claude for `kind: "claude"`, the user's diff TUI for
+ * `kind: "diff"`). Stdio is inherited so tmux owns the user's
+ * terminal until they detach (F11/F12) or the inner program exits.
+ * Returns once tmux's client process exits.
  *
  * Caller is responsible for suspending/resuming any UI renderer around
  * this call — this function makes no assumptions about who owns the
@@ -171,22 +238,29 @@ export type AttachResult =
 export async function attachOrCreate(opts: {
   slug: string;
   cwd: string;
+  kind: SessionKind;
 }): Promise<AttachResult> {
-  const { slug, cwd } = opts;
+  const { slug, cwd, kind } = opts;
+  const name = sessionName(slug, kind);
   const { path: configPath, changed } = writeConfig();
   if (changed) {
-    log.info("config changed, killing server before attach", { slug });
+    log.info("config changed, killing server before attach", { slug, kind });
     await killServer();
   }
 
   let proc: Bun.Subprocess;
   try {
-    // Resolve resume-vs-create at attach time. Re-checking on every
-    // attach (rather than caching) means an externally-deleted jsonl
-    // (claude project purge, manual rm) recovers cleanly: next attach
-    // sees the file gone, switches back to --session-id with the same
-    // UUID, and recreates.
-    const claudeArgs = ["claude", ...wtSessionArgs(cwd)];
+    // Claude resume-vs-create resolves at attach time. Re-checking on
+    // every attach (rather than caching) means an externally-deleted
+    // jsonl (claude project purge, manual rm) recovers cleanly: next
+    // attach sees the file gone, switches back to --session-id with
+    // the same UUID, and recreates. The diff branch just shells out to
+    // the configured command via the user's login shell so PATH/init
+    // (pyenv, mise, …) apply.
+    const innerArgs =
+      kind === "claude"
+        ? ["claude", ...wtSessionArgs(cwd)]
+        : [process.env.SHELL || "bash", "-lc", config.diff.command];
     proc = Bun.spawn(
       [
         "tmux",
@@ -197,7 +271,7 @@ export async function attachOrCreate(opts: {
         "new-session",
         "-A",
         "-s",
-        slug,
+        name,
         "-c",
         cwd,
         // See header: claude downgrades to 256-color when $TMUX is set.
@@ -206,7 +280,7 @@ export async function attachOrCreate(opts: {
         "TMUX",
         "-u",
         "TMUX_PANE",
-        ...claudeArgs,
+        ...innerArgs,
       ],
       {
         cwd,
@@ -230,7 +304,7 @@ export async function attachOrCreate(opts: {
     );
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    log.error("spawn failed", { slug, reason });
+    log.error("spawn failed", { slug, kind, reason });
     return { kind: "spawn-failed", reason };
   }
 
@@ -242,10 +316,11 @@ export async function attachOrCreate(opts: {
     try {
       const text = await new Response(stream).text();
       const trimmed = text.trim();
-      if (trimmed) log.debug("tmux stderr", { slug, text: trimmed });
+      if (trimmed) log.debug("tmux stderr", { slug, kind, text: trimmed });
     } catch (err) {
       log.warn("stderr drain failed", {
         slug,
+        kind,
         err: err instanceof Error ? err.message : String(err),
       });
     }
@@ -253,34 +328,37 @@ export async function attachOrCreate(opts: {
 
   const code = await proc.exited;
   await drainStderr;
-  // tmux client exits with 0 on detach AND on session-end (claude
-  // exit). Distinguish by re-querying: if the session still exists, the
-  // user detached; if not, the inner program exited and tmux cleaned up.
-  const sessions = await listSessions();
-  const stillRunning = sessions.has(slug);
+  // tmux client exits with 0 on detach AND on session-end (inner
+  // program exit). Distinguish by re-querying the raw set: if the
+  // session still exists, the user detached; if not, the inner program
+  // exited and tmux cleaned up.
+  const sessions = await listAllSessionsRaw();
+  const stillRunning = sessions.has(name);
   return stillRunning ? { kind: "detached" } : { kind: "exited", code };
 }
 
 /**
- * Reconcile sessions against a live slug set. Kills any session whose
- * slug isn't in `liveSlugs` — covers the case where a worktree was
- * destroyed (in this wt run or a prior one) without our session-kill
- * hook firing. Errors are swallowed; an orphaned session is a worse
- * outcome than blocking startup.
+ * Reconcile sessions against a live slug set. Kills any session
+ * (claude or diff) whose underlying slug isn't in `liveSlugs` — covers
+ * the case where a worktree was destroyed (in this wt run or a prior
+ * one) without our session-kill hook firing. The bare slug is derived
+ * by stripping the diff suffix when present so both kinds are reaped
+ * for a removed worktree. Errors are swallowed; an orphaned session is
+ * a worse outcome than blocking startup.
  */
 export async function reapOrphanedSessions(
   liveSlugs: ReadonlySet<string>,
 ): Promise<void> {
   let sessions: Set<string>;
   try {
-    sessions = await listSessions();
+    sessions = await listAllSessionsRaw();
   } catch {
     return;
   }
-  const orphans = [...sessions].filter((s) => !liveSlugs.has(s));
+  const orphans = [...sessions].filter((s) => !liveSlugs.has(bareSlug(s)));
   if (orphans.length === 0) return;
   log.info(`reaping ${orphans.length} orphaned tmux session(s)`, {
     orphans,
   });
-  await Promise.allSettled(orphans.map((s) => killSession(s)));
+  await Promise.allSettled(orphans.map((name) => killByName(name)));
 }

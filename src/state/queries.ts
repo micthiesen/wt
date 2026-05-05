@@ -91,18 +91,28 @@ export const wtStateQuery = () =>
     staleTime: STALE.fast,
   });
 
+export type TmuxSessionsData = {
+  /** Slugs with a live claude session. */
+  claude: string[];
+  /** Slugs with a live diff session. */
+  diff: string[];
+};
+
 /**
- * Set of slug names with a live interactive tmux session. One CLI
- * shell-out per refresh covers every worktree at once — far cheaper
- * than per-row `has-session` polling. The 2s refetch keeps the
- * indicator in sync without manual invalidation; explicit invalidation
- * still happens on enter/detach so the badge flips immediately rather
- * than waiting up to 2s.
+ * Slugs with live wt-private tmux sessions, partitioned by kind. One
+ * CLI shell-out per refresh covers every worktree and both kinds at
+ * once — far cheaper than per-row `has-session` polling or two
+ * parallel queries. The 2s refetch keeps both indicators in sync;
+ * explicit invalidation still fires on enter/detach so the badges
+ * flip immediately rather than waiting up to 2s.
  */
 export const tmuxSessionsQuery = () =>
   queryOptions({
     queryKey: qk.tmuxSessions(),
-    queryFn: async (): Promise<string[]> => [...(await listTmuxSessions())],
+    queryFn: async (): Promise<TmuxSessionsData> => {
+      const { claude, diff } = await listTmuxSessions();
+      return { claude: [...claude], diff: [...diff] };
+    },
     staleTime: STALE.fast,
     refetchInterval: 2_000,
   });

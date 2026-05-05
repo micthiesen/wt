@@ -20,7 +20,7 @@ import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
 import { stageUrl } from "../core/stage.ts";
-import { killSession } from "../core/tmux.ts";
+import { killAllSessionsFor, killDiffSession, killSession } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
 import { useWtActions } from "../state/index.ts";
 
@@ -46,8 +46,9 @@ import { WorktreeList } from "./panels/list.tsx";
 import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { enterClaudeSession } from "./claude-session.ts";
+import { enterDiffSession } from "./diff-session.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
-import { useActiveSessions } from "./hooks/useActiveSessions.ts";
+import { useActiveDiffSessions, useActiveSessions } from "./hooks/useActiveSessions.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -240,7 +241,11 @@ type Modal =
     }
   | { kind: "actionPicker"; state: ActionPickerState }
   | { kind: "killActionConfirm"; slug: string; actionName: string }
-  | { kind: "killSessionConfirm"; slug: string };
+  | {
+      kind: "killSessionConfirm";
+      slug: string;
+      sessionKind: "claude" | "diff";
+    };
 
 /**
  * A worktree is safe to clean when the branch is finished upstream. We
@@ -408,6 +413,9 @@ export function App({ onExit }: Props) {
   // Set of slugs with a live interactive tmux session — populates the
   // same cluster glyph in cyan when no one-off action is masking it.
   const activeSessions = useActiveSessions();
+  // Parallel set for diff sessions — used by the Shift+F11 hint so
+  // the kill-confirm only opens when there's something to kill.
+  const activeDiffSessions = useActiveDiffSessions();
 
   // Reconcile session tailers against the live tmux-session set so the
   // jsonl-watch lifecycle tracks the daemon. Re-runs whenever the live
@@ -657,14 +665,14 @@ export function App({ onExit }: Props) {
     // at next startup; re-creating the same slug clears the entry via
     // createWorktree.
     archive(slug);
-    // Tear down any interactive claude session BEFORE the worktree
-    // removal starts. tmux's session has cwd inside the worktree;
-    // letting the remove race against a live claude can leave it
-    // writing into a half-deleted directory. killSession is idempotent
-    // and fast (it just SIGHUPs tmux's session daemon). Awaited so
-    // spawnBackgroundRemove only starts once the live process is gone.
+    // Tear down any interactive claude/diff sessions BEFORE the
+    // worktree removal starts. Their cwds are inside the worktree;
+    // letting the remove race against a live tmux child can leave it
+    // writing into a half-deleted directory. killAllSessionsFor is
+    // idempotent and fast (just SIGHUPs the tmux session daemons).
+    // Awaited so spawnBackgroundRemove only starts once they're gone.
     try {
-      await killSession(slug);
+      await killAllSessionsFor(slug);
       void refreshTmuxSessions();
     } catch (err) {
       log.warn("kill session before remove failed", {
@@ -693,12 +701,12 @@ export function App({ onExit }: Props) {
     appLog.event.info(
       `clean: dispatching ${candidates.length} destroy${candidates.length === 1 ? "" : "s"}`,
     );
-    // Kill every candidate's tmux session before dispatching any
-    // remove — same rationale as `doRemove`: don't let the remove
-    // race against a live claude with cwd inside the worktree. Done
-    // in parallel since each kill is independent.
+    // Kill every candidate's tmux sessions (claude + diff) before
+    // dispatching any remove — same rationale as `doRemove`: don't
+    // let the remove race against a live child with cwd inside the
+    // worktree. Done in parallel since each kill is independent.
     await Promise.allSettled(
-      candidates.map((row) => killSession(row.wt.slug)),
+      candidates.map((row) => killAllSessionsFor(row.wt.slug)),
     );
     void refreshTmuxSessions();
     for (const row of candidates) {
@@ -1283,20 +1291,24 @@ export function App({ onExit }: Props) {
     }
 
     // Kill-confirm for an interactive tmux session on the selected
-    // worktree. Mirrors `killActionConfirm`. The conversation jsonl is
-    // preserved — next F12 attaches via --resume to the same UUID.
+    // worktree. Mirrors `killActionConfirm`. For claude, the
+    // conversation jsonl is preserved — next F12 attaches via --resume
+    // to the same UUID. For diff, the next F11 opens fresh state.
     if (modal?.kind === "killSessionConfirm") {
       if (k.name === "y" || k.name === "return") {
-        const { slug } = modal;
+        const { slug, sessionKind } = modal;
         setModal(null);
-        void killSession(slug)
+        const kill = sessionKind === "diff" ? killDiffSession : killSession;
+        void kill(slug)
           .then(() => {
-            appLog.event.warn(`killed claude session on ${slug}`);
+            appLog.event.warn(`killed ${sessionKind} session on ${slug}`);
             void refreshTmuxSessions();
           })
           .catch((err) => {
             const msg = err instanceof Error ? err.message : String(err);
-            appLog.event.err(`kill session failed for ${slug}: ${msg}`);
+            appLog.event.err(
+              `kill ${sessionKind} session failed for ${slug}: ${msg}`,
+            );
           });
         return;
       }
@@ -1615,6 +1627,73 @@ export function App({ onExit }: Props) {
       }
       return;
     }
+    // F11 — toggle into the selected worktree's diff TUI
+    // (`[diff].command`, default `gitu`). tmux's `new-session -A`
+    // makes this idempotent (creates or attaches), and the
+    // wt-private tmux config binds F11 to detach-client → the same
+    // physical key flips between contexts. Sessions persist (named
+    // `<slug>-diff`) so detach-then-reattach keeps gitu's scroll +
+    // expansion state. Refuse on busy worktrees so we don't race a
+    // destroy.
+    if (
+      k.name === "f11" &&
+      !k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (current.status.kind === StatusKind.Busy) {
+        toast(`${slug} is busy`, theme.warn, 2000);
+        return;
+      }
+      const cwd = current.wt.path;
+      const diffLog = createLogger(slug);
+      void (async () => {
+        diffLog.event.info(`opening diff (${config.diff.command}, F11 to detach)`);
+        const result = await enterDiffSession({ renderer, slug, cwd });
+        if (result.kind === "spawn-failed") {
+          diffLog.event.err(`diff failed to start: ${result.reason}`);
+          toast(`diff failed: ${result.reason}`, theme.err, 3000);
+        } else if (result.kind === "detached") {
+          diffLog.event.info(`detached from diff (${slug})`);
+        } else {
+          diffLog.event.info(`diff exited (${result.code ?? "?"})`);
+        }
+      })();
+      return;
+    }
+    // Shift+F11 — kill-confirm for the selected worktree's diff
+    // session. Mirrors Shift+F12. No-op (with a hint) when there's no
+    // session. Killing throws away gitu's scroll/expansion state, so
+    // next F11 opens fresh.
+    if (
+      k.name === "f11" &&
+      k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (!activeDiffSessions.has(slug)) {
+        toast(`no diff session on ${slug}`, theme.fgDim, 1500);
+        return;
+      }
+      setModal({ kind: "killSessionConfirm", slug, sessionKind: "diff" });
+      return;
+    }
     // Shift+F12 — kill-confirm for the selected worktree's interactive
     // claude session. No-op (with a hint) when there's no session.
     // Conversation jsonl is preserved; this kills only the live tmux
@@ -1637,7 +1716,7 @@ export function App({ onExit }: Props) {
         toast(`no session on ${slug}`, theme.fgDim, 1500);
         return;
       }
-      setModal({ kind: "killSessionConfirm", slug });
+      setModal({ kind: "killSessionConfirm", slug, sessionKind: "claude" });
       return;
     }
     // F12 — toggle into the selected worktree's interactive claude
@@ -1950,7 +2029,7 @@ export function App({ onExit }: Props) {
         />
       ) : null}
       {modal?.kind === "killSessionConfirm" ? (
-        <KillSessionConfirmModal slug={modal.slug} />
+        <KillSessionConfirmModal slug={modal.slug} sessionKind={modal.sessionKind} />
       ) : null}
     </box>
   );

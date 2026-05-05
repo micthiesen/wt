@@ -52,6 +52,16 @@ export type GithubConfig = {
   ignoredChecks: readonly string[];
 };
 
+export type DiffConfig = {
+  /**
+   * Shell command launched on F11 inside the selected worktree's path.
+   * Runs via `$SHELL -lc` (bash fallback) so pipes (`git diff | delta --paging=always`)
+   * and aliases work. Defaults to `gitu`; users can swap in `lazygit`,
+   * `tig status`, or anything else they prefer.
+   */
+  command: string;
+};
+
 export type AiConfig = {
   /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
   endpoint: string;
@@ -68,7 +78,7 @@ export type AiConfig = {
  *
  *   - `claude`: launches `claude -p` with the configured prompt; the
  *     edit modal exposes an extras textarea that gets appended.
- *   - `shell`: launches `bash -lc <shell>` in the worktree path; the
+ *   - `shell`: launches `$SHELL -lc <shell>` in the worktree path; the
  *     edit modal is skipped and Enter launches directly.
  *
  * When `[[actions]]` is absent the built-in defaults take effect; when
@@ -110,6 +120,7 @@ export type Config = {
   sst: SstConfig | null;
   linear: LinearConfig | null;
   ai: AiConfig | null;
+  diff: DiffConfig;
   github: GithubConfig;
   actions: readonly ActionDef[];
   ui: {
@@ -139,6 +150,9 @@ const GENERIC_DEFAULTS = {
   // stage is `sst-env.d.ts`.
   sst: {
     autoRegenPaths: ["sst-env.d.ts"] as const,
+  },
+  diff: {
+    command: "gitu",
   },
   ai: {
     maxInputTokens: 8000,
@@ -306,6 +320,11 @@ function build(raw: Raw, errs: Errors): Config {
       timeoutMs: errs.optNum(aiRaw, "timeout_ms", GENERIC_DEFAULTS.ai.timeoutMs),
     };
 
+  const diffRaw = obj(raw.diff);
+  const diff: DiffConfig = {
+    command: errs.optStr(diffRaw, "command", GENERIC_DEFAULTS.diff.command),
+  };
+
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   const githubRaw = obj(raw.github);
@@ -327,6 +346,7 @@ function build(raw: Raw, errs: Errors): Config {
     sst,
     linear,
     ai,
+    diff,
     github,
     actions,
     ui: { rows },
