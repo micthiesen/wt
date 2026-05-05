@@ -2,6 +2,9 @@ import type { ActionDef } from "../../core/config.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
+/** Claude-flavored action def — the only kind that uses the edit modal. */
+type ClaudeActionDef = Extract<ActionDef, { kind: "claude" }>;
+
 /**
  * Picker-mode item: one of the configured actions, or the trailing
  * "Custom prompt..." entry that drops you straight into a freeform
@@ -14,11 +17,13 @@ export type PickerItem =
 /**
  * Two-screen state machine. Esc in `edit` pops back to `list` when a
  * pre-built was selected (informative restore point) or cancels out
- * entirely from custom (no list state worth restoring).
+ * entirely from custom (no list state worth restoring). Only claude-
+ * flavored actions reach `edit`; shell actions launch directly from
+ * `list`.
  */
 export type ActionPickerState =
   | { mode: "list"; slug: string; index: number; items: PickerItem[] }
-  | { mode: "edit"; slug: string; def: ActionDef | null; extras: string };
+  | { mode: "edit"; slug: string; def: ClaudeActionDef | null; extras: string };
 
 type Props = {
   slug: string;
@@ -51,7 +56,11 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
         const prefixFg = isCustom ? theme.accent : theme.fgDim;
         const labelFg = isCustom ? theme.accent : fg;
         const label = isCustom ? "Custom prompt…" : item.def.name;
-        const hint = isCustom ? "freeform" : item.def.id;
+        const hint = isCustom
+          ? "freeform"
+          : item.def.kind === "shell"
+            ? `$ ${item.def.id}`
+            : item.def.id;
         return (
           <box
             key={isCustom ? "__custom__" : item.def.id}
@@ -82,7 +91,7 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
 type EditProps = {
   slug: string;
   /** `null` = custom prompt (extras IS the entire prompt). */
-  def: ActionDef | null;
+  def: ClaudeActionDef | null;
   extras: string;
 };
 

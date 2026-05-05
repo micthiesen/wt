@@ -64,16 +64,20 @@ export type AiConfig = {
 };
 
 /**
- * Pre-built `claude -p` action surfaced by the `!` modal. When
- * `[[actions]]` is absent the built-in defaults take effect; when it's
- * present (even with one entry), the user's list is authoritative —
- * the way to drop a default is to list everything except it.
+ * Pre-built action surfaced by the `!` modal. Two flavors:
+ *
+ *   - `claude`: launches `claude -p` with the configured prompt; the
+ *     edit modal exposes an extras textarea that gets appended.
+ *   - `shell`: launches `bash -lc <shell>` in the worktree path; the
+ *     edit modal is skipped and Enter launches directly.
+ *
+ * When `[[actions]]` is absent the built-in defaults take effect; when
+ * it's present (even with one entry), the user's list is authoritative
+ * — the way to drop a default is to list everything except it.
  */
-export type ActionDef = {
-  id: string;
-  name: string;
-  prompt: string;
-};
+export type ActionDef =
+  | { kind: "claude"; id: string; name: string; prompt: string }
+  | { kind: "shell"; id: string; name: string; shell: string };
 
 export type Config = {
   paths: {
@@ -149,12 +153,14 @@ const GENERIC_DEFAULTS = {
   },
   actions: [
     {
+      kind: "claude" as const,
       id: "rebase-main",
       name: "Rebase on main",
       prompt:
         "Please rebase this branch on origin/main and intelligently resolve any conflicts that come up. Push when you're done.",
     },
     {
+      kind: "claude" as const,
       id: "address-review",
       name: "Address PR review",
       prompt:
@@ -344,14 +350,40 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     }
     const id = errs.reqStr(entry, tag, "id");
     const name = errs.reqStr(entry, tag, "name");
-    const prompt = errs.reqStr(entry, tag, "prompt");
-    if (!id || !name || !prompt) continue;
+    if (!id || !name) continue;
     if (seenIds.has(id)) {
       errs.add(`${tag}.id "${id}" is duplicated`);
       continue;
     }
+    const promptVal = entry.prompt;
+    const shellVal = entry.shell;
+    const hasPrompt = typeof promptVal === "string" && promptVal.length > 0;
+    const hasShell = typeof shellVal === "string" && shellVal.length > 0;
+    // Distinguish "wrong type / empty" from "missing entirely" so the
+    // error names the real problem instead of demanding a field the
+    // user already tried to set.
+    if (promptVal !== undefined && !hasPrompt) {
+      errs.add(`${tag}.prompt must be a non-empty string`);
+      continue;
+    }
+    if (shellVal !== undefined && !hasShell) {
+      errs.add(`${tag}.shell must be a non-empty string`);
+      continue;
+    }
+    if (hasPrompt && hasShell) {
+      errs.add(`${tag} must set exactly one of "prompt" or "shell", not both`);
+      continue;
+    }
+    if (!hasPrompt && !hasShell) {
+      errs.add(`${tag} must set one of "prompt" or "shell"`);
+      continue;
+    }
     seenIds.add(id);
-    out.push({ id, name, prompt });
+    if (hasPrompt) {
+      out.push({ kind: "claude", id, name, prompt: promptVal as string });
+    } else {
+      out.push({ kind: "shell", id, name, shell: shellVal as string });
+    }
   }
   return out;
 }

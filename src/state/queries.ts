@@ -27,7 +27,7 @@ import type {
 import { createLogger } from "../core/logger.ts";
 import { isOurStageDeployed } from "../core/stage-safety.ts";
 import { pluralize } from "../core/text.ts";
-import { fetchOrigin, listWorktrees, syncState, type SyncState, worktreeIsDirty } from "../core/worktree.ts";
+import { fetchOrigin, listWorktrees, syncState, type SyncState, worktreeDirtyFiles } from "../core/worktree.ts";
 
 import { qk } from "./keys.ts";
 
@@ -151,7 +151,7 @@ export const contributorsQuery = () =>
 export const wtDirtyQuery = (wt: Pick<Worktree, "slug" | "path">) =>
   queryOptions({
     queryKey: qk.wt(wt.slug).dirty(),
-    queryFn: async (): Promise<boolean> => worktreeIsDirty(wt.path),
+    queryFn: async (): Promise<readonly string[]> => worktreeDirtyFiles(wt.path),
     staleTime: STALE.fast,
   });
 

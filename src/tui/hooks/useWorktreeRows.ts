@@ -50,7 +50,7 @@ export type FieldState<T> = {
 };
 
 export type WorktreeFields = {
-  dirty: FieldState<boolean>;
+  dirty: FieldState<readonly string[]>;
   lock: FieldState<Partial<LockMeta> | null>;
   deploy: FieldState<boolean>;
   merged: FieldState<boolean>;
@@ -209,7 +209,16 @@ function deriveStatus(
   if (fields.merged.data) {
     return { kind: StatusKind.Merged, label: "merged into origin/main" };
   }
-  if (fields.dirty.data) {
+  const dirty = fields.dirty.data;
+  if (dirty && dirty.length > 0) {
+    // Single auto-regen file (default `sst-env.d.ts`) → label by name so
+    // the user can tell at a glance that the dirt is just SST output and
+    // not a real edit. Falls through to plain "dirty" for any other
+    // mix.
+    const regen = config.sst?.autoRegenPaths ?? [];
+    if (dirty.length === 1 && regen.includes(dirty[0]!)) {
+      return { kind: StatusKind.Dirty, label: dirty[0]! };
+    }
     return { kind: StatusKind.Dirty, label: "dirty" };
   }
   return { kind: StatusKind.Clean, label: "clean" };
@@ -431,7 +440,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const fieldArr = FIELD_ORDER.map((_, j) => results[base + j]!);
     const prev = rowCache.current.get(wt.slug);
     const fields: WorktreeFields = {
-      dirty: reuseField(prev?.fields.dirty, toFieldState(fieldArr[0] as FieldState<boolean>)),
+      dirty: reuseField(prev?.fields.dirty, toFieldState(fieldArr[0] as FieldState<readonly string[]>)),
       lock: reuseField(prev?.fields.lock, toFieldState(fieldArr[1] as FieldState<Partial<LockMeta> | null>)),
       deploy: reuseField(prev?.fields.deploy, toFieldState(fieldArr[2] as FieldState<boolean>)),
       merged: reuseField(prev?.fields.merged, toFieldState(fieldArr[3] as FieldState<boolean>)),

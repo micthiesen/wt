@@ -18,6 +18,10 @@ function lineFg(kind: ActionLine["kind"]): string {
       return theme.accentAlt;
     case "tool-result":
       return theme.fgDim;
+    case "stdout":
+      return theme.fg;
+    case "stderr":
+      return theme.warn;
     case "exit-success":
       return theme.ok;
     case "exit-failure":

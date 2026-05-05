@@ -633,7 +633,7 @@ export function App({ onExit }: Props) {
       toast(`${slug} is ${label}`, theme.warn, 2000);
       return;
     }
-    if (row.fields.dirty.data) {
+    if ((row.fields.dirty.data?.length ?? 0) > 0) {
       log.event.err("refused: uncommitted changes, use `wt rm <slug> --force` from shell");
       toast(`${slug} has uncommitted changes`, theme.err, 3000);
       return;
@@ -1167,22 +1167,34 @@ export function App({ onExit }: Props) {
           const i = parseInt(k.sequence, 10) - 1;
           const item = ap.items[i];
           if (item && item.kind === "action") {
-            setModal({
-              kind: "actionPicker",
-              state: { mode: "edit", slug: ap.slug, def: item.def, extras: "" },
-            });
+            if (item.def.kind === "shell") {
+              setModal(null);
+              launchAction(ap.slug, item.def, "");
+            } else {
+              setModal({
+                kind: "actionPicker",
+                state: { mode: "edit", slug: ap.slug, def: item.def, extras: "" },
+              });
+            }
           }
           return;
         }
         if (k.name === "return") {
           const item = ap.items[ap.index];
           if (!item) return;
+          if (item.kind === "action" && item.def.kind === "shell") {
+            setModal(null);
+            launchAction(ap.slug, item.def, "");
+            return;
+          }
+          // Custom (no def) or claude action → into the edit modal.
+          const def = item.kind === "action" ? item.def : null;
           setModal({
             kind: "actionPicker",
             state: {
               mode: "edit",
               slug: ap.slug,
-              def: item.kind === "action" ? item.def : null,
+              def: def && def.kind === "claude" ? def : null,
               extras: "",
             },
           });

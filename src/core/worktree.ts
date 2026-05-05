@@ -118,14 +118,29 @@ export async function syncState(
 }
 
 /**
+ * Paths flagged by `git status --porcelain` (relative to the worktree
+ * root). Empty array == clean. Each entry is the porcelain `XY path`
+ * line with the leading 3 chars stripped — fine for plain modifies /
+ * adds / deletes / untracked, treats renames as the literal `old ->
+ * new` payload (which callers comparing against a known path will
+ * naturally fall through on).
+ */
+export async function worktreeDirtyFiles(wtPath: string): Promise<string[]> {
+  const porcelain = await runOk(["git", "status", "--porcelain"], { cwd: wtPath });
+  return porcelain
+    .split("\n")
+    .filter((l) => l.length > 0)
+    .map((l) => l.slice(3));
+}
+
+/**
  * True when the working tree has uncommitted changes — matches git's
  * own "dirty" convention. Unpushed commits are tracked separately via
  * `syncState`; callers that want to guard against losing *any* kind of
  * work (e.g. `wt rm`) should check both.
  */
 export async function worktreeIsDirty(wtPath: string): Promise<boolean> {
-  const porcelain = await runOk(["git", "status", "--porcelain"], { cwd: wtPath });
-  return porcelain.trim().length > 0;
+  return (await worktreeDirtyFiles(wtPath)).length > 0;
 }
 
 /**

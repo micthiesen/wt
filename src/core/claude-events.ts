@@ -18,6 +18,8 @@ export type ActionLineKind =
   | "assistant" // assistant text
   | "tool" // tool_use call
   | "tool-result" // tool result (success or error)
+  | "stdout" // shell action stdout line
+  | "stderr" // shell action stderr line
   | "exit-success" // result event w/ subtype success
   | "exit-failure"; // result event w/ is_error or non-zero exit
 

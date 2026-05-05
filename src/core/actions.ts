@@ -50,6 +50,9 @@ export type ActionStatus = "running" | "succeeded" | "failed" | "killed";
 
 export type ActionRun = {
   slug: string;
+  /** Mirrors `ActionDef["kind"]`; used by the runner to pick stream
+   *  consumers and process-group-aware kill behavior. */
+  kind: "claude" | "shell";
   actionId: string;
   actionName: string;
   prompt: string;
@@ -100,8 +103,6 @@ class ActionRegistry {
     if (existing?.status === "running") {
       return { ok: false, reason: "an action is already running for this worktree" };
     }
-    const trimmed = extras.trim();
-    const fullPrompt = trimmed ? `${def.prompt}\n\n${trimmed}` : def.prompt;
 
     const actionsDir = join(config.paths.logDir, "actions");
     try {
@@ -115,24 +116,47 @@ class ActionRegistry {
       `${slug}-${new Date().toISOString().replace(/[:.]/g, "-")}.log`,
     );
 
+    const argv =
+      def.kind === "shell"
+        ? ["bash", "-lc", def.shell]
+        : (() => {
+            const trimmed = extras.trim();
+            const fullPrompt = trimmed ? `${def.prompt}\n\n${trimmed}` : def.prompt;
+            return [
+              "claude",
+              "-p",
+              "--permission-mode",
+              "auto",
+              "--verbose",
+              "--output-format",
+              "stream-json",
+              fullPrompt,
+            ];
+          })();
+    const promptForRun =
+      def.kind === "shell"
+        ? def.shell
+        : extras.trim()
+          ? `${def.prompt}\n\n${extras.trim()}`
+          : def.prompt;
+
     let proc: Bun.Subprocess;
     try {
-      proc = Bun.spawn(
-        [
-          "claude",
-          "-p",
-          "--permission-mode",
-          "auto",
-          "--verbose",
-          "--output-format",
-          "stream-json",
-          fullPrompt,
-        ],
-        { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
-      );
+      proc = Bun.spawn(argv, {
+        cwd,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        // Shell actions get their own process group so SIGTERM can be
+        // sent to the group (`-pid`) and reach every child bash spawned
+        // (`pnpm`, `node`, build subprocesses). Without this, killing
+        // bash leaves orphaned children running.
+        ...(def.kind === "shell" ? { detached: true } : {}),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, reason: `spawn claude: ${msg}` };
+      const target = def.kind === "shell" ? "shell" : "claude";
+      return { ok: false, reason: `spawn ${target}: ${msg}` };
     }
 
     const startTs = Date.now();
@@ -143,9 +167,10 @@ class ActionRegistry {
     };
     const run: ActionRun = {
       slug,
+      kind: def.kind,
       actionId: def.id,
       actionName: def.name,
-      prompt: fullPrompt,
+      prompt: promptForRun,
       startedAt: startTs,
       status: "running",
       lines: [initialLine],
@@ -156,11 +181,20 @@ class ActionRegistry {
     log.event.info(`${slug}: ${def.name} → ${logPath}`);
 
     this.procs.set(slug, proc);
-    this.toolStarts.set(slug, new Map());
-    const drain = Promise.all([
-      this.consumeStdout(slug, proc),
-      this.consumeStderr(slug, proc),
-    ]).then(() => {});
+    // toolStarts is a claude-only concept (tracks tool_use_id timing); skip
+    // the allocation for shell runs — awaitExit's unconditional delete is a
+    // no-op when there's no entry.
+    if (def.kind === "claude") this.toolStarts.set(slug, new Map());
+    const drain =
+      def.kind === "shell"
+        ? Promise.all([
+            this.consumeShellStream(slug, proc, "stdout"),
+            this.consumeShellStream(slug, proc, "stderr"),
+          ]).then(() => {})
+        : Promise.all([
+            this.consumeStdout(slug, proc),
+            this.consumeStderr(slug, proc),
+          ]).then(() => {});
     this.drains.set(slug, drain);
     void this.awaitExit(slug, proc, drain);
     this.scheduleCleanup();
@@ -169,7 +203,7 @@ class ActionRegistry {
 
   startCustom(slug: string, cwd: string, prompt: string): ActionStartResult {
     return this.start(
-      { id: CUSTOM_ACTION_ID, name: "Custom prompt", prompt: "" },
+      { kind: "claude", id: CUSTOM_ACTION_ID, name: "Custom prompt", prompt: "" },
       slug,
       cwd,
       prompt,
@@ -182,7 +216,15 @@ class ActionRegistry {
     if (!proc || !run || run.status !== "running") return false;
     this.update(slug, (r) => ({ ...r, status: "killed" }));
     try {
-      proc.kill("SIGTERM");
+      // Shell runs were spawned `detached`, so the bash leader and its
+      // children share a pgid equal to the bash pid. Signaling `-pid`
+      // hits the whole group; without this, `pnpm`/`node`/build children
+      // outlive the bash leader and the user has no way to clean them up.
+      if (run.kind === "shell" && proc.pid) {
+        process.kill(-proc.pid, "SIGTERM");
+      } else {
+        proc.kill("SIGTERM");
+      }
     } catch {
       // proc might have already exited between the check and the kill —
       // awaitExit will record the final state regardless.
@@ -218,9 +260,14 @@ class ActionRegistry {
    * reject — cleanup must always run even if a drain throws.
    */
   async shutdown(): Promise<void> {
-    for (const [, proc] of this.procs) {
+    for (const [slug, proc] of this.procs) {
       try {
-        proc.kill("SIGTERM");
+        const run = this.runs.get(slug);
+        if (run?.kind === "shell" && proc.pid) {
+          process.kill(-proc.pid, "SIGTERM");
+        } else {
+          proc.kill("SIGTERM");
+        }
       } catch {
         // best-effort
       }
@@ -307,10 +354,30 @@ class ActionRegistry {
         if (line.trim()) {
           this.pushLine(slug, {
             ts: Date.now(),
-            kind: "exit-failure",
+            kind: "stderr",
             text: `stderr: ${line}`,
           });
         }
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  /** Plain stdout/stderr line tailer for shell actions. Each non-empty
+   *  source line becomes one ActionLine; awaitExit synthesizes the
+   *  terminal exit-success / exit-failure line. */
+  private async consumeShellStream(
+    slug: string,
+    proc: Bun.Subprocess,
+    which: "stdout" | "stderr",
+  ): Promise<void> {
+    const stream = proc[which] as ReadableStream<Uint8Array> | undefined;
+    if (!stream) return;
+    try {
+      await streamLines(stream, (line) => {
+        if (!line.trim()) return;
+        this.pushLine(slug, { ts: Date.now(), kind: which, text: line });
       });
     } catch {
       // best-effort
