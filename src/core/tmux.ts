@@ -212,7 +212,14 @@ export async function attachOrCreate(opts: {
         cwd,
         stdin: "inherit",
         stdout: "inherit",
-        stderr: "inherit",
+        // Pipe (not inherit) so tmux client noise like
+        // `[detached (from session X)]` and `[exited]` doesn't leak
+        // into the user's terminal. opentui's alt-screen hides them
+        // while wt is running, but they stick around in the main-screen
+        // buffer and become visible after wt exits — multiplied by every
+        // F12 cycle the user did. Claude's UI is unaffected; it flows
+        // through tmux's pty into our inherited stdout.
+        stderr: "pipe",
         env: {
           ...process.env,
           TERM: process.env.TERM ?? "xterm-256color",
@@ -227,7 +234,25 @@ export async function attachOrCreate(opts: {
     return { kind: "spawn-failed", reason };
   }
 
+  // Drain stderr to the file log so genuine tmux errors aren't
+  // silently lost. Resolves when the process closes the stream.
+  const drainStderr = (async () => {
+    const stream = proc.stderr as ReadableStream<Uint8Array> | undefined;
+    if (!stream) return;
+    try {
+      const text = await new Response(stream).text();
+      const trimmed = text.trim();
+      if (trimmed) log.debug("tmux stderr", { slug, text: trimmed });
+    } catch (err) {
+      log.warn("stderr drain failed", {
+        slug,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+
   const code = await proc.exited;
+  await drainStderr;
   // tmux client exits with 0 on detach AND on session-end (claude
   // exit). Distinguish by re-querying: if the session still exists, the
   // user detached; if not, the inner program exited and tmux cleaned up.
