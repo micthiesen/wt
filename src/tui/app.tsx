@@ -387,7 +387,11 @@ export function App({ onExit }: Props) {
   }
 
   const listWidth = Math.max(32, Math.min(52, Math.floor(width * 0.44)));
-  const activityHeight = Math.max(6, Math.min(16, Math.floor(height * 0.35)));
+  // Middle (list + details) is capped; activity absorbs the rest. Title
+  // and footer take 1 row each, so `height - 2` is the usable column
+  // budget split between middle and activity.
+  const middleMax = 20;
+  const activityHeight = Math.max(7, height - 2 - middleMax);
 
   // Action runtime state for the *selected* worktree. `currentRun`
   // drives the activity-pane swap (showing the streamed claude output
