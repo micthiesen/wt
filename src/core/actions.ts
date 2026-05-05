@@ -17,11 +17,22 @@ import { mkdirSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import {
+  type ActionLine,
+  type ActionLineKind,
+  type ToolStartMap,
+  MAX_BUFFERED_LINES,
+  asObj,
+  formatDuration,
+  formatTokens,
+  messageToLines,
+} from "./claude-events.ts";
 import { type ActionDef, config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { streamLines } from "./proc.ts";
 
 export type { ActionDef } from "./config.ts";
+export type { ActionLine, ActionLineKind } from "./claude-events.ts";
 
 const log = createLogger("[actions]");
 
@@ -32,28 +43,8 @@ const log = createLogger("[actions]");
  * client-side timer, and they have to stay in lockstep.
  */
 export const RECENT_WINDOW_MS = 30 * 60 * 1000;
-/** Per-run line cap. Old lines drop off the front; tail-clip in the viewer is independent. */
-const MAX_LINES_PER_RUN = 1000;
-/** Cap message-fragment count from a single assistant turn so a runaway response can't blow MAX_LINES. */
-const MAX_PIECES_PER_MESSAGE = 50;
-/** Brief tool-input truncation length. Keeps each ⚒ row to one TUI line. */
-const TOOL_INPUT_BRIEF = 60;
 /** actionId stamped on runs launched via the picker's "Custom prompt…" entry. */
 export const CUSTOM_ACTION_ID = "__custom__";
-
-export type ActionLineKind =
-  | "info" // synthesized — start, kill, error
-  | "assistant" // assistant text
-  | "tool" // tool_use call
-  | "tool-result" // tool result (success or error)
-  | "exit-success" // result event w/ subtype success
-  | "exit-failure"; // result event w/ is_error or non-zero exit
-
-export type ActionLine = {
-  ts: number;
-  kind: ActionLineKind;
-  text: string;
-};
 
 export type ActionStatus = "running" | "succeeded" | "failed" | "killed";
 
@@ -84,7 +75,7 @@ class ActionRegistry {
   /** Per-slug map of tool_use_id → call metadata. Per-slug isolation prevents the
    *  unlikely but real case of two concurrent claude sessions colliding on a
    *  shared id when results would otherwise route to the wrong run. */
-  private toolStarts = new Map<string, Map<string, { toolName: string; ts: number }>>();
+  private toolStarts = new Map<string, ToolStartMap>();
   /** Slugs whose `result` event has already been processed. Set inside the
    *  stream parser; read by awaitExit to decide whether to synthesize a
    *  fallback exit line. Cheaper than scanning `lines.at(-1)`, and immune
@@ -272,8 +263,8 @@ class ActionRegistry {
   private pushLine(slug: string, line: ActionLine): void {
     const cur = this.runs.get(slug);
     if (!cur) return;
-    const lines = cur.lines.length >= MAX_LINES_PER_RUN
-      ? [...cur.lines.slice(-(MAX_LINES_PER_RUN - 1)), line]
+    const lines = cur.lines.length >= MAX_BUFFERED_LINES
+      ? [...cur.lines.slice(-(MAX_BUFFERED_LINES - 1)), line]
       : [...cur.lines, line];
     this.commit((m) => m.set(slug, { ...cur, lines }));
     this.appendLogFile(cur, line);
@@ -367,8 +358,8 @@ class ActionRegistry {
       // Single commit — status flip and exit line in one snapshot so
       // observers don't see a transient frame with the new status but
       // no exit line.
-      const lines = cur.lines.length >= MAX_LINES_PER_RUN
-        ? [...cur.lines.slice(-(MAX_LINES_PER_RUN - 1)), exitLine]
+      const lines = cur.lines.length >= MAX_BUFFERED_LINES
+        ? [...cur.lines.slice(-(MAX_BUFFERED_LINES - 1)), exitLine]
         : [...cur.lines, exitLine];
       this.commit((m) => m.set(slug, { ...cur, endedAt, status, lines }));
       this.appendLogFile({ ...cur, endedAt, status, lines }, exitLine);
@@ -400,64 +391,14 @@ class ActionRegistry {
     const t = e.type;
     const toolStarts = this.toolStarts.get(slug);
 
-    if (t === "assistant") {
-      const message = asObj(e.message);
-      const content = asArr(message?.content);
-      if (!content) return;
-      for (const block of content) {
-        const b = asObj(block);
-        if (!b) continue;
-        if (b.type === "text" && typeof b.text === "string") {
-          const { pieces, truncated } = splitMessage(b.text);
-          for (const piece of pieces) {
-            this.pushLine(slug, {
-              ts,
-              kind: "assistant",
-              text: `  ${piece}`,
-            });
-          }
-          if (truncated > 0) {
-            this.pushLine(slug, {
-              ts,
-              kind: "info",
-              text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
-            });
-          }
-        } else if (b.type === "tool_use") {
-          const toolName = typeof b.name === "string" ? b.name : "?";
-          const id = typeof b.id === "string" ? b.id : null;
-          const arg = briefToolInput(b.input);
-          if (id && toolStarts) toolStarts.set(id, { toolName, ts });
-          this.pushLine(slug, {
-            ts,
-            kind: "tool",
-            text: `  ⚒ ${toolName}${arg ? `(${arg})` : ""}`,
-          });
-        }
-      }
-      return;
-    }
-
-    if (t === "user") {
-      const message = asObj(e.message);
-      const content = asArr(message?.content);
-      if (!content) return;
-      for (const block of content) {
-        const b = asObj(block);
-        if (!b || b.type !== "tool_result") continue;
-        const id = typeof b.tool_use_id === "string" ? b.tool_use_id : null;
-        const start = id && toolStarts ? toolStarts.get(id) : undefined;
-        if (id && toolStarts) toolStarts.delete(id);
-        const toolName = start?.toolName ?? "?";
-        const dur = start ? formatDuration(ts - start.ts) : "—";
-        const isErr = b.is_error === true;
-        const arrow = isErr ? "✗" : "✓";
-        this.pushLine(slug, {
-          ts,
-          kind: "tool-result",
-          text: `  ${arrow} ${toolName} → ${isErr ? "err" : "ok"} (${dur})`,
-        });
-      }
+    if ((t === "assistant" || t === "user") && toolStarts) {
+      const lines = messageToLines({
+        role: t,
+        message: e.message,
+        ts,
+        toolStarts,
+      });
+      for (const line of lines) this.pushLine(slug, line);
       return;
     }
 
@@ -490,8 +431,8 @@ class ActionRegistry {
       // the same render frame.
       const cur = this.runs.get(slug);
       if (cur) {
-        const lines = cur.lines.length >= MAX_LINES_PER_RUN
-          ? [...cur.lines.slice(-(MAX_LINES_PER_RUN - 1)), exitLine]
+        const lines = cur.lines.length >= MAX_BUFFERED_LINES
+          ? [...cur.lines.slice(-(MAX_BUFFERED_LINES - 1)), exitLine]
           : [...cur.lines, exitLine];
         this.commit((m) => m.set(slug, { ...cur, numTurns: turns, tokensIn, tokensOut, lines }));
         this.appendLogFile({ ...cur, numTurns: turns, tokensIn, tokensOut, lines }, exitLine);
@@ -527,82 +468,6 @@ class ActionRegistry {
       if (next.size > 0) this.scheduleCleanup();
     }, 60 * 1000);
   }
-}
-
-// ---------- helpers ----------
-
-function asObj(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === "object" && !Array.isArray(v)
-    ? (v as Record<string, unknown>)
-    : null;
-}
-
-function asArr(v: unknown): unknown[] | null {
-  return Array.isArray(v) ? v : null;
-}
-
-/**
- * Cap at MAX_PIECES_PER_MESSAGE so a runaway response can't drown out
- * the per-run line buffer; report the dropped count back so the caller
- * can render a "…N more truncated" hint instead of silently swallowing.
- */
-function splitMessage(text: string): { pieces: string[]; truncated: number } {
-  const all: string[] = [];
-  for (const line of text.split("\n")) {
-    const trimmed = line.replace(/\s+$/, "");
-    if (trimmed.length > 0) all.push(trimmed);
-  }
-  if (all.length <= MAX_PIECES_PER_MESSAGE) {
-    return { pieces: all, truncated: 0 };
-  }
-  return {
-    pieces: all.slice(0, MAX_PIECES_PER_MESSAGE),
-    truncated: all.length - MAX_PIECES_PER_MESSAGE,
-  };
-}
-
-/**
- * One-line summary of a tool's input. Tries common keys (command, path,
- * pattern, …) and falls back to empty when nothing useful is on top.
- * Trailing-truncate to TOOL_INPUT_BRIEF; ⚒ rows have to stay one line.
- */
-function briefToolInput(input: unknown): string {
-  const obj = asObj(input);
-  if (!obj) return "";
-  const keys = [
-    "command",
-    "file_path",
-    "path",
-    "pattern",
-    "query",
-    "url",
-    "subagent_type",
-    "description",
-  ];
-  for (const k of keys) {
-    const v = obj[k];
-    if (typeof v === "string" && v.length > 0) {
-      const oneLine = v.replaceAll("\n", " ").replace(/\s+/g, " ");
-      return oneLine.length > TOOL_INPUT_BRIEF
-        ? `${oneLine.slice(0, TOOL_INPUT_BRIEF - 1)}…`
-        : oneLine;
-    }
-  }
-  return "";
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.floor((ms % 60_000) / 1000);
-  return `${m}m${s.toString().padStart(2, "0")}s`;
-}
-
-function formatTokens(n: number): string {
-  if (n < 1000) return `${n}`;
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
 function formatLogLine(l: ActionLine): string {

@@ -5,6 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
+import { sessionTailRegistry } from "../core/session-tail.ts";
 import { reapOrphanedSessions } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
@@ -96,6 +97,8 @@ export async function runTui(): Promise<TuiExit> {
     // so we don't strand subprocesses (or truncate their log files)
     // when main.ts hits process.exit.
     await actionRegistry.shutdown();
+    // Close all jsonl watchers + drop tailer state.
+    sessionTailRegistry.stopAll();
     // Drain queued log writes before main.ts hits process.exit.
     await flushLogger();
   });

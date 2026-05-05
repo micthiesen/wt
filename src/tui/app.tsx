@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 
@@ -18,6 +18,7 @@ import {
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
+import { sessionTailRegistry } from "../core/session-tail.ts";
 import { stageUrl } from "../core/stage.ts";
 import { killSession } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
@@ -29,7 +30,7 @@ import {
   type ActionPickerState,
   type PickerItem,
 } from "./panels/action-picker.tsx";
-import { ActionViewer } from "./panels/action-viewer.tsx";
+import { ActionViewer, SessionViewer } from "./panels/action-viewer.tsx";
 import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
@@ -403,6 +404,20 @@ export function App({ onExit }: Props) {
   // Set of slugs with a live interactive tmux session — populates the
   // same cluster glyph in cyan when no one-off action is masking it.
   const activeSessions = useActiveSessions();
+
+  // Reconcile session tailers against the live tmux-session set so the
+  // jsonl-watch lifecycle tracks the daemon. Re-runs whenever the live
+  // set changes; the registry is otherwise idempotent so this is safe
+  // to call on every render-driven change. Path comes from `rows` so
+  // we always seed against the worktree's actual cwd (the wtPath the
+  // tmux session was created with).
+  useEffect(() => {
+    const live = new Map<string, string>();
+    for (const r of rows) {
+      if (activeSessions.has(r.wt.slug)) live.set(r.wt.slug, r.wt.path);
+    }
+    sessionTailRegistry.reconcile(live);
+  }, [rows, activeSessions]);
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -1863,6 +1878,8 @@ export function App({ onExit }: Props) {
       </box>
       {showActionViewer && currentRun ? (
         <ActionViewer run={currentRun} height={activityHeight} />
+      ) : currentSlug && activeSessions.has(currentSlug) ? (
+        <SessionViewer slug={currentSlug} height={activityHeight} />
       ) : (
         <ActivityPane height={activityHeight} />
       )}
