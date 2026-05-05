@@ -63,24 +63,15 @@ export type WorktreeFields = {
 
 /**
  * Stack relationship for a worktree, with the resolved diff base.
- * Populated by three signals in priority order:
+ * Populated by two signals in priority order:
  *
- *   "commits"  — parent's tip is an ancestor of HEAD. Stack is in sync;
- *                three-dot diff against `branch` covers exactly this
- *                worktree's unique work. `diffBase === branch`.
- *   "patch-id" — parent rebased after the child branched, so its tip
- *                is no longer an ancestor of HEAD, but its commits (by
- *                patch-id) still appear in HEAD's history under
- *                different SHAs. `diffBase` is a SHA inside HEAD's
- *                history that skips the rebased-copy commits.
- *   "pr"       — neither commit nor patch-id signal fires, but the PR
- *                declares a non-trunk base. `diffBase === branch`; the
- *                diff may be inaccurate (no patch-id overlap means the
- *                two histories aren't actually related) but we honor
- *                the user's declared intent.
- *
- * Anything other than `"commits"` is "out of sync" — the consuming UI
- * surfaces a muted suffix so the user knows to rebase.
+ *   "stack" — patch-id detection (see `detectStacks`) found a worktree
+ *             whose unique-past-trunk commits are all in this branch's
+ *             history. `diffBase` is a SHA inside HEAD's history.
+ *   "pr"    — no stack signal, but the PR declares a non-trunk base.
+ *             `diffBase === branch`; the diff may be inaccurate when
+ *             the histories don't actually overlap, but we honor the
+ *             declared intent.
  *
  * `slug` is `null` for PR-base hits where the declared base isn't
  * another worktree in the list; the consumer can still use the diff
@@ -89,8 +80,8 @@ export type WorktreeFields = {
 export type StackedOn = {
   slug: string | null;
   branch: string;
-  via: "commits" | "patch-id" | "pr";
-  /** Ref or SHA to use for `git diff <diffBase>...HEAD`. */
+  via: "stack" | "pr";
+  /** Ref or SHA to use for `git diff <diffBase>..HEAD`. */
   diffBase: string;
 };
 
@@ -212,10 +203,10 @@ function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
 
 /**
  * Resolve `stackedOn` for a single worktree. Single source of truth for
- * the priority chain (commits → patch-id → pr → null) and the resolved
- * diff base — the row aggregator reads this to populate `row.stackedOn`,
- * and the details pane reads `row.stackedOn?.diffBase` directly so both
- * sites land queries in the same per-(slug, base) cache slot.
+ * the priority chain (stack → pr → null) and the resolved diff base —
+ * the row aggregator reads this to populate `row.stackedOn`, and the
+ * details pane reads `row.stackedOn?.diffBase` directly so both sites
+ * land queries in the same per-(slug, base) cache slot.
  *
  * `worktrees` is the active set; needed only to associate a PR's
  * declared base branch with a worktree slug for the UI hint.
@@ -228,16 +219,11 @@ function resolveStackedOn(
 ): StackedOn | null {
   const fromStack = stackData?.[wt.slug];
   if (fromStack) {
-    // Pre-patch-id cache entries lack `via` / `diffBase` but had a
-    // valid `slug` + `branch`, which described a `"commits"` stack.
-    // Fill the missing fields with that interpretation so a recently
-    // upgraded process doesn't visibly flip stacked rows to "(pr)" or
-    // trunk for one staleTime window.
     return {
       slug: fromStack.slug,
       branch: fromStack.branch,
-      via: fromStack.via ?? "commits",
-      diffBase: fromStack.diffBase ?? fromStack.branch,
+      via: "stack",
+      diffBase: fromStack.diffBase,
     };
   }
   if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
