@@ -65,6 +65,17 @@ function sessionName(slug: string, kind: SessionKind): string {
   return kind === "claude" ? slug : `${slug}${SUFFIX[kind]}`;
 }
 
+/**
+ * Single-quote a path for safe interpolation into a /bin/sh command
+ * string. Used by the pipe-pane redirect target — `homedir()` paths
+ * can contain spaces ("My Name" accounts on macOS), so a raw splice
+ * would break the redirect. Embedded single quotes are escaped via
+ * `'\''` per POSIX shell convention.
+ */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 /** Strip a kind suffix from a session name to recover the bare slug. */
 function bareSlug(name: string): string {
   for (const suffix of Object.values(SUFFIX)) {
@@ -367,6 +378,10 @@ export async function attachOrCreate(opts: {
   // own jsonl tail, and diff is a TUI we don't surface as an output.
   if (kind === "shell") {
     const shellLog = shellLogPath(slug);
+    // pipe-pane runs its argument through /bin/sh -c, so the path
+    // has to survive shell parsing — `homedir()` can contain spaces
+    // (macOS "My Name" accounts) even though the slug can't.
+    const quotedLog = shQuote(shellLog);
     const setup = Bun.spawn(
       [
         "tmux",
@@ -402,15 +417,25 @@ export async function attachOrCreate(opts: {
         // pipe-pane spawns this shell once per session lifetime; the
         // truncate fires only on first attach, subsequent re-attaches
         // are `-o` no-ops and the existing FD keeps streaming.
-        `cat > ${shellLog}`,
+        `cat > ${quotedLog}`,
       ],
-      { stdout: "ignore", stderr: "ignore" },
+      { stdout: "ignore", stderr: "pipe" },
     );
-    const setupCode = await setup.exited;
+    const [setupCode, setupErr] = await Promise.all([
+      setup.exited,
+      new Response(setup.stderr).text(),
+    ]);
     if (setupCode !== 0) {
-      log.warn("shell pre-create + pipe-pane failed", { slug, code: setupCode });
-      // Fall through to the regular attach below — output won't be
-      // tailed, but the user still gets their shell.
+      // Falling through to the regular attach below means the user
+      // still gets a working shell, but the bottom-pane tail will sit
+      // at "waiting for shell session output…" for this session's
+      // lifetime. Surface the actual stderr so the failure is
+      // diagnosable instead of just logged as an exit code.
+      log.warn("shell pre-create + pipe-pane failed; tail disabled", {
+        slug,
+        code: setupCode,
+        stderr: setupErr.trim() || null,
+      });
     }
   }
 
@@ -518,13 +543,13 @@ export async function attachOrCreate(opts: {
 }
 
 /**
- * Reconcile sessions against a live slug set. Kills any session
- * (claude or diff) whose underlying slug isn't in `liveSlugs` — covers
- * the case where a worktree was destroyed (in this wt run or a prior
- * one) without our session-kill hook firing. The bare slug is derived
- * by stripping the diff suffix when present so both kinds are reaped
- * for a removed worktree. Errors are swallowed; an orphaned session is
- * a worse outcome than blocking startup.
+ * Reconcile sessions against a live slug set. Kills any session of
+ * any kind (claude, diff, or shell) whose underlying slug isn't in
+ * `liveSlugs` — covers the case where a worktree was destroyed (in
+ * this wt run or a prior one) without our session-kill hook firing.
+ * The bare slug is derived by stripping the kind suffix so every
+ * kind is reaped for a removed worktree. Errors are swallowed; an
+ * orphaned session is a worse outcome than blocking startup.
  */
 export async function reapOrphanedSessions(
   liveSlugs: ReadonlySet<string>,

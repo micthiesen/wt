@@ -26,6 +26,7 @@ import {
   killDiffSession,
   killSession,
   killShellSession,
+  type SessionKind,
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
@@ -275,7 +276,7 @@ type Modal =
   | {
       kind: "killSessionConfirm";
       slug: string;
-      sessionKind: "claude" | "diff" | "shell";
+      sessionKind: SessionKind;
     };
 
 /**
@@ -894,8 +895,8 @@ export function App({ onExit }: Props) {
     // at next startup; re-creating the same slug clears the entry via
     // createWorktree.
     archive(slug);
-    // Tear down any interactive claude/diff sessions BEFORE the
-    // worktree removal starts. Their cwds are inside the worktree;
+    // Tear down any interactive sessions (claude, diff, shell) BEFORE
+    // the worktree removal starts. Their cwds are inside the worktree;
     // letting the remove race against a live tmux child can leave it
     // writing into a half-deleted directory. killAllSessionsFor is
     // idempotent and fast (just SIGHUPs the tmux session daemons).
@@ -930,7 +931,7 @@ export function App({ onExit }: Props) {
     appLog.event.info(
       `clean: dispatching ${candidates.length} destroy${candidates.length === 1 ? "" : "s"}`,
     );
-    // Kill every candidate's tmux sessions (claude + diff) before
+    // Kill every candidate's tmux sessions (every kind) before
     // dispatching any remove — same rationale as `doRemove`: don't
     // let the remove race against a live child with cwd inside the
     // worktree. Done in parallel since each kill is independent.
@@ -2058,6 +2059,11 @@ export function App({ onExit }: Props) {
       void (async () => {
         shellLog.event.info("entering shell (F10 to detach)");
         const result = await enterShellSession({ renderer, slug, cwd });
+        // Flip the indicator + spin up the shell-tail tailer
+        // immediately rather than waiting for the 2s tmux-sessions
+        // poll. Without this, lines written in the first ~2s arrive
+        // only via seed-on-late-ensure, not as live deltas.
+        void refreshTmuxSessions();
         if (result.kind === "spawn-failed") {
           shellLog.event.err(`shell failed to start: ${result.reason}`);
           toast(`shell failed: ${result.reason}`, theme.err, 3000);

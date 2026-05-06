@@ -1,10 +1,11 @@
+import type { SessionKind } from "../../core/tmux.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
 type Props = {
   slug: string;
   /** Which session kind is being killed — drives the body copy. */
-  sessionKind: "claude" | "diff" | "shell";
+  sessionKind: SessionKind;
 };
 
 const COPY: Record<Props["sessionKind"], { title: string; body: string }> = {

@@ -7,8 +7,11 @@
  *
  * `attachOrCreate(kind: "shell")` chains a `tmux pipe-pane -o` after
  * `new-session -A -d` so every byte the shell writes to its pane gets
- * appended to `shellLogPath(slug)`. From there it's the same fs.watch
- * + debounce + delta-read pattern as session-tail.
+ * written to `shellLogPath(slug)`. The pipe shell uses `>` (not `>>`),
+ * so the log truncates on first session-create and a destroy-and-recreate
+ * of the same slug doesn't seed the new tail with the prior session's
+ * lines. From there it's the same fs.watch + debounce + delta-read
+ * pattern as session-tail.
  *
  * # ANSI stripping & carriage returns
  *

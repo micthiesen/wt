@@ -27,7 +27,7 @@ export type OutputKind = "events" | "action" | "session" | "destroy";
  * via stream-json, shell via `tmux pipe-pane` with ANSI stripping.
  * F11 diff is deliberately excluded (see file header).
  */
-export type SessionKind = "claude" | "shell";
+export type OutputSessionKind = "claude" | "shell";
 export type OutputStatus = "live" | "running" | "done" | "failed" | "killed";
 
 export type Output = {
@@ -38,7 +38,7 @@ export type Output = {
   /** Worktree slug this output belongs to. `undefined` for global (events). */
   slug?: string;
   /** Session sub-kind for `kind: "session"`; otherwise undefined. */
-  sessionKind?: SessionKind;
+  sessionKind?: OutputSessionKind;
   status: OutputStatus;
   startedAt: number;
   /** Drives picker sorting. For events: the latest event timestamp. */
@@ -71,7 +71,7 @@ export function actionOutputId(slug: string, startedAt: number): string {
   return `action:${slug}:${startedAt}`;
 }
 
-export function sessionOutputId(slug: string, kind: SessionKind): string {
+export function sessionOutputId(slug: string, kind: OutputSessionKind): string {
   return `session:${slug}:${kind}`;
 }
 
@@ -79,7 +79,7 @@ export function destroyOutputId(slug: string): string {
   return `destroy:${slug}`;
 }
 
-const SESSION_LABEL: Record<SessionKind, string> = {
+const SESSION_LABEL: Record<OutputSessionKind, string> = {
   claude: "F12 claude",
   shell: "F10 shell",
 };
@@ -153,7 +153,7 @@ export function destroyOutput(
  */
 export function sessionOutput(
   slug: string,
-  kind: SessionKind,
+  kind: OutputSessionKind,
   startedAt: number,
   lastActivity: number,
 ): Output {
