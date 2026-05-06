@@ -35,7 +35,9 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readSync,
+  rmSync,
   statSync,
   watch,
 } from "node:fs";
@@ -61,11 +63,65 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1
 // eslint-disable-next-line no-control-regex
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
+function shellLogDir(): string {
+  return join(homedir(), ".cache", "wt", "shell-logs");
+}
+
 /** Stable per-slug log path under wt's cache dir. */
 export function shellLogPath(slug: string): string {
-  const dir = join(homedir(), ".cache", "wt", "shell-logs");
+  const dir = shellLogDir();
   mkdirSync(dir, { recursive: true });
   return join(dir, `${slug}.log`);
+}
+
+/**
+ * Best-effort delete of a slug's pipe-pane log file. Called from the
+ * destroy path so the file doesn't outlive the worktree. Errors are
+ * swallowed — the startup reap covers anything left behind.
+ */
+export function removeShellLog(slug: string): void {
+  const path = join(shellLogDir(), `${slug}.log`);
+  try {
+    rmSync(path, { force: true });
+  } catch (err) {
+    log.warn("shell log delete failed", {
+      slug,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Drop `<slug>.log` files whose slug isn't in `liveSlugs`. Catches
+ * logs orphaned by external `git worktree remove`, by destroys that
+ * skipped the in-process delete, or by pre-fix wt versions that never
+ * cleaned up. Errors are swallowed.
+ */
+export function reapShellLogs(liveSlugs: ReadonlySet<string>): void {
+  const dir = shellLogDir();
+  if (!existsSync(dir)) return;
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.endsWith(".log")) continue;
+    const slug = name.slice(0, -".log".length);
+    if (liveSlugs.has(slug)) continue;
+    try {
+      rmSync(join(dir, name), { force: true });
+      removed++;
+    } catch (err) {
+      log.warn("shell log reap failed", {
+        name,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (removed > 0) log.info("reaped shell logs", { removed });
 }
 
 export type ShellLine = {

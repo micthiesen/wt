@@ -19,7 +19,7 @@ import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
-import { shellTailRegistry } from "../core/shell-tail.ts";
+import { removeShellLog, shellTailRegistry } from "../core/shell-tail.ts";
 import { stageUrl } from "../core/stage.ts";
 import {
   killAllSessionsFor,
@@ -911,6 +911,10 @@ export function App({ onExit }: Props) {
       // Don't block the destroy on a kill failure — worst case the
       // session is already dead, or it'll get reaped on next startup.
     }
+    // Drop the shell-tail log now that the session is gone — the
+    // startup reap would catch it eventually, but cleaning up at the
+    // source keeps the cache dir tidy without waiting for a restart.
+    removeShellLog(slug);
     spawnBackgroundRemove(slug, {
       force: false,
       destroyStage: row.fields.deploy.data ?? false,
@@ -941,6 +945,7 @@ export function App({ onExit }: Props) {
     void refreshTmuxSessions();
     for (const row of candidates) {
       archive(row.wt.slug);
+      removeShellLog(row.wt.slug);
       spawnBackgroundRemove(row.wt.slug, {
         force: false,
         destroyStage: row.fields.deploy.data ?? false,

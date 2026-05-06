@@ -5,8 +5,9 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
+import { reapDestroyLogs } from "../core/logs.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
-import { shellTailRegistry } from "../core/shell-tail.ts";
+import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
 import { reapOrphanedSessions, WT_SOURCE_SLUG } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
@@ -34,6 +35,12 @@ async function reapStartup(): Promise<void> {
     const live = new Set(wts.map((w) => w.slug));
     reapWtState(live);
     reapArchived(live);
+    // Drop pipe-pane shell logs and `<slug>-*.log` destroy logs whose
+    // slug no longer exists — keeps `~/.cache/wt/` from accumulating
+    // ghosts from worktrees long since destroyed. Live-slug logs are
+    // always kept (a destroy in flight may still be writing).
+    reapShellLogs(live);
+    reapDestroyLogs(live);
     // Kill any tmux sessions whose slug no longer exists. Covers the
     // case where a worktree was removed externally (or in a prior wt
     // run that crashed before the destroy hook fired). The wt-source
