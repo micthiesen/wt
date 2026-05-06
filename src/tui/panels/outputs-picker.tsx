@@ -1,5 +1,10 @@
-import type { Output, OutputStatus } from "../../core/outputs.ts";
+import {
+  type Output,
+  type OutputStatus,
+  outputStatusLabel,
+} from "../../core/outputs.ts";
 import { Modal } from "../modal.tsx";
+import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 
 function statusFg(status: OutputStatus): string {
@@ -16,21 +21,6 @@ function statusFg(status: OutputStatus): string {
   }
 }
 
-function statusLabel(status: OutputStatus): string {
-  switch (status) {
-    case "running":
-      return "running";
-    case "live":
-      return "live";
-    case "done":
-      return "done";
-    case "failed":
-      return "failed";
-    case "killed":
-      return "killed";
-  }
-}
-
 function relTime(ts: number, now: number): string {
   const diff = Math.max(0, now - ts);
   if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
@@ -42,16 +32,17 @@ function relTime(ts: number, now: number): string {
 type Props = {
   items: readonly Output[];
   selectedIndex: number;
-  pinned: boolean;
+  /** Id of the pinned output, if any — drives the row pin glyph. */
+  pinnedId: string | null;
 };
 
-export function OutputsPicker({ items, selectedIndex, pinned }: Props) {
+export function OutputsPicker({ items, selectedIndex, pinnedId }: Props) {
   const now = Date.now();
   const hints: Array<[string, string]> = [
     ["j/k", "move"],
     ["1-9", "quick pick"],
     ["⏎", "select"],
-    ["*", pinned ? "unpin" : "pin"],
+    ["*", pinnedId ? "unpin" : "pin"],
     ["esc / q", "cancel"],
   ];
   return (
@@ -61,6 +52,7 @@ export function OutputsPicker({ items, selectedIndex, pinned }: Props) {
       ) : (
         items.map((o, i) => {
           const selected = i === selectedIndex;
+          const isPinned = pinnedId === o.id;
           const bg = selected ? theme.rowSelectedBg : undefined;
           const fg = selected ? theme.fgBright : theme.fg;
           const showDigit = i < 9;
@@ -84,10 +76,12 @@ export function OutputsPicker({ items, selectedIndex, pinned }: Props) {
                 {selected ? "▸ " : "  "}
               </text>
               <box width={2} flexShrink={0}>
-                <text fg={theme.fgDim}>{prefix}</text>
+                <text fg={isPinned ? theme.accent : theme.fgDim}>
+                  {isPinned ? NF.pin : prefix}
+                </text>
               </box>
               <box width={9} flexShrink={0}>
-                <text fg={statusFg(o.status)}>{statusLabel(o.status)}</text>
+                <text fg={statusFg(o.status)}>{outputStatusLabel(o.status)}</text>
               </box>
               <box flexGrow={1} flexShrink={1} overflow="hidden">
                 <text fg={fg} wrapMode="none" truncate>

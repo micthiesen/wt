@@ -33,8 +33,8 @@ function sourceFg(source: string): string {
 
 /**
  * Inner content for the events tail — caller owns the surrounding
- * `<box>` chrome. Used by the unified `OutputViewer`; the standalone
- * `ActivityPane` below wraps this with its own border + title.
+ * `<box>` chrome. Rendered inside `OutputViewer`'s border when the
+ * `events` output is selected.
  */
 export function ActivityContent({ height }: { height: number }) {
   const events = useEvents();

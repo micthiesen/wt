@@ -490,17 +490,19 @@ export function App({ onExit }: Props) {
   const outputs = useOutputs();
   // Auto-rule for the bottom pane when the user hasn't explicitly
   // picked anything: prefer the selected row's running/recent action,
-  // then a live tmux session, then events. Mirrors the prior
-  // ActionViewer / SessionViewer / ActivityPane conditional.
+  // then a live claude tmux session, then events. Mirrors the prior
+  // ActionViewer / SessionViewer / ActivityPane conditional. Depends
+  // on `currentRun?.startedAt` (not the whole run object) so a stream
+  // of line appends doesn't re-run the memo for an unchanged id.
   const autoOutputId = useMemo<string>(() => {
     if (currentSlug && currentRun && showActionViewer) {
       return actionOutputId(currentSlug, currentRun.startedAt);
     }
     if (currentSlug && activeSessions.has(currentSlug)) {
-      return sessionOutputId(currentSlug, "claude");
+      return sessionOutputId(currentSlug);
     }
     return eventsOutputId();
-  }, [currentSlug, currentRun, showActionViewer, activeSessions]);
+  }, [currentSlug, currentRun?.startedAt, showActionViewer, activeSessions]);
   // Pin > explicit user pick > auto. We then validate the chosen id
   // is still present in `outputs`; if it evicted (e.g. the action
   // FIFO'd out), drop back through the precedence chain.
@@ -1365,22 +1367,28 @@ export function App({ onExit }: Props) {
     }
 
     // Outputs picker — vim-buffer-style list of every renderable
-    // stream (events / running + recent actions / live tmux sessions).
-    // j/k or arrows move; 1-9 quick-pick by index; Enter sets focus
-    // and closes; `*` toggles pin on the selected entry; esc/q cancels.
+    // stream (events / running + recent actions / live claude
+    // sessions). j/k or arrows move; 1-9 quick-pick by index; Enter
+    // sets focus and closes; `*` toggles pin on the selected entry;
+    // esc/q cancels. `idx` is clamped against the live `outputs`
+    // length on every keypress because the underlying list can shrink
+    // while the picker is open (FIFO eviction, session ending).
     if (modal?.kind === "outputsPicker") {
-      const op = modal;
+      const idx =
+        outputs.length === 0
+          ? 0
+          : Math.min(Math.max(0, modal.index), outputs.length - 1);
       if (k.name === "j" || k.name === "down") {
         setModal({
           kind: "outputsPicker",
-          index: Math.min(op.index + 1, outputs.length - 1),
+          index: Math.min(idx + 1, outputs.length - 1),
         });
         return;
       }
       if (k.name === "k" || k.name === "up") {
         setModal({
           kind: "outputsPicker",
-          index: Math.max(0, op.index - 1),
+          index: Math.max(0, idx - 1),
         });
         return;
       }
@@ -1394,7 +1402,7 @@ export function App({ onExit }: Props) {
         return;
       }
       if (k.sequence === "*") {
-        const target = outputs[op.index];
+        const target = outputs[idx];
         if (!target) return;
         setPinnedOutput((p) => (p === target.id ? null : target.id));
         setFocusedOutput(target.id);
@@ -1402,7 +1410,7 @@ export function App({ onExit }: Props) {
         return;
       }
       if (k.name === "return") {
-        const target = outputs[op.index];
+        const target = outputs[idx];
         if (target) setFocusedOutput(target.id);
         setModal(null);
         return;
@@ -1704,8 +1712,11 @@ export function App({ onExit }: Props) {
     }
     // `~` jumps straight to the events output — the "global" pane
     // when you want to step out of whatever per-row context the
-    // auto-rules surfaced.
+    // auto-rules surfaced. Clears pin so the jump actually takes
+    // effect; otherwise pin > focus and the keypress would be a
+    // silent no-op.
     if (k.sequence === "~") {
+      setPinnedOutput(null);
       setFocusedOutput(eventsOutputId());
       return;
     }
@@ -2273,8 +2284,12 @@ export function App({ onExit }: Props) {
       {modal?.kind === "outputsPicker" ? (
         <OutputsPicker
           items={outputs}
-          selectedIndex={modal.index}
-          pinned={!!pinnedOutput}
+          selectedIndex={
+            outputs.length === 0
+              ? 0
+              : Math.min(Math.max(0, modal.index), outputs.length - 1)
+          }
+          pinnedId={pinnedOutput}
         />
       ) : null}
       <Footer mode={footer} hint={footerHint} />

@@ -16,7 +16,6 @@
 import type { ActionRun } from "./actions.ts";
 
 export type OutputKind = "events" | "action" | "session";
-export type SessionKind = "claude" | "diff" | "shell";
 export type OutputStatus = "live" | "running" | "done" | "failed" | "killed";
 
 export type Output = {
@@ -28,12 +27,25 @@ export type Output = {
   slug?: string;
   status: OutputStatus;
   startedAt: number;
-  endedAt?: number;
   /** Drives picker sorting. For events: the latest event timestamp. */
   lastActivity: number;
-  /** Session sub-kind for `kind: "session"`; otherwise undefined. */
-  sessionKind?: SessionKind;
 };
+
+/** Human-readable label for an Output's status — picker badge + pane title. */
+export function outputStatusLabel(status: OutputStatus): string {
+  switch (status) {
+    case "running":
+      return "running";
+    case "live":
+      return "live";
+    case "done":
+      return "done";
+    case "failed":
+      return "failed";
+    case "killed":
+      return "killed";
+  }
+}
 
 const EVENTS_OUTPUT_ID = "events";
 
@@ -45,8 +57,8 @@ export function actionOutputId(slug: string, startedAt: number): string {
   return `action:${slug}:${startedAt}`;
 }
 
-export function sessionOutputId(slug: string, kind: SessionKind): string {
-  return `session:${slug}:${kind}`;
+export function sessionOutputId(slug: string): string {
+  return `session:${slug}:claude`;
 }
 
 export function eventsOutput(lastEventTs: number): Output {
@@ -79,25 +91,28 @@ export function actionOutput(run: ActionRun): Output {
     slug: run.slug,
     status,
     startedAt: run.startedAt,
-    endedAt: run.endedAt,
     lastActivity,
   };
 }
 
+/**
+ * Live claude session for a slug. We only enumerate claude-kind tmux
+ * sessions (F12) because that's the only kind with a content tail
+ * registered in `core/session-tail.ts`. Diff (F11) and shell (F10)
+ * sessions exist but produce no replayable byte stream — surfacing
+ * them here would route the picker into a permanent "waiting for
+ * output…" placeholder.
+ */
 export function sessionOutput(
   slug: string,
-  kind: SessionKind,
   startedAt: number,
   lastActivity: number,
 ): Output {
-  const label =
-    kind === "claude" ? "F12 claude" : kind === "diff" ? "F11 diff" : "F10 shell";
   return {
-    id: sessionOutputId(slug, kind),
+    id: sessionOutputId(slug),
     kind: "session",
-    title: `${slug} · ${label}`,
+    title: `${slug} · F12 claude`,
     slug,
-    sessionKind: kind,
     status: "live",
     startedAt,
     lastActivity,
