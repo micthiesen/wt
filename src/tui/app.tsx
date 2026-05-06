@@ -2152,6 +2152,10 @@ export function App({ onExit }: Props) {
           slug={modal.state.slug}
           def={modal.state.def}
           extras={modal.state.extras}
+          vars={(() => {
+            const row = rows.find((r) => r.wt.slug === modal.state.slug);
+            return row ? buildActionVars(row) : {};
+          })()}
         />
       ) : null}
       {modal?.kind === "killActionConfirm" ? (

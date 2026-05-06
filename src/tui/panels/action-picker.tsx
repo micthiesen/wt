@@ -1,3 +1,4 @@
+import { applyVars, type ActionVars } from "../../core/actions.ts";
 import type { ActionDef } from "../../core/config.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
@@ -93,10 +94,17 @@ type EditProps = {
   /** `null` = custom prompt (extras IS the entire prompt). */
   def: ClaudeActionDef | null;
   extras: string;
+  /**
+   * Substitutions for `{{name}}` in `def.prompt`. Mirrors what gets
+   * applied at launch, so the preview matches what claude actually
+   * receives.
+   */
+  vars: ActionVars;
 };
 
-export function ActionEditModal({ slug, def, extras }: EditProps) {
+export function ActionEditModal({ slug, def, extras, vars }: EditProps) {
   const title = def ? `action · ${def.name} · ${slug}` : `action · custom · ${slug}`;
+  const renderedPrompt = def ? applyVars(def.prompt, vars) : "";
   return (
     <Modal
       title={title}
@@ -112,7 +120,7 @@ export function ActionEditModal({ slug, def, extras }: EditProps) {
             prompt
           </text>
           <box flexDirection="column" marginTop={0}>
-            {def.prompt.split("\n").map((line, i) => (
+            {renderedPrompt.split("\n").map((line, i) => (
               <text key={i} fg={theme.fg} wrapMode="word">
                 {line || " "}
               </text>
