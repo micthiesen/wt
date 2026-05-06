@@ -25,6 +25,37 @@ import { sessionTailRegistry } from "../../core/session-tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
 import { events as eventsLog } from "../events.ts";
 
+/**
+ * Per-(slug, kind) first-seen timestamp for diff/shell sessions.
+ * Module-level so re-derivations of the `useOutputs` memo don't reset
+ * the clock. Pruned against the live tmux session set so a closed +
+ * reopened session restarts its activity stamp — otherwise we'd hand
+ * out a stale 6-hour-old timestamp from the previous attach.
+ */
+const firstSeen = {
+  diff: new Map<string, number>(),
+  shell: new Map<string, number>(),
+};
+
+function firstSeenStamp(kind: "diff" | "shell", slug: string): number {
+  const map = firstSeen[kind];
+  let ts = map.get(slug);
+  if (ts === undefined) {
+    ts = Date.now();
+    map.set(slug, ts);
+  }
+  return ts;
+}
+
+function pruneFirstSeen(kind: "diff" | "shell", live: readonly string[]): void {
+  const map = firstSeen[kind];
+  if (map.size === 0) return;
+  const liveSet = new Set(live);
+  for (const slug of map.keys()) {
+    if (!liveSet.has(slug)) map.delete(slug);
+  }
+}
+
 export function useOutputs(): readonly Output[] {
   const evts = useSyncExternalStore(
     eventsLog.subscribe,
@@ -68,16 +99,24 @@ export function useOutputs(): readonly Output[] {
         out.push(sessionOutput(slug, "claude", startedAt, lastActivity));
       }
       // Diff/shell sessions: no content tail. We don't know when
-      // they were created (tmuxSessionsQuery only returns slugs), so
-      // `startedAt` and `lastActivity` are best-effort `now`. They
-      // still appear in the picker for awareness; the OutputViewer
-      // renders a placeholder when selected.
-      const sessNow = Date.now();
+      // they were created (tmuxSessionsQuery only returns slugs),
+      // so we cache the first-seen timestamp per (slug, kind) and
+      // reuse it across re-derivations. Without this, every memo
+      // recompute (every event line, every claude tail line) would
+      // stamp `Date.now()` and these placeholder outputs would
+      // constantly tie or beat the real claude session in the sort,
+      // causing the live group order to flicker. Entries are
+      // pruned for sessions that are no longer live so a slug that
+      // re-attaches restarts its first-seen clock.
+      pruneFirstSeen("diff", sessions.diff);
+      pruneFirstSeen("shell", sessions.shell);
       for (const slug of sessions.diff) {
-        out.push(sessionOutput(slug, "diff", sessNow, sessNow));
+        const ts = firstSeenStamp("diff", slug);
+        out.push(sessionOutput(slug, "diff", ts, ts));
       }
       for (const slug of sessions.shell) {
-        out.push(sessionOutput(slug, "shell", sessNow, sessNow));
+        const ts = firstSeenStamp("shell", slug);
+        out.push(sessionOutput(slug, "shell", ts, ts));
       }
     }
 

@@ -539,10 +539,13 @@ export function App({ onExit }: Props) {
     visibleOutputs.find((o) => o.id === autoOutputId) ??
     visibleOutputs[0]!; // events always present in the filtered list
   // GC stale per-slug state: drop bucket fields whose target output
-  // is no longer in `outputs`, and drop entire buckets for slugs that
-  // are no longer worktrees. Without the second sweep, a long wt
-  // session destroying and recreating worktrees would accumulate dead
-  // entries forever.
+  // is no longer in `outputs`, and drop entire buckets for slugs
+  // that are no longer worktrees. Without the second sweep, a long
+  // wt session destroying and recreating worktrees would accumulate
+  // dead entries forever. Surface a dim event line whenever a
+  // non-empty bucket evicts so a user who pinned an action and then
+  // destroyed the worktree gets a breadcrumb instead of a silent
+  // disappearance.
   useEffect(() => {
     setSlugFocus((prev) => {
       const liveSlugs = new Set<string>([NO_ROW_KEY]);
@@ -551,6 +554,11 @@ export function App({ onExit }: Props) {
       const next: Record<string, SlugFocus> = {};
       for (const [key, bucket] of Object.entries(prev)) {
         if (!liveSlugs.has(key)) {
+          if (bucket.focused !== null || bucket.pinned !== null) {
+            appLog.event.dim(
+              `dropped output state for ${key} (worktree gone)`,
+            );
+          }
           changed = true;
           continue;
         }
@@ -567,8 +575,12 @@ export function App({ onExit }: Props) {
         }
         if (focused === null && pinned === null) {
           // Drop empty buckets so the map doesn't grow unbounded
-          // through ordinary navigation.
-          if (bucket.focused !== null || bucket.pinned !== null) changed = true;
+          // through ordinary navigation. `changed = true` here
+          // unconditionally — `setFocus` already prevents writing
+          // all-null buckets, but defending the invariant here means
+          // the GC sweep is correct even if some other code path
+          // ever inserts one.
+          changed = true;
           continue;
         }
         next[key] = { focused, pinned };
@@ -1783,7 +1795,10 @@ export function App({ onExit }: Props) {
       return;
     }
     // `[` / `]` — cycle prev/next through THIS worktree's visible
-    // outputs. Wraps at both ends.
+    // outputs. Wraps at both ends. Clears any pin so the cycle
+    // actually moves the displayed output; otherwise pin > focus
+    // and the keypress would be a silent no-op (same trap `~`
+    // explicitly handles).
     if (k.sequence === "[" || k.sequence === "]") {
       if (visibleOutputs.length === 0) return;
       const cur = Math.max(
@@ -1794,7 +1809,12 @@ export function App({ onExit }: Props) {
       const next =
         (cur + step + visibleOutputs.length) % visibleOutputs.length;
       const target = visibleOutputs[next];
-      if (target) setFocus(currentSlug ?? null, { focused: target.id });
+      if (target) {
+        setFocus(currentSlug ?? null, {
+          focused: target.id,
+          pinned: null,
+        });
+      }
       return;
     }
     // `~` jumps to events for this worktree's bucket — the global
@@ -1812,11 +1832,22 @@ export function App({ onExit }: Props) {
     // `*` toggles pin on the current displayed output for THIS
     // worktree. Pin overrides auto-rules and other focus changes for
     // this slug; press again to unpin and resume auto.
+    //
+    // Edge case: if the bucket's pinned id no longer resolves to a
+    // visible output (action FIFO'd, session ended) we're in a
+    // "dangling pin" window before the GC sweep clears it. Treat
+    // dangling as "currently unpinned" so the user's first `*`
+    // reliably ends in unpinned, instead of pinning the
+    // auto-resolved fallback (typically events).
     if (k.sequence === "*") {
       const id = displayedOutput.id;
+      const pinned = focusBucket.pinned;
+      const pinResolves =
+        pinned !== null && visibleOutputs.some((o) => o.id === pinned);
+      const togglingOff = pinResolves && pinned === id;
       setFocus(currentSlug ?? null, {
         focused: id,
-        pinned: focusBucket.pinned === id ? null : id,
+        pinned: togglingOff ? null : id,
       });
       return;
     }

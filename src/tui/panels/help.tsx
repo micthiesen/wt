@@ -5,7 +5,13 @@ import { Modal } from "../modal.tsx";
 import { Spinner } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 
-type Section = { title: string; items: [string, string][] };
+type Section = {
+  title: string;
+  items: [string, string][];
+  /** Optional one-line prose above the keys — for sections whose
+   *  mental model isn't obvious from the keys alone. */
+  note?: string;
+};
 type LegendGlyph = ReactNode;
 
 const SECTIONS: Section[] = [
@@ -69,6 +75,7 @@ const SECTIONS: Section[] = [
   },
   {
     title: "outputs (bottom pane · per-worktree)",
+    note: "each worktree remembers its last-shown output and pin; switching rows restores them.",
     items: [
       ["\\", "outputs picker for this worktree"],
       ["[ / ]", "cycle prev / next output for this worktree"],
@@ -164,6 +171,11 @@ export function HelpOverlay() {
               <text fg={theme.fgDim} attributes={1}>
                 {sec.title}
               </text>
+              {sec.note ? (
+                <text fg={theme.fgDim} wrapMode="word">
+                  {sec.note}
+                </text>
+              ) : null}
               {sec.items.map(([k, l]) => (
                 <KeyRow key={k} keyText={k} label={l} />
               ))}

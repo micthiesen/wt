@@ -57,7 +57,11 @@ export function OutputsPicker({
     ["*", pinnedId ? "unpin" : "pin"],
     ["esc / q", "cancel"],
   ];
-  const title = slug ? `outputs · ${slug}` : "outputs · global";
+  // "(no row)" rather than "global" when nothing is selected: the
+  // outputs themselves haven't changed scope, only the bucket the
+  // user's pin/focus lands in. "global" implied per-session-wide
+  // outputs which isn't what's happening.
+  const title = slug ? `outputs · ${slug}` : "outputs · (no row)";
   return (
     <Modal title={title} hints={hints}>
       {items.length === 0 ? (
@@ -89,9 +93,7 @@ export function OutputsPicker({
                 {selected ? "▸ " : "  "}
               </text>
               <box width={2} flexShrink={0}>
-                <text fg={isPinned ? theme.accent : theme.fgDim}>
-                  {isPinned ? NF.pin : prefix}
-                </text>
+                <text fg={theme.fgDim}>{prefix}</text>
               </box>
               <box width={9} flexShrink={0}>
                 <text fg={statusFg(o.status)}>{outputStatusLabel(o.status)}</text>
@@ -101,6 +103,16 @@ export function OutputsPicker({
                   {o.title}
                 </text>
               </box>
+              {/*
+                Pin glyph at the right edge so the quick-pick digit
+                in the prefix slot stays visible — pressing `1` to
+                jump to the pinned row should still work, and a user
+                scanning by digit shouldn't see one row's number
+                replaced by an icon.
+              */}
+              {isPinned ? (
+                <text fg={theme.accent}>{NF.pin} </text>
+              ) : null}
               <text fg={theme.fgDim}>{right}</text>
             </box>
           );
