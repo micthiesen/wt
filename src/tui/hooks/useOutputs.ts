@@ -27,18 +27,23 @@ import { tmuxSessionsQuery } from "../../state/queries.ts";
 import { events as eventsLog } from "../events.ts";
 
 /**
- * Per-(slug, kind) first-seen timestamp for diff/shell sessions.
- * Module-level so re-derivations of the `useOutputs` memo don't reset
- * the clock. Pruned against the live tmux session set so a closed +
- * reopened session restarts its activity stamp — otherwise we'd hand
- * out a stale 6-hour-old timestamp from the previous attach.
+ * Per-(slug, kind) first-seen timestamp for outputs whose underlying
+ * source doesn't expose a real start ts: diff/shell sessions
+ * (tmuxSessionsQuery only returns slugs) and destroy entries (the
+ * fallback when no slug-tagged event has landed yet). Module-level
+ * so re-derivations of the `useOutputs` memo don't reset the clock.
+ * Pruned against the live set so a closed + reopened session — or a
+ * second destroy after a recreate — restarts the activity stamp;
+ * otherwise we'd hand out a stale timestamp from the previous run.
  */
-const firstSeen = {
-  diff: new Map<string, number>(),
-  shell: new Map<string, number>(),
+type FirstSeenKind = "diff" | "shell" | "destroy";
+const firstSeen: Record<FirstSeenKind, Map<string, number>> = {
+  diff: new Map(),
+  shell: new Map(),
+  destroy: new Map(),
 };
 
-function firstSeenStamp(kind: "diff" | "shell", slug: string): number {
+function firstSeenStamp(kind: FirstSeenKind, slug: string): number {
   const map = firstSeen[kind];
   let ts = map.get(slug);
   if (ts === undefined) {
@@ -48,7 +53,7 @@ function firstSeenStamp(kind: "diff" | "shell", slug: string): number {
   return ts;
 }
 
-function pruneFirstSeen(kind: "diff" | "shell", live: readonly string[]): void {
+function pruneFirstSeen(kind: FirstSeenKind, live: readonly string[]): void {
   const map = firstSeen[kind];
   if (map.size === 0) return;
   const liveSet = new Set(live);
@@ -96,16 +101,28 @@ export function useOutputs(opts: {
 
     // Destroy in flight: one entry per destroying slug. `lastActivity`
     // is the ts of the latest event tagged with `source = slug` so
-    // sort order tracks real progress; falls back to "now" until the
-    // first line lands.
+    // sort order tracks real progress; the per-slug first-seen
+    // timestamp is the stable fallback when no line has landed yet
+    // (mirrors the diff/shell session caching above so picker order
+    // doesn't flicker on every events recompute).
     if (destroyingSlugs.length > 0) {
+      // Set lookup + early break: the events buffer is up to 500
+      // lines, scanned on every memo recompute, so per-line work
+      // matters. We walk newest → oldest and stop once every
+      // destroying slug has a stamp.
+      const destroying = new Set(destroyingSlugs);
       const lastBySlug = new Map<string, number>();
-      for (const e of evts) {
-        if (destroyingSlugs.includes(e.source)) lastBySlug.set(e.source, e.ts);
+      for (let i = evts.length - 1; i >= 0; i--) {
+        const e = evts[i]!;
+        if (!destroying.has(e.source) || lastBySlug.has(e.source)) continue;
+        lastBySlug.set(e.source, e.ts);
+        if (lastBySlug.size === destroying.size) break;
       }
-      const fallback = Date.now();
+      pruneFirstSeen("destroy", destroyingSlugs);
       for (const slug of destroyingSlugs) {
-        out.push(destroyOutput(slug, lastBySlug.get(slug) ?? fallback));
+        const startedAt = firstSeenStamp("destroy", slug);
+        const lastActivity = lastBySlug.get(slug) ?? startedAt;
+        out.push(destroyOutput(slug, startedAt, lastActivity));
       }
     }
 

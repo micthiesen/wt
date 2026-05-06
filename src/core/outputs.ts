@@ -120,18 +120,23 @@ export function actionOutput(run: ActionRun): Output {
  * `useLogTails` under `source = slug`) so the user can navigate to
  * watch progress in a dedicated pane instead of reading destroy
  * output mixed with everything else in the events tail. Once the
- * destroy completes, the worktree disappears from the rows list and
- * this output disappears with it; check `wt logs <slug>` from CLI for
- * the on-disk record after.
+ * destroy completes the worktree disappears from the rows list and
+ * this output disappears with it; same path on destroy *failure* —
+ * the lock releases and the entry vanishes. Either way `wt logs
+ * <slug>` from the CLI is the on-disk record.
  */
-export function destroyOutput(slug: string, lastActivity: number): Output {
+export function destroyOutput(
+  slug: string,
+  startedAt: number,
+  lastActivity: number,
+): Output {
   return {
     id: destroyOutputId(slug),
     kind: "destroy",
     title: `${slug} · remove`,
     slug,
     status: "running",
-    startedAt: lastActivity,
+    startedAt,
     lastActivity,
   };
 }

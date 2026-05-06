@@ -70,6 +70,13 @@ import {
   outputsForSlug,
   sessionOutputId,
 } from "../core/outputs.ts";
+import { useAutoCopy } from "./hooks/useAutoCopy.ts";
+import { useLogTails } from "./hooks/useLogTails.ts";
+import { usePaste } from "./hooks/usePaste.ts";
+import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
+import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
+import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard, WT_REPO_PATH } from "./helpers.ts";
+import { theme } from "./theme.ts";
 
 /** Per-worktree pin/focus state for the Outputs system. */
 type SlugFocus = { focused: string | null; pinned: string | null };
@@ -78,13 +85,6 @@ type SlugFocus = { focused: string | null; pinned: string | null };
  *  collide. */
 const NO_ROW_KEY = "__no_row__";
 const EMPTY_FOCUS: SlugFocus = { focused: null, pinned: null };
-import { useAutoCopy } from "./hooks/useAutoCopy.ts";
-import { useLogTails } from "./hooks/useLogTails.ts";
-import { usePaste } from "./hooks/usePaste.ts";
-import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
-import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
-import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard, WT_REPO_PATH } from "./helpers.ts";
-import { theme } from "./theme.ts";
 
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
@@ -574,48 +574,60 @@ export function App({ onExit }: Props) {
   // non-empty bucket evicts so a user who pinned an action and then
   // destroyed the worktree gets a breadcrumb instead of a silent
   // disappearance.
+  //
+  // Implementation note: the diff (which buckets to drop, which to
+  // log about) is computed in a non-updater pass first, then the
+  // event log emit + state update fire outside `setSlugFocus`.
+  // Emitting `appLog.event.dim` from inside an updater would mutate
+  // the events store, which feeds back into this effect via
+  // `outputs` → `useOutputs` and trip the same effect on the next
+  // render. Cleaner to keep the side effect out of the updater.
   useEffect(() => {
-    setSlugFocus((prev) => {
-      const liveSlugs = new Set<string>([NO_ROW_KEY]);
-      for (const r of rows) liveSlugs.add(r.wt.slug);
-      let changed = false;
-      const next: Record<string, SlugFocus> = {};
-      for (const [key, bucket] of Object.entries(prev)) {
-        if (!liveSlugs.has(key)) {
-          if (bucket.focused !== null || bucket.pinned !== null) {
-            appLog.event.dim(
-              `dropped output state for ${key} (worktree gone)`,
-            );
-          }
-          changed = true;
-          continue;
+    const liveSlugs = new Set<string>([NO_ROW_KEY]);
+    for (const r of rows) liveSlugs.add(r.wt.slug);
+    const liveOutputIds = new Set<string>();
+    for (const o of outputs) liveOutputIds.add(o.id);
+
+    let changed = false;
+    const next: Record<string, SlugFocus> = {};
+    const evictedSlugs: string[] = [];
+    for (const [key, bucket] of Object.entries(slugFocus)) {
+      if (!liveSlugs.has(key)) {
+        if (bucket.focused !== null || bucket.pinned !== null) {
+          evictedSlugs.push(key);
         }
-        const focused =
-          bucket.focused && outputs.find((o) => o.id === bucket.focused)
-            ? bucket.focused
-            : null;
-        const pinned =
-          bucket.pinned && outputs.find((o) => o.id === bucket.pinned)
-            ? bucket.pinned
-            : null;
-        if (focused !== bucket.focused || pinned !== bucket.pinned) {
-          changed = true;
-        }
-        if (focused === null && pinned === null) {
-          // Drop empty buckets so the map doesn't grow unbounded
-          // through ordinary navigation. `changed = true` here
-          // unconditionally — `setFocus` already prevents writing
-          // all-null buckets, but defending the invariant here means
-          // the GC sweep is correct even if some other code path
-          // ever inserts one.
-          changed = true;
-          continue;
-        }
-        next[key] = { focused, pinned };
+        changed = true;
+        continue;
       }
-      return changed ? next : prev;
-    });
-  }, [outputs, rows]);
+      const focused =
+        bucket.focused && liveOutputIds.has(bucket.focused)
+          ? bucket.focused
+          : null;
+      const pinned =
+        bucket.pinned && liveOutputIds.has(bucket.pinned)
+          ? bucket.pinned
+          : null;
+      if (focused !== bucket.focused || pinned !== bucket.pinned) {
+        changed = true;
+      }
+      if (focused === null && pinned === null) {
+        // Drop empty buckets so the map doesn't grow unbounded
+        // through ordinary navigation. `setFocus` already prevents
+        // writing all-null buckets, but defending the invariant
+        // here means the GC sweep is correct even if some other
+        // code path ever inserts one.
+        changed = true;
+        continue;
+      }
+      next[key] = { focused, pinned };
+    }
+
+    if (!changed) return;
+    for (const key of evictedSlugs) {
+      appLog.event.dim(`dropped output state for ${key} (worktree gone)`);
+    }
+    setSlugFocus(next);
+  }, [outputs, rows, slugFocus]);
 
   // Helper — applies a partial update to the current worktree's
   // bucket without forcing every callsite to spell out the spread.
