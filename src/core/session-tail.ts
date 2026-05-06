@@ -58,6 +58,7 @@ import {
   asObj,
   compactMeta,
   messageToLines,
+  splitMessage,
 } from "./claude-events.ts";
 import { wtSessionUuid } from "./claude.ts";
 import { createLogger } from "./logger.ts";
@@ -376,14 +377,27 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
   // system.away_summary — claude's auto-generated context-recap when
   // the conversation is auto-compacted. High-signal: the user can
   // glance at the pane and see "this is what the previous turns were
-  // about" without re-reading the whole tail.
+  // about" without re-reading the whole tail. Multi-line: same
+  // newline-split + per-line cap as assistant text, with the leading
+  // `─` only on the first row so the block reads as one summary
+  // group rather than a series of dash bullets.
   if (t === "system" && e.subtype === "away_summary") {
     const content = typeof e.content === "string" ? e.content : "";
-    const compacted = compactMeta(content);
-    if (compacted) {
-      return [{ ts, kind: "info", text: `─ summary: ${compacted}` }];
+    const { pieces, truncated } = splitMessage(content);
+    if (pieces.length === 0) return [];
+    const lines: ActionLine[] = pieces.map((piece, i) => ({
+      ts,
+      kind: "info",
+      text: `${i === 0 ? "─ " : "  "}${piece}`,
+    }));
+    if (truncated > 0) {
+      lines.push({
+        ts,
+        kind: "info",
+        text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
+      });
     }
-    return [];
+    return lines;
   }
   // attachment.queued_command — when the user types-ahead while
   // claude is still processing, the prompt sits queued. Surface the
