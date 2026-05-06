@@ -57,12 +57,22 @@ export function applyVars(template: string, vars: ActionVars): string {
 }
 
 /**
- * Window during which a finished run keeps showing in the action
- * viewer. Exported so `useActionVisible` reuses the same constant
- * — it drives both the registry-side `isVisible` predicate and the
- * client-side timer, and they have to stay in lockstep.
+ * Window during which a finished run keeps auto-focusing the bottom
+ * pane in "follow selected row" mode. Exported so `useActionVisible`
+ * reuses the same constant — it drives both the registry-side
+ * `isVisible` predicate and the client-side timer, and they have to
+ * stay in lockstep. After this window the run drops out of auto-
+ * focus, but stays in memory (`MAX_RETAINED_RUNS`) so the Outputs
+ * picker can still surface it as a "done"/"failed"/"killed" entry.
  */
 export const RECENT_WINDOW_MS = 10 * 1000;
+/**
+ * How many completed runs to keep in the in-memory registry before
+ * evicting the oldest. Drives the Outputs picker — bigger means more
+ * historical runs visible without restart, but more memory held.
+ * Restart re-hydrates whatever's still on disk via the per-run log.
+ */
+export const MAX_RETAINED_RUNS = 20;
 /** actionId stamped on runs launched via the picker's "Custom prompt…" entry. */
 export const CUSTOM_ACTION_ID = "__custom__";
 
@@ -545,12 +555,24 @@ class ActionRegistry {
     if (this.cleanupTimer) return;
     this.cleanupTimer = setTimeout(() => {
       this.cleanupTimer = null;
-      const now = Date.now();
       let changed = false;
       const next = new Map(this.runs);
+      // Cap by total non-running count rather than the old 10-second
+      // window: completed runs stay visible in the Outputs picker
+      // until they're FIFO'd out by newer entries. The bounded set
+      // means a long wt session doesn't accumulate dozens of dead
+      // entries and the per-run side maps don't leak.
+      const finished: Array<{ slug: string; endedAt: number }> = [];
       for (const [slug, run] of next) {
         if (run.status === "running") continue;
-        if (run.endedAt !== undefined && now - run.endedAt >= RECENT_WINDOW_MS) {
+        if (run.endedAt !== undefined) {
+          finished.push({ slug, endedAt: run.endedAt });
+        }
+      }
+      if (finished.length > MAX_RETAINED_RUNS) {
+        finished.sort((a, b) => a.endedAt - b.endedAt);
+        const drop = finished.slice(0, finished.length - MAX_RETAINED_RUNS);
+        for (const { slug } of drop) {
           next.delete(slug);
           this.writeChains.delete(slug);
           this.toolStarts.delete(slug);

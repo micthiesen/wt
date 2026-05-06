@@ -1,0 +1,104 @@
+import type { Output, OutputStatus } from "../../core/outputs.ts";
+import { Modal } from "../modal.tsx";
+import { theme } from "../theme.ts";
+
+function statusFg(status: OutputStatus): string {
+  switch (status) {
+    case "running":
+    case "live":
+      return theme.accent;
+    case "done":
+      return theme.ok;
+    case "failed":
+      return theme.err;
+    case "killed":
+      return theme.warn;
+  }
+}
+
+function statusLabel(status: OutputStatus): string {
+  switch (status) {
+    case "running":
+      return "running";
+    case "live":
+      return "live";
+    case "done":
+      return "done";
+    case "failed":
+      return "failed";
+    case "killed":
+      return "killed";
+  }
+}
+
+function relTime(ts: number, now: number): string {
+  const diff = Math.max(0, now - ts);
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+type Props = {
+  items: readonly Output[];
+  selectedIndex: number;
+  pinned: boolean;
+};
+
+export function OutputsPicker({ items, selectedIndex, pinned }: Props) {
+  const now = Date.now();
+  const hints: Array<[string, string]> = [
+    ["j/k", "move"],
+    ["1-9", "quick pick"],
+    ["⏎", "select"],
+    ["*", pinned ? "unpin" : "pin"],
+    ["esc / q", "cancel"],
+  ];
+  return (
+    <Modal title="outputs" hints={hints}>
+      {items.length === 0 ? (
+        <text fg={theme.fgDim}>(no outputs)</text>
+      ) : (
+        items.map((o, i) => {
+          const selected = i === selectedIndex;
+          const bg = selected ? theme.rowSelectedBg : undefined;
+          const fg = selected ? theme.fgBright : theme.fg;
+          const showDigit = i < 9;
+          const prefix = showDigit ? `${i + 1}` : " ";
+          const isLive = o.status === "running" || o.status === "live";
+          const right =
+            o.kind === "events"
+              ? "global"
+              : isLive
+                ? "·"
+                : relTime(o.lastActivity, now);
+          return (
+            <box
+              key={o.id}
+              flexDirection="row"
+              backgroundColor={bg}
+              paddingLeft={1}
+              paddingRight={1}
+            >
+              <text fg={selected ? theme.accent : theme.fgDim}>
+                {selected ? "▸ " : "  "}
+              </text>
+              <box width={2} flexShrink={0}>
+                <text fg={theme.fgDim}>{prefix}</text>
+              </box>
+              <box width={9} flexShrink={0}>
+                <text fg={statusFg(o.status)}>{statusLabel(o.status)}</text>
+              </box>
+              <box flexGrow={1} flexShrink={1} overflow="hidden">
+                <text fg={fg} wrapMode="none" truncate>
+                  {o.title}
+                </text>
+              </box>
+              <text fg={theme.fgDim}>{right}</text>
+            </box>
+          );
+        })
+      )}
+    </Modal>
+  );
+}

@@ -50,4 +50,5 @@ export const NF = {
 	boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
 	comment: "\u{F41F}", // nf-oct-comment        — Claude Code session activity
 	anglesUp: "\u{F102}", // nf-fa-angle_double_up — stacked-on hint when parent worktree sits immediately above
+	pin: "\u{F08D}", // nf-fa-thumb_tack — pinned output in OutputViewer title
 } as const;

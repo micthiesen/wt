@@ -36,7 +36,6 @@ import {
   type ActionPickerState,
   type PickerItem,
 } from "./panels/action-picker.tsx";
-import { ActionViewer, SessionViewer } from "./panels/action-viewer.tsx";
 import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
@@ -44,12 +43,13 @@ import { HelpOverlay } from "./panels/help.tsx";
 import { KillActionConfirmModal } from "./panels/kill-action-confirm.tsx";
 import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
 import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
+import { OutputsPicker } from "./panels/outputs-picker.tsx";
+import { OutputViewer } from "./panels/output-viewer.tsx";
 import {
   SectionPickerModal,
   type SectionPickerItem,
 } from "./panels/section-picker.tsx";
 import { WorktreeList } from "./panels/list.tsx";
-import { ActivityPane } from "./panels/activity.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { enterClaudeSession } from "./claude-session.ts";
 import { enterDiffSession } from "./diff-session.ts";
@@ -60,6 +60,14 @@ import {
   useActiveSessions,
   useActiveShellSessions,
 } from "./hooks/useActiveSessions.ts";
+import { useOutputs } from "./hooks/useOutputs.ts";
+import {
+  type Output,
+  actionOutputId,
+  eventsOutputId,
+  indexOfOutput,
+  sessionOutputId,
+} from "../core/outputs.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -251,6 +259,7 @@ type Modal =
       newName: string | null;
     }
   | { kind: "actionPicker"; state: ActionPickerState }
+  | { kind: "outputsPicker"; index: number }
   | { kind: "killActionConfirm"; slug: string; actionName: string }
   | {
       kind: "killSessionConfirm";
@@ -347,6 +356,14 @@ export function App({ onExit }: Props) {
   // identity of the thing being renamed). Not folded into `modal`
   // because the rename UX uses the footer, not an overlay.
   const [pendingRename, setPendingRename] = useState<string | null>(null);
+  // User's explicit choice of which Output to render in the bottom
+  // pane, when set. `null` means "follow the auto-rules" (selected
+  // row's running action / session / events). Cleared by `escape`,
+  // by a new action launching, or when the targeted output evicts.
+  const [focusedOutput, setFocusedOutput] = useState<string | null>(null);
+  // Pin sticks the displayed output even past auto-rule changes
+  // (selected row, new action). Toggled with `*`.
+  const [pinnedOutput, setPinnedOutput] = useState<string | null>(null);
   const toastTimer = useRef<Timer | null>(null);
 
   // Auto-tail every busy worktree so logs surface in the activity pane
@@ -465,6 +482,43 @@ export function App({ onExit }: Props) {
     }
     sessionTailRegistry.reconcile(live);
   }, [rows, activeSessions]);
+
+  // Cross-source list of everything renderable in the bottom pane —
+  // events, in-flight + recently-completed actions, live tmux
+  // sessions. The picker enumerates this list; cycle keys index into
+  // it; the displayed output resolves against it.
+  const outputs = useOutputs();
+  // Auto-rule for the bottom pane when the user hasn't explicitly
+  // picked anything: prefer the selected row's running/recent action,
+  // then a live tmux session, then events. Mirrors the prior
+  // ActionViewer / SessionViewer / ActivityPane conditional.
+  const autoOutputId = useMemo<string>(() => {
+    if (currentSlug && currentRun && showActionViewer) {
+      return actionOutputId(currentSlug, currentRun.startedAt);
+    }
+    if (currentSlug && activeSessions.has(currentSlug)) {
+      return sessionOutputId(currentSlug, "claude");
+    }
+    return eventsOutputId();
+  }, [currentSlug, currentRun, showActionViewer, activeSessions]);
+  // Pin > explicit user pick > auto. We then validate the chosen id
+  // is still present in `outputs`; if it evicted (e.g. the action
+  // FIFO'd out), drop back through the precedence chain.
+  const desiredOutputId = pinnedOutput ?? focusedOutput ?? autoOutputId;
+  const displayedOutput: Output =
+    outputs.find((o) => o.id === desiredOutputId) ??
+    outputs.find((o) => o.id === autoOutputId) ??
+    outputs[0]!; // events always present
+  // Drop a stale focus reference so escape-to-auto doesn't silently
+  // restore an evicted output. Same for pin.
+  useEffect(() => {
+    if (focusedOutput && !outputs.find((o) => o.id === focusedOutput)) {
+      setFocusedOutput(null);
+    }
+    if (pinnedOutput && !outputs.find((o) => o.id === pinnedOutput)) {
+      setPinnedOutput(null);
+    }
+  }, [outputs, focusedOutput, pinnedOutput]);
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -985,6 +1039,10 @@ export function App({ onExit }: Props) {
       toast(`action: ${result.reason}`, theme.err, 3000);
       return;
     }
+    // Clear any user-pinned/focused output so the auto-rules surface
+    // the just-launched action. Pin survives — if the user explicitly
+    // pinned something else, they wanted to stay there.
+    if (!pinnedOutput) setFocusedOutput(null);
     toast(`launched ${result.run.actionName}`, theme.info, 2000);
   }
 
@@ -1306,6 +1364,60 @@ export function App({ onExit }: Props) {
       return;
     }
 
+    // Outputs picker — vim-buffer-style list of every renderable
+    // stream (events / running + recent actions / live tmux sessions).
+    // j/k or arrows move; 1-9 quick-pick by index; Enter sets focus
+    // and closes; `*` toggles pin on the selected entry; esc/q cancels.
+    if (modal?.kind === "outputsPicker") {
+      const op = modal;
+      if (k.name === "j" || k.name === "down") {
+        setModal({
+          kind: "outputsPicker",
+          index: Math.min(op.index + 1, outputs.length - 1),
+        });
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setModal({
+          kind: "outputsPicker",
+          index: Math.max(0, op.index - 1),
+        });
+        return;
+      }
+      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+        const i = parseInt(k.sequence, 10) - 1;
+        const target = outputs[i];
+        if (target) {
+          setFocusedOutput(target.id);
+          setModal(null);
+        }
+        return;
+      }
+      if (k.sequence === "*") {
+        const target = outputs[op.index];
+        if (!target) return;
+        setPinnedOutput((p) => (p === target.id ? null : target.id));
+        setFocusedOutput(target.id);
+        setModal(null);
+        return;
+      }
+      if (k.name === "return") {
+        const target = outputs[op.index];
+        if (target) setFocusedOutput(target.id);
+        setModal(null);
+        return;
+      }
+      if (
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        k.sequence === "\\" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setModal(null);
+      }
+      return;
+    }
+
     // Kill-confirm for an in-flight `!` action on the selected
     // worktree. Mirrors the y/N pattern used by clean-confirm; also
     // accepts `!` (the opening key) per the modal toggle convention.
@@ -1559,6 +1671,51 @@ export function App({ onExit }: Props) {
     if (k.name === "escape" && filter) {
       setFilter("");
       setSel(null);
+      return;
+    }
+    // Escape clears any explicit Output focus / pin so the bottom
+    // pane returns to follow-row auto-rules. Filter-clear above
+    // takes precedence; both can apply but they're disjoint states
+    // (filter edits set the filter; output focus comes from picker /
+    // cycle keys), so the order is fine.
+    if (k.name === "escape" && (focusedOutput || pinnedOutput)) {
+      setFocusedOutput(null);
+      setPinnedOutput(null);
+      return;
+    }
+    // `\` opens the Outputs picker — vim-:ls flavor for the bottom
+    // pane. The cycle keys (`[`/`]`) are the muscle-memory affordance;
+    // this is the discoverability surface.
+    if (k.sequence === "\\") {
+      const idx = Math.max(0, indexOfOutput(outputs, displayedOutput.id));
+      setModal({ kind: "outputsPicker", index: idx });
+      return;
+    }
+    // `[` / `]` — cycle prev/next through Outputs without opening
+    // the picker. Wraps at both ends.
+    if (k.sequence === "[" || k.sequence === "]") {
+      if (outputs.length === 0) return;
+      const cur = Math.max(0, indexOfOutput(outputs, displayedOutput.id));
+      const step = k.sequence === "]" ? 1 : -1;
+      const next = (cur + step + outputs.length) % outputs.length;
+      const target = outputs[next];
+      if (target) setFocusedOutput(target.id);
+      return;
+    }
+    // `~` jumps straight to the events output — the "global" pane
+    // when you want to step out of whatever per-row context the
+    // auto-rules surfaced.
+    if (k.sequence === "~") {
+      setFocusedOutput(eventsOutputId());
+      return;
+    }
+    // `*` toggles pin on the current displayed output. Pinning
+    // overrides auto-rules and other focus changes; press again to
+    // unpin and resume auto.
+    if (k.sequence === "*") {
+      const id = displayedOutput.id;
+      setPinnedOutput((p) => (p === id ? null : id));
+      setFocusedOutput(id);
       return;
     }
     // Unified Shift+J/K — moves the current row one position in
@@ -2108,13 +2265,18 @@ export function App({ onExit }: Props) {
         />
         <Details row={current} width={Math.max(0, width - listWidth)} />
       </box>
-      {showActionViewer && currentRun ? (
-        <ActionViewer run={currentRun} height={activityHeight} />
-      ) : currentSlug && activeSessions.has(currentSlug) ? (
-        <SessionViewer slug={currentSlug} height={activityHeight} />
-      ) : (
-        <ActivityPane height={activityHeight} />
-      )}
+      <OutputViewer
+        output={displayedOutput}
+        height={activityHeight}
+        pinned={!!pinnedOutput && pinnedOutput === displayedOutput.id}
+      />
+      {modal?.kind === "outputsPicker" ? (
+        <OutputsPicker
+          items={outputs}
+          selectedIndex={modal.index}
+          pinned={!!pinnedOutput}
+        />
+      ) : null}
       <Footer mode={footer} hint={footerHint} />
       {modal?.kind === "help" ? <HelpOverlay /> : null}
       {modal?.kind === "cleanConfirm" ? (

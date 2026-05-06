@@ -67,6 +67,16 @@ const SECTIONS: Section[] = [
       ["q / ^C", "quit"],
     ],
   },
+  {
+    title: "outputs (bottom pane)",
+    items: [
+      ["\\", "outputs picker (events / actions / sessions)"],
+      ["[ / ]", "cycle prev / next output"],
+      ["~", "jump to events"],
+      ["*", "pin current output (resists auto-switch)"],
+      ["esc", "clear focus / pin (return to follow-row auto)"],
+    ],
+  },
 ];
 
 const STATUS_GLYPHS: [LegendGlyph, string, string][] = [
