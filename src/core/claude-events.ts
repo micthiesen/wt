@@ -83,8 +83,6 @@ const DETAILED_TOOLS = new Set([
 export const MAX_BUFFERED_LINES = 1000;
 /** Cap message-fragment count from a single assistant turn so a runaway response can't blow line buffers. */
 const MAX_PIECES_PER_MESSAGE = 50;
-/** Brief tool-input truncation length. Keeps each ⚒ row to one TUI line. */
-const TOOL_INPUT_BRIEF = 60;
 /** User-prompt truncation length. The `> …` row is informational, not the full prompt. */
 const PROMPT_BRIEF = 200;
 /** Compaction length for thinking + summary + queued lines. */
@@ -117,7 +115,10 @@ export function formatTokens(n: number): string {
 /**
  * One-line summary of a tool's input. Tries common keys (command, path,
  * pattern, …) and falls back to empty when nothing useful is on top.
- * Trailing-truncate to TOOL_INPUT_BRIEF; ⚒ rows have to stay one line.
+ * Whitespace is collapsed so the row stays single-line; length-capping
+ * is OpenTUI's job (`<text wrapMode="none" truncate>` clips at the
+ * pane width, so cutting at a fixed 60 chars here just hides characters
+ * the pane could have shown).
  */
 export function briefToolInput(input: unknown): string {
   const obj = asObj(input);
@@ -135,10 +136,7 @@ export function briefToolInput(input: unknown): string {
   for (const k of keys) {
     const v = obj[k];
     if (typeof v === "string" && v.length > 0) {
-      const oneLine = v.replaceAll("\n", " ").replace(/\s+/g, " ");
-      return oneLine.length > TOOL_INPUT_BRIEF
-        ? `${oneLine.slice(0, TOOL_INPUT_BRIEF - 1)}…`
-        : oneLine;
+      return v.replaceAll("\n", " ").replace(/\s+/g, " ");
     }
   }
   return "";
@@ -165,6 +163,29 @@ export function splitMessage(text: string): {
     pieces: all.slice(0, MAX_PIECES_PER_MESSAGE),
     truncated: all.length - MAX_PIECES_PER_MESSAGE,
   };
+}
+
+/**
+ * User-envelope `text` blocks fall into three buckets that aren't
+ * user-typed prompts and shouldn't render as `> …`:
+ *  - skill bodies — auto-injected when claude invokes a Skill tool;
+ *    the body is just the file at `~/.claude/skills/<name>/SKILL.md`
+ *    and the user already saw the `⚒ Skill` call.
+ *  - slash-command bodies — same idea for `/<name>` commands;
+ *    auto-injected starting with `# /<name>`.
+ *  - interrupt markers — claude emits `[Request interrupted by user]`
+ *    when the user cancels a turn. Worth surfacing.
+ *
+ * Anything else is treated as a real user prompt (some sessions store
+ * prompts as text-block arrays rather than bare strings).
+ */
+function classifyUserText(
+  text: string,
+): "drop" | "interrupted" | "prompt" {
+  if (text.startsWith("[Request interrupted")) return "interrupted";
+  if (text.startsWith("Base directory for this skill:")) return "drop";
+  if (/^#\s+\//.test(text)) return "drop";
+  return "prompt";
 }
 
 function compactPrompt(text: string): string {
@@ -228,6 +249,12 @@ export function messageToLines(opts: {
     const b = asObj(block);
     if (!b) continue;
     if (b.type === "text" && typeof b.text === "string") {
+      const injection = classifyUserText(b.text);
+      if (injection === "drop") continue;
+      if (injection === "interrupted") {
+        out.push({ ts, kind: "info", text: "! interrupted" });
+        continue;
+      }
       const compacted = compactPrompt(b.text);
       if (compacted) out.push({ ts, kind: "user", text: `> ${compacted}` });
     } else if (b.type === "tool_result") {
