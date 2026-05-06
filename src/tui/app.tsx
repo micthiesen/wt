@@ -64,6 +64,7 @@ import { useOutputs } from "./hooks/useOutputs.ts";
 import {
   type Output,
   actionOutputId,
+  destroyOutputId,
   eventsOutputId,
   indexOfOutput,
   outputsForSlug,
@@ -492,10 +493,23 @@ export function App({ onExit }: Props) {
     sessionTailRegistry.reconcile(live);
   }, [rows, activeSessions]);
 
+  // Slugs whose lock op is `"remove"` — drives the destroy outputs
+  // surfaced in the picker. Computed from `rows` (each busy row
+  // exposes the lock's `op`) so it tracks the same source the
+  // worktree list uses for its own busy state, no extra query.
+  const destroyingSlugs = useMemo(
+    () =>
+      rows
+        .filter(
+          (r) => r.status.kind === StatusKind.Busy && r.status.op === "remove",
+        )
+        .map((r) => r.wt.slug),
+    [rows],
+  );
   // Global, slug-tagged list of everything renderable in the bottom
   // pane. Filtered per worktree at the consumption site — see
   // `visibleOutputs` below.
-  const outputs = useOutputs();
+  const outputs = useOutputs({ destroyingSlugs });
   // Bucket key for the current worktree's pin/focus state. Stays in
   // sync with the selected row; falls back to `NO_ROW_KEY` when
   // nothing is selected so the picker / pin still have a place to
@@ -513,12 +527,20 @@ export function App({ onExit }: Props) {
   );
   // Auto-rule for the bottom pane when the user hasn't explicitly
   // picked anything for this worktree: prefer the selected row's
-  // running/recent action, then a live claude tmux session, then
-  // events. Mirrors the prior ActionViewer / SessionViewer /
-  // ActivityPane conditional. Depends on `currentRun?.startedAt`
-  // (not the whole run object) so a stream of line appends doesn't
-  // re-run the memo for an unchanged id.
+  // in-flight destroy, then its running/recent action, then a live
+  // claude tmux session, then events. Destroy beats action because
+  // when a worktree is being torn down the user almost certainly
+  // wants to watch progress (and an action can't run during destroy
+  // — the lock is exclusive — so the precedence isn't really
+  // contested). Depends on `currentRun?.startedAt` (not the whole
+  // run object) so a stream of line appends doesn't re-run the memo
+  // for an unchanged id.
+  const isDestroying =
+    currentSlug !== undefined && destroyingSlugs.includes(currentSlug);
   const autoOutputId = useMemo<string>(() => {
+    if (currentSlug && isDestroying) {
+      return destroyOutputId(currentSlug);
+    }
     if (currentSlug && currentRun && showActionViewer) {
       return actionOutputId(currentSlug, currentRun.startedAt);
     }
@@ -526,7 +548,13 @@ export function App({ onExit }: Props) {
       return sessionOutputId(currentSlug, "claude");
     }
     return eventsOutputId();
-  }, [currentSlug, currentRun?.startedAt, showActionViewer, activeSessions]);
+  }, [
+    currentSlug,
+    isDestroying,
+    currentRun?.startedAt,
+    showActionViewer,
+    activeSessions,
+  ]);
   // Pin > explicit user pick > auto, all scoped to the current
   // worktree's bucket. If the chosen id has evicted from the visible
   // list (action FIFO'd, session ended, or this slug's id belongs to

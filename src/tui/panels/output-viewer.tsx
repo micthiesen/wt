@@ -10,7 +10,7 @@ import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 
 import { ActionContent, SessionContent } from "./action-viewer.tsx";
-import { ActivityContent } from "./activity.tsx";
+import { ActivityContent, DestroyContent } from "./activity.tsx";
 
 type Props = {
   output: Output;
@@ -21,6 +21,9 @@ type Props = {
 function borderColor(o: Output): string {
   if (o.kind === "events") return theme.border;
   if (o.kind === "session") return theme.info;
+  // Destroy borrows the warn palette — it's a destructive op in
+  // flight, distinct from a benign action's running cyan.
+  if (o.kind === "destroy") return theme.warn;
   switch (o.status) {
     case "running":
       return theme.accent;
@@ -38,6 +41,9 @@ function borderColor(o: Output): string {
 function titleFor(o: Output): string {
   if (o.kind === "events") return "events";
   if (o.kind === "session") return o.title;
+  if (o.kind === "destroy") {
+    return `destroy · ${o.slug ?? "?"} · running`;
+  }
   const killHint = o.status === "running" ? " · ! kill" : "";
   return `action · ${o.title} · ${outputStatusLabel(o.status)}${killHint}`;
 }
@@ -66,6 +72,9 @@ export function OutputViewer({ output, height, pinned }: Props) {
 function OutputContent({ output, height }: { output: Output; height: number }) {
   if (output.kind === "events") {
     return <ActivityContent height={height} />;
+  }
+  if (output.kind === "destroy" && output.slug) {
+    return <DestroyContent slug={output.slug} height={height} />;
   }
   if (output.kind === "session" && output.slug) {
     // Claude is the only session kind with a live content tail

@@ -15,7 +15,7 @@
  */
 import type { ActionRun } from "./actions.ts";
 
-export type OutputKind = "events" | "action" | "session";
+export type OutputKind = "events" | "action" | "session" | "destroy";
 /**
  * Subkind of a `kind: "session"` output. Drives both the title label
  * (F10 shell / F11 diff / F12 claude) and the OutputViewer's content
@@ -70,6 +70,10 @@ export function sessionOutputId(slug: string, kind: SessionKind): string {
   return `session:${slug}:${kind}`;
 }
 
+export function destroyOutputId(slug: string): string {
+  return `destroy:${slug}`;
+}
+
 const SESSION_LABEL: Record<SessionKind, string> = {
   claude: "F12 claude",
   diff: "F11 diff",
@@ -106,6 +110,28 @@ export function actionOutput(run: ActionRun): Output {
     slug: run.slug,
     status,
     startedAt: run.startedAt,
+    lastActivity,
+  };
+}
+
+/**
+ * In-flight worktree destroy for a slug. Surfaces the per-destroy log
+ * file's content (already routed through the global events log via
+ * `useLogTails` under `source = slug`) so the user can navigate to
+ * watch progress in a dedicated pane instead of reading destroy
+ * output mixed with everything else in the events tail. Once the
+ * destroy completes, the worktree disappears from the rows list and
+ * this output disappears with it; check `wt logs <slug>` from CLI for
+ * the on-disk record after.
+ */
+export function destroyOutput(slug: string, lastActivity: number): Output {
+  return {
+    id: destroyOutputId(slug),
+    kind: "destroy",
+    title: `${slug} · remove`,
+    slug,
+    status: "running",
+    startedAt: lastActivity,
     lastActivity,
   };
 }

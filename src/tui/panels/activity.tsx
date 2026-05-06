@@ -1,3 +1,5 @@
+import { useMemo } from "react";
+
 import { useEvents, type WtEvent } from "../events.ts";
 import { theme } from "../theme.ts";
 
@@ -32,19 +34,25 @@ function sourceFg(source: string): string {
 }
 
 /**
- * Inner content for the events tail — caller owns the surrounding
- * `<box>` chrome. Rendered inside `OutputViewer`'s border when the
- * `events` output is selected.
+ * Pure renderer for an event tail — caller owns events and chrome.
+ * Used by `ActivityContent` (full event log) and `DestroyContent`
+ * (events filtered to a single slug).
  */
-export function ActivityContent({ height }: { height: number }) {
-  const events = useEvents();
+function EventsList({
+  events,
+  height,
+  emptyText,
+}: {
+  events: readonly WtEvent[];
+  height: number;
+  emptyText: string;
+}) {
   // Take just the tail that fits. Rendering the entire buffer each
   // frame is cheap (~500 lines max) but pointless — only the last N
   // are visible anyway, and flat boxes are ideal for the layout.
   const visible = events.slice(-Math.max(1, height - 2));
-
   if (visible.length === 0) {
-    return <text fg={theme.fgDim}>(no events yet)</text>;
+    return <text fg={theme.fgDim}>{emptyText}</text>;
   }
   return (
     <>
@@ -76,3 +84,43 @@ export function ActivityContent({ height }: { height: number }) {
   );
 }
 
+/**
+ * Inner content for the events tail — caller owns the surrounding
+ * `<box>` chrome. Rendered inside `OutputViewer`'s border when the
+ * `events` output is selected.
+ */
+export function ActivityContent({ height }: { height: number }) {
+  const events = useEvents();
+  return (
+    <EventsList events={events} height={height} emptyText="(no events yet)" />
+  );
+}
+
+/**
+ * Inner content for an in-flight destroy — events filtered to that
+ * slug's source. Destroy logs are tailed by `useLogTails` and pushed
+ * into the global events log under `source = <slug>`, so this view
+ * is the right slice rather than a separate buffer. Slug-tagged
+ * non-destroy events for the same slug also land here, but during a
+ * destroy the destroy lines dominate by volume.
+ */
+export function DestroyContent({
+  slug,
+  height,
+}: {
+  slug: string;
+  height: number;
+}) {
+  const events = useEvents();
+  const filtered = useMemo(
+    () => events.filter((e) => e.source === slug),
+    [events, slug],
+  );
+  return (
+    <EventsList
+      events={filtered}
+      height={height}
+      emptyText="(waiting for destroy output…)"
+    />
+  );
+}

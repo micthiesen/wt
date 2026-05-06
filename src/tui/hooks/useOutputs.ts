@@ -17,6 +17,7 @@ import { actionRegistry } from "../../core/actions.ts";
 import {
   type Output,
   actionOutput,
+  destroyOutput,
   eventsOutput,
   sessionOutput,
   sortOutputs,
@@ -56,7 +57,11 @@ function pruneFirstSeen(kind: "diff" | "shell", live: readonly string[]): void {
   }
 }
 
-export function useOutputs(): readonly Output[] {
+export function useOutputs(opts: {
+  /** Slugs whose lock op is `"remove"` — drives the destroy outputs. */
+  destroyingSlugs: readonly string[];
+}): readonly Output[] {
+  const { destroyingSlugs } = opts;
   const evts = useSyncExternalStore(
     eventsLog.subscribe,
     eventsLog.getSnapshot,
@@ -87,6 +92,21 @@ export function useOutputs(): readonly Output[] {
 
     for (const run of actions.values()) {
       out.push(actionOutput(run));
+    }
+
+    // Destroy in flight: one entry per destroying slug. `lastActivity`
+    // is the ts of the latest event tagged with `source = slug` so
+    // sort order tracks real progress; falls back to "now" until the
+    // first line lands.
+    if (destroyingSlugs.length > 0) {
+      const lastBySlug = new Map<string, number>();
+      for (const e of evts) {
+        if (destroyingSlugs.includes(e.source)) lastBySlug.set(e.source, e.ts);
+      }
+      const fallback = Date.now();
+      for (const slug of destroyingSlugs) {
+        out.push(destroyOutput(slug, lastBySlug.get(slug) ?? fallback));
+      }
     }
 
     if (sessions) {
@@ -121,5 +141,5 @@ export function useOutputs(): readonly Output[] {
     }
 
     return sortOutputs(out);
-  }, [evts, actions, tails, sessions]);
+  }, [evts, actions, tails, sessions, destroyingSlugs]);
 }
