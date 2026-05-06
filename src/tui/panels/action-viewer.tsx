@@ -19,6 +19,8 @@ function lineFg(kind: ActionLine["kind"]): string {
       return theme.accent;
     case "assistant":
       return theme.fg;
+    case "thinking":
+      return theme.fgDim;
     case "tool":
       return theme.accentAlt;
     case "tool-result":

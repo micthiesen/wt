@@ -16,6 +16,7 @@ export type ActionLineKind =
   | "info" // synthesized — start, kill, error, truncation hints
   | "user" // user-typed prompt (session only)
   | "assistant" // assistant text
+  | "thinking" // assistant chain-of-thought (session only)
   | "tool" // tool_use call
   | "tool-result" // tool result (success or error)
   | "stdout" // shell action stdout line
@@ -33,8 +34,46 @@ export type ActionLine = {
  * Per-run map of `tool_use_id → call metadata`. Caller-owned so durations
  * stay correct across batched and restarted reads. `messageToLines`
  * mutates: `tool_use` blocks insert, `tool_result` blocks delete.
+ *
+ * `batch` is non-null when this call is part of a multi-tool batch
+ * within one assistant message — it points at a state object shared
+ * by every entry in the batch so the summary line on the result side
+ * (`✓ Bash×3 ok, Read×2 ok (3.4s)`) emits exactly once when the last
+ * result lands. Detailed tools (Edit/Write/Task/…) and lone non-
+ * detailed calls leave `batch` null and render individually.
  */
-export type ToolStartMap = Map<string, { toolName: string; ts: number }>;
+export type ToolStartEntry = {
+  toolName: string;
+  ts: number;
+  batch: BatchState | null;
+};
+export type ToolStartMap = Map<string, ToolStartEntry>;
+
+type BatchState = {
+  /** Total duration accumulator across the batch. */
+  startedAt: number;
+  /** tool_use_ids in this batch that haven't seen their result yet. */
+  remaining: number;
+  /** Per-tool counters; insertion-ordered so the summary preserves call order. */
+  results: Map<
+    string,
+    { ok: number; err: number; durMs: number }
+  >;
+};
+
+/**
+ * Tools that always render individually, even inside a multi-call
+ * message. Edits/writes carry their target path — collapsing them to
+ * `Edit×3` would hide which files claude touched. `Task` invokes a
+ * subagent and the subagent_type / description is the whole point.
+ */
+const DETAILED_TOOLS = new Set([
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
+  "Task",
+]);
 
 /**
  * Per-buffer line cap shared by both the action runner and the session
@@ -48,6 +87,8 @@ const MAX_PIECES_PER_MESSAGE = 50;
 const TOOL_INPUT_BRIEF = 60;
 /** User-prompt truncation length. The `> …` row is informational, not the full prompt. */
 const PROMPT_BRIEF = 200;
+/** Compaction length for thinking + summary + queued lines. */
+const META_BRIEF = 200;
 
 export function asObj(v: unknown): Record<string, unknown> | null {
   return v && typeof v === "object" && !Array.isArray(v)
@@ -134,6 +175,19 @@ function compactPrompt(text: string): string {
 }
 
 /**
+ * Compact a multi-line meta string (thinking text, away summary,
+ * queued prompt) to a single dimmed-tail line. Same shape as
+ * `compactPrompt`, just a different cap so a long thought doesn't
+ * fill the pane on its own.
+ */
+export function compactMeta(text: string): string {
+  const oneLine = text.replaceAll("\n", " ").replace(/\s+/g, " ").trim();
+  return oneLine.length > META_BRIEF
+    ? `${oneLine.slice(0, META_BRIEF - 1)}…`
+    : oneLine;
+}
+
+/**
  * Walk one message envelope's `content` array and emit ActionLine entries.
  * Mutates `toolStarts`: tool_use blocks register start metadata, tool_result
  * blocks consume it (so the `→ ok (1.2s)` duration is the real round-trip).
@@ -166,36 +220,13 @@ export function messageToLines(opts: {
   }
   const content = asArr(m.content);
   if (!content) return out;
+  if (role === "assistant") {
+    return assistantToLines(content, ts, toolStarts);
+  }
+  // role === "user"
   for (const block of content) {
     const b = asObj(block);
     if (!b) continue;
-    if (role === "assistant") {
-      if (b.type === "text" && typeof b.text === "string") {
-        const { pieces, truncated } = splitMessage(b.text);
-        for (const piece of pieces) {
-          out.push({ ts, kind: "assistant", text: `  ${piece}` });
-        }
-        if (truncated > 0) {
-          out.push({
-            ts,
-            kind: "info",
-            text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
-          });
-        }
-      } else if (b.type === "tool_use") {
-        const toolName = typeof b.name === "string" ? b.name : "?";
-        const id = typeof b.id === "string" ? b.id : null;
-        const arg = briefToolInput(b.input);
-        if (id) toolStarts.set(id, { toolName, ts });
-        out.push({
-          ts,
-          kind: "tool",
-          text: `  ⚒ ${toolName}${arg ? `(${arg})` : ""}`,
-        });
-      }
-      continue;
-    }
-    // role === "user"
     if (b.type === "text" && typeof b.text === "string") {
       const compacted = compactPrompt(b.text);
       if (compacted) out.push({ ts, kind: "user", text: `> ${compacted}` });
@@ -203,9 +234,34 @@ export function messageToLines(opts: {
       const id = typeof b.tool_use_id === "string" ? b.tool_use_id : null;
       const start = id ? toolStarts.get(id) : undefined;
       if (id) toolStarts.delete(id);
-      const toolName = start?.toolName ?? "?";
-      const dur = start ? formatDuration(ts - start.ts) : "—";
       const isErr = b.is_error === true;
+      const durMs = start ? ts - start.ts : 0;
+      // Batched call → accumulate into shared state; emit one
+      // summary line when the last result lands. Unbatched (lone or
+      // detailed) → legacy per-result line.
+      if (start?.batch) {
+        const batch = start.batch;
+        const r = batch.results.get(start.toolName) ?? {
+          ok: 0,
+          err: 0,
+          durMs: 0,
+        };
+        if (isErr) r.err++;
+        else r.ok++;
+        r.durMs += durMs;
+        batch.results.set(start.toolName, r);
+        batch.remaining--;
+        if (batch.remaining === 0) {
+          out.push({
+            ts,
+            kind: "tool-result",
+            text: `  ${formatBatchResult(batch)}`,
+          });
+        }
+        continue;
+      }
+      const toolName = start?.toolName ?? "?";
+      const dur = start ? formatDuration(durMs) : "—";
       const arrow = isErr ? "✗" : "✓";
       out.push({
         ts,
@@ -215,4 +271,139 @@ export function messageToLines(opts: {
     }
   }
   return out;
+}
+
+/**
+ * Render one assistant message's content blocks. text/thinking
+ * stream out in source order; tool_use blocks are classified
+ * detailed-vs-bulk and rendered with a single summary line
+ * (`⚒ Bash×3, Read×2`) at the position of the first bulk call when
+ * 2+ bulk tools share the message.
+ */
+function assistantToLines(
+  content: unknown[],
+  ts: number,
+  toolStarts: ToolStartMap,
+): ActionLine[] {
+  const out: ActionLine[] = [];
+  // Bulk classification needs total count up front, so scan once for
+  // bulk tool names + ids before emitting in source order.
+  const bulkNames: string[] = [];
+  const bulkIds: string[] = [];
+  let firstBulkPos: number | null = null;
+  content.forEach((block, i) => {
+    const b = asObj(block);
+    if (!b || b.type !== "tool_use") return;
+    const name = typeof b.name === "string" ? b.name : "?";
+    if (DETAILED_TOOLS.has(name)) return;
+    bulkNames.push(name);
+    if (typeof b.id === "string") bulkIds.push(b.id);
+    if (firstBulkPos === null) firstBulkPos = i;
+  });
+  // ≥2 bulk calls share a batch state and emit one summary line at
+  // the first bulk position; a lone bulk call just renders inline.
+  const useBatch = bulkNames.length >= 2;
+  const batch: BatchState | null = useBatch
+    ? {
+        startedAt: ts,
+        remaining: bulkIds.length,
+        results: new Map(),
+      }
+    : null;
+
+  content.forEach((block, i) => {
+    const b = asObj(block);
+    if (!b) return;
+    if (b.type === "text" && typeof b.text === "string") {
+      const { pieces, truncated } = splitMessage(b.text);
+      for (const piece of pieces) {
+        out.push({ ts, kind: "assistant", text: `  ${piece}` });
+      }
+      if (truncated > 0) {
+        out.push({
+          ts,
+          kind: "info",
+          text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
+        });
+      }
+      return;
+    }
+    if (b.type === "thinking" && typeof b.thinking === "string") {
+      const compacted = compactMeta(b.thinking);
+      if (compacted) out.push({ ts, kind: "thinking", text: `· ${compacted}` });
+      return;
+    }
+    if (b.type !== "tool_use") return;
+    const toolName = typeof b.name === "string" ? b.name : "?";
+    const id = typeof b.id === "string" ? b.id : null;
+    if (DETAILED_TOOLS.has(toolName)) {
+      const arg = briefToolInput(b.input);
+      if (id) toolStarts.set(id, { toolName, ts, batch: null });
+      out.push({
+        ts,
+        kind: "tool",
+        text: `  ⚒ ${toolName}${arg ? `(${arg})` : ""}`,
+      });
+      return;
+    }
+    // Bulk tool. Either part of a batch (≥2 in this message) or a
+    // lone non-detailed call rendered inline.
+    if (useBatch && batch) {
+      if (id) toolStarts.set(id, { toolName, ts, batch });
+      if (i === firstBulkPos) {
+        out.push({
+          ts,
+          kind: "tool",
+          text: `  ⚒ ${formatBatchCall(bulkNames)}`,
+        });
+      }
+      return;
+    }
+    const arg = briefToolInput(b.input);
+    if (id) toolStarts.set(id, { toolName, ts, batch: null });
+    out.push({
+      ts,
+      kind: "tool",
+      text: `  ⚒ ${toolName}${arg ? `(${arg})` : ""}`,
+    });
+  });
+  return out;
+}
+
+/**
+ * `Bash×3, Read×2` — join per-tool counts with insertion order
+ * preserved so the summary reads in the order claude issued the
+ * calls.
+ */
+function formatBatchCall(names: readonly string[]): string {
+  const counts = new Map<string, number>();
+  for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+  return [...counts]
+    .map(([name, n]) => `${name}×${n}`)
+    .join(", ");
+}
+
+/**
+ * `✓ Bash×2 ok, Read×3 ok, Grep×1 err (3.4s)` — same shape as the
+ * call summary, with ok/err breakdown per tool and one combined
+ * duration. The leading glyph is `✓` only if every result succeeded;
+ * any failure flips it to `✗` so a glance still reads "this batch
+ * had a problem".
+ */
+function formatBatchResult(batch: BatchState): string {
+  let totalDurMs = 0;
+  let anyErr = false;
+  const parts: string[] = [];
+  for (const [name, r] of batch.results) {
+    totalDurMs += r.durMs;
+    const segs: string[] = [];
+    if (r.ok > 0) segs.push(`${name}×${r.ok} ok`);
+    if (r.err > 0) {
+      segs.push(`${name}×${r.err} err`);
+      anyErr = true;
+    }
+    parts.push(segs.join(", "));
+  }
+  const arrow = anyErr ? "✗" : "✓";
+  return `${arrow} ${parts.join(", ")} (${formatDuration(totalDurMs)})`;
 }

@@ -56,6 +56,7 @@ import {
   type ToolStartMap,
   MAX_BUFFERED_LINES,
   asObj,
+  compactMeta,
   messageToLines,
 } from "./claude-events.ts";
 import { wtSessionUuid } from "./claude.ts";
@@ -368,9 +369,43 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
   const e = asObj(evt);
   if (!e) return [];
   const t = e.type;
-  if (t !== "assistant" && t !== "user") return [];
   const ts = entryTs(e);
-  return messageToLines({ role: t, message: e.message, ts, toolStarts });
+  if (t === "assistant" || t === "user") {
+    return messageToLines({ role: t, message: e.message, ts, toolStarts });
+  }
+  // system.away_summary — claude's auto-generated context-recap when
+  // the conversation is auto-compacted. High-signal: the user can
+  // glance at the pane and see "this is what the previous turns were
+  // about" without re-reading the whole tail.
+  if (t === "system" && e.subtype === "away_summary") {
+    const content = typeof e.content === "string" ? e.content : "";
+    const compacted = compactMeta(content);
+    if (compacted) {
+      return [{ ts, kind: "info", text: `─ summary: ${compacted}` }];
+    }
+    return [];
+  }
+  // attachment.queued_command — when the user types-ahead while
+  // claude is still processing, the prompt sits queued. Surface the
+  // user-typed ones (`commandMode === "prompt"`) so the pane shows
+  // intent that would otherwise be invisible. `task-notification`
+  // and other system-injected attachments stay dropped.
+  if (t === "attachment") {
+    const att = asObj(e.attachment);
+    if (
+      att &&
+      att.type === "queued_command" &&
+      att.commandMode === "prompt" &&
+      typeof att.prompt === "string"
+    ) {
+      const compacted = compactMeta(att.prompt);
+      if (compacted) {
+        return [{ ts, kind: "info", text: `⏎ queued: ${compacted}` }];
+      }
+    }
+    return [];
+  }
+  return [];
 }
 
 function readBytes(path: string, start: number, len: number): string {
