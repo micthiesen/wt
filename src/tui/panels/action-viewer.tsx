@@ -4,7 +4,7 @@
  * OutputViewer; these emit just the line rows.
  */
 import type { ActionLine, ActionRun } from "../../core/actions.ts";
-import { useSessionRun } from "../hooks/useSessionRun.ts";
+import { useSessionRun, useShellRun } from "../hooks/useSessionRun.ts";
 import { theme } from "../theme.ts";
 
 function fmtTime(ts: number): string {
@@ -106,6 +106,34 @@ export function SessionContent({
             ts: run?.startedAt ?? Date.now(),
             kind: "info",
             text: "  waiting for claude session output…",
+          },
+        ];
+  return <LinesContent height={height} lines={lines} />;
+}
+
+/**
+ * Live capture of the F10 shell tmux pane via `tmux pipe-pane`. Lines
+ * are plain text post-ANSI-strip; they map cleanly onto the existing
+ * `kind: "stdout"` row style so we don't need a separate renderer.
+ * Pre-creation race + empty-buffer state surfaces a placeholder for
+ * the same reason `SessionContent` does.
+ */
+export function ShellContent({
+  slug,
+  height,
+}: {
+  slug: string;
+  height: number;
+}) {
+  const run = useShellRun(slug);
+  const lines: readonly ActionLine[] =
+    run && run.lines.length > 0
+      ? run.lines.map((l) => ({ ts: l.ts, kind: "stdout", text: l.text }))
+      : [
+          {
+            ts: run?.startedAt ?? Date.now(),
+            kind: "info",
+            text: "  waiting for shell session output…",
           },
         ];
   return <LinesContent height={height} lines={lines} />;

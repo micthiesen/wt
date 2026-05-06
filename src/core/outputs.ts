@@ -1,7 +1,11 @@
 /**
  * Cross-source index over everything that can render in the bottom pane:
  * the global event log, per-worktree action runs (running and recently
- * completed), and live interactive tmux sessions (F10/F11/F12).
+ * completed), and live interactive tmux sessions (F10 shell, F12 claude).
+ * F11 diff sessions are intentionally excluded — they're a TUI app whose
+ * "output" is the diff itself, which the user can already see via the
+ * details pane and `core/diff/`. Surfacing F11 here would only ever
+ * render an attach-prompt stub.
  *
  * Outputs is intentionally a thin index — it does not own buffers. The
  * underlying registries (events log, action registry, session-tail
@@ -18,11 +22,12 @@ import type { ActionRun } from "./actions.ts";
 export type OutputKind = "events" | "action" | "session" | "destroy";
 /**
  * Subkind of a `kind: "session"` output. Drives both the title label
- * (F10 shell / F11 diff / F12 claude) and the OutputViewer's content
- * dispatch — only `claude` has a live tail registry, the others
- * render an informational placeholder.
+ * (F10 shell / F12 claude) and the OutputViewer's content dispatch.
+ * Both kinds tail their tmux pane via `core/session-tail.ts` — claude
+ * via stream-json, shell via `tmux pipe-pane` with ANSI stripping.
+ * F11 diff is deliberately excluded (see file header).
  */
-export type SessionKind = "claude" | "diff" | "shell";
+export type SessionKind = "claude" | "shell";
 export type OutputStatus = "live" | "running" | "done" | "failed" | "killed";
 
 export type Output = {
@@ -76,7 +81,6 @@ export function destroyOutputId(slug: string): string {
 
 const SESSION_LABEL: Record<SessionKind, string> = {
   claude: "F12 claude",
-  diff: "F11 diff",
   shell: "F10 shell",
 };
 
@@ -142,12 +146,10 @@ export function destroyOutput(
 }
 
 /**
- * Live tmux session for a slug. F12 claude has a content tail
- * registered in `core/session-tail.ts`; F10 shell and F11 diff don't,
- * so the OutputViewer renders a "live · attach to view" placeholder
- * for those instead of running content. They still appear in the
- * picker so the user has at-a-glance awareness of every live tmux
- * session attached to a worktree.
+ * Live tmux session for a slug. Both F10 shell and F12 claude have a
+ * content tail registered in `core/session-tail.ts`, so the
+ * OutputViewer renders running content for both. F11 diff is not an
+ * output kind — see the file header.
  */
 export function sessionOutput(
   slug: string,

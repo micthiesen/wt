@@ -77,10 +77,10 @@ const SECTIONS: Section[] = [
     title: "outputs (bottom pane · per-worktree)",
     note: "each worktree remembers its last-shown output and pin; switching rows restores them.",
     items: [
-      ["\\", "outputs picker for this worktree"],
+      [";", "outputs picker for this worktree"],
       ["[ / ]", "cycle prev / next output for this worktree"],
-      ["~", "jump to events for this worktree"],
-      ["*", "pin current output (resists auto-switch)"],
+      ["\"", "jump to events for this worktree"],
+      ["'", "pin current output (resists auto-switch)"],
       ["esc", "clear focus / pin (return to follow-row auto)"],
     ],
   },

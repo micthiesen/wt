@@ -9,7 +9,11 @@ import { type Output, outputStatusLabel } from "../../core/outputs.ts";
 import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 
-import { ActionContent, SessionContent } from "./action-viewer.tsx";
+import {
+  ActionContent,
+  SessionContent,
+  ShellContent,
+} from "./action-viewer.tsx";
 import { ActivityContent, DestroyContent } from "./activity.tsx";
 
 type Props = {
@@ -77,16 +81,16 @@ function OutputContent({ output, height }: { output: Output; height: number }) {
     return <DestroyContent slug={output.slug} height={height} />;
   }
   if (output.kind === "session" && output.slug) {
-    // Claude is the only session kind with a live content tail
-    // registered in `core/session-tail.ts`. Diff (F11) and shell
-    // (F10) sessions exist as tmux sessions but produce no
-    // replayable byte stream here, so we surface them as
-    // informational placeholders — the user attaches with the F-key
-    // to see content.
+    // Both claude and shell tail their tmux pane: claude reads
+    // stream-json from the wt-managed jsonl, shell reads the
+    // pipe-pane log with ANSI stripped. Different parsers, same
+    // shape downstream.
     if (output.sessionKind === "claude") {
       return <SessionContent slug={output.slug} height={height} />;
     }
-    return <SessionPlaceholder kind={output.sessionKind ?? "shell"} />;
+    if (output.sessionKind === "shell") {
+      return <ShellContent slug={output.slug} height={height} />;
+    }
   }
   if (output.kind === "action" && output.slug) {
     // Both `outputs` (the picker source) and this lookup read from
@@ -102,17 +106,3 @@ function OutputContent({ output, height }: { output: Output; height: number }) {
   return null;
 }
 
-function SessionPlaceholder({ kind }: { kind: "diff" | "shell" | "claude" }) {
-  const fkey = kind === "shell" ? "F10" : kind === "diff" ? "F11" : "F12";
-  const label =
-    kind === "shell"
-      ? "shell session"
-      : kind === "diff"
-        ? "diff TUI session"
-        : "claude session";
-  return (
-    <text fg={theme.fgDim}>
-      live · {label} · press {fkey} to attach
-    </text>
-  );
-}

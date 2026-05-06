@@ -1,14 +1,10 @@
 /**
  * Cross-source enumeration of every output the bottom pane could
  * render: the global event log, in-flight + recently-completed action
- * runs, and live tmux sessions (claude / diff / shell). Returns a
+ * runs, and live tmux sessions (F10 shell, F12 claude). Returns a
  * sorted, stable list and re-evaluates on any underlying source
- * mutation.
- *
- * Only F12 claude sessions have a content tail registered in
- * `core/session-tail.ts`. F10 shell and F11 diff appear in the
- * picker for awareness; selecting them in the OutputViewer renders
- * a "live · attach to view" placeholder.
+ * mutation. F11 diff is deliberately excluded from this universe —
+ * see `core/outputs.ts`.
  */
 import { useMemo, useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -23,42 +19,33 @@ import {
   sortOutputs,
 } from "../../core/outputs.ts";
 import { sessionTailRegistry } from "../../core/session-tail.ts";
+import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
 import { events as eventsLog } from "../events.ts";
 
 /**
- * Per-(slug, kind) first-seen timestamp for outputs whose underlying
- * source doesn't expose a real start ts: diff/shell sessions
- * (tmuxSessionsQuery only returns slugs) and destroy entries (the
- * fallback when no slug-tagged event has landed yet). Module-level
- * so re-derivations of the `useOutputs` memo don't reset the clock.
- * Pruned against the live set so a closed + reopened session — or a
- * second destroy after a recreate — restarts the activity stamp;
- * otherwise we'd hand out a stale timestamp from the previous run.
+ * Per-slug first-seen timestamp for destroy entries (the fallback
+ * when no slug-tagged event has landed yet). Module-level so
+ * re-derivations of the `useOutputs` memo don't reset the clock;
+ * pruned against the live destroying set so a second destroy after
+ * a recreate restarts the activity stamp.
  */
-type FirstSeenKind = "diff" | "shell" | "destroy";
-const firstSeen: Record<FirstSeenKind, Map<string, number>> = {
-  diff: new Map(),
-  shell: new Map(),
-  destroy: new Map(),
-};
+const destroyFirstSeen = new Map<string, number>();
 
-function firstSeenStamp(kind: FirstSeenKind, slug: string): number {
-  const map = firstSeen[kind];
-  let ts = map.get(slug);
+function destroyStamp(slug: string): number {
+  let ts = destroyFirstSeen.get(slug);
   if (ts === undefined) {
     ts = Date.now();
-    map.set(slug, ts);
+    destroyFirstSeen.set(slug, ts);
   }
   return ts;
 }
 
-function pruneFirstSeen(kind: FirstSeenKind, live: readonly string[]): void {
-  const map = firstSeen[kind];
-  if (map.size === 0) return;
+function pruneDestroyStamps(live: readonly string[]): void {
+  if (destroyFirstSeen.size === 0) return;
   const liveSet = new Set(live);
-  for (const slug of map.keys()) {
-    if (!liveSet.has(slug)) map.delete(slug);
+  for (const slug of destroyFirstSeen.keys()) {
+    if (!liveSet.has(slug)) destroyFirstSeen.delete(slug);
   }
 }
 
@@ -77,15 +64,20 @@ export function useOutputs(opts: {
     actionRegistry.getSnapshot,
     actionRegistry.getSnapshot,
   );
-  // Subscribed too — `lastActivity` for a claude session is the
-  // timestamp of the most recent line in its tail. Without
-  // subscribing, the picker would order sessions by their
-  // first-seen-now() stamp forever, so an idle 2h-old session would
-  // sort above a busy 5m-old one.
-  const tails = useSyncExternalStore(
+  // Subscribed — `lastActivity` for a session is the timestamp of the
+  // most recent line in its tail. Without that, sessions would sort
+  // by their first-seen-now() stamp forever and an idle 2h-old
+  // session would beat a busy 5m-old one. Two registries: claude
+  // (jsonl, structured) and shell (pipe-pane log, plain text).
+  const claudeTails = useSyncExternalStore(
     sessionTailRegistry.subscribe,
     sessionTailRegistry.getSnapshot,
     sessionTailRegistry.getSnapshot,
+  );
+  const shellTails = useSyncExternalStore(
+    shellTailRegistry.subscribe,
+    shellTailRegistry.getSnapshot,
+    shellTailRegistry.getSnapshot,
   );
   const sessions = useQuery(tmuxSessionsQuery()).data;
 
@@ -118,45 +110,34 @@ export function useOutputs(opts: {
         lastBySlug.set(e.source, e.ts);
         if (lastBySlug.size === destroying.size) break;
       }
-      pruneFirstSeen("destroy", destroyingSlugs);
+      pruneDestroyStamps(destroyingSlugs);
       for (const slug of destroyingSlugs) {
-        const startedAt = firstSeenStamp("destroy", slug);
+        const startedAt = destroyStamp(slug);
         const lastActivity = lastBySlug.get(slug) ?? startedAt;
         out.push(destroyOutput(slug, startedAt, lastActivity));
       }
     }
 
     if (sessions) {
-      // Claude sessions: real per-line activity from the tail.
+      // Both kinds tail their tmux pane and expose the same shape
+      // (startedAt + ordered lines with ts), so the lastActivity
+      // calculation is uniform.
       for (const slug of sessions.claude) {
-        const tail = tails.get(slug);
+        const tail = claudeTails.get(slug);
         const startedAt = tail?.startedAt ?? Date.now();
         const lastLineTs = tail?.lines[tail.lines.length - 1]?.ts;
         const lastActivity = lastLineTs ?? startedAt;
         out.push(sessionOutput(slug, "claude", startedAt, lastActivity));
       }
-      // Diff/shell sessions: no content tail. We don't know when
-      // they were created (tmuxSessionsQuery only returns slugs),
-      // so we cache the first-seen timestamp per (slug, kind) and
-      // reuse it across re-derivations. Without this, every memo
-      // recompute (every event line, every claude tail line) would
-      // stamp `Date.now()` and these placeholder outputs would
-      // constantly tie or beat the real claude session in the sort,
-      // causing the live group order to flicker. Entries are
-      // pruned for sessions that are no longer live so a slug that
-      // re-attaches restarts its first-seen clock.
-      pruneFirstSeen("diff", sessions.diff);
-      pruneFirstSeen("shell", sessions.shell);
-      for (const slug of sessions.diff) {
-        const ts = firstSeenStamp("diff", slug);
-        out.push(sessionOutput(slug, "diff", ts, ts));
-      }
       for (const slug of sessions.shell) {
-        const ts = firstSeenStamp("shell", slug);
-        out.push(sessionOutput(slug, "shell", ts, ts));
+        const tail = shellTails.get(slug);
+        const startedAt = tail?.startedAt ?? Date.now();
+        const lastLineTs = tail?.lines[tail.lines.length - 1]?.ts;
+        const lastActivity = lastLineTs ?? startedAt;
+        out.push(sessionOutput(slug, "shell", startedAt, lastActivity));
       }
     }
 
     return sortOutputs(out);
-  }, [evts, actions, tails, sessions, destroyingSlugs]);
+  }, [evts, actions, claudeTails, shellTails, sessions, destroyingSlugs]);
 }

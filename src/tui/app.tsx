@@ -19,6 +19,7 @@ import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
+import { shellTailRegistry } from "../core/shell-tail.ts";
 import { stageUrl } from "../core/stage.ts";
 import {
   killAllSessionsFor,
@@ -492,6 +493,18 @@ export function App({ onExit }: Props) {
     }
     sessionTailRegistry.reconcile(live);
   }, [rows, activeSessions]);
+
+  // Same shape for the F10 shell tail: spin a tailer per live shell
+  // session, drop tailers for sessions that ended. The shell registry
+  // doesn't need the worktree path — its log file is keyed on the
+  // bare slug under wt's cache dir.
+  useEffect(() => {
+    const live = new Set<string>();
+    for (const r of rows) {
+      if (activeShellSessions.has(r.wt.slug)) live.add(r.wt.slug);
+    }
+    shellTailRegistry.reconcile(live);
+  }, [rows, activeShellSessions]);
 
   // Slugs whose lock op is `"remove"` — drives the destroy outputs
   // surfaced in the picker. Computed from `rows` (each busy row
@@ -1494,41 +1507,55 @@ export function App({ onExit }: Props) {
 
     // Outputs picker — vim-buffer-style list of this worktree's
     // outputs (events + this slug's actions + this slug's claude
-    // session). j/k or arrows move; 1-9 quick-pick by index; Enter
-    // sets focus and closes; `*` toggles pin on the selected entry;
-    // esc/q cancels. `idx` is clamped against the live
-    // `visibleOutputs` length on every keypress because the
-    // underlying list can shrink while the picker is open (FIFO
-    // eviction, session ending).
+    // session). j/k or arrows move AND commit focus immediately
+    // (live preview: ";jj;" lands on the third entry without a
+    // return press); 1-9 quick-pick by index; Enter just closes (the
+    // focus already matches); `'` toggles pin on the selected entry;
+    // esc/q cancels (without revert — live commit semantics). `idx`
+    // is clamped against the live `visibleOutputs` length on every
+    // keypress because the underlying list can shrink while the
+    // picker is open (FIFO eviction, session ending). Pin is cleared
+    // on movement so the live preview actually displays — same
+    // reason `[`/`]` clear pin.
     if (modal?.kind === "outputsPicker") {
       const idx =
         visibleOutputs.length === 0
           ? 0
           : Math.min(Math.max(0, modal.index), visibleOutputs.length - 1);
+      const moveTo = (next: number): void => {
+        setModal({ kind: "outputsPicker", index: next });
+        const target = visibleOutputs[next];
+        if (target) {
+          setFocus(currentSlug ?? null, {
+            focused: target.id,
+            pinned: null,
+          });
+        }
+      };
       if (k.name === "j" || k.name === "down") {
-        setModal({
-          kind: "outputsPicker",
-          index: Math.min(idx + 1, visibleOutputs.length - 1),
-        });
+        moveTo(Math.min(idx + 1, visibleOutputs.length - 1));
         return;
       }
       if (k.name === "k" || k.name === "up") {
-        setModal({
-          kind: "outputsPicker",
-          index: Math.max(0, idx - 1),
-        });
+        moveTo(Math.max(0, idx - 1));
         return;
       }
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
         const i = parseInt(k.sequence, 10) - 1;
         const target = visibleOutputs[i];
         if (target) {
-          setFocus(currentSlug ?? null, { focused: target.id });
+          // Same pin-clearing as j/k movement — quick-pick is a
+          // navigation override, so any prior pin shouldn't outvote
+          // the explicit choice.
+          setFocus(currentSlug ?? null, {
+            focused: target.id,
+            pinned: null,
+          });
           setModal(null);
         }
         return;
       }
-      if (k.sequence === "*") {
+      if (k.sequence === "'") {
         const target = visibleOutputs[idx];
         if (!target) return;
         const cur = focusBucket.pinned;
@@ -1548,7 +1575,7 @@ export function App({ onExit }: Props) {
       if (
         k.name === "escape" ||
         k.sequence === "q" ||
-        k.sequence === "\\" ||
+        k.sequence === ";" ||
         (k.ctrl && k.name === "c")
       ) {
         setModal(null);
@@ -1823,10 +1850,11 @@ export function App({ onExit }: Props) {
       setFocus(currentSlug ?? null, { focused: null, pinned: null });
       return;
     }
-    // `\` opens the Outputs picker — vim-:ls flavor for the bottom
+    // `;` opens the Outputs picker — vim-:ls flavor for the bottom
     // pane. Cursor lands on the displayed output within this
-    // worktree's filtered list.
-    if (k.sequence === "\\") {
+    // worktree's filtered list. Pinky-friendly home-row position;
+    // `'` and `"` neighbor it for pin / events.
+    if (k.sequence === ";") {
       const idx = Math.max(
         0,
         indexOfOutput(visibleOutputs, displayedOutput.id),
@@ -1857,29 +1885,29 @@ export function App({ onExit }: Props) {
       }
       return;
     }
-    // `~` jumps to events for this worktree's bucket — the global
+    // `"` jumps to events for this worktree's bucket — the global
     // pane when you want to step out of whatever per-row context the
     // auto-rules surfaced. Clears pin so the jump actually takes
     // effect; otherwise pin > focus and the keypress would be a
     // silent no-op.
-    if (k.sequence === "~") {
+    if (k.sequence === '"') {
       setFocus(currentSlug ?? null, {
         focused: eventsOutputId(),
         pinned: null,
       });
       return;
     }
-    // `*` toggles pin on the current displayed output for THIS
+    // `'` toggles pin on the current displayed output for THIS
     // worktree. Pin overrides auto-rules and other focus changes for
     // this slug; press again to unpin and resume auto.
     //
     // Edge case: if the bucket's pinned id no longer resolves to a
     // visible output (action FIFO'd, session ended) we're in a
     // "dangling pin" window before the GC sweep clears it. Treat
-    // dangling as "currently unpinned" so the user's first `*`
+    // dangling as "currently unpinned" so the user's first `'`
     // reliably ends in unpinned, instead of pinning the
     // auto-resolved fallback (typically events).
-    if (k.sequence === "*") {
+    if (k.sequence === "'") {
       const id = displayedOutput.id;
       const pinned = focusBucket.pinned;
       const pinResolves =

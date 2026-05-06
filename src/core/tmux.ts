@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { wtSessionArgs } from "./claude.ts";
 import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
+import { shellLogPath } from "./shell-tail.ts";
 
 const log = createLogger("[tmux]");
 
@@ -338,23 +339,83 @@ export async function attachOrCreate(opts: {
   // and disappear, leaving only "exited (0)" in the activity pane.
   const stderrPath = join(sessionsDir(), `${name}.err`);
 
+  // Claude resume-vs-create resolves at attach time. Re-checking on
+  // every attach (rather than caching) means an externally-deleted
+  // jsonl (claude project purge, manual rm) recovers cleanly: next
+  // attach sees the file gone, switches back to --session-id with
+  // the same UUID, and recreates. The diff branch shells out to the
+  // configured command via the user's login shell so PATH/init
+  // (pyenv, mise, …) apply. The shell branch is just the login
+  // shell with no command — exit (Ctrl+D / `exit`) ends the session.
+  const userShell = process.env.SHELL || "bash";
+  const innerArgs =
+    kind === "claude"
+      ? ["claude", ...wtSessionArgs(cwd)]
+      : kind === "diff"
+        ? [userShell, "-lc", config.diff.command]
+        : [userShell, "-l"];
+
+  // Shell: pre-create the session detached and chain `pipe-pane` to a
+  // per-slug log so every byte the shell writes is captured for the
+  // bottom-pane tail (`core/shell-tail.ts`). Doing this before the
+  // attach call (instead of chaining after `new-session -A`) closes
+  // the would-be race where output written between session-create and
+  // pipe-pane attach gets dropped — chained commands after `-A`
+  // (attached) only run when the *client* detaches, far too late.
+  // `-o` makes pipe-pane a no-op when already piping, so re-attaches
+  // don't double-up. claude/diff don't need this — claude has its
+  // own jsonl tail, and diff is a TUI we don't surface as an output.
+  if (kind === "shell") {
+    const shellLog = shellLogPath(slug);
+    const setup = Bun.spawn(
+      [
+        "tmux",
+        "-L",
+        TMUX_SOCKET,
+        "-f",
+        configPath,
+        "new-session",
+        "-A",
+        "-d",
+        "-s",
+        name,
+        "-c",
+        cwd,
+        "env",
+        "-u",
+        "TMUX",
+        "-u",
+        "TMUX_PANE",
+        "bash",
+        "-c",
+        'p="$1"; shift; exec "$@" 2> "$p"',
+        "_wt_wrap",
+        stderrPath,
+        ...innerArgs,
+        ";",
+        "pipe-pane",
+        "-o",
+        "-t",
+        name,
+        // `>` not `>>` so a destroy-and-recreate of the same slug
+        // doesn't seed the new tail with the prior session's lines.
+        // pipe-pane spawns this shell once per session lifetime; the
+        // truncate fires only on first attach, subsequent re-attaches
+        // are `-o` no-ops and the existing FD keeps streaming.
+        `cat > ${shellLog}`,
+      ],
+      { stdout: "ignore", stderr: "ignore" },
+    );
+    const setupCode = await setup.exited;
+    if (setupCode !== 0) {
+      log.warn("shell pre-create + pipe-pane failed", { slug, code: setupCode });
+      // Fall through to the regular attach below — output won't be
+      // tailed, but the user still gets their shell.
+    }
+  }
+
   let proc: Bun.Subprocess;
   try {
-    // Claude resume-vs-create resolves at attach time. Re-checking on
-    // every attach (rather than caching) means an externally-deleted
-    // jsonl (claude project purge, manual rm) recovers cleanly: next
-    // attach sees the file gone, switches back to --session-id with
-    // the same UUID, and recreates. The diff branch shells out to the
-    // configured command via the user's login shell so PATH/init
-    // (pyenv, mise, …) apply. The shell branch is just the login
-    // shell with no command — exit (Ctrl+D / `exit`) ends the session.
-    const userShell = process.env.SHELL || "bash";
-    const innerArgs =
-      kind === "claude"
-        ? ["claude", ...wtSessionArgs(cwd)]
-        : kind === "diff"
-          ? [userShell, "-lc", config.diff.command]
-          : [userShell, "-l"];
     proc = Bun.spawn(
       [
         "tmux",

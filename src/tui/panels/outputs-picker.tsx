@@ -54,7 +54,7 @@ export function OutputsPicker({
     ["j/k", "move"],
     ["1-9", "quick pick"],
     ["⏎", "select"],
-    ["*", pinnedId ? "unpin" : "pin"],
+    ["'", pinnedId ? "unpin" : "pin"],
     ["esc / q", "cancel"],
   ];
   // "(no row)" rather than "global" when nothing is selected: the
@@ -62,6 +62,14 @@ export function OutputsPicker({
   // user's pin/focus lands in. "global" implied per-session-wide
   // outputs which isn't what's happening.
   const title = slug ? `outputs · ${slug}` : "outputs · (no row)";
+  // Strip the slug prefix from per-row titles when the modal's
+  // already scoped to that slug — `eng-1234 · F10 shell` collapses
+  // to `F10 shell`. The slug is not redundant in the OutputViewer
+  // title (a pin can leave you on another row), so we do this only
+  // here, not at the Output level.
+  const slugPrefix = slug ? `${slug} · ` : "";
+  const shortTitle = (t: string): string =>
+    slugPrefix && t.startsWith(slugPrefix) ? t.slice(slugPrefix.length) : t;
   return (
     <Modal title={title} hints={hints}>
       {items.length === 0 ? (
@@ -100,7 +108,7 @@ export function OutputsPicker({
               </box>
               <box flexGrow={1} flexShrink={1} overflow="hidden">
                 <text fg={fg} wrapMode="none" truncate>
-                  {o.title}
+                  {shortTitle(o.title)}
                 </text>
               </box>
               {/*
