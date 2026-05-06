@@ -166,15 +166,45 @@ export function splitMessage(text: string): {
 type UserTextClass =
   | { kind: "drop" }
   | { kind: "interrupted" }
+  | { kind: "task-notification"; summary: string; event: string | null }
   | { kind: "prompt"; text: string };
 
 const CMD_MESSAGE_RE =
   /^\s*<command-message>([^<]*)<\/command-message>\s*<command-name>([^<]*)<\/command-name>(?:\s*<command-args>([\s\S]*?)<\/command-args>)?/;
 
+const TASK_NOTIFICATION_RE = /^\s*<task-notification>/;
+const SUMMARY_RE = /<summary>([\s\S]*?)<\/summary>/;
+const EVENT_RE = /<event>([\s\S]*?)<\/event>/;
+
+/**
+ * Strip the wrapping verbiage Claude Code's Monitor / Background-command
+ * emitter adds around the meaningful summary so the row reads as the
+ * thing being watched, not the protocol envelope. Examples:
+ *
+ *  - `Monitor event: "deploy progress and failures"` →
+ *    `Monitor — deploy progress and failures`
+ *  - `Background command "Run pnpm deploy" completed (exit code 0)` →
+ *    `Background — Run pnpm deploy (exit 0)`
+ *
+ * Falls back to the raw summary verbatim when neither pattern matches.
+ */
+function compactTaskSummary(raw: string): string {
+  const trimmed = raw.trim();
+  const monitor = /^Monitor event:\s*"([^"]*)"\s*$/.exec(trimmed);
+  if (monitor) return `Monitor — ${monitor[1]}`;
+  const bg =
+    /^Background command\s*"([^"]*)"\s*completed\s*\(exit code (-?\d+)\)\s*$/.exec(
+      trimmed,
+    );
+  if (bg) return `Background — ${bg[1]} (exit ${bg[2]})`;
+  return trimmed;
+}
+
 /**
  * Classify user-envelope text into one of: drop (auto-injected noise
  * the user already saw via the matching tool call), interrupted (a
- * cancel marker worth surfacing), or prompt (real user-typed content).
+ * cancel marker worth surfacing), task-notification (Monitor /
+ * Background-command auto-feedback), or prompt (real user-typed content).
  *
  *  - skill bodies (`Base directory for this skill: …`) and slash-
  *    command bodies (`# /<name>`) are auto-injected after the
@@ -183,6 +213,11 @@ const CMD_MESSAGE_RE =
  *  - command-message XML wraps a `/<name> <args>` invocation in
  *    `<command-message><command-name>…<command-args>` tags. Unwrap
  *    to `> /<name> <args>` so the user's actual typed input shows.
+ *  - task-notification XML wraps Claude Code's auto-injected Monitor
+ *    events and Background-command completions. Surface the summary +
+ *    event body as a dim block (one header line, then indented body
+ *    rows) instead of letting the raw XML render through the multi-
+ *    line user-prompt path.
  *  - `[Request interrupted by user]` → `! interrupted` info line.
  *
  * Applied to both bare string content and array text blocks so the
@@ -191,6 +226,13 @@ const CMD_MESSAGE_RE =
 function classifyUserText(text: string): UserTextClass {
   if (text.startsWith("[Request interrupted")) return { kind: "interrupted" };
   if (text.startsWith("Base directory for this skill:")) return { kind: "drop" };
+  if (TASK_NOTIFICATION_RE.test(text)) {
+    const summaryM = SUMMARY_RE.exec(text);
+    const summary = summaryM ? compactTaskSummary(summaryM[1] ?? "") : "task";
+    const eventM = EVENT_RE.exec(text);
+    const event = eventM ? (eventM[1] ?? "").replace(/^\n+|\n+$/g, "") : null;
+    return { kind: "task-notification", summary, event: event || null };
+  }
   const cmd = CMD_MESSAGE_RE.exec(text);
   if (cmd) {
     const name = (cmd[2] ?? "").trim();
@@ -219,6 +261,23 @@ function appendUserText(out: ActionLine[], ts: number, text: string): void {
   if (cls.kind === "drop") return;
   if (cls.kind === "interrupted") {
     out.push({ ts, kind: "info", text: "! interrupted" });
+    return;
+  }
+  if (cls.kind === "task-notification") {
+    out.push({ ts, kind: "info", text: `◉ ${cls.summary}` });
+    if (cls.event) {
+      const { pieces, truncated } = splitMessage(cls.event);
+      for (const piece of pieces) {
+        out.push({ ts, kind: "info", text: `  ${piece}` });
+      }
+      if (truncated > 0) {
+        out.push({
+          ts,
+          kind: "info",
+          text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
+        });
+      }
+    }
     return;
   }
   const { pieces, truncated } = splitMessage(cls.text);
