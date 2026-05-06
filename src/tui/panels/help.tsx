@@ -68,11 +68,11 @@ const SECTIONS: Section[] = [
     ],
   },
   {
-    title: "outputs (bottom pane)",
+    title: "outputs (bottom pane · per-worktree)",
     items: [
-      ["\\", "outputs picker (events / actions / sessions)"],
-      ["[ / ]", "cycle prev / next output"],
-      ["~", "jump to events"],
+      ["\\", "outputs picker for this worktree"],
+      ["[ / ]", "cycle prev / next output for this worktree"],
+      ["~", "jump to events for this worktree"],
       ["*", "pin current output (resists auto-switch)"],
       ["esc", "clear focus / pin (return to follow-row auto)"],
     ],

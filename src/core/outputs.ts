@@ -16,6 +16,13 @@
 import type { ActionRun } from "./actions.ts";
 
 export type OutputKind = "events" | "action" | "session";
+/**
+ * Subkind of a `kind: "session"` output. Drives both the title label
+ * (F10 shell / F11 diff / F12 claude) and the OutputViewer's content
+ * dispatch — only `claude` has a live tail registry, the others
+ * render an informational placeholder.
+ */
+export type SessionKind = "claude" | "diff" | "shell";
 export type OutputStatus = "live" | "running" | "done" | "failed" | "killed";
 
 export type Output = {
@@ -25,6 +32,8 @@ export type Output = {
   title: string;
   /** Worktree slug this output belongs to. `undefined` for global (events). */
   slug?: string;
+  /** Session sub-kind for `kind: "session"`; otherwise undefined. */
+  sessionKind?: SessionKind;
   status: OutputStatus;
   startedAt: number;
   /** Drives picker sorting. For events: the latest event timestamp. */
@@ -57,9 +66,15 @@ export function actionOutputId(slug: string, startedAt: number): string {
   return `action:${slug}:${startedAt}`;
 }
 
-export function sessionOutputId(slug: string): string {
-  return `session:${slug}:claude`;
+export function sessionOutputId(slug: string, kind: SessionKind): string {
+  return `session:${slug}:${kind}`;
 }
+
+const SESSION_LABEL: Record<SessionKind, string> = {
+  claude: "F12 claude",
+  diff: "F11 diff",
+  shell: "F10 shell",
+};
 
 export function eventsOutput(lastEventTs: number): Output {
   return {
@@ -96,23 +111,25 @@ export function actionOutput(run: ActionRun): Output {
 }
 
 /**
- * Live claude session for a slug. We only enumerate claude-kind tmux
- * sessions (F12) because that's the only kind with a content tail
- * registered in `core/session-tail.ts`. Diff (F11) and shell (F10)
- * sessions exist but produce no replayable byte stream — surfacing
- * them here would route the picker into a permanent "waiting for
- * output…" placeholder.
+ * Live tmux session for a slug. F12 claude has a content tail
+ * registered in `core/session-tail.ts`; F10 shell and F11 diff don't,
+ * so the OutputViewer renders a "live · attach to view" placeholder
+ * for those instead of running content. They still appear in the
+ * picker so the user has at-a-glance awareness of every live tmux
+ * session attached to a worktree.
  */
 export function sessionOutput(
   slug: string,
+  kind: SessionKind,
   startedAt: number,
   lastActivity: number,
 ): Output {
   return {
-    id: sessionOutputId(slug),
+    id: sessionOutputId(slug, kind),
     kind: "session",
-    title: `${slug} · F12 claude`,
+    title: `${slug} · ${SESSION_LABEL[kind]}`,
     slug,
+    sessionKind: kind,
     status: "live",
     startedAt,
     lastActivity,
@@ -147,4 +164,22 @@ export function indexOfOutput(items: readonly Output[], id: string): number {
     if (items[i]!.id === id) return i;
   }
   return -1;
+}
+
+/**
+ * Outputs visible to the bottom pane when sitting on `slug`. Slug-
+ * tagged outputs (actions, sessions) are filtered to that slug;
+ * global outputs (events) come through regardless. When `slug` is
+ * null — no row selected — only globals are shown.
+ *
+ * The Outputs picker, cycle keys, and the per-slug pin/focus state
+ * all consult the same filter so the user sees one consistent
+ * "outputs for this worktree" universe at every entry point.
+ */
+export function outputsForSlug(
+  items: readonly Output[],
+  slug: string | null,
+): readonly Output[] {
+  if (!slug) return items.filter((o) => !o.slug);
+  return items.filter((o) => !o.slug || o.slug === slug);
 }

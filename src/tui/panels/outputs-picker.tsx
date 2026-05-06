@@ -30,13 +30,25 @@ function relTime(ts: number, now: number): string {
 }
 
 type Props = {
+  /**
+   * Slug whose outputs are listed, or `null` for the no-row scope
+   * (events only). Surfaces in the modal title so the user knows
+   * which worktree's pin/focus they're editing — buckets are
+   * per-worktree.
+   */
+  slug: string | null;
   items: readonly Output[];
   selectedIndex: number;
   /** Id of the pinned output, if any — drives the row pin glyph. */
   pinnedId: string | null;
 };
 
-export function OutputsPicker({ items, selectedIndex, pinnedId }: Props) {
+export function OutputsPicker({
+  slug,
+  items,
+  selectedIndex,
+  pinnedId,
+}: Props) {
   const now = Date.now();
   const hints: Array<[string, string]> = [
     ["j/k", "move"],
@@ -45,8 +57,9 @@ export function OutputsPicker({ items, selectedIndex, pinnedId }: Props) {
     ["*", pinnedId ? "unpin" : "pin"],
     ["esc / q", "cancel"],
   ];
+  const title = slug ? `outputs · ${slug}` : "outputs · global";
   return (
-    <Modal title="outputs" hints={hints}>
+    <Modal title={title} hints={hints}>
       {items.length === 0 ? (
         <text fg={theme.fgDim}>(no outputs)</text>
       ) : (

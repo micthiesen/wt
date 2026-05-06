@@ -66,8 +66,17 @@ import {
   actionOutputId,
   eventsOutputId,
   indexOfOutput,
+  outputsForSlug,
   sessionOutputId,
 } from "../core/outputs.ts";
+
+/** Per-worktree pin/focus state for the Outputs system. */
+type SlugFocus = { focused: string | null; pinned: string | null };
+/** Bucket key for the "no row selected" state. Slugs are user-
+ *  generated branch names with limited charset; this sentinel can't
+ *  collide. */
+const NO_ROW_KEY = "__no_row__";
+const EMPTY_FOCUS: SlugFocus = { focused: null, pinned: null };
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -356,14 +365,14 @@ export function App({ onExit }: Props) {
   // identity of the thing being renamed). Not folded into `modal`
   // because the rename UX uses the footer, not an overlay.
   const [pendingRename, setPendingRename] = useState<string | null>(null);
-  // User's explicit choice of which Output to render in the bottom
-  // pane, when set. `null` means "follow the auto-rules" (selected
-  // row's running action / session / events). Cleared by `escape`,
-  // by a new action launching, or when the targeted output evicts.
-  const [focusedOutput, setFocusedOutput] = useState<string | null>(null);
-  // Pin sticks the displayed output even past auto-rule changes
-  // (selected row, new action). Toggled with `*`.
-  const [pinnedOutput, setPinnedOutput] = useState<string | null>(null);
+  // Per-worktree bottom-pane state. Each slug has its own focused
+  // (explicit pick from picker / cycle keys) and pinned (sticky
+  // override) output. Switching rows restores that worktree's last
+  // selection — so monitoring an action on one slug and a CC session
+  // on another stays mutually independent. The `__no_row__` bucket
+  // covers the "nothing selected" edge (filter excludes everything,
+  // brand-new repo) and pins down what the global pane shows there.
+  const [slugFocus, setSlugFocus] = useState<Record<string, SlugFocus>>({});
   const toastTimer = useRef<Timer | null>(null);
 
   // Auto-tail every busy worktree so logs surface in the activity pane
@@ -483,44 +492,108 @@ export function App({ onExit }: Props) {
     sessionTailRegistry.reconcile(live);
   }, [rows, activeSessions]);
 
-  // Cross-source list of everything renderable in the bottom pane —
-  // events, in-flight + recently-completed actions, live tmux
-  // sessions. The picker enumerates this list; cycle keys index into
-  // it; the displayed output resolves against it.
+  // Global, slug-tagged list of everything renderable in the bottom
+  // pane. Filtered per worktree at the consumption site — see
+  // `visibleOutputs` below.
   const outputs = useOutputs();
+  // Bucket key for the current worktree's pin/focus state. Stays in
+  // sync with the selected row; falls back to `NO_ROW_KEY` when
+  // nothing is selected so the picker / pin still have a place to
+  // store state.
+  const focusKey = currentSlug ?? NO_ROW_KEY;
+  const focusBucket = slugFocus[focusKey] ?? EMPTY_FOCUS;
+  // Outputs visible while sitting on this worktree: the global ones
+  // (events) plus this worktree's actions and sessions. Picker, cycle
+  // keys, and the displayed-output resolver all see the same filtered
+  // universe — that's what makes the per-worktree experience
+  // coherent.
+  const visibleOutputs = useMemo(
+    () => outputsForSlug(outputs, currentSlug ?? null),
+    [outputs, currentSlug],
+  );
   // Auto-rule for the bottom pane when the user hasn't explicitly
-  // picked anything: prefer the selected row's running/recent action,
-  // then a live claude tmux session, then events. Mirrors the prior
-  // ActionViewer / SessionViewer / ActivityPane conditional. Depends
-  // on `currentRun?.startedAt` (not the whole run object) so a stream
-  // of line appends doesn't re-run the memo for an unchanged id.
+  // picked anything for this worktree: prefer the selected row's
+  // running/recent action, then a live claude tmux session, then
+  // events. Mirrors the prior ActionViewer / SessionViewer /
+  // ActivityPane conditional. Depends on `currentRun?.startedAt`
+  // (not the whole run object) so a stream of line appends doesn't
+  // re-run the memo for an unchanged id.
   const autoOutputId = useMemo<string>(() => {
     if (currentSlug && currentRun && showActionViewer) {
       return actionOutputId(currentSlug, currentRun.startedAt);
     }
     if (currentSlug && activeSessions.has(currentSlug)) {
-      return sessionOutputId(currentSlug);
+      return sessionOutputId(currentSlug, "claude");
     }
     return eventsOutputId();
   }, [currentSlug, currentRun?.startedAt, showActionViewer, activeSessions]);
-  // Pin > explicit user pick > auto. We then validate the chosen id
-  // is still present in `outputs`; if it evicted (e.g. the action
-  // FIFO'd out), drop back through the precedence chain.
-  const desiredOutputId = pinnedOutput ?? focusedOutput ?? autoOutputId;
+  // Pin > explicit user pick > auto, all scoped to the current
+  // worktree's bucket. If the chosen id has evicted from the visible
+  // list (action FIFO'd, session ended, or this slug's id belongs to
+  // a different slug after a row change) drop back through the
+  // precedence chain.
+  const desiredOutputId =
+    focusBucket.pinned ?? focusBucket.focused ?? autoOutputId;
   const displayedOutput: Output =
-    outputs.find((o) => o.id === desiredOutputId) ??
-    outputs.find((o) => o.id === autoOutputId) ??
-    outputs[0]!; // events always present
-  // Drop a stale focus reference so escape-to-auto doesn't silently
-  // restore an evicted output. Same for pin.
+    visibleOutputs.find((o) => o.id === desiredOutputId) ??
+    visibleOutputs.find((o) => o.id === autoOutputId) ??
+    visibleOutputs[0]!; // events always present in the filtered list
+  // GC stale per-slug state: drop bucket fields whose target output
+  // is no longer in `outputs`, and drop entire buckets for slugs that
+  // are no longer worktrees. Without the second sweep, a long wt
+  // session destroying and recreating worktrees would accumulate dead
+  // entries forever.
   useEffect(() => {
-    if (focusedOutput && !outputs.find((o) => o.id === focusedOutput)) {
-      setFocusedOutput(null);
-    }
-    if (pinnedOutput && !outputs.find((o) => o.id === pinnedOutput)) {
-      setPinnedOutput(null);
-    }
-  }, [outputs, focusedOutput, pinnedOutput]);
+    setSlugFocus((prev) => {
+      const liveSlugs = new Set<string>([NO_ROW_KEY]);
+      for (const r of rows) liveSlugs.add(r.wt.slug);
+      let changed = false;
+      const next: Record<string, SlugFocus> = {};
+      for (const [key, bucket] of Object.entries(prev)) {
+        if (!liveSlugs.has(key)) {
+          changed = true;
+          continue;
+        }
+        const focused =
+          bucket.focused && outputs.find((o) => o.id === bucket.focused)
+            ? bucket.focused
+            : null;
+        const pinned =
+          bucket.pinned && outputs.find((o) => o.id === bucket.pinned)
+            ? bucket.pinned
+            : null;
+        if (focused !== bucket.focused || pinned !== bucket.pinned) {
+          changed = true;
+        }
+        if (focused === null && pinned === null) {
+          // Drop empty buckets so the map doesn't grow unbounded
+          // through ordinary navigation.
+          if (bucket.focused !== null || bucket.pinned !== null) changed = true;
+          continue;
+        }
+        next[key] = { focused, pinned };
+      }
+      return changed ? next : prev;
+    });
+  }, [outputs, rows]);
+
+  // Helper — applies a partial update to the current worktree's
+  // bucket without forcing every callsite to spell out the spread.
+  function setFocus(slug: string | null, patch: Partial<SlugFocus>): void {
+    const key = slug ?? NO_ROW_KEY;
+    setSlugFocus((prev) => {
+      const cur = prev[key] ?? EMPTY_FOCUS;
+      const next = { ...cur, ...patch };
+      // Drop the bucket entirely when both fields collapse to null
+      // (parity with the GC effect; keeps the map tight).
+      if (next.focused === null && next.pinned === null) {
+        if (!(key in prev)) return prev;
+        const { [key]: _, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [key]: next };
+    });
+  }
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -1041,10 +1114,11 @@ export function App({ onExit }: Props) {
       toast(`action: ${result.reason}`, theme.err, 3000);
       return;
     }
-    // Clear any user-pinned/focused output so the auto-rules surface
-    // the just-launched action. Pin survives — if the user explicitly
-    // pinned something else, they wanted to stay there.
-    if (!pinnedOutput) setFocusedOutput(null);
+    // Clear this worktree's focus so the auto-rules surface the
+    // just-launched action. Per-slug pin survives if set — the user
+    // explicitly pinned something else for this slug; respect it.
+    const bucket = slugFocus[slug] ?? EMPTY_FOCUS;
+    if (!bucket.pinned) setFocus(slug, { focused: null });
     toast(`launched ${result.run.actionName}`, theme.info, 2000);
   }
 
@@ -1366,22 +1440,23 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Outputs picker — vim-buffer-style list of every renderable
-    // stream (events / running + recent actions / live claude
-    // sessions). j/k or arrows move; 1-9 quick-pick by index; Enter
+    // Outputs picker — vim-buffer-style list of this worktree's
+    // outputs (events + this slug's actions + this slug's claude
+    // session). j/k or arrows move; 1-9 quick-pick by index; Enter
     // sets focus and closes; `*` toggles pin on the selected entry;
-    // esc/q cancels. `idx` is clamped against the live `outputs`
-    // length on every keypress because the underlying list can shrink
-    // while the picker is open (FIFO eviction, session ending).
+    // esc/q cancels. `idx` is clamped against the live
+    // `visibleOutputs` length on every keypress because the
+    // underlying list can shrink while the picker is open (FIFO
+    // eviction, session ending).
     if (modal?.kind === "outputsPicker") {
       const idx =
-        outputs.length === 0
+        visibleOutputs.length === 0
           ? 0
-          : Math.min(Math.max(0, modal.index), outputs.length - 1);
+          : Math.min(Math.max(0, modal.index), visibleOutputs.length - 1);
       if (k.name === "j" || k.name === "down") {
         setModal({
           kind: "outputsPicker",
-          index: Math.min(idx + 1, outputs.length - 1),
+          index: Math.min(idx + 1, visibleOutputs.length - 1),
         });
         return;
       }
@@ -1394,24 +1469,27 @@ export function App({ onExit }: Props) {
       }
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
         const i = parseInt(k.sequence, 10) - 1;
-        const target = outputs[i];
+        const target = visibleOutputs[i];
         if (target) {
-          setFocusedOutput(target.id);
+          setFocus(currentSlug ?? null, { focused: target.id });
           setModal(null);
         }
         return;
       }
       if (k.sequence === "*") {
-        const target = outputs[idx];
+        const target = visibleOutputs[idx];
         if (!target) return;
-        setPinnedOutput((p) => (p === target.id ? null : target.id));
-        setFocusedOutput(target.id);
+        const cur = focusBucket.pinned;
+        setFocus(currentSlug ?? null, {
+          focused: target.id,
+          pinned: cur === target.id ? null : target.id,
+        });
         setModal(null);
         return;
       }
       if (k.name === "return") {
-        const target = outputs[idx];
-        if (target) setFocusedOutput(target.id);
+        const target = visibleOutputs[idx];
+        if (target) setFocus(currentSlug ?? null, { focused: target.id });
         setModal(null);
         return;
       }
@@ -1681,52 +1759,65 @@ export function App({ onExit }: Props) {
       setSel(null);
       return;
     }
-    // Escape clears any explicit Output focus / pin so the bottom
-    // pane returns to follow-row auto-rules. Filter-clear above
-    // takes precedence; both can apply but they're disjoint states
-    // (filter edits set the filter; output focus comes from picker /
-    // cycle keys), so the order is fine.
-    if (k.name === "escape" && (focusedOutput || pinnedOutput)) {
-      setFocusedOutput(null);
-      setPinnedOutput(null);
+    // Escape clears this worktree's explicit focus / pin so the
+    // bottom pane returns to follow-row auto-rules. Filter-clear
+    // above takes precedence; both can apply but they're disjoint
+    // states (filter edits set the filter; output focus is per-slug
+    // bucket), so the order is fine.
+    if (
+      k.name === "escape" &&
+      (focusBucket.focused || focusBucket.pinned)
+    ) {
+      setFocus(currentSlug ?? null, { focused: null, pinned: null });
       return;
     }
     // `\` opens the Outputs picker — vim-:ls flavor for the bottom
-    // pane. The cycle keys (`[`/`]`) are the muscle-memory affordance;
-    // this is the discoverability surface.
+    // pane. Cursor lands on the displayed output within this
+    // worktree's filtered list.
     if (k.sequence === "\\") {
-      const idx = Math.max(0, indexOfOutput(outputs, displayedOutput.id));
+      const idx = Math.max(
+        0,
+        indexOfOutput(visibleOutputs, displayedOutput.id),
+      );
       setModal({ kind: "outputsPicker", index: idx });
       return;
     }
-    // `[` / `]` — cycle prev/next through Outputs without opening
-    // the picker. Wraps at both ends.
+    // `[` / `]` — cycle prev/next through THIS worktree's visible
+    // outputs. Wraps at both ends.
     if (k.sequence === "[" || k.sequence === "]") {
-      if (outputs.length === 0) return;
-      const cur = Math.max(0, indexOfOutput(outputs, displayedOutput.id));
+      if (visibleOutputs.length === 0) return;
+      const cur = Math.max(
+        0,
+        indexOfOutput(visibleOutputs, displayedOutput.id),
+      );
       const step = k.sequence === "]" ? 1 : -1;
-      const next = (cur + step + outputs.length) % outputs.length;
-      const target = outputs[next];
-      if (target) setFocusedOutput(target.id);
+      const next =
+        (cur + step + visibleOutputs.length) % visibleOutputs.length;
+      const target = visibleOutputs[next];
+      if (target) setFocus(currentSlug ?? null, { focused: target.id });
       return;
     }
-    // `~` jumps straight to the events output — the "global" pane
-    // when you want to step out of whatever per-row context the
+    // `~` jumps to events for this worktree's bucket — the global
+    // pane when you want to step out of whatever per-row context the
     // auto-rules surfaced. Clears pin so the jump actually takes
     // effect; otherwise pin > focus and the keypress would be a
     // silent no-op.
     if (k.sequence === "~") {
-      setPinnedOutput(null);
-      setFocusedOutput(eventsOutputId());
+      setFocus(currentSlug ?? null, {
+        focused: eventsOutputId(),
+        pinned: null,
+      });
       return;
     }
-    // `*` toggles pin on the current displayed output. Pinning
-    // overrides auto-rules and other focus changes; press again to
-    // unpin and resume auto.
+    // `*` toggles pin on the current displayed output for THIS
+    // worktree. Pin overrides auto-rules and other focus changes for
+    // this slug; press again to unpin and resume auto.
     if (k.sequence === "*") {
       const id = displayedOutput.id;
-      setPinnedOutput((p) => (p === id ? null : id));
-      setFocusedOutput(id);
+      setFocus(currentSlug ?? null, {
+        focused: id,
+        pinned: focusBucket.pinned === id ? null : id,
+      });
       return;
     }
     // Unified Shift+J/K — moves the current row one position in
@@ -2279,17 +2370,23 @@ export function App({ onExit }: Props) {
       <OutputViewer
         output={displayedOutput}
         height={activityHeight}
-        pinned={!!pinnedOutput && pinnedOutput === displayedOutput.id}
+        pinned={
+          !!focusBucket.pinned && focusBucket.pinned === displayedOutput.id
+        }
       />
       {modal?.kind === "outputsPicker" ? (
         <OutputsPicker
-          items={outputs}
+          slug={currentSlug ?? null}
+          items={visibleOutputs}
           selectedIndex={
-            outputs.length === 0
+            visibleOutputs.length === 0
               ? 0
-              : Math.min(Math.max(0, modal.index), outputs.length - 1)
+              : Math.min(
+                  Math.max(0, modal.index),
+                  visibleOutputs.length - 1,
+                )
           }
-          pinnedId={pinnedOutput}
+          pinnedId={focusBucket.pinned}
         />
       ) : null}
       <Footer mode={footer} hint={footerHint} />
