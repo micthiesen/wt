@@ -165,27 +165,43 @@ export function splitMessage(text: string): {
   };
 }
 
+type UserTextClass =
+  | { kind: "drop" }
+  | { kind: "interrupted" }
+  | { kind: "prompt"; text: string };
+
+const CMD_MESSAGE_RE =
+  /^\s*<command-message>([^<]*)<\/command-message>\s*<command-name>([^<]*)<\/command-name>(?:\s*<command-args>([\s\S]*?)<\/command-args>)?/;
+
 /**
- * User-envelope `text` blocks fall into three buckets that aren't
- * user-typed prompts and shouldn't render as `> …`:
- *  - skill bodies — auto-injected when claude invokes a Skill tool;
- *    the body is just the file at `~/.claude/skills/<name>/SKILL.md`
- *    and the user already saw the `⚒ Skill` call.
- *  - slash-command bodies — same idea for `/<name>` commands;
- *    auto-injected starting with `# /<name>`.
- *  - interrupt markers — claude emits `[Request interrupted by user]`
- *    when the user cancels a turn. Worth surfacing.
+ * Classify user-envelope text into one of: drop (auto-injected noise
+ * the user already saw via the matching tool call), interrupted (a
+ * cancel marker worth surfacing), or prompt (real user-typed content).
  *
- * Anything else is treated as a real user prompt (some sessions store
- * prompts as text-block arrays rather than bare strings).
+ *  - skill bodies (`Base directory for this skill: …`) and slash-
+ *    command bodies (`# /<name>`) are auto-injected after the
+ *    matching `⚒ Skill` / `⚒ <Tool>` call; the call already conveys
+ *    the invocation, so the body is noise. Drop.
+ *  - command-message XML wraps a `/<name> <args>` invocation in
+ *    `<command-message><command-name>…<command-args>` tags. Unwrap
+ *    to `> /<name> <args>` so the user's actual typed input shows.
+ *  - `[Request interrupted by user]` → `! interrupted` info line.
+ *
+ * Applied to both bare string content and array text blocks so the
+ * XML-stripping logic runs in one place.
  */
-function classifyUserText(
-  text: string,
-): "drop" | "interrupted" | "prompt" {
-  if (text.startsWith("[Request interrupted")) return "interrupted";
-  if (text.startsWith("Base directory for this skill:")) return "drop";
-  if (/^#\s+\//.test(text)) return "drop";
-  return "prompt";
+function classifyUserText(text: string): UserTextClass {
+  if (text.startsWith("[Request interrupted")) return { kind: "interrupted" };
+  if (text.startsWith("Base directory for this skill:")) return { kind: "drop" };
+  const cmd = CMD_MESSAGE_RE.exec(text);
+  if (cmd) {
+    const name = (cmd[2] ?? "").trim();
+    const args = (cmd[3] ?? "").trim();
+    const rendered = args ? `${name} ${args}` : name;
+    return { kind: "prompt", text: rendered };
+  }
+  if (/^#\s+\//.test(text)) return { kind: "drop" };
+  return { kind: "prompt", text };
 }
 
 function compactPrompt(text: string): string {
@@ -193,6 +209,23 @@ function compactPrompt(text: string): string {
   return oneLine.length > PROMPT_BRIEF
     ? `${oneLine.slice(0, PROMPT_BRIEF - 1)}…`
     : oneLine;
+}
+
+/**
+ * Run `text` through `classifyUserText` and append the appropriate
+ * line(s) to `out`. Shared between the bare-string envelope path and
+ * the per-text-block path so the XML / interrupt / drop logic only
+ * lives in one place.
+ */
+function appendUserText(out: ActionLine[], ts: number, text: string): void {
+  const cls = classifyUserText(text);
+  if (cls.kind === "drop") return;
+  if (cls.kind === "interrupted") {
+    out.push({ ts, kind: "info", text: "! interrupted" });
+    return;
+  }
+  const compacted = compactPrompt(cls.text);
+  if (compacted) out.push({ ts, kind: "user", text: `> ${compacted}` });
 }
 
 /**
@@ -235,8 +268,7 @@ export function messageToLines(opts: {
   const out: ActionLine[] = [];
   if (!m) return out;
   if (role === "user" && typeof m.content === "string") {
-    const compacted = compactPrompt(m.content);
-    if (compacted) out.push({ ts, kind: "user", text: `> ${compacted}` });
+    appendUserText(out, ts, m.content);
     return out;
   }
   const content = asArr(m.content);
@@ -249,14 +281,7 @@ export function messageToLines(opts: {
     const b = asObj(block);
     if (!b) continue;
     if (b.type === "text" && typeof b.text === "string") {
-      const injection = classifyUserText(b.text);
-      if (injection === "drop") continue;
-      if (injection === "interrupted") {
-        out.push({ ts, kind: "info", text: "! interrupted" });
-        continue;
-      }
-      const compacted = compactPrompt(b.text);
-      if (compacted) out.push({ ts, kind: "user", text: `> ${compacted}` });
+      appendUserText(out, ts, b.text);
     } else if (b.type === "tool_result") {
       const id = typeof b.tool_use_id === "string" ? b.tool_use_id : null;
       const start = id ? toolStarts.get(id) : undefined;
