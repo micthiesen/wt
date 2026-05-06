@@ -83,9 +83,7 @@ const DETAILED_TOOLS = new Set([
 export const MAX_BUFFERED_LINES = 1000;
 /** Cap message-fragment count from a single assistant turn so a runaway response can't blow line buffers. */
 const MAX_PIECES_PER_MESSAGE = 50;
-/** User-prompt truncation length. The `> …` row is informational, not the full prompt. */
-const PROMPT_BRIEF = 200;
-/** Compaction length for thinking + summary + queued lines. */
+/** Compaction length for thinking + queued lines. */
 const META_BRIEF = 200;
 
 export function asObj(v: unknown): Record<string, unknown> | null {
@@ -204,18 +202,17 @@ function classifyUserText(text: string): UserTextClass {
   return { kind: "prompt", text };
 }
 
-function compactPrompt(text: string): string {
-  const oneLine = text.replaceAll("\n", " ").replace(/\s+/g, " ").trim();
-  return oneLine.length > PROMPT_BRIEF
-    ? `${oneLine.slice(0, PROMPT_BRIEF - 1)}…`
-    : oneLine;
-}
-
 /**
  * Run `text` through `classifyUserText` and append the appropriate
  * line(s) to `out`. Shared between the bare-string envelope path and
  * the per-text-block path so the XML / interrupt / drop logic only
  * lives in one place.
+ *
+ * Real prompts use the same newline-split + per-line cap as assistant
+ * text, so a multi-paragraph prompt renders as multiple rows instead
+ * of collapsing to a single truncated `> …` line. The leading `>` is
+ * on the first row only; subsequent rows align with the assistant
+ * indent.
  */
 function appendUserText(out: ActionLine[], ts: number, text: string): void {
   const cls = classifyUserText(text);
@@ -224,15 +221,28 @@ function appendUserText(out: ActionLine[], ts: number, text: string): void {
     out.push({ ts, kind: "info", text: "! interrupted" });
     return;
   }
-  const compacted = compactPrompt(cls.text);
-  if (compacted) out.push({ ts, kind: "user", text: `> ${compacted}` });
+  const { pieces, truncated } = splitMessage(cls.text);
+  if (pieces.length === 0) return;
+  pieces.forEach((piece, i) => {
+    out.push({
+      ts,
+      kind: "user",
+      text: `${i === 0 ? "> " : "  "}${piece}`,
+    });
+  });
+  if (truncated > 0) {
+    out.push({
+      ts,
+      kind: "info",
+      text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
+    });
+  }
 }
 
 /**
- * Compact a multi-line meta string (thinking text, away summary,
- * queued prompt) to a single dimmed-tail line. Same shape as
- * `compactPrompt`, just a different cap so a long thought doesn't
- * fill the pane on its own.
+ * Compact a multi-line meta string (thinking text, queued prompt) to
+ * a single dim-prefixed line — for content that doesn't earn the
+ * multi-row treatment user prompts and assistant text get.
  */
 export function compactMeta(text: string): string {
   const oneLine = text.replaceAll("\n", " ").replace(/\s+/g, " ").trim();
