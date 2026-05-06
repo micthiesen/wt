@@ -26,10 +26,15 @@ export const qk = {
   github: (branches: readonly string[]) =>
     ["github", [...branches].sort()] as const,
   /**
-   * Repo-wide contributor list (sorted by commit count). Sits under
-   * `["github"]` so it clears alongside the PR fetch on `refreshGithub`.
+   * Repo-wide contributor list (sorted by commit count). Lives outside
+   * the `["github"]` prefix on purpose — `refreshGithub`/`refreshAll`
+   * blow that prefix away every time the user hits `r`, but the
+   * contributor set drifts on a scale of weeks, not minutes. Letting it
+   * survive cross-refresh is the difference between "reviewer picker
+   * opens instantly" and "reviewer picker pays a 6-round-trip refetch
+   * after every refresh".
    */
-  contributors: () => ["github", "contributors"] as const,
+  contributors: () => ["contributors"] as const,
   /** Per-worktree property namespace. */
   wt: (slug: string) =>
     ({

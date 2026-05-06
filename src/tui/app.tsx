@@ -793,6 +793,11 @@ export function App({ onExit }: Props) {
       toast("PR is a draft (mark ready first)", theme.warn, 2000);
       return;
     }
+    // `fetchContributors` returns cached data without awaiting when
+    // warm (background refresh when stale). Only the first-ever open
+    // pays a fetch; after that the picker opens instantly even when
+    // the cached list is stale. `fetchMe` is process-cached after
+    // first call.
     const [contributors, me] = await Promise.all([
       fetchContributors(),
       fetchMe(),

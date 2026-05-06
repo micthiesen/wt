@@ -146,15 +146,18 @@ export const githubQuery = (branches: readonly string[]) =>
 
 /**
  * Repo-wide contributor list. Fetched lazily on first reviewer-picker
- * open; the staleTime is generous because the contributor set drifts
- * slowly. Sits under the `["github"]` prefix so `refreshGithub()`
- * clears it alongside the PR fetch.
+ * open; the staleTime is a week because the contributor set drifts on
+ * a scale of weeks (former contractors, new joiners). The picker reads
+ * cached data synchronously and triggers a background refetch when
+ * stale rather than blocking, so a stale entry just means "next open
+ * gets the refreshed list" — not "this open hangs for 6 round-trips".
+ * Persisted across runs via the SQLite persister (30-day maxAge).
  */
 export const contributorsQuery = () =>
   queryOptions({
     queryKey: qk.contributors(),
     queryFn: async ({ signal }): Promise<Contributor[]> => fetchRepoContributors(signal),
-    staleTime: 24 * 60 * 60 * 1000,
+    staleTime: 7 * 24 * 60 * 60 * 1000,
     gcTime: Number.POSITIVE_INFINITY,
   });
 

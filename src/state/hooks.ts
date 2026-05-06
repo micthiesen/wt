@@ -118,12 +118,30 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
     },
     /**
-     * Fetch the repo-wide contributor list, hitting the cache when
-     * available. Used by the reviewer picker so we have a fallback
-     * candidate list when GitHub's `suggestedReviewers` is empty.
+     * Read the repo-wide contributor list from cache without blocking
+     * on the network when warm. If the cached entry is stale we kick
+     * off a background refetch so the *next* picker open sees the
+     * refreshed list, but return what we already have right now — a
+     * stale list is fine, what's not fine is paying 6 sequential gh
+     * round-trips on every open. The one exception is a truly cold
+     * cache (first-ever open, or the persister evicted past its
+     * 30-day maxAge): there we await one fetch so the picker has
+     * *something* to show beyond an empty fallback list.
      */
     async fetchContributors(): Promise<readonly Contributor[]> {
-      return await qc.fetchQuery(contributorsQuery());
+      const opts = contributorsQuery();
+      const cached = qc.getQueryData<readonly Contributor[]>(opts.queryKey);
+      if (cached === undefined) {
+        return await qc.fetchQuery(opts);
+      }
+      const state = qc.getQueryState(opts.queryKey);
+      const isStale =
+        !state ||
+        Date.now() - state.dataUpdatedAt > (opts.staleTime as number);
+      if (isStale) {
+        void qc.prefetchQuery(opts);
+      }
+      return cached;
     },
     /**
      * Currently-authenticated GitHub login (or `null` when gh isn't
