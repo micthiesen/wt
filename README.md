@@ -18,6 +18,7 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 - `gh` (GitHub CLI, authenticated) — needed for the PR row (PR state, checks, review, merge queue, auto-merge state, suggested + requested reviewers) and for the in-TUI PR actions (arm/disable auto-merge, mark draft ready, edit reviewers). Also used to derive the repo's `nameWithOwner`.
 - `aws` CLI with a profile that can read your SST state bucket — needed when `[deploy.sst]` is configured (drives the stage row + `wt stages`).
 - `zed` CLI — needed for `wt open` and the `o` keybinding.
+- [`hunk`](https://github.com/modem-dev/hunk) (`npm i -g hunkdiff`) — needed for the default F11 diff command (`hunk diff {{base}} --watch`). Override `[diff].command` in `config.toml` if you'd rather use `gitu`, `lazygit`, etc.
 - Linear — no CLI; the integration only constructs URLs from issue IDs in your branch slug.
 - Claude Code — no CLI; the integration reads `~/.claude/projects/*` directly to surface live session state.
 - An OpenAI-compatible LLM endpoint (LM Studio, Ollama with the OpenAI bridge, llama.cpp's server, etc.) — needed for the AI title + description in the details pane. `wt` runs a single graceful-degradation diff through `/v1/chat/completions`; results are content-addressed so identical diffs (across rebase / amend / branch rename) share a cached summary.

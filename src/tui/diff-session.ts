@@ -23,12 +23,20 @@ export async function enterDiffSession(opts: {
   renderer: CliRenderer;
   slug: string;
   cwd: string;
+  /**
+   * Resolved diff base ref to splice into `{{base}}` in
+   * `[diff].command` (default `hunk diff {{base}} --watch`). For
+   * trunk-targeted worktrees this is `origin/<config.branch.base>`;
+   * for stack-detected or non-trunk-PR worktrees it's the parent
+   * branch ref. Forwarded verbatim to `attachOrCreate`.
+   */
+  base: string;
 }): Promise<DiffResult> {
-  const { renderer, slug, cwd } = opts;
+  const { renderer, slug, cwd, base } = opts;
   renderer.suspend();
   process.stdout.write(CLEAR_SCREEN);
   try {
-    return await attachOrCreate({ slug, cwd, kind: "diff" });
+    return await attachOrCreate({ slug, cwd, kind: "diff", base });
   } finally {
     process.stdout.write(CLEAR_SCREEN);
     renderer.resume();

@@ -22,6 +22,7 @@ import { sessionTailRegistry } from "../core/session-tail.ts";
 import { removeShellLog, shellTailRegistry } from "../core/shell-tail.ts";
 import { stageUrl } from "../core/stage.ts";
 import {
+  diffCommandUsesBase,
   killAllSessionsFor,
   killDiffSession,
   killSession,
@@ -79,6 +80,18 @@ import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
 import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard, WT_REPO_PATH } from "./helpers.ts";
 import { theme } from "./theme.ts";
+
+/**
+ * Resolve the diff base ref for a worktree row. Same priority chain
+ * as `useWorktreeRows.resolveStackedOn` exposes: a parent branch when
+ * the row is stack-detected or its PR targets a non-trunk base,
+ * otherwise `origin/<config.branch.base>`. Used by the F11 handler to
+ * fill `{{base}}` in `[diff].command` and by the kill-on-base-change
+ * effect to detect when a stacked row's parent moved.
+ */
+function resolveDiffBase(row: WorktreeRow): string {
+  return row.stackedOn?.diffBase ?? `origin/${config.branch.base}`;
+}
 
 /** Per-worktree pin/focus state for the Outputs system. */
 type SlugFocus = { focused: string | null; pinned: string | null };
@@ -506,6 +519,40 @@ export function App({ onExit }: Props) {
     }
     shellTailRegistry.reconcile(live);
   }, [rows, activeShellSessions]);
+
+  // Kill any live `<slug>-diff` tmux session whose resolved base ref
+  // has changed since the session was opened, so the next F11 spawns
+  // fresh against the new ref instead of leaving the user staring at a
+  // diff vs the prior parent. Triggered by stack re-detection (reflog
+  // says we rebased onto a different worktree) or PR base flips. Only
+  // runs when the user's diff command actually depends on `{{base}}` —
+  // commands like `gitu` ignore the base and shouldn't be torn down on
+  // unrelated re-resolutions.
+  const lastDiffBase = useRef<Map<string, string>>(new Map());
+  useEffect(() => {
+    if (!diffCommandUsesBase(config.diff.command)) return;
+    const seen = new Set<string>();
+    for (const r of rows) {
+      const slug = r.wt.slug;
+      seen.add(slug);
+      const next = resolveDiffBase(r);
+      const prev = lastDiffBase.current.get(slug);
+      lastDiffBase.current.set(slug, next);
+      if (prev === undefined || prev === next) continue;
+      if (!activeDiffSessions.has(slug)) continue;
+      const log = createLogger(slug);
+      log.event.info(`diff base changed (${prev} → ${next}); killing diff session`);
+      void (async () => {
+        await killDiffSession(slug);
+        await refreshTmuxSessions();
+      })();
+    }
+    // Drop entries for slugs that no longer exist so the map doesn't
+    // grow unboundedly across the session.
+    for (const slug of [...lastDiffBase.current.keys()]) {
+      if (!seen.has(slug)) lastDiffBase.current.delete(slug);
+    }
+  }, [rows, activeDiffSessions, refreshTmuxSessions]);
 
   // Slugs whose lock op is `"remove"` — drives the destroy outputs
   // surfaced in the picker. Computed from `rows` (each busy row
@@ -2108,10 +2155,11 @@ export function App({ onExit }: Props) {
         return;
       }
       const cwd = current.wt.path;
+      const base = resolveDiffBase(current);
       const diffLog = createLogger(slug);
       void (async () => {
-        diffLog.event.info(`opening diff (${config.diff.command}, F11 to detach)`);
-        const result = await enterDiffSession({ renderer, slug, cwd });
+        diffLog.event.info(`opening diff vs ${base} (F11 to detach)`);
+        const result = await enterDiffSession({ renderer, slug, cwd, base });
         if (result.kind === "spawn-failed") {
           diffLog.event.err(`diff failed to start: ${result.reason}`);
           toast(`diff failed: ${result.reason}`, theme.err, 3000);

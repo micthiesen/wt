@@ -56,8 +56,22 @@ export type DiffConfig = {
   /**
    * Shell command launched on F11 inside the selected worktree's path.
    * Runs via `$SHELL -lc` (bash fallback) so pipes (`git diff | delta --paging=always`)
-   * and aliases work. Defaults to `gitu`; users can swap in `lazygit`,
-   * `tig status`, or anything else they prefer.
+   * and aliases work.
+   *
+   * Supports a single `{{base}}` placeholder that's substituted at
+   * spawn time with the worktree's resolved diff base — `origin/<trunk>`
+   * for un-stacked worktrees, the parent branch ref for stacked /
+   * non-trunk-PR worktrees. The default is `hunk diff {{base}} --watch`,
+   * which renders a live working-tree-vs-base diff (untracked files
+   * included) and reflows on commits, edits, and base-tip movement.
+   * When the base wt resolved against changes (PR base flip, stack
+   * reroot), the existing diff session is killed so the next F11
+   * reopens against the new ref.
+   *
+   * Users can swap in any other diff TUI: `gitu`, `lazygit`, `tig
+   * status`, `delta`-piped commands, or a custom script. Commands
+   * that don't use `{{base}}` are passed through unchanged and aren't
+   * subject to base-change kills.
    */
   command: string;
 };
@@ -157,7 +171,7 @@ const GENERIC_DEFAULTS = {
     autoRegenPaths: ["sst-env.d.ts"] as const,
   },
   diff: {
-    command: "gitu",
+    command: "hunk diff {{base}} --watch",
   },
   ai: {
     maxInputTokens: 8000,

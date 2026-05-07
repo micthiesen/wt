@@ -203,6 +203,34 @@ export async function killAllSessionsFor(slug: string): Promise<void> {
   ]);
 }
 
+const BASE_PLACEHOLDER = "{{base}}";
+
+/** Whether the user's `[diff].command` template depends on the diff base. */
+export function diffCommandUsesBase(template: string): boolean {
+  return template.includes(BASE_PLACEHOLDER);
+}
+
+/**
+ * Substitute `{{base}}` in the user's diff command template with the
+ * resolved base ref. The ref is wrapped in double quotes so refs
+ * containing characters that the user's shell would otherwise expand
+ * (e.g. globs in oddly-named local branches) survive intact. Refs
+ * starting with `origin/` and ordinary branch names contain only safe
+ * characters in practice; the quoting is belt-and-braces.
+ *
+ * Templates that don't reference `{{base}}` pass through unchanged so
+ * users with custom diff commands (`gitu`, `lazygit`, …) keep working.
+ * Templates that do reference it but receive no base resolve the
+ * placeholder to the empty string so the user's shell surfaces the
+ * resulting parse error visibly rather than us silently masking the
+ * misuse.
+ */
+function resolveDiffCommand(template: string, base: string | undefined): string {
+  if (!diffCommandUsesBase(template)) return template;
+  const ref = base ? `"${base.replaceAll('"', '\\"')}"` : "";
+  return template.replaceAll(BASE_PLACEHOLDER, ref);
+}
+
 async function killByName(name: string): Promise<void> {
   const proc = Bun.spawn(
     ["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${name}`],
@@ -334,8 +362,18 @@ export async function attachOrCreate(opts: {
   slug: string;
   cwd: string;
   kind: SessionKind;
+  /**
+   * Resolved diff base ref for `{{base}}` substitution in
+   * `config.diff.command`. Required by callers using a base-aware diff
+   * command (the shipped default `hunk diff {{base}} --watch`); ignored
+   * for non-diff kinds and for diff commands that don't reference
+   * `{{base}}`. Substitution is verbatim — caller is responsible for
+   * providing a ref that's safe to splice into a shell-quoted command
+   * (the ref is double-quoted at spawn time).
+   */
+  base?: string;
 }): Promise<AttachResult> {
-  const { slug, cwd, kind } = opts;
+  const { slug, cwd, kind, base } = opts;
   const name = sessionName(slug, kind);
   const { path: configPath, changed } = writeConfig();
   if (changed) {
@@ -363,7 +401,7 @@ export async function attachOrCreate(opts: {
     kind === "claude"
       ? ["claude", ...wtSessionArgs(cwd)]
       : kind === "diff"
-        ? [userShell, "-lc", config.diff.command]
+        ? [userShell, "-lc", resolveDiffCommand(config.diff.command, base)]
         : [userShell, "-l"];
 
   // Shell: pre-create the session detached and chain `pipe-pane` to a
