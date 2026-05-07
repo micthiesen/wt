@@ -44,20 +44,37 @@
  *    is what you want. "Mark stale" is a web-app pattern for
  *    background tabs; we don't have those.
  *
- * 3. Custom actions declare what they affect.
+ * 3. Custom actions declare what they affect AND what they require.
  *
- *    `[[actions]]` entries in `config.toml` carry an `affects` tag
- *    array (`"git"`, `"github"`). The TUI subscribes to action
- *    completions and invalidates the matching state domains when a
- *    run reaches a terminal status. Defaults: claude actions push
- *    commits, so they default to `["git", "github"]`; shell actions
- *    are opaque, so they default to `[]` and the user opts in (e.g.
- *    a `git checkout` shell action sets `affects = ["git"]`).
+ *    `[[actions]]` entries in `config.toml` carry two tag arrays:
  *
- *    For a built-in mutation, the equivalent is just calling the
- *    relevant refresh helper at the call site (`refreshGithub`,
- *    `invalidateWorktree(slug)`, …) — the action runner only exists
- *    to bridge config-defined work to the same invalidation surface.
+ *    - `affects` (`"git"`, `"github"`) — state domains the action
+ *      mutates. The TUI subscribes to action completions and
+ *      invalidates the matching state domains on any terminal status.
+ *      Defaults: claude actions push commits → `["git", "github"]`;
+ *      shell actions are opaque → `[]` (opt in explicitly, e.g. a
+ *      `git checkout` shell action sets `affects = ["git"]`).
+ *
+ *    - `requires` (`"pr"`, `"pr.ready"`) — preconditions evaluated
+ *      synchronously against the row state via
+ *      `evaluateActionRequirements` (in `core/actions.ts`). The
+ *      picker grays out unavailable entries with the reason as the
+ *      dim subtitle; the launcher toasts the reason if a digit /
+ *      Enter pick targets a blocked entry. Default: `[]`.
+ *
+ *    Predicates read row state synchronously, so they cascade off
+ *    the optimistic patches in rule (1) for free — marking a PR
+ *    ready optimistically flips `isDraft`, and the next picker open
+ *    shows `requires = ["pr.ready"]` actions as available before the
+ *    server confirms; rollback re-blocks them.
+ *
+ *    For built-in mutations, the equivalent of `affects` is just
+ *    calling the relevant refresh helper at the call site
+ *    (`refreshGithub`, `invalidateWorktree(slug)`, …); the
+ *    equivalent of `requires` is the inline guards at the keybinding
+ *    handler (`if (!row?.pr) { toast(…); return; }`). The action
+ *    runner exists to bridge config-defined work to the same
+ *    invalidation + gating surface.
  *
  * ────────────────────────────────────────────────────────────────────
  */
@@ -136,17 +153,20 @@ export function useWtActions() {
   const qc = useQueryClient();
   return {
     /**
-     * Run a mutation with an optimistic cache patch and reconcile-on-success.
+     * Run a mutation with an optimistic cache patch and reconcile-on-settle.
      *
      * Four steps: cancel any in-flight refetches against `filter` (so
      * they can't clobber the optimistic state on completion), snapshot
      * every matching cache entry, write the patch (synchronous — the
      * badge flips before the network call lands), await `run`, then
-     * invalidate (active refetch reconciles against server truth). On
-     * throw, rollback every captured snapshot to its prior value and
-     * rethrow. The post-success invalidate is fire-and-forget; if its
-     * refetch fails the optimistic state remains until the next user
-     * refresh.
+     * invalidate the same filter (active refetch reconciles against
+     * server truth). Both success and failure paths invalidate: on
+     * throw, rollback every captured snapshot to its prior value AND
+     * invalidate so a network error after server commit (rare but
+     * possible) gets reconciled rather than leaving the UI lying
+     * indefinitely. The invalidates are fire-and-forget; if a refetch
+     * itself fails the optimistic/rolled-back state remains until the
+     * next user refresh.
      *
      * `filter` is a queryKey prefix. The patch runs against every
      * matching entry — for queries keyed by inputs the call site
@@ -179,11 +199,12 @@ export function useWtActions() {
       qc.setQueriesData<TData>(filter, patch);
       try {
         await run();
-        void qc.invalidateQueries(filter);
       } catch (err) {
         for (const [key, value] of snapshots) qc.setQueryData(key, value);
+        void qc.invalidateQueries(filter);
         throw err;
       }
+      void qc.invalidateQueries(filter);
     },
     /**
      * Refetch only the observed queries that are past their staleTime.

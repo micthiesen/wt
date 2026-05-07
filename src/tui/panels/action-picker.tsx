@@ -1,4 +1,8 @@
-import { applyVars, type ActionVars } from "../../core/actions.ts";
+import {
+  applyVars,
+  type ActionAvailability,
+  type ActionVars,
+} from "../../core/actions.ts";
 import type { ActionDef } from "../../core/config.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
@@ -9,10 +13,13 @@ type ClaudeActionDef = Extract<ActionDef, { kind: "claude" }>;
 /**
  * Picker-mode item: one of the configured actions, or the trailing
  * "Custom prompt..." entry that drops you straight into a freeform
- * editor with no template prefix.
+ * editor with no template prefix. `availability` reflects the def's
+ * `requires` evaluated against the current row state — `ok: false`
+ * grays the entry and surfaces the reason as the dim subtitle. The
+ * Custom entry is always available.
  */
 export type PickerItem =
-  | { kind: "action"; def: ActionDef }
+  | { kind: "action"; def: ActionDef; availability: ActionAvailability }
   | { kind: "custom" };
 
 /**
@@ -47,21 +54,39 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
       {items.map((item, i) => {
         const selected = i === selectedIndex;
         const bg = selected ? theme.rowSelectedBg : undefined;
-        const fg = selected ? theme.fgBright : theme.fg;
+        const isCustom = item.kind === "custom";
+        const blocked = !isCustom && !item.availability.ok;
         // Custom entry gets the `!` chord prefix (mirrors `l` for "+ new
         // section"); configured actions get 1..9 quick-pick digits.
-        const isCustom = item.kind === "custom";
         const actionIndex = isCustom ? -1 : i;
         const showDigit = !isCustom && actionIndex < 9;
         const prefix = isCustom ? "!" : showDigit ? `${actionIndex + 1}` : " ";
-        const prefixFg = isCustom ? theme.accent : theme.fgDim;
+        const prefixFg = isCustom
+          ? theme.accent
+          : blocked
+            ? theme.fgDim
+            : theme.fgDim;
+        // Blocked actions: dim label even when selected. Mirrors the
+        // disabled-but-discoverable convention used for grayed sections
+        // elsewhere — entry stays visible (so the user knows it exists)
+        // but reads as inactive at a glance.
+        const fg = blocked
+          ? theme.fgDim
+          : selected
+            ? theme.fgBright
+            : theme.fg;
         const labelFg = isCustom ? theme.accent : fg;
         const label = isCustom ? "Custom prompt…" : item.def.name;
+        // Hint replaces the action id with the block reason for
+        // unavailable items so the user knows *why* it's grayed out
+        // without needing to remember the def's requirements.
         const hint = isCustom
           ? "freeform"
-          : item.def.kind === "shell"
-            ? `$ ${item.def.id}`
-            : item.def.id;
+          : blocked
+            ? `(${(item.availability as { reason: string }).reason})`
+            : item.def.kind === "shell"
+              ? `$ ${item.def.id}`
+              : item.def.id;
         return (
           <box
             key={isCustom ? "__custom__" : item.def.id}

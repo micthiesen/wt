@@ -27,12 +27,51 @@ import {
   formatTokens,
   messageToLines,
 } from "./claude-events.ts";
-import { type ActionDef, type EffectTag, config } from "./config.ts";
+import { type ActionDef, type EffectTag, type RequireTag, config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { streamLines } from "./proc.ts";
+import type { PullRequest } from "./types.ts";
 
-export type { ActionDef, EffectTag } from "./config.ts";
+export type { ActionDef, EffectTag, RequireTag } from "./config.ts";
 export type { ActionLine, ActionLineKind } from "./claude-events.ts";
+
+/**
+ * Snapshot of row state the requirement predicates read. Kept narrow
+ * so callers can pass a row from the TUI aggregator or a synthesized
+ * shape from a one-off context without dragging in `WorktreeRow`'s
+ * full surface.
+ */
+export type ActionRowState = {
+  pr: PullRequest | undefined;
+};
+
+export type ActionAvailability =
+  | { ok: true }
+  | { ok: false; reason: string };
+
+/**
+ * Evaluate a def's `requires` against a row snapshot. Pure synchronous
+ * fn: predicates read cached row state, so optimistic patches that
+ * already mutated row state cascade for free (mark a PR ready → next
+ * picker open shows `requires = ["pr.ready"]` actions as available
+ * before the server confirms; rollback re-blocks them). See the
+ * architecture block in `state/hooks.ts`.
+ */
+export function evaluateActionRequirements(
+  requires: readonly RequireTag[],
+  row: ActionRowState,
+): ActionAvailability {
+  for (const req of requires) {
+    if (req === "pr") {
+      if (!row.pr) return { ok: false, reason: "no PR" };
+    } else if (req === "pr.ready") {
+      if (!row.pr) return { ok: false, reason: "no PR" };
+      if (row.pr.isDraft) return { ok: false, reason: "PR is draft" };
+      if (row.pr.state !== "OPEN") return { ok: false, reason: "PR not open" };
+    }
+  }
+  return { ok: true };
+}
 
 const log = createLogger("[actions]");
 
@@ -259,6 +298,7 @@ class ActionRegistry {
         name: "Custom prompt",
         prompt: "",
         affects: ["git", "github"],
+        requires: [],
       },
       slug,
       cwd,

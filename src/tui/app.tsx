@@ -4,6 +4,7 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 
 import {
   actionRegistry,
+  evaluateActionRequirements,
   type ActionDef,
   type ActionRun,
   type ActionVars,
@@ -1249,6 +1250,14 @@ export function App({ onExit }: Props) {
       toast("no PR for this row", theme.warn, 2000);
       return;
     }
+    if (action === "enable" && row.pr.autoMerge) {
+      toast("auto-merge already enabled", theme.info, 2000);
+      return;
+    }
+    if (action === "disable" && !row.pr.autoMerge) {
+      toast("auto-merge not enabled", theme.info, 2000);
+      return;
+    }
     const prNumber = row.pr.number;
     const branch = row.wt.branch;
     // Optimistic shape for enable: we don't know the merge method
@@ -1288,15 +1297,35 @@ export function App({ onExit }: Props) {
     toast(`auto-merge ${past} for #${prNumber}`, theme.ok, 2500);
   }
 
-  function buildActionPickerItems(): PickerItem[] {
+  function buildActionPickerItems(slug: string): PickerItem[] {
+    const row = rows.find((r) => r.wt.slug === slug);
+    const rowState = { pr: row?.pr };
     return [
-      ...config.actions.map((def) => ({ kind: "action" as const, def })),
+      ...config.actions.map((def) => ({
+        kind: "action" as const,
+        def,
+        availability: evaluateActionRequirements(def.requires, rowState),
+      })),
       { kind: "custom" as const },
     ];
   }
 
+  /**
+   * Returns true if the item is launchable. For unavailable actions
+   * toasts the reason so the user understands the no-op without
+   * having to scan the dim subtitle in the picker. Used at both the
+   * Enter and quick-pick-digit handlers so an unavailable action
+   * can't slip into the edit modal.
+   */
+  function canPickAction(item: PickerItem): boolean {
+    if (item.kind === "custom") return true;
+    if (item.availability.ok) return true;
+    toast(`${item.def.name}: ${item.availability.reason}`, theme.warn, 2500);
+    return false;
+  }
+
   function openActionPicker(slug: string): void {
-    const items = buildActionPickerItems();
+    const items = buildActionPickerItems(slug);
     setModal({
       kind: "actionPicker",
       state: { mode: "list", slug, index: 0, items },
@@ -1328,6 +1357,13 @@ export function App({ onExit }: Props) {
     if (row.status.kind === StatusKind.Busy) {
       toast(`${slug} is busy`, theme.warn, 2000);
       return;
+    }
+    if (def) {
+      const avail = evaluateActionRequirements(def.requires, { pr: row.pr });
+      if (!avail.ok) {
+        toast(`${def.name}: ${avail.reason}`, theme.warn, 2500);
+        return;
+      }
     }
     const vars = buildActionVars(row);
     const result = def
@@ -1573,6 +1609,7 @@ export function App({ onExit }: Props) {
           const i = parseInt(k.sequence, 10) - 1;
           const item = ap.items[i];
           if (item && item.kind === "action") {
+            if (!canPickAction(item)) return;
             if (item.def.kind === "shell") {
               setModal(null);
               launchAction(ap.slug, item.def, "");
@@ -1588,6 +1625,7 @@ export function App({ onExit }: Props) {
         if (k.name === "return") {
           const item = ap.items[ap.index];
           if (!item) return;
+          if (!canPickAction(item)) return;
           if (item.kind === "action" && item.def.kind === "shell") {
             setModal(null);
             launchAction(ap.slug, item.def, "");
@@ -1626,7 +1664,7 @@ export function App({ onExit }: Props) {
         // restore (custom is the only entry there), so esc cancels out.
         const def = ap.def;
         if (def) {
-          const items = buildActionPickerItems();
+          const items = buildActionPickerItems(ap.slug);
           const idx = items.findIndex(
             (it) => it.kind === "action" && it.def.id === def.id,
           );

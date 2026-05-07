@@ -106,11 +106,23 @@ export type AiConfig = {
  *
  * `affects` declares which state domains the action mutates so the
  * runner can invalidate the matching cache prefixes after the action
- * exits. See the architecture block in `state/hooks.ts` for the rules.
- * Defaults: claude actions push commits → `["git", "github"]`; shell
- * actions are opaque → `[]` (opt in explicitly when needed).
+ * exits. Defaults: claude actions push commits → `["git", "github"]`;
+ * shell actions are opaque → `[]` (opt in explicitly when needed).
+ *
+ * `requires` declares preconditions evaluated synchronously against
+ * the current row state. The picker grays out entries whose
+ * requirements aren't met (with the reason as the dim subtitle); the
+ * keybinding launcher toasts the reason and skips the run. Tag
+ * vocabulary:
+ *   "pr"        — row has a PR (open, draft, terminal — any).
+ *   "pr.ready"  — row has a non-draft, OPEN PR.
+ * Default is `[]` (no preconditions).
+ *
+ * Both arrays are deduped at parse time. See the architecture block
+ * in `state/hooks.ts` for the rules these tags participate in.
  */
 export type EffectTag = "git" | "github";
+export type RequireTag = "pr" | "pr.ready";
 
 export type ActionDef =
   | {
@@ -119,6 +131,7 @@ export type ActionDef =
       name: string;
       prompt: string;
       affects: readonly EffectTag[];
+      requires: readonly RequireTag[];
     }
   | {
       kind: "shell";
@@ -126,6 +139,7 @@ export type ActionDef =
       name: string;
       shell: string;
       affects: readonly EffectTag[];
+      requires: readonly RequireTag[];
     };
 
 export type Config = {
@@ -212,6 +226,7 @@ const GENERIC_DEFAULTS = {
       prompt:
         "Please rebase this branch on origin/{{base_branch}} and intelligently resolve any conflicts that come up. Push when you're done.",
       affects: ["git", "github"] as readonly EffectTag[],
+      requires: [] as readonly RequireTag[],
     },
     {
       kind: "claude" as const,
@@ -220,13 +235,16 @@ const GENERIC_DEFAULTS = {
       prompt:
         "Check the requested changes from the review on the PR for this branch and address them. Push the changes, then resolve the review threads (no reply comments). When done, request a re-review from the original reviewers.",
       affects: ["git", "github"] as readonly EffectTag[],
+      requires: ["pr.ready"] as readonly RequireTag[],
     },
   ] as const,
 };
 
 const DEFAULT_CLAUDE_AFFECTS: readonly EffectTag[] = ["git", "github"];
 const DEFAULT_SHELL_AFFECTS: readonly EffectTag[] = [];
+const DEFAULT_REQUIRES: readonly RequireTag[] = [];
 const VALID_EFFECT_TAGS = new Set<EffectTag>(["git", "github"]);
+const VALID_REQUIRE_TAGS = new Set<RequireTag>(["pr", "pr.ready"]);
 
 function configPath(): { path: string; present: boolean } {
   const explicit = process.env.WT_CONFIG;
@@ -445,6 +463,8 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     }
     const affects = parseAffects(entry.affects, tag, errs);
     if (affects === "invalid") continue;
+    const requires = parseRequires(entry.requires, tag, errs);
+    if (requires === "invalid") continue;
     seenIds.add(id);
     if (hasPrompt) {
       out.push({
@@ -453,6 +473,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         name,
         prompt: promptVal as string,
         affects: affects ?? DEFAULT_CLAUDE_AFFECTS,
+        requires: requires ?? DEFAULT_REQUIRES,
       });
     } else {
       out.push({
@@ -461,10 +482,45 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         name,
         shell: shellVal as string,
         affects: affects ?? DEFAULT_SHELL_AFFECTS,
+        requires: requires ?? DEFAULT_REQUIRES,
       });
     }
   }
   return out;
+}
+
+function parseTagArray<T extends string>(
+  raw: unknown,
+  tag: string,
+  field: "affects" | "requires",
+  valid: ReadonlySet<T>,
+  errs: Errors,
+): readonly T[] | undefined | "invalid" {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    errs.add(`${tag}.${field} must be an array of strings`);
+    return "invalid";
+  }
+  const out: T[] = [];
+  let bad = false;
+  for (const v of raw) {
+    if (typeof v !== "string") {
+      errs.add(`${tag}.${field} entries must be strings`);
+      bad = true;
+      continue;
+    }
+    if (!valid.has(v as T)) {
+      const allowed = [...valid].join(", ");
+      errs.add(`${tag}.${field}: unknown tag "${v}" (allowed: ${allowed})`);
+      bad = true;
+      continue;
+    }
+    out.push(v as T);
+  }
+  if (bad) return "invalid";
+  // Dedupe so `["git", "git"]` doesn't fan out to two invalidations
+  // (or two precondition checks). Order is preserved.
+  return [...new Set(out)];
 }
 
 function parseAffects(
@@ -472,30 +528,15 @@ function parseAffects(
   tag: string,
   errs: Errors,
 ): readonly EffectTag[] | undefined | "invalid" {
-  if (raw === undefined) return undefined;
-  if (!Array.isArray(raw)) {
-    errs.add(`${tag}.affects must be an array of strings`);
-    return "invalid";
-  }
-  const valid: EffectTag[] = [];
-  let bad = false;
-  for (const v of raw) {
-    if (typeof v !== "string") {
-      errs.add(`${tag}.affects entries must be strings`);
-      bad = true;
-      continue;
-    }
-    if (!VALID_EFFECT_TAGS.has(v as EffectTag)) {
-      errs.add(`${tag}.affects: unknown tag "${v}" (allowed: git, github)`);
-      bad = true;
-      continue;
-    }
-    valid.push(v as EffectTag);
-  }
-  if (bad) return "invalid";
-  // Dedupe so `["git", "git", "github"]` doesn't fire `invalidateWorktree`
-  // twice for one completion. Order is preserved (first occurrence wins).
-  return [...new Set(valid)];
+  return parseTagArray(raw, tag, "affects", VALID_EFFECT_TAGS, errs);
+}
+
+function parseRequires(
+  raw: unknown,
+  tag: string,
+  errs: Errors,
+): readonly RequireTag[] | undefined | "invalid" {
+  return parseTagArray(raw, tag, "requires", VALID_REQUIRE_TAGS, errs);
 }
 
 function load(): { cfg: Config; path: string } {
