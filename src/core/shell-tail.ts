@@ -388,10 +388,17 @@ class ShellTailRegistry {
  */
 function clean(raw: string): string | null {
   let s = raw.replace(ANSI_RE, "");
-  // CR collapse: keep only what was on the line after the last \r.
-  // Progress bars (`npm install`, `pnpm`, `yarn`) render via repeated
-  // \r-overwrites of the same line; pipe-pane captures every redraw,
-  // so this drops the dozens of intermediate states and keeps the last.
+  // Drop a single trailing CR from CRLF line endings — pipe-pane
+  // captures the raw byte stream, so splitting on \n leaves the \r
+  // behind on the previous segment. Without this every interactive
+  // command output (ls, git, …) ends in \r and the mid-line CR-collapse
+  // below would treat the trailing \r as a progress-bar overwrite and
+  // discard the whole line.
+  if (s.endsWith("\r")) s = s.slice(0, -1);
+  // Mid-line CR collapse: progress bars (`npm install`, `pnpm`, `yarn`)
+  // render via repeated \r-overwrites of the same line; pipe-pane
+  // captures every redraw, so this drops the intermediate states and
+  // keeps only what's after the last remaining CR.
   const cr = s.lastIndexOf("\r");
   if (cr !== -1) s = s.slice(cr + 1);
   s = s.replace(CTRL_RE, "");
