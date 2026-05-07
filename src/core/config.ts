@@ -107,7 +107,9 @@ export type AiConfig = {
  * `affects` declares which state domains the action mutates so the
  * runner can invalidate the matching cache prefixes after the action
  * exits. Defaults: claude actions push commits → `["git", "github"]`;
- * shell actions are opaque → `[]` (opt in explicitly when needed).
+ * shell actions are opaque → `[]` (opt in explicitly when needed). An
+ * explicit `affects = []` opts out entirely — useful for a claude
+ * action that just analyzes without writing.
  *
  * `requires` declares preconditions evaluated synchronously against
  * the current row state. The picker grays out entries whose
@@ -225,8 +227,8 @@ const GENERIC_DEFAULTS = {
       name: "Rebase on base",
       prompt:
         "Please rebase this branch on origin/{{base_branch}} and intelligently resolve any conflicts that come up. Push when you're done.",
-      affects: ["git", "github"] as readonly EffectTag[],
-      requires: [] as readonly RequireTag[],
+      affects: ["git", "github"] as const satisfies readonly EffectTag[],
+      requires: [] as const satisfies readonly RequireTag[],
     },
     {
       kind: "claude" as const,
@@ -234,15 +236,21 @@ const GENERIC_DEFAULTS = {
       name: "Address PR review",
       prompt:
         "Check the requested changes from the review on the PR for this branch and address them. Push the changes, then resolve the review threads (no reply comments). When done, request a re-review from the original reviewers.",
-      affects: ["git", "github"] as readonly EffectTag[],
-      requires: ["pr.ready"] as readonly RequireTag[],
+      affects: ["git", "github"] as const satisfies readonly EffectTag[],
+      requires: ["pr.ready"] as const satisfies readonly RequireTag[],
     },
   ] as const,
 };
 
-const DEFAULT_CLAUDE_AFFECTS: readonly EffectTag[] = ["git", "github"];
-const DEFAULT_SHELL_AFFECTS: readonly EffectTag[] = [];
-const DEFAULT_REQUIRES: readonly RequireTag[] = [];
+/**
+ * Exported so the custom-prompt action def in `core/actions.ts` (and
+ * any future built-in not declared in `GENERIC_DEFAULTS.actions`) can
+ * pick up the same defaults the parser applies — keeping a single
+ * source of truth for "what does a claude action affect by default".
+ */
+export const DEFAULT_CLAUDE_AFFECTS: readonly EffectTag[] = ["git", "github"];
+export const DEFAULT_SHELL_AFFECTS: readonly EffectTag[] = [];
+export const DEFAULT_REQUIRES: readonly RequireTag[] = [];
 const VALID_EFFECT_TAGS = new Set<EffectTag>(["git", "github"]);
 const VALID_REQUIRE_TAGS = new Set<RequireTag>(["pr", "pr.ready"]);
 

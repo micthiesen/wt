@@ -79,7 +79,12 @@
  * ────────────────────────────────────────────────────────────────────
  */
 import { useMemo } from "react";
-import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useQuery,
+  useQueryClient,
+  type QueryFilters,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 
 import {
   archiveSlug as archiveOnDisk,
@@ -148,52 +153,91 @@ export function useGithub(): UseQueryResult<GithubData, Error> {
   return useQuery(githubQuery(branches));
 }
 
+/**
+ * Per-filter serialization chain. Two `mutate()` calls against the same
+ * filter prefix must run sequentially — call B snapshots the cache
+ * AFTER call A's optimistic patch, so A's rollback would clobber B's
+ * state. The TUI used to rely on "one mutation per keypress" but the
+ * modal closes synchronously before the gh round-trip, so a fast user
+ * could fire mark-ready then immediately reopen the reviewer picker
+ * and submit while the first mutation was still mid-flight.
+ *
+ * Module-scope so the chain survives across `useWtActions()` calls
+ * (which return a fresh object every render). Map keys are
+ * JSON-serialised filter prefixes; entries are deleted once the chain
+ * settles to avoid unbounded growth.
+ */
+const mutationChains = new Map<string, Promise<void>>();
+
 /** Imperative helpers that wrap the raw QueryClient for common ops. */
 export function useWtActions() {
   const qc = useQueryClient();
-  return {
-    /**
-     * Run a mutation with an optimistic cache patch and reconcile-on-settle.
-     *
-     * Four steps: cancel any in-flight refetches against `filter` (so
-     * they can't clobber the optimistic state on completion), snapshot
-     * every matching cache entry, write the patch (synchronous — the
-     * badge flips before the network call lands), await `run`, then
-     * invalidate the same filter (active refetch reconciles against
-     * server truth). Both success and failure paths invalidate: on
-     * throw, rollback every captured snapshot to its prior value AND
-     * invalidate so a network error after server commit (rare but
-     * possible) gets reconciled rather than leaving the UI lying
-     * indefinitely. The invalidates are fire-and-forget; if a refetch
-     * itself fails the optimistic/rolled-back state remains until the
-     * next user refresh.
-     *
-     * `filter` is a queryKey prefix. The patch runs against every
-     * matching entry — for queries keyed by inputs the call site
-     * doesn't have (e.g. the github query keyed by sorted branch list,
-     * not PR number), this is what makes the helper work, but it also
-     * means the patch fn must be safe against entries that don't
-     * contain the target row (see `patchPullRequest`'s "no PR for
-     * branch → return data unchanged" path). Reconcile only happens
-     * for entries with active observers; cache entries observed by no
-     * one stay patched until eviction.
-     *
-     * `run` must throw on failure; mutations that return `{ ok: false,
-     * error }` should be wrapped to throw at the call site.
-     *
-     * Concurrent calls against the same filter are not safe — call B
-     * snapshots A's optimistic state as its baseline, so an A failure
-     * after B has patched will rollback to B's optimistic state, not
-     * A's pre-patch state. The TUI fires one mutation per keypress so
-     * the constraint is naturally honored; if that ever changes,
-     * serialize via TanStack's MutationObserver.
-     */
-    async mutate<TData>(opts: {
-      filter: { queryKey: readonly unknown[] };
-      patch: (prev: TData | undefined) => TData | undefined;
-      run: () => Promise<void>;
-    }): Promise<void> {
-      const { filter, patch, run } = opts;
+
+  /**
+   * Run a mutation with an optimistic cache patch and reconcile-on-settle.
+   *
+   * Pipeline: serialize against the per-filter chain (so concurrent
+   * calls run in submission order), cancel any in-flight refetches
+   * against `filter` (so they can't clobber the optimistic state on
+   * completion), snapshot every matching cache entry, write the patch
+   * (synchronous — the badge flips before the network call lands),
+   * await `run`, then invalidate the same filter (active refetch
+   * reconciles against server truth).
+   *
+   * Both success and failure paths invalidate: on throw, rollback every
+   * captured snapshot to its prior value AND invalidate so a network
+   * error after server commit (rare but possible) gets reconciled
+   * rather than leaving the UI lying indefinitely. The trailing
+   * invalidates are fire-and-forget so the next keypress isn't gated
+   * on a network round-trip; the architecture's "active refetch
+   * always" promise is best-effort if the refetch itself fails.
+   *
+   * `filter` is a queryKey prefix. The patch runs against every
+   * matching entry — for queries keyed by inputs the call site
+   * doesn't have (e.g. the github query keyed by sorted branch list,
+   * not PR number), this is what makes the helper work, but it also
+   * means the patch fn must be safe against entries that don't
+   * contain the target row (see `patchPullRequest`'s "no PR for
+   * branch → return data unchanged" path). Reconcile only happens
+   * for entries with active observers; cache entries observed by no
+   * one stay patched until eviction.
+   *
+   * `run` must throw on failure; mutations that return `{ ok: false,
+   * error }` should be wrapped to throw at the call site.
+   *
+   * Caveat: `cancelQueries` only cancels in-flight refetches at call
+   * time. A new background refetch that starts during the await
+   * window (e.g. an action-completion subscriber firing
+   * `refreshGithub()` while a PR mutation is mid-flight) can resolve
+   * with pre-mutation server data and overwrite the optimistic patch.
+   * The settling invalidate eventually reconciles, so any drift is
+   * transient. Full immunity would require migrating to TanStack's
+   * `useMutation` with `mutationKey`-scoped optimistic updates.
+   */
+  async function mutate<TData>(opts: {
+    filter: QueryFilters;
+    patch: (prev: TData | undefined) => TData | undefined;
+    run: () => Promise<void>;
+  }): Promise<void> {
+    const { filter, patch, run } = opts;
+    // chainKey is the filter's queryKey serialized — falls back to a
+    // sentinel when no queryKey was supplied (no current callers omit
+    // it, but `QueryFilters` types it as optional).
+    const chainKey = filter.queryKey
+      ? JSON.stringify(filter.queryKey)
+      : "__nokey__";
+    const prev = mutationChains.get(chainKey);
+    let release!: () => void;
+    const released = new Promise<void>((r) => {
+      release = r;
+    });
+    mutationChains.set(chainKey, released);
+    try {
+      // Wait for the prior call's settle, but don't propagate its error
+      // — each caller gets its own throw via `next` below. `prev` is
+      // already a `Promise<void>` so the `.catch(() => {})` here just
+      // turns a rejection into a no-op resolution.
+      if (prev) await prev.catch(() => {});
       await qc.cancelQueries(filter);
       const snapshots = qc.getQueriesData<TData>(filter);
       qc.setQueriesData<TData>(filter, patch);
@@ -205,7 +249,19 @@ export function useWtActions() {
         throw err;
       }
       void qc.invalidateQueries(filter);
-    },
+    } finally {
+      release();
+      // Only delete if we're still the tail. A later call may have
+      // chained onto our `released` promise already; in that case
+      // they own the slot.
+      if (mutationChains.get(chainKey) === released) {
+        mutationChains.delete(chainKey);
+      }
+    }
+  }
+
+  return {
+    mutate,
     /**
      * Refetch only the observed queries that are past their staleTime.
      * Unlike `refreshAll`, this doesn't run `git fetch origin` and
@@ -372,23 +428,54 @@ export function useWtActions() {
       return true;
     },
     /**
-     * Flip the archived flag for a slug. Awaits invalidation so the
-     * caller can rely on `useWorktreeRows` having the new state on
-     * the next render — required for cursor-follow logic.
+     * Flip the archived flag for a slug. Optimistically patches the
+     * archive set so the row reorders immediately under the cursor;
+     * the disk write is sync and the post-settle invalidate just
+     * confirms. Awaits the mutate call so `useWorktreeRows` has the
+     * new state before the caller's next render — cursor-follow logic
+     * relies on this.
      */
     async toggleArchived(slug: string): Promise<{ archived: boolean }> {
-      const result = toggleArchivedOnDisk(slug);
-      await qc.invalidateQueries({ queryKey: qk.archive() });
+      let result: { archived: boolean } | null = null;
+      await mutate<readonly string[]>({
+        filter: { queryKey: qk.archive() },
+        patch: (prev) => {
+          const set = new Set(prev ?? []);
+          if (set.has(slug)) set.delete(slug);
+          else set.add(slug);
+          return [...set];
+        },
+        run: async () => {
+          // Disk write is synchronous; wrapped in async so it slots
+          // into the mutate pipeline. Errors propagate as throws and
+          // trigger the rollback path.
+          result = toggleArchivedOnDisk(slug);
+        },
+      });
+      // `result` is set inside `run` which always runs before mutate
+      // resolves; the `?? throw` here is just a type-narrowing prop.
+      if (!result) throw new Error("toggleArchivedOnDisk did not return");
       return result;
     },
     /**
      * Idempotently mark a slug as archived. Used by remove/clean to
      * move a destroying row into the archived section immediately, so
-     * the active list isn't visually cluttered during the tail.
+     * the active list isn't visually cluttered during the tail. Fire-
+     * and-forget — the disk write is sync, callers don't need to
+     * await before dispatching the destroy.
      */
     archive(slug: string): void {
-      archiveOnDisk(slug);
-      void qc.invalidateQueries({ queryKey: qk.archive() });
+      void mutate<readonly string[]>({
+        filter: { queryKey: qk.archive() },
+        patch: (prev) => {
+          const set = new Set(prev ?? []);
+          set.add(slug);
+          return [...set];
+        },
+        run: async () => {
+          archiveOnDisk(slug);
+        },
+      });
     },
     /**
      * Assign (or clear, with `null`) a slug's section. Order is reset

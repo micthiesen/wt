@@ -598,8 +598,21 @@ export function App({ onExit }: Props) {
         handled.add(key);
         const { invalidateWorktree: inv, refreshGithub: rg } = actionHelpersRef.current;
         for (const tag of run.affects) {
-          if (tag === "git") void inv(run.slug);
-          else if (tag === "github") void rg();
+          switch (tag) {
+            case "git":
+              void inv(run.slug);
+              break;
+            case "github":
+              void rg();
+              break;
+            default: {
+              // Exhaustiveness check — a new EffectTag without a case
+              // here would silently skip its invalidation, leaving the
+              // UI stale after the action exits.
+              const _exhaustive: never = tag;
+              void _exhaustive;
+            }
+          }
         }
       }
     });
@@ -1325,10 +1338,9 @@ export function App({ onExit }: Props) {
   }
 
   function openActionPicker(slug: string): void {
-    const items = buildActionPickerItems(slug);
     setModal({
       kind: "actionPicker",
-      state: { mode: "list", slug, index: 0, items },
+      state: { mode: "list", slug, index: 0 },
     });
   }
 
@@ -1577,10 +1589,15 @@ export function App({ onExit }: Props) {
     if (modal?.kind === "actionPicker") {
       const ap = modal.state;
       if (ap.mode === "list") {
+        // Recompute items here rather than reading from state — they
+        // depend on live row state via `requires`, and a stale snapshot
+        // would block actions whose preconditions just flipped (or
+        // unblock ones that just stopped applying).
+        const items = buildActionPickerItems(ap.slug);
         if (k.name === "j" || k.name === "down") {
           setModal({
             kind: "actionPicker",
-            state: { ...ap, index: Math.min(ap.index + 1, ap.items.length - 1) },
+            state: { ...ap, index: Math.min(ap.index + 1, items.length - 1) },
           });
           return;
         }
@@ -1607,7 +1624,7 @@ export function App({ onExit }: Props) {
         // doesn't fire something unintended.
         if (k.sequence && /^[1-9]$/.test(k.sequence)) {
           const i = parseInt(k.sequence, 10) - 1;
-          const item = ap.items[i];
+          const item = items[i];
           if (item && item.kind === "action") {
             if (!canPickAction(item)) return;
             if (item.def.kind === "shell") {
@@ -1623,7 +1640,7 @@ export function App({ onExit }: Props) {
           return;
         }
         if (k.name === "return") {
-          const item = ap.items[ap.index];
+          const item = items[ap.index];
           if (!item) return;
           if (!canPickAction(item)) return;
           if (item.kind === "action" && item.def.kind === "shell") {
@@ -1664,13 +1681,21 @@ export function App({ onExit }: Props) {
         // restore (custom is the only entry there), so esc cancels out.
         const def = ap.def;
         if (def) {
+          // Worktree may have been destroyed while the edit modal was
+          // open. Bail to a clean exit rather than dropping the user
+          // into a phantom-slug list whose entries all read "no PR".
+          if (!rows.find((r) => r.wt.slug === ap.slug)) {
+            setModal(null);
+            toast("worktree gone", theme.warn, 2000);
+            return;
+          }
           const items = buildActionPickerItems(ap.slug);
           const idx = items.findIndex(
             (it) => it.kind === "action" && it.def.id === def.id,
           );
           setModal({
             kind: "actionPicker",
-            state: { mode: "list", slug: ap.slug, index: Math.max(0, idx), items },
+            state: { mode: "list", slug: ap.slug, index: Math.max(0, idx) },
           });
         } else {
           setModal(null);
@@ -2723,7 +2748,7 @@ export function App({ onExit }: Props) {
       {modal?.kind === "actionPicker" && modal.state.mode === "list" ? (
         <ActionPickerModal
           slug={modal.state.slug}
-          items={modal.state.items}
+          items={buildActionPickerItems(modal.state.slug)}
           selectedIndex={modal.state.index}
         />
       ) : null}

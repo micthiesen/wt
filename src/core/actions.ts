@@ -27,7 +27,14 @@ import {
   formatTokens,
   messageToLines,
 } from "./claude-events.ts";
-import { type ActionDef, type EffectTag, type RequireTag, config } from "./config.ts";
+import {
+  DEFAULT_CLAUDE_AFFECTS,
+  DEFAULT_REQUIRES,
+  type ActionDef,
+  type EffectTag,
+  type RequireTag,
+  config,
+} from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { streamLines } from "./proc.ts";
 import type { PullRequest } from "./types.ts";
@@ -62,12 +69,22 @@ export function evaluateActionRequirements(
   row: ActionRowState,
 ): ActionAvailability {
   for (const req of requires) {
-    if (req === "pr") {
-      if (!row.pr) return { ok: false, reason: "no PR" };
-    } else if (req === "pr.ready") {
-      if (!row.pr) return { ok: false, reason: "no PR" };
-      if (row.pr.isDraft) return { ok: false, reason: "PR is draft" };
-      if (row.pr.state !== "OPEN") return { ok: false, reason: "PR not open" };
+    switch (req) {
+      case "pr":
+        if (!row.pr) return { ok: false, reason: "no PR" };
+        break;
+      case "pr.ready":
+        if (!row.pr) return { ok: false, reason: "no PR" };
+        if (row.pr.isDraft) return { ok: false, reason: "PR is draft" };
+        if (row.pr.state !== "OPEN") return { ok: false, reason: "PR not open" };
+        break;
+      default: {
+        // Exhaustiveness check — adding a new RequireTag without
+        // updating this switch is a type error. Critical because the
+        // failure mode is silent always-allow (worse than always-block).
+        const _exhaustive: never = req;
+        throw new Error(`unhandled require tag: ${String(_exhaustive)}`);
+      }
     }
   }
   return { ok: true };
@@ -264,6 +281,13 @@ class ActionRegistry {
     this.appendLogFile(run, initialLine);
     log.event.info(`${slug}: ${def.name} → ${logPath}`);
 
+    // Reset slug-keyed side state in case the previous run on this slug
+    // was killed and its `awaitExit` hasn't drained yet. Without this,
+    // a stale `resultEventSeen` flag from the killed run would make the
+    // new run's `awaitExit` skip the synthesized exit line. `procs`,
+    // `drains`, and `toolStarts` are unconditionally overwritten below,
+    // but `resultEventSeen` is a Set that the killed run added to.
+    this.resultEventSeen.delete(slug);
     this.procs.set(slug, proc);
     // toolStarts is a claude-only concept (tracks tool_use_id timing); skip
     // the allocation for shell runs — awaitExit's unconditional delete is a
@@ -297,8 +321,8 @@ class ActionRegistry {
         id: CUSTOM_ACTION_ID,
         name: "Custom prompt",
         prompt: "",
-        affects: ["git", "github"],
-        requires: [],
+        affects: DEFAULT_CLAUDE_AFFECTS,
+        requires: DEFAULT_REQUIRES,
       },
       slug,
       cwd,
@@ -490,7 +514,14 @@ class ActionRegistry {
     // Wait for stdout/stderr to fully drain so a result event still in
     // the pipe at exit gets recorded before we synthesize a fallback.
     await drain;
-    if (this.procs.get(slug) === proc) this.procs.delete(slug);
+    // If `start()` overwrote this slug with a new run while we were
+    // draining (kill → re-launch in quick succession), bail entirely.
+    // The new run owns the slug now; the slug-keyed side state has
+    // already been reset by `start()`, and committing this proc's
+    // exit metadata onto the new run would silently flip its status
+    // to `killed`/`failed` while the actual subprocess keeps running.
+    if (this.procs.get(slug) !== proc) return;
+    this.procs.delete(slug);
     const cur = this.runs.get(slug);
     if (!cur) {
       this.toolStarts.delete(slug);

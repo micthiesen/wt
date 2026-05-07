@@ -28,9 +28,16 @@ export type PickerItem =
  * entirely from custom (no list state worth restoring). Only claude-
  * flavored actions reach `edit`; shell actions launch directly from
  * `list`.
+ *
+ * `items` is deliberately not in the state — it's recomputed at each
+ * use site from `buildActionPickerItems(slug)`. That lets `requires`
+ * predicates re-evaluate against live row state, so an optimistic
+ * patch (or a background refetch) that flips a PR's draft status
+ * unblocks/blocks actions in the open picker without requiring a
+ * close-and-reopen.
  */
 export type ActionPickerState =
-  | { mode: "list"; slug: string; index: number; items: PickerItem[] }
+  | { mode: "list"; slug: string; index: number }
   | { mode: "edit"; slug: string; def: ClaudeActionDef | null; extras: string };
 
 type Props = {
