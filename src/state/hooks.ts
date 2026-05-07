@@ -12,11 +12,14 @@
  *
  * 1. Compose optimistic patch + invalidate. Don't pick one.
  *
- *    `mutate({ filter, patch, run })` codifies the dance: snapshot
- *    every cache entry matching `filter`, apply `patch` synchronously
- *    (badge flips before the network round-trip lands), await `run`,
- *    invalidate the same filter (active refetch reconciles against
- *    server truth), and rollback the snapshots on throw.
+ *    `mutate({ filter, patch, run })` codifies the dance: cancel any
+ *    in-flight refetches against `filter`, snapshot every matching
+ *    cache entry, apply `patch` synchronously (badge flips before the
+ *    network round-trip lands), await `run`, invalidate the same
+ *    filter (active refetch reconciles against server truth), and
+ *    rollback the snapshots on throw. `filter` is a prefix and the
+ *    patch fans out across every matching entry, so the patch fn must
+ *    be safe against entries that don't contain the target row.
  *
  *    Use it for any mutation whose post-state is a clean function of
  *    inputs — PR draft→ready, auto-merge on/off, reviewer add/remove,
@@ -95,8 +98,9 @@ import type { Contributor } from "../core/types.ts";
  * so callers don't have a single concrete queryKey — they patch every
  * matching `["github", …]` entry via `mutate({ filter: { queryKey:
  * ["github"] }, ... })`. Returns the input unchanged when there's no
- * matching PR (cache miss for this branch); the runtime caller will
- * still invalidate, so server truth lands shortly after.
+ * matching PR (cache miss for this branch); the follow-up invalidate
+ * only re-fetches entries with active observers, so a cold cache that
+ * nothing observes stays missing until something subscribes.
  */
 export function patchPullRequest(
   data: GithubData | undefined,
@@ -134,33 +138,48 @@ export function useWtActions() {
     /**
      * Run a mutation with an optimistic cache patch and reconcile-on-success.
      *
-     * Three steps: snapshot every cache entry matching `filter`, write
-     * the patch (synchronous — the badge flips before the network call
-     * lands), await `run`, then invalidate (active refetch reconciles
-     * against server truth). On throw, rollback every captured
-     * snapshot to its prior value and rethrow.
+     * Four steps: cancel any in-flight refetches against `filter` (so
+     * they can't clobber the optimistic state on completion), snapshot
+     * every matching cache entry, write the patch (synchronous — the
+     * badge flips before the network call lands), await `run`, then
+     * invalidate (active refetch reconciles against server truth). On
+     * throw, rollback every captured snapshot to its prior value and
+     * rethrow. The post-success invalidate is fire-and-forget; if its
+     * refetch fails the optimistic state remains until the next user
+     * refresh.
      *
-     * `filter` is a queryKey prefix. For queries keyed by inputs the
-     * call site doesn't know (e.g. the github query is keyed by the
-     * sorted branch list, not by PR number), pass the prefix and let
-     * the patch fn handle every matching entry — see
-     * `patchPullRequest` for the typical PR-shaped helper.
+     * `filter` is a queryKey prefix. The patch runs against every
+     * matching entry — for queries keyed by inputs the call site
+     * doesn't have (e.g. the github query keyed by sorted branch list,
+     * not PR number), this is what makes the helper work, but it also
+     * means the patch fn must be safe against entries that don't
+     * contain the target row (see `patchPullRequest`'s "no PR for
+     * branch → return data unchanged" path). Reconcile only happens
+     * for entries with active observers; cache entries observed by no
+     * one stay patched until eviction.
      *
-     * `run` should throw on failure; mutations that return `{ ok:
-     * false, error }` should be wrapped to throw at the call site.
+     * `run` must throw on failure; mutations that return `{ ok: false,
+     * error }` should be wrapped to throw at the call site.
+     *
+     * Concurrent calls against the same filter are not safe — call B
+     * snapshots A's optimistic state as its baseline, so an A failure
+     * after B has patched will rollback to B's optimistic state, not
+     * A's pre-patch state. The TUI fires one mutation per keypress so
+     * the constraint is naturally honored; if that ever changes,
+     * serialize via TanStack's MutationObserver.
      */
-    async mutate<TData, TResult>(opts: {
+    async mutate<TData>(opts: {
       filter: { queryKey: readonly unknown[] };
       patch: (prev: TData | undefined) => TData | undefined;
-      run: () => Promise<TResult>;
-    }): Promise<TResult> {
+      run: () => Promise<void>;
+    }): Promise<void> {
       const { filter, patch, run } = opts;
+      await qc.cancelQueries(filter);
       const snapshots = qc.getQueriesData<TData>(filter);
       qc.setQueriesData<TData>(filter, patch);
       try {
-        const result = await run();
+        await run();
         void qc.invalidateQueries(filter);
-        return result;
       } catch (err) {
         for (const [key, value] of snapshots) qc.setQueryData(key, value);
         throw err;

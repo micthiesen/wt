@@ -493,7 +493,9 @@ function parseAffects(
     valid.push(v as EffectTag);
   }
   if (bad) return "invalid";
-  return valid;
+  // Dedupe so `["git", "git", "github"]` doesn't fire `invalidateWorktree`
+  // twice for one completion. Order is preserved (first occurrence wins).
+  return [...new Set(valid)];
 }
 
 function load(): { cfg: Config; path: string } {

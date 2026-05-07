@@ -567,21 +567,22 @@ export function App({ onExit }: Props) {
   // invalidation helpers. The `handled` set keys on `slug@endedAt`
   // so a completion fires exactly once even when the registry
   // notifies for unrelated state churn afterwards.
+  //
+  // `handled` and the helper closures live in refs so the effect
+  // subscribes exactly once at mount. `useWtActions` returns a fresh
+  // object every render — without the ref indirection the deps array
+  // would tear down + re-seed on every render, and a completion that
+  // fires inside that window can be lost to the seed before dispatch
+  // runs.
+  const actionHelpersRef = useRef({ invalidateWorktree, refreshGithub });
+  actionHelpersRef.current = { invalidateWorktree, refreshGithub };
+  const actionHandledRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const handled = new Set<string>();
-    const dispatch = (run: ActionRun): void => {
-      if (run.endedAt === undefined) return;
-      const key = `${run.slug}@${run.endedAt}`;
-      if (handled.has(key)) return;
-      handled.add(key);
-      for (const tag of run.affects) {
-        if (tag === "git") void invalidateWorktree(run.slug);
-        else if (tag === "github") void refreshGithub();
-      }
-    };
-    // Seed `handled` with already-finished runs in the snapshot so a
-    // subscribe-after-mount doesn't re-fire invalidations for stale
-    // entries the picker is still showing.
+    const handled = actionHandledRef.current;
+    // Seed once with already-finished runs so a fresh mount doesn't
+    // re-fire dispatch for runs the previous mount already handled.
+    // (Singleton registry survives across mounts; ref survives across
+    // renders. The seed is a no-op on a clean process start.)
     for (const run of actionRegistry.getSnapshot().values()) {
       if (run.status !== "running" && run.endedAt !== undefined) {
         handled.add(`${run.slug}@${run.endedAt}`);
@@ -590,10 +591,18 @@ export function App({ onExit }: Props) {
     return actionRegistry.subscribe(() => {
       for (const run of actionRegistry.getSnapshot().values()) {
         if (run.status === "running") continue;
-        dispatch(run);
+        if (run.endedAt === undefined) continue;
+        const key = `${run.slug}@${run.endedAt}`;
+        if (handled.has(key)) continue;
+        handled.add(key);
+        const { invalidateWorktree: inv, refreshGithub: rg } = actionHelpersRef.current;
+        for (const tag of run.affects) {
+          if (tag === "git") void inv(run.slug);
+          else if (tag === "github") void rg();
+        }
       }
     });
-  }, [invalidateWorktree, refreshGithub]);
+  }, []);
 
   // Slugs whose lock op is `"remove"` — drives the destroy outputs
   // surfaced in the picker. Computed from `rows` (each busy row
@@ -1153,26 +1162,33 @@ export function App({ onExit }: Props) {
     const { slug, prNumber, checked, original } = modal;
     const log = createLogger(slug);
     const branch = rows.find((r) => r.wt.slug === slug)?.wt.branch;
+    setModal(null);
+    if (!branch) {
+      // Slug disappeared between picker open and submit (race against
+      // a destroy). The mutation would still succeed at the gh layer,
+      // but the optimistic patch has nothing to target — bail rather
+      // than silently dropping the cache update.
+      log.event.warn(`slug ${slug} no longer present; aborting reviewer edit`);
+      toast("worktree gone, edit aborted", theme.warn, 2500);
+      return;
+    }
     const add: string[] = [];
     const remove: string[] = [];
     for (const k of checked) if (!original.has(k)) add.push(k);
     for (const k of original) if (!checked.has(k)) remove.push(k);
-    setModal(null);
     if (add.length === 0 && remove.length === 0) {
       toast("no changes", theme.fgDim, 1500);
       return;
     }
     try {
-      await mutate<GithubData, void>({
+      await mutate<GithubData>({
         filter: { queryKey: ["github"] },
         patch: (data) =>
-          branch
-            ? patchPullRequest(data, branch, (pr) => ({
-                ...pr,
-                requestedReviewers: [...checked],
-                reviewRequests: pr.reviewRequests + add.length - remove.length,
-              }))
-            : data,
+          patchPullRequest(data, branch, (pr) => ({
+            ...pr,
+            requestedReviewers: [...checked],
+            reviewRequests: pr.reviewRequests + add.length - remove.length,
+          })),
         run: async () => {
           const result = await editReviewers(prNumber, { add, remove });
           if (!result.ok) throw new Error(result.error);
@@ -1207,7 +1223,7 @@ export function App({ onExit }: Props) {
     const prNumber = row.pr.number;
     const branch = row.wt.branch;
     try {
-      await mutate<GithubData, void>({
+      await mutate<GithubData>({
         filter: { queryKey: ["github"] },
         patch: (data) =>
           patchPullRequest(data, branch, (pr) => ({ ...pr, isDraft: false })),
@@ -1245,7 +1261,7 @@ export function App({ onExit }: Props) {
         ? { enabledAt: new Date().toISOString(), mergeMethod: "REBASE" }
         : null;
     try {
-      await mutate<GithubData, void>({
+      await mutate<GithubData>({
         filter: { queryKey: ["github"] },
         patch: (data) =>
           patchPullRequest(data, branch, (pr) => ({
