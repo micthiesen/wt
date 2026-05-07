@@ -103,10 +103,30 @@ export type AiConfig = {
  * When `[[actions]]` is absent the built-in defaults take effect; when
  * it's present (even with one entry), the user's list is authoritative
  * — the way to drop a default is to list everything except it.
+ *
+ * `affects` declares which state domains the action mutates so the
+ * runner can invalidate the matching cache prefixes after the action
+ * exits. See the architecture block in `state/hooks.ts` for the rules.
+ * Defaults: claude actions push commits → `["git", "github"]`; shell
+ * actions are opaque → `[]` (opt in explicitly when needed).
  */
+export type EffectTag = "git" | "github";
+
 export type ActionDef =
-  | { kind: "claude"; id: string; name: string; prompt: string }
-  | { kind: "shell"; id: string; name: string; shell: string };
+  | {
+      kind: "claude";
+      id: string;
+      name: string;
+      prompt: string;
+      affects: readonly EffectTag[];
+    }
+  | {
+      kind: "shell";
+      id: string;
+      name: string;
+      shell: string;
+      affects: readonly EffectTag[];
+    };
 
 export type Config = {
   paths: {
@@ -191,6 +211,7 @@ const GENERIC_DEFAULTS = {
       name: "Rebase on base",
       prompt:
         "Please rebase this branch on origin/{{base_branch}} and intelligently resolve any conflicts that come up. Push when you're done.",
+      affects: ["git", "github"] as readonly EffectTag[],
     },
     {
       kind: "claude" as const,
@@ -198,9 +219,14 @@ const GENERIC_DEFAULTS = {
       name: "Address PR review",
       prompt:
         "Check the requested changes from the review on the PR for this branch and address them. Push the changes, then resolve the review threads (no reply comments). When done, request a re-review from the original reviewers.",
+      affects: ["git", "github"] as readonly EffectTag[],
     },
   ] as const,
 };
+
+const DEFAULT_CLAUDE_AFFECTS: readonly EffectTag[] = ["git", "github"];
+const DEFAULT_SHELL_AFFECTS: readonly EffectTag[] = [];
+const VALID_EFFECT_TAGS = new Set<EffectTag>(["git", "github"]);
 
 function configPath(): { path: string; present: boolean } {
   const explicit = process.env.WT_CONFIG;
@@ -417,14 +443,57 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
       errs.add(`${tag} must set one of "prompt" or "shell"`);
       continue;
     }
+    const affects = parseAffects(entry.affects, tag, errs);
+    if (affects === "invalid") continue;
     seenIds.add(id);
     if (hasPrompt) {
-      out.push({ kind: "claude", id, name, prompt: promptVal as string });
+      out.push({
+        kind: "claude",
+        id,
+        name,
+        prompt: promptVal as string,
+        affects: affects ?? DEFAULT_CLAUDE_AFFECTS,
+      });
     } else {
-      out.push({ kind: "shell", id, name, shell: shellVal as string });
+      out.push({
+        kind: "shell",
+        id,
+        name,
+        shell: shellVal as string,
+        affects: affects ?? DEFAULT_SHELL_AFFECTS,
+      });
     }
   }
   return out;
+}
+
+function parseAffects(
+  raw: unknown,
+  tag: string,
+  errs: Errors,
+): readonly EffectTag[] | undefined | "invalid" {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    errs.add(`${tag}.affects must be an array of strings`);
+    return "invalid";
+  }
+  const valid: EffectTag[] = [];
+  let bad = false;
+  for (const v of raw) {
+    if (typeof v !== "string") {
+      errs.add(`${tag}.affects entries must be strings`);
+      bad = true;
+      continue;
+    }
+    if (!VALID_EFFECT_TAGS.has(v as EffectTag)) {
+      errs.add(`${tag}.affects: unknown tag "${v}" (allowed: git, github)`);
+      bad = true;
+      continue;
+    }
+    valid.push(v as EffectTag);
+  }
+  if (bad) return "invalid";
+  return valid;
 }
 
 function load(): { cfg: Config; path: string } {

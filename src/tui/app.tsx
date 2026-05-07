@@ -2,7 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 
-import { actionRegistry, type ActionDef, type ActionVars } from "../core/actions.ts";
+import {
+  actionRegistry,
+  type ActionDef,
+  type ActionRun,
+  type ActionVars,
+} from "../core/actions.ts";
 import { config, configFilePath } from "../core/config.ts";
 import {
   createWorktree,
@@ -30,8 +35,8 @@ import {
   type SessionKind,
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
-import { StatusKind } from "../core/types.ts";
-import { useWtActions } from "../state/index.ts";
+import { StatusKind, type PullRequest } from "../core/types.ts";
+import { patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
 
 import {
   ActionEditModal,
@@ -352,6 +357,7 @@ export function App({ onExit }: Props) {
     swapOrder,
     placeSlug,
     renameSection,
+    mutate,
   } = useWtActions();
   // Cursor is tracked by slug, not index. Slug identity survives row
   // moves (archive, section change, manual reorder) without any
@@ -553,6 +559,41 @@ export function App({ onExit }: Props) {
       if (!seen.has(slug)) lastDiffBase.current.delete(slug);
     }
   }, [rows, activeDiffSessions, refreshTmuxSessions]);
+
+  // Custom action effect dispatch — see rule (3) in the architecture
+  // block at the top of `state/hooks.ts`. Each action carries an
+  // `affects` tag set captured at start time; on every transition
+  // from `running` → terminal status, fan that out to the matching
+  // invalidation helpers. The `handled` set keys on `slug@endedAt`
+  // so a completion fires exactly once even when the registry
+  // notifies for unrelated state churn afterwards.
+  useEffect(() => {
+    const handled = new Set<string>();
+    const dispatch = (run: ActionRun): void => {
+      if (run.endedAt === undefined) return;
+      const key = `${run.slug}@${run.endedAt}`;
+      if (handled.has(key)) return;
+      handled.add(key);
+      for (const tag of run.affects) {
+        if (tag === "git") void invalidateWorktree(run.slug);
+        else if (tag === "github") void refreshGithub();
+      }
+    };
+    // Seed `handled` with already-finished runs in the snapshot so a
+    // subscribe-after-mount doesn't re-fire invalidations for stale
+    // entries the picker is still showing.
+    for (const run of actionRegistry.getSnapshot().values()) {
+      if (run.status !== "running" && run.endedAt !== undefined) {
+        handled.add(`${run.slug}@${run.endedAt}`);
+      }
+    }
+    return actionRegistry.subscribe(() => {
+      for (const run of actionRegistry.getSnapshot().values()) {
+        if (run.status === "running") continue;
+        dispatch(run);
+      }
+    });
+  }, [invalidateWorktree, refreshGithub]);
 
   // Slugs whose lock op is `"remove"` — drives the destroy outputs
   // surfaced in the picker. Computed from `rows` (each busy row
@@ -1111,6 +1152,7 @@ export function App({ onExit }: Props) {
     if (modal?.kind !== "reviewerPicker") return;
     const { slug, prNumber, checked, original } = modal;
     const log = createLogger(slug);
+    const branch = rows.find((r) => r.wt.slug === slug)?.wt.branch;
     const add: string[] = [];
     const remove: string[] = [];
     for (const k of checked) if (!original.has(k)) add.push(k);
@@ -1120,10 +1162,26 @@ export function App({ onExit }: Props) {
       toast("no changes", theme.fgDim, 1500);
       return;
     }
-    const result = await editReviewers(prNumber, { add, remove });
-    if (!result.ok) {
-      log.event.err(`edit reviewers failed for #${prNumber}: ${result.error}`);
-      toast(`edit reviewers failed: ${result.error}`, theme.err, 4000);
+    try {
+      await mutate<GithubData, void>({
+        filter: { queryKey: ["github"] },
+        patch: (data) =>
+          branch
+            ? patchPullRequest(data, branch, (pr) => ({
+                ...pr,
+                requestedReviewers: [...checked],
+                reviewRequests: pr.reviewRequests + add.length - remove.length,
+              }))
+            : data,
+        run: async () => {
+          const result = await editReviewers(prNumber, { add, remove });
+          if (!result.ok) throw new Error(result.error);
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.event.err(`edit reviewers failed for #${prNumber}: ${msg}`);
+      toast(`edit reviewers failed: ${msg}`, theme.err, 4000);
       return;
     }
     const parts: string[] = [];
@@ -1137,7 +1195,6 @@ export function App({ onExit }: Props) {
       .filter(Boolean)
       .join(", ");
     toast(summary, theme.ok, 2500);
-    void refreshGithub();
   }
 
   async function doMarkReady(slug: string): Promise<void> {
@@ -1148,15 +1205,25 @@ export function App({ onExit }: Props) {
       return;
     }
     const prNumber = row.pr.number;
-    const result = await markPullRequestReady(prNumber);
-    if (!result.ok) {
-      log.event.err(`mark ready failed for #${prNumber}: ${result.error}`);
-      toast(`mark ready failed: ${result.error}`, theme.err, 4000);
+    const branch = row.wt.branch;
+    try {
+      await mutate<GithubData, void>({
+        filter: { queryKey: ["github"] },
+        patch: (data) =>
+          patchPullRequest(data, branch, (pr) => ({ ...pr, isDraft: false })),
+        run: async () => {
+          const result = await markPullRequestReady(prNumber);
+          if (!result.ok) throw new Error(result.error);
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.event.err(`mark ready failed for #${prNumber}: ${msg}`);
+      toast(`mark ready failed: ${msg}`, theme.err, 4000);
       return;
     }
     log.event.ok(`marked #${prNumber} ready for review`);
     toast(`marked #${prNumber} ready`, theme.ok, 2500);
-    void refreshGithub();
   }
 
   async function doAutoMerge(slug: string, action: "enable" | "disable"): Promise<void> {
@@ -1167,20 +1234,42 @@ export function App({ onExit }: Props) {
       return;
     }
     const prNumber = row.pr.number;
-    const result =
+    const branch = row.wt.branch;
+    // Optimistic shape for enable: we don't know the merge method
+    // GitHub will land on (depends on repo settings), so seed a
+    // placeholder. The invalidate that fires on success replaces it
+    // with truth on the next refetch — what matters for UX is that
+    // the badge flips immediately.
+    const optimisticAutoMerge: PullRequest["autoMerge"] | null =
       action === "enable"
-        ? await enableAutoMerge(prNumber)
-        : await disableAutoMerge(prNumber);
-    if (!result.ok) {
+        ? { enabledAt: new Date().toISOString(), mergeMethod: "REBASE" }
+        : null;
+    try {
+      await mutate<GithubData, void>({
+        filter: { queryKey: ["github"] },
+        patch: (data) =>
+          patchPullRequest(data, branch, (pr) => ({
+            ...pr,
+            autoMerge: optimisticAutoMerge,
+          })),
+        run: async () => {
+          const result =
+            action === "enable"
+              ? await enableAutoMerge(prNumber)
+              : await disableAutoMerge(prNumber);
+          if (!result.ok) throw new Error(result.error);
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       const verb = action === "enable" ? "auto-merge" : "disable auto-merge";
-      log.event.err(`${verb} failed for #${prNumber}: ${result.error}`);
-      toast(`${verb} failed: ${result.error}`, theme.err, 4000);
+      log.event.err(`${verb} failed for #${prNumber}: ${msg}`);
+      toast(`${verb} failed: ${msg}`, theme.err, 4000);
       return;
     }
     const past = action === "enable" ? "enabled" : "disabled";
     log.event.ok(`auto-merge ${past} for #${prNumber}`);
     toast(`auto-merge ${past} for #${prNumber}`, theme.ok, 2500);
-    void refreshGithub();
   }
 
   function buildActionPickerItems(): PickerItem[] {

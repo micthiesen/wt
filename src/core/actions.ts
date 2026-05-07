@@ -27,11 +27,11 @@ import {
   formatTokens,
   messageToLines,
 } from "./claude-events.ts";
-import { type ActionDef, config } from "./config.ts";
+import { type ActionDef, type EffectTag, config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { streamLines } from "./proc.ts";
 
-export type { ActionDef } from "./config.ts";
+export type { ActionDef, EffectTag } from "./config.ts";
 export type { ActionLine, ActionLineKind } from "./claude-events.ts";
 
 const log = createLogger("[actions]");
@@ -94,6 +94,14 @@ export type ActionRun = {
   numTurns?: number;
   tokensIn?: number;
   tokensOut?: number;
+  /**
+   * State domains this run mutates. Snapshot of the def's `affects` at
+   * start time so a later config edit can't change which invalidations
+   * fire for an in-flight run. Consumed by the TUI subscriber that
+   * dispatches cache invalidations when the run reaches a terminal
+   * status — see the architecture block in `state/hooks.ts`.
+   */
+  affects: readonly EffectTag[];
 };
 
 export type ActionStartResult =
@@ -211,6 +219,7 @@ class ActionRegistry {
       status: "running",
       lines: [initialLine],
       logPath,
+      affects: def.affects,
     };
     this.commit((m) => m.set(slug, run));
     this.appendLogFile(run, initialLine);
@@ -244,7 +253,13 @@ class ActionRegistry {
     vars: ActionVars = {},
   ): ActionStartResult {
     return this.start(
-      { kind: "claude", id: CUSTOM_ACTION_ID, name: "Custom prompt", prompt: "" },
+      {
+        kind: "claude",
+        id: CUSTOM_ACTION_ID,
+        name: "Custom prompt",
+        prompt: "",
+        affects: ["git", "github"],
+      },
       slug,
       cwd,
       prompt,

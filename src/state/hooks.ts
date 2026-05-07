@@ -3,6 +3,60 @@
  * out of the TUI code. The per-worktree aggregator lives in
  * `tui/hooks/useWorktreeRows.ts` — that's the only consumer, so this
  * file only needs the imperative actions helper.
+ *
+ * ───────────────────────── State management ─────────────────────────
+ *
+ * Three rules govern how mutations interact with cached state. They
+ * generalise across both built-in mutations (mark-ready, auto-merge,
+ * reviewer edits) and config-driven custom actions.
+ *
+ * 1. Compose optimistic patch + invalidate. Don't pick one.
+ *
+ *    `mutate({ filter, patch, run })` codifies the dance: snapshot
+ *    every cache entry matching `filter`, apply `patch` synchronously
+ *    (badge flips before the network round-trip lands), await `run`,
+ *    invalidate the same filter (active refetch reconciles against
+ *    server truth), and rollback the snapshots on throw.
+ *
+ *    Use it for any mutation whose post-state is a clean function of
+ *    inputs — PR draft→ready, auto-merge on/off, reviewer add/remove,
+ *    archive toggle, section move. Skip the patch and just invalidate
+ *    when the post-state cascades unpredictably (kick CI, free-form
+ *    shell action). Skip both when polling already covers it (tmux
+ *    session lifecycle ticks every 2s, lock state every 2s while
+ *    held).
+ *
+ *    The interaction with synchronous preconditions is the punchline:
+ *    optimistic patches show up in row state immediately, so any
+ *    inline guard that reads row state cascades for free. Marking a
+ *    PR ready unblocks `openReviewerPicker`'s `!pr.isDraft` gate
+ *    before the server confirms; a rollback re-blocks it. No
+ *    explicit wiring needed between the two mechanisms.
+ *
+ * 2. Active refetch always.
+ *
+ *    `invalidateQueries` with default `refetchType: "active"` actively
+ *    refetches the observed query rather than just marking it stale.
+ *    In a TUI where the user is staring at the affected row, active
+ *    is what you want. "Mark stale" is a web-app pattern for
+ *    background tabs; we don't have those.
+ *
+ * 3. Custom actions declare what they affect.
+ *
+ *    `[[actions]]` entries in `config.toml` carry an `affects` tag
+ *    array (`"git"`, `"github"`). The TUI subscribes to action
+ *    completions and invalidates the matching state domains when a
+ *    run reaches a terminal status. Defaults: claude actions push
+ *    commits, so they default to `["git", "github"]`; shell actions
+ *    are opaque, so they default to `[]` and the user opts in (e.g.
+ *    a `git checkout` shell action sets `affects = ["git"]`).
+ *
+ *    For a built-in mutation, the equivalent is just calling the
+ *    relevant refresh helper at the call site (`refreshGithub`,
+ *    `invalidateWorktree(slug)`, …) — the action runner only exists
+ *    to bridge config-defined work to the same invalidation surface.
+ *
+ * ────────────────────────────────────────────────────────────────────
  */
 import { useMemo } from "react";
 import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
@@ -14,6 +68,7 @@ import {
 import type { DiffContext } from "../core/diff/index.ts";
 import { invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
+import type { PullRequest } from "../core/types.ts";
 import {
   placeSlug as placeSlugOnDisk,
   renameSection as renameSectionOnDisk,
@@ -33,6 +88,26 @@ import {
   type GithubData,
 } from "./queries.ts";
 import type { Contributor } from "../core/types.ts";
+
+/**
+ * In-place patch helper for a single PR inside the github cache. The
+ * github query is keyed by the sorted branch list, not by PR number,
+ * so callers don't have a single concrete queryKey — they patch every
+ * matching `["github", …]` entry via `mutate({ filter: { queryKey:
+ * ["github"] }, ... })`. Returns the input unchanged when there's no
+ * matching PR (cache miss for this branch); the runtime caller will
+ * still invalidate, so server truth lands shortly after.
+ */
+export function patchPullRequest(
+  data: GithubData | undefined,
+  branch: string,
+  patch: (pr: PullRequest) => PullRequest,
+): GithubData | undefined {
+  if (!data) return data;
+  const pr = data.prs[branch];
+  if (!pr) return data;
+  return { ...data, prs: { ...data.prs, [branch]: patch(pr) } };
+}
 
 /**
  * Observe the combined GitHub query, scoped to the current set of
@@ -56,6 +131,41 @@ export function useGithub(): UseQueryResult<GithubData, Error> {
 export function useWtActions() {
   const qc = useQueryClient();
   return {
+    /**
+     * Run a mutation with an optimistic cache patch and reconcile-on-success.
+     *
+     * Three steps: snapshot every cache entry matching `filter`, write
+     * the patch (synchronous — the badge flips before the network call
+     * lands), await `run`, then invalidate (active refetch reconciles
+     * against server truth). On throw, rollback every captured
+     * snapshot to its prior value and rethrow.
+     *
+     * `filter` is a queryKey prefix. For queries keyed by inputs the
+     * call site doesn't know (e.g. the github query is keyed by the
+     * sorted branch list, not by PR number), pass the prefix and let
+     * the patch fn handle every matching entry — see
+     * `patchPullRequest` for the typical PR-shaped helper.
+     *
+     * `run` should throw on failure; mutations that return `{ ok:
+     * false, error }` should be wrapped to throw at the call site.
+     */
+    async mutate<TData, TResult>(opts: {
+      filter: { queryKey: readonly unknown[] };
+      patch: (prev: TData | undefined) => TData | undefined;
+      run: () => Promise<TResult>;
+    }): Promise<TResult> {
+      const { filter, patch, run } = opts;
+      const snapshots = qc.getQueriesData<TData>(filter);
+      qc.setQueriesData<TData>(filter, patch);
+      try {
+        const result = await run();
+        void qc.invalidateQueries(filter);
+        return result;
+      } catch (err) {
+        for (const [key, value] of snapshots) qc.setQueryData(key, value);
+        throw err;
+      }
+    },
     /**
      * Refetch only the observed queries that are past their staleTime.
      * Unlike `refreshAll`, this doesn't run `git fetch origin` and
