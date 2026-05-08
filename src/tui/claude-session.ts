@@ -28,8 +28,19 @@ export async function enterClaudeSession(opts: {
   renderer: CliRenderer;
   slug: string;
   cwd: string;
+  /**
+   * Named-session selector. Undefined = primary (`<slug>`); string =
+   * one of the named sessions spawned via Shift+F12 / picker (tmux
+   * session = `<slug>~<name>`, claude --name = `<name>`).
+   */
+  claudeName?: string;
+  /**
+   * Display name for the primary session in claude's `/resume` picker.
+   * Defaults to the slug when omitted; ignored for named sessions.
+   */
+  claudeDisplayName?: string;
 }): Promise<EnterResult> {
-  const { renderer, slug, cwd } = opts;
+  const { renderer, slug, cwd, claudeName, claudeDisplayName } = opts;
   // try/finally so a spawn-failed throw can't strand the UI in the
   // suspended state. attachOrCreate already swallows spawn errors and
   // returns `spawn-failed`, but defending against future regressions
@@ -37,7 +48,13 @@ export async function enterClaudeSession(opts: {
   renderer.suspend();
   process.stdout.write(CLEAR_SCREEN);
   try {
-    return await attachOrCreate({ slug, cwd, kind: "claude" });
+    return await attachOrCreate({
+      slug,
+      cwd,
+      kind: "claude",
+      claudeName,
+      claudeDisplayName,
+    });
   } finally {
     process.stdout.write(CLEAR_SCREEN);
     renderer.resume();

@@ -9,20 +9,29 @@ import { useSyncExternalStore } from "react";
 import {
   type SessionRun,
   sessionTailRegistry,
+  tailKey,
 } from "../../core/session-tail.ts";
 import {
   type ShellRun,
   shellTailRegistry,
 } from "../../core/shell-tail.ts";
 
-export function useSessionRun(slug: string | undefined): SessionRun | null {
+/**
+ * Live session tail for a (slug, name) pair. `name` defaults to null
+ * (primary) so existing callers reading the primary's tail don't
+ * change.
+ */
+export function useSessionRun(
+  slug: string | undefined,
+  name: string | null = null,
+): SessionRun | null {
   const map = useSyncExternalStore(
     sessionTailRegistry.subscribe,
     sessionTailRegistry.getSnapshot,
     sessionTailRegistry.getSnapshot,
   );
   if (!slug) return null;
-  return map.get(slug) ?? null;
+  return map.get(tailKey(slug, name)) ?? null;
 }
 
 export function useShellRun(slug: string | undefined): ShellRun | null {

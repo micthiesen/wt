@@ -39,6 +39,13 @@ export type Output = {
   slug?: string;
   /** Session sub-kind for `kind: "session"`; otherwise undefined. */
   sessionKind?: OutputSessionKind;
+  /**
+   * For `kind: "session"` and `sessionKind: "claude"`, the user-typed
+   * session name; `null` is the primary. Undefined for non-claude or
+   * non-session outputs. Carried through so the OutputViewer / picker
+   * can resolve back to the right tmux session and tail registry key.
+   */
+  sessionName?: string | null;
   status: OutputStatus;
   startedAt: number;
   /** Drives picker sorting. For events: the latest event timestamp. */
@@ -71,7 +78,17 @@ export function actionOutputId(slug: string, startedAt: number): string {
   return `action:${slug}:${startedAt}`;
 }
 
-export function sessionOutputId(slug: string, kind: OutputSessionKind): string {
+export function sessionOutputId(
+  slug: string,
+  kind: OutputSessionKind,
+  name?: string | null,
+): string {
+  // Primary claude (and any shell, which has no naming concept) keep
+  // the legacy two-segment id so existing pin/focus state survives the
+  // multi-session rollout. Named claudes get a fourth segment.
+  if (kind === "claude" && name != null && name !== "") {
+    return `session:${slug}:${kind}:${name}`;
+  }
   return `session:${slug}:${kind}`;
 }
 
@@ -150,19 +167,28 @@ export function destroyOutput(
  * content tail registered in `core/session-tail.ts`, so the
  * OutputViewer renders running content for both. F11 diff is not an
  * output kind — see the file header.
+ *
+ * `name` is the user-typed claude session name; `null` is the primary.
+ * Ignored for shell (which has no naming concept).
  */
 export function sessionOutput(
   slug: string,
   kind: OutputSessionKind,
   startedAt: number,
   lastActivity: number,
+  name?: string | null,
 ): Output {
+  const isNamed = kind === "claude" && name != null && name !== "";
+  const title = isNamed
+    ? `${slug} · ${SESSION_LABEL[kind]} · ${name}`
+    : `${slug} · ${SESSION_LABEL[kind]}`;
   return {
-    id: sessionOutputId(slug, kind),
+    id: sessionOutputId(slug, kind, name),
     kind: "session",
-    title: `${slug} · ${SESSION_LABEL[kind]}`,
+    title,
     slug,
     sessionKind: kind,
+    sessionName: kind === "claude" ? (name ?? null) : undefined,
     status: "live",
     startedAt,
     lastActivity,

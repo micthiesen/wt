@@ -48,7 +48,39 @@ export const NF = {
 	mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — prefix for `⇥N`
 	bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed
 	boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
-	comment: "\u{F41F}", // nf-oct-comment        — Claude Code session activity
+	comment: "\u{F41F}", // nf-oct-comment        — legacy claude marker (action runs)
+	// Filled circled digits for the per-row claude session count.
+	// Unicode dingbats (U+2776..U+277E for 1..9) — guaranteed to render
+	// in any monospace font, no NerdFont dependency. Matches the visual
+	// weight of the comment glyph being replaced.
+	circled1: "\u{2776}",
+	circled2: "\u{2777}",
+	circled3: "\u{2778}",
+	circled4: "\u{2779}",
+	circled5: "\u{277A}",
+	circled6: "\u{277B}",
+	circled7: "\u{277C}",
+	circled8: "\u{277D}",
+	circled9: "\u{277E}",
 	anglesUp: "\u{F102}", // nf-fa-angle_double_up — stacked-on hint when parent worktree sits immediately above
 	pin: "\u{F08D}", // nf-fa-thumb_tack — pinned output in OutputViewer title
 } as const;
+
+/**
+ * Glyph for a per-row claude session count. 1..9 → filled circled
+ * digit; 10+ → "9+" sigil (filled circled 9 followed by a plus). 0
+ * shouldn't reach here — callers should omit the badge entirely.
+ */
+export function claudeCountGlyph(count: number): string {
+  if (count <= 0) return "";
+  if (count === 1) return NF.circled1;
+  if (count === 2) return NF.circled2;
+  if (count === 3) return NF.circled3;
+  if (count === 4) return NF.circled4;
+  if (count === 5) return NF.circled5;
+  if (count === 6) return NF.circled6;
+  if (count === 7) return NF.circled7;
+  if (count === 8) return NF.circled8;
+  if (count === 9) return NF.circled9;
+  return `${NF.circled9}+`;
+}

@@ -54,7 +54,8 @@ export const WT_SOURCE_SLUG = "wt";
  * F10 plain login shell; `action` is a wt-managed action runner
  * (claude `-p` or shell command) supervised by tmux so it survives
  * wt restarts. Each gets its own tmux session per slug — `<slug>`
- * for claude, `<slug>-diff` for diff, `<slug>-shell` for shell,
+ * for claude (primary), `<slug>~<name>` for additional named claude
+ * sessions, `<slug>-diff` for diff, `<slug>-shell` for shell,
  * `<slug>-action` for action — so they coexist without interfering.
  *
  * Action sessions are not user-attachable and are not driven by the
@@ -70,8 +71,20 @@ const SUFFIX: Record<Exclude<SessionKind, "claude">, string> = {
   action: "-action",
 };
 
-function sessionName(slug: string, kind: SessionKind): string {
-  return kind === "claude" ? slug : `${slug}${SUFFIX[kind]}`;
+/**
+ * Separator between slug and a named claude session's user-supplied
+ * name in the tmux session name. `~` was picked because it never
+ * appears in slugs (derived from branch names — git accepts most
+ * ASCII but `~` collides with reflog syntax in practice) and never in
+ * validated session names (see `validateSessionName` in
+ * `claude-sessions.ts`). Stripping is unambiguous: rightmost `~`
+ * splits slug from name.
+ */
+const CLAUDE_NAMED_SEP = "~";
+
+function sessionName(slug: string, kind: SessionKind, claudeName?: string): string {
+  if (kind !== "claude") return `${slug}${SUFFIX[kind]}`;
+  return claudeName === undefined ? slug : `${slug}${CLAUDE_NAMED_SEP}${claudeName}`;
 }
 
 /**
@@ -85,12 +98,23 @@ function shQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-/** Strip a kind suffix from a session name to recover the bare slug. */
+/**
+ * Recover the bare slug from a tmux session name. Strips any kind
+ * suffix (`-diff`, `-shell`, `-action`) and any named-claude suffix
+ * (`~<name>`). Order matters: a named-claude session like
+ * `foo-shell~bar` (theoretically impossible — slugs don't end in
+ * `-shell`) would parse as kind=`shell`, slug=`foo`, but our
+ * validation forbids `~` in names so this never resolves wrong in
+ * practice. We strip the named-claude `~` first since it's the
+ * rightmost decoration.
+ */
 function bareSlug(name: string): string {
+  const tildeIdx = name.lastIndexOf(CLAUDE_NAMED_SEP);
+  const stripped = tildeIdx >= 0 ? name.slice(0, tildeIdx) : name;
   for (const suffix of Object.values(SUFFIX)) {
-    if (name.endsWith(suffix)) return name.slice(0, -suffix.length);
+    if (stripped.endsWith(suffix)) return stripped.slice(0, -suffix.length);
   }
-  return name;
+  return stripped;
 }
 
 /** Path to the generated tmux.conf. */
@@ -180,13 +204,23 @@ export async function killServer(): Promise<void> {
 }
 
 /**
- * Kill one worktree's claude session. Idempotent — silently no-ops
- * when the session doesn't exist or the server isn't running. Other
- * kinds are unaffected; use `killDiffSession` / `killShellSession`
- * for those, or `killAllSessionsFor` to drop every kind at once.
+ * Kill one worktree's primary claude session. Idempotent — silently
+ * no-ops when the session doesn't exist or the server isn't running.
+ * Other kinds and any *named* claude sessions on the same slug are
+ * unaffected; use `killClaudeNamedSession` / `killDiffSession` /
+ * `killShellSession` for those, or `killAllSessionsFor` to drop
+ * every kind at once.
  */
 export async function killSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "claude"));
+}
+
+/** Kill one worktree's named (non-primary) claude session. Idempotent. */
+export async function killClaudeNamedSession(
+  slug: string,
+  claudeName: string,
+): Promise<void> {
+  await killByName(sessionName(slug, "claude", claudeName));
 }
 
 /** Kill one worktree's diff session. Idempotent. */
@@ -205,18 +239,20 @@ export async function killShellSession(slug: string): Promise<void> {
 // truth for the same tmux command.
 
 /**
- * Kill every kind of session for a slug (claude, diff, shell,
- * action). Used by destroy paths so none linger with cwd inside a
- * half-deleted worktree.
+ * Kill every kind of session for a slug (claude primary + every
+ * named claude, diff, shell, action). Used by destroy paths so none
+ * linger with cwd inside a half-deleted worktree.
  */
 export async function killAllSessionsFor(slug: string): Promise<void> {
-  // action-tmux.ts owns the action-session kill; we just call it
-  // alongside the others. It's sync (Bun.spawnSync), so wrap in
-  // Promise.resolve for the allSettled shape.
+  // List once and pick out any session whose bareSlug matches —
+  // covers primary, named claudes, diff, shell, and action without
+  // hardcoding the named-claude list. Action kills go via
+  // action-tmux.ts which is synchronous; wrap in Promise.resolve to
+  // keep the allSettled shape uniform.
+  const all = await listAllSessionsRaw().catch(() => new Set<string>());
+  const ours = [...all].filter((n) => bareSlug(n) === slug);
   await Promise.allSettled([
-    killSession(slug),
-    killDiffSession(slug),
-    killShellSession(slug),
+    ...ours.map((n) => killByName(n)),
     Promise.resolve().then(() => killActionSession(slug)),
   ]);
 }
@@ -258,22 +294,37 @@ async function killByName(name: string): Promise<void> {
 }
 
 /**
- * Bare slug sets for the live sessions of each kind, partitioned so
- * the indicators and the F10/F11/F12 kill-confirm hints can read
- * each independently. One CLI call regardless of worktree count.
+ * One live claude session as seen by tmux. `name = null` is the
+ * primary (tmux session name = bare slug); a string is a user-named
+ * additional session (tmux session name = `<slug>~<name>`).
+ */
+export type ClaudeSessionEntry = { slug: string; name: string | null };
+
+/**
+ * Bare slug sets (and named-claude entries) for the live sessions of
+ * each kind. Partitioned so the indicators, kill-confirm hints, and
+ * the sessions picker can each read what they need independently.
+ * One CLI call regardless of worktree count.
+ *
+ * `claude` is now a list of `(slug, name)` because a single worktree
+ * can host multiple claude sessions (primary + N named). The legacy
+ * `claudeSlugs` set is the unique-slug projection — preserved so
+ * "row has any live claude" checks stay a Set lookup.
  *
  * Server-not-running exits non-zero with a "no server running"
  * stderr; we map that to empty sets rather than throwing — it's the
  * steady state when no worktree has been entered yet.
  */
 export async function listSessions(): Promise<{
-  claude: Set<string>;
+  claude: ClaudeSessionEntry[];
+  claudeSlugs: Set<string>;
   diff: Set<string>;
   shell: Set<string>;
   action: Set<string>;
 }> {
   const all = await listAllSessionsRaw();
-  const claude = new Set<string>();
+  const claude: ClaudeSessionEntry[] = [];
+  const claudeSlugs = new Set<string>();
   const diff = new Set<string>();
   const shell = new Set<string>();
   const action = new Set<string>();
@@ -285,10 +336,19 @@ export async function listSessions(): Promise<{
     } else if (name.endsWith(SUFFIX.action)) {
       action.add(name.slice(0, -SUFFIX.action.length));
     } else {
-      claude.add(name);
+      const tildeIdx = name.lastIndexOf(CLAUDE_NAMED_SEP);
+      if (tildeIdx > 0) {
+        const slug = name.slice(0, tildeIdx);
+        const claudeName = name.slice(tildeIdx + 1);
+        claude.push({ slug, name: claudeName });
+        claudeSlugs.add(slug);
+      } else {
+        claude.push({ slug: name, name: null });
+        claudeSlugs.add(name);
+      }
     }
   }
-  return { claude, diff, shell, action };
+  return { claude, claudeSlugs, diff, shell, action };
 }
 
 /**
@@ -389,6 +449,21 @@ export async function attachOrCreate(opts: {
   cwd: string;
   kind: Exclude<SessionKind, "action">;
   /**
+   * For `kind: "claude"` only. Undefined → the primary session
+   * (tmux session name = bare slug; display name in `/resume` =
+   * `displayName`). String → a named additional session (tmux name
+   * = `<slug>~<claudeName>`; display name = `claudeName`). Ignored
+   * for other kinds.
+   */
+  claudeName?: string;
+  /**
+   * For `kind: "claude"` only. Label shown in claude's `/resume`
+   * picker for the *primary* session. Defaults to the slug. Ignored
+   * for named sessions (whose display name is the name itself) and
+   * for non-claude kinds.
+   */
+  claudeDisplayName?: string;
+  /**
    * Resolved diff base ref for `{{base}}` substitution in
    * `config.diff.command`. Required by callers using a base-aware diff
    * command (the shipped default `hunk diff {{base}} --watch`); ignored
@@ -399,8 +474,8 @@ export async function attachOrCreate(opts: {
    */
   base?: string;
 }): Promise<AttachResult> {
-  const { slug, cwd, kind, base } = opts;
-  const name = sessionName(slug, kind);
+  const { slug, cwd, kind, claudeName, claudeDisplayName, base } = opts;
+  const name = sessionName(slug, kind, kind === "claude" ? claudeName : undefined);
   const { path: configPath, changed } = writeConfig();
   if (changed) {
     log.info("config changed, killing server before attach", { slug, kind });
@@ -425,7 +500,17 @@ export async function attachOrCreate(opts: {
   const userShell = process.env.SHELL || "bash";
   const innerArgs =
     kind === "claude"
-      ? ["claude", ...wtSessionArgs(cwd)]
+      ? [
+          "claude",
+          ...wtSessionArgs({
+            wtPath: cwd,
+            name: claudeName,
+            displayName:
+              claudeName !== undefined
+                ? claudeName
+                : (claudeDisplayName ?? slug),
+          }),
+        ]
       : kind === "diff"
         ? [userShell, "-lc", resolveDiffCommand(config.diff.command, base)]
         : [userShell, "-l"];

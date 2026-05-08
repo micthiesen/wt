@@ -86,7 +86,13 @@ function OutputContent({ output, height }: { output: Output; height: number }) {
     // pipe-pane log with ANSI stripped. Different parsers, same
     // shape downstream.
     if (output.sessionKind === "claude") {
-      return <SessionContent slug={output.slug} height={height} />;
+      return (
+        <SessionContent
+          slug={output.slug}
+          name={output.sessionName ?? null}
+          height={height}
+        />
+      );
     }
     if (output.sessionKind === "shell") {
       return <ShellContent slug={output.slug} height={height} />;

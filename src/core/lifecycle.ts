@@ -2,6 +2,7 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, writeFileSync
 import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
+import { clearClaudeNames } from "./claude-sessions.ts";
 import { clearSlugState } from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet } from "./git.ts";
@@ -163,6 +164,7 @@ export async function createWorktree(
   // destroy is in flight, is the race-free counterpart.
   clearArchived(slug);
   clearSlugState(slug);
+  clearClaudeNames(slug);
 
   try {
     opts.onPhase?.("fetching origin");

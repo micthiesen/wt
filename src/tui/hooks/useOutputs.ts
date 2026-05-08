@@ -18,7 +18,7 @@ import {
   sessionOutput,
   sortOutputs,
 } from "../../core/outputs.ts";
-import { sessionTailRegistry } from "../../core/session-tail.ts";
+import { sessionTailRegistry, tailKey } from "../../core/session-tail.ts";
 import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
 import { events as eventsLog } from "../events.ts";
@@ -119,15 +119,24 @@ export function useOutputs(opts: {
     }
 
     if (sessions) {
-      // Both kinds tail their tmux pane and expose the same shape
-      // (startedAt + ordered lines with ts), so the lastActivity
-      // calculation is uniform.
-      for (const slug of sessions.claude) {
-        const tail = claudeTails.get(slug);
+      // Claude can host multiple sessions per slug (primary + N
+      // named); each is its own output. The tail registry is keyed by
+      // tmux session name (`<slug>` or `<slug>~<name>`), shared via
+      // `tailKey` so the lookup matches the registry-side key.
+      for (const entry of sessions.claude) {
+        const tail = claudeTails.get(tailKey(entry.slug, entry.name));
         const startedAt = tail?.startedAt ?? Date.now();
         const lastLineTs = tail?.lines[tail.lines.length - 1]?.ts;
         const lastActivity = lastLineTs ?? startedAt;
-        out.push(sessionOutput(slug, "claude", startedAt, lastActivity));
+        out.push(
+          sessionOutput(
+            entry.slug,
+            "claude",
+            startedAt,
+            lastActivity,
+            entry.name,
+          ),
+        );
       }
       for (const slug of sessions.shell) {
         const tail = shellTails.get(slug);

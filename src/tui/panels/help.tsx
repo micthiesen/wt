@@ -54,8 +54,9 @@ const SECTIONS: Section[] = [
       ["⇧F10", "kill shell session (ends background procs)"],
       ["F11", "enter diff TUI · F11 again to detach"],
       ["⇧F11", "kill diff session (resets gitu state)"],
-      ["F12", "enter claude session · F12 again to detach"],
-      ["⇧F12", "kill claude session (preserves history)"],
+      ["F12", "enter primary claude · F12 again to detach"],
+      ["⇧F12", "spawn new auto-named claude (attach)"],
+      [";", "claude sessions picker (current row)"],
       ["d", "remove worktree"],
     ],
   },
@@ -78,7 +79,7 @@ const SECTIONS: Section[] = [
     title: "outputs (bottom pane · per-worktree)",
     note: "each worktree remembers its last-shown output and pin; switching rows restores them.",
     items: [
-      [";", "outputs picker for this worktree"],
+      [":", "outputs picker for this worktree"],
       ["[ / ]", "cycle prev / next output for this worktree"],
       ["\"", "jump to events for this worktree"],
       ["'", "pin current output (resists auto-switch)"],
@@ -112,9 +113,9 @@ const BADGES: [LegendGlyph, string, string][] = [
   [NF.mergeQueue, theme.info, "auto-merge armed (waiting)"],
   [NF.bolt, theme.warn, "SST stage deployed"],
   [NF.comment, theme.ok, "Claude · `!` action running"],
-  [NF.comment, theme.accent, "Claude · interactive session live"],
+  [NF.circled1, theme.accent, "Claude · live session count (1, 2, …)"],
   [NF.comment, theme.warn, "Claude · waiting (details pane)"],
-  [NF.comment, theme.fgDim, "Claude · idle"],
+  [NF.comment, theme.fgDim, "Claude · idle (details pane)"],
 ];
 
 function KeyRow({ keyText, label }: { keyText: string; label: string }) {

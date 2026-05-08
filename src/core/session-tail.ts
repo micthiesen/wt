@@ -66,6 +66,16 @@ import { createLogger } from "./logger.ts";
 
 const log = createLogger("[session-tail]");
 
+/**
+ * Composite identifier for a session tail. `null` name = primary
+ * (key collapses to the bare slug, matching the tmux session name);
+ * a string name yields `<slug>~<name>`. Stable across the codebase
+ * so anything that touches a session-tail map agrees on the key.
+ */
+export function tailKey(slug: string, name: string | null): string {
+  return name === null ? slug : `${slug}~${name}`;
+}
+
 /** How many trailing bytes of the jsonl to seed from on first ensure. */
 const SEED_TAIL_BYTES = 64 * 1024;
 /** Coalesce window for fs.watch bursts. */
@@ -73,6 +83,8 @@ const READ_DEBOUNCE_MS = 80;
 
 export type SessionRun = {
   slug: string;
+  /** `null` = primary, otherwise the user-typed name. */
+  name: string | null;
   startedAt: number;
   lines: readonly ActionLine[];
 };
@@ -80,6 +92,8 @@ export type SessionRun = {
 type Listener = () => void;
 
 type State = {
+  slug: string;
+  name: string | null;
   path: string;
   projectDir: string;
   jsonlName: string;
@@ -91,17 +105,34 @@ type State = {
   debounce: Timer | null;
 };
 
+/**
+ * Description of one live claude session for reconciliation. The
+ * registry needs (slug, name, wtPath) per session: slug+name compose
+ * the tail key; wtPath resolves the jsonl path via `wtSessionUuid`.
+ */
+export type LiveSessionDesc = {
+  slug: string;
+  /** `null` = primary. */
+  name: string | null;
+  wtPath: string;
+};
+
 class SessionTailRegistry {
+  // Keys here are tail keys (tmux session names) — `<slug>` for
+  // primary, `<slug>~<name>` for named. Multiple sessions per slug
+  // coexist as separate entries.
   private runs: ReadonlyMap<string, SessionRun> = new Map();
   private state = new Map<string, State>();
   private listeners = new Set<Listener>();
 
   /**
-   * Idempotent. Spins up a tailer for `slug`'s wt-managed jsonl if not
-   * already running; safe to call on every render-driven reconcile.
+   * Idempotent. Spins up a tailer for the (slug, name) session's
+   * wt-managed jsonl if not already running; safe to call on every
+   * render-driven reconcile.
    */
-  ensure(slug: string, wtPath: string): void {
-    const uuid = wtSessionUuid(wtPath);
+  ensure(slug: string, wtPath: string, name: string | null = null): void {
+    const key = tailKey(slug, name);
+    const uuid = wtSessionUuid(wtPath, name ?? undefined);
     const projectDir = join(
       homedir(),
       ".claude",
@@ -110,16 +141,18 @@ class SessionTailRegistry {
     );
     const jsonlName = `${uuid}.jsonl`;
     const path = join(projectDir, jsonlName);
-    const existing = this.state.get(slug);
+    const existing = this.state.get(key);
     if (existing) {
-      // Already tracking this slug — only restart if the resolved path
-      // changed (e.g. a destroy+recreate cycle re-pointed the slug at a
+      // Already tracking — only restart if the resolved path changed
+      // (e.g. a destroy+recreate cycle re-pointed the slug at a
       // different worktree path within the same TUI run).
       if (existing.path === path) return;
-      this.stop(slug);
+      this.stop(slug, name);
     }
 
     const st: State = {
+      slug,
+      name,
       path,
       projectDir,
       jsonlName,
@@ -130,50 +163,66 @@ class SessionTailRegistry {
       dirWatcher: null,
       debounce: null,
     };
-    this.state.set(slug, st);
+    this.state.set(key, st);
 
     const startedAt = Date.now();
-    this.commit((m) => m.set(slug, { slug, startedAt, lines: [] }));
+    this.commit((m) => m.set(key, { slug, name, startedAt, lines: [] }));
 
     if (existsSync(path)) {
-      this.seedAndWatch(slug);
+      this.seedAndWatch(key);
     } else {
-      this.watchForCreation(slug);
+      this.watchForCreation(key);
     }
   }
 
-  stop(slug: string): void {
-    const st = this.state.get(slug);
+  stop(slug: string, name: string | null = null): void {
+    const key = tailKey(slug, name);
+    const st = this.state.get(key);
     if (!st) return;
     closeSilent(st.watcher);
     closeSilent(st.dirWatcher);
     if (st.debounce) clearTimeout(st.debounce);
-    this.state.delete(slug);
+    this.state.delete(key);
     this.commit((m) => {
-      m.delete(slug);
+      m.delete(key);
     });
   }
 
   /**
-   * Sync tracked tailers to a live `slug → wtPath` set. Spins up
-   * tailers for new live slugs, stops tailers for slugs no longer live.
+   * Sync tracked tailers to a live session set. Spins up tailers for
+   * new live sessions, stops tailers for sessions no longer live.
    * Designed to be called from a reactive effect with the current
-   * tmux-session set.
+   * tmux-session list.
    */
-  reconcile(liveSlugs: ReadonlyMap<string, string>): void {
-    for (const [slug, wtPath] of liveSlugs) this.ensure(slug, wtPath);
-    for (const slug of [...this.state.keys()]) {
-      if (!liveSlugs.has(slug)) this.stop(slug);
+  reconcile(live: readonly LiveSessionDesc[]): void {
+    const liveKeys = new Set<string>();
+    for (const desc of live) {
+      liveKeys.add(tailKey(desc.slug, desc.name));
+      this.ensure(desc.slug, desc.wtPath, desc.name);
+    }
+    for (const key of [...this.state.keys()]) {
+      if (liveKeys.has(key)) continue;
+      const run = this.runs.get(key);
+      if (run) this.stop(run.slug, run.name);
+      else this.state.delete(key);
     }
   }
 
   /** Stop every tailer. Used on TUI shutdown. */
   stopAll(): void {
-    for (const slug of [...this.state.keys()]) this.stop(slug);
+    for (const key of [...this.state.keys()]) {
+      const run = this.runs.get(key);
+      if (run) this.stop(run.slug, run.name);
+      else this.state.delete(key);
+    }
   }
 
-  get(slug: string): SessionRun | null {
-    return this.runs.get(slug) ?? null;
+  /**
+   * Lookup by (slug, name). Convenience overload `get(slug)` returns
+   * primary — same as the prior single-session API.
+   */
+  get(slug: string, name: string | null = null): SessionRun | null {
+    return this.runs.get(tailKey(slug, name)) ?? null;
   }
 
   getSnapshot = (): ReadonlyMap<string, SessionRun> => this.runs;
@@ -204,14 +253,14 @@ class SessionTailRegistry {
     this.notify();
   }
 
-  private update(slug: string, mut: (r: SessionRun) => SessionRun): void {
-    const cur = this.runs.get(slug);
+  private update(key: string, mut: (r: SessionRun) => SessionRun): void {
+    const cur = this.runs.get(key);
     if (!cur) return;
-    this.commit((m) => m.set(slug, mut(cur)));
+    this.commit((m) => m.set(key, mut(cur)));
   }
 
-  private watchForCreation(slug: string): void {
-    const st = this.state.get(slug);
+  private watchForCreation(key: string): void {
+    const st = this.state.get(key);
     if (!st) return;
     // Project dir may not exist if claude has never written for this
     // worktree before; create it so fs.watch has something to attach to.
@@ -231,12 +280,13 @@ class SessionTailRegistry {
           if (!existsSync(st.path)) return;
           closeSilent(st.dirWatcher);
           st.dirWatcher = null;
-          this.seedAndWatch(slug);
+          this.seedAndWatch(key);
         },
       );
     } catch (err) {
       log.warn("dir watch failed", {
-        slug,
+        slug: st.slug,
+        name: st.name,
         projectDir: st.projectDir,
         err: errMsg(err),
       });
@@ -249,29 +299,29 @@ class SessionTailRegistry {
     if (existsSync(st.path)) {
       closeSilent(st.dirWatcher);
       st.dirWatcher = null;
-      this.seedAndWatch(slug);
+      this.seedAndWatch(key);
     }
   }
 
-  private seedAndWatch(slug: string): void {
-    const st = this.state.get(slug);
+  private seedAndWatch(key: string): void {
+    const st = this.state.get(key);
     if (!st) return;
     try {
-      this.readSeed(slug);
+      this.readSeed(key);
     } catch (err) {
-      log.warn("seed read failed", { slug, err: errMsg(err) });
+      log.warn("seed read failed", { slug: st.slug, name: st.name, err: errMsg(err) });
     }
     try {
       st.watcher = watch(st.path, { persistent: false }, () =>
-        this.scheduleRead(slug),
+        this.scheduleRead(key),
       );
     } catch (err) {
-      log.warn("file watch failed", { slug, err: errMsg(err) });
+      log.warn("file watch failed", { slug: st.slug, name: st.name, err: errMsg(err) });
     }
   }
 
-  private readSeed(slug: string): void {
-    const st = this.state.get(slug);
+  private readSeed(key: string): void {
+    const st = this.state.get(key);
     if (!st) return;
     let size = 0;
     try {
@@ -304,25 +354,25 @@ class SessionTailRegistry {
       accum.length > MAX_BUFFERED_LINES
         ? accum.slice(-MAX_BUFFERED_LINES)
         : accum;
-    this.update(slug, (r) => ({ ...r, lines: trimmed }));
+    this.update(key, (r) => ({ ...r, lines: trimmed }));
   }
 
-  private scheduleRead(slug: string): void {
-    const st = this.state.get(slug);
+  private scheduleRead(key: string): void {
+    const st = this.state.get(key);
     if (!st) return;
     if (st.debounce) return;
     st.debounce = setTimeout(() => {
       st.debounce = null;
       try {
-        this.readDelta(slug);
+        this.readDelta(key);
       } catch (err) {
-        log.warn("delta read failed", { slug, err: errMsg(err) });
+        log.warn("delta read failed", { slug: st.slug, name: st.name, err: errMsg(err) });
       }
     }, READ_DEBOUNCE_MS);
   }
 
-  private readDelta(slug: string): void {
-    const st = this.state.get(slug);
+  private readDelta(key: string): void {
+    const st = this.state.get(key);
     if (!st) return;
     let size = 0;
     try {
@@ -349,7 +399,7 @@ class SessionTailRegistry {
       for (const l of out) newLines.push(l);
     }
     if (newLines.length === 0) return;
-    this.update(slug, (r) => {
+    this.update(key, (r) => {
       const merged = [...r.lines, ...newLines];
       const lines =
         merged.length > MAX_BUFFERED_LINES

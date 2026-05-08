@@ -85,17 +85,21 @@ export function ActionContent({
 
 /**
  * Live capture of the wt-managed interactive `claude` session jsonl.
- * Subscribes via `useSessionRun(slug)` so registry commits during a
- * busy claude turn re-render only this content, not the whole tree.
+ * Subscribes via `useSessionRun(slug, name)` so registry commits during
+ * a busy claude turn re-render only this content, not the whole tree.
+ * `name = null` is the primary; a string is one of the named sessions
+ * spawned via Shift+F12.
  */
 export function SessionContent({
   slug,
+  name,
   height,
 }: {
   slug: string;
+  name?: string | null;
   height: number;
 }) {
-  const run = useSessionRun(slug);
+  const run = useSessionRun(slug, name ?? null);
   // No data yet: the tailer is in its pre-creation race (jsonl not on
   // disk) or we just mounted in the same frame the registry was first
   // populated. Surface a placeholder line so the pane doesn't read as

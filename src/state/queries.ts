@@ -92,9 +92,21 @@ export const wtStateQuery = () =>
     staleTime: STALE.fast,
   });
 
+/**
+ * One live claude session as seen by tmux. `name = null` is the
+ * primary; a string is a user-named additional session.
+ */
+export type ClaudeSessionEntry = { slug: string; name: string | null };
+
 export type TmuxSessionsData = {
-  /** Slugs with a live claude session. */
-  claude: string[];
+  /**
+   * Every live claude session, including primary and named. Multiple
+   * entries can share a slug. Drives the sessions picker; consumers
+   * that just want "any live claude" should use `claudeSlugs`.
+   */
+  claude: ClaudeSessionEntry[];
+  /** Slug set with at least one live claude session (primary or named). */
+  claudeSlugs: string[];
   /** Slugs with a live diff session. */
   diff: string[];
   /** Slugs with a live shell session. */
@@ -115,9 +127,10 @@ export const tmuxSessionsQuery = () =>
   queryOptions({
     queryKey: qk.tmuxSessions(),
     queryFn: async (): Promise<TmuxSessionsData> => {
-      const { claude, diff, shell, action } = await listTmuxSessions();
+      const { claude, claudeSlugs, diff, shell, action } = await listTmuxSessions();
       return {
-        claude: [...claude],
+        claude,
+        claudeSlugs: [...claudeSlugs],
         diff: [...diff],
         shell: [...shell],
         action: [...action],
