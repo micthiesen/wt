@@ -21,6 +21,7 @@ import {
   enableAutoMerge,
   markPullRequestReady,
 } from "../core/github.ts";
+import { graphiteUrlFromGithubPr } from "../core/graphite.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
@@ -2663,8 +2664,9 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no PR for this branch");
         return;
       }
+      const url = graphiteUrlFromGithubPr(current.pr.url) ?? current.pr.url;
       hideFrontmostAlacritty();
-      openUrl(current.pr.url);
+      openUrl(url);
       rowLog.event.info(`opened PR #${current.pr.number}`);
       return;
     }

@@ -44,7 +44,7 @@ const SECTIONS: Section[] = [
       ["p", "open PR in browser"],
       ["i", "open linear issue"],
       ["s", "open deployed app"],
-      ["y", "yank menu (b/s/S/p/n/i)"],
+      ["y", "yank menu (b/s/S/p/n/i/r)"],
       ["t", "regenerate AI summary"],
       ["m", "merge when ready (toggle)"],
       ["e", "exit draft (mark ready for review)"],

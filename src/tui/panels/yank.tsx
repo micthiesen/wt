@@ -1,3 +1,4 @@
+import { graphiteUrlFromGithubPr } from "../../core/graphite.ts";
 import { linearUrlForSlug } from "../../core/linear.ts";
 import { stageUrl } from "../../core/stage.ts";
 import { Modal } from "../modal.tsx";
@@ -16,6 +17,7 @@ type Props = { row: WorktreeRow };
 export function yankItemsFor(row: WorktreeRow): Item[] {
   const stageUrlValue =
     row.fields.deploy.data === true ? stageUrl(row.wt.stage) : null;
+  const prUrlValue = row.pr ? (graphiteUrlFromGithubPr(row.pr.url) ?? row.pr.url) : null;
   return [
     { key: "b", label: "branch", value: row.wt.branch || null },
     { key: "s", label: "stage", value: row.wt.stage },
@@ -23,6 +25,7 @@ export function yankItemsFor(row: WorktreeRow): Item[] {
     { key: "p", label: "path", value: row.wt.path },
     { key: "n", label: "slug", value: row.wt.slug },
     { key: "i", label: "issue url", value: linearUrlForSlug(row.wt.slug) },
+    { key: "r", label: "pr url", value: prUrlValue },
   ];
 }
 
