@@ -69,6 +69,7 @@ import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
 import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
 import { OutputsPicker } from "./panels/outputs-picker.tsx";
 import { OutputViewer } from "./panels/output-viewer.tsx";
+import { previewFocusPatch, togglePinPatch } from "./picker-preview.ts";
 import {
   SectionPickerModal,
   type SectionPickerItem,
@@ -2084,13 +2085,8 @@ export function App({ onExit }: Props) {
           : Math.min(Math.max(0, modal.index), visibleOutputs.length - 1);
       const moveTo = (next: number): void => {
         setModal({ kind: "outputsPicker", index: next });
-        const target = visibleOutputs[next];
-        if (target) {
-          setFocus(currentSlug ?? null, {
-            focused: target.id,
-            pinned: null,
-          });
-        }
+        const patch = previewFocusPatch(visibleOutputs[next]?.id ?? null);
+        if (patch) setFocus(currentSlug ?? null, patch);
       };
       if (k.name === "j" || k.name === "down") {
         moveTo(Math.min(idx + 1, visibleOutputs.length - 1));
@@ -2102,28 +2098,25 @@ export function App({ onExit }: Props) {
       }
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
         const i = parseInt(k.sequence, 10) - 1;
-        const target = visibleOutputs[i];
-        if (target) {
-          // Same pin-clearing as j/k movement — quick-pick is a
-          // navigation override, so any prior pin shouldn't outvote
-          // the explicit choice.
-          setFocus(currentSlug ?? null, {
-            focused: target.id,
-            pinned: null,
-          });
+        // Same pin-clearing as j/k movement — quick-pick is a
+        // navigation override, so any prior pin shouldn't outvote
+        // the explicit choice.
+        const patch = previewFocusPatch(visibleOutputs[i]?.id ?? null);
+        if (patch) {
+          setFocus(currentSlug ?? null, patch);
           setModal(null);
         }
         return;
       }
       if (k.sequence === "'") {
-        const target = visibleOutputs[idx];
-        if (!target) return;
-        const cur = focusBucket.pinned;
-        setFocus(currentSlug ?? null, {
-          focused: target.id,
-          pinned: cur === target.id ? null : target.id,
-        });
-        setModal(null);
+        const patch = togglePinPatch(
+          visibleOutputs[idx]?.id ?? null,
+          focusBucket.pinned,
+        );
+        if (patch) {
+          setFocus(currentSlug ?? null, patch);
+          setModal(null);
+        }
         return;
       }
       if (k.name === "return") {
@@ -2168,15 +2161,16 @@ export function App({ onExit }: Props) {
       // index `entries.length` as that "+ new" affordance.
       const totalRows = entries.length + 1;
       const idx = Math.min(Math.max(0, modal.index), totalRows - 1);
+      const previewIdFor = (i: number): string | null => {
+        const target = entries[i];
+        return target && target.isLive
+          ? sessionOutputId(slug, "claude", target.name)
+          : null;
+      };
       const moveTo = (next: number): void => {
         setModal({ ...modal, index: next });
-        const target = entries[next];
-        if (target && target.isLive) {
-          setFocus(slug, {
-            focused: sessionOutputId(slug, "claude", target.name),
-            pinned: null,
-          });
-        }
+        const patch = previewFocusPatch(previewIdFor(next));
+        if (patch) setFocus(slug, patch);
       };
       const select = (i: number): void => {
         if (i < 0 || i >= totalRows) return;
@@ -2220,15 +2214,11 @@ export function App({ onExit }: Props) {
         return;
       }
       if (k.sequence === "'") {
-        const target = entries[idx];
-        if (!target || !target.isLive) return;
-        const id = sessionOutputId(slug, "claude", target.name);
-        const cur = modalBucket.pinned;
-        setFocus(slug, {
-          focused: id,
-          pinned: cur === id ? null : id,
-        });
-        setModal(null);
+        const patch = togglePinPatch(previewIdFor(idx), modalBucket.pinned);
+        if (patch) {
+          setFocus(slug, patch);
+          setModal(null);
+        }
         return;
       }
       if (k.name === "return") {
