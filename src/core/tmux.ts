@@ -138,7 +138,7 @@ set -g default-terminal "tmux-256color"
 set -as terminal-features ",${outerTerm}:RGB"
 set -ag terminal-overrides ",${outerTerm}:Tc"
 set -ag update-environment "COLORTERM"
-set -g allow-passthrough off
+set -g allow-passthrough on
 set -s extended-keys on
 set -as terminal-features ",${outerTerm}:extkeys"
 unbind C-b
