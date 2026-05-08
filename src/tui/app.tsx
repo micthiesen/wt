@@ -2148,14 +2148,36 @@ export function App({ onExit }: Props) {
     // so a kill or spawn elsewhere reflects immediately when the user
     // navigates. Layout: primary first, then live named, then ghost
     // named (live in tmux = false), then "+ new".
+    //
+    // Live-preview semantics borrowed from the outputs picker: j/k
+    // moves AND points the bottom pane at the highlighted session's
+    // log so the user can scan sessions without committing. Ghost /
+    // "+ new" rows leave focus alone (no live output to preview).
+    // `'` pins the highlighted session's log; Enter / 1-9 attach to
+    // its tmux session.
     if (modal?.kind === "claudeSessionsPicker") {
       const slug = modal.slug;
       const entries = pickerEntries;
+      // Read pin/focus from `modal.slug`'s bucket, NOT
+      // `currentSlug`'s. While `;` opens with the two equal, a row
+      // churn under the open modal could decouple them — and then
+      // the toggle would read bucket A and write to bucket B.
+      const modalBucket = slugFocus[slug] ?? EMPTY_FOCUS;
       // Total interactive rows = entries + the trailing "+ new" row,
       // which is appended by the picker UI itself. The handler treats
       // index `entries.length` as that "+ new" affordance.
       const totalRows = entries.length + 1;
       const idx = Math.min(Math.max(0, modal.index), totalRows - 1);
+      const moveTo = (next: number): void => {
+        setModal({ ...modal, index: next });
+        const target = entries[next];
+        if (target && target.isLive) {
+          setFocus(slug, {
+            focused: sessionOutputId(slug, "claude", target.name),
+            pinned: null,
+          });
+        }
+      };
       const select = (i: number): void => {
         if (i < 0 || i >= totalRows) return;
         if (i === entries.length) {
@@ -2171,11 +2193,11 @@ export function App({ onExit }: Props) {
         doEnterClaudeSession(slug, entries[i]!.name);
       };
       if (k.name === "j" || k.name === "down") {
-        setModal({ ...modal, index: Math.min(idx + 1, totalRows - 1) });
+        moveTo(Math.min(idx + 1, totalRows - 1));
         return;
       }
       if (k.name === "k" || k.name === "up") {
-        setModal({ ...modal, index: Math.max(0, idx - 1) });
+        moveTo(Math.max(0, idx - 1));
         return;
       }
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
@@ -2195,6 +2217,18 @@ export function App({ onExit }: Props) {
           }
           setModal(null);
         }
+        return;
+      }
+      if (k.sequence === "'") {
+        const target = entries[idx];
+        if (!target || !target.isLive) return;
+        const id = sessionOutputId(slug, "claude", target.name);
+        const cur = modalBucket.pinned;
+        setFocus(slug, {
+          focused: id,
+          pinned: cur === id ? null : id,
+        });
+        setModal(null);
         return;
       }
       if (k.name === "return") {
@@ -2526,6 +2560,12 @@ export function App({ onExit }: Props) {
     // Lists live primary + named sessions plus a "+ new" affordance
     // so the user can spawn additional named sessions in one place.
     // Refuses on rows with no current row (no slug to scope to).
+    //
+    // Initial cursor: if the bottom pane is currently displaying a
+    // claude session for this slug, land on its row so the picker
+    // mirrors what the user is already looking at. Otherwise default
+    // to primary (entries[0]). Mirrors the outputs picker's "open
+    // on the displayed item" pattern.
     if (k.sequence === ";") {
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
@@ -2535,7 +2575,23 @@ export function App({ onExit }: Props) {
         toast(`${current.wt.slug} is busy`, theme.warn, 2000);
         return;
       }
-      setModal({ kind: "claudeSessionsPicker", slug: current.wt.slug, index: 0 });
+      const slug = current.wt.slug;
+      const entries = buildClaudeSessionEntries(
+        slug,
+        claudeSessionsBySlug.get(slug) ?? [],
+      );
+      let initialIdx = 0;
+      if (
+        displayedOutput.kind === "session" &&
+        displayedOutput.sessionKind === "claude" &&
+        displayedOutput.slug === slug
+      ) {
+        const matchIdx = entries.findIndex(
+          (e) => e.name === displayedOutput.sessionName,
+        );
+        if (matchIdx >= 0) initialIdx = matchIdx;
+      }
+      setModal({ kind: "claudeSessionsPicker", slug, index: initialIdx });
       return;
     }
     // `[` / `]` — cycle prev/next through THIS worktree's visible
@@ -3175,6 +3231,7 @@ export function App({ onExit }: Props) {
             Math.max(0, modal.index),
             pickerEntries.length, // index `length` = the trailing "+ new" row
           )}
+          pinnedId={(slugFocus[modal.slug] ?? EMPTY_FOCUS).pinned}
         />
       ) : null}
       {modal?.kind === "claudeSessionsNew" ? (

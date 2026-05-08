@@ -470,18 +470,21 @@ export async function attachOrCreate(opts: {
   cwd: string;
   kind: Exclude<SessionKind, "action">;
   /**
-   * For `kind: "claude"` only. Undefined → the primary session
-   * (tmux session name = bare slug; display name in `/resume` =
-   * `displayName`). String → a named additional session (tmux name
-   * = `<slug>~<claudeName>`; display name = `claudeName`). Ignored
-   * for other kinds.
+   * For `kind: "claude"` only. Undefined / null → the primary session
+   * (tmux session name = bare slug; display name in `/resume` defaults
+   * to `"primary"` and is overridable via `claudeDisplayName`). String
+   * → a named additional session (tmux name = `<slug>~<claudeName>`;
+   * display name = `claudeName`). Ignored for other kinds.
    */
   claudeName?: string | null;
   /**
    * For `kind: "claude"` only. Label shown in claude's `/resume`
-   * picker for the *primary* session. Defaults to the slug. Ignored
-   * for named sessions (whose display name is the name itself) and
-   * for non-claude kinds.
+   * picker for the *primary* session. Defaults to `"primary"` so the
+   * label matches the picker entry the user sees in `;`. Pass an
+   * override (e.g. the wt source-repo `.` shortcut passes
+   * `WT_SOURCE_SLUG`) to surface a different name in `/resume`.
+   * Ignored for named sessions (whose display name is the name
+   * itself) and for non-claude kinds.
    */
   claudeDisplayName?: string;
   /**
@@ -530,7 +533,7 @@ export async function attachOrCreate(opts: {
             displayName:
               claudeNameNorm !== null
                 ? claudeNameNorm
-                : (claudeDisplayName ?? slug),
+                : (claudeDisplayName ?? "primary"),
           }),
         ]
       : kind === "diff"

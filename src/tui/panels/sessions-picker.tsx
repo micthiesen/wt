@@ -11,8 +11,15 @@
  *    is rare, so an extra keystroke matters more than a safety net.
  *  - Auto-name in the new-name input is the smallest unused integer
  *    starting at 2 (primary is implicit). Empty input → that name.
+ *  - Live-preview / pin: j/k on a live entry points the bottom pane
+ *    at that session's log, mirroring the outputs picker. `'` pins
+ *    that session as the displayed output (or unpins if already
+ *    pinned). The pin glyph renders at the right edge alongside the
+ *    live/ghost label, same shape as `OutputsPicker`.
  */
 import type { ClaudeSessionPickerEntry } from "../../core/claude-sessions.ts";
+import { sessionOutputId } from "../../core/outputs.ts";
+import { NF } from "../icons.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
@@ -20,6 +27,12 @@ type ListProps = {
   slug: string;
   entries: ReadonlyArray<ClaudeSessionPickerEntry>;
   selectedIndex: number;
+  /**
+   * Currently pinned output id for this slug's bucket, or null when
+   * nothing is pinned. Used to render the pin glyph next to the
+   * matching entry; also drives the hint label (`'` toggles).
+   */
+  pinnedId: string | null;
 };
 
 // React `key` for the sentinel "+ new" row appended after every
@@ -31,6 +44,7 @@ export function SessionsPickerList({
   slug,
   entries,
   selectedIndex,
+  pinnedId,
 }: ListProps) {
   const items: Array<{
     key: string;
@@ -38,15 +52,22 @@ export function SessionsPickerList({
     rightLabel: string;
     rightFg: string;
     labelFg: string;
+    isPinned: boolean;
   }> = [];
   for (const entry of entries) {
     const label = entry.name === null ? "primary" : entry.name;
+    const outputId = sessionOutputId(slug, "claude", entry.name);
     items.push({
       key: entry.name === null ? "primary" : `name:${entry.name}`,
       label,
       rightLabel: entry.isLive ? "live" : "ghost",
       rightFg: entry.isLive ? theme.accent : theme.fgDim,
       labelFg: entry.isLive ? theme.fg : theme.fgDim,
+      // Match purely by output id (slug + kind + name). A pin on a
+      // session that just transitioned to ghost can briefly render
+      // the glyph on the ghost row before the GC sweep clears the
+      // stale pin; visually fine — the "ghost" label disambiguates.
+      isPinned: pinnedId === outputId,
     });
   }
   items.push({
@@ -55,6 +76,7 @@ export function SessionsPickerList({
     rightLabel: "+",
     rightFg: theme.fgDim,
     labelFg: theme.fg,
+    isPinned: false,
   });
   return (
     <Modal
@@ -63,6 +85,7 @@ export function SessionsPickerList({
         ["j/k", "move"],
         ["1-9", "quick pick"],
         ["⏎", "select"],
+        ["'", pinnedId ? "unpin" : "pin"],
         ["x", "kill"],
         ["esc / q / ;", "cancel"],
       ]}
@@ -92,6 +115,7 @@ export function SessionsPickerList({
                 {it.label}
               </text>
             </box>
+            {it.isPinned ? <text fg={theme.accent}>{NF.pin} </text> : null}
             <text fg={it.rightFg}>{it.rightLabel}</text>
           </box>
         );
