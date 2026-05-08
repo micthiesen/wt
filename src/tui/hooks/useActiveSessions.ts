@@ -1,15 +1,16 @@
 /**
  * Hooks returning the sets of slugs that currently own live wt tmux
- * sessions, per kind. `useActiveSessions` is the claude variant —
- * used by the worktree list panel (per-row indicator) and the
- * details-pane claude row. `useActiveDiffSessions` /
+ * sessions, per kind. The claude variants
+ * (`useClaudeSessionsBySlug` / `useClaudeSessionsForSlug`) drive the
+ * worktree list count badge, the details-pane claude row's state
+ * derivation, and the sessions picker. `useActiveDiffSessions` /
  * `useActiveShellSessions` power the Shift+F11 / Shift+F10
- * kill-confirm hints. One global query powers all three — see
+ * kill-confirm hints. One global query powers all of them — see
  * `tmuxSessionsQuery` in `state/queries.ts`.
  *
  * `useClaudeSessionsBySlug` exposes the multi-session shape: a Map
  * from slug to the list of session names live on it (`null` is the
- * primary). Drives the sessions picker and the row count badge.
+ * primary). `useClaudeSessionsForSlug` is the per-row convenience.
  */
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -19,15 +20,6 @@ import { tmuxSessionsQuery } from "../../state/queries.ts";
 const EMPTY: ReadonlySet<string> = new Set();
 const EMPTY_NAMES: ReadonlyArray<string | null> = [];
 const EMPTY_MAP: ReadonlyMap<string, ReadonlyArray<string | null>> = new Map();
-
-export function useActiveSessions(): ReadonlySet<string> {
-  const q = useQuery(tmuxSessionsQuery());
-  const list = q.data?.claudeSlugs;
-  return useMemo(() => {
-    if (!list || list.length === 0) return EMPTY;
-    return new Set(list);
-  }, [list]);
-}
 
 /**
  * Map from slug → list of live claude session names on that slug.

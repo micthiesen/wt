@@ -8,26 +8,34 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { asObj } from "./claude-events.ts";
 import { listClaudeNames } from "./claude-sessions.ts";
 
 /**
  * Last meaningful entry in a session jsonl, classified for the per-
  * session state machine. The row combines this with tmux liveness
  * for `(slug, name)` to derive working / waiting / abandoned / idle —
- * see `tui/rows/claude.tsx`.
+ * see `tui/rows/claude.tsx`. Mid-turn vs. end-of-turn is the only
+ * distinction the row cares about, but the granular kinds make
+ * future consumers (CLI status, debugging) easier.
  *
- *   - "tool_use"    — assistant message ended with stop_reason="tool_use"
- *                     (claude is mid-turn, expects a tool_result next).
- *   - "tool_result" — user message carried a tool_result block (claude
- *                     just got tool output back, will produce more turns).
- *   - "end_turn"    — assistant message ended with stop_reason="end_turn"
- *                     (claude finished its turn, waiting for human input).
- *   - "other"       — any other entry kind we don't classify.
+ *   - "tool_use"    — assistant ended with stop_reason="tool_use"
+ *                     (mid-turn; expects a tool_result next).
+ *   - "tool_result" — user message carried a tool_result block
+ *                     (mid-turn; claude just got tool output back).
+ *   - "paused"      — assistant ended with stop_reason="pause_turn"
+ *                     (mid-turn; extended-thinking pause).
+ *   - "end_turn"    — assistant ended with a terminal stop_reason
+ *                     (end_turn / max_tokens / stop_sequence /
+ *                     refusal). Claude is done writing for now;
+ *                     waiting for human input.
+ *   - "other"       — entry didn't match any of the above.
  *   - null          — no meaningful entries (jsonl missing or empty).
  */
 export type LastEntryKind =
   | "tool_use"
   | "tool_result"
+  | "paused"
   | "end_turn"
   | "other"
   | null;
@@ -52,7 +60,13 @@ export type SessionTail = {
    */
   lastEntryMs: number | null;
   lastEntryKind: LastEntryKind;
-  /** Pending queued prompts (enqueues − dequeues, clamped at 0). */
+  /**
+   * Pending queued prompts (enqueues − dequeues, clamped at 0).
+   * Counted only within the last `TAIL_BYTES` of the jsonl, so a
+   * long-running session that has paged earlier enqueues out of
+   * the window will under-report. Acceptable: queued counters
+   * tend to settle to small numbers within a turn or two.
+   */
   queued: number;
 };
 
@@ -67,7 +81,12 @@ export type ClaudeStatus = {
   sessions: readonly SessionTail[];
 };
 
-const TAIL_BYTES = 16 * 1024;
+// Sized to match `SEED_TAIL_BYTES` in `core/session-tail.ts`; large
+// assistant turns (multi-tool blocks, sub-agent inlines) regularly
+// exceed 16 KiB and would truncate the most-recent envelope's
+// `stop_reason` line. 64 KiB is still cheap and covers typical max-
+// length turns.
+const TAIL_BYTES = 64 * 1024;
 
 /**
  * Claude Code's per-project storage dir. Both `/` and `.` map to `-` —
@@ -164,7 +183,8 @@ function parseTailLines(tail: string, fileStart: boolean): Entry[] {
     const line = lines[i];
     if (!line) continue;
     try {
-      const obj = JSON.parse(line) as Record<string, unknown>;
+      const obj = asObj(JSON.parse(line));
+      if (!obj) continue;
       const type = obj.type;
       if (typeof type === "string") entries.push({ type, raw: obj });
     } catch {
@@ -182,17 +202,21 @@ function entryTimestampMs(raw: Record<string, unknown>): number | null {
 }
 
 function isToolResultUser(raw: Record<string, unknown>): boolean {
-  const message = raw.message as Record<string, unknown> | undefined;
-  const content = message?.content;
+  const message = asObj(raw.message);
+  if (!message) return false;
+  const content = message.content;
   if (!Array.isArray(content)) return false;
-  return content.some(
-    (b) => b && typeof b === "object" && (b as Record<string, unknown>).type === "tool_result",
-  );
+  for (const b of content) {
+    const obj = asObj(b);
+    if (obj && obj.type === "tool_result") return true;
+  }
+  return false;
 }
 
 function assistantStopReason(raw: Record<string, unknown>): string | null {
-  const message = raw.message as Record<string, unknown> | undefined;
-  const sr = message?.stop_reason;
+  const message = asObj(raw.message);
+  if (!message) return null;
+  const sr = message.stop_reason;
   return typeof sr === "string" ? sr : null;
 }
 
@@ -200,6 +224,11 @@ function assistantStopReason(raw: Record<string, unknown>): string | null {
  * Classify the latest meaningful entry walking back from the tail.
  * "Meaningful" filters out non-conversation entries (system events,
  * pure metadata) so the classifier doesn't get distracted by chrome.
+ *
+ * Stop-reason mapping: `tool_use` and `pause_turn` are mid-turn
+ * (claude isn't done with its turn); everything terminal —
+ * `end_turn`, `max_tokens`, `stop_sequence`, `refusal` — collapses
+ * to `end_turn` since the row only cares about mid-turn vs. not.
  */
 function classifyLast(entries: readonly Entry[]): {
   kind: LastEntryKind;
@@ -212,7 +241,10 @@ function classifyLast(entries: readonly Entry[]): {
     if (e.type === "assistant") {
       const sr = assistantStopReason(e.raw);
       if (sr === "tool_use") return { kind: "tool_use", ts };
-      if (sr === "end_turn") return { kind: "end_turn", ts };
+      if (sr === "pause_turn") return { kind: "paused", ts };
+      // end_turn / max_tokens / stop_sequence / refusal / etc. all
+      // mean "claude stopped writing" — fold to end_turn for the row.
+      if (sr !== null) return { kind: "end_turn", ts };
       return { kind: "other", ts };
     }
     if (e.type === "user" && isToolResultUser(e.raw)) {
@@ -223,54 +255,101 @@ function classifyLast(entries: readonly Entry[]): {
   return { kind: null, ts: null };
 }
 
+/**
+ * Per-path memo of the last `tailSession` result keyed on
+ * `(mtimeMs, size)`. The query polls every 5s and most worktrees
+ * are idle most of the time — without this, every poll re-parses
+ * tens of KB per session even when nothing changed. The cache
+ * holds at most O(sessions) entries and is GC-bounded by an LRU
+ * cap (the prune below); module-scoped so it survives across
+ * queryFn invocations within one process.
+ */
+type TailCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  result: SessionTail;
+};
+const tailCache = new Map<string, TailCacheEntry>();
+const TAIL_CACHE_MAX = 256;
+
+function emptyTail(name: string | null, hasJsonl: boolean): SessionTail {
+  return { name, hasJsonl, lastEntryMs: null, lastEntryKind: null, queued: 0 };
+}
+
 function tailSession(wtPath: string, name: string | null): SessionTail {
   const path = sessionJsonlPath(wtPath, wtSessionUuid(wtPath, name));
   let size = 0;
+  let mtimeMs = 0;
   try {
     const st = statSync(path);
-    if (!st.isFile()) {
-      return { name, hasJsonl: false, lastEntryMs: null, lastEntryKind: null, queued: 0 };
-    }
+    if (!st.isFile()) return emptyTail(name, false);
     size = st.size;
+    mtimeMs = st.mtimeMs;
   } catch {
-    return { name, hasJsonl: false, lastEntryMs: null, lastEntryKind: null, queued: 0 };
+    // ENOENT is the common case (no jsonl yet); other errors degrade
+    // to the same "nothing to report" rather than rejecting the whole
+    // worktree's claudeStatus.
+    tailCache.delete(path);
+    return emptyTail(name, false);
   }
-  if (size === 0) {
-    return { name, hasJsonl: true, lastEntryMs: null, lastEntryKind: null, queued: 0 };
-  }
-  const tail = readTail(path, size);
-  const fromStart = size <= TAIL_BYTES;
-  const parsed = parseTailLines(tail, fromStart);
+  if (size === 0) return emptyTail(name, true);
 
-  let queued = 0;
-  for (const e of parsed) {
-    if (e.type !== "queue-operation") continue;
-    const op = e.raw.operation;
-    if (op === "enqueue") queued++;
-    else if (op === "dequeue") queued--;
+  const cached = tailCache.get(path);
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+    return cached.result;
   }
-  if (queued < 0) queued = 0;
 
-  const last = classifyLast(parsed);
-  // mtime is the fallback when the entry has no `timestamp` (rare);
-  // it still beats returning null for a non-empty jsonl.
-  const lastEntryMs = last.ts ?? (size > 0 ? statSync(path).mtimeMs : null);
-  return {
-    name,
-    hasJsonl: true,
-    lastEntryMs,
-    lastEntryKind: last.kind,
-    queued,
-  };
+  // The file may disappear / truncate between stat and read. Treat
+  // that the same as "nothing parseable yet" rather than rejecting.
+  let result: SessionTail;
+  try {
+    const tail = readTail(path, size);
+    const parsed = parseTailLines(tail, size <= TAIL_BYTES);
+
+    let queued = 0;
+    for (const e of parsed) {
+      if (e.type !== "queue-operation") continue;
+      const op = e.raw.operation;
+      if (op === "enqueue") queued++;
+      else if (op === "dequeue") queued--;
+    }
+    if (queued < 0) queued = 0;
+
+    const last = classifyLast(parsed);
+    // mtime fallback when the entry has no `timestamp` (rare); it
+    // beats returning null for a non-empty jsonl.
+    const lastEntryMs = last.ts ?? mtimeMs;
+    result = {
+      name,
+      hasJsonl: true,
+      lastEntryMs,
+      lastEntryKind: last.kind,
+      queued,
+    };
+  } catch {
+    return emptyTail(name, true);
+  }
+
+  if (tailCache.size >= TAIL_CACHE_MAX) {
+    // Cheap LRU-ish prune: drop the oldest insertion. Map iteration
+    // order is insertion order; one delete on overflow keeps memory
+    // bounded without per-access bookkeeping.
+    const first = tailCache.keys().next().value;
+    if (first !== undefined) tailCache.delete(first);
+  }
+  tailCache.set(path, { mtimeMs, size, result });
+  return result;
 }
 
 /**
- * Snapshot every wt-managed session in `wt`'s claude project: primary
- * first, then persisted-named sessions in stored order. Sessions with
- * no jsonl AND no persisted entry are absent — there's nothing to
- * report. State derivation lives in the consumer so tmux liveness
- * (a separate, polled query) flows through reactively without
- * forcing this filesystem source to refetch.
+ * Snapshot every wt-managed session in `wt`'s claude project that has
+ * a backing jsonl: primary first, then persisted-named sessions in
+ * stored order. A persisted name with no jsonl yet (e.g. a freshly-
+ * spawned session that hasn't written its first entry, or a stale
+ * entry from a spawn-failed name) is filtered out — the row would
+ * have nothing real to summarize. State derivation lives in the
+ * consumer so tmux liveness (a separate, polled query) flows through
+ * reactively without forcing this filesystem source to refetch.
  */
 export async function claudeStatus(wt: {
   slug: string;
@@ -279,7 +358,9 @@ export async function claudeStatus(wt: {
   const sessions: SessionTail[] = [];
   const primary = tailSession(wt.path, null);
   if (primary.hasJsonl) sessions.push(primary);
-  const persisted = listClaudeNames(wt.slug);
-  for (const name of persisted) sessions.push(tailSession(wt.path, name));
+  for (const name of listClaudeNames(wt.slug)) {
+    const tail = tailSession(wt.path, name);
+    if (tail.hasJsonl) sessions.push(tail);
+  }
   return { sessions };
 }

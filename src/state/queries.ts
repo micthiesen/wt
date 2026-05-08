@@ -259,9 +259,10 @@ export const wtClaudeQuery = (wt: Pick<Worktree, "slug" | "path">) =>
     // The session jsonls update every time claude writes a turn or
     // tool-call boundary; polling on a short loop keeps the per-
     // session age + queue counts honest. State (working/waiting/
-    // abandoned/idle) is derived in the row by combining this data
-    // with `tmuxSessionsQuery`, which has its own poll loop, so a
-    // tmux state change flows through without rerunning this query.
+    // abandoned/idle) is derived in the row via
+    // `useClaudeSessionsForSlug`, which subscribes to
+    // `tmuxSessionsQuery` (its own poll loop). A tmux state change
+    // re-renders the row without rerunning this query.
     refetchInterval: 5_000,
   });
 
