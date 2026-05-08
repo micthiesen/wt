@@ -253,12 +253,15 @@ export const wtSyncQuery = (
 export const wtClaudeQuery = (wt: Pick<Worktree, "slug" | "path">) =>
   queryOptions({
     queryKey: qk.wt(wt.slug).claude(),
-    queryFn: async (): Promise<ClaudeStatus> => claudeStatus({ path: wt.path }),
+    queryFn: async (): Promise<ClaudeStatus> =>
+      claudeStatus({ slug: wt.slug, path: wt.path }),
     staleTime: STALE.fast,
-    // Working/waiting states age into "stale" without further file
-    // writes, so the panel re-derives state from the cached
-    // lastEntryMs. A short refetch keeps the count + freshness
-    // honest when a CC session writes new turns.
+    // The session jsonls update every time claude writes a turn or
+    // tool-call boundary; polling on a short loop keeps the per-
+    // session age + queue counts honest. State (working/waiting/
+    // abandoned/idle) is derived in the row by combining this data
+    // with `tmuxSessionsQuery`, which has its own poll loop, so a
+    // tmux state change flows through without rerunning this query.
     refetchInterval: 5_000,
   });
 
