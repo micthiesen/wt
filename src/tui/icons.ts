@@ -48,7 +48,7 @@ export const NF = {
 	mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — prefix for `⇥N`
 	bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed
 	boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
-	comment: "\u{F41F}", // nf-oct-comment        — legacy claude marker (action runs)
+	comment: "\u{F41F}", // nf-oct-comment        — claude action-running marker (list + details)
 	// Filled circled digits for the per-row claude session count.
 	// Unicode dingbats (U+2776..U+277E for 1..9) — guaranteed to render
 	// in any monospace font, no NerdFont dependency. Matches the visual

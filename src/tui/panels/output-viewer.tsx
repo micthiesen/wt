@@ -89,7 +89,7 @@ function OutputContent({ output, height }: { output: Output; height: number }) {
       return (
         <SessionContent
           slug={output.slug}
-          name={output.sessionName ?? null}
+          name={output.sessionName}
           height={height}
         />
       );

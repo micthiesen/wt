@@ -41,11 +41,11 @@ export type Output = {
   sessionKind?: OutputSessionKind;
   /**
    * For `kind: "session"` and `sessionKind: "claude"`, the user-typed
-   * session name; `null` is the primary. Undefined for non-claude or
+   * session name; `null` is the primary. `null` for non-claude /
    * non-session outputs. Carried through so the OutputViewer / picker
    * can resolve back to the right tmux session and tail registry key.
    */
-  sessionName?: string | null;
+  sessionName: string | null;
   status: OutputStatus;
   startedAt: number;
   /** Drives picker sorting. For events: the latest event timestamp. */
@@ -81,12 +81,14 @@ export function actionOutputId(slug: string, startedAt: number): string {
 export function sessionOutputId(
   slug: string,
   kind: OutputSessionKind,
-  name?: string | null,
+  name: string | null = null,
 ): string {
-  // Primary claude (and any shell, which has no naming concept) keep
-  // the legacy two-segment id so existing pin/focus state survives the
-  // multi-session rollout. Named claudes get a fourth segment.
-  if (kind === "claude" && name != null && name !== "") {
+  // Primary claude (and shell, which has no naming concept) use the
+  // two-segment id so a slug's pin/focus state stays consistent
+  // across the primary's lifecycle. Named claudes get a fourth
+  // segment; the per-name id makes parallel sessions individually
+  // pinnable.
+  if (kind === "claude" && name !== null) {
     return `session:${slug}:${kind}:${name}`;
   }
   return `session:${slug}:${kind}`;
@@ -106,6 +108,7 @@ export function eventsOutput(lastEventTs: number): Output {
     id: EVENTS_OUTPUT_ID,
     kind: "events",
     title: "events",
+    sessionName: null,
     status: "live",
     startedAt: 0,
     lastActivity: lastEventTs,
@@ -129,6 +132,7 @@ export function actionOutput(run: ActionRun): Output {
     kind: "action",
     title: `${run.slug} · ${run.actionName}`,
     slug: run.slug,
+    sessionName: null,
     status,
     startedAt: run.startedAt,
     lastActivity,
@@ -156,6 +160,7 @@ export function destroyOutput(
     kind: "destroy",
     title: `${slug} · remove`,
     slug,
+    sessionName: null,
     status: "running",
     startedAt,
     lastActivity,
@@ -176,9 +181,9 @@ export function sessionOutput(
   kind: OutputSessionKind,
   startedAt: number,
   lastActivity: number,
-  name?: string | null,
+  name: string | null = null,
 ): Output {
-  const isNamed = kind === "claude" && name != null && name !== "";
+  const isNamed = kind === "claude" && name !== null;
   const title = isNamed
     ? `${slug} · ${SESSION_LABEL[kind]} · ${name}`
     : `${slug} · ${SESSION_LABEL[kind]}`;
@@ -188,7 +193,7 @@ export function sessionOutput(
     title,
     slug,
     sessionKind: kind,
-    sessionName: kind === "claude" ? (name ?? null) : undefined,
+    sessionName: kind === "claude" ? name : null,
     status: "live",
     startedAt,
     lastActivity,

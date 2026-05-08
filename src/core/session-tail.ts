@@ -48,7 +48,6 @@ import {
   statSync,
   watch,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -61,19 +60,20 @@ import {
   messageToLines,
   splitMessage,
 } from "./claude-events.ts";
-import { wtSessionUuid } from "./claude.ts";
+import { projectDir as claudeProjectDir, wtSessionUuid } from "./claude.ts";
 import { createLogger } from "./logger.ts";
+import { claudeSessionName } from "./tmux.ts";
 
 const log = createLogger("[session-tail]");
 
 /**
- * Composite identifier for a session tail. `null` name = primary
- * (key collapses to the bare slug, matching the tmux session name);
- * a string name yields `<slug>~<name>`. Stable across the codebase
- * so anything that touches a session-tail map agrees on the key.
+ * Composite identifier for a session tail. By construction the same
+ * string as the underlying tmux session name (`<slug>` for primary,
+ * `<slug>~<name>` for named) — sharing one composition rule means the
+ * tail-registry map and tmux's session list always agree on keys.
  */
 export function tailKey(slug: string, name: string | null): string {
-  return name === null ? slug : `${slug}~${name}`;
+  return claudeSessionName(slug, name);
 }
 
 /** How many trailing bytes of the jsonl to seed from on first ensure. */
@@ -132,13 +132,8 @@ class SessionTailRegistry {
    */
   ensure(slug: string, wtPath: string, name: string | null = null): void {
     const key = tailKey(slug, name);
-    const uuid = wtSessionUuid(wtPath, name ?? undefined);
-    const projectDir = join(
-      homedir(),
-      ".claude",
-      "projects",
-      wtPath.replaceAll("/", "-"),
-    );
+    const uuid = wtSessionUuid(wtPath, name);
+    const projectDir = claudeProjectDir(wtPath);
     const jsonlName = `${uuid}.jsonl`;
     const path = join(projectDir, jsonlName);
     const existing = this.state.get(key);
@@ -176,7 +171,16 @@ class SessionTailRegistry {
   }
 
   stop(slug: string, name: string | null = null): void {
-    const key = tailKey(slug, name);
+    this.stopByKey(tailKey(slug, name));
+  }
+
+  /**
+   * Close watchers/timers + drop both maps for `key`. Centralizing
+   * the cleanup ensures `reconcile` / `stopAll` paths can't
+   * accidentally orphan an FSWatcher or debounce Timer if `runs` and
+   * `state` ever fall out of sync.
+   */
+  private stopByKey(key: string): void {
     const st = this.state.get(key);
     if (!st) return;
     closeSilent(st.watcher);
@@ -201,20 +205,13 @@ class SessionTailRegistry {
       this.ensure(desc.slug, desc.wtPath, desc.name);
     }
     for (const key of [...this.state.keys()]) {
-      if (liveKeys.has(key)) continue;
-      const run = this.runs.get(key);
-      if (run) this.stop(run.slug, run.name);
-      else this.state.delete(key);
+      if (!liveKeys.has(key)) this.stopByKey(key);
     }
   }
 
   /** Stop every tailer. Used on TUI shutdown. */
   stopAll(): void {
-    for (const key of [...this.state.keys()]) {
-      const run = this.runs.get(key);
-      if (run) this.stop(run.slug, run.name);
-      else this.state.delete(key);
-    }
+    for (const key of [...this.state.keys()]) this.stopByKey(key);
   }
 
   /**

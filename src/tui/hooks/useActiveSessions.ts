@@ -18,14 +18,15 @@ import { tmuxSessionsQuery } from "../../state/queries.ts";
 
 const EMPTY: ReadonlySet<string> = new Set();
 const EMPTY_NAMES: ReadonlyArray<string | null> = [];
+const EMPTY_MAP: ReadonlyMap<string, ReadonlyArray<string | null>> = new Map();
 
 export function useActiveSessions(): ReadonlySet<string> {
   const q = useQuery(tmuxSessionsQuery());
+  const list = q.data?.claudeSlugs;
   return useMemo(() => {
-    const list = q.data?.claudeSlugs;
     if (!list || list.length === 0) return EMPTY;
     return new Set(list);
-  }, [q.data]);
+  }, [list]);
 }
 
 /**
@@ -33,15 +34,19 @@ export function useActiveSessions(): ReadonlySet<string> {
  * `null` entry = primary session. Entries are deduped and stable in
  * tmux-listed order. Empty slugs are absent (no key) rather than
  * present-with-empty-array, so consumers can `.get(slug) ?? []`.
+ *
+ * Depends on the inner `claude` array (not the wrapping `q.data`)
+ * so two refetches with identical contents reuse the prior Map
+ * identity — downstream effects/memos don't re-fire.
  */
 export function useClaudeSessionsBySlug(): ReadonlyMap<
   string,
   ReadonlyArray<string | null>
 > {
   const q = useQuery(tmuxSessionsQuery());
+  const list = q.data?.claude;
   return useMemo(() => {
-    const list = q.data?.claude;
-    if (!list || list.length === 0) return new Map();
+    if (!list || list.length === 0) return EMPTY_MAP;
     const map = new Map<string, (string | null)[]>();
     for (const entry of list) {
       const arr = map.get(entry.slug);
@@ -49,7 +54,7 @@ export function useClaudeSessionsBySlug(): ReadonlyMap<
       else map.set(entry.slug, [entry.name]);
     }
     return map;
-  }, [q.data]);
+  }, [list]);
 }
 
 /**
@@ -66,18 +71,18 @@ export function useClaudeSessionsForSlug(
 
 export function useActiveDiffSessions(): ReadonlySet<string> {
   const q = useQuery(tmuxSessionsQuery());
+  const list = q.data?.diff;
   return useMemo(() => {
-    const list = q.data?.diff;
     if (!list || list.length === 0) return EMPTY;
     return new Set(list);
-  }, [q.data]);
+  }, [list]);
 }
 
 export function useActiveShellSessions(): ReadonlySet<string> {
   const q = useQuery(tmuxSessionsQuery());
+  const list = q.data?.shell;
   return useMemo(() => {
-    const list = q.data?.shell;
     if (!list || list.length === 0) return EMPTY;
     return new Set(list);
-  }, [q.data]);
+  }, [list]);
 }

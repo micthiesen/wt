@@ -112,6 +112,7 @@ import {
   tmuxSessionsQuery,
   worktreesQuery,
   type GithubData,
+  type TmuxSessionsData,
 } from "./queries.ts";
 import type { Contributor } from "../core/types.ts";
 
@@ -374,6 +375,26 @@ export function useWtActions() {
      */
     async refreshTmuxSessions(): Promise<void> {
       await qc.invalidateQueries({ queryKey: tmuxSessionsQuery().queryKey });
+    },
+    /**
+     * Optimistically remove a single (slug, name) claude entry from
+     * the tmux-sessions cache. Used by the kill flow so the picker
+     * stops listing the dying session as live the instant `x` is
+     * pressed — without waiting for the kill to land or the 2s poll
+     * to refetch. Same-shape `claudeSlugs` is recomputed from the
+     * filtered `claude` array. No-op if no cache entry exists.
+     */
+    optimisticRemoveClaude(slug: string, name: string | null): void {
+      const key = tmuxSessionsQuery().queryKey;
+      qc.setQueryData<TmuxSessionsData>(key, (prev) => {
+        if (!prev) return prev;
+        const claude = prev.claude.filter(
+          (e) => !(e.slug === slug && e.name === name),
+        );
+        if (claude.length === prev.claude.length) return prev;
+        const claudeSlugs = [...new Set(claude.map((e) => e.slug))];
+        return { ...prev, claude, claudeSlugs };
+      });
     },
     /**
      * Force the LM Studio call to re-run for one worktree. Returns

@@ -29,11 +29,11 @@ export async function enterClaudeSession(opts: {
   slug: string;
   cwd: string;
   /**
-   * Named-session selector. Undefined = primary (`<slug>`); string =
-   * one of the named sessions spawned via Shift+F12 / picker (tmux
-   * session = `<slug>~<name>`, claude --name = `<name>`).
+   * Named-session selector. `null` (or omitted) = primary (`<slug>`);
+   * string = one of the named sessions spawned via Shift+F12 / picker
+   * (tmux session = `<slug>~<name>`, claude --name = `<name>`).
    */
-  claudeName?: string;
+  claudeName?: string | null;
   /**
    * Display name for the primary session in claude's `/resume` picker.
    * Defaults to the slug when omitted; ignored for named sessions.

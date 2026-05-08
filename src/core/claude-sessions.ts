@@ -3,6 +3,12 @@
  * (F12) is implicit — never stored here. Backing file:
  * `~/.cache/wt/claude-sessions.json`.
  *
+ * The exported helpers cover both the persistence layer (read / mutate
+ * the JSON file) and the picker-data composition (build the
+ * (live, ghost, +new) item list shared by the keyboard handler and
+ * the JSX render). Keeping the latter here means the two callers can't
+ * silently drift in the picker's item ordering.
+ *
  * Names alone are persisted; UUIDs are derived deterministically from
  * `(wtPath, name)` via `wtSessionUuid`, so a wt restart (or a
  * reboot-killed tmux server) reconstructs the full picture from the
@@ -11,7 +17,7 @@
  *
  * Names are validated: `^[a-zA-Z0-9_-]+$`, no `~` (the tmux session-name
  * separator). The picker reserves `primary` and digits used by
- * `nextAutoNumber` so the auto-numbering ladder stays predictable.
+ * `nextAutoName` so the auto-numbering ladder stays predictable.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -35,7 +41,7 @@ export function validateSessionName(input: string): string | null {
   const trimmed = input.trim();
   if (!trimmed) return "name can't be empty";
   if (trimmed.length > 32) return "name too long (max 32)";
-  if (trimmed === "primary") return "`primary` is reserved";
+  if (trimmed.toLowerCase() === "primary") return "`primary` is reserved";
   if (!NAME_RE.test(trimmed)) {
     return "use letters, digits, _ or - only";
   }
@@ -85,11 +91,6 @@ export function listClaudeNames(slug: string): string[] {
   return shape[slug] ? [...shape[slug]] : [];
 }
 
-/** All slugs that have at least one named session on file. */
-export function allSlugsWithNamedSessions(): string[] {
-  return Object.keys(readFile());
-}
-
 /** Whether `name` already exists for `slug`. Primary is never matched. */
 export function nameInUse(slug: string, name: string): boolean {
   return listClaudeNames(slug).includes(name);
@@ -136,11 +137,47 @@ export function clearClaudeNames(slug: string): void {
  * empty input. Starts at 2 so the auto-numbered ladder reads as
  * "primary, 2, 3, ..." even though primary isn't stored here.
  */
-export function nextAutoNumber(slug: string): string {
+export function nextAutoName(slug: string): string {
   const taken = new Set(listClaudeNames(slug));
   let n = 2;
   while (taken.has(`${n}`)) n++;
   return `${n}`;
+}
+
+/**
+ * One row's worth of state for the sessions picker. `name = null` is
+ * the primary; strings are user-named. `isLive` is true when a tmux
+ * session for the (slug, name) pair is currently running. The
+ * trailing "+ new" affordance is appended downstream by the picker
+ * UI itself; this helper returns only the session entries.
+ */
+export type ClaudeSessionPickerEntry = {
+  name: string | null;
+  isLive: boolean;
+};
+
+/**
+ * Build the picker's session entries for `slug`. Order: primary
+ * first (live or ghost), then live named (in the order tmux reports),
+ * then ghost named (persisted but not in tmux). Single source of
+ * truth so the keyboard handler and the JSX render never drift.
+ *
+ * `liveNames` should come from `useClaudeSessionsBySlug` — null = the
+ * primary, strings = named sessions live in tmux right now.
+ */
+export function buildClaudeSessionEntries(
+  slug: string,
+  liveNames: ReadonlyArray<string | null>,
+): ClaudeSessionPickerEntry[] {
+  const liveNamed = liveNames.filter((n): n is string => n !== null);
+  const liveNamedSet = new Set(liveNamed);
+  const persisted = listClaudeNames(slug);
+  const ghostNamed = persisted.filter((n) => !liveNamedSet.has(n));
+  return [
+    { name: null, isLive: liveNames.includes(null) },
+    ...liveNamed.map((n) => ({ name: n, isLive: true })),
+    ...ghostNamed.map((n) => ({ name: n, isLive: false })),
+  ];
 }
 
 /**

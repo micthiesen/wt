@@ -17,7 +17,12 @@ import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
 import { fetchGithub, fetchRepoContributors } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
 import { detectStacks, type StackMap } from "../core/stack.ts";
-import { listSessions as listTmuxSessions } from "../core/tmux.ts";
+import {
+  type ClaudeSessionEntry,
+  listSessions as listTmuxSessions,
+} from "../core/tmux.ts";
+
+export type { ClaudeSessionEntry };
 import type {
   Contributor,
   LockMeta,
@@ -91,12 +96,6 @@ export const wtStateQuery = () =>
     queryFn: async (): Promise<WtState> => readWtState(),
     staleTime: STALE.fast,
   });
-
-/**
- * One live claude session as seen by tmux. `name = null` is the
- * primary; a string is a user-named additional session.
- */
-export type ClaudeSessionEntry = { slug: string; name: string | null };
 
 export type TmuxSessionsData = {
   /**

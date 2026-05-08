@@ -12,29 +12,20 @@
  *  - Auto-name in the new-name input is the smallest unused integer
  *    starting at 2 (primary is implicit). Empty input → that name.
  */
+import type { ClaudeSessionPickerEntry } from "../../core/claude-sessions.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
-/**
- * One row's worth of state from the caller's perspective. `name`
- * `null` = primary; strings = user-named. `isLive` is true when a
- * tmux session for the (slug, name) pair is currently running. The
- * "+ new" row has no `name` / `isLive` and is appended unconditionally
- * by the picker.
- */
-export type SessionsPickerEntry = {
-  name: string | null;
-  isLive: boolean;
-};
-
 type ListProps = {
   slug: string;
-  entries: ReadonlyArray<SessionsPickerEntry>;
+  entries: ReadonlyArray<ClaudeSessionPickerEntry>;
   selectedIndex: number;
 };
 
-/** "+ new" is always the last entry — list view treats it as a row. */
-export const NEW_SESSION_ENTRY = "__new__" as const;
+// React `key` for the sentinel "+ new" row appended after every
+// entry list. Internal — callers identify "+ new" by its index
+// (entries.length), not by this string.
+const NEW_ROW_KEY = "__new__";
 
 export function SessionsPickerList({
   slug,
@@ -51,7 +42,7 @@ export function SessionsPickerList({
   for (const entry of entries) {
     const label = entry.name === null ? "primary" : entry.name;
     items.push({
-      key: entry.name === null ? "__primary__" : `n:${entry.name}`,
+      key: entry.name === null ? "primary" : `name:${entry.name}`,
       label,
       rightLabel: entry.isLive ? "live" : "ghost",
       rightFg: entry.isLive ? theme.accent : theme.fgDim,
@@ -59,7 +50,7 @@ export function SessionsPickerList({
     });
   }
   items.push({
-    key: NEW_SESSION_ENTRY,
+    key: NEW_ROW_KEY,
     label: "new session",
     rightLabel: "+",
     rightFg: theme.fgDim,
@@ -115,7 +106,7 @@ type NewProps = {
   /**
    * Auto-name surfaced as the placeholder when input is empty —
    * what'll be used if the user just hits Enter. Computed by the
-   * caller via `nextAutoNumber`.
+   * caller via `nextAutoName`.
    */
   autoName: string;
   /**

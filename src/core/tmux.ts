@@ -82,9 +82,23 @@ const SUFFIX: Record<Exclude<SessionKind, "claude">, string> = {
  */
 const CLAUDE_NAMED_SEP = "~";
 
-function sessionName(slug: string, kind: SessionKind, claudeName?: string): string {
+function sessionName(
+  slug: string,
+  kind: SessionKind,
+  claudeName: string | null = null,
+): string {
   if (kind !== "claude") return `${slug}${SUFFIX[kind]}`;
-  return claudeName === undefined ? slug : `${slug}${CLAUDE_NAMED_SEP}${claudeName}`;
+  return claudeSessionName(slug, claudeName);
+}
+
+/**
+ * Tmux session name for a claude session. Primary (`name = null`) is
+ * the bare slug; named is `<slug>~<name>`. Single source of truth so
+ * every consumer (tmux composer, session-tail key, activity-pane log
+ * line) agrees on the format.
+ */
+export function claudeSessionName(slug: string, name: string | null): string {
+  return name === null ? slug : `${slug}${CLAUDE_NAMED_SEP}${name}`;
 }
 
 /**
@@ -99,22 +113,29 @@ function shQuote(s: string): string {
 }
 
 /**
- * Recover the bare slug from a tmux session name. Strips any kind
- * suffix (`-diff`, `-shell`, `-action`) and any named-claude suffix
- * (`~<name>`). Order matters: a named-claude session like
- * `foo-shell~bar` (theoretically impossible — slugs don't end in
- * `-shell`) would parse as kind=`shell`, slug=`foo`, but our
- * validation forbids `~` in names so this never resolves wrong in
- * practice. We strip the named-claude `~` first since it's the
- * rightmost decoration.
+ * Recover the bare slug from a tmux session name.
+ *
+ * A `~` in the name unambiguously marks a named claude session: the
+ * slug is everything before the rightmost `~`. The kind suffix
+ * (`-diff` / `-shell` / `-action`) is only a possibility for names
+ * that have NO `~`, since named claudes are claude-only and never
+ * carry a kind suffix.
+ *
+ * Pre-existing collision: a slug ending in `-diff` / `-shell` /
+ * `-action` (which `slugify` will produce from a description like
+ * "Add shell") makes its primary claude session indistinguishable
+ * from a same-namespace `<bare>-shell` session in tmux. The ordering
+ * here doesn't fix that — the only fixes are slug-level validation
+ * or moving kinds to a separator that can't appear in slugs. Out of
+ * scope for the named-claude rollout; flagged for a future sweep.
  */
 function bareSlug(name: string): string {
   const tildeIdx = name.lastIndexOf(CLAUDE_NAMED_SEP);
-  const stripped = tildeIdx >= 0 ? name.slice(0, tildeIdx) : name;
+  if (tildeIdx >= 0) return name.slice(0, tildeIdx);
   for (const suffix of Object.values(SUFFIX)) {
-    if (stripped.endsWith(suffix)) return stripped.slice(0, -suffix.length);
+    if (name.endsWith(suffix)) return name.slice(0, -suffix.length);
   }
-  return stripped;
+  return name;
 }
 
 /** Path to the generated tmux.conf. */
@@ -455,7 +476,7 @@ export async function attachOrCreate(opts: {
    * = `<slug>~<claudeName>`; display name = `claudeName`). Ignored
    * for other kinds.
    */
-  claudeName?: string;
+  claudeName?: string | null;
   /**
    * For `kind: "claude"` only. Label shown in claude's `/resume`
    * picker for the *primary* session. Defaults to the slug. Ignored
@@ -475,7 +496,8 @@ export async function attachOrCreate(opts: {
   base?: string;
 }): Promise<AttachResult> {
   const { slug, cwd, kind, claudeName, claudeDisplayName, base } = opts;
-  const name = sessionName(slug, kind, kind === "claude" ? claudeName : undefined);
+  const claudeNameNorm = kind === "claude" ? (claudeName ?? null) : null;
+  const name = sessionName(slug, kind, claudeNameNorm);
   const { path: configPath, changed } = writeConfig();
   if (changed) {
     log.info("config changed, killing server before attach", { slug, kind });
@@ -504,10 +526,10 @@ export async function attachOrCreate(opts: {
           "claude",
           ...wtSessionArgs({
             wtPath: cwd,
-            name: claudeName,
+            name: claudeNameNorm,
             displayName:
-              claudeName !== undefined
-                ? claudeName
+              claudeNameNorm !== null
+                ? claudeNameNorm
                 : (claudeDisplayName ?? slug),
           }),
         ]

@@ -23,8 +23,9 @@ import {
 } from "../core/github.ts";
 import {
   addClaudeName,
-  listClaudeNames,
-  nextAutoNumber,
+  buildClaudeSessionEntries,
+  nameInUse,
+  nextAutoName,
   removeClaudeName,
   validateSessionName,
 } from "../core/claude-sessions.ts";
@@ -32,10 +33,14 @@ import { graphiteUrlFromGithubPr } from "../core/graphite.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
-import { sessionTailRegistry } from "../core/session-tail.ts";
+import {
+  type LiveSessionDesc,
+  sessionTailRegistry,
+} from "../core/session-tail.ts";
 import { removeShellLog, shellTailRegistry } from "../core/shell-tail.ts";
 import { stageUrl } from "../core/stage.ts";
 import {
+  claudeSessionName,
   diffCommandUsesBase,
   killAllSessionsFor,
   killClaudeNamedSession,
@@ -321,7 +326,10 @@ type Modal =
   | {
       kind: "killSessionConfirm";
       slug: string;
-      sessionKind: Exclude<SessionKind, "action">;
+      // Claude kill is reachable only via the picker (`x`), which
+      // bypasses this modal entirely; only diff and shell still use
+      // the y/N confirm.
+      sessionKind: "diff" | "shell";
     };
 
 /**
@@ -463,6 +471,7 @@ export function App({ onExit }: Props) {
     refreshStale,
     refreshGithub,
     refreshTmuxSessions,
+    optimisticRemoveClaude,
     fetchContributors,
     fetchMe,
     clearAll,
@@ -613,6 +622,18 @@ export function App({ onExit }: Props) {
   // Drives the tail-registry reconcile, the sessions picker, the
   // count badge in the row list, and the auto-output focus rule.
   const claudeSessionsBySlug = useClaudeSessionsBySlug();
+  // Pre-compute the sessions-picker entries for the current modal
+  // slug (when the picker is open). Memoized so we don't pay the
+  // `listClaudeNames` disk read on every render — only when the live
+  // session set or the modal target changes. Empty array when the
+  // modal is closed or pointed at a different kind.
+  const pickerEntries = useMemo(() => {
+    if (modal?.kind !== "claudeSessionsPicker") return [];
+    return buildClaudeSessionEntries(
+      modal.slug,
+      claudeSessionsBySlug.get(modal.slug) ?? [],
+    );
+  }, [modal, claudeSessionsBySlug]);
   // Parallel set for diff sessions — used by the Shift+F11 hint so
   // the kill-confirm only opens when there's something to kill.
   const activeDiffSessions = useActiveDiffSessions();
@@ -628,7 +649,7 @@ export function App({ onExit }: Props) {
   useEffect(() => {
     const pathBySlug = new Map<string, string>();
     for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
-    const live: { slug: string; name: string | null; wtPath: string }[] = [];
+    const live: LiveSessionDesc[] = [];
     for (const [slug, names] of claudeSessionsBySlug) {
       const wtPath = pathBySlug.get(slug);
       if (!wtPath) continue;
@@ -792,15 +813,25 @@ export function App({ onExit }: Props) {
       return actionOutputId(currentSlug, currentRun.startedAt);
     }
     if (currentSlug) {
-      // Multi-session: prefer primary when live, otherwise the first
-      // live named session. The output id has to match an entry in
-      // `visibleOutputs` for the auto-pick to actually display, so
-      // refusing to invent an id for a dead session keeps the
-      // fallback (events) reachable.
+      // Multi-session: prefer primary when live, otherwise the
+      // most-recently-active named session — same sort `;` and the
+      // outputs picker use, so the auto-pick lines up with what the
+      // user sees up top in `:`. Only ids that exist in
+      // `visibleOutputs` win the auto-rule (the lookup at
+      // `displayedOutput` enforces that), so refusing to invent an
+      // id for a dead session keeps the events fallback reachable.
       const liveNames = claudeSessionsBySlug.get(currentSlug);
       if (liveNames && liveNames.length > 0) {
-        const name = liveNames.includes(null) ? null : liveNames[0]!;
-        return sessionOutputId(currentSlug, "claude", name);
+        if (liveNames.includes(null)) {
+          return sessionOutputId(currentSlug, "claude", null);
+        }
+        const liveClaude = visibleOutputs.find(
+          (o) =>
+            o.kind === "session" &&
+            o.sessionKind === "claude" &&
+            o.sessionName !== null,
+        );
+        if (liveClaude) return liveClaude.id;
       }
     }
     return eventsOutputId();
@@ -810,6 +841,7 @@ export function App({ onExit }: Props) {
     currentRun?.startedAt,
     showActionViewer,
     claudeSessionsBySlug,
+    visibleOutputs,
   ]);
   // Pin > explicit user pick > auto, all scoped to the current
   // worktree's bucket. If the chosen id has evicted from the visible
@@ -1272,14 +1304,14 @@ export function App({ onExit }: Props) {
         renderer,
         slug,
         cwd: row.wt.path,
-        claudeName: name ?? undefined,
+        claudeName: name,
       });
       void refreshTmuxSessions();
       if (result.kind === "spawn-failed") {
         sessionLog.event.err(`claude failed to start: ${result.reason}`);
         toast(`claude failed: ${result.reason}`, theme.err, 3000);
       } else if (result.kind === "detached") {
-        sessionLog.event.info(`detached from ${slug}${name ? `~${name}` : ""}`);
+        sessionLog.event.info(`detached from ${claudeSessionName(slug, name)}`);
       } else {
         sessionLog.event.info(`claude exited (${result.code ?? "?"})`);
         if (result.stderr) sessionLog.event.err(result.stderr);
@@ -1294,10 +1326,49 @@ export function App({ onExit }: Props) {
    * ghost when tmux is dead but the conversation jsonl survives.
    * If `name` already exists in state, this is a resume (no
    * duplicate state mutation).
+   *
+   * Persist-before-spawn is intentional: a wt crash mid-spawn must
+   * leave the name reachable on next start. The trade-off is a
+   * spawn-failure window where we'd persist a name for a session
+   * that never started; we roll that back below by only persisting
+   * fresh names (not pre-existing ones) and removing on spawn-fail.
    */
   function doSpawnNamedClaudeSession(slug: string, name: string): void {
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row) {
+      toast(`no row for ${slug}`, theme.warn, 1500);
+      return;
+    }
+    if (row.status.kind === StatusKind.Busy) {
+      toast(`${slug} is busy`, theme.warn, 2000);
+      return;
+    }
+    const wasPersisted = nameInUse(slug, name);
     addClaudeName(slug, name);
-    doEnterClaudeSession(slug, name);
+    const sessionLog = createLogger(slug);
+    void (async () => {
+      sessionLog.event.info(`entering claude session "${name}" (F12 to detach)`);
+      const result = await enterClaudeSession({
+        renderer,
+        slug,
+        cwd: row.wt.path,
+        claudeName: name,
+      });
+      void refreshTmuxSessions();
+      if (result.kind === "spawn-failed") {
+        // Roll back the optimistic add IFF we created the entry —
+        // if `name` was already in the file (resume case), leave it
+        // so the user can retry from the picker.
+        if (!wasPersisted) removeClaudeName(slug, name);
+        sessionLog.event.err(`claude failed to start: ${result.reason}`);
+        toast(`claude failed: ${result.reason}`, theme.err, 3000);
+      } else if (result.kind === "detached") {
+        sessionLog.event.info(`detached from ${claudeSessionName(slug, name)}`);
+      } else {
+        sessionLog.event.info(`claude exited (${result.code ?? "?"})`);
+        if (result.stderr) sessionLog.event.err(result.stderr);
+      }
+    })();
   }
 
   /**
@@ -1307,6 +1378,14 @@ export function App({ onExit }: Props) {
    * picker stops listing it as a ghost. Idempotent.
    */
   function doKillClaudeSession(slug: string, name: string | null): void {
+    // Optimistically drop the entry from `tmuxSessionsQuery` cache
+    // BEFORE awaiting the kill so the picker / row badge reflect
+    // immediately. Without this, a user reopening `;` in the
+    // ~hundreds-of-ms window between dispatch and tmux completion
+    // would still see the dying session as live and pressing Enter
+    // would `tmux new-session -A` it back to life.
+    optimisticRemoveClaude(slug, name);
+    if (name !== null) removeClaudeName(slug, name);
     void (async () => {
       try {
         if (name === null) {
@@ -1314,13 +1393,15 @@ export function App({ onExit }: Props) {
           appLog.event.warn(`killed primary claude session on ${slug}`);
         } else {
           await killClaudeNamedSession(slug, name);
-          removeClaudeName(slug, name);
           appLog.event.warn(`killed claude session "${name}" on ${slug}`);
         }
         void refreshTmuxSessions();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         appLog.event.err(`kill claude session failed for ${slug}: ${msg}`);
+        // Refetch to reconcile against truth — the optimistic remove
+        // is wrong if the kill genuinely failed.
+        void refreshTmuxSessions();
       }
     })();
   }
@@ -2069,29 +2150,15 @@ export function App({ onExit }: Props) {
     // named (live in tmux = false), then "+ new".
     if (modal?.kind === "claudeSessionsPicker") {
       const slug = modal.slug;
-      const live = claudeSessionsBySlug.get(slug) ?? [];
-      const liveNamed = live.filter((n): n is string => n !== null);
-      const liveNamedSet = new Set(liveNamed);
-      const persisted = listClaudeNames(slug);
-      const ghostNamed = persisted.filter((n) => !liveNamedSet.has(n));
-      type Item =
-        | { kind: "session"; name: string | null; isLive: boolean }
-        | { kind: "new" };
-      const items: Item[] = [
-        { kind: "session", name: null, isLive: live.includes(null) },
-        ...liveNamed.map(
-          (n): Item => ({ kind: "session", name: n, isLive: true }),
-        ),
-        ...ghostNamed.map(
-          (n): Item => ({ kind: "session", name: n, isLive: false }),
-        ),
-        { kind: "new" },
-      ];
-      const idx = Math.min(Math.max(0, modal.index), items.length - 1);
+      const entries = pickerEntries;
+      // Total interactive rows = entries + the trailing "+ new" row,
+      // which is appended by the picker UI itself. The handler treats
+      // index `entries.length` as that "+ new" affordance.
+      const totalRows = entries.length + 1;
+      const idx = Math.min(Math.max(0, modal.index), totalRows - 1);
       const select = (i: number): void => {
-        const target = items[i];
-        if (!target) return;
-        if (target.kind === "new") {
+        if (i < 0 || i >= totalRows) return;
+        if (i === entries.length) {
           setModal({
             kind: "claudeSessionsNew",
             slug,
@@ -2101,10 +2168,10 @@ export function App({ onExit }: Props) {
           return;
         }
         setModal(null);
-        doEnterClaudeSession(slug, target.name);
+        doEnterClaudeSession(slug, entries[i]!.name);
       };
       if (k.name === "j" || k.name === "down") {
-        setModal({ ...modal, index: Math.min(idx + 1, items.length - 1) });
+        setModal({ ...modal, index: Math.min(idx + 1, totalRows - 1) });
         return;
       }
       if (k.name === "k" || k.name === "up") {
@@ -2116,8 +2183,8 @@ export function App({ onExit }: Props) {
         return;
       }
       if (k.sequence === "x") {
-        const target = items[idx];
-        if (target?.kind === "session") {
+        const target = entries[idx];
+        if (target) {
           if (target.isLive) {
             doKillClaudeSession(slug, target.name);
           } else if (target.name !== null) {
@@ -2156,7 +2223,7 @@ export function App({ onExit }: Props) {
       }
       if (k.name === "return") {
         const trimmed = modal.input.trim();
-        const name = trimmed === "" ? nextAutoNumber(modal.slug) : trimmed;
+        const name = trimmed === "" ? nextAutoName(modal.slug) : trimmed;
         const err = validateSessionName(name);
         if (err) {
           setModal({ ...modal, error: err });
@@ -2214,12 +2281,7 @@ export function App({ onExit }: Props) {
       if (k.name === "y" || k.name === "return") {
         const { slug, sessionKind } = modal;
         setModal(null);
-        const kill =
-          sessionKind === "diff"
-            ? killDiffSession
-            : sessionKind === "shell"
-              ? killShellSession
-              : killSession;
+        const kill = sessionKind === "diff" ? killDiffSession : killShellSession;
         void kill(slug)
           .then(() => {
             appLog.event.warn(`killed ${sessionKind} session on ${slug}`);
@@ -2450,10 +2512,8 @@ export function App({ onExit }: Props) {
     }
     // `:` opens the Outputs picker — vim-`:ls` flavor for the bottom
     // pane. Cursor lands on the displayed output within this
-    // worktree's filtered list. (Was `;` originally; moved when the
-    // sessions picker took over `;` — outputs is reached less often
-    // than sessions in normal use, so the shifted-pinky cost lands on
-    // the rarer key.)
+    // worktree's filtered list. Outputs is the rarer chord; sessions
+    // wins `;`.
     if (k.sequence === ":") {
       const idx = Math.max(
         0,
@@ -2821,7 +2881,7 @@ export function App({ onExit }: Props) {
         toast(`${slug} is busy`, theme.warn, 2000);
         return;
       }
-      doSpawnNamedClaudeSession(slug, nextAutoNumber(slug));
+      doSpawnNamedClaudeSession(slug, nextAutoName(slug));
       return;
     }
     // F12 — toggle into the selected worktree's primary claude
@@ -3107,49 +3167,21 @@ export function App({ onExit }: Props) {
           pinnedId={focusBucket.pinned}
         />
       ) : null}
-      {modal?.kind === "claudeSessionsPicker"
-        ? (() => {
-            // Items must mirror the keyboard handler exactly so the
-            // index lines up with what the user sees. Cheap to recompute
-            // each render — keeps the list in sync with live tmux state
-            // without an effect.
-            const live = claudeSessionsBySlug.get(modal.slug) ?? [];
-            const liveNamed = live.filter((n): n is string => n !== null);
-            const liveNamedSet = new Set(liveNamed);
-            const persisted = listClaudeNames(modal.slug);
-            const ghostNamed = persisted.filter((n) => !liveNamedSet.has(n));
-            const entries = [
-              { name: null as string | null, isLive: live.includes(null) },
-              ...liveNamed.map((n) => ({
-                name: n as string | null,
-                isLive: true,
-              })),
-              ...ghostNamed.map((n) => ({
-                name: n as string | null,
-                isLive: false,
-              })),
-            ];
-            // Modal index spans entries.length + 1 ("+ new" trailing
-            // row); clamp so a stale index from a kill/spawn doesn't
-            // overshoot.
-            const clampedIndex = Math.min(
-              Math.max(0, modal.index),
-              entries.length,
-            );
-            return (
-              <SessionsPickerList
-                slug={modal.slug}
-                entries={entries}
-                selectedIndex={clampedIndex}
-              />
-            );
-          })()
-        : null}
+      {modal?.kind === "claudeSessionsPicker" ? (
+        <SessionsPickerList
+          slug={modal.slug}
+          entries={pickerEntries}
+          selectedIndex={Math.min(
+            Math.max(0, modal.index),
+            pickerEntries.length, // index `length` = the trailing "+ new" row
+          )}
+        />
+      ) : null}
       {modal?.kind === "claudeSessionsNew" ? (
         <SessionsPickerNew
           slug={modal.slug}
           input={modal.input}
-          autoName={nextAutoNumber(modal.slug)}
+          autoName={nextAutoName(modal.slug)}
           error={modal.error}
         />
       ) : null}
