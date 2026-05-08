@@ -7,6 +7,7 @@ import { queryOptions } from "@tanstack/react-query";
 
 import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
+import { readClaudeUsage, type ClaudeUsage } from "../core/claude-usage.ts";
 import { config } from "../core/config.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
@@ -98,6 +99,8 @@ export type TmuxSessionsData = {
   diff: string[];
   /** Slugs with a live shell session. */
   shell: string[];
+  /** Slugs with a live action session (wt-managed wrapper). */
+  action: string[];
 };
 
 /**
@@ -112,8 +115,13 @@ export const tmuxSessionsQuery = () =>
   queryOptions({
     queryKey: qk.tmuxSessions(),
     queryFn: async (): Promise<TmuxSessionsData> => {
-      const { claude, diff, shell } = await listTmuxSessions();
-      return { claude: [...claude], diff: [...diff], shell: [...shell] };
+      const { claude, diff, shell, action } = await listTmuxSessions();
+      return {
+        claude: [...claude],
+        diff: [...diff],
+        shell: [...shell],
+        action: [...action],
+      };
     },
     staleTime: STALE.fast,
     refetchInterval: 2_000,
@@ -153,6 +161,21 @@ export const githubQuery = (branches: readonly string[]) =>
  * gets the refreshed list" — not "this open hangs for 6 round-trips".
  * Persisted across runs via the SQLite persister (30-day maxAge).
  */
+/**
+ * Anthropic API utilization read from the Claude Code statusline's
+ * cache file (~/.cache/claude-statusline-usage.json). The statusline
+ * is the only thing that hits the API; we just observe its cache, so
+ * there's no auth or rate-limit concern here. Refetch every minute so
+ * the title bar trails the cache by at most ~60s.
+ */
+export const claudeUsageQuery = () =>
+  queryOptions({
+    queryKey: qk.claudeUsage(),
+    queryFn: async (): Promise<ClaudeUsage | null> => readClaudeUsage(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
 export const contributorsQuery = () =>
   queryOptions({
     queryKey: qk.contributors(),

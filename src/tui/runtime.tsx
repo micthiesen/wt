@@ -50,6 +50,16 @@ async function reapStartup(): Promise<void> {
     const liveWithSource = new Set(live);
     liveWithSource.add(WT_SOURCE_SLUG);
     await reapOrphanedSessions(liveWithSource);
+    // Drop terminal action run dirs whose slug is gone OR that fall
+    // beyond the rehydration window. Ordered before `boot` so the
+    // boot scan only sees dirs we'll actually keep — saves a meta-
+    // read per stale dir.
+    actionRegistry.reapDirs(live);
+    // Rehydrate action runs from disk + tmux. Picks up any action
+    // session that was running when the previous wt exited (or
+    // crashed) and re-attaches a live tail; finalizes runs whose
+    // wrapper exited while wt was down.
+    await actionRegistry.boot(live);
   } catch (err) {
     startupLog.warn("reap failed", { err: err instanceof Error ? err.message : String(err) });
   }
@@ -106,9 +116,11 @@ export async function runTui(): Promise<TuiExit> {
     detachFetchLogs();
     setEventSink(null);
     wtClient.shutdown();
-    // SIGTERM in-flight `claude -p` actions and await their drains
-    // so we don't strand subprocesses (or truncate their log files)
-    // when main.ts hits process.exit.
+    // Detach from in-flight actions: close tails + done watchers so
+    // we don't dangle file handles, but leave the tmux-supervised
+    // wrappers running. The next `wt` invocation rehydrates them via
+    // `actionRegistry.boot` — that's the whole point of moving
+    // actions onto tmux.
     await actionRegistry.shutdown();
     // Close all jsonl + pipe-pane watchers + drop tailer state.
     sessionTailRegistry.stopAll();

@@ -28,6 +28,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { killActionSession } from "./action-tmux.ts";
 import { wtSessionArgs } from "./claude.ts";
 import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
@@ -50,15 +51,23 @@ export const WT_SOURCE_SLUG = "wt";
 /**
  * Kinds of session this module manages. `claude` is the persistent
  * F12 conversation; `diff` is the F11 git-diff TUI; `shell` is the
- * F10 plain login shell. Each gets its own tmux session per slug —
- * `<slug>` for claude, `<slug>-diff` for diff, `<slug>-shell` for
- * shell — so they coexist without interfering.
+ * F10 plain login shell; `action` is a wt-managed action runner
+ * (claude `-p` or shell command) supervised by tmux so it survives
+ * wt restarts. Each gets its own tmux session per slug — `<slug>`
+ * for claude, `<slug>-diff` for diff, `<slug>-shell` for shell,
+ * `<slug>-action` for action — so they coexist without interfering.
+ *
+ * Action sessions are not user-attachable and are not driven by the
+ * F-key codepath in this module — `core/action-tmux.ts` owns their
+ * lifecycle. The kind is registered here so `listSessions` and
+ * `reapOrphanedSessions` see them uniformly with the other kinds.
  */
-export type SessionKind = "claude" | "diff" | "shell";
+export type SessionKind = "claude" | "diff" | "shell" | "action";
 
 const SUFFIX: Record<Exclude<SessionKind, "claude">, string> = {
   diff: "-diff",
   shell: "-shell",
+  action: "-action",
 };
 
 function sessionName(slug: string, kind: SessionKind): string {
@@ -129,7 +138,7 @@ set -g default-terminal "tmux-256color"
 set -as terminal-features ",${outerTerm}:RGB"
 set -ag terminal-overrides ",${outerTerm}:Tc"
 set -ag update-environment "COLORTERM"
-set -g allow-passthrough on
+set -g allow-passthrough off
 set -s extended-keys on
 set -as terminal-features ",${outerTerm}:extkeys"
 unbind C-b
@@ -190,16 +199,25 @@ export async function killShellSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "shell"));
 }
 
+// Action session kills go through `core/action-tmux.ts` —
+// `killAllSessionsFor` below imports the sync helper there. Keeping a
+// duplicate definition here would invite drift between two sources of
+// truth for the same tmux command.
+
 /**
- * Kill every kind of session for a slug (claude, diff, shell). Used
- * by destroy paths so none linger with cwd inside a half-deleted
- * worktree.
+ * Kill every kind of session for a slug (claude, diff, shell,
+ * action). Used by destroy paths so none linger with cwd inside a
+ * half-deleted worktree.
  */
 export async function killAllSessionsFor(slug: string): Promise<void> {
+  // action-tmux.ts owns the action-session kill; we just call it
+  // alongside the others. It's sync (Bun.spawnSync), so wrap in
+  // Promise.resolve for the allSettled shape.
   await Promise.allSettled([
     killSession(slug),
     killDiffSession(slug),
     killShellSession(slug),
+    Promise.resolve().then(() => killActionSession(slug)),
   ]);
 }
 
@@ -252,21 +270,25 @@ export async function listSessions(): Promise<{
   claude: Set<string>;
   diff: Set<string>;
   shell: Set<string>;
+  action: Set<string>;
 }> {
   const all = await listAllSessionsRaw();
   const claude = new Set<string>();
   const diff = new Set<string>();
   const shell = new Set<string>();
+  const action = new Set<string>();
   for (const name of all) {
     if (name.endsWith(SUFFIX.diff)) {
       diff.add(name.slice(0, -SUFFIX.diff.length));
     } else if (name.endsWith(SUFFIX.shell)) {
       shell.add(name.slice(0, -SUFFIX.shell.length));
+    } else if (name.endsWith(SUFFIX.action)) {
+      action.add(name.slice(0, -SUFFIX.action.length));
     } else {
       claude.add(name);
     }
   }
-  return { claude, diff, shell };
+  return { claude, diff, shell, action };
 }
 
 /**
@@ -354,6 +376,10 @@ function scrubStderr(raw: string): string | null {
  * terminal until they detach (F11/F12) or the inner program exits.
  * Returns once tmux's client process exits.
  *
+ * Action sessions are intentionally excluded — they're not user-
+ * attachable and have no inner-program-from-config story; their
+ * lifecycle lives in `core/action-tmux.ts`.
+ *
  * Caller is responsible for suspending/resuming any UI renderer around
  * this call — this function makes no assumptions about who owns the
  * terminal before/after.
@@ -361,7 +387,7 @@ function scrubStderr(raw: string): string | null {
 export async function attachOrCreate(opts: {
   slug: string;
   cwd: string;
-  kind: SessionKind;
+  kind: Exclude<SessionKind, "action">;
   /**
    * Resolved diff base ref for `{{base}}` substitution in
    * `config.diff.command`. Required by callers using a base-aware diff

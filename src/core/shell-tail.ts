@@ -63,6 +63,39 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1
 // eslint-disable-next-line no-control-regex
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
+// Powerline glyphs and nerd-font symbols used as prompt segment
+// separators and theme icons (powerlevel10k, starship, …). U+E000..
+// U+E0FF spans the BMP private-use area where these glyphs live; real
+// command output essentially never contains characters in this range,
+// so any line that does is a prompt redraw.
+const POWERLINE_GLYPHS_RE = /[-]/;
+// Prompt filler — `·` (U+00B7) and `.` runs, used by powerlevel10k to
+// pad the prompt out to the right edge. 6+ in a row is a strong signal:
+// real output doesn't hit that threshold without being deliberately
+// cosmetic.
+const PROMPT_FILLER_RE = /[·.]{6,}/;
+// zsh's missing-newline marker: an inverted `%` at the start of a line
+// when the previous command's output didn't end with `\n`. After ANSI
+// + control stripping it lands as a bare `%`. Drop only when that's
+// the entire line so output containing literal `%` isn't filtered.
+const ZSH_MISSING_NL_RE = /^%$/;
+
+// Bracketed-paste mode markers. zsh wraps user input in
+// `\e[?2004h ... \e[?2004l`, so a line containing `[?2004l` carries
+// a typed command in its preceding bytes — surface it as `> <cmd>`.
+const PASTE_START = "\x1b[?2004h";
+const PASTE_END = "\x1b[?2004l";
+// Strip the prompt indicator off the front of the reconstructed input:
+// optional leading whitespace + box-drawing chars + an arrow-style
+// marker + space. Covers powerlevel10k's `╰─❯ `, starship's `❯ `,
+// bash-style `$ ` / `% ` / `# `, and similar. Anchored — bare `>` /
+// `$` / `%` mid-command stay intact.
+const PROMPT_PREFIX_RE = /^[\s─-▟]*[❯>›→»$%#]\s+/;
+// Cap on reconstructed input length. Some interactive TUIs (e.g. hunk)
+// toggle bracketed-paste mode internally so the entire TUI session
+// reconstructs as one giant "command"; drop those.
+const MAX_RECONSTRUCT_LEN = 200;
+
 function shellLogDir(): string {
   return join(homedir(), ".cache", "wt", "shell-logs");
 }
@@ -382,11 +415,129 @@ class ShellTailRegistry {
 }
 
 /**
- * Strip ANSI + collapse carriage returns + drop control chars. Returns
- * `null` for lines that are empty after cleanup so the buffer doesn't
- * fill with blanks from cursor-only escape sequences.
+ * Reconstruct the user's typed command from the bracketed-paste region
+ * of a raw shell-log line. zsh-syntax-highlighting redraws the line on
+ * every keystroke with SGR colour codes, autosuggestion ghost text, and
+ * backspace-rewinds; a minimal cursor simulator that interprets BS,
+ * CR, and the cursor / erase CSI sequences (ignoring SGR) reproduces
+ * the final state of what the user actually typed.
+ *
+ * We don't try to be a full terminal — `\e[D` (cursor-back), `\e[C`
+ * (cursor-forward), `\e[K` (erase-in-line), `\e[P` (delete-chars), and
+ * `\e[G` (cursor-horizontal-absolute) cover the redraw vocabulary zsh
+ * emits in practice. Everything else (SGR, mode set/reset, OSC) is
+ * scanned for length and skipped.
+ */
+function reconstructInput(raw: string): string {
+  const buf: string[] = [];
+  let pos = 0;
+  let i = 0;
+  const len = raw.length;
+  while (i < len) {
+    const c = raw[i]!;
+    if (c === "\x1b") {
+      if (raw[i + 1] === "[") {
+        let j = i + 2;
+        while (j < len && "<=>?".includes(raw[j]!)) j++;
+        let params = "";
+        while (j < len && /[0-9;]/.test(raw[j]!)) {
+          params += raw[j];
+          j++;
+        }
+        while (j < len) {
+          const cc = raw.charCodeAt(j);
+          if (cc >= 0x20 && cc <= 0x2f) j++;
+          else break;
+        }
+        const final = raw[j];
+        if (final === "D") {
+          const n = params ? Math.max(1, parseInt(params, 10)) : 1;
+          pos = Math.max(0, pos - n);
+        } else if (final === "C") {
+          const n = params ? Math.max(1, parseInt(params, 10)) : 1;
+          pos = Math.min(buf.length, pos + n);
+        } else if (final === "K") {
+          const mode = parseInt(params || "0", 10);
+          if (mode === 0) buf.length = pos;
+          else if (mode === 2) {
+            buf.length = 0;
+            pos = 0;
+          }
+        } else if (final === "P") {
+          const n = params ? Math.max(1, parseInt(params, 10)) : 1;
+          buf.splice(pos, n);
+        } else if (final === "G") {
+          const n = params ? Math.max(1, parseInt(params, 10)) : 1;
+          pos = Math.max(0, n - 1);
+        }
+        // SGR ('m'), mode set/reset ('h'/'l'), save/restore ('s'/'u'),
+        // and other CSI finals: no buffer effect, just skip.
+        i = j + 1;
+      } else if (raw[i + 1] === "]") {
+        // OSC: scan to ST (ESC \) or BEL.
+        let j = i + 2;
+        while (j < len) {
+          if (raw[j] === "\x07") {
+            j++;
+            break;
+          }
+          if (raw[j] === "\x1b" && raw[j + 1] === "\\") {
+            j += 2;
+            break;
+          }
+          j++;
+        }
+        i = j;
+      } else {
+        i += 2;
+      }
+    } else if (c === "\b") {
+      pos = Math.max(0, pos - 1);
+      i++;
+    } else if (c === "\r") {
+      pos = 0;
+      i++;
+    } else if (c.charCodeAt(0) < 0x20 || c === "\x7f") {
+      i++;
+    } else {
+      buf[pos] = c;
+      pos++;
+      i++;
+    }
+  }
+  return buf.join("").trimEnd();
+}
+
+/**
+ * Strip ANSI + collapse carriage returns + drop control chars + filter
+ * prompt redraws. Returns `null` for lines that should not surface in
+ * the activity pane (empty after cleanup, prompt artifacts).
+ *
+ * Lines containing `\e[?2004l` carry a user-typed command in their
+ * bracketed-paste region: extract via `reconstructInput`, prepend `> `,
+ * and short-circuit the rest of the pipeline. The command output that
+ * follows the paste-end is on a subsequent log line so it flows through
+ * the regular path.
  */
 function clean(raw: string): string | null {
+  const pasteEnd = raw.indexOf(PASTE_END);
+  if (pasteEnd !== -1) {
+    const pasteStart = raw.lastIndexOf(PASTE_START, pasteEnd);
+    const region =
+      pasteStart === -1
+        ? raw.slice(0, pasteEnd)
+        : raw.slice(pasteStart + PASTE_START.length, pasteEnd);
+    const reconstructed = reconstructInput(region);
+    if (
+      reconstructed.length === 0 ||
+      reconstructed.length > MAX_RECONSTRUCT_LEN
+    ) {
+      return null;
+    }
+    const cmd = reconstructed.replace(PROMPT_PREFIX_RE, "");
+    if (cmd.length === 0) return null;
+    return `> ${cmd}`;
+  }
   let s = raw.replace(ANSI_RE, "");
   // Drop a single trailing CR from CRLF line endings — pipe-pane
   // captures the raw byte stream, so splitting on \n leaves the \r
@@ -403,7 +554,20 @@ function clean(raw: string): string | null {
   if (cr !== -1) s = s.slice(cr + 1);
   s = s.replace(CTRL_RE, "");
   s = s.trimEnd();
-  return s.length === 0 ? null : s;
+  if (s.length === 0) return null;
+  // Prompt redraws (powerlevel10k and similar) emit a fresh status
+  // line on every keystroke, resize, and command — they'd dominate
+  // the pane otherwise. Filter on the three signals that are unique
+  // to prompts: powerline-glyph segment separators, dot-fill padding,
+  // and zsh's missing-newline marker.
+  if (
+    POWERLINE_GLYPHS_RE.test(s) ||
+    PROMPT_FILLER_RE.test(s) ||
+    ZSH_MISSING_NL_RE.test(s)
+  ) {
+    return null;
+  }
+  return s;
 }
 
 function readBytes(path: string, start: number, len: number): string {

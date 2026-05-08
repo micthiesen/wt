@@ -35,6 +35,12 @@ export const qk = {
    * after every refresh".
    */
   contributors: () => ["contributors"] as const,
+  /**
+   * Anthropic API utilization snapshot read from the Claude Code
+   * statusline cache. Single global key — the cache is per-user, not
+   * per-worktree.
+   */
+  claudeUsage: () => ["claudeUsage"] as const,
   /** Per-worktree property namespace. */
   wt: (slug: string) =>
     ({

@@ -95,6 +95,7 @@ import { invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
 import type { PullRequest } from "../core/types.ts";
 import {
+  moveSection as moveSectionOnDisk,
   placeSlug as placeSlugOnDisk,
   renameSection as renameSectionOnDisk,
   setSlugSection as setSlugSectionOnDisk,
@@ -522,6 +523,20 @@ export function useWtActions() {
     async renameSection(oldName: string, newName: string): Promise<void> {
       renameSectionOnDisk(oldName, newName);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Move a section one slot up or down in `sectionsOrder`. Returns
+     * true when the swap landed, false when at boundary. Skips the
+     * invalidate on a no-op so the keypress is truly inert (no
+     * spurious re-fetch / re-render churn that could otherwise look
+     * like a phantom step to the user).
+     */
+    async moveSection(name: string, dir: -1 | 1): Promise<boolean> {
+      const moved = moveSectionOnDisk(name, dir);
+      if (moved) {
+        await qc.invalidateQueries({ queryKey: qk.wtState() });
+      }
+      return moved;
     },
   };
 }

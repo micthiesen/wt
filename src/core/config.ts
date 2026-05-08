@@ -207,7 +207,21 @@ const GENERIC_DEFAULTS = {
     autoRegenPaths: ["sst-env.d.ts"] as const,
   },
   diff: {
-    command: "hunk diff {{base}} --watch",
+    // revdiff: stacked diff TUI with vim motions. `{{base}}` resolves
+    // to the trunk branch so the view spans commits + staged +
+    // unstaged (untracked is one keypress away via `u`). No watch
+    // flag — manual refresh on `R`; the tmux session preserves scroll
+    // position across F11 detaches, which matters more than always-
+    // current state.
+    //
+    // TODO: hook revdiff annotations into the F12 claude action loop.
+    // Add `-o {{worktree}}/.wt-review.md` to the command so a review
+    // pass dumps annotations to a known path, then a new claude-kind
+    // action ("address review annotations") whose prompt reads that
+    // file and addresses each comment. Cleaner than depending on
+    // revdiff's separate Claude Code plugin since wt already owns
+    // the action plumbing.
+    command: "revdiff --vim-motion {{base}}",
   },
   ai: {
     maxInputTokens: 8000,

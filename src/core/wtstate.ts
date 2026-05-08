@@ -250,6 +250,29 @@ export function renameSection(oldName: string, newName: string): void {
 }
 
 /**
+ * Move a named section one slot up (`dir = -1`) or down (`dir = 1`)
+ * in `sectionsOrder`. Returns true when the swap landed, false when it
+ * was a no-op (section absent, or already at the boundary). Member
+ * slugs keep their `order` values; only the index moves.
+ */
+export function moveSection(name: string, dir: -1 | 1): boolean {
+  const state = readWtState();
+  const idx = state.sectionsOrder.indexOf(name);
+  if (idx < 0) return false;
+  const target = idx + dir;
+  if (target < 0 || target >= state.sectionsOrder.length) return false;
+  const next: WtState = {
+    ...state,
+    sectionsOrder: [...state.sectionsOrder],
+  };
+  const tmp = next.sectionsOrder[idx]!;
+  next.sectionsOrder[idx] = next.sectionsOrder[target]!;
+  next.sectionsOrder[target] = tmp;
+  writeWtState(next);
+  return true;
+}
+
+/**
  * Reap stale slug entries against the live slug set. Called after
  * destroys to keep the state file tidy. No-op when nothing to drop.
  */

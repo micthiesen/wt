@@ -130,7 +130,7 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1
  * terminal expands to the next tab stop), which cascades into rows
  * overflowing their allocated height and colliding with siblings.
  */
-function sanitizeLine(line: string): string {
+export function sanitizeLine(line: string): string {
   let s = line.replace(ANSI_RE, "");
   const lastCr = s.lastIndexOf("\r");
   if (lastCr >= 0) s = s.slice(lastCr + 1);

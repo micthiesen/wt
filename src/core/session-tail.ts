@@ -57,6 +57,7 @@ import {
   MAX_BUFFERED_LINES,
   asObj,
   compactMeta,
+  formatTokens,
   messageToLines,
   splitMessage,
 } from "./claude-events.ts";
@@ -372,7 +373,37 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
   const t = e.type;
   const ts = entryTs(e);
   if (t === "assistant" || t === "user") {
+    // The auto-injected post-compaction summary blob ("This session is
+    // being continued from a previous conversation…") arrives as a
+    // user envelope flagged with `isCompactSummary`. Skip it — the
+    // `compact_boundary` system event below carries the high-signal
+    // marker (token deltas, trigger), and rendering the full summary
+    // would dump several hundred lines of internal detail into the pane.
+    if (t === "user" && e.isCompactSummary === true) return [];
     return messageToLines({ role: t, message: e.message, ts, toolStarts });
+  }
+  // system.compact_boundary — fired when the conversation is compacted
+  // (manual `/compact` or auto when the context window fills). Surface
+  // as a single dim marker line so the user can see where compactions
+  // landed in the timeline. Token counts come from `compactMetadata`;
+  // we annotate the trigger only when it's `auto` since manual is the
+  // common case (the user just typed /compact).
+  if (t === "system" && e.subtype === "compact_boundary") {
+    const meta = asObj(e.compactMetadata);
+    const pre =
+      meta && typeof meta.preTokens === "number" ? meta.preTokens : null;
+    const post =
+      meta && typeof meta.postTokens === "number" ? meta.postTokens : null;
+    const trigger =
+      meta && typeof meta.trigger === "string" ? meta.trigger : null;
+    const tokenPart =
+      pre != null && post != null
+        ? ` (${formatTokens(pre)} → ${formatTokens(post)})`
+        : "";
+    const triggerPart = trigger && trigger !== "manual" ? ` ${trigger}` : "";
+    return [
+      { ts, kind: "info", text: `↘ compacted${triggerPart}${tokenPart}` },
+    ];
   }
   // system.away_summary — claude's auto-generated context-recap when
   // the conversation is auto-compacted. High-signal: the user can

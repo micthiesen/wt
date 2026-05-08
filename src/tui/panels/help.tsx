@@ -33,6 +33,7 @@ const SECTIONS: Section[] = [
       ["l l", "new section (chord)"],
       ["L", "rename current section"],
       ["J / K", "move row · across sections"],
+      ["{ / }", "move section up / down"],
       ["a", "archive / restore"],
     ],
   },

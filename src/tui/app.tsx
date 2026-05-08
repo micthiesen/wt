@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useIsFetching } from "@tanstack/react-query";
+import { useIsFetching, useQuery } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 
 import {
@@ -37,7 +37,8 @@ import {
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind, type PullRequest } from "../core/types.ts";
-import { patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
+import { claudeUsageQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
+import type { ClaudeUsage } from "../core/claude-usage.ts";
 
 import {
   ActionEditModal,
@@ -295,7 +296,7 @@ type Modal =
   | {
       kind: "killSessionConfirm";
       slug: string;
-      sessionKind: SessionKind;
+      sessionKind: Exclude<SessionKind, "action">;
     };
 
 /**
@@ -338,6 +339,96 @@ function buildActionVars(row: WorktreeRow): ActionVars {
   };
 }
 
+/**
+ * Right-aligned title-bar slot that surfaces the Claude Code
+ * statusline's API utilization snapshot. Data comes from the
+ * statusline's own cache file; we never call Anthropic directly. Two
+ * clusters — 5h window and rolling 7d window — each pairing the
+ * percentage with the time remaining until that window resets. The
+ * 30-second ticker keeps the remaining-time labels drifting forward
+ * between cache writes (the underlying query refetches once a minute).
+ */
+const USAGE_STALE_MS = 30 * 60 * 1000;
+
+function ClaudeUsageBadge() {
+  const { data } = useQuery(claudeUsageQuery());
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  const formatted = useMemo(() => formatClaudeUsage(data, nowMs), [data, nowMs]);
+  if (!formatted) return null;
+  const { fiveHour: five, sevenDay: seven } = formatted;
+  return (
+    <box flexShrink={0} flexDirection="row">
+      <text fg={theme.fgDim}>{"  🔥 "}</text>
+      <text fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</text>
+      {five.remaining ? <text fg={theme.fgDim}>{` (${five.remaining})`}</text> : null}
+      <text fg={theme.fgDim}>{"  ·  "}</text>
+      <text fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</text>
+      {seven.remaining ? <text fg={theme.fgDim}>{` (${seven.remaining})`}</text> : null}
+    </box>
+  );
+}
+
+/**
+ * Match statusline.sh's coloring: cool/dim under 60%, warm 60-80%,
+ * hot at 80%+. Only the percentage itself is tinted — the surrounding
+ * "5h ..." / "(time)" framing stays dim so the colored numbers pop.
+ */
+function pctColor(pct: number): string {
+  if (pct >= 80) return theme.err;
+  if (pct >= 60) return theme.warn;
+  return theme.fg;
+}
+
+type FormattedUsage = {
+  fiveHour: { pct: number; remaining: string | null };
+  sevenDay: { pct: number; remaining: string | null };
+};
+
+function formatClaudeUsage(
+  usage: ClaudeUsage | null | undefined,
+  nowMs: number,
+): FormattedUsage | null {
+  if (!usage) return null;
+  // Mirror statusline.sh's CACHE_STALE_AGE: don't display data older
+  // than 30 minutes — at that point the user has either exited Claude
+  // Code or it's failing to refresh, and a 6h-stale "5h 12%" is worse
+  // than nothing.
+  if (nowMs - usage.cachedAtMs > USAGE_STALE_MS) return null;
+  return {
+    fiveHour: {
+      pct: Math.round(usage.fiveHour.utilization),
+      remaining: formatRemaining(usage.fiveHour.resetsAt, nowMs),
+    },
+    sevenDay: {
+      pct: Math.round(usage.sevenDay.utilization),
+      remaining: formatRemaining(usage.sevenDay.resetsAt, nowMs),
+    },
+  };
+}
+
+/**
+ * Format a duration as the two coarsest non-zero units. Picks d+h when
+ * the duration spans days, h+m otherwise. Drops the smaller unit when
+ * it would render as 0 — `2h0m` becomes `2h`. Returns null on missing
+ * or unparseable input.
+ */
+function formatRemaining(iso: string | null, nowMs: number): string | null {
+  if (!iso) return null;
+  const target = Date.parse(iso);
+  if (Number.isNaN(target)) return null;
+  const ms = Math.max(0, target - nowMs);
+  const d = Math.floor(ms / 86_400_000);
+  const h = Math.floor((ms % 86_400_000) / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  if (d > 0) return h > 0 ? `${d}d${h}h` : `${d}d`;
+  if (h > 0) return m > 0 ? `${h}h${m}m` : `${h}h`;
+  return `${m}m`;
+}
+
 export function App({ onExit }: Props) {
   const { width, height } = useTerminalDimensions();
   const renderer = useRenderer();
@@ -358,6 +449,7 @@ export function App({ onExit }: Props) {
     swapOrder,
     placeSlug,
     renameSection,
+    moveSection,
     mutate,
   } = useWtActions();
   // Cursor is tracked by slug, not index. Slug identity survives row
@@ -885,6 +977,44 @@ export function App({ onExit }: Props) {
     );
   }
 
+  /**
+   * `{` / `}` — shift the *section* containing the current row one
+   * slot up or down in `sectionsOrder`. Unsectioned rows can't move
+   * (they're pinned to the top); archived rows ignore section order.
+   * Boundary cases toast explicitly so a silent no-op can't read as a
+   * phantom move.
+   */
+  function doMoveSection(dir: -1 | 1): void {
+    if (!current) return;
+    if (current.archived) {
+      toast("archived rows don't have a section", theme.fgDim, 1500);
+      return;
+    }
+    if (current.section === null) {
+      toast("unsectioned rows are pinned to the top", theme.fgDim, 1500);
+      return;
+    }
+    if (filter) {
+      toast("clear filter to reorder sections", theme.warn, 1500);
+      return;
+    }
+    const name = current.section;
+    appLog.event.dim(`moveSection enter name="${name}" dir=${dir}`);
+    moveSection(name, dir).then(
+      (moved) => {
+        appLog.event.dim(`moveSection result name="${name}" dir=${dir} moved=${moved}`);
+        if (!moved) {
+          toast(
+            dir > 0 ? "section already at bottom" : "section already at top",
+            theme.fgDim,
+            1500,
+          );
+        }
+      },
+      (err) => reportActionError("move section", err),
+    );
+  }
+
   function openSectionPicker(): void {
     if (!current) return;
     if (current.archived) {
@@ -1006,6 +1136,13 @@ export function App({ onExit }: Props) {
     // at next startup; re-creating the same slug clears the entry via
     // createWorktree.
     archive(slug);
+    // Mark any in-flight action as killed in the registry first, so
+    // the activity pane reads "killed" rather than the "failed" the
+    // wrapper's exit code would otherwise produce. Has to happen
+    // before killAllSessionsFor below — once tmux drops the session
+    // out from under the wrapper there's no way for the registry to
+    // distinguish "user destroyed worktree" from "wrapper crashed".
+    actionRegistry.kill(slug);
     // Tear down any interactive sessions (claude, diff, shell) BEFORE
     // the worktree removal starts. Their cwds are inside the worktree;
     // letting the remove race against a live tmux child can leave it
@@ -1050,6 +1187,10 @@ export function App({ onExit }: Props) {
     // dispatching any remove — same rationale as `doRemove`: don't
     // let the remove race against a live child with cwd inside the
     // worktree. Done in parallel since each kill is independent.
+    // Notify the action registry first (synchronous, fast) so the
+    // activity pane reads "killed" rather than the "failed" the
+    // wrapper's exit code would otherwise produce.
+    for (const row of candidates) actionRegistry.kill(row.wt.slug);
     await Promise.allSettled(
       candidates.map((row) => killAllSessionsFor(row.wt.slug)),
     );
@@ -2158,6 +2299,17 @@ export function App({ onExit }: Props) {
       openSectionRename();
       return;
     }
+    // `{` / `}` — shift the current row's section up/down in the
+    // section list. Sibling rows move with it; member ordering within
+    // the section is preserved.
+    if (k.sequence === "{") {
+      doMoveSection(-1);
+      return;
+    }
+    if (k.sequence === "}") {
+      doMoveSection(1);
+      return;
+    }
     if (k.name === "j" || k.name === "down") {
       if (filteredRows.length === 0) return;
       const nextIdx = Math.min(cursorIndex + 1, filteredRows.length - 1);
@@ -2671,14 +2823,18 @@ export function App({ onExit }: Props) {
     <box flexDirection="column" width={width} height={height} backgroundColor={theme.bg}>
       <box
         flexShrink={0}
+        flexDirection="row"
         backgroundColor={theme.bgAlt}
         paddingLeft={1}
         paddingRight={1}
         height={1}
       >
-        <text fg={theme.fgBright} attributes={1}>
-          {titleBar}
-        </text>
+        <box flexGrow={1} flexShrink={1} overflow="hidden">
+          <text fg={theme.fgBright} attributes={1}>
+            {titleBar}
+          </text>
+        </box>
+        <ClaudeUsageBadge />
       </box>
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList
