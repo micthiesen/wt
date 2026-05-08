@@ -277,10 +277,11 @@ const RowView = memo(function RowView({
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
   const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
   // Two independent 2-cell slots: action (comment glyph, green) and
-  // session count (circled digit, cyan). They coexist so a row running
-  // an action while also hosting a live interactive session shows both.
-  // Both slots stay lit on archived rows — running work or a live
-  // session against an archived worktree is unusual and worth seeing.
+  // session count (circled digit, Claude orange). They coexist so a
+  // row running an action while also hosting a live interactive
+  // session shows both. Both slots stay lit on archived rows —
+  // running work or a live session against an archived worktree is
+  // unusual and worth seeing.
   const showSessionSlot = sessionCount > 0;
   const hasAnyBadge =
     actionRunning ||
@@ -352,7 +353,7 @@ const RowView = memo(function RowView({
           ) : null}
           {showSessionSlot ? (
             <box width={2} flexShrink={0}>
-              <text fg={theme.accent}>{claudeCountGlyph(sessionCount)}</text>
+              <text fg={theme.claudeOrange}>{claudeCountGlyph(sessionCount)}</text>
             </box>
           ) : null}
           {/* CR and review hints sit immediately to the left of the
