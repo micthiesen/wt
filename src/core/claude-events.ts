@@ -18,17 +18,53 @@ export type ActionLineKind =
   | "user" // user-typed prompt (session only)
   | "assistant" // assistant text
   | "thinking" // assistant chain-of-thought (session only)
-  | "tool" // tool_use call
-  | "tool-result" // tool result (success or error)
+  | "tool" // tool_use call awaiting its result (dim)
+  | "tool-ok" // tool result, success — patched onto the call line (green)
+  | "tool-err" // tool result, failure — patched onto the call line (red)
   | "stdout" // shell action stdout line
   | "stderr" // shell action stderr line
   | "exit-success" // result event w/ subtype success
   | "exit-failure"; // result event w/ is_error or non-zero exit
 
+/**
+ * Monotonic per-buffer line identity. The buffer owner (`session-tail`,
+ * `actions`) hands out ids via a `nextId()` closure passed into the
+ * parser; the parser stores the id of every tool-call line on the
+ * matching `ToolStartEntry` so the later `tool_result` can return a
+ * patch op that mutates the original call line in place instead of
+ * appending a separate `✓ → ok` line. Non-patchable lines still get
+ * ids — uniform shape, near-zero cost, future-proof.
+ */
 export type ActionLine = {
+  id: number;
   ts: number;
   kind: ActionLineKind;
   text: string;
+};
+
+/**
+ * Replace the buffer entry with id `id`. No-op when the id no longer
+ * exists in the buffer — e.g. the call was evicted past the
+ * `MAX_BUFFERED_LINES` window between the call and its result, so
+ * silently swallowing the patch is correct (the user has scrolled
+ * past it long ago).
+ */
+export type LinePatch = {
+  id: number;
+  line: ActionLine;
+};
+
+/**
+ * What one envelope's parse emits. `append` lines push onto the
+ * buffer; `patch` ops replace existing entries (matched by `id`) so
+ * tool_use → tool_result pairs collapse to a single line that turns
+ * green/red when it resolves. Most envelopes emit only `append`;
+ * patches show up when a user envelope carries `tool_result` blocks
+ * for prior assistant tool_uses.
+ */
+export type MessageEmit = {
+  append: ActionLine[];
+  patch: LinePatch[];
 };
 
 /**
@@ -36,17 +72,25 @@ export type ActionLine = {
  * stay correct across batched and restarted reads. `messageToLines`
  * mutates: `tool_use` blocks insert, `tool_result` blocks delete.
  *
+ * `label` is the call line's text body (e.g. `Edit(/path/to/file.ts)`)
+ * stashed at insert time so the result handler can rebuild the line
+ * (`✓ Edit(/path/to/file.ts) 1.2s`) without re-walking the original
+ * input. `lineId` is the buffer id of the call line — `null` for batch
+ * members (the batch has one shared line, addressed via `batch.lineId`).
+ *
  * `batch` is non-null when this call is part of a multi-tool batch
  * within one assistant message — it points at a state object shared
  * by every entry in the batch so the summary line on the result side
- * (`✓ Bash×3 ok, Read×2 ok (3.4s)`) emits exactly once when the last
+ * (`✓ Bash×3, Read×2 (3.4s)`) emits exactly once when the last
  * result lands. Detailed tools (Edit/Write/Task/…) and lone non-
  * detailed calls leave `batch` null and render individually.
  */
 export type ToolStartEntry = {
   toolName: string;
+  label: string;
   ts: number;
   batch: BatchState | null;
+  lineId: number | null;
 };
 export type ToolStartMap = Map<string, ToolStartEntry>;
 
@@ -60,6 +104,10 @@ type BatchState = {
     string,
     { ok: number; err: number; durMs: number }
   >;
+  /** Buffer id of the batch summary call line — patched on last result. */
+  lineId: number;
+  /** Pre-formatted "Bash×3, Read×2" call label for result-line rebuild. */
+  callLabel: string;
 };
 
 /**
@@ -139,6 +187,41 @@ export function briefToolInput(input: unknown): string {
     }
   }
   return "";
+}
+
+/**
+ * Pull a one-line summary out of a `tool_result.content` payload —
+ * used when `is_error: true` so the collapsed result line can carry
+ * the reason (`✗ Bash(npm test) err: 3 tests failed 1.2s`) instead of
+ * just `err`. Content arrives as either a bare string or an array of
+ * `{type: "text", text}` blocks; both shapes get the same treatment:
+ * first non-empty line after ANSI scrub, length-capped so the line
+ * stays single-row.
+ */
+const TOOL_ERR_MAX = 120;
+export function briefToolResultBody(content: unknown): string | null {
+  const pick = (text: string): string | null => {
+    for (const raw of text.split("\n")) {
+      const cleaned = sanitizeLine(raw).trim();
+      if (cleaned.length === 0) continue;
+      return cleaned.length > TOOL_ERR_MAX
+        ? `${cleaned.slice(0, TOOL_ERR_MAX - 1)}…`
+        : cleaned;
+    }
+    return null;
+  };
+  if (typeof content === "string") return pick(content);
+  const arr = asArr(content);
+  if (!arr) return null;
+  for (const block of arr) {
+    const b = asObj(block);
+    if (!b) continue;
+    if (typeof b.text === "string") {
+      const out = pick(b.text);
+      if (out) return out;
+    }
+  }
+  return null;
 }
 
 /**
@@ -283,22 +366,28 @@ function classifyUserText(text: string): UserTextClass {
  * on the first row only; subsequent rows align with the assistant
  * indent.
  */
-function appendUserText(out: ActionLine[], ts: number, text: string): void {
+function appendUserText(
+  out: ActionLine[],
+  ts: number,
+  text: string,
+  nextId: () => number,
+): void {
   const cls = classifyUserText(text);
   if (cls.kind === "drop") return;
   if (cls.kind === "interrupted") {
-    out.push({ ts, kind: "info", text: "! interrupted" });
+    out.push({ id: nextId(), ts, kind: "info", text: "! interrupted" });
     return;
   }
   if (cls.kind === "task-notification") {
-    out.push({ ts, kind: "info", text: `◉ ${cls.summary}` });
+    out.push({ id: nextId(), ts, kind: "info", text: `◉ ${cls.summary}` });
     if (cls.event) {
       const { pieces, truncated } = splitMessage(cls.event);
       for (const piece of pieces) {
-        out.push({ ts, kind: "info", text: `  ${piece}` });
+        out.push({ id: nextId(), ts, kind: "info", text: `  ${piece}` });
       }
       if (truncated > 0) {
         out.push({
+          id: nextId(),
           ts,
           kind: "info",
           text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
@@ -318,6 +407,7 @@ function appendUserText(out: ActionLine[], ts: number, text: string): void {
     if (cleaned.length === 0) return;
     cleaned.forEach((piece, i) => {
       out.push({
+        id: nextId(),
         ts,
         kind: "info",
         text: `${i === 0 ? "↳ " : "  "}${piece}`,
@@ -329,6 +419,7 @@ function appendUserText(out: ActionLine[], ts: number, text: string): void {
   if (pieces.length === 0) return;
   pieces.forEach((piece, i) => {
     out.push({
+      id: nextId(),
       ts,
       kind: "user",
       text: `${i === 0 ? "> " : "  "}${piece}`,
@@ -336,6 +427,7 @@ function appendUserText(out: ActionLine[], ts: number, text: string): void {
   });
   if (truncated > 0) {
     out.push({
+      id: nextId(),
       ts,
       kind: "info",
       text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
@@ -356,16 +448,24 @@ export function compactMeta(text: string): string {
 }
 
 /**
- * Walk one message envelope's `content` array and emit ActionLine entries.
- * Mutates `toolStarts`: tool_use blocks register start metadata, tool_result
- * blocks consume it (so the `→ ok (1.2s)` duration is the real round-trip).
+ * Walk one message envelope's `content` array and emit a delta —
+ * `append` lines (new buffer entries) plus `patch` ops (existing call
+ * lines mutated in place when their results arrive). Mutates
+ * `toolStarts`: tool_use blocks insert, tool_result blocks consume.
  *
  * `role` distinguishes the two envelopes that carry content:
- *  - `assistant` → text + tool_use blocks
+ *  - `assistant` → text + tool_use blocks (always append, never patch).
  *  - `user` → tool_result blocks AND typed prompts (interactive only).
  *    Older session entries store the prompt as a bare string in
  *    `message.content`; newer ones use a `[{type: "text", text: ...}]`
- *    array. Both are accepted.
+ *    array. Both are accepted. tool_result blocks patch the matching
+ *    call line (single-tool) or the batch summary line (batched);
+ *    when the call has been evicted past the buffer window the patch
+ *    is silently dropped at apply time.
+ *
+ * `nextId` is the buffer's monotonic id factory — pass the same
+ * closure across all `parseEntry` calls for a given buffer so ids
+ * stay unique.
  *
  * `claude -p` never produces typed-prompt user entries (the prompt is a
  * CLI arg), so the action runner never exercises that code path — it's
@@ -376,35 +476,35 @@ export function messageToLines(opts: {
   message: unknown;
   ts: number;
   toolStarts: ToolStartMap;
-}): ActionLine[] {
-  const { role, message, ts, toolStarts } = opts;
+  nextId: () => number;
+}): MessageEmit {
+  const { role, message, ts, toolStarts, nextId } = opts;
+  const emit: MessageEmit = { append: [], patch: [] };
   const m = asObj(message);
-  const out: ActionLine[] = [];
-  if (!m) return out;
+  if (!m) return emit;
   if (role === "user" && typeof m.content === "string") {
-    appendUserText(out, ts, m.content);
-    return out;
+    appendUserText(emit.append, ts, m.content, nextId);
+    return emit;
   }
   const content = asArr(m.content);
-  if (!content) return out;
+  if (!content) return emit;
   if (role === "assistant") {
-    return assistantToLines(content, ts, toolStarts);
+    return assistantToEmit(content, ts, toolStarts, nextId);
   }
   // role === "user"
   for (const block of content) {
     const b = asObj(block);
     if (!b) continue;
     if (b.type === "text" && typeof b.text === "string") {
-      appendUserText(out, ts, b.text);
+      appendUserText(emit.append, ts, b.text, nextId);
     } else if (b.type === "tool_result") {
       const id = typeof b.tool_use_id === "string" ? b.tool_use_id : null;
       const start = id ? toolStarts.get(id) : undefined;
       if (id) toolStarts.delete(id);
       const isErr = b.is_error === true;
       const durMs = start ? ts - start.ts : 0;
-      // Batched call → accumulate into shared state; emit one
-      // summary line when the last result lands. Unbatched (lone or
-      // detailed) → legacy per-result line.
+      // Batched call → accumulate into shared state; patch the
+      // summary line when the last result lands.
       if (start?.batch) {
         const batch = start.batch;
         const r = batch.results.get(start.toolName) ?? {
@@ -418,25 +518,54 @@ export function messageToLines(opts: {
         batch.results.set(start.toolName, r);
         batch.remaining--;
         if (batch.remaining === 0) {
-          out.push({
-            ts,
-            kind: "tool-result",
-            text: `  ${formatBatchResult(batch)}`,
+          const anyErr = [...batch.results.values()].some((v) => v.err > 0);
+          emit.patch.push({
+            id: batch.lineId,
+            line: {
+              id: batch.lineId,
+              ts,
+              kind: anyErr ? "tool-err" : "tool-ok",
+              text: `  ${formatBatchResult(batch)}`,
+            },
           });
         }
         continue;
       }
-      const toolName = start?.toolName ?? "?";
-      const dur = start ? formatDuration(durMs) : "—";
+      // Single tool. Patch the call line in place when we still have
+      // its id (the live case); fall through to appending a standalone
+      // result line when the call was never seen (seed-window orphan).
       const arrow = isErr ? "✗" : "✓";
-      out.push({
+      const dur = start ? formatDuration(durMs) : "—";
+      const errBody = isErr ? briefToolResultBody(b.content) : null;
+      if (start && start.lineId !== null) {
+        const label = start.label;
+        const errPart = errBody ? ` err: ${errBody}` : "";
+        const text = `  ${arrow} ${label}${errPart} ${dur}`;
+        emit.patch.push({
+          id: start.lineId,
+          line: {
+            id: start.lineId,
+            ts,
+            kind: isErr ? "tool-err" : "tool-ok",
+            text,
+          },
+        });
+        continue;
+      }
+      // Orphan path: no call line to patch. Synthesize a standalone
+      // result so the user still sees that *something* finished.
+      const label = start?.label ?? start?.toolName ?? "?";
+      const errPart = errBody ? ` err: ${errBody}` : "";
+      const orphanId = nextId();
+      emit.append.push({
+        id: orphanId,
         ts,
-        kind: "tool-result",
-        text: `  ${arrow} ${toolName} → ${isErr ? "err" : "ok"} (${dur})`,
+        kind: isErr ? "tool-err" : "tool-ok",
+        text: `  ${arrow} ${label}${errPart} ${dur}`,
       });
     }
   }
-  return out;
+  return emit;
 }
 
 /**
@@ -445,12 +574,16 @@ export function messageToLines(opts: {
  * detailed-vs-bulk and rendered with a single summary line
  * (`⚒ Bash×3, Read×2`) at the position of the first bulk call when
  * 2+ bulk tools share the message.
+ *
+ * Stashes the call line's id + label on each `ToolStartEntry` so the
+ * later `tool_result` patches the same line — see `messageToLines`.
  */
-function assistantToLines(
+function assistantToEmit(
   content: unknown[],
   ts: number,
   toolStarts: ToolStartMap,
-): ActionLine[] {
+  nextId: () => number,
+): MessageEmit {
   const out: ActionLine[] = [];
   // Bulk classification needs total count up front, so scan once for
   // bulk tool names + ids before emitting in source order.
@@ -469,11 +602,15 @@ function assistantToLines(
   // ≥2 bulk calls share a batch state and emit one summary line at
   // the first bulk position; a lone bulk call just renders inline.
   const useBatch = bulkNames.length >= 2;
+  const batchLineId = useBatch ? nextId() : 0;
+  const batchLabel = useBatch ? formatBatchCall(bulkNames) : "";
   const batch: BatchState | null = useBatch
     ? {
         startedAt: ts,
         remaining: bulkIds.length,
         results: new Map(),
+        lineId: batchLineId,
+        callLabel: batchLabel,
       }
     : null;
 
@@ -483,10 +620,16 @@ function assistantToLines(
     if (b.type === "text" && typeof b.text === "string") {
       const { pieces, truncated } = splitMessage(b.text);
       for (const piece of pieces) {
-        out.push({ ts, kind: "assistant", text: `  ${piece}` });
+        out.push({
+          id: nextId(),
+          ts,
+          kind: "assistant",
+          text: `  ${piece}`,
+        });
       }
       if (truncated > 0) {
         out.push({
+          id: nextId(),
           ts,
           kind: "info",
           text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
@@ -496,44 +639,62 @@ function assistantToLines(
     }
     if (b.type === "thinking" && typeof b.thinking === "string") {
       const compacted = compactMeta(b.thinking);
-      if (compacted) out.push({ ts, kind: "thinking", text: `· ${compacted}` });
+      if (compacted) {
+        out.push({
+          id: nextId(),
+          ts,
+          kind: "thinking",
+          text: `· ${compacted}`,
+        });
+      }
       return;
     }
     if (b.type !== "tool_use") return;
     const toolName = typeof b.name === "string" ? b.name : "?";
-    const id = typeof b.id === "string" ? b.id : null;
+    const useId = typeof b.id === "string" ? b.id : null;
+    const arg = briefToolInput(b.input);
+    const label = `${toolName}${arg ? `(${arg})` : ""}`;
     if (DETAILED_TOOLS.has(toolName)) {
-      const arg = briefToolInput(b.input);
-      if (id) toolStarts.set(id, { toolName, ts, batch: null });
-      out.push({
-        ts,
-        kind: "tool",
-        text: `  ⚒ ${toolName}${arg ? `(${arg})` : ""}`,
-      });
+      const lineId = nextId();
+      if (useId) {
+        toolStarts.set(useId, { toolName, label, ts, batch: null, lineId });
+      }
+      out.push({ id: lineId, ts, kind: "tool", text: `  ⚒ ${label}` });
       return;
     }
     // Bulk tool. Either part of a batch (≥2 in this message) or a
     // lone non-detailed call rendered inline.
     if (useBatch && batch) {
-      if (id) toolStarts.set(id, { toolName, ts, batch });
+      if (useId) {
+        // Members share the batch line id via `batch.lineId`; their
+        // own `lineId` stays null so the result handler routes them
+        // through the batch path rather than trying to patch their
+        // own (non-existent) line.
+        toolStarts.set(useId, {
+          toolName,
+          label,
+          ts,
+          batch,
+          lineId: null,
+        });
+      }
       if (i === firstBulkPos) {
         out.push({
+          id: batch.lineId,
           ts,
           kind: "tool",
-          text: `  ⚒ ${formatBatchCall(bulkNames)}`,
+          text: `  ⚒ ${batch.callLabel}`,
         });
       }
       return;
     }
-    const arg = briefToolInput(b.input);
-    if (id) toolStarts.set(id, { toolName, ts, batch: null });
-    out.push({
-      ts,
-      kind: "tool",
-      text: `  ⚒ ${toolName}${arg ? `(${arg})` : ""}`,
-    });
+    const lineId = nextId();
+    if (useId) {
+      toolStarts.set(useId, { toolName, label, ts, batch: null, lineId });
+    }
+    out.push({ id: lineId, ts, kind: "tool", text: `  ⚒ ${label}` });
   });
-  return out;
+  return { append: out, patch: [] };
 }
 
 /**
@@ -550,26 +711,32 @@ function formatBatchCall(names: readonly string[]): string {
 }
 
 /**
- * `✓ Bash×2 ok, Read×3 ok, Grep×1 err (3.4s)` — same shape as the
- * call summary, with ok/err breakdown per tool and one combined
- * duration. The leading glyph is `✓` only if every result succeeded;
- * any failure flips it to `✗` so a glance still reads "this batch
- * had a problem".
+ * `✓ Bash×3, Read×2 (3.4s)` on the happy path; `✗ Bash×2 ok, Bash×1
+ * err, Read×2 ok (3.4s)` when something failed. The all-ok case
+ * drops the redundant per-tool `ok` annotations — line color
+ * (`tool-ok` = green) carries that signal — but the err-mixed case
+ * spells out the breakdown so the user can see how many of which
+ * tool failed without opening the pane.
  */
 function formatBatchResult(batch: BatchState): string {
   let totalDurMs = 0;
   let anyErr = false;
+  for (const r of batch.results.values()) {
+    totalDurMs += r.durMs;
+    if (r.err > 0) anyErr = true;
+  }
+  const dur = formatDuration(totalDurMs);
+  if (!anyErr) {
+    // Reuse the call-side label verbatim ("Bash×3, Read×2") so the
+    // resolved line reads as the same call, just resolved.
+    return `✓ ${batch.callLabel} (${dur})`;
+  }
   const parts: string[] = [];
   for (const [name, r] of batch.results) {
-    totalDurMs += r.durMs;
     const segs: string[] = [];
     if (r.ok > 0) segs.push(`${name}×${r.ok} ok`);
-    if (r.err > 0) {
-      segs.push(`${name}×${r.err} err`);
-      anyErr = true;
-    }
+    if (r.err > 0) segs.push(`${name}×${r.err} err`);
     parts.push(segs.join(", "));
   }
-  const arrow = anyErr ? "✗" : "✓";
-  return `${arrow} ${parts.join(", ")} (${formatDuration(totalDurMs)})`;
+  return `✗ ${parts.join(", ")} (${dur})`;
 }

@@ -107,6 +107,11 @@ function mergeabilityLabel(
       // Same signal as the GitHub review badge (thumbs-down + prose);
       // suppress to keep the line lean.
       return null;
+    case "NEEDS_APPROVAL":
+    case "NEEDS_APPROVALS":
+      // Same signal as the GitHub review badge's "review pending" state
+      // (hourglass + prose); suppress to keep the line lean.
+      return null;
     case "MERGEABLE":
       return { text: "mergeable", fg: theme.ok };
     default:

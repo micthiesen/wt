@@ -52,6 +52,7 @@ import { join } from "node:path";
 
 import {
   type ActionLine,
+  type MessageEmit,
   type ToolStartMap,
   MAX_BUFFERED_LINES,
   asObj,
@@ -98,6 +99,15 @@ type State = {
   projectDir: string;
   jsonlName: string;
   toolStarts: ToolStartMap;
+  /**
+   * Monotonic per-tail line id. Tool calls stash their assigned id on
+   * the `ToolStartEntry` so the later `tool_result` can patch the
+   * same buffer line in place (collapsing the `⚒ → ✓` two-line pair
+   * into one line that flips green/red). Survives seed→live handoff;
+   * the seed pass and the live pass share the same counter so ids
+   * stay unique across the boundary.
+   */
+  nextLineId: number;
   lastByte: number;
   pending: string;
   watcher: FSWatcher | null;
@@ -152,6 +162,7 @@ class SessionTailRegistry {
       projectDir,
       jsonlName,
       toolStarts: new Map(),
+      nextLineId: 1,
       lastByte: 0,
       pending: "",
       watcher: null,
@@ -336,14 +347,16 @@ class SessionTailRegistry {
     // Drop the first fragment if we didn't start at byte 0 — likely partial.
     // Tool_uses outside the seed window leave their tool_results in the
     // window without a matching start in `toolStarts`, so those results
-    // render with `→ ok (—)`. Acceptable for a seed of bounded size.
+    // render as standalone `→ ok (—)` orphan lines via the orphan path
+    // in messageToLines. Acceptable for a seed of bounded size.
     const startIdx = start === 0 ? 0 : 1;
-    const accum: ActionLine[] = [];
+    let accum: ActionLine[] = [];
+    const nextId = () => st.nextLineId++;
     for (let i = startIdx; i < lines.length; i++) {
       const line = lines[i];
       if (!line) continue;
-      const out = parseEntry(line, st.toolStarts);
-      for (const l of out) accum.push(l);
+      const out = parseEntry(line, st.toolStarts, nextId);
+      accum = applyEmit(accum, out);
     }
     st.lastByte = size;
     st.pending = "";
@@ -389,34 +402,62 @@ class SessionTailRegistry {
     const combined = st.pending + body;
     const lines = combined.split("\n");
     st.pending = lines.pop() ?? "";
-    const newLines: ActionLine[] = [];
+    const nextId = () => st.nextLineId++;
+    const emits: MessageEmit[] = [];
     for (const line of lines) {
       if (!line) continue;
-      const out = parseEntry(line, st.toolStarts);
-      for (const l of out) newLines.push(l);
+      const out = parseEntry(line, st.toolStarts, nextId);
+      if (out.append.length > 0 || out.patch.length > 0) emits.push(out);
     }
-    if (newLines.length === 0) return;
+    if (emits.length === 0) return;
     this.update(key, (r) => {
-      const merged = [...r.lines, ...newLines];
+      let next: ActionLine[] = r.lines.slice();
+      for (const emit of emits) next = applyEmit(next, emit);
       const lines =
-        merged.length > MAX_BUFFERED_LINES
-          ? merged.slice(-MAX_BUFFERED_LINES)
-          : merged;
+        next.length > MAX_BUFFERED_LINES
+          ? next.slice(-MAX_BUFFERED_LINES)
+          : next;
       return { ...r, lines };
     });
   }
 
 }
 
-function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
+/**
+ * Apply one parser delta to a snapshot of buffer lines, returning a
+ * new array. Patches by id (no-op when the id has already been evicted
+ * past `MAX_BUFFERED_LINES` — the user can't see the line anyway),
+ * then appends. Single pass over the array per delta; cheap at our
+ * buffer scale (1000 lines, a handful of patches per delta).
+ */
+function applyEmit(prev: readonly ActionLine[], emit: MessageEmit): ActionLine[] {
+  const { append, patch } = emit;
+  if (append.length === 0 && patch.length === 0) return prev.slice();
+  let next: ActionLine[] = prev.slice();
+  if (patch.length > 0) {
+    const byId = new Map<number, ActionLine>();
+    for (const p of patch) byId.set(p.id, p.line);
+    next = next.map((l) => byId.get(l.id) ?? l);
+  }
+  if (append.length > 0) next = [...next, ...append];
+  return next;
+}
+
+const EMPTY_EMIT: MessageEmit = { append: [], patch: [] };
+
+function parseEntry(
+  raw: string,
+  toolStarts: ToolStartMap,
+  nextId: () => number,
+): MessageEmit {
   let evt: unknown;
   try {
     evt = JSON.parse(raw);
   } catch {
-    return [];
+    return EMPTY_EMIT;
   }
   const e = asObj(evt);
-  if (!e) return [];
+  if (!e) return EMPTY_EMIT;
   const t = e.type;
   const ts = entryTs(e);
   if (t === "assistant" || t === "user") {
@@ -426,8 +467,14 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
     // `compact_boundary` system event below carries the high-signal
     // marker (token deltas, trigger), and rendering the full summary
     // would dump several hundred lines of internal detail into the pane.
-    if (t === "user" && e.isCompactSummary === true) return [];
-    return messageToLines({ role: t, message: e.message, ts, toolStarts });
+    if (t === "user" && e.isCompactSummary === true) return EMPTY_EMIT;
+    return messageToLines({
+      role: t,
+      message: e.message,
+      ts,
+      toolStarts,
+      nextId,
+    });
   }
   // system.compact_boundary — fired when the conversation is compacted
   // (manual `/compact` or auto when the context window fills). Surface
@@ -448,9 +495,17 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
         ? ` (${formatTokens(pre)} → ${formatTokens(post)})`
         : "";
     const triggerPart = trigger && trigger !== "manual" ? ` ${trigger}` : "";
-    return [
-      { ts, kind: "info", text: `↘ compacted${triggerPart}${tokenPart}` },
-    ];
+    return {
+      append: [
+        {
+          id: nextId(),
+          ts,
+          kind: "info",
+          text: `↘ compacted${triggerPart}${tokenPart}`,
+        },
+      ],
+      patch: [],
+    };
   }
   // system.away_summary — claude's auto-generated context-recap when
   // the conversation is auto-compacted. High-signal: the user can
@@ -462,20 +517,22 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
   if (t === "system" && e.subtype === "away_summary") {
     const content = typeof e.content === "string" ? e.content : "";
     const { pieces, truncated } = splitMessage(content);
-    if (pieces.length === 0) return [];
+    if (pieces.length === 0) return EMPTY_EMIT;
     const lines: ActionLine[] = pieces.map((piece, i) => ({
+      id: nextId(),
       ts,
       kind: "info",
       text: `${i === 0 ? "─ " : "  "}${piece}`,
     }));
     if (truncated > 0) {
       lines.push({
+        id: nextId(),
         ts,
         kind: "info",
         text: `  …${truncated} more line${truncated === 1 ? "" : "s"} truncated`,
       });
     }
-    return lines;
+    return { append: lines, patch: [] };
   }
   // attachment.queued_command — when the user types-ahead while
   // claude is still processing, the prompt sits queued. Surface the
@@ -492,12 +549,22 @@ function parseEntry(raw: string, toolStarts: ToolStartMap): ActionLine[] {
     ) {
       const compacted = compactMeta(att.prompt);
       if (compacted) {
-        return [{ ts, kind: "info", text: `⏎ queued: ${compacted}` }];
+        return {
+          append: [
+            {
+              id: nextId(),
+              ts,
+              kind: "info",
+              text: `⏎ queued: ${compacted}`,
+            },
+          ],
+          patch: [],
+        };
       }
     }
-    return [];
+    return EMPTY_EMIT;
   }
-  return [];
+  return EMPTY_EMIT;
 }
 
 function readBytes(path: string, start: number, len: number): string {

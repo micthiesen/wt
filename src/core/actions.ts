@@ -52,6 +52,7 @@ import { join } from "node:path";
 import {
   type ActionLine,
   type ActionLineKind,
+  type MessageEmit,
   type ToolStartMap,
   MAX_BUFFERED_LINES,
   asObj,
@@ -248,6 +249,16 @@ class ActionRegistry {
   private liveHandles = new Map<string, LiveHandles>();
   private listeners = new Set<Listener>();
   private cleanupTimer: Timer | null = null;
+  /**
+   * Registry-global monotonic line id. Every ActionLine emitted by this
+   * registry — across all runs, all slugs — pulls from this counter.
+   * Lines patched by id are scoped per-slug (the result handler only
+   * touches its own slug's buffer), so cross-slug uniqueness isn't
+   * required; using one counter just simplifies plumbing — every emit
+   * site goes through `nextLineId()`.
+   */
+  private nextId = 1;
+  private nextLineId = (): number => this.nextId++;
   /** Per runDir: serialized meta.json write chain. Concurrent updates
    *  (status flip + result-event metadata) would otherwise race and
    *  one would lose. */
@@ -348,6 +359,7 @@ class ActionRegistry {
     }
 
     const initialLine: ActionLine = {
+      id: this.nextLineId(),
       ts: startedAt,
       kind: "info",
       text: `▶ ${def.name} starting`,
@@ -433,6 +445,7 @@ class ActionRegistry {
     const endedAt = Date.now();
     const dur = formatDuration(endedAt - cur.startedAt);
     const exitLine: ActionLine = {
+      id: this.nextLineId(),
       ts: endedAt,
       kind: "exit-failure",
       text: `■ killed after ${dur}`,
@@ -571,8 +584,9 @@ class ActionRegistry {
       // wrapper redirects after launch, not before). Keeps the
       // rehydrated rendering visually consistent with a freshly-
       // launched run.
-      const seededLines: ActionLine[] = [
+      let seededLines: ActionLine[] = [
         {
+          id: this.nextLineId(),
           ts: metaResolved.startedAt,
           kind: "info",
           text: `▶ ${metaResolved.actionName} starting`,
@@ -581,8 +595,8 @@ class ActionRegistry {
       seedActionDir({
         runDir,
         onLine: (line) => {
-          const parsed = this.parseLine(metaResolved.kind, line, handles);
-          for (const al of parsed) seededLines.push(al);
+          const emit = this.parseLine(metaResolved.kind, line, handles);
+          seededLines = applyEmit(seededLines, emit);
         },
       });
 
@@ -740,13 +754,6 @@ class ActionRegistry {
     this.commit((m) => m.set(slug, next));
   }
 
-  private pushLine(slug: string, line: ActionLine): void {
-    const cur = this.runs.get(slug);
-    if (!cur) return;
-    const lines = capLines([...cur.lines, line]);
-    this.commit((m) => m.set(slug, { ...cur, lines }));
-  }
-
   /**
    * Live mode: open the tail + done watcher, install `handles` in the
    * registry. Used both by `start` (fresh handles) and `boot`
@@ -772,8 +779,12 @@ class ActionRegistry {
     const onLine = (line: TailLine) => {
       const live = this.liveHandles.get(slug);
       if (!live) return;
-      const parsed = this.parseLine(kind, line, live);
-      for (const al of parsed) this.pushLine(slug, al);
+      const emit = this.parseLine(kind, line, live);
+      if (emit.append.length === 0 && emit.patch.length === 0) return;
+      const cur = this.runs.get(slug);
+      if (!cur) return;
+      const lines = capLines(applyEmit(cur.lines, emit));
+      this.commit((m) => m.set(slug, { ...cur, lines }));
     };
     const tail = startActionTail({ runDir, onLine, seed });
     const done = watchDoneSentinel({
@@ -789,21 +800,21 @@ class ActionRegistry {
   }
 
   /**
-   * Convert one raw tail line into zero or more ActionLines. The two
-   * branches mirror the per-kind handlers from the pre-tmux runner:
-   * claude stdout is stream-json (parsed for tool/result events),
-   * shell stdout/stderr and claude stderr are raw text.
+   * Convert one raw tail line into a parser delta. The two branches
+   * mirror the per-kind handlers from the pre-tmux runner: claude
+   * stdout is stream-json (parsed for tool/result events), shell
+   * stdout/stderr and claude stderr are raw text appended directly.
    */
   private parseLine(
     kind: "claude" | "shell",
     line: TailLine,
     handles: { toolStarts: ToolStartMap; resultEventSeen: boolean },
-  ): ActionLine[] {
+  ): MessageEmit {
     if (kind === "claude" && line.source === "stdout") {
       return this.parseStreamJsonLine(line.text, handles);
     }
     const cleaned = sanitizeLine(line.text);
-    if (!cleaned) return [];
+    if (!cleaned) return { append: [], patch: [] };
     const lineKind: ActionLineKind =
       line.source === "stderr" ? "stderr" : "stdout";
     // Claude stderr is rare (mostly setup errors); render with a
@@ -812,22 +823,27 @@ class ActionRegistry {
       kind === "claude" && line.source === "stderr"
         ? `stderr: ${cleaned}`
         : cleaned;
-    return [{ ts: Date.now(), kind: lineKind, text }];
+    return {
+      append: [
+        { id: this.nextLineId(), ts: Date.now(), kind: lineKind, text },
+      ],
+      patch: [],
+    };
   }
 
   private parseStreamJsonLine(
     raw: string,
     handles: { toolStarts: ToolStartMap; resultEventSeen: boolean },
-  ): ActionLine[] {
-    if (!raw.trim()) return [];
+  ): MessageEmit {
+    if (!raw.trim()) return { append: [], patch: [] };
     let evt: unknown;
     try {
       evt = JSON.parse(raw);
     } catch {
-      return [];
+      return { append: [], patch: [] };
     }
     const e = asObj(evt);
-    if (!e) return [];
+    if (!e) return { append: [], patch: [] };
     const ts = Date.now();
     const t = e.type;
 
@@ -837,6 +853,7 @@ class ActionRegistry {
         message: e.message,
         ts,
         toolStarts: handles.toolStarts,
+        nextId: this.nextLineId,
       });
     }
 
@@ -862,6 +879,7 @@ class ActionRegistry {
       const head = isErr ? `✗ ${subtype ?? "failed"}` : "✓ exited 0";
       const text = `${head} in ${formatDuration(durMs)}${tokensStr}${turnsStr}`;
       const exitLine: ActionLine = {
+        id: this.nextLineId(),
         ts,
         kind: isErr ? "exit-failure" : "exit-success",
         text,
@@ -872,9 +890,9 @@ class ActionRegistry {
       // Adding a panel that wants them later would mean re-extracting
       // from the result event at that point — cheap, since stream.log
       // is on disk.
-      return [exitLine];
+      return { append: [exitLine], patch: [] };
     }
-    return [];
+    return { append: [], patch: [] };
   }
 
   /**
@@ -922,7 +940,12 @@ class ActionRegistry {
             : `✗ exited ${done.exitCode} in ${dur}`;
       const lineKind: ActionLineKind =
         status === "succeeded" ? "exit-success" : "exit-failure";
-      const exitLine: ActionLine = { ts: endedAt, kind: lineKind, text };
+      const exitLine: ActionLine = {
+        id: this.nextLineId(),
+        ts: endedAt,
+        kind: lineKind,
+        text,
+      };
       const lines = capLines([...cur.lines, exitLine]);
       this.commit((m) => m.set(slug, { ...cur, endedAt, status, lines }));
     }
@@ -1026,6 +1049,28 @@ function makeFreshHandles(): {
   resultEventSeen: boolean;
 } {
   return { toolStarts: new Map(), resultEventSeen: false };
+}
+
+/**
+ * Apply one parser delta to a buffer snapshot. Patches by id (no-op
+ * when the id has already been evicted past `MAX_BUFFERED_LINES`),
+ * then appends. Cheap at our buffer scale (1000 lines, a handful of
+ * patches per delta) and stays pure for reasoning.
+ */
+function applyEmit(
+  prev: readonly ActionLine[],
+  emit: MessageEmit,
+): ActionLine[] {
+  const { append, patch } = emit;
+  if (append.length === 0 && patch.length === 0) return prev.slice();
+  let next: ActionLine[] = prev.slice();
+  if (patch.length > 0) {
+    const byId = new Map<number, ActionLine>();
+    for (const p of patch) byId.set(p.id, p.line);
+    next = next.map((l) => byId.get(l.id) ?? l);
+  }
+  if (append.length > 0) next = next.concat(append);
+  return next;
 }
 
 function capLines(lines: readonly ActionLine[]): readonly ActionLine[] {

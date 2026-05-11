@@ -61,8 +61,12 @@ export function hasGraphite(): boolean {
 export type MergeabilityStatus =
   | "DRAFT"
   | "NEEDS_REVIEWERS"
+  | "NEEDS_APPROVAL"
+  | "NEEDS_APPROVALS"
   | "UNRESOLVED_COMMENTS"
+  | "CHANGES_REQUESTED"
   | "FAILING_REQUIRED"
+  | "MERGEABLE"
   | (string & {});
 
 export type MergeabilityEntry = {

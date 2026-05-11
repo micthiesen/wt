@@ -22,9 +22,14 @@ function lineFg(kind: ActionLine["kind"]): string {
     case "thinking":
       return theme.fgDim;
     case "tool":
-      return theme.accentAlt;
-    case "tool-result":
+      // In-flight — dim, intentionally muted so a column of pending
+      // tool calls reads as "background activity" while the eye gets
+      // drawn to whatever's actively resolving below them.
       return theme.fgDim;
+    case "tool-ok":
+      return theme.ok;
+    case "tool-err":
+      return theme.err;
     case "stdout":
       return theme.fg;
     case "stderr":
@@ -51,9 +56,9 @@ function LinesContent({ height, lines }: LinesProps) {
   const visible = lines.slice(-visibleRows);
   return (
     <box flexDirection="column" flexGrow={1} overflow="hidden">
-      {visible.map((line, i) => (
+      {visible.map((line) => (
         <box
-          key={`${line.ts}-${i}`}
+          key={line.id}
           flexDirection="row"
           flexShrink={0}
           overflow="hidden"
@@ -109,6 +114,7 @@ export function SessionContent({
       ? run.lines
       : [
           {
+            id: 0,
             ts: run?.startedAt ?? Date.now(),
             kind: "info",
             text: "  waiting for claude session output…",
@@ -134,9 +140,10 @@ export function ShellContent({
   const run = useShellRun(slug);
   const lines: readonly ActionLine[] =
     run && run.lines.length > 0
-      ? run.lines.map((l) => ({ ts: l.ts, kind: "stdout", text: l.text }))
+      ? run.lines.map((l) => ({ id: l.id, ts: l.ts, kind: "stdout", text: l.text }))
       : [
           {
+            id: 0,
             ts: run?.startedAt ?? Date.now(),
             kind: "info",
             text: "  waiting for shell session output…",
