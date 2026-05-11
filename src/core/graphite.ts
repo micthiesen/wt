@@ -13,5 +13,5 @@ export function graphiteUrlFromGithubPr(githubPrUrl: string): string | null {
   const m = GH_PR_URL_RE.exec(githubPrUrl);
   if (!m) return null;
   const [, owner, repo, number] = m;
-  return `https://app.graphite.dev/github/pr/${owner}/${repo}/${number}`;
+  return `https://app.graphite.com/github/pr/${owner}/${repo}/${number}`;
 }

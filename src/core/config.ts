@@ -221,7 +221,7 @@ const GENERIC_DEFAULTS = {
     // file and addresses each comment. Cleaner than depending on
     // revdiff's separate Claude Code plugin since wt already owns
     // the action plumbing.
-    command: "revdiff --vim-motion {{base}}",
+    command: "revdiff --vim-motion --compact {{base}}",
   },
   ai: {
     maxInputTokens: 8000,
