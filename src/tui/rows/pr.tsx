@@ -1,8 +1,7 @@
 import { memo, useMemo } from "react";
 
+import type { MergeabilityEntry } from "../../core/graphite-api.ts";
 import type {
-  MergeQueueEntry,
-  MergeQueueState,
   PrChecks,
   PrReview,
   PullRequest,
@@ -83,29 +82,50 @@ function rabbitLabel(
   }
 }
 
-function mqStateLabel(state: MergeQueueState): { text: string; fg: string } {
-  switch (state) {
+/**
+ * Graphite mergeability label. Short prose for the segment renderer;
+ * color tier follows severity (err for blocked-by-CI, warn for
+ * blocked-by-humans, dim for the draft case which the PR badge already
+ * conveys). Unknown status values pass through verbatim so a new
+ * Graphite enum doesn't silently disappear.
+ */
+function mergeabilityLabel(
+  m: MergeabilityEntry,
+): { text: string; fg: string } | null {
+  switch (m.status) {
+    case "FAILING_REQUIRED":
+      return { text: "checks failing", fg: theme.err };
+    case "NEEDS_REVIEWERS":
+      return { text: "needs reviewers", fg: theme.warn };
+    case "UNRESOLVED_COMMENTS":
+      return { text: "unresolved comments", fg: theme.warn };
+    case "DRAFT":
+      // The PR-state badge already says "draft"; suppress here to
+      // avoid stating the same thing twice on the same line.
+      return null;
+    case "CHANGES_REQUESTED":
+      // Same signal as the GitHub review badge (thumbs-down + prose);
+      // suppress to keep the line lean.
+      return null;
     case "MERGEABLE":
       return { text: "mergeable", fg: theme.ok };
-    case "AWAITING_CHECKS":
-      return { text: "awaiting checks", fg: theme.warn };
-    case "QUEUED":
-      return { text: "queued", fg: theme.warn };
-    case "UNMERGEABLE":
-      return { text: "unmergeable", fg: theme.err };
-    case "LOCKED":
-      return { text: "locked", fg: theme.err };
     default:
-      return { text: state, fg: theme.fgDim };
+      // Pass-through for statuses we haven't seen yet — likely the
+      // armed / in-queue / merging variants that show up once a PR is
+      // actually advancing.
+      return { text: m.status.toLowerCase().replace(/_/g, " "), fg: theme.info };
   }
 }
 
 /**
  * Build the PR row's segment list. Tiers picked so the PR id is sticky,
- * the merge-queue state (next action) outranks ambient signals, and
+ * the mergeability state (next action) outranks ambient signals, and
  * carrots drop first because they're the noisiest line item.
  */
-function buildPrSegments(pr: PullRequest, mq: MergeQueueEntry | undefined): Segment[] {
+function buildPrSegments(
+  pr: PullRequest,
+  mergeability: MergeabilityEntry | undefined,
+): Segment[] {
   const segs: Segment[] = [];
   const badge = prStateBadge(pr);
   const num = `#${pr.number}`;
@@ -128,72 +148,32 @@ function buildPrSegments(pr: PullRequest, mq: MergeQueueEntry | undefined): Segm
     ],
   });
 
-  if (mq) {
-    const label = mqStateLabel(mq.state);
-    const full = `queue #${mq.position} ${label.text}`;
-    const mid = `queue #${mq.position}`;
-    const tiny = `#${mq.position}`;
-    segs.push({
-      key: "queue",
-      tier: 2,
-      modes: [
-        {
-          width: 3 + Bun.stringWidth(full),
-          render: () => (
-            <span fg={label.fg}>
-              {NF.mergeQueue}  {full}
-            </span>
-          ),
-        },
-        {
-          width: 3 + Bun.stringWidth(mid),
-          render: () => (
-            <span fg={label.fg}>
-              {NF.mergeQueue}  {mid}
-            </span>
-          ),
-        },
-        {
-          width: 3 + Bun.stringWidth(tiny),
-          render: () => (
-            <span fg={label.fg}>
-              {NF.mergeQueue}  {tiny}
-            </span>
-          ),
-        },
-        { width: 0, render: () => null },
-      ],
-    });
-  } else if (pr.autoMerge && pr.state === "OPEN") {
-    // Same slot as the queue segment — mutually exclusive in practice.
-    // Dimmer color than `queue mergeable` since auto-merge is "armed
-    // but idle" (waiting on preconditions) rather than actively
-    // advancing.
-    const full = "auto-merge";
-    const tiny = "auto";
-    segs.push({
-      key: "queue",
-      tier: 2,
-      modes: [
-        {
-          width: 3 + Bun.stringWidth(full),
-          render: () => (
-            <span fg={theme.info}>
-              {NF.mergeQueue}  {full}
-            </span>
-          ),
-        },
-        {
-          width: 3 + Bun.stringWidth(tiny),
-          render: () => (
-            <span fg={theme.info}>
-              {NF.mergeQueue}  {tiny}
-            </span>
-          ),
-        },
-        { width: 0, render: () => null },
-      ],
-    });
+  if (mergeability && pr.state === "OPEN") {
+    const label = mergeabilityLabel(mergeability);
+    if (label) {
+      segs.push({
+        key: "mergeability",
+        tier: 2,
+        modes: [
+          {
+            width: 3 + Bun.stringWidth(label.text),
+            render: () => (
+              <span fg={label.fg}>
+                {NF.mergeQueue}  {label.text}
+              </span>
+            ),
+          },
+          // Drop the prose first, keep just the glyph (color-coded) when
+          // space gets tight — preserves the "something's blocking
+          // merge" signal even in a narrow pane.
+          {
+            width: 2,
+            render: () => <span fg={label.fg}>{NF.mergeQueue}</span>,
+          },
+          { width: 0, render: () => null },
+        ],
+      });
+    }
   }
 
   if (pr.state === "OPEN") {
@@ -284,7 +264,7 @@ const PrLine = memo(function PrLine({
   valueWidth: number;
 }) {
   const segments = useMemo(
-    () => (row.pr ? buildPrSegments(row.pr, row.mq) : null),
+    () => (row.pr ? buildPrSegments(row.pr, row.mergeability) : null),
     [row],
   );
   const fit = useMemo(

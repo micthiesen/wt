@@ -14,7 +14,12 @@ import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
 import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
-import { fetchGithub, fetchRepoContributors } from "../core/github.ts";
+import { fetchGithub, fetchRepoContributors, repoSlug } from "../core/github.ts";
+import {
+  fetchMergeability,
+  hasGraphite,
+  type MergeabilityEntry,
+} from "../core/graphite-api.ts";
 import { lockStatus } from "../core/locks.ts";
 import { detectStacks, type StackMap } from "../core/stack.ts";
 import {
@@ -26,10 +31,10 @@ export type { ClaudeSessionEntry };
 import type {
   Contributor,
   LockMeta,
-  MergeQueueEntry,
   PullRequest,
   Worktree,
 } from "../core/types.ts";
+export type { MergeabilityEntry } from "../core/graphite-api.ts";
 import { createLogger } from "../core/logger.ts";
 import { isOurStageDeployed } from "../core/stage-safety.ts";
 import { pluralize } from "../core/text.ts";
@@ -141,28 +146,60 @@ export const tmuxSessionsQuery = () =>
 
 export type GithubData = {
   prs: Record<string, PullRequest>;
-  mergeQueue: Record<string, MergeQueueEntry>;
 };
 
 /**
- * Combined PR + merge-queue fetch scoped to exact worktree branches.
- * One aliased `pullRequests(headRefName:)` per branch + the merge
- * queue, all in a single graphql round trip. Bounded by worktree
- * count rather than repo activity — stays fast regardless of how
- * many PRs the repo churns through.
+ * PR fetch scoped to exact worktree branches. One aliased
+ * `pullRequests(headRefName:)` per branch in a single graphql round
+ * trip. Bounded by worktree count rather than repo activity — stays
+ * fast regardless of how many PRs the repo churns through.
  */
 export const githubQuery = (branches: readonly string[]) =>
   queryOptions({
     queryKey: qk.github(branches),
     queryFn: async ({ signal }): Promise<GithubData> => {
-      const { prs, mergeQueue } = await fetchGithub([...branches], signal);
-      return {
-        prs: Object.fromEntries(prs),
-        mergeQueue: Object.fromEntries(mergeQueue),
-      };
+      const { prs } = await fetchGithub([...branches], signal);
+      return { prs: Object.fromEntries(prs) };
     },
     staleTime: STALE.slow,
   });
+
+export type GraphiteData = {
+  /** Keyed by PR number; absent entries fell off the API's response. */
+  mergeability: Record<number, MergeabilityEntry>;
+};
+
+/**
+ * Graphite mergeability for the current PR set. Calls Graphite's
+ * private `/mergeability-status` endpoint with the same auth token the
+ * `gt` CLI uses (`~/.config/graphite/user_config`). One batched request
+ * per refresh covers every worktree's PR; the response carries the
+ * block reason per PR (`NEEDS_REVIEWERS`, `UNRESOLVED_COMMENTS`,
+ * `FAILING_REQUIRED`, `DRAFT`, …).
+ *
+ * Disabled cleanly when there's no Graphite token on disk — the query
+ * resolves to an empty map and the PR row simply omits the badge.
+ */
+export const graphiteQuery = (prNumbers: readonly number[]) =>
+  queryOptions({
+    queryKey: qk.graphite(prNumbers),
+    queryFn: async ({ signal }): Promise<GraphiteData> => {
+      if (prNumbers.length === 0) return { mergeability: {} };
+      const slug = await repoSlug();
+      if (!slug) return { mergeability: {} };
+      const [owner, name] = slug.split("/");
+      if (!owner || !name) return { mergeability: {} };
+      const map = await fetchMergeability(
+        { repoOwner: owner, repoName: name, prNumbers: [...prNumbers] },
+        signal,
+      );
+      return { mergeability: Object.fromEntries(map) };
+    },
+    staleTime: STALE.slow,
+  });
+
+/** True iff a Graphite token is configured. Consumers gate `useQuery` on this. */
+export const graphiteEnabled = (): boolean => hasGraphite();
 
 /**
  * Repo-wide contributor list. Fetched lazily on first reviewer-picker

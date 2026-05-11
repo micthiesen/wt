@@ -9,10 +9,11 @@ import { lockAge, lockLabel } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
 import type { StackMap } from "../../core/stack.ts";
 import { slugLabel } from "../../core/stage.ts";
-import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from "../../core/types.ts";
+import type { LockMeta, PullRequest, Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
 import type { SyncState } from "../../core/worktree.ts";
-import { useGithub } from "../../state/hooks.ts";
+import type { MergeabilityEntry } from "../../core/graphite-api.ts";
+import { useGithub, useGraphite } from "../../state/hooks.ts";
 import { qk } from "../../state/keys.ts";
 import {
   aiSummaryQuery,
@@ -88,7 +89,14 @@ export type WorktreeRow = {
   fields: WorktreeFields;
   status: Status;
   pr?: PullRequest;
-  mq?: MergeQueueEntry;
+  /**
+   * Graphite's per-PR block reason (`NEEDS_REVIEWERS`,
+   * `UNRESOLVED_COMMENTS`, `FAILING_REQUIRED`, …). Sourced from
+   * Graphite's private API via the same auth token `gt` uses. Absent
+   * when the PR is closed/merged, the API didn't return an entry, or
+   * the user hasn't authenticated `gt`.
+   */
+  mergeability?: MergeabilityEntry;
   /**
    * Resolved stack parent. `null` for trunk-targeted worktrees. Drives
    * the diff base for `wtDiffContextQuery` (so the AI summary describes
@@ -377,6 +385,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const qc = useQueryClient();
   const wtList = useQuery(worktreesQuery());
   const github = useGithub();
+  const graphite = useGraphite();
   const archive = useQuery(archiveQuery());
   const wtState = useQuery(wtStateQuery());
   const archivedSet = new Set(archive.data ?? []);
@@ -505,7 +514,9 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const nextStatus = deriveStatus(wt, fields);
     const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
     const pr = prsByIndex[i];
-    const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
+    const mergeability = pr
+      ? graphite.data?.mergeability?.[pr.number]
+      : undefined;
     const stackedOn = stackedOnByIndex[i] ?? null;
     // Include the combined GitHub fetch that feeds the details pane
     // so the row glyph lights up whenever anything visible for this
@@ -514,7 +525,9 @@ export function useWorktreeRows(): WorktreeRowsResult {
     // together during e.g. a refresh; intentional, since each row's
     // details pane would show the PR/merge-queue spinner.
     const anyFetching =
-      fieldArr.some((r) => r.isFetching) || github.isFetching;
+      fieldArr.some((r) => r.isFetching) ||
+      github.isFetching ||
+      graphite.isFetching;
     const archived = archivedSet.has(wt.slug);
     const section = stateSlugs[wt.slug]?.section ?? null;
     const llmTitle = aiResults[i]?.data?.title ?? null;
@@ -528,9 +541,9 @@ export function useWorktreeRows(): WorktreeRowsResult {
       commitTitle,
     );
     // After per-field reuse above, identity-equality on each `fields.X`,
-    // `status`, `pr`, `mq` plus primitives is sufficient — anything
-    // observable changing produces a fresh reference at one of those
-    // levels, which falls through to a new row.
+    // `status`, `pr`, `mergeability` plus primitives is sufficient —
+    // anything observable changing produces a fresh reference at one of
+    // those levels, which falls through to a new row.
     if (
       prev &&
       prev.wt === wt &&
@@ -544,7 +557,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.fields.gitActivity === fields.gitActivity &&
       prev.status === status &&
       prev.pr === pr &&
-      prev.mq === mq &&
+      prev.mergeability === mergeability &&
       prev.anyFetching === anyFetching &&
       prev.archived === archived &&
       prev.title === title &&
@@ -565,7 +578,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       fields,
       status,
       pr,
-      mq,
+      mergeability,
       stackedOn: stackedOnOut,
       anyFetching,
       archived,

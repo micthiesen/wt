@@ -4,11 +4,8 @@ import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { run } from "./proc.ts";
 import type {
-  AutoMergeMethod,
   Contributor,
   LatestReview,
-  MergeQueueEntry,
-  MergeQueueState,
   PrChecks,
   PrReview,
   PullRequest,
@@ -26,7 +23,7 @@ async function hasGh(): Promise<boolean> {
 
 // Cache the resolved `owner/name` — it never changes for a given clone.
 let _repoSlug: string | null | undefined;
-async function repoSlug(): Promise<string | null> {
+export async function repoSlug(): Promise<string | null> {
   if (_repoSlug !== undefined) return _repoSlug;
   const r = await run(
     ["gh", "repo", "view", "--json", "nameWithOwner"],
@@ -128,10 +125,6 @@ fragment PrFields on PullRequest {
     isAuthor
     isCommenter
   }
-  autoMergeRequest {
-    enabledAt
-    mergeMethod
-  }
   commits(last: 1) {
     nodes {
       commit {
@@ -213,9 +206,9 @@ function rollupRabbit(
 
 /**
  * Build a graphql doc with one aliased `pullRequests(headRefName:)`
- * sub-query per branch, plus the merge queue. `first: 2` per branch
- * catches the rare "branch has a reopen" case where there's an OPEN
- * and a terminal PR on the same ref — we'll prefer OPEN at parse time.
+ * sub-query per branch. `first: 2` per branch catches the rare
+ * "branch has a reopen" case where there's an OPEN and a terminal PR
+ * on the same ref — we'll prefer OPEN at parse time.
  *
  * Scoping to exact branches rather than pulling the 100 most recent
  * drops wall-clock ~4x and response size ~8x at 10 worktrees; it also
@@ -223,31 +216,25 @@ function rollupRabbit(
  * how busy the repo is.
  */
 function buildQuery(branchCount: number): string {
+  if (branchCount === 0) {
+    // Graphql rejects an empty selection set; a noop `__typename` plus
+    // no fragment keeps the round-trip well-formed in the degenerate
+    // "no worktrees" case.
+    return `query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) { __typename }
+}`;
+  }
   const varDecls = Array.from({ length: branchCount }, (_, i) => `$b${i}: String!`).join(", ");
-  const varsClause = varDecls ? `, ${varDecls}` : "";
   const aliases = Array.from({ length: branchCount }, (_, i) =>
     `    wt_${i}: pullRequests(first: 2, headRefName: $b${i}, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { ...PrFields } }`,
   ).join("\n");
-  // Omit the fragment when there are no branches — graphql rejects
-  // unused fragments as a validation error.
-  const fragment = branchCount > 0 ? PR_FRAGMENT : "";
   return `
-query($owner: String!, $name: String!${varsClause}) {
+query($owner: String!, $name: String!, ${varDecls}) {
   repository(owner: $owner, name: $name) {
-${aliases ? aliases + "\n" : ""}    mergeQueue {
-      entries(first: 50) {
-        nodes {
-          enqueuedAt
-          estimatedTimeToMerge
-          position
-          state
-          pullRequest { headRefName }
-        }
-      }
-    }
+${aliases}
   }
 }
-${fragment}`;
+${PR_FRAGMENT}`;
 }
 
 type GqlReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
@@ -277,7 +264,6 @@ type GqlPrNode = {
     isAuthor: boolean;
     isCommenter: boolean;
   }> | null;
-  autoMergeRequest: { enabledAt: string; mergeMethod: AutoMergeMethod } | null;
   commits: {
     nodes: Array<{
       commit: {
@@ -360,16 +346,7 @@ function hasStaleChangesRequest(
   return false;
 }
 
-type GqlMqEntry = {
-  enqueuedAt: string;
-  estimatedTimeToMerge: number | null;
-  position: number;
-  state: MergeQueueState;
-  pullRequest: { headRefName: string } | null;
-};
-
 type GqlRepo = {
-  mergeQueue?: { entries?: { nodes?: GqlMqEntry[] } } | null;
   // Each aliased `wt_N` key lands here as `{ nodes: GqlPrNode[] }`.
   [alias: `wt_${number}`]: { nodes?: GqlPrNode[] } | undefined;
 };
@@ -380,7 +357,6 @@ type GqlResponse = {
 
 export type GithubData = {
   prs: Map<string, PullRequest>;
-  mergeQueue: Map<string, MergeQueueEntry>;
 };
 
 function extractRequestedReviewers(
@@ -457,12 +433,6 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     rabbit: rollupRabbit(pr.state, contexts, threads),
     requestedReviewers,
     suggestedReviewers: extractSuggestedReviewers(pr.suggestedReviewers),
-    autoMerge: pr.autoMergeRequest
-      ? {
-          enabledAt: pr.autoMergeRequest.enabledAt,
-          mergeMethod: pr.autoMergeRequest.mergeMethod,
-        }
-      : null,
     latestReview: extractLatestReview(pr.reviews),
     mergedAt: pr.mergedAt ?? null,
     closedAt: pr.closedAt ?? null,
@@ -470,11 +440,11 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
 }
 
 /**
- * Fetch PRs for a fixed set of branches + merge-queue entries in a
- * single graphql round trip. Returns empty maps on any failure — the
- * TUI treats "no entry" as "not there" rather than surfacing transient
- * errors. Pass the exact worktree branches; anything not on the list
- * is never fetched (the TUI wouldn't display it anyway).
+ * Fetch PRs for a fixed set of branches in a single graphql round
+ * trip. Returns an empty map on any failure — the TUI treats "no
+ * entry" as "not there" rather than surfacing transient errors. Pass
+ * the exact worktree branches; anything not on the list is never
+ * fetched (the TUI wouldn't display it anyway).
  *
  * `signal` (when provided) cascades into the underlying `gh` invocation
  * so a superseded query — branch list re-keyed before the previous
@@ -485,7 +455,7 @@ export async function fetchGithub(
   branches: string[],
   signal?: AbortSignal,
 ): Promise<GithubData> {
-  const empty: GithubData = { prs: new Map(), mergeQueue: new Map() };
+  const empty: GithubData = { prs: new Map() };
   if (!(await hasGh())) return empty;
   const slug = await repoSlug();
   if (!slug) return empty;
@@ -537,20 +507,7 @@ export async function fetchGithub(
     prs.set(chosen.headRefName, nodeToPr(chosen));
   }
 
-  const mergeQueue = new Map<string, MergeQueueEntry>();
-  for (const n of repo.mergeQueue?.entries?.nodes ?? []) {
-    const head = n.pullRequest?.headRefName;
-    if (!head) continue;
-    mergeQueue.set(head, {
-      headRefName: head,
-      position: n.position,
-      state: n.state,
-      enqueuedAt: n.enqueuedAt,
-      estimatedTimeToMerge: n.estimatedTimeToMerge,
-    });
-  }
-
-  return { prs, mergeQueue };
+  return { prs };
 }
 
 const CONTRIB_RECENCY_MS = 6 * 30 * 24 * 60 * 60 * 1000; // ~6 months
@@ -706,28 +663,6 @@ export async function fetchPrs(): Promise<Map<string, PullRequest>> {
 }
 
 export type GhActionResult = { ok: true } | { ok: false; error: string };
-export type EnableAutoMergeResult = GhActionResult;
-
-/**
- * Cancel a previously-armed "merge when ready" via
- * `gh pr merge --disable-auto`. No-op on PRs that aren't currently
- * armed; gh returns an error in that case which we surface verbatim.
- */
-export async function disableAutoMerge(
-  prNumber: number,
-): Promise<GhActionResult> {
-  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
-  const r = await run(
-    ["gh", "pr", "merge", String(prNumber), "--disable-auto"],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
-  );
-  if (r.exitCode !== 0) {
-    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
-    log.error("disable auto-merge failed", { prNumber, msg });
-    return { ok: false, error: msg };
-  }
-  return { ok: true };
-}
 
 /**
  * Edit a PR's review requests via `gh pr edit`. Both `add` and
@@ -772,30 +707,6 @@ export async function markPullRequestReady(
   if (r.exitCode !== 0) {
     const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
     log.error("mark ready failed", { prNumber, msg });
-    return { ok: false, error: msg };
-  }
-  return { ok: true };
-}
-
-/**
- * Enable "merge when ready" on a PR via `gh pr merge --auto`. Rebase
- * is hardcoded to match the repo's merge style; promote to config
- * when there's a second concrete preference. Runs from the main clone
- * so gh resolves the right repo. `gh` does the right thing for both
- * classic auto-merge and merge-queue repos — the same flag enqueues
- * when a queue is configured.
- */
-export async function enableAutoMerge(
-  prNumber: number,
-): Promise<EnableAutoMergeResult> {
-  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
-  const r = await run(
-    ["gh", "pr", "merge", String(prNumber), "--auto", "--rebase"],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
-  );
-  if (r.exitCode !== 0) {
-    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
-    log.error("auto-merge failed", { prNumber, msg });
     return { ok: false, error: msg };
   }
   return { ok: true };

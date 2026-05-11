@@ -45,7 +45,7 @@ export const NF = {
 	carrot: "\u{EF3B}", // nf-md-carrot
 
 	// Other badges
-	mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — prefix for `⇥N`
+	mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — Graphite mergeability badge
 	bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed
 	boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
 	comment: "\u{F41F}", // nf-oct-comment        — claude action-running marker (list + details)

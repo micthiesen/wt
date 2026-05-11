@@ -16,7 +16,8 @@ import { Spinner } from "../spinner.tsx";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
-import { type MergeQueueState, StatusKind } from "../../core/types.ts";
+import { StatusKind } from "../../core/types.ts";
+import type { MergeabilityEntry } from "../../core/graphite-api.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = {
@@ -58,39 +59,41 @@ function isRefreshing(row: WorktreeRow): boolean {
 }
 
 /**
- * Color the merge-queue indicator by state. Green = about to land,
- * yellow = waiting on checks or behind others, red = blocked/failed.
+ * Color the mergeability indicator by Graphite's status. Red for the
+ * machine-blocked case (CI), yellow for human-blocked, dim for
+ * resolved/unknown. The row only renders this slot when an entry is
+ * present and the PR is OPEN — terminal PRs drop the badge entirely.
  */
-function mqColor(state: MergeQueueState): string {
-  switch (state) {
+function mergeabilityColor(m: MergeabilityEntry): string {
+  switch (m.status) {
+    case "FAILING_REQUIRED":
+      return theme.err;
+    case "NEEDS_REVIEWERS":
+    case "UNRESOLVED_COMMENTS":
+      return theme.warn;
     case "MERGEABLE":
       return theme.ok;
-    case "AWAITING_CHECKS":
-    case "QUEUED":
-      return theme.warn;
-    case "UNMERGEABLE":
-    case "LOCKED":
-      return theme.err;
-    default:
+    case "DRAFT":
+    case "CHANGES_REQUESTED":
       return theme.fgDim;
+    default:
+      return theme.info;
   }
 }
 
 /**
- * "<mq-glyph>N" for a merge-queue position: nerd-font merge-queue
- * octicon + 1-based position (`+` if there are ≥10 ahead).
+ * The list panel renders one badge slot for mergeability — just the
+ * merge-queue glyph, color-coded. The detail pane carries the prose
+ * label; here a single coloured cell is enough at-a-glance signal that
+ * something needs attention.
  */
-function mqGlyph(row: WorktreeRow): string {
-  const mq = row.mq;
-  // Empty placeholder fills the 4-cell slot (2-cell icon + 1-cell space
-  // + 1-cell digit). The space prevents the icon's right-half from
-  // overlapping the digit when opentui's native renderer treats the
-  // icon as 1-cell wide — the explicit gap is sturdier than relying
-  // on the renderer's wide-char handling.
-  if (!mq) return "    ";
-  const pos = mq.position;
-  const digit = pos >= 10 ? "+" : String(pos);
-  return `${NF.mergeQueue} ${digit}`;
+function mergeabilityHint(row: WorktreeRow): { glyph: string; fg: string } | null {
+  const m = row.mergeability;
+  if (!m || !row.pr || row.pr.state !== "OPEN") return null;
+  // Skip statuses we already render elsewhere in the cluster (PR-state
+  // badge covers draft; review badge covers changes-requested).
+  if (m.status === "DRAFT" || m.status === "CHANGES_REQUESTED") return null;
+  return { glyph: NF.mergeQueue, fg: mergeabilityColor(m) };
 }
 
 /**
@@ -127,6 +130,7 @@ function badgeClusterCells(
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
+  const mergeability = mergeabilityHint(row);
   // Action and session count have separate 2-cell slots so they
   // coexist (e.g. a row running an action while also having a live
   // interactive session shows both glyphs).
@@ -135,7 +139,7 @@ function badgeClusterCells(
     actionRunning ||
     showSessionSlot ||
     refreshing ||
-    !!(row.pr || row.mq || isDeployed);
+    !!(row.pr || mergeability || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (actionRunning) cells += 2;
@@ -145,7 +149,7 @@ function badgeClusterCells(
   if (reviewHint(row)) cells += 2;
   if (row.pr) cells += 2;
   if (showChecks) cells += 2;
-  if (row.mq) cells += 4;
+  if (mergeability) cells += 2;
   if (isDeployed) cells += 2;
   return cells;
 }
@@ -266,16 +270,17 @@ const RowView = memo(function RowView({
     : (row.fields.deploy.data ?? false)
       ? theme.warn
       : theme.fgDim;
-  const mqFg = row.archived || !row.mq ? theme.fgDim : mqColor(row.mq.state);
-  const mqText = mqGlyph(row);
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
   const rabbit = rabbitHint(row);
   const review = reviewHint(row);
+  const mergeability = mergeabilityHint(row);
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
   const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
+  const mergeabilityFg =
+    row.archived || !mergeability ? theme.fgDim : mergeability.fg;
   // Two independent 2-cell slots: action (comment glyph, green) and
   // session count (circled digit, Claude orange). They coexist so a
   // row running an action while also hosting a live interactive
@@ -287,7 +292,7 @@ const RowView = memo(function RowView({
     actionRunning ||
     showSessionSlot ||
     refreshing ||
-    !!(row.pr || row.mq || isDeployed);
+    !!(row.pr || mergeability || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
   // a row is both selected and being tailed.
@@ -384,9 +389,9 @@ const RowView = memo(function RowView({
               <text fg={checkFg}>{c.glyph}</text>
             </box>
           ) : null}
-          {row.mq ? (
-            <box width={4} flexShrink={0}>
-              <text fg={mqFg}>{mqText}</text>
+          {mergeability ? (
+            <box width={2} flexShrink={0}>
+              <text fg={mergeabilityFg}>{mergeability.glyph}</text>
             </box>
           ) : null}
           {isDeployed ? (

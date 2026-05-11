@@ -16,11 +16,10 @@ import {
   spawnBackgroundRemove,
 } from "../core/lifecycle.ts";
 import {
-  disableAutoMerge,
   editReviewers,
-  enableAutoMerge,
   markPullRequestReady,
 } from "../core/github.ts";
+import { armMergeWhenReady } from "../core/graphite.ts";
 import {
   addClaudeName,
   buildClaudeSessionEntries,
@@ -50,7 +49,7 @@ import {
   type SessionKind,
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
-import { StatusKind, type PullRequest } from "../core/types.ts";
+import { StatusKind } from "../core/types.ts";
 import { claudeUsageQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
 
@@ -471,6 +470,7 @@ export function App({ onExit }: Props) {
     refreshAll,
     refreshStale,
     refreshGithub,
+    refreshGraphite,
     refreshTmuxSessions,
     optimisticRemoveClaude,
     fetchContributors,
@@ -1596,58 +1596,40 @@ export function App({ onExit }: Props) {
     toast(`marked #${prNumber} ready`, theme.ok, 2500);
   }
 
-  async function doAutoMerge(slug: string, action: "enable" | "disable"): Promise<void> {
+  /**
+   * Arm Graphite's "merge when ready" via `gt submit -m`. No optimistic
+   * patch — we don't currently know which `mergeabilityStatus` value
+   * Graphite returns for an armed PR, so there's nothing to flip in the
+   * cache. The settling invalidate of the graphite query picks up the
+   * change on the next round-trip.
+   *
+   * One-way arm: there's no documented disarm path through `gt` or
+   * Graphite's API. The toast directs the user to the web UI for that.
+   */
+  async function doMergeWhenReady(slug: string): Promise<void> {
     const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row?.pr) {
       toast("no PR for this row", theme.warn, 2000);
       return;
     }
-    if (action === "enable" && row.pr.autoMerge) {
-      toast("auto-merge already enabled", theme.info, 2000);
-      return;
-    }
-    if (action === "disable" && !row.pr.autoMerge) {
-      toast("auto-merge not enabled", theme.info, 2000);
-      return;
-    }
     const prNumber = row.pr.number;
-    const branch = row.wt.branch;
-    // Optimistic shape for enable: we don't know the merge method
-    // GitHub will land on (depends on repo settings), so seed a
-    // placeholder. The invalidate that fires on success replaces it
-    // with truth on the next refetch — what matters for UX is that
-    // the badge flips immediately.
-    const optimisticAutoMerge: PullRequest["autoMerge"] | null =
-      action === "enable"
-        ? { enabledAt: new Date().toISOString(), mergeMethod: "REBASE" }
-        : null;
-    try {
-      await mutate<GithubData>({
-        filter: { queryKey: ["github"] },
-        patch: (data) =>
-          patchPullRequest(data, branch, (pr) => ({
-            ...pr,
-            autoMerge: optimisticAutoMerge,
-          })),
-        run: async () => {
-          const result =
-            action === "enable"
-              ? await enableAutoMerge(prNumber)
-              : await disableAutoMerge(prNumber);
-          if (!result.ok) throw new Error(result.error);
-        },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const verb = action === "enable" ? "auto-merge" : "disable auto-merge";
-      log.event.err(`${verb} failed for #${prNumber}: ${msg}`);
-      toast(`${verb} failed: ${msg}`, theme.err, 4000);
+    const wtPath = row.wt.path;
+    log.event.dim(`arming merge-when-ready for #${prNumber}...`);
+    const result = await armMergeWhenReady(wtPath);
+    if (!result.ok) {
+      log.event.err(`merge-when-ready failed for #${prNumber}: ${result.error}`);
+      toast(`merge-when-ready failed: ${result.error}`, theme.err, 4000);
       return;
     }
-    const past = action === "enable" ? "enabled" : "disabled";
-    log.event.ok(`auto-merge ${past} for #${prNumber}`);
-    toast(`auto-merge ${past} for #${prNumber}`, theme.ok, 2500);
+    log.event.ok(`armed merge-when-ready for #${prNumber}`);
+    toast(
+      `armed #${prNumber} · disarm at app.graphite.com`,
+      theme.ok,
+      4000,
+    );
+    void refreshGraphite();
+    void refreshGithub();
   }
 
   function buildActionPickerItems(slug: string): PickerItem[] {
@@ -2498,9 +2480,7 @@ export function App({ onExit }: Props) {
         if (pending === "d" && current) {
           void doRemove(current.wt.slug);
         } else if (pending === "m+" && current) {
-          void doAutoMerge(current.wt.slug, "enable");
-        } else if (pending === "m-" && current) {
-          void doAutoMerge(current.wt.slug, "disable");
+          void doMergeWhenReady(current.wt.slug);
         } else if (pending === "e" && current) {
           void doMarkReady(current.wt.slug);
         } else if (pending === "R") {
@@ -3086,15 +3066,8 @@ export function App({ onExit }: Props) {
         toast("PR is not open", theme.warn, 2000);
         return;
       }
-      // Toggle: if already armed, the same key prompts to disable.
-      if (current.pr.autoMerge) {
-        setFooter({
-          kind: "confirm",
-          message: `disable auto-merge for #${current.pr.number}? [y/N]`,
-          pendingKey: "m-",
-        });
-        return;
-      }
+      // One-way arm: Graphite has no documented disarm path through
+      // gt or its API. Use app.graphite.com to disable once armed.
       setFooter({
         kind: "confirm",
         message: `merge when ready for #${current.pr.number}? [y/N]`,

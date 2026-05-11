@@ -19,12 +19,19 @@ export const qk = {
   /** First-parent SHAs of origin/main; supports branchIsMerged. */
   mainFirstParents: () => ["mainFirstParents"] as const,
   /**
-   * Combined GitHub fetch: PR map (one query per listed branch) +
-   * merge-queue entries. Branches are sorted so the key is stable
-   * regardless of worktree list order.
+   * GitHub PR fetch: one aliased query per listed branch. Branches are
+   * sorted so the key is stable regardless of worktree list order.
    */
   github: (branches: readonly string[]) =>
     ["github", [...branches].sort()] as const,
+  /**
+   * Graphite mergeability statuses keyed by the sorted PR-number list.
+   * Single-repo per `wt` instance, so the repo identity is implicit in
+   * the process; the key only carries what the call actually fans out
+   * across.
+   */
+  graphite: (prNumbers: readonly number[]) =>
+    ["graphite", [...prNumbers].sort((a, b) => a - b)] as const,
   /**
    * Repo-wide contributor list (sorted by commit count). Lives outside
    * the `["github"]` prefix on purpose — `refreshGithub`/`refreshAll`
