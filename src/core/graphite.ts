@@ -31,20 +31,34 @@ export type GraphiteActionResult = { ok: true } | { ok: false; error: string };
  * that `gt` synthesizes from the local repo state — re-implementing
  * that would mean shadowing `gt`'s internal stack engine.
  *
- * Runs in `wtPath` so `gt` resolves the right repo and branch. There
- * is no documented disarm path; Graphite expects you to flip the
- * "Merge when ready" toggle off in `app.graphite.com` or remove the
- * configured merge-queue label on the PR.
+ * Runs `gt track --parent` first so the branch is known to Graphite.
+ * Untracked branches fail `gt submit` with "Cannot perform this
+ * operation on untracked branch"; `gt track` is idempotent so we
+ * always run it. Caller passes the parent branch — typically derived
+ * from `row.stackedOn?.branch` falling back to the configured trunk.
+ *
+ * There is no documented disarm path; Graphite expects you to flip
+ * the "Merge when ready" toggle off in `app.graphite.com`.
  */
 export async function armMergeWhenReady(
   wtPath: string,
+  parent: string,
 ): Promise<GraphiteActionResult> {
-  const r = await run(["gt", "submit", "--merge-when-ready"], {
+  const track = await run(
+    ["gt", "track", "--parent", parent, "--no-interactive"],
+    { cwd: wtPath, timeoutMs: 10_000 },
+  );
+  if (track.exitCode !== 0) {
+    const msg = (track.stderr || track.stdout).trim() || `gt track exited ${track.exitCode}`;
+    log.error("gt track failed", { wtPath, parent, msg });
+    return { ok: false, error: msg };
+  }
+  const arm = await run(["gt", "submit", "--merge-when-ready"], {
     cwd: wtPath,
     timeoutMs: 60_000,
   });
-  if (r.exitCode !== 0) {
-    const msg = (r.stderr || r.stdout).trim() || `gt exited ${r.exitCode}`;
+  if (arm.exitCode !== 0) {
+    const msg = (arm.stderr || arm.stdout).trim() || `gt exited ${arm.exitCode}`;
     log.error("gt submit --merge-when-ready failed", { wtPath, msg });
     return { ok: false, error: msg };
   }

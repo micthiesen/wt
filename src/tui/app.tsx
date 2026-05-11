@@ -1615,8 +1615,13 @@ export function App({ onExit }: Props) {
     }
     const prNumber = row.pr.number;
     const wtPath = row.wt.path;
-    log.event.dim(`arming merge-when-ready for #${prNumber}...`);
-    const result = await armMergeWhenReady(wtPath);
+    // Graphite refuses `gt submit` on untracked branches; pre-emptively
+    // register the parent every time (idempotent). `stackedOn` is the
+    // auto-detected parent — if we have one, use it; otherwise the
+    // branch sits directly on trunk.
+    const parent = row.stackedOn?.branch ?? config.branch.base;
+    log.event.dim(`arming merge-when-ready for #${prNumber} (parent: ${parent})...`);
+    const result = await armMergeWhenReady(wtPath, parent);
     if (!result.ok) {
       log.event.err(`merge-when-ready failed for #${prNumber}: ${result.error}`);
       toast(`merge-when-ready failed: ${result.error}`, theme.err, 4000);
