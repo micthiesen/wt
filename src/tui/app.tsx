@@ -20,6 +20,15 @@ import {
   markPullRequestReady,
 } from "../core/github.ts";
 import { armMergeWhenReady } from "../core/graphite.ts";
+import { fetchOrigin } from "../core/worktree.ts";
+import { isRebaseInProgress } from "../core/git.ts";
+import { run } from "../core/proc.ts";
+import {
+  chainOf,
+  planRebase,
+  type RebaseStep,
+  type StackRow,
+} from "../core/stack-plan.ts";
 import {
   addClaudeName,
   buildClaudeSessionEntries,
@@ -30,7 +39,7 @@ import {
 } from "../core/claude-sessions.ts";
 import { graphiteUrlFromGithubPr } from "../core/graphite.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
-import { lockLabel, lockStatus } from "../core/locks.ts";
+import { lockLabel, lockStatus, tryAcquireLock } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import {
   type LiveSessionDesc,
@@ -79,6 +88,7 @@ import {
 } from "./panels/sessions-picker.tsx";
 import { WorktreeList } from "./panels/list.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
+import { StackActionsModal } from "./panels/stack-actions.tsx";
 import { enterClaudeSession } from "./claude-session.ts";
 import { enterDiffSession } from "./diff-session.ts";
 import { enterShellSession } from "./shell-session.ts";
@@ -278,6 +288,7 @@ type Modal =
   | { kind: "help" }
   | { kind: "cleanConfirm" }
   | { kind: "yank" }
+  | { kind: "stackActions" }
   | {
       kind: "branchPicker";
       title: string;
@@ -1637,6 +1648,175 @@ export function App({ onExit }: Props) {
     void refreshGithub();
   }
 
+  /**
+   * Build a `StackRow[]` from the current row list, suitable for
+   * passing to the stack-plan helpers. Drops main + archived since
+   * neither belong in a rebase plan.
+   */
+  function buildStackRows(): StackRow[] {
+    return rows
+      .filter((r) => !r.archived && !r.wt.isMain && !!r.wt.branch)
+      .map((r) => ({
+        slug: r.wt.slug,
+        path: r.wt.path,
+        branch: r.wt.branch,
+        parentSlug: r.stackedOn?.slug ?? null,
+        parentBranch: r.stackedOn?.branch ?? null,
+      }));
+  }
+
+  /**
+   * Walk the plan one rebase at a time. Each step acquires the
+   * worktree's lock, runs `git rebase <base>`, and releases. On exit:
+   *
+   *   - clean → continue to the next step
+   *   - paused on conflict (`rebase-merge/` exists) → spawn a claude
+   *     session in the halted worktree with the remaining plan baked
+   *     into the prompt so it can finish the chain
+   *   - any other failure → toast and stop
+   *
+   * Locks are per-step (held only during that worktree's rebase) so
+   * a halt-and-claude hands off cleanly: when launchAction acquires
+   * its own lock on the halted slug, the previous lock is already
+   * released.
+   */
+  async function executeStackPlan(
+    originSlug: string,
+    plan: RebaseStep[],
+    opName: "sync" | "rebase",
+  ): Promise<void> {
+    if (plan.length === 0) {
+      toast(`nothing to ${opName}`, theme.fgDim, 1500);
+      return;
+    }
+    const log = createLogger(originSlug);
+    log.event.dim(`${opName}: ${plan.length} branch${plan.length === 1 ? "" : "es"}`);
+    for (let i = 0; i < plan.length; i++) {
+      const step = plan[i]!;
+      const handle = tryAcquireLock(step.slug, opName, {
+        phase: `rebase onto ${step.base}`,
+      });
+      if (!handle) {
+        log.event.warn(`${step.slug} is busy; aborting ${opName}`);
+        toast(`${step.slug} is busy`, theme.warn, 2000);
+        return;
+      }
+      log.event.dim(`rebase ${step.branch} onto ${step.base}...`);
+      let exitCode: number;
+      let errorText = "";
+      try {
+        const r = await run(["git", "rebase", step.base], {
+          cwd: step.path,
+          timeoutMs: 120_000,
+        });
+        exitCode = r.exitCode;
+        errorText = (r.stderr || r.stdout).trim();
+      } finally {
+        handle.release();
+        void invalidateWorktree(step.slug);
+      }
+      if (exitCode === 0) {
+        log.event.ok(`rebase ${step.branch} clean`);
+        continue;
+      }
+      if (await isRebaseInProgress(step.path)) {
+        const remaining = plan.slice(i + 1);
+        log.event.warn(`rebase ${step.branch} paused on conflict — opening claude`);
+        escalateStackToClaude(step, remaining, opName);
+        return;
+      }
+      const msg = errorText.slice(0, 200) || `git rebase exit ${exitCode}`;
+      log.event.err(`rebase ${step.branch} failed: ${msg.slice(0, 200)}`);
+      toast(`rebase ${step.branch} failed: ${msg.slice(0, 80)}`, theme.err, 4000);
+      return;
+    }
+    log.event.ok(`${opName} clean`);
+    toast(`${opName} clean`, theme.ok, 2500);
+    void refreshGithub();
+  }
+
+  /**
+   * Hand a paused rebase off to a claude session with enough context
+   * to finish: the current worktree state plus the remaining steps
+   * (cwd + base) so claude can drive `git rebase --continue` here and
+   * then walk the rest of the plan.
+   */
+  function escalateStackToClaude(
+    step: RebaseStep,
+    remaining: readonly RebaseStep[],
+    opName: "sync" | "rebase",
+  ): void {
+    const remainingLines = remaining
+      .map((s) => `  cd ${s.path} && git rebase ${s.base}`)
+      .join("\n");
+    const tail =
+      remaining.length === 0
+        ? ""
+        : [
+            "",
+            "After this branch lands cleanly, finish the remaining rebases",
+            "in order. If any of these conflicts, resolve the same way:",
+            "",
+            remainingLines,
+          ].join("\n");
+    const prompt = [
+      `A git rebase is paused mid-conflict during a wt ${opName}.`,
+      "",
+      "Current state:",
+      `  cwd: ${step.path}`,
+      `  branch: ${step.branch}`,
+      `  rebasing onto: ${step.base}`,
+      "",
+      "Resolve the conflicts in the current worktree (preserve both",
+      "intents where possible), stage the resolution, and run",
+      "`git rebase --continue` until it completes cleanly.",
+      tail,
+      "",
+      "Report briefly when done.",
+    ].join("\n");
+    toast(`${opName} hit a conflict, opening claude...`, theme.warn, 3000);
+    launchAction(
+      step.slug,
+      {
+        kind: "claude",
+        id: `wt-${opName}-resume`,
+        name: `wt ${opName} (resume)`,
+        prompt,
+        affects: ["git", "github"],
+        requires: [],
+      },
+      "",
+    );
+  }
+
+  async function doStackSync(slug: string): Promise<void> {
+    const log = createLogger(slug);
+    log.event.dim("fetching origin...");
+    try {
+      await fetchOrigin();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.event.err(`fetch failed: ${msg}`);
+      toast(`fetch failed: ${msg}`, theme.err, 4000);
+      return;
+    }
+    const trunkBase = `origin/${config.branch.base}`;
+    const plan = planRebase(buildStackRows(), trunkBase);
+    await executeStackPlan(slug, plan, "sync");
+  }
+
+  async function doStackRebase(slug: string): Promise<void> {
+    const stackRows = buildStackRows();
+    const chain = chainOf(stackRows, slug);
+    if (chain.size === 0) {
+      toast("not a tracked worktree", theme.warn, 2000);
+      return;
+    }
+    const trunkBase = `origin/${config.branch.base}`;
+    const plan = planRebase(stackRows, trunkBase, (r) => chain.has(r.slug));
+    await executeStackPlan(slug, plan, "rebase");
+  }
+
   function buildActionPickerItems(slug: string): PickerItem[] {
     const row = rows.find((r) => r.wt.slug === slug);
     const rowState = { pr: row?.pr };
@@ -2374,6 +2554,36 @@ export function App({ onExit }: Props) {
       return;
     }
 
+    // Stack chord: same shape as yank — `R` opens, the next key
+    // (s/r) launches a stack op; `R` again or esc/q cancels.
+    if (modal?.kind === "stackActions") {
+      if (
+        k.name === "escape" ||
+        k.sequence === "R" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setModal(null);
+        return;
+      }
+      if (!current) {
+        setModal(null);
+        return;
+      }
+      const slug = current.wt.slug;
+      if (k.sequence === "s") {
+        setModal(null);
+        void doStackSync(slug);
+        return;
+      }
+      if (k.sequence === "r") {
+        setModal(null);
+        void doStackRebase(slug);
+        return;
+      }
+      return;
+    }
+
     // Clean-confirm modal swallows input while open.
     if (modal?.kind === "cleanConfirm") {
       if (k.name === "y" || k.name === "return") {
@@ -2696,6 +2906,17 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "R") {
+      if (!current) {
+        toast("no row selected", theme.warn, 1500);
+        return;
+      }
+      setModal({ kind: "stackActions" });
+      return;
+    }
+    // Ctrl+R: clear all caches. Moved off bare R when R became the
+    // stack chord; same confirm flow, same handler — only the trigger
+    // changed.
+    if (k.ctrl && k.name === "r") {
       setFooter({
         kind: "confirm",
         message: "clear all cached data? [y/N]",
@@ -3216,6 +3437,7 @@ export function App({ onExit }: Props) {
         <CleanConfirmModal candidates={cleanCandidates} />
       ) : null}
       {modal?.kind === "yank" && current ? <YankModal row={current} /> : null}
+      {modal?.kind === "stackActions" ? <StackActionsModal /> : null}
       {modal?.kind === "branchPicker" ? (
         <PickerModal
           title={modal.title}

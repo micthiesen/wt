@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+
 import { config } from "./config.ts";
 import { run, runOk, runQuiet } from "./proc.ts";
 
@@ -25,6 +28,26 @@ export async function branchExists(branch: string): Promise<boolean> {
     "--quiet",
     `refs/remotes/origin/${branch}`,
   ]);
+}
+
+/**
+ * True when the given worktree has a rebase paused (rebase-merge or
+ * rebase-apply dir present in its git dir). The git dir comes from
+ * `git rev-parse --git-dir` so linked-worktree paths just work.
+ * Used by the stack chord runner to decide between "halted on
+ * conflict → escalate to claude" vs "failed for another reason →
+ * just toast".
+ */
+export async function isRebaseInProgress(wtPath: string): Promise<boolean> {
+  const r = await run(["git", "rev-parse", "--git-dir"], {
+    cwd: wtPath,
+    timeoutMs: 5_000,
+  });
+  if (r.exitCode !== 0) return false;
+  const raw = r.stdout.trim();
+  if (!raw) return false;
+  const dir = isAbsolute(raw) ? raw : join(wtPath, raw);
+  return existsSync(join(dir, "rebase-merge")) || existsSync(join(dir, "rebase-apply"));
 }
 
 export async function branchIsGone(branch: string): Promise<boolean> {
