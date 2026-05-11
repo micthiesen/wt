@@ -64,22 +64,25 @@ export type WorktreeFields = {
 
 /**
  * Stack relationship for a worktree, with the resolved diff base.
- * Populated by two signals in priority order:
+ * Populated by three signals in priority order:
  *
- *   "pr"    — PR declares a non-trunk base. Strongest signal: the
- *             user told GitHub explicitly. `diffBase === branch`.
- *   "stack" — `detectStacks` resolved a parent from the branch's
- *             reflog (reset to / rebased-from / created-from another
- *             worktree). `diffBase` is the parent's branch ref.
+ *   "manual" — explicit override set via the stack chord. Wins over
+ *              both auto-detection paths; cleared by setting parent
+ *              to null. `diffBase === branch`.
+ *   "pr"     — PR declares a non-trunk base. Strongest *auto* signal:
+ *              the user told GitHub explicitly. `diffBase === branch`.
+ *   "stack"  — `detectStacks` resolved a parent from the branch's
+ *              reflog (reset to / rebased-from / created-from another
+ *              worktree). `diffBase` is the parent's branch ref.
  *
- * `slug` is `null` for PR-base hits where the declared base isn't
- * another worktree in the list; the consumer can still use the diff
- * base for diffing but has no row to draw a UI hint to.
+ * `slug` is `null` when the declared base isn't another worktree in
+ * the list; the consumer can still use the diff base for diffing but
+ * has no row to draw a UI hint to.
  */
 export type StackedOn = {
   slug: string | null;
   branch: string;
-  via: "stack" | "pr";
+  via: "stack" | "pr" | "manual";
   /** Ref to use for `git diff <diffBase>...HEAD`. */
   diffBase: string;
 };
@@ -209,20 +212,36 @@ function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
 
 /**
  * Resolve `stackedOn` for a single worktree. Single source of truth for
- * the priority chain (pr → stack → null) and the resolved diff base —
- * the row aggregator reads this to populate `row.stackedOn`, and the
- * details pane reads `row.stackedOn?.diffBase` directly so both sites
- * land queries in the same per-(slug, base) cache slot.
+ * the priority chain (manual → pr → stack → null) and the resolved
+ * diff base — the row aggregator reads this to populate
+ * `row.stackedOn`, and the details pane reads `row.stackedOn?.diffBase`
+ * directly so both sites land queries in the same per-(slug, base)
+ * cache slot.
  *
- * `worktrees` is the active set; needed only to associate a PR's
- * declared base branch with a worktree slug for the UI hint.
+ * `manualParent` comes from `wtState.slugs[slug]?.parent` and wins over
+ * both auto-detection paths. Set/cleared via the stack chord; a value
+ * equal to trunk is treated as "no override" so the auto signals can
+ * still expose a non-trunk PR base.
+ *
+ * `worktrees` is the active set; needed to associate a parent branch
+ * with a worktree slug for the UI hint.
  */
 function resolveStackedOn(
   wt: Worktree,
   stackData: StackMap | undefined,
   pr: PullRequest | undefined,
   worktrees: readonly Worktree[],
+  manualParent: string | null | undefined,
 ): StackedOn | null {
+  if (manualParent && manualParent !== config.branch.base) {
+    const parentWt = worktrees.find((w) => w.branch === manualParent);
+    return {
+      slug: parentWt?.slug ?? null,
+      branch: manualParent,
+      via: "manual",
+      diffBase: manualParent,
+    };
+  }
   if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
     const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
     return {
@@ -422,7 +441,13 @@ export function useWorktreeRows(): WorktreeRowsResult {
   // reads through `row.stackedOn`, so they all land queries in the same
   // per-(slug, base) cache slot.
   const stackedOnByIndex = worktrees.map((wt, i) =>
-    resolveStackedOn(wt, stack.data, prsByIndex[i], worktrees),
+    resolveStackedOn(
+      wt,
+      stack.data,
+      prsByIndex[i],
+      worktrees,
+      stateSlugs[wt.slug]?.parent ?? null,
+    ),
   );
   const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
 

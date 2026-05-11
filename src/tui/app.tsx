@@ -290,6 +290,17 @@ type Modal =
   | { kind: "yank" }
   | { kind: "stackActions" }
   | {
+      kind: "parentPicker";
+      slug: string;
+      items: string[];
+      index: number;
+      /**
+       * Index of the synthetic "clear override" sentinel in `items`, or
+       * -1 when no override currently exists (no sentinel rendered).
+       */
+      clearIndex: number;
+    }
+  | {
       kind: "branchPicker";
       title: string;
       items: string[];
@@ -493,6 +504,7 @@ export function App({ onExit }: Props) {
     toggleArchived,
     archive,
     setSection,
+    setParent,
     swapOrder,
     placeSlug,
     renameSection,
@@ -1824,6 +1836,36 @@ export function App({ onExit }: Props) {
     await executeStackPlan(slug, plan, "sync");
   }
 
+  /**
+   * Open a picker listing trunk + every other active worktree's branch
+   * as candidate stack parents. When a manual override is currently in
+   * effect, a synthetic "(clear override)" entry appears at the top so
+   * the user can drop back to auto-detection.
+   */
+  const PARENT_CLEAR_LABEL = "(clear override · auto-detect)";
+
+  function openParentPicker(slug: string): void {
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row) {
+      toast("worktree gone", theme.warn, 1500);
+      return;
+    }
+    const trunk = config.branch.base;
+    const others = rows
+      .filter((r) => r.wt.branch && r.wt.slug !== slug && !r.archived)
+      .map((r) => r.wt.branch as string)
+      .filter((b) => b !== trunk);
+    others.sort((a, b) => a.localeCompare(b));
+    const items = [trunk, ...others];
+    const hasOverride = row.stackedOn?.via === "manual";
+    let clearIndex = -1;
+    if (hasOverride) {
+      items.unshift(PARENT_CLEAR_LABEL);
+      clearIndex = 0;
+    }
+    setModal({ kind: "parentPicker", slug, items, index: 0, clearIndex });
+  }
+
   async function doStackRebase(slug: string): Promise<void> {
     const stackRows = buildStackRows();
     const chain = chainOf(stackRows, slug);
@@ -2573,12 +2615,12 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Stack chord: same shape as yank — `R` opens, the next key
-    // (s/r) launches a stack op; `R` again or esc/q cancels.
+    // Stack chord: same shape as yank — `b` opens, the next key
+    // (s/r/p) launches a stack op; `b` again or esc/q cancels.
     if (modal?.kind === "stackActions") {
       if (
         k.name === "escape" ||
-        k.sequence === "R" ||
+        k.sequence === "b" ||
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
@@ -2599,6 +2641,51 @@ export function App({ onExit }: Props) {
         setModal(null);
         void doStackRebase(slug);
         return;
+      }
+      if (k.sequence === "p") {
+        setModal(null);
+        openParentPicker(slug);
+        return;
+      }
+      return;
+    }
+
+    // Parent picker (second step of `b p`): j/k nav, Enter picks. The
+    // synthetic clear-sentinel at `clearIndex` maps to `null` (drop the
+    // override). Anything else is a branch name passed straight to
+    // setParent.
+    if (modal?.kind === "parentPicker") {
+      const pp = modal;
+      if (k.name === "j" || k.name === "down") {
+        setModal({
+          ...pp,
+          index: Math.min(pp.index + 1, pp.items.length - 1),
+        });
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setModal({ ...pp, index: Math.max(pp.index - 1, 0) });
+        return;
+      }
+      if (k.name === "return") {
+        const picked = pp.items[pp.index]!;
+        setModal(null);
+        const next = pp.index === pp.clearIndex ? null : picked;
+        void setParent(pp.slug, next).then(() => {
+          if (next === null) {
+            toast("cleared base override", theme.fgDim, 2000);
+          } else {
+            toast(`base set: ${next}`, theme.ok, 2500);
+          }
+        });
+        return;
+      }
+      if (
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setModal(null);
       }
       return;
     }
@@ -2924,7 +3011,7 @@ export function App({ onExit }: Props) {
       void refreshAll();
       return;
     }
-    if (k.sequence === "R") {
+    if (k.sequence === "b") {
       if (!current) {
         toast("no row selected", theme.warn, 1500);
         return;
@@ -2932,9 +3019,8 @@ export function App({ onExit }: Props) {
       setModal({ kind: "stackActions" });
       return;
     }
-    // Ctrl+R: clear all caches. Moved off bare R when R became the
-    // stack chord; same confirm flow, same handler — only the trigger
-    // changed.
+    // Ctrl+R: clear all caches. Moved off bare R when R lost its
+    // single-letter slot; same confirm flow, same handler.
     if (k.ctrl && k.name === "r") {
       setFooter({
         kind: "confirm",
@@ -3457,6 +3543,15 @@ export function App({ onExit }: Props) {
       ) : null}
       {modal?.kind === "yank" && current ? <YankModal row={current} /> : null}
       {modal?.kind === "stackActions" ? <StackActionsModal /> : null}
+      {modal?.kind === "parentPicker" ? (
+        <PickerModal
+          title={`stack · set base${
+            current ? ` · ${current.wt.slug}` : ""
+          }`}
+          items={modal.items}
+          selectedIndex={modal.index}
+        />
+      ) : null}
       {modal?.kind === "branchPicker" ? (
         <PickerModal
           title={modal.title}

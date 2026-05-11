@@ -20,6 +20,11 @@ export const STACK_ITEMS: Item[] = [
     label: "rebase",
     hint: "rebase the current chain on its parents",
   },
+  {
+    key: "p",
+    label: "set base",
+    hint: "manually set this worktree's parent branch",
+  },
 ];
 
 export function StackActionsModal() {
@@ -27,7 +32,7 @@ export function StackActionsModal() {
     <Modal
       title="stack · pick action"
       inset={{ top: "35%", right: "20%", bottom: "40%", left: "20%" }}
-      hints={[["esc / q / R", "cancel"]]}
+      hints={[["esc / q / b", "cancel"]]}
     >
       {STACK_ITEMS.map((it) => (
         <box key={it.key} flexDirection="row">

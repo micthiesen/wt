@@ -47,7 +47,7 @@ const SECTIONS: Section[] = [
       ["y", "yank menu (b/s/S/p/n/i/r)"],
       ["t", "regenerate AI summary"],
       ["m", "merge when ready (toggle)"],
-      ["R", "stack menu · s=sync · r=rebase chain"],
+      ["b", "stack menu · s=sync · r=rebase chain · p=set base"],
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker)"],
       ["!", "run claude action · kill if running"],

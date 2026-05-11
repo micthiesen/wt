@@ -97,6 +97,7 @@ import type { PullRequest } from "../core/types.ts";
 import {
   moveSection as moveSectionOnDisk,
   placeSlug as placeSlugOnDisk,
+  setSlugParent as setSlugParentOnDisk,
   renameSection as renameSectionOnDisk,
   setSlugSection as setSlugSectionOnDisk,
   swapOrders as swapOrdersOnDisk,
@@ -558,6 +559,16 @@ export function useWtActions() {
      */
     async setSection(slug: string, section: string | null): Promise<void> {
       setSlugSectionOnDisk(slug, section);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Persist a manual stack-parent override for `slug`. `null` clears
+     * the override; auto-detection (PR base, reflog) takes over again.
+     * `resolveStackedOn` reads this on the next render; cache
+     * invalidation on `wtState` re-runs the row aggregator.
+     */
+    async setParent(slug: string, parent: string | null): Promise<void> {
+      setSlugParentOnDisk(slug, parent);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
     },
     /**

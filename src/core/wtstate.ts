@@ -12,6 +12,12 @@ export type WtSlugState = {
   section: string | null;
   /** Manual ordering scalar within (section, archived) bucket. Lower = earlier. */
   order: number;
+  /**
+   * Manual override for this worktree's parent (stack base) branch.
+   * When set, beats both the PR-base hint and the reflog detection
+   * in `resolveStackedOn`. `null`/undefined means "auto-detect".
+   */
+  parent?: string | null;
 };
 
 /**
@@ -45,7 +51,10 @@ export function readWtState(): WtState {
           ? rec.section
           : null;
         const order = typeof rec.order === "number" && Number.isFinite(rec.order) ? rec.order : 0;
-        slugs[k] = { section, order };
+        const parent = typeof rec.parent === "string" && rec.parent.trim() !== ""
+          ? rec.parent
+          : null;
+        slugs[k] = { section, order, parent };
       }
     }
     const sectionsOrder: string[] = [];
@@ -158,7 +167,11 @@ export function placeSlug(
     const max = maxOrderIn(next, section);
     order = max === null ? 0 : max + 1;
   }
-  next.slugs[slug] = { section, order };
+  // Preserve any unrelated per-slug state (e.g. `parent` override) when
+  // re-placing this slug. The picker/Shift+J flow shouldn't clobber a
+  // manual stack parent.
+  const prev = next.slugs[slug];
+  next.slugs[slug] = { ...prev, section, order };
   next.sectionsOrder = prunedSectionsOrder(next);
   writeWtState(next);
 }
@@ -190,7 +203,8 @@ export function swapOrders(
   const baseline = min === null ? 0 : min;
   for (let i = 0; i < bucketDisplay.length; i++) {
     const slug = bucketDisplay[i]!;
-    next.slugs[slug] = { section, order: baseline + i };
+    const prev = next.slugs[slug];
+    next.slugs[slug] = { ...prev, section, order: baseline + i };
   }
   const a = next.slugs[slugA];
   const b = next.slugs[slugB];
@@ -270,6 +284,20 @@ export function moveSection(name: string, dir: -1 | 1): boolean {
   next.sectionsOrder[target] = tmp;
   writeWtState(next);
   return true;
+}
+
+/**
+ * Set or clear the manual parent branch for `slug`. `null` removes the
+ * override (falling back to PR-base / reflog detection). Preserves
+ * section + order; creates a fresh unsectioned entry when the slug has
+ * never been recorded before.
+ */
+export function setSlugParent(slug: string, parent: string | null): void {
+  const state = readWtState();
+  const next: WtState = { ...state, slugs: { ...state.slugs } };
+  const prev = next.slugs[slug] ?? { section: null, order: 0 };
+  next.slugs[slug] = { ...prev, parent };
+  writeWtState(next);
 }
 
 /**

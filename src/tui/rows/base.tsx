@@ -18,7 +18,12 @@ export const baseRow: RowModule = {
   render: ({ row }) => {
     const stackedOn = row.stackedOn;
     const base = stackedOn?.branch ?? config.branch.base;
-    const suffix = stackedOn?.via === "pr" ? " (pr)" : null;
+    const suffix =
+      stackedOn?.via === "pr"
+        ? " (pr)"
+        : stackedOn?.via === "manual"
+          ? " (manual)"
+          : null;
     return (
       <text wrapMode="none" truncate>
         <span fg={theme.fg}>{base}</span>
