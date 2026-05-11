@@ -488,6 +488,7 @@ export function App({ onExit }: Props) {
     fetchMe,
     clearAll,
     invalidateWorktree,
+    refreshStack,
     refreshAiSummary,
     toggleArchived,
     archive,
@@ -730,8 +731,16 @@ export function App({ onExit }: Props) {
   // would tear down + re-seed on every render, and a completion that
   // fires inside that window can be lost to the seed before dispatch
   // runs.
-  const actionHelpersRef = useRef({ invalidateWorktree, refreshGithub });
-  actionHelpersRef.current = { invalidateWorktree, refreshGithub };
+  const actionHelpersRef = useRef({
+    invalidateWorktree,
+    refreshGithub,
+    refreshStack,
+  });
+  actionHelpersRef.current = {
+    invalidateWorktree,
+    refreshGithub,
+    refreshStack,
+  };
   const actionHandledRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const handled = actionHandledRef.current;
@@ -751,11 +760,20 @@ export function App({ onExit }: Props) {
         const key = `${run.slug}@${run.endedAt}`;
         if (handled.has(key)) continue;
         handled.add(key);
-        const { invalidateWorktree: inv, refreshGithub: rg } = actionHelpersRef.current;
+        const {
+          invalidateWorktree: inv,
+          refreshGithub: rg,
+          refreshStack: rs,
+        } = actionHelpersRef.current;
         for (const tag of run.affects) {
           switch (tag) {
             case "git":
               void inv(run.slug);
+              // History-rewriting actions (rebase, modify, …) can
+              // change a worktree's reflog signal without changing
+              // the branch list, so the stack query key stays the
+              // same. Re-detect explicitly.
+              void rs();
               break;
             case "github":
               void rg();
@@ -1733,6 +1751,7 @@ export function App({ onExit }: Props) {
     log.event.ok(`${opName} clean`);
     toast(`${opName} clean`, theme.ok, 2500);
     void refreshGithub();
+    void refreshStack();
   }
 
   /**

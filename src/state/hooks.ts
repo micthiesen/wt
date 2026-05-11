@@ -318,11 +318,15 @@ export function useWtActions() {
      */
     async refreshAll(): Promise<void> {
       // `queryKey: ["github"]` uses prefix match — invalidates every
-      // github query regardless of the branches suffix.
+      // github query regardless of the branches suffix. Stack is also
+      // a prefix-keyed query (`["stack", ...branches]`) and we want
+      // reflog-based detection to re-run on `r` so a recent rebase
+      // picks up its new parent without waiting for staleTime.
       await Promise.all([
         qc.fetchQuery(fetchOriginQuery()),
         qc.invalidateQueries({ queryKey: qk.worktrees() }),
         qc.invalidateQueries({ queryKey: ["github"] }),
+        qc.invalidateQueries({ queryKey: ["stack"] }),
       ]);
       await Promise.all([
         qc.invalidateQueries({ queryKey: qk.mainFirstParents() }),
@@ -354,6 +358,16 @@ export function useWtActions() {
     /** Invalidate everything for a single worktree (useful after an action). */
     async invalidateWorktree(slug: string): Promise<void> {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
+    },
+    /**
+     * Invalidate the cross-worktree stack-detection cache. Stack
+     * detection reads each worktree's reflog, so any operation that
+     * rewrites history (rebase, modify, action that pushes commits)
+     * can change the result without changing the branch list — and
+     * therefore without changing the stack query key.
+     */
+    async refreshStack(): Promise<void> {
+      await qc.invalidateQueries({ queryKey: ["stack"] });
     },
     /**
      * Read the repo-wide contributor list from cache without blocking
