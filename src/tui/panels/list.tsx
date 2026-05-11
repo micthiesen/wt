@@ -17,7 +17,6 @@ import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { StatusKind } from "../../core/types.ts";
-import type { MergeabilityEntry } from "../../core/graphite-api.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = {
@@ -59,44 +58,6 @@ function isRefreshing(row: WorktreeRow): boolean {
 }
 
 /**
- * Color the mergeability indicator by Graphite's status. Red for the
- * machine-blocked case (CI), yellow for human-blocked, dim for
- * resolved/unknown. The row only renders this slot when an entry is
- * present and the PR is OPEN — terminal PRs drop the badge entirely.
- */
-function mergeabilityColor(m: MergeabilityEntry): string {
-  switch (m.status) {
-    case "FAILING_REQUIRED":
-      return theme.err;
-    case "NEEDS_REVIEWERS":
-    case "UNRESOLVED_COMMENTS":
-      return theme.warn;
-    case "MERGEABLE":
-      return theme.ok;
-    case "DRAFT":
-    case "CHANGES_REQUESTED":
-      return theme.fgDim;
-    default:
-      return theme.info;
-  }
-}
-
-/**
- * The list panel renders one badge slot for mergeability — just the
- * merge-queue glyph, color-coded. The detail pane carries the prose
- * label; here a single coloured cell is enough at-a-glance signal that
- * something needs attention.
- */
-function mergeabilityHint(row: WorktreeRow): { glyph: string; fg: string } | null {
-  const m = row.mergeability;
-  if (!m || !row.pr || row.pr.state !== "OPEN") return null;
-  // Skip statuses we already render elsewhere in the cluster (PR-state
-  // badge covers draft; review badge covers changes-requested).
-  if (m.status === "DRAFT" || m.status === "CHANGES_REQUESTED") return null;
-  return { glyph: NF.mergeQueue, fg: mergeabilityColor(m) };
-}
-
-/**
  * Row label text. Prefers the LLM-authored `brief` (caveman-talk noun
  * phrase) over the longer `title`, since the list column is tight —
  * after the badge cluster on a busy row the slug area can drop to ~20
@@ -130,7 +91,6 @@ function badgeClusterCells(
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
-  const mergeability = mergeabilityHint(row);
   // Action and session count have separate 2-cell slots so they
   // coexist (e.g. a row running an action while also having a live
   // interactive session shows both glyphs).
@@ -139,7 +99,7 @@ function badgeClusterCells(
     actionRunning ||
     showSessionSlot ||
     refreshing ||
-    !!(row.pr || mergeability || isDeployed);
+    !!(row.pr || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (actionRunning) cells += 2;
@@ -149,7 +109,6 @@ function badgeClusterCells(
   if (reviewHint(row)) cells += 2;
   if (row.pr) cells += 2;
   if (showChecks) cells += 2;
-  if (mergeability) cells += 2;
   if (isDeployed) cells += 2;
   return cells;
 }
@@ -276,11 +235,8 @@ const RowView = memo(function RowView({
   const refreshing = isRefreshing(row);
   const rabbit = rabbitHint(row);
   const review = reviewHint(row);
-  const mergeability = mergeabilityHint(row);
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
   const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
-  const mergeabilityFg =
-    row.archived || !mergeability ? theme.fgDim : mergeability.fg;
   // Two independent 2-cell slots: action (comment glyph, green) and
   // session count (circled digit, Claude orange). They coexist so a
   // row running an action while also hosting a live interactive
@@ -292,7 +248,7 @@ const RowView = memo(function RowView({
     actionRunning ||
     showSessionSlot ||
     refreshing ||
-    !!(row.pr || mergeability || isDeployed);
+    !!(row.pr || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
   // a row is both selected and being tailed.
@@ -387,11 +343,6 @@ const RowView = memo(function RowView({
           {showChecks ? (
             <box width={2} flexShrink={0}>
               <text fg={checkFg}>{c.glyph}</text>
-            </box>
-          ) : null}
-          {mergeability ? (
-            <box width={2} flexShrink={0}>
-              <text fg={mergeabilityFg}>{mergeability.glyph}</text>
             </box>
           ) : null}
           {isDeployed ? (

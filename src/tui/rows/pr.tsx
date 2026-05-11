@@ -83,41 +83,42 @@ function rabbitLabel(
 }
 
 /**
- * Graphite mergeability label. Short prose for the segment renderer;
- * color tier follows severity (err for blocked-by-CI, warn for
- * blocked-by-humans, dim for the draft case which the PR badge already
- * conveys). Unknown status values pass through verbatim so a new
- * Graphite enum doesn't silently disappear.
+ * Graphite mergeability label. Only the statuses that add information
+ * beyond the existing PR/review/checks badges get rendered; the rest
+ * (DRAFT, CHANGES_REQUESTED, NEEDS_APPROVAL(S), NEEDS_REVIEWERS) are
+ * suppressed because the same signal is already on the line via
+ * `prStateBadge`/`reviewLabel`. Three signals survive:
+ *
+ *   - `MERGEABLE`        — every gate green, ready to ship. Composite
+ *                          signal, not derivable from any single badge.
+ *   - `FAILING_REQUIRED` — required checks failing. Distinguishes
+ *                          "blocked" from "optional check is angry"
+ *                          (our `pr.checks === "fail"` doesn't).
+ *   - `UNRESOLVED_COMMENTS` — human-authored unresolved review threads.
+ *                          The carrot badge only counts CodeRabbit
+ *                          threads, so this fills a real gap.
+ *
+ * Unknown statuses fall through to a pass-through label so future
+ * Graphite enums (e.g. in-queue / merging) show up rather than
+ * silently disappearing — we just don't know which colour tier yet.
  */
 function mergeabilityLabel(
   m: MergeabilityEntry,
 ): { text: string; fg: string } | null {
   switch (m.status) {
+    case "MERGEABLE":
+      return { text: "mergeable", fg: theme.ok };
     case "FAILING_REQUIRED":
-      return { text: "checks failing", fg: theme.err };
-    case "NEEDS_REVIEWERS":
-      return { text: "needs reviewers", fg: theme.warn };
+      return { text: "required checks failing", fg: theme.err };
     case "UNRESOLVED_COMMENTS":
       return { text: "unresolved comments", fg: theme.warn };
     case "DRAFT":
-      // The PR-state badge already says "draft"; suppress here to
-      // avoid stating the same thing twice on the same line.
-      return null;
     case "CHANGES_REQUESTED":
-      // Same signal as the GitHub review badge (thumbs-down + prose);
-      // suppress to keep the line lean.
-      return null;
     case "NEEDS_APPROVAL":
     case "NEEDS_APPROVALS":
-      // Same signal as the GitHub review badge's "review pending" state
-      // (hourglass + prose); suppress to keep the line lean.
+    case "NEEDS_REVIEWERS":
       return null;
-    case "MERGEABLE":
-      return { text: "mergeable", fg: theme.ok };
     default:
-      // Pass-through for statuses we haven't seen yet — likely the
-      // armed / in-queue / merging variants that show up once a PR is
-      // actually advancing.
       return { text: m.status.toLowerCase().replace(/_/g, " "), fg: theme.info };
   }
 }
