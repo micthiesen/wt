@@ -15,6 +15,8 @@ import { NF, claudeCountGlyph } from "../icons.ts";
 import { Spinner } from "../spinner.tsx";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
+import type { DerivedState } from "../../core/claude-status.ts";
+import { STATE_FG_GLYPH } from "../claude-state.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { StatusKind } from "../../core/types.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
@@ -32,6 +34,13 @@ type Props = {
    *  count of names. Distinct slot from `activeActions` so a running
    *  action and a live session can show side-by-side. */
   claudeSessionsBySlug: ReadonlyMap<string, ReadonlyArray<string | null>>;
+  /**
+   * Aggregate per-slug claude state. Absent when the slug has no
+   * sessions; when present, drives the session-count glyph color so
+   * a busy worktree pops in the list (accent) vs an idle one (the
+   * default warn/orange tint).
+   */
+  claudeAggStateBySlug: ReadonlyMap<string, DerivedState>;
   /**
    * Slugs to tint with the chain-highlight bg. Populated while the
    * stack chord (`b`) modal is open with the chain containing the
@@ -192,6 +201,7 @@ const RowView = memo(function RowView({
   isTailing,
   actionRunning,
   sessionCount,
+  sessionAggState,
   panelWidth,
   stackParentAbove,
   chainHighlighted,
@@ -204,6 +214,12 @@ const RowView = memo(function RowView({
   /** Count of live interactive claude sessions on this slug (primary
    *  + named). Renders a circled-digit badge when ≥ 1. */
   sessionCount: number;
+  /**
+   * Aggregate state across the slug's claude sessions. Drives the
+   * session-count glyph color so the user can spot a busy worktree
+   * at a glance without opening the row. Absent when no sessions.
+   */
+  sessionAggState: DerivedState | undefined;
   panelWidth: number;
   /**
    * True when the row immediately above is the worktree this one is
@@ -331,7 +347,15 @@ const RowView = memo(function RowView({
           ) : null}
           {showSessionSlot ? (
             <box width={2} flexShrink={0}>
-              <text fg={theme.claudeOrange}>{claudeCountGlyph(sessionCount)}</text>
+              <text
+                fg={
+                  sessionAggState
+                    ? STATE_FG_GLYPH[sessionAggState]
+                    : theme.claudeOrange
+                }
+              >
+                {claudeCountGlyph(sessionCount)}
+              </text>
             </box>
           ) : null}
           {/* CR and review hints sit immediately to the left of the
@@ -418,7 +442,7 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, chainHighlight, isLoading, filter }: Props) {
+export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, claudeAggStateBySlug, chainHighlight, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -498,6 +522,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                   isTailing={activeTails.has(row.wt.slug)}
                   actionRunning={activeActions.has(row.wt.slug)}
                   sessionCount={claudeSessionsBySlug.get(row.wt.slug)?.length ?? 0}
+                  sessionAggState={claudeAggStateBySlug.get(row.wt.slug)}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
                   chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}
@@ -524,6 +549,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                     isTailing={activeTails.has(row.wt.slug)}
                     actionRunning={activeActions.has(row.wt.slug)}
                     sessionCount={claudeSessionsBySlug.get(row.wt.slug)?.length ?? 0}
+                    sessionAggState={claudeAggStateBySlug.get(row.wt.slug)}
                     panelWidth={width}
                     stackParentAbove={false}
                     chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}

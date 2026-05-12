@@ -55,6 +55,15 @@ export const qk = {
    * runtime on every file event — polling is the slow backstop.
    */
   claudeRegistry: () => ["claudeRegistry"] as const,
+  /**
+   * Per-worktree LLM-authored session summaries — `ai-title` /
+   * `away_summary` / `last-prompt` snippets pulled from each
+   * session's jsonl. Single key per slug; the queryFn derives the
+   * sessionId set internally from the persisted name list, so name
+   * churn doesn't require a key change (the cache stays warm and the
+   * (mtime, size) memo inside the reader covers correctness).
+   */
+  claudeSummaries: (slug: string) => ["claudeSummaries", slug] as const,
   /** Per-worktree property namespace. */
   wt: (slug: string) =>
     ({

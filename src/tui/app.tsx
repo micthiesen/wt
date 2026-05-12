@@ -59,8 +59,13 @@ import {
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
-import { claudeUsageQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
+import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
+import type { SessionTail } from "../core/claude.ts";
+import { wtSessionUuid } from "../core/claude.ts";
+import type { ClaudeRegistryData } from "../state/queries.ts";
+import type { RegistryStatus } from "../core/claude-registry.ts";
+import { deriveSessionState, pickAggregateState, type DerivedState } from "../core/claude-status.ts";
 
 import {
   ActionEditModal,
@@ -126,6 +131,42 @@ import { theme } from "./theme.ts";
  */
 function resolveDiffBase(row: WorktreeRow): string {
   return row.stackedOn?.diffBase ?? `origin/${config.branch.base}`;
+}
+
+/**
+ * Shape `buildClaudeSessionEntries`'s pure inputs out of the live wt
+ * state. Two call sites need this (the picker render memo + the `;`
+ * keyboard handler's initial-index computation), and the picker's
+ * "two callers can't silently drift" invariant rides on both using
+ * identical projections — extracted here so a new field added to
+ * `buildClaudeSessionEntries` lands once.
+ */
+function buildPickerInputs(
+  row: WorktreeRow,
+  liveNamesForSlug: ReadonlyArray<string | null>,
+  registry: ClaudeRegistryData | undefined,
+): {
+  slug: string;
+  wtPath: string;
+  liveNames: ReadonlyArray<string | null>;
+  tailByName: Map<string | null, SessionTail>;
+  registryStatusBySessionId: Record<string, RegistryStatus>;
+} {
+  const tailByName = new Map<string | null, SessionTail>();
+  for (const t of row.fields.claude.data?.sessions ?? []) {
+    tailByName.set(t.name, t);
+  }
+  const registryStatusBySessionId: Record<string, RegistryStatus> = {};
+  for (const [id, s] of Object.entries(registry?.bySessionId ?? {})) {
+    registryStatusBySessionId[id] = s.status;
+  }
+  return {
+    slug: row.wt.slug,
+    wtPath: row.wt.path,
+    liveNames: liveNamesForSlug,
+    tailByName,
+    registryStatusBySessionId,
+  };
 }
 
 /** Per-worktree pin/focus state for the Outputs system. */
@@ -501,6 +542,7 @@ export function App({ onExit }: Props) {
     invalidateWorktree,
     refreshStack,
     refreshAiSummary,
+    refreshClaudeSummaries,
     toggleArchived,
     archive,
     setSection,
@@ -649,18 +691,69 @@ export function App({ onExit }: Props) {
   // Drives the tail-registry reconcile, the sessions picker, the
   // count badge in the row list, and the auto-output focus rule.
   const claudeSessionsBySlug = useClaudeSessionsBySlug();
+  // Live claude process registry — feeds the picker's per-session
+  // state (busy/idle), the row's status, and the list pane glyph
+  // tint via `claudeAggStateBySlug` below.
+  const claudeRegistry = useQuery(claudeRegistryQuery());
+  // LLM-authored summary snippets for the picker's currently-open
+  // worktree. Only fetched when the picker is open (gated by
+  // `enabled`); the queryFn does light tail-bounded disk reads
+  // cached by (mtime, size) so repeat opens are essentially free.
+  const pickerWt = (modal?.kind === "claudeSessionsPicker"
+    ? rows.find((r) => r.wt.slug === modal.slug)?.wt
+    : undefined);
+  const pickerWtForQuery = pickerWt ?? { slug: "__none__", path: "" };
+  const summariesQuery = useQuery({
+    ...claudeSummariesQuery(pickerWtForQuery),
+    enabled: !!pickerWt,
+  });
   // Pre-compute the sessions-picker entries for the current modal
-  // slug (when the picker is open). Memoized so we don't pay the
-  // `listClaudeNames` disk read on every render — only when the live
-  // session set or the modal target changes. Empty array when the
-  // modal is closed or pointed at a different kind.
+  // slug (when the picker is open). Memoized so the listClaudeNames
+  // disk read, the per-session UUID derivation, and the sort only
+  // run when something observable changes. Empty when the modal is
+  // closed or pointed at a different kind.
+  // Narrow the modal dep to its slug so j/k navigation (which changes
+  // `modal.index`) doesn't refire the listClaudeNames disk read +
+  // sort that `buildClaudeSessionEntries` does.
+  const pickerSlug =
+    modal?.kind === "claudeSessionsPicker" ? modal.slug : null;
   const pickerEntries = useMemo(() => {
-    if (modal?.kind !== "claudeSessionsPicker") return [];
-    return buildClaudeSessionEntries(
-      modal.slug,
-      claudeSessionsBySlug.get(modal.slug) ?? [],
+    if (pickerSlug === null) return [];
+    const row = rows.find((r) => r.wt.slug === pickerSlug);
+    if (!row) return [];
+    const inputs = buildPickerInputs(
+      row,
+      claudeSessionsBySlug.get(row.wt.slug) ?? [],
+      claudeRegistry.data,
     );
-  }, [modal, claudeSessionsBySlug]);
+    return buildClaudeSessionEntries({
+      ...inputs,
+      summaryBySessionId: summariesQuery.data ?? {},
+    });
+  }, [pickerSlug, rows, claudeSessionsBySlug, claudeRegistry.data, summariesQuery.data]);
+
+  // Per-slug aggregate claude state for the list pane's session
+  // count glyph tint. Same registry + tail signals the row uses,
+  // collapsed to one state per slug via `pickAggregateState`. Idle
+  // slugs (no live sessions) drop out — the glyph isn't rendered
+  // for them anyway.
+  const claudeAggStateBySlug = useMemo(() => {
+    const map = new Map<string, DerivedState>();
+    const bySessionId = claudeRegistry.data?.bySessionId;
+    for (const row of rows) {
+      const tails = row.fields.claude.data?.sessions ?? [];
+      if (tails.length === 0) continue;
+      const liveSet = new Set(claudeSessionsBySlug.get(row.wt.slug) ?? []);
+      const states: DerivedState[] = tails.map((tail) => {
+        const uuid = wtSessionUuid(row.wt.path, tail.name);
+        const reg = bySessionId?.[uuid];
+        return deriveSessionState(tail, liveSet.has(tail.name), reg?.status ?? null);
+      });
+      const agg = pickAggregateState(states);
+      if (agg !== null) map.set(row.wt.slug, agg);
+    }
+    return map;
+  }, [rows, claudeSessionsBySlug, claudeRegistry.data]);
   // Parallel set for diff sessions — used by the Shift+F11 hint so
   // the kill-confirm only opens when there's something to kill.
   const activeDiffSessions = useActiveDiffSessions();
@@ -1484,6 +1577,7 @@ export function App({ onExit }: Props) {
     }
     const wasPersisted = nameInUse(slug, name);
     addClaudeName(slug, name);
+    void refreshClaudeSummaries(slug);
     const sessionLog = createLogger(slug);
     void (async () => {
       sessionLog.event.info(`entering claude session "${name}" (F12 to detach)`);
@@ -1524,7 +1618,10 @@ export function App({ onExit }: Props) {
     // would still see the dying session as live and pressing Enter
     // would `tmux new-session -A` it back to life.
     optimisticRemoveClaude(slug, name);
-    if (name !== null) removeClaudeName(slug, name);
+    if (name !== null) {
+      removeClaudeName(slug, name);
+      void refreshClaudeSummaries(slug);
+    }
     void (async () => {
       try {
         if (name === null) {
@@ -2532,6 +2629,7 @@ export function App({ onExit }: Props) {
             // Ghost: jsonl is gone or session was already killed —
             // just drop from state so the picker stops listing it.
             removeClaudeName(slug, target.name);
+            void refreshClaudeSummaries(slug);
             appLog.event.info(`forgot ghost session "${target.name}" on ${slug}`);
           }
           setModal(null);
@@ -2964,10 +3062,19 @@ export function App({ onExit }: Props) {
         return;
       }
       const slug = current.wt.slug;
-      const entries = buildClaudeSessionEntries(
-        slug,
-        claudeSessionsBySlug.get(slug) ?? [],
-      );
+      // Same pure inputs the memo uses; built inline because we need
+      // the order *now* to compute the initial highlight, before the
+      // modal opens and the memo fires. `summaryBySessionId` doesn't
+      // affect ordering, so we pass an empty record and let the modal's
+      // memo backfill summary text once it opens.
+      const entries = buildClaudeSessionEntries({
+        ...buildPickerInputs(
+          current,
+          claudeSessionsBySlug.get(slug) ?? [],
+          claudeRegistry.data,
+        ),
+        summaryBySessionId: {},
+      });
       let initialIdx = 0;
       if (
         displayedOutput.kind === "session" &&
@@ -3587,6 +3694,7 @@ export function App({ onExit }: Props) {
           activeTails={activeTails}
           activeActions={activeActions}
           claudeSessionsBySlug={claudeSessionsBySlug}
+          claudeAggStateBySlug={claudeAggStateBySlug}
           chainHighlight={
             modal?.kind === "stackActions" && current
               ? chainOf(buildStackRows(), current.wt.slug)

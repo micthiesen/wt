@@ -82,11 +82,12 @@ export async function runTui(): Promise<TuiExit> {
   // idle" indicator in the claude row flips the instant claude rewrites
   // its state file, without waiting for the 5s polling backstop on
   // `claudeRegistryQuery`. Cheap: a single FSEvents subscription on the
-  // top-level dir, no recursion.
+  // top-level dir, no recursion. `.catch(noop)` swallows rejections
+  // from invalidations that race a torn-down client during shutdown.
   const stopRegistryWatch = watchRegistry(() => {
-    void wtClient.client.invalidateQueries({
-      queryKey: qk.claudeRegistry(),
-    });
+    wtClient.client
+      .invalidateQueries({ queryKey: qk.claudeRegistry() })
+      .catch(() => {});
   });
   // Wait briefly for the SQLite cache to hydrate so the first paint
   // shows stale data instead of empty. If hydration takes longer than

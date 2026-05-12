@@ -5,8 +5,19 @@
  * (3-cell ASCII `...`). Mixing this and the 1-cell `…` in the same
  * pane reads as a font/encoding bug at a glance — keep them in sync.
  */
+import { humanAge } from "../core/locks.ts";
+
 export const ELLIPSIS = "...";
 export const ELLIPSIS_WIDTH = 3;
+
+/**
+ * Format a millisecond delta as a human-readable age string ("12m",
+ * "3h", "5d", …). Negative deltas clamp to zero — common when system
+ * clocks drift relative to file timestamps.
+ */
+export function ageMsToText(ms: number): string {
+  return humanAge(Math.max(0, ms) / 1000);
+}
 
 /**
  * End-truncate `s` to fit within `maxWidth` terminal cells, suffixing

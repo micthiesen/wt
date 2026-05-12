@@ -54,10 +54,15 @@ export function createWtQueryClient(): WtQueryClient {
     // otherwise burn one INSERT OR REPLACE per poll for data with
     // zero cross-session value. Worse, restoring stale lock state on
     // startup mis-classifies the worktree as "busy" until the first
-    // refetch lands. Filter them out so they live purely in-memory.
+    // refetch lands. `claudeRegistry` follows the same rule: its
+    // pid→busy/idle map is only meaningful within one wt uptime
+    // window, and a restored entry would flash a prior run's pids
+    // (often dead, possibly recycled) until the polling backstop
+    // catches up. Filter them out so they live purely in-memory.
     filters: {
       predicate: (query) => {
         const key = query.queryKey;
+        if (key[0] === "claudeRegistry") return false;
         if (key.length < 3 || key[0] !== "wt") return true;
         const slot = key[2];
         return slot !== "lock" && slot !== "claude";

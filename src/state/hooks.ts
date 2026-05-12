@@ -432,6 +432,16 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: tmuxSessionsQuery().queryKey });
     },
     /**
+     * Invalidate the cached LLM summaries for `slug`. The query key
+     * doesn't include the persisted-name list, so adding or removing
+     * a named session needs an explicit nudge — without this, a
+     * freshly-spawned session opens the picker showing "(no summary
+     * yet)" for up to staleTime (~30s).
+     */
+    async refreshClaudeSummaries(slug: string): Promise<void> {
+      await qc.invalidateQueries({ queryKey: qk.claudeSummaries(slug) });
+    },
+    /**
      * Optimistically remove a single (slug, name) claude entry from
      * the tmux-sessions cache. Used by the kill flow so the picker
      * stops listing the dying session as live the instant `x` is

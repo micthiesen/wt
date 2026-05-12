@@ -9,6 +9,9 @@ import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
 import { readClaudeUsage, type ClaudeUsage } from "../core/claude-usage.ts";
 import { readRegistry, type RegistrySession } from "../core/claude-registry.ts";
+import { wtSessionUuid } from "../core/claude.ts";
+import { listClaudeNames } from "../core/claude-sessions.ts";
+import { readSummariesForSessions, type SessionSummary } from "../core/claude-summaries.ts";
 import { config } from "../core/config.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
@@ -252,6 +255,26 @@ export const claudeRegistryQuery = () =>
     },
     staleTime: 1_000,
     refetchInterval: 5_000,
+  });
+
+/**
+ * Per-worktree session summaries — only fetched when the picker
+ * actually opens, gated by `enabled` at the call site. Derives the
+ * sessionId set internally from `listClaudeNames(slug) + primary`,
+ * keeping the query key stable across name churn. The jsonl reads
+ * are cached internally by (mtime, size) so repeated opens within an
+ * unchanged file are near-free; staleTime lets observers share the
+ * same fetch when the picker reopens shortly after closing.
+ */
+export const claudeSummariesQuery = (wt: Pick<Worktree, "slug" | "path">) =>
+  queryOptions({
+    queryKey: qk.claudeSummaries(wt.slug),
+    queryFn: async (): Promise<Record<string, SessionSummary | null>> => {
+      const names: ReadonlyArray<string | null> = [null, ...listClaudeNames(wt.slug)];
+      const ids = names.map((n) => wtSessionUuid(wt.path, n));
+      return readSummariesForSessions(wt.path, ids);
+    },
+    staleTime: 30_000,
   });
 
 export const contributorsQuery = () =>

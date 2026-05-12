@@ -89,15 +89,23 @@ export type ClaudeStatus = {
 const TAIL_BYTES = 64 * 1024;
 
 /**
- * Claude Code's per-project storage dir. Both `/` and `.` map to `-` —
- * `/Users/michael/.wt` becomes `-Users-michael--wt`. Missing the dot
- * replacement means existsSync always returns false for dot-prefixed
- * paths, so the resume-vs-create gate hands claude `--session-id` for
- * an already-used UUID and it exits immediately. Exported so other
- * modules (session-tail) derive the same dir from the same rule.
+ * Claude Code's per-project storage dir. Claude slugifies the cwd by
+ * replacing every non-alphanumeric char with `-`, so `_` and other
+ * symbols collapse too — `/Users/michael/.wt` → `-Users-michael--wt`,
+ * and `…/eng-5058-66-build_excel-…` → `…-build-excel-…`. A narrower
+ * rule (just `/` and `.`) means existsSync misses paths with `_` or
+ * other separators, and the resume-vs-create gate hands claude
+ * `--session-id` for an already-used UUID, which exits immediately
+ * with "Session ID … is already in use". Exported so other modules
+ * (session-tail) derive the same dir from the same rule.
  */
 export function projectDir(wtPath: string): string {
-  return join(homedir(), ".claude", "projects", wtPath.replace(/[/.]/g, "-"));
+  return join(
+    homedir(),
+    ".claude",
+    "projects",
+    wtPath.replace(/[^a-zA-Z0-9]/g, "-"),
+  );
 }
 
 /**

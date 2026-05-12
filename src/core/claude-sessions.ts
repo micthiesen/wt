@@ -4,16 +4,18 @@
  * `~/.cache/wt/claude-sessions.json`.
  *
  * The exported helpers cover both the persistence layer (read / mutate
- * the JSON file) and the picker-data composition (build the
- * (live, ghost, +new) item list shared by the keyboard handler and
- * the JSX render). Keeping the latter here means the two callers can't
- * silently drift in the picker's item ordering.
+ * the JSON file) and the picker-data composition
+ * (`buildClaudeSessionEntries`, which composes the rich entry shape
+ * the keyboard handler and the JSX render both consume). Keeping the
+ * latter here means the two callers can't silently drift in the
+ * picker's item ordering.
  *
  * Names alone are persisted; UUIDs are derived deterministically from
  * `(wtPath, name)` via `wtSessionUuid`, so a wt restart (or a
  * reboot-killed tmux server) reconstructs the full picture from the
- * names list plus the path. This is what makes "ghost" sessions
- * (tmux dead, conversation alive on disk) attachable in one keystroke.
+ * names list plus the path. That's what lets the picker resume a
+ * session whose tmux session is dead but whose conversation jsonl is
+ * still on disk.
  *
  * Names are validated: `^[a-zA-Z0-9_-]+$`, no `~` (the tmux session-name
  * separator). The picker reserves `primary` and digits used by
@@ -23,6 +25,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { wtSessionUuid, type SessionTail } from "./claude.ts";
+import type { RegistryStatus } from "./claude-registry.ts";
+import { deriveSessionState, type DerivedState } from "./claude-status.ts";
+import type { SessionSummary } from "./claude-summaries.ts";
 import { createLogger } from "./logger.ts";
 
 const STATE_FILE = join(homedir(), ".cache", "wt", "claude-sessions.json");
@@ -145,39 +151,145 @@ export function nextAutoName(slug: string): string {
 }
 
 /**
- * One row's worth of state for the sessions picker. `name = null` is
- * the primary; strings are user-named. `isLive` is true when a tmux
- * session for the (slug, name) pair is currently running. The
- * trailing "+ new" affordance is appended downstream by the picker
- * UI itself; this helper returns only the session entries.
+ * One row's worth of state for the sessions picker. Rich entries
+ * carry everything the picker needs to render and sort:
+ *   - identity (`name`, `sessionId`)
+ *   - liveness (`isLive` — tmux-managed by wt; the registry covers
+ *     non-wt processes too but they aren't pickable)
+ *   - derived state (`working / waiting / abandoned / idle`)
+ *   - last-activity timestamp (`lastEntryMs`) for the age column
+ *   - typed-ahead `queued` count
+ *   - LLM-authored `summary` snippet (or null when nothing yet)
+ *
+ * The trailing "+ new" affordance is appended downstream by the
+ * picker UI itself; this helper returns only the session entries.
  */
 export type ClaudeSessionPickerEntry = {
   name: string | null;
+  /**
+   * Deterministic UUID derived from (wtPath, name). Matches the
+   * sessionId in the registry and the jsonl filename, so consumers
+   * can look up summary / registry status without re-deriving.
+   */
+  sessionId: string;
   isLive: boolean;
+  state: DerivedState;
+  /** Most-recent meaningful jsonl entry timestamp, or null when empty. */
+  lastEntryMs: number | null;
+  queued: number;
+  summary: SessionSummary | null;
 };
 
 /**
- * Build the picker's session entries for `slug`. Order: primary
- * first (live or ghost), then live named (in the order tmux reports),
- * then ghost named (persisted but not in tmux). Single source of
- * truth so the keyboard handler and the JSX render never drift.
- *
- * `liveNames` should come from `useClaudeSessionsBySlug` — null = the
- * primary, strings = named sessions live in tmux right now.
+ * Picker sort order. Intentionally diverges from `STATE_PRIORITY` in
+ * `claude-status.ts`: that one's a *headline aggregation* priority
+ * (abandoned outranks waiting so a crashed peer surfaces when nothing
+ * is busy), but the picker is a *to-do list* — the user is most likely
+ * to want to attach to a session that's ready for input (`waiting`)
+ * over one that crashed mid-turn (`abandoned`, which needs
+ * investigation). Different question, different order.
  */
-export function buildClaudeSessionEntries(
-  slug: string,
-  liveNames: ReadonlyArray<string | null>,
-): ClaudeSessionPickerEntry[] {
-  const liveNamed = liveNames.filter((n): n is string => n !== null);
-  const liveNamedSet = new Set(liveNamed);
+const STATE_RANK: Record<DerivedState, number> = {
+  working: 0,
+  waiting: 1,
+  abandoned: 2,
+  idle: 3,
+};
+
+/**
+ * Build the picker's session entries for one worktree. Order is
+ * status-priority-first (working > waiting > abandoned > idle), then
+ * within each bucket primary before named, then by most-recent
+ * activity first. Single source of truth so the keyboard handler and
+ * the JSX render never drift.
+ *
+ * Caller passes the full lookup bag — keeping pure inputs lets the
+ * picker recompute synchronously on every render-driving signal
+ * change (registry flip, tmux churn, new summary fetch) without
+ * paying for the listClaudeNames disk read twice.
+ *
+ * `liveNames` — names live in tmux right now (`null` = primary).
+ * `tailByName` — jsonl tails keyed by `name | null` for the worktree.
+ * `registryStatusBySessionId` — busy/idle per sessionId from
+ *   `~/.claude/sessions/<pid>.json`. Look up via
+ *   `wtSessionUuid(wt.path, name)`.
+ * `summaryBySessionId` — per-session summary snippet (or null).
+ */
+export function buildClaudeSessionEntries(opts: {
+  slug: string;
+  wtPath: string;
+  liveNames: ReadonlyArray<string | null>;
+  tailByName: ReadonlyMap<string | null, SessionTail>;
+  registryStatusBySessionId: Readonly<Record<string, RegistryStatus>>;
+  summaryBySessionId: Readonly<Record<string, SessionSummary | null>>;
+}): ClaudeSessionPickerEntry[] {
+  const { slug, wtPath, liveNames, tailByName, registryStatusBySessionId, summaryBySessionId } = opts;
+  const liveSet = new Set(liveNames);
   const persisted = listClaudeNames(slug);
-  const ghostNamed = persisted.filter((n) => !liveNamedSet.has(n));
-  return [
-    { name: null, isLive: liveNames.includes(null) },
-    ...liveNamed.map((n) => ({ name: n, isLive: true })),
-    ...ghostNamed.map((n) => ({ name: n, isLive: false })),
-  ];
+  // Names we care about: primary (always) + every persisted name +
+  // any tmux-live name that somehow isn't persisted (defensive).
+  const seen = new Set<string>();
+  const namedNames: string[] = [];
+  for (const n of persisted) {
+    if (!seen.has(n)) {
+      seen.add(n);
+      namedNames.push(n);
+    }
+  }
+  for (const n of liveNames) {
+    if (n === null || seen.has(n)) continue;
+    seen.add(n);
+    namedNames.push(n);
+  }
+  const allNames: ReadonlyArray<string | null> = [null, ...namedNames];
+
+  const out: ClaudeSessionPickerEntry[] = allNames.map((name) => {
+    const sessionId = wtSessionUuid(wtPath, name);
+    const tail =
+      tailByName.get(name) ??
+      ({
+        name,
+        hasJsonl: false,
+        lastEntryMs: null,
+        lastEntryKind: null,
+        queued: 0,
+      } satisfies SessionTail);
+    const regStatus = registryStatusBySessionId[sessionId] ?? null;
+    const isLive = liveSet.has(name);
+    return {
+      name,
+      sessionId,
+      isLive,
+      state: deriveSessionState(tail, isLive, regStatus),
+      lastEntryMs: tail.lastEntryMs,
+      queued: tail.queued,
+      summary: summaryBySessionId[sessionId] ?? null,
+    };
+  });
+
+  // Filter ghost entries that have no live tmux AND no on-disk
+  // signal at all (no jsonl, no registry process). Those are stale
+  // persisted names left behind by spawn-failed entries; surfacing
+  // them in the picker invites confusion.
+  const filtered = out.filter((e) => {
+    if (e.isLive) return true;
+    if (e.state !== "idle") return true;
+    if (e.lastEntryMs !== null) return true;
+    if (e.name === null) return true; // always show primary
+    return false;
+  });
+
+  filtered.sort((a, b) => {
+    const rankDiff = STATE_RANK[a.state] - STATE_RANK[b.state];
+    if (rankDiff !== 0) return rankDiff;
+    // Within a state bucket: primary first, then by recency desc.
+    if ((a.name === null) !== (b.name === null)) return a.name === null ? -1 : 1;
+    const aMs = a.lastEntryMs ?? 0;
+    const bMs = b.lastEntryMs ?? 0;
+    if (aMs !== bMs) return bMs - aMs;
+    return (a.name ?? "").localeCompare(b.name ?? "");
+  });
+  return filtered;
 }
 
 /**

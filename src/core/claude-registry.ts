@@ -44,6 +44,13 @@ function asNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/** Accept only positive integer pids. `process.kill(0, 0)` targets the
+ *  current process group; `process.kill(-N, 0)` targets a group. Either
+ *  yields a phantom "live" entry against a malformed/stale registry file. */
+function asPid(v: unknown): number | null {
+  return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : null;
+}
+
 function parseEntry(path: string): RegistrySession | null {
   let raw: string;
   try {
@@ -59,7 +66,7 @@ function parseEntry(path: string): RegistrySession | null {
   } catch {
     return null;
   }
-  const pid = asNumber(obj.pid);
+  const pid = asPid(obj.pid);
   const sessionId = obj.sessionId;
   const cwd = obj.cwd;
   const status = obj.status;
@@ -87,7 +94,16 @@ function parseEntry(path: string): RegistrySession | null {
 /**
  * True iff `pid` names a process visible to us. `EPERM` means the
  * process exists but is owned by a different uid — still alive from our
- * perspective, so we keep it. `ESRCH` is the no-such-process signal.
+ * perspective. `ESRCH` is the no-such-process signal. Anything else
+ * (transient kernel weirdness, EFAULT, …) we treat as alive and log,
+ * so a one-shot syscall failure doesn't silently disappear a real
+ * session from the picker.
+ *
+ * Pid-recycling note: this can't distinguish "the process that wrote
+ * this file" from "a new process that reused the pid". Stale files
+ * left after a crash can briefly point at an unrelated process. The
+ * downside is bounded — the stale `status` reads as last-known until
+ * the real claude rewrites or the file ages out via cleanup.
  */
 function pidAlive(pid: number): boolean {
   try {
@@ -95,7 +111,10 @@ function pidAlive(pid: number): boolean {
     return true;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    return code === "EPERM";
+    if (code === "EPERM") return true;
+    if (code === "ESRCH") return false;
+    log.warn("pid liveness check failed", { pid, code: code ?? "?" });
+    return true;
   }
 }
 
@@ -125,21 +144,45 @@ export function readRegistry(): RegistrySession[] {
   return out;
 }
 
+/** Coalesce a burst of file events into one `onChange` call. Claude
+ *  rewrites its state file on every transition + a slow heartbeat; with
+ *  several concurrent sessions FSEvents can dispatch many events per
+ *  status flip. Trailing-edge wait so we fire after the burst settles. */
+const WATCH_DEBOUNCE_MS = 100;
+
 /**
- * Subscribe to file events in the registry dir. The callback fires on
- * every create/change/delete; callers debounce by re-reading lazily
- * (the cheap path is a no-op if nothing observable changed). Returns a
- * disposer; safe to call multiple times.
+ * Subscribe to file events in the registry dir. The callback fires
+ * after a brief debounce; callers re-read lazily (the cheap path is a
+ * no-op if nothing observable changed). Returns a disposer; safe to
+ * call multiple times.
  *
  * fs.watch can throw ENOENT if the dir doesn't exist yet (fresh
- * machine, never ran claude). We log and return a no-op disposer in
- * that case — the polling backstop on the query covers eventual
- * appearance.
+ * machine, never ran claude). FSEvents can also emit a runtime `error`
+ * after a successful start (dir replaced, perms changed). Both paths
+ * log and fall through to the polling backstop on the query rather
+ * than crashing the TUI.
  */
 export function watchRegistry(onChange: () => void): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let disposed = false;
+  const trigger = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (!disposed) onChange();
+    }, WATCH_DEBOUNCE_MS);
+  };
   try {
-    const w = watch(REGISTRY_DIR, () => onChange());
+    const w = watch(REGISTRY_DIR, trigger);
+    w.on("error", (err) => {
+      log.warn("fs.watch error", { err: String(err), dir: REGISTRY_DIR });
+    });
     return () => {
+      disposed = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
       try {
         w.close();
       } catch {
