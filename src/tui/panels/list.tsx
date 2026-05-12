@@ -373,10 +373,41 @@ const RowView = memo(function RowView({
   );
 });
 
-function Divider({ label, width }: { label: string; width: number }) {
+/**
+ * Section divider. The `stack` variant signals an auto-managed
+ * stack section: double-line rule chars, bluer accent color, a
+ * leading stack glyph, and a trailing glyph on the right edge so
+ * the eye picks up the difference at a glance.
+ */
+function Divider({
+  label,
+  width,
+  variant = "manual",
+}: {
+  label: string;
+  width: number;
+  variant?: "manual" | "stack";
+}) {
   // Leave room for padding (border+paddingLeft+paddingRight roughly 4
   // cells) so the rule doesn't bleed past the panel edge.
   const inner = Math.max(0, width - 4);
+  if (variant === "stack") {
+    // Reserve cells for: leading glyph (2) + spaces around label + label
+    // + trail rule + trailing glyph (2). 6 fixed cells of chrome plus
+    // the label string itself.
+    const labelStr = ` ${label} `;
+    const overhead = 2 + labelStr.length + 2;
+    const trailLen = Math.max(0, inner - overhead);
+    const trail = "═".repeat(trailLen);
+    return (
+      <box flexDirection="row" paddingLeft={1} paddingRight={1}>
+        <text fg={theme.accentAlt}>{`${NF.stack} `}</text>
+        <text fg={theme.fg}>{labelStr}</text>
+        <text fg={theme.accentAlt}>{trail}</text>
+        <text fg={theme.accentAlt}>{` ${NF.stack}`}</text>
+      </box>
+    );
+  }
   const labelStr = ` ${label} `;
   const padding = Math.max(0, inner - labelStr.length - 2);
   const trail = "─".repeat(padding);
@@ -456,7 +487,11 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                 {showDivider ? (
                   <>
                     <box height={1} flexShrink={0} />
-                    <Divider label={row.section!} width={width} />
+                    <Divider
+                      label={row.section!}
+                      width={width}
+                      variant={row.sectionIsStack ? "stack" : "manual"}
+                    />
                   </>
                 ) : null}
                 <RowView

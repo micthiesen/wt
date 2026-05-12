@@ -95,8 +95,10 @@ import { invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
 import type { PullRequest } from "../core/types.ts";
 import {
+  addStackSection as addStackSectionOnDisk,
   moveSection as moveSectionOnDisk,
   placeSlug as placeSlugOnDisk,
+  removeStackSection as removeStackSectionOnDisk,
   setSlugParent as setSlugParentOnDisk,
   renameSection as renameSectionOnDisk,
   setSlugSection as setSlugSectionOnDisk,
@@ -570,6 +572,26 @@ export function useWtActions() {
     async setParent(slug: string, parent: string | null): Promise<void> {
       setSlugParentOnDisk(slug, parent);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Register a stack-managed section keyed by `rootSlug`. The row
+     * aggregator finds every worktree whose `stackedOn` chain bottoms
+     * out at that slug and auto-assigns them to this section
+     * (depth-ordered). Idempotent.
+     */
+    async addStackSection(name: string, rootSlug: string): Promise<void> {
+      addStackSectionOnDisk(name, rootSlug);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Drop the stack section. Members fall back to their underlying
+     * `slugs[slug].section` (never overwritten), so the prior manual
+     * placement returns automatically.
+     */
+    async removeStackSection(name: string): Promise<boolean> {
+      const removed = removeStackSectionOnDisk(name);
+      if (removed) await qc.invalidateQueries({ queryKey: qk.wtState() });
+      return removed;
     },
     /**
      * Place a slug at the top or bottom of a section. Used by the

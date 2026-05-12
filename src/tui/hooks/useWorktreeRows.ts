@@ -126,12 +126,20 @@ export type WorktreeRow = {
    */
   brief: string | null;
   /**
-   * User-assigned section name from `state.json`, or `null` for the
-   * unsectioned bucket at the top of the list. Persisted across the
-   * archived flag — restoring an archived worktree drops it back into
-   * the same named section it was in before.
+   * Effective section after stack-section auto-assignment. When a
+   * registered stack section's `rootSlug` matches this row's chain
+   * root, the row's `section` is the stack section's name regardless
+   * of any manual placement; otherwise it's the slug's stored
+   * `slugs[slug].section`. `null` means the unsectioned bucket at the
+   * top of the list.
    */
   section: string | null;
+  /**
+   * True when `section` is a registered stack-managed section. Drives
+   * divider styling in the list pane and the J/K/move-into refusals
+   * in the action layer.
+   */
+  sectionIsStack: boolean;
 };
 
 const FIELD_ORDER = [
@@ -340,7 +348,7 @@ function resolveTitle(
 function sortActiveRows(
   active: WorktreeRow[],
   unsortedIndex: ReadonlyMap<string, number>,
-  stateSlugs: Record<string, { order: number }>,
+  effectiveOrders: ReadonlyMap<string, number>,
   sectionsOrder: readonly string[],
 ): WorktreeRow[] {
   const sectionRank = new Map<string, number>();
@@ -357,8 +365,8 @@ function sortActiveRows(
       if (rankA !== rankB) return rankA - rankB;
       return a.section.localeCompare(b.section);
     }
-    const orderA = stateSlugs[a.wt.slug]?.order ?? -Infinity;
-    const orderB = stateSlugs[b.wt.slug]?.order ?? -Infinity;
+    const orderA = effectiveOrders.get(a.wt.slug) ?? -Infinity;
+    const orderB = effectiveOrders.get(b.wt.slug) ?? -Infinity;
     if (orderA !== orderB) return orderA - orderB;
     return (unsortedIndex.get(a.wt.slug) ?? 0) - (unsortedIndex.get(b.wt.slug) ?? 0);
   });
@@ -451,6 +459,48 @@ export function useWorktreeRows(): WorktreeRowsResult {
   );
   const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
 
+  // Reverse-map slug → parent slug for the stack-section auto-assign
+  // walk below. Built once per render off `stackedOnByIndex` so the
+  // walks are O(depth) lookups.
+  const parentSlugBySlug = new Map<string, string>();
+  worktrees.forEach((wt, i) => {
+    const so = stackedOnByIndex[i];
+    if (so?.slug) parentSlugBySlug.set(wt.slug, so.slug);
+  });
+
+  // Index registered stack sections by their root slug so the walk
+  // can short-circuit the instant it hits a registered root.
+  const sectionMeta = wtState.data?.sectionMeta ?? {};
+  const stackSectionByRoot = new Map<string, string>();
+  for (const [name, meta] of Object.entries(sectionMeta)) {
+    if (meta.kind === "stack") stackSectionByRoot.set(meta.rootSlug, name);
+  }
+
+  /**
+   * Walk parents from `slug` until we hit a registered stack root, or
+   * the chain bottoms out. Returns the matching section name + depth
+   * (root=0, child=1, …) or null when no enclosing stack section
+   * exists. Depth ordering keeps the root visually at the top of the
+   * section.
+   */
+  function findStackSection(
+    slug: string,
+  ): { name: string; depth: number } | null {
+    let cur = slug;
+    let depth = 0;
+    const seen = new Set<string>();
+    while (!seen.has(cur)) {
+      seen.add(cur);
+      const name = stackSectionByRoot.get(cur);
+      if (name) return { name, depth };
+      const parent = parentSlugBySlug.get(cur);
+      if (!parent) return null;
+      cur = parent;
+      depth++;
+    }
+    return null;
+  }
+
   const queries = worktrees.flatMap((wt, i) => [
     wtDirtyQuery(wt),
     wtLockQuery(wt),
@@ -522,6 +572,11 @@ export function useWorktreeRows(): WorktreeRowsResult {
     })),
   });
 
+  // Effective order map populated during row construction so the
+  // section-aware sorter below can read it without re-walking the
+  // stack-section topology.
+  const effectiveOrders = new Map<string, number>();
+
   const unsorted: WorktreeRow[] = worktrees.map((wt, i) => {
     const base = i * FIELD_ORDER.length;
     const fieldArr = FIELD_ORDER.map((_, j) => results[base + j]!);
@@ -554,7 +609,17 @@ export function useWorktreeRows(): WorktreeRowsResult {
       github.isFetching ||
       graphite.isFetching;
     const archived = archivedSet.has(wt.slug);
-    const section = stateSlugs[wt.slug]?.section ?? null;
+    // Effective section: stack-managed override beats the stored
+    // manual section. Archived rows skip the override so the archived
+    // bucket stays homogeneous at the bottom of the list.
+    const manualSection = stateSlugs[wt.slug]?.section ?? null;
+    const stackHit = archived ? null : findStackSection(wt.slug);
+    const section = stackHit?.name ?? manualSection;
+    const sectionIsStack = stackHit !== null;
+    effectiveOrders.set(
+      wt.slug,
+      stackHit?.depth ?? stateSlugs[wt.slug]?.order ?? -Infinity,
+    );
     const llmTitle = aiResults[i]?.data?.title ?? null;
     const llmBrief = aiResults[i]?.data?.brief ?? null;
     const prTitle = pr?.title ?? null;
@@ -589,6 +654,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.titleSource === titleSource &&
       prev.brief === llmBrief &&
       prev.section === section &&
+      prev.sectionIsStack === sectionIsStack &&
       stackedOnEq(prev.stackedOn, stackedOn)
     ) {
       return prev;
@@ -611,6 +677,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       titleSource,
       brief: llmBrief,
       section,
+      sectionIsStack,
     };
     rowCache.current.set(wt.slug, next);
     return next;
@@ -636,7 +703,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const active = sortActiveRows(
     unsorted.filter((r) => !r.archived),
     listIndexOf,
-    stateSlugs,
+    effectiveOrders,
     sectionsOrder,
   );
   const archived = unsorted.filter((r) => r.archived);

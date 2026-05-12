@@ -29,7 +29,7 @@ const SECTIONS: Section[] = [
   {
     title: "organize",
     items: [
-      ["l", "set section (picker)"],
+      ["l", "set section (picker) · + stack section for current chain"],
       ["l l", "new section (chord)"],
       ["L", "rename current section"],
       ["J / K", "move row · across sections"],

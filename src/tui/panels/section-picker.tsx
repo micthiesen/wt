@@ -1,10 +1,20 @@
+import { NF } from "../icons.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
 export type SectionPickerItem =
   | { kind: "none" }
   | { kind: "section"; name: string }
-  | { kind: "create" };
+  | { kind: "create" }
+  | {
+      kind: "stack";
+      /** Whether picking this entry creates or removes the stack section. */
+      mode: "create" | "remove";
+      /** Section name to register or drop. */
+      name: string;
+      /** Root slug of the chain — recorded into sectionMeta on create. */
+      rootSlug: string;
+    };
 
 type Props = {
   title: string;
@@ -21,6 +31,11 @@ type Props = {
 function itemLabel(item: SectionPickerItem): string {
   if (item.kind === "none") return "(none)";
   if (item.kind === "create") return "+ new section";
+  if (item.kind === "stack") {
+    return item.mode === "create"
+      ? `+ stack section (${item.name})`
+      : `× remove ${item.name}`;
+  }
   return item.name;
 }
 
@@ -61,14 +76,27 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
         // create entry shows "l" instead — matches the chord shortcut
         // (`l l` from normal mode jumps straight into create-name).
         const isCreate = item.kind === "create";
-        const showDigit = i < 9 && !isCreate;
-        const prefix = isCreate ? "l" : showDigit ? `${i + 1}` : " ";
-        const prefixFg = isCreate ? theme.accent : theme.fgDim;
+        const isStack = item.kind === "stack";
+        const showDigit = i < 9 && !isCreate && !isStack;
+        const prefix = isCreate
+          ? "l"
+          : isStack
+            ? NF.stack
+            : showDigit
+              ? `${i + 1}`
+              : " ";
+        const prefixFg = isCreate
+          ? theme.accent
+          : isStack
+            ? theme.accentAlt
+            : theme.fgDim;
         const labelFg = isCreate
           ? theme.accent
-          : item.kind === "none"
-            ? theme.fgDim
-            : fg;
+          : isStack
+            ? theme.accentAlt
+            : item.kind === "none"
+              ? theme.fgDim
+              : fg;
         return (
           <box
             key={i}

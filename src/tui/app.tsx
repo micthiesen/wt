@@ -46,7 +46,7 @@ import {
   sessionTailRegistry,
 } from "../core/session-tail.ts";
 import { removeShellLog, shellTailRegistry } from "../core/shell-tail.ts";
-import { stageUrl } from "../core/stage.ts";
+import { slugLabel, stageUrl } from "../core/stage.ts";
 import {
   claudeSessionName,
   diffCommandUsesBase,
@@ -505,6 +505,8 @@ export function App({ onExit }: Props) {
     archive,
     setSection,
     setParent,
+    addStackSection,
+    removeStackSection,
     swapOrder,
     placeSlug,
     renameSection,
@@ -1008,8 +1010,11 @@ export function App({ onExit }: Props) {
    * "+ new section" sits at the bottom with `l` as its quick chord
    * trigger so `l l` creates a fresh section in two keystrokes.
    */
-  function buildSectionItems(currentSection: string | null): SectionPickerItem[] {
+  function buildSectionItems(
+    currentRow: WorktreeRow,
+  ): SectionPickerItem[] {
     const items: SectionPickerItem[] = [];
+    const currentSection = currentRow.section;
     if (currentSection !== null) items.push({ kind: "none" });
     const seen = new Set<string>();
     for (const r of rows) {
@@ -1017,10 +1022,71 @@ export function App({ onExit }: Props) {
       if (r.section === null || seen.has(r.section)) continue;
       seen.add(r.section);
       if (r.section === currentSection) continue;
+      // Stack-managed sections aren't manually joinable — they get
+      // their own explicit entry below.
+      if (r.sectionIsStack) continue;
       items.push({ kind: "section", name: r.section });
     }
+    // Stack-section action keyed off the cursor row's chain root.
+    // Already in a stack section → offer "× remove"; otherwise →
+    // "+ create" with a derived name from the root's slug/id.
+    const stackItem = buildStackSectionItem(currentRow);
+    if (stackItem) items.push(stackItem);
     items.push({ kind: "create" });
     return items;
+  }
+
+  /**
+   * Walk `stackedOn` from a slug up to a fixed point (chain root). The
+   * root is itself when no parent exists. Cycle-safe via `seen`.
+   */
+  function chainRootOf(slug: string): string | null {
+    let cur = slug;
+    const seen = new Set<string>();
+    while (!seen.has(cur)) {
+      seen.add(cur);
+      const r = rows.find((row) => row.wt.slug === cur);
+      if (!r) return null;
+      const parent = r.stackedOn?.slug;
+      if (!parent || parent === cur) return cur;
+      cur = parent;
+    }
+    return cur;
+  }
+
+  /**
+   * Section name derived from the root's Linear ID when available, or
+   * a short slug fallback. Keeps names stable across renames/refreshes
+   * (the rootSlug doesn't change).
+   */
+  function deriveStackSectionName(rootSlug: string): string {
+    const { id } = slugLabel(rootSlug);
+    if (id) return `stack: ${id.replace(/^[A-Z]+-/, "")}`;
+    const short = rootSlug.slice(0, 20);
+    return `stack: ${short}`;
+  }
+
+  function buildStackSectionItem(
+    currentRow: WorktreeRow,
+  ): SectionPickerItem | null {
+    const rootSlug = chainRootOf(currentRow.wt.slug);
+    if (!rootSlug) return null;
+    // Already in a stack section → its name is on `row.section` (the
+    // row aggregator computed the override). Offer to remove it.
+    if (currentRow.sectionIsStack && currentRow.section !== null) {
+      return {
+        kind: "stack",
+        mode: "remove",
+        name: currentRow.section,
+        rootSlug,
+      };
+    }
+    return {
+      kind: "stack",
+      mode: "create",
+      name: deriveStackSectionName(rootSlug),
+      rootSlug,
+    };
   }
 
   /**
@@ -1037,6 +1103,10 @@ export function App({ onExit }: Props) {
     if (!current) return;
     if (current.archived) {
       toast("archived rows don't reorder, use `a` to restore", theme.fgDim, 1500);
+      return;
+    }
+    if (current.sectionIsStack) {
+      toast("stack section is auto-managed", theme.fgDim, 1500);
       return;
     }
     if (filter) {
@@ -1076,6 +1146,12 @@ export function App({ onExit }: Props) {
       swapOrder(slug, target.wt.slug, current.section, bucket).catch((err) =>
         reportActionError("reorder", err),
       );
+      return;
+    }
+    // Refuse to move into a stack section — its membership is
+    // auto-derived from chain topology, not manual placement.
+    if (target.sectionIsStack) {
+      toast("can't move into a stack section", theme.fgDim, 1500);
       return;
     }
     // Cross-section: place at the edge of `target.section` adjacent to
@@ -1138,7 +1214,7 @@ export function App({ onExit }: Props) {
       toast("clear filter to set section", theme.warn, 1500);
       return;
     }
-    const items = buildSectionItems(current.section);
+    const items = buildSectionItems(current);
     // Default cursor: sticky last-move-target if it's still in the
     // list (and isn't the current section), else the first item.
     // The user's most common workflow is "move several rows into the
@@ -1180,6 +1256,23 @@ export function App({ onExit }: Props) {
       setModal(null);
       return;
     }
+    if (item.kind === "stack") {
+      if (item.mode === "create") {
+        addStackSection(item.name, item.rootSlug).then(
+          () => toast(`stack section: ${item.name}`, theme.ok, 2000),
+          (err) => reportActionError("stack section", err),
+        );
+      } else {
+        removeStackSection(item.name).then(
+          (removed) => {
+            if (removed) toast(`removed ${item.name}`, theme.info, 1500);
+          },
+          (err) => reportActionError("stack section", err),
+        );
+      }
+      setModal(null);
+      return;
+    }
     // "+ new section" — switch to input mode. Submission lives in the
     // keyboard handler.
     setModal((m) =>
@@ -1200,6 +1293,10 @@ export function App({ onExit }: Props) {
     }
     if (current.section === null) {
       toast("cursor is in (none), nothing to rename", theme.fgDim, 1500);
+      return;
+    }
+    if (current.sectionIsStack) {
+      toast("stack section name is auto-derived", theme.fgDim, 1500);
       return;
     }
     setPendingRename(current.section);
