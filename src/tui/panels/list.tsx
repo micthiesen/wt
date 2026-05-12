@@ -392,19 +392,17 @@ function Divider({
   // cells) so the rule doesn't bleed past the panel edge.
   const inner = Math.max(0, width - 4);
   if (variant === "stack") {
-    // Layout: `╔═` + ` label ` + `═══…═` + `═╗`. Fixed chrome is 4
-    // cells (2 per corner+rule pair); the label already carries its
-    // own padding spaces.
+    // Layout: `├═` + ` label ` + `═══…═`. Leading T-junction hints
+    // that the section is a branch point in the worktree tree.
     const labelStr = ` ${label} `;
-    const overhead = 2 + labelStr.length + 2;
+    const overhead = 2 + labelStr.length;
     const trailLen = Math.max(0, inner - overhead);
     const trail = "═".repeat(trailLen);
     return (
       <box flexDirection="row" paddingLeft={1} paddingRight={1}>
-        <text fg={theme.accentAlt}>╔═</text>
+        <text fg={theme.accentAlt}>├═</text>
         <text fg={theme.fg}>{labelStr}</text>
         <text fg={theme.accentAlt}>{trail}</text>
-        <text fg={theme.accentAlt}>═╗</text>
       </box>
     );
   }

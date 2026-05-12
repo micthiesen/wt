@@ -80,7 +80,7 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
         const prefix = isCreate
           ? "l"
           : isStack
-            ? "╔"
+            ? "├"
             : showDigit
               ? `${i + 1}`
               : " ";
