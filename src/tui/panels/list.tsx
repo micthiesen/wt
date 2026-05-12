@@ -392,15 +392,15 @@ function Divider({
   // cells) so the rule doesn't bleed past the panel edge.
   const inner = Math.max(0, width - 4);
   if (variant === "stack") {
-    // Layout: `├═` + ` label ` + `═══…═`. Leading T-junction hints
-    // that the section is a branch point in the worktree tree.
+    // Layout: `══` + ` label ` + `═══…═`. Same shape as the manual
+    // divider but with double-line rule chars in accentAlt.
     const labelStr = ` ${label} `;
     const overhead = 2 + labelStr.length;
     const trailLen = Math.max(0, inner - overhead);
     const trail = "═".repeat(trailLen);
     return (
       <box flexDirection="row" paddingLeft={1} paddingRight={1}>
-        <text fg={theme.accentAlt}>├═</text>
+        <text fg={theme.accentAlt}>══</text>
         <text fg={theme.fg}>{labelStr}</text>
         <text fg={theme.accentAlt}>{trail}</text>
       </box>
