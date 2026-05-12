@@ -4,6 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
+import { watchRegistry } from "../core/claude-registry.ts";
 import { reapClaudeNames } from "../core/claude-sessions.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
@@ -13,6 +14,7 @@ import { reapOrphanedSessions, WT_SOURCE_SLUG } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
+import { qk } from "../state/keys.ts";
 
 import { App, type TuiExit } from "./app.tsx";
 import { events } from "./events.ts";
@@ -76,6 +78,16 @@ export async function runTui(): Promise<TuiExit> {
 
   const wtClient = createWtQueryClient();
   const detachFetchLogs = attachFetchLogs(wtClient.client);
+  // fs-watch the claude session registry so the per-session "busy /
+  // idle" indicator in the claude row flips the instant claude rewrites
+  // its state file, without waiting for the 5s polling backstop on
+  // `claudeRegistryQuery`. Cheap: a single FSEvents subscription on the
+  // top-level dir, no recursion.
+  const stopRegistryWatch = watchRegistry(() => {
+    void wtClient.client.invalidateQueries({
+      queryKey: qk.claudeRegistry(),
+    });
+  });
   // Wait briefly for the SQLite cache to hydrate so the first paint
   // shows stale data instead of empty. If hydration takes longer than
   // the budget we render anyway and it'll swap in when ready. Reap
@@ -116,6 +128,7 @@ export async function runTui(): Promise<TuiExit> {
       void err;
     }
     detachFetchLogs();
+    stopRegistryWatch();
     setEventSink(null);
     wtClient.shutdown();
     // Detach from in-flight actions: close tails + done watchers so

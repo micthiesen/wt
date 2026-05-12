@@ -8,6 +8,7 @@ import { queryOptions } from "@tanstack/react-query";
 import { summarizeDiff, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
 import { readClaudeUsage, type ClaudeUsage } from "../core/claude-usage.ts";
+import { readRegistry, type RegistrySession } from "../core/claude-registry.ts";
 import { config } from "../core/config.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
@@ -223,6 +224,34 @@ export const claudeUsageQuery = () =>
     queryFn: async (): Promise<ClaudeUsage | null> => readClaudeUsage(),
     staleTime: 30_000,
     refetchInterval: 60_000,
+  });
+
+export type ClaudeRegistryData = {
+  /** Every live claude session on the machine, in readdir order. */
+  sessions: readonly RegistrySession[];
+  /** Indexed by deterministic UUID for wt-managed session lookups. */
+  bySessionId: Readonly<Record<string, RegistrySession>>;
+};
+
+/**
+ * Live registry of running claude processes. The source file is
+ * `~/.claude/sessions/<pid>.json`, rewritten by claude on every status
+ * transition + a slow heartbeat. fs.watch in the TUI runtime invalidates
+ * this query on file events for near-instant updates; the polling
+ * backstop catches anything FSEvents coalesces away and bounds staleness
+ * when the watcher isn't installed (CLI mode, watch setup failure).
+ */
+export const claudeRegistryQuery = () =>
+  queryOptions({
+    queryKey: qk.claudeRegistry(),
+    queryFn: async (): Promise<ClaudeRegistryData> => {
+      const sessions = readRegistry();
+      const bySessionId: Record<string, RegistrySession> = {};
+      for (const s of sessions) bySessionId[s.sessionId] = s;
+      return { sessions, bySessionId };
+    },
+    staleTime: 1_000,
+    refetchInterval: 5_000,
   });
 
 export const contributorsQuery = () =>

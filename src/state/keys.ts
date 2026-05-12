@@ -48,6 +48,13 @@ export const qk = {
    * per-worktree.
    */
   claudeUsage: () => ["claudeUsage"] as const,
+  /**
+   * Live registry of running claude processes from
+   * `~/.claude/sessions/<pid>.json`. Single global key; consumers
+   * filter by sessionId or cwd. Invalidated by fs.watch in the TUI
+   * runtime on every file event — polling is the slow backstop.
+   */
+  claudeRegistry: () => ["claudeRegistry"] as const,
   /** Per-worktree property namespace. */
   wt: (slug: string) =>
     ({

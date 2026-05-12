@@ -1,26 +1,39 @@
-import type { ClaudeStatus, SessionTail } from "../../core/claude.ts";
+import { useQuery } from "@tanstack/react-query";
+
+import { wtSessionUuid, type ClaudeStatus, type SessionTail } from "../../core/claude.ts";
+import type { RegistryStatus } from "../../core/claude-registry.ts";
 import { humanAge } from "../../core/locks.ts";
+import type { Worktree } from "../../core/types.ts";
+import { claudeRegistryQuery } from "../../state/queries.ts";
 import { useClaudeSessionsForSlug } from "../hooks/useActiveSessions.ts";
 import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 import type { RowModule } from "./types.ts";
 
 /**
- * Per-session derived state. The state machine is two signals — last
- * jsonl entry (from `SessionTail.lastEntryKind`) and tmux liveness for
- * `(slug, name)`. No heuristic age windows: a session "waiting" for a
- * week is still waiting; a session "working" silently for an hour is
- * still working as long as tmux holds it. Age is reported as a stat,
- * never as a state input.
+ * Per-session derived state. Two signals drive it:
  *
- *   - working   — tmux live + last entry is mid-turn (tool_use /
- *                 tool_result / paused). Claude is busy.
- *   - waiting   — tmux live + last entry is end_turn (or unrecognized).
- *                 Ready for input.
- *   - abandoned — tmux dead + last entry is mid-turn. Process died
- *                 without finishing — actionable, surfaces explicitly.
- *   - idle      — tmux dead + end_turn (or unclassified entry).
- *                 Resumable ghost; no live process.
+ *   1. The registry entry from `~/.claude/sessions/<pid>.json`
+ *      (authoritative when present — claude itself wrote it, fs.watch
+ *      makes us see the flip within FSEvents latency).
+ *   2. The jsonl tail (`SessionTail.lastEntryKind`) — fallback when no
+ *      claude process is running for this session, used to decide
+ *      whether a ghost was mid-turn (abandoned) or finished cleanly
+ *      (idle).
+ *
+ *   - working   — claude is alive and busy (or, with no registry entry,
+ *                 tmux is live and the jsonl ends mid-turn).
+ *   - waiting   — claude is alive and idle (or tmux is live with an
+ *                 end-of-turn jsonl).
+ *   - abandoned — no claude process and the jsonl ends mid-turn. The
+ *                 process died without finishing — actionable.
+ *   - idle      — no claude process, jsonl ended cleanly. Resumable
+ *                 ghost.
+ *
+ * No heuristic age windows. A session "waiting" for a week is still
+ * waiting; a session "working" silently for an hour is still working
+ * as long as claude itself reports busy. Age is reported as a stat,
+ * never as a state input.
  */
 type DerivedState = "working" | "waiting" | "abandoned" | "idle";
 
@@ -48,12 +61,22 @@ const STATE_FG: Record<DerivedState, string> = {
   idle: theme.fgDim,
 };
 
-function deriveState(tail: SessionTail, isLive: boolean): DerivedState {
+function deriveState(
+  tail: SessionTail,
+  isTmuxLive: boolean,
+  registryStatus: RegistryStatus | null,
+): DerivedState {
+  if (registryStatus !== null) {
+    // Claude is alive (the registry-load step filters dead pids) and
+    // told us what it's doing. Trust it over the tmux/jsonl proxy
+    // signals — those exist to compensate for not having this.
+    return registryStatus === "busy" ? "working" : "waiting";
+  }
   const midTurn =
     tail.lastEntryKind === "tool_use" ||
     tail.lastEntryKind === "tool_result" ||
     tail.lastEntryKind === "paused";
-  if (isLive) return midTurn ? "working" : "waiting";
+  if (isTmuxLive) return midTurn ? "working" : "waiting";
   return midTurn ? "abandoned" : "idle";
 }
 
@@ -63,22 +86,33 @@ function ageMsToText(ms: number): string {
 
 function ClaudeLine({
   data,
-  slug,
+  wt,
 }: {
   data: ClaudeStatus | undefined;
-  slug: string;
+  wt: Worktree;
 }) {
-  const liveNames = useClaudeSessionsForSlug(slug);
+  const liveNames = useClaudeSessionsForSlug(wt.slug);
+  const registry = useQuery(claudeRegistryQuery());
 
   if (!data || data.sessions.length === 0) {
     return <text fg={theme.fgDim}>—</text>;
   }
 
   const liveSet = new Set(liveNames);
-  const derived = data.sessions.map((tail) => ({
-    tail,
-    state: deriveState(tail, liveSet.has(tail.name)),
-  }));
+  const bySessionId = registry.data?.bySessionId;
+  const derived = data.sessions.map((tail) => {
+    // wt-managed sessions key the registry by their deterministic
+    // UUID — same function the spawn path uses, so the lookup
+    // matches every session wt itself launched. Non-wt-managed
+    // claude processes in the same cwd land outside this map and
+    // fall back to the jsonl signal.
+    const uuid = wtSessionUuid(wt.path, tail.name);
+    const reg = bySessionId?.[uuid] ?? null;
+    return {
+      tail,
+      state: deriveState(tail, liveSet.has(tail.name), reg?.status ?? null),
+    };
+  });
   const counts: Record<DerivedState, number> = {
     working: 0,
     waiting: 0,
@@ -142,6 +176,6 @@ export const claudeRow: RowModule = {
   label: "claude",
   sources: ({ row }) => [row.fields.claude],
   render: ({ row }) => (
-    <ClaudeLine data={row.fields.claude.data} slug={row.wt.slug} />
+    <ClaudeLine data={row.fields.claude.data} wt={row.wt} />
   ),
 };
