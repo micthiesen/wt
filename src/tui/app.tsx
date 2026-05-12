@@ -3490,6 +3490,11 @@ export function App({ onExit }: Props) {
           activeTails={activeTails}
           activeActions={activeActions}
           claudeSessionsBySlug={claudeSessionsBySlug}
+          chainHighlight={
+            modal?.kind === "stackActions" && current
+              ? chainOf(buildStackRows(), current.wt.slug)
+              : null
+          }
           isLoading={isLoading}
           filter={filter}
         />

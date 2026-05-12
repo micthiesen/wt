@@ -3,6 +3,13 @@ export const theme = {
   bg: "#1b1d23",
   bgAlt: "#23262e",
   rowSelectedBg: "#3b4252",
+  /**
+   * Subtler blue tint used to highlight every worktree in the current
+   * row's stack chain while the `b` (stack) modal is open. Dim enough
+   * to coexist with the selection bg on the cursor row without
+   * competing, distinct enough that the chain reads as a group.
+   */
+  rowChainBg: "#2c3a4a",
   border: "#3b4252",
   borderDim: "#2e3440",
   fg: "#d8dee9",

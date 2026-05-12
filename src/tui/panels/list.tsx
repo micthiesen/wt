@@ -32,6 +32,12 @@ type Props = {
    *  count of names. Distinct slot from `activeActions` so a running
    *  action and a live session can show side-by-side. */
   claudeSessionsBySlug: ReadonlyMap<string, ReadonlyArray<string | null>>;
+  /**
+   * Slugs to tint with the chain-highlight bg. Populated while the
+   * stack chord (`b`) modal is open with the chain containing the
+   * current row; null otherwise.
+   */
+  chainHighlight: ReadonlySet<string> | null;
   isLoading: boolean;
   filter: string;
 };
@@ -188,6 +194,7 @@ const RowView = memo(function RowView({
   sessionCount,
   panelWidth,
   stackParentAbove,
+  chainHighlighted,
 }: {
   row: WorktreeRow;
   selected: boolean;
@@ -207,8 +214,18 @@ const RowView = memo(function RowView({
    * the badge cluster stays aligned with rows that show the PR icon.
    */
   stackParentAbove: boolean;
+  /**
+   * True when this row belongs to the chain highlighted by an open
+   * stack chord. Renders a muted blue bg; selection bg still wins on
+   * the cursor row, archived rows opt out (consistent dim treatment).
+   */
+  chainHighlighted: boolean;
 }) {
-  const bg = selected ? theme.rowSelectedBg : undefined;
+  const bg = selected
+    ? theme.rowSelectedBg
+    : chainHighlighted && !row.archived
+      ? theme.rowChainBg
+      : undefined;
   // Archived rows render dim (unless selected, where we still want
   // contrast). Badges also render dim so the eye skips over them.
   const slugFg = row.archived
@@ -372,7 +389,7 @@ function Divider({ label, width }: { label: string; width: number }) {
   );
 }
 
-export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, isLoading, filter }: Props) {
+export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, chainHighlight, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -450,6 +467,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                   sessionCount={claudeSessionsBySlug.get(row.wt.slug)?.length ?? 0}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
+                  chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}
                 />
               </Fragment>
             );
@@ -475,6 +493,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                     sessionCount={claudeSessionsBySlug.get(row.wt.slug)?.length ?? 0}
                     panelWidth={width}
                     stackParentAbove={false}
+                    chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}
                   />
                 );
               })}
