@@ -375,9 +375,9 @@ const RowView = memo(function RowView({
 
 /**
  * Section divider. The `stack` variant signals an auto-managed
- * stack section: double-line rule chars, bluer accent color, a
- * leading stack glyph, and a trailing glyph on the right edge so
- * the eye picks up the difference at a glance.
+ * stack section: double-line rule chars with `╔═ … ═╗` corner
+ * brackets in the accentAlt color, so the section reads as an
+ * enclosed structural block rather than a plain rule.
  */
 function Divider({
   label,
@@ -392,19 +392,19 @@ function Divider({
   // cells) so the rule doesn't bleed past the panel edge.
   const inner = Math.max(0, width - 4);
   if (variant === "stack") {
-    // Reserve cells for: leading glyph (2) + spaces around label + label
-    // + trail rule + trailing glyph (2). 6 fixed cells of chrome plus
-    // the label string itself.
+    // Layout: `╔═` + ` label ` + `═══…═` + `═╗`. Fixed chrome is 4
+    // cells (2 per corner+rule pair); the label already carries its
+    // own padding spaces.
     const labelStr = ` ${label} `;
     const overhead = 2 + labelStr.length + 2;
     const trailLen = Math.max(0, inner - overhead);
     const trail = "═".repeat(trailLen);
     return (
       <box flexDirection="row" paddingLeft={1} paddingRight={1}>
-        <text fg={theme.accentAlt}>{`${NF.stack} `}</text>
+        <text fg={theme.accentAlt}>╔═</text>
         <text fg={theme.fg}>{labelStr}</text>
         <text fg={theme.accentAlt}>{trail}</text>
-        <text fg={theme.accentAlt}>{` ${NF.stack}`}</text>
+        <text fg={theme.accentAlt}>═╗</text>
       </box>
     );
   }

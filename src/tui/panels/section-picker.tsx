@@ -1,4 +1,3 @@
-import { NF } from "../icons.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
@@ -81,7 +80,7 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
         const prefix = isCreate
           ? "l"
           : isStack
-            ? NF.stack
+            ? "╔"
             : showDigit
               ? `${i + 1}`
               : " ";
