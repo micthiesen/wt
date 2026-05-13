@@ -87,13 +87,6 @@ const SUFFIX: Record<Exclude<SessionKind, "claude">, string> = {
   action: "-action",
 };
 
-/** Kinds backed by an AI harness. F12 / `;` route through the harness layer. */
-const AI_KINDS: ReadonlySet<SessionKind> = new Set([
-  "claude",
-  "codex",
-  "opencode",
-]);
-
 function harnessIdForKind(kind: SessionKind): HarnessId | null {
   if (kind === "claude" || kind === "codex" || kind === "opencode") return kind;
   return null;
@@ -110,19 +103,19 @@ function harnessIdForKind(kind: SessionKind): HarnessId | null {
  */
 const CLAUDE_NAMED_SEP = "~";
 
+/**
+ * Tmux session name for a (slug, kind, managedName). Claude has a
+ * primary-vs-named distinction encoded in the name (`<slug>` vs
+ * `<slug>~<name>`); every other kind uses a single fixed suffix
+ * (`<slug>-<suffix>`). Codex / OpenCode are single-tmux-per-slug for
+ * v1 — `managedName` is ignored for those.
+ */
 function sessionName(
   slug: string,
   kind: SessionKind,
   managedName: string | null = null,
 ): string {
   if (kind === "claude") return claudeSessionName(slug, managedName);
-  if (kind === "codex" || kind === "opencode") {
-    // Codex / OpenCode are single-tmux-per-slug for v1: tmux name is
-    // `<slug>-codex` / `<slug>-opencode` regardless of which resume id
-    // the inner program is running. Switching ids requires killing
-    // and respawning the tmux session.
-    return `${slug}${SUFFIX[kind]}`;
-  }
   return `${slug}${SUFFIX[kind]}`;
 }
 
@@ -152,17 +145,19 @@ function shQuote(s: string): string {
  *
  * A `~` in the name unambiguously marks a named claude session: the
  * slug is everything before the rightmost `~`. The kind suffix
- * (`-diff` / `-shell` / `-action`) is only a possibility for names
- * that have NO `~`, since named claudes are claude-only and never
- * carry a kind suffix.
+ * (`-codex` / `-opencode` / `-diff` / `-shell` / `-action`) is only
+ * a possibility for names that have NO `~`, since named claudes are
+ * claude-only and never carry a kind suffix.
  *
- * Pre-existing collision: a slug ending in `-diff` / `-shell` /
- * `-action` (which `slugify` will produce from a description like
- * "Add shell") makes its primary claude session indistinguishable
- * from a same-namespace `<bare>-shell` session in tmux. The ordering
- * here doesn't fix that — the only fixes are slug-level validation
- * or moving kinds to a separator that can't appear in slugs. Out of
- * scope for the named-claude rollout; flagged for a future sweep.
+ * Pre-existing collision: a slug ending in any of the kind suffixes
+ * (a description like "Add codex" or a branch like `eng-1234-codex`
+ * slugifies into one) makes its primary claude session
+ * indistinguishable from a same-namespace `<bare>-codex` session in
+ * tmux. `-codex` and `-opencode` make this materially riskier than
+ * the old `-diff`/`-shell` collisions because AI harness names are
+ * plausible branch-description words. The only proper fixes are
+ * slug-level validation or moving kinds to a separator that can't
+ * appear in slugs. Out of scope here; flagged for a future sweep.
  */
 function bareSlug(name: string): string {
   // Strip a trailing `~<name>` if present (claude named, or any

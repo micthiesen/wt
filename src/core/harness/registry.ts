@@ -26,25 +26,3 @@ export function getHarness(id: HarnessId): Harness {
   if (!h) throw new Error(`unknown harness id: ${id}`);
   return h;
 }
-
-/**
- * Identify which harness owns a tmux session name (if any) for the
- * given slug. Walks impls in registration order and returns the first
- * match. Used by the tmux lister + reaper so harness-aware code can
- * route per-harness session names back to the right impl.
- */
-export function detectHarnessFromTmuxName(
-  name: string,
-  slug: string,
-): HarnessId | null {
-  // Claude is special: its primary name is the bare slug, which would
-  // also match an unrelated session name by accident. Check it via
-  // the slug-aware infix rules in claudeHarness first.
-  // Order: codex/opencode have unambiguous `-<id>~` infix, claude is
-  // anything else that matches slug or slug~.
-  if (name.startsWith(`${slug}-codex~`)) return "codex";
-  if (name.startsWith(`${slug}-opencode~`)) return "opencode";
-  if (name === slug) return "claude";
-  if (name.startsWith(`${slug}~`)) return "claude";
-  return null;
-}

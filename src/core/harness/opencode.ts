@@ -6,13 +6,15 @@
  *
  * Resume: `opencode -s <ses_…>`. Fresh: `opencode` (no args).
  *
- * Tmux session naming follows the codex pattern: `<slug>-opencode~<id>`
- * per session. The id is the first 8 visible chars of the opencode
- * session id (after the `ses_` prefix) so multiple concurrent opencode
- * sessions on the same slug get distinct tmux names.
+ * Tmux session naming: single slot per slug (`<slug>-opencode`) for
+ * v1. Switching opencode sessions on the same worktree requires
+ * detaching and respawning; multi-tmux-per-slug is a followup.
  *
- * We open the SQLite DB read-only so concurrent reads with opencode
- * itself can't conflict. The handle is module-scoped so repeated
+ * We open the SQLite DB read-only so we never hold a write lock; a
+ * read racing an opencode write under DELETE journal would surface as
+ * `SQLITE_BUSY` and fall into the `catch` returning []. OpenCode
+ * currently uses WAL, which lets concurrent reads succeed without the
+ * busy fallback. The handle is module-scoped so repeated
  * discoverSessions calls don't pay the file-open cost.
  */
 import { existsSync } from "node:fs";
@@ -67,7 +69,7 @@ export const opencodeHarness: Harness = {
     return `${slug}${OPENCODE_TMUX_INFIX}`;
   },
 
-  async discoverSessions({ slug, wtPath, liveTmuxNames }) {
+  async discoverSessions({ slug, wtPath }) {
     const db = openDb();
     if (!db) return [];
     let rows: Array<{ id: string; title: string; time_updated: number }>;
@@ -85,7 +87,6 @@ export const opencodeHarness: Harness = {
       return [];
     }
     const tmuxName = `${slug}${OPENCODE_TMUX_INFIX}`;
-    const isLive = liveTmuxNames.has(tmuxName);
     const out: HarnessSession[] = rows.map((row) => ({
       displayName: row.title || row.id.slice(0, 8),
       sessionId: row.id,
@@ -93,7 +94,8 @@ export const opencodeHarness: Harness = {
       // SQLite stores time_updated as ms-since-epoch (per opencode
       // schema). Use directly.
       lastActiveMs: row.time_updated,
-      isLive,
+      // `useHarnessSessions` re-annotates against the live tmux set.
+      isLive: false,
       extras: { managedName: null, derivedState: null, queued: 0 },
     }));
     return out;

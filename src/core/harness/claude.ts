@@ -67,14 +67,9 @@ export const claudeHarness: Harness = {
     return claudeTmuxName(slug, managedName);
   },
 
-  async discoverSessions({ slug, wtPath, liveTmuxNames }) {
+  async discoverSessions({ slug, wtPath }) {
     const status = await claudeStatus({ slug, path: wtPath });
     const tailByName = new Map(status.sessions.map((t) => [t.name, t]));
-    const liveNames: Array<string | null> = [];
-    for (const n of liveTmuxNames) {
-      const parsed = parseClaudeTmuxName(n, slug);
-      if (parsed.matches) liveNames.push(parsed.managedName);
-    }
     const registryStatusBySessionId: Record<string, "busy" | "idle"> = {};
     for (const r of readRegistry()) {
       registryStatusBySessionId[r.sessionId] = r.status;
@@ -82,7 +77,12 @@ export const claudeHarness: Harness = {
     const entries = buildClaudeSessionEntries({
       slug,
       wtPath,
-      liveNames,
+      // Liveness is computed in `useHarnessSessions` from the live
+      // tmux name set, not here. Passing an empty list means
+      // `buildClaudeSessionEntries` won't add tmux-live-but-not-
+      // persisted ghost names — see the gap noted on
+      // `Harness.discoverSessions`.
+      liveNames: [],
       tailByName,
       registryStatusBySessionId,
       // Summaries are merged in by the consumer (sessions picker) via
@@ -96,7 +96,9 @@ export const claudeHarness: Harness = {
       sessionId: e.sessionId,
       tmuxSessionName: claudeTmuxName(slug, e.name),
       lastActiveMs: e.lastEntryMs,
-      isLive: e.isLive,
+      // Always false here; `useHarnessSessions` re-annotates against
+      // the live tmux name set.
+      isLive: false,
       extras: {
         managedName: e.name,
         derivedState: e.state,
@@ -129,10 +131,12 @@ export const claudeHarness: Harness = {
 /**
  * Parse a tmux session name and decide whether it represents a Claude
  * session for `slug`. Claude uses `<slug>` for primary and
- * `<slug>~<name>` for named. Other harnesses carry a `-codex` /
- * `-opencode` suffix before any `~`, so this returns `matches: false`
- * for them. Non-claude kinds (`-diff`, `-shell`, `-action`) likewise
- * fail to match — they don't end with a tilde infix.
+ * `<slug>~<name>` for named. The `startsWith(`${slug}~`)` guard
+ * excludes other harnesses' tmux names (`<slug>-codex`, etc.) and
+ * non-AI kinds (`<slug>-diff`, `-shell`, `-action`) — none of those
+ * carry a `~` separator, so any name that starts with `<slug>~` is
+ * unambiguously a named claude session. `validateSessionName` allows
+ * hyphens in the managed portion, so we don't filter on hyphens here.
  */
 export function parseClaudeTmuxName(
   name: string,
@@ -140,9 +144,7 @@ export function parseClaudeTmuxName(
 ): { matches: boolean; managedName: string | null } {
   if (name === slug) return { matches: true, managedName: null };
   if (name.startsWith(`${slug}~`)) {
-    const managed = name.slice(slug.length + 1);
-    if (managed.includes("-")) return { matches: false, managedName: null };
-    return { matches: true, managedName: managed };
+    return { matches: true, managedName: name.slice(slug.length + 1) };
   }
   return { matches: false, managedName: null };
 }

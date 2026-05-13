@@ -43,16 +43,19 @@ type Props = {
   /** Slugs with an in-flight `claude -p` action. Renders the comment
    *  glyph in the badge cluster while running. */
   activeActions: ReadonlySet<string>;
-  /** Per-slug list of live interactive claude session names (`null`
-   *  = primary). The list panel renders a circled digit per row =
-   *  count of names. Distinct slot from `activeActions` so a running
-   *  action and a live session can show side-by-side. */
-  claudeSessionsBySlug: ReadonlyMap<string, ReadonlyArray<string | null>>;
+  /** Per-slug count of live AI tmux sessions across every harness
+   *  (claude primary + each claude named + codex + opencode). The
+   *  list panel renders a circled digit per row = this count.
+   *  Distinct slot from `activeActions` so a running action and a
+   *  live session can show side-by-side. */
+  aiSessionCountBySlug: ReadonlyMap<string, number>;
   /**
    * Aggregate per-slug claude state. Absent when the slug has no
-   * sessions; when present, drives the session-count glyph color so
-   * a busy worktree pops in the list (accent) vs an idle one (the
-   * default warn/orange tint).
+   * claude sessions; when present, drives the session-count glyph
+   * color so a busy worktree pops in the list (accent) vs an idle
+   * one (the default warn/orange tint). Non-claude harnesses don't
+   * contribute (no busy/idle registry yet); a slug with only a live
+   * codex/opencode shows the count glyph in the dim default color.
    */
   claudeAggStateBySlug: ReadonlyMap<string, DerivedState>;
   /**
@@ -541,7 +544,7 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, claudeAggStateBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
+export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiSessionCountBySlug, claudeAggStateBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -640,7 +643,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                   selected={i === selectedIndex}
                   isTailing={activeTails.has(row.wt.slug)}
                   actionRunning={activeActions.has(row.wt.slug)}
-                  sessionCount={claudeSessionsBySlug.get(row.wt.slug)?.length ?? 0}
+                  sessionCount={aiSessionCountBySlug.get(row.wt.slug) ?? 0}
                   sessionAggState={claudeAggStateBySlug.get(row.wt.slug)}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
@@ -685,7 +688,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
                     actionRunning={activeActions.has(row.wt.slug)}
-                    sessionCount={claudeSessionsBySlug.get(row.wt.slug)?.length ?? 0}
+                    sessionCount={aiSessionCountBySlug.get(row.wt.slug) ?? 0}
                     sessionAggState={claudeAggStateBySlug.get(row.wt.slug)}
                     panelWidth={width}
                     stackParentAbove={false}

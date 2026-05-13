@@ -52,15 +52,14 @@ import {
   claudeSessionName,
   diffCommandUsesBase,
   killAllSessionsFor,
-  killClaudeNamedSession,
   killDiffSession,
-  killSession,
+  killHarnessSession,
   killShellSession,
   type SessionKind,
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
-import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
+import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, tmuxSessionsQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
 import { wtSessionUuid } from "../core/claude.ts";
 import { deriveSessionState, pickAggregateState, type DerivedState } from "../core/claude-status.ts";
@@ -801,9 +800,31 @@ export function App({ onExit }: Props) {
   // not currently viewing.
   const activeActions = useActiveActions();
   // Per-slug list of live claude session names (`null` = primary).
-  // Drives the tail-registry reconcile, the sessions picker, the
-  // count badge in the row list, and the auto-output focus rule.
+  // Drives the tail-registry reconcile, the sessions picker, and the
+  // auto-output focus rule. The list-pane count badge uses
+  // `aiSessionCountBySlug` below so codex / opencode liveness also
+  // lights up the indicator.
   const claudeSessionsBySlug = useClaudeSessionsBySlug();
+  // Per-slug total count of live AI tmux sessions across every
+  // harness: claude (primary + each named) + codex (single slot) +
+  // opencode (single slot). Drives the count glyph in the list pane.
+  // Aggregate state derivation (working/waiting/etc.) stays claude-
+  // only via `claudeAggStateBySlug`; non-claude harnesses don't
+  // expose busy/idle yet so they contribute only to the count.
+  const tmuxSessionsData = useQuery(tmuxSessionsQuery()).data;
+  const aiSessionCountBySlug = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const [slug, names] of claudeSessionsBySlug) {
+      map.set(slug, names.length);
+    }
+    for (const slug of tmuxSessionsData?.codex ?? []) {
+      map.set(slug, (map.get(slug) ?? 0) + 1);
+    }
+    for (const slug of tmuxSessionsData?.opencode ?? []) {
+      map.set(slug, (map.get(slug) ?? 0) + 1);
+    }
+    return map;
+  }, [claudeSessionsBySlug, tmuxSessionsData?.codex, tmuxSessionsData?.opencode]);
   // Live claude process registry — feeds the picker's per-session
   // state (busy/idle), the row's status, and the list pane glyph
   // tint via `claudeAggStateBySlug` below.
@@ -1771,13 +1792,16 @@ export function App({ onExit }: Props) {
     }
     void (async () => {
       try {
-        if (name === null) {
-          await killSession(slug);
-          appLog.event.warn(`killed primary claude session on ${slug}`);
-        } else {
-          await killClaudeNamedSession(slug, name);
-          appLog.event.warn(`killed claude session "${name}" on ${slug}`);
-        }
+        // killHarnessSession routes both primary (`name === null`)
+        // and named claude sessions through the same call — same
+        // implementation as the legacy `killSession` /
+        // `killClaudeNamedSession` pair, one source of truth.
+        await killHarnessSession(slug, "claude", name);
+        appLog.event.warn(
+          name === null
+            ? `killed primary claude session on ${slug}`
+            : `killed claude session "${name}" on ${slug}`,
+        );
         void refreshTmuxSessions();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -2857,18 +2881,26 @@ export function App({ onExit }: Props) {
           } else {
             // Codex / opencode kill via tmux name (live only). Dead
             // sessions are owned by the harness's own store and we
-            // don't write there.
+            // don't write there — surface that as a toast so `d`
+            // doesn't read as a silent no-op (the picker dismisses
+            // either way; without the toast the user can't tell
+            // whether the kill landed or nothing happened).
             if (e.isLive) {
               void (async () => {
-                const { killHarnessSession } = await import("../core/tmux.ts");
                 await killHarnessSession(slug, e.harnessId);
                 void refreshTmuxSessions();
                 appLog.event.warn(
                   `killed ${getHarness(e.harnessId).label} session on ${slug}`,
                 );
               })();
+              setModal(null);
+            } else {
+              toast(
+                `${getHarness(e.harnessId).label} session is dead; remove via ${e.harnessId} CLI`,
+                theme.fgDim,
+                2000,
+              );
             }
-            setModal(null);
           }
         }
         return;
@@ -4064,7 +4096,7 @@ export function App({ onExit }: Props) {
           width={listWidth}
           activeTails={activeTails}
           activeActions={activeActions}
-          claudeSessionsBySlug={claudeSessionsBySlug}
+          aiSessionCountBySlug={aiSessionCountBySlug}
           claudeAggStateBySlug={claudeAggStateBySlug}
           chainHighlight={
             modal?.kind === "stackActions" && current

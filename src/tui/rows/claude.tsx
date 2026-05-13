@@ -67,10 +67,11 @@ function AiLine({ wt }: { wt: Worktree }) {
 export const claudeRow: RowModule = {
   id: "claude",
   label: "ai",
-  // The legacy fields.claude is still wired through for back-compat
-  // but unused here. We could drop it from `sources` once nothing
-  // else reads it, but pulling the dependency now would force a sync
-  // change to `useWorktreeRows` for no behavior gain.
-  sources: ({ row }) => [row.fields.claude],
+  // No `sources`: the row pulls its data from `useHarnessSessions` /
+  // `usePrimaryHarness` inside `AiLine`, not from the row aggregator's
+  // `fields` channel. Tying the row's staleness glyph to the legacy
+  // `fields.claude` (which only knows about Claude jsonl tails) would
+  // misrepresent codex/opencode-only worktrees, so it stays unset
+  // until the harness queries plumb in their own staleness signal.
   render: ({ row }) => <AiLine wt={row.wt} />,
 };

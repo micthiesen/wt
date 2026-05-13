@@ -3,11 +3,7 @@ export {
   readPrimaryHarness,
   writePrimaryHarness,
 } from "./primary.ts";
-export {
-  detectHarnessFromTmuxName,
-  getHarness,
-  HARNESSES,
-} from "./registry.ts";
+export { getHarness, HARNESSES } from "./registry.ts";
 export type {
   Harness,
   HarnessExtras,

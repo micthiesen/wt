@@ -61,7 +61,7 @@ const SECTIONS: Section[] = [
       ["⇧F12", "harness picker (one-off spawn)"],
       ["TAB", "cycle primary harness (top-right)"],
       [";", "sessions picker (all harnesses for current row)"],
-      ["; c / o / x", "jump to + new claude / opencode / codex"],
+      ["; c / x / o", "jump to + new claude / codex / opencode"],
       ["; d", "kill highlighted session"],
       ["d", "remove worktree"],
     ],

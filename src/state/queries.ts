@@ -197,15 +197,7 @@ export const harnessSessionsQuery = (
     queryKey: qk.harnessSessions(harnessId, slug),
     queryFn: async (): Promise<HarnessSession[]> => {
       const harness = getHarness(harnessId);
-      return harness.discoverSessions({
-        slug,
-        wtPath,
-        // The cache value strips liveness; the consumer hook re-flags
-        // each entry against the current tmux name set. Pass an empty
-        // set so impls that try to read it see "nothing live yet";
-        // they're allowed to also include dead entries.
-        liveTmuxNames: new Set<string>(),
-      });
+      return harness.discoverSessions({ slug, wtPath });
     },
     staleTime: STALE.fast,
     enabled: wtPath !== "",

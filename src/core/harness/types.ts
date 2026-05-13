@@ -101,13 +101,21 @@ export interface Harness {
 
   /**
    * Discover every session this harness knows about for the given
-   * worktree — live (tmux) and dead (on-disk only). Caller passes the
-   * live tmux name set so impls can flag liveness with one pass.
+   * worktree. Liveness is NOT decided here — the impl returns
+   * `isLive: false` for every entry and `useHarnessSessions`
+   * re-annotates against the current tmux name set. Decoupling
+   * liveness from discovery means the discovery query can cache on
+   * `(harnessId, slug)` without invalidating on every 2s tmux poll.
+   *
+   * Known gap: a session that is live in tmux but absent from the
+   * impl's on-disk store (e.g. a hypothetical hand-renamed tmux
+   * session, or a spawn whose persistence write failed) won't appear
+   * in the picker. The spawn flows persist before attaching, so this
+   * is unreachable in practice; flagging here for the future.
    */
   discoverSessions(opts: {
     slug: string;
     wtPath: string;
-    liveTmuxNames: ReadonlySet<string>;
   }): Promise<HarnessSession[]>;
 
   /** Inner argv to launch (or resume) a session. Spliced into tmux new-session. */

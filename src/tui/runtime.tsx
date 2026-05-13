@@ -5,7 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
-import { HARNESSES } from "../core/harness/index.ts";
+import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
@@ -151,7 +151,6 @@ export async function runTui(): Promise<TuiExit> {
     // SQLite handle is the only one today). No-op for harnesses
     // without persistent handles.
     try {
-      const { closeOpencodeDb } = await import("../core/harness/index.ts");
       closeOpencodeDb();
     } catch (err) {
       void err;

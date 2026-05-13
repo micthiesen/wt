@@ -8,13 +8,19 @@
  * Resume: `codex resume <uuid>`. Fresh: `codex` (no args). Codex
  * generates the new session id itself; we never specify one.
  *
- * Tmux session naming: `<slug>-codex~<short-id>` per session, so
- * multiple concurrent codex sessions on the same slug get distinct
- * tmux names. The short-id is the first 8 chars of the UUID — long
- * enough to be unique in practice for any reasonable session count
- * per worktree, short enough to keep the tmux name readable.
+ * Tmux session naming: single slot per slug (`<slug>-codex`) for v1.
+ * Switching codex sessions on the same worktree requires detaching
+ * and respawning; multi-tmux-per-slug is a followup.
  */
-import { existsSync, readdirSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -53,16 +59,13 @@ export const codexHarness: Harness = {
     return `${slug}${CODEX_TMUX_INFIX}`;
   },
 
-  async discoverSessions({ slug, wtPath, liveTmuxNames }) {
+  async discoverSessions({ slug, wtPath }) {
     const titles = readSessionIndex();
     const rollouts = scanRollouts(wtPath);
     // Single-tmux-per-slug for v1: every codex session reports the
-    // bare `<slug>-codex` tmux name. The user can only have one codex
-    // tmux session live per slug; switching ids happens by detaching
-    // and respawning. isLive reflects whether that single slot is
-    // currently occupied — all sessions on the slug share liveness.
+    // bare `<slug>-codex` tmux name. `useHarnessSessions` re-annotates
+    // `isLive` against the current tmux name set; here we set false.
     const tmuxName = `${slug}${CODEX_TMUX_INFIX}`;
-    const isLive = liveTmuxNames.has(tmuxName);
     const out: HarnessSession[] = [];
     for (const r of rollouts) {
       const title = titles.get(r.sessionId) ?? r.sessionId.slice(0, 8);
@@ -71,7 +74,7 @@ export const codexHarness: Harness = {
         sessionId: r.sessionId,
         tmuxSessionName: tmuxName,
         lastActiveMs: r.mtimeMs,
-        isLive,
+        isLive: false,
         extras: { managedName: null, derivedState: null, queued: 0 },
       });
     }
@@ -173,12 +176,12 @@ function readRolloutMeta(path: string): RolloutMeta | null {
   // lines are big (full system prompt embedded) — 32 KB is plenty.
   let buf: Uint8Array;
   try {
-    const fd = require("node:fs").openSync(path, "r");
+    const fd = openSync(path, "r");
     try {
       buf = new Uint8Array(Math.min(stat.size, 64 * 1024));
-      require("node:fs").readSync(fd, buf, 0, buf.length, 0);
+      readSync(fd, buf, 0, buf.length, 0);
     } finally {
-      require("node:fs").closeSync(fd);
+      closeSync(fd);
     }
   } catch {
     return null;
@@ -211,7 +214,7 @@ function readSessionIndex(): Map<string, string> {
   if (!existsSync(CODEX_SESSION_INDEX)) return out;
   let raw: string;
   try {
-    raw = require("node:fs").readFileSync(CODEX_SESSION_INDEX, "utf8");
+    raw = readFileSync(CODEX_SESSION_INDEX, "utf8");
   } catch (err) {
     log.warn("read session_index.jsonl failed", { err: String(err) });
     return out;

@@ -105,9 +105,12 @@ export function SessionsPickerList({
       title={`sessions · ${slug}`}
       inset={{ top: "8%", bottom: "8%" }}
       hints={[
-        ["j/k", "move"],
+        ["j/k ↑↓", "move"],
         ["1-9", "quick pick"],
-        ["c / o / x", "new …"],
+        // Letter order follows HARNESSES registry order (which also
+        // controls the rendered row order for the "+ new" affordances)
+        // so the hint reads top-to-bottom.
+        [HARNESSES.map((h) => h.letter).join(" / "), "new …"],
         ["d", "kill"],
         ["; / ⏎", "select"],
         ["esc / q", "cancel"],
