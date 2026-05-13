@@ -805,26 +805,29 @@ export function App({ onExit }: Props) {
   // `aiSessionCountBySlug` below so codex / opencode liveness also
   // lights up the indicator.
   const claudeSessionsBySlug = useClaudeSessionsBySlug();
-  // Per-slug total count of live AI tmux sessions across every
-  // harness: claude (primary + each named) + codex (single slot) +
-  // opencode (single slot). Drives the count glyph in the list pane.
-  // Aggregate state derivation (working/waiting/etc.) stays claude-
-  // only via `claudeAggStateBySlug`; non-claude harnesses don't
-  // expose busy/idle yet so they contribute only to the count.
+  // Per-slug first-match live harness in HARNESSES order (claude >
+  // codex > opencode). Drives the harness-glyph badge in the list
+  // pane: only shown when at least one live session exists, tinted
+  // with that harness's own color.
   const tmuxSessionsData = useQuery(tmuxSessionsQuery()).data;
-  const aiSessionCountBySlug = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const [slug, names] of claudeSessionsBySlug) {
-      map.set(slug, names.length);
-    }
-    for (const slug of tmuxSessionsData?.codex ?? []) {
-      map.set(slug, (map.get(slug) ?? 0) + 1);
-    }
-    for (const slug of tmuxSessionsData?.opencode ?? []) {
-      map.set(slug, (map.get(slug) ?? 0) + 1);
+  const aiLiveHarnessBySlug = useMemo(() => {
+    const map = new Map<string, HarnessId>();
+    // Iterate in HARNESSES order so the first live match wins.
+    for (const h of HARNESSES) {
+      let slugs: Iterable<string>;
+      if (h.id === "claude") {
+        slugs = tmuxSessionsData?.claudeSlugs ?? [];
+      } else if (h.id === "codex") {
+        slugs = tmuxSessionsData?.codex ?? [];
+      } else {
+        slugs = tmuxSessionsData?.opencode ?? [];
+      }
+      for (const slug of slugs) {
+        if (!map.has(slug)) map.set(slug, h.id);
+      }
     }
     return map;
-  }, [claudeSessionsBySlug, tmuxSessionsData?.codex, tmuxSessionsData?.opencode]);
+  }, [tmuxSessionsData?.claudeSlugs, tmuxSessionsData?.codex, tmuxSessionsData?.opencode]);
   // Live claude process registry — feeds the picker's per-session
   // state (busy/idle), the row's status, and the list pane glyph
   // tint via `claudeAggStateBySlug` below.
@@ -876,28 +879,6 @@ export function App({ onExit }: Props) {
     return m;
   }, [summariesQuery.data]);
 
-  // Per-slug aggregate claude state for the list pane's session
-  // count glyph tint. Same registry + tail signals the row uses,
-  // collapsed to one state per slug via `pickAggregateState`. Idle
-  // slugs (no live sessions) drop out — the glyph isn't rendered
-  // for them anyway.
-  const claudeAggStateBySlug = useMemo(() => {
-    const map = new Map<string, DerivedState>();
-    const bySessionId = claudeRegistry.data?.bySessionId;
-    for (const row of rows) {
-      const tails = row.fields.claude.data?.sessions ?? [];
-      if (tails.length === 0) continue;
-      const liveSet = new Set(claudeSessionsBySlug.get(row.wt.slug) ?? []);
-      const states: DerivedState[] = tails.map((tail) => {
-        const uuid = wtSessionUuid(row.wt.path, tail.name);
-        const reg = bySessionId?.[uuid];
-        return deriveSessionState(tail, liveSet.has(tail.name), reg?.status ?? null);
-      });
-      const agg = pickAggregateState(states);
-      if (agg !== null) map.set(row.wt.slug, agg);
-    }
-    return map;
-  }, [rows, claudeSessionsBySlug, claudeRegistry.data]);
   // Parallel set for diff sessions — used by the Shift+F11 hint so
   // the kill-confirm only opens when there's something to kill.
   const activeDiffSessions = useActiveDiffSessions();
@@ -4096,8 +4077,7 @@ export function App({ onExit }: Props) {
           width={listWidth}
           activeTails={activeTails}
           activeActions={activeActions}
-          aiSessionCountBySlug={aiSessionCountBySlug}
-          claudeAggStateBySlug={claudeAggStateBySlug}
+          aiLiveHarnessBySlug={aiLiveHarnessBySlug}
           chainHighlight={
             modal?.kind === "stackActions" && current
               ? chainOf(buildStackRows(), current.wt.slug)

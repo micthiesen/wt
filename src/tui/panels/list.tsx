@@ -15,8 +15,8 @@ import { NF, claudeCountGlyph } from "../icons.ts";
 import { Spinner } from "../spinner.tsx";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
-import type { DerivedState } from "../../core/claude-status.ts";
-import { STATE_FG_GLYPH } from "../claude-state.ts";
+import { getHarness } from "../../core/harness/index.ts";
+import type { HarnessId } from "../../core/harness/index.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { StatusKind } from "../../core/types.ts";
@@ -43,21 +43,13 @@ type Props = {
   /** Slugs with an in-flight `claude -p` action. Renders the comment
    *  glyph in the badge cluster while running. */
   activeActions: ReadonlySet<string>;
-  /** Per-slug count of live AI tmux sessions across every harness
-   *  (claude primary + each claude named + codex + opencode). The
-   *  list panel renders a circled digit per row = this count.
-   *  Distinct slot from `activeActions` so a running action and a
-   *  live session can show side-by-side. */
-  aiSessionCountBySlug: ReadonlyMap<string, number>;
   /**
-   * Aggregate per-slug claude state. Absent when the slug has no
-   * claude sessions; when present, drives the session-count glyph
-   * color so a busy worktree pops in the list (accent) vs an idle
-   * one (the default warn/orange tint). Non-claude harnesses don't
-   * contribute (no busy/idle registry yet); a slug with only a live
-   * codex/opencode shows the count glyph in the dim default color.
+   * Per-slug first-live harness in HARNESSES order. Present only
+   * when at least one live AI tmux session exists on the slug.
+   * Drives the harness-glyph badge in the list pane, tinted with
+   * that harness's own color.
    */
-  claudeAggStateBySlug: ReadonlyMap<string, DerivedState>;
+  aiLiveHarnessBySlug: ReadonlyMap<string, HarnessId>;
   /**
    * Slugs to tint with the chain-highlight bg. Populated while the
    * stack chord (`b`) modal is open with the chain containing the
@@ -125,16 +117,15 @@ function rowLabel(row: WorktreeRow): string {
 function badgeClusterCells(
   row: WorktreeRow,
   actionRunning: boolean,
-  sessionCount: number,
+  activeHarnessId: HarnessId | undefined,
 ): number {
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
   const refreshing = isRefreshing(row);
-  // Action and session count have separate 2-cell slots so they
-  // coexist (e.g. a row running an action while also having a live
-  // interactive session shows both glyphs).
-  const showSessionSlot = sessionCount > 0;
+  // Action and harness-glyph slots coexist (e.g. a row running an
+  // action while hosting a live session shows both glyphs).
+  const showSessionSlot = activeHarnessId !== undefined;
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
@@ -225,8 +216,7 @@ const RowView = memo(function RowView({
   selected,
   isTailing,
   actionRunning,
-  sessionCount,
-  sessionAggState,
+  activeHarnessId,
   panelWidth,
   stackParentAbove,
   chainHighlighted,
@@ -236,15 +226,10 @@ const RowView = memo(function RowView({
   isTailing: boolean;
   /** Whether a `claude -p` action is currently running on this slug. */
   actionRunning: boolean;
-  /** Count of live interactive claude sessions on this slug (primary
-   *  + named). Renders a circled-digit badge when ≥ 1. */
-  sessionCount: number;
-  /**
-   * Aggregate state across the slug's claude sessions. Drives the
-   * session-count glyph color so the user can spot a busy worktree
-   * at a glance without opening the row. Absent when no sessions.
-   */
-  sessionAggState: DerivedState | undefined;
+  /** The first live harness (in HARNESSES order) on this slug, or
+   *  undefined when no live AI sessions exist. Renders the harness
+   *  glyph in the badge cluster when defined. */
+  activeHarnessId: HarnessId | undefined;
   panelWidth: number;
   /**
    * True when the row immediately above is the worktree this one is
@@ -296,12 +281,11 @@ const RowView = memo(function RowView({
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
   const reviewFg = row.archived || !review ? theme.fgDim : review.fg;
   // Two independent 2-cell slots: action (comment glyph, green) and
-  // session count (circled digit, Claude orange). They coexist so a
-  // row running an action while also hosting a live interactive
-  // session shows both. Both slots stay lit on archived rows —
-  // running work or a live session against an archived worktree is
-  // unusual and worth seeing.
-  const showSessionSlot = sessionCount > 0;
+  // harness glyph (tinted with the harness's own color). They
+  // coexist so a row running an action while hosting a live session
+  // shows both. Both slots stay lit on archived rows — running work
+  // or a live session against an archived worktree is worth seeing.
+  const showSessionSlot = activeHarnessId !== undefined;
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
@@ -339,7 +323,7 @@ const RowView = memo(function RowView({
             width − borders(2) − row padding(2) − marker+gap(3) − badge
             cluster. */}
         <text fg={slugFg} attributes={slugAttrs} wrapMode="none">
-          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row, actionRunning, sessionCount)))}
+          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row, actionRunning, activeHarnessId)))}
         </text>
       </box>
       {/* Compact badge cluster: only render present badges, butted up
@@ -370,16 +354,10 @@ const RowView = memo(function RowView({
               <text fg={theme.ok}>{NF.comment}</text>
             </box>
           ) : null}
-          {showSessionSlot ? (
+          {showSessionSlot && activeHarnessId ? (
             <box width={2} flexShrink={0}>
-              <text
-                fg={
-                  sessionAggState
-                    ? STATE_FG_GLYPH[sessionAggState]
-                    : theme.claudeOrange
-                }
-              >
-                {claudeCountGlyph(sessionCount)}
+              <text fg={getHarness(activeHarnessId).color}>
+                {getHarness(activeHarnessId).glyph}
               </text>
             </box>
           ) : null}
@@ -544,7 +522,7 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiSessionCountBySlug, claudeAggStateBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
+export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiLiveHarnessBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -643,8 +621,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                   selected={i === selectedIndex}
                   isTailing={activeTails.has(row.wt.slug)}
                   actionRunning={activeActions.has(row.wt.slug)}
-                  sessionCount={aiSessionCountBySlug.get(row.wt.slug) ?? 0}
-                  sessionAggState={claudeAggStateBySlug.get(row.wt.slug)}
+                  activeHarnessId={aiLiveHarnessBySlug.get(row.wt.slug)}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
                   chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}
@@ -688,8 +665,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
                     actionRunning={activeActions.has(row.wt.slug)}
-                    sessionCount={aiSessionCountBySlug.get(row.wt.slug) ?? 0}
-                    sessionAggState={claudeAggStateBySlug.get(row.wt.slug)}
+                    activeHarnessId={aiLiveHarnessBySlug.get(row.wt.slug)}
                     panelWidth={width}
                     stackParentAbove={false}
                     chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}
