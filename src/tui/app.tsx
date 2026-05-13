@@ -93,7 +93,10 @@ import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { StackActionsModal } from "./panels/stack-actions.tsx";
 import { enterHarnessSession } from "./harness-session.ts";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
-import { useHarnessSessions } from "./hooks/useHarnessSessions.ts";
+import {
+  isSyntheticLiveSessionId,
+  useHarnessSessions,
+} from "./hooks/useHarnessSessions.ts";
 import { getHarness, HARNESSES, type HarnessId } from "../core/harness/index.ts";
 import { HarnessPickerModal } from "./panels/harness-picker.tsx";
 import type { PickerRow } from "./panels/sessions-picker.tsx";
@@ -1647,6 +1650,13 @@ export function App({ onExit }: Props) {
     opts: {
       managedName?: string | null;
       resumeSessionId?: string | null;
+      /**
+       * Codex / OpenCode only: kill the existing tmux slot before
+       * attaching so a fresh codex/opencode actually spawns. See the
+       * `freshSlot` doc on `enterHarnessSession` / `attachOrCreate`
+       * for the rationale.
+       */
+      freshSlot?: boolean;
     } = {},
   ): void {
     const row = rows.find((r) => r.wt.slug === slug);
@@ -1671,6 +1681,7 @@ export function App({ onExit }: Props) {
         harnessId,
         managedName: opts.managedName ?? null,
         resumeSessionId: opts.resumeSessionId ?? null,
+        freshSlot: opts.freshSlot,
       });
       void refreshTmuxSessions();
       void refreshHarnessSessions(slug);
@@ -2802,16 +2813,36 @@ export function App({ onExit }: Props) {
           if (r.harnessId === "claude") {
             openNewClaude();
           } else {
+            // Codex / OpenCode share one tmux slot per slug — force a
+            // fresh spawn so the slot's running CLI is replaced rather
+            // than re-attached to. Without this, "+ new" silently
+            // attaches to whatever was already running.
             setModal(null);
-            doEnterHarnessSession(slug, r.harnessId, {});
+            doEnterHarnessSession(slug, r.harnessId, { freshSlot: true });
           }
           return;
         }
         const e = r.entry;
+        // Synthesized "(fresh)" rows carry a sentinel sessionId — treat
+        // them as plain re-attach (no resume id, no slot kill). They
+        // exist precisely because the slot is alive but discovery
+        // hasn't seen anything yet, so attaching is exactly what the
+        // user wants.
+        const isSyntheticLive = isSyntheticLiveSessionId(e.sessionId);
+        const resumeSessionId =
+          e.isLive || isSyntheticLive ? null : e.sessionId;
+        // For codex/opencode, picking a dead session means "resume
+        // this specific one" — that only works if the slot starts
+        // fresh, otherwise `tmux -A` attaches to whatever's there and
+        // ignores our `<cli> resume <id>` argv.
+        const freshSlot =
+          (e.harnessId === "codex" || e.harnessId === "opencode") &&
+          resumeSessionId !== null;
         setModal(null);
         doEnterHarnessSession(slug, e.harnessId, {
           managedName: e.extras.managedName,
-          resumeSessionId: e.isLive ? null : e.sessionId,
+          resumeSessionId,
+          freshSlot,
         });
       };
       const jumpToNew = (harnessId: HarnessId): void => {
@@ -2844,7 +2875,12 @@ export function App({ onExit }: Props) {
         }
         return;
       }
-      if (k.sequence === "d") {
+      // `x` kills (CLAUDE.md modal UX rule). Codex's harness letter
+      // is also `x`, so we dispatch by row kind: on a session row,
+      // kill it and return; on anything else, fall through to the
+      // letter-shortcut loop below (which jumps the highlight to
+      // "+ new codex").
+      if (k.sequence === "x") {
         const r = rowsLocal[idx];
         if (r?.kind === "session") {
           const e = r.entry;
@@ -2862,7 +2898,7 @@ export function App({ onExit }: Props) {
           } else {
             // Codex / opencode kill via tmux name (live only). Dead
             // sessions are owned by the harness's own store and we
-            // don't write there — surface that as a toast so `d`
+            // don't write there — surface that as a toast so `x`
             // doesn't read as a silent no-op (the picker dismisses
             // either way; without the toast the user can't tell
             // whether the kill landed or nothing happened).
@@ -2870,6 +2906,7 @@ export function App({ onExit }: Props) {
               void (async () => {
                 await killHarnessSession(slug, e.harnessId);
                 void refreshTmuxSessions();
+                void refreshHarnessSessions(slug);
                 appLog.event.warn(
                   `killed ${getHarness(e.harnessId).label} session on ${slug}`,
                 );
@@ -2883,8 +2920,10 @@ export function App({ onExit }: Props) {
               );
             }
           }
+          return;
         }
-        return;
+        // Highlight isn't on a session row — fall through so the
+        // letter-shortcut loop below treats `x` as the codex jump key.
       }
       // Per-harness letter — jump to the matching "+ new" row. The
       // user then presses `;` (or Enter) to confirm and spawn.

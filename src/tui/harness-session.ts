@@ -52,6 +52,16 @@ export async function enterHarnessSession(opts: {
    * "primary". The wt-source-repo `.` shortcut passes the source slug.
    */
   claudeDisplayName?: string;
+  /**
+   * Codex / OpenCode only: ensure the single-tmux-per-slug slot starts
+   * fresh by killing any existing slot before attaching. Needed for
+   * "+ new" and for "resume a specific dead session" — without it,
+   * `tmux new-session -A` silently attaches to whatever's already in
+   * the slot and the harness argv (`codex` / `codex resume <id>` /
+   * `opencode -s <id>`) is ignored. Claude has per-name tmux slots so
+   * it never needs this; the flag is ignored for `harnessId === claude`.
+   */
+  freshSlot?: boolean;
 }): Promise<EnterResult> {
   const {
     renderer,
@@ -61,6 +71,7 @@ export async function enterHarnessSession(opts: {
     managedName,
     resumeSessionId,
     claudeDisplayName,
+    freshSlot,
   } = opts;
   renderer.suspend();
   process.stdout.write(CLEAR_SCREEN);
@@ -72,6 +83,7 @@ export async function enterHarnessSession(opts: {
       managedName,
       resumeSessionId,
       claudeDisplayName,
+      freshSlot,
     });
   } finally {
     process.stdout.write(CLEAR_SCREEN);

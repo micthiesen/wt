@@ -31,6 +31,30 @@ import {
 
 export type HarnessSessionEntry = HarnessSession & { harnessId: HarnessId };
 
+/**
+ * Sentinel sessionId prefix used by the synthesized live-slot placeholder
+ * for codex/opencode when the tmux slot is alive but no on-disk session
+ * record exists yet. `commitRow` strips this and passes
+ * `resumeSessionId: null` so the spawn just attaches to the slot.
+ */
+export const SYNTHETIC_LIVE_PREFIX = "__live__";
+
+export function isSyntheticLiveSessionId(sessionId: string): boolean {
+  return sessionId.startsWith(SYNTHETIC_LIVE_PREFIX);
+}
+
+function mostRecentSessionId(
+  raw: ReadonlyArray<HarnessSession>,
+): string | null {
+  let best: HarnessSession | null = null;
+  for (const s of raw) {
+    if (!best || (s.lastActiveMs ?? 0) > (best.lastActiveMs ?? 0)) {
+      best = s;
+    }
+  }
+  return best?.sessionId ?? null;
+}
+
 export type UseHarnessSessionsResult = {
   sessions: ReadonlyArray<HarnessSessionEntry>;
   byHarness: ReadonlyMap<HarnessId, ReadonlyArray<HarnessSessionEntry>>;
@@ -71,13 +95,35 @@ export function useHarnessSessions(
     const all: HarnessSessionEntry[] = [];
     for (const h of HARNESSES) {
       const raw = queries.get(h.id) ?? EMPTY;
-      const annotated: HarnessSessionEntry[] = raw.map((s) => {
-        const isLive = tmuxNames.has(s.tmuxSessionName);
+      // Single-tmux-per-slug for codex/opencode means at most ONE
+      // discovered session can actually be running in the slot at any
+      // time. The previous "any session whose tmuxSessionName matches a
+      // live tmux name is live" rule marked EVERY discovered session
+      // live whenever the slot was alive, which is wrong and made
+      // resume-vs-attach indistinguishable in the picker. Resolve it
+      // here: when the slot is alive, the most-recently-active
+      // discovered session represents the slot; all others are dead.
+      // When the slot is alive but no discovered session points at it
+      // yet (fresh codex/opencode before the first prompt — the only
+      // moment when rollout/DB write hasn't happened), synthesize a
+      // placeholder so the picker isn't blank for an actively-running
+      // session.
+      const isSingleSlot = h.id === "codex" || h.id === "opencode";
+      const slotTmuxName = isSingleSlot ? `${slug}-${h.id}` : null;
+      const slotAlive = slotTmuxName !== null && tmuxNames.has(slotTmuxName);
+      const liveDiscoveredId =
+        isSingleSlot && slotAlive
+          ? mostRecentSessionId(raw)
+          : null;
+      let annotated: HarnessSessionEntry[] = raw.map((s) => {
+        const isLive = isSingleSlot
+          ? s.sessionId === liveDiscoveredId
+          : tmuxNames.has(s.tmuxSessionName);
         // Finalize opencode/codex derived state now that we know liveness.
         // discoverSessions() returns state from DB/tail without liveness;
         // we apply the liveness-dependent transitions here.
         let extras = s.extras;
-        if ((h.id === "opencode" || h.id === "codex") && extras.derivedState !== null) {
+        if (isSingleSlot && extras.derivedState !== null) {
           const st = extras.derivedState;
           let finalState = st;
           if (isLive && (st === "idle" || st === "abandoned")) {
@@ -95,6 +141,33 @@ export function useHarnessSessions(
         }
         return { ...s, isLive, harnessId: h.id, extras };
       });
+      if (isSingleSlot && slotAlive && liveDiscoveredId === null) {
+        // Slot is alive but nothing on disk points at it yet — codex
+        // and opencode don't persist a rollout/DB row until the first
+        // user prompt, so a freshly spawned session is invisible to
+        // discovery. Surface a placeholder so the user can re-attach
+        // (or kill) it from the picker. Sentinel sessionId is consumed
+        // by commitRow → enterHarnessSession to mean "attach to the
+        // live slot, no resume id". `lastActiveMs: Date.now()` floats
+        // it to the top of the sorted list.
+        annotated = [
+          {
+            displayName: `(fresh ${h.label})`,
+            sessionId: `${SYNTHETIC_LIVE_PREFIX}${h.id}:${slug}`,
+            tmuxSessionName: slotTmuxName!,
+            lastActiveMs: Date.now(),
+            isLive: true,
+            harnessId: h.id,
+            extras: {
+              managedName: null,
+              derivedState: "waiting",
+              queued: 0,
+              tailEndedAt: null,
+            },
+          },
+          ...annotated,
+        ];
+      }
       byHarness.set(h.id, annotated);
       all.push(...annotated);
     }

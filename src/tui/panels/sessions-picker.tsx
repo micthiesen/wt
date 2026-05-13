@@ -22,9 +22,11 @@
  *    "(no summary yet)".
  *  - Quick-pick digits track the rendered order of the SESSION rows
  *    only; "+ new" rows are reached via per-harness letters.
- *  - `d` on a row kills that session (claude only; for codex /
- *    opencode the picker shows a hint and the user kills the tmux
- *    slot from outside).
+ *  - `x` on a row kills that session (matches the universal modal
+ *    kill key in CLAUDE.md). Claude rows: kills the named slot or
+ *    forgets the ghost. Codex/OpenCode rows: kills the shared tmux
+ *    slot when live; toasts a hint when dead (those stores are owned
+ *    by the harness CLI, not wt).
  *  - Live-preview: j/k on a live claude entry points the bottom pane
  *    at that session's log, mirroring the outputs picker.
  */
@@ -114,7 +116,7 @@ export function SessionsPickerList({
         // controls the rendered row order for the "+ new" affordances)
         // so the hint reads top-to-bottom.
         [HARNESSES.map((h) => h.letter).join(" / "), "new …"],
-        ["d", "kill"],
+        ["x", "kill"],
         ["; / ⏎", "select"],
         ["esc / q", "cancel"],
       ]}
@@ -204,7 +206,7 @@ export function SessionsPickerList({
                 <text fg={theme.warn}>{e.extras.queued}⏵ </text>
               ) : null}
               {/* Tweak 1: fixed-width status and age columns */}
-              <box width={11} flexShrink={0} justifyContent="flex-end">
+              <box width={13} flexShrink={0} justifyContent="flex-end">
                 <text fg={stateFg}>
                   {state ? STATE_DOT[state] : "●"} {statusText}
                 </text>
