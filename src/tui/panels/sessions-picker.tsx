@@ -100,6 +100,9 @@ export function SessionsPickerList({
   // Track digit assignments for session rows only; "+ new" rows get
   // their per-harness letter prefix instead.
   let sessionDigitCursor = 0;
+  // Detect the boundary between session rows and "+ new" rows so we
+  // can insert a spacer between them.
+  const firstNewIndex = rows.findIndex((r) => r.kind === "new");
   return (
     <Modal
       title={`sessions · ${slug}`}
@@ -120,27 +123,38 @@ export function SessionsPickerList({
         {rows.map((row, i) => {
           const selected = i === selectedIndex;
           const bg = selected ? theme.rowSelectedBg : undefined;
+          // Spacer between last session row and first "+ new" row.
+          const spacer =
+            firstNewIndex > 0 && i === firstNewIndex ? (
+              <box key="__spacer" height={1} flexShrink={0} />
+            ) : null;
           if (row.kind === "new") {
             const h = HARNESSES.find((h) => h.id === row.harnessId)!;
             return (
-              <box
-                key={`new:${row.harnessId}`}
-                flexDirection="row"
-                backgroundColor={bg}
-                paddingLeft={1}
-                paddingRight={1}
-              >
-                <text fg={selected ? theme.accent : theme.fgDim}>
-                  {selected ? "▸ " : "  "}
-                </text>
-                <box width={2} flexShrink={0}>
-                  <text fg={theme.accent}>{h.letter}</text>
+              <>
+                {spacer}
+                <box
+                  key={`new:${row.harnessId}`}
+                  flexDirection="row"
+                  backgroundColor={bg}
+                  paddingLeft={1}
+                  paddingRight={1}
+                >
+                  <text fg={selected ? theme.accent : theme.fgDim}>
+                    {selected ? "▸ " : "  "}
+                  </text>
+                  <box width={2} flexShrink={0}>
+                    <text fg={selected ? theme.accent : theme.fgDim}>{h.letter}</text>
+                  </box>
+                  {/* Tweak 3: fixed-width glyph cell */}
+                  <box width={2} flexShrink={0}>
+                    <text fg={selected ? h.color : theme.fgDim}>{h.glyph}</text>
+                  </box>
+                  <text fg={selected ? theme.fgBright : theme.fgDim}>
+                    new {h.label} session
+                  </text>
                 </box>
-                <text fg={h.color}>{h.glyph} </text>
-                <text fg={selected ? theme.fgBright : theme.fg}>
-                  new {h.label} session
-                </text>
-              </box>
+              </>
             );
           }
           const e = row.entry;
@@ -177,7 +191,10 @@ export function SessionsPickerList({
               <box width={2} flexShrink={0}>
                 <text fg={theme.fgDim}>{prefix}</text>
               </box>
-              <text fg={h.color}>{h.glyph} </text>
+              {/* Tweak 3: fixed-width glyph cell */}
+              <box width={2} flexShrink={0}>
+                <text fg={h.color}>{h.glyph}</text>
+              </box>
               <box flexGrow={1} flexShrink={1} overflow="hidden">
                 <text fg={labelFg} wrapMode="none" truncate>
                   {e.displayName}
@@ -186,16 +203,19 @@ export function SessionsPickerList({
               {e.extras.queued > 0 ? (
                 <text fg={theme.warn}>{e.extras.queued}⏵ </text>
               ) : null}
-              {state ? (
-                <text fg={stateFg}>
-                  {STATE_DOT[state]} {statusText}
-                </text>
-              ) : (
-                <text fg={stateFg}>{statusText}</text>
-              )}
-              {ageText ? (
-                <text fg={theme.fgDim}> · {ageText}</text>
-              ) : null}
+              {/* Tweak 1: fixed-width status and age columns */}
+              <box width={11} flexShrink={0} justifyContent="flex-end">
+                {state ? (
+                  <text fg={stateFg}>
+                    {STATE_DOT[state]} {statusText}
+                  </text>
+                ) : (
+                  <text fg={stateFg}>{statusText}</text>
+                )}
+              </box>
+              <box width={6} flexShrink={0} justifyContent="flex-end">
+                <text fg={theme.fgDim}>{ageText ?? ""}</text>
+              </box>
             </box>
           );
         })}
