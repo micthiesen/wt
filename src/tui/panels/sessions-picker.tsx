@@ -147,7 +147,7 @@ export function SessionsPickerList({
                     <text fg={selected ? theme.accent : theme.fgDim}>{h.letter}</text>
                   </box>
                   {/* Tweak 3: fixed-width glyph cell */}
-                  <box width={2} flexShrink={0}>
+                  <box width={3} flexShrink={0}>
                     <text fg={selected ? h.color : theme.fgDim}>{h.glyph}</text>
                   </box>
                   <text fg={selected ? theme.fgBright : theme.fgDim}>
@@ -192,7 +192,7 @@ export function SessionsPickerList({
                 <text fg={theme.fgDim}>{prefix}</text>
               </box>
               {/* Tweak 3: fixed-width glyph cell */}
-              <box width={2} flexShrink={0}>
+              <box width={3} flexShrink={0}>
                 <text fg={h.color}>{h.glyph}</text>
               </box>
               <box flexGrow={1} flexShrink={1} overflow="hidden">

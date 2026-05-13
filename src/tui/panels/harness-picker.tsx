@@ -48,7 +48,7 @@ export function HarnessPickerModal({ slug, selectedIndex }: Props) {
               <box width={2} flexShrink={0}>
                 <text fg={theme.fgDim}>{h.letter}</text>
               </box>
-              <text fg={h.color}>{h.glyph} </text>
+              <text fg={h.color}>{h.glyph}  </text>
               <text fg={selected ? theme.fgBright : theme.fg}>{h.label}</text>
             </box>
           );

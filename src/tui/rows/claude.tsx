@@ -33,7 +33,7 @@ function AiLine({ wt }: { wt: Worktree }) {
     const harness = getHarness(primary);
     return (
       <text fg={theme.fgDim} wrapMode="none" truncate>
-        <span fg={harness.color}>{harness.glyph} </span>
+        <span fg={harness.color}>{harness.glyph}  </span>
         primary: {harness.label} · F12 to start
       </text>
     );

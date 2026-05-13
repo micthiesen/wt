@@ -437,7 +437,7 @@ function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
   return (
     <box flexShrink={0} flexDirection="row">
       <text fg={theme.fgDim}> </text>
-      <text fg={harness.color}>{harness.glyph} </text>
+      <text fg={harness.color}>{harness.glyph}  </text>
       <text fg={theme.fg}>{harness.label}</text>
       <text fg={theme.fgDim}>  TAB</text>
     </box>
