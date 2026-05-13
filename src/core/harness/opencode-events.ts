@@ -25,6 +25,8 @@ import { openDb } from "./opencode.ts";
 const log = createLogger("[opencode]");
 
 const POLL_INTERVAL_MS = 2_500;
+/** Max per-session snapshot entries before LRU-trim. See `tick`. */
+const SNAPSHOT_CAP = 256;
 
 // ---------- DB row types ----------
 
@@ -135,6 +137,20 @@ function tick(getActiveSlugs: () => Array<{ slug: string; wtPath: string }>): vo
     } catch (err) {
       log.warn("opencode event poll error", { slug, err: String(err) });
     }
+  }
+
+  // Cap `snapshots` to keep memory bounded across long-running wt
+  // processes. OpenCode sessions persist in the DB forever (until
+  // archived), so each kill-and-respawn cycle adds a new entry that
+  // we'd otherwise hold for the lifetime of the process. Drop oldest-
+  // inserted entries when we exceed the cap — they'll get re-seeded
+  // (without emitting historical events) the next time their session
+  // surfaces in the per-slug processing loop. `seenSessionIds` is a
+  // set of small strings, not worth capping.
+  while (snapshots.size > SNAPSHOT_CAP) {
+    const oldest = snapshots.keys().next().value;
+    if (oldest === undefined) break;
+    snapshots.delete(oldest);
   }
 
   baselineEstablished = true;

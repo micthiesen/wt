@@ -133,15 +133,27 @@ function pollSlug(
     return;
   }
 
-  // Advance offset and mtime.
-  state.offset += readLen;
+  // Advance only by complete lines: if the chunk ends mid-line
+  // (because codex was writing concurrently or we hit MAX_READ_PER_TICK
+  // mid-event), the trailing partial line stays unconsumed and we'll
+  // pick up its rest on the next tick. Previously we advanced by raw
+  // `readLen`, which silently dropped any partial last event since the
+  // JSON.parse would just fail and the bytes were already skipped.
+  const lastNewlineIdx = chunk.lastIndexOf("\n");
+  if (lastNewlineIdx === -1) {
+    // No complete line in this chunk yet — wait for more.
+    state.mtimeMs = rollout.mtimeMs;
+    return;
+  }
+  const consumedBytes = Buffer.byteLength(
+    chunk.slice(0, lastNewlineIdx + 1),
+    "utf8",
+  );
+  state.offset += consumedBytes;
   state.mtimeMs = rollout.mtimeMs;
 
-  // Parse and emit new events.
-  const lines = chunk.split("\n");
-  // If we read from mid-file, the first segment may be partial. Since
-  // our offset starts at a line boundary (we always advance by full
-  // lines below), this is safe — but guard anyway.
+  // Parse and emit complete lines only.
+  const lines = chunk.slice(0, lastNewlineIdx).split("\n");
   for (const line of lines) {
     if (!line.trim()) continue;
     let obj: Record<string, unknown>;

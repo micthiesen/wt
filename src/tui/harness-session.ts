@@ -11,8 +11,13 @@
  */
 import type { CliRenderer } from "@opentui/core";
 
-import { type HarnessId } from "../core/harness/index.ts";
-import { attachOrCreate, type AttachResult } from "../core/tmux.ts";
+import { getHarness, type HarnessId } from "../core/harness/index.ts";
+import { createLogger } from "../core/logger.ts";
+import {
+  attachOrCreate,
+  killHarnessSession,
+  type AttachResult,
+} from "../core/tmux.ts";
 
 export type EnterResult = AttachResult;
 
@@ -73,6 +78,19 @@ export async function enterHarnessSession(opts: {
     claudeDisplayName,
     freshSlot,
   } = opts;
+  // Kill the single-slot tmux before suspending the renderer so (a)
+  // the user sees the activity event in the still-rendered pane
+  // rather than a black screen during the kill, and (b) the
+  // subsequent `tmux new-session -A` always lands on a clean slot
+  // and our buildArgs argv actually runs. Single-slot semantics are
+  // codex/opencode only — claude already gets a unique tmux name
+  // per managedName so the flag is a no-op there.
+  if (freshSlot && (harnessId === "codex" || harnessId === "opencode")) {
+    createLogger(slug).event.warn(
+      `replacing ${getHarness(harnessId).label} slot`,
+    );
+    await killHarnessSession(slug, harnessId);
+  }
   renderer.suspend();
   process.stdout.write(CLEAR_SCREEN);
   try {
@@ -83,7 +101,6 @@ export async function enterHarnessSession(opts: {
       managedName,
       resumeSessionId,
       claudeDisplayName,
-      freshSlot,
     });
   } finally {
     process.stdout.write(CLEAR_SCREEN);

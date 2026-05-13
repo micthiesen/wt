@@ -359,9 +359,24 @@ function resolveDiffCommand(template: string, base: string | undefined): string 
 async function killByName(name: string): Promise<void> {
   const proc = Bun.spawn(
     ["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${name}`],
-    { stdout: "ignore", stderr: "ignore" },
+    { stdout: "ignore", stderr: "pipe" },
   );
-  await proc.exited;
+  const [code, errText] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr).text(),
+  ]);
+  // tmux exits non-zero for "session not found" (the desired no-op
+  // path when killing an absent slot) but ALSO for connection /
+  // permission failures. Filter the benign case so the noise floor
+  // is low, but surface real errors so a failed kill doesn't look
+  // like silent success.
+  if (code !== 0 && !/can't find session/i.test(errText)) {
+    log.warn("tmux kill-session failed", {
+      name,
+      code,
+      stderr: errText.trim() || null,
+    });
+  }
 }
 
 /**
@@ -562,15 +577,6 @@ export async function attachOrCreate(opts: {
    * (the ref is double-quoted at spawn time).
    */
   base?: string;
-  /**
-   * Codex / OpenCode only: kill any existing tmux session with the
-   * same name before attaching so `new-session -A` actually creates
-   * fresh (and our innerArgs run) instead of silently attaching to a
-   * stale slot. Needed by the picker's "+ new" and "resume a specific
-   * dead session" paths. Ignored for kinds where each session has its
-   * own tmux name (claude / diff / shell).
-   */
-  freshSlot?: boolean;
 }): Promise<AttachResult> {
   const {
     slug,
@@ -580,22 +586,11 @@ export async function attachOrCreate(opts: {
     resumeSessionId,
     claudeDisplayName,
     base,
-    freshSlot,
   } = opts;
   const harnessId = harnessIdForKind(kind);
   const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
   const managedNameNorm = harness ? (managedName ?? null) : null;
   const name = sessionName(slug, kind, managedNameNorm);
-  // Single-tmux-per-slug harnesses share one slot across all their
-  // sessions, so a `new-session -A` would silently attach to whatever
-  // is already there and the buildArgs result would be ignored. Kill
-  // the existing slot first to force a real spawn. Idempotent — no-op
-  // when nothing's there. Only honored for harness kinds: claude rows
-  // already get unique tmux names per managedName, and diff/shell
-  // shouldn't be force-restarted from this path.
-  if (freshSlot && harness && (kind === "codex" || kind === "opencode")) {
-    await killByName(name);
-  }
   const { path: configPath, changed } = writeConfig();
   if (changed) {
     log.info("config changed, killing server before attach", { slug, kind });

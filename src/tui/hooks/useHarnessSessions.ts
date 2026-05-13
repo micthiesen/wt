@@ -20,6 +20,7 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import {
+  getHarness,
   HARNESSES,
   type HarnessId,
   type HarnessSession,
@@ -109,7 +110,12 @@ export function useHarnessSessions(
       // placeholder so the picker isn't blank for an actively-running
       // session.
       const isSingleSlot = h.id === "codex" || h.id === "opencode";
-      const slotTmuxName = isSingleSlot ? `${slug}-${h.id}` : null;
+      // Pull the tmux name from the canonical harness impl rather than
+      // re-deriving `${slug}-${h.id}` inline — keeps this hook in sync
+      // if the format ever changes (e.g. a future multi-slot scheme).
+      const slotTmuxName = isSingleSlot
+        ? getHarness(h.id).tmuxSessionName(slug, null)
+        : null;
       const slotAlive = slotTmuxName !== null && tmuxNames.has(slotTmuxName);
       const liveDiscoveredId =
         isSingleSlot && slotAlive

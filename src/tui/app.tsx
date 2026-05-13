@@ -1683,8 +1683,11 @@ export function App({ onExit }: Props) {
         resumeSessionId: opts.resumeSessionId ?? null,
         freshSlot: opts.freshSlot,
       });
-      void refreshTmuxSessions();
-      void refreshHarnessSessions(slug);
+      // Refresh both together so the picker doesn't see a transient
+      // state where tmux says "slot dead" but discovery still has the
+      // session marked live (or vice versa) and the synthetic-row
+      // logic in useHarnessSessions decides incorrectly.
+      await Promise.all([refreshTmuxSessions(), refreshHarnessSessions(slug)]);
       if (result.kind === "spawn-failed") {
         sessionLog.event.err(`${harness.label} failed to start: ${result.reason}`);
         toast(`${harness.label} failed: ${result.reason}`, theme.err, 3000);
@@ -2905,8 +2908,14 @@ export function App({ onExit }: Props) {
             if (e.isLive) {
               void (async () => {
                 await killHarnessSession(slug, e.harnessId);
-                void refreshTmuxSessions();
-                void refreshHarnessSessions(slug);
+                // Refresh both together — same reasoning as the
+                // post-detach path: avoid the transient state where
+                // tmux + discovery disagree about whether the slot
+                // is still alive.
+                await Promise.all([
+                  refreshTmuxSessions(),
+                  refreshHarnessSessions(slug),
+                ]);
                 appLog.event.warn(
                   `killed ${getHarness(e.harnessId).label} session on ${slug}`,
                 );
@@ -3812,14 +3821,21 @@ export function App({ onExit }: Props) {
       }
       const target = currentHarnessSessions.f12Target;
       if (target) {
-        // For Claude: managedName preserves primary-vs-named. For
-        // Codex / OpenCode: managedName is unused; if the tmux slot
-        // is already live, `new-session -A` re-attaches and the
-        // resumeSessionId is ignored. For a dead session, the harness
-        // builds `<id> resume <sessionId>` argv.
+        // Mirror the picker's commitRow logic: synthetic placeholders
+        // ride the live slot (no resume id, no kill), real live entries
+        // attach, and dead codex/opencode entries need `freshSlot` to
+        // displace whatever's in the shared slot — without it, the
+        // resume argv is silently ignored.
+        const isSyntheticLive = isSyntheticLiveSessionId(target.sessionId);
+        const resumeSessionId =
+          target.isLive || isSyntheticLive ? null : target.sessionId;
+        const freshSlot =
+          (target.harnessId === "codex" || target.harnessId === "opencode") &&
+          resumeSessionId !== null;
         doEnterHarnessSession(slug, target.harnessId, {
           managedName: target.extras.managedName,
-          resumeSessionId: target.isLive ? null : target.sessionId,
+          resumeSessionId,
+          freshSlot,
         });
       } else {
         // No discoverable session — spawn primary fresh.
