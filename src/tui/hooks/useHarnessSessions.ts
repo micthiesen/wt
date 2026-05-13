@@ -71,11 +71,30 @@ export function useHarnessSessions(
     const all: HarnessSessionEntry[] = [];
     for (const h of HARNESSES) {
       const raw = queries.get(h.id) ?? EMPTY;
-      const annotated: HarnessSessionEntry[] = raw.map((s) => ({
-        ...s,
-        isLive: tmuxNames.has(s.tmuxSessionName),
-        harnessId: h.id,
-      }));
+      const annotated: HarnessSessionEntry[] = raw.map((s) => {
+        const isLive = tmuxNames.has(s.tmuxSessionName);
+        // Finalize opencode/codex derived state now that we know liveness.
+        // discoverSessions() returns state from DB/tail without liveness;
+        // we apply the liveness-dependent transitions here.
+        let extras = s.extras;
+        if ((h.id === "opencode" || h.id === "codex") && extras.derivedState !== null) {
+          const st = extras.derivedState;
+          let finalState = st;
+          if (isLive && (st === "idle" || st === "abandoned")) {
+            // Tmux is live; session is active even if DB shows idle.
+            finalState = "waiting";
+          } else if (!isLive && st === "waiting") {
+            // Not live. Fresh tail (< 10 min) → abandoned; old → idle.
+            const tailMs = extras.tailEndedAt ?? 0;
+            const ageMs = Date.now() - tailMs;
+            finalState = ageMs < 10 * 60 * 1000 ? "abandoned" : "idle";
+          }
+          if (finalState !== st) {
+            extras = { ...extras, derivedState: finalState };
+          }
+        }
+        return { ...s, isLive, harnessId: h.id, extras };
+      });
       byHarness.set(h.id, annotated);
       all.push(...annotated);
     }

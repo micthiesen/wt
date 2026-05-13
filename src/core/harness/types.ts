@@ -36,6 +36,15 @@ export type HarnessExtras = {
   derivedState: DerivedState | null;
   /** Pending-prompt count for the queued badge. Claude-only. */
   queued: number;
+  /**
+   * Timestamp (ms-since-epoch) of the last message row seen, used by
+   * `useHarnessSessions` to finalize `derivedState` once liveness is
+   * known. OpenCode populates this; Claude / Codex leave it undefined.
+   * When `derivedState === "waiting"` and the session is not live, the
+   * re-annotator uses this to decide between `idle` (old tail) and
+   * `abandoned` (fresh tail — tmux died recently).
+   */
+  tailEndedAt?: number | null;
 };
 
 export type HarnessSession = {

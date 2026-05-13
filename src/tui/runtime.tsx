@@ -6,6 +6,8 @@ import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
+import { startCodexEventPolling } from "../core/harness/codex-events.ts";
+import { startOpencodeEventPolling } from "../core/harness/opencode-events.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
@@ -15,6 +17,8 @@ import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
 import { qk } from "../state/keys.ts";
+import type { TmuxSessionsData } from "../state/queries.ts";
+import type { Worktree } from "../core/types.ts";
 
 import { App, type TuiExit } from "./app.tsx";
 import { events } from "./events.ts";
@@ -103,6 +107,31 @@ export async function runTui(): Promise<TuiExit> {
     reapStartup(),
   ]);
 
+  // Start Codex activity-event polling. Same pattern as opencode: the
+  // getter reads from the query cache imperatively (no React) and is
+  // safe to call from the interval callback outside the render tree.
+  const stopCodexEvents = startCodexEventPolling(() => {
+    const worktrees = wtClient.client.getQueryData<Worktree[]>(qk.worktrees()) ?? [];
+    const tmux = wtClient.client.getQueryData<TmuxSessionsData>(qk.tmuxSessions());
+    const liveCodex = new Set(tmux?.codex ?? []);
+    return worktrees
+      .filter((wt) => liveCodex.has(wt.slug))
+      .map((wt) => ({ slug: wt.slug, wtPath: wt.path }));
+  });
+
+  // Start OpenCode activity-event polling. The getter reads from the
+  // query cache imperatively (no React) so it's safe to call from the
+  // interval callback outside the render tree.
+  const stopOpencodeEvents = startOpencodeEventPolling(() => {
+    const worktrees = wtClient.client.getQueryData<Worktree[]>(qk.worktrees()) ?? [];
+    const tmux = wtClient.client.getQueryData<TmuxSessionsData>(qk.tmuxSessions());
+    // Only scan slugs that have a live opencode tmux session.
+    const liveOpecode = new Set(tmux?.opencode ?? []);
+    return worktrees
+      .filter((wt) => liveOpecode.has(wt.slug))
+      .map((wt) => ({ slug: wt.slug, wtPath: wt.path }));
+  });
+
   // Evict orphaned cache entries whose key shape changed across a wt
   // upgrade. Without this, an entry persisted under an old key sits in
   // memory after `restoreQueries` pre-warms it, where prefix-matching
@@ -145,6 +174,8 @@ export async function runTui(): Promise<TuiExit> {
     }
     detachFetchLogs();
     stopRegistryWatch();
+    stopCodexEvents();
+    stopOpencodeEvents();
     setEventSink(null);
     wtClient.shutdown();
     // Close the harness-owned read handles (opencode's read-only
