@@ -172,7 +172,7 @@ export function SessionsPickerList({
             : state === "idle"
               ? theme.fgDim
               : theme.fg;
-          const stateFg = state ? STATE_FG[state] : theme.fgDim;
+          const stateFg = state ? STATE_FG[state] : e.isLive ? theme.ok : theme.fgDim;
           const statusText = state ? state : e.isLive ? "live" : "dead";
           const showDigit = sessionDigitCursor < 9;
           const prefix = showDigit ? `${sessionDigitCursor + 1}` : " ";
@@ -205,13 +205,9 @@ export function SessionsPickerList({
               ) : null}
               {/* Tweak 1: fixed-width status and age columns */}
               <box width={11} flexShrink={0} justifyContent="flex-end">
-                {state ? (
-                  <text fg={stateFg}>
-                    {STATE_DOT[state]} {statusText}
-                  </text>
-                ) : (
-                  <text fg={stateFg}>{statusText}</text>
-                )}
+                <text fg={stateFg}>
+                  {state ? STATE_DOT[state] : "●"} {statusText}
+                </text>
               </box>
               <box width={6} flexShrink={0} justifyContent="flex-end">
                 <text fg={theme.fgDim}>{ageText ?? ""}</text>
