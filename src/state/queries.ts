@@ -3,9 +3,11 @@
  * returns a `queryOptions(...)` result, which gives strong type
  * inference from queryKey → queryFn return type at the hook site.
  */
+import { createHash } from "node:crypto";
+
 import { queryOptions } from "@tanstack/react-query";
 
-import { summarizeDiff, type AiSummary } from "../core/ai.ts";
+import { summarizeDiff, summarizeStack, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
 import { readClaudeUsage, type ClaudeUsage } from "../core/claude-usage.ts";
 import { readRegistry, type RegistrySession } from "../core/claude-registry.ts";
@@ -18,7 +20,13 @@ import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
 import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
-import { fetchGithub, fetchRepoContributors, repoSlug } from "../core/github.ts";
+import {
+  fetchGithub,
+  fetchRepoContributors,
+  fetchReviewRequests,
+  repoSlug,
+  type ReviewRequestPr,
+} from "../core/github.ts";
 import {
   fetchMergeability,
   hasGraphite,
@@ -26,6 +34,11 @@ import {
 } from "../core/graphite-api.ts";
 import { lockStatus } from "../core/locks.ts";
 import { detectStacks, type StackMap } from "../core/stack.ts";
+import {
+  getHarness,
+  type HarnessId,
+  type HarnessSession,
+} from "../core/harness/index.ts";
 import {
   type ClaudeSessionEntry,
   listSessions as listTmuxSessions,
@@ -115,12 +128,24 @@ export type TmuxSessionsData = {
   claude: ClaudeSessionEntry[];
   /** Slug set with at least one live claude session (primary or named). */
   claudeSlugs: string[];
+  /** Slugs with a live codex tmux session. */
+  codex: string[];
+  /** Slugs with a live opencode tmux session. */
+  opencode: string[];
   /** Slugs with a live diff session. */
   diff: string[];
   /** Slugs with a live shell session. */
   shell: string[];
   /** Slugs with a live action session (wt-managed wrapper). */
   action: string[];
+  /**
+   * Raw set of every live tmux session name on the wt-private server.
+   * Consumers that need to know whether a specific harness's tmux name
+   * is live (e.g. `useHarnessSessions`) read this rather than running
+   * a second `list-sessions`. Stored as an array for serialisation;
+   * convert to a Set in the consumer hook if needed.
+   */
+  all: string[];
 };
 
 /**
@@ -135,17 +160,70 @@ export const tmuxSessionsQuery = () =>
   queryOptions({
     queryKey: qk.tmuxSessions(),
     queryFn: async (): Promise<TmuxSessionsData> => {
-      const { claude, claudeSlugs, diff, shell, action } = await listTmuxSessions();
+      const { claude, claudeSlugs, codex, opencode, diff, shell, action, all } =
+        await listTmuxSessions();
       return {
         claude,
         claudeSlugs: [...claudeSlugs],
+        codex: [...codex],
+        opencode: [...opencode],
         diff: [...diff],
         shell: [...shell],
         action: [...action],
+        all: [...all],
       };
     },
     staleTime: STALE.fast,
     refetchInterval: 2_000,
+  });
+
+/**
+ * Per-(slug, harness) session discovery. Each impl returns whatever it
+ * can derive from its own state stores; this query caches it so the
+ * picker / row don't pay the cost on every render. Liveness is NOT
+ * baked into the cached value — the consumer hook reannotates against
+ * the live tmux name set so a tmux flip doesn't invalidate the
+ * discovery cache.
+ *
+ * `enabled` short-circuits to false when wtPath is empty (defensive —
+ * the row pipeline can briefly show empty paths during reordering).
+ */
+export const harnessSessionsQuery = (
+  harnessId: HarnessId,
+  slug: string,
+  wtPath: string,
+) =>
+  queryOptions({
+    queryKey: qk.harnessSessions(harnessId, slug),
+    queryFn: async (): Promise<HarnessSession[]> => {
+      const harness = getHarness(harnessId);
+      return harness.discoverSessions({
+        slug,
+        wtPath,
+        // The cache value strips liveness; the consumer hook re-flags
+        // each entry against the current tmux name set. Pass an empty
+        // set so impls that try to read it see "nothing live yet";
+        // they're allowed to also include dead entries.
+        liveTmuxNames: new Set<string>(),
+      });
+    },
+    staleTime: STALE.fast,
+    enabled: wtPath !== "",
+  });
+
+/**
+ * Persisted primary harness id. Read once on mount; mutate via
+ * `usePrimaryHarness().setPrimary(id)`. Tiny query, refreshed only on
+ * explicit invalidation.
+ */
+export const primaryHarnessQuery = () =>
+  queryOptions({
+    queryKey: qk.primaryHarness(),
+    queryFn: async () => {
+      const { readPrimaryHarness } = await import("../core/harness/primary.ts");
+      return readPrimaryHarness();
+    },
+    staleTime: Infinity,
   });
 
 export type GithubData = {
@@ -165,6 +243,23 @@ export const githubQuery = (branches: readonly string[]) =>
       const { prs } = await fetchGithub([...branches], signal);
       return { prs: Object.fromEntries(prs) };
     },
+    staleTime: STALE.slow,
+  });
+
+export type { ReviewRequestPr };
+
+/**
+ * PRs that the authenticated user has been asked to review. Single
+ * GraphQL `search` call, capped at 50. Lives under the `["github"]`
+ * prefix so the `r` refresh and any post-mutation `refreshGithub` both
+ * pick it up. Same staleTime as the per-worktree github query — server
+ * truth doesn't drift faster on one than the other.
+ */
+export const reviewRequestsQuery = () =>
+  queryOptions({
+    queryKey: qk.reviewRequests(),
+    queryFn: async ({ signal }): Promise<ReviewRequestPr[]> =>
+      fetchReviewRequests(signal),
     staleTime: STALE.slow,
   });
 
@@ -496,3 +591,76 @@ export const aiSummaryQuery = (
 function formatDuration(ms: number): string {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
+
+export type StackMember = { branch: string; brief: string };
+
+/**
+ * Stable signature for a stack: a hash over the sorted *branch names*
+ * only. Briefs are passed to the LLM as flavor but deliberately don't
+ * participate in the cache key, so:
+ *
+ *   - Cold start (briefs not loaded yet) → signature stable; restored
+ *     persisted title appears immediately without a wasted refetch.
+ *   - A member's commits change (brief regenerates) → signature
+ *     unchanged; title sticks. Stack themes rarely pivot per-commit,
+ *     so this is the right default. A manual regen knob lives below
+ *     for the "title is wrong, redo it" case.
+ *   - Member set changes (branch added / removed from the chain) →
+ *     signature flips → fresh title fetched.
+ *
+ * Sentinel `__empty__` for an empty list pairs with the `enabled`
+ * guard so the queryFn never runs against it.
+ */
+export function buildStackSignature(
+  members: ReadonlyArray<StackMember>,
+): string {
+  if (members.length === 0) return "__empty__";
+  const branches = members.map((m) => m.branch).sort();
+  return createHash("sha256").update(branches.join("\0")).digest("hex").slice(0, 16);
+}
+
+/**
+ * AI-named stack section title. Hash-keyed on the member-branch
+ * signature (see `buildStackSignature` for why briefs are excluded
+ * from the key) so two stacks with the same membership share one
+ * cache entry. Member additions / removals cut a fresh entry; commit
+ * churn within members does not.
+ *
+ * `sectionName` is passed through for the activity log line only; it
+ * doesn't participate in the cache key.
+ *
+ * Persisted: falls into the persister's default-true branch (key
+ * length < 3) so the entry survives TUI restarts; restored entries
+ * skip the queryFn on first observe, no LM call needed until the
+ * member set changes.
+ */
+export const stackTitleQuery = (
+  sectionName: string,
+  members: ReadonlyArray<StackMember>,
+) =>
+  queryOptions({
+    queryKey: qk.stackTitle(buildStackSignature(members)),
+    queryFn: async ({ signal }): Promise<string> => {
+      if (members.length === 0) {
+        throw new Error("stackTitleQuery: members empty (enabled guard missed)");
+      }
+      aiLog.event.dim(`naming stack ${sectionName} (${members.length} members)...`);
+      const start = Date.now();
+      try {
+        const title = await summarizeStack(members, signal);
+        aiLog.event.dim(
+          `named stack ${sectionName} → "${title}" (${formatDuration(Date.now() - start)})`,
+        );
+        return title;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        aiLog.event.err(
+          `naming stack ${sectionName} failed (${formatDuration(Date.now() - start)}): ${msg}`,
+        );
+        throw err;
+      }
+    },
+    enabled: members.length > 0 && !!config.ai,
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: Number.POSITIVE_INFINITY,
+  });

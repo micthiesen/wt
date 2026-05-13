@@ -29,8 +29,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { killActionSession } from "./action-tmux.ts";
-import { wtSessionArgs } from "./claude.ts";
 import { config } from "./config.ts";
+import {
+  getHarness,
+  type Harness,
+  type HarnessId,
+} from "./harness/index.ts";
 import { createLogger } from "./logger.ts";
 import { shellLogPath } from "./shell-tail.ts";
 
@@ -49,27 +53,51 @@ export const TMUX_SOCKET = "wt";
 export const WT_SOURCE_SLUG = "wt";
 
 /**
- * Kinds of session this module manages. `claude` is the persistent
- * F12 conversation; `diff` is the F11 git-diff TUI; `shell` is the
- * F10 plain login shell; `action` is a wt-managed action runner
- * (claude `-p` or shell command) supervised by tmux so it survives
- * wt restarts. Each gets its own tmux session per slug — `<slug>`
- * for claude (primary), `<slug>~<name>` for additional named claude
- * sessions, `<slug>-diff` for diff, `<slug>-shell` for shell,
- * `<slug>-action` for action — so they coexist without interfering.
+ * Kinds of session this module manages. `claude` / `codex` / `opencode`
+ * are AI harness sessions (each spawned for one worktree at a time);
+ * `diff` is the F11 git-diff TUI; `shell` is the F10 plain login
+ * shell; `action` is a wt-managed action runner (claude `-p` or shell
+ * command) supervised by tmux so it survives wt restarts.
+ *
+ * Each gets its own tmux session per slug. Naming:
+ *  - `<slug>` for claude primary (back-compat)
+ *  - `<slug>~<name>` for additional named claude sessions
+ *  - `<slug>-codex` for the slug's codex tmux session (one at a time)
+ *  - `<slug>-opencode` for the slug's opencode tmux session
+ *  - `<slug>-diff` / `<slug>-shell` / `<slug>-action` for non-AI kinds
  *
  * Action sessions are not user-attachable and are not driven by the
  * F-key codepath in this module — `core/action-tmux.ts` owns their
  * lifecycle. The kind is registered here so `listSessions` and
  * `reapOrphanedSessions` see them uniformly with the other kinds.
  */
-export type SessionKind = "claude" | "diff" | "shell" | "action";
+export type SessionKind =
+  | "claude"
+  | "codex"
+  | "opencode"
+  | "diff"
+  | "shell"
+  | "action";
 
 const SUFFIX: Record<Exclude<SessionKind, "claude">, string> = {
+  codex: "-codex",
+  opencode: "-opencode",
   diff: "-diff",
   shell: "-shell",
   action: "-action",
 };
+
+/** Kinds backed by an AI harness. F12 / `;` route through the harness layer. */
+const AI_KINDS: ReadonlySet<SessionKind> = new Set([
+  "claude",
+  "codex",
+  "opencode",
+]);
+
+function harnessIdForKind(kind: SessionKind): HarnessId | null {
+  if (kind === "claude" || kind === "codex" || kind === "opencode") return kind;
+  return null;
+}
 
 /**
  * Separator between slug and a named claude session's user-supplied
@@ -85,10 +113,17 @@ const CLAUDE_NAMED_SEP = "~";
 function sessionName(
   slug: string,
   kind: SessionKind,
-  claudeName: string | null = null,
+  managedName: string | null = null,
 ): string {
-  if (kind !== "claude") return `${slug}${SUFFIX[kind]}`;
-  return claudeSessionName(slug, claudeName);
+  if (kind === "claude") return claudeSessionName(slug, managedName);
+  if (kind === "codex" || kind === "opencode") {
+    // Codex / OpenCode are single-tmux-per-slug for v1: tmux name is
+    // `<slug>-codex` / `<slug>-opencode` regardless of which resume id
+    // the inner program is running. Switching ids requires killing
+    // and respawning the tmux session.
+    return `${slug}${SUFFIX[kind]}`;
+  }
+  return `${slug}${SUFFIX[kind]}`;
 }
 
 /**
@@ -130,12 +165,19 @@ function shQuote(s: string): string {
  * scope for the named-claude rollout; flagged for a future sweep.
  */
 function bareSlug(name: string): string {
+  // Strip a trailing `~<name>` if present (claude named, or any
+  // future per-id-named harness session).
   const tildeIdx = name.lastIndexOf(CLAUDE_NAMED_SEP);
-  if (tildeIdx >= 0) return name.slice(0, tildeIdx);
-  for (const suffix of Object.values(SUFFIX)) {
-    if (name.endsWith(suffix)) return name.slice(0, -suffix.length);
+  const beforeTilde = tildeIdx >= 0 ? name.slice(0, tildeIdx) : name;
+  // Strip the kind suffix (`-codex`, `-opencode`, `-diff`, `-shell`,
+  // `-action`) from what's left. Order matters: longest-suffix first
+  // so `-opencode` doesn't get partially-stripped by `-code` if a
+  // future entry were added.
+  const suffixes = Object.values(SUFFIX).sort((a, b) => b.length - a.length);
+  for (const suffix of suffixes) {
+    if (beforeTilde.endsWith(suffix)) return beforeTilde.slice(0, -suffix.length);
   }
-  return name;
+  return beforeTilde;
 }
 
 /** Path to the generated tmux.conf. */
@@ -244,6 +286,19 @@ export async function killClaudeNamedSession(
   await killByName(sessionName(slug, "claude", claudeName));
 }
 
+/**
+ * Kill one worktree's harness session by id. For Claude with a non-null
+ * managedName, kills the named session; otherwise kills the primary
+ * tmux slot for that harness on that slug. Idempotent.
+ */
+export async function killHarnessSession(
+  slug: string,
+  harnessId: HarnessId,
+  managedName: string | null = null,
+): Promise<void> {
+  await killByName(sessionName(slug, harnessId, managedName));
+}
+
 /** Kill one worktree's diff session. Idempotent. */
 export async function killDiffSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "diff"));
@@ -327,10 +382,12 @@ export type ClaudeSessionEntry = { slug: string; name: string | null };
  * the sessions picker can each read what they need independently.
  * One CLI call regardless of worktree count.
  *
- * `claude` is now a list of `(slug, name)` because a single worktree
- * can host multiple claude sessions (primary + N named). The legacy
- * `claudeSlugs` set is the unique-slug projection — preserved so
- * "row has any live claude" checks stay a Set lookup.
+ * `claude` is a list of `(slug, name)` because a single worktree can
+ * host multiple claude sessions (primary + N named). `codex` and
+ * `opencode` are slug sets — for v1 they're single-tmux-per-slug.
+ * The legacy `claudeSlugs` set is the unique-slug projection of
+ * `claude` — preserved so "row has any live claude" checks stay a
+ * Set lookup.
  *
  * Server-not-running exits non-zero with a "no server running"
  * stderr; we map that to empty sets rather than throwing — it's the
@@ -339,18 +396,29 @@ export type ClaudeSessionEntry = { slug: string; name: string | null };
 export async function listSessions(): Promise<{
   claude: ClaudeSessionEntry[];
   claudeSlugs: Set<string>;
+  codex: Set<string>;
+  opencode: Set<string>;
   diff: Set<string>;
   shell: Set<string>;
   action: Set<string>;
+  /** Raw set of every live tmux session name. Used by harness impls
+   *  to compute `isLive` without a second `list-sessions` call. */
+  all: Set<string>;
 }> {
   const all = await listAllSessionsRaw();
   const claude: ClaudeSessionEntry[] = [];
   const claudeSlugs = new Set<string>();
+  const codex = new Set<string>();
+  const opencode = new Set<string>();
   const diff = new Set<string>();
   const shell = new Set<string>();
   const action = new Set<string>();
   for (const name of all) {
-    if (name.endsWith(SUFFIX.diff)) {
+    if (name.endsWith(SUFFIX.codex)) {
+      codex.add(name.slice(0, -SUFFIX.codex.length));
+    } else if (name.endsWith(SUFFIX.opencode)) {
+      opencode.add(name.slice(0, -SUFFIX.opencode.length));
+    } else if (name.endsWith(SUFFIX.diff)) {
       diff.add(name.slice(0, -SUFFIX.diff.length));
     } else if (name.endsWith(SUFFIX.shell)) {
       shell.add(name.slice(0, -SUFFIX.shell.length));
@@ -369,7 +437,7 @@ export async function listSessions(): Promise<{
       }
     }
   }
-  return { claude, claudeSlugs, diff, shell, action };
+  return { claude, claudeSlugs, codex, opencode, diff, shell, action, all };
 }
 
 /**
@@ -470,21 +538,23 @@ export async function attachOrCreate(opts: {
   cwd: string;
   kind: Exclude<SessionKind, "action">;
   /**
-   * For `kind: "claude"` only. Undefined / null → the primary session
-   * (tmux session name = bare slug; display name in `/resume` defaults
-   * to `"primary"` and is overridable via `claudeDisplayName`). String
-   * → a named additional session (tmux name = `<slug>~<claudeName>`;
-   * display name = `claudeName`). Ignored for other kinds.
+   * For AI harness kinds (`claude` / `codex` / `opencode`). Claude:
+   * `null` → primary tmux slot, string → named additional session
+   * (`<slug>~<name>`). Codex / OpenCode ignore the managed name for
+   * the tmux name (single-tmux-per-slug) but pass it through to
+   * `harness.buildArgs` so the impl can surface it where relevant.
    */
-  claudeName?: string | null;
+  managedName?: string | null;
   /**
-   * For `kind: "claude"` only. Label shown in claude's `/resume`
-   * picker for the *primary* session. Defaults to `"primary"` so the
-   * label matches the picker entry the user sees in `;`. Pass an
-   * override (e.g. the wt source-repo `.` shortcut passes
-   * `WT_SOURCE_SLUG`) to surface a different name in `/resume`.
-   * Ignored for named sessions (whose display name is the name
-   * itself) and for non-claude kinds.
+   * Harness session id to resume. Only the AI kinds honor this. Pass
+   * `null` to spawn fresh.
+   */
+  resumeSessionId?: string | null;
+  /**
+   * For Claude primary only — label shown in `/resume`. Defaults to
+   * "primary". Pass an override (e.g. the wt source-repo `.` shortcut
+   * uses `WT_SOURCE_SLUG`) to surface a different name. Ignored for
+   * named claude sessions and for other harnesses.
    */
   claudeDisplayName?: string;
   /**
@@ -498,9 +568,19 @@ export async function attachOrCreate(opts: {
    */
   base?: string;
 }): Promise<AttachResult> {
-  const { slug, cwd, kind, claudeName, claudeDisplayName, base } = opts;
-  const claudeNameNorm = kind === "claude" ? (claudeName ?? null) : null;
-  const name = sessionName(slug, kind, claudeNameNorm);
+  const {
+    slug,
+    cwd,
+    kind,
+    managedName,
+    resumeSessionId,
+    claudeDisplayName,
+    base,
+  } = opts;
+  const harnessId = harnessIdForKind(kind);
+  const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
+  const managedNameNorm = harness ? (managedName ?? null) : null;
+  const name = sessionName(slug, kind, managedNameNorm);
   const { path: configPath, changed } = writeConfig();
   if (changed) {
     log.info("config changed, killing server before attach", { slug, kind });
@@ -514,31 +594,28 @@ export async function attachOrCreate(opts: {
   // and disappear, leaving only "exited (0)" in the activity pane.
   const stderrPath = join(sessionsDir(), `${name}.err`);
 
-  // Claude resume-vs-create resolves at attach time. Re-checking on
-  // every attach (rather than caching) means an externally-deleted
-  // jsonl (claude project purge, manual rm) recovers cleanly: next
-  // attach sees the file gone, switches back to --session-id with
-  // the same UUID, and recreates. The diff branch shells out to the
-  // configured command via the user's login shell so PATH/init
-  // (pyenv, mise, …) apply. The shell branch is just the login
-  // shell with no command — exit (Ctrl+D / `exit`) ends the session.
+  // AI harness branches delegate argv to the registered impl. Each
+  // impl decides resume-vs-create at attach time (claude: presence of
+  // its jsonl; codex / opencode: presence of `resumeSessionId`) so
+  // recovery from external deletes is automatic — the next attach
+  // re-evaluates and picks the right form. The diff branch shells out
+  // to the configured command via the user's login shell so PATH/init
+  // (pyenv, mise, …) apply. The shell branch is just the login shell
+  // with no command — exit (Ctrl+D / `exit`) ends the session.
   const userShell = process.env.SHELL || "bash";
-  const innerArgs =
-    kind === "claude"
-      ? [
-          "claude",
-          ...wtSessionArgs({
-            wtPath: cwd,
-            name: claudeNameNorm,
-            displayName:
-              claudeNameNorm !== null
-                ? claudeNameNorm
-                : (claudeDisplayName ?? "primary"),
-          }),
-        ]
-      : kind === "diff"
-        ? [userShell, "-lc", resolveDiffCommand(config.diff.command, base)]
-        : [userShell, "-l"];
+  let innerArgs: string[];
+  if (harness) {
+    innerArgs = harness.buildArgs({
+      wtPath: cwd,
+      managedName: managedNameNorm,
+      resumeSessionId: resumeSessionId ?? null,
+      displayLabel: claudeDisplayName,
+    });
+  } else if (kind === "diff") {
+    innerArgs = [userShell, "-lc", resolveDiffCommand(config.diff.command, base)];
+  } else {
+    innerArgs = [userShell, "-l"];
+  }
 
   // Shell: pre-create the session detached and chain `pipe-pane` to a
   // per-slug log so every byte the shell writes is captured for the

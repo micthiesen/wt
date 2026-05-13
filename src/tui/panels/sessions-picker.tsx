@@ -1,72 +1,82 @@
 /**
- * Sessions picker for `;` — lists every claude session known to wt for
- * the current worktree plus a "+ new" affordance. Two phases: a list
- * view, and an input view for typing a custom name when `+ new` is
- * chosen.
+ * Sessions picker for `;` — multi-harness list of every session known
+ * to wt for the current worktree plus a per-harness "+ new" affordance.
+ * Two phases: a list view, and an input view for typing a custom name
+ * when "+ new claude" is chosen (codex / opencode generate their own
+ * session ids so they skip the name-input phase).
  *
  * UX rules:
- *  - Sort is status-priority-first (working > waiting > abandoned >
- *    idle), then primary > named, then most-recent-active first. The
- *    user's "what should I look at" eye lands on row 1 every time.
- *  - Status drives color (accent / warn / err / dim) for the right-side
- *    label, matching the details-pane claude row.
+ *  - Sort: live sessions first (most-recently-active inside each
+ *    harness's live set wins), then dead sessions (by recency across
+ *    harnesses). Heterogeneous status (claude has busy/idle, codex /
+ *    opencode don't) makes a strict state-priority sort impossible
+ *    across the whole list — the dead-vs-live split is the most
+ *    legible thing left.
+ *  - Status color drives the right-side label. Claude entries surface
+ *    their derived state (working / waiting / abandoned / idle) via
+ *    the per-state color; codex / opencode show a simple "live" or
+ *    age glyph in dim.
  *  - The summary panel below the list shows the LLM-authored snippet
- *    for the selected entry (ai-title > away_summary > last-prompt
- *    fallback). Modal height is fixed so navigation doesn't reflow.
- *  - Quick-pick digits track the rendered (sorted) order.
- *  - `x` on a row kills that session without an extra confirm modal.
- *  - Auto-name on `+ new` is the smallest unused integer starting at 2
- *    (primary is implicit). Empty input → that name.
- *  - Live-preview / pin: j/k on a live entry points the bottom pane
- *    at that session's log, mirroring the outputs picker. `'` pins or
- *    unpins, same shape as `OutputsPicker`.
+ *    for the selected entry when one exists. Today only Claude
+ *    supplies summaries — codex / opencode entries fall back to
+ *    "(no summary yet)".
+ *  - Quick-pick digits track the rendered order of the SESSION rows
+ *    only; "+ new" rows are reached via per-harness letters.
+ *  - `d` on a row kills that session (claude only; for codex /
+ *    opencode the picker shows a hint and the user kills the tmux
+ *    slot from outside).
+ *  - Live-preview: j/k on a live claude entry points the bottom pane
+ *    at that session's log, mirroring the outputs picker.
  */
 import { TextAttributes } from "@opentui/core";
 
-import type { ClaudeSessionPickerEntry } from "../../core/claude-sessions.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
-import { sessionOutputId } from "../../core/outputs.ts";
+import { HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import { STATE_DOT, STATE_FG } from "../claude-state.ts";
-import { NF } from "../icons.ts";
+import type { HarnessSessionEntry } from "../hooks/useHarnessSessions.ts";
 import { Modal } from "../modal.tsx";
 import { ageMsToText } from "../text.ts";
 import { theme } from "../theme.ts";
 
+export type PickerRow =
+  | { kind: "session"; entry: HarnessSessionEntry }
+  | { kind: "new"; harnessId: HarnessId };
+
+type SummaryBySessionId = ReadonlyMap<string, { text: string } | null>;
+
 type ListProps = {
   slug: string;
-  entries: ReadonlyArray<ClaudeSessionPickerEntry>;
+  rows: ReadonlyArray<PickerRow>;
   selectedIndex: number;
   /**
-   * Currently pinned output id for this slug's bucket, or null when
-   * nothing is pinned. Used to render the pin glyph next to the
-   * matching entry; also drives the hint label (`'` toggles).
+   * Per-claude-session summary snippets (ai-title / away_summary /
+   * last-prompt). Keyed by session UUID; passed through from the
+   * existing `claudeSummariesQuery`. Codex / opencode entries don't
+   * have summaries today.
    */
-  pinnedId: string | null;
+  summaries: SummaryBySessionId;
 };
 
-// React `key` for the sentinel "+ new" row appended after every
-// entry list. Internal — callers identify "+ new" by its index
-// (entries.length), not by this string.
-const NEW_ROW_KEY = "__new__";
-
 /**
- * Render the LLM-authored summary blob for the selected entry.
- * Italicized so the prose reads as "context about", not "row content"
- * — the body is model output, not a label.
+ * Render the LLM-authored summary blob for the selected entry. Empty
+ * for codex / opencode (no summary source yet). Italicized so the
+ * prose reads as "context about", not "row content".
  */
 function SummaryPanel({
-  entry,
+  row,
+  summaries,
 }: {
-  entry: ClaudeSessionPickerEntry | null;
+  row: PickerRow | null;
+  summaries: SummaryBySessionId;
 }) {
-  if (!entry) {
+  if (!row || row.kind !== "session") {
     return (
       <text fg={theme.fgDim} attributes={TextAttributes.ITALIC} wrapMode="word">
         no session selected
       </text>
     );
   }
-  const summary = entry.summary;
+  const summary = summaries.get(row.entry.sessionId);
   if (!summary) {
     return (
       <text fg={theme.fgDim} attributes={TextAttributes.ITALIC} wrapMode="word">
@@ -83,85 +93,76 @@ function SummaryPanel({
 
 export function SessionsPickerList({
   slug,
-  entries,
+  rows,
   selectedIndex,
-  pinnedId,
+  summaries,
 }: ListProps) {
-  const items: Array<{
-    key: string;
-    label: string;
-    state: DerivedState | null;
-    statusText: string;
-    ageText: string | null;
-    queued: number;
-    isPinned: boolean;
-  }> = [];
-  for (const entry of entries) {
-    const label = entry.name === null ? "primary" : entry.name;
-    const outputId = sessionOutputId(slug, "claude", entry.name);
-    const ageText =
-      entry.lastEntryMs !== null
-        ? ageMsToText(Date.now() - entry.lastEntryMs)
-        : null;
-    items.push({
-      key: entry.name === null ? "primary" : `name:${entry.name}`,
-      label,
-      state: entry.state,
-      statusText: entry.state,
-      ageText,
-      queued: entry.queued,
-      isPinned: pinnedId === outputId,
-    });
-  }
-  items.push({
-    key: NEW_ROW_KEY,
-    label: "new session",
-    state: null,
-    statusText: "+",
-    ageText: null,
-    queued: 0,
-    isPinned: false,
-  });
-
-  const selectedEntry =
-    selectedIndex < entries.length ? entries[selectedIndex] ?? null : null;
-
+  // Track digit assignments for session rows only; "+ new" rows get
+  // their per-harness letter prefix instead.
+  let sessionDigitCursor = 0;
   return (
     <Modal
-      title={`claude · ${slug}`}
-      // Bigger than the default 20% so the summary panel below the
-      // list has room to breathe. Consistent height across selections
-      // keeps j/k navigation steady — no reflow on summary swap.
+      title={`sessions · ${slug}`}
       inset={{ top: "8%", bottom: "8%" }}
       hints={[
         ["j/k", "move"],
         ["1-9", "quick pick"],
-        ["⏎", "select"],
-        ["'", pinnedId ? "unpin" : "pin"],
-        ["x", "kill"],
-        ["esc / q / ;", "cancel"],
+        ["c / o / x", "new …"],
+        ["d", "kill"],
+        ["; / ⏎", "select"],
+        ["esc / q", "cancel"],
       ]}
     >
       <box flexDirection="column" flexGrow={1} overflow="hidden">
-        {items.map((it, i) => {
+        {rows.map((row, i) => {
           const selected = i === selectedIndex;
           const bg = selected ? theme.rowSelectedBg : undefined;
-          // Label fg: bright when selected, state-tinted dim when
-          // not — keeps the eye flowing down the active set without
-          // making non-selected rows feel washed out.
+          if (row.kind === "new") {
+            const h = HARNESSES.find((h) => h.id === row.harnessId)!;
+            return (
+              <box
+                key={`new:${row.harnessId}`}
+                flexDirection="row"
+                backgroundColor={bg}
+                paddingLeft={1}
+                paddingRight={1}
+              >
+                <text fg={selected ? theme.accent : theme.fgDim}>
+                  {selected ? "▸ " : "  "}
+                </text>
+                <box width={2} flexShrink={0}>
+                  <text fg={theme.accent}>{h.letter}</text>
+                </box>
+                <text fg={h.color}>{h.glyph} </text>
+                <text fg={selected ? theme.fgBright : theme.fg}>
+                  new {h.label} session
+                </text>
+              </box>
+            );
+          }
+          const e = row.entry;
+          const h = HARNESSES.find((h) => h.id === e.harnessId)!;
+          const ageText =
+            e.lastActiveMs !== null
+              ? ageMsToText(Date.now() - e.lastActiveMs)
+              : null;
+          const state: DerivedState | null = e.extras.derivedState;
+          // Claude entries show derived state + state-tinted dot;
+          // codex / opencode entries show simple "live" / "dead" in
+          // dim color. Picker is the only place this differs.
           const labelFg = selected
             ? theme.fgBright
-            : it.state === null
-              ? theme.fg
-              : it.state === "idle"
-                ? theme.fgDim
-                : theme.fg;
-          const stateFg = it.state ? STATE_FG[it.state] : theme.fgDim;
-          const showDigit = i < 9;
-          const prefix = showDigit ? `${i + 1}` : " ";
+            : state === "idle"
+              ? theme.fgDim
+              : theme.fg;
+          const stateFg = state ? STATE_FG[state] : theme.fgDim;
+          const statusText = state ? state : e.isLive ? "live" : "dead";
+          const showDigit = sessionDigitCursor < 9;
+          const prefix = showDigit ? `${sessionDigitCursor + 1}` : " ";
+          if (showDigit) sessionDigitCursor++;
           return (
             <box
-              key={it.key}
+              key={`s:${e.harnessId}:${e.sessionId}`}
               flexDirection="row"
               backgroundColor={bg}
               paddingLeft={1}
@@ -173,24 +174,24 @@ export function SessionsPickerList({
               <box width={2} flexShrink={0}>
                 <text fg={theme.fgDim}>{prefix}</text>
               </box>
+              <text fg={h.color}>{h.glyph} </text>
               <box flexGrow={1} flexShrink={1} overflow="hidden">
                 <text fg={labelFg} wrapMode="none" truncate>
-                  {it.label}
+                  {e.displayName}
                 </text>
               </box>
-              {it.queued > 0 ? (
-                <text fg={theme.warn}>{it.queued}⏵ </text>
+              {e.extras.queued > 0 ? (
+                <text fg={theme.warn}>{e.extras.queued}⏵ </text>
               ) : null}
-              {it.isPinned ? <text fg={theme.accent}>{NF.pin} </text> : null}
-              {it.state ? (
+              {state ? (
                 <text fg={stateFg}>
-                  {STATE_DOT[it.state]} {it.statusText}
+                  {STATE_DOT[state]} {statusText}
                 </text>
               ) : (
-                <text fg={stateFg}>{it.statusText}</text>
+                <text fg={stateFg}>{statusText}</text>
               )}
-              {it.ageText ? (
-                <text fg={theme.fgDim}> · {it.ageText}</text>
+              {ageText ? (
+                <text fg={theme.fgDim}> · {ageText}</text>
               ) : null}
             </box>
           );
@@ -208,7 +209,10 @@ export function SessionsPickerList({
           paddingRight={1}
           marginTop={1}
         >
-          <SummaryPanel entry={selectedEntry} />
+          <SummaryPanel
+            row={rows[selectedIndex] ?? null}
+            summaries={summaries}
+          />
         </box>
       </box>
     </Modal>
@@ -221,7 +225,7 @@ type NewProps = {
   /**
    * Auto-name surfaced as the placeholder when input is empty —
    * what'll be used if the user just hits Enter. Computed by the
-   * caller via `nextAutoName`.
+   * caller via `nextAutoName`. Claude-only flow.
    */
   autoName: string;
   /**
@@ -233,7 +237,7 @@ type NewProps = {
 export function SessionsPickerNew({ slug, input, autoName, error }: NewProps) {
   return (
     <Modal
-      title={`claude · ${slug} · new`}
+      title={`new claude session · ${slug}`}
       hints={[
         ["⏎", "spawn & attach"],
         ["esc", "back"],

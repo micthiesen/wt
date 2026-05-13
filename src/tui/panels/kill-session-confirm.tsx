@@ -13,22 +13,36 @@ const COPY: Record<Props["sessionKind"], { title: string; body: string }> = {
     title: "Kill the interactive Claude session on",
     body:
       "The tmux session and the running Claude process are " +
-      "terminated. Conversation history is preserved on disk — " +
+      "terminated. Conversation history is preserved on disk, " +
       "next F12 resumes the same conversation. Use /clear inside " +
       "Claude if you want a fresh context.",
+  },
+  codex: {
+    title: "Kill the Codex session on",
+    body:
+      "The tmux session and the running Codex process are " +
+      "terminated. The session rollout is preserved on disk; " +
+      "resume it from the picker via `codex resume`.",
+  },
+  opencode: {
+    title: "Kill the OpenCode session on",
+    body:
+      "The tmux session and the running OpenCode process are " +
+      "terminated. The session is preserved in opencode.db; " +
+      "resume it from the picker.",
   },
   diff: {
     title: "Kill the diff session on",
     body:
       "The tmux session and the diff TUI are terminated. Next F11 " +
-      "opens a fresh session — scroll position and expanded hunks " +
+      "opens a fresh session, scroll position and expanded hunks " +
       "won't carry over.",
   },
   shell: {
     title: "Kill the shell session on",
     body:
-      "The tmux session and the shell — including any background " +
-      "processes you launched in it — are terminated. Next F10 " +
+      "The tmux session and the shell, including any background " +
+      "processes you launched in it, are terminated. Next F10 " +
       "starts a fresh shell.",
   },
 };

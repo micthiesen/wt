@@ -399,6 +399,11 @@ function useLockReleasedInvalidator(lockedSig: string): void {
     prevLockedRef.current = curr;
     if (released) {
       void qc.invalidateQueries({ queryKey: qk.worktrees() });
+      // Destroys (and `init`) mutate state.json from the child process
+      // — refresh the wtState query so the row aggregator sees those
+      // mutations (e.g. `clearParentRefs` after a destroy) without
+      // waiting for the staleTime to expire.
+      void qc.invalidateQueries({ queryKey: qk.wtState() });
     }
   }, [lockedSig, qc]);
 }

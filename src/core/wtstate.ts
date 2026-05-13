@@ -376,6 +376,31 @@ export function removeStackSection(name: string): boolean {
 }
 
 /**
+ * Clear every slug's manual `parent` override that points at
+ * `branch`. Called after a worktree destroy / clean so dependent
+ * worktrees fall back to auto-detection (PR base → reflog → trunk)
+ * instead of dangling on a deleted branch. Returns the slugs whose
+ * override was cleared, so callers can log / toast them.
+ */
+export function clearParentRefs(branch: string): string[] {
+  if (!branch) return [];
+  const state = readWtState();
+  const cleared: string[] = [];
+  let changed = false;
+  const nextSlugs: Record<string, WtSlugState> = { ...state.slugs };
+  for (const [slug, v] of Object.entries(state.slugs)) {
+    if (v.parent === branch) {
+      nextSlugs[slug] = { ...v, parent: null };
+      cleared.push(slug);
+      changed = true;
+    }
+  }
+  if (!changed) return [];
+  writeWtState({ ...state, slugs: nextSlugs });
+  return cleared;
+}
+
+/**
  * Reap stale slug entries against the live slug set. Called after
  * destroys to keep the state file tidy. No-op when nothing to drop.
  */

@@ -1,4 +1,4 @@
-import { QueryClient } from "@tanstack/react-query";
+import { hashKey, QueryClient } from "@tanstack/react-query";
 import { experimental_createQueryPersister } from "@tanstack/query-persist-client-core";
 
 import { config } from "../core/config.ts";
@@ -38,6 +38,14 @@ const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export type WtQueryClient = {
   client: QueryClient;
   restored: Promise<void>;
+  /**
+   * Drop a query from both the in-memory cache and the SQLite blob.
+   * Used at startup to evict orphaned entries persisted under keys
+   * whose shape changed across a wt upgrade — without it the entry
+   * sits dead in the persister forever (or until maxAge) and gets
+   * pre-warmed back into memory on every launch.
+   */
+  evict(queryKey: readonly unknown[]): void;
   /** Stop the persister, close the storage handle. */
   shutdown(): void;
 };
@@ -100,6 +108,14 @@ export function createWtQueryClient(): WtQueryClient {
   return {
     client,
     restored,
+    evict(queryKey): void {
+      // Mirror what the persister does on write: storage key = prefix
+      // + hashKey(queryKey). hashKey is the same hasher the QueryCache
+      // uses to dedupe observers, so it's the only correct way to
+      // address a persisted row from outside.
+      client.removeQueries({ queryKey: [...queryKey], exact: true });
+      storage.removeItem(`${STORAGE_PREFIX}-${hashKey([...queryKey])}`);
+    },
     shutdown(): void {
       client.getQueryCache().clear();
       client.unmount();

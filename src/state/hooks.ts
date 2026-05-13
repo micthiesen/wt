@@ -139,9 +139,21 @@ export function patchPullRequest(
   patch: (pr: PullRequest) => PullRequest,
 ): GithubData | undefined {
   if (!data) return data;
-  const pr = data.prs[branch];
+  // The `["github"]` prefix filter used by `mutate` also matches any
+  // future / orphaned cache entries that happen to start with the same
+  // prefix but carry a different value shape (e.g. a stale persisted
+  // `["github", "reviewRequests"]` blob whose data is
+  // `ReviewRequestPr[]`, not `GithubData`). Treat anything without a
+  // `prs` object as not-our-entry and return it untouched rather than
+  // crashing on `data.prs[branch]`.
+  const prs = (data as { prs?: unknown }).prs;
+  if (!prs || typeof prs !== "object") return data;
+  const pr = (prs as Record<string, PullRequest>)[branch];
   if (!pr) return data;
-  return { ...data, prs: { ...data.prs, [branch]: patch(pr) } };
+  return {
+    ...data,
+    prs: { ...(prs as Record<string, PullRequest>), [branch]: patch(pr) },
+  };
 }
 
 /**
@@ -324,11 +336,14 @@ export function useWtActions() {
       // github query regardless of the branches suffix. Stack is also
       // a prefix-keyed query (`["stack", ...branches]`) and we want
       // reflog-based detection to re-run on `r` so a recent rebase
-      // picks up its new parent without waiting for staleTime.
+      // picks up its new parent without waiting for staleTime. The
+      // review-requests query lives off-prefix (see qk.reviewRequests)
+      // and gets its own invalidation here.
       await Promise.all([
         qc.fetchQuery(fetchOriginQuery()),
         qc.invalidateQueries({ queryKey: qk.worktrees() }),
         qc.invalidateQueries({ queryKey: ["github"] }),
+        qc.invalidateQueries({ queryKey: qk.reviewRequests() }),
         qc.invalidateQueries({ queryKey: ["stack"] }),
       ]);
       await Promise.all([
@@ -413,7 +428,10 @@ export function useWtActions() {
      * waiting for the slow staleTime to expire.
      */
     async refreshGithub(): Promise<void> {
-      await qc.invalidateQueries({ queryKey: ["github"] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["github"] }),
+        qc.invalidateQueries({ queryKey: qk.reviewRequests() }),
+      ]);
     },
     /**
      * Invalidate Graphite's mergeability cache. Call after a write that
@@ -430,6 +448,37 @@ export function useWtActions() {
      */
     async refreshTmuxSessions(): Promise<void> {
       await qc.invalidateQueries({ queryKey: tmuxSessionsQuery().queryKey });
+    },
+    /**
+     * Invalidate the harness-sessions discovery for a slug. Call after
+     * spawning / killing a harness session so the picker entries pick
+     * up the new on-disk state. Hits all harnesses since codex /
+     * opencode write to shared stores that could surface new entries.
+     */
+    async refreshHarnessSessions(slug: string): Promise<void> {
+      await qc.invalidateQueries({
+        queryKey: ["harnessSessions"],
+        predicate: (q) => q.queryKey[2] === slug,
+      });
+    },
+    /**
+     * Persist a new primary harness selection and invalidate the
+     * cached query so observers pick up the change.
+     */
+    async setPrimaryHarness(id: import("../core/harness/index.ts").HarnessId): Promise<void> {
+      const { writePrimaryHarness } = await import("../core/harness/primary.ts");
+      writePrimaryHarness(id);
+      await qc.invalidateQueries({ queryKey: qk.primaryHarness() });
+    },
+    /**
+     * Cycle the primary harness to the next registered impl and
+     * invalidate the cached query.
+     */
+    async cyclePrimaryHarness(): Promise<import("../core/harness/index.ts").HarnessId> {
+      const { cyclePrimaryHarness } = await import("../core/harness/primary.ts");
+      const next = cyclePrimaryHarness();
+      await qc.invalidateQueries({ queryKey: qk.primaryHarness() });
+      return next;
     },
     /**
      * Invalidate the cached LLM summaries for `slug`. The query key

@@ -63,7 +63,6 @@ export const NF = {
 	circled8: "\u{277D}",
 	circled9: "\u{277E}",
 	anglesUp: "\u{F102}", // nf-fa-angle_double_up — stacked-on hint when parent worktree sits immediately above
-	pin: "\u{F08D}", // nf-fa-thumb_tack — pinned output in OutputViewer title
 } as const;
 
 /**

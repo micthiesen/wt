@@ -6,7 +6,6 @@
  */
 import { actionRegistry } from "../../core/actions.ts";
 import { type Output, outputStatusLabel } from "../../core/outputs.ts";
-import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 
 import {
@@ -19,7 +18,6 @@ import { ActivityContent, DestroyContent } from "./activity.tsx";
 type Props = {
   output: Output;
   height: number;
-  pinned: boolean;
 };
 
 function borderColor(o: Output): string {
@@ -52,9 +50,8 @@ function titleFor(o: Output): string {
   return `action · ${o.title} · ${outputStatusLabel(o.status)}${killHint}`;
 }
 
-export function OutputViewer({ output, height, pinned }: Props) {
-  const pinPrefix = pinned ? `${NF.pin} ` : "";
-  const title = ` ${pinPrefix}${titleFor(output)} `;
+export function OutputViewer({ output, height }: Props) {
+  const title = ` ${titleFor(output)} `;
   return (
     <box
       flexShrink={0}

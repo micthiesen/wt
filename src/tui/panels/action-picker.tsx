@@ -53,8 +53,8 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
       hints={[
         ["j/k", "move"],
         ["1-9", "quick pick"],
-        ["!", "custom prompt"],
-        ["⏎", "select"],
+        ["c", "custom prompt"],
+        ["! / ⏎", "select"],
         ["esc / q", "cancel"],
       ]}
     >
@@ -63,11 +63,11 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
         const bg = selected ? theme.rowSelectedBg : undefined;
         const isCustom = item.kind === "custom";
         const blocked = !isCustom && !item.availability.ok;
-        // Custom entry gets the `!` chord prefix (mirrors `l` for "+ new
+        // Custom entry gets the `c` chord prefix (mirrors `n` for "+ new
         // section"); configured actions get 1..9 quick-pick digits.
         const actionIndex = isCustom ? -1 : i;
         const showDigit = !isCustom && actionIndex < 9;
-        const prefix = isCustom ? "!" : showDigit ? `${actionIndex + 1}` : " ";
+        const prefix = isCustom ? "c" : showDigit ? `${actionIndex + 1}` : " ";
         const prefixFg = isCustom
           ? theme.accent
           : blocked

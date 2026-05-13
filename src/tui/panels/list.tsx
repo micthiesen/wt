@@ -17,12 +17,26 @@ import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
 import { STATE_FG_GLYPH } from "../claude-state.ts";
+import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { StatusKind } from "../../core/types.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = {
   rows: WorktreeRow[];
+  /**
+   * PRs the user has been asked to review. Pinned in their own section
+   * between the active worktrees and the archived block. Not worktrees
+   * (no local checkout, no per-slug state) so they render with a
+   * stripped-down row component and no badge cluster.
+   */
+  reviewRequests: readonly ReviewRequestPr[];
+  /**
+   * Combined cursor index across `activeRows + reviewRequests +
+   * archivedRows` in render order. Parent owns the unification so
+   * navigation handlers can pick the right item type by index without
+   * the list panel re-implementing the ordering.
+   */
   selectedIndex: number;
   width: number;
   activeTails: Set<string>;
@@ -47,6 +61,14 @@ type Props = {
    * current row; null otherwise.
    */
   chainHighlight: ReadonlySet<string> | null;
+  /**
+   * Per-stack-section AI-derived display label, keyed by the stored
+   * section name (`stack: 1234`). When present, the section's divider
+   * shows the AI title instead of the storage name. Missing entries
+   * fall back to the storage name silently — AI unconfigured / call
+   * pending / call failed all look identical.
+   */
+  stackSectionLabels: ReadonlyMap<string, string>;
   isLoading: boolean;
   filter: string;
 };
@@ -398,6 +420,83 @@ const RowView = memo(function RowView({
 });
 
 /**
+ * Tiny CI rollup for a review-request row. Same icons as the worktree
+ * row's `checkGlyph` but standalone (no `PullRequest` shape), so it can
+ * read directly from the `ReviewRequestPr.checks` rollup.
+ */
+function reviewCheckGlyph(checks: ReviewRequestPr["checks"]): {
+  glyph: string;
+  fg: string;
+} {
+  switch (checks) {
+    case "pass":
+      return { glyph: NF.checkPass, fg: theme.ok };
+    case "fail":
+      return { glyph: NF.checkFail, fg: theme.err };
+    case "pending":
+      return { glyph: NF.checkPend, fg: theme.warn };
+    default:
+      return { glyph: "  ", fg: theme.fgDim };
+  }
+}
+
+/**
+ * Row in the "review requests" pinned section. Not a worktree — no
+ * slug, no per-slug state, no badge cluster. Just the PR icon (open or
+ * draft), a label (`owner/repo#N · title`), and a check-rollup glyph
+ * on the right when CI is reporting. Selection still highlights with
+ * the same bg as worktree rows so j/k navigation feels unified.
+ */
+const ReviewRequestRowView = memo(function ReviewRequestRowView({
+  pr,
+  selected,
+  panelWidth,
+}: {
+  pr: ReviewRequestPr;
+  selected: boolean;
+  panelWidth: number;
+}) {
+  const bg = selected ? theme.rowSelectedBg : undefined;
+  const prFg = pr.isDraft ? theme.fgDim : theme.accentAlt;
+  const prGlyph = pr.isDraft ? NF.prDraft : NF.prOpen;
+  const check = reviewCheckGlyph(pr.checks);
+  const showChecks = pr.checks !== "none";
+  // PR title only; repo + number live in the details pane.
+  const label = capitalizeFirst(pr.title);
+  // Match worktree row width budget: borders(2) + paddingLeft+right(2)
+  // + leading PR-icon slot(3) + trailing check slot when present(2).
+  const trailingCells = showChecks ? 2 + 2 : 0;
+  const budget = Math.max(0, panelWidth - 7 - trailingCells);
+  const slugAttrs = selected ? TextAttributes.BOLD : 0;
+  const slugFg = selected ? theme.fgBright : theme.fg;
+  return (
+    <box flexDirection="row" backgroundColor={bg} paddingLeft={1} paddingRight={1}>
+      <box flexShrink={0} flexDirection="row">
+        <box width={2} flexShrink={0}>
+          <text fg={prFg}>{prGlyph}</text>
+        </box>
+        <box width={1} flexShrink={0}>
+          <text> </text>
+        </box>
+      </box>
+      <box flexGrow={1} flexShrink={1} overflow="hidden">
+        <text fg={slugFg} attributes={slugAttrs} wrapMode="none">
+          {truncateEnd(label, budget)}
+        </text>
+      </box>
+      {showChecks ? (
+        <box flexShrink={0} flexDirection="row">
+          <text>  </text>
+          <box width={2} flexShrink={0}>
+            <text fg={check.fg}>{check.glyph}</text>
+          </box>
+        </box>
+      ) : null}
+    </box>
+  );
+});
+
+/**
  * Section divider. The `stack` variant signals an auto-managed
  * stack section: double-line rule chars with `╔═ … ═╗` corner
  * brackets in the accentAlt color, so the section reads as an
@@ -442,11 +541,15 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, claudeAggStateBySlug, chainHighlight, isLoading, filter }: Props) {
+export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, claudeSessionsBySlug, claudeAggStateBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
   const archivedRows = hasArchived ? rows.slice(firstArchivedIndex) : [];
+  const hasReviewRequests = reviewRequests.length > 0;
+  // Index offsets into the combined cursor space owned by the parent.
+  const reviewOffset = activeRows.length;
+  const archivedOffset = reviewOffset + reviewRequests.length;
   return (
     <box
       flexDirection="column"
@@ -459,7 +562,7 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
       titleAlignment="left"
       paddingTop={0}
     >
-      {rows.length === 0 ? (
+      {rows.length === 0 && !hasReviewRequests ? (
         <box padding={1}>
           {isLoading ? (
             <text fg={theme.fgDim}>Loading worktrees...</text>
@@ -481,6 +584,18 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
         </box>
       ) : (
         <>
+          {rows.length === 0 ? (
+            // No worktrees but review-requests are loaded — still surface
+            // the new-worktree hint so the user isn't left wondering where
+            // the worktree column went. The PR section renders below.
+            <box padding={1} flexDirection="row">
+              <text fg={theme.fgDim}>No worktrees. Press </text>
+              <text fg={theme.accent} attributes={1}>
+                n
+              </text>
+              <text fg={theme.fgDim}> to create one.</text>
+            </box>
+          ) : null}
           {activeRows.map((row, i) => {
             // Section transition: render an empty spacer row plus a
             // muted divider (matching the archived divider style) the
@@ -510,7 +625,11 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
                   <>
                     <box height={1} flexShrink={0} />
                     <Divider
-                      label={row.section!}
+                      label={
+                        row.sectionIsStack
+                          ? stackSectionLabels.get(row.section!) ?? row.section!
+                          : row.section!
+                      }
                       width={width}
                       variant={row.sectionIsStack ? "stack" : "manual"}
                     />
@@ -530,13 +649,31 @@ export function WorktreeList({ rows, selectedIndex, width, activeTails, activeAc
               </Fragment>
             );
           })}
+          {hasReviewRequests || hasArchived ? (
+            // Pushes the pinned bottom sections to the bottom of the pane.
+            <box flexGrow={1} flexShrink={1} />
+          ) : null}
+          {hasReviewRequests ? (
+            <>
+              <Divider label="Review requests" width={width} />
+              {reviewRequests.map((pr, i) => {
+                const globalIndex = reviewOffset + i;
+                return (
+                  <ReviewRequestRowView
+                    key={pr.url}
+                    pr={pr}
+                    selected={globalIndex === selectedIndex}
+                    panelWidth={width}
+                  />
+                );
+              })}
+            </>
+          ) : null}
           {hasArchived ? (
             <>
-              {/* Pushes the archived section to the bottom of the pane. */}
-              <box flexGrow={1} flexShrink={1} />
-              <Divider label="archived" width={width} />
+              <Divider label="Archived" width={width} />
               {archivedRows.map((row, i) => {
-                const globalIndex = activeRows.length + i;
+                const globalIndex = archivedOffset + i;
                 // Archived rows never show the stack hint — the
                 // archive block is a flat list with a hard divider
                 // above it, so any "above me" relationship across

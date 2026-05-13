@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./claude-sessions.ts";
-import { clearSlugState } from "./wtstate.ts";
+import { clearParentRefs, clearSlugState } from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
@@ -328,16 +328,28 @@ export async function removeWorktree(
       }
     }
 
-    // Note: archive.json / state.json entries are NOT cleared here.
-    // Doing so from the child process while the parent TUI's
-    // worktreesQuery cache still includes this slug causes the row to
-    // visibly "un-archive" mid-destroy: the archive query refetches and
-    // sees the slug gone, but the worktrees list still has it, so the
-    // row pops into the active section as merged/gone until the next
-    // worktrees refetch. The fresh-start guarantee for re-creates lives
-    // in createWorktree (which clears both files for the new slug); the
-    // stale-entry sweep for external destroys lives in `reapStartup` so
-    // archive.json/state.json don't accumulate ghosts.
+    // Note: archive.json / state.json entries for THIS slug are NOT
+    // cleared here. Doing so from the child process while the parent
+    // TUI's worktreesQuery cache still includes this slug causes the
+    // row to visibly "un-archive" mid-destroy: the archive query
+    // refetches and sees the slug gone, but the worktrees list still
+    // has it, so the row pops into the active section as merged/gone
+    // until the next worktrees refetch. The fresh-start guarantee for
+    // re-creates lives in createWorktree (which clears both files for
+    // the new slug); the stale-entry sweep for external destroys lives
+    // in `reapStartup` so archive.json/state.json don't accumulate
+    // ghosts.
+    //
+    // Clearing OTHER slugs' parent overrides that referenced this
+    // branch is safe: those rows aren't being destroyed, they're just
+    // losing a dangling override that pointed at the now-gone branch.
+    // Falls back through PR base → reflog → trunk on next render.
+    if (wt.branch) {
+      const cleared = clearParentRefs(wt.branch);
+      for (const s of cleared) {
+        opts.onLog?.(`cleared manual parent override on ${s} (${wt.branch} removed)`);
+      }
+    }
 
     return {
       ok: true,

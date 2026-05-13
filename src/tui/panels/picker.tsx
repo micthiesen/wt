@@ -5,15 +5,27 @@ type Props = {
   title: string;
   items: string[];
   selectedIndex: number;
+  /**
+   * Key that opens the modal — re-pressing it confirms (chord-confirm
+   * convention; see modal UX rules in CLAUDE.md). Shown in the "pick"
+   * hint when set.
+   */
+  toggleKey?: string;
 };
 
-export function PickerModal({ title, items, selectedIndex }: Props) {
+export function PickerModal({
+  title,
+  items,
+  selectedIndex,
+  toggleKey,
+}: Props) {
+  const pickKeys = toggleKey ? `${toggleKey} / ⏎` : "⏎";
   return (
     <Modal
       title={title}
       hints={[
         ["j/k", "move"],
-        ["⏎", "pick"],
+        [pickKeys, "pick"],
         ["esc / q", "cancel"],
       ]}
     >
@@ -57,9 +69,9 @@ type MultiProps = {
   selectedIndex: number;
   checked: ReadonlySet<string>;
   /**
-   * Key that opens & closes the modal. When set, it's prepended to
-   * the cancel hint so the user sees the full dismiss vocabulary
-   * (toggle key + universal esc/q). See `Modal` for the convention.
+   * Key that opens the modal — re-pressing it submits (chord-confirm
+   * convention; see modal UX rules in CLAUDE.md). Shown in the
+   * "submit" hint when set.
    */
   toggleKey?: string;
 };
@@ -71,15 +83,15 @@ export function MultiPickerModal({
   checked,
   toggleKey,
 }: MultiProps) {
-  const cancelKeys = toggleKey ? `${toggleKey} / esc / q` : "esc / q";
+  const submitKeys = toggleKey ? `${toggleKey} / ⏎` : "⏎";
   return (
     <Modal
       title={title}
       hints={[
         ["j/k", "move"],
         ["space", "toggle"],
-        ["⏎", "submit"],
-        [cancelKeys, "cancel"],
+        [submitKeys, "submit"],
+        ["esc / q", "cancel"],
       ]}
     >
       {items.length === 0 ? (

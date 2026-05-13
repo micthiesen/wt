@@ -13,12 +13,12 @@ export const STACK_ITEMS: Item[] = [
   {
     key: "s",
     label: "sync",
-    hint: "fetch origin, rebase every chain on trunk",
+    hint: "fetch origin, rebase every chain on trunk, force-push",
   },
   {
     key: "r",
     label: "rebase",
-    hint: "rebase the current chain on its parents",
+    hint: "rebase the current chain on its parents, force-push",
   },
   {
     key: "p",

@@ -14,6 +14,24 @@ export const qk = {
    * "session attached" hint.
    */
   tmuxSessions: () => ["tmuxSessions"] as const,
+  /**
+   * Harness session discovery for one (slug, harness) pair. Each impl
+   * (`core/harness/<id>.ts`) defines what "discoverable" means: Claude
+   * reads its persisted-name file + jsonl tails + the registry; Codex
+   * scans rollouts under `~/.codex/sessions/`; OpenCode reads
+   * `opencode.db`. Live-status is annotated on top by the consumer
+   * hook against `tmuxSessionsQuery.all`, so the key intentionally
+   * does NOT include the tmux name set — that would invalidate this
+   * query on every 2s tmux refresh.
+   */
+  harnessSessions: (harnessId: string, slug: string) =>
+    ["harnessSessions", harnessId, slug] as const,
+  /**
+   * Currently-selected primary harness id. Persisted at
+   * `~/.cache/wt/harness.json`. Drives F12 / top-right indicator /
+   * TAB cycle. Single global key.
+   */
+  primaryHarness: () => ["primaryHarness"] as const,
   /** Origin/main fetch marker; invalidated manually. */
   fetchOrigin: () => ["fetchOrigin"] as const,
   /** First-parent SHAs of origin/main; supports branchIsMerged. */
@@ -24,6 +42,19 @@ export const qk = {
    */
   github: (branches: readonly string[]) =>
     ["github", [...branches].sort()] as const,
+  /**
+   * Pull requests where the authenticated user has been requested as
+   * reviewer. Single global key — the GraphQL `search` doesn't take a
+   * worktree-keyed parameter. Intentionally NOT under the `["github"]`
+   * prefix: the per-branch PR cache and this list have different
+   * `data` shapes, and `mutate({ filter: { queryKey: ["github"] } })`
+   * iterates every matching entry via `setQueriesData`. A shared
+   * prefix would push `ReviewRequestPr[]` through `patchPullRequest`,
+   * which expects `GithubData.prs[branch]` and throws on the wrong
+   * shape. `refreshAll` / `refreshGithub` invalidate this key
+   * explicitly to keep refresh semantics.
+   */
+  reviewRequests: () => ["reviewRequests"] as const,
   /**
    * Graphite mergeability statuses keyed by the sorted PR-number list.
    * Single-repo per `wt` instance, so the repo identity is implicit in
@@ -107,6 +138,13 @@ export const qk = {
    * observer rather than a separate slug-stable layer.
    */
   aiSummary: (hash: string) => ["aiSummary", hash] as const,
+  /**
+   * AI-named stack section title, keyed by a signature over the
+   * sorted member branch names. Stays warm across commit churn
+   * within a fixed member set; only membership changes cut new
+   * cache entries. Persisted alongside other AI summaries.
+   */
+  stackTitle: (sig: string) => ["stackTitle", sig] as const,
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
   /** Per-slug section + manual order (fs-backed). */

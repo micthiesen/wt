@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useIsFetching, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useIsFetching, useQueries, useQuery } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 
 import {
   actionRegistry,
+  BUILTIN_ACTIONS,
   evaluateActionRequirements,
   type ActionDef,
   type ActionRun,
@@ -21,7 +22,8 @@ import {
 } from "../core/github.ts";
 import { armMergeWhenReady } from "../core/graphite.ts";
 import { fetchOrigin } from "../core/worktree.ts";
-import { isRebaseInProgress } from "../core/git.ts";
+import { branchIsGone, isRebaseInProgress } from "../core/git.ts";
+import { expectedStage } from "../core/stage-safety.ts";
 import { run } from "../core/proc.ts";
 import {
   chainOf,
@@ -31,7 +33,6 @@ import {
 } from "../core/stack-plan.ts";
 import {
   addClaudeName,
-  buildClaudeSessionEntries,
   nameInUse,
   nextAutoName,
   removeClaudeName,
@@ -59,12 +60,9 @@ import {
   WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
-import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
+import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
-import type { SessionTail } from "../core/claude.ts";
 import { wtSessionUuid } from "../core/claude.ts";
-import type { ClaudeRegistryData } from "../state/queries.ts";
-import type { RegistryStatus } from "../core/claude-registry.ts";
 import { deriveSessionState, pickAggregateState, type DerivedState } from "../core/claude-status.ts";
 
 import {
@@ -82,7 +80,7 @@ import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
 import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
 import { OutputsPicker } from "./panels/outputs-picker.tsx";
 import { OutputViewer } from "./panels/output-viewer.tsx";
-import { previewFocusPatch, togglePinPatch } from "./picker-preview.ts";
+import { previewFocusPatch } from "./picker-preview.ts";
 import {
   SectionPickerModal,
   type SectionPickerItem,
@@ -94,7 +92,12 @@ import {
 import { WorktreeList } from "./panels/list.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { StackActionsModal } from "./panels/stack-actions.tsx";
-import { enterClaudeSession } from "./claude-session.ts";
+import { enterHarnessSession } from "./harness-session.ts";
+import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
+import { useHarnessSessions } from "./hooks/useHarnessSessions.ts";
+import { getHarness, HARNESSES, type HarnessId } from "../core/harness/index.ts";
+import { HarnessPickerModal } from "./panels/harness-picker.tsx";
+import type { PickerRow } from "./panels/sessions-picker.tsx";
 import { enterDiffSession } from "./diff-session.ts";
 import { enterShellSession } from "./shell-session.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
@@ -133,49 +136,13 @@ function resolveDiffBase(row: WorktreeRow): string {
   return row.stackedOn?.diffBase ?? `origin/${config.branch.base}`;
 }
 
-/**
- * Shape `buildClaudeSessionEntries`'s pure inputs out of the live wt
- * state. Two call sites need this (the picker render memo + the `;`
- * keyboard handler's initial-index computation), and the picker's
- * "two callers can't silently drift" invariant rides on both using
- * identical projections — extracted here so a new field added to
- * `buildClaudeSessionEntries` lands once.
- */
-function buildPickerInputs(
-  row: WorktreeRow,
-  liveNamesForSlug: ReadonlyArray<string | null>,
-  registry: ClaudeRegistryData | undefined,
-): {
-  slug: string;
-  wtPath: string;
-  liveNames: ReadonlyArray<string | null>;
-  tailByName: Map<string | null, SessionTail>;
-  registryStatusBySessionId: Record<string, RegistryStatus>;
-} {
-  const tailByName = new Map<string | null, SessionTail>();
-  for (const t of row.fields.claude.data?.sessions ?? []) {
-    tailByName.set(t.name, t);
-  }
-  const registryStatusBySessionId: Record<string, RegistryStatus> = {};
-  for (const [id, s] of Object.entries(registry?.bySessionId ?? {})) {
-    registryStatusBySessionId[id] = s.status;
-  }
-  return {
-    slug: row.wt.slug,
-    wtPath: row.wt.path,
-    liveNames: liveNamesForSlug,
-    tailByName,
-    registryStatusBySessionId,
-  };
-}
-
-/** Per-worktree pin/focus state for the Outputs system. */
-type SlugFocus = { focused: string | null; pinned: string | null };
+/** Per-worktree focus state for the Outputs system. */
+type SlugFocus = { focused: string | null };
 /** Bucket key for the "no row selected" state. Slugs are user-
  *  generated branch names with limited charset; this sentinel can't
  *  collide. */
 const NO_ROW_KEY = "__no_row__";
-const EMPTY_FOCUS: SlugFocus = { focused: null, pinned: null };
+const EMPTY_FOCUS: SlugFocus = { focused: null };
 
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
@@ -385,6 +352,16 @@ type Modal =
       input: string;
       error: string | null;
     }
+  | {
+      /**
+       * Pick a harness to spawn fresh. Opened by Shift+F12 — gives the
+       * user a one-off override of the primary selection without
+       * changing the global TAB-cycled primary.
+       */
+      kind: "harnessSelect";
+      slug: string;
+      index: number;
+    }
   | { kind: "killActionConfirm"; slug: string; actionName: string }
   | {
       kind: "killSessionConfirm";
@@ -432,6 +409,10 @@ function buildActionVars(row: WorktreeRow): ActionVars {
     slug: row.wt.slug,
     cwd: row.wt.path,
     pr: row.pr ? String(row.pr.number) : "",
+    // Deterministic stage from the slug, never from disk. Built-in
+    // remove-local + any user shell action that wants a stage handle
+    // reads through this.
+    stage: expectedStage(row.wt),
   };
 }
 
@@ -445,6 +426,24 @@ function buildActionVars(row: WorktreeRow): ActionVars {
  * between cache writes (the underlying query refetches once a minute).
  */
 const USAGE_STALE_MS = 30 * 60 * 1000;
+
+/**
+ * Top-right harness selector indicator. Shows the current primary
+ * harness with its glyph + label and a "TAB" hint. Tabbing through
+ * the registered impls is wired in the main keypress handler; this
+ * component just renders.
+ */
+function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
+  const harness = getHarness(primary);
+  return (
+    <box flexShrink={0} flexDirection="row">
+      <text fg={theme.fgDim}> </text>
+      <text fg={harness.color}>{harness.glyph} </text>
+      <text fg={theme.fg}>{harness.label}</text>
+      <text fg={theme.fgDim}>  TAB</text>
+    </box>
+  );
+}
 
 function ClaudeUsageBadge() {
   const { data } = useQuery(claudeUsageQuery());
@@ -554,7 +553,11 @@ export function App({ onExit }: Props) {
     renameSection,
     moveSection,
     mutate,
+    cyclePrimaryHarness,
+    setPrimaryHarness,
+    refreshHarnessSessions,
   } = useWtActions();
+  const primaryHarness = usePrimaryHarness();
   // Cursor is tracked by slug, not index. Slug identity survives row
   // moves (archive, section change, manual reorder) without any
   // explicit "follow this row" plumbing — the visual index falls out
@@ -584,12 +587,12 @@ export function App({ onExit }: Props) {
   // because the rename UX uses the footer, not an overlay.
   const [pendingRename, setPendingRename] = useState<string | null>(null);
   // Per-worktree bottom-pane state. Each slug has its own focused
-  // (explicit pick from picker / cycle keys) and pinned (sticky
-  // override) output. Switching rows restores that worktree's last
-  // selection — so monitoring an action on one slug and a CC session
-  // on another stays mutually independent. The `__no_row__` bucket
-  // covers the "nothing selected" edge (filter excludes everything,
-  // brand-new repo) and pins down what the global pane shows there.
+  // (explicit pick from picker / cycle keys) output. Switching rows
+  // restores that worktree's last selection — so monitoring an
+  // action on one slug and a CC session on another stays mutually
+  // independent. The `__no_row__` bucket covers the "nothing
+  // selected" edge (filter excludes everything, brand-new repo) and
+  // pins down what the global pane shows there.
   const [slugFocus, setSlugFocus] = useState<Record<string, SlugFocus>>({});
   const toastTimer = useRef<Timer | null>(null);
 
@@ -641,25 +644,125 @@ export function App({ onExit }: Props) {
     return rows.filter((r) => r.wt.slug.toLowerCase().includes(needle));
   }, [rows, filter]);
 
+  // Stack section AI title pipeline. Filter against `rows` (not
+  // `filteredRows`) so a `/`-filter narrowing the visible set doesn't
+  // make a section's title flicker — the title describes membership,
+  // not what's currently on screen. Members preserve `rows` order
+  // (chain depth from the row aggregator).
+  const stackSectionMembers = useMemo((): Map<string, StackMember[]> => {
+    const byName = new Map<string, StackMember[]>();
+    for (const r of rows) {
+      if (!r.sectionIsStack || r.section === null) continue;
+      // A detached HEAD wouldn't legitimately be part of a stack
+      // (stacks walk branch-parent chains), but the type allows it.
+      // Skipping keeps the signature stable and the prompt clean.
+      if (!r.wt.branch) continue;
+      const { id, rest } = slugLabel(r.wt.slug);
+      // Brief is the LLM's pithy noun phrase. Falls back to the
+      // slug-derived label so a brand-new stack — no member has
+      // produced an AI summary yet — still gets a useful prompt.
+      // (Briefs aren't part of the cache key, only fetch-time flavor.)
+      const brief = r.brief ?? (rest || id || r.wt.slug);
+      let arr = byName.get(r.section);
+      if (!arr) {
+        arr = [];
+        byName.set(r.section, arr);
+      }
+      arr.push({ branch: r.wt.branch, brief });
+    }
+    return byName;
+  }, [rows]);
+  const stackSectionEntries = useMemo(
+    () => Array.from(stackSectionMembers.entries()),
+    [stackSectionMembers],
+  );
+  // `placeholderData: keepPreviousData` so adding/removing a member
+  // mid-session doesn't flicker the divider through the storage name
+  // — the prior title stays on screen while the new key fetches.
+  const stackTitleResults = useQueries({
+    queries: stackSectionEntries.map(([name, members]) => ({
+      ...stackTitleQuery(name, members),
+      placeholderData: keepPreviousData,
+    })),
+  });
+  // Map sectionName → display label. Quiet fallback: when AI is
+  // unconfigured or the call hasn't resolved yet, the entry is
+  // missing and the Divider renders the storage name (`stack: 1234`).
+  const stackSectionLabels = useMemo((): Map<string, string> => {
+    const m = new Map<string, string>();
+    for (let i = 0; i < stackSectionEntries.length; i++) {
+      const [name] = stackSectionEntries[i]!;
+      const title = stackTitleResults[i]?.data;
+      if (typeof title === "string" && title.trim() !== "") {
+        m.set(name, title);
+      }
+    }
+    return m;
+  }, [stackSectionEntries, stackTitleResults]);
+
   const cleanCandidates = useMemo(
     () => rows.filter((r) => isCleanCandidate(r)),
     [rows],
   );
 
-  // Resolve the selected slug to a visual index. When the slug isn't
-  // in the current filtered set (destroyed, filtered out, never set),
-  // fall back to the last known visual index, clamped to the new
-  // length. That fallback is what makes "destroy the selected row"
-  // land the cursor on the row that took its place.
+  // Review-requested PRs are a pinned section at the bottom of the
+  // list. Filter is intentionally a no-op for them: the `/` filter
+  // narrows by slug, and these aren't worktrees with slugs. Hiding
+  // the section while a filter is active matches the user mental
+  // model — `/foo` is "show me my work matching foo", PRs awaiting my
+  // review are explicitly not my work.
+  const reviewRequests = useQuery(reviewRequestsQuery());
+  const reviewRequestRows = useMemo<readonly ReviewRequestPr[]>(
+    () => (filter.trim() === "" ? reviewRequests.data ?? [] : []),
+    [reviewRequests.data, filter],
+  );
+
+  // Unified cursor space: active wts → review-request PRs → archived
+  // wts. j/k/g/G traverse this list as a single sequence so the user
+  // can navigate into the pinned sections without an extra chord.
+  // Selection identity is the slug for wt rows and `pr:<url>` for PR
+  // rows so it survives row reordering and PR list churn.
+  type VisualItem =
+    | { kind: "wt"; row: WorktreeRow }
+    | { kind: "pr"; pr: ReviewRequestPr };
+  const visualItems = useMemo<VisualItem[]>(() => {
+    const active: VisualItem[] = [];
+    const archived: VisualItem[] = [];
+    for (const r of filteredRows) {
+      (r.archived ? archived : active).push({ kind: "wt", row: r });
+    }
+    const prs: VisualItem[] = reviewRequestRows.map((pr) => ({ kind: "pr", pr }));
+    return [...active, ...prs, ...archived];
+  }, [filteredRows, reviewRequestRows]);
+
+  const visualKey = (item: VisualItem): string =>
+    item.kind === "wt" ? item.row.wt.slug : `pr:${item.pr.url}`;
+
+  // Resolve the selected key to a visual index. When the key isn't in
+  // the current visible set (destroyed, filtered out, never set), fall
+  // back to the last known visual index, clamped to the new length.
+  // That fallback is what makes "destroy the selected row" land the
+  // cursor on the row that took its place. Cold launch (`sel === null`,
+  // ref still at its initial 0) deliberately biases toward worktree
+  // rows so a fresh repo with pinned review-requests doesn't open with
+  // the cursor parked on a PR — `p` / Enter there would silently open
+  // a Graphite tab the user wasn't aiming at.
   const lookupIndex =
-    sel === null ? -1 : filteredRows.findIndex((r) => r.wt.slug === sel);
-  const cursorIndex =
-    filteredRows.length === 0
-      ? -1
-      : lookupIndex >= 0
-        ? lookupIndex
-        : Math.min(lastIndexRef.current, filteredRows.length - 1);
-  const current = cursorIndex >= 0 ? filteredRows[cursorIndex] : undefined;
+    sel === null ? -1 : visualItems.findIndex((v) => visualKey(v) === sel);
+  const cursorIndex = (() => {
+    if (visualItems.length === 0) return -1;
+    if (lookupIndex >= 0) return lookupIndex;
+    if (sel === null) {
+      const firstWt = visualItems.findIndex((v) => v.kind === "wt");
+      return firstWt >= 0 ? firstWt : -1;
+    }
+    return Math.min(lastIndexRef.current, visualItems.length - 1);
+  })();
+  const currentItem = cursorIndex >= 0 ? visualItems[cursorIndex] : undefined;
+  const current =
+    currentItem?.kind === "wt" ? currentItem.row : undefined;
+  const selectedPr =
+    currentItem?.kind === "pr" ? currentItem.pr : undefined;
   // Stash the resolved index so it's available as a fallback the next
   // time the slug can't be found. Writing during render is safe — the
   // value is derived purely from this render's inputs, the write is
@@ -681,6 +784,16 @@ export function App({ onExit }: Props) {
   // when running, open picker otherwise).
   const currentSlug = current?.wt.slug;
   const currentRun = useAction(currentSlug);
+  // Per-current-row harness session discovery: combines per-harness
+  // discoverSessions queries with the live tmux name set. The hook
+  // fans out three queries unconditionally (so the call is stable
+  // across cursor moves) but each is `enabled: false` when wtPath is
+  // empty, so cursor-on-a-PR / cursor-on-empty costs nothing.
+  const currentHarnessSessions = useHarnessSessions(
+    current?.wt.slug ?? "",
+    current?.wt.path ?? "",
+    primaryHarness,
+  );
   const showActionViewer = useActionVisible(currentSlug);
   // Set of slugs whose action is in flight RIGHT NOW (no recent-window
   // tail). Drives the leftmost cluster glyph in `WorktreeList` so the
@@ -707,30 +820,40 @@ export function App({ onExit }: Props) {
     ...claudeSummariesQuery(pickerWtForQuery),
     enabled: !!pickerWt,
   });
-  // Pre-compute the sessions-picker entries for the current modal
-  // slug (when the picker is open). Memoized so the listClaudeNames
-  // disk read, the per-session UUID derivation, and the sort only
-  // run when something observable changes. Empty when the modal is
-  // closed or pointed at a different kind.
-  // Narrow the modal dep to its slug so j/k navigation (which changes
-  // `modal.index`) doesn't refire the listClaudeNames disk read +
-  // sort that `buildClaudeSessionEntries` does.
+  // Sessions-picker rows for the current modal slug. Built from
+  // `currentHarnessSessions` so claude/codex/opencode entries surface
+  // in one list. Trailing "+ new" affordances are appended one per
+  // harness so per-harness letters (`c`/`o`/`x`) land on distinct
+  // rows. Index space: [sessions...] [new-claude] [new-codex] [new-opencode].
   const pickerSlug =
     modal?.kind === "claudeSessionsPicker" ? modal.slug : null;
-  const pickerEntries = useMemo(() => {
+  const pickerRows = useMemo<ReadonlyArray<PickerRow>>(() => {
     if (pickerSlug === null) return [];
-    const row = rows.find((r) => r.wt.slug === pickerSlug);
-    if (!row) return [];
-    const inputs = buildPickerInputs(
-      row,
-      claudeSessionsBySlug.get(row.wt.slug) ?? [],
-      claudeRegistry.data,
-    );
-    return buildClaudeSessionEntries({
-      ...inputs,
-      summaryBySessionId: summariesQuery.data ?? {},
+    const sessions = [...currentHarnessSessions.sessions].sort((a, b) => {
+      // Live first, then by recency desc within each bucket.
+      if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+      return (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0);
     });
-  }, [pickerSlug, rows, claudeSessionsBySlug, claudeRegistry.data, summariesQuery.data]);
+    const out: PickerRow[] = sessions.map((entry) => ({
+      kind: "session",
+      entry,
+    }));
+    for (const h of HARNESSES) {
+      out.push({ kind: "new", harnessId: h.id });
+    }
+    return out;
+  }, [pickerSlug, currentHarnessSessions.sessions]);
+  // Summaries keyed by session id for the picker's bottom panel.
+  // Claude-only today; codex / opencode entries fall back to the
+  // "(no summary yet)" placeholder.
+  const pickerSummaries = useMemo(() => {
+    const m = new Map<string, { text: string } | null>();
+    const raw = summariesQuery.data ?? {};
+    for (const [id, value] of Object.entries(raw)) {
+      m.set(id, value);
+    }
+    return m;
+  }, [summariesQuery.data]);
 
   // Per-slug aggregate claude state for the list pane's session
   // count glyph tint. Same registry + tail signals the row uses,
@@ -980,25 +1103,23 @@ export function App({ onExit }: Props) {
     claudeSessionsBySlug,
     visibleOutputs,
   ]);
-  // Pin > explicit user pick > auto, all scoped to the current
-  // worktree's bucket. If the chosen id has evicted from the visible
-  // list (action FIFO'd, session ended, or this slug's id belongs to
-  // a different slug after a row change) drop back through the
-  // precedence chain.
-  const desiredOutputId =
-    focusBucket.pinned ?? focusBucket.focused ?? autoOutputId;
+  // Explicit user pick > auto, scoped to the current worktree's
+  // bucket. If the chosen id has evicted from the visible list
+  // (action FIFO'd, session ended, or this slug's id belongs to a
+  // different slug after a row change) drop back to auto.
+  const desiredOutputId = focusBucket.focused ?? autoOutputId;
   const displayedOutput: Output =
     visibleOutputs.find((o) => o.id === desiredOutputId) ??
     visibleOutputs.find((o) => o.id === autoOutputId) ??
     visibleOutputs[0]!; // events always present in the filtered list
-  // GC stale per-slug state: drop bucket fields whose target output
-  // is no longer in `outputs`, and drop entire buckets for slugs
-  // that are no longer worktrees. Without the second sweep, a long
-  // wt session destroying and recreating worktrees would accumulate
-  // dead entries forever. Surface a dim event line whenever a
-  // non-empty bucket evicts so a user who pinned an action and then
-  // destroyed the worktree gets a breadcrumb instead of a silent
-  // disappearance.
+  // GC stale per-slug state: drop the `focused` field when its target
+  // output is no longer in `outputs`, and drop entire buckets for
+  // slugs that are no longer worktrees. Without the second sweep, a
+  // long wt session destroying and recreating worktrees would
+  // accumulate dead entries forever. Surface a dim event line
+  // whenever a non-empty bucket evicts so a user who explicitly
+  // focused an action and then destroyed the worktree gets a
+  // breadcrumb instead of a silent disappearance.
   //
   // Implementation note: the diff (which buckets to drop, which to
   // log about) is computed in a non-updater pass first, then the
@@ -1018,9 +1139,7 @@ export function App({ onExit }: Props) {
     const evictedSlugs: string[] = [];
     for (const [key, bucket] of Object.entries(slugFocus)) {
       if (!liveSlugs.has(key)) {
-        if (bucket.focused !== null || bucket.pinned !== null) {
-          evictedSlugs.push(key);
-        }
+        if (bucket.focused !== null) evictedSlugs.push(key);
         changed = true;
         continue;
       }
@@ -1028,14 +1147,8 @@ export function App({ onExit }: Props) {
         bucket.focused && liveOutputIds.has(bucket.focused)
           ? bucket.focused
           : null;
-      const pinned =
-        bucket.pinned && liveOutputIds.has(bucket.pinned)
-          ? bucket.pinned
-          : null;
-      if (focused !== bucket.focused || pinned !== bucket.pinned) {
-        changed = true;
-      }
-      if (focused === null && pinned === null) {
+      if (focused !== bucket.focused) changed = true;
+      if (focused === null) {
         // Drop empty buckets so the map doesn't grow unbounded
         // through ordinary navigation. `setFocus` already prevents
         // writing all-null buckets, but defending the invariant
@@ -1044,7 +1157,7 @@ export function App({ onExit }: Props) {
         changed = true;
         continue;
       }
-      next[key] = { focused, pinned };
+      next[key] = { focused };
     }
 
     if (!changed) return;
@@ -1061,9 +1174,9 @@ export function App({ onExit }: Props) {
     setSlugFocus((prev) => {
       const cur = prev[key] ?? EMPTY_FOCUS;
       const next = { ...cur, ...patch };
-      // Drop the bucket entirely when both fields collapse to null
+      // Drop the bucket entirely when focused collapses to null
       // (parity with the GC effect; keeps the map tight).
-      if (next.focused === null && next.pinned === null) {
+      if (next.focused === null) {
         if (!(key in prev)) return prev;
         const { [key]: _, ...rest } = prev;
         return rest;
@@ -1401,7 +1514,10 @@ export function App({ onExit }: Props) {
     });
   }
 
-  async function doRemove(slug: string): Promise<void> {
+  async function doRemove(
+    slug: string,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
     const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) return;
@@ -1415,19 +1531,24 @@ export function App({ onExit }: Props) {
       toast(`${slug} is ${label}`, theme.warn, 2000);
       return;
     }
-    if ((row.fields.dirty.data?.length ?? 0) > 0) {
-      log.event.err("refused: uncommitted changes, use `wt rm <slug> --force` from shell");
-      toast(`${slug} has uncommitted changes`, theme.err, 3000);
-      return;
-    }
-    const unpushed = row.fields.sync.data?.remote?.ahead ?? 0;
-    if (unpushed > 0) {
-      const plural = unpushed === 1 ? "" : "s";
-      log.event.err(
-        `refused: ${unpushed} unpushed commit${plural}, use \`wt rm ${slug} --force\` from shell`,
-      );
-      toast(`${slug} has ${unpushed} unpushed commit${plural}`, theme.err, 3000);
-      return;
+    const force = opts.force ?? false;
+    if (!force) {
+      if ((row.fields.dirty.data?.length ?? 0) > 0) {
+        log.event.err("refused: uncommitted changes, press d again to force");
+        toast(`${slug} has uncommitted changes`, theme.err, 3000);
+        return;
+      }
+      const unpushed = row.fields.sync.data?.remote?.ahead ?? 0;
+      if (unpushed > 0) {
+        const plural = unpushed === 1 ? "" : "s";
+        log.event.err(
+          `refused: ${unpushed} unpushed commit${plural}, press d again to force`,
+        );
+        toast(`${slug} has ${unpushed} unpushed commit${plural}`, theme.err, 3000);
+        return;
+      }
+    } else {
+      log.event.warn("force destroy: skipping dirty + unpushed guards");
     }
     // Tuck the row into the archived section for the duration of the
     // destroy — keeps the active list uncluttered while tail output
@@ -1467,11 +1588,11 @@ export function App({ onExit }: Props) {
     // source keeps the cache dir tidy without waiting for a restart.
     removeShellLog(slug);
     spawnBackgroundRemove(slug, {
-      force: false,
+      force,
       destroyStage: row.fields.deploy.data ?? false,
       deleteBranch: true,
     });
-    log.event.info("dispatched destroy");
+    log.event.info(`dispatched destroy${force ? " (force)" : ""}`);
     toast(`dispatched destroy of ${slug}`, theme.info);
     setTimeout(() => void invalidateWorktree(slug), 600);
   }
@@ -1512,13 +1633,20 @@ export function App({ onExit }: Props) {
   }
 
   /**
-   * Attach to (or create) a claude session for `slug`. `name = null`
-   * is the primary; a string is one of the named sessions. Suspends
-   * the renderer, hands the terminal to tmux, surfaces lifecycle
-   * events to the activity pane. Toasts on spawn-fail; the rest is
-   * background.
+   * Attach to (or create) a harness session for `slug`. Used for all
+   * three harnesses (claude/codex/opencode). For Claude, `managedName`
+   * controls primary-vs-named; for Codex/OpenCode `managedName` is
+   * ignored and `resumeSessionId` selects which session id to resume
+   * (null = spawn fresh).
    */
-  function doEnterClaudeSession(slug: string, name: string | null): void {
+  function doEnterHarnessSession(
+    slug: string,
+    harnessId: HarnessId,
+    opts: {
+      managedName?: string | null;
+      resumeSessionId?: string | null;
+    } = {},
+  ): void {
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) {
       toast(`no row for ${slug}`, theme.warn, 1500);
@@ -1528,27 +1656,45 @@ export function App({ onExit }: Props) {
       toast(`${slug} is busy`, theme.warn, 2000);
       return;
     }
+    const harness = getHarness(harnessId);
     const sessionLog = createLogger(slug);
     void (async () => {
-      const label = name === null ? "" : ` "${name}"`;
-      sessionLog.event.info(`entering claude session${label} (F12 to detach)`);
-      const result = await enterClaudeSession({
+      sessionLog.event.info(
+        `entering ${harness.label} session (F12 to detach)`,
+      );
+      const result = await enterHarnessSession({
         renderer,
         slug,
         cwd: row.wt.path,
-        claudeName: name,
+        harnessId,
+        managedName: opts.managedName ?? null,
+        resumeSessionId: opts.resumeSessionId ?? null,
       });
       void refreshTmuxSessions();
+      void refreshHarnessSessions(slug);
       if (result.kind === "spawn-failed") {
-        sessionLog.event.err(`claude failed to start: ${result.reason}`);
-        toast(`claude failed: ${result.reason}`, theme.err, 3000);
+        sessionLog.event.err(`${harness.label} failed to start: ${result.reason}`);
+        toast(`${harness.label} failed: ${result.reason}`, theme.err, 3000);
       } else if (result.kind === "detached") {
-        sessionLog.event.info(`detached from ${claudeSessionName(slug, name)}`);
+        sessionLog.event.info(`detached from ${harness.label} session`);
       } else {
-        sessionLog.event.info(`claude exited (${result.code ?? "?"})`);
+        sessionLog.event.info(
+          `${harness.label} exited (${result.code ?? "?"})`,
+        );
         if (result.stderr) sessionLog.event.err(result.stderr);
       }
     })();
+  }
+
+  /**
+   * Attach to (or create) a claude session for `slug`. `name = null`
+   * is the primary; a string is one of the named sessions. Suspends
+   * the renderer, hands the terminal to tmux, surfaces lifecycle
+   * events to the activity pane. Toasts on spawn-fail; the rest is
+   * background.
+   */
+  function doEnterClaudeSession(slug: string, name: string | null): void {
+    doEnterHarnessSession(slug, "claude", { managedName: name });
   }
 
   /**
@@ -1581,11 +1727,12 @@ export function App({ onExit }: Props) {
     const sessionLog = createLogger(slug);
     void (async () => {
       sessionLog.event.info(`entering claude session "${name}" (F12 to detach)`);
-      const result = await enterClaudeSession({
+      const result = await enterHarnessSession({
         renderer,
         slug,
         cwd: row.wt.path,
-        claudeName: name,
+        harnessId: "claude",
+        managedName: name,
       });
       void refreshTmuxSessions();
       if (result.kind === "spawn-failed") {
@@ -1891,9 +2038,12 @@ export function App({ onExit }: Props) {
 
   /**
    * Walk the plan one rebase at a time. Each step acquires the
-   * worktree's lock, runs `git rebase <base>`, and releases. On exit:
+   * worktree's lock, runs `git rebase <base>`, force-pushes the
+   * result, and releases. On rebase exit:
    *
-   *   - clean → continue to the next step
+   *   - clean → push (force-with-lease), then continue to the next
+   *     step. Push failures warn and continue — origin mismatch is
+   *     recoverable and shouldn't halt the chain.
    *   - paused on conflict (`rebase-merge/` exists) → spawn a claude
    *     session in the halted worktree with the remaining plan baked
    *     into the prompt so it can finish the chain
@@ -1915,17 +2065,21 @@ export function App({ onExit }: Props) {
     }
     const log = createLogger(originSlug);
     log.event.dim(`${opName}: ${plan.length} branch${plan.length === 1 ? "" : "es"}`);
+    let pushedOk = 0;
+    let pushFailed = 0;
+    let pushSkipped = 0;
     for (let i = 0; i < plan.length; i++) {
       const step = plan[i]!;
+      const tag = `[${i + 1}/${plan.length}] ${step.branch}`;
       const handle = tryAcquireLock(step.slug, opName, {
         phase: `rebase onto ${step.base}`,
       });
       if (!handle) {
-        log.event.warn(`${step.slug} is busy; aborting ${opName}`);
+        log.event.warn(`${tag}: busy, aborting ${opName}`);
         toast(`${step.slug} is busy`, theme.warn, 2000);
         return;
       }
-      log.event.dim(`rebase ${step.branch} onto ${step.base}...`);
+      log.event.dim(`${tag}: rebasing onto ${step.base}`);
       let exitCode: number;
       let errorText = "";
       try {
@@ -1940,24 +2094,82 @@ export function App({ onExit }: Props) {
         void invalidateWorktree(step.slug);
       }
       if (exitCode === 0) {
-        log.event.ok(`rebase ${step.branch} clean`);
+        const pushResult = await pushAfterRebase(step);
+        if (pushResult.kind === "ok") {
+          log.event.ok(`${tag}: done`);
+          pushedOk++;
+        } else if (pushResult.kind === "skipped") {
+          log.event.ok(`${tag}: done (push skipped, ${pushResult.reason})`);
+          pushSkipped++;
+        } else {
+          log.event.warn(`${tag}: rebased, push failed: ${pushResult.msg}`);
+          pushFailed++;
+        }
         continue;
       }
       if (await isRebaseInProgress(step.path)) {
         const remaining = plan.slice(i + 1);
-        log.event.warn(`rebase ${step.branch} paused on conflict — opening claude`);
+        log.event.warn(`${tag}: paused on conflict, opening claude`);
         escalateStackToClaude(step, remaining, opName);
         return;
       }
       const msg = errorText.slice(0, 200) || `git rebase exit ${exitCode}`;
-      log.event.err(`rebase ${step.branch} failed: ${msg.slice(0, 200)}`);
+      log.event.err(`${tag}: rebase failed: ${msg.slice(0, 200)}`);
       toast(`rebase ${step.branch} failed: ${msg.slice(0, 80)}`, theme.err, 4000);
       return;
     }
-    log.event.ok(`${opName} clean`);
-    toast(`${opName} clean`, theme.ok, 2500);
+    const pushSummary =
+      pushFailed > 0
+        ? ` · pushed ${pushedOk}/${plan.length - pushSkipped} (${pushFailed} failed)`
+        : pushedOk > 0
+          ? ` · pushed ${pushedOk}`
+          : "";
+    log.event.ok(`${opName} clean${pushSummary}`);
+    const toastColor = pushFailed > 0 ? theme.warn : theme.ok;
+    toast(`${opName} clean${pushSummary}`, toastColor, 2500);
     void refreshGithub();
     void refreshStack();
+  }
+
+  /**
+   * Force-push a freshly-rebased branch to origin so the remote ref
+   * matches local. Strategy:
+   *
+   *   - `branchIsGone` (upstream deleted by squash-merge + prune) →
+   *     skip; recreating it would resurrect a finished branch.
+   *   - `refs/remotes/origin/<branch>` exists → `--force-with-lease`.
+   *     Safe default; refuses if origin moved unexpectedly.
+   *   - No upstream-tracking ref → plain `git push`; relies on the
+   *     global `push.autoSetupRemote` to create origin/<branch> and
+   *     set the upstream.
+   *
+   * Returns a tagged result so the caller can emit a single
+   * terminal log line per step. Push failures are not fatal.
+   */
+  async function pushAfterRebase(
+    step: RebaseStep,
+  ): Promise<
+    | { kind: "ok" }
+    | { kind: "skipped"; reason: string }
+    | { kind: "failed"; msg: string }
+  > {
+    if (await branchIsGone(step.branch)) {
+      return { kind: "skipped", reason: "upstream gone" };
+    }
+    const upstreamCheck = await run(
+      ["git", "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${step.branch}`],
+      { cwd: step.path, timeoutMs: 5_000 },
+    );
+    const hasUpstream = upstreamCheck.exitCode === 0;
+    const args = hasUpstream
+      ? ["git", "push", "--force-with-lease"]
+      : ["git", "push"];
+    const r = await run(args, { cwd: step.path, timeoutMs: 60_000 });
+    if (r.exitCode === 0) return { kind: "ok" };
+    const msg =
+      (r.stderr || r.stdout).trim().slice(0, 200) ||
+      `git push exit ${r.exitCode}`;
+    return { kind: "failed", msg };
   }
 
   /**
@@ -2074,9 +2286,17 @@ export function App({ onExit }: Props) {
 
   function buildActionPickerItems(slug: string): PickerItem[] {
     const row = rows.find((r) => r.wt.slug === slug);
-    const rowState = { pr: row?.pr };
+    const rowState = {
+      pr: row?.pr,
+      deployed: row?.fields.deploy.data ?? false,
+    };
     return [
       ...config.actions.map((def) => ({
+        kind: "action" as const,
+        def,
+        availability: evaluateActionRequirements(def.requires, rowState),
+      })),
+      ...BUILTIN_ACTIONS.map((def) => ({
         kind: "action" as const,
         def,
         availability: evaluateActionRequirements(def.requires, rowState),
@@ -2133,7 +2353,10 @@ export function App({ onExit }: Props) {
       return;
     }
     if (def) {
-      const avail = evaluateActionRequirements(def.requires, { pr: row.pr });
+      const avail = evaluateActionRequirements(def.requires, {
+        pr: row.pr,
+        deployed: row.fields.deploy.data ?? false,
+      });
       if (!avail.ok) {
         toast(`${def.name}: ${avail.reason}`, theme.warn, 2500);
         return;
@@ -2148,10 +2371,8 @@ export function App({ onExit }: Props) {
       return;
     }
     // Clear this worktree's focus so the auto-rules surface the
-    // just-launched action. Per-slug pin survives if set — the user
-    // explicitly pinned something else for this slug; respect it.
-    const bucket = slugFocus[slug] ?? EMPTY_FOCUS;
-    if (!bucket.pinned) setFocus(slug, { focused: null });
+    // just-launched action.
+    setFocus(slug, { focused: null });
     toast(`launched ${result.run.actionName}`, theme.info, 2000);
   }
 
@@ -2213,8 +2434,10 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Reviewer multi-picker. Space toggles the cursor item, enter
-    // submits the checked set, esc cancels.
+    // Reviewer multi-picker. Space toggles the cursor item, enter or
+    // `v` (trigger-key re-press) submits the checked set, esc
+    // cancels. Multi-select: re-press is "I'm done choosing" not
+    // "confirm this row".
     if (modal?.kind === "reviewerPicker") {
       const rp = modal;
       if (k.name === "j" || k.name === "down") {
@@ -2238,13 +2461,12 @@ export function App({ onExit }: Props) {
         }
         return;
       }
-      if (k.name === "return") {
+      if (k.name === "return" || k.sequence === "v") {
         void submitReviewerPicker();
         return;
       }
       if (
         k.name === "escape" ||
-        k.sequence === "v" ||
         k.sequence === "q" ||
         (k.ctrl && k.name === "c")
       ) {
@@ -2308,29 +2530,30 @@ export function App({ onExit }: Props) {
         setModal({ ...sp, index: Math.max(sp.index - 1, 0) });
         return;
       }
-      // `l` inside the picker is the chord trigger for "+ new section"
-      // (so `l l` from normal mode lands you in the create-name
-      // input). Plain `l`, no modifiers — Shift+L doesn't apply here
-      // since rename is only a normal-mode action.
-      if (isPlainLetter(k, "l")) {
+      // `n` jumps straight to "+ new section" (chord shortcut: `l n`
+      // from normal mode lands directly in the create-name input).
+      if (isPlainLetter(k, "n")) {
         const createIdx = sp.items.findIndex((it) => it.kind === "create");
         if (createIdx >= 0) {
-          const item = sp.items[createIdx]!;
-          commitSectionPick(item, sp.slug);
+          commitSectionPick(sp.items[createIdx]!, sp.slug);
         }
         return;
       }
       // Quick-pick digits 1..9 jump straight to that item by display
-      // position. Mirrors the digit prefix the modal renders. Ignored
-      // when the position is out of range (so a stray "9" in a list
-      // of three doesn't fire something unintended).
+      // position. Mirrors the digit prefix the modal renders — which
+      // skips the `+ new section` (`n`) and stack (`═`) rows. So we
+      // skip them here too rather than firing on a "phantom" digit.
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
         const i = parseInt(k.sequence, 10) - 1;
         const item = sp.items[i];
-        if (item) commitSectionPick(item, sp.slug);
+        if (item && item.kind !== "create" && item.kind !== "stack") {
+          commitSectionPick(item, sp.slug);
+        }
         return;
       }
-      if (k.name === "return") {
+      // Trigger-key re-press confirms (`l l` chord). See the modal
+      // UX rules in CLAUDE.md.
+      if (k.name === "return" || isPlainLetter(k, "l")) {
         const item = sp.items[sp.index];
         if (item) commitSectionPick(item, sp.slug);
         return;
@@ -2370,39 +2593,8 @@ export function App({ onExit }: Props) {
           });
           return;
         }
-        // `!` chord — jumps straight to the custom-prompt entry. Mirrors
-        // the section picker's `l → "+ new section"` chord, so `! !`
-        // from normal mode lands directly in freeform-edit mode.
-        if (k.sequence === "!") {
-          setModal({
-            kind: "actionPicker",
-            state: { mode: "edit", slug: ap.slug, def: null, extras: "" },
-          });
-          return;
-        }
-        // Quick-pick digits 1..9 jump straight to that *action* item
-        // (the custom entry is reachable via `!`, not a digit). Out-of-
-        // range digits are ignored so a stray "9" in a list of three
-        // doesn't fire something unintended.
-        if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-          const i = parseInt(k.sequence, 10) - 1;
+        const commitIndex = (i: number): void => {
           const item = items[i];
-          if (item && item.kind === "action") {
-            if (!canPickAction(item)) return;
-            if (item.def.kind === "shell") {
-              setModal(null);
-              launchAction(ap.slug, item.def, "");
-            } else {
-              setModal({
-                kind: "actionPicker",
-                state: { mode: "edit", slug: ap.slug, def: item.def, extras: "" },
-              });
-            }
-          }
-          return;
-        }
-        if (k.name === "return") {
-          const item = items[ap.index];
           if (!item) return;
           if (!canPickAction(item)) return;
           if (item.kind === "action" && item.def.kind === "shell") {
@@ -2421,6 +2613,30 @@ export function App({ onExit }: Props) {
               extras: "",
             },
           });
+        };
+        // `c` jumps straight to the custom-prompt entry (chord
+        // shortcut: `! c` from normal mode lands in freeform-edit
+        // mode). Note: `c` is also the clean-confirm key in normal
+        // mode but the modal is the only context here.
+        if (k.sequence === "c") {
+          setModal({
+            kind: "actionPicker",
+            state: { mode: "edit", slug: ap.slug, def: null, extras: "" },
+          });
+          return;
+        }
+        // Quick-pick digits 1..9 jump straight to that *action* item
+        // (the custom entry is reachable via `c`, not a digit).
+        // Out-of-range digits are ignored.
+        if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+          const i = parseInt(k.sequence, 10) - 1;
+          if (items[i] && items[i]!.kind === "action") commitIndex(i);
+          return;
+        }
+        // Trigger-key re-press confirms (`! !` chord). See the modal
+        // UX rules in CLAUDE.md.
+        if (k.name === "return" || k.sequence === "!") {
+          commitIndex(ap.index);
           return;
         }
         if (
@@ -2497,9 +2713,7 @@ export function App({ onExit }: Props) {
     // esc/q cancels (without revert — live commit semantics). `idx`
     // is clamped against the live `visibleOutputs` length on every
     // keypress because the underlying list can shrink while the
-    // picker is open (FIFO eviction, session ending). Pin is cleared
-    // on movement so the live preview actually displays — same
-    // reason `[`/`]` clear pin.
+    // picker is open (FIFO eviction, session ending).
     if (modal?.kind === "outputsPicker") {
       const idx =
         visibleOutputs.length === 0
@@ -2509,6 +2723,11 @@ export function App({ onExit }: Props) {
         setModal({ kind: "outputsPicker", index: next });
         const patch = previewFocusPatch(visibleOutputs[next]?.id ?? null);
         if (patch) setFocus(currentSlug ?? null, patch);
+      };
+      const commit = (i: number): void => {
+        const target = visibleOutputs[i];
+        if (target) setFocus(currentSlug ?? null, { focused: target.id });
+        setModal(null);
       };
       if (k.name === "j" || k.name === "down") {
         moveTo(Math.min(idx + 1, visibleOutputs.length - 1));
@@ -2520,37 +2739,18 @@ export function App({ onExit }: Props) {
       }
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
         const i = parseInt(k.sequence, 10) - 1;
-        // Same pin-clearing as j/k movement — quick-pick is a
-        // navigation override, so any prior pin shouldn't outvote
-        // the explicit choice.
-        const patch = previewFocusPatch(visibleOutputs[i]?.id ?? null);
-        if (patch) {
-          setFocus(currentSlug ?? null, patch);
-          setModal(null);
-        }
+        if (visibleOutputs[i]) commit(i);
         return;
       }
-      if (k.sequence === "'") {
-        const patch = togglePinPatch(
-          visibleOutputs[idx]?.id ?? null,
-          focusBucket.pinned,
-        );
-        if (patch) {
-          setFocus(currentSlug ?? null, patch);
-          setModal(null);
-        }
-        return;
-      }
-      if (k.name === "return") {
-        const target = visibleOutputs[idx];
-        if (target) setFocus(currentSlug ?? null, { focused: target.id });
-        setModal(null);
+      // Trigger-key re-press confirms (`' '` chord) — see the modal
+      // UX rules in CLAUDE.md.
+      if (k.sequence === "'" || k.name === "return") {
+        commit(idx);
         return;
       }
       if (
         k.name === "escape" ||
         k.sequence === "q" ||
-        k.sequence === ":" ||
         (k.ctrl && k.name === "c")
       ) {
         setModal(null);
@@ -2558,55 +2758,62 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Claude sessions picker — list view. Items are derived live on
-    // each keypress from the tmux session list + persisted name list,
-    // so a kill or spawn elsewhere reflects immediately when the user
-    // navigates. Layout: primary first, then live named, then ghost
-    // named (live in tmux = false), then "+ new".
-    //
-    // Live-preview semantics borrowed from the outputs picker: j/k
-    // moves AND points the bottom pane at the highlighted session's
-    // log so the user can scan sessions without committing. Ghost /
-    // "+ new" rows leave focus alone (no live output to preview).
-    // `'` pins the highlighted session's log; Enter / 1-9 attach to
-    // its tmux session.
+    // Sessions picker — multi-harness list view. Rows: every live /
+    // dead session across all harnesses, then a "+ new X" affordance
+    // per harness. Per-harness letter shortcuts (`c`/`o`/`x`) jump to
+    // the matching "+ new" row; trigger-re-press (`;`) or Enter
+    // commits the highlight. `d` kills the highlighted live claude
+    // session (codex / opencode kills route via the harness selector
+    // -> kill flow, not v1).
     if (modal?.kind === "claudeSessionsPicker") {
       const slug = modal.slug;
-      const entries = pickerEntries;
-      // Read pin/focus from `modal.slug`'s bucket, NOT
-      // `currentSlug`'s. While `;` opens with the two equal, a row
-      // churn under the open modal could decouple them — and then
-      // the toggle would read bucket A and write to bucket B.
-      const modalBucket = slugFocus[slug] ?? EMPTY_FOCUS;
-      // Total interactive rows = entries + the trailing "+ new" row,
-      // which is appended by the picker UI itself. The handler treats
-      // index `entries.length` as that "+ new" affordance.
-      const totalRows = entries.length + 1;
-      const idx = Math.min(Math.max(0, modal.index), totalRows - 1);
+      const rowsLocal = pickerRows;
+      const totalRows = rowsLocal.length;
+      const idx = Math.min(Math.max(0, modal.index), Math.max(0, totalRows - 1));
       const previewIdFor = (i: number): string | null => {
-        const target = entries[i];
-        return target && target.isLive
-          ? sessionOutputId(slug, "claude", target.name)
-          : null;
+        const r = rowsLocal[i];
+        if (!r || r.kind !== "session") return null;
+        if (!r.entry.isLive) return null;
+        if (r.entry.harnessId !== "claude") return null;
+        return sessionOutputId(slug, "claude", r.entry.extras.managedName);
       };
       const moveTo = (next: number): void => {
         setModal({ ...modal, index: next });
         const patch = previewFocusPatch(previewIdFor(next));
         if (patch) setFocus(slug, patch);
       };
-      const select = (i: number): void => {
-        if (i < 0 || i >= totalRows) return;
-        if (i === entries.length) {
-          setModal({
-            kind: "claudeSessionsNew",
-            slug,
-            input: "",
-            error: null,
-          });
+      const openNewClaude = (): void => {
+        setModal({
+          kind: "claudeSessionsNew",
+          slug,
+          input: "",
+          error: null,
+        });
+      };
+      const commitRow = (i: number): void => {
+        const r = rowsLocal[i];
+        if (!r) return;
+        if (r.kind === "new") {
+          if (r.harnessId === "claude") {
+            openNewClaude();
+          } else {
+            setModal(null);
+            doEnterHarnessSession(slug, r.harnessId, {});
+          }
           return;
         }
+        const e = r.entry;
         setModal(null);
-        doEnterClaudeSession(slug, entries[i]!.name);
+        doEnterHarnessSession(slug, e.harnessId, {
+          managedName: e.extras.managedName,
+          resumeSessionId: e.isLive ? null : e.sessionId,
+        });
+      };
+      const jumpToNew = (harnessId: HarnessId): void => {
+        const target = rowsLocal.findIndex(
+          (r) => r.kind === "new" && r.harnessId === harnessId,
+        );
+        if (target >= 0) moveTo(target);
       };
       if (k.name === "j" || k.name === "down") {
         moveTo(Math.min(idx + 1, totalRows - 1));
@@ -2616,42 +2823,72 @@ export function App({ onExit }: Props) {
         moveTo(Math.max(0, idx - 1));
         return;
       }
+      // Digits address SESSION rows only (in their rendered order),
+      // matching the digit prefix the picker draws. The "+ new" rows
+      // are reached via per-harness letters.
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-        select(parseInt(k.sequence, 10) - 1);
-        return;
-      }
-      if (k.sequence === "x") {
-        const target = entries[idx];
-        if (target) {
-          if (target.isLive) {
-            doKillClaudeSession(slug, target.name);
-          } else if (target.name !== null) {
-            // Ghost: jsonl is gone or session was already killed —
-            // just drop from state so the picker stops listing it.
-            removeClaudeName(slug, target.name);
-            void refreshClaudeSummaries(slug);
-            appLog.event.info(`forgot ghost session "${target.name}" on ${slug}`);
+        const n = parseInt(k.sequence, 10) - 1;
+        let cursor = 0;
+        for (let i = 0; i < rowsLocal.length; i++) {
+          if (rowsLocal[i]!.kind !== "session") continue;
+          if (cursor === n) {
+            commitRow(i);
+            return;
           }
-          setModal(null);
+          cursor++;
         }
         return;
       }
-      if (k.sequence === "'") {
-        const patch = togglePinPatch(previewIdFor(idx), modalBucket.pinned);
-        if (patch) {
-          setFocus(slug, patch);
-          setModal(null);
+      if (k.sequence === "d") {
+        const r = rowsLocal[idx];
+        if (r?.kind === "session") {
+          const e = r.entry;
+          if (e.harnessId === "claude") {
+            if (e.isLive) {
+              doKillClaudeSession(slug, e.extras.managedName);
+            } else if (e.extras.managedName !== null) {
+              removeClaudeName(slug, e.extras.managedName);
+              void refreshClaudeSummaries(slug);
+              appLog.event.info(
+                `forgot ghost session "${e.extras.managedName}" on ${slug}`,
+              );
+            }
+            setModal(null);
+          } else {
+            // Codex / opencode kill via tmux name (live only). Dead
+            // sessions are owned by the harness's own store and we
+            // don't write there.
+            if (e.isLive) {
+              void (async () => {
+                const { killHarnessSession } = await import("../core/tmux.ts");
+                await killHarnessSession(slug, e.harnessId);
+                void refreshTmuxSessions();
+                appLog.event.warn(
+                  `killed ${getHarness(e.harnessId).label} session on ${slug}`,
+                );
+              })();
+            }
+            setModal(null);
+          }
         }
         return;
       }
-      if (k.name === "return") {
-        select(idx);
+      // Per-harness letter — jump to the matching "+ new" row. The
+      // user then presses `;` (or Enter) to confirm and spawn.
+      for (const h of HARNESSES) {
+        if (k.sequence === h.letter && !k.shift && !k.ctrl && !k.meta) {
+          jumpToNew(h.id);
+          return;
+        }
+      }
+      // `;` re-press confirms (trigger-toggle convention).
+      if (k.sequence === ";" || k.name === "return") {
+        commitRow(idx);
         return;
       }
       if (
         k.name === "escape" ||
         k.sequence === "q" ||
-        k.sequence === ";" ||
         (k.ctrl && k.name === "c")
       ) {
         setModal(null);
@@ -2661,11 +2898,18 @@ export function App({ onExit }: Props) {
 
     // Claude sessions picker — new-name input phase. Accepts the
     // same chars `validateSessionName` accepts plus backspace; Enter
-    // commits, esc returns to the list. Empty input on Enter spawns
-    // with the auto-numbered name (next free integer ≥ 2).
+    // commits, esc pops back to list, Ctrl+C closes the modal,
+    // backspace-on-empty pops back to list (parity with the section
+    // picker newName mode and the global filter). Empty input on
+    // Enter spawns with the auto-numbered name (next free integer
+    // ≥ 2).
     if (modal?.kind === "claudeSessionsNew") {
-      if (k.name === "escape" || (k.ctrl && k.name === "c")) {
+      if (k.name === "escape") {
         setModal({ kind: "claudeSessionsPicker", slug: modal.slug, index: 0 });
+        return;
+      }
+      if (k.ctrl && k.name === "c") {
+        setModal(null);
         return;
       }
       if (k.name === "return") {
@@ -2681,6 +2925,10 @@ export function App({ onExit }: Props) {
         return;
       }
       if (k.name === "backspace") {
+        if (modal.input.length === 0) {
+          setModal({ kind: "claudeSessionsPicker", slug: modal.slug, index: 0 });
+          return;
+        }
         setModal({ ...modal, input: modal.input.slice(0, -1), error: null });
         return;
       }
@@ -2691,6 +2939,62 @@ export function App({ onExit }: Props) {
           error: null,
         });
         return;
+      }
+      return;
+    }
+
+    // Harness selector modal — Shift+F12 opens it; user picks which
+    // harness to spawn fresh on the current slug. The per-harness
+    // letter shortcut (`c`/`o`/`x`) jumps + commits in one keystroke;
+    // F12 re-press / Enter commits the highlighted row.
+    if (modal?.kind === "harnessSelect") {
+      const items = HARNESSES;
+      const idx = Math.min(Math.max(0, modal.index), items.length - 1);
+      const slug = modal.slug;
+      const commit = (chosen: HarnessId): void => {
+        setModal(null);
+        if (chosen === "claude") {
+          // Preserve the auto-named behavior the old Shift+F12 had:
+          // bare `claude` on Shift+F12 means "give me another claude
+          // here without making me name it".
+          doSpawnNamedClaudeSession(slug, nextAutoName(slug));
+        } else {
+          doEnterHarnessSession(slug, chosen, {});
+        }
+      };
+      if (k.name === "j" || k.name === "down") {
+        setModal({ ...modal, index: Math.min(idx + 1, items.length - 1) });
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setModal({ ...modal, index: Math.max(0, idx - 1) });
+        return;
+      }
+      // Per-harness letter shortcut. Letters are unique across the
+      // registry by contract.
+      const letterMatch = items.find(
+        (h) => k.sequence === h.letter && !k.shift && !k.ctrl && !k.meta,
+      );
+      if (letterMatch) {
+        commit(letterMatch.id);
+        return;
+      }
+      // F12 re-press or Enter confirms the current highlight. Reject
+      // shift+F12 here since shift+F12 is what opened this modal —
+      // a stray re-press shouldn't re-trigger the open.
+      if (
+        (k.name === "f12" && !k.shift) ||
+        k.name === "return"
+      ) {
+        commit(items[idx]!.id);
+        return;
+      }
+      if (
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setModal(null);
       }
       return;
     }
@@ -2862,7 +3166,9 @@ export function App({ onExit }: Props) {
         setModal({ ...pp, index: Math.max(pp.index - 1, 0) });
         return;
       }
-      if (k.name === "return") {
+      // Trigger-key re-press confirms. `b p` opens the picker;
+      // a second `p` confirms the highlight (mirrors `l l` / `! !`).
+      if (k.name === "return" || k.sequence === "p") {
         const picked = pp.items[pp.index]!;
         setModal(null);
         const next = pp.index === pp.clearIndex ? null : picked;
@@ -2995,6 +3301,8 @@ export function App({ onExit }: Props) {
         setFooter({ kind: "legend" });
         if (pending === "d" && current) {
           void doRemove(current.wt.slug);
+        } else if (pending === "d!" && current) {
+          void doRemove(current.wt.slug, { force: true });
         } else if (pending === "m+" && current) {
           void doMergeWhenReady(current.wt.slug);
         } else if (pending === "e" && current) {
@@ -3018,23 +3326,20 @@ export function App({ onExit }: Props) {
       setSel(null);
       return;
     }
-    // Escape clears this worktree's explicit focus / pin so the
-    // bottom pane returns to follow-row auto-rules. Filter-clear
-    // above takes precedence; both can apply but they're disjoint
-    // states (filter edits set the filter; output focus is per-slug
+    // Escape clears this worktree's explicit focus so the bottom
+    // pane returns to follow-row auto-rules. Filter-clear above
+    // takes precedence; both can apply but they're disjoint states
+    // (filter edits set the filter; output focus is per-slug
     // bucket), so the order is fine.
-    if (
-      k.name === "escape" &&
-      (focusBucket.focused || focusBucket.pinned)
-    ) {
-      setFocus(currentSlug ?? null, { focused: null, pinned: null });
+    if (k.name === "escape" && focusBucket.focused) {
+      setFocus(currentSlug ?? null, { focused: null });
       return;
     }
-    // `:` opens the Outputs picker — vim-`:ls` flavor for the bottom
+    // `'` opens the Outputs picker — vim-`:ls` flavor for the bottom
     // pane. Cursor lands on the displayed output within this
     // worktree's filtered list. Outputs is the rarer chord; sessions
     // wins `;`.
-    if (k.sequence === ":") {
+    if (k.sequence === "'") {
       const idx = Math.max(
         0,
         indexOfOutput(visibleOutputs, displayedOutput.id),
@@ -3062,27 +3367,31 @@ export function App({ onExit }: Props) {
         return;
       }
       const slug = current.wt.slug;
-      // Same pure inputs the memo uses; built inline because we need
-      // the order *now* to compute the initial highlight, before the
-      // modal opens and the memo fires. `summaryBySessionId` doesn't
-      // affect ordering, so we pass an empty record and let the modal's
-      // memo backfill summary text once it opens.
-      const entries = buildClaudeSessionEntries({
-        ...buildPickerInputs(
-          current,
-          claudeSessionsBySlug.get(slug) ?? [],
-          claudeRegistry.data,
-        ),
-        summaryBySessionId: {},
-      });
+      // Initial cursor: if the bottom pane is currently displaying a
+      // claude session for this slug, land on its row so the picker
+      // mirrors what the user is already looking at. Otherwise default
+      // to row 0 (most-recent live session, or "+ new claude" if no
+      // sessions exist). Sessions come from `currentHarnessSessions`,
+      // sorted by the picker memo on first render.
       let initialIdx = 0;
       if (
         displayedOutput.kind === "session" &&
         displayedOutput.sessionKind === "claude" &&
         displayedOutput.slug === slug
       ) {
-        const matchIdx = entries.findIndex(
-          (e) => e.name === displayedOutput.sessionName,
+        // Mirror the picker's session ordering (live first, then by
+        // recency) when computing the initial highlight. Falling back
+        // to 0 when the displayed session is no longer in the list.
+        const sessionsSorted = [...currentHarnessSessions.sessions].sort(
+          (a, b) => {
+            if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+            return (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0);
+          },
+        );
+        const matchIdx = sessionsSorted.findIndex(
+          (e) =>
+            e.harnessId === "claude" &&
+            e.extras.managedName === displayedOutput.sessionName,
         );
         if (matchIdx >= 0) initialIdx = matchIdx;
       }
@@ -3090,10 +3399,7 @@ export function App({ onExit }: Props) {
       return;
     }
     // `[` / `]` — cycle prev/next through THIS worktree's visible
-    // outputs. Wraps at both ends. Clears any pin so the cycle
-    // actually moves the displayed output; otherwise pin > focus
-    // and the keypress would be a silent no-op (same trap `~`
-    // explicitly handles).
+    // outputs. Wraps at both ends.
     if (k.sequence === "[" || k.sequence === "]") {
       if (visibleOutputs.length === 0) return;
       const cur = Math.max(
@@ -3104,46 +3410,14 @@ export function App({ onExit }: Props) {
       const next =
         (cur + step + visibleOutputs.length) % visibleOutputs.length;
       const target = visibleOutputs[next];
-      if (target) {
-        setFocus(currentSlug ?? null, {
-          focused: target.id,
-          pinned: null,
-        });
-      }
+      if (target) setFocus(currentSlug ?? null, { focused: target.id });
       return;
     }
     // `"` jumps to events for this worktree's bucket — the global
     // pane when you want to step out of whatever per-row context the
-    // auto-rules surfaced. Clears pin so the jump actually takes
-    // effect; otherwise pin > focus and the keypress would be a
-    // silent no-op.
+    // auto-rules surfaced.
     if (k.sequence === '"') {
-      setFocus(currentSlug ?? null, {
-        focused: eventsOutputId(),
-        pinned: null,
-      });
-      return;
-    }
-    // `'` toggles pin on the current displayed output for THIS
-    // worktree. Pin overrides auto-rules and other focus changes for
-    // this slug; press again to unpin and resume auto.
-    //
-    // Edge case: if the bucket's pinned id no longer resolves to a
-    // visible output (action FIFO'd, session ended) we're in a
-    // "dangling pin" window before the GC sweep clears it. Treat
-    // dangling as "currently unpinned" so the user's first `'`
-    // reliably ends in unpinned, instead of pinning the
-    // auto-resolved fallback (typically events).
-    if (k.sequence === "'") {
-      const id = displayedOutput.id;
-      const pinned = focusBucket.pinned;
-      const pinResolves =
-        pinned !== null && visibleOutputs.some((o) => o.id === pinned);
-      const togglingOff = pinResolves && pinned === id;
-      setFocus(currentSlug ?? null, {
-        focused: id,
-        pinned: togglingOff ? null : id,
-      });
+      setFocus(currentSlug ?? null, { focused: eventsOutputId() });
       return;
     }
     // Unified Shift+J/K — moves the current row one position in
@@ -3176,26 +3450,30 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.name === "j" || k.name === "down") {
-      if (filteredRows.length === 0) return;
-      const nextIdx = Math.min(cursorIndex + 1, filteredRows.length - 1);
-      setSel(filteredRows[nextIdx]?.wt.slug ?? null);
+      if (visualItems.length === 0) return;
+      const nextIdx = Math.min(cursorIndex + 1, visualItems.length - 1);
+      const next = visualItems[nextIdx];
+      setSel(next ? visualKey(next) : null);
       return;
     }
     if (k.name === "k" || k.name === "up") {
-      if (filteredRows.length === 0) return;
+      if (visualItems.length === 0) return;
       const nextIdx = Math.max(0, cursorIndex - 1);
-      setSel(filteredRows[nextIdx]?.wt.slug ?? null);
+      const next = visualItems[nextIdx];
+      setSel(next ? visualKey(next) : null);
       return;
     }
     // The raw-stdin keypress parser lowercases `name` for A–Z and sets
     // `shift: true`, so case-sensitive bindings (`g`/`G`, `r`/`R`) have
     // to disambiguate on `sequence` rather than `name`.
     if (k.sequence === "g") {
-      setSel(filteredRows[0]?.wt.slug ?? null);
+      const first = visualItems[0];
+      setSel(first ? visualKey(first) : null);
       return;
     }
     if (k.sequence === "G") {
-      setSel(filteredRows[filteredRows.length - 1]?.wt.slug ?? null);
+      const last = visualItems[visualItems.length - 1];
+      setSel(last ? visualKey(last) : null);
       return;
     }
     if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
@@ -3239,7 +3517,11 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "N") {
-      if (!current?.wt.branch) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 2000);
+        return;
+      }
+      if (!current.wt.branch) {
         toast("no branch on selected row", theme.warn, 2000);
         return;
       }
@@ -3417,13 +3699,11 @@ export function App({ onExit }: Props) {
       setModal({ kind: "killSessionConfirm", slug, sessionKind: "diff" });
       return;
     }
-    // Shift+F12 — spawn-and-attach a new auto-named claude session
-    // on the selected worktree. The picker (`;`) covers the
-    // explicit-name path; this is the keystroke shortcut for "give me
-    // another claude here, don't make me name it". Auto-name is the
-    // smallest free integer ≥ 2 in this slug's name list (primary is
-    // implicit). Replaces the old kill-confirm — kill is rare enough
-    // to live in the picker (`x`) only.
+    // Shift+F12 — open the harness selector for a fresh spawn.
+    // Replaces the old "auto-name new claude" semantics; the user now
+    // picks which harness to spawn (claude / codex / opencode). The
+    // claude option preserves the prior auto-name behavior (see the
+    // `harnessSelect` handler above).
     if (
       k.name === "f12" &&
       k.shift &&
@@ -3442,17 +3722,24 @@ export function App({ onExit }: Props) {
         toast(`${slug} is busy`, theme.warn, 2000);
         return;
       }
-      doSpawnNamedClaudeSession(slug, nextAutoName(slug));
+      // Default highlight = current primary, so the muscle-memory
+      // "Shift+F12, F12 again" path spawns whatever TAB selected.
+      const initialIdx = HARNESSES.findIndex((h) => h.id === primaryHarness);
+      setModal({
+        kind: "harnessSelect",
+        slug,
+        index: initialIdx >= 0 ? initialIdx : 0,
+      });
       return;
     }
-    // F12 — toggle into the selected worktree's primary claude
-    // session. tmux's `new-session -A` makes this idempotent (creates
-    // or attaches), so the same key works whether the session exists
-    // yet or not. From inside the session, the wt-private tmux config
-    // binds F12 to detach-client → the same physical key flips
-    // between contexts. Refuse on busy worktrees so we don't race a
-    // destroy. The unmodified-only guard prevents Shift+F12 (handled
-    // above as new-session) from also entering.
+    // F12 — toggle into the selected worktree's "F12 target" harness
+    // session. Target = most-recently-active live session across any
+    // harness; if nothing live, the primary's most-recent dead
+    // session; if nothing at all, spawn primary fresh. tmux's
+    // `new-session -A` makes attach-or-create idempotent. From inside
+    // the session, the wt-private tmux config binds F12 to
+    // detach-client so the same physical key flips between contexts.
+    // Refuse on busy worktrees so we don't race a destroy.
     if (
       k.name === "f12" &&
       !k.shift &&
@@ -3466,7 +3753,45 @@ export function App({ onExit }: Props) {
         toast("select a worktree first", theme.warn, 1500);
         return;
       }
-      doEnterClaudeSession(current.wt.slug, null);
+      const slug = current.wt.slug;
+      if (current.status.kind === StatusKind.Busy) {
+        toast(`${slug} is busy`, theme.warn, 2000);
+        return;
+      }
+      const target = currentHarnessSessions.f12Target;
+      if (target) {
+        // For Claude: managedName preserves primary-vs-named. For
+        // Codex / OpenCode: managedName is unused; if the tmux slot
+        // is already live, `new-session -A` re-attaches and the
+        // resumeSessionId is ignored. For a dead session, the harness
+        // builds `<id> resume <sessionId>` argv.
+        doEnterHarnessSession(slug, target.harnessId, {
+          managedName: target.extras.managedName,
+          resumeSessionId: target.isLive ? null : target.sessionId,
+        });
+      } else {
+        // No discoverable session — spawn primary fresh.
+        doEnterHarnessSession(slug, primaryHarness, {});
+      }
+      return;
+    }
+    // TAB — cycle the primary harness selection. Re-rendered top-
+    // right indicator reflects the new primary; subsequent F12 spawns
+    // pick it up. Guarded against modifiers so accidental
+    // Shift+Tab / Ctrl+Tab don't fire.
+    if (
+      k.name === "tab" &&
+      !k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      void (async () => {
+        const next = await cyclePrimaryHarness();
+        appLog.event.info(`primary harness → ${getHarness(next).label}`);
+      })();
       return;
     }
     if (k.sequence === ",") {
@@ -3482,10 +3807,11 @@ export function App({ onExit }: Props) {
     if (k.sequence === ".") {
       void (async () => {
         wtLog.event.info("entering wt claude session (F12 to detach)");
-        const result = await enterClaudeSession({
+        const result = await enterHarnessSession({
           renderer,
           slug: WT_SOURCE_SLUG,
           cwd: WT_REPO_PATH,
+          harnessId: "claude",
           claudeDisplayName: WT_SOURCE_SLUG,
         });
         if (result.kind === "spawn-failed") {
@@ -3504,6 +3830,28 @@ export function App({ onExit }: Props) {
       void openInZed(WT_REPO_PATH);
       wtLog.event.info(`opened ${WT_REPO_PATH}`);
       return;
+    }
+
+    // Review-request rows: a tiny set of PR-only keybinds, no
+    // worktree-keyed actions. Unmapped keys fall through to the wt
+    // per-row block below, which is gated on `current` (undefined for
+    // a PR selection) and silently no-ops.
+    if (selectedPr) {
+      const prLog = createLogger("[review]");
+      if (isPlainLetter(k, "p") || k.name === "return") {
+        const url =
+          graphiteUrlFromGithubPr(selectedPr.url) ?? selectedPr.url;
+        hideFrontmostAlacritty();
+        openUrl(url);
+        prLog.event.info(`opened review #${selectedPr.number}`);
+        return;
+      }
+      if (isPlainLetter(k, "o")) {
+        hideFrontmostAlacritty();
+        openUrl(selectedPr.url);
+        prLog.event.info(`opened review #${selectedPr.number} on GitHub`);
+        return;
+      }
     }
 
     // Per-row actions.
@@ -3561,11 +3909,32 @@ export function App({ onExit }: Props) {
         toast(`${current.wt.slug} is ${label}`, theme.warn, 2000);
         return;
       }
-      setFooter({
-        kind: "confirm",
-        message: `remove ${current.wt.slug}? [y/N]`,
-        pendingKey: "d",
-      });
+      // Surface the same conditions `doRemove` guards on, at prompt
+      // time. When any of them would refuse the destroy, switch the
+      // confirm to a force-variant so the user can opt into the
+      // destructive path inline instead of bouncing out to the shell.
+      const dirty = current.fields.dirty.data?.length ?? 0;
+      const ahead = current.fields.sync.data?.remote?.ahead ?? 0;
+      const reasons: string[] = [];
+      if (dirty > 0) {
+        reasons.push(`${dirty} uncommitted file${dirty === 1 ? "" : "s"}`);
+      }
+      if (ahead > 0) {
+        reasons.push(`${ahead} unpushed commit${ahead === 1 ? "" : "s"}`);
+      }
+      if (reasons.length > 0) {
+        setFooter({
+          kind: "confirm",
+          message: `force remove ${current.wt.slug} (${reasons.join(", ")})? [y/N]`,
+          pendingKey: "d!",
+        });
+      } else {
+        setFooter({
+          kind: "confirm",
+          message: `remove ${current.wt.slug}? [y/N]`,
+          pendingKey: "d",
+        });
+      }
       return;
     }
     if (isPlainLetter(k, "v")) {
@@ -3684,11 +4053,13 @@ export function App({ onExit }: Props) {
             {titleBar}
           </text>
         </box>
+        <PrimaryHarnessBadge primary={primaryHarness} />
         <ClaudeUsageBadge />
       </box>
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList
           rows={filteredRows}
+          reviewRequests={reviewRequestRows}
           selectedIndex={cursorIndex}
           width={listWidth}
           activeTails={activeTails}
@@ -3700,18 +4071,17 @@ export function App({ onExit }: Props) {
               ? chainOf(buildStackRows(), current.wt.slug)
               : null
           }
+          stackSectionLabels={stackSectionLabels}
           isLoading={isLoading}
           filter={filter}
         />
-        <Details row={current} width={Math.max(0, width - listWidth)} />
+        <Details
+          row={current}
+          reviewRequest={selectedPr}
+          width={Math.max(0, width - listWidth)}
+        />
       </box>
-      <OutputViewer
-        output={displayedOutput}
-        height={activityHeight}
-        pinned={
-          !!focusBucket.pinned && focusBucket.pinned === displayedOutput.id
-        }
-      />
+      <OutputViewer output={displayedOutput} height={activityHeight} />
       {modal?.kind === "outputsPicker" ? (
         <OutputsPicker
           slug={currentSlug ?? null}
@@ -3724,18 +4094,17 @@ export function App({ onExit }: Props) {
                   visibleOutputs.length - 1,
                 )
           }
-          pinnedId={focusBucket.pinned}
         />
       ) : null}
       {modal?.kind === "claudeSessionsPicker" ? (
         <SessionsPickerList
           slug={modal.slug}
-          entries={pickerEntries}
+          rows={pickerRows}
           selectedIndex={Math.min(
             Math.max(0, modal.index),
-            pickerEntries.length, // index `length` = the trailing "+ new" row
+            Math.max(0, pickerRows.length - 1),
           )}
-          pinnedId={(slugFocus[modal.slug] ?? EMPTY_FOCUS).pinned}
+          summaries={pickerSummaries}
         />
       ) : null}
       {modal?.kind === "claudeSessionsNew" ? (
@@ -3744,6 +4113,15 @@ export function App({ onExit }: Props) {
           input={modal.input}
           autoName={nextAutoName(modal.slug)}
           error={modal.error}
+        />
+      ) : null}
+      {modal?.kind === "harnessSelect" ? (
+        <HarnessPickerModal
+          slug={modal.slug}
+          selectedIndex={Math.min(
+            Math.max(0, modal.index),
+            HARNESSES.length - 1,
+          )}
         />
       ) : null}
       <Footer mode={footer} hint={footerHint} />
@@ -3760,6 +4138,7 @@ export function App({ onExit }: Props) {
           }`}
           items={modal.items}
           selectedIndex={modal.index}
+          toggleKey="p"
         />
       ) : null}
       {modal?.kind === "branchPicker" ? (

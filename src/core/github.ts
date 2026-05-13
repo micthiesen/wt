@@ -359,6 +359,25 @@ export type GithubData = {
   prs: Map<string, PullRequest>;
 };
 
+/**
+ * A pull request the authenticated user has been asked to review. Not a
+ * worktree (we typically don't have a local checkout of someone else's
+ * branch), just a pinned list at the bottom of the TUI. Carries the
+ * minimum surface needed for the list label, the lite details pane, and
+ * the `p` open-in-Graphite action.
+ */
+export type ReviewRequestPr = {
+  number: number;
+  url: string;
+  title: string;
+  repoNameWithOwner: string;
+  author: string | null;
+  isDraft: boolean;
+  checks: PrChecks;
+  createdAt: string;
+  updatedAt: string;
+};
+
 function extractRequestedReviewers(
   rr: GqlPrNode["reviewRequests"],
 ): string[] {
@@ -508,6 +527,121 @@ export async function fetchGithub(
   }
 
   return { prs };
+}
+
+/**
+ * Pull requests where the authenticated user (or one of their teams)
+ * has been asked to review. Uses GitHub's `search` GraphQL — same auth
+ * channel as `fetchGithub`, but a separate round trip because the
+ * result set isn't keyed by worktree branches and the response shape is
+ * narrower (no review threads, no requested reviewers list, no
+ * suggestedReviewers). Capped at 50 since this is meant to be a
+ * digestible "what's on your plate" list, not an inbox.
+ */
+const REVIEW_REQUESTS_QUERY = `
+query {
+  search(query: "is:pr is:open review-requested:@me", type: ISSUE, first: 50) {
+    nodes {
+      ... on PullRequest {
+        number
+        url
+        title
+        isDraft
+        createdAt
+        updatedAt
+        author { login }
+        repository { nameWithOwner }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                contexts(first: 50) {
+                  nodes {
+                    __typename
+                    ... on CheckRun { name status conclusion }
+                    ... on StatusContext { context state }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+type GqlReviewRequestNode = {
+  number?: number;
+  url?: string;
+  title?: string;
+  isDraft?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+  author?: { login?: string | null } | null;
+  repository?: { nameWithOwner?: string } | null;
+  commits?: {
+    nodes: Array<{
+      commit: {
+        statusCheckRollup: { contexts: { nodes: RawCheck[] } } | null;
+      };
+    }>;
+  } | null;
+};
+
+type GqlReviewRequestResponse = {
+  // `search(type: ISSUE)` returns a heterogeneous node list; for a node
+  // that resolved to a non-`PullRequest` typename (or an empty object
+  // from a deleted/inaccessible item) the spread fragment yields `{}`.
+  // Modelled as nullable so the parser doesn't crash on those.
+  data?: { search?: { nodes?: Array<GqlReviewRequestNode | null> } };
+};
+
+export async function fetchReviewRequests(
+  signal?: AbortSignal,
+): Promise<ReviewRequestPr[]> {
+  if (!(await hasGh())) return [];
+  const r = await run(
+    ["gh", "api", "graphql", "-f", `query=${REVIEW_REQUESTS_QUERY}`],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000, signal },
+  );
+  if (r.exitCode !== 0) {
+    log.error("review-requests fetch failed", { stderr: r.stderr.slice(0, 200) });
+    return [];
+  }
+  let parsed: GqlReviewRequestResponse;
+  try {
+    parsed = JSON.parse(r.stdout);
+  } catch (err) {
+    log.error(err instanceof Error ? err : String(err), {
+      stdout: r.stdout.slice(0, 200),
+    });
+    return [];
+  }
+  const nodes = parsed.data?.search?.nodes ?? [];
+  const out: ReviewRequestPr[] = [];
+  for (const n of nodes) {
+    // Drop incomplete nodes defensively — search returns `... on
+    // PullRequest`-typed fragments, so a null or empty object means it
+    // wasn't a PR (shouldn't happen with `is:pr` filter, but the type
+    // is `[Issue | PullRequest | ...]`).
+    if (!n) continue;
+    if (typeof n.number !== "number" || !n.url || !n.title) continue;
+    const contexts =
+      n.commits?.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? null;
+    out.push({
+      number: n.number,
+      url: n.url,
+      title: n.title,
+      repoNameWithOwner: n.repository?.nameWithOwner ?? "",
+      author: n.author?.login ?? null,
+      isDraft: n.isDraft ?? false,
+      checks: rollupChecks(contexts),
+      createdAt: n.createdAt ?? "",
+      updatedAt: n.updatedAt ?? "",
+    });
+  }
+  return out;
 }
 
 const CONTRIB_RECENCY_MS = 6 * 30 * 24 * 60 * 60 * 1000; // ~6 months

@@ -97,6 +97,12 @@ export type { ActionLine, ActionLineKind } from "./claude-events.ts";
  */
 export type ActionRowState = {
   pr: PullRequest | undefined;
+  /**
+   * `isOurStageDeployed` result for the row. Strict gate (matches
+   * the safe-stage rules); used by `requires: ["deployed"]` actions
+   * like the built-in `remove-local`.
+   */
+  deployed: boolean;
 };
 
 export type ActionAvailability =
@@ -125,8 +131,11 @@ export function evaluateActionRequirements(
         if (row.pr.isDraft) return { ok: false, reason: "PR is draft" };
         if (row.pr.state !== "OPEN") return { ok: false, reason: "PR not open" };
         break;
+      case "deployed":
+        if (!row.deployed) return { ok: false, reason: "no stage deployed" };
+        break;
       default: {
-        // Exhaustiveness check — adding a new RequireTag without
+        // Exhaustiveness check, adding a new RequireTag without
         // updating this switch is a type error. Critical because the
         // failure mode is silent always-allow (worse than always-block).
         const _exhaustive: never = req;
@@ -136,6 +145,31 @@ export function evaluateActionRequirements(
   }
   return { ok: true };
 }
+
+/**
+ * Built-in shell actions appended after `config.actions` in the
+ * picker. They behave exactly like user-configured shell actions —
+ * the `actionRegistry` doesn't distinguish, the only difference is
+ * they're defined in code rather than read from `config.toml`.
+ * Adding one: declare it here, no other wiring needed. The picker
+ * places these between user actions and the trailing "Custom prompt…"
+ * sentinel.
+ */
+export const BUILTIN_ACTIONS: readonly ActionDef[] = [
+  {
+    kind: "shell",
+    id: "remove-local",
+    name: "Remove local",
+    // `{{stage}}` resolves to the deterministic `expectedStage(slug)`
+    // at launch time, NOT whatever's pinned on disk. The
+    // `requires: ["deployed"]` gate already enforces that the pin
+    // matches expected, but using the deterministic value defends
+    // against tampering between picker-open and launch.
+    shell: "pnpm sst remove --stage {{stage}}",
+    affects: ["git"],
+    requires: ["deployed"],
+  },
+];
 
 const log = createLogger("[actions]");
 

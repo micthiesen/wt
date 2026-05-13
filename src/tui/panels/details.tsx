@@ -25,6 +25,7 @@ import { TextAttributes } from "@opentui/core";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
+import type { ReviewRequestPr } from "../../core/github.ts";
 import { StatusKind } from "../../core/types.ts";
 import { useGithub } from "../../state/hooks.ts";
 import {
@@ -33,12 +34,17 @@ import {
 } from "../../state/queries.ts";
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
-import { ELLIPSIS } from "../text.ts";
+import { ageMsToText, ELLIPSIS } from "../text.ts";
 import { Spinner, useBouncingBall } from "../spinner.tsx";
+import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
-type Props = { row?: WorktreeRow; width: number };
+type Props = {
+  row?: WorktreeRow;
+  reviewRequest?: ReviewRequestPr;
+  width: number;
+};
 
 const RESOLVED_ROWS: readonly RowModule[] = resolveRows(config.ui.rows);
 
@@ -360,7 +366,109 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
   );
 });
 
-export function Details({ row, width }: Props) {
+/**
+ * Lite details body for a review-request PR. Not a worktree — no local
+ * checkout, no per-slug sources, no AI summary pipeline. Renders the
+ * minimum surface that's already in the PR search payload: title,
+ * author, repo, draft/ready, CI rollup, and age. `p` opens it in
+ * Graphite from the parent; this pane is read-only.
+ */
+function ReviewRequestBody({
+  pr,
+  width: _width,
+}: {
+  pr: ReviewRequestPr;
+  width: number;
+}) {
+  const created = pr.createdAt ? Date.parse(pr.createdAt) : NaN;
+  const updated = pr.updatedAt ? Date.parse(pr.updatedAt) : NaN;
+  const ageText = Number.isFinite(created)
+    ? `opened ${ageMsToText(Date.now() - created)} ago`
+    : null;
+  const updatedText =
+    Number.isFinite(updated) && Number.isFinite(created) && updated !== created
+      ? `updated ${ageMsToText(Date.now() - updated)} ago`
+      : null;
+  const checks = pr.checks;
+  const checkLine =
+    checks === "pass"
+      ? { fg: theme.ok, text: "passing" }
+      : checks === "fail"
+        ? { fg: theme.err, text: "failing" }
+        : checks === "pending"
+          ? { fg: theme.warn, text: "pending" }
+          : null;
+  return (
+    <box
+      flexGrow={1}
+      flexShrink={1}
+      overflow="hidden"
+      border
+      borderStyle="single"
+      borderColor={theme.border}
+      title={` ${pr.repoNameWithOwner}#${pr.number} `}
+      titleAlignment="left"
+      padding={1}
+      flexDirection="column"
+    >
+      <box marginBottom={1}>
+        <text wrapMode="word">
+          <span fg={theme.fg} attributes={TextAttributes.BOLD}>{pr.title}</span>
+        </text>
+      </box>
+      <Row label="state">
+        <text fg={pr.isDraft ? theme.fgDim : theme.accentAlt} wrapMode="none">
+          {`${pr.isDraft ? NF.prDraft : NF.prOpen} ${pr.isDraft ? "draft" : "ready"}`}
+        </text>
+      </Row>
+      <Row label="repo">
+        <text fg={theme.fg} wrapMode="none" truncate>
+          {pr.repoNameWithOwner}
+        </text>
+      </Row>
+      {pr.author ? (
+        <Row label="author">
+          <text fg={theme.fg} wrapMode="none" truncate>
+            {`@${pr.author}`}
+          </text>
+        </Row>
+      ) : null}
+      {checkLine ? (
+        <Row label="checks">
+          <text fg={checkLine.fg} wrapMode="none">{checkLine.text}</text>
+        </Row>
+      ) : null}
+      {ageText ? (
+        <Row label="opened">
+          <text fg={theme.fgDim} wrapMode="none">{ageText}</text>
+        </Row>
+      ) : null}
+      {updatedText ? (
+        <Row label="updated">
+          <text fg={theme.fgDim} wrapMode="none">{updatedText}</text>
+        </Row>
+      ) : null}
+      <box marginTop={1}>
+        <text fg={theme.fgDim} wrapMode="none" truncate>
+          {pr.url}
+        </text>
+      </box>
+    </box>
+  );
+}
+
+export function Details({ row, reviewRequest, width }: Props) {
+  if (reviewRequest) {
+    // Key by url so navigating across review-request rows remounts
+    // cleanly — no chance of bleeding state from one PR to another.
+    return (
+      <ReviewRequestBody
+        key={reviewRequest.url}
+        pr={reviewRequest}
+        width={width}
+      />
+    );
+  }
   if (!row) {
     return (
       <box

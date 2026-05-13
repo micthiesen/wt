@@ -46,6 +46,23 @@ These define contracts. Touching them ripples; read them first.
 - **Convention over configuration for the niche stuff.** `branch.id_pattern` exists but most users will never set it; the default matches Linear/Jira/Shortcut conventions.
 - **Mutating GitHub state? Invalidate `["github"]`, not the worktree.** TUI actions that hit `gh` for a write (auto-merge arm/disable, mark-ready, edit reviewers, …) must call `refreshGithub()` from `state/hooks.ts` so the badge flips immediately. `invalidateWorktree(slug)` looks plausible but the github query is keyed by branch list, not slug — it'll silently miss and the user will see stale state until the slow staleTime expires.
 
+## Modal UX rules
+
+Every list-picker modal follows the same shape so muscle memory carries across pickers. Hold to these when adding or modifying a picker; deviations fragment the UX.
+
+- **Trigger-key re-press confirms.** Whatever single key opens the picker (`l`, `;`, `'`, `!`, `v`, the `p` inside `b p`) also commits the highlighted row when pressed again. Concretely: `l l` = open section picker, confirm current highlight. `; ;` = open sessions, attach. `' '` = open outputs, focus. `! !` = open action picker, run/edit. `v v` = submit reviewers (multi-select special case: "I'm done choosing"). The chord-loop replaces the old "Enter to confirm" requirement so the user never has to hop their hand off the trigger key.
+- **Enter still works.** Enter is always a valid confirm. The chord is the cheap path; Enter is the discoverable path.
+- **Esc / q / Ctrl+C cancel.** Universal across every modal. No exceptions.
+- **j/k or arrows move.** No fancier nav; `g`/`G` aren't bound inside pickers.
+- **1–9 quick-pick.** When a list shows ≤9 items, digit jumps + commits in one keystroke. Out-of-range digits are silently ignored.
+- **Sub-affordances get their own letter.** Special rows like "+ new section" or "Custom prompt…" used to share the trigger key (`l l` jumped to "+ new section"). Now they get a distinct letter: `l n` = new section, `! c` = custom prompt, `; n` = new claude session. The trigger-re-press always means "confirm the highlight", never "jump to the special row."
+- **Live preview on the bottom pane when it helps.** Pickers that map a row to a viewable output (outputs picker, sessions picker) push the highlight into the OutputViewer on j/k via `previewFocusPatch` from `tui/picker-preview.ts`. Pickers without a sensible preview (section, action, reviewer, parent, branch) leave the pane alone.
+- **`x` kills.** Where rows represent killable things (claude sessions), `x` on the highlight invokes destroy without an extra confirm.
+- **Hints reflect the chord.** Always render the trigger-key-confirm pair in the modal's `hints` prop (e.g. `["l / ⏎", "select"]`). `PickerModal` and `MultiPickerModal` take an optional `toggleKey` prop that wires this for you.
+- **No pin.** The bottom pane has no sticky "pin" override anymore. Per-slug focus is a single nullable field; auto-rules surface things in the foreground, explicit picks override until escape or row change.
+
+When a picker doesn't naturally have a single trigger key (e.g. branchPicker is reached mid-`n` flow, not via a dedicated chord), drop the trigger-re-press leg and keep just Enter/Esc. Don't invent a trigger key to satisfy the rule.
+
 ## Logging & debugging
 
 - **Daily app log**: `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log`. Every `createLogger(source)` call writes here, regardless of TUI/CLI. Plaintext header (`<iso-ts> <LEVEL> <source>`) with structured ctx as a trailing JSON blob. Read it when something looked wrong: errors thrown deep in queries, stack traces from caught exceptions, or to recover what the activity pane scrolled past (event lines are tagged `EVENT`, so `grep ' EVENT '` shows exactly what the user saw).

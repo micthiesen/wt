@@ -5,7 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
-import { reapClaudeNames } from "../core/claude-sessions.ts";
+import { HARNESSES } from "../core/harness/index.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
 import { sessionTailRegistry } from "../core/session-tail.ts";
@@ -38,7 +38,7 @@ async function reapStartup(): Promise<void> {
     const live = new Set(wts.map((w) => w.slug));
     reapWtState(live);
     reapArchived(live);
-    reapClaudeNames(live);
+    for (const harness of HARNESSES) harness.reapState(live);
     // Drop pipe-pane shell logs and `<slug>-*.log` destroy logs whose
     // slug no longer exists — keeps `~/.cache/wt/` from accumulating
     // ghosts from worktrees long since destroyed. Live-slug logs are
@@ -103,6 +103,21 @@ export async function runTui(): Promise<TuiExit> {
     reapStartup(),
   ]);
 
+  // Evict orphaned cache entries whose key shape changed across a wt
+  // upgrade. Without this, an entry persisted under an old key sits in
+  // memory after `restoreQueries` pre-warms it, where prefix-matching
+  // mutation filters can mistake it for a current entry and feed the
+  // wrong data shape to a patch helper. Cheap to keep this list as a
+  // small append-only ledger — the alternative is bumping CACHE_BUSTER
+  // and nuking every persisted entry, AI summaries included.
+  const ORPHANED_KEYS: ReadonlyArray<readonly unknown[]> = [
+    // v0.x: `reviewRequests` was briefly keyed `["github", "reviewRequests"]`
+    // before moving off the `["github"]` prefix to avoid the
+    // `setQueriesData(filter, patch)` shape mismatch in `patchPullRequest`.
+    ["github", "reviewRequests"],
+  ];
+  for (const key of ORPHANED_KEYS) wtClient.evict(key);
+
   const renderer = await createCliRenderer({
     exitOnCtrlC: false,
     targetFps: 60,
@@ -132,6 +147,15 @@ export async function runTui(): Promise<TuiExit> {
     stopRegistryWatch();
     setEventSink(null);
     wtClient.shutdown();
+    // Close the harness-owned read handles (opencode's read-only
+    // SQLite handle is the only one today). No-op for harnesses
+    // without persistent handles.
+    try {
+      const { closeOpencodeDb } = await import("../core/harness/index.ts");
+      closeOpencodeDb();
+    } catch (err) {
+      void err;
+    }
     // Detach from in-flight actions: close tails + done watchers so
     // we don't dangle file handles, but leave the tmux-supervised
     // wrappers running. The next `wt` invocation rehydrates them via

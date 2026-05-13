@@ -4,7 +4,6 @@ import {
   outputStatusLabel,
 } from "../../core/outputs.ts";
 import { Modal } from "../modal.tsx";
-import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 
 function statusFg(status: OutputStatus): string {
@@ -33,28 +32,19 @@ type Props = {
   /**
    * Slug whose outputs are listed, or `null` for the no-row scope
    * (events only). Surfaces in the modal title so the user knows
-   * which worktree's pin/focus they're editing — buckets are
-   * per-worktree.
+   * which worktree's focus they're editing — buckets are per-worktree.
    */
   slug: string | null;
   items: readonly Output[];
   selectedIndex: number;
-  /** Id of the pinned output, if any — drives the row pin glyph. */
-  pinnedId: string | null;
 };
 
-export function OutputsPicker({
-  slug,
-  items,
-  selectedIndex,
-  pinnedId,
-}: Props) {
+export function OutputsPicker({ slug, items, selectedIndex }: Props) {
   const now = Date.now();
   const hints: Array<[string, string]> = [
     ["j/k", "move"],
     ["1-9", "quick pick"],
-    ["⏎", "select"],
-    ["'", pinnedId ? "unpin" : "pin"],
+    ["' / ⏎", "select"],
     ["esc / q", "cancel"],
   ];
   // "(no row)" rather than "global" when nothing is selected: the
@@ -77,7 +67,6 @@ export function OutputsPicker({
       ) : (
         items.map((o, i) => {
           const selected = i === selectedIndex;
-          const isPinned = pinnedId === o.id;
           const bg = selected ? theme.rowSelectedBg : undefined;
           const fg = selected ? theme.fgBright : theme.fg;
           const showDigit = i < 9;
@@ -111,16 +100,6 @@ export function OutputsPicker({
                   {shortTitle(o.title)}
                 </text>
               </box>
-              {/*
-                Pin glyph at the right edge so the quick-pick digit
-                in the prefix slot stays visible — pressing `1` to
-                jump to the pinned row should still work, and a user
-                scanning by digit shouldn't see one row's number
-                replaced by an icon.
-              */}
-              {isPinned ? (
-                <text fg={theme.accent}>{NF.pin} </text>
-              ) : null}
               <text fg={theme.fgDim}>{right}</text>
             </box>
           );

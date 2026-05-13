@@ -116,15 +116,18 @@ export type AiConfig = {
  * requirements aren't met (with the reason as the dim subtitle); the
  * keybinding launcher toasts the reason and skips the run. Tag
  * vocabulary:
- *   "pr"        — row has a PR (open, draft, terminal — any).
+ *   "pr"        — row has a PR (open, draft, terminal, any).
  *   "pr.ready"  — row has a non-draft, OPEN PR.
+ *   "deployed"  — `isOurStageDeployed` (.sst/stage matches expected
+ *                 AND outputs.json references it). Strict gate; matches
+ *                 what `wt rm --destroy-stage` uses.
  * Default is `[]` (no preconditions).
  *
  * Both arrays are deduped at parse time. See the architecture block
  * in `state/hooks.ts` for the rules these tags participate in.
  */
 export type EffectTag = "git" | "github";
-export type RequireTag = "pr" | "pr.ready";
+export type RequireTag = "pr" | "pr.ready" | "deployed";
 
 export type ActionDef =
   | {
@@ -266,7 +269,7 @@ export const DEFAULT_CLAUDE_AFFECTS: readonly EffectTag[] = ["git", "github"];
 export const DEFAULT_SHELL_AFFECTS: readonly EffectTag[] = [];
 export const DEFAULT_REQUIRES: readonly RequireTag[] = [];
 const VALID_EFFECT_TAGS = new Set<EffectTag>(["git", "github"]);
-const VALID_REQUIRE_TAGS = new Set<RequireTag>(["pr", "pr.ready"]);
+const VALID_REQUIRE_TAGS = new Set<RequireTag>(["pr", "pr.ready", "deployed"]);
 
 function configPath(): { path: string; present: boolean } {
   const explicit = process.env.WT_CONFIG;

@@ -62,8 +62,8 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
       hints={[
         ["j/k", "move"],
         ["1-9", "quick pick"],
-        ["l", "new section"],
-        ["⏎", "select"],
+        ["n", "new section"],
+        ["l / ⏎", "select"],
         ["esc / q", "cancel"],
       ]}
     >
@@ -72,13 +72,13 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
         const bg = selected ? theme.rowSelectedBg : undefined;
         const fg = selected ? theme.fgBright : theme.fg;
         // Quick-pick digit prefix for the first 9 items (1..9). The
-        // create entry shows "l" instead — matches the chord shortcut
-        // (`l l` from normal mode jumps straight into create-name).
+        // create entry shows "n" instead — matches the chord shortcut
+        // (`l n` from normal mode jumps straight into create-name).
         const isCreate = item.kind === "create";
         const isStack = item.kind === "stack";
         const showDigit = i < 9 && !isCreate && !isStack;
         const prefix = isCreate
-          ? "l"
+          ? "n"
           : isStack
             ? "═"
             : showDigit

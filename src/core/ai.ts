@@ -29,6 +29,19 @@ Rules:
 
 Return only the formatted output. Nothing before TITLE, nothing after the description.`;
 
+const STACK_SYSTEM_PROMPT = `You name a stack of related git branches for a developer's TUI section header.
+
+Output exactly:
+TITLE: <name>
+
+Rules:
+- Find the common theme — what unifies the branches. Often a feature, subsystem, or area they all touch.
+- TITLE: 4 words maximum. Caveman noun phrase, no leading verb ("Add", "Fix", "Refactor"...), no articles, no quotes, no trailing period.
+- Examples: "Auto-merge support", "Markdown link popover", "Reviewer picker UI", "Stack rebase + push".
+- If the branches look unrelated, pick the most prominent shared theme rather than listing them.
+
+Return only the TITLE line.`;
+
 type ChatResponse = {
   choices?: Array<{ message?: { content?: string } }>;
   error?: { message?: string };
@@ -64,6 +77,50 @@ export async function summarizeDiff(
   prompt: string,
   external?: AbortSignal,
 ): Promise<AiSummary> {
+  // max_tokens bump from prior 200 to give title + description headroom
+  // without inviting rambling. ~3 sentences fits comfortably here.
+  const content = await callChat(SYSTEM_PROMPT, prompt, 260, external);
+  return parseTitleDescription(content);
+}
+
+/**
+ * Stack-naming round trip. Same client as `summarizeDiff` but a
+ * different system prompt and a tiny `max_tokens` since the output is
+ * just one line. Input shape is a list of branch summaries; ordering
+ * is irrelevant to the model so callers can sort for cache stability.
+ *
+ * Returns the cleaned title with a hard 6-word ceiling (≤4 prompted,
+ * extra slack absorbs small models that overshoot). Throws on
+ * transport / HTTP errors; if the model emits a non-TITLE response
+ * the whole content is used as a last-resort fallback.
+ */
+export async function summarizeStack(
+  members: ReadonlyArray<{ branch: string; brief: string }>,
+  external?: AbortSignal,
+): Promise<string> {
+  const userPrompt = `Branches in this stack:\n${members
+    .map((m) => `- ${m.branch}: ${m.brief}`)
+    .join("\n")}`;
+  const content = await callChat(STACK_SYSTEM_PROMPT, userPrompt, 30, external);
+  const titleMatch = content.match(/^TITLE:\s*(.+?)\s*$/m);
+  const raw = (titleMatch?.[1] ?? content).trim();
+  const cleaned = cleanInline(raw);
+  // Hard ceiling — 4 prompted, slight slack for small-model drift.
+  const capped = cleaned.split(/\s+/).slice(0, 6).join(" ");
+  return capped;
+}
+
+/**
+ * Single round-trip to the OpenAI-compatible `/v1/chat/completions`
+ * endpoint. Shared by `summarizeDiff` and `summarizeStack` so both
+ * use the same abort chaining, timeout handling, and error messages.
+ */
+async function callChat(
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number,
+  external?: AbortSignal,
+): Promise<string> {
   if (!config.ai) {
     throw new Error("AI is not configured ([ai] missing in config.toml)");
   }
@@ -83,13 +140,11 @@ export async function summarizeDiff(
       body: JSON.stringify({
         model: config.ai.model,
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: prompt },
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
         ],
         temperature: 0.2,
-        // Small bump from prior 200 to give title + description headroom
-        // without inviting rambling. ~3 sentences fits comfortably here.
-        max_tokens: 260,
+        max_tokens: maxTokens,
         stream: false,
       }),
     });
@@ -122,7 +177,7 @@ export async function summarizeDiff(
   if (!content) {
     throw new Error("LM Studio returned no content");
   }
-  return parseTitleDescription(content);
+  return content;
 }
 
 /**
