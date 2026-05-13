@@ -53,7 +53,7 @@ export function claudeTmuxName(slug: string, name: string | null): string {
  * `theme.accent` (orange) — inlined here so core/ doesn't import from
  * tui/.
  */
-const CLAUDE_GLYPH = "\u{F0335}"; // nf-md-brain
+const CLAUDE_GLYPH = "\u{F021A}"; // nf-md-robot
 const CLAUDE_COLOR = "#c47b3a";
 
 export const claudeHarness: Harness = {

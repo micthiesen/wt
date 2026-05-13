@@ -30,8 +30,8 @@ import type { Harness, HarnessSession, HarnessSpawnArgs } from "./types.ts";
 
 const log = createLogger("[codex]");
 
-const CODEX_GLYPH = "\u{F00BD}"; // nf-md-code_braces
-const CODEX_COLOR = "#7c9cff";
+const CODEX_GLYPH = "\u{F4AC}"; // nf-oct-cloud
+const CODEX_COLOR = "#434cff";
 const CODEX_TMUX_INFIX = "-codex";
 
 const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");

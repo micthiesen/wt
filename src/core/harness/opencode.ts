@@ -29,8 +29,8 @@ import type { Harness, HarnessSession, HarnessSpawnArgs } from "./types.ts";
 
 const log = createLogger("[opencode]");
 
-const OPENCODE_GLYPH = "\u{F0179}"; // nf-md-folder_open
-const OPENCODE_COLOR = "#62c073";
+const OPENCODE_GLYPH = "\u{F018D}"; // nf-md-console
+const OPENCODE_COLOR = "#a78bfa";
 const OPENCODE_TMUX_INFIX = "-opencode";
 
 const OPENCODE_DB = join(
