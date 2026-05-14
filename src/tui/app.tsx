@@ -38,7 +38,7 @@ import {
   removeClaudeName,
   validateSessionName,
 } from "../core/claude-sessions.ts";
-import { graphiteUrlFromGithubPr } from "../core/graphite.ts";
+import { prViewerUrl } from "../core/graphite.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus, tryAcquireLock } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
@@ -3907,8 +3907,7 @@ export function App({ onExit }: Props) {
     if (selectedPr) {
       const prLog = createLogger("[review]");
       if (isPlainLetter(k, "p") || k.name === "return") {
-        const url =
-          graphiteUrlFromGithubPr(selectedPr.url) ?? selectedPr.url;
+        const url = prViewerUrl(selectedPr.url);
         hideFrontmostAlacritty();
         openUrl(url);
         prLog.event.info(`opened review #${selectedPr.number}`);
@@ -3935,7 +3934,7 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no PR for this branch");
         return;
       }
-      const url = graphiteUrlFromGithubPr(current.pr.url) ?? current.pr.url;
+      const url = prViewerUrl(current.pr.url);
       hideFrontmostAlacritty();
       openUrl(url);
       rowLog.event.info(`opened PR #${current.pr.number}`);

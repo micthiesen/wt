@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 
+import { config } from "../../core/config.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import { STATE_DOT, STATE_FG } from "../claude-state.ts";
 import { NF } from "../icons.ts";
@@ -87,7 +88,10 @@ const SECTIONS: Section[] = [
     title: "review requests (pinned section)",
     note: "PRs awaiting your review, pulled from GitHub. Not worktrees — only these keys apply.",
     items: [
-      ["p / ⏎", "open in Graphite"],
+      [
+        "p / ⏎",
+        `open in ${config.github.prViewer === "graphite" ? "Graphite" : "GitHub"}`,
+      ],
       ["o", "open on GitHub"],
     ],
   },

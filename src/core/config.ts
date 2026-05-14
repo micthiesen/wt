@@ -42,6 +42,14 @@ export type LinearConfig = {
   workspace: string;
 };
 
+/**
+ * Where the `p` / `⏎` PR-open keybind (and the yank menu's `r`) points.
+ * `"graphite"` rewrites the github.com URL to its Graphite reskin;
+ * `"github"` opens GitHub directly.
+ */
+export type PrViewer = "github" | "graphite";
+export const PR_VIEWERS: readonly PrViewer[] = ["github", "graphite"];
+
 export type GithubConfig = {
   /**
    * Glob patterns matched against check context names (CheckRun.name /
@@ -50,6 +58,8 @@ export type GithubConfig = {
    * flip the badge. Case-insensitive; `*` is the only wildcard.
    */
   ignoredChecks: readonly string[];
+  /** Which UI the PR-open keybind targets. Defaults to `"github"`. */
+  prViewer: PrViewer;
 };
 
 export type DiffConfig = {
@@ -320,6 +330,22 @@ class Errors {
     const v = parent?.[key];
     return typeof v === "number" && Number.isFinite(v) ? v : fallback;
   }
+  /** Read an optional string-enum field; record an error on a value outside `allowed`. */
+  optEnum<T extends string>(
+    parent: Raw | null,
+    section: string,
+    key: string,
+    allowed: readonly T[],
+    fallback: T,
+  ): T {
+    const v = parent?.[key];
+    if (v === undefined) return fallback;
+    if (typeof v === "string" && (allowed as readonly string[]).includes(v)) {
+      return v as T;
+    }
+    this.add(`${section}.${key} must be one of: ${allowed.join(", ")}`);
+    return fallback;
+  }
   flush(configFile: string): void {
     if (this.list.length === 0) return;
     const lines = this.list.map((l) => `  - ${l}`).join("\n");
@@ -418,6 +444,7 @@ function build(raw: Raw, errs: Errors): Config {
   const githubRaw = obj(raw.github);
   const github: GithubConfig = {
     ignoredChecks: strArr(githubRaw?.ignored_checks, []),
+    prViewer: errs.optEnum(githubRaw, "github", "pr_viewer", PR_VIEWERS, "github"),
   };
 
   // [[actions]] is fully replaced when the user provides any entries

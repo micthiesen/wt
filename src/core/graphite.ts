@@ -1,3 +1,4 @@
+import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { run } from "./proc.ts";
 
@@ -19,6 +20,20 @@ export function graphiteUrlFromGithubPr(githubPrUrl: string): string | null {
   if (!m) return null;
   const [, owner, repo, number] = m;
   return `https://app.graphite.com/github/pr/${owner}/${repo}/${number}`;
+}
+
+/**
+ * The URL the `p` / `⏎` keybind (and the yank menu's `r`) should open
+ * for a GitHub PR, honoring the `github.pr_viewer` setting. `"graphite"`
+ * rewrites to the Graphite reskin; `"github"` (the default) passes the
+ * github.com URL through. Falls back to the GitHub URL if the Graphite
+ * rewrite can't parse the input.
+ */
+export function prViewerUrl(githubPrUrl: string): string {
+  if (config.github.prViewer === "graphite") {
+    return graphiteUrlFromGithubPr(githubPrUrl) ?? githubPrUrl;
+  }
+  return githubPrUrl;
 }
 
 export type GraphiteActionResult = { ok: true } | { ok: false; error: string };
