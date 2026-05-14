@@ -195,6 +195,12 @@ export async function runTui(): Promise<TuiExit> {
     stopCodexEvents();
     stopOpencodeEvents();
     setEventSink(null);
+    // Must null the trigger sink BEFORE `wtClient.shutdown()`: a
+    // debounce timer can still be pending here, and nulling the sink
+    // first makes its late fire a no-op. Reordering these two lines
+    // reintroduces a window where the timer invalidates queries on a
+    // torn-down client (the `.catch(() => {})` on the sink only papers
+    // over it).
     setSessionTriggerSink(null);
     wtClient.shutdown();
     // Close the harness-owned read handles (opencode's read-only
