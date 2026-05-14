@@ -606,7 +606,15 @@ export async function fetchReviewRequests(
     { cwd: config.paths.mainClone, timeoutMs: 15_000, signal },
   );
   if (r.exitCode !== 0) {
-    log.error("review-requests fetch failed", { stderr: r.stderr.slice(0, 200) });
+    // `gh api graphql` puts GraphQL errors / rate-limit bodies on
+    // stdout, not stderr — and a timeout/abort leaves both empty with
+    // only a non-zero exit code. Log all three so the failure is
+    // actually diagnosable instead of `{"stderr":""}`.
+    log.error("review-requests fetch failed", {
+      exitCode: r.exitCode,
+      stderr: r.stderr.slice(0, 200) || null,
+      stdout: r.stdout.slice(0, 200) || null,
+    });
     return [];
   }
   let parsed: GqlReviewRequestResponse;

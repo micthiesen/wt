@@ -630,58 +630,61 @@ export async function attachOrCreate(opts: {
   // Shell: pre-create the session detached and chain `pipe-pane` to a
   // per-slug log so every byte the shell writes is captured for the
   // bottom-pane tail (`core/shell-tail.ts`). Doing this before the
-  // attach call (instead of chaining after `new-session -A`) closes
-  // the would-be race where output written between session-create and
-  // pipe-pane attach gets dropped — chained commands after `-A`
-  // (attached) only run when the *client* detaches, far too late.
-  // `-o` makes pipe-pane a no-op when already piping, so re-attaches
-  // don't double-up. claude/diff don't need this — claude has its
-  // own jsonl tail, and diff is a TUI we don't surface as an output.
+  // attach call closes the would-be race where output written between
+  // session-create and pipe-pane attach gets dropped.
+  //
+  // The pre-create must NOT use `new-session -A`: when the session
+  // already exists (re-entering F10), `-A` switches to attach
+  // semantics, which needs a controlling tty — but this spawn has
+  // none (`stdout: "ignore"`), so tmux fails with "open terminal
+  // failed: not a terminal" and the tail silently never attaches.
+  // Branch instead:
+  //  - fresh session: `new-session -d` chained with `pipe-pane` in one
+  //    command so no shell output is lost between create and pipe.
+  //  - existing session: just re-run `pipe-pane -o` (the `-o` makes it
+  //    a no-op when the pipe's already attached); the shell's been
+  //    running, so there's no create→pipe race to close.
+  // claude/diff don't need any of this — claude has its own jsonl
+  // tail, and diff is a TUI we don't surface as an output.
   if (kind === "shell") {
     const shellLog = shellLogPath(slug);
     // pipe-pane runs its argument through /bin/sh -c, so the path
     // has to survive shell parsing — `homedir()` can contain spaces
     // (macOS "My Name" accounts) even though the slug can't.
     const quotedLog = shQuote(shellLog);
-    const setup = Bun.spawn(
-      [
-        "tmux",
-        "-L",
-        TMUX_SOCKET,
-        "-f",
-        configPath,
-        "new-session",
-        "-A",
-        "-d",
-        "-s",
-        name,
-        "-c",
-        cwd,
-        "env",
-        "-u",
-        "TMUX",
-        "-u",
-        "TMUX_PANE",
-        "bash",
-        "-c",
-        'p="$1"; shift; exec "$@" 2> "$p"',
-        "_wt_wrap",
-        stderrPath,
-        ...innerArgs,
-        ";",
-        "pipe-pane",
-        "-o",
-        "-t",
-        name,
-        // `>` not `>>` so a destroy-and-recreate of the same slug
-        // doesn't seed the new tail with the prior session's lines.
-        // pipe-pane spawns this shell once per session lifetime; the
-        // truncate fires only on first attach, subsequent re-attaches
-        // are `-o` no-ops and the existing FD keeps streaming.
-        `cat > ${quotedLog}`,
-      ],
-      { stdout: "ignore", stderr: "pipe" },
-    );
+    // `>` not `>>` so a destroy-and-recreate of the same slug doesn't
+    // seed the new tail with the prior session's lines.
+    const pipePaneArgs = ["pipe-pane", "-o", "-t", name, `cat > ${quotedLog}`];
+    const alreadyRunning = (await listAllSessionsRaw().catch(() => new Set<string>())).has(name);
+    const setupArgs = alreadyRunning
+      ? ["tmux", "-L", TMUX_SOCKET, "-f", configPath, ...pipePaneArgs]
+      : [
+          "tmux",
+          "-L",
+          TMUX_SOCKET,
+          "-f",
+          configPath,
+          "new-session",
+          "-d",
+          "-s",
+          name,
+          "-c",
+          cwd,
+          "env",
+          "-u",
+          "TMUX",
+          "-u",
+          "TMUX_PANE",
+          "bash",
+          "-c",
+          'p="$1"; shift; exec "$@" 2> "$p"',
+          "_wt_wrap",
+          stderrPath,
+          ...innerArgs,
+          ";",
+          ...pipePaneArgs,
+        ];
+    const setup = Bun.spawn(setupArgs, { stdout: "ignore", stderr: "pipe" });
     const [setupCode, setupErr] = await Promise.all([
       setup.exited,
       new Response(setup.stderr).text(),
