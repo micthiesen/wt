@@ -101,6 +101,16 @@ export async function buildDiffContext(
   const log = await commitLog(wtPath, base, signal);
   if (signal?.aborted) return null;
   const rawDiff = await fullDiff(wtPath, base, signal);
+  if (signal?.aborted) return null;
+
+  // Nothing in `base...HEAD` — a freshly created worktree, or one
+  // whose only changes are uncommitted (never in the diff context) or
+  // excluded files (lockfiles &c). There's no content worth a model
+  // call, so return null: `aiSummaryQuery` is gated `enabled: !!ctx`,
+  // so this lands in the exact same "no summary" state as an
+  // unconfigured pipeline rather than firing LM Studio with an empty
+  // `File summary:` prompt.
+  if (!stat && !log && !rawDiff.trim()) return null;
 
   // Hash the unfiltered diff so summaries cache by content. Filter
   // tweaks (mode changes, exclude list updates) don't invalidate the
