@@ -10,7 +10,10 @@ import { startCodexEventPolling } from "../core/harness/codex-events.ts";
 import { startOpencodeEventPolling } from "../core/harness/opencode-events.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
-import { sessionTailRegistry } from "../core/session-tail.ts";
+import {
+  sessionTailRegistry,
+  setSessionTriggerSink,
+} from "../core/session-tail.ts";
 import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
 import { reapOrphanedSessions, WT_SOURCE_SLUG } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
@@ -132,6 +135,21 @@ export async function runTui(): Promise<TuiExit> {
       .map((wt) => ({ slug: wt.slug, wtPath: wt.path }));
   });
 
+  // Wire the session tail's refresh triggers to the query cache. The
+  // tailer is already reading every live Claude jsonl for the activity
+  // pane; when it spots a `gh pr create` / `git push` &c it reports a
+  // refresh target here and we invalidate the matching query right
+  // away instead of waiting out its slow staleTime. `.catch` swallows
+  // the race against a torn-down client during shutdown.
+  setSessionTriggerSink((target) => {
+    if (target === "github") {
+      Promise.all([
+        wtClient.client.invalidateQueries({ queryKey: ["github"] }),
+        wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
+      ]).catch(() => {});
+    }
+  });
+
   // Evict orphaned cache entries whose key shape changed across a wt
   // upgrade. Without this, an entry persisted under an old key sits in
   // memory after `restoreQueries` pre-warms it, where prefix-matching
@@ -177,6 +195,7 @@ export async function runTui(): Promise<TuiExit> {
     stopCodexEvents();
     stopOpencodeEvents();
     setEventSink(null);
+    setSessionTriggerSink(null);
     wtClient.shutdown();
     // Close the harness-owned read handles (opencode's read-only
     // SQLite handle is the only one today). No-op for harnesses

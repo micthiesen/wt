@@ -63,9 +63,66 @@ import {
 } from "./claude-events.ts";
 import { projectDir as claudeProjectDir, wtSessionUuid } from "./claude.ts";
 import { createLogger } from "./logger.ts";
+import {
+  detectRefreshTriggers,
+  type RefreshTarget,
+} from "./session-triggers.ts";
 import { claudeSessionName } from "./tmux.ts";
 
 const log = createLogger("[session-tail]");
+
+// ---------------------------------------------------------------------------
+// Refresh triggers
+//
+// While the live tail is reading the jsonl anyway, it scans each new
+// entry for Bash tool calls (`gh pr create`, `git push`, …) that change
+// GitHub-side state and asks the runtime to invalidate the matching
+// query — see `session-triggers.ts`. Detection is per-line; delivery is
+// debounced per target so a burst of git/gh calls collapses to one
+// refresh, and so the triggering command has finished by the time the
+// refetch fires (we match on tool_use, not tool_result).
+// ---------------------------------------------------------------------------
+
+/** Debounce window for refresh triggers. See block comment above. */
+const TRIGGER_DEBOUNCE_MS = 3_000;
+
+let triggerSink: ((target: RefreshTarget) => void) | null = null;
+const triggerTimers = new Map<RefreshTarget, ReturnType<typeof setTimeout>>();
+
+/**
+ * Register the refresh-trigger sink. The TUI runtime wires this to the
+ * QueryClient so a `gh pr create` in a live session invalidates
+ * `["github"]` immediately instead of waiting out its slow staleTime.
+ * CLI runs leave it unset — triggers are a silent no-op there. Pass
+ * `null` on shutdown; pending debounce timers are cleared.
+ */
+export function setSessionTriggerSink(
+  fn: ((target: RefreshTarget) => void) | null,
+): void {
+  triggerSink = fn;
+  if (!fn) {
+    for (const t of triggerTimers.values()) clearTimeout(t);
+    triggerTimers.clear();
+  }
+}
+
+/**
+ * Debounced per-target dispatch. Resets the timer on every hit, so a
+ * burst collapses to a single refresh `TRIGGER_DEBOUNCE_MS` after the
+ * last trigger.
+ */
+function scheduleTrigger(target: RefreshTarget): void {
+  const existing = triggerTimers.get(target);
+  if (existing) clearTimeout(existing);
+  triggerTimers.set(
+    target,
+    setTimeout(() => {
+      triggerTimers.delete(target);
+      log.debug("refresh trigger fired", { target });
+      triggerSink?.(target);
+    }, TRIGGER_DEBOUNCE_MS),
+  );
+}
 
 /**
  * Composite identifier for a session tail. By construction the same
@@ -223,6 +280,11 @@ class SessionTailRegistry {
   /** Stop every tailer. Used on TUI shutdown. */
   stopAll(): void {
     for (const key of [...this.state.keys()]) this.stopByKey(key);
+    // Drop any pending refresh-trigger debounce timers — no tailer is
+    // left to have produced them, and a late fire would invalidate
+    // queries on a torn-down client.
+    for (const t of triggerTimers.values()) clearTimeout(t);
+    triggerTimers.clear();
   }
 
   /**
@@ -408,6 +470,12 @@ class SessionTailRegistry {
       if (!line) continue;
       const out = parseEntry(line, st.toolStarts, nextId);
       if (out.append.length > 0 || out.patch.length > 0) emits.push(out);
+      // Live tail only: scan for `gh pr …` / `git push` &c and schedule
+      // a debounced query refresh. `readSeed` deliberately skips this —
+      // replaying hours-old history must not fire refreshes.
+      for (const target of detectRefreshTriggers(line)) {
+        scheduleTrigger(target);
+      }
     }
     if (emits.length === 0) return;
     this.update(key, (r) => {
