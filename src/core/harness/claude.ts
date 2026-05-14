@@ -47,13 +47,11 @@ export function claudeTmuxName(slug: string, name: string | null): string {
 }
 
 /**
- * `nf-fa-anthropic` would be ideal but isn't in the patched set; the
- * brain glyph reads as "AI/thought" and matches the comment-bubble
- * motif Claude already used in the row. Color is the existing
- * `theme.accent` (orange) — inlined here so core/ doesn't import from
- * tui/.
+ * `nf-fa-anthropic` would be ideal but isn't in the patched set, so we
+ * use the Material Design robot. Color is Claude Code's brand orange,
+ * inlined here so core/ doesn't import from tui/.
  */
-const CLAUDE_GLYPH = "\u{F021A}"; // nf-md-robot
+const CLAUDE_GLYPH = "\u{F06A9}"; // nf-md-robot (󰚩)
 const CLAUDE_COLOR = "#c47b3a";
 
 export const claudeHarness: Harness = {

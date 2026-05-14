@@ -11,7 +11,7 @@ import { Fragment, memo } from "react";
 import { TextAttributes } from "@opentui/core";
 
 import { prStateBadge, statusBadge } from "../badges.ts";
-import { NF, claudeCountGlyph } from "../icons.ts";
+import { NF } from "../icons.ts";
 import { Spinner } from "../spinner.tsx";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";

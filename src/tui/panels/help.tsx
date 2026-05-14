@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { getHarness } from "../../core/harness/index.ts";
+import { STATE_DOT, STATE_FG } from "../claude-state.ts";
 import { NF } from "../icons.ts";
 import { Modal } from "../modal.tsx";
 import { Spinner } from "../spinner.tsx";
@@ -137,9 +139,15 @@ const BADGES: [LegendGlyph, string, string][] = [
   [NF.mergeQueue, theme.err, "required checks failing (Graphite)"],
   [NF.bolt, theme.warn, "SST stage deployed"],
   [NF.comment, theme.ok, "Claude · `!` action running"],
-  [NF.circled1, theme.accent, "Claude · live session count (1, 2, …)"],
-  [NF.comment, theme.warn, "Claude · waiting (details pane)"],
-  [NF.comment, theme.fgDim, "Claude · idle (details pane)"],
+  [
+    getHarness("claude").glyph,
+    getHarness("claude").color,
+    "AI session live (list pane shows the F12-target harness glyph)",
+  ],
+  [STATE_DOT.working, STATE_FG.working, "AI session · working"],
+  [STATE_DOT.waiting, STATE_FG.waiting, "AI session · waiting"],
+  [STATE_DOT.idle, STATE_FG.idle, "AI session · idle"],
+  [STATE_DOT.abandoned, STATE_FG.abandoned, "AI session · abandoned"],
 ];
 
 function KeyRow({ keyText, label }: { keyText: string; label: string }) {

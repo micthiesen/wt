@@ -21,7 +21,4 @@ export const theme = {
   warn: "#ebcb8b",
   err: "#bf616a",
   info: "#b48ead",
-  // Anthropic / Claude Code brand orange — used for the per-row
-  // claude session count badge so the cluster reads as "claude".
-  claudeOrange: "#d97757",
 };
