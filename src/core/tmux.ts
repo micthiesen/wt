@@ -44,11 +44,12 @@ const log = createLogger("[tmux]");
 export const TMUX_SOCKET = "wt";
 
 /**
- * Slug for the persistent claude session at the wt source repo (the
- * `.` keybinding). Reuses `kind: "claude"`, so the tmux session name
- * is just `wt` and the conversation shows up as `wt` in claude's
- * `/resume` listings. `runtime.tsx` adds this to `live` so the orphan
- * reaper doesn't mistake it for a vanished worktree.
+ * Slug for the persistent harness session at the wt source repo (the
+ * `.` keybinding — one of two session slots, see
+ * `tui/session-slots.ts`). Tmux session name is just `wt`; for the
+ * claude harness the conversation also surfaces as `wt` in `/resume`
+ * listings. The startup orphan reaper whitelists every slot slug so
+ * this session survives the per-slug cleanup sweep.
  */
 export const WT_SOURCE_SLUG = "wt";
 
@@ -562,9 +563,9 @@ export async function attachOrCreate(opts: {
   resumeSessionId?: string | null;
   /**
    * For Claude primary only — label shown in `/resume`. Defaults to
-   * "primary". Pass an override (e.g. the wt source-repo `.` shortcut
-   * uses `WT_SOURCE_SLUG`) to surface a different name. Ignored for
-   * named claude sessions and for other harnesses.
+   * "primary". Session-slot entries (`.` / `,` bindings) pass the
+   * slot's label here so the conversation is recognizable by name;
+   * ignored for named claude sessions and for other harnesses.
    */
   claudeDisplayName?: string;
   /**

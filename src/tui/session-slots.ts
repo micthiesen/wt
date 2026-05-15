@@ -6,9 +6,15 @@
  * Slots reuse all the harness / tmux / session-tail machinery a
  * worktree row uses. They differ in that they don't appear in the
  * list panel, don't carry a PR, and don't participate in any per-
- * worktree state queries. The slug must not collide with a real
- * worktree slug — both registered slots use names you'd never get
- * out of `slugify(branch)`.
+ * worktree state queries.
+ *
+ * Slot slugs share the namespace with worktree slugs in tmux, the
+ * session-tail registry, the orphan reaper, and claude's /resume
+ * listings. The current values (`"wt"`, `"main"`) are short and can
+ * in theory collide with a user-created worktree whose directory
+ * basename happens to match — vanishingly unlikely in practice, but
+ * the `pathBySlug` build in `app.tsx`'s session-tail reconcile is
+ * ordered so a real row's path wins on tie.
  *
  * Consumers:
  *  - `tui/app.tsx` — `.` / `,` keybind handlers enter the slot via

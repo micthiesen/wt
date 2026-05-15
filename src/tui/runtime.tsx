@@ -56,12 +56,11 @@ async function reapStartup(): Promise<void> {
     // Kill any tmux sessions whose slug no longer exists. Covers the
     // case where a worktree was removed externally (or in a prior wt
     // run that crashed before the destroy hook fired). Session slots
-    // (the `.` and `,` bindings) live on sentinel slugs outside the
-    // worktree namespace — whitelist them here so the reaper doesn't
-    // kill them.
-    const liveWithSlots = new Set(live);
-    for (const slug of SLOT_SLUGS) liveWithSlots.add(slug);
-    await reapOrphanedSessions(liveWithSlots);
+    // (the `.` and `,` bindings) own slugs outside the worktree
+    // namespace — whitelist them here so the reaper doesn't kill them.
+    const protectedSlugs = new Set(live);
+    for (const slug of SLOT_SLUGS) protectedSlugs.add(slug);
+    await reapOrphanedSessions(protectedSlugs);
     // Drop terminal action run dirs whose slug is gone OR that fall
     // beyond the rehydration window. Ordered before `boot` so the
     // boot scan only sees dirs we'll actually keep — saves a meta-

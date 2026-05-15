@@ -603,8 +603,6 @@ function load(): { cfg: Config; path: string } {
 const loaded = load();
 
 export const config: Config = Object.freeze(loaded.cfg) as Config;
-/** Absolute path of the TOML file the config was loaded from. */
-export const configFilePath: string = loaded.path;
 
 /**
  * Assert SST is configured and return its config. Call from code paths

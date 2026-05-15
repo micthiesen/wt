@@ -101,7 +101,7 @@ function MainSlotTail() {
   if (!lastLine) {
     return (
       <text wrapMode="none" truncate>
-        <span fg={theme.fgDim}>{MAIN_CLONE_SLOT.label}</span>
+        <span fg={theme.accent}>{MAIN_CLONE_SLOT.label}</span>
         <span fg={theme.fgDim}> · idle  ·  </span>
         <span fg={theme.accent}>,</span>
         <span fg={theme.fgDim}> start  ·  </span>

@@ -895,16 +895,16 @@ export function App({ onExit }: Props) {
   // Reconcile session tailers against the live (slug, name) set so the
   // jsonl-watch lifecycle tracks the daemon. Re-runs whenever the live
   // set changes; the registry is otherwise idempotent so this is safe
-  // to call on every render-driven change. Path comes from `rows` so
-  // we always seed against the worktree's actual cwd (the wtPath the
-  // tmux session was created with). Session slots (the `.` / `,`
-  // bindings) are folded in here too — claude derives its project
-  // dir from cwd, so a slot's tailer reads from the same jsonl claude
-  // wrote for the slot's path, and the bottom-bar tail picks it up.
+  // to call on every render-driven change. Path comes from `rows` for
+  // worktrees and from `SESSION_SLOTS` for the `.` / `,` slot bindings
+  // — claude derives its project dir from cwd, so a slot's tailer
+  // reads from the same jsonl claude wrote for the slot's path. Slots
+  // are seeded first so a real row's path wins on the (extremely
+  // narrow) slug collision case.
   useEffect(() => {
     const pathBySlug = new Map<string, string>();
-    for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
     for (const slot of SESSION_SLOTS) pathBySlug.set(slot.slug, slot.path);
+    for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
     const live: LiveSessionDesc[] = [];
     for (const [slug, names] of claudeSessionsBySlug) {
       const wtPath = pathBySlug.get(slug);
@@ -1722,9 +1722,7 @@ export function App({ onExit }: Props) {
     const harness = getHarness(primaryHarness);
     const slotLog = createLogger(slot.label);
     void (async () => {
-      slotLog.event.info(
-        `entering ${slot.label} ${harness.label} session (F12 to detach)`,
-      );
+      slotLog.event.info(`entering ${harness.label} session (F12 to detach)`);
       const result = await enterHarnessSession({
         renderer,
         slug: slot.slug,
@@ -1735,25 +1733,24 @@ export function App({ onExit }: Props) {
         // opencode (their tmux name is the discriminator).
         claudeDisplayName: slot.label,
       });
-      // Refresh tmux + harness sessions so the bottom-bar tail and
-      // any future slot-aware UI pick up the new session immediately
-      // rather than waiting for the next 2s poll tick.
-      await Promise.all([
-        refreshTmuxSessions(),
-        refreshHarnessSessions(slot.slug),
-      ]);
+      // Refresh tmux sessions so the bottom-bar tail picks up the new
+      // session immediately rather than waiting for the next 2s poll
+      // tick. `allSettled` (not `all`) so a refresh-rejection — e.g.
+      // a torn-down query client during shutdown — doesn't bubble up
+      // and swallow the result-feedback below.
+      // Harness-session discovery is row-keyed, so there's no slot
+      // entry to refresh there; only tmux matters.
+      await Promise.allSettled([refreshTmuxSessions()]);
       if (result.kind === "spawn-failed") {
         slotLog.event.err(
           `${harness.label} failed to start: ${result.reason}`,
         );
         toast(`${harness.label} failed: ${result.reason}`, theme.err, 3000);
       } else if (result.kind === "detached") {
-        slotLog.event.info(
-          `detached from ${slot.label} ${harness.label} session`,
-        );
+        slotLog.event.info(`detached from ${harness.label} session`);
       } else {
         slotLog.event.info(
-          `${slot.label} ${harness.label} exited (${result.code ?? "?"})`,
+          `${harness.label} exited (${result.code ?? "?"})`,
         );
         if (result.stderr) slotLog.event.err(result.stderr);
       }
