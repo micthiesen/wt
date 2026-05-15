@@ -3918,17 +3918,17 @@ export function App({ onExit }: Props) {
       return;
     }
     // Toggle into a persistent harness session for a session slot —
-    // `.` is the wt source repo, `,` is the configured main clone.
-    // Same model as F12 on a worktree row: tmux's `new-session -A`
-    // makes re-entry idempotent, and F12 (bound to detach-client in
-    // the wt-private tmux config) takes the user back out. The
-    // selected primary harness (TAB to cycle) is the spawned kind,
-    // mirroring how row F12 picks a harness.
-    if (k.sequence === ".") {
+    // `,` is the wt source repo (config/self edits), `.` is the
+    // configured main clone. Same model as F12 on a worktree row:
+    // tmux's `new-session -A` makes re-entry idempotent, and F12
+    // (bound to detach-client in the wt-private tmux config) takes
+    // the user back out. The selected primary harness (TAB to cycle)
+    // is the spawned kind, mirroring how row F12 picks a harness.
+    if (k.sequence === ",") {
       doEnterSlotSession(WT_SOURCE_SLOT);
       return;
     }
-    if (k.sequence === ",") {
+    if (k.sequence === ".") {
       doEnterSlotSession(MAIN_CLONE_SLOT);
       return;
     }
