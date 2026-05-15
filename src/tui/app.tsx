@@ -10,7 +10,7 @@ import {
   type ActionRun,
   type ActionVars,
 } from "../core/actions.ts";
-import { config, configFilePath } from "../core/config.ts";
+import { config } from "../core/config.ts";
 import {
   createWorktree,
   parseInput,
@@ -56,7 +56,6 @@ import {
   killHarnessSession,
   killShellSession,
   type SessionKind,
-  WT_SOURCE_SLUG,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
 import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, tmuxSessionsQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
@@ -123,7 +122,13 @@ import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
-import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard, WT_REPO_PATH } from "./helpers.ts";
+import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard } from "./helpers.ts";
+import {
+  MAIN_CLONE_SLOT,
+  SESSION_SLOTS,
+  WT_SOURCE_SLOT,
+  type SessionSlot,
+} from "./session-slots.ts";
 import { theme } from "./theme.ts";
 
 /**
@@ -148,8 +153,7 @@ const EMPTY_FOCUS: SlugFocus = { focused: null };
 
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
-const configLog = createLogger("config");
-const wtLog = createLogger("wt");
+const wtSourceLog = createLogger(WT_SOURCE_SLOT.label);
 
 export type TuiExit = { kind: "quit" };
 
@@ -893,10 +897,14 @@ export function App({ onExit }: Props) {
   // set changes; the registry is otherwise idempotent so this is safe
   // to call on every render-driven change. Path comes from `rows` so
   // we always seed against the worktree's actual cwd (the wtPath the
-  // tmux session was created with).
+  // tmux session was created with). Session slots (the `.` / `,`
+  // bindings) are folded in here too — claude derives its project
+  // dir from cwd, so a slot's tailer reads from the same jsonl claude
+  // wrote for the slot's path, and the bottom-bar tail picks it up.
   useEffect(() => {
     const pathBySlug = new Map<string, string>();
     for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
+    for (const slot of SESSION_SLOTS) pathBySlug.set(slot.slug, slot.path);
     const live: LiveSessionDesc[] = [];
     for (const [slug, names] of claudeSessionsBySlug) {
       const wtPath = pathBySlug.get(slug);
@@ -1698,6 +1706,56 @@ export function App({ onExit }: Props) {
           `${harness.label} exited (${result.code ?? "?"})`,
         );
         if (result.stderr) sessionLog.event.err(result.stderr);
+      }
+    })();
+  }
+
+  /**
+   * Attach to (or create) the harness session for a non-worktree slot
+   * (the `.` / `,` keybinds). Mirrors `doEnterHarnessSession` but
+   * skips the row lookup + busy guard — slots aren't worktrees, have
+   * no per-slug locking, and are guaranteed to exist (registered at
+   * module load). Uses the TAB-cycled primary harness, so a slot
+   * matches a row's F12 default.
+   */
+  function doEnterSlotSession(slot: SessionSlot): void {
+    const harness = getHarness(primaryHarness);
+    const slotLog = createLogger(slot.label);
+    void (async () => {
+      slotLog.event.info(
+        `entering ${slot.label} ${harness.label} session (F12 to detach)`,
+      );
+      const result = await enterHarnessSession({
+        renderer,
+        slug: slot.slug,
+        cwd: slot.path,
+        harnessId: primaryHarness,
+        // Surface the slot's label in claude's /resume listing so the
+        // conversation is recognizable by name; ignored by codex /
+        // opencode (their tmux name is the discriminator).
+        claudeDisplayName: slot.label,
+      });
+      // Refresh tmux + harness sessions so the bottom-bar tail and
+      // any future slot-aware UI pick up the new session immediately
+      // rather than waiting for the next 2s poll tick.
+      await Promise.all([
+        refreshTmuxSessions(),
+        refreshHarnessSessions(slot.slug),
+      ]);
+      if (result.kind === "spawn-failed") {
+        slotLog.event.err(
+          `${harness.label} failed to start: ${result.reason}`,
+        );
+        toast(`${harness.label} failed: ${result.reason}`, theme.err, 3000);
+      } else if (result.kind === "detached") {
+        slotLog.event.info(
+          `detached from ${slot.label} ${harness.label} session`,
+        );
+      } else {
+        slotLog.event.info(
+          `${slot.label} ${harness.label} exited (${result.code ?? "?"})`,
+        );
+        if (result.stderr) slotLog.event.err(result.stderr);
       }
     })();
   }
@@ -3862,41 +3920,24 @@ export function App({ onExit }: Props) {
       })();
       return;
     }
-    if (k.sequence === ",") {
-      void openInZed(configFilePath);
-      configLog.event.info(`opened ${configFilePath}`);
+    // Toggle into a persistent harness session for a session slot —
+    // `.` is the wt source repo, `,` is the configured main clone.
+    // Same model as F12 on a worktree row: tmux's `new-session -A`
+    // makes re-entry idempotent, and F12 (bound to detach-client in
+    // the wt-private tmux config) takes the user back out. The
+    // selected primary harness (TAB to cycle) is the spawned kind,
+    // mirroring how row F12 picks a harness.
+    if (k.sequence === ".") {
+      doEnterSlotSession(WT_SOURCE_SLOT);
       return;
     }
-    // `.` — toggle into a persistent claude session at the wt source
-    // repo. Same model as F12 on a worktree: tmux's `new-session -A`
-    // makes it idempotent, and F10/F11/F12 (bound to detach-client in
-    // the wt-private tmux config) takes the user back out. Slug "wt"
-    // so the tmux session and `/resume` entry both surface as `wt`.
-    if (k.sequence === ".") {
-      void (async () => {
-        wtLog.event.info("entering wt claude session (F12 to detach)");
-        const result = await enterHarnessSession({
-          renderer,
-          slug: WT_SOURCE_SLUG,
-          cwd: WT_REPO_PATH,
-          harnessId: "claude",
-          claudeDisplayName: WT_SOURCE_SLUG,
-        });
-        if (result.kind === "spawn-failed") {
-          wtLog.event.err(`claude failed to start: ${result.reason}`);
-          toast(`claude failed: ${result.reason}`, theme.err, 3000);
-        } else if (result.kind === "detached") {
-          wtLog.event.info("detached from wt claude session");
-        } else {
-          wtLog.event.info(`wt claude session exited (${result.code ?? "?"})`);
-          if (result.stderr) wtLog.event.err(result.stderr);
-        }
-      })();
+    if (k.sequence === ",") {
+      doEnterSlotSession(MAIN_CLONE_SLOT);
       return;
     }
     if (k.sequence === ">") {
-      void openInZed(WT_REPO_PATH);
-      wtLog.event.info(`opened ${WT_REPO_PATH}`);
+      openInZed(WT_SOURCE_SLOT.path);
+      wtSourceLog.event.info(`opened ${WT_SOURCE_SLOT.path}`);
       return;
     }
 

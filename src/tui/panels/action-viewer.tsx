@@ -4,41 +4,12 @@
  * OutputViewer; these emit just the line rows.
  */
 import type { ActionLine, ActionRun } from "../../core/actions.ts";
+import { actionLineFg } from "../action-line-style.ts";
 import { useSessionRun, useShellRun } from "../hooks/useSessionRun.ts";
 import { theme } from "../theme.ts";
 
 function fmtTime(ts: number): string {
   return new Date(ts).toTimeString().slice(0, 8);
-}
-
-function lineFg(kind: ActionLine["kind"]): string {
-  switch (kind) {
-    case "info":
-      return theme.fgDim;
-    case "user":
-      return theme.accent;
-    case "assistant":
-      return theme.fg;
-    case "thinking":
-      return theme.fgDim;
-    case "tool":
-      // In-flight — dim, intentionally muted so a column of pending
-      // tool calls reads as "background activity" while the eye gets
-      // drawn to whatever's actively resolving below them.
-      return theme.fgDim;
-    case "tool-ok":
-      return theme.ok;
-    case "tool-err":
-      return theme.err;
-    case "stdout":
-      return theme.fg;
-    case "stderr":
-      return theme.warn;
-    case "exit-success":
-      return theme.ok;
-    case "exit-failure":
-      return theme.err;
-  }
 }
 
 type LinesProps = {
@@ -68,7 +39,7 @@ function LinesContent({ height, lines }: LinesProps) {
             <text> </text>
           </box>
           <box flexGrow={1} flexShrink={1} overflow="hidden">
-            <text fg={lineFg(line.kind)} wrapMode="none" truncate>
+            <text fg={actionLineFg(line.kind)} wrapMode="none" truncate>
               {line.text}
             </text>
           </box>

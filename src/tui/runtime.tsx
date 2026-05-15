@@ -15,7 +15,7 @@ import {
   setSessionTriggerSink,
 } from "../core/session-tail.ts";
 import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
-import { reapOrphanedSessions, WT_SOURCE_SLUG } from "../core/tmux.ts";
+import { reapOrphanedSessions } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
@@ -26,6 +26,7 @@ import type { Worktree } from "../core/types.ts";
 import { App, type TuiExit } from "./app.tsx";
 import { events } from "./events.ts";
 import { attachFetchLogs } from "./fetch-log.ts";
+import { SLOT_SLUGS } from "./session-slots.ts";
 
 const startupLog = createLogger("[startup]");
 
@@ -54,13 +55,13 @@ async function reapStartup(): Promise<void> {
     reapDestroyLogs(live);
     // Kill any tmux sessions whose slug no longer exists. Covers the
     // case where a worktree was removed externally (or in a prior wt
-    // run that crashed before the destroy hook fired). The wt-source
-    // shell session (`.` binding) lives on a sentinel slug outside the
-    // worktree namespace, so add it explicitly to keep the reaper from
-    // killing it.
-    const liveWithSource = new Set(live);
-    liveWithSource.add(WT_SOURCE_SLUG);
-    await reapOrphanedSessions(liveWithSource);
+    // run that crashed before the destroy hook fired). Session slots
+    // (the `.` and `,` bindings) live on sentinel slugs outside the
+    // worktree namespace — whitelist them here so the reaper doesn't
+    // kill them.
+    const liveWithSlots = new Set(live);
+    for (const slug of SLOT_SLUGS) liveWithSlots.add(slug);
+    await reapOrphanedSessions(liveWithSlots);
     // Drop terminal action run dirs whose slug is gone OR that fall
     // beyond the rehydration window. Ordered before `boot` so the
     // boot scan only sees dirs we'll actually keep — saves a meta-

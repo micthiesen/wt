@@ -1,0 +1,78 @@
+/**
+ * Session slots — non-worktree projects we host an AI harness session
+ * for. Two instances today: the wt source repo itself (`.` keybind)
+ * and the configured `paths.main_clone` (`,` keybind).
+ *
+ * Slots reuse all the harness / tmux / session-tail machinery a
+ * worktree row uses. They differ in that they don't appear in the
+ * list panel, don't carry a PR, and don't participate in any per-
+ * worktree state queries. The slug must not collide with a real
+ * worktree slug — both registered slots use names you'd never get
+ * out of `slugify(branch)`.
+ *
+ * Consumers:
+ *  - `tui/app.tsx` — `.` / `,` keybind handlers enter the slot via
+ *    `enterHarnessSession` with the slot's path as `cwd`, picking
+ *    the TAB-cycled primary harness so the choice mirrors a row's
+ *    F12 default.
+ *  - `tui/runtime.tsx` — the startup orphan reaper whitelists
+ *    `SLOT_SLUGS` so slot-owned tmux sessions survive the per-slug
+ *    cleanup sweep.
+ *  - `tui/panels/footer.tsx` — subscribes to `MAIN_CLONE_SLOT`'s tail
+ *    via `useSessionRun` and renders the last line in the bottom bar.
+ *  - `tui/app.tsx`'s session-tail reconcile effect — adds slot paths
+ *    to `pathBySlug` so a slot's live claude session gets a tailer.
+ */
+import { config } from "../core/config.ts";
+import { WT_SOURCE_SLUG } from "../core/tmux.ts";
+
+import { WT_REPO_PATH } from "./helpers.ts";
+
+export type SessionSlot = {
+  /** Tmux slug. Shares the namespace with worktree slugs. */
+  slug: string;
+  /** cwd for the harness session — also feeds claude's project-dir
+   *  derivation, so the jsonl lands in a stable per-slot location. */
+  path: string;
+  /** Human label. Surfaces in event-log lines and the bottom-bar
+   *  prefix; also passed as claude's `claudeDisplayName` so the slot's
+   *  /resume entry shows the same word. */
+  label: string;
+};
+
+/**
+ * Slot for the wt source repo itself. Backs the `.` keybind. Slug is
+ * the historical `"wt"` value so anyone with an existing wt-source
+ * claude conversation keeps it across this refactor.
+ */
+export const WT_SOURCE_SLOT: SessionSlot = {
+  slug: WT_SOURCE_SLUG,
+  path: WT_REPO_PATH,
+  label: "wt",
+};
+
+/**
+ * Slot for the user's configured main clone. Backs the `,` keybind
+ * and feeds the bottom-bar tail. Slug is the fixed string `"main"`
+ * rather than something derived from `config.paths.mainClone`, so
+ * the tmux session name (and claude /resume entry) stay stable
+ * across machines with different `mainClone` values.
+ */
+export const MAIN_CLONE_SLOT: SessionSlot = {
+  slug: "main",
+  path: config.paths.mainClone,
+  label: "main",
+};
+
+/**
+ * Every registered slot in display order. Iterated by the session-
+ * tail reconcile (to map slot slugs to paths) and the orphan reaper
+ * (to whitelist slot slugs).
+ */
+export const SESSION_SLOTS: readonly SessionSlot[] = [
+  WT_SOURCE_SLOT,
+  MAIN_CLONE_SLOT,
+];
+
+/** Convenience projection — just the slugs, for set membership tests. */
+export const SLOT_SLUGS: readonly string[] = SESSION_SLOTS.map((s) => s.slug);

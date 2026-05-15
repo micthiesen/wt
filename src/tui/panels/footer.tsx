@@ -1,4 +1,6 @@
-import { KeyHint, type KeyHintPair } from "../key-hint.tsx";
+import { actionLineFg } from "../action-line-style.ts";
+import { useSessionRun } from "../hooks/useSessionRun.ts";
+import { MAIN_CLONE_SLOT } from "../session-slots.ts";
 import { theme } from "../theme.ts";
 
 export type FooterMode =
@@ -26,18 +28,6 @@ type Props = {
   height?: number;
 };
 
-const LEGEND: KeyHintPair[] = [
-  ["jk", "move"],
-  ["o", "zed"],
-  ["l", "section"],
-  ["/", "filter"],
-  ["n", "new"],
-  ["d", "rm"],
-  ["r", "refresh"],
-  ["?", "help"],
-  ["q", "quit"],
-];
-
 export function Footer({ mode, hint }: Props) {
   return (
     <box
@@ -49,7 +39,7 @@ export function Footer({ mode, hint }: Props) {
       flexDirection="row"
     >
       <box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
-        {mode.kind === "legend" ? <Legend /> : null}
+        {mode.kind === "legend" ? <MainSlotTail /> : null}
         {mode.kind === "toast" ? (
           <text fg={mode.color ?? theme.ok}>{mode.message}</text>
         ) : null}
@@ -91,6 +81,40 @@ export function Footer({ mode, hint }: Props) {
   );
 }
 
-function Legend() {
-  return <KeyHint pairs={LEGEND} separator="  ·  " />;
+/**
+ * Single-line tail of the main-clone session — the bottom bar's
+ * default-mode content. Renders the slot label, a dim separator, and
+ * the latest `ActionLine` colored per its kind (so an assistant reply
+ * reads as plain text, a tool-error as red, etc.). When no session is
+ * live or no lines have arrived yet (pre-creation race), falls back
+ * to a dim idle hint that still surfaces `,` as the start key and `?`
+ * for help. The tail is claude-jsonl-only; if the user spawns a
+ * codex/opencode session via `,` (because that's the active primary
+ * harness) the bar reads as "idle" because there's no jsonl to tail.
+ * That's a known v1 trade-off — bottom-bar feedback for non-claude
+ * harnesses would mean wiring their event streams in here too.
+ */
+function MainSlotTail() {
+  const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
+  const lastLine =
+    run && run.lines.length > 0 ? run.lines[run.lines.length - 1] : null;
+  if (!lastLine) {
+    return (
+      <text wrapMode="none" truncate>
+        <span fg={theme.fgDim}>{MAIN_CLONE_SLOT.label}</span>
+        <span fg={theme.fgDim}> · idle  ·  </span>
+        <span fg={theme.accent}>,</span>
+        <span fg={theme.fgDim}> start  ·  </span>
+        <span fg={theme.accent}>?</span>
+        <span fg={theme.fgDim}> help</span>
+      </text>
+    );
+  }
+  return (
+    <text wrapMode="none" truncate>
+      <span fg={theme.accent}>{MAIN_CLONE_SLOT.label}</span>
+      <span fg={theme.fgDim}> · </span>
+      <span fg={actionLineFg(lastLine.kind)}>{lastLine.text}</span>
+    </text>
+  );
 }
