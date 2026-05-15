@@ -5,7 +5,7 @@
  */
 import { createHash } from "node:crypto";
 
-import { queryOptions } from "@tanstack/react-query";
+import { keepPreviousData, queryOptions } from "@tanstack/react-query";
 
 import { summarizeDiff, summarizeStack, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
@@ -69,6 +69,21 @@ const aiLog = createLogger("ai");
  * `"__noctx__"` literal.
  */
 const NO_CTX_HASH = "__noctx__";
+
+/**
+ * Default `placeholderData` for every query whose queryKey embeds a
+ * runtime parameter (branch list, base ref, PR-number list, …). When
+ * the parameter shifts (worktree added/removed/renamed, stack parent
+ * flips, PR set churns), the observer switches to a different cache
+ * entry; without this, the new entry's `data` is `undefined` until
+ * the fetch lands and every dependent badge / row blanks together.
+ * `keepPreviousData` keeps the prior entry's value on screen across
+ * the flip so the UI stays painted. Stable-key queries don't need
+ * this — TanStack already retains data across refetches when the
+ * key doesn't change. `aiSummaryQuery` opts in at the consumer
+ * instead (see its docstring for the cross-slug hazard).
+ */
+const KEEP_PREV = { placeholderData: keepPreviousData } as const;
 
 // ---------- Stale-time policy ----------
 // Short for cheap fs-backed queries; longer for network/git-heavy ones.
@@ -236,6 +251,7 @@ export const githubQuery = (branches: readonly string[]) =>
       return { prs: Object.fromEntries(prs) };
     },
     staleTime: STALE.slow,
+    ...KEEP_PREV,
   });
 
 export type { ReviewRequestPr };
@@ -287,6 +303,7 @@ export const graphiteQuery = (prNumbers: readonly number[]) =>
       return { mergeability: Object.fromEntries(map) };
     },
     staleTime: STALE.slow,
+    ...KEEP_PREV,
   });
 
 /** True iff a Graphite token is configured. Consumers gate `useQuery` on this. */
@@ -423,6 +440,7 @@ export const wtSyncQuery = (
     queryKey: qk.wt(wt.slug).sync(base),
     queryFn: async (): Promise<SyncState> => syncState(wt.path, base),
     staleTime: STALE.mid,
+    ...KEEP_PREV,
   });
 };
 
@@ -452,6 +470,7 @@ export const wtGitActivityQuery = (
     queryFn: async (): Promise<GitActivity> =>
       gitActivity({ path: wt.path, branch: wt.branch }, base),
     staleTime: STALE.mid,
+    ...KEEP_PREV,
   });
 };
 
@@ -489,6 +508,7 @@ export const wtDiffContextQuery = (
     queryFn: async ({ signal }): Promise<DiffContext | null> =>
       buildDiffContext(wt.path, base, signal),
     staleTime: STALE.mid,
+    ...KEEP_PREV,
   });
 };
 
@@ -513,6 +533,7 @@ export const stackQuery = (worktrees: readonly Worktree[]) => {
     queryKey: qk.stack(branches),
     queryFn: async (): Promise<StackMap> => detectStacks(worktrees),
     staleTime: STALE.mid,
+    ...KEEP_PREV,
   });
 };
 
