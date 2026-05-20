@@ -17,6 +17,10 @@ export const theme = {
   fgBright: "#eceff4",
   accent: "#88c0d0",
   accentAlt: "#81a1c1",
+  // Muted teal: "working, but backgrounded". Same cool family as accent
+  // (cyan) but quieter, so the `polling` AI-session state reads as
+  // work-in-flight without the success connotation of green (`ok`).
+  teal: "#6a9b8e",
   ok: "#a3be8c",
   warn: "#ebcb8b",
   err: "#bf616a",
