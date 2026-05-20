@@ -43,6 +43,16 @@ export type HarnessExtras = {
    */
   waitingFor?: string | null;
   /**
+   * Registry `updatedAt` — ms-since-epoch of the session's last status
+   * write. For idle/asking/waiting/shell, CC writes once on entering the
+   * state, so this is effectively when the session entered its current
+   * state; for busy a slow heartbeat keeps it fresh. The claude row
+   * renders `now - statusSince` as time-in-state. Claude-only and live-
+   * only — null when there's no registry entry (e.g. a dead session),
+   * so the row falls back to the jsonl `lastActiveMs`.
+   */
+  statusSince?: number | null;
+  /**
    * Timestamp (ms-since-epoch) of the last message row seen, used by
    * `useHarnessSessions` to finalize `derivedState` once liveness is
    * known. OpenCode populates this; Claude / Codex leave it undefined.

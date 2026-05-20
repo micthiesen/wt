@@ -51,10 +51,14 @@ function AiLine({ wt }: { wt: Worktree }) {
     state === "asking" && f12Target.extras.waitingFor
       ? f12Target.extras.waitingFor.replace(/\s*prompt$/i, "").trim()
       : null;
+  // Prefer the registry's status-write time (time-in-state) over the
+  // jsonl last-activity time: for a live session it reads as "how long
+  // it's been asking / idle", and a `working` session whose heartbeat
+  // has gone quiet shows a growing age (likely stuck). Falls back to the
+  // jsonl age for dead sessions with no registry entry.
+  const ageBasisMs = f12Target.extras.statusSince ?? f12Target.lastActiveMs;
   const ageText =
-    f12Target.lastActiveMs !== null
-      ? ageMsToText(Date.now() - f12Target.lastActiveMs)
-      : null;
+    ageBasisMs !== null ? ageMsToText(Date.now() - ageBasisMs) : null;
   const queued = f12Target.extras.queued;
   return (
     <text fg={theme.fg} wrapMode="none" truncate>

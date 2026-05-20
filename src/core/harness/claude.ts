@@ -70,9 +70,11 @@ export const claudeHarness: Harness = {
     const tailByName = new Map(status.sessions.map((t) => [t.name, t]));
     const registryStatusBySessionId: Record<string, RegistryStatus> = {};
     const waitingForBySessionId: Record<string, string | null> = {};
+    const updatedAtBySessionId: Record<string, number> = {};
     for (const r of readRegistry()) {
       registryStatusBySessionId[r.sessionId] = r.status;
       waitingForBySessionId[r.sessionId] = r.waitingFor;
+      updatedAtBySessionId[r.sessionId] = r.updatedAt;
     }
     const entries = buildClaudeSessionEntries({
       slug,
@@ -105,6 +107,9 @@ export const claudeHarness: Harness = {
         queued: e.queued,
         waitingFor:
           e.state === "asking" ? (waitingForBySessionId[e.sessionId] ?? null) : null,
+        // 0/absent (no live registry entry) → null so the row falls back
+        // to the jsonl `lastActiveMs` age.
+        statusSince: updatedAtBySessionId[e.sessionId] || null,
       },
     }));
     return out;
