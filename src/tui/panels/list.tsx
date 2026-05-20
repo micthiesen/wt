@@ -11,7 +11,14 @@ import { Fragment, memo, useEffect, useRef } from "react";
 import { TextAttributes } from "@opentui/core";
 import type { ScrollBoxRenderable } from "@opentui/core";
 
-import { prStateBadge, statusBadge } from "../badges.ts";
+import {
+  type Badge,
+  checkBadge,
+  prStateBadge,
+  rabbitBadge,
+  reviewBadge,
+  statusBadge,
+} from "../badges.ts";
 import { NF } from "../icons.ts";
 import { Spinner } from "../spinner.tsx";
 import { truncateEnd } from "../text.ts";
@@ -157,76 +164,36 @@ function badgeClusterCells(
 }
 
 /**
- * Tiny CI rollup glyph rendered next to the PR badge. Only shown for
- * live PRs — after merge/close the check state is noise.
+ * Tiny CI rollup glyph rendered next to the PR badge. Glyph/color from
+ * `checkBadge`; only shown for live PRs — after merge/close the check
+ * state is noise. Falls back to the empty 2-cell slot for the quiet
+ * `none` state so the cluster stays aligned.
  */
-function checkGlyph(row: WorktreeRow): { glyph: string; fg: string } {
+function checkGlyph(row: WorktreeRow): Badge {
   const pr = row.pr;
   if (!pr || pr.state !== "OPEN") return { glyph: "  ", fg: theme.fgDim };
-  switch (pr.checks) {
-    case "pass":
-      return { glyph: NF.checkPass, fg: theme.ok };
-    case "fail":
-      return { glyph: NF.checkFail, fg: theme.err };
-    case "pending":
-      return { glyph: NF.checkPend, fg: theme.warn };
-    default:
-      return { glyph: "  ", fg: theme.fgDim };
-  }
+  return checkBadge(pr.checks) ?? { glyph: "  ", fg: theme.fgDim };
 }
 
 /**
- * Human-review hint. Approved / changes-requested get distinct shapes
- * (thumbs up/down); `pending` and `unrequested` share the eye glyph,
- * told apart by color (orange = asked + waiting, dim = nobody asked
- * yet) — review-pending uses the eye rather than a clock so it doesn't
- * collide with the CI pending clock (`checkPend`). Same gate as
- * `pr.tsx`'s `reviewLabel` + `buildPrSegments`: OPEN, non-draft, review
- * state non-null. Glyphs match the details pane exactly so the list
- * teaches itself by reading the details pane once (per `badges.ts` #1).
+ * Human-review hint. Glyph/color from `reviewBadge`; gated to OPEN
+ * non-draft PRs (mirrors `reviewLabel` + `buildPrSegments` in pr.tsx).
  */
-function reviewHint(row: WorktreeRow): { glyph: string; fg: string } | null {
+function reviewHint(row: WorktreeRow): Badge | null {
   const pr = row.pr;
   if (!pr || pr.state !== "OPEN" || pr.isDraft) return null;
-  switch (pr.review) {
-    case "approved":
-      return { glyph: NF.thumbsUp, fg: theme.ok };
-    case "changes_requested":
-      return { glyph: NF.thumbsDown, fg: theme.err };
-    case "pending":
-      return { glyph: NF.eye, fg: theme.warn };
-    case "unrequested":
-      return { glyph: NF.eye, fg: theme.fgDim };
-    default:
-      return null;
-  }
+  return reviewBadge(pr.review);
 }
 
 /**
- * CodeRabbit hint. Single carrot glyph, color-coded by state. Color is
- * load-bearing here (the deliberate "if possible" exception in
- * `badges.ts` rule #1) — carrot has no clean state-specific variants. Same gate as review (OPEN, not draft) plus rollup must
- * report an active state. Draft-hide also sidesteps the "review
- * skipped" → mis-classified-as-clean issue described in
- * `rabbitLabel`'s docstring.
+ * CodeRabbit hint. Glyph/color from `rabbitBadge`; same OPEN/non-draft
+ * gate as review. Draft-hide also sidesteps the "review skipped" →
+ * mis-classified-as-clean issue (see `buildPrSegments` in pr.tsx).
  */
-function rabbitHint(row: WorktreeRow): { glyph: string; fg: string } | null {
+function rabbitHint(row: WorktreeRow): Badge | null {
   const pr = row.pr;
   if (!pr || pr.state !== "OPEN" || pr.isDraft) return null;
-  switch (pr.rabbit.state) {
-    // CR echoes the human-review palette but one notch softer: grazing↔
-    // pending (yellow), resting↔approved (green). Unresolved threads are
-    // "address these", not a rejection — so magenta (the `asking`
-    // look-here tier), not changes_requested red.
-    case "unresolved":
-      return { glyph: NF.carrot, fg: theme.info };
-    case "pending":
-      return { glyph: NF.carrot, fg: theme.warn };
-    case "clean":
-      return { glyph: NF.carrot, fg: theme.ok };
-    default:
-      return null;
-  }
+  return rabbitBadge(pr.rabbit);
 }
 
 const RowView = memo(function RowView({
@@ -444,24 +411,12 @@ const RowView = memo(function RowView({
 });
 
 /**
- * Tiny CI rollup for a review-request row. Same icons as the worktree
- * row's `checkGlyph` but standalone (no `PullRequest` shape), so it can
- * read directly from the `ReviewRequestPr.checks` rollup.
+ * Tiny CI rollup for a review-request row — same `checkBadge` as the
+ * worktree row, just read from the standalone `ReviewRequestPr.checks`
+ * rollup (no `PullRequest` shape). Empty slot for the quiet state.
  */
-function reviewCheckGlyph(checks: ReviewRequestPr["checks"]): {
-  glyph: string;
-  fg: string;
-} {
-  switch (checks) {
-    case "pass":
-      return { glyph: NF.checkPass, fg: theme.ok };
-    case "fail":
-      return { glyph: NF.checkFail, fg: theme.err };
-    case "pending":
-      return { glyph: NF.checkPend, fg: theme.warn };
-    default:
-      return { glyph: "  ", fg: theme.fgDim };
-  }
+function reviewCheckGlyph(checks: ReviewRequestPr["checks"]): Badge {
+  return checkBadge(checks) ?? { glyph: "  ", fg: theme.fgDim };
 }
 
 /**
@@ -590,9 +545,14 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
       : selectedIndex < archivedOffset
         ? reviewRequests[selectedIndex - reviewOffset]?.url
         : archivedRows[selectedIndex - archivedOffset]?.wt.slug;
+  // Depend on `rows`/`reviewRequests` (both identity-stable per
+  // useWorktreeRows / the query layer) as well as the selected id, so a
+  // reflow under a stationary selection — a row inserted above, a
+  // section divider appearing, an active↔archived split shift — re-runs
+  // the follow instead of leaving the cursor drifted off-screen.
   useEffect(() => {
     if (selectedChildId) listRef.current?.scrollChildIntoView(selectedChildId);
-  }, [selectedChildId]);
+  }, [selectedChildId, rows, reviewRequests]);
   return (
     <box
       flexDirection="column"

@@ -45,7 +45,14 @@
  *    font renders them 2-cell. The extra space prevents the icon's
  *    right half from overlapping the next char.
  */
-import { type PullRequest, type Status, StatusKind } from "../core/types.ts";
+import {
+  type PrChecks,
+  type PrReview,
+  type PullRequest,
+  type RabbitStatus,
+  type Status,
+  StatusKind,
+} from "../core/types.ts";
 
 import { NF } from "./icons.ts";
 import { theme } from "./theme.ts";
@@ -71,4 +78,66 @@ export function prStateBadge(pr: PullRequest): Badge {
   if (pr.state === "CLOSED") return { glyph: NF.prClosed, fg: theme.err };
   if (pr.isDraft) return { glyph: NF.prDraft, fg: theme.fgDim };
   return { glyph: NF.prOpen, fg: theme.accentAlt };
+}
+
+/**
+ * Glyph + color for a PR's CI rollup — used by the list cluster AND the
+ * details checks segment. Null for the quiet `none` state so both panes
+ * omit it (absence-as-signal, rule #3).
+ */
+export function checkBadge(c: PrChecks): Badge | null {
+  switch (c) {
+    case "pass":
+      return { glyph: NF.checkPass, fg: theme.ok };
+    case "fail":
+      return { glyph: NF.checkFail, fg: theme.err };
+    case "pending":
+      return { glyph: NF.checkPend, fg: theme.warn };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Glyph + color for human review state. Approved / changes-requested get
+ * distinct shapes (thumbs up/down); `pending` and `unrequested` share
+ * the eye glyph and are told apart by color (warn = asked + waiting, dim
+ * = nobody asked yet) — the eye rather than a clock so review-pending
+ * doesn't collide with the CI pending clock (`checkPend`). Null for the
+ * quiet `none` state.
+ */
+export function reviewBadge(r: PrReview): Badge | null {
+  switch (r) {
+    case "approved":
+      return { glyph: NF.thumbsUp, fg: theme.ok };
+    case "changes_requested":
+      return { glyph: NF.thumbsDown, fg: theme.err };
+    case "pending":
+      return { glyph: NF.eye, fg: theme.warn };
+    case "unrequested":
+      return { glyph: NF.eye, fg: theme.fgDim };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Glyph + color for CodeRabbit state. Single carrot glyph, color-coded:
+ * it echoes the human-review palette one notch softer — pending↔grazing
+ * (warn), clean↔resting (ok). Unresolved threads are "address these",
+ * not a rejection, so info (the magenta "look-here" tier) rather than
+ * changes-requested red. Color is load-bearing here — the carrot family
+ * has no clean state-specific variants. Null for the quiet `none` state.
+ */
+export function rabbitBadge(rb: RabbitStatus): Badge | null {
+  switch (rb.state) {
+    case "unresolved":
+      return { glyph: NF.carrot, fg: theme.info };
+    case "pending":
+      return { glyph: NF.carrot, fg: theme.warn };
+    case "clean":
+      return { glyph: NF.carrot, fg: theme.ok };
+    default:
+      return null;
+  }
 }

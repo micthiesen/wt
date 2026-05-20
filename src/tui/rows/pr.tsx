@@ -8,80 +8,54 @@ import type {
   RabbitStatus,
 } from "../../core/types.ts";
 import { pluralize } from "../../core/text.ts";
-import { prStateBadge } from "../badges.ts";
+import { checkBadge, prStateBadge, rabbitBadge, reviewBadge } from "../badges.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { NF } from "../icons.ts";
 import { theme } from "../theme.ts";
 import { fitSegments, type Segment } from "./fit.tsx";
 import type { RowModule } from "./types.ts";
 
+// Glyph/color from `checkBadge`; this only adds the details-pane prose.
 function checksLabel(c: PrChecks): { glyph: string; text: string; fg: string } | null {
-  switch (c) {
-    case "pass":
-      return { glyph: NF.checkPass, text: "checks", fg: theme.ok };
-    case "fail":
-      return { glyph: NF.checkFail, text: "checks", fg: theme.err };
-    case "pending":
-      return { glyph: NF.checkPend, text: "checks pending", fg: theme.warn };
-    default:
-      return null;
-  }
+  const badge = checkBadge(c);
+  if (!badge) return null;
+  return { ...badge, text: c === "pending" ? "checks pending" : "checks" };
 }
 
-/**
- * Review badge mapping. Approved / changes-requested get distinct shapes
- * (thumbs up/down). `pending` and `unrequested` share the eye glyph and
- * are told apart by color (orange = asked + waiting, dim = nobody asked
- * yet) — the one spot color is load-bearing here, chosen so review-
- * pending doesn't reuse the CI clock (`checkPend`) and collide with it.
- * Distinct family from CI checks otherwise so the signals don't blur.
- */
+// Glyph/color from `reviewBadge`; this only adds the details-pane prose.
 function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } | null {
-  switch (r) {
-    case "approved":
-      return { glyph: NF.thumbsUp, text: "approved", fg: theme.ok };
-    case "changes_requested":
-      return { glyph: NF.thumbsDown, text: "changes requested", fg: theme.err };
-    case "pending":
-      return { glyph: NF.eye, text: "review pending", fg: theme.warn };
-    case "unrequested":
-      return { glyph: NF.eye, text: "no reviewers", fg: theme.fgDim };
-    default:
-      return null;
-  }
+  const badge = reviewBadge(r);
+  if (!badge) return null;
+  const text =
+    r === "approved"
+      ? "approved"
+      : r === "changes_requested"
+        ? "changes requested"
+        : r === "pending"
+          ? "review pending"
+          : "no reviewers";
+  return { ...badge, text };
 }
 
-/**
- * CodeRabbit badge mapping. Single carrot glyph, color-coded — fits
- * the existing "carrots / grazing / resting" vocab and stays visually
- * distinct from human review (thumbs/eye) and CI checks
- * (circles). Color is load-bearing here, accepted as the "if possible"
- * exception to the no-color-only rule since the paw family doesn't
- * have clean state-specific variants. Hidden on draft PRs at the
- * segment level (see `buildPrSegments`) since CR's "review skipped"
- * outcome on drafts collapses to status=COMPLETED, which the rollup
- * misreads as "resting" — gating on `isDraft` is the simpler fix and
- * mirrors review's draft-hide convention.
- */
+// Glyph/color from `rabbitBadge`; this only adds the details-pane
+// `full`/`tiny` prose. Draft-hide lives at the `buildPrSegments` call
+// site, not here.
 function rabbitLabel(
   rb: RabbitStatus,
 ): { glyph: string; full: string; tiny: string; fg: string } | null {
+  const badge = rabbitBadge(rb);
+  if (!badge) return null;
   switch (rb.state) {
-    // CR echoes the human-review palette but one notch softer: grazing↔
-    // pending (yellow), resting↔approved (green). Unresolved threads are
-    // "address these", not a rejection — so magenta (the `asking`
-    // look-here tier), not changes_requested red.
     case "unresolved":
       return {
-        glyph: NF.carrot,
+        ...badge,
         full: pluralize(rb.unresolved, "carrot"),
         tiny: String(rb.unresolved),
-        fg: theme.info,
       };
     case "pending":
-      return { glyph: NF.carrot, full: "grazing", tiny: "", fg: theme.warn };
+      return { ...badge, full: "grazing", tiny: "" };
     case "clean":
-      return { glyph: NF.carrot, full: "resting", tiny: "", fg: theme.ok };
+      return { ...badge, full: "resting", tiny: "" };
     default:
       return null;
   }
