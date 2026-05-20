@@ -92,7 +92,7 @@ function rabbitLabel(
  * beyond the existing PR/review/checks badges get rendered; the rest
  * (DRAFT, CHANGES_REQUESTED, NEEDS_APPROVAL(S), NEEDS_REVIEWERS) are
  * suppressed because the same signal is already on the line via
- * `prStateBadge`/`reviewLabel`. Three signals survive:
+ * `prStateBadge`/`reviewLabel`. Four signals survive:
  *
  *   - `MERGEABLE`        — every gate green, ready to ship. Composite
  *                          signal, not derivable from any single badge.
@@ -103,9 +103,18 @@ function rabbitLabel(
  *                          The carrot badge only counts CodeRabbit
  *                          threads, so this fills a real gap.
  *
+ *   - `QUEUED` / `QUEUED_TO_MERGE` / `RUNNING` — armed in the Graphite
+ *                          merge queue. `RUNNING` = required CI in
+ *                          flight, `QUEUED_TO_MERGE` = waiting its turn;
+ *                          we collapse all to a single `queued to merge`
+ *                          in the cyan "in-flight" tier. The adjacent
+ *                          checks badge already conveys CI status, so the
+ *                          mergeability slot only needs "it's queued to
+ *                          land".
+ *
  * Unknown statuses fall through to a pass-through label so future
- * Graphite enums (e.g. in-queue / merging) show up rather than
- * silently disappearing — we just don't know which colour tier yet.
+ * Graphite enums (e.g. merging) show up rather than silently
+ * disappearing — we just don't know which colour tier yet.
  */
 function mergeabilityLabel(
   m: MergeabilityEntry,
@@ -117,6 +126,10 @@ function mergeabilityLabel(
       return { text: "required checks failing", fg: theme.err };
     case "UNRESOLVED_COMMENTS":
       return { text: "unresolved comments", fg: theme.warn };
+    case "QUEUED":
+    case "QUEUED_TO_MERGE":
+    case "RUNNING":
+      return { text: "queued to merge", fg: theme.accent };
     case "DRAFT":
     case "CHANGES_REQUESTED":
     case "NEEDS_APPROVAL":

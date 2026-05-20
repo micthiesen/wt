@@ -53,10 +53,11 @@ export function hasGraphite(): boolean {
 /**
  * Per-PR mergeability state from Graphite. Values observed so far in
  * the wild: `DRAFT`, `NEEDS_REVIEWERS`, `UNRESOLVED_COMMENTS`,
- * `FAILING_REQUIRED`. The set isn't documented and Graphite may add
- * new variants, so we keep it open as `string` and the renderer falls
- * back to a passthrough label for anything unrecognized rather than
- * silently dropping the signal.
+ * `FAILING_REQUIRED`, `RUNNING` (armed, required CI in flight),
+ * `QUEUED_TO_MERGE` (armed, awaiting its turn). The set isn't
+ * documented and Graphite may add new variants, so we keep it open as
+ * `string` and the renderer falls back to a passthrough label for
+ * anything unrecognized rather than silently dropping the signal.
  */
 export type MergeabilityStatus =
   | "DRAFT"
@@ -66,6 +67,9 @@ export type MergeabilityStatus =
   | "UNRESOLVED_COMMENTS"
   | "CHANGES_REQUESTED"
   | "FAILING_REQUIRED"
+  | "QUEUED"
+  | "QUEUED_TO_MERGE"
+  | "RUNNING"
   | "MERGEABLE"
   | (string & {});
 
