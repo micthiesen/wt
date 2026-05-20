@@ -14,9 +14,11 @@ export const stageRow: RowModule = {
     const deployed = row.fields.deploy.data ?? false;
     const url = stageUrl(row.wt.stage);
     return deployed ? (
+      // The stage name is the URL's subdomain, so the URL alone already
+      // carries it — show just the URL and reclaim the space. Fall back to
+      // the bare stage name when no domain is configured (url === null).
       <text fg={theme.warn} wrapMode="none" truncate>
-        {NF.bolt}  {row.wt.stage}
-        {url ? ` → ${url}` : ""}
+        {NF.bolt}  {url ?? row.wt.stage}
       </text>
     ) : (
       <text fg={theme.fgDim} wrapMode="none" truncate>
