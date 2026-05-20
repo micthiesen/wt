@@ -78,6 +78,18 @@ export type MergeabilityEntry = {
   status: MergeabilityStatus;
 };
 
+/**
+ * Statuses that mean "armed in the Graphite merge queue" — `RUNNING`
+ * (required CI in flight), `QUEUED_TO_MERGE` (awaiting its turn), or the
+ * bare `QUEUED`. Single source of truth so the details-pane pill and the
+ * list-pane PR-glyph override agree on what counts as queued.
+ */
+const MERGE_QUEUED_STATUSES = new Set(["QUEUED", "QUEUED_TO_MERGE", "RUNNING"]);
+
+export function isMergeQueued(m: MergeabilityEntry | undefined): boolean {
+  return m != null && MERGE_QUEUED_STATUSES.has(m.status);
+}
+
 async function apiPost<T>(
   route: string,
   body: unknown,

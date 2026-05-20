@@ -1,6 +1,6 @@
 import { memo, useMemo } from "react";
 
-import type { MergeabilityEntry } from "../../core/graphite-api.ts";
+import { isMergeQueued, type MergeabilityEntry } from "../../core/graphite-api.ts";
 import type {
   PrChecks,
   PrReview,
@@ -103,14 +103,14 @@ function rabbitLabel(
  *                          The carrot badge only counts CodeRabbit
  *                          threads, so this fills a real gap.
  *
- *   - `QUEUED` / `QUEUED_TO_MERGE` / `RUNNING` — armed in the Graphite
- *                          merge queue. `RUNNING` = required CI in
- *                          flight, `QUEUED_TO_MERGE` = waiting its turn;
- *                          we collapse all to a single `queued to merge`
- *                          in the cyan "in-flight" tier. The adjacent
- *                          checks badge already conveys CI status, so the
- *                          mergeability slot only needs "it's queued to
- *                          land".
+ *   - queued (`QUEUED` / `QUEUED_TO_MERGE` / `RUNNING`, via
+ *                          `isMergeQueued`) — armed in the Graphite merge
+ *                          queue, CI either in flight or awaiting its
+ *                          turn. Collapsed to a single magenta `queued to
+ *                          merge`; the adjacent checks badge already
+ *                          conveys CI status. The list pane mirrors this
+ *                          by overriding the PR glyph to the merge-queue
+ *                          icon in the same magenta.
  *
  * Unknown statuses fall through to a pass-through label so future
  * Graphite enums (e.g. merging) show up rather than silently
@@ -119,6 +119,7 @@ function rabbitLabel(
 function mergeabilityLabel(
   m: MergeabilityEntry,
 ): { text: string; fg: string } | null {
+  if (isMergeQueued(m)) return { text: "queued to merge", fg: theme.info };
   switch (m.status) {
     case "MERGEABLE":
       return { text: "mergeable", fg: theme.ok };
@@ -126,10 +127,6 @@ function mergeabilityLabel(
       return { text: "required checks failing", fg: theme.err };
     case "UNRESOLVED_COMMENTS":
       return { text: "unresolved comments", fg: theme.warn };
-    case "QUEUED":
-    case "QUEUED_TO_MERGE":
-    case "RUNNING":
-      return { text: "queued to merge", fg: theme.accent };
     case "DRAFT":
     case "CHANGES_REQUESTED":
     case "NEEDS_APPROVAL":

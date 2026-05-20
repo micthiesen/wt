@@ -139,7 +139,7 @@ const BADGES: [LegendGlyph, string, string][] = [
   [NF.checkFail, theme.err, "CI checks failing"],
   [NF.checkPend, theme.warn, "CI checks pending"],
   [NF.mergeQueue, theme.ok, "mergeable (Graphite)"],
-  [NF.mergeQueue, theme.accent, "queued to merge (Graphite)"],
+  [NF.mergeQueue, theme.info, "queued to merge (Graphite)"],
   [NF.mergeQueue, theme.warn, "unresolved comments (Graphite)"],
   [NF.mergeQueue, theme.err, "required checks failing (Graphite)"],
   [NF.bolt, theme.warn, "SST stage deployed"],

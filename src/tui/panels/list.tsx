@@ -20,6 +20,7 @@ import { getHarness } from "../../core/harness/index.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
 import { STATE_FG } from "../claude-state.ts";
+import { isMergeQueued } from "../../core/graphite-api.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { StatusKind } from "../../core/types.ts";
@@ -283,10 +284,16 @@ const RowView = memo(function RowView({
     : selected
       ? theme.fgBright
       : theme.fg;
+  // When the PR is armed in the Graphite merge queue, the PR slot stops
+  // showing the open/draft state and instead reads as "merging": the
+  // merge-queue glyph in magenta. Mirrors the details-pane `queued to
+  // merge` pill so both panes agree the next thing that happens is a
+  // merge, not more review.
+  const queued = !!row.pr && isMergeQueued(row.mergeability);
   const prb = row.pr
     ? prStateBadge(row.pr)
     : { glyph: "  ", fg: theme.fgDim };
-  const prFg = row.archived ? theme.fgDim : prb.fg;
+  const prFg = row.archived ? theme.fgDim : queued ? theme.info : prb.fg;
   const c = checkGlyph(row);
   const checkFg = row.archived ? theme.fgDim : c.fg;
   const deployFg = row.archived
@@ -417,7 +424,11 @@ const RowView = memo(function RowView({
           {row.pr ? (
             <box width={2} flexShrink={0}>
               <text fg={prFg}>
-                {stackParentAbove ? NF.anglesUp : prb.glyph}
+                {queued
+                  ? NF.mergeQueue
+                  : stackParentAbove
+                    ? NF.anglesUp
+                    : prb.glyph}
               </text>
             </box>
           ) : null}
