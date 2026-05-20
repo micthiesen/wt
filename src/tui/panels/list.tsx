@@ -607,11 +607,13 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               rather than shove the layout. */}
           <scrollbox ref={listRef} scrollY flexGrow={1} minHeight={0}>
           {activeRows.map((row, i) => {
-            // Section transition: a blank line above the divider (only
-            // when there are rows above it, so the list doesn't open with
-            // a stray blank), then the divider, then the section's rows
-            // immediately — no blank between a header and its worktrees.
-            // Unsectioned rows at the top get no header — implicit "inbox".
+            // Section transition: a blank line above the divider, then the
+            // divider, then the section's rows immediately — no blank
+            // between a header and its worktrees. Unsectioned rows at the
+            // top get no header — implicit "inbox". When the very first row
+            // belongs to a section (no inbox rows above it), the leading
+            // blank still renders so the list opens with breathing room
+            // above the first header rather than butting it to the border.
             const prev = i > 0 ? activeRows[i - 1] : undefined;
             const sectionChanged = (prev?.section ?? null) !== row.section;
             const showDivider = sectionChanged && row.section !== null;
@@ -634,7 +636,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               <Fragment key={row.wt.slug}>
                 {showDivider ? (
                   <>
-                    {i > 0 ? <box height={1} flexShrink={0} /> : null}
+                    <box height={1} flexShrink={0} />
                     <Divider
                       label={
                         row.sectionIsStack
