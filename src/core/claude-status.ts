@@ -46,20 +46,37 @@ export const STATE_PRIORITY: readonly DerivedState[] = [
   "idle",
 ];
 
+/**
+ * Map a live registry status to a derived state. The registry only ever
+ * describes a live process, so it's authoritative whenever present —
+ * `deriveSessionState` consults the jsonl tail only when there's no
+ * registry entry. Exported so the list pane can tint its glyph straight
+ * from the registry snapshot without synthesizing a tail.
+ */
+export function registryStatusToState(status: RegistryStatus): DerivedState {
+  switch (status) {
+    case "busy":
+      return "working";
+    // `waiting` = claude blocked mid-turn on a human (permission /
+    // question). `idle` = turn complete, awaiting your next prompt.
+    case "waiting":
+      return "asking";
+    // A live session in a status we don't recognize (newer CC). Surface
+    // it honestly rather than guessing working/idle.
+    case "unknown":
+      return "unknown";
+    case "idle":
+      return "waiting";
+  }
+}
+
 export function deriveSessionState(
   tail: SessionTail,
   isTmuxLive: boolean,
   registryStatus: RegistryStatus | null,
 ): DerivedState {
   if (registryStatus !== null) {
-    if (registryStatus === "busy") return "working";
-    // `waiting` = claude blocked mid-turn on a human (permission /
-    // question). `idle` = turn complete, awaiting your next prompt.
-    if (registryStatus === "waiting") return "asking";
-    // A live session in a status we don't recognize (newer CC). Surface
-    // it honestly rather than guessing working/idle.
-    if (registryStatus === "unknown") return "unknown";
-    return "waiting";
+    return registryStatusToState(registryStatus);
   }
   const midTurn =
     tail.lastEntryKind === "tool_use" ||

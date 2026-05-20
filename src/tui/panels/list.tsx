@@ -17,6 +17,8 @@ import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
+import type { DerivedState } from "../../core/claude-status.ts";
+import { STATE_FG } from "../claude-state.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { StatusKind } from "../../core/types.ts";
@@ -50,6 +52,14 @@ type Props = {
    * that harness's own color.
    */
   aiLiveHarnessBySlug: ReadonlyMap<string, HarnessId>;
+  /**
+   * Per-slug aggregate Claude session state. When present (and the live
+   * harness is Claude) the CC glyph is tinted with `STATE_FG[state]`
+   * instead of the harness brand color, so the badge reads working /
+   * asking / waiting / unknown at a glance. Registry-only, so codex /
+   * opencode slugs are absent here and keep their brand color.
+   */
+  aiStateBySlug: ReadonlyMap<string, DerivedState>;
   /**
    * Slugs to tint with the chain-highlight bg. Populated while the
    * stack chord (`b`) modal is open with the chain containing the
@@ -217,6 +227,7 @@ const RowView = memo(function RowView({
   isTailing,
   actionRunning,
   activeHarnessId,
+  sessionState,
   panelWidth,
   stackParentAbove,
   chainHighlighted,
@@ -230,6 +241,10 @@ const RowView = memo(function RowView({
    *  undefined when no live AI sessions exist. Renders the harness
    *  glyph in the badge cluster when defined. */
   activeHarnessId: HarnessId | undefined;
+  /** Aggregate Claude session state for this slug. Tints the CC glyph
+   *  with `STATE_FG[state]` when the active harness is Claude; otherwise
+   *  the glyph falls back to the harness brand color. */
+  sessionState: DerivedState | undefined;
   panelWidth: number;
   /**
    * True when the row immediately above is the worktree this one is
@@ -356,7 +371,13 @@ const RowView = memo(function RowView({
           ) : null}
           {showSessionSlot && activeHarnessId ? (
             <box width={2} flexShrink={0}>
-              <text fg={getHarness(activeHarnessId).color}>
+              <text
+                fg={
+                  activeHarnessId === "claude" && sessionState
+                    ? STATE_FG[sessionState]
+                    : getHarness(activeHarnessId).color
+                }
+              >
                 {getHarness(activeHarnessId).glyph}
               </text>
             </box>
@@ -522,7 +543,7 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiLiveHarnessBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
+export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiLiveHarnessBySlug, aiStateBySlug, chainHighlight, stackSectionLabels, isLoading, filter }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -622,6 +643,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                   isTailing={activeTails.has(row.wt.slug)}
                   actionRunning={activeActions.has(row.wt.slug)}
                   activeHarnessId={aiLiveHarnessBySlug.get(row.wt.slug)}
+                  sessionState={aiStateBySlug.get(row.wt.slug)}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
                   chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}
@@ -667,6 +689,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                     isTailing={activeTails.has(row.wt.slug)}
                     actionRunning={activeActions.has(row.wt.slug)}
                     activeHarnessId={aiLiveHarnessBySlug.get(row.wt.slug)}
+                    sessionState={aiStateBySlug.get(row.wt.slug)}
                     panelWidth={width}
                     stackParentAbove={false}
                     chainHighlighted={chainHighlight?.has(row.wt.slug) ?? false}

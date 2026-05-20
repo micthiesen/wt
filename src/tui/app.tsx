@@ -61,7 +61,7 @@ import { StatusKind } from "../core/types.ts";
 import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, tmuxSessionsQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
 import { wtSessionUuid } from "../core/claude.ts";
-import { deriveSessionState, pickAggregateState, type DerivedState } from "../core/claude-status.ts";
+import { deriveSessionState, pickAggregateState, registryStatusToState, type DerivedState } from "../core/claude-status.ts";
 
 import {
   ActionEditModal,
@@ -835,10 +835,37 @@ export function App({ onExit }: Props) {
     }
     return map;
   }, [tmuxSessionsData?.claudeSlugs, tmuxSessionsData?.codex, tmuxSessionsData?.opencode]);
-  // Live claude process registry — feeds the picker's per-session
-  // state (busy/idle), the row's status, and the list pane glyph
-  // tint via `claudeAggStateBySlug` below.
+  // Live claude process registry — feeds the per-slug aggregate state
+  // (`aiStateBySlug`) that tints the list-pane CC glyph.
   const claudeRegistry = useQuery(claudeRegistryQuery());
+  // Per-slug aggregate Claude session state from the live registry. The
+  // list pane tints its CC glyph with STATE_FG[state] so the badge
+  // encodes working / asking / waiting / unknown at a glance (matching
+  // the details-pane row), not just "a session is live". Registry-only:
+  // codex / opencode have no busy/idle registry, so their glyphs keep
+  // the harness brand color. Keyed by slug via each session's cwd, which
+  // claude reports as the worktree path.
+  const aiStateBySlug = useMemo(() => {
+    const sessions = claudeRegistry.data?.sessions ?? [];
+    const out = new Map<string, DerivedState>();
+    if (sessions.length === 0) return out;
+    const slugByPath = new Map<string, string>();
+    for (const r of rows) slugByPath.set(r.wt.path, r.wt.slug);
+    const statesBySlug = new Map<string, DerivedState[]>();
+    for (const s of sessions) {
+      const slug = slugByPath.get(s.cwd);
+      if (!slug) continue;
+      const state = registryStatusToState(s.status);
+      const arr = statesBySlug.get(slug);
+      if (arr) arr.push(state);
+      else statesBySlug.set(slug, [state]);
+    }
+    for (const [slug, states] of statesBySlug) {
+      const agg = pickAggregateState(states);
+      if (agg) out.set(slug, agg);
+    }
+    return out;
+  }, [claudeRegistry.data, rows]);
   // LLM-authored summary snippets for the picker's currently-open
   // worktree. Only fetched when the picker is open (gated by
   // `enabled`); the queryFn does light tail-bounded disk reads
@@ -4170,6 +4197,7 @@ export function App({ onExit }: Props) {
           activeTails={activeTails}
           activeActions={activeActions}
           aiLiveHarnessBySlug={aiLiveHarnessBySlug}
+          aiStateBySlug={aiStateBySlug}
           chainHighlight={
             modal?.kind === "stackActions" && current
               ? chainOf(buildStackRows(), current.wt.slug)

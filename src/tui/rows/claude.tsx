@@ -42,6 +42,9 @@ function AiLine({ wt }: { wt: Worktree }) {
   const state = f12Target.extras.derivedState;
   const stateText = state ?? (f12Target.isLive ? "live" : "dead");
   const stateFg = state ? STATE_FG[state] : theme.fgDim;
+  // Tint the glyph by state too (matching the list pane); fall back to
+  // the harness brand color when state is unknown (live codex/opencode).
+  const glyphFg = state ? STATE_FG[state] : harness.color;
   // When asking, append the registry's reason (e.g. "permission prompt"
   // → "permission") so the row says *what* claude is blocked on.
   const reason =
@@ -55,7 +58,7 @@ function AiLine({ wt }: { wt: Worktree }) {
   const queued = f12Target.extras.queued;
   return (
     <text fg={theme.fg} wrapMode="none" truncate>
-      <span fg={harness.color}>{harness.glyph}  </span>
+      <span fg={glyphFg}>{harness.glyph}  </span>
       <span fg={stateFg}>{stateText}</span>
       {reason ? <span fg={theme.fgDim}> · {reason}</span> : null}
       <span fg={theme.fgDim}> · </span>

@@ -21,4 +21,7 @@ export const theme = {
   warn: "#ebcb8b",
   err: "#bf616a",
   info: "#b48ead",
+  // Anthropic / Claude brand orange. Mirrors CLAUDE_COLOR in
+  // core/harness/claude.ts (core can't import this tui-layer palette).
+  claude: "#c47b3a",
 };

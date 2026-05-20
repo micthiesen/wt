@@ -16,7 +16,8 @@ export const STATE_FG: Record<DerivedState, string> = {
   // `unknown` = live session, status we don't recognize. Muted blue so
   // it reads as "alive but indeterminate", distinct from working (cyan).
   unknown: theme.accentAlt,
-  waiting: theme.warn,
+  // `waiting` = turn done, your move. Anthropic brand orange.
+  waiting: theme.claude,
   abandoned: theme.err,
   // `idle` shares fgDim with the empty-state `—` — a ghost session is
   // visually closer to "nothing happening" than to a warning.
