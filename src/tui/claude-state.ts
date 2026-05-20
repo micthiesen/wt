@@ -13,6 +13,10 @@ export const STATE_FG: Record<DerivedState, string> = {
   // `asking` = claude is blocked on you right now. Magenta so it stands
   // apart from working (cyan) and abandoned (red) and reads as "look here".
   asking: theme.info,
+  // `polling` = turn done but a background shell/task is still running.
+  // Green reads as healthy background work in flight, distinct from
+  // working (cyan) and idle (dim).
+  polling: theme.ok,
   // `unknown` = live session, status we don't recognize. Muted blue so
   // it reads as "alive but indeterminate", distinct from working (cyan).
   unknown: theme.accentAlt,
@@ -27,6 +31,7 @@ export const STATE_FG: Record<DerivedState, string> = {
 export const STATE_DOT: Record<DerivedState, string> = {
   working: "●",
   asking: "?",
+  polling: "↻",
   unknown: "◌",
   waiting: "○",
   abandoned: "✕",

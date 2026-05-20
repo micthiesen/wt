@@ -193,10 +193,11 @@ export type ClaudeSessionPickerEntry = {
 const STATE_RANK: Record<DerivedState, number> = {
   asking: 0,
   working: 1,
-  unknown: 2,
-  waiting: 3,
-  abandoned: 4,
-  idle: 5,
+  polling: 2,
+  unknown: 3,
+  waiting: 4,
+  abandoned: 5,
+  idle: 6,
 };
 
 /**

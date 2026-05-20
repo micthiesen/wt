@@ -1,12 +1,15 @@
 /**
  * Live per-process state files that Claude Code writes for every
  * running interactive session at `~/.claude/sessions/<pid>.json`. The
- * file is rewritten on every status transition (busy / idle / waiting)
- * plus a slow heartbeat while busy, which makes it the fastest "is
- * claude doing something right now" signal we can read without
- * subscribing to a binary daemon socket. `waiting` is the newest
- * status (CC 2.1.145+): claude is blocked mid-turn on a human, with a
- * `waitingFor` reason like "permission prompt".
+ * file is rewritten on every status transition (busy / idle / waiting /
+ * shell) plus a slow heartbeat while busy, which makes it the fastest
+ * "is claude doing something right now" signal we can read without
+ * subscribing to a binary daemon socket. `waiting` (CC 2.1.145+) means
+ * claude is blocked mid-turn on a human, with a `waitingFor` reason like
+ * "permission prompt". `shell` means a background shell/task is running
+ * while the turn is otherwise done. The full enum is exactly
+ * `["busy","shell","idle","waiting"]` (verified against the CC binary),
+ * so `unknown` below is purely a future-proofing net.
  *
  * Claude doesn't clean up the file on SIGKILL, so we filter dead pids
  * via `kill -0`. The schema is undocumented — we pin to a small subset
@@ -27,7 +30,7 @@ const log = createLogger("[claude-registry]");
 
 export const REGISTRY_DIR = join(homedir(), ".claude", "sessions");
 
-export type RegistryStatus = "busy" | "idle" | "waiting" | "unknown";
+export type RegistryStatus = "busy" | "shell" | "idle" | "waiting" | "unknown";
 
 export type RegistrySession = {
   pid: number;
@@ -89,7 +92,10 @@ function parseEntry(path: string): RegistrySession | null {
   // path and mislabel as "abandoned". Only an absent/non-string status
   // (genuinely malformed file) is rejected above.
   const status: RegistryStatus =
-    rawStatus === "busy" || rawStatus === "idle" || rawStatus === "waiting"
+    rawStatus === "busy" ||
+    rawStatus === "shell" ||
+    rawStatus === "idle" ||
+    rawStatus === "waiting"
       ? rawStatus
       : "unknown";
   return {

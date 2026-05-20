@@ -151,6 +151,7 @@ const BADGES: [LegendGlyph, string, string][] = [
   ],
   [STATE_DOT.working, STATE_FG.working, "AI session · working"],
   [STATE_DOT.asking, STATE_FG.asking, "AI session · asking"],
+  [STATE_DOT.polling, STATE_FG.polling, "AI session · polling"],
   [STATE_DOT.unknown, STATE_FG.unknown, "AI session · unknown"],
   [STATE_DOT.waiting, STATE_FG.waiting, "AI session · waiting"],
   [STATE_DOT.idle, STATE_FG.idle, "AI session · idle"],

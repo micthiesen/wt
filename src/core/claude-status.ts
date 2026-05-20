@@ -24,6 +24,7 @@ import type { RegistryStatus } from "./claude-registry.ts";
 export type DerivedState =
   | "working"
   | "asking"
+  | "polling"
   | "unknown"
   | "waiting"
   | "abandoned"
@@ -33,13 +34,15 @@ export type DerivedState =
  * Headline priority for multi-session aggregation. `asking` wins above
  * everything: a session explicitly blocked on the human is the single
  * most actionable thing to surface. Then "is anything actively
- * working?" — `working`, with `unknown` (a live session in a status we
- * don't recognize) right behind it since it's also active. `abandoned`
- * ranks above `waiting` so a crashed peer surfaces when nothing is busy.
+ * working?" — `working`, then `polling` (turn done but a background
+ * task is still running), then `unknown` (a live session in a status we
+ * don't recognize), all still active. `abandoned` ranks above `waiting`
+ * so a crashed peer surfaces when nothing is busy.
  */
 export const STATE_PRIORITY: readonly DerivedState[] = [
   "asking",
   "working",
+  "polling",
   "unknown",
   "abandoned",
   "waiting",
@@ -57,6 +60,10 @@ export function registryStatusToState(status: RegistryStatus): DerivedState {
   switch (status) {
     case "busy":
       return "working";
+    // `shell` = turn done but a background shell/task is still running
+    // (CC polls it). Distinct from idle so the user sees work in flight.
+    case "shell":
+      return "polling";
     // `waiting` = claude blocked mid-turn on a human (permission /
     // question). `idle` = turn complete, awaiting your next prompt.
     case "waiting":
