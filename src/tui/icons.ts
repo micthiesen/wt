@@ -29,13 +29,13 @@ export const NF = {
 	checkFail: "\u{F52F}", // nf-oct-x_circle
 	checkPend: "\u{F43A}", // nf-oct-clock
 
-	// Review badges — shape varies by state so color isn't the sole
-	// signal. Distinct family from `checkPass/Fail/Pend` (CI) so a row's
-	// "did checks pass" and "did review pass" signals don't collide.
+	// Review badges. Approved/changes get distinct shapes (thumbs); the
+	// eye covers both `pending` and `unrequested`, told apart by color
+	// (orange vs dim). Kept off the CI clock (`checkPend`) so review and
+	// check signals don't collide on one row.
 	thumbsUp: "\u{F164}", // nf-fa-thumbs_up    — review approved
 	thumbsDown: "\u{F165}", // nf-fa-thumbs_down — review changes_requested
-	hourglass: "\u{F43A}", // review pending (active)
-	eye: "\u{F441}", // nf-oct-eye               — review unrequested ("eyes wanted")
+	eye: "\u{F441}", // nf-oct-eye               — review pending (orange) / unrequested (dim)
 
 	// CodeRabbit badge — single whimsy glyph (carrot, on-theme with the
 	// "carrots / grazing / resting" vocab in pr.tsx); state is conveyed

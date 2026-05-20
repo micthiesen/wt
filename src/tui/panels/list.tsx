@@ -174,12 +174,14 @@ function checkGlyph(row: WorktreeRow): { glyph: string; fg: string } {
 }
 
 /**
- * Human-review hint. Glyph SHAPE varies by state (thumbs up/down,
- * hourglass, eye) so the badge is readable without relying on color.
- * Same gate as `pr.tsx`'s `reviewLabel` + `buildPrSegments`: OPEN,
- * non-draft, review state non-null. Glyphs match the details pane
- * exactly so the list teaches itself by reading the details pane once
- * (per `badges.ts` rule #1).
+ * Human-review hint. Approved / changes-requested get distinct shapes
+ * (thumbs up/down); `pending` and `unrequested` share the eye glyph,
+ * told apart by color (orange = asked + waiting, dim = nobody asked
+ * yet) — review-pending uses the eye rather than a clock so it doesn't
+ * collide with the CI pending clock (`checkPend`). Same gate as
+ * `pr.tsx`'s `reviewLabel` + `buildPrSegments`: OPEN, non-draft, review
+ * state non-null. Glyphs match the details pane exactly so the list
+ * teaches itself by reading the details pane once (per `badges.ts` #1).
  */
 function reviewHint(row: WorktreeRow): { glyph: string; fg: string } | null {
   const pr = row.pr;
@@ -190,7 +192,7 @@ function reviewHint(row: WorktreeRow): { glyph: string; fg: string } | null {
     case "changes_requested":
       return { glyph: NF.thumbsDown, fg: theme.err };
     case "pending":
-      return { glyph: NF.hourglass, fg: theme.warn };
+      return { glyph: NF.eye, fg: theme.warn };
     case "unrequested":
       return { glyph: NF.eye, fg: theme.fgDim };
     default:

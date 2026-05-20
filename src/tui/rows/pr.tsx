@@ -29,11 +29,12 @@ function checksLabel(c: PrChecks): { glyph: string; text: string; fg: string } |
 }
 
 /**
- * Review badge mapping. Glyph SHAPE varies by state (thumbs up/down
- * for the verdict-bearing states, hourglass for pending, eye for "no
- * reviewers requested") so color isn't load-bearing — a colorblind
- * reader can still read the state. Distinct family from CI checks
- * (`checkPass/Fail/Pend`) so the two signals don't visually collide.
+ * Review badge mapping. Approved / changes-requested get distinct shapes
+ * (thumbs up/down). `pending` and `unrequested` share the eye glyph and
+ * are told apart by color (orange = asked + waiting, dim = nobody asked
+ * yet) — the one spot color is load-bearing here, chosen so review-
+ * pending doesn't reuse the CI clock (`checkPend`) and collide with it.
+ * Distinct family from CI checks otherwise so the signals don't blur.
  */
 function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } | null {
   switch (r) {
@@ -42,7 +43,7 @@ function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } |
     case "changes_requested":
       return { glyph: NF.thumbsDown, text: "changes requested", fg: theme.err };
     case "pending":
-      return { glyph: NF.hourglass, text: "review pending", fg: theme.warn };
+      return { glyph: NF.eye, text: "review pending", fg: theme.warn };
     case "unrequested":
       return { glyph: NF.eye, text: "no reviewers", fg: theme.fgDim };
     default:
@@ -53,7 +54,7 @@ function reviewLabel(r: PrReview): { glyph: string; text: string; fg: string } |
 /**
  * CodeRabbit badge mapping. Single carrot glyph, color-coded — fits
  * the existing "carrots / grazing / resting" vocab and stays visually
- * distinct from human review (thumbs/hourglass/eye) and CI checks
+ * distinct from human review (thumbs/eye) and CI checks
  * (circles). Color is load-bearing here, accepted as the "if possible"
  * exception to the no-color-only rule since the paw family doesn't
  * have clean state-specific variants. Hidden on draft PRs at the
