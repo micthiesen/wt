@@ -134,6 +134,12 @@ export const MAX_BUFFERED_LINES = 1000;
 const MAX_PIECES_PER_MESSAGE = 50;
 /** Compaction length for thinking + queued lines. */
 const META_BRIEF = 200;
+/**
+ * Claude appends a "(disable recaps in /config)" hint to every
+ * `away_summary`. Pure UI clutter — strip it everywhere we render
+ * away-summary content (live tail + post-hoc summary scan).
+ */
+export const AWAY_RECAP_HINT_RE = /\s*\(disable recaps in [^)]+\)\s*$/i;
 
 export function asObj(v: unknown): Record<string, unknown> | null {
   return v && typeof v === "object" && !Array.isArray(v)

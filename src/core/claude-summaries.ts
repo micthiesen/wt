@@ -32,7 +32,7 @@
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 
 import { sessionJsonlPath } from "./claude.ts";
-import { asObj } from "./claude-events.ts";
+import { AWAY_RECAP_HINT_RE, asObj } from "./claude-events.ts";
 import { createLogger } from "./logger.ts";
 
 const log = createLogger("[claude-summaries]");
@@ -45,10 +45,6 @@ const AWAY_TRUNCATE = 800;
  *  CSI / OSC escape introducers we'd never want to forward to the
  *  terminal renderer. */
 const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
-/** Claude appends a "(disable recaps in /config)" hint to every
- *  `away_summary`. Pure UI clutter on our side — strip it before
- *  caching so users don't see the same parenthetical on every row. */
-const AWAY_RECAP_HINT_RE = /\s*\(disable recaps in [^)]+\)\s*$/i;
 /** Strict UUID v1-v5 shape. The summary reader joins arbitrary
  *  `sessionId` strings into a filesystem path; the only legitimate
  *  caller passes UUIDs from `wtSessionUuid`, but the guard means a

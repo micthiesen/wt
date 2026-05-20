@@ -635,7 +635,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
           ) : null}
           {hasReviewRequests ? (
             <>
-              <Divider label="Review requests" width={width} />
+              <Divider label="Review Requests" width={width} />
               {reviewRequests.map((pr, i) => {
                 const globalIndex = reviewOffset + i;
                 return (
@@ -649,6 +649,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               })}
             </>
           ) : null}
+          {hasReviewRequests && hasArchived ? <box height={1} /> : null}
           {hasArchived ? (
             <>
               <Divider label="Archived" width={width} />

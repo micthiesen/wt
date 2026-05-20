@@ -53,6 +53,13 @@ const log = createLogger("[shell-tail]");
 const SEED_TAIL_BYTES = 32 * 1024;
 /** Coalesce window for fs.watch bursts. */
 const READ_DEBOUNCE_MS = 80;
+/**
+ * Backstop polling cadence — matches session-tail / action-tail. Bun's
+ * `fs.watch` on macOS can silently miss appends; the poll re-uses the
+ * delta-read pipeline (`readDelta` short-circuits when `size === lastByte`)
+ * so the idle cost is one stat per tail per tick.
+ */
+const POLL_INTERVAL_MS = 3_000;
 
 // CSI + OSC + bare ESC — same regex as core/tmux.ts's stderr scrubber.
 // eslint-disable-next-line no-control-regex
@@ -187,6 +194,7 @@ class ShellTailRegistry {
   private runs: ReadonlyMap<string, ShellRun> = new Map();
   private state = new Map<string, State>();
   private listeners = new Set<Listener>();
+  private poller: Timer | null = null;
 
   /**
    * Idempotent. Spins up a tailer for `slug`'s pipe-pane log if not
@@ -219,6 +227,7 @@ class ShellTailRegistry {
     } else {
       this.watchForCreation(slug);
     }
+    this.ensurePoller();
   }
 
   stop(slug: string): void {
@@ -231,6 +240,7 @@ class ShellTailRegistry {
     this.commit((m) => {
       m.delete(slug);
     });
+    if (this.state.size === 0) this.stopPoller();
   }
 
   reconcile(liveSlugs: ReadonlySet<string>): void {
@@ -242,6 +252,7 @@ class ShellTailRegistry {
 
   stopAll(): void {
     for (const slug of [...this.state.keys()]) this.stop(slug);
+    this.stopPoller();
   }
 
   get(slug: string): ShellRun | null {
@@ -274,6 +285,23 @@ class ShellTailRegistry {
     mut(next);
     this.runs = next;
     this.notify();
+  }
+
+  private ensurePoller(): void {
+    if (this.poller) return;
+    this.poller = setInterval(() => {
+      for (const [slug, st] of this.state) {
+        // Skip tails still in `watchForCreation` mode — see session-tail.
+        if (st.watcher == null) continue;
+        this.scheduleRead(slug);
+      }
+    }, POLL_INTERVAL_MS);
+  }
+
+  private stopPoller(): void {
+    if (!this.poller) return;
+    clearInterval(this.poller);
+    this.poller = null;
   }
 
   private update(slug: string, mut: (r: ShellRun) => ShellRun): void {

@@ -54,6 +54,7 @@ import {
   type ActionLine,
   type MessageEmit,
   type ToolStartMap,
+  AWAY_RECAP_HINT_RE,
   MAX_BUFFERED_LINES,
   asObj,
   compactMeta,
@@ -138,6 +139,15 @@ export function tailKey(slug: string, name: string | null): string {
 const SEED_TAIL_BYTES = 64 * 1024;
 /** Coalesce window for fs.watch bursts. */
 const READ_DEBOUNCE_MS = 80;
+/**
+ * Backstop polling cadence. Bun's `fs.watch` on macOS can silently miss
+ * append events on long-lived jsonls (e.g. the main-clone slot's bottom-
+ * bar tail going stale even though claude is still writing). One shared
+ * interval iterates every tracked tail and re-uses the same delta-read
+ * pipeline; `readDelta` short-circuits when `size === lastByte`, so the
+ * idle cost is one stat per tailer per tick.
+ */
+const POLL_INTERVAL_MS = 3_000;
 
 export type SessionRun = {
   slug: string;
@@ -191,6 +201,7 @@ class SessionTailRegistry {
   private runs: ReadonlyMap<string, SessionRun> = new Map();
   private state = new Map<string, State>();
   private listeners = new Set<Listener>();
+  private poller: Timer | null = null;
 
   /**
    * Idempotent. Spins up a tailer for the (slug, name) session's
@@ -236,6 +247,7 @@ class SessionTailRegistry {
     } else {
       this.watchForCreation(key);
     }
+    this.ensurePoller();
   }
 
   stop(slug: string, name: string | null = null): void {
@@ -258,6 +270,7 @@ class SessionTailRegistry {
     this.commit((m) => {
       m.delete(key);
     });
+    if (this.state.size === 0) this.stopPoller();
   }
 
   /**
@@ -280,6 +293,7 @@ class SessionTailRegistry {
   /** Stop every tailer. Used on TUI shutdown. */
   stopAll(): void {
     for (const key of [...this.state.keys()]) this.stopByKey(key);
+    this.stopPoller();
     // Drop any pending refresh-trigger debounce timers — no tailer is
     // left to have produced them, and a late fire would invalidate
     // queries on a torn-down client.
@@ -321,6 +335,26 @@ class SessionTailRegistry {
     mut(next);
     this.runs = next;
     this.notify();
+  }
+
+  private ensurePoller(): void {
+    if (this.poller) return;
+    this.poller = setInterval(() => {
+      for (const [key, st] of this.state) {
+        // Skip tails still in `watchForCreation` mode — the dirWatcher
+        // promotes them to `seedAndWatch` when the file appears, and a
+        // pre-seed `readDelta` would race the seed's drop-first-partial
+        // logic and duplicate content.
+        if (st.watcher == null) continue;
+        this.scheduleRead(key);
+      }
+    }, POLL_INTERVAL_MS);
+  }
+
+  private stopPoller(): void {
+    if (!this.poller) return;
+    clearInterval(this.poller);
+    this.poller = null;
   }
 
   private update(key: string, mut: (r: SessionRun) => SessionRun): void {
@@ -583,7 +617,8 @@ function parseEntry(
   // `─` only on the first row so the block reads as one summary
   // group rather than a series of dash bullets.
   if (t === "system" && e.subtype === "away_summary") {
-    const content = typeof e.content === "string" ? e.content : "";
+    const raw = typeof e.content === "string" ? e.content : "";
+    const content = raw.replace(AWAY_RECAP_HINT_RE, "");
     const { pieces, truncated } = splitMessage(content);
     if (pieces.length === 0) return EMPTY_EMIT;
     const lines: ActionLine[] = pieces.map((piece, i) => ({

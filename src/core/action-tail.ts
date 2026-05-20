@@ -46,6 +46,38 @@ const log = createLogger("[action-tail]");
 const SEED_TAIL_BYTES = 32 * 1024;
 /** Coalesce window for fs.watch bursts. */
 const READ_DEBOUNCE_MS = 80;
+/**
+ * Backstop polling cadence. Bun's `fs.watch` on macOS can silently miss
+ * append events on long-lived logs, leaving the action viewer stuck on
+ * the seeded "starting…" line until close() runs its final flush. One
+ * shared interval re-uses the same delta-read pipeline; `readDelta`
+ * short-circuits when `size === lastByte`, so the idle cost is one
+ * stat per stream per tick.
+ */
+const POLL_INTERVAL_MS = 3_000;
+
+const activeStreams = new Set<StreamState>();
+let pollTimer: Timer | null = null;
+
+function ensurePoller(): void {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => {
+    for (const st of activeStreams) {
+      // Skip streams still in `watchForCreation` mode — the dirWatcher
+      // promotes them to `seedAndWatch` when the file appears; a
+      // pre-seed readDelta would race the seed's drop-first-partial
+      // logic and duplicate content.
+      if (st.watcher == null) continue;
+      if (st.onLine) scheduleRead(st, st.onLine);
+    }
+  }, POLL_INTERVAL_MS);
+}
+
+function stopPollerIfIdle(): void {
+  if (activeStreams.size > 0 || pollTimer == null) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+}
 
 export type LineSource = "stdout" | "stderr";
 
@@ -99,12 +131,14 @@ export function startActionTail(opts: {
   stdout.onLine = onLine;
   stderr.onLine = onLine;
   for (const st of [stdout, stderr]) {
+    activeStreams.add(st);
     if (existsSync(st.path)) {
       seedAndWatch(st, onLine, seed);
     } else {
       watchForCreation(st, onLine, seed);
     }
   }
+  ensurePoller();
   return {
     close() {
       for (const st of [stdout, stderr]) closeStream(st);
@@ -402,6 +436,8 @@ function closeStream(st: StreamState): void {
     }
   }
   st.onLine = null;
+  activeStreams.delete(st);
+  stopPollerIfIdle();
 }
 
 function readBytes(path: string, start: number, len: number): string {

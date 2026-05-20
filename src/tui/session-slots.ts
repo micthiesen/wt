@@ -1,7 +1,7 @@
 /**
  * Session slots — non-worktree projects we host an AI harness session
- * for. Two instances today: the wt source repo itself (`.` keybind)
- * and the configured `paths.main_clone` (`,` keybind).
+ * for. Two instances today: the wt source repo itself (`,` keybind)
+ * and the configured `paths.main_clone` (`.` keybind).
  *
  * Slots reuse all the harness / tmux / session-tail machinery a
  * worktree row uses. They differ in that they don't appear in the
@@ -17,7 +17,7 @@
  * ordered so a real row's path wins on tie.
  *
  * Consumers:
- *  - `tui/app.tsx` — `.` / `,` keybind handlers enter the slot via
+ *  - `tui/app.tsx` — `,` / `.` keybind handlers enter the slot via
  *    `enterHarnessSession` with the slot's path as `cwd`, picking
  *    the TAB-cycled primary harness so the choice mirrors a row's
  *    F12 default.
@@ -47,7 +47,7 @@ export type SessionSlot = {
 };
 
 /**
- * Slot for the wt source repo itself. Backs the `.` keybind. Slug is
+ * Slot for the wt source repo itself. Backs the `,` keybind. Slug is
  * the historical `"wt"` value so anyone with an existing wt-source
  * claude conversation keeps it across this refactor.
  */
@@ -58,7 +58,7 @@ export const WT_SOURCE_SLOT: SessionSlot = {
 };
 
 /**
- * Slot for the user's configured main clone. Backs the `,` keybind
+ * Slot for the user's configured main clone. Backs the `.` keybind
  * and feeds the bottom-bar tail. Slug is the fixed string `"main"`
  * rather than something derived from `config.paths.mainClone`, so
  * the tmux session name (and claude /resume entry) stay stable
