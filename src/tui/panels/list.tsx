@@ -371,6 +371,14 @@ const RowView = memo(function RowView({
               <text fg={theme.ok}>{NF.comment}</text>
             </box>
           ) : null}
+          {/* Ephemeral / scattered badges are left-anchored so they
+              don't displace the PR-status run on the right, ordered by
+              transience: spinner → action-running → stage/deploy bolt. */}
+          {isDeployed ? (
+            <box width={2} flexShrink={0}>
+              <text fg={deployFg}>{NF.bolt}</text>
+            </box>
+          ) : null}
           {showSessionSlot && activeHarnessId ? (
             <box width={2} flexShrink={0}>
               <text
@@ -410,11 +418,6 @@ const RowView = memo(function RowView({
           {showChecks ? (
             <box width={2} flexShrink={0}>
               <text fg={checkFg}>{c.glyph}</text>
-            </box>
-          ) : null}
-          {isDeployed ? (
-            <box width={2} flexShrink={0}>
-              <text fg={deployFg}>{NF.bolt}</text>
             </box>
           ) : null}
         </box>
