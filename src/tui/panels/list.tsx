@@ -7,8 +7,9 @@
  * Anything new that should read consistently across both panels
  * belongs in `badges.ts` first, not here.
  */
-import { Fragment, memo } from "react";
+import { Fragment, memo, useEffect, useRef } from "react";
 import { TextAttributes } from "@opentui/core";
+import type { ScrollBoxRenderable } from "@opentui/core";
 
 import { prStateBadge, statusBadge } from "../badges.ts";
 import { NF } from "../icons.ts";
@@ -320,6 +321,7 @@ const RowView = memo(function RowView({
     (isTailing ? TextAttributes.ITALIC : 0);
   return (
     <box
+      id={row.wt.slug}
       flexDirection="row"
       backgroundColor={bg}
       paddingLeft={1}
@@ -481,7 +483,7 @@ const ReviewRequestRowView = memo(function ReviewRequestRowView({
   const slugAttrs = selected ? TextAttributes.BOLD : 0;
   const slugFg = selected ? theme.fgBright : theme.fg;
   return (
-    <box flexDirection="row" backgroundColor={bg} paddingLeft={1} paddingRight={1}>
+    <box id={pr.url} flexDirection="row" backgroundColor={bg} paddingLeft={1} paddingRight={1}>
       <box flexShrink={0} flexDirection="row">
         <box width={2} flexShrink={0}>
           <text fg={prFg}>{prGlyph}</text>
@@ -533,21 +535,25 @@ function Divider({
     const trailLen = Math.max(0, inner - overhead);
     const trail = "═".repeat(trailLen);
     return (
-      <box flexDirection="row" paddingLeft={1} paddingRight={1}>
-        <text fg={theme.accentAlt}>══</text>
-        <text fg={theme.fg}>{labelStr}</text>
-        <text fg={theme.accentAlt}>{trail}</text>
+      <box flexDirection="row" height={1} paddingLeft={1} paddingRight={1}>
+        <text fg={theme.accentAlt} wrapMode="none">══</text>
+        <text fg={theme.fg} wrapMode="none">{labelStr}</text>
+        <text fg={theme.accentAlt} wrapMode="none">{trail}</text>
       </box>
     );
   }
   const labelStr = ` ${label} `;
   const padding = Math.max(0, inner - labelStr.length - 2);
   const trail = "─".repeat(padding);
+  // height={1} + wrapMode="none" keep the rule on a single line. Inside
+  // the scrollbox the vertical scrollbar steals a column when the list
+  // overflows, which makes the computed-width trail one cell too wide;
+  // without these it text-wraps to a phantom blank line under the header.
   return (
-    <box flexDirection="row" paddingLeft={1} paddingRight={1}>
-      <text fg={theme.borderDim}>──</text>
-      <text fg={theme.fgDim}>{labelStr}</text>
-      <text fg={theme.borderDim}>{trail}</text>
+    <box flexDirection="row" height={1} paddingLeft={1} paddingRight={1}>
+      <text fg={theme.borderDim} wrapMode="none">──</text>
+      <text fg={theme.fgDim} wrapMode="none">{labelStr}</text>
+      <text fg={theme.borderDim} wrapMode="none">{trail}</text>
     </box>
   );
 }
@@ -561,6 +567,21 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
   // Index offsets into the combined cursor space owned by the parent.
   const reviewOffset = activeRows.length;
   const archivedOffset = reviewOffset + reviewRequests.length;
+  // Keep the selected row scrolled into view. The whole list (active +
+  // review-requests + archived) lives in one scrollbox, so the follow
+  // covers every row. scrollChildIntoView is a no-op when the row is
+  // already visible. Child ids: the worktree slug for active/archived
+  // rows, the PR url for review-request rows.
+  const listRef = useRef<ScrollBoxRenderable>(null);
+  const selectedChildId =
+    selectedIndex < reviewOffset
+      ? activeRows[selectedIndex]?.wt.slug
+      : selectedIndex < archivedOffset
+        ? reviewRequests[selectedIndex - reviewOffset]?.url
+        : archivedRows[selectedIndex - archivedOffset]?.wt.slug;
+  useEffect(() => {
+    if (selectedChildId) listRef.current?.scrollChildIntoView(selectedChildId);
+  }, [selectedChildId]);
   return (
     <box
       flexDirection="column"
@@ -607,11 +628,19 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               <text fg={theme.fgDim}> to create one.</text>
             </box>
           ) : null}
+          {/* The whole list scrolls as one — active worktrees, review
+              requests, and the archived block all live in this scrollbox.
+              `minHeight={0}` lets it shrink to the flex-allotted height
+              instead of growing to fit its content (the default
+              `min-height: auto`), which is what makes it actually scroll
+              rather than shove the layout. */}
+          <scrollbox ref={listRef} scrollY flexGrow={1} minHeight={0}>
           {activeRows.map((row, i) => {
-            // Section transition: render an empty spacer row plus a
-            // muted divider (matching the archived divider style) the
-            // first time we see a new named section. Unsectioned rows
-            // at the top get no header — they're the implicit "inbox".
+            // Section transition: a blank line above the divider (only
+            // when there are rows above it, so the list doesn't open with
+            // a stray blank), then the divider, then the section's rows
+            // immediately — no blank between a header and its worktrees.
+            // Unsectioned rows at the top get no header — implicit "inbox".
             const prev = i > 0 ? activeRows[i - 1] : undefined;
             const sectionChanged = (prev?.section ?? null) !== row.section;
             const showDivider = sectionChanged && row.section !== null;
@@ -634,7 +663,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               <Fragment key={row.wt.slug}>
                 {showDivider ? (
                   <>
-                    <box height={1} flexShrink={0} />
+                    {i > 0 ? <box height={1} flexShrink={0} /> : null}
                     <Divider
                       label={
                         row.sectionIsStack
@@ -660,12 +689,11 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               </Fragment>
             );
           })}
-          {hasReviewRequests || hasArchived ? (
-            // Pushes the pinned bottom sections to the bottom of the pane.
-            <box flexGrow={1} flexShrink={1} />
-          ) : null}
           {hasReviewRequests ? (
             <>
+              {activeRows.length > 0 ? (
+                <box height={1} flexShrink={0} />
+              ) : null}
               <Divider label="Review Requests" width={width} />
               {reviewRequests.map((pr, i) => {
                 const globalIndex = reviewOffset + i;
@@ -680,9 +708,11 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               })}
             </>
           ) : null}
-          {hasReviewRequests && hasArchived ? <box height={1} /> : null}
           {hasArchived ? (
             <>
+              {activeRows.length > 0 || hasReviewRequests ? (
+                <box height={1} flexShrink={0} />
+              ) : null}
               <Divider label="Archived" width={width} />
               {archivedRows.map((row, i) => {
                 const globalIndex = archivedOffset + i;
@@ -707,6 +737,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               })}
             </>
           ) : null}
+          </scrollbox>
         </>
       )}
     </box>
