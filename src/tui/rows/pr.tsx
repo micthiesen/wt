@@ -67,12 +67,16 @@ function rabbitLabel(
   rb: RabbitStatus,
 ): { glyph: string; full: string; tiny: string; fg: string } | null {
   switch (rb.state) {
+    // CR echoes the human-review palette but one notch softer: grazing↔
+    // pending (yellow), resting↔approved (green). Unresolved threads are
+    // "address these", not a rejection — so magenta (the `asking`
+    // look-here tier), not changes_requested red.
     case "unresolved":
       return {
         glyph: NF.carrot,
         full: pluralize(rb.unresolved, "carrot"),
         tiny: String(rb.unresolved),
-        fg: theme.warn,
+        fg: theme.info,
       };
     case "pending":
       return { glyph: NF.carrot, full: "grazing", tiny: "", fg: theme.warn };

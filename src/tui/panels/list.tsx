@@ -212,8 +212,12 @@ function rabbitHint(row: WorktreeRow): { glyph: string; fg: string } | null {
   const pr = row.pr;
   if (!pr || pr.state !== "OPEN" || pr.isDraft) return null;
   switch (pr.rabbit.state) {
+    // CR echoes the human-review palette but one notch softer: grazing↔
+    // pending (yellow), resting↔approved (green). Unresolved threads are
+    // "address these", not a rejection — so magenta (the `asking`
+    // look-here tier), not changes_requested red.
     case "unresolved":
-      return { glyph: NF.carrot, fg: theme.warn };
+      return { glyph: NF.carrot, fg: theme.info };
     case "pending":
       return { glyph: NF.carrot, fg: theme.warn };
     case "clean":
