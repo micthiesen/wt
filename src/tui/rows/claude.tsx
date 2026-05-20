@@ -42,6 +42,12 @@ function AiLine({ wt }: { wt: Worktree }) {
   const state = f12Target.extras.derivedState;
   const stateText = state ?? (f12Target.isLive ? "live" : "dead");
   const stateFg = state ? STATE_FG[state] : theme.fgDim;
+  // When asking, append the registry's reason (e.g. "permission prompt"
+  // → "permission") so the row says *what* claude is blocked on.
+  const reason =
+    state === "asking" && f12Target.extras.waitingFor
+      ? f12Target.extras.waitingFor.replace(/\s*prompt$/i, "").trim()
+      : null;
   const ageText =
     f12Target.lastActiveMs !== null
       ? ageMsToText(Date.now() - f12Target.lastActiveMs)
@@ -51,6 +57,7 @@ function AiLine({ wt }: { wt: Worktree }) {
     <text fg={theme.fg} wrapMode="none" truncate>
       <span fg={harness.color}>{harness.glyph}  </span>
       <span fg={stateFg}>{stateText}</span>
+      {reason ? <span fg={theme.fgDim}> · {reason}</span> : null}
       <span fg={theme.fgDim}> · </span>
       <span fg={theme.fg}>{f12Target.displayName}</span>
       {ageText ? <span fg={theme.fgDim}> · {ageText}</span> : null}

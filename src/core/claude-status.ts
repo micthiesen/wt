@@ -21,16 +21,26 @@
 import type { SessionTail } from "./claude.ts";
 import type { RegistryStatus } from "./claude-registry.ts";
 
-export type DerivedState = "working" | "waiting" | "abandoned" | "idle";
+export type DerivedState =
+  | "working"
+  | "asking"
+  | "unknown"
+  | "waiting"
+  | "abandoned"
+  | "idle";
 
 /**
- * Headline priority for multi-session aggregation. The user's first
- * question is "is anything actively working?" — `working` wins if any
- * session is busy. `abandoned` ranks above `waiting` so a crashed peer
- * surfaces when nothing is busy.
+ * Headline priority for multi-session aggregation. `asking` wins above
+ * everything: a session explicitly blocked on the human is the single
+ * most actionable thing to surface. Then "is anything actively
+ * working?" — `working`, with `unknown` (a live session in a status we
+ * don't recognize) right behind it since it's also active. `abandoned`
+ * ranks above `waiting` so a crashed peer surfaces when nothing is busy.
  */
 export const STATE_PRIORITY: readonly DerivedState[] = [
+  "asking",
   "working",
+  "unknown",
   "abandoned",
   "waiting",
   "idle",
@@ -42,7 +52,14 @@ export function deriveSessionState(
   registryStatus: RegistryStatus | null,
 ): DerivedState {
   if (registryStatus !== null) {
-    return registryStatus === "busy" ? "working" : "waiting";
+    if (registryStatus === "busy") return "working";
+    // `waiting` = claude blocked mid-turn on a human (permission /
+    // question). `idle` = turn complete, awaiting your next prompt.
+    if (registryStatus === "waiting") return "asking";
+    // A live session in a status we don't recognize (newer CC). Surface
+    // it honestly rather than guessing working/idle.
+    if (registryStatus === "unknown") return "unknown";
+    return "waiting";
   }
   const midTurn =
     tail.lastEntryKind === "tool_use" ||

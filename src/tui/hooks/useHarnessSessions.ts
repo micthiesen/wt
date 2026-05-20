@@ -144,6 +144,13 @@ export function useHarnessSessions(
           if (finalState !== st) {
             extras = { ...extras, derivedState: finalState };
           }
+        } else if (!isSingleSlot && isLive && extras.derivedState === "abandoned") {
+          // Claude: discoverSessions derives state with isTmuxLive=false
+          // (liveness isn't known there). A live session whose registry
+          // entry is missing — write failed, or a pre-2.1 build — lands
+          // on "abandoned" (midTurn + not-live). It's live, so it's
+          // actually working; a live session is never abandoned.
+          extras = { ...extras, derivedState: "working" };
         }
         return { ...s, isLive, harnessId: h.id, extras };
       });

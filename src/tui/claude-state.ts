@@ -1,8 +1,8 @@
 /**
- * Theme + glyph mapping for the four `DerivedState` values, shared by
- * every surface that displays AI-session state: the details-pane row
- * and the sessions picker. Single source of truth so a color or glyph
- * change lands in one place.
+ * Theme + glyph mapping for the `DerivedState` values, shared by every
+ * surface that displays AI-session state: the details-pane row and the
+ * sessions picker. Single source of truth so a color or glyph change
+ * lands in one place.
  */
 import type { DerivedState } from "../core/claude-status.ts";
 
@@ -10,6 +10,12 @@ import { theme } from "./theme.ts";
 
 export const STATE_FG: Record<DerivedState, string> = {
   working: theme.accent,
+  // `asking` = claude is blocked on you right now. Magenta so it stands
+  // apart from working (cyan) and abandoned (red) and reads as "look here".
+  asking: theme.info,
+  // `unknown` = live session, status we don't recognize. Muted blue so
+  // it reads as "alive but indeterminate", distinct from working (cyan).
+  unknown: theme.accentAlt,
   waiting: theme.warn,
   abandoned: theme.err,
   // `idle` shares fgDim with the empty-state `—` — a ghost session is
@@ -19,6 +25,8 @@ export const STATE_FG: Record<DerivedState, string> = {
 
 export const STATE_DOT: Record<DerivedState, string> = {
   working: "●",
+  asking: "?",
+  unknown: "◌",
   waiting: "○",
   abandoned: "✕",
   idle: "·",

@@ -16,7 +16,7 @@
  * scan resolves.
  */
 import { claudeStatus, wtSessionArgs, wtSessionUuid } from "../claude.ts";
-import { readRegistry } from "../claude-registry.ts";
+import { readRegistry, type RegistryStatus } from "../claude-registry.ts";
 import {
   buildClaudeSessionEntries,
   listClaudeNames,
@@ -68,9 +68,11 @@ export const claudeHarness: Harness = {
   async discoverSessions({ slug, wtPath }) {
     const status = await claudeStatus({ slug, path: wtPath });
     const tailByName = new Map(status.sessions.map((t) => [t.name, t]));
-    const registryStatusBySessionId: Record<string, "busy" | "idle"> = {};
+    const registryStatusBySessionId: Record<string, RegistryStatus> = {};
+    const waitingForBySessionId: Record<string, string | null> = {};
     for (const r of readRegistry()) {
       registryStatusBySessionId[r.sessionId] = r.status;
+      waitingForBySessionId[r.sessionId] = r.waitingFor;
     }
     const entries = buildClaudeSessionEntries({
       slug,
@@ -101,6 +103,8 @@ export const claudeHarness: Harness = {
         managedName: e.name,
         derivedState: e.state,
         queued: e.queued,
+        waitingFor:
+          e.state === "asking" ? (waitingForBySessionId[e.sessionId] ?? null) : null,
       },
     }));
     return out;

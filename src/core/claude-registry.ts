@@ -1,10 +1,12 @@
 /**
  * Live per-process state files that Claude Code writes for every
  * running interactive session at `~/.claude/sessions/<pid>.json`. The
- * file is rewritten on every status transition (busy ↔ idle) plus a
- * slow heartbeat while busy, which makes it the fastest "is claude
- * doing something right now" signal we can read without subscribing
- * to a binary daemon socket.
+ * file is rewritten on every status transition (busy / idle / waiting)
+ * plus a slow heartbeat while busy, which makes it the fastest "is
+ * claude doing something right now" signal we can read without
+ * subscribing to a binary daemon socket. `waiting` is the newest
+ * status (CC 2.1.145+): claude is blocked mid-turn on a human, with a
+ * `waitingFor` reason like "permission prompt".
  *
  * Claude doesn't clean up the file on SIGKILL, so we filter dead pids
  * via `kill -0`. The schema is undocumented — we pin to a small subset
@@ -25,7 +27,7 @@ const log = createLogger("[claude-registry]");
 
 export const REGISTRY_DIR = join(homedir(), ".claude", "sessions");
 
-export type RegistryStatus = "busy" | "idle";
+export type RegistryStatus = "busy" | "idle" | "waiting" | "unknown";
 
 export type RegistrySession = {
   pid: number;
@@ -34,6 +36,9 @@ export type RegistrySession = {
   /** `--name` flag value; null when unnamed (the implicit primary). */
   name: string | null;
   status: RegistryStatus;
+  /** Reason claude is blocked, present only when status is "waiting"
+   *  (e.g. "permission prompt"). Null otherwise. */
+  waitingFor: string | null;
   kind: string;
   entrypoint: string;
   startedAt: number;
@@ -69,21 +74,31 @@ function parseEntry(path: string): RegistrySession | null {
   const pid = asPid(obj.pid);
   const sessionId = obj.sessionId;
   const cwd = obj.cwd;
-  const status = obj.status;
+  const rawStatus = obj.status;
   if (
     pid === null ||
     typeof sessionId !== "string" ||
     typeof cwd !== "string" ||
-    (status !== "busy" && status !== "idle")
+    typeof rawStatus !== "string"
   ) {
     return null;
   }
+  // A present-but-unrecognized status (a future CC status we don't know
+  // yet) is kept as "unknown" rather than dropping the whole entry —
+  // dropping it would make a live session fall through to the jsonl-tail
+  // path and mislabel as "abandoned". Only an absent/non-string status
+  // (genuinely malformed file) is rejected above.
+  const status: RegistryStatus =
+    rawStatus === "busy" || rawStatus === "idle" || rawStatus === "waiting"
+      ? rawStatus
+      : "unknown";
   return {
     pid,
     sessionId,
     cwd,
     name: typeof obj.name === "string" ? obj.name : null,
     status,
+    waitingFor: typeof obj.waitingFor === "string" ? obj.waitingFor : null,
     kind: typeof obj.kind === "string" ? obj.kind : "",
     entrypoint: typeof obj.entrypoint === "string" ? obj.entrypoint : "",
     startedAt: asNumber(obj.startedAt) ?? 0,

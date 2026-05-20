@@ -37,6 +37,12 @@ export type HarnessExtras = {
   /** Pending-prompt count for the queued badge. Claude-only. */
   queued: number;
   /**
+   * What claude is blocked on when `derivedState === "asking"` (e.g.
+   * "permission prompt"), straight from the registry's `waitingFor`.
+   * Null in every other state and for non-Claude harnesses.
+   */
+  waitingFor?: string | null;
+  /**
    * Timestamp (ms-since-epoch) of the last message row seen, used by
    * `useHarnessSessions` to finalize `derivedState` once liveness is
    * known. OpenCode populates this; Claude / Codex leave it undefined.
