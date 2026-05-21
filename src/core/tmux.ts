@@ -821,6 +821,18 @@ const READY_MAX_MS = 12_000;
 /** Gap between the paste landing and the Enter that submits it. */
 const SUBMIT_DELAY_MS = 500;
 
+/**
+ * Exact-match target for the *pane* commands below (capture-pane,
+ * paste-buffer, send-keys). Their `-t` is a target-pane, where the bare
+ * `=name` exact-session prefix that works for `kill-session` is rejected
+ * with "can't find pane". The form that both targets the session's active
+ * pane AND keeps exact (non-prefix) matching is `=<name>:` — the trailing
+ * colon selects the session's current window. Don't drop the colon.
+ */
+function paneTarget(name: string): string {
+  return `=${name}:`;
+}
+
 /** Run a tmux command on our private server; collect exit code + stderr. */
 async function runTmux(
   args: readonly string[],
@@ -839,7 +851,7 @@ async function runTmux(
 /** Snapshot a session's active pane as plain text, or null on failure. */
 async function capturePane(name: string): Promise<string | null> {
   const proc = Bun.spawn(
-    ["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-t", `=${name}`],
+    ["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-t", paneTarget(name)],
     { stdout: "pipe", stderr: "ignore" },
   );
   const [out, code] = await Promise.all([
@@ -986,7 +998,7 @@ async function pasteBuffer(name: string, text: string): Promise<void> {
     "-b",
     INJECT_BUFFER,
     "-t",
-    `=${name}`,
+    paneTarget(name),
   ]);
 }
 
@@ -1035,7 +1047,7 @@ export async function injectIntoSession(opts: {
     const { code, stderr } = await runTmux([
       "send-keys",
       "-t",
-      `=${name}`,
+      paneTarget(name),
       "Enter",
     ]);
     if (code !== 0) {
