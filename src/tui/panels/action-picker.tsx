@@ -112,9 +112,9 @@ type Props = {
 };
 
 export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
-  // Claude Code's robot glyph + brand color, reused verbatim from the
-  // harness registry so the action-kind marker matches the session badges.
-  const claude = getHarness("claude");
+  // Claude Code's robot glyph, reused verbatim from the harness registry
+  // so the action-kind marker matches the session badges.
+  const claudeGlyph = getHarness("claude").glyph;
   return (
     <Modal
       title={`action · ${slug}`}
@@ -165,25 +165,17 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
         const labelFg = isCustom ? theme.accent : fg;
         const label = isCustom ? "Custom prompt…" : item.def.name;
         // Trailing hint: a kind marker plus the action id — `$` for shell
-        // commands, the Claude robot (brand color, same glyph as the
-        // session badges) for claude prompts. Unavailable items show the
-        // block reason instead so the user knows *why* it's grayed out;
-        // the custom entry shows "freeform".
-        let hintIcon: string | null = null;
-        let hintIconFg = theme.fgDim;
-        let hintText: string;
-        if (isCustom) {
-          hintText = "freeform";
-        } else if (blocked) {
-          hintText = `(${(item.availability as { reason: string }).reason})`;
-        } else if (item.def.kind === "shell") {
-          hintIcon = "$";
-          hintText = item.def.id;
-        } else {
-          hintIcon = claude.glyph;
-          hintIconFg = claude.color;
-          hintText = item.def.id;
-        }
+        // commands, the Claude robot glyph for claude prompts (two spaces:
+        // the nerd-font glyph renders wide and reads cramped with one).
+        // Both stay muted like the id. Unavailable items show the block
+        // reason instead; the custom entry shows "freeform".
+        const hint = isCustom
+          ? "freeform"
+          : blocked
+            ? `(${(item.availability as { reason: string }).reason})`
+            : item.def.kind === "shell"
+              ? `$ ${item.def.id}`
+              : `${claudeGlyph}  ${item.def.id}`;
         return (
           <Fragment key={isCustom ? "__custom__" : item.def.id}>
             {showHeader ? (
@@ -210,9 +202,8 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
                   {label}
                 </text>
               </box>
-              <text wrapMode="none">
-                {hintIcon ? <span fg={hintIconFg}>{hintIcon} </span> : null}
-                <span fg={theme.fgDim}>{hintText}</span>
+              <text fg={theme.fgDim} wrapMode="none">
+                {hint}
               </text>
             </box>
           </Fragment>
