@@ -1,7 +1,22 @@
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  pickAggregateState,
+  registryStatusToState,
+  type DerivedState,
+} from "../../core/claude-status.ts";
+import { getHarness } from "../../core/harness/index.ts";
+import { claudeRegistryQuery } from "../../state/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
+import { STATE_FG } from "../claude-state.ts";
 import { useSessionRun } from "../hooks/useSessionRun.ts";
-import { MAIN_CLONE_SLOT } from "../session-slots.ts";
+import { MAIN_CLONE_SLOT, WT_SOURCE_SLOT } from "../session-slots.ts";
 import { theme } from "../theme.ts";
+
+/** Claude Code robot glyph, reused from the harness registry so the
+ *  slot status markers match the row/session badges. */
+const CLAUDE_GLYPH = getHarness("claude").glyph;
 
 export type FooterMode =
   | { kind: "legend" }
@@ -28,7 +43,34 @@ type Props = {
   height?: number;
 };
 
+/**
+ * Live derived state for a session slot, matched by cwd against the
+ * Claude registry (claude reports its project dir as cwd, so a slot's
+ * sessions land under the slot path). Aggregates when more than one
+ * session runs in the slot dir; null when none is live.
+ */
+function useSlotState(path: string): DerivedState | null {
+  const registry = useQuery(claudeRegistryQuery());
+  return useMemo(() => {
+    const sessions = registry.data?.sessions ?? [];
+    const states: DerivedState[] = [];
+    for (const s of sessions) {
+      if (s.cwd === path) states.push(registryStatusToState(s.status));
+    }
+    return pickAggregateState(states);
+  }, [registry.data, path]);
+}
+
+/** Status color for a slot's robot glyph; dim when no live session. */
+function slotGlyphFg(state: DerivedState | null): string {
+  return state ? STATE_FG[state] : theme.fgDim;
+}
+
 export function Footer({ mode, hint }: Props) {
+  // The wt-source slot (`,`) gets a permanent status robot pinned to the
+  // far right with no label — it's the only marker out there, so it reads
+  // unambiguously as "the other session". Color tracks its live state.
+  const wtState = useSlotState(WT_SOURCE_SLOT.path);
   return (
     <box
       flexShrink={0}
@@ -77,33 +119,38 @@ export function Footer({ mode, hint }: Props) {
           <text fg={theme.fgDim}>{hint}</text>
         </box>
       ) : null}
+      <box flexShrink={0} marginLeft={1}>
+        <text fg={slotGlyphFg(wtState)}>{CLAUDE_GLYPH}</text>
+      </box>
     </box>
   );
 }
 
 /**
  * Single-line tail of the main-clone session — the bottom bar's
- * default-mode content. Renders the slot label, a dim separator, and
- * the latest `ActionLine` colored per its kind (so an assistant reply
- * reads as plain text, a tool-error as red, etc.). When no session is
- * live or no lines have arrived yet (pre-creation race), falls back
- * to a dim idle hint that still surfaces `,` as the start key and `?`
- * for help. The tail is claude-jsonl-only; if the user spawns a
- * codex/opencode session via `,` (because that's the active primary
- * harness) the bar reads as "idle" because there's no jsonl to tail.
- * That's a known v1 trade-off — bottom-bar feedback for non-claude
+ * default-mode content. A status-colored robot glyph leads, then the
+ * slot label, a dim separator, and the latest `ActionLine` colored per
+ * its kind (so an assistant reply reads as plain text, a tool-error as
+ * red, etc.). When no session is live or no lines have arrived yet
+ * (pre-creation race), falls back to a dim idle hint that still surfaces
+ * `.` as the start key and `?` for help. The tail is claude-jsonl-only;
+ * if the user spawns a codex/opencode session via `.` (the active
+ * primary harness) the bar reads as "idle" because there's no jsonl to
+ * tail. That's a known v1 trade-off — bottom-bar feedback for non-claude
  * harnesses would mean wiring their event streams in here too.
  */
 function MainSlotTail() {
   const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
+  const glyphFg = slotGlyphFg(useSlotState(MAIN_CLONE_SLOT.path));
   const lastLine =
     run && run.lines.length > 0 ? run.lines[run.lines.length - 1] : null;
   if (!lastLine) {
     return (
       <text wrapMode="none" truncate>
+        <span fg={glyphFg}>{CLAUDE_GLYPH}  </span>
         <span fg={theme.accent}>{MAIN_CLONE_SLOT.label}</span>
         <span fg={theme.fgDim}> · idle  ·  </span>
-        <span fg={theme.accent}>,</span>
+        <span fg={theme.accent}>.</span>
         <span fg={theme.fgDim}> start  ·  </span>
         <span fg={theme.accent}>?</span>
         <span fg={theme.fgDim}> help</span>
@@ -112,6 +159,7 @@ function MainSlotTail() {
   }
   return (
     <text wrapMode="none" truncate>
+      <span fg={glyphFg}>{CLAUDE_GLYPH}  </span>
       <span fg={theme.accent}>{MAIN_CLONE_SLOT.label}</span>
       <span fg={theme.fgDim}> · </span>
       <span fg={actionLineFg(lastLine.kind)}>{lastLine.text}</span>
