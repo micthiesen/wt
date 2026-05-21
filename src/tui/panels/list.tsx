@@ -666,7 +666,14 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
           {hasArchived ? (
             <>
               {activeRows.length > 0 || hasReviewRequests ? (
-                <box height={1} flexShrink={0} />
+                // Flex spacer: pushes the archived block to the bottom of
+                // the viewport when the list is short, but collapses to a
+                // 1-row gap (minHeight) once content overflows, so archived
+                // just scrolls into place instead of staying pinned. Relies
+                // on the scrollbox content box's default `minHeight: 100%` —
+                // free space exists only while content is shorter than the
+                // viewport, so flexGrow has room to grow only then.
+                <box flexGrow={1} flexShrink={0} minHeight={1} />
               ) : null}
               <Divider label="Archived" width={width} />
               {archivedRows.map((row, i) => {
