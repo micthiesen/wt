@@ -20,7 +20,6 @@ const CLAUDE_GLYPH = getHarness("claude").glyph;
 
 export type FooterMode =
   | { kind: "legend" }
-  | { kind: "confirm"; message: string; pendingKey: string }
   | { kind: "toast"; message: string; color?: string }
   | {
       kind: "input";
@@ -84,9 +83,6 @@ export function Footer({ mode, hint }: Props) {
         {mode.kind === "legend" ? <MainSlotTail /> : null}
         {mode.kind === "toast" ? (
           <text fg={mode.color ?? theme.ok}>{mode.message}</text>
-        ) : null}
-        {mode.kind === "confirm" ? (
-          <text fg={theme.warn}>{mode.message}</text>
         ) : null}
         {mode.kind === "input" ? (
           <>

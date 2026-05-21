@@ -63,6 +63,7 @@ import {
   type PickerItem,
 } from "./panels/action-picker.tsx";
 import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
+import { ConfirmModal } from "./panels/confirm-modal.tsx";
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
@@ -293,6 +294,21 @@ function parseNewInput(raw: string, defaultBase?: string): NewInput {
 type Modal =
   | { kind: "help" }
   | { kind: "cleanConfirm" }
+  | {
+      /**
+       * Generic y/N confirmation. `pendingKey` selects the action to run
+       * on `y` (dispatched in the key handler, same string codes the
+       * footer confirm used). Rendered by `ConfirmModal`. Lives in the
+       * modal layer so async toasts can't clobber a pending prompt.
+       */
+      kind: "confirm";
+      pendingKey: string;
+      title: string;
+      message: string;
+      detail?: string;
+      confirmLabel?: string;
+      danger?: boolean;
+    }
   | { kind: "yank" }
   | {
       kind: "parentPicker";
@@ -3085,6 +3101,39 @@ export function App({ onExit }: Props) {
       return;
     }
 
+    // Generic y/N confirm. Dispatches on `pendingKey` (same codes the
+    // footer confirm used before it moved into the modal layer). The
+    // modal swallows input while open, so `current` is stable between
+    // open and confirm.
+    if (modal?.kind === "confirm") {
+      if (k.name === "y" || k.name === "return") {
+        const pending = modal.pendingKey;
+        setModal(null);
+        if (pending === "d" && current) {
+          void doRemove(current.wt.slug);
+        } else if (pending === "d!" && current) {
+          void doRemove(current.wt.slug, { force: true });
+        } else if (pending === "m+" && current) {
+          void doMergeWhenReady(current.wt.slug);
+        } else if (pending === "e" && current) {
+          void doMarkReady(current.wt.slug);
+        } else if (pending === "R") {
+          appLog.event.warn("cleared all cached data; refetching from scratch");
+          void clearAll();
+        }
+        return;
+      }
+      if (
+        k.name === "n" ||
+        k.name === "escape" ||
+        k.sequence === "q" ||
+        (k.ctrl && k.name === "c")
+      ) {
+        setModal(null);
+      }
+      return;
+    }
+
     // Filter mode: typing live-narrows the list.
     if (footer.kind === "filter") {
       if (k.name === "escape" || (k.ctrl && k.name === "c")) {
@@ -3167,32 +3216,6 @@ export function App({ onExit }: Props) {
       // ASCII so control chars in the middle of a paste don't corrupt.
       const text = printableText(k.sequence);
       if (text) setFooter({ ...footer, value: footer.value + text });
-      return;
-    }
-
-    // Inline confirm.
-    if (footer.kind === "confirm") {
-      if (k.name === "y" || k.name === "return") {
-        const pending = footer.pendingKey;
-        setFooter({ kind: "legend" });
-        if (pending === "d" && current) {
-          void doRemove(current.wt.slug);
-        } else if (pending === "d!" && current) {
-          void doRemove(current.wt.slug, { force: true });
-        } else if (pending === "m+" && current) {
-          void doMergeWhenReady(current.wt.slug);
-        } else if (pending === "e" && current) {
-          void doMarkReady(current.wt.slug);
-        } else if (pending === "R") {
-          appLog.event.warn("cleared all cached data; refetching from scratch");
-          void clearAll();
-        }
-        return;
-      }
-      if (k.name === "n" || k.name === "escape" || (k.ctrl && k.name === "c")) {
-        setFooter({ kind: "legend" });
-        return;
-      }
       return;
     }
 
@@ -3380,10 +3403,12 @@ export function App({ onExit }: Props) {
     // Ctrl+R: clear all caches. Moved off bare R when R lost its
     // single-letter slot; same confirm flow, same handler.
     if (k.ctrl && k.name === "r") {
-      setFooter({
+      setModal({
         kind: "confirm",
-        message: "clear all cached data? [y/N]",
         pendingKey: "R",
+        title: "clear caches",
+        message: "Clear all cached data and refetch from scratch?",
+        confirmLabel: "clear",
       });
       return;
     }
@@ -3788,16 +3813,23 @@ export function App({ onExit }: Props) {
         reasons.push(`${ahead} unpushed commit${ahead === 1 ? "" : "s"}`);
       }
       if (reasons.length > 0) {
-        setFooter({
+        setModal({
           kind: "confirm",
-          message: `force remove ${current.wt.slug} (${reasons.join(", ")})? [y/N]`,
           pendingKey: "d!",
+          title: "force remove",
+          message: `Force remove ${current.wt.slug}?`,
+          detail: `${reasons.join(", ")} will be lost.`,
+          confirmLabel: "remove",
+          danger: true,
         });
       } else {
-        setFooter({
+        setModal({
           kind: "confirm",
-          message: `remove ${current.wt.slug}? [y/N]`,
           pendingKey: "d",
+          title: "remove worktree",
+          message: `Remove ${current.wt.slug}?`,
+          confirmLabel: "remove",
+          danger: true,
         });
       }
       return;
@@ -3819,10 +3851,12 @@ export function App({ onExit }: Props) {
         toast("PR is already ready", theme.info, 2000);
         return;
       }
-      setFooter({
+      setModal({
         kind: "confirm",
-        message: `mark #${current.pr.number} ready for review? [y/N]`,
         pendingKey: "e",
+        title: "mark ready",
+        message: `Mark #${current.pr.number} ready for review?`,
+        confirmLabel: "mark ready",
       });
       return;
     }
@@ -3837,10 +3871,13 @@ export function App({ onExit }: Props) {
       }
       // One-way arm: Graphite has no documented disarm path through
       // gt or its API. Use app.graphite.com to disable once armed.
-      setFooter({
+      setModal({
         kind: "confirm",
-        message: `merge when ready for #${current.pr.number}? [y/N]`,
         pendingKey: "m+",
+        title: "merge when ready",
+        message: `Enable merge-when-ready for #${current.pr.number}?`,
+        detail: "One-way: disable later via app.graphite.com.",
+        confirmLabel: "enable",
       });
       return;
     }
@@ -4050,6 +4087,15 @@ export function App({ onExit }: Props) {
       ) : null}
       {modal?.kind === "killSessionConfirm" ? (
         <KillSessionConfirmModal slug={modal.slug} sessionKind={modal.sessionKind} />
+      ) : null}
+      {modal?.kind === "confirm" ? (
+        <ConfirmModal
+          title={modal.title}
+          message={modal.message}
+          detail={modal.detail}
+          confirmLabel={modal.confirmLabel}
+          danger={modal.danger}
+        />
       ) : null}
     </box>
   );
