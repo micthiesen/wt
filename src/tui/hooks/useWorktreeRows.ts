@@ -250,7 +250,17 @@ function resolveStackedOn(
       diffBase: manualParent,
     };
   }
-  if (pr && pr.baseRefName && pr.baseRefName !== config.branch.base) {
+  // An open PR's base is the authoritative, auto-maintained parent:
+  // when the prior parent merges, GitHub/Graphite retarget the base
+  // (to the grandparent, ultimately trunk). So when a PR exists, trust
+  // its base completely and DON'T fall through to reflog detection — a
+  // non-trunk base names the parent worktree; a trunk base is a positive
+  // "no stack parent". The reflog fallback is actively wrong here: once a
+  // parent squash-merges and its branch is deleted, the fork-point SHA in
+  // this branch's reflog survives only inside its own descendants and
+  // resolves to a wrong-direction parent.
+  if (pr && pr.baseRefName) {
+    if (pr.baseRefName === config.branch.base) return null;
     const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
     return {
       slug: parentWt?.slug ?? null,

@@ -137,13 +137,16 @@ function parseReflogLine(line: string): ReflogEntry {
  *   3. Reachability — the target SHA lies inside some current tip's
  *      history. This covers "we rebased onto X, then X rebased ahead";
  *      X is no longer at the SHA we recorded but the worktree that
- *      *was* at X still has it as an ancestor. Multiple matches break
- *      by closeness (fewest commits between target and tip), then by
- *      slug.
+ *      *was* at X still has it as an ancestor. Candidates that are
+ *      themselves descendants of `child` are excluded (a parent can't be
+ *      downstream of its child — see the wrong-direction guard below).
+ *      Multiple matches break by closeness (fewest commits between
+ *      target and tip), then by slug.
  */
 async function resolveTarget(
   target: string,
   tips: readonly Tip[],
+  child: Tip,
 ): Promise<Tip | null> {
   for (const t of tips) {
     if (t.branch === target) return t;
@@ -161,11 +164,19 @@ async function resolveTarget(
   const reachable: Tip[] = [];
   await Promise.all(
     tips.map(async (t) => {
-      if (
-        await gitQuiet(["merge-base", "--is-ancestor", sha, t.sha])
-      ) {
-        reachable.push(t);
+      if (!(await gitQuiet(["merge-base", "--is-ancestor", sha, t.sha]))) {
+        return;
       }
+      // Wrong-direction guard: a candidate whose tip has the child's own
+      // tip as an ancestor is a *descendant* of the child, never its
+      // parent. This is exactly how a stale fork-point SHA mis-resolves —
+      // after the real parent squash-merges and its branch is deleted,
+      // that SHA survives only inside the child's descendants, and the
+      // reachability match above would otherwise pick one of them.
+      if (await gitQuiet(["merge-base", "--is-ancestor", child.sha, t.sha])) {
+        return;
+      }
+      reachable.push(t);
     }),
   );
   if (reachable.length === 0) return null;
@@ -224,7 +235,7 @@ async function detectParent(
   for (const entry of reflog) {
     if (entry.kind === "reset") {
       if (await isOnTrunk(entry.target)) break;
-      const t = await resolveTarget(entry.target, others);
+      const t = await resolveTarget(entry.target, others, child);
       if (t) return t;
       break;
     }
@@ -251,7 +262,7 @@ async function detectParent(
     }
   }
   if (pendingTarget) {
-    const t = await resolveTarget(pendingTarget, others);
+    const t = await resolveTarget(pendingTarget, others, child);
     if (t) return t;
   }
 
