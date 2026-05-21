@@ -58,6 +58,7 @@ import { deriveSessionState, pickAggregateState, registryStatusToState, type Der
 import {
   ActionEditModal,
   ActionPickerModal,
+  assignActionKeys,
   type ActionPickerState,
   type PickerItem,
 } from "./panels/action-picker.tsx";
@@ -2146,19 +2147,26 @@ export function App({ onExit }: Props) {
       pr: row?.pr,
       deployed: row?.fields.deploy.data ?? false,
     };
-    return [
-      ...config.actions.map((def) => ({
-        kind: "action" as const,
-        def,
-        availability: evaluateActionRequirements(def.requires, rowState),
-      })),
-      ...BUILTIN_ACTIONS.map((def) => ({
-        kind: "action" as const,
-        def,
-        availability: evaluateActionRequirements(def.requires, rowState),
-      })),
-      { kind: "custom" as const },
-    ];
+    const defs = [...config.actions, ...BUILTIN_ACTIONS];
+    const keyById = assignActionKeys(defs);
+    const actionItems = defs.map((def) => ({
+      kind: "action" as const,
+      def,
+      key: keyById.get(def.id) ?? "",
+      availability: evaluateActionRequirements(def.requires, rowState),
+    }));
+    // Cluster by group: group order by first appearance, original order
+    // within a group, so the picker shows one header per section. Keys
+    // are assigned over the unclustered list above so they stay stable
+    // regardless of grouping. The custom-prompt entry always trails.
+    const buckets = new Map<string, typeof actionItems>();
+    for (const it of actionItems) {
+      const g = it.def.group ?? "";
+      const arr = buckets.get(g);
+      if (arr) arr.push(it);
+      else buckets.set(g, [it]);
+    }
+    return [...[...buckets.values()].flat(), { kind: "custom" as const }];
   }
 
   /**
@@ -2481,13 +2489,18 @@ export function App({ onExit }: Props) {
           });
           return;
         }
-        // Quick-pick digits 1..9 jump straight to that *action* item
-        // (the custom entry is reachable via `c`, not a digit).
-        // Out-of-range digits are ignored.
-        if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-          const i = parseInt(k.sequence, 10) - 1;
-          if (items[i] && items[i]!.kind === "action") commitIndex(i);
-          return;
+        // Quick-pick letter jumps straight to the action whose assigned
+        // key matches (the custom entry is reachable via `c`). Reserved
+        // keys (c/j/k/q) are handled above/below, so they never collide.
+        // An unmatched letter falls through to the confirm/cancel checks.
+        if (k.sequence && /^[a-z]$/.test(k.sequence)) {
+          const i = items.findIndex(
+            (it) => it.kind === "action" && it.key === k.sequence,
+          );
+          if (i >= 0) {
+            commitIndex(i);
+            return;
+          }
         }
         // Trigger-key re-press confirms (`! !` chord). See the modal
         // UX rules in CLAUDE.md.

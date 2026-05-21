@@ -1,3 +1,5 @@
+import { Fragment } from "react";
+
 import {
   applyVars,
   type ActionAvailability,
@@ -19,8 +21,70 @@ type ClaudeActionDef = Extract<ActionDef, { kind: "claude" }>;
  * Custom entry is always available.
  */
 export type PickerItem =
-  | { kind: "action"; def: ActionDef; availability: ActionAvailability }
+  | {
+      kind: "action";
+      def: ActionDef;
+      /** Resolved quick-pick letter (see `assignActionKeys`); "" = none. */
+      key: string;
+      availability: ActionAvailability;
+    }
   | { kind: "custom" };
+
+/**
+ * Reserved single-char keys inside the action picker: `c` opens the
+ * custom-prompt entry, `j`/`k` navigate, `q` cancels. Auto-derived
+ * action keys skip these, and an explicit `key` that lands on one is
+ * dropped (the action falls back to auto-derivation).
+ */
+const RESERVED_KEYS = new Set(["c", "j", "k", "q"]);
+
+/**
+ * Assign a stable single-letter quick-pick key to each action, returning
+ * an id→key map. Two passes so explicit `key`s win regardless of order:
+ *   1. Honor each def's explicit `key` when it's a free, non-reserved
+ *      letter.
+ *   2. Auto-derive the rest from the first free letter of the name, then
+ *      any free a–z; leave blank if the alphabet is exhausted (>22
+ *      actions), in which case the entry is reachable via j/k only.
+ * Reserved keys (`c`/`j`/`k`/`q`) are never assigned.
+ */
+export function assignActionKeys(
+  defs: readonly ActionDef[],
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const taken = new Set<string>(RESERVED_KEYS);
+  for (const def of defs) {
+    const k = def.key?.toLowerCase();
+    if (k && /^[a-z]$/.test(k) && !taken.has(k)) {
+      out.set(def.id, k);
+      taken.add(k);
+    }
+  }
+  for (const def of defs) {
+    if (out.has(def.id)) continue;
+    let assigned = "";
+    for (const ch of def.name.toLowerCase()) {
+      if (/[a-z]/.test(ch) && !taken.has(ch)) {
+        assigned = ch;
+        break;
+      }
+    }
+    if (!assigned) {
+      for (let c = 97; c <= 122; c++) {
+        const ch = String.fromCharCode(c);
+        if (!taken.has(ch)) {
+          assigned = ch;
+          break;
+        }
+      }
+    }
+    if (assigned) {
+      out.set(def.id, assigned);
+      taken.add(assigned);
+    }
+  }
+  return out;
+}
 
 /**
  * Two-screen state machine. Esc in `edit` pops back to `list` when a
@@ -50,9 +114,10 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
   return (
     <Modal
       title={`action · ${slug}`}
+      inset={{ top: "12%", right: "18%", bottom: "12%", left: "18%" }}
       hints={[
         ["j/k", "move"],
-        ["1-9", "quick pick"],
+        ["a-z", "quick pick"],
         ["c", "custom prompt"],
         ["! / ⏎", "select"],
         ["esc / q", "cancel"],
@@ -63,16 +128,27 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
         const bg = selected ? theme.rowSelectedBg : undefined;
         const isCustom = item.kind === "custom";
         const blocked = !isCustom && !item.availability.ok;
+        // Group header: rendered once above the first item of each group
+        // (groups are pre-clustered in `buildActionPickerItems`). The
+        // custom entry has no group, so it sits below the last section.
+        const group = isCustom ? null : item.def.group ?? null;
+        const prevGroup =
+          i === 0
+            ? null
+            : items[i - 1]!.kind === "action"
+              ? (items[i - 1] as Extract<PickerItem, { kind: "action" }>).def
+                  .group ?? null
+              : null;
+        const showHeader = group !== null && group !== prevGroup;
         // Custom entry gets the `c` chord prefix (mirrors `n` for "+ new
-        // section"); configured actions get 1..9 quick-pick digits.
-        const actionIndex = isCustom ? -1 : i;
-        const showDigit = !isCustom && actionIndex < 9;
-        const prefix = isCustom ? "c" : showDigit ? `${actionIndex + 1}` : " ";
+        // section"); configured actions get their assigned quick-pick
+        // letter (blank when the alphabet ran out — j/k still reaches it).
+        const prefix = isCustom ? "c" : item.key || " ";
         const prefixFg = isCustom
           ? theme.accent
           : blocked
             ? theme.fgDim
-            : theme.fgDim;
+            : theme.accent;
         // Blocked actions: dim label even when selected. Mirrors the
         // disabled-but-discoverable convention used for grayed sections
         // elsewhere — entry stays visible (so the user knows it exists)
@@ -95,26 +171,34 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
               ? `$ ${item.def.id}`
               : item.def.id;
         return (
-          <box
-            key={isCustom ? "__custom__" : item.def.id}
-            flexDirection="row"
-            backgroundColor={bg}
-            paddingLeft={1}
-            paddingRight={1}
-          >
-            <text fg={selected ? theme.accent : theme.fgDim}>
-              {selected ? "▸ " : "  "}
-            </text>
-            <box width={2} flexShrink={0}>
-              <text fg={prefixFg}>{prefix}</text>
-            </box>
-            <box flexGrow={1} flexShrink={1} overflow="hidden">
-              <text fg={labelFg} wrapMode="none" truncate>
-                {label}
+          <Fragment key={isCustom ? "__custom__" : item.def.id}>
+            {showHeader ? (
+              <box flexDirection="row" paddingLeft={1} marginTop={i > 0 ? 1 : 0}>
+                <text fg={theme.fgDim} attributes={1} wrapMode="none" truncate>
+                  {group}
+                </text>
+              </box>
+            ) : null}
+            <box
+              flexDirection="row"
+              backgroundColor={bg}
+              paddingLeft={1}
+              paddingRight={1}
+            >
+              <text fg={selected ? theme.accent : theme.fgDim}>
+                {selected ? "▸ " : "  "}
               </text>
+              <box width={2} flexShrink={0}>
+                <text fg={prefixFg}>{prefix}</text>
+              </box>
+              <box flexGrow={1} flexShrink={1} overflow="hidden">
+                <text fg={labelFg} wrapMode="none" truncate>
+                  {label}
+                </text>
+              </box>
+              <text fg={theme.fgDim}>{hint}</text>
             </box>
-            <text fg={theme.fgDim}>{hint}</text>
-          </box>
+          </Fragment>
         );
       })}
     </Modal>
@@ -140,6 +224,7 @@ export function ActionEditModal({ slug, def, extras, vars }: EditProps) {
   return (
     <Modal
       title={title}
+      inset={{ top: "8%", right: "12%", bottom: "8%", left: "12%" }}
       hints={[
         ["⏎", "launch"],
         ["esc", def ? "back" : "cancel"],

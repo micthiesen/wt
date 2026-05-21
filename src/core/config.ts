@@ -139,23 +139,36 @@ export type AiConfig = {
 export type EffectTag = "git" | "github";
 export type RequireTag = "pr" | "pr.ready" | "deployed";
 
+/**
+ * Optional picker affordances shared by both action kinds. `key` is the
+ * single-char quick-pick letter in the `!` menu (auto-derived from the
+ * name when omitted; see `assignActionKeys`). `group` is a section
+ * label; actions sharing a group cluster under one header in the picker.
+ */
+type ActionUi = {
+  /** Quick-pick letter in the `!` picker. Omit to auto-derive. */
+  key?: string;
+  /** Section label; actions with the same group cluster together. */
+  group?: string;
+};
+
 export type ActionDef =
-  | {
+  | ({
       kind: "claude";
       id: string;
       name: string;
       prompt: string;
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
-    }
-  | {
+    } & ActionUi)
+  | ({
       kind: "shell";
       id: string;
       name: string;
       shell: string;
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
-    };
+    } & ActionUi);
 
 export type Config = {
   paths: {
@@ -517,6 +530,22 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     if (affects === "invalid") continue;
     const requires = parseRequires(entry.requires, tag, errs);
     if (requires === "invalid") continue;
+    // Optional picker affordances. `key` must be a single character;
+    // `group` a non-empty label. Both default to undefined (auto-derived
+    // key / ungrouped) when absent.
+    const keyRaw = entry.key;
+    if (keyRaw !== undefined && !(typeof keyRaw === "string" && keyRaw.length === 1)) {
+      errs.add(`${tag}.key must be a single character`);
+      continue;
+    }
+    const groupRaw = entry.group;
+    if (groupRaw !== undefined && !(typeof groupRaw === "string" && groupRaw.length > 0)) {
+      errs.add(`${tag}.group must be a non-empty string`);
+      continue;
+    }
+    const ui: { key?: string; group?: string } = {};
+    if (typeof keyRaw === "string") ui.key = keyRaw;
+    if (typeof groupRaw === "string") ui.group = groupRaw;
     seenIds.add(id);
     if (hasPrompt) {
       out.push({
@@ -526,6 +555,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         prompt: promptVal as string,
         affects: affects ?? DEFAULT_CLAUDE_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
+        ...ui,
       });
     } else {
       out.push({
@@ -535,6 +565,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         shell: shellVal as string,
         affects: affects ?? DEFAULT_SHELL_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
+        ...ui,
       });
     }
   }

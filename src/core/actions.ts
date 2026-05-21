@@ -160,6 +160,7 @@ export const BUILTIN_ACTIONS: readonly ActionDef[] = [
     kind: "shell",
     id: "remove-local",
     name: "Remove local",
+    group: "Deploy",
     // `{{stage}}` resolves to the deterministic `expectedStage(slug)`
     // at launch time, NOT whatever's pinned on disk. The
     // `requires: ["deployed"]` gate already enforces that the pin
