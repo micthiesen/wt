@@ -647,7 +647,17 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
           {hasReviewRequests ? (
             <>
               {activeRows.length > 0 ? (
-                <box height={1} flexShrink={0} />
+                // Flex spacer at the top of the bottom group (review
+                // requests + archived): pushes the whole group to the
+                // bottom of the viewport when the list is short, and
+                // collapses to a 1-row gap (minHeight) once content
+                // overflows so the group just scrolls into place. Relies on
+                // the scrollbox content box's default `minHeight: 100%` —
+                // free space exists only while content is shorter than the
+                // viewport. Only one such spacer renders (here when review
+                // requests exist, otherwise above the archived block), so
+                // the group stays contiguous instead of being split.
+                <box flexGrow={1} flexShrink={0} minHeight={1} />
               ) : null}
               <Divider label="Review Requests" width={width} />
               {reviewRequests.map((pr, i) => {
@@ -665,14 +675,13 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
           ) : null}
           {hasArchived ? (
             <>
-              {activeRows.length > 0 || hasReviewRequests ? (
-                // Flex spacer: pushes the archived block to the bottom of
-                // the viewport when the list is short, but collapses to a
-                // 1-row gap (minHeight) once content overflows, so archived
-                // just scrolls into place instead of staying pinned. Relies
-                // on the scrollbox content box's default `minHeight: 100%` —
-                // free space exists only while content is shorter than the
-                // viewport, so flexGrow has room to grow only then.
+              {hasReviewRequests ? (
+                // Review requests already carried the bottom-group spacer
+                // above; archived just needs a 1-row separator below them.
+                <box height={1} flexShrink={0} />
+              ) : activeRows.length > 0 ? (
+                // No review requests, so archived leads the bottom group —
+                // it owns the flex spacer (see the review-requests block).
                 <box flexGrow={1} flexShrink={0} minHeight={1} />
               ) : null}
               <Divider label="Archived" width={width} />
