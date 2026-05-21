@@ -128,16 +128,17 @@ export function Footer({ mode, hint }: Props) {
 
 /**
  * Single-line tail of the main-clone session — the bottom bar's
- * default-mode content. A status-colored robot glyph leads, then the
- * slot label, a dim separator, and the latest `ActionLine` colored per
- * its kind (so an assistant reply reads as plain text, a tool-error as
- * red, etc.). When no session is live or no lines have arrived yet
- * (pre-creation race), falls back to a dim idle hint that still surfaces
- * `.` as the start key and `?` for help. The tail is claude-jsonl-only;
- * if the user spawns a codex/opencode session via `.` (the active
- * primary harness) the bar reads as "idle" because there's no jsonl to
- * tail. That's a known v1 trade-off — bottom-bar feedback for non-claude
- * harnesses would mean wiring their event streams in here too.
+ * default-mode content. A status-colored robot glyph leads (it stands in
+ * for the slot label, so the `main` text is gone), followed directly by
+ * the latest `ActionLine` colored per its kind (so an assistant reply
+ * reads as plain text, a tool-error as red, etc.). When no session is
+ * live or no lines have arrived yet (pre-creation race), falls back to a
+ * dim idle hint that still surfaces `.` as the start key and `?` for
+ * help. The tail is claude-jsonl-only; if the user spawns a
+ * codex/opencode session via `.` (the active primary harness) the bar
+ * reads as "idle" because there's no jsonl to tail. That's a known v1
+ * trade-off — bottom-bar feedback for non-claude harnesses would mean
+ * wiring their event streams in here too.
  */
 function MainSlotTail() {
   const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
@@ -148,8 +149,7 @@ function MainSlotTail() {
     return (
       <text wrapMode="none" truncate>
         <span fg={glyphFg}>{CLAUDE_GLYPH}  </span>
-        <span fg={theme.accent}>{MAIN_CLONE_SLOT.label}</span>
-        <span fg={theme.fgDim}> · idle  ·  </span>
+        <span fg={theme.fgDim}>idle  ·  </span>
         <span fg={theme.accent}>.</span>
         <span fg={theme.fgDim}> start  ·  </span>
         <span fg={theme.accent}>?</span>
@@ -160,8 +160,6 @@ function MainSlotTail() {
   return (
     <text wrapMode="none" truncate>
       <span fg={glyphFg}>{CLAUDE_GLYPH}  </span>
-      <span fg={theme.accent}>{MAIN_CLONE_SLOT.label}</span>
-      <span fg={theme.fgDim}> · </span>
       <span fg={actionLineFg(lastLine.kind)}>{lastLine.text}</span>
     </text>
   );
