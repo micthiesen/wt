@@ -21,16 +21,8 @@ import {
   markPullRequestReady,
 } from "../core/github.ts";
 import { armMergeWhenReady } from "../core/graphite.ts";
-import { fetchOrigin } from "../core/worktree.ts";
-import { branchIsGone, isRebaseInProgress } from "../core/git.ts";
 import { expectedStage } from "../core/stage-safety.ts";
 import { run } from "../core/proc.ts";
-import {
-  chainOf,
-  planRebase,
-  type RebaseStep,
-  type StackRow,
-} from "../core/stack-plan.ts";
 import {
   addClaudeName,
   nameInUse,
@@ -89,7 +81,6 @@ import {
 } from "./panels/sessions-picker.tsx";
 import { WorktreeList } from "./panels/list.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
-import { StackActionsModal } from "./panels/stack-actions.tsx";
 import { enterHarnessSession } from "./harness-session.ts";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
 import {
@@ -302,7 +293,6 @@ type Modal =
   | { kind: "help" }
   | { kind: "cleanConfirm" }
   | { kind: "yank" }
-  | { kind: "stackActions" }
   | {
       kind: "parentPicker";
       slug: string;
@@ -2121,229 +2111,6 @@ export function App({ onExit }: Props) {
   }
 
   /**
-   * Build a `StackRow[]` from the current row list, suitable for
-   * passing to the stack-plan helpers. Drops main + archived since
-   * neither belong in a rebase plan.
-   */
-  function buildStackRows(): StackRow[] {
-    return rows
-      .filter((r) => !r.archived && !r.wt.isMain && !!r.wt.branch)
-      .map((r) => ({
-        slug: r.wt.slug,
-        path: r.wt.path,
-        branch: r.wt.branch,
-        parentSlug: r.stackedOn?.slug ?? null,
-        parentBranch: r.stackedOn?.branch ?? null,
-      }));
-  }
-
-  /**
-   * Walk the plan one rebase at a time. Each step acquires the
-   * worktree's lock, runs `git rebase <base>`, force-pushes the
-   * result, and releases. On rebase exit:
-   *
-   *   - clean → push (force-with-lease), then continue to the next
-   *     step. Push failures warn and continue — origin mismatch is
-   *     recoverable and shouldn't halt the chain.
-   *   - paused on conflict (`rebase-merge/` exists) → spawn a claude
-   *     session in the halted worktree with the remaining plan baked
-   *     into the prompt so it can finish the chain
-   *   - any other failure → toast and stop
-   *
-   * Locks are per-step (held only during that worktree's rebase) so
-   * a halt-and-claude hands off cleanly: when launchAction acquires
-   * its own lock on the halted slug, the previous lock is already
-   * released.
-   */
-  async function executeStackPlan(
-    originSlug: string,
-    plan: RebaseStep[],
-    opName: "sync" | "rebase",
-  ): Promise<void> {
-    if (plan.length === 0) {
-      toast(`nothing to ${opName}`, theme.fgDim, 1500);
-      return;
-    }
-    const log = createLogger(originSlug);
-    log.event.dim(`${opName}: ${plan.length} branch${plan.length === 1 ? "" : "es"}`);
-    let pushedOk = 0;
-    let pushFailed = 0;
-    let pushSkipped = 0;
-    for (let i = 0; i < plan.length; i++) {
-      const step = plan[i]!;
-      const tag = `[${i + 1}/${plan.length}] ${step.branch}`;
-      const handle = tryAcquireLock(step.slug, opName, {
-        phase: `rebase onto ${step.base}`,
-      });
-      if (!handle) {
-        log.event.warn(`${tag}: busy, aborting ${opName}`);
-        toast(`${step.slug} is busy`, theme.warn, 2000);
-        return;
-      }
-      log.event.dim(`${tag}: rebasing onto ${step.base}`);
-      let exitCode: number;
-      let errorText = "";
-      try {
-        const r = await run(["git", "rebase", step.base], {
-          cwd: step.path,
-          timeoutMs: 120_000,
-        });
-        exitCode = r.exitCode;
-        errorText = (r.stderr || r.stdout).trim();
-      } finally {
-        handle.release();
-        void invalidateWorktree(step.slug);
-      }
-      if (exitCode === 0) {
-        const pushResult = await pushAfterRebase(step);
-        if (pushResult.kind === "ok") {
-          log.event.ok(`${tag}: done`);
-          pushedOk++;
-        } else if (pushResult.kind === "skipped") {
-          log.event.ok(`${tag}: done (push skipped, ${pushResult.reason})`);
-          pushSkipped++;
-        } else {
-          log.event.warn(`${tag}: rebased, push failed: ${pushResult.msg}`);
-          pushFailed++;
-        }
-        continue;
-      }
-      if (await isRebaseInProgress(step.path)) {
-        const remaining = plan.slice(i + 1);
-        log.event.warn(`${tag}: paused on conflict, opening claude`);
-        escalateStackToClaude(step, remaining, opName);
-        return;
-      }
-      const msg = errorText.slice(0, 200) || `git rebase exit ${exitCode}`;
-      log.event.err(`${tag}: rebase failed: ${msg.slice(0, 200)}`);
-      toast(`rebase ${step.branch} failed: ${msg.slice(0, 80)}`, theme.err, 4000);
-      return;
-    }
-    const pushSummary =
-      pushFailed > 0
-        ? ` · pushed ${pushedOk}/${plan.length - pushSkipped} (${pushFailed} failed)`
-        : pushedOk > 0
-          ? ` · pushed ${pushedOk}`
-          : "";
-    log.event.ok(`${opName} clean${pushSummary}`);
-    const toastColor = pushFailed > 0 ? theme.warn : theme.ok;
-    toast(`${opName} clean${pushSummary}`, toastColor, 2500);
-    void refreshGithub();
-    void refreshStack();
-  }
-
-  /**
-   * Force-push a freshly-rebased branch to origin so the remote ref
-   * matches local. Strategy:
-   *
-   *   - `branchIsGone` (upstream deleted by squash-merge + prune) →
-   *     skip; recreating it would resurrect a finished branch.
-   *   - `refs/remotes/origin/<branch>` exists → `--force-with-lease`.
-   *     Safe default; refuses if origin moved unexpectedly.
-   *   - No upstream-tracking ref → plain `git push`; relies on the
-   *     global `push.autoSetupRemote` to create origin/<branch> and
-   *     set the upstream.
-   *
-   * Returns a tagged result so the caller can emit a single
-   * terminal log line per step. Push failures are not fatal.
-   */
-  async function pushAfterRebase(
-    step: RebaseStep,
-  ): Promise<
-    | { kind: "ok" }
-    | { kind: "skipped"; reason: string }
-    | { kind: "failed"; msg: string }
-  > {
-    if (await branchIsGone(step.branch)) {
-      return { kind: "skipped", reason: "upstream gone" };
-    }
-    const upstreamCheck = await run(
-      ["git", "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${step.branch}`],
-      { cwd: step.path, timeoutMs: 5_000 },
-    );
-    const hasUpstream = upstreamCheck.exitCode === 0;
-    const args = hasUpstream
-      ? ["git", "push", "--force-with-lease"]
-      : ["git", "push"];
-    const r = await run(args, { cwd: step.path, timeoutMs: 60_000 });
-    if (r.exitCode === 0) return { kind: "ok" };
-    const msg =
-      (r.stderr || r.stdout).trim().slice(0, 200) ||
-      `git push exit ${r.exitCode}`;
-    return { kind: "failed", msg };
-  }
-
-  /**
-   * Hand a paused rebase off to a claude session with enough context
-   * to finish: the current worktree state plus the remaining steps
-   * (cwd + base) so claude can drive `git rebase --continue` here and
-   * then walk the rest of the plan.
-   */
-  function escalateStackToClaude(
-    step: RebaseStep,
-    remaining: readonly RebaseStep[],
-    opName: "sync" | "rebase",
-  ): void {
-    const remainingLines = remaining
-      .map((s) => `  cd ${s.path} && git rebase ${s.base}`)
-      .join("\n");
-    const tail =
-      remaining.length === 0
-        ? ""
-        : [
-            "",
-            "After this branch lands cleanly, finish the remaining rebases",
-            "in order. If any of these conflicts, resolve the same way:",
-            "",
-            remainingLines,
-          ].join("\n");
-    const prompt = [
-      `A git rebase is paused mid-conflict during a wt ${opName}.`,
-      "",
-      "Current state:",
-      `  cwd: ${step.path}`,
-      `  branch: ${step.branch}`,
-      `  rebasing onto: ${step.base}`,
-      "",
-      "Resolve the conflicts in the current worktree (preserve both",
-      "intents where possible), stage the resolution, and run",
-      "`git rebase --continue` until it completes cleanly.",
-      tail,
-      "",
-      "Report briefly when done.",
-    ].join("\n");
-    toast(`${opName} hit a conflict, opening claude...`, theme.warn, 3000);
-    launchAction(
-      step.slug,
-      {
-        kind: "claude",
-        id: `wt-${opName}-resume`,
-        name: `wt ${opName} (resume)`,
-        prompt,
-        affects: ["git", "github"],
-        requires: [],
-      },
-      "",
-    );
-  }
-
-  async function doStackSync(slug: string): Promise<void> {
-    const log = createLogger(slug);
-    log.event.dim("fetching origin...");
-    try {
-      await fetchOrigin();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.event.err(`fetch failed: ${msg}`);
-      toast(`fetch failed: ${msg}`, theme.err, 4000);
-      return;
-    }
-    const trunkBase = `origin/${config.branch.base}`;
-    const plan = planRebase(buildStackRows(), trunkBase);
-    await executeStackPlan(slug, plan, "sync");
-  }
-
-  /**
    * Open a picker listing trunk + every other active worktree's branch
    * as candidate stack parents. When a manual override is currently in
    * effect, a synthetic "(clear override)" entry appears at the top so
@@ -2371,18 +2138,6 @@ export function App({ onExit }: Props) {
       clearIndex = 0;
     }
     setModal({ kind: "parentPicker", slug, items, index: 0, clearIndex });
-  }
-
-  async function doStackRebase(slug: string): Promise<void> {
-    const stackRows = buildStackRows();
-    const chain = chainOf(stackRows, slug);
-    if (chain.size === 0) {
-      toast("not a tracked worktree", theme.warn, 2000);
-      return;
-    }
-    const trunkBase = `origin/${config.branch.base}`;
-    const plan = planRebase(stackRows, trunkBase, (r) => chain.has(r.slug));
-    await executeStackPlan(slug, plan, "rebase");
   }
 
   function buildActionPickerItems(slug: string): PickerItem[] {
@@ -3257,42 +3012,7 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Stack chord: same shape as yank — `b` opens, the next key
-    // (s/r/p) launches a stack op; `b` again or esc/q cancels.
-    if (modal?.kind === "stackActions") {
-      if (
-        k.name === "escape" ||
-        k.sequence === "b" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-        return;
-      }
-      if (!current) {
-        setModal(null);
-        return;
-      }
-      const slug = current.wt.slug;
-      if (k.sequence === "s") {
-        setModal(null);
-        void doStackSync(slug);
-        return;
-      }
-      if (k.sequence === "r") {
-        setModal(null);
-        void doStackRebase(slug);
-        return;
-      }
-      if (k.sequence === "p") {
-        setModal(null);
-        openParentPicker(slug);
-        return;
-      }
-      return;
-    }
-
-    // Parent picker (second step of `b p`): j/k nav, Enter picks. The
+    // Parent picker (opened by `b`): j/k nav, Enter picks. The
     // synthetic clear-sentinel at `clearIndex` maps to `null` (drop the
     // override). Anything else is a branch name passed straight to
     // setParent.
@@ -3641,7 +3361,7 @@ export function App({ onExit }: Props) {
         toast("no row selected", theme.warn, 1500);
         return;
       }
-      setModal({ kind: "stackActions" });
+      openParentPicker(current.wt.slug);
       return;
     }
     // Ctrl+R: clear all caches. Moved off bare R when R lost its
@@ -4198,11 +3918,6 @@ export function App({ onExit }: Props) {
           activeActions={activeActions}
           aiLiveHarnessBySlug={aiLiveHarnessBySlug}
           aiStateBySlug={aiStateBySlug}
-          chainHighlight={
-            modal?.kind === "stackActions" && current
-              ? chainOf(buildStackRows(), current.wt.slug)
-              : null
-          }
           stackSectionLabels={stackSectionLabels}
           isLoading={isLoading}
           filter={filter}
@@ -4262,7 +3977,6 @@ export function App({ onExit }: Props) {
         <CleanConfirmModal candidates={cleanCandidates} />
       ) : null}
       {modal?.kind === "yank" && current ? <YankModal row={current} /> : null}
-      {modal?.kind === "stackActions" ? <StackActionsModal /> : null}
       {modal?.kind === "parentPicker" ? (
         <PickerModal
           title={`stack · set base${

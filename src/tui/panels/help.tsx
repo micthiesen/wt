@@ -51,7 +51,7 @@ const SECTIONS: Section[] = [
       ["y", "yank menu (b/s/S/p/n/i/r)"],
       ["t", "regenerate AI summary"],
       ["m", "merge when ready (toggle)"],
-      ["b", "stack menu · s=sync · r=rebase chain · p=set base (sync/rebase force-push)"],
+      ["b", "set stack base (parent branch) for this worktree"],
       ["e", "exit draft (mark ready for review)"],
       ["v", "edit reviewers (picker · v v submits)"],
       ["!", "run claude action · kill if running"],
