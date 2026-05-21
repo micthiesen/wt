@@ -164,18 +164,22 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
             : theme.fg;
         const labelFg = isCustom ? theme.accent : fg;
         const label = isCustom ? "Custom prompt…" : item.def.name;
-        // Trailing hint: a kind marker plus the action id — `$` for shell
-        // commands, the Claude robot glyph for claude prompts (two spaces:
-        // the nerd-font glyph renders wide and reads cramped with one).
-        // Both stay muted like the id. Unavailable items show the block
-        // reason instead; the custom entry shows "freeform".
+        // Trailing hint: a kind/target marker plus the action id. `$` for
+        // shell commands; the Claude robot glyph for claude prompts (two
+        // spaces: the nerd-font glyph renders wide and reads cramped with
+        // one). Session-target claude actions add a `↪` to mark that they
+        // inject into the live F12 session instead of spawning a headless
+        // `claude -p` run. All stay muted like the id. Unavailable items
+        // show the block reason instead; the custom entry shows "freeform".
         const hint = isCustom
           ? "freeform"
           : blocked
             ? `(${(item.availability as { reason: string }).reason})`
             : item.def.kind === "shell"
               ? `$ ${item.def.id}`
-              : `${claudeGlyph}  ${item.def.id}`;
+              : item.def.target === "session"
+                ? `${claudeGlyph}  ↪ ${item.def.id}`
+                : `${claudeGlyph}  ${item.def.id}`;
         return (
           <Fragment key={isCustom ? "__custom__" : item.def.id}>
             {showHeader ? (

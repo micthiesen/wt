@@ -433,6 +433,7 @@ class ActionRegistry {
         id: CUSTOM_ACTION_ID,
         name: "Custom prompt",
         prompt: "",
+        target: "headless",
         affects: DEFAULT_CLAUDE_AFFECTS,
         requires: DEFAULT_REQUIRES,
       },

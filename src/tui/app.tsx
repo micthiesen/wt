@@ -4,6 +4,7 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 
 import {
   actionRegistry,
+  applyVars,
   BUILTIN_ACTIONS,
   evaluateActionRequirements,
   type ActionDef,
@@ -43,6 +44,7 @@ import { slugLabel, stageUrl } from "../core/stage.ts";
 import {
   claudeSessionName,
   diffCommandUsesBase,
+  injectIntoSession,
   killAllSessionsFor,
   killDiffSession,
   killHarnessSession,
@@ -2243,6 +2245,36 @@ export function App({ onExit }: Props) {
       }
     }
     const vars = buildActionVars(row);
+    // Session-target claude actions bypass the headless `-p` runner and
+    // type the prompt into the live F12 session (starting it if needed).
+    // Fire-and-forget: there's no run to track or focus, so we just log
+    // progress to the activity pane. The cold-start path can take a few
+    // seconds, hence the immediate "sending…" toast.
+    if (def && def.kind === "claude" && def.target === "session") {
+      const renderedPrompt = applyVars(def.prompt, vars);
+      const trimmedExtras = applyVars(extras, vars).trim();
+      const fullPrompt = trimmedExtras
+        ? `${renderedPrompt}\n\n${trimmedExtras}`
+        : renderedPrompt;
+      const sessionLog = createLogger(slug);
+      sessionLog.event.info(`${def.name} → live claude session`);
+      toast(`sending ${def.name} to session…`, theme.info, 2000);
+      void injectIntoSession({ slug, cwd: row.wt.path, text: fullPrompt }).then(
+        (res) => {
+          if (res.ok) {
+            sessionLog.event.ok(
+              res.coldStarted
+                ? `started session and sent ${def.name}`
+                : `sent ${def.name} to session`,
+            );
+          } else {
+            sessionLog.event.err(`inject failed: ${res.reason}`);
+            toast(`inject failed: ${res.reason}`, theme.err, 3000);
+          }
+        },
+      );
+      return;
+    }
     const result = def
       ? actionRegistry.start(def, slug, row.wt.path, extras, vars)
       : actionRegistry.startCustom(slug, row.wt.path, extras, vars);

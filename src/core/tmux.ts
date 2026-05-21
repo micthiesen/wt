@@ -807,6 +807,252 @@ export async function attachOrCreate(opts: {
   return { kind: "exited", code, stderr: stderrText };
 }
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Named tmux paste buffer used by `injectIntoSession`. */
+const INJECT_BUFFER = "wt-inject";
+/** Settle pause when the session is already running before pasting. */
+const WARM_SETTLE_MS = 300;
+/** capture-pane poll interval while waiting for a cold start to render. */
+const READY_POLL_MS = 350;
+/** Hard cap on the cold-start readiness wait; inject anyway after this. */
+const READY_MAX_MS = 12_000;
+/** Gap between the paste landing and the Enter that submits it. */
+const SUBMIT_DELAY_MS = 500;
+
+/** Run a tmux command on our private server; collect exit code + stderr. */
+async function runTmux(
+  args: readonly string[],
+): Promise<{ code: number; stderr: string }> {
+  const proc = Bun.spawn(["tmux", "-L", TMUX_SOCKET, ...args], {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [code, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr).text(),
+  ]);
+  return { code, stderr };
+}
+
+/** Snapshot a session's active pane as plain text, or null on failure. */
+async function capturePane(name: string): Promise<string | null> {
+  const proc = Bun.spawn(
+    ["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-t", `=${name}`],
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  const [out, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ]);
+  return code === 0 ? out : null;
+}
+
+/**
+ * Wait until a freshly-started claude pane stops changing — meaning it
+ * has finished its initial render and is sitting at an idle prompt — or
+ * the cap elapses. Stability (two identical, non-trivial snapshots) is
+ * version-agnostic: we never scrape claude's exact prompt string, we
+ * just watch for the screen to settle. A startup spinner keeps the pane
+ * changing, so the loop naturally waits out a slow boot instead of
+ * guessing a fixed delay. Returns whether it settled (false = hit the
+ * cap; the caller pastes anyway).
+ */
+async function waitForPaneReady(name: string): Promise<boolean> {
+  const deadline = Date.now() + READY_MAX_MS;
+  let prev: string | null = null;
+  // Initial grace — claude writes nothing for the first beat after spawn.
+  await sleep(READY_POLL_MS);
+  while (Date.now() < deadline) {
+    const cur = (await capturePane(name))?.trim() ?? "";
+    if (cur.length > 0 && cur === prev) return true;
+    prev = cur;
+    await sleep(READY_POLL_MS);
+  }
+  return false;
+}
+
+/**
+ * Create the worktree's primary claude session detached (no client
+ * attach). Byte-for-byte the session `attachOrCreate({kind:"claude"})`
+ * would make — same name (`<slug>`), same `buildArgs` argv, same stderr
+ * wrapper and TMUX-stripping env — so a later F12 `new-session -A` just
+ * attaches to this one rather than spawning a second. Sized generously
+ * so claude doesn't render cramped before the user attaches; tmux
+ * resizes to the client on attach.
+ */
+async function startClaudeSessionDetached(
+  slug: string,
+  cwd: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  const name = sessionName(slug, "claude");
+  const { path: configPath, changed } = writeConfig();
+  if (changed) {
+    log.info("config changed, killing server before detached claude start", {
+      slug,
+    });
+    await killServer();
+  }
+  const stderrPath = join(sessionsDir(), `${name}.err`);
+  const innerArgs = getHarness("claude").buildArgs({
+    wtPath: cwd,
+    managedName: null,
+    resumeSessionId: null,
+  });
+  let proc: Bun.Subprocess;
+  try {
+    proc = Bun.spawn(
+      [
+        "tmux",
+        "-L",
+        TMUX_SOCKET,
+        "-f",
+        configPath,
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-c",
+        cwd,
+        "-x",
+        "200",
+        "-y",
+        "50",
+        // See attachOrCreate header: claude downgrades to 256-color when
+        // $TMUX is set, so strip it before exec'ing. The bash wrapper
+        // redirects stderr to a file so a spawn-and-die surfaces a reason.
+        "env",
+        "-u",
+        "TMUX",
+        "-u",
+        "TMUX_PANE",
+        "bash",
+        "-c",
+        'p="$1"; shift; exec "$@" 2> "$p"',
+        "_wt_wrap",
+        stderrPath,
+        ...innerArgs,
+      ],
+      {
+        cwd,
+        stdout: "ignore",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          TERM: process.env.TERM ?? "xterm-256color",
+          COLORTERM: process.env.COLORTERM ?? "truecolor",
+          FORCE_COLOR: process.env.FORCE_COLOR ?? "3",
+        },
+      },
+    );
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    log.error("detached claude start spawn failed", { slug, reason });
+    return { ok: false, reason };
+  }
+  const [code, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+  ]);
+  if (code !== 0) {
+    const reason = stderr.trim() || `tmux new-session exited ${code}`;
+    log.warn("detached claude start failed", { slug, code, reason });
+    return { ok: false, reason };
+  }
+  return { ok: true };
+}
+
+/** Pipe text into the inject buffer and paste it into a session's pane. */
+async function pasteBuffer(name: string, text: string): Promise<void> {
+  // load-buffer reads stdin, so arbitrary text (quotes, `$`, newlines)
+  // needs no shell escaping.
+  const load = Bun.spawn(
+    ["tmux", "-L", TMUX_SOCKET, "load-buffer", "-b", INJECT_BUFFER, "-"],
+    {
+      stdin: new TextEncoder().encode(text),
+      stdout: "ignore",
+      stderr: "ignore",
+    },
+  );
+  await load.exited;
+  // `-p` = bracketed paste (claude receives it as one chunk, so internal
+  // newlines and a leading slash command don't submit early); `-d` drops
+  // the buffer after.
+  await runTmux([
+    "paste-buffer",
+    "-d",
+    "-p",
+    "-b",
+    INJECT_BUFFER,
+    "-t",
+    `=${name}`,
+  ]);
+}
+
+/**
+ * Send `text` to a worktree's primary (F12) claude session as if typed
+ * at the prompt, then submit it. Starts the session first if it isn't
+ * running, waiting for it to finish booting before pasting. The prompt
+ * lands in the live conversation — with its existing context and history
+ * — rather than a fresh headless `claude -p` run.
+ *
+ * Fire-and-forget by nature: there's no completion sentinel the way a
+ * `claude -p` action has, so callers can't observe when claude finishes.
+ *
+ * Known edge: a brand-new worktree directory claude has never run in may
+ * show its trust prompt on cold start; the paste+Enter would answer that
+ * dialog instead of submitting. Attaching via F12 once (to accept trust)
+ * before injecting avoids it.
+ */
+export async function injectIntoSession(opts: {
+  slug: string;
+  cwd: string;
+  text: string;
+}): Promise<{ ok: true; coldStarted: boolean } | { ok: false; reason: string }> {
+  const { slug, cwd, text } = opts;
+  const name = sessionName(slug, "claude");
+  const running = (
+    await listAllSessionsRaw().catch(() => new Set<string>())
+  ).has(name);
+  let coldStarted = false;
+  if (!running) {
+    const started = await startClaudeSessionDetached(slug, cwd);
+    if (!started.ok) {
+      return {
+        ok: false,
+        reason: started.reason ?? "failed to start claude session",
+      };
+    }
+    coldStarted = true;
+    await waitForPaneReady(name);
+  } else {
+    await sleep(WARM_SETTLE_MS);
+  }
+  try {
+    await pasteBuffer(name, text);
+    await sleep(SUBMIT_DELAY_MS);
+    const { code, stderr } = await runTmux([
+      "send-keys",
+      "-t",
+      `=${name}`,
+      "Enter",
+    ]);
+    if (code !== 0) {
+      return {
+        ok: false,
+        reason: stderr.trim() || `tmux send-keys exited ${code}`,
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return { ok: true, coldStarted };
+}
+
 /**
  * Reconcile sessions against a live slug set. Kills any session of
  * any kind (claude, diff, or shell) whose underlying slug isn't in

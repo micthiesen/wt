@@ -152,12 +152,23 @@ type ActionUi = {
   group?: string;
 };
 
+/**
+ * Where a claude action's prompt is delivered. `headless` (default) spawns
+ * a tracked `claude -p` run via the action registry. `session` injects the
+ * prompt into the worktree's live primary (F12) claude session — starting
+ * it first if it isn't running — so the prompt lands in a conversation with
+ * existing context and history. Session delivery is fire-and-forget: there's
+ * no completion sentinel, so `affects` does not auto-refresh on finish.
+ */
+export type ClaudeActionTarget = "headless" | "session";
+
 export type ActionDef =
   | ({
       kind: "claude";
       id: string;
       name: string;
       prompt: string;
+      target: ClaudeActionTarget;
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
     } & ActionUi)
@@ -267,6 +278,7 @@ const GENERIC_DEFAULTS = {
       name: "Rebase on base",
       prompt:
         "Please rebase this branch on origin/{{base_branch}} and intelligently resolve any conflicts that come up. Push when you're done.",
+      target: "headless" as const,
       affects: ["git", "github"] as const satisfies readonly EffectTag[],
       requires: [] as const satisfies readonly RequireTag[],
     },
@@ -276,6 +288,7 @@ const GENERIC_DEFAULTS = {
       name: "Address PR review",
       prompt:
         "Check the requested changes from the review on the PR for this branch and address them. Push the changes, then resolve the review threads (no reply comments). When done, request a re-review from the original reviewers.",
+      target: "headless" as const,
       affects: ["git", "github"] as const satisfies readonly EffectTag[],
       requires: ["pr.ready"] as const satisfies readonly RequireTag[],
     },
@@ -546,6 +559,22 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     const ui: { key?: string; group?: string } = {};
     if (typeof keyRaw === "string") ui.key = keyRaw;
     if (typeof groupRaw === "string") ui.group = groupRaw;
+    // `target` is claude-only: it selects headless `claude -p` (default)
+    // vs injecting into the live F12 session. Reject it on shell actions
+    // so a misplaced field fails loud instead of silently doing nothing.
+    const targetRaw = entry.target;
+    if (targetRaw !== undefined) {
+      if (!hasPrompt) {
+        errs.add(`${tag}.target is only valid on a claude (prompt) action`);
+        continue;
+      }
+      if (targetRaw !== "session" && targetRaw !== "headless") {
+        errs.add(`${tag}.target must be "session" or "headless"`);
+        continue;
+      }
+    }
+    const target: ClaudeActionTarget =
+      targetRaw === "session" ? "session" : "headless";
     seenIds.add(id);
     if (hasPrompt) {
       out.push({
@@ -553,6 +582,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         id,
         name,
         prompt: promptVal as string,
+        target,
         affects: affects ?? DEFAULT_CLAUDE_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
         ...ui,
