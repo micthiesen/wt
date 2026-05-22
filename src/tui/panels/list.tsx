@@ -27,10 +27,9 @@ import { getHarness } from "../../core/harness/index.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
 import { STATE_FG } from "../claude-state.ts";
-import { isMergeQueued } from "../../core/graphite-api.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
-import { StatusKind } from "../../core/types.ts";
+import { type MergeQueueState, StatusKind } from "../../core/types.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = {
@@ -143,7 +142,7 @@ function badgeClusterCells(
     actionRunning ||
     showSessionSlot ||
     refreshing ||
-    !!(row.pr || isDeployed);
+    !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (actionRunning) cells += 2;
@@ -153,8 +152,42 @@ function badgeClusterCells(
   if (reviewHint(row)) cells += 2;
   if (row.pr) cells += 2;
   if (showChecks) cells += 2;
+  if (row.mq) cells += 4;
   if (isDeployed) cells += 2;
   return cells;
+}
+
+/**
+ * Color the merge-queue indicator by state. Green = about to land,
+ * yellow = waiting on checks or behind others, red = blocked/failed.
+ */
+function mqColor(state: MergeQueueState): string {
+  switch (state) {
+    case "MERGEABLE":
+      return theme.ok;
+    case "AWAITING_CHECKS":
+    case "QUEUED":
+      return theme.warn;
+    case "UNMERGEABLE":
+    case "LOCKED":
+      return theme.err;
+    default:
+      return theme.fgDim;
+  }
+}
+
+/**
+ * "<mq-glyph> N" for a merge-queue position: nerd-font merge-queue
+ * octicon + 1-based position (`+` if there are ≥10 ahead). Empty
+ * placeholder fills the 4-cell slot (2-cell icon + 1-cell space +
+ * 1-cell digit) so the cluster stays aligned when no entry exists.
+ */
+function mqGlyph(row: WorktreeRow): string {
+  const mq = row.mq;
+  if (!mq) return "    ";
+  const pos = mq.position;
+  const digit = pos >= 10 ? "+" : String(pos);
+  return `${NF.mergeQueue} ${digit}`;
 }
 
 /**
@@ -234,16 +267,10 @@ const RowView = memo(function RowView({
     : selected
       ? theme.fgBright
       : theme.fg;
-  // When the PR is armed in the Graphite merge queue, the PR slot stops
-  // showing the open/draft state and instead reads as "merging": the
-  // merge-queue glyph in magenta. Mirrors the details-pane `queued to
-  // merge` pill so both panes agree the next thing that happens is a
-  // merge, not more review.
-  const queued = !!row.pr && isMergeQueued(row.mergeability);
   const prb = row.pr
     ? prStateBadge(row.pr)
     : { glyph: "  ", fg: theme.fgDim };
-  const prFg = row.archived ? theme.fgDim : queued ? theme.info : prb.fg;
+  const prFg = row.archived ? theme.fgDim : prb.fg;
   const c = checkGlyph(row);
   const checkFg = row.archived ? theme.fgDim : c.fg;
   const deployFg = row.archived
@@ -251,6 +278,8 @@ const RowView = memo(function RowView({
     : (row.fields.deploy.data ?? false)
       ? theme.warn
       : theme.fgDim;
+  const mqFg = row.archived || !row.mq ? theme.fgDim : mqColor(row.mq.state);
+  const mqText = mqGlyph(row);
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
@@ -269,7 +298,7 @@ const RowView = memo(function RowView({
     actionRunning ||
     showSessionSlot ||
     refreshing ||
-    !!(row.pr || isDeployed);
+    !!(row.pr || row.mq || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
   // a row is both selected and being tailed.
@@ -374,17 +403,18 @@ const RowView = memo(function RowView({
           {row.pr ? (
             <box width={2} flexShrink={0}>
               <text fg={prFg}>
-                {queued
-                  ? NF.mergeQueue
-                  : stackParentAbove
-                    ? NF.anglesUp
-                    : prb.glyph}
+                {stackParentAbove ? NF.anglesUp : prb.glyph}
               </text>
             </box>
           ) : null}
           {showChecks ? (
             <box width={2} flexShrink={0}>
               <text fg={checkFg}>{c.glyph}</text>
+            </box>
+          ) : null}
+          {row.mq ? (
+            <box width={4} flexShrink={0}>
+              <text fg={mqFg}>{mqText}</text>
             </box>
           ) : null}
         </box>

@@ -18,10 +18,11 @@ import {
   spawnBackgroundRemove,
 } from "../core/lifecycle.ts";
 import {
+  disableAutoMerge,
   editReviewers,
+  enableAutoMerge,
   markPullRequestReady,
 } from "../core/github.ts";
-import { armMergeWhenReady } from "../core/graphite.ts";
 import { expectedStage } from "../core/stage-safety.ts";
 import { run } from "../core/proc.ts";
 import {
@@ -31,7 +32,6 @@ import {
   removeClaudeName,
   validateSessionName,
 } from "../core/claude-sessions.ts";
-import { prViewerUrl } from "../core/graphite.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { lockLabel, lockStatus, tryAcquireLock } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
@@ -51,7 +51,7 @@ import {
   killShellSession,
   type SessionKind,
 } from "../core/tmux.ts";
-import { StatusKind } from "../core/types.ts";
+import { StatusKind, type PullRequest } from "../core/types.ts";
 import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, tmuxSessionsQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
 import { wtSessionUuid } from "../core/claude.ts";
@@ -547,7 +547,6 @@ export function App({ onExit }: Props) {
     refreshAll,
     refreshStale,
     refreshGithub,
-    refreshGraphite,
     refreshTmuxSessions,
     optimisticRemoveClaude,
     fetchContributors,
@@ -761,7 +760,7 @@ export function App({ onExit }: Props) {
   // ref still at its initial 0) deliberately biases toward worktree
   // rows so a fresh repo with pinned review-requests doesn't open with
   // the cursor parked on a PR — `p` / Enter there would silently open
-  // a Graphite tab the user wasn't aiming at.
+  // a PR in the browser the user wasn't aiming at.
   const lookupIndex =
     sel === null ? -1 : visualItems.findIndex((v) => visualKey(v) === sel);
   const cursorIndex = (() => {
@@ -2089,44 +2088,68 @@ export function App({ onExit }: Props) {
   }
 
   /**
-   * Arm Graphite's "merge when ready" via `gt submit -m`. No optimistic
-   * patch — we don't currently know which `mergeabilityStatus` value
-   * Graphite returns for an armed PR, so there's nothing to flip in the
-   * cache. The settling invalidate of the graphite query picks up the
-   * change on the next round-trip.
-   *
-   * One-way arm: there's no documented disarm path through `gt` or
-   * Graphite's API. The toast directs the user to the web UI for that.
+   * Toggle GitHub "merge when ready" (auto-merge) on the PR. `gh pr
+   * merge --auto` enqueues into the repo's merge queue when one is
+   * configured, or arms classic auto-merge otherwise; `--disable-auto`
+   * cancels it. Optimistically flips `pr.autoMerge` so the badge
+   * updates before the round-trip; the settling invalidate reconciles
+   * against the merge-method GitHub actually lands on.
    */
-  async function doMergeWhenReady(slug: string): Promise<void> {
+  async function doAutoMerge(
+    slug: string,
+    action: "enable" | "disable",
+  ): Promise<void> {
     const log = createLogger(slug);
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row?.pr) {
       toast("no PR for this row", theme.warn, 2000);
       return;
     }
-    const prNumber = row.pr.number;
-    const wtPath = row.wt.path;
-    // Graphite refuses `gt submit` on untracked branches; pre-emptively
-    // register the parent every time (idempotent). `stackedOn` is the
-    // auto-detected parent — if we have one, use it; otherwise the
-    // branch sits directly on trunk.
-    const parent = row.stackedOn?.branch ?? config.branch.base;
-    log.event.dim(`arming merge-when-ready for #${prNumber} (parent: ${parent})...`);
-    const result = await armMergeWhenReady(wtPath, parent);
-    if (!result.ok) {
-      log.event.err(`merge-when-ready failed for #${prNumber}: ${result.error}`);
-      toast(`merge-when-ready failed: ${result.error}`, theme.err, 4000);
+    if (action === "enable" && row.pr.autoMerge) {
+      toast("auto-merge already enabled", theme.info, 2000);
       return;
     }
-    log.event.ok(`armed merge-when-ready for #${prNumber}`);
-    toast(
-      `armed #${prNumber} · disarm at app.graphite.com`,
-      theme.ok,
-      4000,
-    );
-    void refreshGraphite();
-    void refreshGithub();
+    if (action === "disable" && !row.pr.autoMerge) {
+      toast("auto-merge not enabled", theme.info, 2000);
+      return;
+    }
+    const prNumber = row.pr.number;
+    const branch = row.wt.branch;
+    // Optimistic shape for enable: we don't know the merge method
+    // GitHub will land on (depends on repo settings), so seed a
+    // placeholder. The invalidate that fires on success replaces it
+    // with truth on the next refetch — what matters for UX is that
+    // the badge flips immediately.
+    const optimisticAutoMerge: PullRequest["autoMerge"] | null =
+      action === "enable"
+        ? { enabledAt: new Date().toISOString(), mergeMethod: "REBASE" }
+        : null;
+    try {
+      await mutate<GithubData>({
+        filter: { queryKey: ["github"] },
+        patch: (data) =>
+          patchPullRequest(data, branch, (pr) => ({
+            ...pr,
+            autoMerge: optimisticAutoMerge,
+          })),
+        run: async () => {
+          const result =
+            action === "enable"
+              ? await enableAutoMerge(prNumber)
+              : await disableAutoMerge(prNumber);
+          if (!result.ok) throw new Error(result.error);
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const verb = action === "enable" ? "auto-merge" : "disable auto-merge";
+      log.event.err(`${verb} failed for #${prNumber}: ${msg}`);
+      toast(`${verb} failed: ${msg}`, theme.err, 4000);
+      return;
+    }
+    const past = action === "enable" ? "enabled" : "disabled";
+    log.event.ok(`auto-merge ${past} for #${prNumber}`);
+    toast(`auto-merge ${past} for #${prNumber}`, theme.ok, 2500);
   }
 
   /**
@@ -3146,7 +3169,9 @@ export function App({ onExit }: Props) {
         } else if (pending === "d!" && current) {
           void doRemove(current.wt.slug, { force: true });
         } else if (pending === "m+" && current) {
-          void doMergeWhenReady(current.wt.slug);
+          void doAutoMerge(current.wt.slug, "enable");
+        } else if (pending === "m-" && current) {
+          void doAutoMerge(current.wt.slug, "disable");
         } else if (pending === "e" && current) {
           void doMarkReady(current.wt.slug);
         } else if (pending === "R") {
@@ -3762,16 +3787,9 @@ export function App({ onExit }: Props) {
     if (selectedPr) {
       const prLog = createLogger("[review]");
       if (isPlainLetter(k, "p") || k.name === "return") {
-        const url = prViewerUrl(selectedPr.url);
-        hideFrontmostAlacritty();
-        openUrl(url);
-        prLog.event.info(`opened review #${selectedPr.number}`);
-        return;
-      }
-      if (isPlainLetter(k, "o")) {
         hideFrontmostAlacritty();
         openUrl(selectedPr.url);
-        prLog.event.info(`opened review #${selectedPr.number} on GitHub`);
+        prLog.event.info(`opened review #${selectedPr.number}`);
         return;
       }
     }
@@ -3789,9 +3807,8 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no PR for this branch");
         return;
       }
-      const url = prViewerUrl(current.pr.url);
       hideFrontmostAlacritty();
-      openUrl(url);
+      openUrl(current.pr.url);
       rowLog.event.info(`opened PR #${current.pr.number}`);
       return;
     }
@@ -3901,14 +3918,22 @@ export function App({ onExit }: Props) {
         toast("PR is not open", theme.warn, 2000);
         return;
       }
-      // One-way arm: Graphite has no documented disarm path through
-      // gt or its API. Use app.graphite.com to disable once armed.
+      // Toggle: if already armed, the same key prompts to disable.
+      if (current.pr.autoMerge) {
+        setModal({
+          kind: "confirm",
+          pendingKey: "m-",
+          title: "disable auto-merge",
+          message: `Disable auto-merge for #${current.pr.number}?`,
+          confirmLabel: "disable",
+        });
+        return;
+      }
       setModal({
         kind: "confirm",
         pendingKey: "m+",
         title: "merge when ready",
         message: `Enable merge-when-ready for #${current.pr.number}?`,
-        detail: "One-way: disable later via app.graphite.com.",
         confirmLabel: "enable",
       });
       return;

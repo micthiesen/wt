@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 
-import { config } from "../../core/config.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import { STATE_DOT, STATE_FG } from "../claude-state.ts";
 import { NF } from "../icons.ts";
@@ -87,13 +86,7 @@ const SECTIONS: Section[] = [
   {
     title: "review requests (pinned section)",
     note: "PRs awaiting your review, pulled from GitHub. Not worktrees — only these keys apply.",
-    items: [
-      [
-        "p / ⏎",
-        `open in ${config.github.prViewer === "graphite" ? "Graphite" : "GitHub"}`,
-      ],
-      ["o", "open on GitHub"],
-    ],
+    items: [["p / ⏎", "open PR on GitHub"]],
   },
   {
     title: "outputs (bottom pane · per-worktree)",
@@ -138,10 +131,10 @@ const BADGES: [LegendGlyph, string, string][] = [
   [NF.checkPass, theme.ok, "CI checks passing"],
   [NF.checkFail, theme.err, "CI checks failing"],
   [NF.checkPend, theme.warn, "CI checks pending"],
-  [NF.mergeQueue, theme.ok, "mergeable (Graphite)"],
-  [NF.mergeQueue, theme.info, "queued to merge (Graphite)"],
-  [NF.mergeQueue, theme.warn, "unresolved comments (Graphite)"],
-  [NF.mergeQueue, theme.err, "required checks failing (Graphite)"],
+  [`${NF.mergeQueue} N`, theme.ok, "merge queue pos N · mergeable"],
+  [`${NF.mergeQueue} N`, theme.warn, "merge queue pos N · awaiting/queued"],
+  [`${NF.mergeQueue} N`, theme.err, "merge queue pos N · blocked"],
+  [NF.mergeQueue, theme.info, "auto-merge armed (waiting)"],
   [NF.bolt, theme.warn, "SST stage deployed"],
   [NF.comment, theme.ok, "Claude · `!` action running"],
   [

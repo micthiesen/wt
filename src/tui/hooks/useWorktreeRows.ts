@@ -9,11 +9,10 @@ import { lockAge, lockLabel } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
 import type { StackMap } from "../../core/stack.ts";
 import { slugLabel } from "../../core/stage.ts";
-import type { LockMeta, PullRequest, Status, Worktree } from "../../core/types.ts";
+import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
 import type { SyncState } from "../../core/worktree.ts";
-import type { MergeabilityEntry } from "../../core/graphite-api.ts";
-import { useGithub, useGraphite } from "../../state/hooks.ts";
+import { useGithub } from "../../state/hooks.ts";
 import { qk } from "../../state/keys.ts";
 import {
   aiSummaryQuery,
@@ -93,13 +92,12 @@ export type WorktreeRow = {
   status: Status;
   pr?: PullRequest;
   /**
-   * Graphite's per-PR block reason (`NEEDS_REVIEWERS`,
-   * `UNRESOLVED_COMMENTS`, `FAILING_REQUIRED`, …). Sourced from
-   * Graphite's private API via the same auth token `gt` uses. Absent
-   * when the PR is closed/merged, the API didn't return an entry, or
-   * the user hasn't authenticated `gt`.
+   * GitHub merge-queue entry for this worktree's branch, when the PR is
+   * enqueued. Carries the queue position + state. Absent when the
+   * branch isn't in the merge queue. Keyed off the github fetch's
+   * `mergeQueue` map by branch.
    */
-  mergeability?: MergeabilityEntry;
+  mq?: MergeQueueEntry;
   /**
    * Resolved stack parent. `null` for trunk-targeted worktrees. Drives
    * the diff base for `wtDiffContextQuery` (so the AI summary describes
@@ -251,7 +249,7 @@ function resolveStackedOn(
     };
   }
   // An open PR's base is the authoritative, auto-maintained parent:
-  // when the prior parent merges, GitHub/Graphite retarget the base
+  // when the prior parent merges, GitHub retargets the base
   // (to the grandparent, ultimately trunk). So when a PR exists, trust
   // its base completely and DON'T fall through to reflog detection — a
   // non-trunk base names the parent worktree; a trunk base is a positive
@@ -427,7 +425,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const qc = useQueryClient();
   const wtList = useQuery(worktreesQuery());
   const github = useGithub();
-  const graphite = useGraphite();
   const archive = useQuery(archiveQuery());
   const wtState = useQuery(wtStateQuery());
   const archivedSet = new Set(archive.data ?? []);
@@ -609,9 +606,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const nextStatus = deriveStatus(wt, fields);
     const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
     const pr = prsByIndex[i];
-    const mergeability = pr
-      ? graphite.data?.mergeability?.[pr.number]
-      : undefined;
+    const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
     const stackedOn = stackedOnByIndex[i] ?? null;
     // Include the combined GitHub fetch that feeds the details pane
     // so the row glyph lights up whenever anything visible for this
@@ -620,9 +615,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     // together during e.g. a refresh; intentional, since each row's
     // details pane would show the PR/merge-queue spinner.
     const anyFetching =
-      fieldArr.some((r) => r.isFetching) ||
-      github.isFetching ||
-      graphite.isFetching;
+      fieldArr.some((r) => r.isFetching) || github.isFetching;
     const archived = archivedSet.has(wt.slug);
     // Effective section: stack-managed override beats the stored
     // manual section. Archived rows skip the override so the archived
@@ -646,9 +639,9 @@ export function useWorktreeRows(): WorktreeRowsResult {
       commitTitle,
     );
     // After per-field reuse above, identity-equality on each `fields.X`,
-    // `status`, `pr`, `mergeability` plus primitives is sufficient —
-    // anything observable changing produces a fresh reference at one of
-    // those levels, which falls through to a new row.
+    // `status`, `pr`, `mq` plus primitives is sufficient — anything
+    // observable changing produces a fresh reference at one of those
+    // levels, which falls through to a new row.
     if (
       prev &&
       prev.wt === wt &&
@@ -662,7 +655,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.fields.gitActivity === fields.gitActivity &&
       prev.status === status &&
       prev.pr === pr &&
-      prev.mergeability === mergeability &&
+      prev.mq === mq &&
       prev.anyFetching === anyFetching &&
       prev.archived === archived &&
       prev.title === title &&
@@ -684,7 +677,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       fields,
       status,
       pr,
-      mergeability,
+      mq,
       stackedOn: stackedOnOut,
       anyFetching,
       archived,

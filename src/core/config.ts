@@ -42,24 +42,14 @@ export type LinearConfig = {
   workspace: string;
 };
 
-/**
- * Where the `p` / `⏎` PR-open keybind (and the yank menu's `r`) points.
- * `"graphite"` rewrites the github.com URL to its Graphite reskin;
- * `"github"` opens GitHub directly.
- */
-export type PrViewer = "github" | "graphite";
-export const PR_VIEWERS: readonly PrViewer[] = ["github", "graphite"];
-
 export type GithubConfig = {
   /**
    * Glob patterns matched against check context names (CheckRun.name /
    * StatusContext.context). Matching contexts are dropped from the PR
-   * checks rollup, so non-CI bots like CodeRabbit and Graphite don't
-   * flip the badge. Case-insensitive; `*` is the only wildcard.
+   * checks rollup, so non-CI bots like CodeRabbit don't flip the badge.
+   * Case-insensitive; `*` is the only wildcard.
    */
   ignoredChecks: readonly string[];
-  /** Which UI the PR-open keybind targets. Defaults to `"github"`. */
-  prViewer: PrViewer;
 };
 
 export type DiffConfig = {
@@ -470,7 +460,6 @@ function build(raw: Raw, errs: Errors): Config {
   const githubRaw = obj(raw.github);
   const github: GithubConfig = {
     ignoredChecks: strArr(githubRaw?.ignored_checks, []),
-    prViewer: errs.optEnum(githubRaw, "github", "pr_viewer", PR_VIEWERS, "github"),
   };
 
   // [[actions]] is fully replaced when the user provides any entries

@@ -112,15 +112,11 @@ import {
   contributorsQuery,
   fetchOriginQuery,
   githubQuery,
-  graphiteEnabled,
-  graphiteQuery,
   tmuxSessionsQuery,
   worktreesQuery,
   type GithubData,
-  type GraphiteData,
   type TmuxSessionsData,
 } from "./queries.ts";
-import { pickPrForWorktree } from "../core/github.ts";
 import type { Contributor } from "../core/types.ts";
 
 /**
@@ -172,32 +168,6 @@ export function useGithub(): UseQueryResult<GithubData, Error> {
       .sort();
   }, [wtList.data]);
   return useQuery(githubQuery(branches));
-}
-
-/**
- * Observe Graphite's mergeability fetch, scoped to the current set of
- * worktree PR numbers. PR numbers are derived from the github query so
- * a freshly-opened PR shows up automatically once `useGithub` resolves;
- * the call collapses to a no-op when no PRs exist or the token isn't
- * configured (the queryFn returns an empty map; the row aggregator
- * falls through to "no badge").
- */
-export function useGraphite(): UseQueryResult<GraphiteData, Error> {
-  const wtList = useQuery(worktreesQuery());
-  const github = useGithub();
-  const prNumbers = useMemo(() => {
-    const out: number[] = [];
-    for (const wt of wtList.data ?? []) {
-      if (wt.isMain) continue;
-      const pr = pickPrForWorktree(wt, github.data?.prs);
-      if (pr && pr.state === "OPEN") out.push(pr.number);
-    }
-    return out;
-  }, [wtList.data, github.data]);
-  return useQuery({
-    ...graphiteQuery(prNumbers),
-    enabled: graphiteEnabled(),
-  });
 }
 
 /**
@@ -432,14 +402,6 @@ export function useWtActions() {
         qc.invalidateQueries({ queryKey: ["github"] }),
         qc.invalidateQueries({ queryKey: qk.reviewRequests() }),
       ]);
-    },
-    /**
-     * Invalidate Graphite's mergeability cache. Call after a write that
-     * Graphite would observe (arming "merge when ready") so the badge
-     * picks up the new server-side state without waiting for staleTime.
-     */
-    async refreshGraphite(): Promise<void> {
-      await qc.invalidateQueries({ queryKey: ["graphite"] });
     },
     /**
      * Invalidate the tmux-sessions query. Call after entering or

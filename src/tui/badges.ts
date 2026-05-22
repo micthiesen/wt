@@ -29,7 +29,7 @@
  *    the row reads visually unbalanced. Prefer real shapes.
  *
  *    The list pane is intentionally different: it uses
- *    absence-as-signal for row badges (bolt, mergeability, prState,
+ *    absence-as-signal for row badges (bolt, merge-queue, prState,
  *    checks) so density stays high — most rows show a sparse
  *    cluster, blocked/active rows pop. The badge GLYPHS are
  *    shared with the details pane (rule #1), but the list omits

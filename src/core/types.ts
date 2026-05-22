@@ -72,6 +72,34 @@ export type LatestReview = {
   body: string;
 };
 
+export type AutoMergeMethod = "SQUASH" | "MERGE" | "REBASE";
+
+/**
+ * "Merge when ready" state. Populated when someone has enabled
+ * auto-merge on the PR and it's waiting on preconditions (CI, review,
+ * base-behind). Clears automatically once the PR enters the merge
+ * queue or merges. Mutually exclusive in practice with `MergeQueueEntry`.
+ */
+export type AutoMerge = {
+  enabledAt: string;
+  mergeMethod: AutoMergeMethod;
+};
+
+export type MergeQueueState =
+  | "AWAITING_CHECKS"
+  | "LOCKED"
+  | "MERGEABLE"
+  | "QUEUED"
+  | "UNMERGEABLE";
+
+export type MergeQueueEntry = {
+  headRefName: string;
+  position: number;
+  state: MergeQueueState;
+  enqueuedAt: string;
+  estimatedTimeToMerge: number | null;
+};
+
 export type PullRequest = {
   number: number;
   url: string;
@@ -97,6 +125,8 @@ export type PullRequest = {
   suggestedReviewers: readonly SuggestedReviewer[];
   /** CodeRabbit status — its own track, separate from human reviews. `none` when CR didn't run. */
   rabbit: RabbitStatus;
+  /** "Merge when ready" arming state. `null` when not enabled. */
+  autoMerge: AutoMerge | null;
   /**
    * Most recent submitted review with a non-empty body. `null` when
    * nobody has left a top-level review message yet. Comment-only and

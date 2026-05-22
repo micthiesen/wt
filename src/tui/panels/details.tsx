@@ -370,8 +370,8 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
  * Lite details body for a review-request PR. Not a worktree — no local
  * checkout, no per-slug sources, no AI summary pipeline. Renders the
  * minimum surface that's already in the PR search payload: title,
- * author, repo, draft/ready, CI rollup, and age. `p` opens it in
- * Graphite from the parent; this pane is read-only.
+ * author, repo, draft/ready, CI rollup, and age. `p` opens it on
+ * GitHub from the parent; this pane is read-only.
  */
 function ReviewRequestBody({
   pr,
