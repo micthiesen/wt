@@ -77,7 +77,6 @@ type Props = {
    */
   stackSectionLabels: ReadonlyMap<string, string>;
   isLoading: boolean;
-  filter: string;
 };
 
 /**
@@ -150,9 +149,12 @@ function badgeClusterCells(
   if (refreshing) cells += 2;
   if (rabbitHint(row)) cells += 2;
   if (reviewHint(row)) cells += 2;
-  if (row.pr) cells += 2;
-  if (showChecks) cells += 2;
+  // The PR-state slot doubles as the merge-queue slot: a queued PR
+  // swaps the PR glyph for the mq indicator and the slot widens to 4
+  // (icon + space + position digit); otherwise it's the 2-cell PR icon.
   if (row.mq) cells += 4;
+  else if (row.pr) cells += 2;
+  if (showChecks) cells += 2;
   if (isDeployed) cells += 2;
   return cells;
 }
@@ -178,13 +180,14 @@ function mqColor(state: MergeQueueState): string {
 
 /**
  * "<mq-glyph> N" for a merge-queue position: nerd-font merge-queue
- * octicon + 1-based position (`+` if there are ≥10 ahead). Empty
- * placeholder fills the 4-cell slot (2-cell icon + 1-cell space +
- * 1-cell digit) so the cluster stays aligned when no entry exists.
+ * octicon + 1-based position (`+` if there are ≥10 ahead). Rendered in
+ * place of the PR-state glyph when the PR is queued, so the slot widens
+ * to 4 cells (2-cell icon + 1-cell space + 1-cell digit). Only called
+ * when `row.mq` exists; the empty fallback is defensive.
  */
 function mqGlyph(row: WorktreeRow): string {
   const mq = row.mq;
-  if (!mq) return "    ";
+  if (!mq) return "";
   const pos = mq.position;
   const digit = pos >= 10 ? "+" : String(pos);
   return `${NF.mergeQueue} ${digit}`;
@@ -339,8 +342,10 @@ const RowView = memo(function RowView({
           right-aligned. Each badge sits in an explicit-width box so
           opentui's flex layout reserves the right number of buffer
           cells regardless of whether `Bun.stringWidth` and the native
-          renderer agree on the icon's width. PR/CI/deploy are 2-cell
-          icons → width=2; MQ has a space between icon and digit → 4.
+          renderer agree on the icon's width. CI/deploy are 2-cell
+          icons → width=2. The PR-state slot doubles as the merge-queue
+          slot: a queued PR swaps the PR glyph for the mq indicator and
+          the slot widens to 4 (icon + space + position digit).
           The leading 2-space gap visually separates the cluster from
           the slug, mirroring the gap after the status marker. The
           whole cluster is omitted when no badges are present so the
@@ -400,7 +405,15 @@ const RowView = memo(function RowView({
               <text fg={reviewFg}>{review.glyph}</text>
             </box>
           ) : null}
-          {row.pr ? (
+          {/* PR-state slot, doubling as the merge-queue slot: a queued
+              PR shows the mq indicator (icon + position) in place of the
+              PR glyph, widening to 4 cells. mq wins over the stack-parent
+              "↑" hint — being in the queue is the louder signal. */}
+          {row.mq ? (
+            <box width={4} flexShrink={0}>
+              <text fg={mqFg}>{mqText}</text>
+            </box>
+          ) : row.pr ? (
             <box width={2} flexShrink={0}>
               <text fg={prFg}>
                 {stackParentAbove ? NF.anglesUp : prb.glyph}
@@ -410,11 +423,6 @@ const RowView = memo(function RowView({
           {showChecks ? (
             <box width={2} flexShrink={0}>
               <text fg={checkFg}>{c.glyph}</text>
-            </box>
-          ) : null}
-          {row.mq ? (
-            <box width={4} flexShrink={0}>
-              <text fg={mqFg}>{mqText}</text>
             </box>
           ) : null}
         </box>
@@ -537,7 +545,7 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiLiveHarnessBySlug, aiStateBySlug, stackSectionLabels, isLoading, filter }: Props) {
+export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiLiveHarnessBySlug, aiStateBySlug, stackSectionLabels, isLoading }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -582,10 +590,6 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
         <box padding={1}>
           {isLoading ? (
             <text fg={theme.fgDim}>Loading worktrees...</text>
-          ) : filter ? (
-            <text fg={theme.fgDim}>
-              No matches for <span fg={theme.fg}>/{filter}</span>
-            </text>
           ) : (
             <>
               <text fg={theme.fgDim}>No worktrees.</text>

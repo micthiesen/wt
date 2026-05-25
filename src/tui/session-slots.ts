@@ -1,7 +1,8 @@
 /**
  * Session slots — non-worktree projects we host an AI harness session
- * for. Two instances today: the wt source repo itself (`,` keybind)
- * and the configured `paths.main_clone` (`.` keybind).
+ * for. Three instances today: the wt source repo itself (`,` keybind),
+ * the configured `paths.main_clone` (`.` keybind), and the user's
+ * dotfiles (`/` keybind).
  *
  * Slots reuse all the harness / tmux / session-tail machinery a
  * worktree row uses. They differ in that they don't appear in the
@@ -17,8 +18,8 @@
  * ordered so a real row's path wins on tie.
  *
  * Consumers:
- *  - `tui/app.tsx` — `,` / `.` keybind handlers enter the slot via
- *    `enterHarnessSession` with the slot's path as `cwd`, picking
+ *  - `tui/app.tsx` — `,` / `.` / `/` keybind handlers enter the slot
+ *    via `enterHarnessSession` with the slot's path as `cwd`, picking
  *    the TAB-cycled primary harness so the choice mirrors a row's
  *    F12 default.
  *  - `tui/runtime.tsx` — the startup orphan reaper whitelists
@@ -29,6 +30,9 @@
  *  - `tui/app.tsx`'s session-tail reconcile effect — adds slot paths
  *    to `pathBySlug` so a slot's live claude session gets a tailer.
  */
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { config } from "../core/config.ts";
 import { WT_SOURCE_SLUG } from "../core/tmux.ts";
 
@@ -71,6 +75,18 @@ export const MAIN_CLONE_SLOT: SessionSlot = {
 };
 
 /**
+ * Slot for the user's dotfiles. Backs the `/` keybind. General-purpose
+ * config-editing session; `~/.dotfiles` is the actual git repo, so the
+ * slot's harness lands in a versioned tree (cwd doesn't fence the
+ * harness in — it can still touch `~/.config/...` by absolute path).
+ */
+export const DOTFILES_SLOT: SessionSlot = {
+  slug: "dotfiles",
+  path: join(homedir(), ".dotfiles"),
+  label: "dotfiles",
+};
+
+/**
  * Every registered slot in display order. Iterated by the session-
  * tail reconcile (to map slot slugs to paths) and the orphan reaper
  * (to whitelist slot slugs).
@@ -78,6 +94,7 @@ export const MAIN_CLONE_SLOT: SessionSlot = {
 export const SESSION_SLOTS: readonly SessionSlot[] = [
   WT_SOURCE_SLOT,
   MAIN_CLONE_SLOT,
+  DOTFILES_SLOT,
 ];
 
 /** Convenience projection — just the slugs, for set membership tests. */

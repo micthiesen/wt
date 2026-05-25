@@ -119,6 +119,7 @@ import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
 import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard } from "./helpers.ts";
 import {
+  DOTFILES_SLOT,
   MAIN_CLONE_SLOT,
   SESSION_SLOTS,
   WT_SOURCE_SLOT,
@@ -235,7 +236,7 @@ function printableText(sequence: string | undefined): string {
 /**
  * Like `printableText`, but preserves `\n` and `\t` so multi-line code
  * snippets paste cleanly into the action-edit textarea — single-line
- * filter / new-worktree / rename inputs still use `printableText`.
+ * new-worktree / rename inputs still use `printableText`.
  */
 function printableMultiline(sequence: string | undefined): string {
   if (!sequence) return "";
@@ -575,7 +576,8 @@ export function App({ onExit }: Props) {
   // Cursor is tracked by slug, not index. Slug identity survives row
   // moves (archive, section change, manual reorder) without any
   // explicit "follow this row" plumbing — the visual index falls out
-  // of `filteredRows.findIndex(r.slug === sel)` on each render. When
+  // of `visualItems.findIndex(v => visualKey(v) === sel)` on each
+  // render. When
   // the selected slug disappears (destroy), `lastIndexRef` snaps the
   // cursor to the row that took its place rather than jumping to the
   // top of the list.
@@ -588,7 +590,6 @@ export function App({ onExit }: Props) {
   // items, slug context) lives on its variant. The keyboard handler
   // and JSX both `switch` on `modal.kind`.
   const [modal, setModal] = useState<Modal | null>(null);
-  const [filter, setFilter] = useState("");
   // Last section the user moved a row into. Used to default the
   // section-picker cursor — the common case is "moving several
   // adjacent worktrees into the same section", and re-aiming on
@@ -605,8 +606,8 @@ export function App({ onExit }: Props) {
   // restores that worktree's last selection — so monitoring an
   // action on one slug and a CC session on another stays mutually
   // independent. The `__no_row__` bucket covers the "nothing
-  // selected" edge (filter excludes everything, brand-new repo) and
-  // pins down what the global pane shows there.
+  // selected" edge (brand-new repo, no rows yet) and pins down what
+  // the global pane shows there.
   const [slugFocus, setSlugFocus] = useState<Record<string, SlugFocus>>({});
   const toastTimer = useRef<Timer | null>(null);
 
@@ -642,27 +643,14 @@ export function App({ onExit }: Props) {
     }
     const clean = printableText(text);
     if (!clean) return;
-    if (footer.kind === "filter") {
-      const next = footer.value + clean;
-      setFooter({ kind: "filter", value: next });
-      setFilter(next);
-      setSel(null);
-    } else if (footer.kind === "input") {
+    if (footer.kind === "input") {
       setFooter({ ...footer, value: footer.value + clean });
     }
   });
 
-  const filteredRows = useMemo(() => {
-    const needle = filter.trim().toLowerCase();
-    if (!needle) return rows;
-    return rows.filter((r) => r.wt.slug.toLowerCase().includes(needle));
-  }, [rows, filter]);
-
-  // Stack section AI title pipeline. Filter against `rows` (not
-  // `filteredRows`) so a `/`-filter narrowing the visible set doesn't
-  // make a section's title flicker — the title describes membership,
-  // not what's currently on screen. Members preserve `rows` order
-  // (chain depth from the row aggregator).
+  // Stack section AI title pipeline. The title describes section
+  // membership, so it reads from `rows` directly. Members preserve
+  // `rows` order (chain depth from the row aggregator).
   const stackSectionMembers = useMemo((): Map<string, StackMember[]> => {
     const byName = new Map<string, StackMember[]>();
     for (const r of rows) {
@@ -720,15 +708,12 @@ export function App({ onExit }: Props) {
   );
 
   // Review-requested PRs are a pinned section at the bottom of the
-  // list. Filter is intentionally a no-op for them: the `/` filter
-  // narrows by slug, and these aren't worktrees with slugs. Hiding
-  // the section while a filter is active matches the user mental
-  // model — `/foo` is "show me my work matching foo", PRs awaiting my
-  // review are explicitly not my work.
+  // list. Not worktrees (no slug, no per-slug state) so they render
+  // through a stripped-down row component.
   const reviewRequests = useQuery(reviewRequestsQuery());
   const reviewRequestRows = useMemo<readonly ReviewRequestPr[]>(
-    () => (filter.trim() === "" ? reviewRequests.data ?? [] : []),
-    [reviewRequests.data, filter],
+    () => reviewRequests.data ?? [],
+    [reviewRequests.data],
   );
 
   // Unified cursor space: active wts → review-request PRs → archived
@@ -742,18 +727,18 @@ export function App({ onExit }: Props) {
   const visualItems = useMemo<VisualItem[]>(() => {
     const active: VisualItem[] = [];
     const archived: VisualItem[] = [];
-    for (const r of filteredRows) {
+    for (const r of rows) {
       (r.archived ? archived : active).push({ kind: "wt", row: r });
     }
     const prs: VisualItem[] = reviewRequestRows.map((pr) => ({ kind: "pr", pr }));
     return [...active, ...prs, ...archived];
-  }, [filteredRows, reviewRequestRows]);
+  }, [rows, reviewRequestRows]);
 
   const visualKey = (item: VisualItem): string =>
     item.kind === "wt" ? item.row.wt.slug : `pr:${item.pr.url}`;
 
   // Resolve the selected key to a visual index. When the key isn't in
-  // the current visible set (destroyed, filtered out, never set), fall
+  // the current visible set (destroyed, never set), fall
   // back to the last known visual index, clamped to the new length.
   // That fallback is what makes "destroy the selected row" land the
   // cursor on the row that took its place. Cold launch (`sel === null`,
@@ -1363,10 +1348,6 @@ export function App({ onExit }: Props) {
       toast("stack section is auto-managed", theme.fgDim, 1500);
       return;
     }
-    if (filter) {
-      toast("clear filter to reorder", theme.warn, 1500);
-      return;
-    }
     const active = rows.filter((r) => !r.archived);
     const idx = active.indexOf(current);
     if (idx < 0) return;
@@ -1437,10 +1418,6 @@ export function App({ onExit }: Props) {
       toast("unsectioned rows are pinned to the top", theme.fgDim, 1500);
       return;
     }
-    if (filter) {
-      toast("clear filter to reorder sections", theme.warn, 1500);
-      return;
-    }
     const name = current.section;
     appLog.event.dim(`moveSection enter name="${name}" dir=${dir}`);
     moveSection(name, dir).then(
@@ -1462,10 +1439,6 @@ export function App({ onExit }: Props) {
     if (!current) return;
     if (current.archived) {
       toast("archived rows don't have a section context, use `a` to restore", theme.fgDim, 2000);
-      return;
-    }
-    if (filter) {
-      toast("clear filter to set section", theme.warn, 1500);
       return;
     }
     const items = buildSectionItems(current);
@@ -1541,10 +1514,6 @@ export function App({ onExit }: Props) {
    */
   function openSectionRename(): void {
     if (!current || current.archived) return;
-    if (filter) {
-      toast("clear filter to rename", theme.warn, 1500);
-      return;
-    }
     if (current.section === null) {
       toast("cursor is in (none), nothing to rename", theme.fgDim, 1500);
       return;
@@ -2442,7 +2411,7 @@ export function App({ onExit }: Props) {
         }
         if (k.name === "backspace") {
           // Backspace on empty input pops back to list mode — matches
-          // the filter / new-worktree input convention.
+          // the new-worktree input convention.
           if (sp.newName.length === 0) {
             setModal({ ...sp, newName: null });
             return;
@@ -2882,7 +2851,7 @@ export function App({ onExit }: Props) {
     // same chars `validateSessionName` accepts plus backspace; Enter
     // commits, esc pops back to list, Ctrl+C closes the modal,
     // backspace-on-empty pops back to list (parity with the section
-    // picker newName mode and the global filter). Empty input on
+    // picker newName mode). Empty input on
     // Enter spawns with the auto-numbered name (next free integer
     // ≥ 2).
     if (modal?.kind === "claudeSessionsNew") {
@@ -3191,43 +3160,6 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Filter mode: typing live-narrows the list.
-    if (footer.kind === "filter") {
-      if (k.name === "escape" || (k.ctrl && k.name === "c")) {
-        setFilter("");
-        setFooter({ kind: "legend" });
-        setSel(null);
-        return;
-      }
-      if (k.name === "return") {
-        setFooter({ kind: "legend" });
-        return;
-      }
-      if (k.name === "backspace") {
-        // Backspace on an empty filter exits filter mode, matching the
-        // "one more delete cancels" convention.
-        if (footer.value.length === 0) {
-          setFilter("");
-          setFooter({ kind: "legend" });
-          setSel(null);
-          return;
-        }
-        const next = footer.value.slice(0, -1);
-        setFooter({ kind: "filter", value: next });
-        setFilter(next);
-        setSel(null);
-        return;
-      }
-      const text = printableText(k.sequence);
-      if (text) {
-        const next = footer.value + text;
-        setFooter({ kind: "filter", value: next });
-        setFilter(next);
-        setSel(null);
-      }
-      return;
-    }
-
     // Input mode: typing into the new-worktree prompt or the
     // rename-section prompt — `purpose` discriminates which.
     if (footer.kind === "input") {
@@ -3277,16 +3209,8 @@ export function App({ onExit }: Props) {
     }
 
     // Normal mode.
-    if (k.name === "escape" && filter) {
-      setFilter("");
-      setSel(null);
-      return;
-    }
     // Escape clears this worktree's explicit focus so the bottom
-    // pane returns to follow-row auto-rules. Filter-clear above
-    // takes precedence; both can apply but they're disjoint states
-    // (filter edits set the filter; output focus is per-slug
-    // bucket), so the order is fine.
+    // pane returns to follow-row auto-rules.
     if (k.name === "escape" && focusBucket.focused) {
       setFocus(currentSlug ?? null, { focused: null });
       return;
@@ -3438,10 +3362,6 @@ export function App({ onExit }: Props) {
     }
     if (k.sequence === "?") {
       setModal({ kind: "help" });
-      return;
-    }
-    if (k.sequence === "/") {
-      setFooter({ kind: "filter", value: filter });
       return;
     }
     if (k.sequence === "r") {
@@ -3774,6 +3694,10 @@ export function App({ onExit }: Props) {
       doEnterSlotSession(MAIN_CLONE_SLOT);
       return;
     }
+    if (k.sequence === "/") {
+      doEnterSlotSession(DOTFILES_SLOT);
+      return;
+    }
     if (k.sequence === ">") {
       openInZed(WT_SOURCE_SLOT.path);
       wtSourceLog.event.info(`opened ${WT_SOURCE_SLOT.path}`);
@@ -3992,10 +3916,9 @@ export function App({ onExit }: Props) {
 
   const footerHint = useMemo(() => {
     const parts: string[] = [];
-    if (filter) parts.push(`/${filter} (${filteredRows.length}/${rows.length})`);
     if (activeTails.size > 0) parts.push(`tailing ${activeTails.size}`);
     return parts.length > 0 ? parts.join(" · ") : undefined;
-  }, [filter, filteredRows.length, rows.length, activeTails.size]);
+  }, [activeTails.size]);
 
   return (
     <box flexDirection="column" width={width} height={height} backgroundColor={theme.bg}>
@@ -4017,7 +3940,7 @@ export function App({ onExit }: Props) {
       </box>
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList
-          rows={filteredRows}
+          rows={rows}
           reviewRequests={reviewRequestRows}
           selectedIndex={cursorIndex}
           width={listWidth}
@@ -4027,7 +3950,6 @@ export function App({ onExit }: Props) {
           aiStateBySlug={aiStateBySlug}
           stackSectionLabels={stackSectionLabels}
           isLoading={isLoading}
-          filter={filter}
         />
         <Details
           row={current}

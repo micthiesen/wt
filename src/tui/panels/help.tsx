@@ -24,8 +24,6 @@ const SECTIONS: Section[] = [
       ["k / ↑", "up"],
       ["g", "top"],
       ["G", "bottom"],
-      ["/", "filter list"],
-      ["esc", "clear filter"],
     ],
   },
   {
@@ -78,6 +76,7 @@ const SECTIONS: Section[] = [
       ["^R", "clear all cached data"],
       [",", "enter wt source session · F12 to detach"],
       [".", "enter main repo session · F12 to detach"],
+      ["/", "enter dotfiles session · F12 to detach"],
       [">", "open wt source in zed"],
       ["?", "toggle this help"],
       ["q / ^C", "quit"],

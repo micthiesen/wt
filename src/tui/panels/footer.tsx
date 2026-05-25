@@ -11,7 +11,11 @@ import { claudeRegistryQuery } from "../../state/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
 import { STATE_FG } from "../claude-state.ts";
 import { useSessionRun } from "../hooks/useSessionRun.ts";
-import { MAIN_CLONE_SLOT, WT_SOURCE_SLOT } from "../session-slots.ts";
+import {
+  DOTFILES_SLOT,
+  MAIN_CLONE_SLOT,
+  WT_SOURCE_SLOT,
+} from "../session-slots.ts";
 import { theme } from "../theme.ts";
 
 /** Claude Code robot glyph, reused from the harness registry so the
@@ -33,8 +37,7 @@ export type FooterMode =
        * text overrides this.
        */
       base?: string;
-    }
-  | { kind: "filter"; value: string };
+    };
 
 type Props = {
   mode: FooterMode;
@@ -66,10 +69,13 @@ function slotGlyphFg(state: DerivedState | null): string {
 }
 
 export function Footer({ mode, hint }: Props) {
-  // The wt-source slot (`,`) gets a permanent status robot pinned to the
-  // far right with no label — it's the only marker out there, so it reads
-  // unambiguously as "the other session". Color tracks its live state.
+  // The two tail-less session slots (`,` wt-source and `/` dotfiles) get
+  // permanent status robots bundled at the far right — wt-source first,
+  // dotfiles to its right. No labels: position is the discriminator (the
+  // main-clone slot is represented separately by its tail on the left).
+  // Each robot's color tracks that slot's live state.
   const wtState = useSlotState(WT_SOURCE_SLOT.path);
+  const dotfilesState = useSlotState(DOTFILES_SLOT.path);
   return (
     <box
       flexShrink={0}
@@ -97,26 +103,19 @@ export function Footer({ mode, hint }: Props) {
             <text fg={theme.fgDim}> (⏎ submit, esc cancel)</text>
           </>
         ) : null}
-        {mode.kind === "filter" ? (
-          <>
-            <text>
-              <span fg={theme.accent} attributes={1}>
-                /
-              </span>
-              <span fg={theme.fgBright}>{mode.value}</span>
-              <span fg={theme.accent}>█</span>
-            </text>
-            <text fg={theme.fgDim}> (⏎ apply, esc clear)</text>
-          </>
-        ) : null}
       </box>
       {hint ? (
         <box flexShrink={0} flexDirection="row">
           <text fg={theme.fgDim}>{hint}</text>
         </box>
       ) : null}
-      <box flexShrink={0} marginLeft={1}>
-        <text fg={slotGlyphFg(wtState)}>{CLAUDE_GLYPH}</text>
+      <box flexShrink={0} marginLeft={1} flexDirection="row">
+        <box width={2} flexShrink={0}>
+          <text fg={slotGlyphFg(wtState)}>{CLAUDE_GLYPH}</text>
+        </box>
+        <box width={2} flexShrink={0}>
+          <text fg={slotGlyphFg(dotfilesState)}>{CLAUDE_GLYPH}</text>
+        </box>
       </box>
     </box>
   );
