@@ -87,8 +87,17 @@ const log = createLogger("[session-tail]");
 /** Debounce window for refresh triggers. See block comment above. */
 const TRIGGER_DEBOUNCE_MS = 3_000;
 
+/** Tighter window for the per-slug "this jsonl moved" sink. The 80ms
+ *  read-debounce already coalesces FSEvents bursts at the file level;
+ *  this just collapses a turn's worth of appends into one invalidation
+ *  pass so `wtClaudeQuery` (ages, queue counts) snaps on turn end
+ *  instead of drifting up to its 5s poll. */
+const SLUG_CHANGE_DEBOUNCE_MS = 500;
+
 let triggerSink: ((target: RefreshTarget) => void) | null = null;
 const triggerTimers = new Map<RefreshTarget, ReturnType<typeof setTimeout>>();
+let slugChangeSink: ((slug: string) => void) | null = null;
+const slugChangeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /**
  * Register the refresh-trigger sink. The TUI runtime wires this to the
@@ -108,6 +117,24 @@ export function setSessionTriggerSink(
 }
 
 /**
+ * Register the per-slug claude-jsonl-moved sink. Fires (debounced) when
+ * any live session jsonl for that slug grows — the runtime invalidates
+ * `qk.wt(slug).claude()` so the row's last-activity age and queue count
+ * snap on turn end. Scoped to one slug; the broader `["github"]` &c
+ * still come through `setSessionTriggerSink` only when the parser spots
+ * a `gh`/`git` Bash call.
+ */
+export function setSessionSlugChangeSink(
+  fn: ((slug: string) => void) | null,
+): void {
+  slugChangeSink = fn;
+  if (!fn) {
+    for (const t of slugChangeTimers.values()) clearTimeout(t);
+    slugChangeTimers.clear();
+  }
+}
+
+/**
  * Debounced per-target dispatch. Resets the timer on every hit, so a
  * burst collapses to a single refresh `TRIGGER_DEBOUNCE_MS` after the
  * last trigger.
@@ -122,6 +149,19 @@ function scheduleTrigger(target: RefreshTarget): void {
       log.debug("refresh trigger fired", { target });
       triggerSink?.(target);
     }, TRIGGER_DEBOUNCE_MS),
+  );
+}
+
+function scheduleSlugChange(slug: string): void {
+  if (!slugChangeSink) return;
+  const existing = slugChangeTimers.get(slug);
+  if (existing) clearTimeout(existing);
+  slugChangeTimers.set(
+    slug,
+    setTimeout(() => {
+      slugChangeTimers.delete(slug);
+      slugChangeSink?.(slug);
+    }, SLUG_CHANGE_DEBOUNCE_MS),
   );
 }
 
@@ -511,6 +551,11 @@ class SessionTailRegistry {
         scheduleTrigger(target);
       }
     }
+    // The jsonl grew — `claudeStatus` reads it directly for the row's
+    // last-activity age + queue count, so a slug-scoped invalidation
+    // here snaps the badge on turn end regardless of whether the line
+    // produced a UI-visible emit (system events, queue-ops, etc).
+    scheduleSlugChange(st.slug);
     if (emits.length === 0) return;
     this.update(key, (r) => {
       let next: ActionLine[] = r.lines.slice();

@@ -13,6 +13,7 @@ import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
 import {
   sessionTailRegistry,
+  setSessionSlugChangeSink,
   setSessionTriggerSink,
 } from "../core/session-tail.ts";
 import { WorktreeWatchSet, watchRefs } from "../core/repo-watch.ts";
@@ -188,6 +189,16 @@ export async function runTui(): Promise<TuiExit> {
       ]).catch(() => {});
     }
   });
+  // The session tail already watches every live claude jsonl for the
+  // activity pane; this sink piggybacks on it to invalidate just the
+  // affected slug's claude query so the row's last-activity age + queue
+  // count snap on turn end instead of waiting out the 5s poll. Scoped
+  // tightly — only `qk.wt(slug).claude()`, nothing global.
+  setSessionSlugChangeSink((slug) => {
+    wtClient.client
+      .invalidateQueries({ queryKey: qk.wt(slug).claude() })
+      .catch(() => {});
+  });
 
   // Evict orphaned cache entries whose key shape changed across a wt
   // upgrade. Without this, an entry persisted under an old key sits in
@@ -244,6 +255,7 @@ export async function runTui(): Promise<TuiExit> {
     // torn-down client (the `.catch(() => {})` on the sink only papers
     // over it).
     setSessionTriggerSink(null);
+    setSessionSlugChangeSink(null);
     wtClient.shutdown();
     // Close the harness-owned read handles (opencode's read-only
     // SQLite handle is the only one today). No-op for harnesses
