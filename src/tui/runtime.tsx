@@ -5,6 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
+import { config } from "../core/config.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { startCodexEventPolling } from "../core/harness/codex-events.ts";
 import { startOpencodeEventPolling } from "../core/harness/opencode-events.ts";
@@ -14,6 +15,7 @@ import {
   sessionTailRegistry,
   setSessionTriggerSink,
 } from "../core/session-tail.ts";
+import { WorktreeWatchSet, watchRefs } from "../core/repo-watch.ts";
 import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
 import { reapOrphanedSessions } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
@@ -96,6 +98,43 @@ export async function runTui(): Promise<TuiExit> {
       .invalidateQueries({ queryKey: qk.claudeRegistry() })
       .catch(() => {});
   });
+  // Local git activity → query invalidations. Coarse refs watcher fires
+  // on commits, fetches, pushes, branch creates/deletes (anything that
+  // touches `<main>/.git/refs/`). Per-worktree dir watchers fire on
+  // working-tree edits and flip the dirty badge without waiting for
+  // staleTime. Active observers refetch; cold queries stay cold.
+  const stopRefsWatch = watchRefs(config.paths.mainClone, () => {
+    Promise.all([
+      wtClient.client.invalidateQueries({ queryKey: ["github"] }),
+      wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
+      wtClient.client.invalidateQueries({ queryKey: ["wt"] }),
+      wtClient.client.invalidateQueries({ queryKey: ["stack"] }),
+    ]).catch(() => {});
+  });
+  const worktreeWatchSet = new WorktreeWatchSet((slug) => {
+    wtClient.client
+      .invalidateQueries({ queryKey: qk.wt(slug).dirty() })
+      .catch(() => {});
+  });
+  // Reconcile the per-worktree watcher set against the worktrees query.
+  // Skip `isMain` — the main clone's tree is heavy (node_modules) and
+  // the user works in worktrees, not trunk. Subscribe first so we never
+  // miss a `set` event, then reconcile against the current cache for
+  // the boot case where the persister already restored data.
+  const reconcileWatchers = (wts: readonly Worktree[] | undefined): void => {
+    if (!wts) return;
+    worktreeWatchSet.reconcile(
+      wts
+        .filter((w) => !w.isMain && w.path)
+        .map((w) => ({ slug: w.slug, path: w.path })),
+    );
+  };
+  const unsubWorktrees = wtClient.client.getQueryCache().subscribe((event) => {
+    if (event.type !== "updated") return;
+    if (event.query.queryKey[0] !== "worktrees") return;
+    reconcileWatchers(event.query.state.data as Worktree[] | undefined);
+  });
+  reconcileWatchers(wtClient.client.getQueryData<Worktree[]>(qk.worktrees()));
   // Wait briefly for the SQLite cache to hydrate so the first paint
   // shows stale data instead of empty. If hydration takes longer than
   // the budget we render anyway and it'll swap in when ready. Reap
@@ -192,6 +231,9 @@ export async function runTui(): Promise<TuiExit> {
     }
     detachFetchLogs();
     stopRegistryWatch();
+    stopRefsWatch();
+    unsubWorktrees();
+    worktreeWatchSet.dispose();
     stopCodexEvents();
     stopOpencodeEvents();
     setEventSink(null);
