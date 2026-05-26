@@ -50,6 +50,12 @@ export type GithubConfig = {
    * Case-insensitive; `*` is the only wildcard.
    */
   ignoredChecks: readonly string[];
+  /**
+   * GitHub login requested by the `E` ("ship it") chord, which marks
+   * the PR ready, requests this reviewer, and arms auto-merge in one
+   * keystroke. Null disables the reviewer-request leg of the chord.
+   */
+  defaultReviewer: string | null;
 };
 
 export type DiffConfig = {
@@ -460,6 +466,7 @@ function build(raw: Raw, errs: Errors): Config {
   const githubRaw = obj(raw.github);
   const github: GithubConfig = {
     ignoredChecks: strArr(githubRaw?.ignored_checks, []),
+    defaultReviewer: errs.optStrOrNull(githubRaw, "default_reviewer"),
   };
 
   // [[actions]] is fully replaced when the user provides any entries

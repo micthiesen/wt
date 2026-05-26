@@ -2122,6 +2122,136 @@ export function App({ onExit }: Props) {
   }
 
   /**
+   * One-keystroke "ship it" (`E`): mark the PR ready, request
+   * `config.github.defaultReviewer` if set, and arm auto-merge — in
+   * the right order so GitHub doesn't reject the chain. Mark-ready
+   * and reviewer-request run in parallel (no dependency); auto-merge
+   * awaits mark-ready since `gh pr merge --auto` rejects drafts.
+   * Each leg is idempotent: a re-press after partial failure only
+   * re-runs the still-pending legs.
+   */
+  async function doShipPr(slug: string): Promise<void> {
+    const log = createLogger(slug);
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row?.pr) {
+      toast("no PR for this row", theme.warn, 2000);
+      return;
+    }
+    if (row.pr.state !== "OPEN") {
+      toast("PR is not open", theme.warn, 2000);
+      return;
+    }
+    const prNumber = row.pr.number;
+    const branch = row.wt.branch;
+    const wasDraft = row.pr.isDraft;
+    const reviewerToAdd =
+      config.github.defaultReviewer &&
+      !row.pr.requestedReviewers.includes(config.github.defaultReviewer)
+        ? config.github.defaultReviewer
+        : null;
+    const needsAutoMerge = !row.pr.autoMerge;
+
+    if (!wasDraft && !reviewerToAdd && !needsAutoMerge) {
+      toast(`#${prNumber} already shipped`, theme.info, 2000);
+      return;
+    }
+    const steps: string[] = [];
+    if (wasDraft) steps.push("mark ready");
+    if (reviewerToAdd) steps.push(`request ${reviewerToAdd}`);
+    if (needsAutoMerge) steps.push("arm auto-merge");
+    log.event.info(`ship #${prNumber}: ${steps.join(" + ")}`);
+
+    const markReadyP: Promise<unknown> = wasDraft
+      ? mutate<GithubData>({
+          filter: { queryKey: ["github"] },
+          patch: (data) =>
+            patchPullRequest(data, branch, (pr) => ({ ...pr, isDraft: false })),
+          run: async () => {
+            const r = await markPullRequestReady(prNumber);
+            if (!r.ok) throw new Error(r.error);
+          },
+        })
+      : Promise.resolve();
+    const reviewerP: Promise<unknown> = reviewerToAdd
+      ? mutate<GithubData>({
+          filter: { queryKey: ["github"] },
+          patch: (data) =>
+            patchPullRequest(data, branch, (pr) => ({
+              ...pr,
+              requestedReviewers: [...pr.requestedReviewers, reviewerToAdd],
+              reviewRequests: pr.reviewRequests + 1,
+            })),
+          run: async () => {
+            const r = await editReviewers(prNumber, {
+              add: [reviewerToAdd],
+              remove: [],
+            });
+            if (!r.ok) throw new Error(r.error);
+          },
+        })
+      : Promise.resolve();
+
+    const [readyRes, reviewerRes] = await Promise.allSettled([
+      markReadyP,
+      reviewerP,
+    ]);
+
+    if (readyRes.status === "rejected") {
+      const msg =
+        readyRes.reason instanceof Error
+          ? readyRes.reason.message
+          : String(readyRes.reason);
+      log.event.err(`mark ready failed for #${prNumber}: ${msg}`);
+      toast(`mark ready failed: ${msg}`, theme.err, 4000);
+      // Bail: auto-merge would fail on the still-draft PR.
+      return;
+    }
+    if (wasDraft) log.event.ok(`marked #${prNumber} ready`);
+
+    if (reviewerRes.status === "rejected") {
+      const msg =
+        reviewerRes.reason instanceof Error
+          ? reviewerRes.reason.message
+          : String(reviewerRes.reason);
+      log.event.err(
+        `request reviewer ${reviewerToAdd} failed for #${prNumber}: ${msg}`,
+      );
+      toast(`reviewer request failed: ${msg}`, theme.err, 4000);
+      // Don't bail — auto-merge is independent of the reviewer request.
+    } else if (reviewerToAdd) {
+      log.event.ok(`requested ${reviewerToAdd} for #${prNumber}`);
+    }
+
+    if (needsAutoMerge) {
+      try {
+        await mutate<GithubData>({
+          filter: { queryKey: ["github"] },
+          patch: (data) =>
+            patchPullRequest(data, branch, (pr) => ({
+              ...pr,
+              autoMerge: {
+                enabledAt: new Date().toISOString(),
+                mergeMethod: "REBASE",
+              },
+            })),
+          run: async () => {
+            const r = await enableAutoMerge(prNumber);
+            if (!r.ok) throw new Error(r.error);
+          },
+        });
+        log.event.ok(`auto-merge enabled for #${prNumber}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.event.err(`auto-merge failed for #${prNumber}: ${msg}`);
+        toast(`auto-merge failed: ${msg}`, theme.err, 4000);
+        return;
+      }
+    }
+
+    toast(`shipped #${prNumber}`, theme.ok, 2500);
+  }
+
+  /**
    * Open a picker listing trunk + every other active worktree's branch
    * as candidate stack parents. When a manual override is currently in
    * effect, a synthetic "(clear override)" entry appears at the top so
@@ -3831,6 +3961,10 @@ export function App({ onExit }: Props) {
         message: `Mark #${current.pr.number} ready for review?`,
         confirmLabel: "mark ready",
       });
+      return;
+    }
+    if (k.sequence === "E") {
+      void doShipPr(current.wt.slug);
       return;
     }
     if (isPlainLetter(k, "m")) {

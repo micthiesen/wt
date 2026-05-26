@@ -50,6 +50,7 @@ const SECTIONS: Section[] = [
       ["m", "merge when ready (toggle)"],
       ["b", "set stack base (parent branch) for this worktree"],
       ["e", "exit draft (mark ready for review)"],
+      ["E", "ship: mark ready + request default_reviewer + arm auto-merge"],
       ["v", "edit reviewers (picker · v v submits)"],
       ["!", "run claude action · kill if running"],
       ["! c", "open action picker, jump to custom prompt"],
