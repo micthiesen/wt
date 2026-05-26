@@ -3835,6 +3835,14 @@ export function App({ onExit }: Props) {
       wtSourceLog.event.info(`opened ${WT_SOURCE_SLOT.path}`);
       return;
     }
+    if (k.sequence === "O") {
+      openInZed(MAIN_CLONE_SLOT.path);
+      hideFrontmostAlacritty();
+      createLogger(MAIN_CLONE_SLOT.label).event.info(
+        `opened ${MAIN_CLONE_SLOT.path}`,
+      );
+      return;
+    }
 
     // Review-request rows: a tiny set of PR-only keybinds, no
     // worktree-keyed actions. Unmapped keys fall through to the wt

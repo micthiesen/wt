@@ -79,6 +79,7 @@ const SECTIONS: Section[] = [
       [".", "enter main repo session · F12 to detach"],
       ["/", "enter dotfiles session · F12 to detach"],
       [">", "open wt source in zed"],
+      ["O", "open main repo in zed (hides Alacritty)"],
       ["?", "toggle this help"],
       ["q / ^C", "quit"],
     ],
