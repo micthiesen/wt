@@ -3273,6 +3273,8 @@ export function App({ onExit }: Props) {
           void doAutoMerge(current.wt.slug, "disable");
         } else if (pending === "e" && current) {
           void doMarkReady(current.wt.slug);
+        } else if (pending === "E" && current) {
+          void doShipPr(current.wt.slug);
         } else if (pending === "R") {
           appLog.event.warn("cleared all cached data; refetching from scratch");
           void clearAll();
@@ -3964,7 +3966,31 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "E") {
-      void doShipPr(current.wt.slug);
+      if (!current.pr) {
+        toast("no PR for this row", theme.warn, 2000);
+        return;
+      }
+      if (current.pr.state !== "OPEN") {
+        toast("PR is not open", theme.warn, 2000);
+        return;
+      }
+      const reviewer = config.github.defaultReviewer;
+      const steps: string[] = [];
+      if (current.pr.isDraft) steps.push("mark ready");
+      if (reviewer && !current.pr.requestedReviewers.includes(reviewer))
+        steps.push(`request ${reviewer}`);
+      if (!current.pr.autoMerge) steps.push("arm auto-merge");
+      if (steps.length === 0) {
+        toast(`#${current.pr.number} already shipped`, theme.info, 2000);
+        return;
+      }
+      setModal({
+        kind: "confirm",
+        pendingKey: "E",
+        title: "ship PR",
+        message: `Ship #${current.pr.number}? (${steps.join(", ")})`,
+        confirmLabel: "ship",
+      });
       return;
     }
     if (isPlainLetter(k, "m")) {
