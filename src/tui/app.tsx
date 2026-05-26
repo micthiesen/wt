@@ -3863,6 +3863,7 @@ export function App({ onExit }: Props) {
     const rowLog = createLogger(current.wt.slug);
     if (isPlainLetter(k, "o")) {
       openInZed(current.wt.path);
+      hideFrontmostAlacritty();
       rowLog.event.info("opened in zed");
       return;
     }
