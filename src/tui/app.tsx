@@ -8,9 +8,15 @@ import {
   BUILTIN_ACTIONS,
   evaluateActionRequirements,
   type ActionDef,
+  type ActionLine,
   type ActionRun,
   type ActionVars,
 } from "../core/actions.ts";
+import {
+  recentValues,
+  recordRun as recordHistoryRun,
+  type HistoryEntry,
+} from "../core/action-history.ts";
 import { config } from "../core/config.ts";
 import {
   createWorktree,
@@ -71,7 +77,7 @@ import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
 import { KillActionConfirmModal } from "./panels/kill-action-confirm.tsx";
 import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
-import { MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
+import { ArgPickerModal, MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
 import { OutputsPicker } from "./panels/outputs-picker.tsx";
 import { OutputViewer } from "./panels/output-viewer.tsx";
 import { previewFocusPatch } from "./picker-preview.ts";
@@ -355,6 +361,22 @@ type Modal =
       newName: string | null;
     }
   | { kind: "actionPicker"; state: ActionPickerState }
+  | {
+      /**
+       * Action arg picker — opened after the `!` picker confirms an
+       * action whose def has `argPrompt`. Shows recent values for that
+       * action with `WT_META`-derived labels; trailing slot opens a
+       * single-line input for a fresh value. Empty history skips
+       * straight to input mode (`input: ""`, `index: 0`).
+       */
+      kind: "argPicker";
+      slug: string;
+      def: ActionDef;
+      history: readonly HistoryEntry[];
+      index: number;
+      /** null = list mode, string = typing a new value. */
+      input: string | null;
+    }
   | { kind: "outputsPicker"; index: number }
   | {
       kind: "claudeSessionsPicker";
@@ -415,6 +437,23 @@ function isCleanCandidate(row: WorktreeRow): boolean {
  * stack signal is `patch-id`); `base_branch` is always a named ref —
  * the right thing to plug into `git rebase` or a "rebase on X" prompt.
  */
+/**
+ * Scan an ActionRun's captured lines for a `WT_META: <text>` marker
+ * the script may have emitted on stdout. Latest match wins so a script
+ * can iterate its own label (e.g. "Acme Co · downloading…" then "Acme
+ * Co (42 files)"). Match is anchored to the line start and tolerates
+ * surrounding whitespace; the returned label is trimmed.
+ */
+function extractWtMeta(lines: readonly ActionLine[]): string | null {
+  const re = /^\s*WT_META:\s*(.+?)\s*$/;
+  let found: string | null = null;
+  for (const line of lines) {
+    const m = re.exec(line.text);
+    if (m) found = m[1] ?? null;
+  }
+  return found;
+}
+
 function buildActionVars(row: WorktreeRow): ActionVars {
   const baseBranch = row.stackedOn?.branch ?? config.branch.base;
   const base = row.stackedOn?.diffBase ?? config.branch.base;
@@ -1005,6 +1044,15 @@ export function App({ onExit }: Props) {
     refreshStack,
   };
   const actionHandledRef = useRef<Set<string>>(new Set());
+  /**
+   * Per-launch arg values, keyed by `${slug}/${actionId}`. Populated by
+   * `launchAction` when an arg was supplied; consulted by the action-
+   * registry subscriber once the matching run reaches a terminal status
+   * to refine the just-written history entry with any `WT_META: <text>`
+   * label the script emitted. Cleared on consumption — bounded by the
+   * number of concurrent in-flight runs.
+   */
+  const pendingArgs = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     const handled = actionHandledRef.current;
     // Seed once with already-finished runs so a fresh mount doesn't
@@ -1048,6 +1096,21 @@ export function App({ onExit }: Props) {
               const _exhaustive: never = tag;
               void _exhaustive;
             }
+          }
+        }
+        // Arg-prompt history label refinement. Only fires for runs the
+        // current TUI session launched with an `{{arg}}` value AND
+        // succeeded — scan the captured lines for a `WT_META: <text>`
+        // marker the script may have emitted, and (re)write the
+        // history entry with that label. No marker → entry keeps its
+        // raw-value rendering; that's the graceful default.
+        const argKey = `${run.slug}/${run.actionId}`;
+        const argVal = pendingArgs.current.get(argKey);
+        if (argVal !== undefined) {
+          pendingArgs.current.delete(argKey);
+          if (run.status === "succeeded") {
+            const label = extractWtMeta(run.lines);
+            if (label) recordHistoryRun(run.actionId, argVal, label);
           }
         }
       }
@@ -2334,6 +2397,7 @@ export function App({ onExit }: Props) {
     slug: string,
     def: ActionDef | null,
     extras: string,
+    arg?: string,
   ): void {
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) {
@@ -2366,7 +2430,20 @@ export function App({ onExit }: Props) {
         return;
       }
     }
-    const vars = buildActionVars(row);
+    const baseVars = buildActionVars(row);
+    // `{{arg}}` substitution lives alongside the row-derived vars. The
+    // value, when present, came from the action-arg picker; gets folded
+    // in for both shell and claude actions (including session-target).
+    const vars: ActionVars = arg ? { ...baseVars, arg } : baseVars;
+    // Record the value used so the next picker open shows it at top.
+    // Label is null here — the WT_META scan in the actionRegistry
+    // subscriber refines it after the run finishes (if the script
+    // emitted a marker line). Idempotent against re-runs of the same
+    // value (LRU dedup).
+    if (def && arg && def.id !== "__custom__") {
+      recordHistoryRun(def.id, arg, null);
+      pendingArgs.current.set(`${slug}/${def.id}`, arg);
+    }
     // Session-target claude actions bypass the headless `-p` runner and
     // type the prompt into the live F12 session (starting it if needed).
     // Fire-and-forget: there's no run to track or focus, so we just log
@@ -2631,6 +2708,22 @@ export function App({ onExit }: Props) {
           const item = items[i];
           if (!item) return;
           if (!canPickAction(item)) return;
+          // Action declared `arg_prompt` — open the arg picker first.
+          // Applies to both shell and claude. Empty history short-
+          // circuits to input mode so the user doesn't see a one-row
+          // picker that's just "+ new value…".
+          if (item.kind === "action" && item.def.argPrompt) {
+            const history = recentValues(item.def.id);
+            setModal({
+              kind: "argPicker",
+              slug: ap.slug,
+              def: item.def,
+              history,
+              index: 0,
+              input: history.length === 0 ? "" : null,
+            });
+            return;
+          }
           if (item.kind === "action" && item.def.kind === "shell") {
             setModal(null);
             launchAction(ap.slug, item.def, "");
@@ -2739,6 +2832,87 @@ export function App({ onExit }: Props) {
           kind: "actionPicker",
           state: { ...ap, extras: ap.extras + text },
         });
+      }
+      return;
+    }
+
+    // Action arg picker — opened after a `arg_prompt`-equipped action
+    // is picked from the `!` menu. List mode shows recent values
+    // (`WT_META`-derived labels when available); trailing slot opens
+    // input mode for a fresh value. Reached mid-`!` flow so Enter/Esc
+    // are the only commit/cancel keys (no chord — see CLAUDE.md modal
+    // rules). Esc from input pops back to the list when history is
+    // non-empty; otherwise closes the modal.
+    if (modal?.kind === "argPicker") {
+      const ap = modal;
+      const rowCount = ap.history.length + 1; // trailing "+ new"
+      const isInput = ap.input !== null;
+      const launch = (value: string): void => {
+        const trimmed = value.trim();
+        if (!trimmed) return;
+        setModal(null);
+        launchAction(ap.slug, ap.def, "", trimmed);
+      };
+      if (k.ctrl && k.name === "c") {
+        setModal(null);
+        return;
+      }
+      if (isInput) {
+        if (k.name === "escape") {
+          // Pop back to list when there was a history to return to;
+          // otherwise the input was the only screen the user ever saw.
+          if (ap.history.length > 0) {
+            setModal({ ...ap, input: null, index: 0 });
+          } else {
+            setModal(null);
+          }
+          return;
+        }
+        if (k.name === "return") {
+          launch(ap.input ?? "");
+          return;
+        }
+        if (k.name === "backspace") {
+          setModal({ ...ap, input: (ap.input ?? "").slice(0, -1) });
+          return;
+        }
+        const text = printableMultiline(k.sequence);
+        if (text) setModal({ ...ap, input: (ap.input ?? "") + text });
+        return;
+      }
+      // list mode
+      if (k.name === "escape" || k.sequence === "q") {
+        setModal(null);
+        return;
+      }
+      if (k.name === "j" || k.name === "down") {
+        setModal({ ...ap, index: Math.min(ap.index + 1, rowCount - 1) });
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setModal({ ...ap, index: Math.max(ap.index - 1, 0) });
+        return;
+      }
+      // Digit quick-pick over history rows (1..9) — confirms in one
+      // keystroke. Out-of-range digits silently ignored.
+      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+        const i = Number(k.sequence) - 1;
+        if (i < ap.history.length) {
+          const entry = ap.history[i];
+          if (entry) launch(entry.value);
+        }
+        return;
+      }
+      if (k.name === "return") {
+        // Trailing "+ new" row drops into input mode; history rows
+        // commit their value.
+        if (ap.index >= ap.history.length) {
+          setModal({ ...ap, input: "" });
+          return;
+        }
+        const entry = ap.history[ap.index];
+        if (entry) launch(entry.value);
+        return;
       }
       return;
     }
@@ -4158,6 +4332,18 @@ export function App({ onExit }: Props) {
           input={modal.input}
           autoName={nextAutoName(modal.slug)}
           error={modal.error}
+        />
+      ) : null}
+      {modal?.kind === "argPicker" ? (
+        <ArgPickerModal
+          title={modal.def.name}
+          prompt={modal.def.argPrompt?.label ?? ""}
+          history={modal.history}
+          index={Math.min(
+            Math.max(0, modal.index),
+            modal.history.length, // trailing "+ new"
+          )}
+          input={modal.input}
         />
       ) : null}
       {modal?.kind === "harnessSelect" ? (

@@ -158,6 +158,24 @@ type ActionUi = {
  */
 export type ClaudeActionTarget = "headless" | "session";
 
+/**
+ * Per-launch user-supplied value collected by the picker before the
+ * action runs. When set, picking the action opens a second picker
+ * showing recent values for this action (drawn from
+ * `~/.cache/wt/action-history.json`); a trailing "new…" row opens a
+ * single-line input for a fresh value. The collected value substitutes
+ * `{{arg}}` in `prompt` / `shell`. `null` skips the second-step prompt
+ * entirely (the existing direct-launch / claude-extras flow applies).
+ *
+ * The label rendered in history rows comes from a `WT_META: <text>`
+ * line emitted on the action's stdout. Actions whose scripts don't emit
+ * the marker just show the raw value.
+ */
+type ActionArgPrompt = {
+  /** Picker / input modal header. Plain text. */
+  label: string;
+};
+
 export type ActionDef =
   | ({
       kind: "claude";
@@ -167,6 +185,7 @@ export type ActionDef =
       target: ClaudeActionTarget;
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
+      argPrompt: ActionArgPrompt | null;
     } & ActionUi)
   | ({
       kind: "shell";
@@ -175,6 +194,7 @@ export type ActionDef =
       shell: string;
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
+      argPrompt: ActionArgPrompt | null;
     } & ActionUi);
 
 export type Config = {
@@ -277,6 +297,7 @@ const GENERIC_DEFAULTS = {
       target: "headless" as const,
       affects: ["git", "github"] as const satisfies readonly EffectTag[],
       requires: [] as const satisfies readonly RequireTag[],
+      argPrompt: null,
     },
     {
       kind: "claude" as const,
@@ -287,6 +308,7 @@ const GENERIC_DEFAULTS = {
       target: "headless" as const,
       affects: ["git", "github"] as const satisfies readonly EffectTag[],
       requires: ["pr.ready"] as const satisfies readonly RequireTag[],
+      argPrompt: null,
     },
   ] as const,
 };
@@ -571,6 +593,13 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     }
     const target: ClaudeActionTarget =
       targetRaw === "session" ? "session" : "headless";
+    // `arg_prompt` is a single-line string ("company id") or omitted.
+    // Stored as a small object so future extensions (placeholder text,
+    // validation, multi-arg) don't churn the schema.
+    const argPromptRaw = errs.optStrOrNull(entry, "arg_prompt");
+    const argPrompt: ActionArgPrompt | null = argPromptRaw
+      ? { label: argPromptRaw }
+      : null;
     seenIds.add(id);
     if (hasPrompt) {
       out.push({
@@ -581,6 +610,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         target,
         affects: affects ?? DEFAULT_CLAUDE_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
+        argPrompt,
         ...ui,
       });
     } else {
@@ -591,6 +621,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         shell: shellVal as string,
         affects: affects ?? DEFAULT_SHELL_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
+        argPrompt,
         ...ui,
       });
     }

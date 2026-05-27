@@ -1,3 +1,4 @@
+import type { HistoryEntry } from "../../core/action-history.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 
@@ -121,6 +122,103 @@ export function MultiPickerModal({
               {item.hint ? (
                 <span fg={theme.fgDim}> {item.hint}</span>
               ) : null}
+            </text>
+          </box>
+        );
+      })}
+    </Modal>
+  );
+}
+
+type ArgProps = {
+  title: string;
+  prompt: string;
+  history: readonly HistoryEntry[];
+  /**
+   * Cursor index across `history.length + 1` rows — the trailing slot
+   * is the "new value" affordance that opens the input on confirm.
+   */
+  index: number;
+  /**
+   * When non-null, the picker is in input mode (typing a fresh value).
+   * The text field replaces the list footer.
+   */
+  input: string | null;
+};
+
+/**
+ * Action-arg picker: shows recent values for one action with an
+ * optional human label (sourced from `WT_META: <text>` lines emitted
+ * by the action's stdout — see `core/action-history.ts`). The trailing
+ * row, "+ new value...", drops into a single-line input. Empty history
+ * skips straight to input mode at the call site, so this list never
+ * renders as just the "+ new" row alone.
+ *
+ * Modal UX rules: Enter / Esc only (no chord — reached mid-`!` flow,
+ * see CLAUDE.md "When a picker doesn't naturally have a single trigger
+ * key").
+ */
+export function ArgPickerModal({
+  title,
+  prompt,
+  history,
+  index,
+  input,
+}: ArgProps) {
+  if (input !== null) {
+    return (
+      <Modal
+        title={title}
+        hints={[
+          ["⏎", "launch"],
+          ["esc", "back"],
+        ]}
+      >
+        <box flexDirection="row" paddingLeft={1} paddingRight={1}>
+          <text fg={theme.accent} attributes={1}>{prompt}</text>
+          <text fg={theme.fg}> </text>
+          <text fg={theme.fgBright}>{input}</text>
+          <text fg={theme.accent}>█</text>
+        </box>
+      </Modal>
+    );
+  }
+  const rows: Array<{ label: string; hint?: string; isNew: boolean }> = [];
+  for (const entry of history) {
+    rows.push({
+      label: entry.label ?? entry.value,
+      hint: entry.label ? entry.value : undefined,
+      isNew: false,
+    });
+  }
+  rows.push({ label: "+ new value…", isNew: true });
+  return (
+    <Modal
+      title={title}
+      hints={[
+        ["j/k", "move"],
+        ["⏎", "pick"],
+        ["esc / q", "cancel"],
+      ]}
+    >
+      {rows.map((row, i) => {
+        const selected = i === index;
+        const bg = selected ? theme.rowSelectedBg : undefined;
+        const labelFg = row.isNew ? theme.accent : (selected ? theme.fgBright : theme.fg);
+        return (
+          <box
+            key={`${i}-${row.label}`}
+            flexDirection="row"
+            backgroundColor={bg}
+            paddingLeft={1}
+            paddingRight={1}
+          >
+            <text fg={selected ? theme.accent : theme.fgDim}>
+              {selected ? "▸ " : "  "}
+            </text>
+            <text fg={labelFg} wrapMode="none" truncate>
+              {row.label}
+              {row.hint ? <span fg={theme.fgDim}> · {row.hint}</span> : null}
             </text>
           </box>
         );
