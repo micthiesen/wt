@@ -438,18 +438,28 @@ function isCleanCandidate(row: WorktreeRow): boolean {
  * the right thing to plug into `git rebase` or a "rebase on X" prompt.
  */
 /**
- * Scan an ActionRun's captured lines for a `LABEL: <text>` marker the
- * script may have emitted on stdout. Latest match wins so a script can
- * iterate its own label (e.g. "Acme Co · downloading…" then "Acme Co
- * (42 files)"). Match is anchored to the line start and tolerates
- * surrounding whitespace; the returned label is trimmed.
+ * Scan an ActionRun's captured lines with the action's `label_extract`
+ * regex. Latest per-line match wins, capture group 1 becomes the label
+ * (falls back to the full match when the pattern has no group); the
+ * result is trimmed. Returns null when the def has no extractor, the
+ * pattern fails to compile, or nothing matched. Compile is per-call —
+ * runs once per terminal action, so caching wouldn't buy much.
  */
-function extractLabel(lines: readonly ActionLine[]): string | null {
-  const re = /^\s*LABEL:\s*(.+?)\s*$/;
+function extractLabel(
+  lines: readonly ActionLine[],
+  pattern: string | null,
+): string | null {
+  if (!pattern) return null;
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern);
+  } catch {
+    return null;
+  }
   let found: string | null = null;
   for (const line of lines) {
     const m = re.exec(line.text);
-    if (m) found = m[1] ?? null;
+    if (m) found = (m[1] ?? m[0]).trim() || null;
   }
   return found;
 }
@@ -1057,9 +1067,9 @@ export function App({ onExit }: Props) {
    * Per-launch arg values, keyed by `${slug}/${actionId}`. Populated by
    * `launchAction` when an arg was supplied; consulted by the action-
    * registry subscriber once the matching run reaches a terminal status
-   * to refine the just-written history entry with any `LABEL: <text>`
-   * label the script emitted. Cleared on consumption — bounded by the
-   * number of concurrent in-flight runs.
+   * to refine the just-written history entry via the def's
+   * `label_extract` regex against the captured output. Cleared on
+   * consumption — bounded by the number of concurrent in-flight runs.
    */
   const pendingArgs = useRef<Map<string, string>>(new Map());
   useEffect(() => {
@@ -1109,16 +1119,21 @@ export function App({ onExit }: Props) {
         }
         // Arg-prompt history label refinement. Only fires for runs the
         // current TUI session launched with an `{{arg}}` value AND
-        // succeeded — scan the captured lines for a `LABEL: <text>`
-        // marker the script may have emitted, and (re)write the
-        // history entry with that label. No marker → entry keeps its
-        // raw-value rendering; that's the graceful default.
+        // succeeded. Looks up the def by actionId, then scans the
+        // captured output with its `label_extract` regex (when set)
+        // and (re)writes the history entry with the matched label.
+        // No def, no regex, or no match → entry keeps the raw value;
+        // graceful default.
         const argKey = `${run.slug}/${run.actionId}`;
         const argVal = pendingArgs.current.get(argKey);
         if (argVal !== undefined) {
           pendingArgs.current.delete(argKey);
           if (run.status === "succeeded") {
-            const label = extractLabel(run.lines);
+            const def =
+              config.actions.find((d) => d.id === run.actionId) ??
+              BUILTIN_ACTIONS.find((d) => d.id === run.actionId) ??
+              null;
+            const label = extractLabel(run.lines, def?.labelExtract ?? null);
             if (label) recordHistoryRun(run.actionId, argVal, label);
           }
         }

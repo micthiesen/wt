@@ -167,9 +167,10 @@ export type ClaudeActionTarget = "headless" | "session";
  * `{{arg}}` in `prompt` / `shell`. `null` skips the second-step prompt
  * entirely (the existing direct-launch / claude-extras flow applies).
  *
- * The label rendered in history rows comes from a `LABEL: <text>` line
- * emitted on the action's stdout. Actions whose scripts don't emit the
- * marker just show the raw value.
+ * The label rendered in history rows comes from a per-line regex match
+ * against the run's captured output — see `labelExtract` below.
+ * Actions without a regex (or whose run doesn't match) keep showing
+ * the raw value.
  */
 type ActionArgPrompt = {
   /** Picker / input modal header. Plain text. */
@@ -186,6 +187,16 @@ export type ActionDef =
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
       argPrompt: ActionArgPrompt | null;
+      /**
+       * Optional regex (source pattern, no flags) wt scans the run's
+       * captured output with — last per-line match wins, capture group
+       * 1 becomes the history label (falls back to the full match when
+       * the pattern has no capture group). Lets the script stay vendor-
+       * neutral: it just emits whatever line is naturally useful and
+       * the action def declares how to pull a label out of it. Null
+       * skips label extraction; the picker shows the raw value.
+       */
+      labelExtract: string | null;
     } & ActionUi)
   | ({
       kind: "shell";
@@ -195,6 +206,8 @@ export type ActionDef =
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
       argPrompt: ActionArgPrompt | null;
+      /** See the claude-variant docstring. */
+      labelExtract: string | null;
     } & ActionUi);
 
 export type Config = {
@@ -298,6 +311,7 @@ const GENERIC_DEFAULTS = {
       affects: ["git", "github"] as const satisfies readonly EffectTag[],
       requires: [] as const satisfies readonly RequireTag[],
       argPrompt: null,
+      labelExtract: null,
     },
     {
       kind: "claude" as const,
@@ -309,6 +323,7 @@ const GENERIC_DEFAULTS = {
       affects: ["git", "github"] as const satisfies readonly EffectTag[],
       requires: ["pr.ready"] as const satisfies readonly RequireTag[],
       argPrompt: null,
+      labelExtract: null,
     },
   ] as const,
 };
@@ -600,6 +615,19 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     const argPrompt: ActionArgPrompt | null = argPromptRaw
       ? { label: argPromptRaw }
       : null;
+    // `label_extract` is a regex source string. Compile-validate at
+    // load time so a bad pattern fails the loader rather than silently
+    // suppressing label extraction at run-time. Per-launch we recompile
+    // (cheap; runs once per terminal action).
+    const labelExtractRaw = errs.optStrOrNull(entry, "label_extract");
+    if (labelExtractRaw !== null) {
+      try {
+        new RegExp(labelExtractRaw);
+      } catch (err) {
+        errs.add(`${tag}.label_extract: invalid regex (${(err as Error).message})`);
+        continue;
+      }
+    }
     seenIds.add(id);
     if (hasPrompt) {
       out.push({
@@ -611,6 +639,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         affects: affects ?? DEFAULT_CLAUDE_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
         argPrompt,
+        labelExtract: labelExtractRaw,
         ...ui,
       });
     } else {
@@ -622,6 +651,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         affects: affects ?? DEFAULT_SHELL_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
         argPrompt,
+        labelExtract: labelExtractRaw,
         ...ui,
       });
     }

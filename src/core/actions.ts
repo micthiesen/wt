@@ -170,6 +170,7 @@ export const BUILTIN_ACTIONS: readonly ActionDef[] = [
     affects: ["git"],
     requires: ["deployed"],
     argPrompt: null,
+    labelExtract: null,
   },
 ];
 
@@ -438,6 +439,7 @@ class ActionRegistry {
         affects: DEFAULT_CLAUDE_AFFECTS,
         requires: DEFAULT_REQUIRES,
         argPrompt: null,
+        labelExtract: null,
       },
       slug,
       cwd,
