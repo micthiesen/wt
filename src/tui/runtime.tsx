@@ -6,6 +6,7 @@ import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
 import { config } from "../core/config.ts";
+import { disposeDiffPool } from "../core/diff/pool.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { startCodexEventPolling } from "../core/harness/codex-events.ts";
 import { startOpencodeEventPolling } from "../core/harness/opencode-events.ts";
@@ -17,6 +18,7 @@ import {
   setSessionTriggerSink,
 } from "../core/session-tail.ts";
 import { WorktreeWatchSet, watchRefs } from "../core/repo-watch.ts";
+import { startLoopLagProbe } from "../core/perf.ts";
 import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
 import { reapOrphanedSessions } from "../core/tmux.ts";
 import { listWorktrees } from "../core/worktree.ts";
@@ -215,6 +217,11 @@ export async function runTui(): Promise<TuiExit> {
   ];
   for (const key of ORPHANED_KEYS) wtClient.evict(key);
 
+  // Opt-in (`WT_PERF=1`) probe that logs whenever the single JS thread
+  // is blocked long enough to drop a frame / stall a keypress. Used to
+  // confirm the diff-pool offload actually unblocked the render thread.
+  const stopLoopLagProbe = startLoopLagProbe();
+
   const renderer = await createCliRenderer({
     exitOnCtrlC: false,
     targetFps: 60,
@@ -241,6 +248,8 @@ export async function runTui(): Promise<TuiExit> {
       void err;
     }
     detachFetchLogs();
+    stopLoopLagProbe();
+    disposeDiffPool();
     stopRegistryWatch();
     stopRefsWatch();
     unsubWorktrees();

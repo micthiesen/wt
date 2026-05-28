@@ -19,7 +19,8 @@ import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
-import { buildDiffContext, type DiffContext } from "../core/diff/index.ts";
+import type { DiffContext } from "../core/diff/index.ts";
+import { buildDiffContextViaPool } from "../core/diff/pool.ts";
 import {
   fetchGithub,
   fetchRepoContributors,
@@ -468,7 +469,7 @@ export const wtDiffContextQuery = (
   return queryOptions({
     queryKey: qk.wt(wt.slug).diffContext(base),
     queryFn: async ({ signal }): Promise<DiffContext | null> =>
-      buildDiffContext(wt.path, base, signal),
+      buildDiffContextViaPool(wt.path, base, signal),
     staleTime: STALE.mid,
     ...KEEP_PREV,
   });
