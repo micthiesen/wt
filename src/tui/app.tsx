@@ -9,7 +9,6 @@ import {
   evaluateActionRequirements,
   type ActionDef,
   type ActionLine,
-  type ActionRun,
   type ActionVars,
 } from "../core/actions.ts";
 import {
@@ -30,7 +29,6 @@ import {
   markPullRequestReady,
 } from "../core/github.ts";
 import { expectedStage } from "../core/stage-safety.ts";
-import { run } from "../core/proc.ts";
 import {
   addClaudeName,
   nameInUse,
@@ -39,7 +37,7 @@ import {
   validateSessionName,
 } from "../core/claude-sessions.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
-import { lockLabel, lockStatus, tryAcquireLock } from "../core/locks.ts";
+import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import {
   type LiveSessionDesc,
@@ -55,13 +53,11 @@ import {
   killDiffSession,
   killHarnessSession,
   killShellSession,
-  type SessionKind,
 } from "../core/tmux.ts";
 import { StatusKind, type PullRequest } from "../core/types.ts";
 import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, tmuxSessionsQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
-import { wtSessionUuid } from "../core/claude.ts";
-import { deriveSessionState, pickAggregateState, registryStatusToState, type DerivedState } from "../core/claude-status.ts";
+import { pickAggregateState, registryStatusToState, type DerivedState } from "../core/claude-status.ts";
 
 import {
   ActionEditModal,
@@ -619,7 +615,6 @@ export function App({ onExit }: Props) {
     moveSection,
     mutate,
     cyclePrimaryHarness,
-    setPrimaryHarness,
     refreshHarnessSessions,
   } = useWtActions();
   const primaryHarness = usePrimaryHarness();
@@ -1858,17 +1853,6 @@ export function App({ onExit }: Props) {
         if (result.stderr) slotLog.event.err(result.stderr);
       }
     })();
-  }
-
-  /**
-   * Attach to (or create) a claude session for `slug`. `name = null`
-   * is the primary; a string is one of the named sessions. Suspends
-   * the renderer, hands the terminal to tmux, surfaces lifecycle
-   * events to the activity pane. Toasts on spawn-fail; the rest is
-   * background.
-   */
-  function doEnterClaudeSession(slug: string, name: string | null): void {
-    doEnterHarnessSession(slug, "claude", { managedName: name });
   }
 
   /**

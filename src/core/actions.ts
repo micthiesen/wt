@@ -824,13 +824,6 @@ class ActionRegistry {
     this.notify();
   }
 
-  private update(slug: string, mut: (r: ActionRun) => ActionRun): void {
-    const cur = this.runs.get(slug);
-    if (!cur) return;
-    const next = mut(cur);
-    this.commit((m) => m.set(slug, next));
-  }
-
   /**
    * Live mode: open the tail + done watcher, install `handles` in the
    * registry. Used both by `start` (fresh handles) and `boot`

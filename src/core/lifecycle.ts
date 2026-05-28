@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 import { branchExists, git, gitQuiet } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
 import { lockStatus, tryAcquireLock } from "./locks.ts";
-import { run, runQuiet, runStreaming } from "./proc.ts";
+import { run, runStreaming } from "./proc.ts";
 import { computeStage, dirSlug, slugify } from "./stage.ts";
 import { safeStage } from "./stage-safety.ts";
 import type { Worktree } from "./types.ts";
