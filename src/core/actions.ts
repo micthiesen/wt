@@ -474,19 +474,23 @@ class ActionRegistry {
   }
 
   /**
-   * Synchronously finalize the run as killed. Closes the tail (final
-   * flush captures any last-second output), kills the tmux session,
-   * appends the killed exit-line, persists meta. The wrapper's EXIT
-   * trap will still fire and write `done.json`, but no one watches
-   * it — the run is already terminal as far as the registry is
-   * concerned.
+   * Finalize the run as killed. The in-memory teardown — close the tail
+   * (its final flush captures any last-second output), append the killed
+   * exit-line, commit the `killed` status, persist meta — all runs
+   * *synchronously* before the awaited `tmux kill-session`. So
+   * fire-and-forget callers (`doRemove`/`doClean`) get the status flip
+   * immediately, and a re-entrant kill() sees a terminal run and bails.
+   * Closing handles before anything else prevents the old wrapper's
+   * done.json from landing on a freshly-installed `liveHandles[slug]`.
+   * The awaited tmux kill frees the `<slug>-action` session name once it
+   * resolves; the wrapper's EXIT trap then fires and writes done.json,
+   * but no one watches it — the run is already terminal here.
    *
-   * Sync teardown matters: `kill` + immediate `start` on the same
-   * slug must not race. Closing handles synchronously prevents the
-   * old wrapper's done.json from landing on a freshly-installed
-   * `liveHandles[slug]`; sync-killing the tmux session frees the
-   * `<slug>-action` name so `startActionSession` can claim it again
-   * on the next call.
+   * Caveat: the "running" guard is released at the synchronous status
+   * flip, *before* the tmux name is freed. A `start()` interleaved into
+   * that window collides on the still-alive session; `new-session` (no
+   * `-A`) fails loudly rather than corrupting state — the intended
+   * backstop, not dead code.
    */
   async kill(slug: string): Promise<boolean> {
     const run = this.runs.get(slug);

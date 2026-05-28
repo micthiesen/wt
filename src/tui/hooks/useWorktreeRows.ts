@@ -552,10 +552,14 @@ export function useWorktreeRows(): WorktreeRowsResult {
     .sort();
   useLockReleasedInvalidator(JSON.stringify(lockedSlugs));
 
+  // Gated on `aiEnabled`: the diff context exists only to feed
+  // `aiSummaryQuery`, so with AI unconfigured there's no consumer — and
+  // running it would dispatch a worker-pool job (spawning the pool) per
+  // worktree just to compute a hash nothing reads.
   const diffResults = useQueries({
     queries: worktrees.map((wt, i) => ({
       ...wtDiffContextQuery(wt, bases[i]!),
-      enabled: !busyByIndex[i],
+      enabled: aiEnabled && !busyByIndex[i],
     })),
   });
 
