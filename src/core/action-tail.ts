@@ -55,6 +55,18 @@ const READ_DEBOUNCE_MS = 80;
  * stat per stream per tick.
  */
 const POLL_INTERVAL_MS = 3_000;
+/**
+ * Backstop interval for `watchDoneSentinel`. FSEvents on a freshly-
+ * created dir has a ~tens-of-ms warm-up window where events for files
+ * written *after* `watch()` returns but *before* the kernel subscription
+ * is hot can be silently dropped. Fast actions (e.g. a one-line `git
+ * checkout`) finish inside that window, write `done.json`, and the
+ * watcher never fires — leaving the run stuck at `status: running`
+ * forever (until the next wt restart, when the boot reconciler picks it
+ * up via `readDoneFile`). Polling existsSync every ~half-second covers
+ * the gap cheaply.
+ */
+const DONE_POLL_INTERVAL_MS = 500;
 
 const activeStreams = new Set<StreamState>();
 let pollTimer: Timer | null = null;
@@ -205,7 +217,17 @@ export function watchDoneSentinel(opts: {
   const { runDir, onDone } = opts;
   const path = join(runDir, "done.json");
   let dirWatcher: FSWatcher | null = null;
+  let pollTimer: Timer | null = null;
   let fired = false;
+
+  const stopAll = (): void => {
+    closeSilent(dirWatcher);
+    dirWatcher = null;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  };
 
   const tryRead = (): boolean => {
     if (fired) return true;
@@ -213,34 +235,37 @@ export function watchDoneSentinel(opts: {
     if (!sentinel) return false;
     fired = true;
     onDone(sentinel);
+    stopAll();
     return true;
   };
 
   if (tryRead()) {
-    return { close: () => {} };
+    return { close: stopAll };
   }
 
   try {
     dirWatcher = watch(runDir, { persistent: false }, (_event, filename) => {
       if (filename != null && filename !== "done.json") return;
-      if (tryRead()) {
-        closeSilent(dirWatcher);
-        dirWatcher = null;
-      }
+      tryRead();
     });
   } catch (err) {
     log.warn("done watcher failed", { runDir, err: errMsg(err) });
   }
-  // Race window: the file may have been written between the existsSync
-  // check above and the watch registration.
+  // Race window 1: file may have been written between the existsSync
+  // check above and the `watch()` call landing.
   tryRead();
+  // Race window 2: FSEvents on a freshly-created dir has a brief
+  // warm-up gap where events for files written immediately after
+  // `watch()` returns can be dropped. A fast shell action (a one-line
+  // git checkout) finishes inside that gap. The poller covers it; it
+  // also stops as soon as the file appears.
+  if (!fired) {
+    pollTimer = setInterval(() => {
+      tryRead();
+    }, DONE_POLL_INTERVAL_MS);
+  }
 
-  return {
-    close() {
-      closeSilent(dirWatcher);
-      dirWatcher = null;
-    },
-  };
+  return { close: stopAll };
 }
 
 /**
