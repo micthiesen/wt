@@ -36,6 +36,7 @@ import {
   type HarnessId,
 } from "./harness/index.ts";
 import { createLogger } from "./logger.ts";
+import { run } from "./proc.ts";
 import { shellLogPath } from "./shell-tail.ts";
 
 const log = createLogger("[tmux]");
@@ -255,11 +256,7 @@ export function writeConfig(): { path: string; changed: boolean } {
  * 0 when no server is running, after warning to stderr we discard.
  */
 export async function killServer(): Promise<void> {
-  const proc = Bun.spawn(["tmux", "-L", TMUX_SOCKET, "kill-server"], {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  await proc.exited;
+  await run(["tmux", "-L", TMUX_SOCKET, "kill-server"]);
 }
 
 /**
@@ -357,24 +354,17 @@ function resolveDiffCommand(template: string, base: string | undefined): string 
 }
 
 async function killByName(name: string): Promise<void> {
-  const proc = Bun.spawn(
-    ["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${name}`],
-    { stdout: "ignore", stderr: "pipe" },
-  );
-  const [code, errText] = await Promise.all([
-    proc.exited,
-    new Response(proc.stderr).text(),
-  ]);
+  const r = await run(["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", `=${name}`]);
   // tmux exits non-zero for "session not found" (the desired no-op
   // path when killing an absent slot) but ALSO for connection /
   // permission failures. Filter the benign case so the noise floor
   // is low, but surface real errors so a failed kill doesn't look
   // like silent success.
-  if (code !== 0 && !/can't find session/i.test(errText)) {
+  if (r.exitCode !== 0 && !/can't find session/i.test(r.stderr)) {
     log.warn("tmux kill-session failed", {
       name,
-      code,
-      stderr: errText.trim() || null,
+      code: r.exitCode,
+      stderr: r.stderr.trim() || null,
     });
   }
 }
@@ -457,23 +447,16 @@ export async function listSessions(): Promise<{
  * regardless of kind.
  */
 async function listAllSessionsRaw(): Promise<Set<string>> {
-  const proc = Bun.spawn(
-    [
-      "tmux",
-      "-L",
-      TMUX_SOCKET,
-      "list-sessions",
-      "-F",
-      "#{session_name}",
-    ],
-    { stdout: "pipe", stderr: "ignore" },
-  );
-  const [out, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    proc.exited,
+  const r = await run([
+    "tmux",
+    "-L",
+    TMUX_SOCKET,
+    "list-sessions",
+    "-F",
+    "#{session_name}",
   ]);
-  if (code !== 0) return new Set();
-  const names = out
+  if (r.exitCode !== 0) return new Set();
+  const names = r.stdout
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
@@ -836,28 +819,22 @@ function paneTarget(name: string): string {
 async function runTmux(
   args: readonly string[],
 ): Promise<{ code: number; stderr: string }> {
-  const proc = Bun.spawn(["tmux", "-L", TMUX_SOCKET, ...args], {
-    stdout: "ignore",
-    stderr: "pipe",
-  });
-  const [code, stderr] = await Promise.all([
-    proc.exited,
-    new Response(proc.stderr).text(),
-  ]);
-  return { code, stderr };
+  const r = await run(["tmux", "-L", TMUX_SOCKET, ...args]);
+  return { code: r.exitCode, stderr: r.stderr };
 }
 
 /** Snapshot a session's active pane as plain text, or null on failure. */
 async function capturePane(name: string): Promise<string | null> {
-  const proc = Bun.spawn(
-    ["tmux", "-L", TMUX_SOCKET, "capture-pane", "-p", "-t", paneTarget(name)],
-    { stdout: "pipe", stderr: "ignore" },
-  );
-  const [out, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    proc.exited,
+  const r = await run([
+    "tmux",
+    "-L",
+    TMUX_SOCKET,
+    "capture-pane",
+    "-p",
+    "-t",
+    paneTarget(name),
   ]);
-  return code === 0 ? out : null;
+  return r.exitCode === 0 ? r.stdout : null;
 }
 
 /**

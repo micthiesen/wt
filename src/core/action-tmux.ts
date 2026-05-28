@@ -30,7 +30,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "./logger.ts";
-import { run } from "./proc.ts";
+import { run, runQuiet } from "./proc.ts";
 
 const log = createLogger("[action-tmux]");
 
@@ -205,17 +205,12 @@ export async function killActionSession(slug: string): Promise<void> {
  * without firing the EXIT trap.
  */
 export async function actionSessionExists(slug: string): Promise<boolean> {
-  const proc = Bun.spawn(
-    [
-      "tmux",
-      "-L",
-      TMUX_SOCKET,
-      "has-session",
-      "-t",
-      `=${actionSessionName(slug)}`,
-    ],
-    { stdout: "ignore", stderr: "ignore" },
-  );
-  const code = await proc.exited;
-  return code === 0;
+  return runQuiet([
+    "tmux",
+    "-L",
+    TMUX_SOCKET,
+    "has-session",
+    "-t",
+    `=${actionSessionName(slug)}`,
+  ]);
 }
