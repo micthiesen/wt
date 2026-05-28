@@ -365,7 +365,7 @@ type Modal =
       /**
        * Action arg picker — opened after the `!` picker confirms an
        * action whose def has `argPrompt`. Shows recent values for that
-       * action with `WT_META`-derived labels; trailing slot opens a
+       * action with `LABEL`-derived labels; trailing slot opens a
        * single-line input for a fresh value. Empty history skips
        * straight to input mode (`input: ""`, `index: 0`).
        */
@@ -438,14 +438,14 @@ function isCleanCandidate(row: WorktreeRow): boolean {
  * the right thing to plug into `git rebase` or a "rebase on X" prompt.
  */
 /**
- * Scan an ActionRun's captured lines for a `WT_META: <text>` marker
- * the script may have emitted on stdout. Latest match wins so a script
- * can iterate its own label (e.g. "Acme Co · downloading…" then "Acme
- * Co (42 files)"). Match is anchored to the line start and tolerates
+ * Scan an ActionRun's captured lines for a `LABEL: <text>` marker the
+ * script may have emitted on stdout. Latest match wins so a script can
+ * iterate its own label (e.g. "Acme Co · downloading…" then "Acme Co
+ * (42 files)"). Match is anchored to the line start and tolerates
  * surrounding whitespace; the returned label is trimmed.
  */
-function extractWtMeta(lines: readonly ActionLine[]): string | null {
-  const re = /^\s*WT_META:\s*(.+?)\s*$/;
+function extractLabel(lines: readonly ActionLine[]): string | null {
+  const re = /^\s*LABEL:\s*(.+?)\s*$/;
   let found: string | null = null;
   for (const line of lines) {
     const m = re.exec(line.text);
@@ -1057,7 +1057,7 @@ export function App({ onExit }: Props) {
    * Per-launch arg values, keyed by `${slug}/${actionId}`. Populated by
    * `launchAction` when an arg was supplied; consulted by the action-
    * registry subscriber once the matching run reaches a terminal status
-   * to refine the just-written history entry with any `WT_META: <text>`
+   * to refine the just-written history entry with any `LABEL: <text>`
    * label the script emitted. Cleared on consumption — bounded by the
    * number of concurrent in-flight runs.
    */
@@ -1109,7 +1109,7 @@ export function App({ onExit }: Props) {
         }
         // Arg-prompt history label refinement. Only fires for runs the
         // current TUI session launched with an `{{arg}}` value AND
-        // succeeded — scan the captured lines for a `WT_META: <text>`
+        // succeeded — scan the captured lines for a `LABEL: <text>`
         // marker the script may have emitted, and (re)write the
         // history entry with that label. No marker → entry keeps its
         // raw-value rendering; that's the graceful default.
@@ -1118,7 +1118,7 @@ export function App({ onExit }: Props) {
         if (argVal !== undefined) {
           pendingArgs.current.delete(argKey);
           if (run.status === "succeeded") {
-            const label = extractWtMeta(run.lines);
+            const label = extractLabel(run.lines);
             if (label) recordHistoryRun(run.actionId, argVal, label);
           }
         }
@@ -2445,7 +2445,7 @@ export function App({ onExit }: Props) {
     // in for both shell and claude actions (including session-target).
     const vars: ActionVars = arg ? { ...baseVars, arg } : baseVars;
     // Record the value used so the next picker open shows it at top.
-    // Label is null here — the WT_META scan in the actionRegistry
+    // Label is null here — the LABEL scan in the actionRegistry
     // subscriber refines it after the run finishes (if the script
     // emitted a marker line). Idempotent against re-runs of the same
     // value (LRU dedup).
@@ -2847,7 +2847,7 @@ export function App({ onExit }: Props) {
 
     // Action arg picker — opened after a `arg_prompt`-equipped action
     // is picked from the `!` menu. List mode shows recent values
-    // (`WT_META`-derived labels when available); trailing slot opens
+    // (`LABEL`-derived labels when available); trailing slot opens
     // input mode for a fresh value. Reached mid-`!` flow so Enter/Esc
     // are the only commit/cancel keys (no chord — see CLAUDE.md modal
     // rules). Esc from input pops back to the list when history is

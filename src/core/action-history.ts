@@ -19,7 +19,7 @@
  *   }
  *
  * `label` is set by `recordRun` when the action's stdout emitted a
- * `WT_META: <text>` marker line; if not, only `value` carries through
+ * `LABEL: <text>` marker line; if not, only `value` carries through
  * and the picker renders the value verbatim.
  *
  * # Behavior
@@ -60,8 +60,8 @@ const HISTORY_PATH = join(dirname(config.paths.cacheDb), "action-history.json");
 
 export type HistoryEntry = {
   value: string;
-  /** From `WT_META: <text>` on the action's stdout. Null when the
-   *  script didn't emit a marker line. */
+  /** From `LABEL: <text>` on the action's stdout. Null when the script
+   *  didn't emit a marker line. */
   label: string | null;
   /** Last-used timestamp (ms). The newest entry sits at index 0. */
   ts: number;
@@ -118,7 +118,7 @@ export function recentValues(actionId: string): readonly HistoryEntry[] {
  * exists in the list, it's removed first (so a re-use floats to the
  * top instead of growing duplicates). `label` is optional; passing
  * `null` keeps any existing label intact (e.g. early write at launch
- * before the WT_META marker is known, refined later).
+ * before the LABEL marker is known, refined later).
  */
 export function recordRun(
   actionId: string,

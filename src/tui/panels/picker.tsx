@@ -148,7 +148,7 @@ type ArgProps = {
 
 /**
  * Action-arg picker: shows recent values for one action with an
- * optional human label (sourced from `WT_META: <text>` lines emitted
+ * optional human label (sourced from `LABEL: <text>` lines emitted
  * by the action's stdout — see `core/action-history.ts`). The trailing
  * row, "+ new value...", drops into a single-line input. Empty history
  * skips straight to input mode at the call site, so this list never

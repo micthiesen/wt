@@ -167,9 +167,9 @@ export type ClaudeActionTarget = "headless" | "session";
  * `{{arg}}` in `prompt` / `shell`. `null` skips the second-step prompt
  * entirely (the existing direct-launch / claude-extras flow applies).
  *
- * The label rendered in history rows comes from a `WT_META: <text>`
- * line emitted on the action's stdout. Actions whose scripts don't emit
- * the marker just show the raw value.
+ * The label rendered in history rows comes from a `LABEL: <text>` line
+ * emitted on the action's stdout. Actions whose scripts don't emit the
+ * marker just show the raw value.
  */
 type ActionArgPrompt = {
   /** Picker / input modal header. Plain text. */
