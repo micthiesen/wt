@@ -31,11 +31,28 @@ const BALL_FRAMES = [
 ] as const;
 const BALL_FRAME_MS = 80;
 
+/**
+ * Connected "traveling wave" for the header refresh indicator. A
+ * triangle of block heights that loops seamlessly (rises ▁→█ then falls
+ * back toward ▁). Rendered across N cells phase-shifted by position, so
+ * one undulation flows through the whole strip rather than N independent
+ * spinners. Width N encodes the in-flight query count.
+ */
+const WAVE_FRAMES = "▁▂▃▄▅▆▇█▇▆▅▄▃▂";
+const WAVE_FRAME_MS = 90;
+/** Cap so a big refresh fan-out can't overrun the header line. */
+const MAX_WAVE_WIDTH = 12;
+
 /** Cell width of {@link Spinner} — useful when sizing layout slots. */
 export const SPINNER_WIDTH = 2;
 
-function useFrameLoop(frames: readonly string[], frameMs: number): string {
-  const cycleMs = frameMs * frames.length;
+/**
+ * Shared frame ticker: advances a frame index `0..period-1` on a loop at
+ * `frameMs` per frame. Single source of motion for both the rotating
+ * spinner glyphs and the multi-cell {@link RefreshWave}.
+ */
+function useFrameIndex(period: number, frameMs: number): number {
+  const cycleMs = frameMs * period;
   const [idx, setIdx] = useState(0);
   const timeline = useTimeline({ duration: cycleMs, loop: true });
   // Register the animation once on mount. `useTimeline` returns a fresh
@@ -45,17 +62,21 @@ function useFrameLoop(frames: readonly string[], frameMs: number): string {
   useEffect(() => {
     const target = { t: 0 };
     timeline.add(target, {
-      t: frames.length,
+      t: period,
       duration: cycleMs,
       ease: "linear",
       onUpdate: () => {
-        const next = Math.floor(target.t) % frames.length;
+        const next = Math.floor(target.t) % period;
         setIdx((prev) => (prev === next ? prev : next));
       },
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  return frames[idx]!;
+  return idx;
+}
+
+function useFrameLoop(frames: readonly string[], frameMs: number): string {
+  return frames[useFrameIndex(frames.length, frameMs)]!;
 }
 
 export const useSpinnerFrame = (): string =>
@@ -73,4 +94,22 @@ export const useBouncingBall = (): string =>
 export function Spinner({ fg }: { fg: string }) {
   const frame = useSpinnerFrame();
   return <text fg={fg}>{frame}</text>;
+}
+
+/**
+ * Header refresh indicator: a strip of `count` cells (capped at
+ * {@link MAX_WAVE_WIDTH}) showing one shared traveling wave. Cell `i`
+ * renders the wave frame at `tick + i`, so the cells read as a single
+ * connected undulation flowing across the strip. Renders nothing when
+ * `count` is 0; the wave keeps flowing as the count drains, so a refresh
+ * reads as a live, shrinking ribbon rather than a flickering number.
+ */
+export function RefreshWave({ count, fg }: { count: number; fg: string }) {
+  const tick = useFrameIndex(WAVE_FRAMES.length, WAVE_FRAME_MS);
+  const width = Math.min(Math.max(count, 0), MAX_WAVE_WIDTH);
+  if (width === 0) return null;
+  const len = WAVE_FRAMES.length;
+  let s = "";
+  for (let i = 0; i < width; i++) s += WAVE_FRAMES.charAt((tick + i) % len);
+  return <text fg={fg}>{s}</text>;
 }

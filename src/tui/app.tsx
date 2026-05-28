@@ -81,6 +81,7 @@ import { ArgPickerModal, MultiPickerModal, PickerModal, type MultiPickerItem } f
 import { OutputsPicker } from "./panels/outputs-picker.tsx";
 import { OutputViewer } from "./panels/output-viewer.tsx";
 import { previewFocusPatch } from "./picker-preview.ts";
+import { RefreshWave } from "./spinner.tsx";
 import {
   SectionPickerModal,
   type SectionPickerItem,
@@ -4283,15 +4284,15 @@ export function App({ onExit }: Props) {
   const fetchingCount = useIsFetching();
   const activeCount = rows.filter((r) => !r.archived).length;
   const archivedCount = rows.length - activeCount;
+  // The "refreshing" signal is the animated `RefreshWave` rendered after
+  // this string (width = in-flight count); the title itself stays static
+  // so it doesn't re-render on every count tick. `loading...` still wins
+  // during cold start — the wave is suppressed below while isLoading.
   const titleBar = useMemo(() => {
-    const suffix = isLoading
-      ? " · loading..."
-      : fetchingCount > 0
-        ? ` · refreshing (${fetchingCount})`
-        : "";
+    const loadingNote = isLoading ? " · loading..." : "";
     const archivedNote = archivedCount > 0 ? ` · ${archivedCount} archived` : "";
-    return ` wt · ${activeCount} worktree${activeCount === 1 ? "" : "s"}${archivedNote}${suffix} `;
-  }, [activeCount, archivedCount, isLoading, fetchingCount]);
+    return ` wt · ${activeCount} worktree${activeCount === 1 ? "" : "s"}${archivedNote}${loadingNote} `;
+  }, [activeCount, archivedCount, isLoading]);
 
   const footerHint = useMemo(() => {
     const parts: string[] = [];
@@ -4309,10 +4310,11 @@ export function App({ onExit }: Props) {
         paddingRight={1}
         height={1}
       >
-        <box flexGrow={1} flexShrink={1} overflow="hidden">
+        <box flexGrow={1} flexShrink={1} overflow="hidden" flexDirection="row">
           <text fg={theme.fgBright} attributes={1}>
             {titleBar}
           </text>
+          <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
         </box>
         <PrimaryHarnessBadge primary={primaryHarness} />
         <ClaudeUsageBadge />
