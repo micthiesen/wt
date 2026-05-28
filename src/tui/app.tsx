@@ -1134,7 +1134,15 @@ export function App({ onExit }: Props) {
               BUILTIN_ACTIONS.find((d) => d.id === run.actionId) ??
               null;
             const label = extractLabel(run.lines, def?.labelExtract ?? null);
-            if (label) recordHistoryRun(run.actionId, argVal, label);
+            // Suppress redundant labels — when the regex captures the
+            // same text the user typed (e.g. "Seeding company: <id>"
+            // with no name resolution), recording it would render the
+            // picker as `<id> · <id>`. Skip the update; the entry
+            // keeps its `label: null` from launch-time and the picker
+            // shows just the raw value.
+            if (label && label !== argVal) {
+              recordHistoryRun(run.actionId, argVal, label);
+            }
           }
         }
       }
