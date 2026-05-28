@@ -120,7 +120,7 @@ import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
-import { hideFrontmostAlacritty, openInZed, openUrl, writeClipboard } from "./helpers.ts";
+import { openInZed, openUrlHidingAlacritty, writeClipboard } from "./helpers.ts";
 import {
   DOTFILES_SLOT,
   MAIN_CLONE_SLOT,
@@ -4032,7 +4032,6 @@ export function App({ onExit }: Props) {
     }
     if (k.sequence === "O") {
       openInZed(MAIN_CLONE_SLOT.path);
-      hideFrontmostAlacritty();
       createLogger(MAIN_CLONE_SLOT.label).event.info(
         `opened ${MAIN_CLONE_SLOT.path}`,
       );
@@ -4046,8 +4045,7 @@ export function App({ onExit }: Props) {
     if (selectedPr) {
       const prLog = createLogger("[review]");
       if (isPlainLetter(k, "p") || k.name === "return") {
-        hideFrontmostAlacritty();
-        openUrl(selectedPr.url);
+        void openUrlHidingAlacritty(selectedPr.url);
         prLog.event.info(`opened review #${selectedPr.number}`);
         return;
       }
@@ -4058,7 +4056,6 @@ export function App({ onExit }: Props) {
     const rowLog = createLogger(current.wt.slug);
     if (isPlainLetter(k, "o")) {
       openInZed(current.wt.path);
-      hideFrontmostAlacritty();
       rowLog.event.info("opened in zed");
       return;
     }
@@ -4067,8 +4064,7 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no PR for this branch");
         return;
       }
-      hideFrontmostAlacritty();
-      openUrl(current.pr.url);
+      void openUrlHidingAlacritty(current.pr.url);
       rowLog.event.info(`opened PR #${current.pr.number}`);
       return;
     }
@@ -4078,8 +4074,7 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no linear id in slug");
         return;
       }
-      hideFrontmostAlacritty();
-      openUrl(url);
+      void openUrlHidingAlacritty(url);
       rowLog.event.info("opened linear");
       return;
     }
@@ -4093,8 +4088,7 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no stage domain configured");
         return;
       }
-      hideFrontmostAlacritty();
-      openUrl(url);
+      void openUrlHidingAlacritty(url);
       rowLog.event.info(`opened ${current.wt.stage}`);
       return;
     }

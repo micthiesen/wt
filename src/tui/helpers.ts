@@ -1,6 +1,8 @@
 import { resolve } from "node:path";
 
-export { hideFrontmostAlacritty, openInZed } from "../core/zed.ts";
+import { hideFrontmostAlacritty, openInZed } from "../core/zed.ts";
+
+export { hideFrontmostAlacritty, openInZed };
 
 /**
  * Path of the wt source tree itself. This file lives at
@@ -17,6 +19,21 @@ export function openUrl(url: string): void {
     stdout: "ignore",
     stderr: "ignore",
   });
+}
+
+/**
+ * Hide a frontmost Alacritty window, *then* open the URL. Order matters:
+ * `openUrl` brings the browser to the front, while `hideFrontmostAlacritty`
+ * shells out to `osascript` to sample the frontmost app and only sends
+ * Cmd+H if it's Alacritty. Firing both without awaiting lets the browser
+ * win the race — the frontmost query then sees the browser, not Alacritty,
+ * and the hide no-ops. Awaiting the hide first keeps Alacritty frontmost
+ * long enough to be detected and hidden. (Matters since the hide became
+ * async; `openInZed` already sequences its own hide internally.)
+ */
+export async function openUrlHidingAlacritty(url: string): Promise<void> {
+  await hideFrontmostAlacritty();
+  openUrl(url);
 }
 
 /** Write to the macOS clipboard via pbcopy. Fire-and-forget. */
