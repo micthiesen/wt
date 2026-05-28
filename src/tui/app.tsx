@@ -680,6 +680,15 @@ export function App({ onExit }: Props) {
       });
       return;
     }
+    if (modal?.kind === "argPicker" && modal.input !== null) {
+      // Single-line input — strip newlines so a paste of "acme-123\n"
+      // (common from terminal selection) doesn't auto-submit or leave
+      // a trailing newline in the substituted `{{arg}}`.
+      const clean = printableText(text);
+      if (!clean) return;
+      setModal({ ...modal, input: (modal.input ?? "") + clean });
+      return;
+    }
     const clean = printableText(text);
     if (!clean) return;
     if (footer.kind === "input") {
