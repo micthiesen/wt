@@ -105,7 +105,6 @@ export type WorktreeRow = {
    * the worktree list when the parent is the row immediately above.
    */
   stackedOn: StackedOn | null;
-  anyFetching: boolean;
   archived: boolean;
   /**
    * Resolved title with `llm > pr > commit > slug` fallback. Both the
@@ -422,7 +421,6 @@ function useLockReleasedInvalidator(lockedSig: string): void {
  * back into a row per worktree with a derived `Status`.
  */
 export function useWorktreeRows(): WorktreeRowsResult {
-  const qc = useQueryClient();
   const wtList = useQuery(worktreesQuery());
   const github = useGithub();
   const archive = useQuery(archiveQuery());
@@ -612,18 +610,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const pr = prsByIndex[i];
     const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
     const stackedOn = stackedOnByIndex[i] ?? null;
-    // Only this row's own per-worktree fields drive the list-row refresh
-    // spinner. We deliberately DON'T fold in the shared `github.isFetching`
-    // here: that one fetch covers every row at once, so including it
-    // re-minted every row's identity — and re-rendered every memoized
-    // `RowView` — twice per github poll (fetch-start → true, end → false),
-    // pure churn for a signal identical across all rows. Reading it here
-    // also subscribed this hook to github fetch-state flips; dropping it
-    // means a background PR poll that doesn't change `github.data` no
-    // longer re-renders the list at all. The details pane still surfaces
-    // PR/merge-queue fetching for the *selected* row via its own source
-    // states (`combinedGlyph`), so no visible per-row activity is lost.
-    const anyFetching = fieldArr.some((r) => r.isFetching);
     const archived = archivedSet.has(wt.slug);
     // Effective section: stack-managed override beats the stored
     // manual section. Archived rows skip the override so the archived
@@ -664,7 +650,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.status === status &&
       prev.pr === pr &&
       prev.mq === mq &&
-      prev.anyFetching === anyFetching &&
       prev.archived === archived &&
       prev.title === title &&
       prev.titleSource === titleSource &&
@@ -687,7 +672,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
       pr,
       mq,
       stackedOn: stackedOnOut,
-      anyFetching,
       archived,
       title,
       titleSource,

@@ -4,7 +4,6 @@ import { getHarness } from "../../core/harness/index.ts";
 import { STATE_DOT, STATE_FG } from "../claude-state.ts";
 import { NF } from "../icons.ts";
 import { Modal } from "../modal.tsx";
-import { Spinner } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 
 type Section = {
@@ -120,7 +119,6 @@ const STATUS_GLYPHS: [LegendGlyph, string, string][] = [
   [NF.slash, theme.warn, "gone (branch deleted upstream)"],
   [NF.merge, theme.ok, "merged into origin/main"],
   [NF.pencil, theme.warn, "uncommitted changes"],
-  [<Spinner key="refresh" fg={theme.fgDim} />, theme.fgDim, "refreshing"],
   ["  ", theme.fgDim, "idle / clean"],
 ];
 

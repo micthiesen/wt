@@ -20,7 +20,6 @@ import {
   statusBadge,
 } from "../badges.ts";
 import { NF } from "../icons.ts";
-import { Spinner } from "../spinner.tsx";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { getHarness } from "../../core/harness/index.ts";
@@ -29,7 +28,7 @@ import type { DerivedState } from "../../core/claude-status.ts";
 import { STATE_FG } from "../claude-state.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
-import { type MergeQueueState, StatusKind } from "../../core/types.ts";
+import type { MergeQueueState } from "../../core/types.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = {
@@ -92,15 +91,6 @@ function StatusMarker({ row }: { row: WorktreeRow }) {
 }
 
 /**
- * Background refetch is in flight. Suppressed during user-initiated busy
- * ops (those have their own loud status icon and tail in the activity
- * pane — adding a refresh hint would be redundant noise).
- */
-function isRefreshing(row: WorktreeRow): boolean {
-  return row.anyFetching && row.status.kind !== StatusKind.Busy;
-}
-
-/**
  * Row label text. Prefers the LLM-authored `brief` (caveman-talk noun
  * phrase) over the longer `title`, since the list column is tight —
  * after the badge cluster on a busy row the slug area can drop to ~20
@@ -122,8 +112,7 @@ function rowLabel(row: WorktreeRow): string {
  * width-prop layout in the JSX below: 2-cell leading gap + each present
  * badge's box width. Returns 0 when no badges are rendered so the slug
  * column reclaims the space. The action-running hint, when present,
- * sits as the leftmost slot inside the cluster, before the refresh
- * spinner.
+ * sits as the leftmost slot inside the cluster.
  */
 function badgeClusterCells(
   row: WorktreeRow,
@@ -133,20 +122,17 @@ function badgeClusterCells(
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     !!row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
-  const refreshing = isRefreshing(row);
   // Action and harness-glyph slots coexist (e.g. a row running an
   // action while hosting a live session shows both glyphs).
   const showSessionSlot = activeHarnessId !== undefined;
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
-    refreshing ||
     !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (actionRunning) cells += 2;
   if (showSessionSlot) cells += 2;
-  if (refreshing) cells += 2;
   if (rabbitHint(row)) cells += 2;
   if (reviewHint(row)) cells += 2;
   // The PR-state slot doubles as the merge-queue slot: a queued PR
@@ -286,7 +272,6 @@ const RowView = memo(function RowView({
   const isDeployed = row.fields.deploy.data ?? false;
   const showChecks =
     row.pr && row.pr.state === "OPEN" && row.pr.checks !== "none";
-  const refreshing = isRefreshing(row);
   const rabbit = rabbitHint(row);
   const review = reviewHint(row);
   const rabbitFg = row.archived || !rabbit ? theme.fgDim : rabbit.fg;
@@ -300,7 +285,6 @@ const RowView = memo(function RowView({
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
-    refreshing ||
     !!(row.pr || row.mq || isDeployed);
   // OpenTUI `attributes` is a bitmask over TextAttributes. Combine BOLD
   // (selection) and ITALIC (tailing) so both indicators survive when
@@ -353,16 +337,6 @@ const RowView = memo(function RowView({
       {hasAnyBadge ? (
         <box flexShrink={0} flexDirection="row">
           <text>  </text>
-          {/* Refresh spinner is ALWAYS the leftmost slot in the badge
-              cluster. It's the most ephemeral signal (a row's data is
-              actively being refetched), so anchoring it on the left
-              gives it a stable, unmissable position regardless of which
-              other badges happen to be present. Don't reorder. */}
-          {refreshing ? (
-            <box width={2} flexShrink={0}>
-              <Spinner fg={theme.fgDim} />
-            </box>
-          ) : null}
           {actionRunning ? (
             <box width={2} flexShrink={0}>
               <text fg={theme.ok}>{NF.comment}</text>
@@ -370,7 +344,7 @@ const RowView = memo(function RowView({
           ) : null}
           {/* Ephemeral / scattered badges are left-anchored so they
               don't displace the PR-status run on the right, ordered by
-              transience: spinner → action-running → stage/deploy bolt. */}
+              transience: action-running → stage/deploy bolt. */}
           {isDeployed ? (
             <box width={2} flexShrink={0}>
               <text fg={deployFg}>{NF.bolt}</text>
