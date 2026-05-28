@@ -300,18 +300,43 @@ class ActionRegistry {
    *  (status flip + result-event metadata) would otherwise race and
    *  one would lose. */
   private metaChains = new Map<string, Promise<void>>();
+  /** Slugs with a `start()` in flight but not yet committed to `runs`.
+   *  `start()` awaits `startActionSession` now, so the "one running per
+   *  slug" guard can no longer rely on check-then-commit being atomic —
+   *  a second concurrent start() could slip through the window between
+   *  the guard and the `runs` commit. Reserving the slug here keeps the
+   *  guard meaningful across that await. */
+  private starting = new Set<string>();
 
-  start(
+  async start(
     def: ActionDef,
     slug: string,
     cwd: string,
     extras: string,
     vars: ActionVars = {},
-  ): ActionStartResult {
+  ): Promise<ActionStartResult> {
     const existing = this.runs.get(slug);
-    if (existing?.status === "running") {
+    if (existing?.status === "running" || this.starting.has(slug)) {
       return { ok: false, reason: "an action is already running for this worktree" };
     }
+    // Reserve the slug synchronously across the async `startActionSession`
+    // inside `startInner` so a second concurrent start() can't slip past
+    // the guard above before this run lands in `runs`.
+    this.starting.add(slug);
+    try {
+      return await this.startInner(def, slug, cwd, extras, vars);
+    } finally {
+      this.starting.delete(slug);
+    }
+  }
+
+  private async startInner(
+    def: ActionDef,
+    slug: string,
+    cwd: string,
+    extras: string,
+    vars: ActionVars,
+  ): Promise<ActionStartResult> {
     // `kill()` synchronously closes the prior run's tail + done
     // watcher and tmux-kills the session, so by the time we reach
     // here `liveHandles[slug]` should be empty. Defense-in-depth:
@@ -383,7 +408,7 @@ class ActionRegistry {
       return { ok: false, reason: `write meta: ${msg}` };
     }
 
-    const spawnResult = startActionSession({ slug, cwd, runDir, argv });
+    const spawnResult = await startActionSession({ slug, cwd, runDir, argv });
     if (!spawnResult.ok) {
       // Persist a failed sentinel so a later boot doesn't see a
       // "running" run with no tmux session.
@@ -428,7 +453,7 @@ class ActionRegistry {
     cwd: string,
     prompt: string,
     vars: ActionVars = {},
-  ): ActionStartResult {
+  ): Promise<ActionStartResult> {
     return this.start(
       {
         kind: "claude",
@@ -463,7 +488,7 @@ class ActionRegistry {
    * `<slug>-action` name so `startActionSession` can claim it again
    * on the next call.
    */
-  kill(slug: string): boolean {
+  async kill(slug: string): Promise<boolean> {
     const run = this.runs.get(slug);
     if (!run || run.status !== "running") return false;
 
@@ -477,10 +502,12 @@ class ActionRegistry {
       this.liveHandles.delete(slug);
     }
 
-    // Sync tmux kill so a follow-up start() can immediately reuse the
-    // session name without colliding on the dying wrapper.
-    killActionTmuxSession(slug);
-
+    // Commit the killed status SYNCHRONOUSLY — before the async tmux
+    // kill below — for two reasons: callers that fire-and-forget
+    // (`doRemove`, `doClean`) still get the immediate UI flip to
+    // "killed" they rely on, and a re-entrant kill() during the await
+    // sees a terminal run (status !== "running") and bails instead of
+    // appending a second exit line.
     const cur = this.runs.get(slug)!;
     const endedAt = Date.now();
     const dur = formatDuration(endedAt - cur.startedAt);
@@ -516,6 +543,12 @@ class ActionRegistry {
         err: err instanceof Error ? err.message : String(err),
       });
     }
+
+    // Free the tmux session name so a follow-up start() can reclaim it;
+    // awaited last, after the in-memory teardown above. The wrapper's
+    // EXIT trap fires once the session dies and writes done.json, but
+    // no one watches it — the run is already terminal here.
+    await killActionTmuxSession(slug);
 
     log.event.warn(`${slug}: ${cur.actionName} killed (${dur})`);
     this.scheduleCleanup();

@@ -318,14 +318,13 @@ export async function killShellSession(slug: string): Promise<void> {
 export async function killAllSessionsFor(slug: string): Promise<void> {
   // List once and pick out any session whose bareSlug matches —
   // covers primary, named claudes, diff, shell, and action without
-  // hardcoding the named-claude list. Action kills go via
-  // action-tmux.ts which is synchronous; wrap in Promise.resolve to
-  // keep the allSettled shape uniform.
+  // hardcoding the named-claude list. The action kill goes via
+  // action-tmux.ts (now async like the rest).
   const all = await listAllSessionsRaw().catch(() => new Set<string>());
   const ours = [...all].filter((n) => bareSlug(n) === slug);
   await Promise.allSettled([
     ...ours.map((n) => killByName(n)),
-    Promise.resolve().then(() => killActionSession(slug)),
+    killActionSession(slug),
   ]);
 }
 

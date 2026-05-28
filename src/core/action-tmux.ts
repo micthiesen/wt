@@ -30,6 +30,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "./logger.ts";
+import { run } from "./proc.ts";
 
 const log = createLogger("[action-tmux]");
 
@@ -124,57 +125,50 @@ export function actionSessionName(slug: string): string {
 
 /**
  * Spawn a detached tmux session that runs the wrapper with the given
- * inner argv. Sync because `tmux new-session -d` exits immediately on
- * success (sub-100ms steady state), and `actionRegistry.start` is a
- * sync entry point — wrapping in async here would force every caller
- * up through `launchAction` to thread it.
+ * inner argv. Async (`run`) so the `tmux new-session` round-trip never
+ * blocks the TUI render thread at launch time; the registry awaits it.
  *
  * The session is created with `new-session -d` (detached), no `-A`
  * (we deliberately don't want attach-or-create — concurrent starts
  * on the same slug should fail loudly so the registry's "one running
  * per slug" guard is meaningful at the tmux layer too).
+ *
+ * `run` inherits `process.env`, so the inner command sees the same
+ * PATH, $SHELL, and any user-set env vars (CLAUDE_API_KEY, etc.). We
+ * deliberately don't strip TMUX the way `attachOrCreate` does for
+ * claude's colour downgrade — actions don't render TUIs, and stripping
+ * would break tmux-aware tools the user may have wired into a shell
+ * action.
  */
-export function startActionSession(opts: {
+export async function startActionSession(opts: {
   slug: string;
   cwd: string;
   runDir: string;
   argv: readonly string[];
-}): { ok: true } | { ok: false; reason: string } {
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
   const { slug, cwd, runDir, argv } = opts;
   const wrapper = ensureWrapper();
   const name = actionSessionName(slug);
-  const proc = Bun.spawnSync(
-    [
-      "tmux",
-      "-L",
-      TMUX_SOCKET,
-      "new-session",
-      "-d",
-      "-s",
-      name,
-      "-c",
-      cwd,
-      "bash",
-      wrapper,
-      runDir,
-      ...argv,
-    ],
-    {
-      stdout: "ignore",
-      stderr: "pipe",
-      // Inherit env so the inner command sees the same PATH, $SHELL,
-      // and any user-set env vars (CLAUDE_API_KEY, etc.). We deliberately
-      // don't strip TMUX here the way `attachOrCreate` does for claude's
-      // colour downgrade — actions don't render TUIs, and stripping would
-      // break tmux-aware tools the user may have wired into a shell action.
-    },
-  );
-  if (proc.exitCode === 0) return { ok: true };
-  const errText = (proc.stderr ?? "").toString().trim();
-  const reason = errText || `tmux new-session exited ${proc.exitCode}`;
+  const r = await run([
+    "tmux",
+    "-L",
+    TMUX_SOCKET,
+    "new-session",
+    "-d",
+    "-s",
+    name,
+    "-c",
+    cwd,
+    "bash",
+    wrapper,
+    runDir,
+    ...argv,
+  ]);
+  if (r.exitCode === 0) return { ok: true };
+  const reason = r.stderr.trim() || `tmux new-session exited ${r.exitCode}`;
   log.warn("startActionSession failed", {
     slug,
-    code: proc.exitCode,
+    code: r.exitCode,
     reason,
   });
   return { ok: false, reason };
@@ -182,28 +176,26 @@ export function startActionSession(opts: {
 
 /**
  * Kill one slug's action session. Idempotent — silently no-ops when
- * the session doesn't exist or the server isn't running. Triggers
- * the wrapper's EXIT trap, which writes `done.json`.
+ * the session doesn't exist or the server isn't running (`run` never
+ * throws and a nonzero exit is ignored). Triggers the wrapper's EXIT
+ * trap, which writes `done.json`.
  *
- * Sync because the registry's `kill()` finalizes state synchronously
- * (closes tail/done watchers, persists meta, commits status flip)
- * and needs the tmux session gone before returning so a follow-up
- * `start()` for the same slug doesn't collide on the session name.
- * `tmux kill-session` is fast (sub-100ms steady state); the wrapper's
- * EXIT trap fires asynchronously after.
+ * Async (`run`) so the `tmux kill-session` round-trip doesn't block the
+ * render thread. The registry's `kill()` does its in-memory teardown
+ * (close tail/done watchers, commit the `killed` status, persist meta)
+ * synchronously *before* awaiting this, so the UI flips to killed
+ * immediately; the awaited resolution then guarantees the session name
+ * is freed so a follow-up `start()` for the same slug can reclaim it.
  */
-export function killActionSession(slug: string): void {
-  Bun.spawnSync(
-    [
-      "tmux",
-      "-L",
-      TMUX_SOCKET,
-      "kill-session",
-      "-t",
-      `=${actionSessionName(slug)}`,
-    ],
-    { stdout: "ignore", stderr: "ignore" },
-  );
+export async function killActionSession(slug: string): Promise<void> {
+  await run([
+    "tmux",
+    "-L",
+    TMUX_SOCKET,
+    "kill-session",
+    "-t",
+    `=${actionSessionName(slug)}`,
+  ]);
 }
 
 /**

@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { run } from "./proc.ts";
+
 /**
  * Zed 0.20x changed `zed <path>` to reuse the current window instead of
  * focusing the one that already has <path> open. Zed's CLI has no flag
@@ -43,25 +45,25 @@ function writeCache(cache: CacheFile): void {
   writeFileSync(CACHE_FILE, `${JSON.stringify(cache, null, 2)}\n`);
 }
 
-function yabaiQueryAllWindows(): YabaiWindow[] | null {
-  const r = Bun.spawnSync(["yabai", "-m", "query", "--windows"]);
+async function yabaiQueryAllWindows(): Promise<YabaiWindow[] | null> {
+  const r = await run(["yabai", "-m", "query", "--windows"]);
   if (r.exitCode !== 0) return null;
   try {
-    const parsed = JSON.parse(r.stdout.toString()) as YabaiWindow[];
+    const parsed = JSON.parse(r.stdout) as YabaiWindow[];
     return Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
-function zedWindowIds(): Set<number> {
-  const all = yabaiQueryAllWindows();
+async function zedWindowIds(): Promise<Set<number>> {
+  const all = await yabaiQueryAllWindows();
   if (!all) return new Set();
   return new Set(all.filter((w) => w.app === "Zed").map((w) => w.id));
 }
 
-function yabaiWindowExists(id: number): boolean {
-  const r = Bun.spawnSync([
+async function yabaiWindowExists(id: number): Promise<boolean> {
+  const r = await run([
     "yabai",
     "-m",
     "query",
@@ -71,15 +73,15 @@ function yabaiWindowExists(id: number): boolean {
   ]);
   if (r.exitCode !== 0) return false;
   try {
-    const w = JSON.parse(r.stdout.toString()) as YabaiWindow;
+    const w = JSON.parse(r.stdout) as YabaiWindow;
     return w?.app === "Zed";
   } catch {
     return false;
   }
 }
 
-function yabaiFocus(id: number): boolean {
-  const r = Bun.spawnSync(["yabai", "-m", "window", "--focus", String(id)]);
+async function yabaiFocus(id: number): Promise<boolean> {
+  const r = await run(["yabai", "-m", "window", "--focus", String(id)]);
   return r.exitCode === 0;
 }
 
@@ -88,17 +90,17 @@ function yabaiFocus(id: number): boolean {
  * known and still alive. Prunes the cache on miss so stale entries
  * don't accumulate.
  */
-export function findZedWindowForPath(path: string): number | null {
+export async function findZedWindowForPath(path: string): Promise<number | null> {
   const cache = readCache();
   const entry = cache.byPath[path];
   if (!entry) return null;
-  if (yabaiWindowExists(entry.windowId)) return entry.windowId;
+  if (await yabaiWindowExists(entry.windowId)) return entry.windowId;
   delete cache.byPath[path];
   writeCache(cache);
   return null;
 }
 
-export function focusYabaiWindow(id: number): boolean {
+export async function focusYabaiWindow(id: number): Promise<boolean> {
   return yabaiFocus(id);
 }
 
@@ -112,7 +114,7 @@ export function focusYabaiWindow(id: number): boolean {
  * work runs in a microtask-ish poll loop via `setTimeout`.
  */
 export async function spawnZedAndTrack(path: string): Promise<void> {
-  const beforeIds = zedWindowIds();
+  const beforeIds = await zedWindowIds();
   const child = spawn("zed", ["-n", path], {
     stdio: "ignore",
     detached: true,
@@ -125,7 +127,7 @@ export async function spawnZedAndTrack(path: string): Promise<void> {
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 150));
-    const now = zedWindowIds();
+    const now = await zedWindowIds();
     for (const id of now) {
       if (!beforeIds.has(id)) {
         const cache = readCache();

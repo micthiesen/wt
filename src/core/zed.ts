@@ -1,3 +1,5 @@
+import { run } from "./proc.ts";
+
 import {
   findZedWindowForPath,
   focusYabaiWindow,
@@ -10,9 +12,9 @@ import {
  * error (missing osascript, no accessibility perms, sandboxed
  * terminal) is swallowed because this is purely cosmetic UX.
  */
-export function hideFrontmostAlacritty(): void {
+export async function hideFrontmostAlacritty(): Promise<void> {
   try {
-    const frontmostProc = Bun.spawnSync([
+    const frontmostProc = await run([
       "osascript",
       "-e",
       'tell application "System Events" to name of first application process whose frontmost is true',
@@ -20,9 +22,9 @@ export function hideFrontmostAlacritty(): void {
     // osascript on some macOS versions returns the lowercased process
     // name (`alacritty`) and on others returns the marketing name
     // (`Alacritty`). Compare case-insensitively.
-    const frontmost = frontmostProc.stdout.toString().trim().toLowerCase();
+    const frontmost = frontmostProc.stdout.trim().toLowerCase();
     if (frontmost !== "alacritty") return;
-    Bun.spawnSync([
+    await run([
       "osascript",
       "-e",
       'tell application "System Events" to key code 4 using {command down}',
@@ -46,8 +48,8 @@ export function hideFrontmostAlacritty(): void {
  * `process.exit`.
  */
 export async function openInZed(path: string): Promise<void> {
-  hideFrontmostAlacritty();
-  const existing = findZedWindowForPath(path);
-  if (existing !== null && focusYabaiWindow(existing)) return;
+  await hideFrontmostAlacritty();
+  const existing = await findZedWindowForPath(path);
+  if (existing !== null && (await focusYabaiWindow(existing))) return;
   await spawnZedAndTrack(path);
 }

@@ -1678,7 +1678,10 @@ export function App({ onExit }: Props) {
     // before killAllSessionsFor below — once tmux drops the session
     // out from under the wrapper there's no way for the registry to
     // distinguish "user destroyed worktree" from "wrapper crashed".
-    actionRegistry.kill(slug);
+    // kill() commits the "killed" status synchronously before its async
+    // tmux teardown, so the status flip lands before killAllSessionsFor
+    // below even though we don't await here.
+    void actionRegistry.kill(slug);
     // Tear down any interactive sessions (claude, diff, shell) BEFORE
     // the worktree removal starts. Their cwds are inside the worktree;
     // letting the remove race against a live tmux child can leave it
@@ -1726,7 +1729,7 @@ export function App({ onExit }: Props) {
     // Notify the action registry first (synchronous, fast) so the
     // activity pane reads "killed" rather than the "failed" the
     // wrapper's exit code would otherwise produce.
-    for (const row of candidates) actionRegistry.kill(row.wt.slug);
+    for (const row of candidates) void actionRegistry.kill(row.wt.slug);
     await Promise.allSettled(
       candidates.map((row) => killAllSessionsFor(row.wt.slug)),
     );
@@ -2425,12 +2428,12 @@ export function App({ onExit }: Props) {
     });
   }
 
-  function launchAction(
+  async function launchAction(
     slug: string,
     def: ActionDef | null,
     extras: string,
     arg?: string,
-  ): void {
+  ): Promise<void> {
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) {
       toast("worktree gone", theme.warn, 1500);
@@ -2507,8 +2510,8 @@ export function App({ onExit }: Props) {
       return;
     }
     const result = def
-      ? actionRegistry.start(def, slug, row.wt.path, extras, vars)
-      : actionRegistry.startCustom(slug, row.wt.path, extras, vars);
+      ? await actionRegistry.start(def, slug, row.wt.path, extras, vars)
+      : await actionRegistry.startCustom(slug, row.wt.path, extras, vars);
     if (!result.ok) {
       toast(`action: ${result.reason}`, theme.err, 3000);
       return;
@@ -2758,7 +2761,7 @@ export function App({ onExit }: Props) {
           }
           if (item.kind === "action" && item.def.kind === "shell") {
             setModal(null);
-            launchAction(ap.slug, item.def, "");
+            void launchAction(ap.slug, item.def, "");
             return;
           }
           // Custom (no def) or claude action → into the edit modal.
@@ -2847,7 +2850,7 @@ export function App({ onExit }: Props) {
       if (k.name === "return") {
         const { slug, def, extras } = ap;
         setModal(null);
-        launchAction(slug, def, extras);
+        void launchAction(slug, def, extras);
         return;
       }
       if (k.name === "backspace") {
@@ -2883,7 +2886,7 @@ export function App({ onExit }: Props) {
         const trimmed = value.trim();
         if (!trimmed) return;
         setModal(null);
-        launchAction(ap.slug, ap.def, "", trimmed);
+        void launchAction(ap.slug, ap.def, "", trimmed);
       };
       if (k.ctrl && k.name === "c") {
         setModal(null);
@@ -3293,10 +3296,11 @@ export function App({ onExit }: Props) {
       if (k.name === "y" || k.name === "return") {
         const { slug, actionName } = modal;
         setModal(null);
-        const killed = actionRegistry.kill(slug);
-        if (killed) {
-          appLog.event.warn(`killed action "${actionName}" on ${slug}`);
-        }
+        void actionRegistry.kill(slug).then((killed) => {
+          if (killed) {
+            appLog.event.warn(`killed action "${actionName}" on ${slug}`);
+          }
+        });
         return;
       }
       if (
