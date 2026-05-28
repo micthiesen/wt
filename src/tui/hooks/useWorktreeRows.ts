@@ -608,14 +608,18 @@ export function useWorktreeRows(): WorktreeRowsResult {
     const pr = prsByIndex[i];
     const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
     const stackedOn = stackedOnByIndex[i] ?? null;
-    // Include the combined GitHub fetch that feeds the details pane
-    // so the row glyph lights up whenever anything visible for this
-    // worktree is refreshing — not just the per-worktree fields. That
-    // one fetch covers all rows at once, so every row's glyph flashes
-    // together during e.g. a refresh; intentional, since each row's
-    // details pane would show the PR/merge-queue spinner.
-    const anyFetching =
-      fieldArr.some((r) => r.isFetching) || github.isFetching;
+    // Only this row's own per-worktree fields drive the list-row refresh
+    // spinner. We deliberately DON'T fold in the shared `github.isFetching`
+    // here: that one fetch covers every row at once, so including it
+    // re-minted every row's identity — and re-rendered every memoized
+    // `RowView` — twice per github poll (fetch-start → true, end → false),
+    // pure churn for a signal identical across all rows. Reading it here
+    // also subscribed this hook to github fetch-state flips; dropping it
+    // means a background PR poll that doesn't change `github.data` no
+    // longer re-renders the list at all. The details pane still surfaces
+    // PR/merge-queue fetching for the *selected* row via its own source
+    // states (`combinedGlyph`), so no visible per-row activity is lost.
+    const anyFetching = fieldArr.some((r) => r.isFetching);
     const archived = archivedSet.has(wt.slug);
     // Effective section: stack-managed override beats the stored
     // manual section. Archived rows skip the override so the archived
