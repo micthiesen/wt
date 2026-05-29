@@ -46,13 +46,15 @@ export function Footer({ mode, hint }: Props) {
   // permanent status robots bundled at the far right — wt-source first,
   // dotfiles to its right. No labels: position is the discriminator (the
   // main-clone slot is represented separately by its tail on the left).
-  // Each robot's glyph follows the TAB-selected primary harness (what the
-  // slot's keybind spawns), and its color tracks the slot's live session
-  // state via the same cross-harness rule the list/details panes use —
-  // so codex/opencode slots light up too, not just claude.
+  // Each robot's glyph AND color follow the TAB-selected primary harness:
+  // a slot keybind always opens the primary harness, so we track that
+  // harness's live session in the slot (not the cross-harness F12 target
+  // the list rows use). TABbing therefore moves both the icon and the
+  // status color together — and a dim glyph means "no live primary-harness
+  // session in this slot", not "no session at all".
   const primary = usePrimaryHarness();
   const primaryGlyph = getHarness(primary).glyph;
-  const slotSessions = useActiveSessionsBySlug(SESSION_SLOTS, primary);
+  const slotSessions = useActiveSessionsBySlug(SESSION_SLOTS, primary, primary);
   const wtState = slotSessions.get(WT_SOURCE_SLOT.slug)?.state ?? null;
   const dotfilesState = slotSessions.get(DOTFILES_SLOT.slug)?.state ?? null;
   return (

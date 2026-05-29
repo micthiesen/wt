@@ -259,50 +259,69 @@ export type ActiveSessionGlyph = {
   state: DerivedState | null;
 };
 
+const ALL_HARNESS_IDS: readonly HarnessId[] = HARNESSES.map((h) => h.id);
+
 /**
  * Per-slug {@link ActiveSessionGlyph}, computed through the same
  * {@link computeHarnessSessions} rule the current-row hook and F12 use —
- * so the list glyph can never disagree with what F12 attaches to or what
- * the details pane shows.
+ * so the glyph can never disagree with what gets attached or what the
+ * details pane shows.
+ *
+ * `targetHarness` restricts which harness counts. Omit it (list rows) for
+ * the cross-harness F12 target — what F12 on a worktree row attaches to.
+ * Pass it (footer slots) to track *that* harness's session only, since a
+ * slot keybind always opens the TAB-selected primary, not whatever's most
+ * recently active — so the footer color follows the same harness as the
+ * glyph instead of drifting to a different live session in the slot.
  *
  * The map only ever holds slugs with a *live* session, and liveness is
  * fully determined by the cheap `tmuxSessionsQuery` set, so we fan the
  * (per-harness, disk-scanning) `harnessSessionsQuery` only across slugs
- * tmux already reports as having a live AI session rather than every
- * worktree. Output is identical; the discovery cost scales with live
- * sessions, not total worktrees.
+ * tmux already reports as live for the considered harness(es). Discovery
+ * cost scales with live sessions, not total worktrees.
  */
 export function useActiveSessionsBySlug(
   worktrees: ReadonlyArray<{ slug: string; path: string }>,
   primary: HarnessId,
+  targetHarness?: HarnessId,
 ): ReadonlyMap<string, ActiveSessionGlyph> {
   const tmux = useQuery(tmuxSessionsQuery());
+  const harnessIds = useMemo(
+    () => (targetHarness ? [targetHarness] : ALL_HARNESS_IDS),
+    [targetHarness],
+  );
   const liveAiSlugs = useMemo(() => {
     const s = new Set<string>();
-    for (const slug of tmux.data?.claudeSlugs ?? []) s.add(slug);
-    for (const slug of tmux.data?.codex ?? []) s.add(slug);
-    for (const slug of tmux.data?.opencode ?? []) s.add(slug);
+    for (const id of harnessIds) {
+      const src =
+        id === "claude"
+          ? tmux.data?.claudeSlugs
+          : id === "codex"
+            ? tmux.data?.codex
+            : tmux.data?.opencode;
+      for (const slug of src ?? []) s.add(slug);
+    }
     return s;
-  }, [tmux.data?.claudeSlugs, tmux.data?.codex, tmux.data?.opencode]);
+  }, [tmux.data?.claudeSlugs, tmux.data?.codex, tmux.data?.opencode, harnessIds]);
   const liveWorktrees = useMemo(
     () => worktrees.filter((w) => liveAiSlugs.has(w.slug)),
     [worktrees, liveAiSlugs],
   );
   const results = useQueries({
     queries: liveWorktrees.flatMap((w) =>
-      HARNESSES.map((h) => harnessSessionsQuery(h.id, w.slug, w.path)),
+      harnessIds.map((id) => harnessSessionsQuery(id, w.slug, w.path)),
     ),
   });
   return useMemo(() => {
     const tmuxNames = new Set(tmux.data?.all ?? []);
     const now = Date.now();
-    const H = HARNESSES.length;
+    const H = harnessIds.length;
     const map = new Map<string, ActiveSessionGlyph>();
     for (let i = 0; i < liveWorktrees.length; i++) {
       const w = liveWorktrees[i]!;
       const rawByHarness = new Map<HarnessId, ReadonlyArray<HarnessSession>>();
       for (let j = 0; j < H; j++) {
-        rawByHarness.set(HARNESSES[j]!.id, results[i * H + j]?.data ?? EMPTY);
+        rawByHarness.set(harnessIds[j]!, results[i * H + j]?.data ?? EMPTY);
       }
       const { f12Target } = computeHarnessSessions(
         rawByHarness,
@@ -319,5 +338,5 @@ export function useActiveSessionsBySlug(
       }
     }
     return map;
-  }, [results, tmux.data?.all, primary, liveWorktrees]);
+  }, [results, tmux.data?.all, primary, liveWorktrees, harnessIds]);
 }
