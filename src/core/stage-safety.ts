@@ -1,26 +1,37 @@
 /**
- * Strict, centralised gate for everything that asserts ownership of
- * a worktree's SST stage — the deploy badge, the `sst remove` step,
+ * Centralised gate for everything that asserts ownership of a
+ * worktree's SST stage — the deploy badge, the `sst remove` step,
  * the doctor check, the URL we hand out.
  *
- * The trap this exists to prevent: a user runs
- * `scripts/deployProductionApp.sh <prod-stage>` (or any other
- * `pnpm sst deploy --stage <foreign>`) from inside the worktree.
- * SST happily writes `.sst/outputs.json` with the foreign deploy's
- * resources, while `.sst/stage` stays pinned to our dev stage.
- * Naively, "outputs.json non-empty" looks deployed — and `wt rm`
- * would offer to `sst remove` based on that, even though the
- * outputs belong to production. We must NEVER act on that signal.
+ * `.sst/stage` is the source of truth for which stage a worktree
+ * owns: it's what `wt new` pins, what SST itself deploys under, and
+ * what you can hand-edit to point a worktree at an existing stage
+ * (e.g. a renamed worktree, or one re-pinned to a deploy whose hash
+ * no longer matches the slug). We read it directly rather than
+ * re-deriving from the slug, so the badge and `sst remove` follow
+ * what's actually deployed.
+ *
+ * The safety net is the PREFIX, not the exact hash. Every personal
+ * stage lives under `config.stage.prefix` (e.g. `michael-`); a
+ * production stage does not. We only treat a worktree as deployed, or
+ * hand a `--stage` to `sst remove`, when the pinned stage carries that
+ * prefix — so you can never act outside your own namespace.
+ *
+ * The trap this still prevents: a `deployProductionApp.sh <prod-stage>`
+ * (or any `pnpm sst deploy --stage <foreign>`) run from inside the
+ * worktree fills `.sst/outputs.json` with production resources while
+ * `.sst/stage` stays pinned to your personal stage. Outputs that don't
+ * reference the pinned stage read as "not deployed", and a pin pointing
+ * at a non-prefixed (foreign/prod) stage is refused outright.
  *
  * Rules enforced here:
- *   1. The "stage we're allowed to manage" is purely a function of
- *      the slug (`expectedStage`). Never trusted from disk.
- *   2. To take any destructive action, `.sst/stage` must exist and
- *      match the expected name exactly (`safeStage`).
- *   3. To call a worktree "deployed", the outputs must reference our
- *      expected stage. Outputs that mention only foreign stages are
- *      treated identically to "never deployed" — no badge, no
- *      auto-destroy, nothing.
+ *   1. The stage a worktree owns is the pinned `.sst/stage` when it
+ *      carries the configured prefix; otherwise the slug-derived
+ *      `computeStage` (uninitialised worktrees) — see `expectedStage`.
+ *   2. Destructive actions require `safeStage.ok`: a `.sst/stage` pin
+ *      that exists and carries the prefix.
+ *   3. "Deployed" additionally requires `.sst/outputs.json` to
+ *      reference that exact stage.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -32,13 +43,17 @@ import type { Worktree } from "./types.ts";
 type WtRef = Pick<Worktree, "slug" | "path">;
 
 /**
- * Deterministic stage name for a worktree. Computed from the slug;
- * never read from on-disk state. This is the ONLY stage value
- * destructive code paths are permitted to act on — see
- * `lifecycle.removeWorktree`, which passes this verbatim as
- * `--stage` to `sst remove`.
+ * The stage a worktree owns: the pinned `.sst/stage` when present and
+ * carrying the configured prefix, else the slug-derived default for an
+ * uninitialised worktree. Used for the deploy URL, the `{{stage}}`
+ * action variable, and display. Destructive paths go through
+ * `safeStage`, which refuses the slug fallback (no pin → nothing to
+ * manage).
  */
-export function expectedStage(wt: Pick<Worktree, "slug">): string {
+export function expectedStage(wt: WtRef): string {
+  const pinned = readPinnedStage(wt.path);
+  const prefix = config.stage.prefix;
+  if (pinned !== null && prefix && pinned.startsWith(prefix)) return pinned;
   return computeStage(wt.slug);
 }
 
@@ -47,28 +62,24 @@ export type StageSafety =
   | { ok: false; reason: string };
 
 /**
- * Gate every destructive stage operation through this. Refuses when
- * the expected name lacks our configured prefix, when no `.sst/stage`
- * is pinned, or when the pin disagrees with the expected name.
+ * Gate every destructive stage operation through this. The returned
+ * `stage` is the pinned `.sst/stage` verbatim — what's actually
+ * deployed — and is what `sst remove --stage` receives. Refuses when
+ * nothing is pinned, when no prefix is configured, or when the pin
+ * lacks the personal prefix (a foreign/production stage we must never
+ * touch).
  */
 export function safeStage(wt: WtRef): StageSafety {
-  const expected = expectedStage(wt);
   const prefix = config.stage.prefix;
-  if (!prefix || !expected.startsWith(prefix)) {
-    return {
-      ok: false,
-      reason: `expected stage "${expected}" lacks configured prefix "${prefix}"`,
-    };
-  }
   const pinned = readPinnedStage(wt.path);
   if (pinned === null) return { ok: false, reason: "no .sst/stage pinned" };
-  if (pinned !== expected) {
+  if (!prefix || !pinned.startsWith(prefix)) {
     return {
       ok: false,
-      reason: `.sst/stage is "${pinned}", expected "${expected}" — refusing to manage a foreign stage`,
+      reason: `.sst/stage is "${pinned}", which lacks the personal prefix "${prefix}" — refusing to manage a foreign stage`,
     };
   }
-  return { ok: true, stage: expected };
+  return { ok: true, stage: pinned };
 }
 
 /**
@@ -76,16 +87,17 @@ export function safeStage(wt: WtRef): StageSafety {
  * worktree as "deployed" for destructive or ownership-asserting
  * purposes. True iff:
  *
- *   - `safeStage` is ok (pinned matches expected, prefix correct).
- *   - `.sst/outputs.json` exists, parses, and references the expected
+ *   - `safeStage` is ok (pinned exists and carries the prefix).
+ *   - `.sst/outputs.json` exists, parses, and references that pinned
  *     stage somewhere in its values.
  *
  * Anything else — missing/empty/foreign outputs — looks identical
  * to "never deployed" to the rest of the app.
  */
 export function isOurStageDeployed(wt: WtRef): boolean {
-  if (!safeStage(wt).ok) return false;
-  return outputsReferenceStage(wt.path, expectedStage(wt));
+  const safe = safeStage(wt);
+  if (!safe.ok) return false;
+  return outputsReferenceStage(wt.path, safe.stage);
 }
 
 function readPinnedStage(wtPath: string): string | null {

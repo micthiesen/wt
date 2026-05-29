@@ -161,11 +161,11 @@ export const BUILTIN_ACTIONS: readonly ActionDef[] = [
     id: "remove-local",
     name: "Remove local",
     group: "Deploy",
-    // `{{stage}}` resolves to the deterministic `expectedStage(slug)`
-    // at launch time, NOT whatever's pinned on disk. The
-    // `requires: ["deployed"]` gate already enforces that the pin
-    // matches expected, but using the deterministic value defends
-    // against tampering between picker-open and launch.
+    // `{{stage}}` resolves to the stage this worktree owns — the pinned
+    // `.sst/stage` (prefix-guarded) — so remove targets what's actually
+    // deployed. The `requires: ["deployed"]` gate runs the same
+    // `safeStage` prefix check, so a foreign/unprefixed pin never gets
+    // here.
     shell: "pnpm sst remove --stage {{stage}}",
     affects: ["git"],
     requires: ["deployed"],

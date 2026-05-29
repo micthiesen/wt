@@ -54,10 +54,10 @@ async function decideDestroyStage(
   if (flag === true) return true;
   if (flag === false) return false;
   // `isOurStageDeployed` is the strict check — outputs.json must
-  // mention the expected stage, otherwise we treat the worktree as
-  // not-deployed-by-us (a foreign deploy in this directory will not
-  // trigger the prompt). `removeWorktree` re-validates via
-  // `safeStage` before shelling out.
+  // mention the owned (pinned, prefix-valid) stage, otherwise we treat
+  // the worktree as not-deployed-by-us (a foreign deploy in this
+  // directory will not trigger the prompt). `removeWorktree`
+  // re-validates via `safeStage` before shelling out.
   if (!isOurStageDeployed(wt)) return false;
   if (yes) return true;
   if (isInteractive()) {

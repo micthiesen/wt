@@ -124,9 +124,9 @@ export type AiConfig = {
  * vocabulary:
  *   "pr"        — row has a PR (open, draft, terminal, any).
  *   "pr.ready"  — row has a non-draft, OPEN PR.
- *   "deployed"  — `isOurStageDeployed` (.sst/stage matches expected
- *                 AND outputs.json references it). Strict gate; matches
- *                 what `wt rm --destroy-stage` uses.
+ *   "deployed"  — `isOurStageDeployed` (.sst/stage is pinned and prefix-
+ *                 valid AND outputs.json references it). Matches what
+ *                 `wt rm --destroy-stage` uses.
  * Default is `[]` (no preconditions).
  *
  * Both arrays are deduped at parse time. See the architecture block

@@ -471,9 +471,9 @@ function buildActionVars(row: WorktreeRow): ActionVars {
     slug: row.wt.slug,
     cwd: row.wt.path,
     pr: row.pr ? String(row.pr.number) : "",
-    // Deterministic stage from the slug, never from disk. Built-in
-    // remove-local + any user shell action that wants a stage handle
-    // reads through this.
+    // The stage this worktree owns — the pinned `.sst/stage` (prefix-
+    // guarded), else the slug-derived default. Built-in remove-local +
+    // any user shell action that wants a stage handle reads through this.
     stage: expectedStage(row.wt),
   };
 }

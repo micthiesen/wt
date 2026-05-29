@@ -274,10 +274,10 @@ export async function removeWorktree(
   let deletedBranch = false;
   try {
     if (destroyStage) {
-      // Central safety gate. Pass `--stage` from the deterministic
-      // expected name, never from `wt.stage` — defends against an
-      // overwritten `.sst/stage` pointing the destroy at a foreign
-      // (e.g. production) stage.
+      // Central safety gate. `safe.stage` is the pinned `.sst/stage`,
+      // accepted only when it carries the personal prefix — so the
+      // destroy targets what's actually deployed but can never point at
+      // a foreign (e.g. production) stage outside our namespace.
       const safe = safeStage(wt);
       if (!safe.ok) {
         opts.onPhase?.("sst remove (skipped)");
