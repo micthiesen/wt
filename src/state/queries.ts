@@ -11,6 +11,11 @@ import { summarizeDiff, summarizeStack, type AiSummary } from "../core/ai.ts";
 import { readArchived } from "../core/archive.ts";
 import { readClaudeUsage, type ClaudeUsage } from "../core/claude-usage.ts";
 import { readRegistry, type RegistrySession } from "../core/claude-registry.ts";
+import { readCodexUsage, type CodexUsage } from "../core/harness/codex-usage.ts";
+import {
+  readOpencodeCost,
+  type OpencodeCost,
+} from "../core/harness/opencode-usage.ts";
 import { wtSessionUuid } from "../core/claude.ts";
 import { listClaudeNames } from "../core/claude-sessions.ts";
 import { readSummariesForSessions, type SessionSummary } from "../core/claude-summaries.ts";
@@ -308,6 +313,33 @@ export const claudeUsageQuery = () =>
   queryOptions({
     queryKey: qk.claudeUsage(),
     queryFn: async (): Promise<ClaudeUsage | null> => readClaudeUsage(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
+/**
+ * Codex rate-limit usage (5h/7d %), parsed from the newest rollout's
+ * latest `token_count` event. No HTTP — purely on-disk. Same cadence as
+ * the claude usage read; gated to the codex primary at the call site.
+ */
+export const codexUsageQuery = () =>
+  queryOptions({
+    queryKey: qk.codexUsage(),
+    queryFn: async (): Promise<CodexUsage | null> => readCodexUsage(),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
+/**
+ * OpenCode spend (5h/7d $), summed from its message-cost rows. Windows
+ * slide with wall-clock, so this is recomputed each refetch rather than
+ * cached against a file mtime.
+ */
+export const opencodeCostQuery = () =>
+  queryOptions({
+    queryKey: qk.opencodeCost(),
+    queryFn: async (): Promise<OpencodeCost | null> =>
+      readOpencodeCost(Date.now()),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });

@@ -59,8 +59,9 @@ import {
   killShellSession,
 } from "../core/tmux.ts";
 import { StatusKind, type PullRequest } from "../core/types.ts";
-import { claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
+import { claudeSummariesQuery, claudeUsageQuery, codexUsageQuery, opencodeCostQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
+import type { CodexUsage } from "../core/harness/codex-usage.ts";
 
 import {
   ActionEditModal,
@@ -512,14 +513,47 @@ function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
   );
 }
 
-function ClaudeUsageBadge() {
-  const { data } = useQuery(claudeUsageQuery());
+/**
+ * Top-right usage slot, following the TAB-selected primary harness:
+ *   - claude / codex → rate-limit windows as `5h X% / 7d Y%`
+ *   - opencode       → spend over the same windows as `5h $X / 7d $Y`
+ *     (it has no rate-limit window — it bills per token)
+ * Each source is gated to its primary so we don't scan rollouts / hit
+ * the opencode DB when that harness isn't selected.
+ */
+function UsageBadge({ primary }: { primary: HarnessId }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 30_000);
     return () => clearInterval(id);
   }, []);
-  const formatted = useMemo(() => formatClaudeUsage(data, nowMs), [data, nowMs]);
+  const claude = useQuery({
+    ...claudeUsageQuery(),
+    enabled: primary === "claude",
+  });
+  const codex = useQuery({ ...codexUsageQuery(), enabled: primary === "codex" });
+  const opencode = useQuery({
+    ...opencodeCostQuery(),
+    enabled: primary === "opencode",
+  });
+
+  if (primary === "opencode") {
+    const cost = opencode.data;
+    if (!cost) return null;
+    return (
+      <box flexShrink={0} flexDirection="row">
+        <text fg={theme.fgDim}>{"  🔥 "}</text>
+        <text fg={theme.fg}>{`5h ${formatCost(cost.fiveHour)}`}</text>
+        <text fg={theme.fgDim}>{"  ·  "}</text>
+        <text fg={theme.fg}>{`7d ${formatCost(cost.sevenDay)}`}</text>
+      </box>
+    );
+  }
+
+  const formatted = formatPctUsage(
+    primary === "claude" ? claude.data : codex.data,
+    nowMs,
+  );
   if (!formatted) return null;
   const { fiveHour: five, sevenDay: seven } = formatted;
   return (
@@ -532,6 +566,11 @@ function ClaudeUsageBadge() {
       {seven.remaining ? <text fg={theme.fgDim}>{` (${seven.remaining})`}</text> : null}
     </box>
   );
+}
+
+/** Compact USD: cents-precise under $100, whole dollars above. */
+function formatCost(n: number): string {
+  return n >= 100 ? `$${Math.round(n)}` : `$${n.toFixed(2)}`;
 }
 
 /**
@@ -550,15 +589,15 @@ type FormattedUsage = {
   sevenDay: { pct: number; remaining: string | null };
 };
 
-function formatClaudeUsage(
-  usage: ClaudeUsage | null | undefined,
+function formatPctUsage(
+  usage: ClaudeUsage | CodexUsage | null | undefined,
   nowMs: number,
 ): FormattedUsage | null {
   if (!usage) return null;
   // Mirror statusline.sh's CACHE_STALE_AGE: don't display data older
-  // than 30 minutes — at that point the user has either exited Claude
-  // Code or it's failing to refresh, and a 6h-stale "5h 12%" is worse
-  // than nothing.
+  // than 30 minutes — at that point the harness has either exited or is
+  // failing to refresh, and a 6h-stale "5h 12%" is worse than nothing.
+  // (claude: statusline cache mtime; codex: newest rollout mtime.)
   if (nowMs - usage.cachedAtMs > USAGE_STALE_MS) return null;
   return {
     fiveHour: {
@@ -4284,7 +4323,7 @@ export function App({ onExit }: Props) {
           <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
         </box>
         <PrimaryHarnessBadge primary={primaryHarness} />
-        <ClaudeUsageBadge />
+        <UsageBadge primary={primaryHarness} />
       </box>
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList

@@ -71,6 +71,10 @@ export const qk = {
    * per-worktree.
    */
   claudeUsage: () => ["claudeUsage"] as const,
+  /** Codex rate-limit usage (5h/7d %), read from the newest rollout. */
+  codexUsage: () => ["codexUsage"] as const,
+  /** OpenCode spend (5h/7d $), summed from its message-cost rows. */
+  opencodeCost: () => ["opencodeCost"] as const,
   /**
    * Live registry of running claude processes from
    * `~/.claude/sessions/<pid>.json`. Single global key; consumers
