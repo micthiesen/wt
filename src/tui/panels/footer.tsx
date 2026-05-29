@@ -10,6 +10,7 @@ import { getHarness } from "../../core/harness/index.ts";
 import { claudeRegistryQuery } from "../../state/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
 import { STATE_FG } from "../claude-state.ts";
+import { usePrimaryHarness } from "../hooks/usePrimaryHarness.ts";
 import { useSessionRun } from "../hooks/useSessionRun.ts";
 import {
   DOTFILES_SLOT,
@@ -17,10 +18,6 @@ import {
   WT_SOURCE_SLOT,
 } from "../session-slots.ts";
 import { theme } from "../theme.ts";
-
-/** Claude Code robot glyph, reused from the harness registry so the
- *  slot status markers match the row/session badges. */
-const CLAUDE_GLYPH = getHarness("claude").glyph;
 
 export type FooterMode =
   | { kind: "legend" }
@@ -73,9 +70,12 @@ export function Footer({ mode, hint }: Props) {
   // permanent status robots bundled at the far right — wt-source first,
   // dotfiles to its right. No labels: position is the discriminator (the
   // main-clone slot is represented separately by its tail on the left).
-  // Each robot's color tracks that slot's live state.
+  // Each robot's color tracks that slot's live state, and its glyph
+  // follows the TAB-selected primary harness (matching what the slot's
+  // keybind spawns).
   const wtState = useSlotState(WT_SOURCE_SLOT.path);
   const dotfilesState = useSlotState(DOTFILES_SLOT.path);
+  const primaryGlyph = getHarness(usePrimaryHarness()).glyph;
   return (
     <box
       flexShrink={0}
@@ -111,10 +111,10 @@ export function Footer({ mode, hint }: Props) {
       ) : null}
       <box flexShrink={0} marginLeft={1} flexDirection="row">
         <box width={2} flexShrink={0}>
-          <text fg={slotGlyphFg(wtState)}>{CLAUDE_GLYPH}</text>
+          <text fg={slotGlyphFg(wtState)}>{primaryGlyph}</text>
         </box>
         <box width={2} flexShrink={0}>
-          <text fg={slotGlyphFg(dotfilesState)}>{CLAUDE_GLYPH}</text>
+          <text fg={slotGlyphFg(dotfilesState)}>{primaryGlyph}</text>
         </box>
       </box>
     </box>
@@ -138,12 +138,13 @@ export function Footer({ mode, hint }: Props) {
 function MainSlotTail() {
   const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
   const glyphFg = slotGlyphFg(useSlotState(MAIN_CLONE_SLOT.path));
+  const primaryGlyph = getHarness(usePrimaryHarness()).glyph;
   const lastLine =
     run && run.lines.length > 0 ? run.lines[run.lines.length - 1] : null;
   if (!lastLine) {
     return (
       <text wrapMode="none" truncate>
-        <span fg={glyphFg}>{CLAUDE_GLYPH}  </span>
+        <span fg={glyphFg}>{primaryGlyph}  </span>
         <span fg={theme.fgDim}>idle  ·  </span>
         <span fg={theme.accent}>.</span>
         <span fg={theme.fgDim}> start  ·  </span>
@@ -154,7 +155,7 @@ function MainSlotTail() {
   }
   return (
     <text wrapMode="none" truncate>
-      <span fg={glyphFg}>{CLAUDE_GLYPH}  </span>
+      <span fg={glyphFg}>{primaryGlyph}  </span>
       <span fg={actionLineFg(lastLine.kind)}>{lastLine.text}</span>
     </text>
   );
