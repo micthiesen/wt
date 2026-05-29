@@ -894,12 +894,9 @@ export function App({ onExit }: Props) {
     modal?.kind === "claudeSessionsPicker" ? modal.slug : null;
   const pickerRows = useMemo<ReadonlyArray<PickerRow>>(() => {
     if (pickerSlug === null) return [];
-    const sessions = [...currentHarnessSessions.sessions].sort((a, b) => {
-      // Live first, then by recency desc within each bucket.
-      if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
-      return (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0);
-    });
-    const out: PickerRow[] = sessions.map((entry) => ({
+    // `sessions` is already sorted live-first then recency-desc by
+    // `compareSessionsForDisplay` inside the hook.
+    const out: PickerRow[] = currentHarnessSessions.sessions.map((entry) => ({
       kind: "session",
       entry,
     }));
@@ -3546,16 +3543,11 @@ export function App({ onExit }: Props) {
         displayedOutput.sessionKind === "claude" &&
         displayedOutput.slug === slug
       ) {
-        // Mirror the picker's session ordering (live first, then by
-        // recency) when computing the initial highlight. Falling back
-        // to 0 when the displayed session is no longer in the list.
-        const sessionsSorted = [...currentHarnessSessions.sessions].sort(
-          (a, b) => {
-            if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
-            return (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0);
-          },
-        );
-        const matchIdx = sessionsSorted.findIndex(
+        // `sessions` is already in the picker's display order (live
+        // first, then recency) from the hook, so the index matches what
+        // the picker renders. Falls back to 0 when the displayed session
+        // is no longer in the list.
+        const matchIdx = currentHarnessSessions.sessions.findIndex(
           (e) =>
             e.harnessId === "claude" &&
             e.extras.managedName === displayedOutput.sessionName,

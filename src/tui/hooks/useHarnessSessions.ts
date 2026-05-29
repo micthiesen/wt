@@ -9,12 +9,13 @@
  *
  * Output shape:
  *   - `sessions` is every session known across every harness, each
- *     tagged with its harness id, sorted most-recently-active first.
+ *     tagged with its harness id, sorted by `compareSessionsForDisplay`
+ *     (live first, then most-recently-active) — the order both session
+ *     pickers consume directly.
  *   - `f12Target` is the session F12 would attach to right now: the
  *     most-recently-active session that's currently live, or the
  *     primary harness's most-recently-active dead session, or null
  *     when nothing exists for any harness.
- *   - `byHarness` indexes the same data per id for picker entries.
  */
 import { useMemo } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
@@ -57,9 +58,22 @@ function mostRecentSessionId(
   return best?.sessionId ?? null;
 }
 
+/**
+ * Canonical display order for a session list: live sessions first, then
+ * most-recently-active within each bucket. The single comparator both
+ * session pickers and the `f12Target` derivation rely on, so the "what's
+ * active" ordering can't drift between them.
+ */
+export function compareSessionsForDisplay(
+  a: HarnessSessionEntry,
+  b: HarnessSessionEntry,
+): number {
+  if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+  return (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0);
+}
+
 export type UseHarnessSessionsResult = {
   sessions: ReadonlyArray<HarnessSessionEntry>;
-  byHarness: ReadonlyMap<HarnessId, ReadonlyArray<HarnessSessionEntry>>;
   /**
    * Most-recently-active session that's currently live (across any
    * harness). When nothing is live, the primary's most-recently-
@@ -69,7 +83,7 @@ export type UseHarnessSessionsResult = {
   f12Target: HarnessSessionEntry | null;
 };
 
-const EMPTY: HarnessSession[] = [];
+const EMPTY: readonly HarnessSession[] = [];
 
 /**
  * The single source of truth for "which session is active" — turning raw
@@ -89,7 +103,6 @@ export function computeHarnessSessions(
   primary: HarnessId,
   nowMs: number,
 ): UseHarnessSessionsResult {
-  const byHarness = new Map<HarnessId, HarnessSessionEntry[]>();
   const all: HarnessSessionEntry[] = [];
   for (const h of HARNESSES) {
     const raw = rawByHarness.get(h.id) ?? EMPTY;
@@ -139,13 +152,19 @@ export function computeHarnessSessions(
         if (finalState !== st) {
           extras = { ...extras, derivedState: finalState };
         }
-      } else if (!isSingleSlot && isLive && extras.derivedState === "abandoned") {
+      } else if (!isSingleSlot && isLive) {
         // Claude: discoverSessions derives state with isTmuxLive=false
         // (liveness isn't known there). A live session whose registry
-        // entry is missing — write failed, or a pre-2.1 build — lands
-        // on "abandoned" (midTurn + not-live). It's live, so it's
-        // actually working; a live session is never abandoned.
-        extras = { ...extras, derivedState: "working" };
+        // entry is missing — write failed, or a pre-2.1 build — lands on
+        // a not-live state: "abandoned" (midTurn) or "idle" (clean tail).
+        // It's actually live, so mirror deriveSessionState's live branch
+        // — midTurn → working, otherwise → waiting (your move). Without
+        // this, "idle" would tint the glyph dim like a dead session.
+        if (extras.derivedState === "abandoned") {
+          extras = { ...extras, derivedState: "working" };
+        } else if (extras.derivedState === "idle") {
+          extras = { ...extras, derivedState: "waiting" };
+        }
       }
       return { ...s, isLive, harnessId: h.id, extras };
     });
@@ -176,13 +195,15 @@ export function computeHarnessSessions(
         ...annotated,
       ];
     }
-    byHarness.set(h.id, annotated);
     all.push(...annotated);
   }
-  all.sort((a, b) => (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0));
-  // F12 target: prefer a live session; if none live, fall back to
-  // the most-recently-active session in the primary harness (so the
-  // hint shown in the AI row reflects what F12 will spawn).
+  all.sort(compareSessionsForDisplay);
+  // F12 target: prefer a live session; if none live, fall back to the
+  // most-recently-active session in the primary harness (so the hint
+  // shown in the AI row reflects what F12 will spawn). `all` is sorted
+  // live-first then recency-desc, so the first live entry is the most
+  // recent live one, and `find` over the primary harness yields its
+  // most-recently-active (here necessarily dead) session.
   let f12Target: HarnessSessionEntry | null = null;
   for (const e of all) {
     if (e.isLive) {
@@ -191,10 +212,9 @@ export function computeHarnessSessions(
     }
   }
   if (!f12Target) {
-    const primaryEntries = byHarness.get(primary) ?? [];
-    f12Target = primaryEntries[0] ?? null;
+    f12Target = all.find((e) => e.harnessId === primary) ?? null;
   }
-  return { sessions: all, byHarness, f12Target };
+  return { sessions: all, f12Target };
 }
 
 export function useHarnessSessions(
@@ -210,7 +230,7 @@ export function useHarnessSessions(
   const codexQ = useQuery(harnessSessionsQuery("codex", slug, wtPath));
   const opencodeQ = useQuery(harnessSessionsQuery("opencode", slug, wtPath));
   const rawByHarness = useMemo(() => {
-    return new Map<HarnessId, HarnessSession[]>([
+    return new Map<HarnessId, ReadonlyArray<HarnessSession>>([
       ["claude", claudeQ.data ?? EMPTY],
       ["codex", codexQ.data ?? EMPTY],
       ["opencode", opencodeQ.data ?? EMPTY],
