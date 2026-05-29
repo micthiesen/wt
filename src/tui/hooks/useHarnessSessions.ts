@@ -263,20 +263,36 @@ export type ActiveSessionGlyph = {
 };
 
 /**
- * Per-slug {@link ActiveSessionGlyph} for *every* worktree, computed
- * through the same {@link computeHarnessSessions} rule the current-row
- * hook and F12 use — so the list glyph can never disagree with what F12
- * attaches to or what the details pane shows. Fans `harnessSessionsQuery`
- * across all worktrees × harnesses (cached at the query layer); the
- * single `tmuxSessionsQuery` supplies liveness for all of them.
+ * Per-slug {@link ActiveSessionGlyph}, computed through the same
+ * {@link computeHarnessSessions} rule the current-row hook and F12 use —
+ * so the list glyph can never disagree with what F12 attaches to or what
+ * the details pane shows.
+ *
+ * The map only ever holds slugs with a *live* session, and liveness is
+ * fully determined by the cheap `tmuxSessionsQuery` set, so we fan the
+ * (per-harness, disk-scanning) `harnessSessionsQuery` only across slugs
+ * tmux already reports as having a live AI session rather than every
+ * worktree. Output is identical; the discovery cost scales with live
+ * sessions, not total worktrees.
  */
 export function useActiveSessionsBySlug(
   worktrees: ReadonlyArray<{ slug: string; path: string }>,
   primary: HarnessId,
 ): ReadonlyMap<string, ActiveSessionGlyph> {
   const tmux = useQuery(tmuxSessionsQuery());
+  const liveAiSlugs = useMemo(() => {
+    const s = new Set<string>();
+    for (const slug of tmux.data?.claudeSlugs ?? []) s.add(slug);
+    for (const slug of tmux.data?.codex ?? []) s.add(slug);
+    for (const slug of tmux.data?.opencode ?? []) s.add(slug);
+    return s;
+  }, [tmux.data?.claudeSlugs, tmux.data?.codex, tmux.data?.opencode]);
+  const liveWorktrees = useMemo(
+    () => worktrees.filter((w) => liveAiSlugs.has(w.slug)),
+    [worktrees, liveAiSlugs],
+  );
   const results = useQueries({
-    queries: worktrees.flatMap((w) =>
+    queries: liveWorktrees.flatMap((w) =>
       HARNESSES.map((h) => harnessSessionsQuery(h.id, w.slug, w.path)),
     ),
   });
@@ -285,8 +301,8 @@ export function useActiveSessionsBySlug(
     const now = Date.now();
     const H = HARNESSES.length;
     const map = new Map<string, ActiveSessionGlyph>();
-    for (let i = 0; i < worktrees.length; i++) {
-      const w = worktrees[i]!;
+    for (let i = 0; i < liveWorktrees.length; i++) {
+      const w = liveWorktrees[i]!;
       const rawByHarness = new Map<HarnessId, ReadonlyArray<HarnessSession>>();
       for (let j = 0; j < H; j++) {
         rawByHarness.set(HARNESSES[j]!.id, results[i * H + j]?.data ?? EMPTY);
@@ -306,5 +322,5 @@ export function useActiveSessionsBySlug(
       }
     }
     return map;
-  }, [results, tmux.data?.all, primary, worktrees]);
+  }, [results, tmux.data?.all, primary, liveWorktrees]);
 }

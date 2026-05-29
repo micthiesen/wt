@@ -97,9 +97,21 @@ export async function runTui(): Promise<TuiExit> {
   // top-level dir, no recursion. `.catch(noop)` swallows rejections
   // from invalidations that race a torn-down client during shutdown.
   const stopRegistryWatch = watchRegistry(() => {
-    wtClient.client
-      .invalidateQueries({ queryKey: qk.claudeRegistry() })
-      .catch(() => {});
+    Promise.all([
+      wtClient.client.invalidateQueries({ queryKey: qk.claudeRegistry() }),
+      // Claude's working/asking/waiting state is baked into the
+      // `harnessSessions` discovery cache (it reads the registry inside
+      // its queryFn), and that cache — not `claudeRegistry` — now drives
+      // the list-pane glyph tint and the details AI row. The registry
+      // write that just fired IS that state changing, so refresh the
+      // claude discovery too; otherwise the tint would only update on
+      // spawn/kill/manual-refresh. Scoped to claude + active observers
+      // (the live-slug fan-out), so it stays cheap.
+      wtClient.client.invalidateQueries({
+        predicate: (q) =>
+          q.queryKey[0] === "harnessSessions" && q.queryKey[1] === "claude",
+      }),
+    ]).catch(() => {});
   });
   // Local git activity → query invalidations. Coarse refs watcher fires
   // on commits, fetches, pushes, branch creates/deletes (anything that
