@@ -485,15 +485,18 @@ function buildActionVars(row: WorktreeRow): ActionVars {
 }
 
 /**
- * Right-aligned title-bar slot that surfaces the Claude Code
- * statusline's API utilization snapshot. Data comes from the
- * statusline's own cache file; we never call Anthropic directly. Two
- * clusters — 5h window and rolling 7d window — each pairing the
- * percentage with the time remaining until that window resets. The
- * 30-second ticker keeps the remaining-time labels drifting forward
- * between cache writes (the underlying query refetches once a minute).
+ * Right-aligned title-bar usage slot. Two clusters — 5h window and
+ * rolling 7d window — each pairing the percentage with the time
+ * remaining until that window resets. The 30-second ticker keeps the
+ * remaining-time labels drifting forward between refetches.
+ *
+ * Freshness is gated per-window on `resetsAt`, not on the source file's
+ * mtime: a window's percentage stays valid (usage only climbs within a
+ * window) until the moment it resets, at which point that cluster drops
+ * off. This matters for codex, whose rollout only updates when it writes
+ * a turn — an hour-idle codex still has a valid 5h reading — while claude
+ * gets the same correct behavior (a genuinely-reset window disappears).
  */
-const USAGE_STALE_MS = 30 * 60 * 1000;
 
 /**
  * Top-right harness selector indicator. Shows the current primary
@@ -559,11 +562,23 @@ function UsageBadge({ primary }: { primary: HarnessId }) {
   return (
     <box flexShrink={0} flexDirection="row">
       <text fg={theme.fgDim}>{"  🔥 "}</text>
-      <text fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</text>
-      {five.remaining ? <text fg={theme.fgDim}>{` (${five.remaining})`}</text> : null}
-      <text fg={theme.fgDim}>{"  ·  "}</text>
-      <text fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</text>
-      {seven.remaining ? <text fg={theme.fgDim}>{` (${seven.remaining})`}</text> : null}
+      {five ? (
+        <text>
+          <span fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</span>
+          {five.remaining ? (
+            <span fg={theme.fgDim}>{` (${five.remaining})`}</span>
+          ) : null}
+        </text>
+      ) : null}
+      {five && seven ? <text fg={theme.fgDim}>{"  ·  "}</text> : null}
+      {seven ? (
+        <text>
+          <span fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</span>
+          {seven.remaining ? (
+            <span fg={theme.fgDim}>{` (${seven.remaining})`}</span>
+          ) : null}
+        </text>
+      ) : null}
     </box>
   );
 }
@@ -584,31 +599,41 @@ function pctColor(pct: number): string {
   return theme.fg;
 }
 
+type PctWindow = { pct: number; remaining: string | null };
 type FormattedUsage = {
-  fiveHour: { pct: number; remaining: string | null };
-  sevenDay: { pct: number; remaining: string | null };
+  fiveHour: PctWindow | null;
+  sevenDay: PctWindow | null;
 };
+
+/**
+ * A window's reading is valid until it resets. Past `resetsAt` the
+ * percentage describes an expired window (the real usage has rolled over
+ * to ~0), so the cluster is dropped. A missing `resetsAt` is treated as
+ * non-expiring — we'd rather show a present number than hide it.
+ */
+function pctWindowOrNull(
+  p: { utilization: number; resetsAt: string | null },
+  nowMs: number,
+): PctWindow | null {
+  if (p.resetsAt) {
+    const t = Date.parse(p.resetsAt);
+    if (!Number.isNaN(t) && nowMs >= t) return null;
+  }
+  return {
+    pct: Math.round(p.utilization),
+    remaining: formatRemaining(p.resetsAt, nowMs),
+  };
+}
 
 function formatPctUsage(
   usage: ClaudeUsage | CodexUsage | null | undefined,
   nowMs: number,
 ): FormattedUsage | null {
   if (!usage) return null;
-  // Mirror statusline.sh's CACHE_STALE_AGE: don't display data older
-  // than 30 minutes — at that point the harness has either exited or is
-  // failing to refresh, and a 6h-stale "5h 12%" is worse than nothing.
-  // (claude: statusline cache mtime; codex: newest rollout mtime.)
-  if (nowMs - usage.cachedAtMs > USAGE_STALE_MS) return null;
-  return {
-    fiveHour: {
-      pct: Math.round(usage.fiveHour.utilization),
-      remaining: formatRemaining(usage.fiveHour.resetsAt, nowMs),
-    },
-    sevenDay: {
-      pct: Math.round(usage.sevenDay.utilization),
-      remaining: formatRemaining(usage.sevenDay.resetsAt, nowMs),
-    },
-  };
+  const fiveHour = pctWindowOrNull(usage.fiveHour, nowMs);
+  const sevenDay = pctWindowOrNull(usage.sevenDay, nowMs);
+  if (!fiveHour && !sevenDay) return null;
+  return { fiveHour, sevenDay };
 }
 
 /**
