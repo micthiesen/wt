@@ -87,8 +87,9 @@ function mqStateLabel(state: MergeQueueState): { text: string; fg: string } {
 
 /**
  * Build the PR row's segment list. Tiers picked so the PR id is sticky,
- * the merge-queue state (next action) outranks ambient signals, and
- * carrots drop first because they're the noisiest line item.
+ * a real merge-queue entry (next action) outranks ambient signals, and
+ * the auto-merge indicator drops first (tier 6) as the least load-
+ * bearing signal — ahead of checks, review, and carrots.
  */
 function buildPrSegments(
   pr: PullRequest,
@@ -153,15 +154,17 @@ function buildPrSegments(
       ],
     });
   } else if (pr.autoMerge && pr.state === "OPEN") {
-    // Same slot as the queue segment — mutually exclusive in practice.
-    // Dimmer color than `queue mergeable` since auto-merge is "armed
-    // but idle" (waiting on preconditions) rather than actively
-    // advancing.
+    // Occupies the queue slot (mutually exclusive with a real queue
+    // entry) but ranks dead last — highest tier, so it compacts and
+    // drops before checks, review, and rabbit. Auto-merge is "armed but
+    // idle" (waiting on preconditions), the least load-bearing signal on
+    // the line, so it's the first thing to yield when space is tight.
+    // Dimmer color than `queue mergeable` for the same reason.
     const full = "auto-merge";
     const tiny = "auto";
     segs.push({
-      key: "queue",
-      tier: 2,
+      key: "automerge",
+      tier: 6,
       modes: [
         {
           width: 3 + Bun.stringWidth(full),
