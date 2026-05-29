@@ -24,12 +24,15 @@ export const theme = {
   // Codex brand indigo. `codex` mirrors CODEX_COLOR in
   // core/harness/codex.ts and lights the attention `waiting` state (the
   // brand color is the punchy "your turn" cue, mirroring claude's
-  // orange); `codexAlt` is a calmer lighter indigo for `working`.
+  // orange). `codexAlt` is amber — the indigo complement — so `working`
+  // contrasts in hue rather than just brightness, the way claude's cyan
+  // working contrasts its orange waiting.
   codex: "#4d56d6",
-  codexAlt: "#9aa0ee",
+  codexAlt: "#e0a94f",
   // OpenCode brand violet. `opencode` mirrors OPENCODE_COLOR in
-  // core/harness/opencode.ts and lights `waiting`; `opencodeAlt` is a
-  // muted violet for the calmer `working` state.
+  // core/harness/opencode.ts and lights `waiting`. `opencodeAlt` is
+  // lime-green — the violet complement — so `working` reads as a
+  // distinct hue, not a dimmed brand shade.
   opencode: "#a78bfa",
-  opencodeAlt: "#7d6bb5",
+  opencodeAlt: "#9ccf6e",
 };

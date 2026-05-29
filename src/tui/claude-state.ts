@@ -5,10 +5,11 @@
  * source of truth so a color or glyph change lands in one place.
  *
  * Color is per-harness: each harness keys its own `DerivedState ->
- * color` table via {@link stateColor}. The `working`/`waiting` states
- * carry the harness's brand hue (cyan/orange for claude, indigo for
- * codex, violet for opencode) so a glance reads vendor *and* state. The
- * remaining states stay semantic and shared: `abandoned` is always red
+ * color` table via {@link stateColor}. `waiting` takes the harness brand
+ * color and `working` its complement, so a glance reads vendor *and*
+ * state through a contrasting hue pair (claude cyan/orange, codex
+ * amber/indigo, opencode lime/violet). The remaining states stay
+ * semantic and shared: `abandoned` is always red
  * (crashed is crashed) and `idle` always dim, while `asking`/`polling`/
  * `unknown` come only from claude's registry — codex/opencode never
  * emit them — so they keep claude's values everywhere for exhaustiveness.
@@ -43,7 +44,9 @@ export const STATE_FG_BY_HARNESS: Record<
   Record<DerivedState, string>
 > = {
   // `waiting` ("your move") takes the harness brand color everywhere;
-  // `working` takes a calmer secondary shade in the same family.
+  // `working` takes that brand's complement, so the two states contrast
+  // in hue (claude cyan/orange, codex amber/indigo, opencode lime/violet)
+  // rather than differing only in brightness.
   claude: { working: theme.accent, waiting: theme.claude, ...SHARED },
   codex: { working: theme.codexAlt, waiting: theme.codex, ...SHARED },
   opencode: {
