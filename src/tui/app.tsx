@@ -499,19 +499,17 @@ function buildActionVars(row: WorktreeRow): ActionVars {
  */
 
 /**
- * Top-right harness selector indicator. Shows the current primary
- * harness with its glyph + label and a "TAB" hint. Tabbing through
- * the registered impls is wired in the main keypress handler; this
- * component just renders.
+ * Top-right harness selector indicator: just the primary harness's
+ * glyph, brand-colored. Rendered as the rightmost element of the title
+ * bar so it anchors to the edge and stays put as the usage figures to
+ * its left change width — no label or TAB hint (the cycle key is muscle
+ * memory). Tabbing is wired in the main keypress handler.
  */
 function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
   const harness = getHarness(primary);
   return (
     <box flexShrink={0} flexDirection="row">
-      <text fg={theme.fgDim}> </text>
-      <text fg={harness.color}>{harness.glyph}  </text>
-      <text fg={theme.fg}>{harness.label}</text>
-      <text fg={theme.fgDim}>  TAB</text>
+      <text fg={harness.color}>{harness.glyph}</text>
     </box>
   );
 }
@@ -545,10 +543,12 @@ function UsageBadge({ primary }: { primary: HarnessId }) {
     if (!cost) return null;
     return (
       <box flexShrink={0} flexDirection="row">
-        <text fg={theme.fgDim}>{"  🔥 "}</text>
-        <text fg={theme.fg}>{`5h ${formatCost(cost.fiveHour)}`}</text>
-        <text fg={theme.fgDim}>{"  ·  "}</text>
-        <text fg={theme.fg}>{`7d ${formatCost(cost.sevenDay)}`}</text>
+        <text>
+          <span fg={theme.fg}>{`5h ${formatCost(cost.fiveHour)}`}</span>
+          <span fg={theme.fgDim}>{" · "}</span>
+          <span fg={theme.fg}>{`7d ${formatCost(cost.sevenDay)}`}</span>
+          <span fg={theme.fgDim}>{" · "}</span>
+        </text>
       </box>
     );
   }
@@ -561,12 +561,18 @@ function UsageBadge({ primary }: { primary: HarnessId }) {
   const { fiveHour: five, sevenDay: seven } = formatted;
   return (
     <box flexShrink={0} flexDirection="row">
-      <text fg={theme.fgDim}>{"  🔥 "}</text>
-      <text fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</text>
-      {five.remaining ? <text fg={theme.fgDim}>{` (${five.remaining})`}</text> : null}
-      <text fg={theme.fgDim}>{"  ·  "}</text>
-      <text fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</text>
-      {seven.remaining ? <text fg={theme.fgDim}>{` (${seven.remaining})`}</text> : null}
+      <text>
+        <span fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</span>
+        {five.remaining ? (
+          <span fg={theme.fgDim}>{` (${five.remaining})`}</span>
+        ) : null}
+        <span fg={theme.fgDim}>{" · "}</span>
+        <span fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</span>
+        {seven.remaining ? (
+          <span fg={theme.fgDim}>{` (${seven.remaining})`}</span>
+        ) : null}
+        <span fg={theme.fgDim}>{" · "}</span>
+      </text>
     </box>
   );
 }
@@ -4337,8 +4343,8 @@ export function App({ onExit }: Props) {
           </text>
           <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
         </box>
-        <PrimaryHarnessBadge primary={primaryHarness} />
         <UsageBadge primary={primaryHarness} />
+        <PrimaryHarnessBadge primary={primaryHarness} />
       </box>
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList
