@@ -4,7 +4,7 @@ import { actionLineFg } from "../action-line-style.ts";
 import { stateColor } from "../claude-state.ts";
 import { useActiveSessionsBySlug } from "../hooks/useHarnessSessions.ts";
 import { usePrimaryHarness } from "../hooks/usePrimaryHarness.ts";
-import { useSessionRun } from "../hooks/useSessionRun.ts";
+import { useHarnessRun, useSessionRun } from "../hooks/useSessionRun.ts";
 import {
   DOTFILES_SLOT,
   MAIN_CLONE_SLOT,
@@ -114,15 +114,25 @@ export function Footer({ mode, hint }: Props) {
  * reads as plain text, a tool-error as red, etc.). When no session is
  * live or no lines have arrived yet (pre-creation race), falls back to a
  * dim idle hint that still surfaces `.` as the start key and `?` for
- * help. The leading glyph's color reflects the slot's live state across
- * any harness (passed in via `state`), but the trailing tail TEXT is
- * claude-jsonl-only: a codex/opencode session in the slot still lights
- * the glyph yet shows no line text, since there's no jsonl to tail.
- * Wiring those event streams into the tail text is a known v1 trade-off.
+ * help. Both the glyph and the trailing tail TEXT follow the TAB-
+ * selected primary harness: claude reads its jsonl tail, codex/opencode
+ * read their `harnessTailRegistry` trail (rollout jsonl / SQLite). The
+ * three tail hooks are all called unconditionally (rules of hooks); we
+ * pick the primary's run. A non-primary harness session in the slot
+ * lights nothing here — the slot keybind opens the primary, so the bar
+ * tracks the primary, same as the slot glyphs above.
  */
 function MainSlotTail({ state }: { state: DerivedState | null }) {
-  const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
   const primary = usePrimaryHarness();
+  const claudeRun = useSessionRun(MAIN_CLONE_SLOT.slug, null);
+  const codexRun = useHarnessRun(MAIN_CLONE_SLOT.slug, "codex");
+  const opencodeRun = useHarnessRun(MAIN_CLONE_SLOT.slug, "opencode");
+  const run =
+    primary === "claude"
+      ? claudeRun
+      : primary === "codex"
+        ? codexRun
+        : opencodeRun;
   const glyphFg = slotGlyphFg(primary, state);
   const primaryGlyph = getHarness(primary).glyph;
   const lastLine =
