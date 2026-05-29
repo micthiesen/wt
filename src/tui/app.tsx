@@ -562,23 +562,11 @@ function UsageBadge({ primary }: { primary: HarnessId }) {
   return (
     <box flexShrink={0} flexDirection="row">
       <text fg={theme.fgDim}>{"  🔥 "}</text>
-      {five ? (
-        <text>
-          <span fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</span>
-          {five.remaining ? (
-            <span fg={theme.fgDim}>{` (${five.remaining})`}</span>
-          ) : null}
-        </text>
-      ) : null}
-      {five && seven ? <text fg={theme.fgDim}>{"  ·  "}</text> : null}
-      {seven ? (
-        <text>
-          <span fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</span>
-          {seven.remaining ? (
-            <span fg={theme.fgDim}>{` (${seven.remaining})`}</span>
-          ) : null}
-        </text>
-      ) : null}
+      <text fg={pctColor(five.pct)}>{`5h ${five.pct}%`}</text>
+      {five.remaining ? <text fg={theme.fgDim}>{` (${five.remaining})`}</text> : null}
+      <text fg={theme.fgDim}>{"  ·  "}</text>
+      <text fg={pctColor(seven.pct)}>{`7d ${seven.pct}%`}</text>
+      {seven.remaining ? <text fg={theme.fgDim}>{` (${seven.remaining})`}</text> : null}
     </box>
   );
 }
@@ -601,23 +589,25 @@ function pctColor(pct: number): string {
 
 type PctWindow = { pct: number; remaining: string | null };
 type FormattedUsage = {
-  fiveHour: PctWindow | null;
-  sevenDay: PctWindow | null;
+  fiveHour: PctWindow;
+  sevenDay: PctWindow;
 };
 
 /**
- * A window's reading is valid until it resets. Past `resetsAt` the
- * percentage describes an expired window (the real usage has rolled over
- * to ~0), so the cluster is dropped. A missing `resetsAt` is treated as
- * non-expiring — we'd rather show a present number than hide it.
+ * Format one window. Past its `resetsAt` the cached percentage describes
+ * the *previous* window; the current one starts fresh at ~0 (no usage
+ * accrues while the source is idle), so we report `0%` with no countdown
+ * rather than the stale figure — or a blank, which is the gap a just-
+ * reset window briefly hits before the source rewrites its `resetsAt`.
+ * The real value (and countdown) returns on the next refresh.
  */
-function pctWindowOrNull(
+function pctWindow(
   p: { utilization: number; resetsAt: string | null },
   nowMs: number,
-): PctWindow | null {
+): PctWindow {
   if (p.resetsAt) {
     const t = Date.parse(p.resetsAt);
-    if (!Number.isNaN(t) && nowMs >= t) return null;
+    if (!Number.isNaN(t) && nowMs >= t) return { pct: 0, remaining: null };
   }
   return {
     pct: Math.round(p.utilization),
@@ -630,10 +620,10 @@ function formatPctUsage(
   nowMs: number,
 ): FormattedUsage | null {
   if (!usage) return null;
-  const fiveHour = pctWindowOrNull(usage.fiveHour, nowMs);
-  const sevenDay = pctWindowOrNull(usage.sevenDay, nowMs);
-  if (!fiveHour && !sevenDay) return null;
-  return { fiveHour, sevenDay };
+  return {
+    fiveHour: pctWindow(usage.fiveHour, nowMs),
+    sevenDay: pctWindow(usage.sevenDay, nowMs),
+  };
 }
 
 /**
