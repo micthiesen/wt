@@ -7,6 +7,12 @@
 import { useSyncExternalStore } from "react";
 
 import {
+  type HarnessRun,
+  type TailHarnessId,
+  harnessTailKey,
+  harnessTailRegistry,
+} from "../../core/harness/harness-tail.ts";
+import {
   type SessionRun,
   sessionTailRegistry,
   tailKey,
@@ -42,4 +48,22 @@ export function useShellRun(slug: string | undefined): ShellRun | null {
   );
   if (!slug) return null;
   return map.get(slug) ?? null;
+}
+
+/**
+ * Live tail for a codex/opencode slot (single slot per slug per
+ * harness). Backed by `harnessTailRegistry`, which polls the rollout
+ * jsonl / SQLite and produces the same `ActionLine[]` shape as claude.
+ */
+export function useHarnessRun(
+  slug: string | undefined,
+  harnessId: TailHarnessId,
+): HarnessRun | null {
+  const map = useSyncExternalStore(
+    harnessTailRegistry.subscribe,
+    harnessTailRegistry.getSnapshot,
+    harnessTailRegistry.getSnapshot,
+  );
+  if (!slug) return null;
+  return map.get(harnessTailKey(slug, harnessId)) ?? null;
 }

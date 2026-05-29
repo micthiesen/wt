@@ -22,12 +22,12 @@ import type { ActionRun } from "./actions.ts";
 export type OutputKind = "events" | "action" | "session" | "destroy";
 /**
  * Subkind of a `kind: "session"` output. Drives both the title label
- * (F10 shell / F12 claude) and the OutputViewer's content dispatch.
- * Both kinds tail their tmux pane via `core/session-tail.ts` — claude
- * via stream-json, shell via `tmux pipe-pane` with ANSI stripping.
+ * and the OutputViewer's content dispatch. claude/shell tail via
+ * `core/session-tail.ts` (stream-json / pipe-pane); codex + opencode
+ * tail via `core/harness/harness-tail.ts` (rollout jsonl / SQLite).
  * F11 diff is deliberately excluded (see file header).
  */
-export type OutputSessionKind = "claude" | "shell";
+export type OutputSessionKind = "claude" | "shell" | "codex" | "opencode";
 export type OutputStatus = "live" | "running" | "done" | "failed" | "killed";
 
 export type Output = {
@@ -101,6 +101,8 @@ export function destroyOutputId(slug: string): string {
 const SESSION_LABEL: Record<OutputSessionKind, string> = {
   claude: "F12 claude",
   shell: "F10 shell",
+  codex: "codex",
+  opencode: "opencode",
 };
 
 export function eventsOutput(lastEventTs: number): Output {

@@ -18,6 +18,11 @@ import {
   sessionOutput,
   sortOutputs,
 } from "../../core/outputs.ts";
+import {
+  harnessTailKey,
+  harnessTailRegistry,
+  type TailHarnessId,
+} from "../../core/harness/harness-tail.ts";
 import { sessionTailRegistry, tailKey } from "../../core/session-tail.ts";
 import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
@@ -78,6 +83,13 @@ export function useOutputs(opts: {
     shellTailRegistry.subscribe,
     shellTailRegistry.getSnapshot,
     shellTailRegistry.getSnapshot,
+  );
+  // Codex/opencode session trails — same role as the claude tail, keyed
+  // `${slug}:${harnessId}` (single slot per slug per harness).
+  const harnessTails = useSyncExternalStore(
+    harnessTailRegistry.subscribe,
+    harnessTailRegistry.getSnapshot,
+    harnessTailRegistry.getSnapshot,
   );
   const sessions = useQuery(tmuxSessionsQuery()).data;
 
@@ -145,8 +157,27 @@ export function useOutputs(opts: {
         const lastActivity = lastLineTs ?? startedAt;
         out.push(sessionOutput(slug, "shell", startedAt, lastActivity));
       }
+      // Codex/opencode: one live slot per slug per harness.
+      const harnessKinds: TailHarnessId[] = ["codex", "opencode"];
+      for (const kind of harnessKinds) {
+        for (const slug of sessions.slugsByHarness[kind]) {
+          const tail = harnessTails.get(harnessTailKey(slug, kind));
+          const startedAt = tail?.startedAt ?? Date.now();
+          const lastLineTs = tail?.lines[tail.lines.length - 1]?.ts;
+          const lastActivity = lastLineTs ?? startedAt;
+          out.push(sessionOutput(slug, kind, startedAt, lastActivity));
+        }
+      }
     }
 
     return sortOutputs(out);
-  }, [evts, actions, claudeTails, shellTails, sessions, destroyingSlugs]);
+  }, [
+    evts,
+    actions,
+    claudeTails,
+    shellTails,
+    harnessTails,
+    sessions,
+    destroyingSlugs,
+  ]);
 }

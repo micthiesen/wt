@@ -9,6 +9,7 @@ import { config } from "../core/config.ts";
 import { disposeDiffPool } from "../core/diff/pool.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { startCodexEventPolling } from "../core/harness/codex-events.ts";
+import { harnessTailRegistry } from "../core/harness/harness-tail.ts";
 import { startOpencodeEventPolling } from "../core/harness/opencode-events.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
@@ -295,6 +296,7 @@ export async function runTui(): Promise<TuiExit> {
     // Close all jsonl + pipe-pane watchers + drop tailer state.
     sessionTailRegistry.stopAll();
     shellTailRegistry.stopAll();
+    harnessTailRegistry.stopAll();
     // Drain queued log writes before main.ts hits process.exit.
     await flushLogger();
   });

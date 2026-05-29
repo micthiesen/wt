@@ -10,6 +10,7 @@ import { theme } from "../theme.ts";
 
 import {
   ActionContent,
+  HarnessSessionContent,
   SessionContent,
   ShellContent,
 } from "./action-viewer.tsx";
@@ -93,6 +94,15 @@ function OutputContent({ output, height }: { output: Output; height: number }) {
     }
     if (output.sessionKind === "shell") {
       return <ShellContent slug={output.slug} height={height} />;
+    }
+    if (output.sessionKind === "codex" || output.sessionKind === "opencode") {
+      return (
+        <HarnessSessionContent
+          slug={output.slug}
+          harnessId={output.sessionKind}
+          height={height}
+        />
+      );
     }
   }
   if (output.kind === "action" && output.slug) {

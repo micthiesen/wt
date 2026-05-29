@@ -37,6 +37,10 @@ import {
   validateSessionName,
 } from "../core/claude-sessions.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
+import {
+  type LiveHarnessSlot,
+  harnessTailRegistry,
+} from "../core/harness/harness-tail.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import {
@@ -102,6 +106,7 @@ import { enterShellSession } from "./shell-session.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
 import {
   useActiveDiffSessions,
+  useActiveHarnessSessions,
   useActiveShellSessions,
   useClaudeSessionsBySlug,
 } from "./hooks/useActiveSessions.ts";
@@ -922,6 +927,10 @@ export function App({ onExit }: Props) {
   const activeDiffSessions = useActiveDiffSessions();
   // Same for shell sessions, gating Shift+F10.
   const activeShellSessions = useActiveShellSessions();
+  // Live codex/opencode slots — drive the harness-tail reconcile so the
+  // bottom pane tails their rollout/SQLite trail like the claude jsonl.
+  const activeCodexSessions = useActiveHarnessSessions("codex");
+  const activeOpencodeSessions = useActiveHarnessSessions("opencode");
 
   // Reconcile session tailers against the live (slug, name) set so the
   // jsonl-watch lifecycle tracks the daemon. Re-runs whenever the live
@@ -956,6 +965,26 @@ export function App({ onExit }: Props) {
     }
     shellTailRegistry.reconcile(live);
   }, [rows, activeShellSessions]);
+
+  // Codex/opencode session trails for the bottom pane. Like the shell
+  // reconcile but per-harness and path-bearing — the rollout/SQLite
+  // tailers resolve their source from the worktree cwd. Slot paths
+  // come from `SESSION_SLOTS`, real rows override on slug collision.
+  useEffect(() => {
+    const pathBySlug = new Map<string, string>();
+    for (const slot of SESSION_SLOTS) pathBySlug.set(slot.slug, slot.path);
+    for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
+    const live: LiveHarnessSlot[] = [];
+    const add = (slugs: ReadonlySet<string>, harnessId: "codex" | "opencode") => {
+      for (const slug of slugs) {
+        const wtPath = pathBySlug.get(slug);
+        if (wtPath) live.push({ slug, wtPath, harnessId });
+      }
+    };
+    add(activeCodexSessions, "codex");
+    add(activeOpencodeSessions, "opencode");
+    harnessTailRegistry.reconcile(live);
+  }, [rows, activeCodexSessions, activeOpencodeSessions]);
 
   // Kill any live `<slug>-diff` tmux session whose resolved base ref
   // has changed since the session was opened, so the next F11 spawns
@@ -1154,7 +1183,16 @@ export function App({ onExit }: Props) {
       return actionOutputId(currentSlug, currentRun.startedAt);
     }
     if (currentSlug) {
-      // Multi-session: prefer primary when live, otherwise the
+      // Codex/opencode are single-slot per slug. When the session F12
+      // would attach to (the cross-harness `activeSessionBySlug` target,
+      // same as the list glyph) is one of these, auto-focus its trail so
+      // the bottom pane follows what the user is actually running.
+      const active = activeSessionBySlug.get(currentSlug);
+      if (active && active.harnessId !== "claude") {
+        const id = sessionOutputId(currentSlug, active.harnessId);
+        if (visibleOutputs.some((o) => o.id === id)) return id;
+      }
+      // Multi-session claude: prefer primary when live, otherwise the
       // most-recently-active named session — same sort `;` and the
       // outputs picker use, so the auto-pick lines up with what the
       // user sees up top in `:`. Only ids that exist in
@@ -1182,6 +1220,7 @@ export function App({ onExit }: Props) {
     currentRun?.startedAt,
     showActionViewer,
     claudeSessionsBySlug,
+    activeSessionBySlug,
     visibleOutputs,
   ]);
   // Explicit user pick > auto, scoped to the current worktree's

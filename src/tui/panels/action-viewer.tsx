@@ -4,8 +4,14 @@
  * OutputViewer; these emit just the line rows.
  */
 import type { ActionLine, ActionRun } from "../../core/actions.ts";
+import type { TailHarnessId } from "../../core/harness/harness-tail.ts";
+import { getHarness } from "../../core/harness/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
-import { useSessionRun, useShellRun } from "../hooks/useSessionRun.ts";
+import {
+  useHarnessRun,
+  useSessionRun,
+  useShellRun,
+} from "../hooks/useSessionRun.ts";
 import { theme } from "../theme.ts";
 
 function fmtTime(ts: number): string {
@@ -89,6 +95,35 @@ export function SessionContent({
             ts: run?.startedAt ?? Date.now(),
             kind: "info",
             text: "  waiting for claude session output…",
+          },
+        ];
+  return <LinesContent height={height} lines={lines} />;
+}
+
+/**
+ * Live trail of a codex/opencode session, tailed from its rollout jsonl
+ * (codex) or SQLite DB (opencode) via `harnessTailRegistry`. Single slot
+ * per slug per harness, so no `name`. Same `ActionLine[]` rows as claude.
+ */
+export function HarnessSessionContent({
+  slug,
+  harnessId,
+  height,
+}: {
+  slug: string;
+  harnessId: TailHarnessId;
+  height: number;
+}) {
+  const run = useHarnessRun(slug, harnessId);
+  const lines: readonly ActionLine[] =
+    run && run.lines.length > 0
+      ? run.lines
+      : [
+          {
+            id: 0,
+            ts: run?.startedAt ?? Date.now(),
+            kind: "info",
+            text: `  waiting for ${getHarness(harnessId).label} session output…`,
           },
         ];
   return <LinesContent height={height} lines={lines} />;
