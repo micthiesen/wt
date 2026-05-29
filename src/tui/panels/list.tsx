@@ -29,6 +29,7 @@ import { STATE_FG } from "../claude-state.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import type { MergeQueueState } from "../../core/types.ts";
+import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 type Props = {
@@ -53,20 +54,15 @@ type Props = {
    *  glyph in the badge cluster while running. */
   activeActions: ReadonlySet<string>;
   /**
-   * Per-slug first-live harness in HARNESSES order. Present only
-   * when at least one live AI tmux session exists on the slug.
-   * Drives the harness-glyph badge in the list pane, tinted with
-   * that harness's own color.
+   * Per-slug "active session" — the harness F12 would attach to plus its
+   * derived state — for every worktree. Computed through the same
+   * `computeHarnessSessions` rule as the F12 keybind and the details-pane
+   * AI row (see `useActiveSessionsBySlug`), so the list glyph can't drift
+   * from either. Absent when no session is live on the slug. The glyph is
+   * tinted by `state` when known (any harness), else the harness's brand
+   * color.
    */
-  aiLiveHarnessBySlug: ReadonlyMap<string, HarnessId>;
-  /**
-   * Per-slug aggregate Claude session state. When present (and the live
-   * harness is Claude) the CC glyph is tinted with `STATE_FG[state]`
-   * instead of the harness brand color, so the badge reads working /
-   * asking / waiting / unknown at a glance. Registry-only, so codex /
-   * opencode slugs are absent here and keep their brand color.
-   */
-  aiStateBySlug: ReadonlyMap<string, DerivedState>;
+  activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   /**
    * Per-stack-section AI-derived display label, keyed by the stored
    * section name (`stack: 1234`). When present, the section's divider
@@ -227,13 +223,13 @@ const RowView = memo(function RowView({
   isTailing: boolean;
   /** Whether a `claude -p` action is currently running on this slug. */
   actionRunning: boolean;
-  /** The first live harness (in HARNESSES order) on this slug, or
-   *  undefined when no live AI sessions exist. Renders the harness
-   *  glyph in the badge cluster when defined. */
+  /** The harness of this slug's active (F12-target) session, or
+   *  undefined when no session is live. Renders the harness glyph in the
+   *  badge cluster when defined. */
   activeHarnessId: HarnessId | undefined;
-  /** Aggregate Claude session state for this slug. Tints the CC glyph
-   *  with `STATE_FG[state]` when the active harness is Claude; otherwise
-   *  the glyph falls back to the harness brand color. */
+  /** Derived state of that active session. Tints the harness glyph with
+   *  `STATE_FG[state]` (any harness) when known; otherwise the glyph
+   *  falls back to the harness brand color. */
   sessionState: DerivedState | undefined;
   panelWidth: number;
   /**
@@ -354,7 +350,7 @@ const RowView = memo(function RowView({
             <box width={2} flexShrink={0}>
               <text
                 fg={
-                  activeHarnessId === "claude" && sessionState
+                  sessionState
                     ? STATE_FG[sessionState]
                     : getHarness(activeHarnessId).color
                 }
@@ -519,7 +515,7 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, aiLiveHarnessBySlug, aiStateBySlug, stackSectionLabels, isLoading }: Props) {
+export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, activeSessionBySlug, stackSectionLabels, isLoading }: Props) {
   const firstArchivedIndex = rows.findIndex((r) => r.archived);
   const hasArchived = firstArchivedIndex !== -1;
   const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
@@ -644,8 +640,8 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                   selected={i === selectedIndex}
                   isTailing={activeTails.has(row.wt.slug)}
                   actionRunning={activeActions.has(row.wt.slug)}
-                  activeHarnessId={aiLiveHarnessBySlug.get(row.wt.slug)}
-                  sessionState={aiStateBySlug.get(row.wt.slug)}
+                  activeHarnessId={activeSessionBySlug.get(row.wt.slug)?.harnessId}
+                  sessionState={activeSessionBySlug.get(row.wt.slug)?.state ?? undefined}
                   panelWidth={width}
                   stackParentAbove={stackParentAbove}
                 />
@@ -706,8 +702,8 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                     selected={globalIndex === selectedIndex}
                     isTailing={activeTails.has(row.wt.slug)}
                     actionRunning={activeActions.has(row.wt.slug)}
-                    activeHarnessId={aiLiveHarnessBySlug.get(row.wt.slug)}
-                    sessionState={aiStateBySlug.get(row.wt.slug)}
+                    activeHarnessId={activeSessionBySlug.get(row.wt.slug)?.harnessId}
+                    sessionState={activeSessionBySlug.get(row.wt.slug)?.state ?? undefined}
                     panelWidth={width}
                     stackParentAbove={false}
                   />

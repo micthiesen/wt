@@ -55,9 +55,8 @@ import {
   killShellSession,
 } from "../core/tmux.ts";
 import { StatusKind, type PullRequest } from "../core/types.ts";
-import { claudeRegistryQuery, claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, tmuxSessionsQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
+import { claudeSummariesQuery, claudeUsageQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
-import { pickAggregateState, registryStatusToState, type DerivedState } from "../core/claude-status.ts";
 
 import {
   ActionEditModal,
@@ -92,6 +91,7 @@ import { enterHarnessSession } from "./harness-session.ts";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
 import {
   isSyntheticLiveSessionId,
+  useActiveSessionsBySlug,
   useHarnessSessions,
 } from "./hooks/useHarnessSessions.ts";
 import { getHarness, HARNESSES, type HarnessId } from "../core/harness/index.ts";
@@ -855,64 +855,24 @@ export function App({ onExit }: Props) {
   const activeActions = useActiveActions();
   // Per-slug list of live claude session names (`null` = primary).
   // Drives the tail-registry reconcile, the sessions picker, and the
-  // auto-output focus rule. The list-pane count badge uses
-  // `aiSessionCountBySlug` below so codex / opencode liveness also
-  // lights up the indicator.
+  // auto-output focus rule.
   const claudeSessionsBySlug = useClaudeSessionsBySlug();
-  // Per-slug first-match live harness in HARNESSES order (claude >
-  // codex > opencode). Drives the harness-glyph badge in the list
-  // pane: only shown when at least one live session exists, tinted
-  // with that harness's own color.
-  const tmuxSessionsData = useQuery(tmuxSessionsQuery()).data;
-  const aiLiveHarnessBySlug = useMemo(() => {
-    const map = new Map<string, HarnessId>();
-    // Iterate in HARNESSES order so the first live match wins.
-    for (const h of HARNESSES) {
-      let slugs: Iterable<string>;
-      if (h.id === "claude") {
-        slugs = tmuxSessionsData?.claudeSlugs ?? [];
-      } else if (h.id === "codex") {
-        slugs = tmuxSessionsData?.codex ?? [];
-      } else {
-        slugs = tmuxSessionsData?.opencode ?? [];
-      }
-      for (const slug of slugs) {
-        if (!map.has(slug)) map.set(slug, h.id);
-      }
-    }
-    return map;
-  }, [tmuxSessionsData?.claudeSlugs, tmuxSessionsData?.codex, tmuxSessionsData?.opencode]);
-  // Live claude process registry — feeds the per-slug aggregate state
-  // (`aiStateBySlug`) that tints the list-pane CC glyph.
-  const claudeRegistry = useQuery(claudeRegistryQuery());
-  // Per-slug aggregate Claude session state from the live registry. The
-  // list pane tints its CC glyph with STATE_FG[state] so the badge
-  // encodes working / asking / waiting / unknown at a glance (matching
-  // the details-pane row), not just "a session is live". Registry-only:
-  // codex / opencode have no busy/idle registry, so their glyphs keep
-  // the harness brand color. Keyed by slug via each session's cwd, which
-  // claude reports as the worktree path.
-  const aiStateBySlug = useMemo(() => {
-    const sessions = claudeRegistry.data?.sessions ?? [];
-    const out = new Map<string, DerivedState>();
-    if (sessions.length === 0) return out;
-    const slugByPath = new Map<string, string>();
-    for (const r of rows) slugByPath.set(r.wt.path, r.wt.slug);
-    const statesBySlug = new Map<string, DerivedState[]>();
-    for (const s of sessions) {
-      const slug = slugByPath.get(s.cwd);
-      if (!slug) continue;
-      const state = registryStatusToState(s.status);
-      const arr = statesBySlug.get(slug);
-      if (arr) arr.push(state);
-      else statesBySlug.set(slug, [state]);
-    }
-    for (const [slug, states] of statesBySlug) {
-      const agg = pickAggregateState(states);
-      if (agg) out.set(slug, agg);
-    }
-    return out;
-  }, [claudeRegistry.data, rows]);
+  // Per-slug "active session" for the list-pane harness glyph: the
+  // harness + derived state F12 would attach to, computed for EVERY
+  // worktree through the same `computeHarnessSessions` rule the
+  // current-row hook, the details-pane AI row, and the F12 keybind use.
+  // This is the single source of truth — the list glyph can't drift from
+  // what F12 does or what the details pane shows. Fans session discovery
+  // across all worktrees (cached at the query layer); codex/opencode get
+  // state tinting too, not just the brand color.
+  const sessionWorktrees = useMemo(
+    () => rows.map((r) => ({ slug: r.wt.slug, path: r.wt.path })),
+    [rows],
+  );
+  const activeSessionBySlug = useActiveSessionsBySlug(
+    sessionWorktrees,
+    primaryHarness,
+  );
   // LLM-authored summary snippets for the picker's currently-open
   // worktree. Only fetched when the picker is open (gated by
   // `enabled`); the queryFn does light tail-bounded disk reads
@@ -4305,8 +4265,7 @@ export function App({ onExit }: Props) {
           width={listWidth}
           activeTails={activeTails}
           activeActions={activeActions}
-          aiLiveHarnessBySlug={aiLiveHarnessBySlug}
-          aiStateBySlug={aiStateBySlug}
+          activeSessionBySlug={activeSessionBySlug}
           stackSectionLabels={stackSectionLabels}
           isLoading={isLoading}
         />
