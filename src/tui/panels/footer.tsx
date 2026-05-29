@@ -1,20 +1,14 @@
-import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
-
-import {
-  pickAggregateState,
-  registryStatusToState,
-  type DerivedState,
-} from "../../core/claude-status.ts";
+import type { DerivedState } from "../../core/claude-status.ts";
 import { getHarness } from "../../core/harness/index.ts";
-import { claudeRegistryQuery } from "../../state/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
 import { STATE_FG } from "../claude-state.ts";
+import { useActiveSessionsBySlug } from "../hooks/useHarnessSessions.ts";
 import { usePrimaryHarness } from "../hooks/usePrimaryHarness.ts";
 import { useSessionRun } from "../hooks/useSessionRun.ts";
 import {
   DOTFILES_SLOT,
   MAIN_CLONE_SLOT,
+  SESSION_SLOTS,
   WT_SOURCE_SLOT,
 } from "../session-slots.ts";
 import { theme } from "../theme.ts";
@@ -42,24 +36,6 @@ type Props = {
   height?: number;
 };
 
-/**
- * Live derived state for a session slot, matched by cwd against the
- * Claude registry (claude reports its project dir as cwd, so a slot's
- * sessions land under the slot path). Aggregates when more than one
- * session runs in the slot dir; null when none is live.
- */
-function useSlotState(path: string): DerivedState | null {
-  const registry = useQuery(claudeRegistryQuery());
-  return useMemo(() => {
-    const sessions = registry.data?.sessions ?? [];
-    const states: DerivedState[] = [];
-    for (const s of sessions) {
-      if (s.cwd === path) states.push(registryStatusToState(s.status));
-    }
-    return pickAggregateState(states);
-  }, [registry.data, path]);
-}
-
 /** Status color for a slot's robot glyph; dim when no live session. */
 function slotGlyphFg(state: DerivedState | null): string {
   return state ? STATE_FG[state] : theme.fgDim;
@@ -70,12 +46,15 @@ export function Footer({ mode, hint }: Props) {
   // permanent status robots bundled at the far right — wt-source first,
   // dotfiles to its right. No labels: position is the discriminator (the
   // main-clone slot is represented separately by its tail on the left).
-  // Each robot's color tracks that slot's live state, and its glyph
-  // follows the TAB-selected primary harness (matching what the slot's
-  // keybind spawns).
-  const wtState = useSlotState(WT_SOURCE_SLOT.path);
-  const dotfilesState = useSlotState(DOTFILES_SLOT.path);
-  const primaryGlyph = getHarness(usePrimaryHarness()).glyph;
+  // Each robot's glyph follows the TAB-selected primary harness (what the
+  // slot's keybind spawns), and its color tracks the slot's live session
+  // state via the same cross-harness rule the list/details panes use —
+  // so codex/opencode slots light up too, not just claude.
+  const primary = usePrimaryHarness();
+  const primaryGlyph = getHarness(primary).glyph;
+  const slotSessions = useActiveSessionsBySlug(SESSION_SLOTS, primary);
+  const wtState = slotSessions.get(WT_SOURCE_SLOT.slug)?.state ?? null;
+  const dotfilesState = slotSessions.get(DOTFILES_SLOT.slug)?.state ?? null;
   return (
     <box
       flexShrink={0}
@@ -86,7 +65,11 @@ export function Footer({ mode, hint }: Props) {
       flexDirection="row"
     >
       <box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
-        {mode.kind === "legend" ? <MainSlotTail /> : null}
+        {mode.kind === "legend" ? (
+          <MainSlotTail
+            state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
+          />
+        ) : null}
         {mode.kind === "toast" ? (
           <text fg={mode.color ?? theme.ok}>{mode.message}</text>
         ) : null}
@@ -129,15 +112,15 @@ export function Footer({ mode, hint }: Props) {
  * reads as plain text, a tool-error as red, etc.). When no session is
  * live or no lines have arrived yet (pre-creation race), falls back to a
  * dim idle hint that still surfaces `.` as the start key and `?` for
- * help. The tail is claude-jsonl-only; if the user spawns a
- * codex/opencode session via `.` (the active primary harness) the bar
- * reads as "idle" because there's no jsonl to tail. That's a known v1
- * trade-off — bottom-bar feedback for non-claude harnesses would mean
- * wiring their event streams in here too.
+ * help. The leading glyph's color reflects the slot's live state across
+ * any harness (passed in via `state`), but the trailing tail TEXT is
+ * claude-jsonl-only: a codex/opencode session in the slot still lights
+ * the glyph yet shows no line text, since there's no jsonl to tail.
+ * Wiring those event streams into the tail text is a known v1 trade-off.
  */
-function MainSlotTail() {
+function MainSlotTail({ state }: { state: DerivedState | null }) {
   const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
-  const glyphFg = slotGlyphFg(useSlotState(MAIN_CLONE_SLOT.path));
+  const glyphFg = slotGlyphFg(state);
   const primaryGlyph = getHarness(usePrimaryHarness()).glyph;
   const lastLine =
     run && run.lines.length > 0 ? run.lines[run.lines.length - 1] : null;
