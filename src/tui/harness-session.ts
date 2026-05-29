@@ -85,7 +85,7 @@ export async function enterHarnessSession(opts: {
   // and our buildArgs argv actually runs. Single-slot semantics are
   // codex/opencode only — claude already gets a unique tmux name
   // per managedName so the flag is a no-op there.
-  if (freshSlot && (harnessId === "codex" || harnessId === "opencode")) {
+  if (freshSlot && getHarness(harnessId).singleSlot) {
     createLogger(slug).event.warn(
       `replacing ${getHarness(harnessId).label} slot`,
     );

@@ -133,15 +133,18 @@ export type TmuxSessionsData = {
   /**
    * Every live claude session, including primary and named. Multiple
    * entries can share a slug. Drives the sessions picker; consumers
-   * that just want "any live claude" should use `claudeSlugs`.
+   * that just want "any live claude" should use `slugsByHarness.claude`.
    */
   claude: ClaudeSessionEntry[];
-  /** Slug set with at least one live claude session (primary or named). */
-  claudeSlugs: string[];
-  /** Slugs with a live codex tmux session. */
-  codex: string[];
-  /** Slugs with a live opencode tmux session. */
-  opencode: string[];
+  /**
+   * Live-session slug lists keyed by harness id. `claude` is the
+   * unique-slug projection of the `claude` entry list (a worktree can
+   * host several named claude sessions); `codex`/`opencode` are the
+   * single-slot slugs. One uniform `Record<HarnessId, string[]>` so
+   * consumers index by harness id instead of branching on it. Arrays
+   * (not Sets) because this query is persisted.
+   */
+  slugsByHarness: Record<HarnessId, string[]>;
   /** Slugs with a live diff session. */
   diff: string[];
   /** Slugs with a live shell session. */
@@ -174,9 +177,11 @@ export const tmuxSessionsQuery = () =>
         await listTmuxSessions();
       return {
         claude,
-        claudeSlugs: [...claudeSlugs],
-        codex: [...codex],
-        opencode: [...opencode],
+        slugsByHarness: {
+          claude: [...claudeSlugs],
+          codex: [...codex],
+          opencode: [...opencode],
+        },
         diff: [...diff],
         shell: [...shell],
         action: [...action],

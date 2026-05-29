@@ -119,7 +119,7 @@ export function computeHarnessSessions(
     // moment when rollout/DB write hasn't happened), synthesize a
     // placeholder so the picker isn't blank for an actively-running
     // session.
-    const isSingleSlot = h.id === "codex" || h.id === "opencode";
+    const isSingleSlot = h.singleSlot;
     // Pull the tmux name from the canonical harness impl rather than
     // re-deriving `${slug}-${h.id}` inline — keeps this hook in sync
     // if the format ever changes (e.g. a future multi-slot scheme).
@@ -220,19 +220,18 @@ export function useHarnessSessions(
   primary: HarnessId,
 ): UseHarnessSessionsResult {
   const tmux = useQuery(tmuxSessionsQuery());
-  // Hooks must be called unconditionally so we always invoke one per
-  // harness in registry order. The query factory short-circuits to
-  // `enabled: false` when wtPath is empty.
-  const claudeQ = useQuery(harnessSessionsQuery("claude", slug, wtPath));
-  const codexQ = useQuery(harnessSessionsQuery("codex", slug, wtPath));
-  const opencodeQ = useQuery(harnessSessionsQuery("opencode", slug, wtPath));
+  // One discovery query per harness, in registry order. `useQueries`
+  // keeps the call count stable (HARNESSES is a fixed constant) and
+  // mirrors `useActiveSessionsBySlug` so the two hooks can't drift. The
+  // query factory short-circuits to `enabled: false` when wtPath is "".
+  const results = useQueries({
+    queries: HARNESSES.map((h) => harnessSessionsQuery(h.id, slug, wtPath)),
+  });
   const rawByHarness = useMemo(() => {
-    return new Map<HarnessId, ReadonlyArray<HarnessSession>>([
-      ["claude", claudeQ.data ?? EMPTY],
-      ["codex", codexQ.data ?? EMPTY],
-      ["opencode", opencodeQ.data ?? EMPTY],
-    ]);
-  }, [claudeQ.data, codexQ.data, opencodeQ.data]);
+    const m = new Map<HarnessId, ReadonlyArray<HarnessSession>>();
+    HARNESSES.forEach((h, i) => m.set(h.id, results[i]?.data ?? EMPTY));
+    return m;
+  }, [results]);
 
   return useMemo(
     () =>
@@ -290,19 +289,14 @@ export function useActiveSessionsBySlug(
     () => (targetHarness ? [targetHarness] : ALL_HARNESS_IDS),
     [targetHarness],
   );
+  const slugsByHarness = tmux.data?.slugsByHarness;
   const liveAiSlugs = useMemo(() => {
     const s = new Set<string>();
     for (const id of harnessIds) {
-      const src =
-        id === "claude"
-          ? tmux.data?.claudeSlugs
-          : id === "codex"
-            ? tmux.data?.codex
-            : tmux.data?.opencode;
-      for (const slug of src ?? []) s.add(slug);
+      for (const slug of slugsByHarness?.[id] ?? []) s.add(slug);
     }
     return s;
-  }, [tmux.data?.claudeSlugs, tmux.data?.codex, tmux.data?.opencode, harnessIds]);
+  }, [slugsByHarness, harnessIds]);
   const liveWorktrees = useMemo(
     () => worktrees.filter((w) => liveAiSlugs.has(w.slug)),
     [worktrees, liveAiSlugs],

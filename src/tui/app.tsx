@@ -3010,8 +3010,7 @@ export function App({ onExit }: Props) {
         // fresh, otherwise `tmux -A` attaches to whatever's there and
         // ignores our `<cli> resume <id>` argv.
         const freshSlot =
-          (e.harnessId === "codex" || e.harnessId === "opencode") &&
-          resumeSessionId !== null;
+          getHarness(e.harnessId).singleSlot && resumeSessionId !== null;
         setModal(null);
         doEnterHarnessSession(slug, e.harnessId, {
           managedName: e.extras.managedName,
@@ -3926,8 +3925,7 @@ export function App({ onExit }: Props) {
         const resumeSessionId =
           target.isLive || isSyntheticLive ? null : target.sessionId;
         const freshSlot =
-          (target.harnessId === "codex" || target.harnessId === "opencode") &&
-          resumeSessionId !== null;
+          getHarness(target.harnessId).singleSlot && resumeSessionId !== null;
         doEnterHarnessSession(slug, target.harnessId, {
           managedName: target.extras.managedName,
           resumeSessionId,

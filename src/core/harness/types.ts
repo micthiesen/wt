@@ -115,6 +115,16 @@ export interface Harness {
   readonly glyph: string;
   /** Theme color hex. */
   readonly color: string;
+  /**
+   * True when the harness uses a single shared tmux slot per slug
+   * (`<slug>-<id>`), so resuming a specific session must displace
+   * whatever's running in the slot (`freshSlot`), and only one
+   * discovered session can be live at a time. False for claude, which
+   * gets a unique tmux name per managed session. This is the capability
+   * that used to be spelled `id === "codex" || id === "opencode"` at
+   * every call site.
+   */
+  readonly singleSlot: boolean;
 
   /**
    * Tmux session name for a (slug, managedName). Each impl encodes its

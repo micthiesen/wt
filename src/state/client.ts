@@ -24,7 +24,10 @@ export const CACHE_DB = config.paths.cacheDb;
 // `experimental_createQueryPersister` per-query model. Storage layout
 // changed (one row per query, prefixed `wt-<queryHash>`), and the
 // older single-row `wt.cache.v1` blob will never be read.
-const CACHE_BUSTER = "v6";
+// v7: TmuxSessionsData replaced the `claudeSlugs`/`codex`/`opencode`
+// fields with a single `slugsByHarness` record; a restored v6 entry
+// would lack it and break consumers that index `slugsByHarness[id]`.
+const CACHE_BUSTER = "v7";
 const STORAGE_PREFIX = "wt";
 const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 

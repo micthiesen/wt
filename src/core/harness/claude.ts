@@ -60,6 +60,9 @@ export const claudeHarness: Harness = {
   letter: "c",
   glyph: CLAUDE_GLYPH,
   color: CLAUDE_COLOR,
+  // Claude gets a unique tmux name per managed session, so multiple
+  // sessions coexist per slug — not a single shared slot.
+  singleSlot: false,
 
   tmuxSessionName(slug, managedName) {
     return claudeTmuxName(slug, managedName);

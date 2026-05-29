@@ -170,7 +170,7 @@ export async function runTui(): Promise<TuiExit> {
   const stopCodexEvents = startCodexEventPolling(() => {
     const worktrees = wtClient.client.getQueryData<Worktree[]>(qk.worktrees()) ?? [];
     const tmux = wtClient.client.getQueryData<TmuxSessionsData>(qk.tmuxSessions());
-    const liveCodex = new Set(tmux?.codex ?? []);
+    const liveCodex = new Set(tmux?.slugsByHarness.codex ?? []);
     return worktrees
       .filter((wt) => liveCodex.has(wt.slug))
       .map((wt) => ({ slug: wt.slug, wtPath: wt.path }));
@@ -183,7 +183,7 @@ export async function runTui(): Promise<TuiExit> {
     const worktrees = wtClient.client.getQueryData<Worktree[]>(qk.worktrees()) ?? [];
     const tmux = wtClient.client.getQueryData<TmuxSessionsData>(qk.tmuxSessions());
     // Only scan slugs that have a live opencode tmux session.
-    const liveOpecode = new Set(tmux?.opencode ?? []);
+    const liveOpecode = new Set(tmux?.slugsByHarness.opencode ?? []);
     return worktrees
       .filter((wt) => liveOpecode.has(wt.slug))
       .map((wt) => ({ slug: wt.slug, wtPath: wt.path }));

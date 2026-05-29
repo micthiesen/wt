@@ -121,6 +121,7 @@ export const opencodeHarness: Harness = {
   letter: "o",
   glyph: OPENCODE_GLYPH,
   color: OPENCODE_COLOR,
+  singleSlot: true,
 
   tmuxSessionName(slug, _managedName) {
     // Single-tmux-per-slug for v1 — same model as codex. The opencode

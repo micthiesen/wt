@@ -457,7 +457,7 @@ export function useWtActions() {
      * the tmux-sessions cache. Used by the kill flow so the picker
      * stops listing the dying session as live the instant `x` is
      * pressed — without waiting for the kill to land or the 2s poll
-     * to refetch. Same-shape `claudeSlugs` is recomputed from the
+     * to refetch. `slugsByHarness.claude` is recomputed from the
      * filtered `claude` array. No-op if no cache entry exists.
      */
     optimisticRemoveClaude(slug: string, name: string | null): void {
@@ -469,7 +469,11 @@ export function useWtActions() {
         );
         if (claude.length === prev.claude.length) return prev;
         const claudeSlugs = [...new Set(claude.map((e) => e.slug))];
-        return { ...prev, claude, claudeSlugs };
+        return {
+          ...prev,
+          claude,
+          slugsByHarness: { ...prev.slugsByHarness, claude: claudeSlugs },
+        };
       });
     },
     /**

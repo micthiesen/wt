@@ -53,6 +53,7 @@ export const codexHarness: Harness = {
   letter: "x",
   glyph: CODEX_GLYPH,
   color: CODEX_COLOR,
+  singleSlot: true,
 
   tmuxSessionName(slug, _managedName) {
     // Single-tmux-per-slug for v1. The managedName is ignored — codex
