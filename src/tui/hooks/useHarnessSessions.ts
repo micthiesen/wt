@@ -133,24 +133,21 @@ export function computeHarnessSessions(
       const isLive = isSingleSlot
         ? s.sessionId === liveDiscoveredId
         : tmuxNames.has(s.tmuxSessionName);
-      // Finalize opencode/codex derived state now that we know liveness.
-      // discoverSessions() returns state from DB/tail without liveness;
-      // we apply the liveness-dependent transitions here.
+      // Finalize codex/opencode derived state now that we know liveness.
+      // discoverSessions() returns a liveness-independent best guess
+      // (working = mid-turn/streaming, waiting = turn closed). A live slot
+      // keeps that guess; a dead slot is abandoned (recent) or idle (old),
+      // by the last-activity age — so a working session reads `working`
+      // rather than being floored to `waiting`.
       let extras = s.extras;
       if (isSingleSlot && extras.derivedState !== null) {
-        const st = extras.derivedState;
-        let finalState = st;
-        if (isLive && (st === "idle" || st === "abandoned")) {
-          // Tmux is live; session is active even if DB shows idle.
-          finalState = "waiting";
-        } else if (!isLive && st === "waiting") {
-          // Not live. Fresh tail (< 10 min) → abandoned; old → idle.
+        if (!isLive) {
           const tailMs = extras.tailEndedAt ?? 0;
           const ageMs = nowMs - tailMs;
-          finalState = ageMs < 10 * 60 * 1000 ? "abandoned" : "idle";
-        }
-        if (finalState !== st) {
-          extras = { ...extras, derivedState: finalState };
+          extras = {
+            ...extras,
+            derivedState: ageMs < 10 * 60 * 1000 ? "abandoned" : "idle",
+          };
         }
       } else if (!isSingleSlot && isLive) {
         // Claude: discoverSessions derives state with isTmuxLive=false

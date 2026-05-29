@@ -39,8 +39,6 @@ const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const CODEX_SESSION_INDEX = join(homedir(), ".codex", "session_index.jsonl");
 /** How far back from end-of-file to read for state derivation. */
 const TAIL_BYTES = 64 * 1024;
-/** Sessions whose last event is older than this threshold are `idle`. */
-const ABANDONED_THRESHOLD_MS = 10 * 60 * 1000;
 /**
  * How far back to walk the date-partitioned sessions tree. Codex names
  * directories `YYYY/MM/DD` so we list the year dirs, then month, then
@@ -85,10 +83,10 @@ export const codexHarness: Harness = {
         isLive: false,
         extras: {
           managedName: null,
-          // Non-live branches computed here; `useHarnessSessions`
-          // applies the same re-annotation logic as opencode: bumps
-          // idle/abandoned to `waiting` when isLive flips on.
-          derivedState: tail ? deriveCodexState(tail, false) : null,
+          // Liveness-independent best guess; `useHarnessSessions`
+          // finalizes it against the live tmux set (dead slot → abandoned/
+          // idle by age, live slot keeps working/waiting).
+          derivedState: tail ? deriveCodexState(tail) : null,
           queued: 0,
           // Stash last-event time so the re-annotator can compute
           // abandoned vs idle when tmux flips dead.
@@ -430,26 +428,16 @@ function setCached(
 }
 
 /**
- * Derive the non-live branch of state from a tail result. The caller
- * (`useHarnessSessions`) bumps to `waiting` when isLive is true and
- * tailClosedCleanly is true.
- *
- * - Unmatched task_started (working mid-turn): `working`
- * - Matched / no task_started + not live + recent: `abandoned`
- * - Matched / no task_started + not live + old: `idle`
+ * Liveness-independent best guess for a codex session's state from its
+ * rollout tail: an unmatched `task_started` (mid-turn) reads as `working`,
+ * a cleanly-closed turn as `waiting`. This mirrors opencode's
+ * `deriveOpencodeState` — `computeHarnessSessions` finalizes it against
+ * real tmux liveness, demoting a dead slot to `abandoned`/`idle` by age
+ * while a live slot keeps this guess (so a working codex reads `working`,
+ * not the floor-`waiting` the old isLive-baked path produced).
  */
-export function deriveCodexState(
-  tail: CodexTailResult,
-  isLive: boolean,
-): DerivedState {
-  if (!tail.tailClosedCleanly) {
-    // Unmatched task_started in tail = mid-turn.
-    return isLive ? "working" : "abandoned";
-  }
-  // Turn closed cleanly.
-  if (isLive) return "waiting";
-  const age = Date.now() - tail.lastEventMs;
-  return age < ABANDONED_THRESHOLD_MS ? "abandoned" : "idle";
+export function deriveCodexState(tail: CodexTailResult): DerivedState {
+  return tail.tailClosedCleanly ? "waiting" : "working";
 }
 
 /** Recognise a codex tmux session for a slug. */

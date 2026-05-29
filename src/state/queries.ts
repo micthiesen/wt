@@ -210,6 +210,17 @@ export const harnessSessionsQuery = (
       return harness.discoverSessions({ slug, wtPath });
     },
     staleTime: STALE.fast,
+    // Claude session state is kept fresh by `watchRegistry` invalidation
+    // (its status lives in the fs-watched registry). Codex/OpenCode bake
+    // their state into discovery and have no such watcher, so a working
+    // session would otherwise show stale state until spawn/kill/refresh —
+    // poll while at least one session exists (no empty-dir re-scans).
+    refetchInterval: (query) =>
+      harnessId === "claude"
+        ? false
+        : (query.state.data?.length ?? 0) > 0
+          ? 3_000
+          : false,
     enabled: wtPath !== "",
   });
 

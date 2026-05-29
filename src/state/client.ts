@@ -71,6 +71,10 @@ export function createWtQueryClient(): WtQueryClient {
       predicate: (query) => {
         const key = query.queryKey;
         if (key[0] === "claudeRegistry") return false;
+        // Session discovery is ephemeral (live-session state, polled for
+        // codex/opencode) and worthless across runs — restoring it would
+        // flash stale sessions on boot. Keep it in-memory only.
+        if (key[0] === "harnessSessions") return false;
         if (key.length < 3 || key[0] !== "wt") return true;
         const slot = key[2];
         return slot !== "lock" && slot !== "claude";
