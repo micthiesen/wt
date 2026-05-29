@@ -1,7 +1,7 @@
 import type { DerivedState } from "../../core/claude-status.ts";
-import { getHarness } from "../../core/harness/index.ts";
+import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
-import { STATE_FG } from "../claude-state.ts";
+import { stateColor } from "../claude-state.ts";
 import { useActiveSessionsBySlug } from "../hooks/useHarnessSessions.ts";
 import { usePrimaryHarness } from "../hooks/usePrimaryHarness.ts";
 import { useSessionRun } from "../hooks/useSessionRun.ts";
@@ -37,8 +37,8 @@ type Props = {
 };
 
 /** Status color for a slot's robot glyph; dim when no live session. */
-function slotGlyphFg(state: DerivedState | null): string {
-  return state ? STATE_FG[state] : theme.fgDim;
+function slotGlyphFg(harnessId: HarnessId, state: DerivedState | null): string {
+  return state ? stateColor(harnessId, state) : theme.fgDim;
 }
 
 export function Footer({ mode, hint }: Props) {
@@ -96,10 +96,10 @@ export function Footer({ mode, hint }: Props) {
       ) : null}
       <box flexShrink={0} marginLeft={1} flexDirection="row">
         <box width={2} flexShrink={0}>
-          <text fg={slotGlyphFg(wtState)}>{primaryGlyph}</text>
+          <text fg={slotGlyphFg(primary, wtState)}>{primaryGlyph}</text>
         </box>
         <box width={2} flexShrink={0}>
-          <text fg={slotGlyphFg(dotfilesState)}>{primaryGlyph}</text>
+          <text fg={slotGlyphFg(primary, dotfilesState)}>{primaryGlyph}</text>
         </box>
       </box>
     </box>
@@ -122,8 +122,9 @@ export function Footer({ mode, hint }: Props) {
  */
 function MainSlotTail({ state }: { state: DerivedState | null }) {
   const run = useSessionRun(MAIN_CLONE_SLOT.slug, null);
-  const glyphFg = slotGlyphFg(state);
-  const primaryGlyph = getHarness(usePrimaryHarness()).glyph;
+  const primary = usePrimaryHarness();
+  const glyphFg = slotGlyphFg(primary, state);
+  const primaryGlyph = getHarness(primary).glyph;
   const lastLine =
     run && run.lines.length > 0 ? run.lines[run.lines.length - 1] : null;
   if (!lastLine) {

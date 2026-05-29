@@ -19,7 +19,7 @@
  */
 import { getHarness } from "../../core/harness/index.ts";
 import type { Worktree } from "../../core/types.ts";
-import { STATE_FG } from "../claude-state.ts";
+import { stateColor } from "../claude-state.ts";
 import { useHarnessSessions } from "../hooks/useHarnessSessions.ts";
 import { usePrimaryHarness } from "../hooks/usePrimaryHarness.ts";
 import { ageMsToText } from "../text.ts";
@@ -41,10 +41,10 @@ function AiLine({ wt }: { wt: Worktree }) {
   const harness = getHarness(f12Target.harnessId);
   const state = f12Target.extras.derivedState;
   const stateText = state ?? (f12Target.isLive ? "live" : "dead");
-  const stateFg = state ? STATE_FG[state] : theme.fgDim;
+  const stateFg = state ? stateColor(harness.id, state) : theme.fgDim;
   // Tint the glyph by state too (matching the list pane); fall back to
   // the harness brand color when state is unknown (live codex/opencode).
-  const glyphFg = state ? STATE_FG[state] : harness.color;
+  const glyphFg = state ? stateColor(harness.id, state) : harness.color;
   // When asking, append the registry's reason (e.g. "permission prompt"
   // → "permission") so the row says *what* claude is blocked on.
   const reason =

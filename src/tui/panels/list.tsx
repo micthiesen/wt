@@ -25,7 +25,7 @@ import { theme } from "../theme.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
-import { STATE_FG } from "../claude-state.ts";
+import { stateColor } from "../claude-state.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import type { MergeQueueState } from "../../core/types.ts";
@@ -228,8 +228,8 @@ const RowView = memo(function RowView({
    *  badge cluster when defined. */
   activeHarnessId: HarnessId | undefined;
   /** Derived state of that active session. Tints the harness glyph with
-   *  `STATE_FG[state]` (any harness) when known; otherwise the glyph
-   *  falls back to the harness brand color. */
+   *  `stateColor(harnessId, state)` (per-harness palette) when known;
+   *  otherwise the glyph falls back to the harness brand color. */
   sessionState: DerivedState | undefined;
   panelWidth: number;
   /**
@@ -351,7 +351,7 @@ const RowView = memo(function RowView({
               <text
                 fg={
                   sessionState
-                    ? STATE_FG[sessionState]
+                    ? stateColor(activeHarnessId, sessionState)
                     : getHarness(activeHarnessId).color
                 }
               >

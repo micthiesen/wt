@@ -34,7 +34,7 @@ import { TextAttributes } from "@opentui/core";
 
 import type { DerivedState } from "../../core/claude-status.ts";
 import { HARNESSES, type HarnessId } from "../../core/harness/index.ts";
-import { STATE_DOT, STATE_FG } from "../claude-state.ts";
+import { STATE_DOT, stateColor } from "../claude-state.ts";
 import type { HarnessSessionEntry } from "../hooks/useHarnessSessions.ts";
 import { Modal } from "../modal.tsx";
 import { ageMsToText } from "../text.ts";
@@ -174,7 +174,11 @@ export function SessionsPickerList({
             : state === "idle"
               ? theme.fgDim
               : theme.fg;
-          const stateFg = state ? STATE_FG[state] : e.isLive ? theme.ok : theme.fgDim;
+          const stateFg = state
+            ? stateColor(e.harnessId, state)
+            : e.isLive
+              ? theme.ok
+              : theme.fgDim;
           const statusText = state ? state : e.isLive ? "live" : "dead";
           const showDigit = sessionDigitCursor < 9;
           const prefix = showDigit ? `${sessionDigitCursor + 1}` : " ";
