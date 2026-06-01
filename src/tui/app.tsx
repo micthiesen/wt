@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useIsFetching, useQueries, useQuery } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
+import type { ScrollBoxRenderable } from "@opentui/core";
 
 import {
   actionRegistry,
@@ -693,6 +694,11 @@ export function App({ onExit }: Props) {
   // top of the list.
   const [sel, setSel] = useState<string | null>(null);
   const lastIndexRef = useRef(0);
+  // Inner scrollbox of the details pane (worktree or review-request
+  // body, whichever is mounted). PageUp/PageDown page it from the
+  // global key handler so tall panes that overflow the viewport stay
+  // readable instead of garbling.
+  const detailsScrollRef = useRef<ScrollBoxRenderable>(null);
   const [footer, setFooter] = useState<FooterMode>({ kind: "legend" });
   // All modal/overlay state collapsed into one discriminated union so
   // the "only one modal is open at a time" invariant is structural
@@ -3706,6 +3712,18 @@ export function App({ onExit }: Props) {
       doMoveSection(1);
       return;
     }
+    // PageUp / PageDown page the details pane (worktree or review
+    // request) by ~85% of a viewport — for panes too tall to fit, which
+    // otherwise clip or garble. No-op when the content fits. List
+    // navigation stays on j/k; this only moves the right pane.
+    if (k.name === "pagedown") {
+      detailsScrollRef.current?.scrollBy(0.85, "viewport");
+      return;
+    }
+    if (k.name === "pageup") {
+      detailsScrollRef.current?.scrollBy(-0.85, "viewport");
+      return;
+    }
     if (k.name === "j" || k.name === "down") {
       if (visualItems.length === 0) return;
       const nextIdx = Math.min(cursorIndex + 1, visualItems.length - 1);
@@ -4362,6 +4380,7 @@ export function App({ onExit }: Props) {
           row={current}
           reviewRequest={selectedPr}
           width={Math.max(0, width - listWidth)}
+          scrollRef={detailsScrollRef}
         />
       </box>
       <OutputViewer output={displayedOutput} height={activityHeight} />

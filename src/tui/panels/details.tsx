@@ -20,8 +20,9 @@
  *   Same-concept-same-glyph between this pane and the row list is
  *   enforced via shared helpers.
  */
-import { memo, useMemo } from "react";
+import { memo, useMemo, type RefObject } from "react";
 import { TextAttributes } from "@opentui/core";
+import type { ScrollBoxRenderable } from "@opentui/core";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
@@ -45,6 +46,14 @@ type Props = {
   row?: WorktreeRow;
   reviewRequest?: ReviewRequestPr;
   width: number;
+  /**
+   * Ref to the inner scrollbox of whichever body is mounted, so the
+   * app's global key handler can page it on PageUp/PageDown. Only one
+   * body mounts at a time, so a single ref covers both the worktree and
+   * review-request panes; switching rows remounts the box and resets
+   * scroll to the top.
+   */
+  scrollRef?: RefObject<ScrollBoxRenderable | null>;
 };
 
 const RESOLVED_ROWS: readonly RowModule[] = resolveRows(config.ui.rows);
@@ -285,7 +294,15 @@ function DescriptionBlock({
   return <box marginTop={1}>{body}</box>;
 }
 
-const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow; width: number }) {
+const DetailsBody = memo(function DetailsBody({
+  row,
+  width,
+  scrollRef,
+}: {
+  row: WorktreeRow;
+  width: number;
+  scrollRef?: RefObject<ScrollBoxRenderable | null>;
+}) {
   // Subscribe to the combined GitHub fetch so per-row indicators
   // reflect its fetch state. Observers dedupe by key — this doesn't
   // trigger an extra fetch, it joins the existing observer in
@@ -353,18 +370,26 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
       padding={1}
       flexDirection="column"
     >
-      <TitleLine title={row.title} source={row.titleSource} />
-      {RESOLVED_ROWS.map((m) => (
-        <RenderedRow key={m.id} module={m} ctx={ctx} />
-      ))}
-      <ReviewBlock review={row.pr?.latestReview ?? null} />
-      <DescriptionBlock
-        summary={summary.data?.description ?? null}
-        isLlmRunning={summary.isFetching}
-        hasContext={!!diffCtx.data}
-        blockedReason={blockedReason}
-        error={summary.error ?? diffCtx.error ?? null}
-      />
+      <scrollbox
+        ref={scrollRef}
+        scrollY
+        flexGrow={1}
+        minHeight={0}
+        contentOptions={{ flexDirection: "column" }}
+      >
+        <TitleLine title={row.title} source={row.titleSource} />
+        {RESOLVED_ROWS.map((m) => (
+          <RenderedRow key={m.id} module={m} ctx={ctx} />
+        ))}
+        <ReviewBlock review={row.pr?.latestReview ?? null} />
+        <DescriptionBlock
+          summary={summary.data?.description ?? null}
+          isLlmRunning={summary.isFetching}
+          hasContext={!!diffCtx.data}
+          blockedReason={blockedReason}
+          error={summary.error ?? diffCtx.error ?? null}
+        />
+      </scrollbox>
     </box>
   );
 });
@@ -424,9 +449,11 @@ function reviewDecisionBadge(
 function ReviewRequestBody({
   pr,
   width: _width,
+  scrollRef,
 }: {
   pr: ReviewRequestPr;
   width: number;
+  scrollRef?: RefObject<ScrollBoxRenderable | null>;
 }) {
   const created = pr.createdAt ? Date.parse(pr.createdAt) : NaN;
   const updated = pr.updatedAt ? Date.parse(pr.updatedAt) : NaN;
@@ -454,6 +481,13 @@ function ReviewRequestBody({
       padding={1}
       flexDirection="column"
     >
+      <scrollbox
+        ref={scrollRef}
+        scrollY
+        flexGrow={1}
+        minHeight={0}
+        contentOptions={{ flexDirection: "column" }}
+      >
       <box marginBottom={1}>
         <text wrapMode="word">
           <span fg={theme.fg} attributes={TextAttributes.BOLD}>{pr.title}</span>
@@ -520,11 +554,12 @@ function ReviewRequestBody({
           {pr.url}
         </text>
       </box>
+      </scrollbox>
     </box>
   );
 }
 
-export function Details({ row, reviewRequest, width }: Props) {
+export function Details({ row, reviewRequest, width, scrollRef }: Props) {
   if (reviewRequest) {
     // Key by url so navigating across review-request rows remounts
     // cleanly — no chance of bleeding state from one PR to another.
@@ -533,6 +568,7 @@ export function Details({ row, reviewRequest, width }: Props) {
         key={reviewRequest.url}
         pr={reviewRequest}
         width={width}
+        scrollRef={scrollRef}
       />
     );
   }
@@ -557,5 +593,12 @@ export function Details({ row, reviewRequest, width }: Props) {
   // new slug has no cache entry (cold key, or disabled because no diff
   // context yet) — so navigating A → B parks A's description on B until
   // B's own fetch lands or the user restarts.
-  return <DetailsBody key={row.wt.slug} row={row} width={width} />;
+  return (
+    <DetailsBody
+      key={row.wt.slug}
+      row={row}
+      width={width}
+      scrollRef={scrollRef}
+    />
+  );
 }
