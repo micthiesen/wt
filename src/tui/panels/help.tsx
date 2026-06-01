@@ -23,7 +23,7 @@ const SECTIONS: Section[] = [
       ["k / ↑", "up"],
       ["g", "top"],
       ["G", "bottom"],
-      ["PgUp / PgDn", "scroll details pane"],
+      ["ctrl+j / ctrl+k", "scroll details pane"],
     ],
   },
   {

@@ -20,6 +20,7 @@ import {
   statusBadge,
 } from "../badges.ts";
 import { NF } from "../icons.ts";
+import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { getHarness } from "../../core/harness/index.ts";
@@ -530,6 +531,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
   // already visible. Child ids: the worktree slug for active/archived
   // rows, the PR url for review-request rows.
   const listRef = useRef<ScrollBoxRenderable>(null);
+  const listScrollRef = useScrollbarNoFlash(listRef);
   const selectedChildId =
     selectedIndex < reviewOffset
       ? activeRows[selectedIndex]?.wt.slug
@@ -592,7 +594,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               instead of growing to fit its content (the default
               `min-height: auto`), which is what makes it actually scroll
               rather than shove the layout. */}
-          <scrollbox ref={listRef} scrollY flexGrow={1} minHeight={0}>
+          <scrollbox ref={listScrollRef} scrollY flexGrow={1} minHeight={0}>
           {activeRows.map((row, i) => {
             // Section transition: a blank line above the divider, then the
             // divider, then the section's rows immediately — no blank

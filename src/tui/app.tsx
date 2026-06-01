@@ -3712,15 +3712,18 @@ export function App({ onExit }: Props) {
       doMoveSection(1);
       return;
     }
-    // PageUp / PageDown page the details pane (worktree or review
-    // request) by ~85% of a viewport — for panes too tall to fit, which
-    // otherwise clip or garble. No-op when the content fits. List
-    // navigation stays on j/k; this only moves the right pane.
-    if (k.name === "pagedown") {
+    // Ctrl+J / Ctrl+K page the details pane (worktree or review request)
+    // by ~85% of a viewport — for panes too tall to fit, which otherwise
+    // clip. No-op when the content fits. List navigation stays on bare
+    // j/k; these require Ctrl and only move the right pane. Ctrl+J
+    // arrives as "linefeed" in legacy terminals (it's the LF byte,
+    // special-cased ahead of ctrl-letter mapping) and as ctrl+"j" under
+    // the kitty keyboard protocol — accept both.
+    if (k.name === "linefeed" || (k.ctrl && k.name === "j")) {
       detailsScrollRef.current?.scrollBy(0.85, "viewport");
       return;
     }
-    if (k.name === "pageup") {
+    if (k.ctrl && k.name === "k") {
       detailsScrollRef.current?.scrollBy(-0.85, "viewport");
       return;
     }

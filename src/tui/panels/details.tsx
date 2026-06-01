@@ -35,6 +35,7 @@ import {
 } from "../../state/queries.ts";
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
+import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
 import { ageMsToText, ELLIPSIS } from "../text.ts";
 import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { NF } from "../icons.ts";
@@ -327,6 +328,7 @@ const DetailsBody = memo(function DetailsBody({
   // re-deriving) keeps the two observers' query keys identical, which
   // is what lets the cache hit cross-pane and avoids re-running LM
   // Studio every time the details pane mounts for a stacked worktree.
+  const sbRef = useScrollbarNoFlash(scrollRef);
   const effectiveBase = row.stackedOn?.diffBase ?? null;
   const diffCtx = useQuery({
     ...wtDiffContextQuery(row.wt, effectiveBase),
@@ -371,7 +373,7 @@ const DetailsBody = memo(function DetailsBody({
       flexDirection="column"
     >
       <scrollbox
-        ref={scrollRef}
+        ref={sbRef}
         scrollY
         flexGrow={1}
         minHeight={0}
@@ -465,6 +467,7 @@ function ReviewRequestBody({
       ? `updated ${ageMsToText(Date.now() - updated)} ago`
       : null;
 
+  const sbRef = useScrollbarNoFlash(scrollRef);
   const check = checkBadge(pr.checks);
   const review = reviewDecisionBadge(pr.reviewDecision);
   const hasDiff = pr.additions > 0 || pr.deletions > 0 || pr.changedFiles > 0;
@@ -482,7 +485,7 @@ function ReviewRequestBody({
       flexDirection="column"
     >
       <scrollbox
-        ref={scrollRef}
+        ref={sbRef}
         scrollY
         flexGrow={1}
         minHeight={0}
