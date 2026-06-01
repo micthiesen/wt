@@ -37,6 +37,7 @@ import type { FetchLike, RowContext } from "../rows/types.ts";
 import { ageMsToText, ELLIPSIS } from "../text.ts";
 import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { NF } from "../icons.ts";
+import { checkBadge, reviewBadge } from "../badges.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -132,15 +133,17 @@ function Row({
   label,
   children,
   trailing,
+  labelWidth = LABEL_WIDTH,
 }: {
   label: string;
   children: React.ReactNode;
   trailing?: React.ReactNode;
+  labelWidth?: number;
 }) {
   return (
     <box flexDirection="row">
       <box
-        width={LABEL_WIDTH}
+        width={labelWidth}
         flexShrink={0}
         flexDirection="row"
         justifyContent="flex-end"
@@ -367,11 +370,56 @@ const DetailsBody = memo(function DetailsBody({ row, width }: { row: WorktreeRow
 });
 
 /**
- * Lite details body for a review-request PR. Not a worktree — no local
- * checkout, no per-slug sources, no AI summary pipeline. Renders the
- * minimum surface that's already in the PR search payload: title,
- * author, repo, draft/ready, CI rollup, and age. `p` opens it on
- * GitHub from the parent; this pane is read-only.
+ * Right-aligned label width for the review-request body. Independent of
+ * the configured `RESOLVED_ROWS`, so it sizes to its *own* labels (+2 gap)
+ * rather than borrowing the narrower shared `LABEL_WIDTH`, which clipped
+ * longer labels like "branch"/"review".
+ */
+const RR_LABEL_WIDTH =
+  ["state", "branch", "author", "diff", "status", "age"].reduce(
+    (m, l) => Math.max(m, l.length),
+    0,
+  ) + 2;
+
+/** One review-request row: shared wide label column. */
+function RRRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <Row label={label} labelWidth={RR_LABEL_WIDTH}>
+      {children}
+    </Row>
+  );
+}
+
+/** Map GitHub's `reviewDecision` to a glyph + color + human label. */
+function reviewDecisionBadge(
+  d: ReviewRequestPr["reviewDecision"],
+): { glyph: string; fg: string; label: string } | null {
+  switch (d) {
+    case "APPROVED": {
+      const b = reviewBadge("approved");
+      return b ? { ...b, label: "approved" } : null;
+    }
+    case "CHANGES_REQUESTED": {
+      const b = reviewBadge("changes_requested");
+      return b ? { ...b, label: "changes requested" } : null;
+    }
+    case "REVIEW_REQUIRED": {
+      const b = reviewBadge("pending");
+      return b ? { ...b, label: "review required" } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Details body for a review-request PR. Not a worktree — no local
+ * checkout, no per-slug sources, no AI summary pipeline — so it renders
+ * straight from the PR search payload. Mirrors the worktree details
+ * aesthetic: right-aligned labels, glyph-led values, and dense
+ * `·`-separated lines (diff size, CI + review, ages) rather than one
+ * stacked row per field. `p` opens it on GitHub from the parent; this
+ * pane is read-only.
  */
 function ReviewRequestBody({
   pr,
@@ -382,22 +430,17 @@ function ReviewRequestBody({
 }) {
   const created = pr.createdAt ? Date.parse(pr.createdAt) : NaN;
   const updated = pr.updatedAt ? Date.parse(pr.updatedAt) : NaN;
-  const ageText = Number.isFinite(created)
+  const openedText = Number.isFinite(created)
     ? `opened ${ageMsToText(Date.now() - created)} ago`
     : null;
   const updatedText =
     Number.isFinite(updated) && Number.isFinite(created) && updated !== created
       ? `updated ${ageMsToText(Date.now() - updated)} ago`
       : null;
-  const checks = pr.checks;
-  const checkLine =
-    checks === "pass"
-      ? { fg: theme.ok, text: "passing" }
-      : checks === "fail"
-        ? { fg: theme.err, text: "failing" }
-        : checks === "pending"
-          ? { fg: theme.warn, text: "pending" }
-          : null;
+
+  const check = checkBadge(pr.checks);
+  const review = reviewDecisionBadge(pr.reviewDecision);
+  const hasDiff = pr.additions > 0 || pr.deletions > 0 || pr.changedFiles > 0;
   return (
     <box
       flexGrow={1}
@@ -416,37 +459,61 @@ function ReviewRequestBody({
           <span fg={theme.fg} attributes={TextAttributes.BOLD}>{pr.title}</span>
         </text>
       </box>
-      <Row label="state">
+      <RRRow label="state">
         <text fg={pr.isDraft ? theme.fgDim : theme.accentAlt} wrapMode="none">
           {`${pr.isDraft ? NF.prDraft : NF.prOpen} ${pr.isDraft ? "draft" : "ready"}`}
         </text>
-      </Row>
-      <Row label="repo">
-        <text fg={theme.fg} wrapMode="none" truncate>
-          {pr.repoNameWithOwner}
-        </text>
-      </Row>
+      </RRRow>
+      {pr.headRefName ? (
+        <RRRow label="branch">
+          <text fg={theme.fg} wrapMode="none" truncate>
+            {pr.headRefName}
+          </text>
+        </RRRow>
+      ) : null}
       {pr.author ? (
-        <Row label="author">
+        <RRRow label="author">
           <text fg={theme.fg} wrapMode="none" truncate>
             {`@${pr.author}`}
           </text>
-        </Row>
+        </RRRow>
       ) : null}
-      {checkLine ? (
-        <Row label="checks">
-          <text fg={checkLine.fg} wrapMode="none">{checkLine.text}</text>
-        </Row>
+      {hasDiff ? (
+        <RRRow label="diff">
+          <text wrapMode="none" truncate>
+            <span fg={theme.warn}>{`+${pr.additions}`}</span>
+            <span> </span>
+            <span fg={theme.err}>{`−${pr.deletions}`}</span>
+            {pr.changedFiles > 0 ? (
+              <span fg={theme.fgDim}>
+                {` · ${pr.changedFiles} ${pr.changedFiles === 1 ? "file" : "files"}`}
+              </span>
+            ) : null}
+            {pr.commentCount > 0 ? (
+              <span fg={theme.fgDim}>{` · ${NF.comment} ${pr.commentCount}`}</span>
+            ) : null}
+          </text>
+        </RRRow>
       ) : null}
-      {ageText ? (
-        <Row label="opened">
-          <text fg={theme.fgDim} wrapMode="none">{ageText}</text>
-        </Row>
+      {check || review ? (
+        <RRRow label="status">
+          <text wrapMode="none">
+            {check ? (
+              <span fg={check.fg}>{`${check.glyph} ${pr.checks === "pass" ? "passing" : pr.checks === "fail" ? "failing" : "pending"}`}</span>
+            ) : null}
+            {check && review ? <span fg={theme.fgDim}>{" · "}</span> : null}
+            {review ? (
+              <span fg={review.fg}>{`${review.glyph} ${review.label}`}</span>
+            ) : null}
+          </text>
+        </RRRow>
       ) : null}
-      {updatedText ? (
-        <Row label="updated">
-          <text fg={theme.fgDim} wrapMode="none">{updatedText}</text>
-        </Row>
+      {openedText ? (
+        <RRRow label="age">
+          <text fg={theme.fgDim} wrapMode="none" truncate>
+            {updatedText ? `${openedText} · ${updatedText}` : openedText}
+          </text>
+        </RRRow>
       ) : null}
       <box marginTop={1}>
         <text fg={theme.fgDim} wrapMode="none" truncate>

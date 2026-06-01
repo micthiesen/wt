@@ -401,9 +401,16 @@ export type ReviewRequestPr = {
   url: string;
   title: string;
   repoNameWithOwner: string;
+  headRefName: string | null;
   author: string | null;
   isDraft: boolean;
   checks: PrChecks;
+  /** GitHub's aggregate review state, or null when none recorded yet. */
+  reviewDecision: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  commentCount: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -600,6 +607,12 @@ query {
         updatedAt
         author { login }
         repository { nameWithOwner }
+        headRefName
+        additions
+        deletions
+        changedFiles
+        reviewDecision
+        comments { totalCount }
         commits(last: 1) {
           nodes {
             commit {
@@ -629,6 +642,12 @@ type GqlReviewRequestNode = {
   updatedAt?: string;
   author?: { login?: string | null } | null;
   repository?: { nameWithOwner?: string } | null;
+  headRefName?: string | null;
+  additions?: number;
+  deletions?: number;
+  changedFiles?: number;
+  reviewDecision?: string | null;
+  comments?: { totalCount?: number } | null;
   commits?: {
     nodes: Array<{
       commit: {
@@ -686,14 +705,26 @@ export async function fetchReviewRequests(
     if (typeof n.number !== "number" || !n.url || !n.title) continue;
     const contexts =
       n.commits?.nodes[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? null;
+    const decision =
+      n.reviewDecision === "APPROVED" ||
+      n.reviewDecision === "CHANGES_REQUESTED" ||
+      n.reviewDecision === "REVIEW_REQUIRED"
+        ? n.reviewDecision
+        : null;
     out.push({
       number: n.number,
       url: n.url,
       title: n.title,
       repoNameWithOwner: n.repository?.nameWithOwner ?? "",
+      headRefName: n.headRefName ?? null,
       author: n.author?.login ?? null,
       isDraft: n.isDraft ?? false,
       checks: rollupChecks(contexts),
+      reviewDecision: decision,
+      additions: n.additions ?? 0,
+      deletions: n.deletions ?? 0,
+      changedFiles: n.changedFiles ?? 0,
+      commentCount: n.comments?.totalCount ?? 0,
       createdAt: n.createdAt ?? "",
       updatedAt: n.updatedAt ?? "",
     });
