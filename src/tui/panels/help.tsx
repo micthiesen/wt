@@ -87,7 +87,10 @@ const SECTIONS: Section[] = [
   {
     title: "review requests (pinned section)",
     note: "PRs awaiting your review, pulled from GitHub. Not worktrees — only these keys apply.",
-    items: [["p / ⏎", "open PR on GitHub"]],
+    items: [
+      ["p / ⏎", "open PR on GitHub"],
+      ["w", "check out branch as worktree → Reviews"],
+    ],
   },
   {
     title: "outputs (bottom pane · per-worktree)",

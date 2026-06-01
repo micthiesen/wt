@@ -161,6 +161,9 @@ const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
 const wtSourceLog = createLogger(WT_SOURCE_SLOT.label);
 
+/** Section a review-requested PR lands in when checked out via `w`. */
+const REVIEW_SECTION = "Reviews";
+
 export type TuiExit = { kind: "quit" };
 
 type Props = {
@@ -321,6 +324,13 @@ type Modal =
       detail?: string;
       confirmLabel?: string;
       danger?: boolean;
+      /**
+       * Captured payload for `pendingKey === "review-wt"`: the PR branch
+       * to check out. Held on the modal (not read from `selectedPr` at
+       * confirm time) so a background review-requests refetch can't shift
+       * the selection out from under the pending action.
+       */
+      reviewBranch?: string;
     }
   | { kind: "yank" }
   | {
@@ -2613,6 +2623,31 @@ export function App({ onExit }: Props) {
     void refreshAll();
   }
 
+  // Check out a review-requested PR's branch as a worktree and drop it
+  // into the "Reviews" section. The branch already exists on origin, so
+  // `createWorktree` takes the checkout-existing path (sets upstream,
+  // installs packages); `setSection` materializes the section by simply
+  // assigning the new slug to it. Leaves the review-request row in place
+  // — this spawns a worktree, it doesn't consume the PR.
+  async function doCheckoutReview(branch: string): Promise<void> {
+    const log = createLogger("[review]");
+    log.event.info(`creating review worktree for ${branch}`);
+    const result = await createWorktree(branch, {
+      onPhase: (p) => log.event.info(`phase: ${p}`),
+      onLog: (line) => log.event.dim(line),
+      runInstall: true,
+    });
+    if (!result.ok) {
+      log.event.err(result.reason);
+      toast(`worktree failed: ${result.reason}`, theme.err, 3000);
+      return;
+    }
+    await setSection(result.slug, REVIEW_SECTION);
+    log.event.ok(`ready at ${result.path} → ${REVIEW_SECTION}`);
+    toast(`created ${result.slug} in ${REVIEW_SECTION}`, theme.info, 2200);
+    void refreshAll();
+  }
+
   useKeyboard((k) => {
     // Help overlay swallows input while open.
     if (modal?.kind === "help") {
@@ -3531,6 +3566,8 @@ export function App({ onExit }: Props) {
           void doMarkReady(current.wt.slug);
         } else if (pending === "E" && current) {
           void doShipPr(current.wt.slug);
+        } else if (pending === "review-wt" && modal.reviewBranch) {
+          void doCheckoutReview(modal.reviewBranch);
         } else if (pending === "R") {
           appLog.event.warn("cleared all cached data; refetching from scratch");
           void clearAll();
@@ -4117,6 +4154,24 @@ export function App({ onExit }: Props) {
       if (isPlainLetter(k, "p") || k.name === "return") {
         void openUrlHidingAlacritty(selectedPr.url);
         prLog.event.info(`opened review #${selectedPr.number}`);
+        return;
+      }
+      // `w` — check out this PR's branch as a worktree in "Reviews".
+      if (isPlainLetter(k, "w")) {
+        const branch = selectedPr.headRefName;
+        if (!branch) {
+          prLog.event.warn(`review #${selectedPr.number} has no branch name`);
+          toast("PR has no branch to check out", theme.warn, 2500);
+          return;
+        }
+        setModal({
+          kind: "confirm",
+          pendingKey: "review-wt",
+          reviewBranch: branch,
+          title: "create review worktree",
+          message: `Create a worktree for ${branch} and add it to "${REVIEW_SECTION}"?`,
+          confirmLabel: "create",
+        });
         return;
       }
     }
