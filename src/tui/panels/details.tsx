@@ -498,7 +498,7 @@ function ReviewRequestBody({
       </box>
       <RRRow label="state">
         <text fg={pr.isDraft ? theme.fgDim : theme.accentAlt} wrapMode="none">
-          {`${pr.isDraft ? NF.prDraft : NF.prOpen} ${pr.isDraft ? "draft" : "ready"}`}
+          {`${pr.isDraft ? NF.prDraft : NF.prOpen}  ${pr.isDraft ? "draft" : "ready"}`}
         </text>
       </RRRow>
       {pr.headRefName ? (
@@ -527,7 +527,7 @@ function ReviewRequestBody({
               </span>
             ) : null}
             {pr.commentCount > 0 ? (
-              <span fg={theme.fgDim}>{` · ${NF.comment} ${pr.commentCount}`}</span>
+              <span fg={theme.fgDim}>{` · ${NF.comment}  ${pr.commentCount}`}</span>
             ) : null}
           </text>
         </RRRow>
@@ -536,11 +536,11 @@ function ReviewRequestBody({
         <RRRow label="status">
           <text wrapMode="none">
             {check ? (
-              <span fg={check.fg}>{`${check.glyph} ${pr.checks === "pass" ? "passing" : pr.checks === "fail" ? "failing" : "pending"}`}</span>
+              <span fg={check.fg}>{`${check.glyph}  ${pr.checks === "pass" ? "passing" : pr.checks === "fail" ? "failing" : "pending"}`}</span>
             ) : null}
             {check && review ? <span fg={theme.fgDim}>{" · "}</span> : null}
             {review ? (
-              <span fg={review.fg}>{`${review.glyph} ${review.label}`}</span>
+              <span fg={review.fg}>{`${review.glyph}  ${review.label}`}</span>
             ) : null}
           </text>
         </RRRow>
