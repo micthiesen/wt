@@ -105,13 +105,17 @@ export function checkBadge(c: PrChecks): Badge | null {
  * = nobody asked yet) — the eye rather than a clock so review-pending
  * doesn't collide with the CI pending clock (`checkPend`). Null for the
  * quiet `none` state.
+ *
+ * `changes_requested` is intentionally amber (`theme.warn`), not alarm-red
+ * (`theme.err`): "needs another pass" reads softer than "rejected." It
+ * shares amber with `pending` but stays distinct via the thumbs-down glyph.
  */
 export function reviewBadge(r: PrReview): Badge | null {
   switch (r) {
     case "approved":
       return { glyph: NF.thumbsUp, fg: theme.ok };
     case "changes_requested":
-      return { glyph: NF.thumbsDown, fg: theme.err };
+      return { glyph: NF.thumbsDown, fg: theme.warn };
     case "pending":
       return { glyph: NF.eye, fg: theme.warn };
     case "unrequested":
