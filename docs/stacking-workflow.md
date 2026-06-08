@@ -304,8 +304,14 @@ standalone skills — never as edits to `/start` or `/done`.
 - [x] wt: `wt stack rebase`/`status` resolve the `stackId` from the current branch
       (`findStackIdByBranch`); `parseFailedBranch` no longer mislabels the
       connective "onto" as the failing branch.
-- [ ] wt: absorb the `stack` CLI into wt (drop `@kitlangton/stack`). DECIDED; needs
-      a design discussion + dedicated wt session. See Open questions.
+- [x] wt: absorbed the `stack` CLI — native squash-safe engine (`restack-engine.ts`
+      `NativeRestackEngine.replaySlice`), `@kitlangton/stack` dropped. Replay is
+      `git rebase --onto <newParentTip> <baseSha> <branch>` in each slice's own
+      worktree (no parking), force-push, retarget PR base. New `StackSlice.baseSha`
+      anchor recorded at apply + advanced per replay. Granular `wt stack reconcile`
+      / `replay` / `rebase` subcommands. PR-body block + GitLab + merge-queue
+      landing intentionally NOT ported. Verified against git fixtures (squash-drop,
+      conflict-bail-with-backup, idempotent no-op).
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -322,24 +328,29 @@ Track friction here as the workflow gets used. Candidate adjustments:
 - **File-level vs hunk-level.** File-level keeps slices compiling and is the
   default. If too many "indivisible" files show up, revisit selective hunk
   splitting — but it's where compiling-correctness gets hard.
-- **Engine: keep `stack` or internalize into wt?** DECIDED (2026-06-08): internalize
-  — absorb the `stack` CLI into wt and drop the `@kitlangton/stack` dependency. The
-  first real restack run made the dual-tooling friction concrete: an unconfigurable
-  PR-body block (see below), three wt-side fixes just to drive its current flags +
-  worktree model, and output-string parsing for failure state. The `RestackEngine`
-  seam stays as the internal boundary; only the squash-safe cherry-pick replay is
-  hard to port. Implementation pending a dedicated design discussion + wt session.
-- **PR-body `<!-- stack:links -->` block.** PINNED (undecided). `stack sync` rewrites
-  every PR's body to maintain a nav block (delimited `<!-- stack:links:start -->`…
-  `<!-- stack:links:end -->`, heading `### [Stack]`). There is NO config/env/flag to
-  disable it (only `stack.codeHost` is configurable). It collides with "/split owns
-  PR bodies, stack section is generate-once and NOT maintained." Options when we
-  absorb the engine: simply don't port the block, or port it as the canonical
-  stack section and have `/split` stop authoring its own. Folds into the
-  internalize decision above.
-- **Dual state reconciliation.** wt manifest (truth) vs stack's projected
-  `state.json`. Watch for drift; `wt stack status` must surface it, not paper
-  over it. (Internalizing the engine collapses this to a single state.)
+- **Engine: keep `stack` or internalize into wt?** RESOLVED (2026-06-08): internalized.
+  Native `NativeRestackEngine.replaySlice` replaced `@kitlangton/stack`. Scoped to
+  this workflow only — GitHub, squash-merge, worktree-per-slice. The squash-safe
+  guarantee comes from the `StackSlice.baseSha` anchor, not a separate engine state.
+  The `RestackEngine` seam stays as the internal boundary. NOT ported (deliberately):
+  the PR-body block, GitLab, merge-queue landing (you land via GitHub / the `m`
+  keybind), `doctor`/`diagram`, English-output parsing.
+- **PR-body `<!-- stack:links -->` block.** RESOLVED by the absorption: the native
+  engine doesn't write a nav block at all, so `/split` stays the sole author of PR
+  bodies. (The old `stack sync` rewrote every body between `<!-- stack:links:start
+  -->`…`<!-- stack:links:end -->`, which Michael disliked and there was no flag to
+  disable.)
+- **Stack-on-stack / polymorphic `base`.** DECIDED (2026-06-08): keep `base` a
+  **string** — trunk name, sibling slice id, or an external branch (another stack's
+  tip, or an unmerged parent PR). A "stack on a stack" is just a slice whose base is
+  the other stack's tip branch; the `baseSha` anchor makes that squash-safe for free
+  (the exact footgun that needs squash-safe handling). Do NOT build a super-stack
+  container or a structured `{stack, slice}` base now — it's modeling weight for a
+  rare trigger. Replay already resolves an external-branch base + records its anchor.
+  Sanctioned future extension (anchor substrate already supports it, won't re-touch
+  the replay core): cross-stack **auto-reconcile** — detecting the external parent
+  merged/deleted and reparenting onto trunk — which `reconcileStack` doesn't do today
+  (it only sees slices within its own manifest).
 - **PR body authoring split.** RESOLVED: `/split` writes bodies at materialize —
   intent prose (CLAUDE.md rules) + a generate-once stack section
   (`stack-section.sh`). Not `/done`. See Locked decisions.
@@ -446,3 +457,24 @@ Track friction here as the workflow gets used. Candidate adjustments:
   later decision: the engine's unconfigurable `<!-- stack:links -->` PR-body block
   (see Open questions). DECIDED this run: absorb the `stack` CLI into wt (drop the
   `@kitlangton/stack` dep) — design discussion + implementation still to come.
+- **2026-06-08** — Absorbed the `stack` CLI into wt (the global binary + personal
+  `stack` skill were already removed, so `wt stack rebase` was broken until this).
+  `restack-engine.ts` is now a native `NativeRestackEngine.replaySlice`: per slice,
+  `git rebase --onto <newParentTip> <baseSha> <branch>` in that slice's OWN worktree
+  (HEAD rebases in place → no `git branch -f`, so the park/unpark added earlier this
+  day is gone), force-with-lease push, leave a `backup/...` branch only on a conflict
+  bail. The squash-safe guarantee is the new `StackSlice.baseSha` anchor (the parent
+  tip a slice's commits sit on), recorded at `applyStack` and advanced after each
+  replay; replay `--onto`s from it, so a squash-merged parent's duplicate is excluded
+  by construction (no patch-id guessing). `stack-ops.ts` split into granular
+  `reconcileStack` (manifest bookkeeping only) + `replayStack` (squash-safe replay +
+  `gh pr edit --base` retarget, flock-serialized) + thin `rebaseStack` (reconcile
+  then replay); CLI gained `wt stack reconcile` / `replay`. Per Michael's steer:
+  scoped to his GitHub/squash-merge/worktree-per-slice flow, no `doctor`-style extras,
+  granular subcommands so the skills drive complex cases with CC's judgment. NOT
+  ported: the PR-body links block, GitLab, merge-queue landing. Decided alongside
+  (see Open questions): keep `base` a string so a "stack on a stack" is just an
+  external-branch base made squash-safe by the same anchor — no super-stack, no
+  structured base; cross-stack auto-reconcile is the sanctioned future extension.
+  Verified the replay against git fixtures: squash-dup drop, clean conflict bail with
+  backup, idempotent no-op. /restack skill rewritten for the native model.

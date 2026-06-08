@@ -45,6 +45,16 @@ export type StackSlice = {
   /** Sanctioned escape hatch: an indivisible unit over the advisory budget. */
   oversized: boolean;
   oversizedReason?: string;
+  /**
+   * Squash-safe replay anchor: the parent-tip SHA this slice's own commits
+   * sit on top of. Recorded at materialize (`applyStack`) and advanced after
+   * each successful replay. The native engine rebases `--onto <newParentTip>
+   * <baseSha> <branch>`, so only the slice's own commits move — a parent
+   * that squash-merged (its commit no longer matching) is excluded by
+   * construction, no patch-id guessing. Absent on manifests authored before
+   * a slice was first materialized; replay falls back to a merge-base then.
+   */
+  baseSha?: string;
 };
 
 /** Advisory size budget for a stack. Never a hard gate (see brief). */
@@ -115,6 +125,7 @@ function parseSlice(v: unknown): StackSlice | null {
     status,
     oversized: rec.oversized === true,
     ...(typeof rec.oversizedReason === "string" ? { oversizedReason: rec.oversizedReason } : {}),
+    ...(typeof rec.baseSha === "string" && rec.baseSha.trim() !== "" ? { baseSha: rec.baseSha } : {}),
   };
 }
 
@@ -157,7 +168,7 @@ const MANIFEST_KEYS = new Set([
 /** Per-slice keys a slice may carry. */
 const SLICE_KEYS = new Set([
   "id", "ordinal", "title", "branch", "base", "dependsOn", "files", "pr",
-  "status", "oversized", "oversizedReason",
+  "status", "oversized", "oversizedReason", "baseSha",
 ]);
 
 /**
@@ -281,6 +292,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
       if (s.oversized === true && (typeof s.oversizedReason !== "string" || s.oversizedReason.trim() === "")) {
         errors.push(`${at}: "oversized: true" requires a non-empty "oversizedReason"`);
       }
+      if (s.baseSha !== undefined && typeof s.baseSha !== "string") errors.push(`${at}: "baseSha" must be a string`);
       if (id && branch && filesOk && ordinalOk && base) {
         slices.push({
           id,
@@ -296,6 +308,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
           status: s.status === "open" || s.status === "merged" ? s.status : "planned",
           oversized: s.oversized === true,
           ...(typeof s.oversizedReason === "string" ? { oversizedReason: s.oversizedReason } : {}),
+          ...(typeof s.baseSha === "string" && s.baseSha.trim() !== "" ? { baseSha: s.baseSha } : {}),
         });
       }
     });

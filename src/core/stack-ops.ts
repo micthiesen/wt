@@ -2,23 +2,25 @@
  * Materialization + maintenance for stack manifests. wt owns the
  * manifest (truth); this module turns a planned manifest into real
  * worktrees, commits, and draft PRs (`applyStack`), reports the manifest
- * DAG against live reality (`stackStatus`), and drives the squash-safe
- * engine for restack/land (`rebaseStack`). The genuinely hard part
- * (anchor + cherry-pick replay) is delegated to `RestackEngine`; this
- * module never touches `.git/stack` directly.
+ * DAG against live reality (`stackStatus`), reconciles the manifest with
+ * landed PRs (`reconcileStack`), and drives the native squash-safe engine
+ * to replay slices onto their (possibly rewritten) parents (`replayStack`).
+ * `rebaseStack` is the thin reconcile-then-replay convenience. The genuinely
+ * hard part (anchored cherry-pick replay) lives in `RestackEngine`.
  */
 import { config } from "./config.ts";
 import { gitQuiet, gitRun } from "./git.ts";
 import { createWorktree } from "./lifecycle.ts";
+import { tryAcquireLock } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 import {
   createDraftPr,
+  retargetPrBase,
   viewPrInfo,
   type LivePrInfo,
 } from "./github.ts";
-import { restackEngine, type EngineResult } from "./restack-engine.ts";
+import { restackEngine } from "./restack-engine.ts";
 import {
-  isLaneRoot,
   isTrunkBase,
   resolveParentBranch,
   topoSortSlices,
@@ -33,6 +35,9 @@ import {
 import { listWorktrees, worktreeIsDirty } from "./worktree.ts";
 
 const log = createLogger("[stack-ops]");
+
+/** Flock slug serializing replay across processes (one restack at a time). */
+const STACK_LOCK_SLUG = "__stack__";
 
 export type Logger = (line: string) => void;
 
@@ -206,7 +211,6 @@ export async function applyStack(
         status: existingPr.state === "MERGED" ? "merged" : "open",
       });
       materialized.push(slice.id);
-      if (!onTrunk) await restackEngine.track(slice.branch, parentBranch);
       continue;
     }
 
@@ -225,6 +229,11 @@ export async function applyStack(
     if (!created.ok) {
       return { materialized, skipped, error: `create ${slice.branch}: ${created.reason}` };
     }
+
+    // Record the squash-safe replay anchor: the parent tip this slice's
+    // commit will sit on. `createWorktree` started the branch at `parentRef`,
+    // so HEAD is that tip right now, before the slice commit lands on top.
+    const baseSha = await revParseAt(created.path, "HEAD");
 
     const mat = await materializeSliceCommit(
       created.path,
@@ -261,19 +270,12 @@ export async function applyStack(
       return { materialized, skipped, error: `pr create ${slice.branch}: ${pr.error}` };
     }
     onLog(`  opened draft PR #${pr.number}`);
-    updateStackSlice(stackId, slice.id, { pr: pr.number, status: "open" });
+    updateStackSlice(stackId, slice.id, {
+      pr: pr.number,
+      status: "open",
+      ...(baseSha ? { baseSha } : {}),
+    });
     materialized.push(slice.id);
-
-    // Seed the engine with the squash-safe restack metadata. Trunk-based
-    // slices aren't tracked — the engine rejects trunk parents. The wt
-    // list derives the parent relationship straight from the manifest, so
-    // there's no separate display state to seed.
-    if (!onTrunk) {
-      const tracked = await restackEngine.track(slice.branch, parentBranch);
-      if (!tracked.ok) {
-        onLog(`  warn: stack track failed: ${tracked.stderr.trim() || tracked.exitCode}`);
-      }
-    }
   }
 
   // Archive the holistic branch as a tag so the origin node survives the
@@ -341,13 +343,11 @@ export async function stackStatus(stackId: string): Promise<StackStatusReport | 
   return { manifest, rows };
 }
 
-// ---------- rebase / land ----------
+// ---------- reconcile / replay / rebase ----------
 
 export type RebaseOptions = {
-  /** Trunk to reparent landed slices onto. Default `config.branch.base`. */
+  /** Trunk that landed roots reparent onto. Default `config.branch.base`. */
   onto?: string;
-  /** Land via the merge queue (`stack merge --auto`) instead of `stack sync`. */
-  merge?: boolean;
 };
 
 export type RebaseResult =
@@ -361,14 +361,11 @@ export type RebaseResult =
     };
 
 /**
- * Maintenance wrapper. Regenerates the engine's links from the manifest
- * (so a sync never surprises us with PR-base inference), runs the engine
- * once per lane, then reconciles the manifest with post-run reality
- * (merged slices flip to `merged`; their children reparent onto trunk).
- *
- * On an engine conflict bail, returns the failing + backup branch so the
- * calling skill resolves it — wt never auto-resolves conflicts.
- * Concurrency is enforced inside the engine via a cross-process flock.
+ * The one-shot /restack convenience: reconcile the manifest against landed
+ * PRs, then replay every surviving slice onto its (possibly rewritten)
+ * parent. `reconcileStack` and `replayStack` are exposed separately so the
+ * skill can drive them step-by-step around a conflict (reconcile once,
+ * replay → resolve → replay again).
  */
 export async function rebaseStack(
   stackId: string,
@@ -380,139 +377,255 @@ export async function rebaseStack(
     return { ok: false, conflict: false, error: `no stack manifest: ${stackId}` };
   }
   const trunk = opts.onto ?? config.branch.base;
-
-  // 1. Reconcile already-landed slices FIRST. When a lane root merged on
-  //    the host (its branch deleted), syncing it would fail with "not
-  //    part of a tracked stack". Flipping it to `merged` and reparenting
-  //    its children onto trunk up front drops it from tracking + sync
-  //    below. Idempotent and a no-op when nothing has landed yet.
-  await reconcileMerged(stackId, trunk, onLog);
-
-  const reconciled = getStackManifest(stackId);
-  if (!reconciled) {
-    return { ok: false, conflict: false, error: `no stack manifest: ${stackId}` };
-  }
-
-  // 2. Regenerate engine links from the (reconciled) manifest for every
-  //    surviving non-trunk slice (stacked children + a root stacked on an
-  //    external parent PR). Trunk-based and merged slices are skipped —
-  //    the engine rejects trunk parents and deleted branches.
-  for (const slice of reconciled.slices) {
-    if (slice.status === "merged" || isTrunkBase(slice)) continue;
-    const parent = resolveParentBranch(reconciled, slice);
-    const tracked = await restackEngine.track(slice.branch, parent);
-    if (!tracked.ok) {
-      onLog(`warn: track ${slice.branch} onto ${parent}: ${tracked.stderr.trim()}`);
-    }
-  }
-
-  // 3. Drive the engine once per surviving lane root so independent lanes
-  //    are each scoped (`stack sync/merge <branch>` operates on that
-  //    branch's stack). The engine moves descendant branches with
-  //    `git branch -f`, which git refuses for a branch checked out in a
-  //    worktree — and in the wt model every slice is its own worktree. So
-  //    park (detach HEAD on) each slice worktree first and restore them to
-  //    the moved tips afterward, no matter how the loop exits.
-  const laneRoots = reconciled.slices.filter(
-    (s) => s.status !== "merged" && isLaneRoot(s),
-  );
-  const parking = await parkSliceWorktrees(reconciled, onLog);
-  if (!parking.ok) {
-    return { ok: false, conflict: false, error: parking.error };
-  }
-  const outputs: string[] = [];
-  try {
-    for (const root of laneRoots) {
-      onLog(`${opts.merge ? "merge" : "sync"} lane ${root.branch}`);
-      const res: EngineResult = opts.merge
-        ? await restackEngine.merge(root.branch, { auto: true })
-        : await restackEngine.sync(root.branch, { apply: true });
-      outputs.push(res.stdout.trim());
-      if (!res.ok) {
-        if (res.conflict) {
-          return {
-            ok: false,
-            conflict: true,
-            error: `engine bailed on conflict in lane ${root.branch}`,
-            ...(res.failedBranch ? { failedBranch: res.failedBranch } : {}),
-            ...(res.backupBranch ? { backupBranch: res.backupBranch } : {}),
-          };
-        }
-        return {
-          ok: false,
-          conflict: false,
-          error:
-            (res.stderr || res.stdout).trim() || `engine exited ${res.exitCode}`,
-        };
-      }
-    }
-  } finally {
-    await unparkSliceWorktrees(parking.parked, onLog);
-  }
-
-  // 4. Reconcile again: in `--merge` mode the root just landed via the
-  //    merge queue, so flip it to `merged` and reparent its children onto
-  //    trunk. A no-op in plain sync mode (step 1 already reconciled).
-  await reconcileMerged(stackId, trunk, onLog);
-
-  return { ok: true, output: outputs.join("\n") };
+  await reconcileStack(stackId, trunk, onLog);
+  return replayStack(stackId, { onto: trunk }, onLog);
 }
 
-type ParkedWorktree = { path: string; branch: string };
-
 /**
- * Detach HEAD on every slice worktree so the engine can `git branch -f`
- * those branches (git refuses to force-update a branch checked out in a
- * worktree). Refuses to touch a dirty worktree — detaching would strand
- * its changes — and rolls back any already-parked on failure so we never
- * leave a half-parked stack. Pair with `unparkSliceWorktrees`.
+ * Replay every surviving slice onto its parent, squash-safe, in topological
+ * order: rebase the slice's own commits in its own worktree, force-push, and
+ * retarget its PR base to match the manifest. Bails clean on the first
+ * conflict, naming the slice + the backup branch the engine left — wt never
+ * auto-resolves. Pure git + gh; does NOT reconcile (run `reconcileStack`
+ * first for a post-merge restack). Serialized across processes by a flock.
  */
-async function parkSliceWorktrees(
-  manifest: StackManifest,
+export async function replayStack(
+  stackId: string,
+  opts: RebaseOptions,
   onLog: Logger,
-): Promise<{ ok: true; parked: ParkedWorktree[] } | { ok: false; error: string }> {
-  const sliceBranches = new Set(manifest.slices.map((s) => s.branch));
-  const targets = (await listWorktrees()).filter(
-    (w) => !w.isMain && sliceBranches.has(w.branch),
+): Promise<RebaseResult> {
+  const handle = tryAcquireLock(STACK_LOCK_SLUG, "stack", { phase: "replay" });
+  if (!handle) {
+    return {
+      ok: false,
+      conflict: false,
+      error: "another wt stack operation is already running",
+    };
+  }
+  try {
+    return await replayStackLocked(stackId, opts, onLog);
+  } finally {
+    handle.release();
+  }
+}
+
+async function replayStackLocked(
+  stackId: string,
+  opts: RebaseOptions,
+  onLog: Logger,
+): Promise<RebaseResult> {
+  const manifest = getStackManifest(stackId);
+  if (!manifest) {
+    return { ok: false, conflict: false, error: `no stack manifest: ${stackId}` };
+  }
+  const trunk = opts.onto ?? config.branch.base;
+
+  // Topo order so each parent is replayed before its children; merged slices
+  // drop out (their branch is gone, their children already reparented).
+  let ordered: StackSlice[];
+  try {
+    ordered = topoSortSlices(manifest);
+  } catch (e) {
+    return { ok: false, conflict: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  const live = ordered.filter((s) => s.status !== "merged");
+  const byId = new Map(manifest.slices.map((s) => [s.id, s]));
+
+  // Each slice replays IN ITS OWN WORKTREE (HEAD rebases in place), so map
+  // branch → path and refuse any dirty one up front — a rebase would clobber.
+  const pathByBranch = new Map(
+    (await listWorktrees())
+      .filter((w) => !w.isMain && w.branch)
+      .map((w) => [w.branch, w.path] as const),
   );
-  for (const w of targets) {
-    if (await worktreeIsDirty(w.path)) {
+  for (const s of live) {
+    const p = pathByBranch.get(s.branch);
+    if (p && (await worktreeIsDirty(p))) {
       return {
         ok: false,
-        error: `slice worktree ${w.path} (${w.branch}) has uncommitted changes — commit or stash before restacking`,
+        conflict: false,
+        error: `slice worktree ${p} (${s.branch}) has uncommitted changes — commit or stash before restacking`,
       };
     }
   }
-  const parked: ParkedWorktree[] = [];
-  for (const w of targets) {
-    if (!(await gitQuiet(["checkout", "--detach", "--quiet"], w.path))) {
-      await unparkSliceWorktrees(parked, onLog);
-      return { ok: false, error: `failed to detach worktree ${w.path} (${w.branch})` };
-    }
-    parked.push({ path: w.path, branch: w.branch });
+
+  // Freshen origin so `origin/<trunk>` and any external-parent ref resolve to
+  // their live tips before we rebase onto them. A failed fetch would silently
+  // leave stale refs and replay every slice onto an outdated base, so bail.
+  const fetched = await gitRun(["fetch", "origin", "--quiet"]);
+  if (fetched.exitCode !== 0) {
+    return {
+      ok: false,
+      conflict: false,
+      error: `git fetch origin failed (${(fetched.stderr || fetched.stdout).trim() || `exit ${fetched.exitCode}`}) — refusing to replay onto possibly-stale refs`,
+    };
   }
-  return { ok: true, parked };
+
+  // Pass 1: resolve each slice's worktree + anchor (the old parent tip its
+  // commits sit on) BEFORE any rewrite — so the merge-base fallback sees
+  // pre-replay tips, AND so a missing worktree or unresolvable anchor fails
+  // the whole run before a single slice has been pushed.
+  const anchorById = new Map<string, string>();
+  for (const s of live) {
+    const p = pathByBranch.get(s.branch);
+    if (!p) {
+      return {
+        ok: false,
+        conflict: false,
+        error: `slice ${s.id} (${s.branch}) has no worktree — recreate it with \`wt stack apply ${stackId}\``,
+      };
+    }
+    const anchor = await resolveAnchor(s, byId, trunk, p);
+    if (!anchor) {
+      return {
+        ok: false,
+        conflict: false,
+        error: `could not resolve a replay anchor for ${s.branch} (no baseSha and no merge-base)`,
+      };
+    }
+    anchorById.set(s.id, anchor);
+  }
+
+  // Pass 2: replay top-down, threading each slice's new tip to its children.
+  // Worktree + anchor are guaranteed present from pass 1.
+  const newTipById = new Map<string, string>();
+  let replayed = 0;
+  for (const s of live) {
+    const worktreePath = pathByBranch.get(s.branch)!;
+    const anchor = anchorById.get(s.id)!;
+    const newBase = await resolveNewBaseSha(s, byId, trunk, newTipById, worktreePath);
+    if (!newBase) {
+      return {
+        ok: false,
+        conflict: false,
+        error: `could not resolve the new base for ${s.branch}`,
+      };
+    }
+
+    onLog(`replay ${s.id} (${s.branch})`);
+    const out = await restackEngine.replaySlice(
+      { branch: s.branch, worktreePath, anchor, newBase },
+      onLog,
+    );
+    if (!out.ok) {
+      if (out.conflict) {
+        return {
+          ok: false,
+          conflict: true,
+          error: `conflict replaying ${s.branch} — resolve in its worktree, then re-run`,
+          failedBranch: s.branch,
+          backupBranch: out.backupBranch,
+        };
+      }
+      return { ok: false, conflict: false, error: out.error };
+    }
+    newTipById.set(s.id, out.newTip);
+    // Advance the stored anchor to the parent we just landed on, so the next
+    // restack is a cheap no-op when nothing has moved.
+    updateStackSlice(stackId, s.id, { baseSha: out.newBaseSha });
+
+    // Keep the PR base aligned with the manifest only when the slice actually
+    // moved (a parent that landed/rewrote shifts the child onto a new base).
+    // An unmoved slice's base is already correct, so we skip the `gh pr view`
+    // probe — any residual drift still surfaces in `wt stack status`.
+    if (out.moved) {
+      replayed++;
+      await retargetIfNeeded(s, resolveParentBranch(manifest, s), onLog);
+    }
+  }
+
+  return { ok: true, output: `replayed ${replayed}/${live.length} slice(s)` };
+}
+
+/** rev-parse a ref to its commit SHA in `cwd`, or null if it doesn't resolve. */
+async function revParseAt(cwd: string, ref: string): Promise<string | null> {
+  const r = await gitRun(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
+  const sha = r.stdout.trim();
+  return r.exitCode === 0 && sha ? sha : null;
+}
+
+/** First resolvable ref among `refs`, as a SHA — local branch then origin. */
+async function firstSha(cwd: string, refs: string[]): Promise<string | null> {
+  for (const ref of refs) {
+    const sha = await revParseAt(cwd, ref);
+    if (sha) return sha;
+  }
+  return null;
 }
 
 /**
- * Re-point each parked worktree at its branch. The branch may have moved
- * under us (the engine rewrote it); re-checking it out fast-forwards the
- * clean, detached worktree to the new tip. Best-effort — a failure to
- * restore is logged, not thrown, so it never masks the engine's result.
+ * The parent-tip SHA a slice currently sits on (the `rebase --onto` anchor):
+ * the stored `baseSha` when present, else the merge-base of the slice and its
+ * current parent ref — computed before any replay so siblings haven't moved.
  */
-async function unparkSliceWorktrees(
-  parked: ParkedWorktree[],
-  onLog: Logger,
-): Promise<void> {
-  for (const p of parked) {
-    if (!(await gitQuiet(["checkout", "--quiet", p.branch], p.path))) {
-      onLog(`warn: could not restore worktree ${p.path} to ${p.branch}`);
-    }
-  }
+async function resolveAnchor(
+  slice: StackSlice,
+  byId: Map<string, StackSlice>,
+  trunk: string,
+  cwd: string,
+): Promise<string | null> {
+  if (slice.baseSha) return slice.baseSha;
+  const parentRef = currentParentRef(slice, byId, trunk);
+  const r = await gitRun(["merge-base", slice.branch, parentRef], cwd);
+  const sha = r.stdout.trim();
+  return r.exitCode === 0 && sha ? sha : null;
 }
 
-/** Flip merged slices + reparent their orphaned children. */
-async function reconcileMerged(
+/** The ref naming a slice's parent tip as it stands now (pre-replay). */
+function currentParentRef(
+  slice: StackSlice,
+  byId: Map<string, StackSlice>,
+  trunk: string,
+): string {
+  if (isTrunkBase(slice)) return `origin/${trunk}`;
+  const sibling = byId.get(slice.base);
+  if (sibling) return sibling.branch;
+  return slice.base; // external parent branch
+}
+
+/**
+ * The SHA to rebase a slice ONTO this run: trunk's freshly-fetched tip, the
+ * parent sibling's just-replayed tip, or an external parent branch's live
+ * tip (a stack stacked on an unmerged parent PR / another stack's tip).
+ */
+async function resolveNewBaseSha(
+  slice: StackSlice,
+  byId: Map<string, StackSlice>,
+  trunk: string,
+  newTipById: Map<string, string>,
+  cwd: string,
+): Promise<string | null> {
+  if (isTrunkBase(slice)) return revParseAt(cwd, `origin/${trunk}`);
+  const sibling = byId.get(slice.base);
+  if (sibling) {
+    const replayed = newTipById.get(sibling.id);
+    return replayed ?? revParseAt(cwd, sibling.branch);
+  }
+  // External parent branch: prefer the local checkout, fall back to origin.
+  return firstSha(cwd, [slice.base, `origin/${slice.base}`]);
+}
+
+/** Retarget a slice's PR base to `expectedBase` when GitHub disagrees. */
+async function retargetIfNeeded(
+  slice: StackSlice,
+  expectedBase: string,
+  onLog: Logger,
+): Promise<void> {
+  if (!slice.pr) return;
+  const live = await viewPrInfo(slice.branch);
+  if (!live || live.baseRefName === expectedBase) return;
+  const r = await retargetPrBase(slice.pr, expectedBase);
+  if (r.ok) onLog(`  retargeted PR #${slice.pr} base → ${expectedBase}`);
+  else onLog(`  warn: retarget PR #${slice.pr} base: ${r.error}`);
+}
+
+/**
+ * Reconcile the manifest against landed reality: flip merged slices to
+ * `merged` and reparent each orphaned child onto its deepest surviving
+ * dependency (or trunk). Pure manifest bookkeeping — no git, no replay — so
+ * the skill can run it on its own before deciding to replay.
+ */
+export async function reconcileStack(
   stackId: string,
   trunk: string,
   onLog: Logger,

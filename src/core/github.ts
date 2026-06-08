@@ -964,6 +964,30 @@ export async function editReviewers(
 }
 
 /**
+ * Retarget a PR's base branch via `gh pr edit --base`. The native restack
+ * engine calls this after replaying a slice whose parent moved (e.g. a
+ * child reparented onto trunk once its parent landed), so the PR's base on
+ * GitHub matches the manifest. No-op-safe: gh is idempotent if the base
+ * already matches. Runs from the main clone so gh resolves the right repo.
+ */
+export async function retargetPrBase(
+  prNumber: number,
+  base: string,
+): Promise<GhActionResult> {
+  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
+  const r = await run(
+    ["gh", "pr", "edit", String(prNumber), "--base", base],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  );
+  if (r.exitCode !== 0) {
+    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    log.error("retarget pr base failed", { prNumber, base, msg });
+    return { ok: false, error: msg };
+  }
+  return { ok: true };
+}
+
+/**
  * Flip a draft PR to "ready for review" via `gh pr ready`. Notifies
  * reviewers and triggers any code-owner auto-requests, so callers
  * should gate on user confirmation. Runs from the main clone so gh

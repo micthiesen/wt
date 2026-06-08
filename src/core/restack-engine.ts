@@ -1,195 +1,160 @@
 /**
- * Thin seam around the squash-safe restack ENGINE. wt owns the stack
- * manifest (the truth); the engine is a driven dependency that does the
- * one genuinely hard thing — squash-safe restack (record a merge-base
- * anchor, cherry-pick-replay the commit range onto the new parent,
- * force-with-lease push, retarget the PR base) and merge-queue landing.
+ * The native squash-safe restack ENGINE. wt owns the stack manifest
+ * (the truth); this is the one genuinely hard mechanical piece —
+ * replaying a slice's own commits onto a rewritten parent without
+ * double-applying — done in pure git, no external `stack` CLI.
  *
- * Everything callers need is expressed through `RestackEngine` so the
- * engine can later be reimplemented inside wt and the `@kitlangton/stack`
- * dependency dropped without touching any call site. The default impl
- * (`StackCliEngine`) shells out to the `stack` CLI.
+ * Squash-safe replay, in one line: `git rebase --onto <newParentTip>
+ * <anchor> <branch>`, where `anchor` is the parent-tip SHA the slice's
+ * commits were last based on (`StackSlice.baseSha`). Only `anchor..branch`
+ * — the slice's OWN commits — moves; a parent that squash-merged (its
+ * commit no longer present as-is on the new base) is simply excluded,
+ * with no patch-id guessing. Each slice is replayed IN ITS OWN WORKTREE
+ * (HEAD rebases in place), so there's no `git branch -f` on a
+ * checked-out branch and thus no worktree "parking" to do.
  *
- * Concurrency: the engine's `.git/stack/state.json` resolves via
- * `git rev-parse --git-common-dir`, so it is SHARED across every
- * worktree of this repo and is NOT safe under concurrent syncs. The CLI
- * engine serialises mutating calls behind a cross-process flock
- * (`STACK_LOCK_SLUG`); a caller that can't get the lock gets a clean
- * `{ ok: false, conflict: false }` with an explanatory message rather
- * than racing.
+ * The engine is per-slice and stateless. Ordering, anchor resolution,
+ * manifest reconcile, and PR-base retargeting live in `stack-ops.ts`;
+ * cross-run serialization (the flock) is taken there too, around the
+ * whole replay. The `RestackEngine` seam stays so the replay mechanism
+ * can be swapped or tested in isolation.
  */
-import { config } from "./config.ts";
-import { tryAcquireLock } from "./locks.ts";
-import { createLogger } from "./logger.ts";
-import { run } from "./proc.ts";
+import { gitRun } from "./git.ts";
 
-const log = createLogger("[restack]");
+export type ReplayLogger = (line: string) => void;
 
-/** Flock slug guarding the shared `.git/stack` state from concurrent mutation. */
-export const STACK_LOCK_SLUG = "__stack__";
-
-const STACK_BIN = "stack";
-
-export type EngineResult = {
-  ok: boolean;
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  /**
-   * True when the engine bailed on a cherry-pick conflict (aborted
-   * clean, left a backup branch, wrote its undo journal). The caller
-   * should NOT retry — it hands off to a human / skill to resolve.
-   */
-  conflict: boolean;
-  /** Branch the engine was repairing when it bailed, parsed from output. */
-  failedBranch?: string;
-  /** `backup/...` branch the engine left behind on a bail, parsed from output. */
-  backupBranch?: string;
+/** One slice's replay request. */
+export type ReplayStep = {
+  branch: string;
+  /** The slice's own worktree; the rebase happens here, in place. */
+  worktreePath: string;
+  /** Old parent-tip SHA the slice's commits sit on (the `--onto` cut point). */
+  anchor: string;
+  /** New parent tip to land the slice's commits on — a sha or a resolvable ref. */
+  newBase: string;
 };
 
-export type SyncOptions = { apply?: boolean };
-export type MergeOptions = {
-  apply?: boolean;
-  auto?: boolean;
-  /** `--through <branch-or-change>`: land one root at a time up to here. */
-  through?: string;
-};
+export type ReplayOutcome =
+  | { ok: true; newTip: string; newBaseSha: string; moved: boolean }
+  | { ok: false; conflict: true; backupBranch: string; error: string }
+  | { ok: false; conflict: false; error: string };
 
 export interface RestackEngine {
-  /** Record stack intent: `branch` stacks onto `parent`. Pure metadata. */
-  track(branch: string, parent: string): Promise<EngineResult>;
-  /** Reconcile + repair drift. `apply` mutates; otherwise it's a preview. */
-  sync(branch: string | undefined, opts?: SyncOptions): Promise<EngineResult>;
-  /** Land the stack root (and repair descendants). */
-  merge(branch: string | undefined, opts?: MergeOptions): Promise<EngineResult>;
-  /** Inspect the engine's view of the tracked stack graph. */
-  status(branch?: string): Promise<EngineResult>;
-}
-
-/** Pull a `backup/...` branch name out of engine output, if present. */
-function parseBackupBranch(text: string): string | undefined {
-  const m = text.match(/\bbackup\/[^\s'"]+/);
-  return m ? m[0] : undefined;
-}
-
-/**
- * A cherry-pick replay conflict is the engine's clean-bail signal: it
- * aborts mid-rebase, restores the branch, leaves a backup, and exits
- * nonzero with guidance. Detect it by the backup branch + conflict
- * vocabulary so callers can hand off instead of retrying.
- */
-function looksLikeConflict(text: string): boolean {
-  return /conflict|could not apply|cherry-pick|failed to (?:replay|rebase)/i.test(
-    text,
-  );
-}
-
-/** Connectives the loose "failed to …" pattern wrongly grabs as a branch. */
-const NOT_A_BRANCH = /^(?:onto|into|from|to|the|a|on|in|main|master|trunk)$/i;
-
-/** Branch named in a "failed to … <branch>" / "repair <branch>" line. */
-function parseFailedBranch(text: string): string | undefined {
-  // The engine narrates each replay as `rebase <branch> onto <base>`;
-  // the last one before it bails names the branch it was on. Prefer that
-  // over the generic "failed to …" phrase, whose object is often the
-  // connective ("onto") rather than the branch — which surfaced as the
-  // nonsense "failing branch: onto".
-  const steps = [...text.matchAll(/\brebase\s+(\S+)\s+onto\b/gi)];
-  const fromStep = steps.at(-1)?.[1];
-  if (fromStep && !NOT_A_BRANCH.test(fromStep)) return fromStep;
-  const m = text.match(
-    /(?:repair|failed (?:to [a-z]+|on)|conflict (?:on|in))\s+([^\s'".,]+)/i,
-  );
-  return m && !NOT_A_BRANCH.test(m[1]!) ? m[1] : undefined;
-}
-
-export class StackCliEngine implements RestackEngine {
-  /** Engine state is per-common-dir; always drive from the main clone. */
-  private readonly cwd = config.paths.mainClone;
-
-  /** Run a non-mutating engine command (no lock needed). */
-  private async readonlyRun(args: string[]): Promise<EngineResult> {
-    return this.exec(args, { mutating: false });
-  }
-
   /**
-   * Run a mutating engine command behind the cross-process flock so two
-   * syncs can't race the shared `.git/stack` state. Track is metadata-
-   * only but still touches state.json, so it locks too.
+   * Squash-safe replay of ONE slice in its worktree, then force-with-lease
+   * push. A no-op (`moved: false`) when the slice already sits on `newBase`.
+   * Bails clean on a cherry-pick conflict: aborts the rebase, leaves a
+   * `backup/...` branch at the pre-rebase tip, and returns it so the caller
+   * hands resolution to a human / skill. wt never auto-resolves conflicts.
    */
-  private async mutatingRun(args: string[]): Promise<EngineResult> {
-    return this.exec(args, { mutating: true });
-  }
+  replaySlice(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome>;
+}
 
-  private async exec(
-    args: string[],
-    opts: { mutating: boolean },
-  ): Promise<EngineResult> {
-    const handle = opts.mutating
-      ? tryAcquireLock(STACK_LOCK_SLUG, "stack", { phase: args[0] ?? "stack" })
-      : null;
-    if (opts.mutating && !handle) {
+/** Resolve a ref to its SHA in `cwd`, or null if it doesn't resolve. */
+async function revParse(ref: string, cwd: string): Promise<string | null> {
+  const r = await gitRun(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
+  const sha = r.stdout.trim();
+  return r.exitCode === 0 && sha ? sha : null;
+}
+
+export class NativeRestackEngine implements RestackEngine {
+  async replaySlice(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome> {
+    const { branch, worktreePath, anchor, newBase } = step;
+    const newBaseSha = await revParse(newBase, worktreePath);
+    if (!newBaseSha) {
+      return { ok: false, conflict: false, error: `cannot resolve base ref ${newBase} for ${branch}` };
+    }
+    const beforeTip = await revParse(branch, worktreePath);
+    if (!beforeTip) {
+      return { ok: false, conflict: false, error: `cannot resolve branch ${branch}` };
+    }
+
+    // Parent tip unchanged → the slice already sits on the right base.
+    // Nothing to replay; report the current tip so the chain continues.
+    if (anchor === newBaseSha) {
+      onLog(`  ${branch}: already on base, skipping`);
+      return { ok: true, newTip: beforeTip, newBaseSha, moved: false };
+    }
+
+    // Snapshot the pre-rebase tip on a backup ref so a conflict bail (or a
+    // bad force-push) is always recoverable. Kept only on conflict; deleted
+    // on success so backups don't pile up.
+    const backupBranch = `backup/restack-${epochMs()}-${branch}`;
+    const backup = await gitRun(["branch", "--force", backupBranch, beforeTip], worktreePath);
+    if (backup.exitCode !== 0) {
       return {
         ok: false,
-        stdout: "",
-        stderr:
-          "another wt stack operation is already running (shared .git/stack state is not concurrency-safe)",
-        exitCode: -1,
         conflict: false,
+        error: `could not snapshot ${branch} to ${backupBranch}: ${backup.stderr.trim()}`,
       };
     }
-    try {
-      log.debug("running engine", { args });
-      const r = await run([STACK_BIN, ...args], { cwd: this.cwd });
-      const combined = `${r.stdout}\n${r.stderr}`;
-      const conflict = r.exitCode !== 0 && looksLikeConflict(combined);
+
+    onLog(`  rebase ${branch} onto ${short(newBaseSha)} (from ${short(anchor)})`);
+    const rebase = await gitRun(["rebase", "--onto", newBaseSha, anchor, branch], worktreePath);
+    if (rebase.exitCode !== 0) {
+      // Abort to restore a clean tree; the backup holds the original tip.
+      const detail = (rebase.stderr || rebase.stdout).trim();
+      const aborted = await gitRun(["rebase", "--abort"], worktreePath);
+      if (aborted.exitCode !== 0) {
+        // Abort failed → the worktree is still mid-rebase, NOT clean. Don't
+        // report a clean conflict bail; point the operator at the stuck tree.
+        return {
+          ok: false,
+          conflict: false,
+          error: `conflict replaying ${branch}, and \`git rebase --abort\` failed — worktree ${worktreePath} left mid-rebase (backup at ${backupBranch}); resolve it manually`,
+        };
+      }
       return {
-        ok: r.exitCode === 0,
-        stdout: r.stdout,
-        stderr: r.stderr,
-        exitCode: r.exitCode,
-        conflict,
-        ...(conflict ? { failedBranch: parseFailedBranch(combined) } : {}),
-        ...(conflict ? { backupBranch: parseBackupBranch(combined) } : {}),
+        ok: false,
+        conflict: true,
+        backupBranch,
+        error: `conflict replaying ${branch} onto ${short(newBaseSha)}${detail ? `: ${detail}` : ""}`,
       };
-    } finally {
-      handle?.release();
     }
-  }
 
-  track(branch: string, parent: string): Promise<EngineResult> {
-    return this.mutatingRun(["track", branch, "--onto", parent]);
-  }
+    const newTip = await revParse(branch, worktreePath);
+    if (!newTip) {
+      return { ok: false, conflict: false, error: `lost ${branch} tip after rebase` };
+    }
 
-  sync(branch: string | undefined, opts: SyncOptions = {}): Promise<EngineResult> {
-    const args = ["sync"];
-    // `stack sync` mutates by default; `--dry-run` makes it a pure
-    // preview. (Unlike `merge`, it has no `--apply` flag.) So the apply
-    // path runs bare and takes the lock; the preview path adds --dry-run.
-    if (!opts.apply) args.push("--dry-run");
-    if (branch) args.push(branch);
-    return opts.apply ? this.mutatingRun(args) : this.readonlyRun(args);
-  }
+    // Already correct and unmoved by the rebase (e.g. all of the slice's
+    // commits were already present on the new base): skip the push.
+    if (newTip === beforeTip) {
+      await deleteBackup(backupBranch, worktreePath);
+      onLog(`  ${branch}: no commits to move`);
+      return { ok: true, newTip, newBaseSha, moved: false };
+    }
 
-  merge(
-    branch: string | undefined,
-    opts: MergeOptions = {},
-  ): Promise<EngineResult> {
-    const args = ["merge"];
-    if (branch) args.push(branch);
-    if (opts.auto) args.push("--auto");
-    else if (opts.apply) args.push("--apply");
-    if (opts.through) args.push("--through", opts.through);
-    // `merge` with no --apply/--auto is a dry run; both mutate.
-    return opts.apply || opts.auto ? this.mutatingRun(args) : this.readonlyRun(args);
-  }
-
-  status(branch?: string): Promise<EngineResult> {
-    const args = ["status"];
-    if (branch) args.push(branch);
-    return this.readonlyRun(args);
+    const push = await gitRun(
+      ["push", "--force-with-lease", "origin", branch],
+      worktreePath,
+    );
+    if (push.exitCode !== 0) {
+      return {
+        ok: false,
+        conflict: false,
+        error: `push ${branch}: ${(push.stderr || push.stdout).trim()}`,
+      };
+    }
+    await deleteBackup(backupBranch, worktreePath);
+    onLog(`  pushed ${branch}`);
+    return { ok: true, newTip, newBaseSha, moved: true };
   }
 }
 
-/** Default engine instance — swap the constructor here to drop the dep. */
-export const restackEngine: RestackEngine = new StackCliEngine();
+/** Best-effort delete of a backup ref after a clean replay. */
+async function deleteBackup(backupBranch: string, cwd: string): Promise<void> {
+  await gitRun(["branch", "-D", backupBranch], cwd);
+}
+
+/** Epoch ms as a ref-safe token. Split out so it's easy to see/replace. */
+function epochMs(): number {
+  return Date.now();
+}
+
+function short(sha: string): string {
+  return sha.slice(0, 9);
+}
+
+/** Default engine instance — swap the constructor here to change the impl. */
+export const restackEngine: RestackEngine = new NativeRestackEngine();
