@@ -1,3 +1,5 @@
+import { readFileSync, statSync } from "node:fs";
+
 import { config } from "../../core/config.ts";
 import {
   applyStack,
@@ -5,18 +7,26 @@ import {
   stackStatus,
   type StackStatusReport,
 } from "../../core/stack-ops.ts";
-import { listStackManifests } from "../../core/wtstate.ts";
+import {
+  getStackManifest,
+  listStackManifests,
+  putStackManifest,
+  validateStackManifest,
+} from "../../core/wtstate.ts";
 import { bold, cyan, dim, green, red, yellow } from "../colors.ts";
 
 const HELP = `usage: wt stack <subcommand> [options]
 
 subcommands:
-  apply <stackId>            materialize a planned manifest into worktrees + draft PRs
+  apply <stackId>            materialize an already-ingested manifest
+  apply --from <file>        strict-validate + ingest a manifest, then materialize
+  plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
   status [stackId]           render the manifest DAG + drift vs reality
   rebase <stackId>           regenerate engine links, sync/land, reconcile manifest
 
 apply options:
-  --install                  run install per slice (default off — slow)
+  --from <file>              ingest a skill-authored manifest JSON (strict validation)
+  --install                  run install per slice (default off — slices are install-free)
 status options:
   --json                     machine-readable output
 rebase options:
@@ -27,12 +37,79 @@ function logLine(line: string): void {
   console.log(dim(line));
 }
 
+type IngestResult =
+  | { ok: true; stackId: string; sliceCount: number }
+  | { ok: false };
+
+/**
+ * Read + STRICT-validate a skill-authored manifest file, then store it
+ * via `putStackManifest`. This is the ONLY boundary by which a manifest
+ * enters wt state — skills never write `state.json`. Validation errors
+ * print verbatim (all of them) and the manifest is NOT stored.
+ */
+function ingestManifest(file: string): IngestResult {
+  let text: string;
+  try {
+    if (!statSync(file).isFile()) {
+      console.error(red(`not a file: ${file}`));
+      return { ok: false };
+    }
+    text = readFileSync(file, "utf8");
+  } catch (e) {
+    console.error(red(`cannot read ${file}: ${e instanceof Error ? e.message : String(e)}`));
+    return { ok: false };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    console.error(red(`invalid JSON in ${file}: ${e instanceof Error ? e.message : String(e)}`));
+    return { ok: false };
+  }
+  const v = validateStackManifest(parsed);
+  if (!v.ok) {
+    console.error(
+      red(`manifest validation failed (${v.errors.length} error${v.errors.length === 1 ? "" : "s"}):`),
+    );
+    for (const err of v.errors) console.error(red(`  • ${err}`));
+    return { ok: false };
+  }
+  // Refuse to clobber an already-materialized stack: a wholesale replace
+  // would drop the `pr`/`status` mutations apply recorded. Re-materialize
+  // via `wt stack apply <stackId>` instead (it's idempotent).
+  const existing = getStackManifest(v.manifest.stackId);
+  if (existing && existing.slices.some((s) => s.status !== "planned")) {
+    console.error(
+      red(
+        `stack ${v.manifest.stackId} is already materialized (has open/merged slices) — ` +
+          `re-ingesting would discard recorded PRs. Run \`wt stack apply ${v.manifest.stackId}\` instead.`,
+      ),
+    );
+    return { ok: false };
+  }
+  try {
+    putStackManifest(v.manifest);
+  } catch (e) {
+    console.error(red(`cannot store manifest: ${e instanceof Error ? e.message : String(e)}`));
+    return { ok: false };
+  }
+  return { ok: true, stackId: v.manifest.stackId, sliceCount: v.manifest.slices.length };
+}
+
 async function runApply(argv: string[]): Promise<number> {
   let stackId: string | undefined;
   let install = false;
-  for (const a of argv) {
+  let from: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
     if (a === "--install") install = true;
-    else if (a.startsWith("--")) {
+    else if (a === "--from") {
+      from = argv[++i];
+      if (!from) {
+        console.error(red("--from requires a path"));
+        return 2;
+      }
+    } else if (a.startsWith("--")) {
       console.error(red(`unknown flag: ${a}`));
       return 2;
     } else if (!stackId) stackId = a;
@@ -41,8 +118,20 @@ async function runApply(argv: string[]): Promise<number> {
       return 2;
     }
   }
+  if (from) {
+    if (stackId) {
+      console.error(red("pass either --from <file> or <stackId>, not both"));
+      return 2;
+    }
+    const ingested = ingestManifest(from);
+    if (!ingested.ok) return 1;
+    stackId = ingested.stackId;
+    console.log(
+      green(`✓ ingested ${bold(stackId)} (${ingested.sliceCount} slices) → materializing`),
+    );
+  }
   if (!stackId) {
-    console.error(red("usage: wt stack apply <stackId> [--install]"));
+    console.error(red("usage: wt stack apply <stackId> | --from <manifest.json> [--install]"));
     return 2;
   }
   const result = await applyStack(stackId, { install }, logLine);
@@ -84,6 +173,35 @@ function renderStatus(report: StackStatusReport): void {
       `  ${ord} ${bold(slice.title)}${over}  ${pr} ${state}  ${dim("base:")} ${baseStr}${driftMark}`,
     );
   }
+}
+
+async function runPlan(argv: string[]): Promise<number> {
+  let from: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--from") {
+      from = argv[++i];
+      if (!from) {
+        console.error(red("--from requires a path"));
+        return 2;
+      }
+    } else {
+      console.error(red(`unexpected arg: ${a}`));
+      return 2;
+    }
+  }
+  if (!from) {
+    console.error(red("usage: wt stack plan --from <manifest.json>"));
+    return 2;
+  }
+  const ingested = ingestManifest(from);
+  if (!ingested.ok) return 1;
+  console.log(
+    green(
+      `✓ ingested ${bold(ingested.stackId)} (${ingested.sliceCount} slices) — run \`wt stack apply ${ingested.stackId}\` to materialize`,
+    ),
+  );
+  return 0;
 }
 
 async function runStatus(argv: string[]): Promise<number> {
@@ -214,6 +332,8 @@ export async function run(argv: string[]): Promise<number> {
   switch (sub) {
     case "apply":
       return runApply(rest);
+    case "plan":
+      return runPlan(rest);
     case "status":
       return runStatus(rest);
     case "rebase":

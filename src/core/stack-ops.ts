@@ -19,6 +19,7 @@ import {
 import { restackEngine, type EngineResult } from "./restack-engine.ts";
 import {
   isLaneRoot,
+  isTrunkBase,
   resolveParentBranch,
   topoSortSlices,
 } from "./stack-layout.ts";
@@ -174,8 +175,24 @@ export async function applyStack(
       continue;
     }
     const parentBranch = resolveParentBranch(manifest, slice);
-    const isRoot = isLaneRoot(slice);
-    const parentRef = isRoot ? `origin/${config.branch.base}` : parentBranch;
+    // A trunk-based slice branches off `origin/<trunk>` and targets its PR
+    // at trunk; any other slice (a stacked child, or a root stacked on an
+    // unmerged parent PR) branches off + targets its resolved parent
+    // branch. The engine only tracks non-trunk parents.
+    const onTrunk = isTrunkBase(slice);
+    let parentRef: string;
+    if (onTrunk) {
+      parentRef = `origin/${config.branch.base}`;
+    } else {
+      // Prefer the local parent branch (a sibling slice just materialized
+      // it, or it's the user's parent-PR worktree); fall back to the
+      // remote-tracking ref when the parent exists only on origin, so
+      // `git worktree add` resolves a real ref either way.
+      const localParent = await gitQuiet(
+        ["show-ref", "--verify", "--quiet", `refs/heads/${parentBranch}`],
+      );
+      parentRef = localParent ? parentBranch : `origin/${parentBranch}`;
+    }
 
     // Idempotent re-run: if a PR already exists on this branch (a prior
     // run materialized + pushed + opened the PR but failed before
@@ -188,12 +205,17 @@ export async function applyStack(
         status: existingPr.state === "MERGED" ? "merged" : "open",
       });
       materialized.push(slice.id);
-      if (!isRoot) await restackEngine.track(slice.branch, parentBranch);
+      if (!onTrunk) await restackEngine.track(slice.branch, parentBranch);
       continue;
     }
 
     onLog(`apply ${slice.id} → ${slice.branch} (off ${parentRef})`);
 
+    // Slices are install-free by design (a slice == a light worktree, no
+    // node_modules), so do NOT add a per-slice typecheck/build gate here —
+    // it can't run. Verification is the skill's job, done BEFORE apply in a
+    // dep-having checkout; per-slice CI is the backstop. `--install` is an
+    // explicit opt-in, default off.
     const created = await createWorktree(slice.branch, {
       base: parentRef,
       runInstall: opts.install === true,
@@ -223,9 +245,10 @@ export async function applyStack(
     }
     onLog(`  pushed ${slice.branch}`);
 
-    // gh wants a branch name for --base: the trunk name for a lane root,
-    // else the parent slice's branch.
-    const prBase = isRoot ? config.branch.base : parentBranch;
+    // gh wants a branch name for --base: the trunk name for a trunk-based
+    // slice, else the resolved parent branch (sibling slice or external
+    // parent PR branch).
+    const prBase = onTrunk ? config.branch.base : parentBranch;
     const pr = await createDraftPr({
       cwd: created.path,
       head: slice.branch,
@@ -240,11 +263,11 @@ export async function applyStack(
     updateStackSlice(stackId, slice.id, { pr: pr.number, status: "open" });
     materialized.push(slice.id);
 
-    // Seed the engine with the squash-safe restack metadata. Lane roots
-    // aren't tracked — the engine rejects trunk parents. The wt list
-    // derives the parent relationship straight from the manifest, so
+    // Seed the engine with the squash-safe restack metadata. Trunk-based
+    // slices aren't tracked — the engine rejects trunk parents. The wt
+    // list derives the parent relationship straight from the manifest, so
     // there's no separate display state to seed.
-    if (!isRoot) {
+    if (!onTrunk) {
       const tracked = await restackEngine.track(slice.branch, parentBranch);
       if (!tracked.ok) {
         onLog(`  warn: stack track failed: ${tracked.stderr.trim() || tracked.exitCode}`);
@@ -357,9 +380,12 @@ export async function rebaseStack(
   }
   const trunk = opts.onto ?? config.branch.base;
 
-  // 1. Regenerate engine links from the manifest (children only).
+  // 1. Regenerate engine links from the manifest for every non-trunk
+  //    slice (stacked children + a root stacked on an external parent
+  //    PR). Trunk-based slices are skipped — the engine rejects trunk
+  //    parents.
   for (const slice of manifest.slices) {
-    if (isLaneRoot(slice)) continue;
+    if (isTrunkBase(slice)) continue;
     const parent = resolveParentBranch(manifest, slice);
     const tracked = await restackEngine.track(slice.branch, parent);
     if (!tracked.ok) {

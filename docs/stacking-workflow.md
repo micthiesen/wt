@@ -50,8 +50,9 @@ granularities. Don't conflate them.
   restack upward. (This is what avoids the classic "do I fix the slice or the
   holistic branch" stacked-PR nightmare.)
 
-ultracheck runs **once** on the holistic branch. Slices only get a cheap
-per-slice typecheck gate, never a re-ultracheck.
+ultracheck runs **once** on the holistic branch. Verification is a cheap
+typecheck in a dep-having checkout (not the install-free slice worktrees) plus
+per-slice CI, never a re-ultracheck.
 
 ---
 
@@ -197,9 +198,26 @@ OpenCode via `.claude/skills`).
   Meta-skill: describe a friction in plain words, it routes the fix to the right
   component (wt code, a skill, CLAUDE.md, or this doc), keeps the pieces coherent,
   and logs it.
-- **wt implementation brief** — `~/.wt/prompt.txt` (point a CC instance in the wt
-  repo at it). Contains the full wt contract: gut heuristics, add `stacks` to
-  wtstate, `wt stack apply/status/rebase`, `wt size`.
+- **wt implementation** — built and shipped in `~/.wt` (the `prompt.txt` brief
+  was consumed and deleted). The contract now lives in the code + this doc:
+  manifest in `core/wtstate.ts` (`stacks` map); strict ingest in
+  `validateStackManifest`; layout in `core/stack-layout.ts`; materialize/rebase
+  in `core/stack-ops.ts`; `wt stack apply|plan|status|rebase` + `wt size`.
+  Key contracts for the skill:
+  - **Ingest is `wt stack apply --from <file>`** (or `wt stack plan --from <file>`
+    to validate + ingest without materializing). STRICT validation (separate from
+    the lenient `parseManifest` read path): unknown keys, missing
+    id/branch/files/ordinal/base, dangling/self `dependsOn`, duplicate id/branch,
+    `oversized` without reason all ERROR loudly (all problems at once, non-zero
+    exit). The skill never writes `state.json`.
+  - **`base` accepts any branch string.** Trunk base → off `origin/main`, PR vs
+    trunk. A sibling slice id or an external parent-PR branch → off that branch,
+    PR vs it, engine-tracked. `isTrunkBase` (not "is this a root") gates the
+    trunk-only behavior, so a stack rooted on an unmerged parent materializes
+    correctly.
+  - **No per-slice build gate.** Slices are install-free (no `node_modules`), so
+    `apply` cannot and does not typecheck them. Verification is the skill's job,
+    run BEFORE materialize in a dep-having checkout; per-slice CI is the backstop.
 - **This doc** — `~/.wt/docs/stacking-workflow.md` (edit in place; not generated).
 
 ### Re-homing note (important constraint)
@@ -254,12 +272,13 @@ standalone skills — never as edits to `/start` or `/done`.
 - [x] `/split` skill (+ context script)
 - [x] `/restack` skill (+ context script)
 - [x] `/improve-stacking` meta-skill (routes any workflow tweak to the right place)
-- [x] `~/.wt/prompt.txt` brief for the wt implementation
+- [x] wt implementation brief (was `~/.wt/prompt.txt`; consumed + deleted once built)
 - [x] This design doc
-- [ ] wt: gut reflog heuristics → explicit-only
-- [ ] wt: `stacks` manifest in wtstate
-- [ ] wt: `wt stack apply` / `status` / `rebase`
-- [ ] wt: `wt size` (canonical "production line" definition)
+- [x] wt: gut reflog heuristics → explicit-only (manifest-driven)
+- [x] wt: `stacks` manifest in wtstate (+ strict `validateStackManifest` ingest)
+- [x] wt: `wt stack apply` (+ `--from`) / `plan --from` / `status` / `rebase`
+- [x] wt: `wt size` (canonical "production line" definition)
+- [x] wt: manifest-driven list rendering (implicit sections, tree spine)
 - [x] Built via `rulesync` → skills live for Claude Code, Codex, OpenCode
 - [ ] Dogfood: split this very `eng-5182` branch as the first real test
 
@@ -339,3 +358,13 @@ Track friction here as the workflow gets used. Candidate adjustments:
   (b) base = unmerged parent. Skill + doc updated now; the wt `--from` + strict
   validation change is staged in `/tmp/eng-stacking-wt-ingest-prompt.txt` to merge
   into `~/.wt/prompt.txt` once the wt repo's in-flight edits settle.
+- **2026-06-08** — Implemented the staged ingest change in wt (`prompt.txt` was
+  already deleted, so the detail folded into "Where each piece lives" above, not
+  `prompt.txt`). Added `wt stack apply --from <file>` + `wt stack plan --from
+  <file>`, a STRICT `validateStackManifest` in `core/wtstate.ts` (distinct from the
+  lenient read-path `parseManifest`; errors loud on unknown keys, missing
+  id/branch/files/ordinal/base, dangling/self deps, dup id/branch, oversized w/o
+  reason). Confirmed NO per-slice build gate (slices stay install-free). Fixed the
+  non-main-`base` case end-to-end: split `isTrunkBase` out of `isLaneRoot` so a
+  stack rooted on an unmerged parent PR branches off + targets + tracks that parent
+  branch instead of silently using `origin/main`.

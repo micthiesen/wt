@@ -8,26 +8,44 @@
 import { config } from "./config.ts";
 import type { StackManifest, StackSlice } from "./wtstate.ts";
 
-/** True when a slice roots at trunk (an independent lane, no stacked parent). */
-export function isLaneRoot(slice: StackSlice): boolean {
-  return (
-    slice.dependsOn.length === 0 ||
-    slice.base === config.branch.base ||
-    slice.base === "main"
-  );
+/**
+ * True when a slice's `base` is the configured trunk. A trunk-based slice
+ * branches off `origin/<trunk>`, opens its PR against trunk, and isn't
+ * tracked by the engine (which rejects trunk parents). Trunk identity
+ * comes solely from `config.branch.base` — no hardcoded `"main"`, so a
+ * repo whose trunk is `master`/`develop` works. Distinct from
+ * `isLaneRoot`: a stack whose root is stacked on an unmerged parent PR
+ * has a *forest root* whose `base` is that parent branch, NOT trunk.
+ */
+export function isTrunkBase(slice: StackSlice): boolean {
+  return slice.base === config.branch.base;
 }
 
 /**
- * The branch a slice stacks on. Lane roots resolve to the trunk base
- * name; stacked children resolve to the parent slice's branch. The
- * `base` field may name the parent by slice `id` or by branch; both are
- * handled.
+ * True when a slice roots its lane (no parent slice): empty `dependsOn`,
+ * or `base` is trunk. Drives the layout forest roots and the per-lane
+ * sync entry points. A root stacked on an external parent branch is
+ * still a lane root here (it has no parent *slice*), even though its
+ * `base` is non-trunk — use `isTrunkBase` for trunk-specific decisions.
+ */
+export function isLaneRoot(slice: StackSlice): boolean {
+  return slice.dependsOn.length === 0 || isTrunkBase(slice);
+}
+
+/**
+ * The branch a slice stacks on, for the diff base / PR base / engine
+ * track target. `base` may be the trunk name, a sibling slice's `id`, or
+ * an external branch (when the whole stack is stacked on an unmerged
+ * parent PR — all three are honored):
+ *   - trunk      → `config.branch.base`
+ *   - slice id   → that slice's branch
+ *   - else       → `base` verbatim (an external branch ref)
  */
 export function resolveParentBranch(
   manifest: StackManifest,
   slice: StackSlice,
 ): string {
-  if (isLaneRoot(slice)) return config.branch.base;
+  if (isTrunkBase(slice)) return config.branch.base;
   const byId = manifest.slices.find((s) => s.id === slice.base);
   if (byId) return byId.branch;
   // `base` already names a branch (or an unknown ref we pass through).
