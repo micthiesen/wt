@@ -7,7 +7,6 @@ import type { GitActivity } from "../../core/git-activity.ts";
 import { pickPrForWorktree } from "../../core/github.ts";
 import { lockAge, lockLabel } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
-import type { StackMap } from "../../core/stack.ts";
 import { slugLabel } from "../../core/stage.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
@@ -17,7 +16,6 @@ import { qk } from "../../state/keys.ts";
 import {
   aiSummaryQuery,
   archiveQuery,
-  stackQuery,
   worktreesQuery,
   wtClaudeQuery,
   wtDeployQuery,
@@ -63,25 +61,22 @@ export type WorktreeFields = {
 
 /**
  * Stack relationship for a worktree, with the resolved diff base.
- * Populated by three signals in priority order:
  *
- *   "manual" — explicit override set via the stack chord. Wins over
- *              both auto-detection paths; cleared by setting parent
- *              to null. `diffBase === branch`.
- *   "pr"     — PR declares a non-trunk base. Strongest *auto* signal:
- *              the user told GitHub explicitly. `diffBase === branch`.
- *   "stack"  — `detectStacks` resolved a parent from the branch's
- *              reflog (reset to / rebased-from / created-from another
- *              worktree). `diffBase` is the parent's branch ref.
+ * Source is EXPLICIT-ONLY: the `parent` branch recorded in wtState
+ * (`slugs[slug].parent`), set either via the stack chord or by
+ * `wt stack apply` materializing a manifest slice. There is no reflog
+ * or PR-base inference — un-managed branches render flat. `via` is
+ * always `"manual"`; the field is retained so callers can stay
+ * forward-compatible if other explicit sources are added later.
  *
- * `slug` is `null` when the declared base isn't another worktree in
+ * `slug` is `null` when the declared parent isn't another worktree in
  * the list; the consumer can still use the diff base for diffing but
  * has no row to draw a UI hint to.
  */
 export type StackedOn = {
   slug: string | null;
   branch: string;
-  via: "stack" | "pr" | "manual";
+  via: "manual";
   /** Ref to use for `git diff <diffBase>...HEAD`. */
   diffBase: string;
 };
@@ -216,66 +211,32 @@ function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
 }
 
 /**
- * Resolve `stackedOn` for a single worktree. Single source of truth for
- * the priority chain (manual → pr → stack → null) and the resolved
- * diff base — the row aggregator reads this to populate
- * `row.stackedOn`, and the details pane reads `row.stackedOn?.diffBase`
- * directly so both sites land queries in the same per-(slug, base)
- * cache slot.
+ * Resolve `stackedOn` for a single worktree from the EXPLICIT parent
+ * recorded in wtState. Single source of truth for the diff base — the
+ * row aggregator reads this to populate `row.stackedOn`, and the
+ * details pane reads `row.stackedOn?.diffBase` directly so both sites
+ * land queries in the same per-(slug, base) cache slot.
  *
- * `manualParent` comes from `wtState.slugs[slug]?.parent` and wins over
- * both auto-detection paths. Set/cleared via the stack chord; a value
- * equal to trunk is treated as "no override" so the auto signals can
- * still expose a non-trunk PR base.
+ * `manualParent` comes from `wtState.slugs[slug]?.parent` — set via the
+ * stack chord or by `wt stack apply`. A value equal to trunk is treated
+ * as "no parent" (flat). No reflog/PR-base inference: an un-managed
+ * branch with no recorded parent renders flat.
  *
  * `worktrees` is the active set; needed to associate a parent branch
  * with a worktree slug for the UI hint.
  */
 function resolveStackedOn(
-  wt: Worktree,
-  stackData: StackMap | undefined,
-  pr: PullRequest | undefined,
   worktrees: readonly Worktree[],
   manualParent: string | null | undefined,
 ): StackedOn | null {
-  if (manualParent && manualParent !== config.branch.base) {
-    const parentWt = worktrees.find((w) => w.branch === manualParent);
-    return {
-      slug: parentWt?.slug ?? null,
-      branch: manualParent,
-      via: "manual",
-      diffBase: manualParent,
-    };
-  }
-  // An open PR's base is the authoritative, auto-maintained parent:
-  // when the prior parent merges, GitHub retargets the base
-  // (to the grandparent, ultimately trunk). So when a PR exists, trust
-  // its base completely and DON'T fall through to reflog detection — a
-  // non-trunk base names the parent worktree; a trunk base is a positive
-  // "no stack parent". The reflog fallback is actively wrong here: once a
-  // parent squash-merges and its branch is deleted, the fork-point SHA in
-  // this branch's reflog survives only inside its own descendants and
-  // resolves to a wrong-direction parent.
-  if (pr && pr.baseRefName) {
-    if (pr.baseRefName === config.branch.base) return null;
-    const parentWt = worktrees.find((w) => w.branch === pr.baseRefName);
-    return {
-      slug: parentWt?.slug ?? null,
-      branch: pr.baseRefName,
-      via: "pr",
-      diffBase: pr.baseRefName,
-    };
-  }
-  const fromStack = stackData?.[wt.slug];
-  if (fromStack) {
-    return {
-      slug: fromStack.slug,
-      branch: fromStack.branch,
-      via: "stack",
-      diffBase: fromStack.diffBase,
-    };
-  }
-  return null;
+  if (!manualParent || manualParent === config.branch.base) return null;
+  const parentWt = worktrees.find((w) => w.branch === manualParent);
+  return {
+    slug: parentWt?.slug ?? null,
+    branch: manualParent,
+    via: "manual",
+    diffBase: manualParent,
+  };
 }
 
 function deriveStatus(
@@ -436,36 +397,21 @@ export function useWorktreeRows(): WorktreeRowsResult {
 
   const worktrees = (wtList.data ?? []).filter((w) => !w.isMain);
 
-  // Stack detection runs once for the full set; the result is shared
-  // across all per-worktree consumers below (effective diff base, the
-  // `stackedOn` field on rows). Keyed by branch list so worktree churn
-  // re-triggers; SHA drift inside a fixed set is caught by staleTime.
-  const stack = useQuery({
-    ...stackQuery(wtList.data ?? []),
-    enabled: !!wtList.data && wtList.data.length > 0,
-  });
-
-  // Per-worktree PR lookup — used both for `stackedOn` resolution
-  // below and for the row's `pr` field further down. Hoisted so the
-  // GitHub map is only walked once per worktree per render.
+  // Per-worktree PR lookup — used for the row's `pr` field further
+  // down. Hoisted so the GitHub map is only walked once per worktree
+  // per render.
   const prsByIndex = worktrees.map((wt) =>
     pickPrForWorktree(wt, github.data?.prs),
   );
 
-  // Resolve `stackedOn` once per render, then derive the diff base from
-  // it. Single source of truth for the commits → patch-id → pr → null
-  // priority chain — every consumer (sync/git-activity/diff-context
-  // queries here, the diff query in `details.tsx`, the row UI hint)
-  // reads through `row.stackedOn`, so they all land queries in the same
-  // per-(slug, base) cache slot.
-  const stackedOnByIndex = worktrees.map((wt, i) =>
-    resolveStackedOn(
-      wt,
-      stack.data,
-      prsByIndex[i],
-      worktrees,
-      stateSlugs[wt.slug]?.parent ?? null,
-    ),
+  // Resolve `stackedOn` once per render from the explicit wtState
+  // parent, then derive the diff base from it. Single source of truth —
+  // every consumer (sync/git-activity/diff-context queries here, the
+  // diff query in `details.tsx`, the row UI hint) reads through
+  // `row.stackedOn`, so they all land queries in the same per-(slug,
+  // base) cache slot.
+  const stackedOnByIndex = worktrees.map((wt) =>
+    resolveStackedOn(worktrees, stateSlugs[wt.slug]?.parent ?? null),
   );
   const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
 

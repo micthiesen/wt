@@ -8,6 +8,8 @@ import * as doctorCmd from "./commands/doctor.ts";
 import * as stagesCmd from "./commands/stages.ts";
 import * as logsCmd from "./commands/logs.ts";
 import * as openCmd from "./commands/open.ts";
+import * as sizeCmd from "./commands/size.ts";
+import * as stackCmd from "./commands/stack.ts";
 import * as destroyCmd from "./commands/_destroy.ts";
 
 const HELP = `usage: wt <command> [options]
@@ -21,6 +23,8 @@ commands:
   stages      list SST stages, optionally clean orphans
   logs        tail a destroy log
   open        open a worktree in Zed
+  size        production-LOC + file count for a diff
+  stack       materialize / inspect / restack a stack manifest
 
 Run \`wt <command> --help\` for per-command options where available.`;
 
@@ -35,6 +39,8 @@ const RUNNERS: Record<string, Runner> = {
   stages: stagesCmd.run,
   logs: logsCmd.run,
   open: openCmd.run,
+  size: sizeCmd.run,
+  stack: stackCmd.run,
   _destroy: destroyCmd.run,
 };
 

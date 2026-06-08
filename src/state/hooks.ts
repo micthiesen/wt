@@ -303,10 +303,9 @@ export function useWtActions() {
      */
     async refreshAll(): Promise<void> {
       // `queryKey: ["github"]` uses prefix match — invalidates every
-      // github query regardless of the branches suffix. Stack is also
-      // a prefix-keyed query (`["stack", ...branches]`) and we want
-      // reflog-based detection to re-run on `r` so a recent rebase
-      // picks up its new parent without waiting for staleTime. The
+      // github query regardless of the branches suffix. Stack
+      // relationships are explicit now (wtState parent overrides), so
+      // refreshing them is just a `["wtState"]` invalidation. The
       // review-requests query lives off-prefix (see qk.reviewRequests)
       // and gets its own invalidation here.
       await Promise.all([
@@ -314,7 +313,7 @@ export function useWtActions() {
         qc.invalidateQueries({ queryKey: qk.worktrees() }),
         qc.invalidateQueries({ queryKey: ["github"] }),
         qc.invalidateQueries({ queryKey: qk.reviewRequests() }),
-        qc.invalidateQueries({ queryKey: ["stack"] }),
+        qc.invalidateQueries({ queryKey: qk.wtState() }),
       ]);
       await Promise.all([
         qc.invalidateQueries({ queryKey: qk.mainFirstParents() }),
@@ -348,14 +347,17 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
     },
     /**
-     * Invalidate the cross-worktree stack-detection cache. Stack
-     * detection reads each worktree's reflog, so any operation that
-     * rewrites history (rebase, modify, action that pushes commits)
-     * can change the result without changing the branch list — and
-     * therefore without changing the stack query key.
+     * Refresh explicit stack relationships and the per-worktree diff
+     * queries. Stack parents now live in wtState (no reflog detection),
+     * so re-reading wtState is what surfaces a freshly-applied or
+     * cleared parent; invalidating `["wt"]` re-runs the per-base diff /
+     * sync queries after a rebase rewrites history under a fixed parent.
      */
     async refreshStack(): Promise<void> {
-      await qc.invalidateQueries({ queryKey: ["stack"] });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.wtState() }),
+        qc.invalidateQueries({ queryKey: ["wt"] }),
+      ]);
     },
     /**
      * Read the repo-wide contributor list from cache without blocking
@@ -589,8 +591,8 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: qk.wtState() });
     },
     /**
-     * Persist a manual stack-parent override for `slug`. `null` clears
-     * the override; auto-detection (PR base, reflog) takes over again.
+     * Persist the explicit stack parent for `slug`. `null` clears it, so
+     * the worktree renders flat (trunk) — there's no inference fallback.
      * `resolveStackedOn` reads this on the next render; cache
      * invalidation on `wtState` re-runs the row aggregator.
      */

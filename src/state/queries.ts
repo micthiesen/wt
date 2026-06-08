@@ -33,7 +33,6 @@ import {
   type ReviewRequestPr,
 } from "../core/github.ts";
 import { lockStatus } from "../core/locks.ts";
-import { detectStacks, type StackMap } from "../core/stack.ts";
 import {
   getHarness,
   type HarnessId,
@@ -518,31 +517,6 @@ export const wtDiffContextQuery = (
     queryKey: qk.wt(wt.slug).diffContext(base),
     queryFn: async ({ signal }): Promise<DiffContext | null> =>
       buildDiffContextViaPool(wt.path, base, signal),
-    staleTime: STALE.mid,
-    ...KEEP_PREV,
-  });
-};
-
-/**
- * Cross-worktree stack detection. Walks commit ancestry once for the
- * full worktree set and returns a map of child-slug → parent {slug,
- * branch}. Single source of truth for the "is this stacked on another
- * worktree" question — the row aggregator combines this with the PR's
- * `baseRefName` (declarative fallback) to produce `stackedOn`.
- *
- * Keyed by the sorted branch list (mirrors the github query) so
- * worktree churn re-triggers detection. SHA drift inside a fixed branch
- * set is picked up by the `STALE.mid` staleTime — short enough that a
- * just-pushed commit re-classifies as a parent within ~15s, long enough
- * to not thrash on every render.
- */
-export const stackQuery = (worktrees: readonly Worktree[]) => {
-  const branches = worktrees
-    .filter((w) => !w.isMain && w.branch)
-    .map((w) => w.branch);
-  return queryOptions({
-    queryKey: qk.stack(branches),
-    queryFn: async (): Promise<StackMap> => detectStacks(worktrees),
     staleTime: STALE.mid,
     ...KEEP_PREV,
   });

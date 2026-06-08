@@ -340,10 +340,10 @@ export async function removeWorktree(
     // in `reapStartup` so archive.json/state.json don't accumulate
     // ghosts.
     //
-    // Clearing OTHER slugs' parent overrides that referenced this
+    // Clearing OTHER slugs' explicit parent that referenced this
     // branch is safe: those rows aren't being destroyed, they're just
-    // losing a dangling override that pointed at the now-gone branch.
-    // Falls back through PR base → reflog → trunk on next render.
+    // losing a dangling parent that pointed at the now-gone branch.
+    // Renders flat (trunk) on next render.
     if (wt.branch) {
       const cleared = clearParentRefs(wt.branch);
       for (const s of cleared) {

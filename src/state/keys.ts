@@ -143,15 +143,10 @@ export const qk = {
   stackTitle: (sig: string) => ["stackTitle", sig] as const,
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
-  /** Per-slug section + manual order (fs-backed). */
-  wtState: () => ["wtState"] as const,
   /**
-   * Cross-worktree stack detection: for each slug, the slug+branch of
-   * the parent worktree it's stacked on (commit-ancestry signal). Keyed
-   * by the sorted branch list so adding/removing a worktree
-   * re-triggers; SHA drift inside a fixed branch set is picked up via
-   * the staleTime on the query rather than a key change.
+   * Per-slug section + manual order + stack manifests (fs-backed). Also
+   * the single source for explicit stack relationships now that reflog
+   * detection is gone — `refreshStack` invalidates this key.
    */
-  stack: (branches: readonly string[]) =>
-    ["stack", [...branches].sort()] as const,
+  wtState: () => ["wtState"] as const,
 } as const;

@@ -5,12 +5,11 @@ import type { RowModule } from "./types.ts";
 /**
  * The branch this worktree is built on. Defaults to `config.branch.base`
  * (trunk) for un-stacked worktrees; switches to the parent worktree's
- * branch when the stack-detection or PR-base signal fires
- * (`row.stackedOn`).
+ * branch when an explicit stack parent is recorded (`row.stackedOn`),
+ * set via the stack chord or `wt stack apply`.
  *
- * A muted "(pr)" suffix flags PR-base hits that have no patch-id
- * overlap with HEAD — the diff falls through to the declared base and
- * may be inaccurate. Stack-detected parents render plain.
+ * A muted "(manual)" suffix flags the explicit parent so it's obvious
+ * the base came from a recorded relationship, not inferred.
  */
 export const baseRow: RowModule = {
   id: "base",
@@ -18,12 +17,7 @@ export const baseRow: RowModule = {
   render: ({ row }) => {
     const stackedOn = row.stackedOn;
     const base = stackedOn?.branch ?? config.branch.base;
-    const suffix =
-      stackedOn?.via === "pr"
-        ? " (pr)"
-        : stackedOn?.via === "manual"
-          ? " (manual)"
-          : null;
+    const suffix = stackedOn ? " (manual)" : null;
     return (
       <text wrapMode="none" truncate>
         <span fg={theme.fg}>{base}</span>

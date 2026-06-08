@@ -124,7 +124,7 @@ export async function runTui(): Promise<TuiExit> {
       wtClient.client.invalidateQueries({ queryKey: ["github"] }),
       wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
       wtClient.client.invalidateQueries({ queryKey: ["wt"] }),
-      wtClient.client.invalidateQueries({ queryKey: ["stack"] }),
+      wtClient.client.invalidateQueries({ queryKey: qk.wtState() }),
     ]).catch(() => {});
   });
   const worktreeWatchSet = new WorktreeWatchSet((slug) => {

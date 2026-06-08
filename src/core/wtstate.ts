@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { config } from "./config.ts";
 import { createLogger } from "./logger.ts";
 
 const STATE_FILE = join(homedir(), ".cache", "wt", "state.json");
@@ -13,9 +14,11 @@ export type WtSlugState = {
   /** Manual ordering scalar within (section, archived) bucket. Lower = earlier. */
   order: number;
   /**
-   * Manual override for this worktree's parent (stack base) branch.
-   * When set, beats both the PR-base hint and the reflog detection
-   * in `resolveStackedOn`. `null`/undefined means "auto-detect".
+   * Explicit parent (stack base) branch for this worktree — the SOLE
+   * source of stack relationships (no reflog / PR-base inference).
+   * Set via the stack chord or `wt stack apply`; read by
+   * `resolveStackedOn`. `null`/undefined (or a value equal to trunk)
+   * means "no parent — render flat".
    */
   parent?: string | null;
 };
@@ -33,12 +36,70 @@ export type WtSlugState = {
  */
 export type WtSectionMeta = { kind: "stack"; rootSlug: string };
 
+/** Lifecycle of a single slice as it moves from plan to landed PR. */
+export type StackSliceStatus = "planned" | "open" | "merged";
+
+/**
+ * One slice of a holistic change — a small, reviewable unit that becomes
+ * a single draft PR. `base` is either the trunk base name (a lane root,
+ * independent PR off trunk) or the `id` of another slice in the same
+ * manifest (a stacked child). `dependsOn` lists slice ids that must
+ * materialize first; an empty list + trunk `base` is a parallel lane.
+ */
+export type StackSlice = {
+  id: string;
+  /** 1-based stack order. Encodes the `-NN-` ordinal in the branch name. */
+  ordinal: number;
+  title: string;
+  branch: string;
+  /** Trunk base name (lane root) or another slice's `id` (stacked child). */
+  base: string;
+  /** Slice ids this one stacks on. Empty = lane root. */
+  dependsOn: string[];
+  /** File-level partition of the holistic diff owned by this slice. */
+  files: string[];
+  /** GitHub PR number once materialized; `null` while planned. */
+  pr: number | null;
+  status: StackSliceStatus;
+  /** Sanctioned escape hatch: an indivisible unit over the advisory budget. */
+  oversized: boolean;
+  oversizedReason?: string;
+};
+
+/** Advisory size budget for a stack. Never a hard gate (see brief). */
+export type StackLimits = { files: number; prodLines: number; hard: boolean };
+
+/**
+ * The authoritative description of a stack's shape. wt owns this; the
+ * `stack` engine's `.git/stack/state.json` is a regenerable projection
+ * of it, never a source of truth. The holistic origin is held
+ * separately so wt can render it as a distinct node and slices can
+ * reach the original conversation via `holisticSessionId`.
+ */
+export type StackManifest = {
+  stackId: string;
+  issue: string;
+  holisticBranch: string;
+  holisticSlug: string;
+  /** Lets a slice find the full holistic conversation via `/history`. */
+  holisticSessionId?: string;
+  /** Set once `wt stack apply` tags the holistic branch. */
+  archivedTag?: string;
+  limits: StackLimits;
+  engine: string;
+  slices: StackSlice[];
+};
+
 /**
  * Persisted state for the worktree list:
  *  - `slugs`: per-worktree section + within-section order.
  *  - `sectionsOrder`: explicit display order for named sections.
  *  - `sectionMeta`: optional per-section metadata, currently used to
  *    flag a section as stack-managed.
+ *  - `stacks`: per-feature stack manifests keyed by `stackId`. The
+ *    single authoritative description of every managed stack's shape;
+ *    everything else (engine links, draft PRs, the rendered DAG) is
+ *    derived from it.
  *
  * Why an explicit array instead of deriving section position from
  * `min(order)` of members: derived ordering causes a section to leap
@@ -51,10 +112,62 @@ export type WtState = {
   slugs: Record<string, WtSlugState>;
   sectionsOrder: string[];
   sectionMeta: Record<string, WtSectionMeta>;
+  stacks: Record<string, StackManifest>;
 };
 
+/** Coerce one persisted slice entry, dropping anything malformed. */
+function parseSlice(v: unknown): StackSlice | null {
+  if (!v || typeof v !== "object") return null;
+  const rec = v as Partial<StackSlice>;
+  if (typeof rec.id !== "string" || rec.id.trim() === "") return null;
+  if (typeof rec.branch !== "string" || rec.branch.trim() === "") return null;
+  const ordinal = typeof rec.ordinal === "number" && Number.isFinite(rec.ordinal) ? rec.ordinal : 0;
+  const status: StackSliceStatus =
+    rec.status === "open" || rec.status === "merged" ? rec.status : "planned";
+  return {
+    id: rec.id,
+    ordinal,
+    title: typeof rec.title === "string" ? rec.title : rec.id,
+    branch: rec.branch,
+    base: typeof rec.base === "string" && rec.base.trim() !== "" ? rec.base : config.branch.base,
+    dependsOn: Array.isArray(rec.dependsOn) ? rec.dependsOn.filter((d): d is string => typeof d === "string") : [],
+    files: Array.isArray(rec.files) ? rec.files.filter((f): f is string => typeof f === "string") : [],
+    pr: typeof rec.pr === "number" && Number.isFinite(rec.pr) ? rec.pr : null,
+    status,
+    oversized: rec.oversized === true,
+    ...(typeof rec.oversizedReason === "string" ? { oversizedReason: rec.oversizedReason } : {}),
+  };
+}
+
+/** Coerce one persisted manifest, dropping anything malformed. */
+function parseManifest(v: unknown): StackManifest | null {
+  if (!v || typeof v !== "object") return null;
+  const rec = v as Partial<StackManifest>;
+  if (typeof rec.stackId !== "string" || rec.stackId.trim() === "") return null;
+  const limitsRaw = (rec.limits ?? {}) as Partial<StackLimits>;
+  const limits: StackLimits = {
+    files: typeof limitsRaw.files === "number" ? limitsRaw.files : 0,
+    prodLines: typeof limitsRaw.prodLines === "number" ? limitsRaw.prodLines : 0,
+    hard: limitsRaw.hard === true,
+  };
+  const slices = Array.isArray(rec.slices)
+    ? rec.slices.map(parseSlice).filter((s): s is StackSlice => s !== null)
+    : [];
+  return {
+    stackId: rec.stackId,
+    issue: typeof rec.issue === "string" ? rec.issue : rec.stackId,
+    holisticBranch: typeof rec.holisticBranch === "string" ? rec.holisticBranch : "",
+    holisticSlug: typeof rec.holisticSlug === "string" ? rec.holisticSlug : "",
+    ...(typeof rec.holisticSessionId === "string" ? { holisticSessionId: rec.holisticSessionId } : {}),
+    ...(typeof rec.archivedTag === "string" ? { archivedTag: rec.archivedTag } : {}),
+    limits,
+    engine: typeof rec.engine === "string" ? rec.engine : "stack",
+    slices,
+  };
+}
+
 export function readWtState(): WtState {
-  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], sectionMeta: {} };
+  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], sectionMeta: {}, stacks: {} };
   try {
     const raw = readFileSync(STATE_FILE, "utf8");
     const data = JSON.parse(raw) as Partial<WtState>;
@@ -108,17 +221,32 @@ export function readWtState(): WtState {
         known.add(name);
       }
     }
-    return { slugs, sectionsOrder, sectionMeta };
+    const stacks: Record<string, StackManifest> = {};
+    if (data?.stacks && typeof data.stacks === "object") {
+      for (const [k, v] of Object.entries(data.stacks)) {
+        const m = parseManifest(v);
+        if (m) stacks[k] = m;
+      }
+    }
+    return { slugs, sectionsOrder, sectionMeta, stacks };
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
-    return { slugs: {}, sectionsOrder: [], sectionMeta: {} };
+    return { slugs: {}, sectionsOrder: [], sectionMeta: {}, stacks: {} };
   }
 }
 
 function writeWtState(state: WtState): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true });
-    writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+    // Write-then-rename so a concurrent reader (the live TUI polls this
+    // file) never observes a half-written file and silently falls back
+    // to empty defaults. rename(2) is atomic within a filesystem. This
+    // closes the torn-read window; it does NOT serialise lost updates
+    // between two writers (that would need a cross-process lock spanning
+    // read-modify-write — out of scope here).
+    const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+    renameSync(tmp, STATE_FILE);
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
     // Re-raise so the action layer can surface the failure to the
@@ -327,10 +455,10 @@ export function moveSection(name: string, dir: -1 | 1): boolean {
 }
 
 /**
- * Set or clear the manual parent branch for `slug`. `null` removes the
- * override (falling back to PR-base / reflog detection). Preserves
- * section + order; creates a fresh unsectioned entry when the slug has
- * never been recorded before.
+ * Set or clear the explicit parent branch for `slug`. `null` clears it,
+ * so the worktree renders flat (trunk). Preserves section + order;
+ * creates a fresh unsectioned entry when the slug has never been
+ * recorded before.
  */
 export function setSlugParent(slug: string, parent: string | null): void {
   const state = readWtState();
@@ -376,11 +504,10 @@ export function removeStackSection(name: string): boolean {
 }
 
 /**
- * Clear every slug's manual `parent` override that points at
- * `branch`. Called after a worktree destroy / clean so dependent
- * worktrees fall back to auto-detection (PR base → reflog → trunk)
- * instead of dangling on a deleted branch. Returns the slugs whose
- * override was cleared, so callers can log / toast them.
+ * Clear every slug's explicit `parent` that points at `branch`. Called
+ * after a worktree destroy / clean so dependent worktrees render flat
+ * (trunk) instead of dangling on a deleted branch. Returns the slugs
+ * whose parent was cleared, so callers can log / toast them.
  */
 export function clearParentRefs(branch: string): string[] {
   if (!branch) return [];
@@ -398,6 +525,83 @@ export function clearParentRefs(branch: string): string[] {
   if (!changed) return [];
   writeWtState({ ...state, slugs: nextSlugs });
   return cleared;
+}
+
+// ---------- Stack manifests ----------
+
+/** Every stored stack manifest, in `stackId` insertion order. */
+export function listStackManifests(): StackManifest[] {
+  return Object.values(readWtState().stacks);
+}
+
+/** One manifest by id, or `null` when absent. */
+export function getStackManifest(stackId: string): StackManifest | null {
+  return readWtState().stacks[stackId] ?? null;
+}
+
+/** Insert or replace a manifest wholesale. Keyed by `manifest.stackId`. */
+export function putStackManifest(manifest: StackManifest): void {
+  const state = readWtState();
+  writeWtState({
+    ...state,
+    stacks: { ...state.stacks, [manifest.stackId]: manifest },
+  });
+}
+
+/**
+ * Shallow-merge a partial onto an existing manifest. No-op (returns
+ * false) when the manifest is absent. `slices` is replaced wholesale
+ * when present in the patch — use `updateStackSlice` for targeted edits.
+ */
+export function patchStackManifest(
+  stackId: string,
+  patch: Partial<StackManifest>,
+): boolean {
+  const state = readWtState();
+  const prev = state.stacks[stackId];
+  if (!prev) return false;
+  writeWtState({
+    ...state,
+    stacks: { ...state.stacks, [stackId]: { ...prev, ...patch } },
+  });
+  return true;
+}
+
+/**
+ * Patch a single slice within a manifest (e.g. record its `pr` and flip
+ * `status` to "open" after materialization). No-op (false) when the
+ * manifest or slice is absent.
+ */
+export function updateStackSlice(
+  stackId: string,
+  sliceId: string,
+  patch: Partial<StackSlice>,
+): boolean {
+  const state = readWtState();
+  const prev = state.stacks[stackId];
+  if (!prev) return false;
+  let hit = false;
+  const slices = prev.slices.map((s) => {
+    if (s.id !== sliceId) return s;
+    hit = true;
+    return { ...s, ...patch };
+  });
+  if (!hit) return false;
+  writeWtState({
+    ...state,
+    stacks: { ...state.stacks, [stackId]: { ...prev, slices } },
+  });
+  return true;
+}
+
+/** Drop a manifest. Returns true when one was removed. */
+export function removeStackManifest(stackId: string): boolean {
+  const state = readWtState();
+  if (!state.stacks[stackId]) return false;
+  const stacks = { ...state.stacks };
+  delete stacks[stackId];
+  writeWtState({ ...state, stacks });
+  return true;
 }
 
 /**

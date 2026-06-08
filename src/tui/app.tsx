@@ -1065,8 +1065,8 @@ export function App({ onExit }: Props) {
   // Kill any live `<slug>-diff` tmux session whose resolved base ref
   // has changed since the session was opened, so the next F11 spawns
   // fresh against the new ref instead of leaving the user staring at a
-  // diff vs the prior parent. Triggered by stack re-detection (reflog
-  // says we rebased onto a different worktree) or PR base flips. Only
+  // diff vs the prior parent. Triggered when the explicit stack parent
+  // changes (the only thing that moves the resolved base now). Only
   // runs when the user's diff command actually depends on `{{base}}` —
   // commands like `gitu` ignore the base and shouldn't be torn down on
   // unrelated re-resolutions.
@@ -1157,10 +1157,11 @@ export function App({ onExit }: Props) {
           switch (tag) {
             case "git":
               void inv(run.slug);
-              // History-rewriting actions (rebase, modify, …) can
-              // change a worktree's reflog signal without changing
-              // the branch list, so the stack query key stays the
-              // same. Re-detect explicitly.
+              // History-rewriting actions (rebase, modify, …) rewrite
+              // commits under a fixed explicit parent, so the per-base
+              // diff / sync queries need a re-run even though the parent
+              // relationship is unchanged. `refreshStack` invalidates
+              // those (see its doc in state/hooks.ts).
               void rs();
               break;
             case "github":
@@ -2412,7 +2413,7 @@ export function App({ onExit }: Props) {
    * effect, a synthetic "(clear override)" entry appears at the top so
    * the user can drop back to auto-detection.
    */
-  const PARENT_CLEAR_LABEL = "(clear override · auto-detect)";
+  const PARENT_CLEAR_LABEL = "(clear parent · render flat)";
 
   function openParentPicker(slug: string): void {
     const row = rows.find((r) => r.wt.slug === slug);
@@ -2427,7 +2428,7 @@ export function App({ onExit }: Props) {
       .filter((b) => b !== trunk);
     others.sort((a, b) => a.localeCompare(b));
     const items = [trunk, ...others];
-    const hasOverride = row.stackedOn?.via === "manual";
+    const hasOverride = row.stackedOn != null;
     let clearIndex = -1;
     if (hasOverride) {
       items.unshift(PARENT_CLEAR_LABEL);

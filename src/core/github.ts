@@ -19,9 +19,14 @@ import { listWorktrees } from "./worktree.ts";
 
 const log = createLogger("[gh]");
 
+// `which gh` never changes within a process; memoize like `repoSlug`
+// so per-slice loops (stack status/rebase) don't re-spawn it each call.
+let _hasGh: boolean | undefined;
 async function hasGh(): Promise<boolean> {
+  if (_hasGh !== undefined) return _hasGh;
   const r = await run(["which", "gh"]);
-  return r.exitCode === 0 && r.stdout.trim().length > 0;
+  _hasGh = r.exitCode === 0 && r.stdout.trim().length > 0;
+  return _hasGh;
 }
 
 // Cache the resolved `owner/name` — it never changes for a given clone.
@@ -978,6 +983,96 @@ export async function markPullRequestReady(
     return { ok: false, error: msg };
   }
   return { ok: true };
+}
+
+export type CreatePrResult =
+  | { ok: true; number: number; url: string }
+  | { ok: false; error: string };
+
+/**
+ * Create a draft PR for `head` targeting `base`, via `gh pr create`.
+ * Used by `wt stack apply` to materialize a manifest slice. The body is
+ * kept minimal but valid — a richer body is authored later by a skill.
+ * `cwd` should be the slice's worktree so gh resolves head/base from
+ * the right checkout. Returns the new PR number parsed from gh's output.
+ */
+export async function createDraftPr(opts: {
+  cwd: string;
+  head: string;
+  base: string;
+  title: string;
+  body: string;
+}): Promise<CreatePrResult> {
+  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
+  const r = await run(
+    [
+      "gh",
+      "pr",
+      "create",
+      "--draft",
+      "--base",
+      opts.base,
+      "--head",
+      opts.head,
+      "--title",
+      opts.title,
+      "--body",
+      opts.body,
+    ],
+    { cwd: opts.cwd, timeoutMs: 30_000 },
+  );
+  if (r.exitCode !== 0) {
+    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    log.error("pr create failed", { head: opts.head, base: opts.base, msg });
+    return { ok: false, error: msg };
+  }
+  // gh prints the new PR URL on success, but may emit warnings / tips on
+  // other lines (before or after). Scan all of stdout for the first
+  // `/pull/<n>` rather than trusting the last line.
+  const m = r.stdout.match(/https?:\/\/\S+\/pull\/(\d+)/);
+  if (!m) {
+    return { ok: false, error: `could not parse PR number from gh output: ${r.stdout.trim()}` };
+  }
+  return { ok: true, number: Number.parseInt(m[1]!, 10), url: m[0] };
+}
+
+export type LivePrInfo = {
+  number: number;
+  baseRefName: string;
+  state: "OPEN" | "CLOSED" | "MERGED";
+  isDraft: boolean;
+};
+
+/**
+ * Read the live `baseRefName` / `state` for a branch's PR via
+ * `gh pr view`. Used by `wt stack status` to detect drift between the
+ * manifest's intended parent and the PR's actual base. Returns null when
+ * there's no PR (or gh is unavailable).
+ */
+export async function viewPrInfo(branch: string): Promise<LivePrInfo | null> {
+  if (!branch || !(await hasGh())) return null;
+  const r = await run(
+    ["gh", "pr", "view", branch, "--json", "number,baseRefName,state,isDraft"],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  );
+  if (r.exitCode !== 0) return null;
+  try {
+    const d = JSON.parse(r.stdout) as Partial<LivePrInfo>;
+    if (typeof d.number !== "number") return null;
+    // Validate `state` against the known set rather than asserting — gh
+    // could in principle return a value outside the union, and downstream
+    // merge-detection branches on it.
+    const state: LivePrInfo["state"] =
+      d.state === "CLOSED" || d.state === "MERGED" ? d.state : "OPEN";
+    return {
+      number: d.number,
+      baseRefName: typeof d.baseRefName === "string" ? d.baseRefName : "",
+      state,
+      isDraft: d.isDraft === true,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
