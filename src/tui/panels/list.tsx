@@ -584,15 +584,24 @@ function Divider({
   const labelStr = ` ${label} `;
   const padding = Math.max(0, inner - labelStr.length - 2);
   const trail = "─".repeat(padding);
-  // height={1} + wrapMode="none" keep the rule on a single line. Inside
-  // the scrollbox the vertical scrollbar steals a column when the list
-  // overflows, which makes the computed-width trail one cell too wide;
-  // without these it text-wraps to a phantom blank line under the header.
+  // The trail is sized for the full width, but when the list overflows the
+  // vertical scrollbar steals a column, making the row one cell too wide.
+  // Flex layout absorbs that: the `──` prefix is pinned (`flexShrink={0}`),
+  // while the label and trail sit in `overflow="hidden"` boxes that shrink —
+  // so the stolen column clips a `─` off the (much wider) trail, and the
+  // label's `truncate` only ever ellipsises its TAIL, never eating the
+  // leading space after `──`. height={1} + wrapMode="none" keep it one line.
   return (
     <box flexDirection="row" height={1} paddingLeft={1} paddingRight={1}>
-      <text fg={theme.borderDim} wrapMode="none">──</text>
-      <text fg={theme.fgDim} wrapMode="none">{labelStr}</text>
-      <text fg={theme.borderDim} wrapMode="none">{trail}</text>
+      <box flexShrink={0}>
+        <text fg={theme.borderDim} wrapMode="none">──</text>
+      </box>
+      <box flexShrink={1} overflow="hidden">
+        <text fg={theme.fgDim} wrapMode="none" truncate>{labelStr}</text>
+      </box>
+      <box flexShrink={1} overflow="hidden">
+        <text fg={theme.borderDim} wrapMode="none">{trail}</text>
+      </box>
     </box>
   );
 }
@@ -622,7 +631,9 @@ const FoldedSectionHeader = memo(function FoldedSectionHeader({
       paddingRight={1}
       backgroundColor={selected ? theme.rowSelectedBg : undefined}
     >
-      <text fg={theme.accent} wrapMode="none" attributes={attrs}>{`${count} `}</text>
+      <box flexShrink={0}>
+        <text fg={theme.accent} wrapMode="none" attributes={attrs}>{`${count} `}</text>
+      </box>
       <box flexGrow={1} flexShrink={1} overflow="hidden">
         <text fg={labelFg} wrapMode="none" truncate attributes={attrs}>
           {item.label}
