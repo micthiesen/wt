@@ -312,6 +312,10 @@ standalone skills — never as edits to `/start` or `/done`.
       / `replay` / `rebase` subcommands. PR-body block + GitLab + merge-queue
       landing intentionally NOT ported. Verified against git fixtures (squash-drop,
       conflict-bail-with-backup, idempotent no-op).
+- [x] wt: clean (`c`) auto-reconciles the manifest for any cleaned stack slice
+      (`reconcileStack` per affected stack, no replay), plus an
+      `effectiveBaseOrTrunk` backstop so a dangling parent base degrades to trunk
+      instead of throwing a raw rev-parse error. Replay stays explicit `/restack`.
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -478,3 +482,22 @@ Track friction here as the workflow gets used. Candidate adjustments:
   structured base; cross-stack auto-reconcile is the sanctioned future extension.
   Verified the replay against git fixtures: squash-dup drop, clean conflict bail with
   backup, idempotent no-op. /restack skill rewritten for the native model.
+- **2026-06-08** — Auto-reconcile on clean. After merging slice 01 and pressing `c`
+  to clean its worktree, the next slice surfaced a raw `rev-parse`/`unknown revision`
+  error in the detail pane: cleaning deletes the parent branch but never told the
+  manifest, so the child still recorded `base: <deleted-branch>` and every
+  `<base>...HEAD` git call (`syncState`'s `rev-list` via `runOk`, `gitActivity`)
+  threw. Root cause is manifest staleness, not git. Two fixes: (1) `doClean`
+  (`tui/app.tsx`) now resolves each cleaned branch's stackId
+  (`findStackIdByBranch`) and runs `reconcileStack` once per affected stack —
+  manifest-only bookkeeping (mark merged, reparent orphans onto trunk), no
+  rebase/push, so it's safe off a keystroke; the orphan re-roots onto trunk and the
+  error clears. The heavier **replay** (rebasing commits off the squashed parent,
+  force-push) deliberately stays an explicit `/restack`. (2) Backstop:
+  `effectiveBaseOrTrunk(wtPath, base)` in `core/git.ts` rev-parses the base and
+  falls back to `origin/<trunk>` when it doesn't resolve; `syncState`, `gitActivity`,
+  and `buildDiffContext` all route through it, so a dangling parent degrades to a
+  (fat) trunk diff instead of a thrown error during the window before reconcile
+  lands. An external (stack-on-stack) base still resolves, so it's untouched.
+  Verified the fallback against a git fixture. /restack skill noted that clean
+  pre-reconciles.

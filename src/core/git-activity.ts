@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 
-import { config } from "./config.ts";
+import { effectiveBaseOrTrunk } from "./git.ts";
 import { run } from "./proc.ts";
 
 export type GitActivity = {
@@ -71,7 +71,7 @@ export async function gitActivity(
   wt: { path: string; branch: string },
   effectiveBase?: string | null,
 ): Promise<GitActivity> {
-  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  const base = await effectiveBaseOrTrunk(wt.path, effectiveBase);
   const [createdMs, lastCommitMs, diff] = await Promise.all([
     Promise.resolve(createdMsFor(wt.path)),
     lastCommitMsFor(wt.path).catch(() => null),

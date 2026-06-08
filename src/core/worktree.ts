@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { config } from "./config.ts";
-import { git, branchIsGone, branchIsMerged, gitQuiet, gitRun } from "./git.ts";
+import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitRun } from "./git.ts";
 import { lockAge, lockLabel, lockStatus } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 import { latestLogFor } from "./logs.ts";
@@ -106,7 +106,7 @@ export async function syncState(
   wtPath: string,
   effectiveBase?: string | null,
 ): Promise<SyncState> {
-  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  const base = await effectiveBaseOrTrunk(wtPath, effectiveBase);
   const main = await countsFor(wtPath, `${base}...HEAD`);
   const hasUpstream = await runQuiet(
     ["git", "rev-parse", "--abbrev-ref", "@{u}"],

@@ -15,6 +15,7 @@
 import { CryptoHasher } from "bun";
 
 import { config } from "../config.ts";
+import { effectiveBaseOrTrunk } from "../git.ts";
 import { run } from "../proc.ts";
 
 import { fitParts, formatCompaction, type ModeCounts } from "./fit.ts";
@@ -89,7 +90,7 @@ export async function buildDiffContext(
   signal?: AbortSignal,
 ): Promise<DiffContext | null> {
   if (!config.ai) return null;
-  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  const base = await effectiveBaseOrTrunk(wtPath, effectiveBase);
 
   // Short-circuit between awaits when the caller has cancelled. Without
   // these checks the post-stat git invocations still spawn just to be

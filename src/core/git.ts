@@ -16,6 +16,31 @@ export async function gitRun(
   return run(["git", ...args], { cwd: cwd ?? config.paths.mainClone });
 }
 
+/**
+ * Resolve the effective diff/sync base for a worktree, guarding against a
+ * dead parent ref. A stacked slice diffs/syncs against its parent branch;
+ * once that parent merges and its worktree is cleaned (branch deleted), the
+ * recorded base no longer resolves and every `<base>...HEAD` git call errors
+ * out (e.g. `git rev-list` via `runOk` throws a raw `fatal: bad revision`).
+ * Fall back to trunk so the row degrades to a (fat) trunk diff instead of
+ * surfacing that error. `reconcileStack` is the real fix — it reparents the
+ * orphan onto trunk in the manifest — so this only covers the window before
+ * reconcile runs (or if the PR-merged probe hasn't landed yet). An external
+ * base (stack-on-stack) still resolves, so it's left untouched.
+ */
+export async function effectiveBaseOrTrunk(
+  wtPath: string,
+  effectiveBase?: string | null,
+): Promise<string> {
+  const trunk = `origin/${config.branch.base}`;
+  if (!effectiveBase || effectiveBase === trunk) return trunk;
+  const resolves = await gitQuiet(
+    ["rev-parse", "--verify", "--quiet", `${effectiveBase}^{commit}`],
+    wtPath,
+  );
+  return resolves ? effectiveBase : trunk;
+}
+
 export async function branchExists(branch: string): Promise<boolean> {
   if (await gitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]))
     return true;

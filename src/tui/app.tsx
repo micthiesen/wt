@@ -44,6 +44,8 @@ import {
 } from "../core/harness/harness-tail.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
+import { reconcileStack } from "../core/stack-ops.ts";
+import { findStackIdByBranch } from "../core/wtstate.ts";
 import {
   type LiveSessionDesc,
   sessionTailRegistry,
@@ -1748,7 +1750,43 @@ export function App({ onExit }: Props) {
       });
       createLogger(row.wt.slug).event.info("dispatched destroy (clean)");
     }
+    // Cleaning a merged stack slice orphans its children: their recorded
+    // base is the branch we just deleted, so the list would diff/sync
+    // against a dead ref and surface a raw rev-parse error. Reconcile the
+    // affected manifests now — pure bookkeeping (mark merged, reparent the
+    // orphans onto trunk), no rebase/push — so the children re-root and the
+    // error clears. The actual replay (rebasing commits off the squashed
+    // parent) stays an explicit `/restack`.
+    void reconcileCleanedStacks(candidates.map((r) => r.wt.branch));
     setTimeout(() => void refreshAll(), 600);
+  }
+
+  /**
+   * Manifest-only reconcile of every stack a just-cleaned branch belonged
+   * to. Local + idempotent (no git history rewrite, no force-push), so it's
+   * safe to run automatically off the `c` keystroke; it probes live PR
+   * state to mark merged slices and reparents their orphaned children onto
+   * trunk. Best-effort: a failure logs and leaves the manifest as-is for an
+   * explicit `/restack` to repair.
+   */
+  async function reconcileCleanedStacks(branches: readonly string[]): Promise<void> {
+    const stackIds = new Set<string>();
+    for (const branch of branches) {
+      const id = findStackIdByBranch(branch);
+      if (id) stackIds.add(id);
+    }
+    if (stackIds.size === 0) return;
+    for (const stackId of stackIds) {
+      try {
+        await reconcileStack(stackId, config.branch.base, (line) =>
+          appLog.event.dim(`reconcile ${stackId}: ${line}`),
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        appLog.event.warn(`reconcile ${stackId} failed: ${msg}`);
+      }
+    }
+    void refreshAll();
   }
 
   /**
