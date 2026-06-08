@@ -30,7 +30,8 @@ subcommands:
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
   status [stackId]           render the manifest DAG + drift vs reality
   split <stackId> <sliceId> --from <frag>   reshape: replace an open slice with N
-                             sub-slices (re-threads descendants); then apply + replay
+                             sub-slices (re-threads descendants). Manifest only;
+                             prints the apply/replay/retire next steps (or --apply)
   reconcile [stackId]        manifest bookkeeping only: mark merged PRs, reparent children
   replay [stackId]           squash-safe replay each slice onto its parent (+ retarget PRs)
   rebase [stackId]           reconcile then replay (the one-shot /restack does)
@@ -42,6 +43,7 @@ apply options:
 split options:
   --from <file>              fragment JSON: array of { id, title, branch, files[] } sub-slices
   --plan                     preview the reshape without writing
+  --apply                    chain reshape → apply → replay (still prints the PR-retire step)
 status options:
   --json                     machine-readable output
 reconcile/replay/rebase options:
@@ -458,9 +460,11 @@ async function runSplit(argv: string[]): Promise<number> {
   let sliceId: string | undefined;
   let from: string | undefined;
   let plan = false;
+  let apply = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--plan") plan = true;
+    else if (a === "--apply") apply = true;
     else if (a === "--from") {
       from = argv[++i];
       if (!from) {
@@ -476,6 +480,10 @@ async function runSplit(argv: string[]): Promise<number> {
       console.error(red(`unexpected arg: ${a}`));
       return 2;
     }
+  }
+  if (plan && apply) {
+    console.error(red("--plan and --apply are mutually exclusive"));
+    return 2;
   }
   if (!stackId || !sliceId || !from) {
     console.error(red("usage: wt stack split <stackId> <sliceId> --from <fragment.json> [--plan]"));
@@ -503,13 +511,53 @@ async function runSplit(argv: string[]): Promise<number> {
     console.log(dim("(--plan: nothing written)"));
     return 0;
   }
+
   const retire = res.supersededPr
     ? `gh pr close ${res.supersededPr} --delete-branch --comment "superseded by re-split"`
     : `git push origin --delete ${res.supersededBranch}`;
-  console.log(`\n${bold("next:")}`);
-  console.log(`  1. wt stack apply ${stackId}     ${dim(`# materialize new sub-slices from ${res.sourceBranch}`)}`);
-  console.log(`  2. wt stack replay ${stackId}    ${dim("# rebase + retarget the re-threaded descendants")}`);
-  console.log(`  3. ${retire}  ${dim("# retire the split slice (after step 1)")}`);
+
+  // The split changed the slice SET, so every re-threaded descendant's PR body
+  // still lists the OLD set (the now-superseded PR, none of the new sub-slices).
+  // wt never authors PR bodies (that's `/split`'s job), so flag which bodies
+  // are now stale rather than silently leaving them wrong.
+  const staleBodies = [...res.newSliceIds.map((id) => `${id} (new)`), ...res.rethreadedChildren];
+  if (staleBodies.length > 0) {
+    console.log(
+      yellow(`\n⚠ stale PR stack-sections — regenerate the bodies for: ${staleBodies.join(", ")}`),
+    );
+    console.log(dim("  (the slice set changed; descendant + new-slice stack sections list the old set)"));
+  }
+
+  if (!apply) {
+    console.log(`\n${bold("next:")}`);
+    console.log(`  1. wt stack apply ${stackId}     ${dim(`# materialize new sub-slices from ${res.sourceBranch}`)}`);
+    console.log(`  2. wt stack replay ${stackId}    ${dim("# rebase + retarget the re-threaded descendants")}`);
+    console.log(`  3. ${retire}  ${dim("# retire the split slice (after step 1)")}`);
+    return 0;
+  }
+
+  // --apply: chain the mechanical happy-path (reshape → materialize → replay).
+  // PR retirement stays an explicit printed step — it closes a PR + deletes a
+  // branch, which wt won't do behind the user's back.
+  console.log(`\n${bold("apply:")} materializing new sub-slices from ${res.sourceBranch}`);
+  const applied = await applyStack(stackId, { install: false }, logLine);
+  if (applied.error) {
+    console.error(red(applied.error));
+    if (applied.materialized.length > 0) {
+      console.error(dim(`(materialized before failure: ${applied.materialized.join(", ")})`));
+    }
+    return 1;
+  }
+  console.log(
+    green(`✓ applied ${bold(stackId)} · ${applied.materialized.length} materialized, ${applied.skipped.length} skipped`),
+  );
+
+  console.log(`\n${bold("replay:")} rebasing re-threaded descendants onto the new tip`);
+  const replayed = await replayStack(stackId, {}, logLine);
+  const rc = reportReplayResult(stackId, "replayed", replayed);
+  if (rc !== 0) return rc;
+
+  console.log(`\n${bold("retire:")} ${retire}  ${dim("# close the superseded PR when ready")}`);
   return 0;
 }
 

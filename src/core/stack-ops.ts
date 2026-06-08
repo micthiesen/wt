@@ -284,14 +284,27 @@ export async function applyStack(
   }
 
   // Archive the holistic branch as a tag so the origin node survives the
-  // user rm'ing its worktree. `-f` so re-apply re-points cleanly.
+  // user rm'ing its worktree. `-f` so re-apply re-points cleanly. On a
+  // re-apply (e.g. `wt stack split` → `apply`) the holistic branch has usually
+  // already been archived to its tag and deleted — the tag still anchors the
+  // origin node, so skip silently instead of warning on an unresolvable ref.
   const tagName = `${stackId}-holistic`;
-  const tag = await gitRun(["tag", "-f", tagName, manifest.holisticBranch]);
-  if (tag.exitCode === 0) {
-    patchStackManifest(stackId, { archivedTag: `refs/tags/${tagName}` });
-    onLog(`tagged holistic branch → refs/tags/${tagName}`);
-  } else {
-    onLog(`warn: could not tag holistic branch: ${tag.stderr.trim()}`);
+  const holisticResolves = await gitQuiet([
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `${manifest.holisticBranch}^{commit}`,
+  ]);
+  if (holisticResolves) {
+    const tag = await gitRun(["tag", "-f", tagName, manifest.holisticBranch]);
+    if (tag.exitCode === 0) {
+      patchStackManifest(stackId, { archivedTag: `refs/tags/${tagName}` });
+      onLog(`tagged holistic branch → refs/tags/${tagName}`);
+    } else {
+      onLog(`warn: could not tag holistic branch: ${tag.stderr.trim()}`);
+    }
+  } else if (!manifest.archivedTag) {
+    onLog(`warn: holistic branch ${manifest.holisticBranch} not found and no archived tag to anchor the origin node`);
   }
 
   log.info("applied stack", { stackId, materialized, skipped });
@@ -560,8 +573,21 @@ async function firstSha(cwd: string, refs: string[]): Promise<string | null> {
 
 /**
  * The parent-tip SHA a slice currently sits on (the `rebase --onto` anchor):
- * the stored `baseSha` when present, else the merge-base of the slice and its
- * current parent ref — computed before any replay so siblings haven't moved.
+ * the stored `baseSha` when it's still honest, else the merge-base of the slice
+ * and its current parent ref — computed before any replay so siblings haven't moved.
+ *
+ * The stored `baseSha` is the squash-safe cut point (the parent tip this
+ * slice's commits were last based on) and is trusted ONLY while it's still an
+ * ancestor of the branch. A conflict bail hands resolution to a human, who
+ * rebases the slice by hand and force-pushes WITHOUT updating the manifest — so
+ * the stored anchor now points at a tip the branch no longer descends from.
+ * Replaying off that stale anchor re-applies the parent's already-present
+ * commits onto themselves, a bogus conflict on an already-correct slice (this
+ * bit the eng-5182 restack + re-split twice). When the anchor is stale, fall
+ * back to the live merge-base with the current parent, which post-rebase is
+ * exactly the parent tip the slice now sits on — self-healing, no manual
+ * bookkeeping. (The healthy squash case keeps `baseSha`: it's still an ancestor
+ * of the unrewritten child, so a squash-merged parent's commits stay excluded.)
  */
 async function resolveAnchor(
   slice: StackSlice,
@@ -569,7 +595,13 @@ async function resolveAnchor(
   trunk: string,
   cwd: string,
 ): Promise<string | null> {
-  if (slice.baseSha) return slice.baseSha;
+  if (slice.baseSha) {
+    const stillAncestor = await gitQuiet(
+      ["merge-base", "--is-ancestor", slice.baseSha, slice.branch],
+      cwd,
+    );
+    if (stillAncestor) return slice.baseSha;
+  }
   const parentRef = currentParentRef(slice, byId, trunk);
   const r = await gitRun(["merge-base", slice.branch, parentRef], cwd);
   const sha = r.stdout.trim();

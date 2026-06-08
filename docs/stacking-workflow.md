@@ -340,6 +340,24 @@ standalone skills — never as edits to `/start` or `/done`.
       holistic branch predates); `applyStack` materializes from `slice.source ??
       holisticBranch`. Then `apply` (incremental) + `replay`/`R` (rebase descendants) +
       close the superseded PR/branch. Closes the "edit the middle of the graph" gap.
+- [x] wt: **replay stale-anchor self-heal** (eng-5182-04 re-split post-mortem). The
+      headline friction across the restack + re-split: `resolveAnchor` trusted the stored
+      `StackSlice.baseSha` unconditionally, so after a conflict bail + manual `git rebase
+      --onto` + force-push (which never updates the manifest), the next `replay` cut from
+      the stale anchor and re-applied the parent's already-present commits → a bogus
+      conflict on an already-correct slice. Now `baseSha` is trusted only while it's still
+      an ancestor of the branch (`merge-base --is-ancestor`); when the branch was rebased
+      off it, replay falls back to the live merge-base with the current parent. Squash
+      case unchanged. No new command, no manual bookkeeping. `/restack` step 5 notes
+      re-running replay is now safe after a hand-resolve.
+- [x] wt: **`wt stack split --apply`** + honest help. `split` is manifest-only; the help
+      wrongly implied it ran apply+replay. Fixed the text and added opt-in `--apply` that
+      chains reshape → apply → replay (PR retirement stays an explicit printed step).
+      `split` also now WARNS which descendant + new-slice PR stack-sections went stale
+      (the slice set changed); `/split` regenerates them. Plus silenced the spurious
+      "could not tag holistic branch … Failed to resolve" warning on a re-split re-apply
+      (only tags when the holistic branch resolves; the archived tag already anchors the
+      origin node).
 - [ ] wt: **cross-stack auto-reconcile**. `reconcileStack` only sees slices within
       its own manifest, so when an external parent (another stack's tip) merges +
       is cleaned, the child stack's root keeps a dead `base` and `replay` fails to
@@ -376,7 +394,12 @@ Track friction here as the workflow gets used. Candidate adjustments:
   engine doesn't write a nav block at all, so `/split` stays the sole author of PR
   bodies. (The old `stack sync` rewrote every body between `<!-- stack:links:start
   -->`…`<!-- stack:links:end -->`, which Michael disliked and there was no flag to
-  disable.)
+  disable.) Refinement (2026-06-08, re-split post-mortem): the "section never needs
+  updating, GitHub renders status live" property holds only while the slice *set* is
+  fixed. A mid-stack re-split changes the set (adds sub-slice PRs, supersedes one), so
+  descendant + new-slice sections go stale. wt won't author bodies, so `split` *flags*
+  the stale ones and `/split` regenerates them — the seam stays "wt detects, skill
+  writes," consistent with the locked decision.
 - **Stack-on-stack / polymorphic `base`.** DECIDED (2026-06-08): keep `base` a
   **string** — trunk name, sibling slice id, or an external branch (another stack's
   tip, or an unmerged parent PR). A "stack on a stack" is just a slice whose base is
@@ -592,3 +615,28 @@ Track friction here as the workflow gets used. Candidate adjustments:
   the merged-slice / <2-sub-slice / unknown-slice guards. `/split` skill gained a
   "Re-splitting a live slice (mid-stack)" section. Insert/drop a mid-stack slice are
   the natural siblings, not built yet.
+- **2026-06-08** — Post-mortem on the eng-5182-04 re-split (it worked, but with
+  friction; reviewed the dogfood session via `/history`). Four fixes:
+  (1) **Replay stale-anchor self-heal** — the headline bug, which bit the eng-5182
+  restack AND the re-split. `resolveAnchor` trusted the stored `baseSha`
+  unconditionally; after a conflict bail + manual `git rebase --onto` + force-push
+  (which never updates the manifest), the next `replay` cut from the stale anchor and
+  re-applied the parent's already-present commits → a bogus conflict on an
+  already-correct slice. Fix: trust `baseSha` only while it's still an ancestor of the
+  branch (`git merge-base --is-ancestor`); when stale, fall back to the live merge-base
+  with the current parent (post-rebase, exactly the tip the slice now sits on). The
+  healthy squash case is unchanged (the unrewritten child still descends from `baseSha`,
+  so the squash-merged parent's commits stay excluded). Self-healing, no new command, no
+  manual bookkeeping. (2) **`wt stack split --apply`** — the `--help` implied split did
+  "apply + replay" but it only reshaped the manifest and printed next steps. Fixed the
+  text AND added an opt-in `--apply` that chains reshape → apply → replay; PR retirement
+  stays an explicit printed step (it closes a PR + deletes a branch). (3) **Stale
+  PR-section flag** — a re-split changes the slice *set*, so re-threaded descendants'
+  (and the new sub-slices') stack sections list the superseded PR and omit the new ones.
+  wt doesn't author PR bodies (locked decision), so it now WARNS with the exact list;
+  `/split`'s re-split section gained a "regenerate the stale stack sections" step. (4)
+  **Silenced a spurious apply warning** — re-apply (split → apply) tried to re-tag a
+  holistic branch already archived to its tag + deleted, emitting "could not tag …
+  Failed to resolve"; now it only tags when the branch resolves and stays quiet when the
+  archived tag already anchors the origin node. `/restack` step 5 updated to note replay
+  self-heals after a manual resolve.
