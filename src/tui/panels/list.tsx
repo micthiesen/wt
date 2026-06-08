@@ -101,13 +101,36 @@ const STACK_CONNECTOR: Record<SpinePos, string> = {
 };
 
 /**
+ * Glyph for the holistic-origin row pinned at the bottom of a stack: a
+ * hollow diamond (the slices are solid ◆) signalling "the whole this
+ * stack was carved from", kept around until it's `wt rm`'d post-split.
+ */
+const HOLISTIC_GLYPH = "◇";
+
+/**
  * Left gutter for a managed-stack row, repurposing the status-marker
  * slot: a 1-cell tree connector (structural, dim) followed by the 2-cell
  * stack ordinal colored by the slice's worktree status (so dirty/merged/
- * busy still read at a glance without a separate status glyph).
+ * busy still read at a glance without a separate status glyph). The
+ * holistic-origin row carries no ordinal — just the distinct dim glyph.
  */
 function StackGutter({ row }: { row: WorktreeRow }) {
   const info = row.stack!;
+  if (info.isHolistic) {
+    return (
+      <box flexShrink={0} flexDirection="row">
+        <box width={2} flexShrink={0}>
+          <text> </text>
+        </box>
+        <box width={1} flexShrink={0}>
+          <text fg={theme.fgDim}>{HOLISTIC_GLYPH}</text>
+        </box>
+        <box width={1} flexShrink={0}>
+          <text> </text>
+        </box>
+      </box>
+    );
+  }
   const ordFg = row.archived ? theme.fgDim : statusBadge(row.status).fg;
   const ord = String(info.ordinal).padStart(2, "0").slice(0, 2);
   return (
@@ -136,6 +159,10 @@ function StackGutter({ row }: { row: WorktreeRow }) {
  * LLM emits lowercase.
  */
 function rowLabel(row: WorktreeRow): string {
+  // The holistic origin's title is the feature title — already on the
+  // section header — so showing it again is noise. Label it for what it
+  // is instead; the dim glyph + text mark it as the carved-from source.
+  if (row.stack?.isHolistic) return "holistic source";
   const text = capitalizeFirst(row.brief ?? row.title);
   // Inside a stack section the issue ID is on the section header, so the
   // row drops the redundant `<id>: ` prefix and shows just the slice.
@@ -275,9 +302,11 @@ const RowView = memo(function RowView({
   panelWidth: number;
 }) {
   const bg = selected ? theme.rowSelectedBg : undefined;
-  // Archived rows render dim (unless selected, where we still want
-  // contrast). Badges also render dim so the eye skips over them.
-  const slugFg = row.archived
+  // Archived rows and the holistic-origin row render dim (unless selected,
+  // where we still want contrast). The holistic row is a kept-around
+  // source, not active work, so it recedes the same way archived does.
+  const dimRow = row.archived || (row.stack?.isHolistic ?? false);
+  const slugFg = dimRow
     ? selected
       ? theme.fg
       : theme.fgDim
@@ -503,38 +532,21 @@ const ReviewRequestRowView = memo(function ReviewRequestRowView({
 });
 
 /**
- * Section divider. The `stack` variant signals an auto-managed
- * stack section: double-line rule chars with `╔═ … ═╗` corner
- * brackets in the accentAlt color, so the section reads as an
- * enclosed structural block rather than a plain rule.
+ * Section divider. One style for every section — manual sections and
+ * auto-managed stack sections render identically (muted rule + label);
+ * the stack's tree spine on its rows is what marks it as a stack, not
+ * the header.
  */
 function Divider({
   label,
   width,
-  variant = "manual",
 }: {
   label: string;
   width: number;
-  variant?: "manual" | "stack";
 }) {
   // Leave room for padding (border+paddingLeft+paddingRight roughly 4
   // cells) so the rule doesn't bleed past the panel edge.
   const inner = Math.max(0, width - 4);
-  if (variant === "stack") {
-    // Layout: `══` + ` label ` + `═══…═`. Same shape as the manual
-    // divider but with double-line rule chars in accentAlt.
-    const labelStr = ` ${label} `;
-    const overhead = 2 + labelStr.length;
-    const trailLen = Math.max(0, inner - overhead);
-    const trail = "═".repeat(trailLen);
-    return (
-      <box flexDirection="row" height={1} paddingLeft={1} paddingRight={1}>
-        <text fg={theme.accentAlt} wrapMode="none">══</text>
-        <text fg={theme.fg} wrapMode="none">{labelStr}</text>
-        <text fg={theme.accentAlt} wrapMode="none">{trail}</text>
-      </box>
-    );
-  }
   const labelStr = ` ${label} `;
   const padding = Math.max(0, inner - labelStr.length - 2);
   const trail = "─".repeat(padding);
@@ -641,8 +653,16 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
             const prev = i > 0 ? activeRows[i - 1] : undefined;
             const sectionChanged = (prev?.section ?? null) !== row.section;
             const showDivider = sectionChanged && row.section !== null;
+            // A stack section is pinned to the top; the unsectioned inbox
+            // that follows it gets no divider of its own, so the rows would
+            // bunch right under the stack. Insert a blank line to break them
+            // off. (A following *manual* section already gets the divider's
+            // leading blank, so this only fires for the inbox case.)
+            const leavingStackToInbox =
+              (prev?.sectionIsStack ?? false) && !row.sectionIsStack && !showDivider;
             return (
               <Fragment key={row.wt.slug}>
+                {leavingStackToInbox ? <box height={1} flexShrink={0} /> : null}
                 {showDivider ? (
                   <>
                     <box height={1} flexShrink={0} />
@@ -653,7 +673,6 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                           : row.section!
                       }
                       width={width}
-                      variant={row.sectionIsStack ? "stack" : "manual"}
                     />
                   </>
                 ) : null}

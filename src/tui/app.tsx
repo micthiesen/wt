@@ -780,6 +780,10 @@ export function App({ onExit }: Props) {
     const byName = new Map<string, StackMember[]>();
     for (const r of rows) {
       if (!r.sectionIsStack || r.section === null) continue;
+      // The holistic origin's brief is the whole-feature title; it would
+      // bias the section title toward describing the feature rather than
+      // the slices, so it never joins the prompt.
+      if (r.stack?.isHolistic) continue;
       // A detached HEAD wouldn't legitimately be part of a stack
       // (stacks walk branch-parent chains), but the type allows it.
       // Skipping keeps the signature stable and the prompt clean.
@@ -829,14 +833,8 @@ export function App({ onExit }: Props) {
     const m = new Map<string, string>();
     for (const man of Object.values(wtStateForStacks.data?.stacks ?? {})) {
       const key = stackSectionKey(man.stackId);
-      const open = man.slices.filter((s) => s.status === "open").length;
-      const merged = man.slices.filter((s) => s.status === "merged").length;
-      const counts: string[] = [];
-      if (open > 0) counts.push(`${open} open`);
-      if (merged > 0) counts.push(`${merged} merged`);
       const title = aiByKey.get(key);
-      const head = title ? `${man.issue} · ${title}` : man.issue;
-      m.set(key, counts.length > 0 ? `${head}  ·  ${counts.join(" · ")}` : head);
+      m.set(key, title ? `${man.issue} · ${title}` : man.issue);
     }
     return m;
   }, [wtStateForStacks.data, stackSectionEntries, stackTitleResults]);
