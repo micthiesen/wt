@@ -316,6 +316,12 @@ standalone skills — never as edits to `/start` or `/done`.
       (`reconcileStack` per affected stack, no replay), plus an
       `effectiveBaseOrTrunk` backstop so a dangling parent base degrades to trunk
       instead of throwing a raw rev-parse error. Replay stays explicit `/restack`.
+- [x] wt: `R` keybind — algorithmic fast-path restack. Resolves the selected
+      worktree's stack and runs the whole stack through `rebaseStack` (fetch +
+      reconcile + squash-safe replay), streaming progress to the activity pane, no
+      model input. Clean → done; conflict bail → stops and points at `/restack`.
+      Whole-stack (the worktree only selects which stack); already-based slices are
+      no-ops.
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -501,3 +507,15 @@ Track friction here as the workflow gets used. Candidate adjustments:
   lands. An external (stack-on-stack) base still resolves, so it's untouched.
   Verified the fallback against a git fixture. /restack skill noted that clean
   pre-reconciles.
+- **2026-06-08** — Added the `R` keybind: the algorithmic fast-path restack. It
+  resolves the selected worktree's stack (`findStackIdByBranch`) and runs the whole
+  stack through `rebaseStack` (fetch → reconcile → squash-safe replay), streaming
+  `onLog` to the activity pane — zero model tokens on the clean path. On a conflict
+  bail it stops and toasts `conflict on <slice> — run /restack`, leaving the engine's
+  backup branch in place; `/restack` stays the escalation path that owns conflict
+  judgment. Whole-stack by design: restack is a coherence operation and the worktree
+  only selects *which* stack; already-based slices are cheap no-ops (anchor ===
+  newBase skip), so there's no need for a partial "from here down" mode. A
+  `restackBusyRef` guards UI re-entry (the engine flock is the real lock). Realized
+  the fast path already existed as `wt stack rebase` — this just gives it a
+  first-class TUI surface so the 90% clean case never touches a model.

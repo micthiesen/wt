@@ -44,7 +44,7 @@ import {
 } from "../core/harness/harness-tail.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
-import { reconcileStack } from "../core/stack-ops.ts";
+import { rebaseStack, reconcileStack } from "../core/stack-ops.ts";
 import { findStackIdByBranch } from "../core/wtstate.ts";
 import {
   type LiveSessionDesc,
@@ -696,6 +696,10 @@ export function App({ onExit }: Props) {
   // top of the list.
   const [sel, setSel] = useState<string | null>(null);
   const lastIndexRef = useRef(0);
+  // Guards the `R` replay-stack action against re-entry while a rebase is
+  // in flight (the engine flock is the real lock; this just avoids spamming
+  // it from the UI). Reset in `doReplayStack`'s finally.
+  const restackBusyRef = useRef(false);
   // Inner scrollbox of the details pane (worktree or review-request
   // body, whichever is mounted). PageUp/PageDown page it from the
   // global key handler so tall panes that overflow the viewport stay
@@ -1786,6 +1790,63 @@ export function App({ onExit }: Props) {
         appLog.event.warn(`reconcile ${stackId} failed: ${msg}`);
       }
     }
+    void refreshAll();
+  }
+
+  /**
+   * `R` — the algorithmic fast path for restacking. Resolves the stack the
+   * selected worktree belongs to (its branch → `findStackIdByBranch`) and
+   * runs the whole stack through `rebaseStack`: fetch, reconcile, then
+   * squash-safe replay of every slice onto its parent (already-based slices
+   * are cheap no-ops). No model input — it streams progress to the activity
+   * pane. On a clean conflict bail it stops and points at `/restack`, which
+   * owns the judgment the engine can't do. Whole-stack on purpose: restack is
+   * a coherence operation, and the worktree only selects *which* stack.
+   */
+  async function doReplayStack(): Promise<void> {
+    if (!current?.wt.branch) {
+      toast("select a stack slice first", theme.warn, 2000);
+      return;
+    }
+    const stackId = findStackIdByBranch(current.wt.branch);
+    if (!stackId) {
+      toast("not a stack slice", theme.warn, 2000);
+      return;
+    }
+    if (restackBusyRef.current) {
+      toast("restack already running", theme.warn, 2000);
+      return;
+    }
+    restackBusyRef.current = true;
+    appLog.event.info(`restack ${stackId}: fetch + reconcile + replay`);
+    try {
+      const res = await rebaseStack(stackId, {}, (line) =>
+        appLog.event.dim(`restack ${stackId}: ${line}`),
+      );
+      if (res.ok) {
+        appLog.event.ok(`restacked ${stackId}: ${res.output}`);
+        toast(`restacked ${stackId}`, theme.ok, 2500);
+      } else if (res.conflict) {
+        const where = res.failedBranch ? ` on ${res.failedBranch}` : "";
+        const backup = res.backupBranch ? ` (backup ${res.backupBranch})` : "";
+        appLog.event.warn(
+          `restack ${stackId}: conflict${where}${backup} — run /restack to resolve`,
+        );
+        toast(`conflict${where} — run /restack`, theme.warn, 6000);
+      } else {
+        appLog.event.err(`restack ${stackId} failed: ${res.error}`);
+        toast(`restack failed: ${res.error}`, theme.err, 6000);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      appLog.event.err(`restack ${stackId} crashed: ${msg}`);
+      toast(`restack crashed: ${msg}`, theme.err, 6000);
+    } finally {
+      restackBusyRef.current = false;
+    }
+    // PR bases shift when slices move, so refresh the github query (keyed by
+    // branch list, not slug) alongside the worktree state.
+    void refreshGithub();
     void refreshAll();
   }
 
@@ -3704,6 +3765,12 @@ export function App({ onExit }: Props) {
     if (k.sequence === "r") {
       appLog.event.dim("refresh");
       void refreshAll();
+      return;
+    }
+    // `R` — restack the stack the selected worktree belongs to (whole stack,
+    // algorithmic; escalates to /restack only on a conflict bail).
+    if (k.sequence === "R") {
+      void doReplayStack();
       return;
     }
     // Ctrl+R: clear all caches. Moved off bare R when R lost its

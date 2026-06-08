@@ -73,6 +73,7 @@ const SECTIONS: Section[] = [
       ["N", "new worktree · base = selected"],
       ["c", "clean merged/gone"],
       ["r", "refresh (fetch + recompute)"],
+      ["R", "restack this stack (replay; /restack on conflict)"],
       ["^R", "clear all cached data"],
       [",", "enter wt source session · F12 to detach"],
       [".", "enter main repo session · F12 to detach"],
