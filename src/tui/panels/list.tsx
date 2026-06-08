@@ -7,7 +7,7 @@
  * Anything new that should read consistently across both panels
  * belongs in `badges.ts` first, not here.
  */
-import { Fragment, memo, useEffect, useRef } from "react";
+import { Fragment, memo, useEffect, useRef, type RefObject } from "react";
 import { TextAttributes } from "@opentui/core";
 import type { ScrollBoxRenderable } from "@opentui/core";
 
@@ -34,8 +34,43 @@ import type { SpinePos } from "../../core/stack-layout.ts";
 import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
+/**
+ * One entry in the ACTIVE portion of the list. Either a worktree row, or a
+ * folded section collapsed to a single selectable header line. The parent
+ * (`app.tsx`) builds this so the cursor model and the render share one source
+ * of truth — a folded section is one cursor stop, not N hidden rows.
+ */
+export type ListActiveItem =
+  | { kind: "wt"; row: WorktreeRow }
+  | {
+      kind: "section";
+      /** Synthetic section key (`stackSectionKey(stackId)` or a manual name). */
+      sectionKey: string;
+      isStack: boolean;
+      /** Resolved header label (stack: issue + AI title; manual: the name). */
+      label: string;
+      /** The collapsed member rows (for the count + the detail-pane summary). */
+      rows: WorktreeRow[];
+    };
+
+/**
+ * Imperative scroll control the parent's j/k handler calls when the cursor is
+ * already at the first/last item — scroll the whole pane to the very top/bottom
+ * so trailing blank space + the review/archived headers below the last row
+ * become reachable (the cursor can't land on them).
+ */
+export type ListScrollHandle = { toEdge: (dir: "top" | "bottom") => void };
+
 type Props = {
-  rows: WorktreeRow[];
+  /**
+   * Active worktrees + folded section headers, in render order. Folded
+   * sections appear as one `section` item; expanded ones as their `wt` rows.
+   */
+  items: readonly ListActiveItem[];
+  /** Populated with the pane's scroll-to-edge control (see `ListScrollHandle`). */
+  scrollHandle?: RefObject<ListScrollHandle | null>;
+  /** The archived block (never folded). */
+  archivedRows: readonly WorktreeRow[];
   /**
    * PRs the user has been asked to review. Pinned in their own section
    * between the active worktrees and the archived block. Not worktrees
@@ -44,10 +79,9 @@ type Props = {
    */
   reviewRequests: readonly ReviewRequestPr[];
   /**
-   * Combined cursor index across `activeRows + reviewRequests +
-   * archivedRows` in render order. Parent owns the unification so
-   * navigation handlers can pick the right item type by index without
-   * the list panel re-implementing the ordering.
+   * Combined cursor index across `items + reviewRequests + archivedRows` in
+   * render order. Parent owns the unification so navigation handlers can pick
+   * the right item type by index without the list panel re-implementing it.
    */
   selectedIndex: number;
   width: number;
@@ -563,36 +597,85 @@ function Divider({
   );
 }
 
-export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activeTails, activeActions, activeSessionBySlug, stackSectionLabels, isLoading }: Props) {
-  const firstArchivedIndex = rows.findIndex((r) => r.archived);
-  const hasArchived = firstArchivedIndex !== -1;
-  const activeRows = hasArchived ? rows.slice(0, firstArchivedIndex) : rows;
-  const archivedRows = hasArchived ? rows.slice(firstArchivedIndex) : [];
+/**
+ * A folded section, collapsed to one selectable header line: a `[×NN]` chip
+ * with the hidden-worktree count, then the section label which truncates to a
+ * native ellipsis. Highlights like a row when selected; the right detail pane
+ * renders the stack/section summary while this is the cursor (TAB to expand).
+ */
+const FoldedSectionHeader = memo(function FoldedSectionHeader({
+  item,
+  selected,
+}: {
+  item: Extract<ListActiveItem, { kind: "section" }>;
+  selected: boolean;
+}) {
+  const count = `[×${String(item.rows.length).padStart(2, "0")}]`;
+  const labelFg = selected ? theme.fgBright : theme.fgDim;
+  const attrs = selected ? TextAttributes.BOLD : 0;
+  return (
+    <box
+      id={`section:${item.sectionKey}`}
+      flexDirection="row"
+      height={1}
+      paddingLeft={1}
+      paddingRight={1}
+      backgroundColor={selected ? theme.rowSelectedBg : undefined}
+    >
+      <text fg={theme.accent} wrapMode="none" attributes={attrs}>{`${count} `}</text>
+      <box flexGrow={1} flexShrink={1} overflow="hidden">
+        <text fg={labelFg} wrapMode="none" truncate attributes={attrs}>
+          {item.label}
+        </text>
+      </box>
+    </box>
+  );
+});
+
+export function WorktreeList({ items, archivedRows, reviewRequests, selectedIndex, width, activeTails, activeActions, activeSessionBySlug, stackSectionLabels, isLoading, scrollHandle }: Props) {
+  const hasArchived = archivedRows.length > 0;
   const hasReviewRequests = reviewRequests.length > 0;
-  // Index offsets into the combined cursor space owned by the parent.
-  const reviewOffset = activeRows.length;
+  const hasActive = items.length > 0;
+  // Index offsets into the combined cursor space owned by the parent
+  // (`items + reviewRequests + archivedRows`).
+  const reviewOffset = items.length;
   const archivedOffset = reviewOffset + reviewRequests.length;
-  // Keep the selected row scrolled into view. The whole list (active +
+  // Keep the selected entry scrolled into view. The whole list (active +
   // review-requests + archived) lives in one scrollbox, so the follow
-  // covers every row. scrollChildIntoView is a no-op when the row is
-  // already visible. Child ids: the worktree slug for active/archived
-  // rows, the PR url for review-request rows.
+  // covers every entry. scrollChildIntoView is a no-op when it's already
+  // visible. Child ids: a worktree slug, `section:<key>` for a folded
+  // header, or the PR url for review-request rows.
   const listRef = useRef<ScrollBoxRenderable>(null);
   const listScrollRef = useScrollbarNoFlash(listRef);
+  // Expose scroll-to-edge to the parent's j/k handler. A large `scrollBy`
+  // clamps at the content edge, so this reveals trailing blank space / the
+  // review + archived headers that sit below the last selectable item.
+  useEffect(() => {
+    if (!scrollHandle) return;
+    scrollHandle.current = {
+      toEdge: (dir) => listRef.current?.scrollBy(dir === "bottom" ? 9999 : -9999, "viewport"),
+    };
+    return () => {
+      if (scrollHandle) scrollHandle.current = null;
+    };
+  }, [scrollHandle]);
+  const selItem = selectedIndex < reviewOffset ? items[selectedIndex] : undefined;
   const selectedChildId =
-    selectedIndex < reviewOffset
-      ? activeRows[selectedIndex]?.wt.slug
+    selItem !== undefined
+      ? selItem.kind === "wt"
+        ? selItem.row.wt.slug
+        : `section:${selItem.sectionKey}`
       : selectedIndex < archivedOffset
         ? reviewRequests[selectedIndex - reviewOffset]?.url
         : archivedRows[selectedIndex - archivedOffset]?.wt.slug;
-  // Depend on `rows`/`reviewRequests` (both identity-stable per
-  // useWorktreeRows / the query layer) as well as the selected id, so a
-  // reflow under a stationary selection — a row inserted above, a
-  // section divider appearing, an active↔archived split shift — re-runs
-  // the follow instead of leaving the cursor drifted off-screen.
+  // Depend on `items`/`reviewRequests`/`archivedRows` (identity-stable per
+  // render of the parent) as well as the selected id, so a reflow under a
+  // stationary selection — a row inserted above, a section folding/unfolding,
+  // an active↔archived split shift — re-runs the follow instead of leaving
+  // the cursor drifted off-screen.
   useEffect(() => {
     if (selectedChildId) listRef.current?.scrollChildIntoView(selectedChildId);
-  }, [selectedChildId, rows, reviewRequests]);
+  }, [selectedChildId, items, reviewRequests, archivedRows]);
   return (
     <box
       flexDirection="column"
@@ -605,7 +688,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
       titleAlignment="left"
       paddingTop={0}
     >
-      {rows.length === 0 && !hasReviewRequests ? (
+      {!hasActive && !hasArchived && !hasReviewRequests ? (
         <box padding={1}>
           {isLoading ? (
             <text fg={theme.fgDim}>Loading worktrees...</text>
@@ -623,7 +706,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
         </box>
       ) : (
         <>
-          {rows.length === 0 ? (
+          {!hasActive && !hasArchived ? (
             // No worktrees but review-requests are loaded — still surface
             // the new-worktree hint so the user isn't left wondering where
             // the worktree column went. The PR section renders below.
@@ -642,7 +725,26 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               `min-height: auto`), which is what makes it actually scroll
               rather than shove the layout. */}
           <scrollbox ref={listScrollRef} scrollY flexGrow={1} minHeight={0}>
-          {activeRows.map((row, i) => {
+          {items.map((item, i) => {
+            // Section context of the previous item (a worktree's section, or a
+            // folded section's key) drives the divider/blank-line transitions.
+            const prev = i > 0 ? items[i - 1] : undefined;
+            const prevSection = prev ? (prev.kind === "wt" ? prev.row.section : prev.sectionKey) : null;
+            const prevIsStack = prev ? (prev.kind === "wt" ? prev.row.sectionIsStack : prev.isStack) : false;
+
+            // A folded section collapses to one selectable header line — it IS
+            // the section divider (a `[×NN]` chip + label in place of the rule),
+            // and its rows are hidden. Mirror the divider's leading blank so it
+            // separates from what's above.
+            if (item.kind === "section") {
+              return (
+                <Fragment key={`section:${item.sectionKey}`}>
+                  <box height={1} flexShrink={0} />
+                  <FoldedSectionHeader item={item} selected={i === selectedIndex} />
+                </Fragment>
+              );
+            }
+
             // Section transition: a blank line above the divider, then the
             // divider, then the section's rows immediately — no blank
             // between a header and its worktrees. Unsectioned rows at the
@@ -650,8 +752,8 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
             // belongs to a section (no inbox rows above it), the leading
             // blank still renders so the list opens with breathing room
             // above the first header rather than butting it to the border.
-            const prev = i > 0 ? activeRows[i - 1] : undefined;
-            const sectionChanged = (prev?.section ?? null) !== row.section;
+            const row = item.row;
+            const sectionChanged = prevSection !== row.section;
             const showDivider = sectionChanged && row.section !== null;
             // A stack section is pinned to the top; the unsectioned inbox
             // that follows it gets no divider of its own, so the rows would
@@ -659,7 +761,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
             // off. (A following *manual* section already gets the divider's
             // leading blank, so this only fires for the inbox case.)
             const leavingStackToInbox =
-              (prev?.sectionIsStack ?? false) && !row.sectionIsStack && !showDivider;
+              prevIsStack && !row.sectionIsStack && !showDivider;
             return (
               <Fragment key={row.wt.slug}>
                 {leavingStackToInbox ? <box height={1} flexShrink={0} /> : null}
@@ -690,7 +792,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
           })}
           {hasReviewRequests ? (
             <>
-              {activeRows.length > 0 ? (
+              {hasActive ? (
                 // Flex spacer at the top of the bottom group (review
                 // requests + archived): pushes the whole group to the
                 // bottom of the viewport when the list is short, and
@@ -723,7 +825,7 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                 // Review requests already carried the bottom-group spacer
                 // above; archived just needs a 1-row separator below them.
                 <box height={1} flexShrink={0} />
-              ) : activeRows.length > 0 ? (
+              ) : hasActive ? (
                 // No review requests, so archived leads the bottom group —
                 // it owns the flex spacer (see the review-requests block).
                 <box flexGrow={1} flexShrink={0} minHeight={1} />

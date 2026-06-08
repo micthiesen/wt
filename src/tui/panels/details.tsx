@@ -42,10 +42,28 @@ import { NF } from "../icons.ts";
 import { checkBadge, reviewBadge } from "../badges.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import type { StackManifest } from "../../core/wtstate.ts";
+
+/**
+ * What the detail pane shows when a FOLDED section header is the cursor: the
+ * stack/section overview. Built by `app.tsx` from the folded section item +
+ * the live manifest, so this pane stays free of state reads.
+ */
+export type SectionDetail = {
+  /** Stable section identity — keys the body so an AI-title label change
+   *  doesn't remount the pane under a stationary cursor. */
+  sectionKey: string;
+  isStack: boolean;
+  label: string;
+  manifest: StackManifest | null;
+  memberSlugs: string[];
+};
 
 type Props = {
   row?: WorktreeRow;
   reviewRequest?: ReviewRequestPr;
+  /** Set when a folded section header is selected — shows the stack summary. */
+  section?: SectionDetail;
   width: number;
   /**
    * Ref to the inner scrollbox of whichever body is mounted, so the
@@ -562,7 +580,93 @@ function ReviewRequestBody({
   );
 }
 
-export function Details({ row, reviewRequest, width, scrollRef }: Props) {
+/** Status glyph + color for one slice in the folded-stack summary. */
+function sliceGlyph(status: StackManifest["slices"][number]["status"]): {
+  t: string;
+  fg: string;
+} {
+  if (status === "merged") return { t: "✓", fg: theme.ok };
+  if (status === "open") return { t: "○", fg: theme.warn };
+  return { t: "·", fg: theme.fgDim };
+}
+
+/** The stack chain (ordinal · status · title · PR), like `wt stack status`. */
+function StackChain({ manifest }: { manifest: StackManifest }) {
+  const slices = [...manifest.slices].sort((a, b) => a.ordinal - b.ordinal);
+  const count = (s: StackManifest["slices"][number]["status"]) =>
+    slices.filter((x) => x.status === s).length;
+  return (
+    <>
+      <text fg={theme.fgDim} wrapMode="none" truncate>
+        {count("merged")} merged · {count("open")} open · {count("planned")} planned
+      </text>
+      <box height={1} flexShrink={0} />
+      {slices.map((s) => {
+        const g = sliceGlyph(s.status);
+        const pr = s.pr ? ` #${s.pr}` : "";
+        return (
+          <box key={s.id} flexDirection="row">
+            <text fg={theme.fgDim} wrapMode="none">{String(s.ordinal).padStart(2, "0")} </text>
+            <text fg={g.fg} wrapMode="none">{`${g.t} `}</text>
+            {/* Flex-grow + overflow-hidden gives the title a bounded width so
+                `truncate` ellipsises a long slice title instead of overflowing
+                the row and garbling the pane. */}
+            <box flexGrow={1} flexShrink={1} overflow="hidden">
+              <text fg={theme.fg} wrapMode="none" truncate>{s.title}</text>
+            </box>
+            {pr ? <text fg={theme.fgDim} wrapMode="none">{pr}</text> : null}
+          </box>
+        );
+      })}
+    </>
+  );
+}
+
+/** Detail-pane body for a folded section header (stack or manual section). */
+function SectionSummaryBody({ section, width }: { section: SectionDetail; width: number }) {
+  return (
+    <box
+      flexGrow={1}
+      width={width}
+      flexShrink={0}
+      border
+      borderStyle="single"
+      borderColor={theme.border}
+      title={section.isStack ? " stack " : " section "}
+      titleAlignment="left"
+      padding={1}
+    >
+      <box flexShrink={0} overflow="hidden">
+        <text fg={theme.fgBright} attributes={TextAttributes.BOLD} wrapMode="none" truncate>
+          {section.label}
+        </text>
+      </box>
+      <box height={1} flexShrink={0} />
+      {section.manifest ? (
+        <StackChain manifest={section.manifest} />
+      ) : (
+        <>
+          <text fg={theme.fgDim} wrapMode="none" truncate>
+            {section.memberSlugs.length} worktree{section.memberSlugs.length === 1 ? "" : "s"}
+          </text>
+          <box height={1} flexShrink={0} />
+          {section.memberSlugs.map((s) => (
+            <box key={s} flexShrink={0} overflow="hidden">
+              <text fg={theme.fg} wrapMode="none" truncate>{`  ${s}`}</text>
+            </box>
+          ))}
+        </>
+      )}
+      <box flexGrow={1} flexShrink={1} minHeight={0} />
+      <text fg={theme.fgDim} wrapMode="none">TAB to expand</text>
+    </box>
+  );
+}
+
+export function Details({ row, reviewRequest, section, width, scrollRef }: Props) {
+  if (section) {
+    return <SectionSummaryBody key={`section:${section.sectionKey}`} section={section} width={width} />;
+  }
   if (reviewRequest) {
     // Key by url so navigating across review-request rows remounts
     // cleanly — no chance of bleeding state from one PR to another.

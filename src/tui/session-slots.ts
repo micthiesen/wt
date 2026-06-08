@@ -20,7 +20,7 @@
  * Consumers:
  *  - `tui/app.tsx` — `,` / `.` / `/` keybind handlers enter the slot
  *    via `enterHarnessSession` with the slot's path as `cwd`, picking
- *    the TAB-cycled primary harness so the choice mirrors a row's
+ *    the Shift+TAB-cycled primary harness so the choice mirrors a row's
  *    F12 default.
  *  - `tui/runtime.tsx` — the startup orphan reaper whitelists
  *    `SLOT_SLUGS` so slot-owned tmux sessions survive the per-slug

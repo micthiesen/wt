@@ -110,6 +110,8 @@ export type WtState = {
   slugs: Record<string, WtSlugState>;
   sectionsOrder: string[];
   stacks: Record<string, StackManifest>;
+  /** Section keys the user has folded in the list (persisted across restarts). */
+  foldedSections: string[];
 };
 
 /** Coerce one persisted slice entry, dropping anything malformed. */
@@ -362,7 +364,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
 }
 
 export function readWtState(): WtState {
-  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], stacks: {} };
+  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], stacks: {}, foldedSections: [] };
   try {
     const raw = readFileSync(STATE_FILE, "utf8");
     const data = JSON.parse(raw) as Partial<WtState>;
@@ -404,10 +406,19 @@ export function readWtState(): WtState {
         if (m) stacks[k] = m;
       }
     }
-    return { slugs, sectionsOrder, stacks };
+    const foldedSections: string[] = [];
+    if (Array.isArray(data?.foldedSections)) {
+      const seen = new Set<string>();
+      for (const s of data.foldedSections) {
+        if (typeof s !== "string" || s.trim() === "" || seen.has(s)) continue;
+        seen.add(s);
+        foldedSections.push(s);
+      }
+    }
+    return { slugs, sectionsOrder, stacks, foldedSections };
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
-    return { slugs: {}, sectionsOrder: [], stacks: {} };
+    return { slugs: {}, sectionsOrder: [], stacks: {}, foldedSections: [] };
   }
 }
 
@@ -577,13 +588,16 @@ export function renameSection(oldName: string, newName: string): void {
     }
     // Drop oldName from the index; trimmed already lives there.
     next.sectionsOrder = next.sectionsOrder.filter((s) => s !== oldName);
+    // The merged-away key is gone; keep the target's fold state as-is.
+    next.foldedSections = next.foldedSections.filter((s) => s !== oldName);
   } else {
     for (const [k, v] of Object.entries(next.slugs)) {
       if (v.section === oldName) next.slugs[k] = { ...v, section: trimmed };
     }
     // Replace oldName with trimmed in-place so the section keeps its
-    // display position.
+    // display position — and carries its folded state to the new name.
     next.sectionsOrder = next.sectionsOrder.map((s) => (s === oldName ? trimmed : s));
+    next.foldedSections = next.foldedSections.map((s) => (s === oldName ? trimmed : s));
   }
   next.sectionsOrder = prunedSectionsOrder(next);
   writeWtState(next);
@@ -610,6 +624,28 @@ export function moveSection(name: string, dir: -1 | 1): boolean {
   next.sectionsOrder[target] = tmp;
   writeWtState(next);
   return true;
+}
+
+/**
+ * Toggle whether a section is folded in the list, persisting it. Returns the
+ * new folded state. Keyed by the section's key (a manual name or a stack's
+ * synthetic `stackSectionKey`). A key for a since-deleted section is inert (no
+ * row matches it, so it renders nothing) and is intentionally left in place
+ * rather than reaped — harmless, and reaping risks dropping a fold while its
+ * rows are momentarily absent during a refresh. `renameSection` does migrate
+ * a manual key so a rename doesn't silently unfold.
+ */
+export function toggleSectionFolded(sectionKey: string): boolean {
+  const state = readWtState();
+  const folded = state.foldedSections.includes(sectionKey);
+  const next: WtState = {
+    ...state,
+    foldedSections: folded
+      ? state.foldedSections.filter((s) => s !== sectionKey)
+      : [...state.foldedSections, sectionKey],
+  };
+  writeWtState(next);
+  return !folded;
 }
 
 // ---------- Stack manifests ----------

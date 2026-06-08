@@ -100,6 +100,7 @@ import {
   renameSection as renameSectionOnDisk,
   setSlugSection as setSlugSectionOnDisk,
   swapOrders as swapOrdersOnDisk,
+  toggleSectionFolded as toggleSectionFoldedOnDisk,
 } from "../core/wtstate.ts";
 
 import { CACHE_DB } from "./client.ts";
@@ -637,6 +638,16 @@ export function useWtActions() {
         await qc.invalidateQueries({ queryKey: qk.wtState() });
       }
       return moved;
+    },
+    /**
+     * Fold or unfold a section in the list (persisted). Returns the new
+     * folded state. The list re-derives its items from the refreshed
+     * `wtState`, collapsing/expanding the section's rows.
+     */
+    async toggleSectionFold(sectionKey: string): Promise<boolean> {
+      const folded = toggleSectionFoldedOnDisk(sectionKey);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+      return folded;
     },
   };
 }

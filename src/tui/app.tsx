@@ -94,7 +94,8 @@ import {
   SessionsPickerList,
   SessionsPickerNew,
 } from "./panels/sessions-picker.tsx";
-import { WorktreeList } from "./panels/list.tsx";
+import { WorktreeList, type ListActiveItem, type ListScrollHandle } from "./panels/list.tsx";
+import type { SectionDetail } from "./panels/details.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { enterHarnessSession } from "./harness-session.ts";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
@@ -130,6 +131,7 @@ import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import {
+  STACK_SECTION_PREFIX,
   stackSectionKey,
   useWorktreeRows,
   type WorktreeRow,
@@ -410,7 +412,7 @@ type Modal =
       /**
        * Pick a harness to spawn fresh. Opened by Shift+F12 — gives the
        * user a one-off override of the primary selection without
-       * changing the global TAB-cycled primary.
+       * changing the global Shift+TAB-cycled primary.
        */
       kind: "harnessSelect";
       slug: string;
@@ -528,7 +530,7 @@ function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
 }
 
 /**
- * Top-right usage slot, following the TAB-selected primary harness:
+ * Top-right usage slot, following the Shift+TAB-selected primary harness:
  *   - claude / codex → rate-limit windows as `5h X% / 7d Y%`
  *   - opencode       → spend over the same windows as `5h $X / 7d $Y`
  *     (it has no rate-limit window — it bills per token)
@@ -688,13 +690,15 @@ export function App({ onExit }: Props) {
     placeSlug,
     renameSection,
     moveSection,
+    toggleSectionFold,
     mutate,
     cyclePrimaryHarness,
     refreshHarnessSessions,
   } = useWtActions();
   const primaryHarness = usePrimaryHarness();
-  // Cursor is tracked by slug, not index. Slug identity survives row
-  // moves (archive, section change, manual reorder) without any
+  // Cursor is tracked by a stable key (a worktree slug, `section:<key>` for a
+  // folded header, or `pr:<url>`), not an index. Key identity survives row
+  // moves (archive, section change, manual reorder, fold/unfold) without any
   // explicit "follow this row" plumbing — the visual index falls out
   // of `visualItems.findIndex(v => visualKey(v) === sel)` on each
   // render. When
@@ -712,6 +716,8 @@ export function App({ onExit }: Props) {
   // global key handler so tall panes that overflow the viewport stay
   // readable instead of garbling.
   const detailsScrollRef = useRef<ScrollBoxRenderable>(null);
+  // Scroll-to-edge control for the list pane, called by j/k at the boundary.
+  const listScrollHandleRef = useRef<ListScrollHandle | null>(null);
   const [footer, setFooter] = useState<FooterMode>({ kind: "legend" });
   // All modal/overlay state collapsed into one discriminated union so
   // the "only one modal is open at a time" invariant is structural
@@ -834,6 +840,12 @@ export function App({ onExit }: Props) {
   // when resolved, is woven in between. The list divider reads this so a
   // stack section never falls back to rendering its raw `\0stack:` key.
   const wtStateForStacks = useQuery(wtStateQuery());
+  // Folded section keys, persisted in wtState (TAB toggles via
+  // `toggleSectionFold`, which writes + invalidates this query).
+  const foldedSections = useMemo<ReadonlySet<string>>(
+    () => new Set(wtStateForStacks.data?.foldedSections ?? []),
+    [wtStateForStacks.data?.foldedSections],
+  );
   const stackSectionLabels = useMemo((): Map<string, string> => {
     const aiByKey = new Map<string, string>();
     for (let i = 0; i < stackSectionEntries.length; i++) {
@@ -871,21 +883,48 @@ export function App({ onExit }: Props) {
   // can navigate into the pinned sections without an extra chord.
   // Selection identity is the slug for wt rows and `pr:<url>` for PR
   // rows so it survives row reordering and PR list churn.
-  type VisualItem =
-    | { kind: "wt"; row: WorktreeRow }
-    | { kind: "pr"; pr: ReviewRequestPr };
-  const visualItems = useMemo<VisualItem[]>(() => {
-    const active: VisualItem[] = [];
-    const archived: VisualItem[] = [];
-    for (const r of rows) {
-      (r.archived ? archived : active).push({ kind: "wt", row: r });
+  type VisualItem = ListActiveItem | { kind: "pr"; pr: ReviewRequestPr };
+  const archivedRows = useMemo(() => rows.filter((r) => r.archived), [rows]);
+  // Active portion, with folded sections collapsed to one `section` item each.
+  // This is the SINGLE source of truth shared by the cursor model (below) and
+  // the list panel, so a fold is exactly one cursor stop, not N hidden rows.
+  // Relies on `rows` keeping each section's rows contiguous (the sort in
+  // `useWorktreeRows`); the `emitted` guard collapses a section to one header
+  // even if that ever weakens.
+  const activeItems = useMemo<ListActiveItem[]>(() => {
+    const activeRows = rows.filter((r) => !r.archived);
+    const out: ListActiveItem[] = [];
+    const emitted = new Set<string>();
+    for (const r of activeRows) {
+      const sec = r.section;
+      if (sec !== null && foldedSections.has(sec)) {
+        if (emitted.has(sec)) continue; // one header per section
+        emitted.add(sec);
+        out.push({
+          kind: "section",
+          sectionKey: sec,
+          isStack: r.sectionIsStack,
+          label: r.sectionIsStack ? stackSectionLabels.get(sec) ?? sec : sec,
+          rows: activeRows.filter((x) => x.section === sec),
+        });
+      } else {
+        out.push({ kind: "wt", row: r });
+      }
     }
+    return out;
+  }, [rows, foldedSections, stackSectionLabels]);
+  const visualItems = useMemo<VisualItem[]>(() => {
     const prs: VisualItem[] = reviewRequestRows.map((pr) => ({ kind: "pr", pr }));
-    return [...active, ...prs, ...archived];
-  }, [rows, reviewRequestRows]);
+    const archived: VisualItem[] = archivedRows.map((r) => ({ kind: "wt", row: r }));
+    return [...activeItems, ...prs, ...archived];
+  }, [activeItems, reviewRequestRows, archivedRows]);
 
   const visualKey = (item: VisualItem): string =>
-    item.kind === "wt" ? item.row.wt.slug : `pr:${item.pr.url}`;
+    item.kind === "wt"
+      ? item.row.wt.slug
+      : item.kind === "section"
+        ? `section:${item.sectionKey}`
+        : `pr:${item.pr.url}`;
 
   // Resolve the selected key to a visual index. When the key isn't in
   // the current visible set (destroyed, never set), fall
@@ -912,6 +951,23 @@ export function App({ onExit }: Props) {
     currentItem?.kind === "wt" ? currentItem.row : undefined;
   const selectedPr =
     currentItem?.kind === "pr" ? currentItem.pr : undefined;
+  const selectedSection =
+    currentItem?.kind === "section" ? currentItem : undefined;
+  // Enrich the folded section with its live manifest for the detail-pane
+  // summary (kept out of `Details` so that pane stays free of state reads).
+  const sectionDetail = useMemo<SectionDetail | undefined>(() => {
+    if (!selectedSection) return undefined;
+    const stackId = selectedSection.isStack
+      ? selectedSection.sectionKey.slice(STACK_SECTION_PREFIX.length)
+      : null;
+    return {
+      sectionKey: selectedSection.sectionKey,
+      isStack: selectedSection.isStack,
+      label: selectedSection.label,
+      manifest: stackId ? wtStateForStacks.data?.stacks[stackId] ?? null : null,
+      memberSlugs: selectedSection.rows.map((r) => r.wt.slug),
+    };
+  }, [selectedSection, wtStateForStacks.data]);
   // Stash the resolved index so it's available as a fallback the next
   // time the slug can't be found. Writing during render is safe — the
   // value is derived purely from this render's inputs, the write is
@@ -1927,7 +1983,7 @@ export function App({ onExit }: Props) {
    * (the `.` / `,` keybinds). Mirrors `doEnterHarnessSession` but
    * skips the row lookup + busy guard — slots aren't worktrees, have
    * no per-slug locking, and are guaranteed to exist (registered at
-   * module load). Uses the TAB-cycled primary harness, so a slot
+   * module load). Uses the Shift+TAB-cycled primary harness, so a slot
    * matches a row's F12 default.
    */
   function doEnterSlotSession(slot: SessionSlot): void {
@@ -3736,6 +3792,13 @@ export function App({ onExit }: Props) {
     }
     if (k.name === "j" || k.name === "down") {
       if (visualItems.length === 0) return;
+      // Already on the last item — there's nowhere to move the cursor, so
+      // scroll the pane to the very bottom instead, revealing any trailing
+      // blank space / the review + archived headers below it.
+      if (cursorIndex >= 0 && cursorIndex >= visualItems.length - 1) {
+        listScrollHandleRef.current?.toEdge("bottom");
+        return;
+      }
       const nextIdx = Math.min(cursorIndex + 1, visualItems.length - 1);
       const next = visualItems[nextIdx];
       setSel(next ? visualKey(next) : null);
@@ -3743,6 +3806,11 @@ export function App({ onExit }: Props) {
     }
     if (k.name === "k" || k.name === "up") {
       if (visualItems.length === 0) return;
+      // Already on the first item — scroll the pane to the very top.
+      if (cursorIndex === 0) {
+        listScrollHandleRef.current?.toEdge("top");
+        return;
+      }
       const nextIdx = Math.max(0, cursorIndex - 1);
       const next = visualItems[nextIdx];
       setSel(next ? visualKey(next) : null);
@@ -4067,13 +4135,42 @@ export function App({ onExit }: Props) {
       }
       return;
     }
-    // TAB — cycle the primary harness selection. Re-rendered top-
-    // right indicator reflects the new primary; subsequent F12 spawns
-    // pick it up. Guarded against modifiers so accidental
-    // Shift+Tab / Ctrl+Tab don't fire.
+    // TAB — fold/unfold the section under the cursor. A folded section
+    // collapses to one selectable header line with a stack/section summary
+    // in the detail pane. (Shift+Tab cycles the primary harness, below.)
     if (
       k.name === "tab" &&
       !k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      // Land the cursor sensibly across the async reflow: unfolding → the
+      // section's first row; folding → the new header line. Only active
+      // (non-archived) sections fold — the archived block stays flat.
+      const item = currentItem;
+      if (item?.kind === "section") {
+        const first = item.rows[0];
+        setSel(first ? first.wt.slug : `section:${item.sectionKey}`);
+        void toggleSectionFold(item.sectionKey);
+        return;
+      }
+      if (item?.kind === "wt" && item.row.section !== null && !item.row.archived) {
+        setSel(`section:${item.row.section}`);
+        void toggleSectionFold(item.row.section);
+        return;
+      }
+      toast("no section here to fold", theme.fgDim, 1500);
+      return;
+    }
+    // Shift+TAB — cycle the primary harness selection. Re-rendered top-
+    // right indicator reflects the new primary; subsequent F12 spawns
+    // pick it up.
+    if (
+      k.name === "tab" &&
+      k.shift &&
       !k.ctrl &&
       !k.option &&
       !k.super &&
@@ -4397,7 +4494,8 @@ export function App({ onExit }: Props) {
       </box>
       <box flexDirection="row" flexGrow={1}>
         <WorktreeList
-          rows={rows}
+          items={activeItems}
+          archivedRows={archivedRows}
           reviewRequests={reviewRequestRows}
           selectedIndex={cursorIndex}
           width={listWidth}
@@ -4406,10 +4504,12 @@ export function App({ onExit }: Props) {
           activeSessionBySlug={activeSessionBySlug}
           stackSectionLabels={stackSectionLabels}
           isLoading={isLoading}
+          scrollHandle={listScrollHandleRef}
         />
         <Details
           row={current}
           reviewRequest={selectedPr}
+          section={sectionDetail}
           width={Math.max(0, width - listWidth)}
           scrollRef={detailsScrollRef}
         />
