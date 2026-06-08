@@ -29,7 +29,7 @@ const SECTIONS: Section[] = [
   {
     title: "organize",
     items: [
-      ["l", "set section (picker) · + stack section for current chain"],
+      ["l", "set section (picker) · manual sections only"],
       ["l l", "confirm highlighted section"],
       ["l n", "new section (chord)"],
       ["L", "rename current section"],
@@ -48,7 +48,6 @@ const SECTIONS: Section[] = [
       ["y", "yank menu (b/s/S/p/n/i/r)"],
       ["t", "regenerate AI summary"],
       ["m", "merge when ready (toggle)"],
-      ["b", "set stack base (parent branch) for this worktree"],
       ["e", "exit draft (mark ready for review)"],
       ["E", "ship: mark ready + request default_reviewer + arm auto-merge"],
       ["v", "edit reviewers (picker · v v submits)"],

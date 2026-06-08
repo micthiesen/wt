@@ -60,7 +60,7 @@ import {
   killShellSession,
 } from "../core/tmux.ts";
 import { StatusKind, type PullRequest } from "../core/types.ts";
-import { claudeSummariesQuery, claudeUsageQuery, codexUsageQuery, opencodeCostQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
+import { claudeSummariesQuery, claudeUsageQuery, codexUsageQuery, opencodeCostQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, wtStateQuery, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 import type { ClaudeUsage } from "../core/claude-usage.ts";
 import type { CodexUsage } from "../core/harness/codex-usage.ts";
 
@@ -126,7 +126,11 @@ import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
-import { useWorktreeRows, type WorktreeRow } from "./hooks/useWorktreeRows.ts";
+import {
+  stackSectionKey,
+  useWorktreeRows,
+  type WorktreeRow,
+} from "./hooks/useWorktreeRows.ts";
 import { openInZed, openUrlHidingAlacritty, writeClipboard } from "./helpers.ts";
 import {
   DOTFILES_SLOT,
@@ -333,17 +337,6 @@ type Modal =
       reviewBranch?: string;
     }
   | { kind: "yank" }
-  | {
-      kind: "parentPicker";
-      slug: string;
-      items: string[];
-      index: number;
-      /**
-       * Index of the synthetic "clear override" sentinel in `items`, or
-       * -1 when no override currently exists (no sentinel rendered).
-       */
-      clearIndex: number;
-    }
   | {
       kind: "branchPicker";
       title: string;
@@ -682,9 +675,6 @@ export function App({ onExit }: Props) {
     toggleArchived,
     archive,
     setSection,
-    setParent,
-    addStackSection,
-    removeStackSection,
     swapOrder,
     placeSlug,
     renameSection,
@@ -822,20 +812,34 @@ export function App({ onExit }: Props) {
       placeholderData: keepPreviousData,
     })),
   });
-  // Map sectionName → display label. Quiet fallback: when AI is
-  // unconfigured or the call hasn't resolved yet, the entry is
-  // missing and the Divider renders the storage name (`stack: 1234`).
+  // Stack section header labels, keyed by the synthetic section key.
+  // Every managed stack gets an entry (issue + progress); the AI title,
+  // when resolved, is woven in between. The list divider reads this so a
+  // stack section never falls back to rendering its raw `\0stack:` key.
+  const wtStateForStacks = useQuery(wtStateQuery());
   const stackSectionLabels = useMemo((): Map<string, string> => {
-    const m = new Map<string, string>();
+    const aiByKey = new Map<string, string>();
     for (let i = 0; i < stackSectionEntries.length; i++) {
       const [name] = stackSectionEntries[i]!;
       const title = stackTitleResults[i]?.data;
       if (typeof title === "string" && title.trim() !== "") {
-        m.set(name, title);
+        aiByKey.set(name, title);
       }
     }
+    const m = new Map<string, string>();
+    for (const man of Object.values(wtStateForStacks.data?.stacks ?? {})) {
+      const key = stackSectionKey(man.stackId);
+      const open = man.slices.filter((s) => s.status === "open").length;
+      const merged = man.slices.filter((s) => s.status === "merged").length;
+      const counts: string[] = [];
+      if (open > 0) counts.push(`${open} open`);
+      if (merged > 0) counts.push(`${merged} merged`);
+      const title = aiByKey.get(key);
+      const head = title ? `${man.issue} · ${title}` : man.issue;
+      m.set(key, counts.length > 0 ? `${head}  ·  ${counts.join(" · ")}` : head);
+    }
     return m;
-  }, [stackSectionEntries, stackTitleResults]);
+  }, [wtStateForStacks.data, stackSectionEntries, stackTitleResults]);
 
   const cleanCandidates = useMemo(
     () => rows.filter((r) => isCleanCandidate(r)),
@@ -1065,7 +1069,7 @@ export function App({ onExit }: Props) {
   // Kill any live `<slug>-diff` tmux session whose resolved base ref
   // has changed since the session was opened, so the next F11 spawns
   // fresh against the new ref instead of leaving the user staring at a
-  // diff vs the prior parent. Triggered when the explicit stack parent
+  // diff vs the prior parent. Triggered when the manifest-derived base
   // changes (the only thing that moves the resolved base now). Only
   // runs when the user's diff command actually depends on `{{base}}` —
   // commands like `gitu` ignore the base and shouldn't be torn down on
@@ -1425,71 +1429,13 @@ export function App({ onExit }: Props) {
       if (r.section === null || seen.has(r.section)) continue;
       seen.add(r.section);
       if (r.section === currentSection) continue;
-      // Stack-managed sections aren't manually joinable — they get
-      // their own explicit entry below.
+      // Manifest-driven stack sections aren't manually joinable — skip
+      // them so the picker only lists manual named sections.
       if (r.sectionIsStack) continue;
       items.push({ kind: "section", name: r.section });
     }
-    // Stack-section action keyed off the cursor row's chain root.
-    // Already in a stack section → offer "× remove"; otherwise →
-    // "+ create" with a derived name from the root's slug/id.
-    const stackItem = buildStackSectionItem(currentRow);
-    if (stackItem) items.push(stackItem);
     items.push({ kind: "create" });
     return items;
-  }
-
-  /**
-   * Walk `stackedOn` from a slug up to a fixed point (chain root). The
-   * root is itself when no parent exists. Cycle-safe via `seen`.
-   */
-  function chainRootOf(slug: string): string | null {
-    let cur = slug;
-    const seen = new Set<string>();
-    while (!seen.has(cur)) {
-      seen.add(cur);
-      const r = rows.find((row) => row.wt.slug === cur);
-      if (!r) return null;
-      const parent = r.stackedOn?.slug;
-      if (!parent || parent === cur) return cur;
-      cur = parent;
-    }
-    return cur;
-  }
-
-  /**
-   * Section name derived from the root's Linear ID when available, or
-   * a short slug fallback. Keeps names stable across renames/refreshes
-   * (the rootSlug doesn't change).
-   */
-  function deriveStackSectionName(rootSlug: string): string {
-    const { id } = slugLabel(rootSlug);
-    if (id) return `stack: ${id.replace(/^[A-Z]+-/, "")}`;
-    const short = rootSlug.slice(0, 20);
-    return `stack: ${short}`;
-  }
-
-  function buildStackSectionItem(
-    currentRow: WorktreeRow,
-  ): SectionPickerItem | null {
-    const rootSlug = chainRootOf(currentRow.wt.slug);
-    if (!rootSlug) return null;
-    // Already in a stack section → its name is on `row.section` (the
-    // row aggregator computed the override). Offer to remove it.
-    if (currentRow.sectionIsStack && currentRow.section !== null) {
-      return {
-        kind: "stack",
-        mode: "remove",
-        name: currentRow.section,
-        rootSlug,
-      };
-    }
-    return {
-      kind: "stack",
-      mode: "create",
-      name: deriveStackSectionName(rootSlug),
-      rootSlug,
-    };
   }
 
   /**
@@ -1578,6 +1524,10 @@ export function App({ onExit }: Props) {
       toast("archived rows don't have a section", theme.fgDim, 1500);
       return;
     }
+    if (current.sectionIsStack) {
+      toast("stack sections are auto-managed (pinned to the top)", theme.fgDim, 1800);
+      return;
+    }
     if (current.section === null) {
       toast("unsectioned rows are pinned to the top", theme.fgDim, 1500);
       return;
@@ -1603,6 +1553,10 @@ export function App({ onExit }: Props) {
     if (!current) return;
     if (current.archived) {
       toast("archived rows don't have a section context, use `a` to restore", theme.fgDim, 2000);
+      return;
+    }
+    if (current.sectionIsStack) {
+      toast("stack rows are auto-managed (manifest-driven)", theme.fgDim, 1800);
       return;
     }
     const items = buildSectionItems(current);
@@ -1644,23 +1598,6 @@ export function App({ onExit }: Props) {
         (err) => reportActionError("move", err),
       );
       setLastMoveTarget(target);
-      setModal(null);
-      return;
-    }
-    if (item.kind === "stack") {
-      if (item.mode === "create") {
-        addStackSection(item.name, item.rootSlug).then(
-          () => toast(`stack section: ${item.name}`, theme.ok, 2000),
-          (err) => reportActionError("stack section", err),
-        );
-      } else {
-        removeStackSection(item.name).then(
-          (removed) => {
-            if (removed) toast(`removed ${item.name}`, theme.info, 1500);
-          },
-          (err) => reportActionError("stack section", err),
-        );
-      }
       setModal(null);
       return;
     }
@@ -2407,36 +2344,6 @@ export function App({ onExit }: Props) {
     toast(`shipped #${prNumber}`, theme.ok, 2500);
   }
 
-  /**
-   * Open a picker listing trunk + every other active worktree's branch
-   * as candidate stack parents. When a manual override is currently in
-   * effect, a synthetic "(clear override)" entry appears at the top so
-   * the user can drop back to auto-detection.
-   */
-  const PARENT_CLEAR_LABEL = "(clear parent · render flat)";
-
-  function openParentPicker(slug: string): void {
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row) {
-      toast("worktree gone", theme.warn, 1500);
-      return;
-    }
-    const trunk = config.branch.base;
-    const others = rows
-      .filter((r) => r.wt.branch && r.wt.slug !== slug && !r.archived)
-      .map((r) => r.wt.branch as string)
-      .filter((b) => b !== trunk);
-    others.sort((a, b) => a.localeCompare(b));
-    const items = [trunk, ...others];
-    const hasOverride = row.stackedOn != null;
-    let clearIndex = -1;
-    if (hasOverride) {
-      items.unshift(PARENT_CLEAR_LABEL);
-      clearIndex = 0;
-    }
-    setModal({ kind: "parentPicker", slug, items, index: 0, clearIndex });
-  }
-
   function buildActionPickerItems(slug: string): PickerItem[] {
     const row = rows.find((r) => r.wt.slug === slug);
     const rowState = {
@@ -2770,12 +2677,12 @@ export function App({ onExit }: Props) {
       }
       // Quick-pick digits 1..9 jump straight to that item by display
       // position. Mirrors the digit prefix the modal renders — which
-      // skips the `+ new section` (`n`) and stack (`═`) rows. So we
-      // skip them here too rather than firing on a "phantom" digit.
+      // skips the `+ new section` (`n`) row. So we skip it here too
+      // rather than firing on a "phantom" digit.
       if (k.sequence && /^[1-9]$/.test(k.sequence)) {
         const i = parseInt(k.sequence, 10) - 1;
         const item = sp.items[i];
-        if (item && item.kind !== "create" && item.kind !== "stack") {
+        if (item && item.kind !== "create") {
           commitSectionPick(item, sp.slug);
         }
         return;
@@ -3487,48 +3394,6 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    // Parent picker (opened by `b`): j/k nav, Enter picks. The
-    // synthetic clear-sentinel at `clearIndex` maps to `null` (drop the
-    // override). Anything else is a branch name passed straight to
-    // setParent.
-    if (modal?.kind === "parentPicker") {
-      const pp = modal;
-      if (k.name === "j" || k.name === "down") {
-        setModal({
-          ...pp,
-          index: Math.min(pp.index + 1, pp.items.length - 1),
-        });
-        return;
-      }
-      if (k.name === "k" || k.name === "up") {
-        setModal({ ...pp, index: Math.max(pp.index - 1, 0) });
-        return;
-      }
-      // Trigger-key re-press confirms. `b p` opens the picker;
-      // a second `p` confirms the highlight (mirrors `l l` / `! !`).
-      if (k.name === "return" || k.sequence === "p") {
-        const picked = pp.items[pp.index]!;
-        setModal(null);
-        const next = pp.index === pp.clearIndex ? null : picked;
-        void setParent(pp.slug, next).then(() => {
-          if (next === null) {
-            toast("cleared base override", theme.fgDim, 2000);
-          } else {
-            toast(`base set: ${next}`, theme.ok, 2500);
-          }
-        });
-        return;
-      }
-      if (
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
-      return;
-    }
-
     // Clean-confirm modal swallows input while open.
     if (modal?.kind === "cleanConfirm") {
       if (k.name === "y" || k.name === "return") {
@@ -3803,14 +3668,6 @@ export function App({ onExit }: Props) {
     if (k.sequence === "r") {
       appLog.event.dim("refresh");
       void refreshAll();
-      return;
-    }
-    if (k.sequence === "b") {
-      if (!current) {
-        toast("no row selected", theme.warn, 1500);
-        return;
-      }
-      openParentPicker(current.wt.slug);
       return;
     }
     // Ctrl+R: clear all caches. Moved off bare R when R lost its
@@ -4503,16 +4360,6 @@ export function App({ onExit }: Props) {
         <CleanConfirmModal candidates={cleanCandidates} />
       ) : null}
       {modal?.kind === "yank" && current ? <YankModal row={current} /> : null}
-      {modal?.kind === "parentPicker" ? (
-        <PickerModal
-          title={`stack · set base${
-            current ? ` · ${current.wt.slug}` : ""
-          }`}
-          items={modal.items}
-          selectedIndex={modal.index}
-          toggleKey="p"
-        />
-      ) : null}
       {modal?.kind === "branchPicker" ? (
         <PickerModal
           title={modal.title}

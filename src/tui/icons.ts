@@ -49,5 +49,4 @@ export const NF = {
 	bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed
 	boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
 	comment: "\u{F41F}", // nf-oct-comment        — claude action-running marker (list + details)
-	anglesUp: "\u{F102}", // nf-fa-angle_double_up — stacked-on hint when parent worktree sits immediately above
 } as const;

@@ -78,6 +78,24 @@ per-slice typecheck gate, never a re-ultracheck.
   auto-associates to the one Linear issue.
 - **Branch naming:** `michael/<issue>-<NN>-<slug>` (2-digit ordinal) for stacked
   slices; `michael/<issue>-<slug>` (semantic) for parallel lanes.
+- **Slice == worktree.** Each slice gets its own light worktree (created
+  install-free, so it's basically a branch checkout + a pinned `.sst/stage` file
+  with no deploy cost). We considered decoupling slices from worktrees; rejected —
+  a split-brain "some slices have worktrees, some don't" is more confusing than
+  six cheap worktrees. Consequence: a slice worktree has no `node_modules`, so
+  **verification runs in a dep-having checkout** (the holistic worktree or a
+  scratch one), never inside the slice worktrees; per-slice CI is the backstop.
+- **wt owns its state; the skill never writes `state.json`.** `/split` emits the
+  manifest JSON and hands it to `wt stack apply --from <file>`. wt validates
+  **strictly and loudly** on ingest (unlike the lenient read-path coercion in
+  `parseManifest`), so a malformed/typo'd manifest fails fast instead of
+  materializing a subtly-wrong stack. No skill ever edits `~/.cache/wt/state.json`
+  directly — that boundary is a CLI, not a private file format.
+- **Base detection asks, never assumes.** `/split` fetches first (main is always
+  current). If HEAD isn't on current `origin/main`, it asks: (a) parent merged /
+  main moved → rebase onto main (base = main); or (b) intentionally stacked on an
+  unmerged parent → base = that parent branch, slices stack on its PR, `/restack`
+  rebases onto main once the parent lands. Never silently rebase or split stale.
 
 ---
 
@@ -151,7 +169,8 @@ wt can show it as a distinct node and slices can find the source conversation.
                 write manifest → approve → `wt stack apply --from <manifest.json>`
 wt stack apply   materialize: worktrees + per-slice commit (git checkout
                  <holistic> -- <files>) + push + draft PR (correct base) +
-                 `stack track` + setSlugParent + archive holistic as a tag
+                 `stack track` + record PR in manifest + archive holistic as a tag
+                 (the wt list derives parent/order/spine from the manifest)
 /done         stack-aware in spirit (via CLAUDE.md): if a manifest exists, ship
               the whole stack, not one PR (project skill, NOT modified)
 /restack      maintenance (personal skill): drives `wt stack rebase`; on a
@@ -163,15 +182,25 @@ wt stack apply   materialize: worktrees + per-slice commit (git checkout
 
 ## Where each piece lives
 
-- **CLAUDE.md guidance** — `~/.dotfiles/ai/.claude/AGENTS.md` → `## PR Size &
-  Stacking` (CLAUDE.md symlinks to AGENTS.md; propagates to all harnesses). Holds
-  the size philosophy + the re-homed `/start`/`/done` behavior.
-- **`/split`** — `~/.dotfiles/ai/.claude/skills/split/` (SKILL.md + scripts/context.sh).
-- **`/restack`** — `~/.dotfiles/ai/.claude/skills/restack/` (SKILL.md + scripts/context.sh).
+The skills + CLAUDE.md guidance are **generated** by `rulesync` from canonical
+source in `~/.dotfiles/.rulesync/`. Edit the source, never the generated `ai/`
+output, then run `bash ~/.dotfiles/scripts/rulesync.sh` to regenerate `ai/` and
+stow to every harness (Claude Code via `~/.claude`, Codex via `.agents`→`.claude`,
+OpenCode via `.claude/skills`).
+
+- **CLAUDE.md guidance** — source `~/.dotfiles/.rulesync/rules/CLAUDE.md` → `## PR
+  Size & Stacking` (generates `ai/.claude/AGENTS.md`; CLAUDE.md symlinks to it).
+  Holds the size philosophy + the re-homed `/start`/`/done` behavior.
+- **`/split`** — source `~/.dotfiles/.rulesync/skills/split/` (SKILL.md + scripts/).
+- **`/restack`** — source `~/.dotfiles/.rulesync/skills/restack/` (SKILL.md + scripts/).
+- **`/improve-stacking`** — source `~/.dotfiles/.rulesync/skills/improve-stacking/`.
+  Meta-skill: describe a friction in plain words, it routes the fix to the right
+  component (wt code, a skill, CLAUDE.md, or this doc), keeps the pieces coherent,
+  and logs it.
 - **wt implementation brief** — `~/.wt/prompt.txt` (point a CC instance in the wt
   repo at it). Contains the full wt contract: gut heuristics, add `stacks` to
   wtstate, `wt stack apply/status/rebase`, `wt size`.
-- **This doc** — `~/.wt/docs/stacking-workflow.md`.
+- **This doc** — `~/.wt/docs/stacking-workflow.md` (edit in place; not generated).
 
 ### Re-homing note (important constraint)
 The user's `/start` and `/done` are **project skills** (in client-app) that take
@@ -202,12 +231,13 @@ standalone skills — never as edits to `/start` or `/done`.
 - Never creates branches/worktrees (only draft PRs for tracked branches missing one).
 
 **`wt`** (Michael's own, `~/.wt`, fully modifiable):
-- State `~/.cache/wt/state.json` (`WtState` in `core/wtstate.ts`), keyed by slug.
-  `setSlugParent` is the existing explicit-parent hook to build on.
-- Existing stack support is DETECTION-based (linear chain): reflog heuristics in
-  `core/stack.ts` (reset-moving-to, fork-from-before-first-commit, SHA
-  reachability, isOnTrunk) + a priority chain (manual > PR base > reflog) in
-  `tui/useWorktreeRows.ts`. **These get gutted** in favor of explicit-only.
+- State `~/.cache/wt/state.json` (`WtState` in `core/wtstate.ts`). The
+  `stacks` manifest map is the SOLE source of stack relationships; the list
+  derives membership/order/spine + diff base from it (`core/stack-layout.ts`
+  → `tui/hooks/useWorktreeRows.ts`). No per-slug `parent`, no manual stack
+  sections, no reflog detection — all gutted.
+- Reflog detection (`core/stack.ts`) and the explicit-parent field/`b`-chord
+  are gone; a worktree is a stack slice iff its branch matches a manifest slice.
 - `createWorktree(branch, {base})` in `core/lifecycle.ts` is the single
   materialization hook (base honored only for new branches; per-slug lock).
 - Sibling branches confirmed safe: `eng-5182-01-foo` → distinct slug, distinct
@@ -223,13 +253,14 @@ standalone skills — never as edits to `/start` or `/done`.
 - [x] CLAUDE.md `## PR Size & Stacking` guidance
 - [x] `/split` skill (+ context script)
 - [x] `/restack` skill (+ context script)
+- [x] `/improve-stacking` meta-skill (routes any workflow tweak to the right place)
 - [x] `~/.wt/prompt.txt` brief for the wt implementation
 - [x] This design doc
 - [ ] wt: gut reflog heuristics → explicit-only
 - [ ] wt: `stacks` manifest in wtstate
 - [ ] wt: `wt stack apply` / `status` / `rebase`
 - [ ] wt: `wt size` (canonical "production line" definition)
-- [ ] Run the dotfiles build CLI to propagate skills to codex/opencode
+- [x] Built via `rulesync` → skills live for Claude Code, Codex, OpenCode
 - [ ] Dogfood: split this very `eng-5182` branch as the first real test
 
 ---
@@ -277,3 +308,34 @@ Track friction here as the workflow gets used. Candidate adjustments:
   explicit-only, file-level, holistic-then-split, wt-owns-state. wt
   implementation not yet built. Born out of rebasing the `eng-5182` branch and a
   conversation about PR-size pushback.
+- **2026-06-08** — Added `/improve-stacking` meta-skill: one entry point that
+  routes a plain-language friction to the owning component (wt code, a skill,
+  CLAUDE.md, or this doc), keeps shared contracts coherent, and updates this doc.
+  This is the intended way to evolve the workflow from here.
+- **2026-06-08** — Dogfooding `/split` on `eng-5182` exposed a stale-base bug: the
+  context script defaulted to a local `origin/main` that was behind (the parent
+  5181 had just merged), so the diff folded merged work into the slices. Fix:
+  `/split` (and `/restack`) context scripts now `git fetch origin` first, and
+  `/split` hard-stops with a "STALE base — rebase first" message when `origin/main`
+  isn't an ancestor of HEAD. Lesson baked in: always split against fresh main.
+- **2026-06-08** — Correction: skills + CLAUDE.md guidance are GENERATED by
+  `rulesync` from `~/.dotfiles/.rulesync/` (source), not `~/.dotfiles/ai/`
+  (output). First pass wrongly edited `ai/`; relocated all three skills to
+  `.rulesync/skills/` (with `targets: ['*']`) and the guidance to
+  `.rulesync/rules/CLAUDE.md`, then ran `scripts/rulesync.sh`. Routing in
+  `/improve-stacking` + this doc now point at `.rulesync/` source and require a
+  rebuild step. **Rule: never edit `~/.dotfiles/ai/`.**
+- **2026-06-08** — Continued the `eng-5182` dogfood; three design calls settled:
+  (1) **Slice == worktree stays** — I'd proposed decoupling them (worried 6
+  worktrees was heavy); rejected as more confusing, and worktrees are light when
+  created install-free. Verification therefore runs in a dep-having checkout, not
+  the install-free slice worktrees. (2) **Ingestion boundary fixed in spec**: the
+  built `wt stack apply` only took `<stackId>` with no way to load a manifest,
+  which would have forced the skill to hand-write `state.json`. Decision: wt adds
+  `apply --from <file>` with strict validation; the skill pipes JSON through it
+  and never touches wt state. (3) **Base detection softened**: the stale-base
+  hard-stop was over-fit (it would mis-advise a branch legitimately stacked on an
+  unmerged parent); `/split` now fetches then *asks* (a) rebase-onto-main vs
+  (b) base = unmerged parent. Skill + doc updated now; the wt `--from` + strict
+  validation change is staged in `/tmp/eng-stacking-wt-ingest-prompt.txt` to merge
+  into `~/.wt/prompt.txt` once the wt repo's in-flight edits settle.

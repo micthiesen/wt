@@ -4,12 +4,12 @@ import type { RowModule } from "./types.ts";
 
 /**
  * The branch this worktree is built on. Defaults to `config.branch.base`
- * (trunk) for un-stacked worktrees; switches to the parent worktree's
- * branch when an explicit stack parent is recorded (`row.stackedOn`),
- * set via the stack chord or `wt stack apply`.
+ * (trunk) for un-stacked worktrees; switches to the parent slice's
+ * branch when this worktree is a stacked manifest slice (`row.stackedOn`,
+ * derived from `wtState.stacks`).
  *
- * A muted "(manual)" suffix flags the explicit parent so it's obvious
- * the base came from a recorded relationship, not inferred.
+ * A muted "(stack)" suffix flags that the base comes from the stack
+ * manifest rather than being trunk.
  */
 export const baseRow: RowModule = {
   id: "base",
@@ -17,7 +17,7 @@ export const baseRow: RowModule = {
   render: ({ row }) => {
     const stackedOn = row.stackedOn;
     const base = stackedOn?.branch ?? config.branch.base;
-    const suffix = stackedOn ? " (manual)" : null;
+    const suffix = stackedOn ? " (stack)" : null;
     return (
       <text wrapMode="none" truncate>
         <span fg={theme.fg}>{base}</span>

@@ -95,11 +95,8 @@ import { invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
 import type { PullRequest } from "../core/types.ts";
 import {
-  addStackSection as addStackSectionOnDisk,
   moveSection as moveSectionOnDisk,
   placeSlug as placeSlugOnDisk,
-  removeStackSection as removeStackSectionOnDisk,
-  setSlugParent as setSlugParentOnDisk,
   renameSection as renameSectionOnDisk,
   setSlugSection as setSlugSectionOnDisk,
   swapOrders as swapOrdersOnDisk,
@@ -347,11 +344,11 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
     },
     /**
-     * Refresh explicit stack relationships and the per-worktree diff
-     * queries. Stack parents now live in wtState (no reflog detection),
-     * so re-reading wtState is what surfaces a freshly-applied or
-     * cleared parent; invalidating `["wt"]` re-runs the per-base diff /
-     * sync queries after a rebase rewrites history under a fixed parent.
+     * Refresh stack relationships and the per-worktree diff queries.
+     * Stack shape lives in the wtState `stacks` manifests, so re-reading
+     * wtState surfaces a freshly-applied or rebased manifest;
+     * invalidating `["wt"]` re-runs the per-base diff / sync queries
+     * after a rebase rewrites history under a fixed parent.
      */
     async refreshStack(): Promise<void> {
       await Promise.all([
@@ -589,36 +586,6 @@ export function useWtActions() {
     async setSection(slug: string, section: string | null): Promise<void> {
       setSlugSectionOnDisk(slug, section);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
-    },
-    /**
-     * Persist the explicit stack parent for `slug`. `null` clears it, so
-     * the worktree renders flat (trunk) — there's no inference fallback.
-     * `resolveStackedOn` reads this on the next render; cache
-     * invalidation on `wtState` re-runs the row aggregator.
-     */
-    async setParent(slug: string, parent: string | null): Promise<void> {
-      setSlugParentOnDisk(slug, parent);
-      await qc.invalidateQueries({ queryKey: qk.wtState() });
-    },
-    /**
-     * Register a stack-managed section keyed by `rootSlug`. The row
-     * aggregator finds every worktree whose `stackedOn` chain bottoms
-     * out at that slug and auto-assigns them to this section
-     * (depth-ordered). Idempotent.
-     */
-    async addStackSection(name: string, rootSlug: string): Promise<void> {
-      addStackSectionOnDisk(name, rootSlug);
-      await qc.invalidateQueries({ queryKey: qk.wtState() });
-    },
-    /**
-     * Drop the stack section. Members fall back to their underlying
-     * `slugs[slug].section` (never overwritten), so the prior manual
-     * placement returns automatically.
-     */
-    async removeStackSection(name: string): Promise<boolean> {
-      const removed = removeStackSectionOnDisk(name);
-      if (removed) await qc.invalidateQueries({ queryKey: qk.wtState() });
-      return removed;
     },
     /**
      * Place a slug at the top or bottom of a section. Used by the

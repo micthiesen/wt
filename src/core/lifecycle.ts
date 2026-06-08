@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./claude-sessions.ts";
-import { clearParentRefs, clearSlugState } from "./wtstate.ts";
+import { clearSlugState } from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
@@ -340,16 +340,9 @@ export async function removeWorktree(
     // in `reapStartup` so archive.json/state.json don't accumulate
     // ghosts.
     //
-    // Clearing OTHER slugs' explicit parent that referenced this
-    // branch is safe: those rows aren't being destroyed, they're just
-    // losing a dangling parent that pointed at the now-gone branch.
-    // Renders flat (trunk) on next render.
-    if (wt.branch) {
-      const cleared = clearParentRefs(wt.branch);
-      for (const s of cleared) {
-        opts.onLog?.(`cleared manual parent override on ${s} (${wt.branch} removed)`);
-      }
-    }
+    // Stack relationships live in the manifest (wtState.stacks), not in
+    // per-slug state, so there's nothing to clear on the dependents of a
+    // removed branch — `wt stack rebase` reconciles the manifest.
 
     return {
       ok: true,

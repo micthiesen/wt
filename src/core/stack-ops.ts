@@ -17,11 +17,14 @@ import {
   type LivePrInfo,
 } from "./github.ts";
 import { restackEngine, type EngineResult } from "./restack-engine.ts";
-import { dirSlug } from "./stage.ts";
+import {
+  isLaneRoot,
+  resolveParentBranch,
+  topoSortSlices,
+} from "./stack-layout.ts";
 import {
   getStackManifest,
   patchStackManifest,
-  setSlugParent,
   updateStackSlice,
   type StackManifest,
   type StackSlice,
@@ -30,73 +33,6 @@ import {
 const log = createLogger("[stack-ops]");
 
 export type Logger = (line: string) => void;
-
-/** True when a slice roots at trunk (a parallel lane, no stacked parent). */
-function isLaneRoot(slice: StackSlice): boolean {
-  return (
-    slice.dependsOn.length === 0 ||
-    slice.base === config.branch.base ||
-    slice.base === "main"
-  );
-}
-
-/**
- * The branch a slice stacks on. Lane roots resolve to the trunk base
- * name; stacked children resolve to the parent slice's branch. The
- * `base` field may name the parent by slice `id` or by branch; both are
- * handled.
- */
-export function resolveParentBranch(
-  manifest: StackManifest,
-  slice: StackSlice,
-): string {
-  if (isLaneRoot(slice)) return config.branch.base;
-  const byId = manifest.slices.find((s) => s.id === slice.base);
-  if (byId) return byId.branch;
-  // `base` already names a branch (or an unknown ref we pass through).
-  return slice.base;
-}
-
-/**
- * Topological order over `dependsOn`, breaking ties by ordinal. Throws
- * on a dependency cycle or a dangling `dependsOn` id so the caller can
- * surface a clear error instead of silently dropping a slice.
- */
-export function topoSortSlices(manifest: StackManifest): StackSlice[] {
-  const byId = new Map(manifest.slices.map((s) => [s.id, s]));
-  // Effective edges = explicit `dependsOn` plus `base` when it names a
-  // sibling slice by id (the manifest may encode the parent either way),
-  // so a slice always sorts after the parent it'll branch from.
-  const depsOf = (s: StackSlice): string[] => {
-    const set = new Set(s.dependsOn);
-    if (s.base !== s.id && byId.has(s.base)) set.add(s.base);
-    return [...set];
-  };
-  for (const s of manifest.slices) {
-    for (const dep of s.dependsOn) {
-      if (!byId.has(dep)) {
-        throw new Error(`slice ${s.id} dependsOn unknown slice ${dep}`);
-      }
-    }
-  }
-  const emitted = new Set<string>();
-  const out: StackSlice[] = [];
-  const remaining = [...manifest.slices].sort((a, b) => a.ordinal - b.ordinal);
-  while (remaining.length > 0) {
-    const idx = remaining.findIndex((s) =>
-      depsOf(s).every((d) => emitted.has(d)),
-    );
-    if (idx === -1) {
-      throw new Error(
-        `dependency cycle among slices: ${remaining.map((s) => s.id).join(", ")}`,
-      );
-    }
-    const [s] = remaining.splice(idx, 1);
-    emitted.add(s!.id);
-    out.push(s!);
-  }
-  return out;
-}
 
 /**
  * Reproduce a slice's content as a single commit in its fresh worktree.
@@ -202,9 +138,11 @@ export type ApplyResult = {
 /**
  * Materialize a planned manifest: for each slice in dependency order,
  * create its worktree off the resolved parent, reproduce its file set as
- * one commit, push, open a draft PR, and record the relationship in both
- * the manifest and wt's explicit parent state. Tags the holistic branch
- * on success. Idempotent: slices already `open`/`merged` are skipped.
+ * one commit, push, open a draft PR, record the PR into the manifest, and
+ * track it in the engine. The wt list derives the parent relationship
+ * from the manifest, so there's no separate display state to write. Tags
+ * the holistic branch on success. Idempotent: slices already
+ * `open`/`merged` are skipped.
  */
 export async function applyStack(
   stackId: string,
@@ -238,7 +176,6 @@ export async function applyStack(
     const parentBranch = resolveParentBranch(manifest, slice);
     const isRoot = isLaneRoot(slice);
     const parentRef = isRoot ? `origin/${config.branch.base}` : parentBranch;
-    const slug = dirSlug(slice.branch);
 
     // Idempotent re-run: if a PR already exists on this branch (a prior
     // run materialized + pushed + opened the PR but failed before
@@ -252,7 +189,6 @@ export async function applyStack(
       });
       materialized.push(slice.id);
       if (!isRoot) await restackEngine.track(slice.branch, parentBranch);
-      setSlugParent(slug, parentBranch);
       continue;
     }
 
@@ -304,17 +240,16 @@ export async function applyStack(
     updateStackSlice(stackId, slice.id, { pr: pr.number, status: "open" });
     materialized.push(slice.id);
 
-    // Seed BOTH the engine (squash-safe restack metadata) and wt's own
-    // explicit display state. Lane roots aren't tracked — the engine
-    // rejects trunk parents — but still get an explicit trunk parent so
-    // the row renders flat by intent rather than by absence.
+    // Seed the engine with the squash-safe restack metadata. Lane roots
+    // aren't tracked — the engine rejects trunk parents. The wt list
+    // derives the parent relationship straight from the manifest, so
+    // there's no separate display state to seed.
     if (!isRoot) {
       const tracked = await restackEngine.track(slice.branch, parentBranch);
       if (!tracked.ok) {
         onLog(`  warn: stack track failed: ${tracked.stderr.trim() || tracked.exitCode}`);
       }
     }
-    setSlugParent(slug, parentBranch);
   }
 
   // Archive the holistic branch as a tag so the origin node survives the
@@ -511,9 +446,9 @@ async function reconcileMerged(
       .filter((s): s is StackSlice => !!s)
       .sort((a, b) => b.ordinal - a.ordinal)[0];
     const base = survivingParent ? survivingParent.id : trunk;
-    const parentBranch = survivingParent ? survivingParent.branch : trunk;
+    // The list reads the parent straight from the manifest, so updating
+    // `base`/`dependsOn` is all that's needed — no separate display state.
     updateStackSlice(stackId, slice.id, { dependsOn, base });
-    setSlugParent(dirSlug(slice.branch), parentBranch);
     onLog(`reparented ${slice.id} onto ${base}`);
   }
 }

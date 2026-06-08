@@ -30,6 +30,7 @@ import { stateColor } from "../claude-state.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import type { MergeQueueState } from "../../core/types.ts";
+import type { SpinePos } from "../../core/stack-layout.ts";
 import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -65,11 +66,10 @@ type Props = {
    */
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   /**
-   * Per-stack-section AI-derived display label, keyed by the stored
-   * section name (`stack: 1234`). When present, the section's divider
-   * shows the AI title instead of the storage name. Missing entries
-   * fall back to the storage name silently — AI unconfigured / call
-   * pending / call failed all look identical.
+   * Stack-section header label (issue + progress, with the AI title
+   * woven in when resolved), keyed by the synthetic stack section key
+   * (`stackSectionKey(stackId)`). Every managed stack has an entry, so
+   * the divider never falls back to rendering the raw NUL-prefixed key.
    */
   stackSectionLabels: ReadonlyMap<string, string>;
   isLoading: boolean;
@@ -88,6 +88,44 @@ function StatusMarker({ row }: { row: WorktreeRow }) {
 }
 
 /**
+ * Tree-spine connector glyph for a managed-stack row, by the slice's
+ * position in its lane. `single` ◆ = a standalone lane; `first` ┌ =
+ * chain root with children; `middle` ├ = a stacked link; `last` └ = the
+ * chain tip.
+ */
+const STACK_CONNECTOR: Record<SpinePos, string> = {
+  single: "◆",
+  first: "┌",
+  middle: "├",
+  last: "└",
+};
+
+/**
+ * Left gutter for a managed-stack row, repurposing the status-marker
+ * slot: a 1-cell tree connector (structural, dim) followed by the 2-cell
+ * stack ordinal colored by the slice's worktree status (so dirty/merged/
+ * busy still read at a glance without a separate status glyph).
+ */
+function StackGutter({ row }: { row: WorktreeRow }) {
+  const info = row.stack!;
+  const ordFg = row.archived ? theme.fgDim : statusBadge(row.status).fg;
+  const ord = String(info.ordinal).padStart(2, "0").slice(0, 2);
+  return (
+    <box flexShrink={0} flexDirection="row">
+      <box width={1} flexShrink={0}>
+        <text fg={theme.fgDim}>{STACK_CONNECTOR[info.pos]}</text>
+      </box>
+      <box width={2} flexShrink={0}>
+        <text fg={ordFg}>{ord}</text>
+      </box>
+      <box width={1} flexShrink={0}>
+        <text> </text>
+      </box>
+    </box>
+  );
+}
+
+/**
  * Row label text. Prefers the LLM-authored `brief` (caveman-talk noun
  * phrase) over the longer `title`, since the list column is tight —
  * after the badge cluster on a busy row the slug area can drop to ~20
@@ -98,9 +136,12 @@ function StatusMarker({ row }: { row: WorktreeRow }) {
  * LLM emits lowercase.
  */
 function rowLabel(row: WorktreeRow): string {
+  const text = capitalizeFirst(row.brief ?? row.title);
+  // Inside a stack section the issue ID is on the section header, so the
+  // row drops the redundant `<id>: ` prefix and shows just the slice.
+  if (row.stack) return text;
   const { id } = slugLabel(row.wt.slug);
   const numId = id ? id.replace(/^[A-Z]+-/, "") : null;
-  const text = capitalizeFirst(row.brief ?? row.title);
   return numId ? `${numId}: ${text}` : text;
 }
 
@@ -217,7 +258,6 @@ const RowView = memo(function RowView({
   activeHarnessId,
   sessionState,
   panelWidth,
-  stackParentAbove,
 }: {
   row: WorktreeRow;
   selected: boolean;
@@ -233,15 +273,6 @@ const RowView = memo(function RowView({
    *  otherwise the glyph falls back to the harness brand color. */
   sessionState: DerivedState | undefined;
   panelWidth: number;
-  /**
-   * True when the row immediately above is the worktree this one is
-   * stacked on (commit-signal), in the same section, not archived.
-   * When true, the PR badge slot renders the "↑" angles-up glyph
-   * instead of the usual PR-state icon — a quiet hint that manual
-   * order matches the actual stack. Width and color are unchanged so
-   * the badge cluster stays aligned with rows that show the PR icon.
-   */
-  stackParentAbove: boolean;
 }) {
   const bg = selected ? theme.rowSelectedBg : undefined;
   // Archived rows render dim (unless selected, where we still want
@@ -297,26 +328,33 @@ const RowView = memo(function RowView({
       paddingLeft={1}
       paddingRight={1}
     >
-      <box flexShrink={0} flexDirection="row">
-        {/* Mirror the right-cluster pattern: width=2 box for the icon,
-            then a width=1 box for the gap. Same shape that produces
-            tight left-aligned icons over there. */}
-        <box width={2} flexShrink={0}>
-          <StatusMarker row={row} />
+      {row.stack ? (
+        // Stack rows repurpose the marker slot for the tree gutter
+        // (connector + ordinal). 4 cells wide (1 + 2 + gap), so the
+        // label budget below accounts for one extra cell of indent.
+        <StackGutter row={row} />
+      ) : (
+        <box flexShrink={0} flexDirection="row">
+          {/* Mirror the right-cluster pattern: width=2 box for the icon,
+              then a width=1 box for the gap. Same shape that produces
+              tight left-aligned icons over there. */}
+          <box width={2} flexShrink={0}>
+            <StatusMarker row={row} />
+          </box>
+          <box width={1} flexShrink={0}>
+            <text> </text>
+          </box>
         </box>
-        <box width={1} flexShrink={0}>
-          <text> </text>
-        </box>
-      </box>
+      )}
       <box flexGrow={1} flexShrink={1} overflow="hidden">
         {/* Truncation lives in JS, not opentui's native `truncate`,
             because the native path middle-clips with `…`. We want the
             head intact (it's the most distinctive part: "ENG-1234: "
             and the leading words of the title). Width budget = panel
-            width − borders(2) − row padding(2) − marker+gap(3) − badge
-            cluster. */}
+            width − borders(2) − row padding(2) − left gutter (3 normal,
+            4 for a stack row) − badge cluster. */}
         <text fg={slugFg} attributes={slugAttrs} wrapMode="none">
-          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - 7 - badgeClusterCells(row, actionRunning, activeHarnessId)))}
+          {truncateEnd(rowLabel(row), Math.max(0, panelWidth - (row.stack ? 8 : 7) - badgeClusterCells(row, actionRunning, activeHarnessId)))}
         </text>
       </box>
       {/* Compact badge cluster: only render present badges, butted up
@@ -378,17 +416,14 @@ const RowView = memo(function RowView({
           ) : null}
           {/* PR-state slot, doubling as the merge-queue slot: a queued
               PR shows the mq indicator (icon + position) in place of the
-              PR glyph, widening to 4 cells. mq wins over the stack-parent
-              "↑" hint — being in the queue is the louder signal. */}
+              PR glyph, widening to 4 cells. */}
           {row.mq ? (
             <box width={4} flexShrink={0}>
               <text fg={mqFg}>{mqText}</text>
             </box>
           ) : row.pr ? (
             <box width={2} flexShrink={0}>
-              <text fg={prFg}>
-                {stackParentAbove ? NF.anglesUp : prb.glyph}
-              </text>
+              <text fg={prFg}>{prb.glyph}</text>
             </box>
           ) : null}
           {showChecks ? (
@@ -606,21 +641,6 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
             const prev = i > 0 ? activeRows[i - 1] : undefined;
             const sectionChanged = (prev?.section ?? null) !== row.section;
             const showDivider = sectionChanged && row.section !== null;
-            // Stack-parent hint fires only when the row immediately
-            // above is the actual parent worktree, sits in the same
-            // section, and isn't archived. Honors manual ordering
-            // without enforcing it: when the user happens to place a
-            // stack contiguously, the "↑" lights up; otherwise the
-            // normal PR badge stays put. The condition explicitly
-            // requires `row.pr` because the hint replaces the PR
-            // glyph slot — without a PR there's no slot to swap.
-            const stackParentAbove =
-              !!row.pr &&
-              !!row.stackedOn &&
-              !!prev &&
-              !sectionChanged &&
-              !prev.archived &&
-              prev.wt.slug === row.stackedOn.slug;
             return (
               <Fragment key={row.wt.slug}>
                 {showDivider ? (
@@ -645,7 +665,6 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                   activeHarnessId={activeSessionBySlug.get(row.wt.slug)?.harnessId}
                   sessionState={activeSessionBySlug.get(row.wt.slug)?.state ?? undefined}
                   panelWidth={width}
-                  stackParentAbove={stackParentAbove}
                 />
               </Fragment>
             );
@@ -693,10 +712,6 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
               <Divider label="Archived" width={width} />
               {archivedRows.map((row, i) => {
                 const globalIndex = archivedOffset + i;
-                // Archived rows never show the stack hint — the
-                // archive block is a flat list with a hard divider
-                // above it, so any "above me" relationship across
-                // that divider would be misleading.
                 return (
                   <RowView
                     key={row.wt.slug}
@@ -707,7 +722,6 @@ export function WorktreeList({ rows, reviewRequests, selectedIndex, width, activ
                     activeHarnessId={activeSessionBySlug.get(row.wt.slug)?.harnessId}
                     sessionState={activeSessionBySlug.get(row.wt.slug)?.state ?? undefined}
                     panelWidth={width}
-                    stackParentAbove={false}
                   />
                 );
               })}

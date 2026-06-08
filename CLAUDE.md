@@ -50,7 +50,7 @@ These define contracts. Touching them ripples; read them first.
 
 Every list-picker modal follows the same shape so muscle memory carries across pickers. Hold to these when adding or modifying a picker; deviations fragment the UX.
 
-- **Trigger-key re-press confirms.** Whatever single key opens the picker (`l`, `;`, `'`, `!`, `v`, the `p` inside `b p`) also commits the highlighted row when pressed again. Concretely: `l l` = open section picker, confirm current highlight. `; ;` = open sessions, attach. `' '` = open outputs, focus. `! !` = open action picker, run/edit. `v v` = submit reviewers (multi-select special case: "I'm done choosing"). The chord-loop replaces the old "Enter to confirm" requirement so the user never has to hop their hand off the trigger key.
+- **Trigger-key re-press confirms.** Whatever single key opens the picker (`l`, `;`, `'`, `!`, `v`) also commits the highlighted row when pressed again. Concretely: `l l` = open section picker, confirm current highlight. `; ;` = open sessions, attach. `' '` = open outputs, focus. `! !` = open action picker, run/edit. `v v` = submit reviewers (multi-select special case: "I'm done choosing"). The chord-loop replaces the old "Enter to confirm" requirement so the user never has to hop their hand off the trigger key.
 - **Enter still works.** Enter is always a valid confirm. The chord is the cheap path; Enter is the discoverable path.
 - **Esc / q / Ctrl+C cancel.** Universal across every modal. No exceptions.
 - **j/k or arrows move.** No fancier nav; `g`/`G` aren't bound inside pickers.

@@ -4,16 +4,7 @@ import { theme } from "../theme.ts";
 export type SectionPickerItem =
   | { kind: "none" }
   | { kind: "section"; name: string }
-  | { kind: "create" }
-  | {
-      kind: "stack";
-      /** Whether picking this entry creates or removes the stack section. */
-      mode: "create" | "remove";
-      /** Section name to register or drop. */
-      name: string;
-      /** Root slug of the chain — recorded into sectionMeta on create. */
-      rootSlug: string;
-    };
+  | { kind: "create" };
 
 type Props = {
   title: string;
@@ -30,11 +21,6 @@ type Props = {
 function itemLabel(item: SectionPickerItem): string {
   if (item.kind === "none") return "(none)";
   if (item.kind === "create") return "+ new section";
-  if (item.kind === "stack") {
-    return item.mode === "create"
-      ? `+ stack section (${item.name})`
-      : `× remove ${item.name}`;
-  }
   return item.name;
 }
 
@@ -75,27 +61,14 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
         // create entry shows "n" instead — matches the chord shortcut
         // (`l n` from normal mode jumps straight into create-name).
         const isCreate = item.kind === "create";
-        const isStack = item.kind === "stack";
-        const showDigit = i < 9 && !isCreate && !isStack;
-        const prefix = isCreate
-          ? "n"
-          : isStack
-            ? "═"
-            : showDigit
-              ? `${i + 1}`
-              : " ";
-        const prefixFg = isCreate
-          ? theme.accent
-          : isStack
-            ? theme.accentAlt
-            : theme.fgDim;
+        const showDigit = i < 9 && !isCreate;
+        const prefix = isCreate ? "n" : showDigit ? `${i + 1}` : " ";
+        const prefixFg = isCreate ? theme.accent : theme.fgDim;
         const labelFg = isCreate
           ? theme.accent
-          : isStack
-            ? theme.accentAlt
-            : item.kind === "none"
-              ? theme.fgDim
-              : fg;
+          : item.kind === "none"
+            ? theme.fgDim
+            : fg;
         return (
           <box
             key={i}

@@ -13,28 +13,7 @@ export type WtSlugState = {
   section: string | null;
   /** Manual ordering scalar within (section, archived) bucket. Lower = earlier. */
   order: number;
-  /**
-   * Explicit parent (stack base) branch for this worktree — the SOLE
-   * source of stack relationships (no reflog / PR-base inference).
-   * Set via the stack chord or `wt stack apply`; read by
-   * `resolveStackedOn`. `null`/undefined (or a value equal to trunk)
-   * means "no parent — render flat".
-   */
-  parent?: string | null;
 };
-
-/**
- * Per-section metadata. Manual sections have no entry (they're the
- * default). Stack-managed sections carry a `rootSlug` — the row
- * aggregator finds every worktree whose `stackedOn` chain bottoms out
- * at that slug and auto-assigns them to this section (depth-ordered).
- *
- * Manual ordering and membership changes are refused for stack
- * sections; the only edits are "create" (registers metadata) and
- * "remove" (drops metadata, members fall back to their underlying
- * `slugs[slug].section`).
- */
-export type WtSectionMeta = { kind: "stack"; rootSlug: string };
 
 /** Lifecycle of a single slice as it moves from plan to landed PR. */
 export type StackSliceStatus = "planned" | "open" | "merged";
@@ -92,26 +71,24 @@ export type StackManifest = {
 
 /**
  * Persisted state for the worktree list:
- *  - `slugs`: per-worktree section + within-section order.
- *  - `sectionsOrder`: explicit display order for named sections.
- *  - `sectionMeta`: optional per-section metadata, currently used to
- *    flag a section as stack-managed.
+ *  - `slugs`: per-worktree manual section + within-section order.
+ *  - `sectionsOrder`: explicit display order for manual named sections.
  *  - `stacks`: per-feature stack manifests keyed by `stackId`. The
  *    single authoritative description of every managed stack's shape;
- *    everything else (engine links, draft PRs, the rendered DAG) is
- *    derived from it.
+ *    everything else (engine links, draft PRs, and the worktree-list
+ *    stack rendering — sections, order, tree) is DERIVED from it. There
+ *    is no manual stack-section state: a stack exists iff a manifest does.
  *
  * Why an explicit array instead of deriving section position from
  * `min(order)` of members: derived ordering causes a section to leap
  * up or down whenever its first item moves out, which the user noticed
- * as "weird unexpected reordering". Sections still feel ephemeral
+ * as "weird unexpected reordering". Manual sections still feel ephemeral
  * (auto-appended on first encounter, pruned when no slug references
  * them) — this array is just a sort hint, not user-managed metadata.
  */
 export type WtState = {
   slugs: Record<string, WtSlugState>;
   sectionsOrder: string[];
-  sectionMeta: Record<string, WtSectionMeta>;
   stacks: Record<string, StackManifest>;
 };
 
@@ -167,7 +144,7 @@ function parseManifest(v: unknown): StackManifest | null {
 }
 
 export function readWtState(): WtState {
-  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], sectionMeta: {}, stacks: {} };
+  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], stacks: {} };
   try {
     const raw = readFileSync(STATE_FILE, "utf8");
     const data = JSON.parse(raw) as Partial<WtState>;
@@ -180,10 +157,7 @@ export function readWtState(): WtState {
           ? rec.section
           : null;
         const order = typeof rec.order === "number" && Number.isFinite(rec.order) ? rec.order : 0;
-        const parent = typeof rec.parent === "string" && rec.parent.trim() !== ""
-          ? rec.parent
-          : null;
-        slugs[k] = { section, order, parent };
+        slugs[k] = { section, order };
       }
     }
     const sectionsOrder: string[] = [];
@@ -196,29 +170,13 @@ export function readWtState(): WtState {
         sectionsOrder.push(s);
       }
     }
-    const sectionMeta: Record<string, WtSectionMeta> = {};
-    if (data?.sectionMeta && typeof data.sectionMeta === "object") {
-      for (const [k, v] of Object.entries(data.sectionMeta)) {
-        if (!v || typeof v !== "object") continue;
-        const rec = v as Partial<WtSectionMeta>;
-        if (rec.kind !== "stack") continue;
-        if (typeof rec.rootSlug !== "string" || rec.rootSlug.trim() === "") continue;
-        sectionMeta[k] = { kind: "stack", rootSlug: rec.rootSlug };
-      }
-    }
-    // Self-heal: any section referenced by a slug OR by sectionMeta but
-    // missing from sectionsOrder gets appended in discovery order.
+    // Self-heal: any manual section referenced by a slug but missing from
+    // sectionsOrder gets appended in discovery order.
     const known = new Set(sectionsOrder);
     for (const v of Object.values(slugs)) {
       if (v.section !== null && !known.has(v.section)) {
         sectionsOrder.push(v.section);
         known.add(v.section);
-      }
-    }
-    for (const name of Object.keys(sectionMeta)) {
-      if (!known.has(name)) {
-        sectionsOrder.push(name);
-        known.add(name);
       }
     }
     const stacks: Record<string, StackManifest> = {};
@@ -228,10 +186,10 @@ export function readWtState(): WtState {
         if (m) stacks[k] = m;
       }
     }
-    return { slugs, sectionsOrder, sectionMeta, stacks };
+    return { slugs, sectionsOrder, stacks };
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
-    return { slugs: {}, sectionsOrder: [], sectionMeta: {}, stacks: {} };
+    return { slugs: {}, sectionsOrder: [], stacks: {} };
   }
 }
 
@@ -256,18 +214,12 @@ function writeWtState(state: WtState): void {
   }
 }
 
-/**
- * Drop sections from `sectionsOrder` that no slug or sectionMeta
- * references. Stack sections survive even when no slug stores their
- * name in `slugs[*].section` (their membership is auto-derived) — the
- * sectionMeta entry keeps them alive.
- */
+/** Drop manual sections from `sectionsOrder` that no slug references. */
 function prunedSectionsOrder(state: WtState): string[] {
   const live = new Set<string>();
   for (const v of Object.values(state.slugs)) {
     if (v.section !== null) live.add(v.section);
   }
-  for (const name of Object.keys(state.sectionMeta)) live.add(name);
   return state.sectionsOrder.filter((s) => live.has(s));
 }
 
@@ -327,11 +279,7 @@ export function placeSlug(
     const max = maxOrderIn(next, section);
     order = max === null ? 0 : max + 1;
   }
-  // Preserve any unrelated per-slug state (e.g. `parent` override) when
-  // re-placing this slug. The picker/Shift+J flow shouldn't clobber a
-  // manual stack parent.
-  const prev = next.slugs[slug];
-  next.slugs[slug] = { ...prev, section, order };
+  next.slugs[slug] = { section, order };
   next.sectionsOrder = prunedSectionsOrder(next);
   writeWtState(next);
 }
@@ -419,14 +367,6 @@ export function renameSection(oldName: string, newName: string): void {
     // display position.
     next.sectionsOrder = next.sectionsOrder.map((s) => (s === oldName ? trimmed : s));
   }
-  // Migrate sectionMeta if the renamed section had a meta entry. Merge
-  // case: the target name's meta wins; the source meta is dropped.
-  if (next.sectionMeta[oldName]) {
-    const nextMeta = { ...next.sectionMeta };
-    if (!isMerge) nextMeta[trimmed] = nextMeta[oldName]!;
-    delete nextMeta[oldName];
-    next.sectionMeta = nextMeta;
-  }
   next.sectionsOrder = prunedSectionsOrder(next);
   writeWtState(next);
 }
@@ -452,79 +392,6 @@ export function moveSection(name: string, dir: -1 | 1): boolean {
   next.sectionsOrder[target] = tmp;
   writeWtState(next);
   return true;
-}
-
-/**
- * Set or clear the explicit parent branch for `slug`. `null` clears it,
- * so the worktree renders flat (trunk). Preserves section + order;
- * creates a fresh unsectioned entry when the slug has never been
- * recorded before.
- */
-export function setSlugParent(slug: string, parent: string | null): void {
-  const state = readWtState();
-  const next: WtState = { ...state, slugs: { ...state.slugs } };
-  const prev = next.slugs[slug] ?? { section: null, order: 0 };
-  next.slugs[slug] = { ...prev, parent };
-  writeWtState(next);
-}
-
-/**
- * Register a stack-managed section. The row aggregator picks up the
- * metadata on the next read and auto-assigns every worktree whose
- * `stackedOn` chain bottoms out at `rootSlug` to this section.
- * Idempotent — updates the entry if the section already exists.
- */
-export function addStackSection(name: string, rootSlug: string): void {
-  const state = readWtState();
-  const next: WtState = {
-    ...state,
-    sectionMeta: { ...state.sectionMeta, [name]: { kind: "stack", rootSlug } },
-  };
-  if (!next.sectionsOrder.includes(name)) {
-    next.sectionsOrder = [...next.sectionsOrder, name];
-  }
-  writeWtState(next);
-}
-
-/**
- * Drop a stack section's metadata. Existing members (slugs that were
- * auto-assigned) revert to whatever `slugs[slug].section` holds — we
- * never overwrote that, so the previous manual section comes back
- * automatically. Returns true when a meta entry was dropped.
- */
-export function removeStackSection(name: string): boolean {
-  const state = readWtState();
-  if (!state.sectionMeta[name]) return false;
-  const nextMeta = { ...state.sectionMeta };
-  delete nextMeta[name];
-  const next: WtState = { ...state, sectionMeta: nextMeta };
-  next.sectionsOrder = prunedSectionsOrder(next);
-  writeWtState(next);
-  return true;
-}
-
-/**
- * Clear every slug's explicit `parent` that points at `branch`. Called
- * after a worktree destroy / clean so dependent worktrees render flat
- * (trunk) instead of dangling on a deleted branch. Returns the slugs
- * whose parent was cleared, so callers can log / toast them.
- */
-export function clearParentRefs(branch: string): string[] {
-  if (!branch) return [];
-  const state = readWtState();
-  const cleared: string[] = [];
-  let changed = false;
-  const nextSlugs: Record<string, WtSlugState> = { ...state.slugs };
-  for (const [slug, v] of Object.entries(state.slugs)) {
-    if (v.parent === branch) {
-      nextSlugs[slug] = { ...v, parent: null };
-      cleared.push(slug);
-      changed = true;
-    }
-  }
-  if (!changed) return [];
-  writeWtState({ ...state, slugs: nextSlugs });
-  return cleared;
 }
 
 // ---------- Stack manifests ----------

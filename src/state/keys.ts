@@ -144,9 +144,10 @@ export const qk = {
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
   /**
-   * Per-slug section + manual order + stack manifests (fs-backed). Also
-   * the single source for explicit stack relationships now that reflog
-   * detection is gone — `refreshStack` invalidates this key.
+   * Per-slug section + manual order + stack manifests (fs-backed). The
+   * `stacks` manifests here are the single source for stack
+   * relationships (membership, order, diff base) — `refreshStack`
+   * invalidates this key.
    */
   wtState: () => ["wtState"] as const,
 } as const;
