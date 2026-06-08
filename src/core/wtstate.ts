@@ -55,6 +55,14 @@ export type StackSlice = {
    * a slice was first materialized; replay falls back to a merge-base then.
    */
   baseSha?: string;
+  /**
+   * Branch to reproduce this slice's files from at materialize, instead of
+   * `manifest.holisticBranch`. Set when a slice is created by re-splitting
+   * another slice mid-stack (`wt stack split`): the sub-slices partition the
+   * ORIGINAL slice's branch, which can carry content the pre-split holistic
+   * branch doesn't (e.g. a refactor committed after the stack was applied).
+   */
+  source?: string;
 };
 
 /** Advisory size budget for a stack. Never a hard gate (see brief). */
@@ -126,6 +134,7 @@ function parseSlice(v: unknown): StackSlice | null {
     oversized: rec.oversized === true,
     ...(typeof rec.oversizedReason === "string" ? { oversizedReason: rec.oversizedReason } : {}),
     ...(typeof rec.baseSha === "string" && rec.baseSha.trim() !== "" ? { baseSha: rec.baseSha } : {}),
+    ...(typeof rec.source === "string" && rec.source.trim() !== "" ? { source: rec.source } : {}),
   };
 }
 
@@ -168,7 +177,7 @@ const MANIFEST_KEYS = new Set([
 /** Per-slice keys a slice may carry. */
 const SLICE_KEYS = new Set([
   "id", "ordinal", "title", "branch", "base", "dependsOn", "files", "pr",
-  "status", "oversized", "oversizedReason", "baseSha",
+  "status", "oversized", "oversizedReason", "baseSha", "source",
 ]);
 
 /**
@@ -293,6 +302,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
         errors.push(`${at}: "oversized: true" requires a non-empty "oversizedReason"`);
       }
       if (s.baseSha !== undefined && typeof s.baseSha !== "string") errors.push(`${at}: "baseSha" must be a string`);
+      if (s.source !== undefined && typeof s.source !== "string") errors.push(`${at}: "source" must be a string`);
       if (id && branch && filesOk && ordinalOk && base) {
         slices.push({
           id,
@@ -309,6 +319,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
           oversized: s.oversized === true,
           ...(typeof s.oversizedReason === "string" ? { oversizedReason: s.oversizedReason } : {}),
           ...(typeof s.baseSha === "string" && s.baseSha.trim() !== "" ? { baseSha: s.baseSha } : {}),
+          ...(typeof s.source === "string" && s.source.trim() !== "" ? { source: s.source } : {}),
         });
       }
     });

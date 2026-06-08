@@ -170,6 +170,9 @@ Lives in wt state, one per feature, keyed by `stackId`.
 `dependsOn: []` + `base: "main"` = parallel lane. A `dependsOn` chain = stack.
 `status` ∈ planned | open | merged. The holistic origin is tracked separately so
 wt can show it as a distinct node and slices can find the source conversation.
+Optional `source` (a branch) overrides where a slice reproduces its files from
+at materialize (default `holisticBranch`); set by `wt stack split` so a re-split
+slice's sub-slices partition the original slice's branch, not the holistic.
 
 ---
 
@@ -328,6 +331,15 @@ standalone skills — never as edits to `/start` or `/done`.
       classification. A stack-on-stack root now labels + diffs against its real
       parent instead of degrading to trunk. Safe because a dead external ref falls
       back to trunk downstream via `effectiveBaseOrTrunk`.
+- [x] wt: `wt stack split <stackId> <sliceId> --from <fragment> [--plan]` — reshape a
+      LIVE stack. Replaces one open (or planned) slice with N sub-slices, chains them,
+      and re-threads the replaced slice's descendants onto the new tip. Manifest
+      bookkeeping only (like `reconcile`); reuses `validateStackManifest` as the safety
+      net. New `StackSlice.source` field records the branch the sub-slices reproduce
+      their files from (the original slice's branch, since it carries a refactor the
+      holistic branch predates); `applyStack` materializes from `slice.source ??
+      holisticBranch`. Then `apply` (incremental) + `replay`/`R` (rebase descendants) +
+      close the superseded PR/branch. Closes the "edit the middle of the graph" gap.
 - [ ] wt: **cross-stack auto-reconcile**. `reconcileStack` only sees slices within
       its own manifest, so when an external parent (another stack's tip) merges +
       is cleaned, the child stack's root keeps a dead `base` and `replay` fails to
@@ -558,3 +570,25 @@ Track friction here as the workflow gets used. Candidate adjustments:
   michael/eng-5182-06...`. Promoted cross-stack **auto-reconcile** (reparent a child
   stack onto trunk when its external parent merges) from a future-extension musing to a
   tracked Status TODO, since the pattern is now real.
+- **2026-06-08** — `wt stack split`: reshape a live stack. Hit on eng-5182-04
+  (save-metric, 629 prod lines / 5 files, ~4× budget) — an already-open mid-stack
+  slice that needs re-splitting, which no command supported: `apply` only materializes
+  a fresh manifest, `reconcile`/`replay`/`rebase` preserve the existing shape. Added a
+  shape-changing primitive `wt stack split <stackId> <sliceId> --from <fragment>
+  [--plan]` that replaces an open slice with N sub-slices (chained), re-threads the
+  replaced slice's children onto the new tip, and removes the replaced slice. Pure
+  manifest bookkeeping (no git/PRs) like `reconcile`; runs the reshaped manifest
+  through the strict `validateStackManifest` before writing. The sub-slices partition
+  the ORIGINAL slice's branch (not the holistic branch — it can carry a refactor the
+  holistic predates), recorded via a new `StackSlice.source` field that `applyStack`
+  reproduces from (`slice.source ?? manifest.holisticBranch`). Flow: refactor + commit
+  on the slice branch → `split --plan` preview → `split` → `apply` (incremental, only
+  the new planned sub-slices materialize) → `replay`/`R` (rebase + retarget the
+  re-threaded descendants) → close the superseded PR + delete its branch. Key bug
+  caught in fixture: a child's `base` is stored as the parent's BRANCH name while
+  `dependsOn` uses slice ids, so the re-thread matches both forms and normalizes to the
+  sub-slice id. Verified the reshape against the live eng-5182 manifest with `--plan`
+  (s4 → s4a..s4d, s5 re-threaded onto s4d, ordinals renumbered, nothing written) plus
+  the merged-slice / <2-sub-slice / unknown-slice guards. `/split` skill gained a
+  "Re-splitting a live slice (mid-stack)" section. Insert/drop a mid-stack slice are
+  the natural siblings, not built yet.

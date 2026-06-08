@@ -6,9 +6,11 @@ import {
   rebaseStack,
   reconcileStack,
   replayStack,
+  splitStack,
   stackStatus,
   type RebaseResult,
   type StackStatusReport,
+  type SubSliceSpec,
 } from "../../core/stack-ops.ts";
 import { git } from "../../core/git.ts";
 import {
@@ -27,6 +29,8 @@ subcommands:
   apply --from <file>        strict-validate + ingest a manifest, then materialize
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
   status [stackId]           render the manifest DAG + drift vs reality
+  split <stackId> <sliceId> --from <frag>   reshape: replace an open slice with N
+                             sub-slices (re-threads descendants); then apply + replay
   reconcile [stackId]        manifest bookkeeping only: mark merged PRs, reparent children
   replay [stackId]           squash-safe replay each slice onto its parent (+ retarget PRs)
   rebase [stackId]           reconcile then replay (the one-shot /restack does)
@@ -35,6 +39,9 @@ subcommands:
 apply options:
   --from <file>              ingest a skill-authored manifest JSON (strict validation)
   --install                  run install per slice (default off — slices are install-free)
+split options:
+  --from <file>              fragment JSON: array of { id, title, branch, files[] } sub-slices
+  --plan                     preview the reshape without writing
 status options:
   --json                     machine-readable output
 reconcile/replay/rebase options:
@@ -381,6 +388,131 @@ async function runReplay(argv: string[]): Promise<number> {
   return reportReplayResult(t.stackId, "replayed", await replayStack(t.stackId, opts, logLine));
 }
 
+/**
+ * Read + structurally validate a `split` fragment: an array of sub-slice
+ * specs (or `{ "into": [...] }`). Deep manifest validation happens in
+ * `splitStack` (which runs the reshaped manifest through
+ * `validateStackManifest`); this just guards the file shape.
+ */
+function readFragment(file: string): SubSliceSpec[] | null {
+  let text: string;
+  try {
+    if (!statSync(file).isFile()) {
+      console.error(red(`not a file: ${file}`));
+      return null;
+    }
+    text = readFileSync(file, "utf8");
+  } catch (e) {
+    console.error(red(`cannot read ${file}: ${e instanceof Error ? e.message : String(e)}`));
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    console.error(red(`invalid JSON in ${file}: ${e instanceof Error ? e.message : String(e)}`));
+    return null;
+  }
+  const arr = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).into)
+      ? ((parsed as Record<string, unknown>).into as unknown[])
+      : null;
+  if (!arr) {
+    console.error(red(`fragment must be an array of sub-slices or { "into": [...] }`));
+    return null;
+  }
+  const specs: SubSliceSpec[] = [];
+  const errs: string[] = [];
+  arr.forEach((v, i) => {
+    if (!v || typeof v !== "object") {
+      errs.push(`into[${i}]: not an object`);
+      return;
+    }
+    const r = v as Record<string, unknown>;
+    if (typeof r.id !== "string" || r.id.trim() === "") errs.push(`into[${i}]: "id" required`);
+    if (typeof r.branch !== "string" || r.branch.trim() === "") errs.push(`into[${i}]: "branch" required`);
+    if (!Array.isArray(r.files) || r.files.length === 0 || !r.files.every((f) => typeof f === "string")) {
+      errs.push(`into[${i}]: "files" must be a non-empty array of strings`);
+    }
+    if (typeof r.id !== "string" || typeof r.branch !== "string" || !Array.isArray(r.files)) return;
+    specs.push({
+      id: r.id,
+      title: typeof r.title === "string" ? r.title : r.id,
+      branch: r.branch,
+      files: r.files.filter((f): f is string => typeof f === "string"),
+      oversized: r.oversized === true,
+      ...(typeof r.oversizedReason === "string" ? { oversizedReason: r.oversizedReason } : {}),
+    });
+  });
+  if (errs.length > 0) {
+    console.error(red(`fragment validation failed:`));
+    for (const e of errs) console.error(red(`  • ${e}`));
+    return null;
+  }
+  return specs;
+}
+
+async function runSplit(argv: string[]): Promise<number> {
+  let stackId: string | undefined;
+  let sliceId: string | undefined;
+  let from: string | undefined;
+  let plan = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--plan") plan = true;
+    else if (a === "--from") {
+      from = argv[++i];
+      if (!from) {
+        console.error(red("--from requires a path"));
+        return 2;
+      }
+    } else if (a.startsWith("--")) {
+      console.error(red(`unknown flag: ${a}`));
+      return 2;
+    } else if (!stackId) stackId = a;
+    else if (!sliceId) sliceId = a;
+    else {
+      console.error(red(`unexpected arg: ${a}`));
+      return 2;
+    }
+  }
+  if (!stackId || !sliceId || !from) {
+    console.error(red("usage: wt stack split <stackId> <sliceId> --from <fragment.json> [--plan]"));
+    return 2;
+  }
+  const fragment = readFragment(from);
+  if (!fragment) return 1;
+  const res = splitStack(stackId, sliceId, fragment, { plan });
+  if (!res.ok) {
+    console.error(red(res.error));
+    return 1;
+  }
+  console.log(
+    green(`${plan ? "would reshape" : "✓ reshaped"} ${bold(stackId)}: ${bold(sliceId)} → ${res.newSliceIds.join(", ")}`),
+  );
+  for (const s of res.slices) {
+    const mark = res.newSliceIds.includes(s.id) ? cyan(" «new»") : "";
+    console.log(`  ${dim(String(s.ordinal).padStart(2, "0"))} ${s.id}  ${dim("base:")} ${s.base}${mark}`);
+  }
+  console.log(dim(`\nsource for new slices: ${res.sourceBranch}`));
+  if (res.rethreadedChildren.length > 0) {
+    console.log(dim(`re-threaded onto new tip: ${res.rethreadedChildren.join(", ")}`));
+  }
+  if (plan) {
+    console.log(dim("(--plan: nothing written)"));
+    return 0;
+  }
+  const retire = res.supersededPr
+    ? `gh pr close ${res.supersededPr} --delete-branch --comment "superseded by re-split"`
+    : `git push origin --delete ${res.supersededBranch}`;
+  console.log(`\n${bold("next:")}`);
+  console.log(`  1. wt stack apply ${stackId}     ${dim(`# materialize new sub-slices from ${res.sourceBranch}`)}`);
+  console.log(`  2. wt stack replay ${stackId}    ${dim("# rebase + retarget the re-threaded descendants")}`);
+  console.log(`  3. ${retire}  ${dim("# retire the split slice (after step 1)")}`);
+  return 0;
+}
+
 async function runReconcile(argv: string[]): Promise<number> {
   const t = await parseStackTarget(argv, "reconcile");
   if (typeof t === "number") return t;
@@ -406,6 +538,8 @@ export async function run(argv: string[]): Promise<number> {
       return runPlan(rest);
     case "status":
       return runStatus(rest);
+    case "split":
+      return runSplit(rest);
     case "reconcile":
       return runReconcile(rest);
     case "replay":
