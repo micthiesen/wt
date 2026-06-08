@@ -119,8 +119,9 @@ function buildPrSegments(
 
   if (mq) {
     const label = mqStateLabel(mq.state);
-    const full = `queue #${mq.position} ${label.text}`;
-    const mid = `queue #${mq.position}`;
+    // The merge-queue glyph already prefixes the segment, so a "queue" word
+    // is redundant — just the position + state.
+    const full = `#${mq.position} ${label.text}`;
     const tiny = `#${mq.position}`;
     segs.push({
       key: "queue",
@@ -131,14 +132,6 @@ function buildPrSegments(
           render: () => (
             <span fg={label.fg}>
               {NF.mergeQueue}  {full}
-            </span>
-          ),
-        },
-        {
-          width: 3 + Bun.stringWidth(mid),
-          render: () => (
-            <span fg={label.fg}>
-              {NF.mergeQueue}  {mid}
             </span>
           ),
         },
