@@ -110,7 +110,11 @@ export type StackNode = {
   /** Distance from this node's lane root (root = 0). */
   depth: number;
   pos: SpinePos;
-  /** Parent branch to diff against; `null` for a lane root (trunk). */
+  /**
+   * Branch to diff/label against. `null` only for a trunk-based slice; an
+   * external-base lane root (stack-on-stack) carries its real parent branch
+   * even though it roots its section in the spine.
+   */
   parentBranch: string | null;
   /** Global display index within the stack (lane order, then depth). */
   index: number;
@@ -152,15 +156,23 @@ export function layoutStack(manifest: StackManifest): StackLayout {
 
   const children = new Map<string, StackSlice[]>();
   const roots: StackSlice[] = [];
-  // Resolve each slice's parent slice ONCE — the spine classification
-  // (root vs child) and the diff base (`parentBranch`) must agree. A
-  // slice whose `base` resolves to no real sibling slice degrades to a
-  // lane root (flat) rather than emitting a diff base against a ref that
-  // doesn't exist.
+  // Spine classification and the diff base are resolved SEPARATELY because
+  // they answer different questions. The spine (root vs child) is about an
+  // in-stack sibling parent: a slice with no sibling parent roots its
+  // section — including a stack-on-stack root, whose real parent lives in
+  // another stack's section and so can't be drawn under it here. The diff
+  // base (`parentBranch`) is resolved via `resolveParentBranch` (a sibling-id
+  // base → that slice's branch; an external base → passed through), so an
+  // external-branch root still diffs/labels against its real parent
+  // (e.g. the parent stack's tip) rather than degrading to trunk. The render
+  // diff/sync/git-activity paths run a dead `parentBranch` through
+  // `effectiveBaseOrTrunk` (falls back to trunk at the git layer), so
+  // emitting a possibly-dead external ref here is safe for them; interactive
+  // consumers that shell out (the F11 diff session) guard it the same way.
   const parentBranchOf = new Map<string, string | null>();
   for (const s of manifest.slices) {
     const parent = parentSliceOf(s);
-    parentBranchOf.set(s.id, parent ? parent.branch : null);
+    parentBranchOf.set(s.id, isTrunkBase(s) ? null : resolveParentBranch(manifest, s));
     if (!parent) {
       roots.push(s);
     } else {

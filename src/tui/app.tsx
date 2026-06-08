@@ -42,6 +42,7 @@ import {
   type LiveHarnessSlot,
   harnessTailRegistry,
 } from "../core/harness/harness-tail.ts";
+import { effectiveBaseOrTrunk } from "../core/git.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
 import { createLogger } from "../core/logger.ts";
 import { rebaseStack, reconcileStack } from "../core/stack-ops.ts";
@@ -150,6 +151,12 @@ import { theme } from "./theme.ts";
  * otherwise `origin/<config.branch.base>`. Used by the F11 handler to
  * fill `{{base}}` in `[diff].command` and by the kill-on-base-change
  * effect to detect when a stacked row's parent moved.
+ *
+ * Returns the raw ref — for a stack-on-stack root this can be an external
+ * parent branch that's since been merged + cleaned (dead). Callers that
+ * shell out against it (the F11 diff session) pass it through
+ * `effectiveBaseOrTrunk` first so a dead base degrades to trunk; the
+ * string-compare consumers (kill-on-base-change) don't care.
  */
 function resolveDiffBase(row: WorktreeRow): string {
   return row.stackedOn?.diffBase ?? `origin/${config.branch.base}`;
@@ -3906,9 +3913,14 @@ export function App({ onExit }: Props) {
         return;
       }
       const cwd = current.wt.path;
-      const base = resolveDiffBase(current);
+      const rawBase = resolveDiffBase(current);
       const diffLog = createLogger(slug);
       void (async () => {
+        // Degrade a dead diff base to trunk before handing it to the user's
+        // diff command — a stack-on-stack parent whose branch was merged +
+        // cleaned would otherwise make `<deadref>...HEAD` error in the
+        // session. Mirrors the render diff/sync paths' `effectiveBaseOrTrunk`.
+        const base = await effectiveBaseOrTrunk(cwd, rawBase);
         diffLog.event.info(`opening diff vs ${base} (F11 to detach)`);
         const result = await enterDiffSession({ renderer, slug, cwd, base });
         if (result.kind === "spawn-failed") {

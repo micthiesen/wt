@@ -322,6 +322,21 @@ standalone skills — never as edits to `/start` or `/done`.
       model input. Clean → done; conflict bail → stops and points at `/restack`.
       Whole-stack (the worktree only selects which stack); already-based slices are
       no-ops.
+- [x] wt: stack-on-stack display. `layoutStack` resolves a slice's diff base
+      (`parentBranch`) from the manifest `base` verbatim — including an external
+      branch (another stack's tip) — decoupled from the in-stack-sibling spine
+      classification. A stack-on-stack root now labels + diffs against its real
+      parent instead of degrading to trunk. Safe because a dead external ref falls
+      back to trunk downstream via `effectiveBaseOrTrunk`.
+- [ ] wt: **cross-stack auto-reconcile**. `reconcileStack` only sees slices within
+      its own manifest, so when an external parent (another stack's tip) merges +
+      is cleaned, the child stack's root keeps a dead `base` and `replay` fails to
+      resolve `--onto <gone-branch>`. Needed: detect the external parent
+      merged/deleted and reparent the child root onto trunk (the manifest already
+      models the link as a `base` string; the `baseSha` anchor already makes the
+      replay squash-safe). Until then, landing across the boundary is a manual
+      `wt stack rebase --onto main` on the child once the parent lands; the display
+      stays sane in the meantime (backstop degrades the dead base to trunk).
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -357,10 +372,16 @@ Track friction here as the workflow gets used. Candidate adjustments:
   (the exact footgun that needs squash-safe handling). Do NOT build a super-stack
   container or a structured `{stack, slice}` base now — it's modeling weight for a
   rare trigger. Replay already resolves an external-branch base + records its anchor.
-  Sanctioned future extension (anchor substrate already supports it, won't re-touch
-  the replay core): cross-stack **auto-reconcile** — detecting the external parent
-  merged/deleted and reparenting onto trunk — which `reconcileStack` doesn't do today
-  (it only sees slices within its own manifest).
+  Validated on a real case (2026-06-08): eng-5183 was forked off the eng-5182 stack
+  tip; `/split` correctly recorded `eng-5183-s1.base =
+  michael/eng-5182-06-register-builder-tools`. Surfaced a *display* gap — `layoutStack`
+  only emitted a diff base for in-stack sibling parents, so the stack-on-stack root
+  showed `main` and diffed fat. FIXED: `parentBranch` now follows the manifest `base`
+  verbatim (external branches included), decoupled from spine classification.
+  Remaining piece is now a tracked TODO (see Status): cross-stack **auto-reconcile** —
+  detecting the external parent merged/deleted and reparenting onto trunk —
+  which `reconcileStack` doesn't do today (it only sees slices within its own
+  manifest), so cross-boundary landing is a manual `wt stack rebase --onto main` for now.
 - **PR body authoring split.** RESOLVED: `/split` writes bodies at materialize —
   intent prose (CLAUDE.md rules) + a generate-once stack section
   (`stack-section.sh`). Not `/done`. See Locked decisions.
@@ -519,3 +540,21 @@ Track friction here as the workflow gets used. Candidate adjustments:
   `restackBusyRef` guards UI re-entry (the engine flock is the real lock). Realized
   the fast path already existed as `wt stack rebase` — this just gives it a
   first-class TUI surface so the 90% clean case never touches a model.
+- **2026-06-08** — Stack-on-stack display fix, from a real case. eng-5183 was forked
+  off the eng-5182 stack tip; `/split` correctly recorded `eng-5183-s1.base =
+  michael/eng-5182-06-register-builder-tools` (an external-branch base, the polymorphic
+  `base` string working as designed). But the detail pane showed its base as `main` and
+  it diffed fat against trunk. Root cause was a *display* gap in `layoutStack`:
+  `parentBranch` (the diff base + base label) was only set from an **in-stack sibling
+  slice**, and `isLaneRoot` (empty `dependsOn`) classified the external-base root as a
+  trunk lane root, so `parentBranch` went null and it fell to trunk. Fix: compute
+  `parentBranch` from `resolveParentBranch(manifest, s)` (which passes an external base
+  through verbatim) for any non-trunk base, decoupled from the in-stack-sibling spine
+  classification. An external-branch root still roots its own *section* (its real parent
+  lives in another stack's section and can't be drawn under it), but now labels + diffs
+  against that real parent. Safe because `effectiveBaseOrTrunk` degrades a dead external
+  ref to trunk at the git layer (the just-shipped backstop). Verified `layoutStack`
+  against the live manifest: eng-5183 s1 now resolves `parentBranch =
+  michael/eng-5182-06...`. Promoted cross-stack **auto-reconcile** (reparent a child
+  stack onto trunk when its external parent merges) from a future-extension musing to a
+  tracked Status TODO, since the pattern is now real.
