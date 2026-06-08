@@ -600,6 +600,24 @@ export function getStackManifest(stackId: string): StackManifest | null {
   return readWtState().stacks[stackId] ?? null;
 }
 
+/**
+ * The stackId of the manifest that owns `branch` — matching a slice
+ * branch OR the holistic origin branch — or `null` when none does. Lets
+ * stack subcommands resolve their target from the current worktree's
+ * branch instead of making the caller pass an id they'd have to look up
+ * (the id is lower-kebab `eng-1234`, not the branch's `michael/eng-1234-…`).
+ * Returns the first match; branches are unique across manifests in
+ * practice, so ambiguity isn't a real case.
+ */
+export function findStackIdByBranch(branch: string): string | null {
+  if (!branch) return null;
+  for (const m of Object.values(readWtState().stacks)) {
+    if (m.holisticBranch === branch) return m.stackId;
+    if (m.slices.some((s) => s.branch === branch)) return m.stackId;
+  }
+  return null;
+}
+
 /** Insert or replace a manifest wholesale. Keyed by `manifest.stackId`. */
 export function putStackManifest(manifest: StackManifest): void {
   const state = readWtState();

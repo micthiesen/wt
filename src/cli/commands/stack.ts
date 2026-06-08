@@ -7,7 +7,9 @@ import {
   stackStatus,
   type StackStatusReport,
 } from "../../core/stack-ops.ts";
+import { git } from "../../core/git.ts";
 import {
+  findStackIdByBranch,
   getStackManifest,
   listStackManifests,
   putStackManifest,
@@ -22,7 +24,8 @@ subcommands:
   apply --from <file>        strict-validate + ingest a manifest, then materialize
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
   status [stackId]           render the manifest DAG + drift vs reality
-  rebase <stackId>           regenerate engine links, sync/land, reconcile manifest
+  rebase [stackId]           regenerate engine links, sync/land, reconcile manifest
+                             (stackId defaults to the current branch's stack)
 
 apply options:
   --from <file>              ingest a skill-authored manifest JSON (strict validation)
@@ -35,6 +38,22 @@ rebase options:
 
 function logLine(line: string): void {
   console.log(dim(line));
+}
+
+/**
+ * Resolve a stackId from the current worktree's branch, for subcommands
+ * run from inside a slice without an explicit id. Returns null on a
+ * detached HEAD or a branch that belongs to no manifest.
+ */
+async function stackIdFromCwd(): Promise<string | null> {
+  let branch = "";
+  try {
+    branch = (await git(["rev-parse", "--abbrev-ref", "HEAD"], process.cwd())).trim();
+  } catch {
+    return null;
+  }
+  if (!branch || branch === "HEAD") return null;
+  return findStackIdByBranch(branch);
 }
 
 type IngestResult =
@@ -299,7 +318,18 @@ async function runRebase(argv: string[]): Promise<number> {
     }
   }
   if (!stackId) {
-    console.error(red("usage: wt stack rebase <stackId> [--onto <ref>] [--merge]"));
+    // No explicit id: resolve from the current worktree's branch so
+    // `/restack` (and a human in a slice) can just run `wt stack rebase`.
+    stackId = (await stackIdFromCwd()) ?? undefined;
+    if (stackId) console.log(dim(`stack ${stackId} (resolved from current branch)`));
+  }
+  if (!stackId) {
+    console.error(
+      red(
+        "usage: wt stack rebase [<stackId>] [--onto <ref>] [--merge]\n" +
+          "  (no stackId given and the current branch isn't a tracked slice)",
+      ),
+    );
     return 2;
   }
   const result = await rebaseStack(

@@ -30,6 +30,7 @@ import {
   type StackManifest,
   type StackSlice,
 } from "./wtstate.ts";
+import { listWorktrees, worktreeIsDirty } from "./worktree.ts";
 
 const log = createLogger("[stack-ops]");
 
@@ -380,52 +381,134 @@ export async function rebaseStack(
   }
   const trunk = opts.onto ?? config.branch.base;
 
-  // 1. Regenerate engine links from the manifest for every non-trunk
-  //    slice (stacked children + a root stacked on an external parent
-  //    PR). Trunk-based slices are skipped — the engine rejects trunk
-  //    parents.
-  for (const slice of manifest.slices) {
-    if (isTrunkBase(slice)) continue;
-    const parent = resolveParentBranch(manifest, slice);
+  // 1. Reconcile already-landed slices FIRST. When a lane root merged on
+  //    the host (its branch deleted), syncing it would fail with "not
+  //    part of a tracked stack". Flipping it to `merged` and reparenting
+  //    its children onto trunk up front drops it from tracking + sync
+  //    below. Idempotent and a no-op when nothing has landed yet.
+  await reconcileMerged(stackId, trunk, onLog);
+
+  const reconciled = getStackManifest(stackId);
+  if (!reconciled) {
+    return { ok: false, conflict: false, error: `no stack manifest: ${stackId}` };
+  }
+
+  // 2. Regenerate engine links from the (reconciled) manifest for every
+  //    surviving non-trunk slice (stacked children + a root stacked on an
+  //    external parent PR). Trunk-based and merged slices are skipped —
+  //    the engine rejects trunk parents and deleted branches.
+  for (const slice of reconciled.slices) {
+    if (slice.status === "merged" || isTrunkBase(slice)) continue;
+    const parent = resolveParentBranch(reconciled, slice);
     const tracked = await restackEngine.track(slice.branch, parent);
     if (!tracked.ok) {
       onLog(`warn: track ${slice.branch} onto ${parent}: ${tracked.stderr.trim()}`);
     }
   }
 
-  // 2. Drive the engine once per lane root so independent lanes are each
-  //    scoped (`stack sync/merge <branch>` operates on that branch's stack).
-  const laneRoots = manifest.slices.filter(isLaneRoot);
+  // 3. Drive the engine once per surviving lane root so independent lanes
+  //    are each scoped (`stack sync/merge <branch>` operates on that
+  //    branch's stack). The engine moves descendant branches with
+  //    `git branch -f`, which git refuses for a branch checked out in a
+  //    worktree — and in the wt model every slice is its own worktree. So
+  //    park (detach HEAD on) each slice worktree first and restore them to
+  //    the moved tips afterward, no matter how the loop exits.
+  const laneRoots = reconciled.slices.filter(
+    (s) => s.status !== "merged" && isLaneRoot(s),
+  );
+  const parking = await parkSliceWorktrees(reconciled, onLog);
+  if (!parking.ok) {
+    return { ok: false, conflict: false, error: parking.error };
+  }
   const outputs: string[] = [];
-  for (const root of laneRoots) {
-    onLog(`${opts.merge ? "merge" : "sync"} lane ${root.branch}`);
-    const res: EngineResult = opts.merge
-      ? await restackEngine.merge(root.branch, { auto: true })
-      : await restackEngine.sync(root.branch, { apply: true });
-    outputs.push(res.stdout.trim());
-    if (!res.ok) {
-      if (res.conflict) {
+  try {
+    for (const root of laneRoots) {
+      onLog(`${opts.merge ? "merge" : "sync"} lane ${root.branch}`);
+      const res: EngineResult = opts.merge
+        ? await restackEngine.merge(root.branch, { auto: true })
+        : await restackEngine.sync(root.branch, { apply: true });
+      outputs.push(res.stdout.trim());
+      if (!res.ok) {
+        if (res.conflict) {
+          return {
+            ok: false,
+            conflict: true,
+            error: `engine bailed on conflict in lane ${root.branch}`,
+            ...(res.failedBranch ? { failedBranch: res.failedBranch } : {}),
+            ...(res.backupBranch ? { backupBranch: res.backupBranch } : {}),
+          };
+        }
         return {
           ok: false,
-          conflict: true,
-          error: `engine bailed on conflict in lane ${root.branch}`,
-          ...(res.failedBranch ? { failedBranch: res.failedBranch } : {}),
-          ...(res.backupBranch ? { backupBranch: res.backupBranch } : {}),
+          conflict: false,
+          error:
+            (res.stderr || res.stdout).trim() || `engine exited ${res.exitCode}`,
         };
       }
-      return {
-        ok: false,
-        conflict: false,
-        error: (res.stderr || res.stdout).trim() || `engine exited ${res.exitCode}`,
-      };
     }
+  } finally {
+    await unparkSliceWorktrees(parking.parked, onLog);
   }
 
-  // 3. Reconcile the manifest with reality: a merged slice flips to
-  //    `merged`; its children reparent onto trunk (drop the dep, base→trunk).
+  // 4. Reconcile again: in `--merge` mode the root just landed via the
+  //    merge queue, so flip it to `merged` and reparent its children onto
+  //    trunk. A no-op in plain sync mode (step 1 already reconciled).
   await reconcileMerged(stackId, trunk, onLog);
 
   return { ok: true, output: outputs.join("\n") };
+}
+
+type ParkedWorktree = { path: string; branch: string };
+
+/**
+ * Detach HEAD on every slice worktree so the engine can `git branch -f`
+ * those branches (git refuses to force-update a branch checked out in a
+ * worktree). Refuses to touch a dirty worktree — detaching would strand
+ * its changes — and rolls back any already-parked on failure so we never
+ * leave a half-parked stack. Pair with `unparkSliceWorktrees`.
+ */
+async function parkSliceWorktrees(
+  manifest: StackManifest,
+  onLog: Logger,
+): Promise<{ ok: true; parked: ParkedWorktree[] } | { ok: false; error: string }> {
+  const sliceBranches = new Set(manifest.slices.map((s) => s.branch));
+  const targets = (await listWorktrees()).filter(
+    (w) => !w.isMain && sliceBranches.has(w.branch),
+  );
+  for (const w of targets) {
+    if (await worktreeIsDirty(w.path)) {
+      return {
+        ok: false,
+        error: `slice worktree ${w.path} (${w.branch}) has uncommitted changes — commit or stash before restacking`,
+      };
+    }
+  }
+  const parked: ParkedWorktree[] = [];
+  for (const w of targets) {
+    if (!(await gitQuiet(["checkout", "--detach", "--quiet"], w.path))) {
+      await unparkSliceWorktrees(parked, onLog);
+      return { ok: false, error: `failed to detach worktree ${w.path} (${w.branch})` };
+    }
+    parked.push({ path: w.path, branch: w.branch });
+  }
+  return { ok: true, parked };
+}
+
+/**
+ * Re-point each parked worktree at its branch. The branch may have moved
+ * under us (the engine rewrote it); re-checking it out fast-forwards the
+ * clean, detached worktree to the new tip. Best-effort — a failure to
+ * restore is logged, not thrown, so it never masks the engine's result.
+ */
+async function unparkSliceWorktrees(
+  parked: ParkedWorktree[],
+  onLog: Logger,
+): Promise<void> {
+  for (const p of parked) {
+    if (!(await gitQuiet(["checkout", "--quiet", p.branch], p.path))) {
+      onLog(`warn: could not restore worktree ${p.path} to ${p.branch}`);
+    }
+  }
 }
 
 /** Flip merged slices + reparent their orphaned children. */

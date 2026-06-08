@@ -84,12 +84,23 @@ function looksLikeConflict(text: string): boolean {
   );
 }
 
+/** Connectives the loose "failed to …" pattern wrongly grabs as a branch. */
+const NOT_A_BRANCH = /^(?:onto|into|from|to|the|a|on|in|main|master|trunk)$/i;
+
 /** Branch named in a "failed to … <branch>" / "repair <branch>" line. */
 function parseFailedBranch(text: string): string | undefined {
+  // The engine narrates each replay as `rebase <branch> onto <base>`;
+  // the last one before it bails names the branch it was on. Prefer that
+  // over the generic "failed to …" phrase, whose object is often the
+  // connective ("onto") rather than the branch — which surfaced as the
+  // nonsense "failing branch: onto".
+  const steps = [...text.matchAll(/\brebase\s+(\S+)\s+onto\b/gi)];
+  const fromStep = steps.at(-1)?.[1];
+  if (fromStep && !NOT_A_BRANCH.test(fromStep)) return fromStep;
   const m = text.match(
     /(?:repair|failed (?:to [a-z]+|on)|conflict (?:on|in))\s+([^\s'".,]+)/i,
   );
-  return m ? m[1] : undefined;
+  return m && !NOT_A_BRANCH.test(m[1]!) ? m[1] : undefined;
 }
 
 export class StackCliEngine implements RestackEngine {
@@ -152,10 +163,11 @@ export class StackCliEngine implements RestackEngine {
 
   sync(branch: string | undefined, opts: SyncOptions = {}): Promise<EngineResult> {
     const args = ["sync"];
-    if (opts.apply) args.push("--apply");
+    // `stack sync` mutates by default; `--dry-run` makes it a pure
+    // preview. (Unlike `merge`, it has no `--apply` flag.) So the apply
+    // path runs bare and takes the lock; the preview path adds --dry-run.
+    if (!opts.apply) args.push("--dry-run");
     if (branch) args.push(branch);
-    // A bare `sync` (no --apply) is a pure preview; only the apply path
-    // mutates and needs the lock.
     return opts.apply ? this.mutatingRun(args) : this.readonlyRun(args);
   }
 

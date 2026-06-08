@@ -97,6 +97,20 @@ per-slice CI, never a re-ultracheck.
   main moved → rebase onto main (base = main); or (b) intentionally stacked on an
   unmerged parent → base = that parent branch, slices stack on its PR, `/restack`
   rebases onto main once the parent lands. Never silently rebase or split stale.
+- **PR bodies = intent prose + a generate-once stack section.** `/split` writes
+  bodies at materialize (improvement 3 — never leave wt's stubs). Top: intent
+  prose per CLAUDE.md's PR rules, framed by the feature so a 1-file slice's
+  reviewer knows why it exists; the oversized slice carries its `oversizedReason`.
+  Bottom: a "Stack" section, header `Stack: **<feature>**`, then bare `#refs` (no
+  titles — GitHub expands each to its live title + merge status) with a 👈 on this
+  PR. Generated once by `split/scripts/stack-section.sh` from
+  `wt stack status --json`. It is NOT maintained — GitHub renders status live, so
+  it never needs updating as slices land. **Never
+  mention the holistic branch/PR** (closed implementation detail).
+- **Verify is opt-in; CI is the default gate.** Rely on per-slice CI and fix what
+  it surfaces. `wt stack apply --verify` typechecks each cumulative prefix in the
+  holistic worktree (which has deps) before opening any PR — worth it for a bigger
+  stack, skippable for a small one.
 
 ---
 
@@ -280,7 +294,22 @@ standalone skills — never as edits to `/start` or `/done`.
 - [x] wt: `wt size` (canonical "production line" definition)
 - [x] wt: manifest-driven list rendering (implicit sections, tree spine)
 - [x] Built via `rulesync` → skills live for Claude Code, Codex, OpenCode
-- [ ] Dogfood: split this very `eng-5182` branch as the first real test
+- [x] Dogfood: `/split` on `eng-5182` → 6 chained draft PRs (#4818–#4823), clean
+      1/2/3/3/3/2 partition, stack tip == holistic. End-to-end works.
+- [x] PR bodies: two-part format + `stack-section.{sh,py}`; six `eng-5182` bodies
+      written; `/split` step 7 authors them at materialize.
+- [x] Dogfood: first `/restack`-after-merge on `eng-5182` (merged s1, cleaned its
+      worktree, rebased s2..s6 onto main). Surfaced + fixed three wt bugs (sync
+      flag, reconcile-first, worktree parking); stack landed clean. See Session log.
+- [x] wt: `wt stack rebase`/`status` resolve the `stackId` from the current branch
+      (`findStackIdByBranch`); `parseFailedBranch` no longer mislabels the
+      connective "onto" as the failing branch.
+- [ ] wt: absorb the `stack` CLI into wt (drop `@kitlangton/stack`). DECIDED; needs
+      a design discussion + dedicated wt session. See Open questions.
+- [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
+      typecheck each cumulative prefix **in the holistic worktree** (it has deps —
+      this is NOT a per-slice gate; slices stay install-free). Abort on a red
+      prefix. Default off; CI is the normal gate.
 
 ---
 
@@ -293,27 +322,41 @@ Track friction here as the workflow gets used. Candidate adjustments:
 - **File-level vs hunk-level.** File-level keeps slices compiling and is the
   default. If too many "indivisible" files show up, revisit selective hunk
   splitting — but it's where compiling-correctness gets hard.
-- **Engine: keep `stack` or internalize into wt?** Day-1 uses `stack` behind the
-  `RestackEngine` seam. Revisit if the shared `.git/stack` state (cross-worktree)
-  or the dual-tooling causes real friction. Only the cherry-pick replay is hard
-  to port.
+- **Engine: keep `stack` or internalize into wt?** DECIDED (2026-06-08): internalize
+  — absorb the `stack` CLI into wt and drop the `@kitlangton/stack` dependency. The
+  first real restack run made the dual-tooling friction concrete: an unconfigurable
+  PR-body block (see below), three wt-side fixes just to drive its current flags +
+  worktree model, and output-string parsing for failure state. The `RestackEngine`
+  seam stays as the internal boundary; only the squash-safe cherry-pick replay is
+  hard to port. Implementation pending a dedicated design discussion + wt session.
+- **PR-body `<!-- stack:links -->` block.** PINNED (undecided). `stack sync` rewrites
+  every PR's body to maintain a nav block (delimited `<!-- stack:links:start -->`…
+  `<!-- stack:links:end -->`, heading `### [Stack]`). There is NO config/env/flag to
+  disable it (only `stack.codeHost` is configurable). It collides with "/split owns
+  PR bodies, stack section is generate-once and NOT maintained." Options when we
+  absorb the engine: simply don't port the block, or port it as the canonical
+  stack section and have `/split` stop authoring its own. Folds into the
+  internalize decision above.
 - **Dual state reconciliation.** wt manifest (truth) vs stack's projected
   `state.json`. Watch for drift; `wt stack status` must surface it, not paper
-  over it.
-- **PR body authoring split.** wt creates minimal draft-PR bodies at materialize;
-  richer intent-first bodies are a skill's job. Decide if `/split` or `/done`
-  enriches, and avoid double-authoring.
-- **`runInstall` per slice.** Each slice worktree needs its own node_modules
-  (slow). Default off + install where needed, or share. Tune for ergonomics.
+  over it. (Internalizing the engine collapses this to a single state.)
+- **PR body authoring split.** RESOLVED: `/split` writes bodies at materialize —
+  intent prose (CLAUDE.md rules) + a generate-once stack section
+  (`stack-section.sh`). Not `/done`. See Locked decisions.
+- **`runInstall` per slice.** RESOLVED: default OFF, slice worktrees are
+  install-free (slice == light worktree); install on demand only when you go edit
+  a slice (e.g. a `/restack` conflict).
 - **Draft-PR noise.** Opening N draft PRs at split time is visible to the team.
   If that itself draws reaction, consider opening lazily per-slice-when-ready.
-- **Verify-build cost in `/split`.** Typechecking each cumulative prefix is the
-  correctness guarantee but is slow; parallelize if it drags.
+- **Verify-build cost in `/split`.** RESOLVED: opt-in `wt stack apply --verify`
+  (typecheck prefixes in the dep-having holistic worktree); default leans on
+  per-slice CI.
 - **Conflict-resolution faithfulness in `/restack`.** Must verify with typecheck
   and consult the holistic tag / original convo; never resolve blindly to pass.
-- **How `/done` detects a manifest.** Needs a reliable "is this branch part of a
-  stack?" lookup (by issue id / branch) so the CLAUDE.md "ship the whole stack"
-  rule actually fires.
+- **How `/done` detects a manifest.** The lookup primitive now exists:
+  `findStackIdByBranch(branch)` in `core/wtstate.ts` (also powers `wt stack
+  rebase`'s id-from-cwd resolution). `/done` still needs wiring to call it and
+  ship the whole stack when it hits.
 - **Ordinal vs semantic naming** for parallel lanes — confirm Linear + wt display
   both read cleanly in practice.
 
@@ -358,6 +401,13 @@ Track friction here as the workflow gets used. Candidate adjustments:
   (b) base = unmerged parent. Skill + doc updated now; the wt `--from` + strict
   validation change is staged in `/tmp/eng-stacking-wt-ingest-prompt.txt` to merge
   into `~/.wt/prompt.txt` once the wt repo's in-flight edits settle.
+- **2026-06-08** — First successful end-to-end run. wt landed `apply --from` +
+  `plan --from` with strict validation. `/split` on `eng-5182` (14 files) →
+  `plan --from` validated, `apply` materialized 6 chained draft PRs (#4818–#4823)
+  off main, each ≤3 files (s4 oversized/flagged), stack tip reproduces the holistic
+  diff exactly. Whole flow works. Remaining polish: PR bodies are wt stubs (enrich
+  later), per-slice typecheck relies on CI (slice worktrees are install-free), and
+  the old single PR #4798 should be closed as superseded.
 - **2026-06-08** — Implemented the staged ingest change in wt (`prompt.txt` was
   already deleted, so the detail folded into "Where each piece lives" above, not
   `prompt.txt`). Added `wt stack apply --from <file>` + `wt stack plan --from
@@ -368,3 +418,31 @@ Track friction here as the workflow gets used. Candidate adjustments:
   non-main-`base` case end-to-end: split `isTrunkBase` out of `isLaneRoot` so a
   stack rooted on an unmerged parent PR branches off + targets + tracks that parent
   branch instead of silently using `origin/main`.
+- **2026-06-08** — PR bodies + format. Decided the two-part body (intent prose +
+  generate-once "Stack" section) and that the section is NOT maintained — GitHub
+  renders each `#ref`'s live status. Added `split/scripts/stack-section.{sh,py}`
+  (reads `wt stack status --json`; gotcha: `wt` is a shell alias, so the script
+  resolves `~/.wt/bin/wt`). Wrote all six `eng-5182` bodies (#4818–#4823). Wired
+  `/split` step 7 to author bodies at materialize. Improvement 1 lives as opt-in
+  `wt stack apply --verify` (still TODO in wt — see Status). Note: `~/.wt/prompt.txt`
+  was deleted; the wt contract now lives in this doc, references updated.
+- **2026-06-08** — First `/restack`-after-merge run (eng-5182: merged s1 #4818,
+  cleaned its worktree, rebased s2..s6 onto main). Exposed three wt bugs, all
+  fixed: (1) `restack-engine.sync()` passed `--apply`, but the current `stack sync`
+  has no such flag (it mutates by default, `--dry-run` previews); (2) `rebaseStack`
+  ran `reconcileMerged` *after* the sync loop, so a merged+deleted lane root broke
+  sync with "not part of a tracked stack" — moved reconcile to run FIRST (idempotent
+  post-sync call kept for `--merge`); (3) the engine moves descendant branches with
+  `git branch -f`, which git refuses for a branch checked out in a worktree, and in
+  the wt model every slice IS a worktree — added park/unpark (detach each slice
+  worktree's HEAD around the engine run, restore via try/finally, refuse dirty). A
+  squash-merged parent's duplicate commit is NOT a hand-resolved conflict: once
+  parking let the engine move branches, its squash-safe replay dropped every
+  descendant's duplicate automatically (the manual `git rebase --onto` mid-run was
+  only needed because the three bugs masked each other). Follow-ups landed here:
+  `wt stack rebase`/`status` resolve the stackId from the current branch
+  (`findStackIdByBranch`), and `parseFailedBranch` stopped mislabeling the
+  connective "onto" as the failing branch. /restack skill updated. Pinned for a
+  later decision: the engine's unconfigurable `<!-- stack:links -->` PR-body block
+  (see Open questions). DECIDED this run: absorb the `stack` CLI into wt (drop the
+  `@kitlangton/stack` dep) — design discussion + implementation still to come.
