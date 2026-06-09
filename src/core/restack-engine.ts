@@ -19,6 +19,9 @@
  * whole replay. The `RestackEngine` seam stays so the replay mechanism
  * can be swapped or tested in isolation.
  */
+import { existsSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+
 import { gitRun } from "./git.ts";
 
 export type ReplayLogger = (line: string) => void;
@@ -57,6 +60,37 @@ async function revParse(ref: string, cwd: string): Promise<string | null> {
   return r.exitCode === 0 && sha ? sha : null;
 }
 
+/**
+ * Is a rebase actually in progress in `cwd`? This is the authoritative test —
+ * the presence of git's per-worktree `rebase-merge`/`rebase-apply` state dir —
+ * NOT the exit code of `git rebase --abort` (which also fails when there's
+ * nothing to abort, the exact ambiguity that produced false "left mid-rebase"
+ * reports on slices whose rebase failed at preflight without ever starting).
+ */
+export async function rebaseInProgress(cwd: string): Promise<boolean> {
+  for (const dir of ["rebase-merge", "rebase-apply"]) {
+    const r = await gitRun(["rev-parse", "--git-path", dir], cwd);
+    const p = r.stdout.trim();
+    // `--git-path` is ABSOLUTE for a linked worktree (the common case here) and
+    // relative to `cwd` only for the main clone. `resolvePath(cwd, p)` is
+    // correct for both — Node's `resolve` returns an absolute second arg
+    // unchanged and joins a relative one onto `cwd`. Don't "simplify" this.
+    if (p && existsSync(resolvePath(cwd, p))) return true;
+  }
+  return false;
+}
+
+/** Collapse git's multi-line / `\r`-laden stderr into one clean line so it
+ *  renders sanely in a one-line CLI error and a JSON log field. */
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** A preflight rebase failure (no rebase started) is often a transient lock —
+ *  the always-running TUI reads git across every worktree concurrently. Retry
+ *  a few times with a short backoff before giving up. */
+const PREFLIGHT_ATTEMPTS = 3;
+
 export class NativeRestackEngine implements RestackEngine {
   async replaySlice(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome> {
     const { branch, worktreePath, anchor, newBase } = step;
@@ -90,25 +124,60 @@ export class NativeRestackEngine implements RestackEngine {
     }
 
     onLog(`  rebase ${branch} onto ${short(newBaseSha)} (from ${short(anchor)})`);
-    const rebase = await gitRun(["rebase", "--onto", newBaseSha, anchor, branch], worktreePath);
+    // Replay the slice's own commits onto the new parent tip. A real content
+    // collision STOPS with a rebase in progress (handled below). A failure
+    // that leaves NO rebase in progress is a preflight error (e.g. a momentary
+    // index/ref lock held by a concurrent reader) that touched nothing — retry
+    // it a few times rather than misreport it as a stuck or conflicted tree.
+    let rebase = await gitRun(["rebase", "--onto", newBaseSha, anchor, branch], worktreePath);
+    let inProgress = rebase.exitCode === 0 ? false : await rebaseInProgress(worktreePath);
+    for (let attempt = 1; rebase.exitCode !== 0 && !inProgress && attempt < PREFLIGHT_ATTEMPTS; attempt++) {
+      onLog(`  ${branch}: rebase didn't start (attempt ${attempt}/${PREFLIGHT_ATTEMPTS}, likely a transient lock) — retrying`);
+      await Bun.sleep(150 * attempt);
+      rebase = await gitRun(["rebase", "--onto", newBaseSha, anchor, branch], worktreePath);
+      inProgress = rebase.exitCode === 0 ? false : await rebaseInProgress(worktreePath);
+    }
     if (rebase.exitCode !== 0) {
-      // Abort to restore a clean tree; the backup holds the original tip.
-      const detail = (rebase.stderr || rebase.stdout).trim();
-      const aborted = await gitRun(["rebase", "--abort"], worktreePath);
-      if (aborted.exitCode !== 0) {
-        // Abort failed → the worktree is still mid-rebase, NOT clean. Don't
-        // report a clean conflict bail; point the operator at the stuck tree.
+      const detail = oneLine(rebase.stderr || rebase.stdout);
+      if (inProgress) {
+        // A genuine content conflict stopped the rebase (an already-upstream
+        // commit is auto-dropped at exit 0, so it never lands here). Name the
+        // conflicting files before aborting — the abort clears the index, and
+        // the file list is far more actionable than git's raw hint blob.
+        const conflicts = await gitRun(
+          ["diff", "--name-only", "--diff-filter=U"],
+          worktreePath,
+        );
+        const files = conflicts.stdout.trim().split("\n").filter(Boolean);
+        const where = files.length ? ` (conflicts in ${files.join(", ")})` : detail ? `: ${detail}` : "";
+        // Abort to restore a clean tree; the backup holds the original tip.
+        const aborted = await gitRun(["rebase", "--abort"], worktreePath);
+        if (aborted.exitCode !== 0) {
+          // Abort itself failed on an in-progress rebase → the worktree really
+          // is stuck mid-rebase. Surface both git errors so it's actionable.
+          const abortErr = oneLine(aborted.stderr || aborted.stdout);
+          return {
+            ok: false,
+            conflict: false,
+            error: `rebase of ${branch} is stuck, and \`git rebase --abort\` failed — worktree ${worktreePath} left mid-rebase (backup at ${backupBranch})${where}${abortErr ? ` [abort: ${abortErr}]` : ""}; resolve it manually`,
+          };
+        }
         return {
           ok: false,
-          conflict: false,
-          error: `conflict replaying ${branch}, and \`git rebase --abort\` failed — worktree ${worktreePath} left mid-rebase (backup at ${backupBranch}); resolve it manually`,
+          conflict: true,
+          backupBranch,
+          error: `conflict replaying ${branch} onto ${short(newBaseSha)}${where}`,
         };
       }
+      // No rebase in progress → git never started applying. The branch tip is
+      // untouched; this is NOT a conflict bail and NOT a stuck mid-rebase.
+      // Surface the real git error (retryable) and drop the unused backup so it
+      // doesn't linger.
+      await deleteBackup(backupBranch, worktreePath);
       return {
         ok: false,
-        conflict: true,
-        backupBranch,
-        error: `conflict replaying ${branch} onto ${short(newBaseSha)}${detail ? `: ${detail}` : ""}`,
+        conflict: false,
+        error: `could not replay ${branch} onto ${short(newBaseSha)} — git rebase exited ${rebase.exitCode} without starting (branch tip untouched)${detail ? `: ${detail}` : ""}`,
       };
     }
 

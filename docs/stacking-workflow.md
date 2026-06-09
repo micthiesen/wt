@@ -358,6 +358,17 @@ standalone skills — never as edits to `/start` or `/done`.
       "could not tag holistic branch … Failed to resolve" warning on a re-split re-apply
       (only tags when the holistic branch resolves; the archived tag already anchors the
       origin node).
+- [x] wt: **replay false "left mid-rebase" fix** (eng-5199 restack post-mortem). The
+      engine inferred mid-rebase from `git rebase --abort`'s exit code, which also fails
+      when there's nothing to abort — so a PREFLIGHT failure (transient index/ref lock
+      from the always-running TUI's concurrent reads, before the rebase started) got
+      misreported as a stuck tree on a slice that was actually clean. Now
+      `replaySlice` detects a real rebase via the `rebase-merge`/`rebase-apply` state dir
+      (`rebaseInProgress`), retries transient preflight failures with backoff, and
+      three-way classifies (clean / conflict-with-named-files / preflight-no-start). Plus:
+      replay failures persist to the daily app log; conflict errors name the clashing
+      files at the CLI; a pass-1 guard refuses to replay into a worktree already wedged
+      mid-rebase. Fixture-verified; ultracheck + refute reviewed.
 - [ ] wt: **cross-stack auto-reconcile**. `reconcileStack` only sees slices within
       its own manifest, so when an external parent (another stack's tip) merges +
       is cleaned, the child stack's root keeps a dead `base` and `replay` fails to
@@ -640,3 +651,24 @@ Track friction here as the workflow gets used. Candidate adjustments:
   Failed to resolve"; now it only tags when the branch resolves and stays quiet when the
   archived tag already anchors the origin node. `/restack` step 5 updated to note replay
   self-heals after a manual resolve.
+- **2026-06-08** — Replay engine: fixed false "left mid-rebase" bails (surfaced by an
+  eng-5199 `/restack` that landed correct but bailed twice on clean single-commit slices;
+  the same `git rebase --onto` succeeded by hand). Root cause: the engine inferred
+  "worktree is mid-rebase" from the exit code of `git rebase --abort`, which ALSO returns
+  non-zero when there's nothing to abort — i.e. when the rebase failed at PREFLIGHT
+  (before it ever started, e.g. a momentary index/ref lock from the always-running TUI's
+  concurrent per-worktree git reads). The tree was untouched but the engine screamed
+  "left mid-rebase." Fix in `NativeRestackEngine.replaySlice`: detect a real in-progress
+  rebase authoritatively via the `rebase-merge`/`rebase-apply` state dir (`rebaseInProgress`),
+  not the abort exit code; retry a transient preflight failure a few times with backoff
+  (the manual retry worked because the lock had cleared); and three-way classify — clean
+  success / genuine conflict (abort, `conflict:true`, backup kept, now names the conflicting
+  files via `--diff-filter=U`) / preflight no-start (clean retryable error with git's
+  stderr). Diagnosability: replay failures now persist to the daily app log (`log.warn`
+  with anchor/newBase/backupBranch) since the engine only streamed to the console before,
+  and an eng-5199-style CLI run left nothing to inspect. Also added a pass-1 guard that
+  refuses to replay into a worktree already wedged mid-rebase from an interrupted run (the
+  porcelain dirty-check can read clean for such a tree, and replaying would silently abort
+  its in-flight state). Verified with a git fixture (clean replay + genuine conflict:
+  correct classification, clean tree, no rebase left in progress, named conflict file).
+  Reviewed via an ultracheck swarm + 3-lens refute.

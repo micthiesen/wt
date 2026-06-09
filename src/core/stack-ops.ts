@@ -19,7 +19,7 @@ import {
   viewPrInfo,
   type LivePrInfo,
 } from "./github.ts";
-import { restackEngine } from "./restack-engine.ts";
+import { rebaseInProgress, restackEngine } from "./restack-engine.ts";
 import {
   isTrunkBase,
   resolveParentBranch,
@@ -458,11 +458,23 @@ async function replayStackLocked(
   );
   for (const s of live) {
     const p = pathByBranch.get(s.branch);
-    if (p && (await worktreeIsDirty(p))) {
+    if (!p) continue;
+    if (await worktreeIsDirty(p)) {
       return {
         ok: false,
         conflict: false,
         error: `slice worktree ${p} (${s.branch}) has uncommitted changes — commit or stash before restacking`,
+      };
+    }
+    // A worktree left mid-rebase by an earlier interrupted run can read clean
+    // via `git status --porcelain` (no unmerged paths), so the dirty check
+    // alone misses it. Replaying into it would make the engine abort and
+    // silently discard that in-flight state — refuse up front instead.
+    if (await rebaseInProgress(p)) {
+      return {
+        ok: false,
+        conflict: false,
+        error: `slice worktree ${p} (${s.branch}) is mid-rebase from an unfinished run — finish or \`git rebase --abort\` it there before restacking`,
       };
     }
   }
@@ -526,11 +538,30 @@ async function replayStackLocked(
       onLog,
     );
     if (!out.ok) {
+      // Persist the failure to the daily app log — the engine only streams to
+      // the console `onLog`, so a replay run from the CLI would otherwise leave
+      // nothing to diagnose after the fact.
+      log.warn("replay slice failed", {
+        stackId,
+        slice: s.id,
+        branch: s.branch,
+        conflict: out.conflict,
+        worktree: worktreePath,
+        anchor,
+        newBase,
+        error: out.error,
+        // backupBranch only exists on the conflict variant — it's the recovery
+        // handle, so log it when present.
+        ...(out.conflict ? { backupBranch: out.backupBranch } : {}),
+      });
       if (out.conflict) {
         return {
           ok: false,
           conflict: true,
-          error: `conflict replaying ${s.branch} — resolve in its worktree, then re-run`,
+          // `out.error` carries the engine's conflicting-file detail; keep it
+          // so the operator sees WHICH files clashed at the CLI, not just in
+          // the log.
+          error: `${out.error} — resolve in its worktree, then re-run`,
           failedBranch: s.branch,
           backupBranch: out.backupBranch,
         };
