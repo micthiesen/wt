@@ -4,6 +4,7 @@ import { config } from "../../core/config.ts";
 import {
   addSliceToStack,
   applyStack,
+  pruneStackBackups,
   rebaseStack,
   reconcileStack,
   replayStack,
@@ -41,6 +42,9 @@ subcommands:
   replay [stackId]           squash-safe replay each slice onto its parent (+ retarget PRs)
   rebase [stackId]           reconcile then replay (the one-shot /restack does)
                              (stackId defaults to the current branch's stack)
+  prune-backups [--days N]   delete backup/restack-* + backup/stack-sync-*
+                             branches older than N days (default 0 — all; the
+                             commits stay recoverable via the reflog)
 
 apply options:
   --from <file>              ingest a skill-authored manifest JSON (strict validation)
@@ -663,6 +667,32 @@ async function runAdd(argv: string[]): Promise<number> {
   return 0;
 }
 
+async function runPruneBackups(argv: string[]): Promise<number> {
+  let days = 0;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--days") {
+      const n = Number(argv[++i]);
+      if (!Number.isFinite(n) || n < 0) {
+        console.error(red(`--days expects a non-negative number, got: ${argv[i] ?? "(nothing)"}`));
+        return 2;
+      }
+      days = n;
+    } else {
+      console.error(red(`unknown prune-backups option: ${argv[i]}\n`));
+      console.error(HELP);
+      return 2;
+    }
+  }
+  const res = await pruneStackBackups(days, logLine);
+  if (res.deleted.length === 0 && res.kept.length === 0) {
+    console.log(dim("no backup branches found"));
+    return 0;
+  }
+  const keptNote = res.kept.length > 0 ? dim(` (${res.kept.length} kept)`) : "";
+  console.log(green(`✓ deleted ${bold(String(res.deleted.length))} backup branch(es)`) + keptNote);
+  return 0;
+}
+
 async function runReconcile(argv: string[]): Promise<number> {
   const t = await parseStackTarget(argv, "reconcile");
   if (typeof t === "number") return t;
@@ -698,6 +728,8 @@ export async function run(argv: string[]): Promise<number> {
       return runReplay(rest);
     case "rebase":
       return runRebase(rest);
+    case "prune-backups":
+      return runPruneBackups(rest);
     default:
       console.error(red(`unknown stack subcommand: ${sub}\n`));
       console.error(HELP);

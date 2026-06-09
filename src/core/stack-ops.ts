@@ -19,7 +19,7 @@ import {
   viewPrInfo,
   type LivePrInfo,
 } from "./github.ts";
-import { rebaseInProgress, restackEngine } from "./restack-engine.ts";
+import { backupBranchOwner, backupTimestamp, rebaseInProgress, restackEngine } from "./restack-engine.ts";
 import {
   isTrunkBase,
   resolveParentBranch,
@@ -35,7 +35,7 @@ import {
   type StackManifest,
   type StackSlice,
 } from "./wtstate.ts";
-import { listWorktrees, worktreeIsDirty } from "./worktree.ts";
+import { listWorktrees, worktreeHasTrackedChanges } from "./worktree.ts";
 
 const log = createLogger("[stack-ops]");
 
@@ -452,6 +452,9 @@ async function replayStackLocked(
 
   // Each slice replays IN ITS OWN WORKTREE (HEAD rebases in place), so map
   // branch → path and refuse any dirty one up front — a rebase would clobber.
+  // Only TRACKED changes block: untracked files ride through a rebase safely
+  // (git refuses cleanly if one would be overwritten), and the workflow itself
+  // drops untracked files like `prompt.txt` into slice worktrees.
   const pathByBranch = new Map(
     (await listWorktrees())
       .filter((w) => !w.isMain && w.branch)
@@ -460,11 +463,11 @@ async function replayStackLocked(
   for (const s of live) {
     const p = pathByBranch.get(s.branch);
     if (!p) continue;
-    if (await worktreeIsDirty(p)) {
+    if (await worktreeHasTrackedChanges(p)) {
       return {
         ok: false,
         conflict: false,
-        error: `slice worktree ${p} (${s.branch}) has uncommitted changes — commit or stash before restacking`,
+        error: `slice worktree ${p} (${s.branch}) has uncommitted changes to tracked files — commit or stash before restacking`,
       };
     }
     // A worktree left mid-rebase by an earlier interrupted run can read clean
@@ -574,12 +577,14 @@ async function replayStackLocked(
     // restack is a cheap no-op when nothing has moved.
     updateStackSlice(stackId, s.id, { baseSha: out.newBaseSha });
 
-    // Keep the PR base aligned with the manifest only when the slice actually
-    // moved (a parent that landed/rewrote shifts the child onto a new base).
-    // An unmoved slice's base is already correct, so we skip the `gh pr view`
-    // probe — any residual drift still surfaces in `wt stack status`.
-    if (out.moved) {
-      replayed++;
+    // Keep the PR base aligned with the manifest when the slice actually
+    // moved (a parent that landed/rewrote shifts the child onto a new base)
+    // OR when the engine synced a stale remote — a hand-resolved conflict may
+    // have changed the parent too. A slice that neither moved nor pushed has
+    // a correct base already, so we skip the `gh pr view` probe — any
+    // residual drift still surfaces in `wt stack status`.
+    if (out.moved) replayed++;
+    if (out.moved || out.pushed) {
       await retargetIfNeeded(s, resolveParentBranch(manifest, s), onLog);
     }
   }
@@ -1107,4 +1112,48 @@ export async function addSliceToStack(
 
   log.info("added slice to stack", { stackId, slice: slice.id, branch, parentBranch, prNumber });
   return { ok: true, slice, parentBranch, prAction };
+}
+
+// ---------- backup pruning ----------
+
+export type PruneBackupsResult = { deleted: string[]; kept: string[] };
+
+/**
+ * Delete restack backup branches (`backup/restack-*` and the retired stack
+ * CLI's `backup/stack-sync-*`) older than `olderThanDays` (0 = all of them).
+ * Backups exist to recover an in-flight conflict bail; once a slice replays
+ * clean the engine prunes its own, but conflict leftovers and pre-pruning
+ * history pile up — this is the manual sweep. `git branch -D` doesn't destroy
+ * commits; everything stays reachable via the reflog. Refs under `backup/`
+ * that don't match a known naming scheme are left alone.
+ */
+export async function pruneStackBackups(
+  olderThanDays: number,
+  onLog: Logger,
+): Promise<PruneBackupsResult> {
+  const r = await gitRun(["for-each-ref", "--format=%(refname:short)", "refs/heads/backup/"]);
+  const deleted: string[] = [];
+  const kept: string[] = [];
+  if (r.exitCode !== 0) return { deleted, kept };
+  const cutoff = Date.now() - olderThanDays * 86_400_000;
+  for (const ref of r.stdout.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    if (backupBranchOwner(ref) === null) {
+      kept.push(ref);
+      continue;
+    }
+    const ts = backupTimestamp(ref);
+    if (ts === null || ts > cutoff) {
+      kept.push(ref);
+      continue;
+    }
+    const del = await gitRun(["branch", "-D", ref]);
+    if (del.exitCode === 0) {
+      deleted.push(ref);
+      onLog(`  deleted ${ref}`);
+    } else {
+      kept.push(ref);
+      onLog(`  could not delete ${ref}: ${(del.stderr || del.stdout).trim()}`);
+    }
+  }
+  return { deleted, kept };
 }

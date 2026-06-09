@@ -144,6 +144,21 @@ export async function worktreeIsDirty(wtPath: string): Promise<boolean> {
 }
 
 /**
+ * Tracked-file changes only (staged or unstaged); untracked files don't
+ * count. The stack replay gate uses this — `git rebase` is safe alongside
+ * untracked files (it refuses cleanly if one would be overwritten), and the
+ * workflow itself drops files like `prompt.txt` into slice worktrees by
+ * convention, so blocking a replay on them is self-inflicted friction.
+ */
+export async function worktreeHasTrackedChanges(wtPath: string): Promise<boolean> {
+  const porcelain = await runOk(
+    ["git", "status", "--porcelain", "--untracked-files=no"],
+    { cwd: wtPath },
+  );
+  return porcelain.split("\n").some((l) => l.trim().length > 0);
+}
+
+/**
  * Count of commits on HEAD that aren't on the branch's upstream (or on
  * origin/main if there's no upstream). Used by remove flows to warn
  * about work that would be lost if the worktree is destroyed.

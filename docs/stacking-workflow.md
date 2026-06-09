@@ -393,6 +393,24 @@ standalone skills — never as edits to `/start` or `/done`.
       re-materialized by `applyStack` from the HOLISTIC branch, clobbering the
       externally-authored content. Never creates branches/worktrees (`wt new` owns
       that). Fixture-verified: adopt + retarget, push + create, anchors, error paths.
+- [x] wt: **replay robustness pass** (eng-5183 restack post-mortem, 2026-06-09).
+      Four fixes from a real restack that needed three replay re-runs + manual
+      babysitting: (1) transient-lock handling got real backoff (5 attempts,
+      250ms-linear + jitter — immediate retries kept losing to the same
+      gitstatusd lock holder) and now also covers the MID-PICK case: a lock that
+      breaks a pick (rebase in progress, zero unmerged paths, lock-shaped
+      stderr) is aborted and the whole rebase re-run, and `git rebase --abort`
+      itself retries with backoff before ever declaring a worktree stuck.
+      (2) The replay gate only blocks on TRACKED changes
+      (`worktreeHasTrackedChanges`) — untracked files like the conventionally
+      dropped `prompt.txt` ride through a rebase safely and no longer force a
+      stash dance. (3) A slice that positionally needs no replay but whose
+      remote lags the local tip (the forgot-to-push-after-hand-resolve case)
+      gets force-with-lease pushed + PR-retargeted (`pushed` on
+      `ReplayOutcome`). (4) Backups self-clean: a clean replay prunes that
+      branch's older `backup/restack-*`/`backup/stack-sync-*` refs, and
+      `wt stack prune-backups [--days N]` sweeps the rest. Fixture-verified
+      end-to-end including a live lock race.
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -707,3 +725,29 @@ Track friction here as the workflow gets used. Candidate adjustments:
   external pass always runs. Both verified with a bare-origin git fixture + fake `gh`
   shim (20 asserts: adopt/retarget/create/anchors/error paths; merged-external
   reparented, live-external untouched).
+- **2026-06-09** — Replay robustness pass, from the eng-5183-01 `/restack`
+  post-mortem (the run worked but needed three replay re-runs, a manual
+  `rebase --abort`, a stash dance, and a hand push). Four wt fixes:
+  (1) **Lock races**: retry backoff is now real (5 attempts, 250ms-linear +
+  jitter — the old quick retries kept losing to the same gitstatusd lock
+  holder) and extends to the two previously fatal shapes: a lock that breaks a
+  pick MID-rebase (in-progress + zero unmerged paths + lock-shaped stderr →
+  abort + re-run the whole rebase, distinguished from a genuine conflict by
+  `--diff-filter=U`), and `git rebase --abort` itself losing to the same lock
+  (`abortRebaseWithRetry`, success judged by `rebaseInProgress`, not exit
+  code). (2) **Untracked files don't block replay**: the gate switched from
+  `worktreeIsDirty` to a new `worktreeHasTrackedChanges` (porcelain with
+  `--untracked-files=no`) — `git rebase` is safe alongside untracked files and
+  the workflow itself drops `prompt.txt` into slice worktrees, so blocking on
+  them was self-inflicted. `wt rm`'s lose-work warning keeps the strict check.
+  (3) **Skip-path push backstop**: a slice already on its base whose remote
+  lags the local tip (hand-resolved conflict, forgotten push) is now
+  force-with-lease pushed and PR-retargeted; `ReplayOutcome` carries `pushed`
+  alongside `moved`. A planned slice with no origin ref is left alone.
+  (4) **Backup hygiene**: a clean replay prunes that branch's older
+  `backup/restack-*` + legacy `backup/stack-sync-*` refs (they're superseded;
+  commits stay in the reflog), and `wt stack prune-backups [--days N]` sweeps
+  the rest (default 0 = all). `/restack` skill updated: tracked-only
+  precondition, lock-retry + prune-backups notes, manual push marked as
+  backstopped. Fixture-verified end-to-end, including a live `index.lock` race
+  (lock dropped mid-run at +600ms; attempt 2 succeeded).
