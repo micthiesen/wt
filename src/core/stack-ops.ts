@@ -447,7 +447,17 @@ async function replayStackLocked(
   } catch (e) {
     return { ok: false, conflict: false, error: e instanceof Error ? e.message : String(e) };
   }
-  const live = ordered.filter((s) => s.status !== "merged");
+  // Only OPEN slices replay. Merged ones dropped out at reconcile, and a
+  // `planned` slice isn't materialized — no PR, and any branch/worktree
+  // already sitting under it is hand-authored WIP the engine must neither
+  // rebase nor gate on (a dirty planned tip used to block the whole stack).
+  // Skip it loudly; it catches up at `wt stack apply` / `wt stack add`.
+  const live = ordered.filter((s) => s.status === "open");
+  for (const s of ordered) {
+    if (s.status === "planned") {
+      onLog(`skip ${s.id} (${s.branch}) — planned slice, not yet materialized`);
+    }
+  }
   const byId = new Map(manifest.slices.map((s) => [s.id, s]));
 
   // Each slice replays IN ITS OWN WORKTREE (HEAD rebases in place), so map
@@ -467,7 +477,7 @@ async function replayStackLocked(
       return {
         ok: false,
         conflict: false,
-        error: `slice worktree ${p} (${s.branch}) has uncommitted changes to tracked files — commit or stash before restacking`,
+        error: `slice ${s.id} worktree ${p} (${s.branch}) has uncommitted changes to tracked files — commit or stash before restacking`,
       };
     }
     // A worktree left mid-rebase by an earlier interrupted run can read clean
@@ -514,7 +524,7 @@ async function replayStackLocked(
       return {
         ok: false,
         conflict: false,
-        error: `could not resolve a replay anchor for ${s.branch} (no baseSha and no merge-base)`,
+        error: `could not resolve a replay anchor for ${s.branch} (no baseSha and no merge-base)${plannedParentHint(s, byId)}`,
       };
     }
     anchorById.set(s.id, anchor);
@@ -532,7 +542,7 @@ async function replayStackLocked(
       return {
         ok: false,
         conflict: false,
-        error: `could not resolve the new base for ${s.branch}`,
+        error: `could not resolve the new base for ${s.branch}${plannedParentHint(s, byId)}`,
       };
     }
 
@@ -643,6 +653,18 @@ async function resolveAnchor(
   const r = await gitRun(["merge-base", slice.branch, parentRef], cwd);
   const sha = r.stdout.trim();
   return r.exitCode === 0 && sha ? sha : null;
+}
+
+/**
+ * Failure hint for a slice whose parent is still `planned`: replay skips
+ * planned slices, so the parent's branch may not exist yet — the likely
+ * reason an anchor or new base failed to resolve.
+ */
+function plannedParentHint(slice: StackSlice, byId: Map<string, StackSlice>): string {
+  const parent = byId.get(slice.base);
+  return parent?.status === "planned"
+    ? ` — parent ${parent.id} is still planned; materialize it with \`wt stack apply\` first`
+    : "";
 }
 
 /** The ref naming a slice's parent tip as it stands now (pre-replay). */

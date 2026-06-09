@@ -411,6 +411,20 @@ standalone skills — never as edits to `/start` or `/done`.
       branch's older `backup/restack-*`/`backup/stack-sync-*` refs, and
       `wt stack prune-backups [--days N]` sweeps the rest. Fixture-verified
       end-to-end including a live lock race.
+- [x] wt: **replay skips planned slices** (eng-5183 restack friction,
+      2026-06-09). `replayStackLocked` now filters `live` to `status ===
+      "open"`: a planned slice has no PR and isn't materialized, so any
+      branch/worktree already under it is hand-authored WIP the engine must
+      neither rebase nor gate on. Previously a dirty planned TIP slice
+      hard-failed the whole stack's replay ("uncommitted changes — commit or
+      stash") even though the open slices below it never touch that worktree.
+      Skipped slices are logged (`skip s4 (…) — planned slice, not yet
+      materialized`); they catch up at `wt stack apply` / `wt stack add`. An
+      open slice whose PARENT is planned now gets an explicit hint on
+      anchor/new-base failure (`parent s4a is still planned; materialize it
+      with \`wt stack apply\` first`) instead of the old misleading
+      "has no worktree" error, and the dirty-gate message names the slice id.
+      `/restack` preconditions updated to "open slices only".
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -751,3 +765,20 @@ Track friction here as the workflow gets used. Candidate adjustments:
   precondition, lock-retry + prune-backups notes, manual push marked as
   backstopped. Fixture-verified end-to-end, including a live `index.lock` race
   (lock dropped mid-run at +600ms; attempt 2 succeeded).
+- **2026-06-09** — Replay skips planned slices. Friction from the eng-5183
+  restack: `wt stack rebase eng-5183` hard-failed because the PLANNED tip slice
+  (eng-5200-preserve-user-cells, no PR) had live WIP in its worktree — the
+  dirty gate covered every non-merged slice, so untouchable in-progress work on
+  a slice the replay would never need blocked rebasing the three open slices
+  below it. (Bonus confusion: the slice's branch carries a different issue id,
+  so the error read like a foreign stack.) Fix in `replayStackLocked`
+  (`stack-ops.ts`): `live` filters to `status === "open"`; planned slices are
+  skipped with an onLog notice and catch up at `apply`/`add`. Rationale: a
+  planned slice's branch/worktree (when one exists at all) is hand-authored WIP
+  — rebasing it would clobber, gating on it blocks, so the engine ignores it
+  entirely. Open-slice-on-planned-parent failures (anchor/new-base unresolvable
+  because the parent branch doesn't exist yet — the normal split-before-apply
+  state) now carry a `plannedParentHint` pointing at `wt stack apply`, replacing
+  the old "has no worktree" misdirection. Dirty-gate error now names the slice
+  id. `/restack` skill preconditions updated (open slices only; planned never
+  blocks). Typecheck + smoke clean; no fixture run (gate-scope change only).
