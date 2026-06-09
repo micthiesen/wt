@@ -19,7 +19,6 @@ import { claudeStatus, wtSessionArgs, wtSessionUuid } from "../claude.ts";
 import { readRegistry, type RegistryStatus } from "../claude-registry.ts";
 import {
   buildClaudeSessionEntries,
-  listClaudeNames,
   reapClaudeNames,
 } from "../claude-sessions.ts";
 
@@ -162,9 +161,4 @@ export function parseClaudeTmuxName(
 /** Resolve the deterministic UUID for a Claude session on this slug. */
 export function claudeSessionId(wtPath: string, managedName: string | null): string {
   return wtSessionUuid(wtPath, managedName);
-}
-
-/** Live persisted names for a Claude slug (drop-in for `listClaudeNames`). */
-export function listClaudePersistedNames(slug: string): string[] {
-  return listClaudeNames(slug);
 }

@@ -78,6 +78,11 @@ export function createWtQueryClient(): WtQueryClient {
         // codex/opencode) and worthless across runs — restoring it would
         // flash stale sessions on boot. Keep it in-memory only.
         if (key[0] === "harnessSessions") return false;
+        // Summaries are keyed only by slug, but the VALUE is derived from
+        // the live persisted-name list at fetch time. A restored entry
+        // pre-warms a previous run's name set (ghost/missing sessions)
+        // until the staleTime refetch — recompute fresh each run instead.
+        if (key[0] === "claudeSummaries") return false;
         if (key.length < 3 || key[0] !== "wt") return true;
         const slot = key[2];
         return slot !== "lock" && slot !== "claude";

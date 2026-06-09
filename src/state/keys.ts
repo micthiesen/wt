@@ -34,8 +34,6 @@ export const qk = {
   primaryHarness: () => ["primaryHarness"] as const,
   /** Origin/main fetch marker; invalidated manually. */
   fetchOrigin: () => ["fetchOrigin"] as const,
-  /** First-parent SHAs of origin/main; supports branchIsMerged. */
-  mainFirstParents: () => ["mainFirstParents"] as const,
   /**
    * GitHub PR fetch: one aliased query per listed branch. Branches are
    * sorted so the key is stable regardless of worktree list order.

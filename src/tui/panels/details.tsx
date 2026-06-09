@@ -20,7 +20,7 @@
  *   Same-concept-same-glyph between this pane and the row list is
  *   enforced via shared helpers.
  */
-import { memo, useMemo, type RefObject } from "react";
+import { memo, type RefObject } from "react";
 import { TextAttributes } from "@opentui/core";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
@@ -365,10 +365,11 @@ const DetailsBody = memo(function DetailsBody({
   });
 
   const valueWidth = valueWidthFor(width);
-  const ctx: RowContext = useMemo(
-    () => ({ row, github, valueWidth }),
-    [row, github, valueWidth],
-  );
+  // No useMemo: `github` is a UseQueryResult wrapper with a fresh identity
+  // every render, so a memo keyed on it would never hold anyway — build
+  // the ctx inline and keep the cost honest. Rows re-render with the pane
+  // regardless (none are React.memo'd on ctx identity).
+  const ctx: RowContext = { row, github, valueWidth };
 
   // Pick a single user-facing reason when we're suppressing AI work.
   const blockedReason: string | null = !aiEnabled

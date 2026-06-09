@@ -334,11 +334,14 @@ class SessionTailRegistry {
   stopAll(): void {
     for (const key of [...this.state.keys()]) this.stopByKey(key);
     this.stopPoller();
-    // Drop any pending refresh-trigger debounce timers — no tailer is
-    // left to have produced them, and a late fire would invalidate
-    // queries on a torn-down client.
+    // Drop any pending debounce timers — no tailer is left to have
+    // produced them, and a late fire would invalidate queries on a
+    // torn-down client. Both maps, symmetrically: the runtime also nulls
+    // the sinks on shutdown, but stopAll shouldn't depend on that.
     for (const t of triggerTimers.values()) clearTimeout(t);
     triggerTimers.clear();
+    for (const t of slugChangeTimers.values()) clearTimeout(t);
+    slugChangeTimers.clear();
   }
 
   /**

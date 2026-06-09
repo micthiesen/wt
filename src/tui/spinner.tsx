@@ -59,9 +59,6 @@ const WAVE_AMP_SNAP = 0.02;
 /** U+2580 is the cell just below ▁ (U+2581); +level gives ▁..█ for 1..8. */
 const BLOCK_BASE = 0x2580;
 
-/** Cell width of {@link Spinner} — useful when sizing layout slots. */
-export const SPINNER_WIDTH = 2;
-
 /**
  * Shared frame ticker: advances a frame index `0..period-1` on a loop at
  * `frameMs` per frame. Single source of motion for both the rotating

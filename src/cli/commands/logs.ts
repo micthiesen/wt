@@ -18,7 +18,14 @@ function mostRecentLog(): string | null {
   }
   const matching = files
     .filter((f) => f.endsWith(".log"))
-    .map((f) => ({ name: f, mtime: statSync(join(dir, f)).mtimeMs }))
+    .flatMap((f) => {
+      // A log can vanish between readdir and stat (startup reap) — skip it.
+      try {
+        return [{ name: f, mtime: statSync(join(dir, f)).mtimeMs }];
+      } catch {
+        return [];
+      }
+    })
     .sort((a, b) => b.mtime - a.mtime);
   return matching[0] ? join(dir, matching[0].name) : null;
 }

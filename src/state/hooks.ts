@@ -313,10 +313,11 @@ export function useWtActions() {
         qc.invalidateQueries({ queryKey: qk.reviewRequests() }),
         qc.invalidateQueries({ queryKey: qk.wtState() }),
       ]);
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: qk.mainFirstParents() }),
-        qc.invalidateQueries({ queryKey: ["wt"] }),
-      ]);
+      // The first-parent SHA set is not a TanStack query — it's a
+      // module-level promise cache in core/git.ts, already dropped by
+      // invalidateMainFirstParents() inside fetchOriginQuery. Only the
+      // real per-worktree ["wt"] queries need invalidating here.
+      await qc.invalidateQueries({ queryKey: ["wt"] });
     },
     /**
      * Nuke every cached query — in-memory *and* the SQLite blob on

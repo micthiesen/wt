@@ -30,7 +30,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "./logger.ts";
-import { run, runQuiet } from "./proc.ts";
+import { run } from "./proc.ts";
 
 const log = createLogger("[action-tmux]");
 
@@ -193,23 +193,6 @@ export async function killActionSession(slug: string): Promise<void> {
     "-L",
     TMUX_SOCKET,
     "kill-session",
-    "-t",
-    `=${actionSessionName(slug)}`,
-  ]);
-}
-
-/**
- * Whether an action session exists right now for `slug`. Used by the
- * boot reconciler when deciding whether a run with `status="running"`
- * on disk is actually still running, or whether the wrapper crashed
- * without firing the EXIT trap.
- */
-export async function actionSessionExists(slug: string): Promise<boolean> {
-  return runQuiet([
-    "tmux",
-    "-L",
-    TMUX_SOCKET,
-    "has-session",
     "-t",
     `=${actionSessionName(slug)}`,
   ]);

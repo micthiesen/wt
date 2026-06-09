@@ -11,7 +11,7 @@
 import { config } from "./config.ts";
 import { branchExists, gitQuiet, gitRun } from "./git.ts";
 import { createWorktree } from "./lifecycle.ts";
-import { tryAcquireLock } from "./locks.ts";
+import { tryAcquireLock, type LockHandle } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 import {
   createDraftPr,
@@ -39,10 +39,30 @@ import { listWorktrees, worktreeHasTrackedChanges } from "./worktree.ts";
 
 const log = createLogger("[stack-ops]");
 
-/** Flock slug serializing replay across processes (one restack at a time). */
+/** Flock slug serializing stack operations across processes. */
 const STACK_LOCK_SLUG = "__stack__";
 
 export type Logger = (line: string) => void;
+
+/** Error every mutator returns/logs when the stack lock can't be had. */
+const STACK_BUSY = "another wt stack operation is already running";
+
+/**
+ * Acquire the cross-process stack lock, waiting briefly for a live holder
+ * to finish. EVERY manifest mutator takes this — not just replay. Each
+ * mutator does read-manifest → async git/gh work → write-manifest-back, so
+ * two unserialized writers (a CLI `wt stack apply` racing the TUI's
+ * reconcile) would silently lose whichever write lands first.
+ */
+async function acquireStackLock(phase: string): Promise<LockHandle | null> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const handle = tryAcquireLock(STACK_LOCK_SLUG, "stack", { phase });
+    if (handle) return handle;
+    if (Date.now() >= deadline) return null;
+    await Bun.sleep(250);
+  }
+}
 
 /**
  * Reproduce a slice's content as a single commit in its fresh worktree.
@@ -155,6 +175,20 @@ export type ApplyResult = {
  * `open`/`merged` are skipped.
  */
 export async function applyStack(
+  stackId: string,
+  opts: ApplyOptions,
+  onLog: Logger,
+): Promise<ApplyResult> {
+  const lock = await acquireStackLock("apply");
+  if (!lock) return { materialized: [], skipped: [], error: STACK_BUSY };
+  try {
+    return await applyStackLocked(stackId, opts, onLog);
+  } finally {
+    lock.release();
+  }
+}
+
+async function applyStackLocked(
   stackId: string,
   opts: ApplyOptions,
   onLog: Logger,
@@ -413,13 +447,9 @@ export async function replayStack(
   opts: RebaseOptions,
   onLog: Logger,
 ): Promise<RebaseResult> {
-  const handle = tryAcquireLock(STACK_LOCK_SLUG, "stack", { phase: "replay" });
+  const handle = await acquireStackLock("replay");
   if (!handle) {
-    return {
-      ok: false,
-      conflict: false,
-      error: "another wt stack operation is already running",
-    };
+    return { ok: false, conflict: false, error: STACK_BUSY };
   }
   try {
     return await replayStackLocked(stackId, opts, onLog);
@@ -728,6 +758,23 @@ export async function reconcileStack(
   trunk: string,
   onLog: Logger,
 ): Promise<void> {
+  const lock = await acquireStackLock("reconcile");
+  if (!lock) {
+    onLog(`skipped reconcile of ${stackId} — ${STACK_BUSY}`);
+    return;
+  }
+  try {
+    await reconcileStackLocked(stackId, trunk, onLog);
+  } finally {
+    lock.release();
+  }
+}
+
+async function reconcileStackLocked(
+  stackId: string,
+  trunk: string,
+  onLog: Logger,
+): Promise<void> {
   const manifest = getStackManifest(stackId);
   if (!manifest) return;
   // Probe live PR state for every candidate slice in parallel.
@@ -849,6 +896,24 @@ export type SplitResult =
  * writing. `opts.plan` validates + returns the new shape WITHOUT writing.
  */
 export function splitStack(
+  stackId: string,
+  sliceId: string,
+  fragment: SubSliceSpec[],
+  opts: { plan?: boolean },
+): SplitResult {
+  // Sync function, so no patient wait — a non-blocking probe is enough to
+  // keep a reshape from interleaving with a live replay/apply. A pure
+  // `--plan` preview writes nothing and can skip the lock.
+  const lock = opts.plan ? null : tryAcquireLock(STACK_LOCK_SLUG, "stack", { phase: "split" });
+  if (!opts.plan && !lock) return { ok: false, error: STACK_BUSY };
+  try {
+    return splitStackLocked(stackId, sliceId, fragment, opts);
+  } finally {
+    lock?.release();
+  }
+}
+
+function splitStackLocked(
   stackId: string,
   sliceId: string,
   fragment: SubSliceSpec[],
@@ -989,6 +1054,21 @@ async function localOrOriginRef(branch: string): Promise<string> {
  * wouldn't be an ancestor of the branch.
  */
 export async function addSliceToStack(
+  stackId: string,
+  branch: string,
+  opts: { onto?: string; title?: string },
+  onLog: Logger,
+): Promise<AddSliceResult> {
+  const lock = await acquireStackLock("add");
+  if (!lock) return { ok: false, error: STACK_BUSY };
+  try {
+    return await addSliceToStackLocked(stackId, branch, opts, onLog);
+  } finally {
+    lock.release();
+  }
+}
+
+async function addSliceToStackLocked(
   stackId: string,
   branch: string,
   opts: { onto?: string; title?: string },

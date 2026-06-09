@@ -19,34 +19,36 @@ import { listWorktrees } from "./worktree.ts";
 
 const log = createLogger("[gh]");
 
-// `which gh` never changes within a process; memoize like `repoSlug`
-// so per-slice loops (stack status/rebase) don't re-spawn it each call.
+// `which gh` is memoized so per-slice loops (stack status/rebase) don't
+// re-spawn it each call — but only the POSITIVE result. A cached negative
+// would pin "no gh" for the whole session even after the user installs it;
+// re-probing in gh-absent mode is cheap (everything gh-backed is off anyway).
 let _hasGh: boolean | undefined;
 async function hasGh(): Promise<boolean> {
-  if (_hasGh !== undefined) return _hasGh;
+  if (_hasGh) return true;
   const r = await run(["which", "gh"]);
-  _hasGh = r.exitCode === 0 && r.stdout.trim().length > 0;
-  return _hasGh;
+  const found = r.exitCode === 0 && r.stdout.trim().length > 0;
+  if (found) _hasGh = true;
+  return found;
 }
 
 // Cache the resolved `owner/name` — it never changes for a given clone.
+// Same positive-only rule as `hasGh`: a transient failure (gh not yet
+// authed at startup) shouldn't pin null for the whole session.
 let _repoSlug: string | null | undefined;
 export async function repoSlug(): Promise<string | null> {
-  if (_repoSlug !== undefined) return _repoSlug;
+  if (_repoSlug != null) return _repoSlug;
   const r = await run(
     ["gh", "repo", "view", "--json", "nameWithOwner"],
     { cwd: config.paths.mainClone, timeoutMs: 5_000 },
   );
-  if (r.exitCode !== 0) {
-    _repoSlug = null;
-    return null;
-  }
+  if (r.exitCode !== 0) return null;
   try {
     const data = JSON.parse(r.stdout) as { nameWithOwner?: string };
     _repoSlug = data.nameWithOwner ?? null;
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { stdout: r.stdout.slice(0, 200) });
-    _repoSlug = null;
+    return null;
   }
   return _repoSlug;
 }
@@ -872,11 +874,10 @@ export async function fetchRepoContributors(signal?: AbortSignal): Promise<Contr
  */
 let _authedLogin: string | null | undefined;
 export async function fetchAuthenticatedLogin(): Promise<string | null> {
-  if (_authedLogin !== undefined) return _authedLogin;
-  if (!(await hasGh())) {
-    _authedLogin = null;
-    return null;
-  }
+  // Positive-only memo (see `hasGh`): a failed probe (not yet authed)
+  // re-tries on the next call instead of pinning null all session.
+  if (_authedLogin != null) return _authedLogin;
+  if (!(await hasGh())) return null;
   const r = await run(["gh", "api", "user", "--jq", ".login"], {
     cwd: config.paths.mainClone,
     timeoutMs: 5_000,
@@ -885,12 +886,11 @@ export async function fetchAuthenticatedLogin(): Promise<string | null> {
     log.error("auth user fetch failed", {
       stderr: r.stderr.slice(0, 200),
     });
-    _authedLogin = null;
     return null;
   }
   const login = r.stdout.trim();
-  _authedLogin = login.length > 0 ? login : null;
-  return _authedLogin;
+  if (login.length > 0) _authedLogin = login;
+  return _authedLogin ?? null;
 }
 
 /**
@@ -909,19 +909,25 @@ export type GhActionResult = { ok: true } | { ok: false; error: string };
 export type EnableAutoMergeResult = GhActionResult;
 
 /**
- * Enable "merge when ready" on a PR via `gh pr merge --auto`. Rebase
- * is hardcoded to match the repo's merge style; promote to config
- * when there's a second concrete preference. Runs from the main clone
- * so gh resolves the right repo. `gh` does the right thing for both
- * classic auto-merge and merge-queue repos — the same flag enqueues
- * when a queue is configured.
+ * The merge method `enableAutoMerge` arms. Hardcoded to match the repo's
+ * merge style; promote to config when there's a second concrete
+ * preference. Exported so the TUI's optimistic patch shows the same
+ * method the gh call will actually use — the two must never drift.
+ */
+export const AUTO_MERGE_METHOD: AutoMergeMethod = "REBASE";
+
+/**
+ * Enable "merge when ready" on a PR via `gh pr merge --auto`. Runs from
+ * the main clone so gh resolves the right repo. `gh` does the right
+ * thing for both classic auto-merge and merge-queue repos — the same
+ * flag enqueues when a queue is configured.
  */
 export async function enableAutoMerge(
   prNumber: number,
 ): Promise<EnableAutoMergeResult> {
   if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
   const r = await run(
-    ["gh", "pr", "merge", String(prNumber), "--auto", "--rebase"],
+    ["gh", "pr", "merge", String(prNumber), "--auto", `--${AUTO_MERGE_METHOD.toLowerCase()}`],
     { cwd: config.paths.mainClone, timeoutMs: 15_000 },
   );
   if (r.exitCode !== 0) {

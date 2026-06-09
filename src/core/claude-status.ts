@@ -31,25 +31,6 @@ export type DerivedState =
   | "idle";
 
 /**
- * Headline priority for multi-session aggregation. `asking` wins above
- * everything: a session explicitly blocked on the human is the single
- * most actionable thing to surface. Then "is anything actively
- * working?" — `working`, then `polling` (turn done but a background
- * task is still running), then `unknown` (a live session in a status we
- * don't recognize), all still active. `abandoned` ranks above `waiting`
- * so a crashed peer surfaces when nothing is busy.
- */
-export const STATE_PRIORITY: readonly DerivedState[] = [
-  "asking",
-  "working",
-  "polling",
-  "unknown",
-  "abandoned",
-  "waiting",
-  "idle",
-];
-
-/**
  * Map a live registry status to a derived state. The registry only ever
  * describes a live process, so it's authoritative whenever present —
  * `deriveSessionState` consults the jsonl tail only when there's no
@@ -93,18 +74,3 @@ export function deriveSessionState(
   return midTurn ? "abandoned" : "idle";
 }
 
-/**
- * Pick the highest-priority state across a session set. Returns `null`
- * when the input is empty so the caller can suppress the entire badge
- * rather than render a placeholder.
- */
-export function pickAggregateState(
-  states: readonly DerivedState[],
-): DerivedState | null {
-  if (states.length === 0) return null;
-  const seen = new Set(states);
-  for (const s of STATE_PRIORITY) {
-    if (seen.has(s)) return s;
-  }
-  return null;
-}

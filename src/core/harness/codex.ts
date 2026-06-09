@@ -226,6 +226,19 @@ function scanRollouts(wtPath: string): RolloutMeta[] {
 type RolloutMetaRaw = Omit<RolloutMeta, "path">;
 
 /**
+ * A rollout's first line (session_meta) is written once at creation and
+ * never changes, and rollout filenames embed a uuid, so the parsed
+ * identity is cacheable by path for the process lifetime. This matters:
+ * the 3s `harnessSessionsQuery` poll and the 2.5s tail/event pollers
+ * each walk the sessions tree and would otherwise re-open + re-parse a
+ * 64KB head per rollout per tick. Only SUCCESSFUL parses are cached — a
+ * just-created rollout can be read before codex flushes the first line,
+ * and a cached failure would hide that session forever.
+ */
+const rolloutIdentityCache = new Map<string, { sessionId: string; cwd: string }>();
+const ROLLOUT_IDENTITY_CACHE_MAX = 8192;
+
+/**
  * Read only the first line of a rollout, parse the `session_meta`
  * event, and return its `payload.id` + `payload.cwd`. The file is
  * synthesised by codex so the first line is reliably session_meta.
@@ -238,6 +251,10 @@ function readRolloutMeta(path: string): RolloutMetaRaw | null {
     stat = statSync(path);
   } catch {
     return null;
+  }
+  const cached = rolloutIdentityCache.get(path);
+  if (cached) {
+    return { ...cached, mtimeMs: stat.mtimeMs, size: stat.size };
   }
   // Read only enough bytes to capture the first line. Session_meta
   // lines are big (full system prompt embedded) — 32 KB is plenty.
@@ -265,6 +282,11 @@ function readRolloutMeta(path: string): RolloutMetaRaw | null {
     const id = obj.payload?.id;
     const cwd = obj.payload?.cwd;
     if (typeof id !== "string" || typeof cwd !== "string") return null;
+    // Runaway backstop only — the 30-day window holds far fewer entries.
+    if (rolloutIdentityCache.size >= ROLLOUT_IDENTITY_CACHE_MAX) {
+      rolloutIdentityCache.clear();
+    }
+    rolloutIdentityCache.set(path, { sessionId: id, cwd });
     return { sessionId: id, cwd, mtimeMs: stat.mtimeMs, size: stat.size };
   } catch {
     return null;

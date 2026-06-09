@@ -280,13 +280,14 @@ const GENERIC_DEFAULTS = {
     // position across F11 detaches, which matters more than always-
     // current state.
     //
-    // TODO: hook revdiff annotations into the F12 claude action loop.
-    // Add `-o {{worktree}}/.wt-review.md` to the command so a review
-    // pass dumps annotations to a known path, then a new claude-kind
-    // action ("address review annotations") whose prompt reads that
-    // file and addresses each comment. Cleaner than depending on
-    // revdiff's separate Claude Code plugin since wt already owns
-    // the action plumbing.
+    // TODO: hook revdiff annotations into the harness action loop (F12
+    // enters the selected primary harness now, not just claude). Add
+    // `-o {{worktree}}/.wt-review.md` to the command so a review pass
+    // dumps annotations to a known path, then a new harness action
+    // ("address review annotations") whose prompt reads that file and
+    // addresses each comment. Cleaner than depending on revdiff's
+    // separate Claude Code plugin since wt already owns the action
+    // plumbing.
     command: "revdiff --vim-motion --compact {{base}}",
   },
   ai: {

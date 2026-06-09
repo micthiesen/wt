@@ -22,7 +22,7 @@ import { readSummariesForSessions, type SessionSummary } from "../core/claude-su
 import { config } from "../core/config.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
-import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mainFirstParentShas } from "../core/git.ts";
+import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
 import type { DiffContext } from "../core/diff/index.ts";
 import { buildDiffContextViaPool } from "../core/diff/pool.ts";
@@ -110,13 +110,6 @@ export const fetchOriginQuery = () =>
       return Date.now();
     },
     staleTime: STALE.slow,
-  });
-
-export const mainFirstParentsQuery = () =>
-  queryOptions({
-    queryKey: qk.mainFirstParents(),
-    queryFn: async (): Promise<string[]> => [...(await mainFirstParentShas())],
-    staleTime: 10 * 60 * 1000,
   });
 
 export const archiveQuery = () =>

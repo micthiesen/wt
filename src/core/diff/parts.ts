@@ -53,10 +53,18 @@ export function parseDiff(diff: string): Part[] {
     const path = m[2]!;
     let adds = 0;
     let dels = 0;
+    // Only count inside hunks. The `+++ b/...` / `--- a/...` file headers
+    // live in the preamble before the first `@@`, so gating on hunk state
+    // skips them without also swallowing CONTENT lines that happen to start
+    // with `++`/`--`/`---` (a deleted markdown `---` divider renders as
+    // `----`, which a naive startsWith("---") check would drop).
+    let inHunk = false;
     for (const line of block.split("\n")) {
-      // File-header markers (`+++ b/...`, `--- a/...`) start with
-      // three chars; skip them so they don't get counted as content.
-      if (line.startsWith("+++") || line.startsWith("---")) continue;
+      if (line.startsWith("@@")) {
+        inHunk = true;
+        continue;
+      }
+      if (!inHunk) continue;
       if (line.startsWith("+")) adds++;
       else if (line.startsWith("-")) dels++;
     }

@@ -20,7 +20,14 @@ export function latestLogFor(slug: string): string | null {
   for (const name of readdirSync(dir)) {
     if (!name.startsWith(prefix) || !name.endsWith(".log")) continue;
     const path = join(dir, name);
-    const mtime = statSync(path).mtimeMs;
+    // The file can vanish between readdir and stat (startup reap, manual
+    // cleanup) — this runs on a polling path, so skip rather than throw.
+    let mtime: number;
+    try {
+      mtime = statSync(path).mtimeMs;
+    } catch {
+      continue;
+    }
     if (!best || mtime > best.mtime) best = { path, mtime };
   }
   return best?.path ?? null;

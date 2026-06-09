@@ -69,11 +69,11 @@ export type StackSlice = {
 export type StackLimits = { files: number; prodLines: number; hard: boolean };
 
 /**
- * The authoritative description of a stack's shape. wt owns this; the
- * `stack` engine's `.git/stack/state.json` is a regenerable projection
- * of it, never a source of truth. The holistic origin is held
- * separately so wt can render it as a distinct node and slices can
- * reach the original conversation via `holisticSessionId`.
+ * The authoritative description of a stack's shape. wt owns this — the
+ * single source of truth the native restack engine replays from. The
+ * holistic origin is held separately so wt can render it as a distinct
+ * node and slices can reach the original conversation via
+ * `holisticSessionId`.
  */
 export type StackManifest = {
   stackId: string;
@@ -85,6 +85,11 @@ export type StackManifest = {
   /** Set once `wt stack apply` tags the holistic branch. */
   archivedTag?: string;
   limits: StackLimits;
+  /**
+   * Vestigial. Named the external `stack` CLI before the engine was
+   * absorbed into wt (2026-06-08); nothing reads it anymore. Kept so
+   * stored manifests and skill-authored ingest JSON stay valid.
+   */
   engine: string;
   slices: StackSlice[];
 };
@@ -730,16 +735,6 @@ export function updateStackSlice(
     ...state,
     stacks: { ...state.stacks, [stackId]: { ...prev, slices } },
   });
-  return true;
-}
-
-/** Drop a manifest. Returns true when one was removed. */
-export function removeStackManifest(stackId: string): boolean {
-  const state = readWtState();
-  if (!state.stacks[stackId]) return false;
-  const stacks = { ...state.stacks };
-  delete stacks[stackId];
-  writeWtState({ ...state, stacks });
   return true;
 }
 

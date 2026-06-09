@@ -1,3 +1,4 @@
+import { viewPrInfo } from "../../core/github.ts";
 import { removeWorktree, spawnBackgroundRemove } from "../../core/lifecycle.ts";
 import { isOurStageDeployed } from "../../core/stage-safety.ts";
 import type { Status, Worktree } from "../../core/types.ts";
@@ -45,11 +46,22 @@ export async function run(argv: string[]): Promise<number> {
 
   const candidates: [Worktree, Status][] = [];
   const skipped: [Worktree, Status][] = [];
+  const risky: Worktree[] = [];
   for (const w of wts) {
     const st = await worktreeStatus(w);
     if (st.kind === StatusKind.Busy) skipped.push([w, st]);
-    else if (st.kind === StatusKind.Merged || st.kind === StatusKind.Gone)
-      candidates.push([w, st]);
+    else if (st.kind === StatusKind.Merged) candidates.push([w, st]);
+    else if (st.kind === StatusKind.Gone) {
+      // `[gone]` only says the remote ref vanished. A squash-merged PR is
+      // the common cause and safe to delete — but a force-deleted remote
+      // with unmerged local commits looks identical, and clean deletes the
+      // branch. Only auto-clean when a MERGED PR confirms the content
+      // landed; everything else goes through `wt rm`, which has the
+      // unpushed-commits guard.
+      const live = await viewPrInfo(w.branch);
+      if (live?.state === "MERGED") candidates.push([w, st]);
+      else risky.push(w);
+    }
   }
 
   if (skipped.length) {
@@ -59,6 +71,13 @@ export async function run(argv: string[]): Promise<number> {
       console.log(
         `  ${cyan(w.slug)} — ${yellow(st.label)}${age}  ${dim(`wt logs ${w.slug}`)}`,
       );
+    }
+  }
+
+  if (risky.length) {
+    console.log(dim("Skipping (remote gone but no merged PR — may hold unmerged work):"));
+    for (const w of risky) {
+      console.log(`  ${cyan(w.slug)}  ${dim(`remove explicitly with: wt rm ${w.slug}`)}`);
     }
   }
 

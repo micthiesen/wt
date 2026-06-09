@@ -2,12 +2,10 @@ import { useSyncExternalStore } from "react";
 
 import type { EventKind } from "../core/logger.ts";
 
-export type EventLevel = EventKind;
-
 export type WtEvent = {
   id: number;
   ts: number;
-  level: EventLevel;
+  level: EventKind;
   source: string; // "app" | slug | arbitrary
   text: string;
 };
@@ -27,11 +25,6 @@ class EventLog {
     this.events = next.length > MAX_EVENTS ? next.slice(-MAX_EVENTS) : next;
     this.notify();
     return full;
-  }
-
-  clear(): void {
-    this.events = [];
-    this.notify();
   }
 
   // Arrow-bound so React's useSyncExternalStore gets stable refs.

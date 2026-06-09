@@ -181,14 +181,10 @@ export type ClaudeSessionPickerEntry = {
 };
 
 /**
- * Picker sort order. Intentionally diverges from `STATE_PRIORITY` in
- * `claude-status.ts`: that one's a *headline aggregation* priority
- * (abandoned outranks waiting so a crashed peer surfaces when nothing
- * is busy), but the picker is a *to-do list* — the user is most likely
- * to want to attach to a session that's blocked on them (`asking`),
- * then one that's ready for input (`waiting`), over one that crashed
- * mid-turn (`abandoned`, which needs investigation). Different
- * question, different order.
+ * Picker sort order — a *to-do list*, not a severity ranking: the user
+ * is most likely to want to attach to a session that's blocked on them
+ * (`asking`), then one that's ready for input (`waiting`), over one
+ * that crashed mid-turn (`abandoned`, which needs investigation).
  */
 const STATE_RANK: Record<DerivedState, number> = {
   asking: 0,

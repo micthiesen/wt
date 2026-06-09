@@ -224,14 +224,19 @@ export function useHarnessSessions(
   // keeps the call count stable (HARNESSES is a fixed constant) and
   // mirrors `useActiveSessionsBySlug` so the two hooks can't drift. The
   // query factory short-circuits to `enabled: false` when wtPath is "".
-  const results = useQueries({
+  // `combine` is load-bearing: the raw `useQueries` results array is a
+  // fresh reference every render, so a useMemo keyed on it never holds —
+  // the combined data array IS structurally shared by TanStack, making
+  // the memos below real.
+  const rawData = useQueries({
     queries: HARNESSES.map((h) => harnessSessionsQuery(h.id, slug, wtPath)),
+    combine: combineSessionData,
   });
   const rawByHarness = useMemo(() => {
     const m = new Map<HarnessId, ReadonlyArray<HarnessSession>>();
-    HARNESSES.forEach((h, i) => m.set(h.id, results[i]?.data ?? EMPTY));
+    HARNESSES.forEach((h, i) => m.set(h.id, rawData[i] ?? EMPTY));
     return m;
-  }, [results]);
+  }, [rawData]);
 
   return useMemo(
     () =>
@@ -259,6 +264,18 @@ export type ActiveSessionGlyph = {
 };
 
 const ALL_HARNESS_IDS: readonly HarnessId[] = HARNESSES.map((h) => h.id);
+
+/**
+ * Shared `useQueries` combiner: project each result down to its data.
+ * TanStack structurally shares the combined value, so the returned array
+ * keeps a stable identity across renders while no query data changed —
+ * which is what lets the downstream `useMemo`s actually memoize.
+ */
+function combineSessionData(
+  results: ReadonlyArray<{ data?: ReadonlyArray<HarnessSession> }>,
+): ReadonlyArray<ReadonlyArray<HarnessSession> | undefined> {
+  return results.map((r) => r.data);
+}
 
 /**
  * Per-slug {@link ActiveSessionGlyph}, computed through the same
@@ -301,10 +318,14 @@ export function useActiveSessionsBySlug(
     () => worktrees.filter((w) => liveAiSlugs.has(w.slug)),
     [worktrees, liveAiSlugs],
   );
-  const results = useQueries({
+  // `combine` for the same reason as `useHarnessSessions`: the raw
+  // results array identity changes every render; the combined data
+  // array is structurally shared, so the memo below actually holds.
+  const rawData = useQueries({
     queries: liveWorktrees.flatMap((w) =>
       harnessIds.map((id) => harnessSessionsQuery(id, w.slug, w.path)),
     ),
+    combine: combineSessionData,
   });
   return useMemo(() => {
     const tmuxNames = new Set(tmux.data?.all ?? []);
@@ -315,7 +336,7 @@ export function useActiveSessionsBySlug(
       const w = liveWorktrees[i]!;
       const rawByHarness = new Map<HarnessId, ReadonlyArray<HarnessSession>>();
       for (let j = 0; j < H; j++) {
-        rawByHarness.set(harnessIds[j]!, results[i * H + j]?.data ?? EMPTY);
+        rawByHarness.set(harnessIds[j]!, rawData[i * H + j] ?? EMPTY);
       }
       const { f12Target } = computeHarnessSessions(
         rawByHarness,
@@ -332,5 +353,5 @@ export function useActiveSessionsBySlug(
       }
     }
     return map;
-  }, [results, tmux.data?.all, primary, liveWorktrees, harnessIds]);
+  }, [rawData, tmux.data?.all, primary, liveWorktrees, harnessIds]);
 }

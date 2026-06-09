@@ -24,6 +24,7 @@ import {
   spawnBackgroundRemove,
 } from "../core/lifecycle.ts";
 import {
+  AUTO_MERGE_METHOD,
   disableAutoMerge,
   editReviewers,
   enableAutoMerge,
@@ -2337,14 +2338,14 @@ export function App({ onExit }: Props) {
     }
     const prNumber = row.pr.number;
     const branch = row.wt.branch;
-    // Optimistic shape for enable: we don't know the merge method
-    // GitHub will land on (depends on repo settings), so seed a
-    // placeholder. The invalidate that fires on success replaces it
-    // with truth on the next refetch — what matters for UX is that
-    // the badge flips immediately.
+    // Optimistic shape for enable: seed the method the gh call will arm
+    // (shared AUTO_MERGE_METHOD constant, so this can't drift from
+    // enableAutoMerge). The invalidate that fires on success replaces it
+    // with truth on the next refetch — what matters for UX is that the
+    // badge flips immediately.
     const optimisticAutoMerge: PullRequest["autoMerge"] | null =
       action === "enable"
-        ? { enabledAt: new Date().toISOString(), mergeMethod: "REBASE" }
+        ? { enabledAt: new Date().toISOString(), mergeMethod: AUTO_MERGE_METHOD }
         : null;
     try {
       await mutate<GithubData>({
@@ -2484,7 +2485,7 @@ export function App({ onExit }: Props) {
               ...pr,
               autoMerge: {
                 enabledAt: new Date().toISOString(),
-                mergeMethod: "REBASE",
+                mergeMethod: AUTO_MERGE_METHOD,
               },
             })),
           run: async () => {
