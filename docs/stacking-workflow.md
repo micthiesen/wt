@@ -2,7 +2,7 @@
 
 > Living design doc. When something in this workflow needs tweaking, read this
 > first for full context, then update it (decisions, what works, what to change).
-> Last updated: 2026-06-08.
+> Last updated: 2026-06-09.
 
 Full design conversation (deep context, the back-and-forth that produced this):
 `/Users/michael/.claude/projects/-Users-michael-Code-client-wt-eng-5182-metric-builder-tools-and-v2-instructions/9323e329-e087-59be-a2cf-7ffd88e9ab4e.jsonl`
@@ -369,15 +369,30 @@ standalone skills — never as edits to `/start` or `/done`.
       replay failures persist to the daily app log; conflict errors name the clashing
       files at the CLI; a pass-1 guard refuses to replay into a worktree already wedged
       mid-rebase. Fixture-verified; ultracheck + refute reviewed.
-- [ ] wt: **cross-stack auto-reconcile**. `reconcileStack` only sees slices within
-      its own manifest, so when an external parent (another stack's tip) merges +
-      is cleaned, the child stack's root keeps a dead `base` and `replay` fails to
-      resolve `--onto <gone-branch>`. Needed: detect the external parent
-      merged/deleted and reparent the child root onto trunk (the manifest already
-      models the link as a `base` string; the `baseSha` anchor already makes the
-      replay squash-safe). Until then, landing across the boundary is a manual
-      `wt stack rebase --onto main` on the child once the parent lands; the display
-      stays sane in the meantime (backstop degrades the dead base to trunk).
+- [x] wt: **cross-stack auto-reconcile**. `reconcileStack` now runs an external-parent
+      pass after its own-slice bookkeeping: a live slice whose `base` is neither trunk
+      nor a sibling (id or branch) is stacked on another stack's branch — probe that
+      branch's PR, and when it's MERGED (or there's no PR and the branch is gone
+      everywhere) reparent the slice onto trunk. The `baseSha` anchor keeps the
+      subsequent replay squash-safe (the landed parent's commits sit below the anchor
+      and are excluded by construction, same as a sibling squash-merge). A still-open
+      or merely-closed external parent is left alone. So `/restack` on a stack-on-stack
+      child is now fully hands-off across the boundary; fixture-verified both ways
+      (merged → reparented, open → untouched).
+- [x] wt: **`wt stack add`** — append an EXISTING branch to a live stack as a new tip
+      slice (the inverse of `split`'s reshape; the registration path for `wt new
+      --base <tip>` + work + "now track it"). Purely additive, so it sidesteps the
+      materialized-stack re-ingest guard by construction. Resolves the parent as the
+      highest-ordinal live slice (`--onto <sliceId|branch>` overrides; `--onto main`
+      roots a new parallel lane), records the squash-safe anchor as
+      `merge-base(branch, parent)` (not the parent tip, which may have advanced),
+      derives `files` from the anchor diff (doubles as the empty-slice guard), and
+      ENSURES a PR — adopts an open one (retargeting its base to match the manifest)
+      or pushes + opens a draft. PR-or-create is load-bearing: `validateStackManifest`
+      rejects `open` without a `pr`, and a `planned` slice would later be
+      re-materialized by `applyStack` from the HOLISTIC branch, clobbering the
+      externally-authored content. Never creates branches/worktrees (`wt new` owns
+      that). Fixture-verified: adopt + retarget, push + create, anchors, error paths.
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -424,10 +439,10 @@ Track friction here as the workflow gets used. Candidate adjustments:
   only emitted a diff base for in-stack sibling parents, so the stack-on-stack root
   showed `main` and diffed fat. FIXED: `parentBranch` now follows the manifest `base`
   verbatim (external branches included), decoupled from spine classification.
-  Remaining piece is now a tracked TODO (see Status): cross-stack **auto-reconcile** —
-  detecting the external parent merged/deleted and reparenting onto trunk —
-  which `reconcileStack` doesn't do today (it only sees slices within its own
-  manifest), so cross-boundary landing is a manual `wt stack rebase --onto main` for now.
+  The remaining piece landed 2026-06-09: cross-stack **auto-reconcile** —
+  `reconcileStack`'s external-parent pass detects the parent merged/deleted and
+  reparents onto trunk (see Status), so cross-boundary landing is now the same
+  hands-off `/restack` as everything else.
 - **PR body authoring split.** RESOLVED: `/split` writes bodies at materialize —
   intent prose (CLAUDE.md rules) + a generate-once stack section
   (`stack-section.sh`). Not `/done`. See Locked decisions.
@@ -672,3 +687,23 @@ Track friction here as the workflow gets used. Candidate adjustments:
   its in-flight state). Verified with a git fixture (clean replay + genuine conflict:
   correct classification, clean tree, no rebase left in progress, named conflict file).
   Reviewed via an ultracheck swarm + 3-lens refute.
+- **2026-06-09** — Appending to a live stack + landing across stack boundaries, both
+  surfaced by the eng-5182/eng-5183 stack-on-stack work. (1) **`wt stack add`** (new
+  subcommand, `addSliceToStack` in `stack-ops.ts`): registers an EXISTING branch as a
+  new tip slice on a materialized stack — the gap found at the end of the
+  eng-5182-04b session, where the only options were a full re-ingest (refused on
+  materialized stacks, by design) or hand-editing `state.json`. Additive-only, so the
+  re-ingest guard doesn't apply. Default parent = highest live slice; `--onto`
+  overrides (slice id, slice branch, or trunk for a new lane); anchor =
+  `merge-base(branch, parent)`; files = anchor diff; PR adopted (base retargeted to
+  match the manifest) or draft-created — required, because `planned` would get
+  re-materialized from the holistic branch by a later `apply` and `open` without a
+  `pr` fails validation. `viewPrInfo` gained `title` so an adopted PR's title becomes
+  the slice title. (2) **Cross-stack auto-reconcile** (closes the Status TODO):
+  `reconcileStack` gained an unconditional external-parent pass — a slice based on a
+  non-trunk, non-sibling branch whose PR is MERGED (or branch gone with no PR) is
+  reparented onto trunk; open/closed parents are untouched. Replay stays squash-safe
+  via the existing anchor. The own-merge early-return became a guarded block so the
+  external pass always runs. Both verified with a bare-origin git fixture + fake `gh`
+  shim (20 asserts: adopt/retarget/create/anchors/error paths; merged-external
+  reparented, live-external untouched).

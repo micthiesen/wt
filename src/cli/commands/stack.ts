@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 
 import { config } from "../../core/config.ts";
 import {
+  addSliceToStack,
   applyStack,
   rebaseStack,
   reconcileStack,
@@ -32,7 +33,11 @@ subcommands:
   split <stackId> <sliceId> --from <frag>   reshape: replace an open slice with N
                              sub-slices (re-threads descendants). Manifest only;
                              prints the apply/replay/retire next steps (or --apply)
-  reconcile [stackId]        manifest bookkeeping only: mark merged PRs, reparent children
+  add [<branch>] [<stackId>] append an EXISTING branch to a live stack as a new
+                             tip slice (adopts its open PR, or opens a draft PR);
+                             never creates branches/worktrees — \`wt new\` does that
+  reconcile [stackId]        manifest bookkeeping only: mark merged PRs, reparent
+                             children (incl. a landed external/stack-on-stack parent)
   replay [stackId]           squash-safe replay each slice onto its parent (+ retarget PRs)
   rebase [stackId]           reconcile then replay (the one-shot /restack does)
                              (stackId defaults to the current branch's stack)
@@ -44,6 +49,13 @@ split options:
   --from <file>              fragment JSON: array of { id, title, branch, files[] } sub-slices
   --plan                     preview the reshape without writing
   --apply                    chain reshape → apply → replay (still prints the PR-retire step)
+add options:
+  (branch defaults to the current worktree's branch; a positional with a "/" is
+   the branch, without is the stackId — resolved from --onto's branch when omitted)
+  --onto <sliceId|branch>    parent to stack on (default: highest-ordinal live
+                             slice; pass ${config.branch.base} to root a new parallel lane)
+  --title <t>                slice title (default: the PR's title, else derived
+                             from the branch name)
 status options:
   --json                     machine-readable output
 reconcile/replay/rebase options:
@@ -561,6 +573,96 @@ async function runSplit(argv: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * `wt stack add [<branch>] [<stackId>] [--onto <sliceId|branch>] [--title <t>]`
+ *
+ * Positional disambiguation: branches in this workflow always carry a
+ * namespace (`michael/…`), stackIds never do — so a positional with a `/` is
+ * the branch, without is the stackId. The branch defaults to the current
+ * worktree's HEAD (the common flow: `wt new --base <tip>`, work, then run
+ * `add` from inside the new worktree). The stackId resolves from the cwd
+ * branch when it's already a tracked slice, else from `--onto` when that
+ * names a tracked branch — the new branch itself is in no manifest yet, so
+ * from its own worktree you pass the stack via `--onto` or positionally.
+ */
+async function runAdd(argv: string[]): Promise<number> {
+  let branch: string | undefined;
+  let stackId: string | undefined;
+  let onto: string | undefined;
+  let title: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--onto") {
+      onto = argv[++i];
+      if (!onto) {
+        console.error(red("--onto requires a slice id or branch"));
+        return 2;
+      }
+    } else if (a === "--title") {
+      title = argv[++i];
+      if (!title) {
+        console.error(red("--title requires a value"));
+        return 2;
+      }
+    } else if (a.startsWith("--")) {
+      console.error(red(`unknown flag: ${a}`));
+      return 2;
+    } else if (a.includes("/")) {
+      if (branch) {
+        console.error(red(`two branch args: ${branch}, ${a}`));
+        return 2;
+      }
+      branch = a;
+    } else if (!stackId) stackId = a;
+    else {
+      console.error(red(`unexpected arg: ${a}`));
+      return 2;
+    }
+  }
+  if (!branch) {
+    try {
+      const head = (await git(["rev-parse", "--abbrev-ref", "HEAD"], process.cwd())).trim();
+      if (head && head !== "HEAD") branch = head;
+    } catch {
+      // fall through to the usage error
+    }
+  }
+  if (!branch) {
+    console.error(red("no branch given and the current directory has no checked-out branch"));
+    return 2;
+  }
+  if (!stackId) stackId = (await stackIdFromCwd()) ?? undefined;
+  if (!stackId && onto?.includes("/")) stackId = findStackIdByBranch(onto) ?? undefined;
+  if (!stackId) {
+    console.error(
+      red(
+        "usage: wt stack add [<branch>] [<stackId>] [--onto <sliceId|branch>] [--title <t>]\n" +
+          "  (couldn't resolve the target stack — pass <stackId>, or --onto a tracked branch)",
+      ),
+    );
+    return 2;
+  }
+
+  const res = await addSliceToStack(stackId, branch, { onto, title }, logLine);
+  if (!res.ok) {
+    console.error(red(res.error));
+    return 1;
+  }
+  const s = res.slice;
+  console.log(
+    green(
+      `✓ added ${bold(s.id)} to ${bold(stackId)} — ${s.branch} onto ${res.parentBranch} (PR #${s.pr} ${res.prAction})`,
+    ),
+  );
+  console.log(
+    `  ${dim(String(s.ordinal).padStart(2, "0"))} ${s.title}  ${dim(`anchor ${s.baseSha?.slice(0, 9) ?? "?"}, ${s.files.length} file(s)`)}`,
+  );
+  // Same staleness as a re-split, milder: existing PR bodies' stack sections
+  // now list a slice set missing the new tip. wt never authors bodies.
+  console.log(dim("  note: sibling PR stack-sections don't list the new slice — regenerate if you care"));
+  return 0;
+}
+
 async function runReconcile(argv: string[]): Promise<number> {
   const t = await parseStackTarget(argv, "reconcile");
   if (typeof t === "number") return t;
@@ -588,6 +690,8 @@ export async function run(argv: string[]): Promise<number> {
       return runStatus(rest);
     case "split":
       return runSplit(rest);
+    case "add":
+      return runAdd(rest);
     case "reconcile":
       return runReconcile(rest);
     case "replay":

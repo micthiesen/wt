@@ -1081,6 +1081,7 @@ export type LivePrInfo = {
   baseRefName: string;
   state: "OPEN" | "CLOSED" | "MERGED";
   isDraft: boolean;
+  title: string;
 };
 
 /**
@@ -1092,7 +1093,7 @@ export type LivePrInfo = {
 export async function viewPrInfo(branch: string): Promise<LivePrInfo | null> {
   if (!branch || !(await hasGh())) return null;
   const r = await run(
-    ["gh", "pr", "view", branch, "--json", "number,baseRefName,state,isDraft"],
+    ["gh", "pr", "view", branch, "--json", "number,baseRefName,state,isDraft,title"],
     { cwd: config.paths.mainClone, timeoutMs: 15_000 },
   );
   if (r.exitCode !== 0) return null;
@@ -1109,6 +1110,7 @@ export async function viewPrInfo(branch: string): Promise<LivePrInfo | null> {
       baseRefName: typeof d.baseRefName === "string" ? d.baseRefName : "",
       state,
       isDraft: d.isDraft === true,
+      title: typeof d.title === "string" ? d.title : "",
     };
   } catch {
     return null;

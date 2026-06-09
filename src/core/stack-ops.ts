@@ -9,7 +9,7 @@
  * hard part (anchored cherry-pick replay) lives in `RestackEngine`.
  */
 import { config } from "./config.ts";
-import { gitQuiet, gitRun } from "./git.ts";
+import { branchExists, gitQuiet, gitRun } from "./git.ts";
 import { createWorktree } from "./lifecycle.ts";
 import { tryAcquireLock } from "./locks.ts";
 import { createLogger } from "./logger.ts";
@@ -26,6 +26,7 @@ import {
   topoSortSlices,
 } from "./stack-layout.ts";
 import {
+  findStackIdByBranch,
   getStackManifest,
   patchStackManifest,
   putStackManifest,
@@ -689,9 +690,11 @@ async function retargetIfNeeded(
 
 /**
  * Reconcile the manifest against landed reality: flip merged slices to
- * `merged` and reparent each orphaned child onto its deepest surviving
- * dependency (or trunk). Pure manifest bookkeeping — no git, no replay — so
- * the skill can run it on its own before deciding to replay.
+ * `merged`, reparent each orphaned child onto its deepest surviving
+ * dependency (or trunk), and reparent a slice whose EXTERNAL parent
+ * (stack-on-stack) has landed onto trunk. Manifest bookkeeping only — reads
+ * GitHub/git state but never rewrites branches — so the skill can run it on
+ * its own before deciding to replay.
  */
 export async function reconcileStack(
   stackId: string,
@@ -717,29 +720,58 @@ export async function reconcileStack(
       onLog(`slice ${s.id} merged (#${s.pr})`);
     }
   }
-  if (mergedIds.size === 0) return;
+  if (mergedIds.size > 0) {
+    // Reparent each surviving slice that lost a dependency onto its
+    // deepest STILL-OPEN dependency (highest ordinal), falling to trunk
+    // only when none survive. Reparenting straight to trunk would flatten
+    // a slice that still has a live ancestor (diamond / multi-parent).
+    const fresh = getStackManifest(stackId);
+    if (!fresh) return;
+    const byId = new Map(fresh.slices.map((s) => [s.id, s]));
+    for (const slice of fresh.slices) {
+      if (slice.status === "merged") continue;
+      const dependsOn = slice.dependsOn.filter((d) => !mergedIds.has(d));
+      const baseMerged = mergedIds.has(slice.base);
+      if (dependsOn.length === slice.dependsOn.length && !baseMerged) continue;
+      const survivingParent = dependsOn
+        .map((d) => byId.get(d))
+        .filter((s): s is StackSlice => !!s)
+        .sort((a, b) => b.ordinal - a.ordinal)[0];
+      const base = survivingParent ? survivingParent.id : trunk;
+      // The list reads the parent straight from the manifest, so updating
+      // `base`/`dependsOn` is all that's needed — no separate display state.
+      updateStackSlice(stackId, slice.id, { dependsOn, base });
+      onLog(`reparented ${slice.id} onto ${base}`);
+    }
+  }
 
-  // Reparent each surviving slice that lost a dependency onto its
-  // deepest STILL-OPEN dependency (highest ordinal), falling to trunk
-  // only when none survive. Reparenting straight to trunk would flatten
-  // a slice that still has a live ancestor (diamond / multi-parent).
-  const fresh = getStackManifest(stackId);
-  if (!fresh) return;
-  const byId = new Map(fresh.slices.map((s) => [s.id, s]));
-  for (const slice of fresh.slices) {
+  // Cross-stack reconcile: a slice stacked on an EXTERNAL parent (another
+  // stack's tip, or a standalone parent PR branch) keeps a dead `base` once
+  // that parent lands — the own-slice probe above only sees THIS manifest's
+  // PRs, so it can't notice. Detect the external parent merged (or its
+  // branch gone) and reparent onto trunk. The slice's `baseSha` anchor keeps
+  // the subsequent replay squash-safe: the landed parent's commits sit below
+  // the anchor and are excluded by construction, exactly like a sibling
+  // squash-merge. Runs unconditionally — the external parent merging is
+  // invisible to `mergedIds`.
+  const after = getStackManifest(stackId);
+  if (!after) return;
+  const siblingIds = new Set(after.slices.map((s) => s.id));
+  const siblingBranches = new Set(after.slices.map((s) => s.branch));
+  for (const slice of after.slices) {
     if (slice.status === "merged") continue;
-    const dependsOn = slice.dependsOn.filter((d) => !mergedIds.has(d));
-    const baseMerged = mergedIds.has(slice.base);
-    if (dependsOn.length === slice.dependsOn.length && !baseMerged) continue;
-    const survivingParent = dependsOn
-      .map((d) => byId.get(d))
-      .filter((s): s is StackSlice => !!s)
-      .sort((a, b) => b.ordinal - a.ordinal)[0];
-    const base = survivingParent ? survivingParent.id : trunk;
-    // The list reads the parent straight from the manifest, so updating
-    // `base`/`dependsOn` is all that's needed — no separate display state.
-    updateStackSlice(stackId, slice.id, { dependsOn, base });
-    onLog(`reparented ${slice.id} onto ${base}`);
+    if (slice.base === trunk || isTrunkBase(slice)) continue;
+    if (siblingIds.has(slice.base) || siblingBranches.has(slice.base)) continue;
+    const live = await viewPrInfo(slice.base);
+    if (live?.state === "MERGED") {
+      updateStackSlice(stackId, slice.id, { base: trunk });
+      onLog(`external parent ${slice.base} merged (#${live.number}) — reparented ${slice.id} onto ${trunk}`);
+    } else if (!live && !(await branchExists(slice.base))) {
+      // No PR and no branch anywhere — the parent is gone. (A CLOSED PR or a
+      // still-open parent leaves the link alone.)
+      updateStackSlice(stackId, slice.id, { base: trunk });
+      onLog(`external parent ${slice.base} is gone — reparented ${slice.id} onto ${trunk}`);
+    }
   }
 }
 
@@ -881,4 +913,198 @@ export function splitStack(
     rethreadedChildren: rethreaded,
     slices: v.manifest.slices,
   };
+}
+
+// ---------- add (append an existing branch to a live stack) ----------
+
+export type AddSliceResult =
+  | {
+      ok: true;
+      slice: StackSlice;
+      /** Branch the new slice stacks on (a sibling's branch, or trunk). */
+      parentBranch: string;
+      /** Whether the slice's PR pre-existed or `add` opened it. */
+      prAction: "adopted" | "created";
+    }
+  | { ok: false; error: string };
+
+/** Fallback slice title from a branch name: strip the namespace + issue-id
+ *  (+ optional ordinal) prefix, de-kebab the rest. `--title` overrides. */
+function titleFromBranch(branch: string): string {
+  const tail = branch.split("/").pop() ?? branch;
+  const stripped = tail.replace(/^[a-z]+-\d+-(\d+[a-z]?-)?/i, "").replace(/-/g, " ").trim();
+  return stripped || tail;
+}
+
+/** The ref (`branch` or `origin/branch`) that resolves in the main clone. */
+async function localOrOriginRef(branch: string): Promise<string> {
+  const local = await gitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+  return local ? branch : `origin/${branch}`;
+}
+
+/**
+ * Append an EXISTING branch to a live stack as a new tip slice — the inverse
+ * of `splitStack`'s reshape, and the registration path for "I `wt new --base
+ * <tip>`'d a branch on top of the stack, now track it". Purely additive
+ * (existing slices untouched), which is what lets it work on a materialized
+ * stack — the re-ingest path refuses those wholesale.
+ *
+ * Never creates a branch or worktree (`wt new` owns that); errors when the
+ * branch doesn't exist. DOES ensure the slice has a PR: adopts an open one,
+ * else pushes + opens a draft PR against the parent. That isn't scope creep —
+ * `validateStackManifest` hard-rejects `open` without a `pr`, and a `planned`
+ * slice would later be re-materialized by `applyStack` from the HOLISTIC
+ * branch, clobbering an externally-authored branch's content. PR-or-create is
+ * what keeps `apply` permanently away from this slice.
+ *
+ * The squash-safe anchor (`baseSha`) is recorded as `merge-base(branch,
+ * parent)` — not the parent's tip, which may have advanced since the fork and
+ * wouldn't be an ancestor of the branch.
+ */
+export async function addSliceToStack(
+  stackId: string,
+  branch: string,
+  opts: { onto?: string; title?: string },
+  onLog: Logger,
+): Promise<AddSliceResult> {
+  const manifest = getStackManifest(stackId);
+  if (!manifest) return { ok: false, error: `no stack manifest: ${stackId}` };
+  const owner = findStackIdByBranch(branch);
+  if (owner) {
+    return { ok: false, error: `${branch} is already tracked by stack ${owner}` };
+  }
+  if (!(await branchExists(branch))) {
+    return {
+      ok: false,
+      error: `branch ${branch} not found (local or origin) — \`add\` registers an existing branch; create it first (e.g. \`wt new … --base <parentTip>\`)`,
+    };
+  }
+
+  // Resolve the parent: `--onto` names a sibling slice (by id or branch) or
+  // trunk (a new parallel lane root); default is the stack tip — the
+  // highest-ordinal live slice.
+  let parentSlice: StackSlice | null = null;
+  if (opts.onto && opts.onto !== config.branch.base) {
+    parentSlice =
+      manifest.slices.find((s) => s.id === opts.onto || s.branch === opts.onto) ?? null;
+    if (!parentSlice) {
+      return {
+        ok: false,
+        error: `--onto ${opts.onto} matches no slice in ${stackId} (pass a slice id, a slice branch, or ${config.branch.base})`,
+      };
+    }
+    if (parentSlice.status === "merged") {
+      return {
+        ok: false,
+        error: `slice ${parentSlice.id} is merged — stack on a live slice, or --onto ${config.branch.base}`,
+      };
+    }
+  } else if (!opts.onto) {
+    parentSlice =
+      manifest.slices
+        .filter((s) => s.status !== "merged")
+        .sort((a, b) => b.ordinal - a.ordinal)[0] ?? null;
+    if (!parentSlice) {
+      return {
+        ok: false,
+        error: `stack ${stackId} has no live slices — pass --onto ${config.branch.base} to root a new lane`,
+      };
+    }
+  }
+  const parentBranch = parentSlice ? parentSlice.branch : config.branch.base;
+
+  const branchRef = await localOrOriginRef(branch);
+  const parentRef = parentSlice
+    ? await localOrOriginRef(parentBranch)
+    : `origin/${config.branch.base}`;
+
+  // Anchor = the cut point the branch's own commits sit on.
+  const mb = await gitRun(["merge-base", branchRef, parentRef]);
+  const baseSha = mb.stdout.trim();
+  if (mb.exitCode !== 0 || !baseSha) {
+    return {
+      ok: false,
+      error: `${branch} shares no history with ${parentBranch} — wrong parent? (--onto)`,
+    };
+  }
+
+  // File partition = the branch's own diff vs the anchor. Doubles as the
+  // empty-slice guard (nothing to review → nothing to track).
+  const diff = await gitRun(["diff", "--name-only", `${baseSha}..${branchRef}`]);
+  const files = diff.stdout.trim().split("\n").filter(Boolean);
+  if (diff.exitCode !== 0 || files.length === 0) {
+    return { ok: false, error: `${branch} has no changes on top of ${parentBranch} (empty slice)` };
+  }
+
+  // Ensure the PR. A CLOSED PR is not adopted — gh happily opens a fresh one
+  // on the same branch, and the closed PR wasn't tracking this work anyway.
+  let prNumber: number;
+  let prAction: "adopted" | "created";
+  let title = opts.title ?? "";
+  const existing = await viewPrInfo(branch);
+  if (existing?.state === "MERGED") {
+    return {
+      ok: false,
+      error: `PR #${existing.number} for ${branch} is already merged — nothing left to stack`,
+    };
+  }
+  if (existing && existing.state === "OPEN") {
+    prNumber = existing.number;
+    prAction = "adopted";
+    title = title || existing.title;
+    onLog(`adopted existing PR #${existing.number}`);
+  } else {
+    if (!(await gitQuiet(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`]))) {
+      const push = await gitRun(["push", "-u", "origin", branch]);
+      if (push.exitCode !== 0) {
+        return { ok: false, error: `push ${branch}: ${(push.stderr || push.stdout).trim()}` };
+      }
+      onLog(`pushed ${branch}`);
+    }
+    title = title || titleFromBranch(branch);
+    const pr = await createDraftPr({
+      cwd: config.paths.mainClone,
+      head: branch,
+      base: parentBranch,
+      title,
+      body: `Stacked on \`${parentBranch}\`.`,
+    });
+    if (!pr.ok) return { ok: false, error: `pr create ${branch}: ${pr.error}` };
+    prNumber = pr.number;
+    prAction = "created";
+    onLog(`opened draft PR #${pr.number} (base ${parentBranch})`);
+  }
+
+  const maxOrdinal = Math.max(0, ...manifest.slices.map((s) => s.ordinal));
+  const ids = new Set(manifest.slices.map((s) => s.id));
+  let n = maxOrdinal + 1;
+  while (ids.has(`s${n}`)) n++;
+
+  const slice: StackSlice = {
+    id: `s${n}`,
+    ordinal: maxOrdinal + 1,
+    title: title || titleFromBranch(branch),
+    branch,
+    base: parentSlice ? parentSlice.id : config.branch.base,
+    dependsOn: parentSlice ? [parentSlice.id] : [],
+    files,
+    pr: prNumber,
+    status: "open",
+    oversized: false,
+    baseSha,
+  };
+
+  const next: StackManifest = { ...manifest, slices: [...manifest.slices, slice] };
+  const v = validateStackManifest(next);
+  if (!v.ok) {
+    return { ok: false, error: `manifest invalid after add:\n  ${v.errors.join("\n  ")}` };
+  }
+  putStackManifest(v.manifest);
+
+  // An adopted PR may target the wrong base (e.g. trunk, because `gh pr
+  // create` defaulted there) — align it with the manifest like replay does.
+  if (prAction === "adopted") await retargetIfNeeded(slice, parentBranch, onLog);
+
+  log.info("added slice to stack", { stackId, slice: slice.id, branch, parentBranch, prNumber });
+  return { ok: true, slice, parentBranch, prAction };
 }
