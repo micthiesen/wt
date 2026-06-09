@@ -105,6 +105,20 @@ function rollupChecks(raw: RawCheck[] | null | undefined): PrChecks {
   return "pass";
 }
 
+/**
+ * Floor an OPEN PR's check rollup at `pending`. GitHub reports an empty
+ * rollup in the window between opening a PR and the first check run
+ * registering (and momentarily during some background refreshes), which
+ * `rollupChecks` maps to `none`. In this workflow every open PR runs CI, so
+ * `none` on an open PR means "checks haven't reported yet", not "no CI" —
+ * surface it as `pending` so the badge holds its slot instead of vanishing
+ * and shoving the rest of the row's glyph cluster around on each refresh.
+ * Closed/merged PRs keep `none` (their check state is genuinely terminal).
+ */
+function openPrChecks(state: PullRequest["state"], checks: PrChecks): PrChecks {
+  return state === "OPEN" && checks === "none" ? "pending" : checks;
+}
+
 // Shared fields for each PR. Used by every aliased sub-query below.
 const PR_FRAGMENT = `
 fragment PrFields on PullRequest {
@@ -483,7 +497,7 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     baseRefName: pr.baseRefName,
     isDraft: pr.isDraft,
     state: pr.state,
-    checks: rollupChecks(contexts),
+    checks: openPrChecks(pr.state, rollupChecks(contexts)),
     review: rollupReview(
       pr.state,
       pr.reviewDecision,
@@ -724,7 +738,9 @@ export async function fetchReviewRequests(
       headRefName: n.headRefName ?? null,
       author: n.author?.login ?? null,
       isDraft: n.isDraft ?? false,
-      checks: rollupChecks(contexts),
+      // The search is `is:open`, so every row here is an open PR — floor an
+      // empty rollup at `pending` the same way the worktree rows do.
+      checks: openPrChecks("OPEN", rollupChecks(contexts)),
       reviewDecision: decision,
       additions: n.additions ?? 0,
       deletions: n.deletions ?? 0,
