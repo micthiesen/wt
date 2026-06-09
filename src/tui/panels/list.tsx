@@ -123,12 +123,12 @@ function StatusMarker({ row }: { row: WorktreeRow }) {
 
 /**
  * Tree-spine connector glyph for a managed-stack row, by the slice's
- * position in its lane. `single` ◆ = a standalone lane; `first` ┌ =
- * chain root with children; `middle` ├ = a stacked link; `last` └ = the
- * chain tip.
+ * position in its lane. `single` ╶ = a standalone lane (a short stub, no
+ * chain above/below to draw); `first` ┌ = chain root with children;
+ * `middle` ├ = a stacked link; `last` └ = the chain tip.
  */
 const STACK_CONNECTOR: Record<SpinePos, string> = {
-  single: "◆",
+  single: "╶",
   first: "┌",
   middle: "├",
   last: "└",
