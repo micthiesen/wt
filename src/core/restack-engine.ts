@@ -230,7 +230,10 @@ export class NativeRestackEngine implements RestackEngine {
     }
     if (!succeeded) {
       // Unreachable — every non-zero path above returns — but keeps the
-      // control flow honest for the compiler and future edits.
+      // control flow honest for the compiler and future edits. Deleting
+      // the backup here is safe even if a future edit makes this
+      // reachable: reaching it means no rebase landed, so the branch tip
+      // is untouched and the backup merely duplicates the live tip.
       await deleteBackup(backupBranch, worktreePath);
       return { ok: false, conflict: false, error: `could not replay ${branch} onto ${short(newBaseSha)}` };
     }
@@ -276,6 +279,12 @@ export class NativeRestackEngine implements RestackEngine {
  * out-of-band local rebase) left the remote behind. A branch with no origin
  * ref is left alone (a planned slice has no PR yet; don't invent a remote).
  * The caller fetched origin up front, so the comparison is against live state.
+ *
+ * No `backup/...` ref is taken here (audited, accepted): backups snapshot a
+ * LOCAL tip before a rebase rewrites it, and this path rewrites nothing —
+ * the local branch is untouched. The remote side is guarded by the lease
+ * (a remote that moved past our tracking ref rejects the push), and the
+ * old remote tip stays reachable via the tracking-ref reflog regardless.
  */
 async function pushIfRemoteStale(
   branch: string,
@@ -321,6 +330,9 @@ export function backupTimestamp(ref: string): number | null {
  * every older backup of that branch — drop them so `git branch` stays sane.
  * Backups exist to recover an in-flight bail; once the slice lands clean
  * they're dead weight (and the commits stay reachable via the reflog anyway).
+ * Best-effort by design (audited, accepted): a failed `for-each-ref` or a
+ * per-ref delete failure is silently skipped — a leftover backup is harmless
+ * and `wt stack prune-backups` sweeps stragglers.
  */
 async function pruneSupersededBackups(
   branch: string,

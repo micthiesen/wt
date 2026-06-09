@@ -2721,7 +2721,10 @@ export function App({ onExit }: Props) {
   // `useKeyboard` below dispatches on `modal.kind` and each handler
   // owns its modal's full key map, swallowing the keypress.
 
-  // Help overlay swallows input while open.
+  // Help overlay swallows input while open. The close keys match on
+  // bare `name`/`sequence` without the modifier guard some other
+  // handlers use — known and accepted: a modified chord at worst
+  // closes a help overlay, so the guard buys nothing here.
   function handleHelpKey(k: KeyEvent): void {
     if (
       k.name === "escape" ||
@@ -2736,7 +2739,9 @@ export function App({ onExit }: Props) {
   // Reviewer multi-picker. Space toggles the cursor item, enter or
   // `v` (trigger-key re-press) submits the checked set, esc
   // cancels. Multi-select: re-press is "I'm done choosing" not
-  // "confirm this row".
+  // "confirm this row". (`v` matches the bare sequence without a
+  // modifier guard — same accepted looseness as the help overlay;
+  // worst case a modified chord submits the already-checked set.)
   function handleReviewerPickerKey(
     k: KeyEvent,
     modal: Extract<Modal, { kind: "reviewerPicker" }>,
@@ -3122,7 +3127,12 @@ export function App({ onExit }: Props) {
   // esc/q cancels (without revert — live commit semantics). `idx`
   // is clamped against the live `visibleOutputs` length on every
   // keypress because the underlying list can shrink while the
-  // picker is open (FIFO eviction, session ending).
+  // picker is open (FIFO eviction, session ending). Known quirk,
+  // accepted: with an EMPTY list, j/k store a transient `index: -1`
+  // (`min(idx+1, length-1)`) — harmless, because this same entry
+  // clamp repairs it on the next keypress and `commit`/preview both
+  // tolerate the missing entry. Don't "fix" without re-checking the
+  // empty-list path end to end.
   function handleOutputsPickerKey(
     k: KeyEvent,
     modal: Extract<Modal, { kind: "outputsPicker" }>,
@@ -3558,7 +3568,9 @@ export function App({ onExit }: Props) {
   // Yank chord: `y` opened the menu; the next key picks what to copy.
   // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
   // rather than re-entering normal mode, so a stray keystroke can't
-  // accidentally trigger a destructive action.
+  // accidentally trigger a destructive action. Same when no row is
+  // selected: mapped keys are silently ignored and the modal stays
+  // open (intentional — only the cancel keys dismiss it).
   function handleYankKey(k: KeyEvent): void {
     if (
       k.name === "escape" ||

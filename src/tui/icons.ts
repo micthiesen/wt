@@ -6,7 +6,14 @@
  * unrenderable glyphs.
  *
  * Codepoint references: https://www.nerdfonts.com/cheat-sheet
- * All glyphs are 1-cell wide (the font was patched with `--mono`).
+ *
+ * Width contract: the font is `--mono`-patched, but the operative rule
+ * for layout is `badges.ts` rule #4 — opentui MEASURES every PUA
+ * codepoint as 1 cell while the rendered glyph can spill into 2, so
+ * badge strings pad a trailing space to compensate. The two comments
+ * describe the same reality from opposite ends (font metric vs
+ * renderer accounting); they are not contradictory, and the badge
+ * padding is the part that must not change.
  */
 export const NF = {
 	// Row status markers

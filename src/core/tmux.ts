@@ -336,9 +336,14 @@ export function diffCommandUsesBase(template: string): boolean {
  * Substitute `{{base}}` in the user's diff command template with the
  * resolved base ref. The ref is wrapped in double quotes so refs
  * containing characters that the user's shell would otherwise expand
- * (e.g. globs in oddly-named local branches) survive intact. Refs
- * starting with `origin/` and ordinary branch names contain only safe
- * characters in practice; the quoting is belt-and-braces.
+ * (e.g. globs in oddly-named local branches) survive intact.
+ *
+ * Injection note (audited, accepted): the double-quote escape leaves
+ * `$`/backtick live, but it is NOT the load-bearing safety — every
+ * caller resolves the base through `effectiveBaseOrTrunk` first, whose
+ * rev-parse gate rejects anything that isn't a real commit-ish. Don't
+ * route an unvalidated ref into this template without hardening the
+ * escape to single-quote (`shQuote`) form first.
  *
  * Templates that don't reference `{{base}}` pass through unchanged so
  * users with custom diff commands (`gitu`, `lazygit`, …) keep working.
@@ -963,6 +968,12 @@ async function pasteBuffer(name: string, text: string): Promise<void> {
       stderr: "ignore",
     },
   );
+  // Exit code deliberately unchecked (audited, accepted): a failed load
+  // (e.g. the server died between the liveness check and here) means
+  // the following paste/Enter lands on an empty buffer — visible in the
+  // pane and recoverable — whereas failing the whole inject on a
+  // transient tmux hiccup is worse. Revisit if a silent empty submit
+  // ever actually bites.
   await load.exited;
   // `-p` = bracketed paste (claude receives it as one chunk, so internal
   // newlines and a leading slash command don't submit early); `-d` drops

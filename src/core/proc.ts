@@ -187,6 +187,11 @@ export async function runStreaming(
   argv: string[],
   opts: RunOptions & { onLine?: (line: string) => void } = {},
 ): Promise<number> {
+  // Deliberately ignores `timeoutMs`/`signal` from RunOptions: callers
+  // are long-running lifecycle ops (pnpm install, sst remove) where a
+  // mid-flight kill leaves worse state than waiting. If a future caller
+  // needs cancellation, wire it up here explicitly — don't assume the
+  // options work just because the type accepts them.
   const { cwd, env, onLine } = opts;
   const proc = Bun.spawn(argv, {
     cwd,

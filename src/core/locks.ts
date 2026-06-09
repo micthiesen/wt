@@ -95,6 +95,12 @@ export function tryAcquireLock(
     closeSync(fd);
     return null;
   }
+  // Known window (audited, accepted): between this acquire and the
+  // first meta write below, a concurrent `lockStatus` reader sees the
+  // previous holder's payload (or an empty file) and renders a generic
+  // "busy" with no age. Purely cosmetic — the flock itself is already
+  // held — and closing it would mean writing meta before knowing the
+  // acquire succeeded.
 
   const started = new Date().toISOString();
   let currentPhase = opts.phase ?? "";

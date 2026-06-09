@@ -16,6 +16,12 @@ function truncateSlug(s: string, limit = config.branch.slugMaxLen): string {
 }
 
 export function dirSlug(branch: string): string {
+  // Charset note (audited, accepted): unlike `slugify` (which gates
+  // NEW-branch input), this only collapses `/` — a foreign branch's
+  // other special characters survive into the slug. Slugs stay single
+  // path components (no traversal) and every downstream tmux/git call
+  // is argv-based, so the loose charset is safe; tightening it would
+  // silently re-home existing worktree dirs for the same branch.
   const prefix = config.branch.prefix;
   // Always strip our own prefix — these are "mine", no need to
   // namespace the directory.

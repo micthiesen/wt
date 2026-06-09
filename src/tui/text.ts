@@ -34,6 +34,11 @@ export function truncateEnd(s: string, maxWidth: number): string {
   if (Bun.stringWidth(s) <= maxWidth) return s;
   if (maxWidth < ELLIPSIS_WIDTH) return ELLIPSIS.slice(0, maxWidth);
   let cut = s;
+  // Code-unit trim, deliberately NOT grapheme-aware: cutting through a
+  // surrogate pair can leave a dangling half before the ellipsis. Known
+  // and accepted — inputs here (slugs, branch names, titles) are
+  // overwhelmingly ASCII and the worst case is one mojibake cell;
+  // grapheme segmentation isn't worth it on this hot render path.
   while (cut.length > 0 && Bun.stringWidth(cut) + ELLIPSIS_WIDTH > maxWidth) {
     cut = cut.slice(0, -1);
   }

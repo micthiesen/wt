@@ -831,7 +831,12 @@ async function reconcileStackLocked(
       onLog(`external parent ${slice.base} merged (#${live.number}) — reparented ${slice.id} onto ${trunk}`);
     } else if (!live && !(await branchExists(slice.base))) {
       // No PR and no branch anywhere — the parent is gone. (A CLOSED PR or a
-      // still-open parent leaves the link alone.)
+      // still-open parent leaves the link alone.) The `branchExists`
+      // corroboration is LOAD-BEARING, not belt-and-braces: `viewPrInfo`
+      // returns null for a transient gh failure exactly as it does for
+      // "no PR", and without the second check a gh hiccup would reparent
+      // a slice whose parent is alive. (The MERGED branch above needs no
+      // such guard — a failed probe can never read as MERGED.)
       updateStackSlice(stackId, slice.id, { base: trunk });
       onLog(`external parent ${slice.base} is gone — reparented ${slice.id} onto ${trunk}`);
     }

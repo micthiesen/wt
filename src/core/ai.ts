@@ -149,6 +149,11 @@ async function callChat(
       }),
     });
   } catch (err) {
+    // One message for every fetch failure, including the timeout abort —
+    // so "unreachable" can also mean "timed out after ai.timeout_ms".
+    // Known conflation, accepted: both cases have the same user remedy
+    // (check LM Studio / bump the timeout) and the appended err.message
+    // carries the distinction when it matters.
     throw new Error(
       `LM Studio unreachable at ${config.ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
     );
