@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { config } from "./config.ts";
-import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitRun } from "./git.ts";
+import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitRun, localBranchExists } from "./git.ts";
 import { lockAge, lockLabel, lockStatus } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 import { latestLogFor } from "./logs.ts";
@@ -227,7 +227,7 @@ export async function fetchOrigin(opts: { onWarn?: (msg: string) => void } = {})
   const main = config.paths.mainClone;
   const localRef = `refs/heads/${base}`;
   const remoteRef = `origin/${base}`;
-  if (!(await gitQuiet(["show-ref", "--verify", "--quiet", localRef], main))) {
+  if (!(await localBranchExists(base, main))) {
     return;
   }
   if (

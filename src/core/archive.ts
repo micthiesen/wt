@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { withFileLock } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 
 const ARCHIVE_FILE = join(homedir(), ".cache", "wt", "archive.json");
@@ -29,17 +30,31 @@ export function readArchived(): Set<string> {
 function writeArchived(set: Set<string>): void {
   mkdirSync(dirname(ARCHIVE_FILE), { recursive: true });
   const data: ArchiveFile = { slugs: [...set].sort() };
-  writeFileSync(ARCHIVE_FILE, `${JSON.stringify(data, null, 2)}\n`);
+  // Write-then-rename so a concurrent reader never sees a torn file.
+  const tmp = `${ARCHIVE_FILE}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+  renameSync(tmp, ARCHIVE_FILE);
+}
+
+/**
+ * Serialize the read-modify-write across processes (TUI + the detached
+ * destroy + CLI) — same rationale as `withWtStateLock` in wtstate.ts:
+ * the atomic rename stops torn reads, the flock stops lost updates.
+ */
+function withArchiveLock<T>(fn: () => T): T {
+  return withFileLock("__archive__", fn);
 }
 
 /** Flip the archived flag for a slug; returns the new state. */
 export function toggleArchived(slug: string): { archived: boolean } {
-  const set = readArchived();
-  const wasArchived = set.has(slug);
-  if (wasArchived) set.delete(slug);
-  else set.add(slug);
-  writeArchived(set);
-  return { archived: !wasArchived };
+  return withArchiveLock(() => {
+    const set = readArchived();
+    const wasArchived = set.has(slug);
+    if (wasArchived) set.delete(slug);
+    else set.add(slug);
+    writeArchived(set);
+    return { archived: !wasArchived };
+  });
 }
 
 /**
@@ -48,10 +63,12 @@ export function toggleArchived(slug: string): { archived: boolean } {
  * row into the archived section for the duration of the destroy.
  */
 export function archiveSlug(slug: string): void {
-  const set = readArchived();
-  if (set.has(slug)) return;
-  set.add(slug);
-  writeArchived(set);
+  withArchiveLock(() => {
+    const set = readArchived();
+    if (set.has(slug)) return;
+    set.add(slug);
+    writeArchived(set);
+  });
 }
 
 /**
@@ -60,9 +77,11 @@ export function archiveSlug(slug: string): void {
  * No-op if the slug wasn't archived.
  */
 export function clearArchived(slug: string): void {
-  const set = readArchived();
-  if (!set.delete(slug)) return;
-  writeArchived(set);
+  withArchiveLock(() => {
+    const set = readArchived();
+    if (!set.delete(slug)) return;
+    writeArchived(set);
+  });
 }
 
 /**
@@ -73,14 +92,16 @@ export function clearArchived(slug: string): void {
  * when nothing to drop, so the common case is a single read.
  */
 export function reapArchived(liveSlugs: ReadonlySet<string>): void {
-  const set = readArchived();
-  let changed = false;
-  for (const slug of set) {
-    if (!liveSlugs.has(slug)) {
-      set.delete(slug);
-      changed = true;
+  withArchiveLock(() => {
+    const set = readArchived();
+    let changed = false;
+    for (const slug of set) {
+      if (!liveSlugs.has(slug)) {
+        set.delete(slug);
+        changed = true;
+      }
     }
-  }
-  if (!changed) return;
-  writeArchived(set);
+    if (!changed) return;
+    writeArchived(set);
+  });
 }

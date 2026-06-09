@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useIsFetching, useQueries, useQuery } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
-import type { ScrollBoxRenderable } from "@opentui/core";
+import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
 import {
   actionRegistry,
@@ -2717,142 +2717,253 @@ export function App({ onExit }: Props) {
     void refreshAll();
   }
 
-  useKeyboard((k) => {
-    // Help overlay swallows input while open.
-    if (modal?.kind === "help") {
-      if (
-        k.name === "escape" ||
-        k.sequence === "?" ||
-        k.name === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
+  // Per-modal key handlers. Exactly one modal is active at a time;
+  // `useKeyboard` below dispatches on `modal.kind` and each handler
+  // owns its modal's full key map, swallowing the keypress.
+
+  // Help overlay swallows input while open.
+  function handleHelpKey(k: KeyEvent): void {
+    if (
+      k.name === "escape" ||
+      k.sequence === "?" ||
+      k.name === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Reviewer multi-picker. Space toggles the cursor item, enter or
+  // `v` (trigger-key re-press) submits the checked set, esc
+  // cancels. Multi-select: re-press is "I'm done choosing" not
+  // "confirm this row".
+  function handleReviewerPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "reviewerPicker" }>,
+  ): void {
+    const rp = modal;
+    if (k.name === "j" || k.name === "down") {
+      setModal({
+        ...rp,
+        index: Math.min(rp.index + 1, rp.items.length - 1),
+      });
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      setModal({ ...rp, index: Math.max(rp.index - 1, 0) });
+      return;
+    }
+    if (k.name === "space" || k.sequence === " ") {
+      const item = rp.items[rp.index];
+      if (item) {
+        const next = new Set(rp.checked);
+        if (next.has(item.key)) next.delete(item.key);
+        else next.add(item.key);
+        setModal({ ...rp, checked: next });
       }
       return;
     }
-
-    // Reviewer multi-picker. Space toggles the cursor item, enter or
-    // `v` (trigger-key re-press) submits the checked set, esc
-    // cancels. Multi-select: re-press is "I'm done choosing" not
-    // "confirm this row".
-    if (modal?.kind === "reviewerPicker") {
-      const rp = modal;
-      if (k.name === "j" || k.name === "down") {
-        setModal({
-          ...rp,
-          index: Math.min(rp.index + 1, rp.items.length - 1),
-        });
-        return;
-      }
-      if (k.name === "k" || k.name === "up") {
-        setModal({ ...rp, index: Math.max(rp.index - 1, 0) });
-        return;
-      }
-      if (k.name === "space" || k.sequence === " ") {
-        const item = rp.items[rp.index];
-        if (item) {
-          const next = new Set(rp.checked);
-          if (next.has(item.key)) next.delete(item.key);
-          else next.add(item.key);
-          setModal({ ...rp, checked: next });
-        }
-        return;
-      }
-      if (k.name === "return" || k.sequence === "v") {
-        void submitReviewerPicker();
-        return;
-      }
-      if (
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
+    if (k.name === "return" || k.sequence === "v") {
+      void submitReviewerPicker();
       return;
     }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
 
-    // Section picker (`l`). Two modes: list mode for picking an
-    // existing section / "(none)" / "+ new section", and input mode
-    // for typing the new section name when the user picks the create
-    // entry. `newName === null` means list mode.
-    if (modal?.kind === "sectionPicker") {
-      const sp = modal;
-      if (sp.newName !== null) {
-        if (k.name === "escape") {
+  // Section picker (`l`). Two modes: list mode for picking an
+  // existing section / "(none)" / "+ new section", and input mode
+  // for typing the new section name when the user picks the create
+  // entry. `newName === null` means list mode.
+  function handleSectionPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "sectionPicker" }>,
+  ): void {
+    const sp = modal;
+    if (sp.newName !== null) {
+      if (k.name === "escape") {
+        setModal({ ...sp, newName: null });
+        return;
+      }
+      if (k.ctrl && k.name === "c") {
+        setModal(null);
+        return;
+      }
+      if (k.name === "return") {
+        const name = sp.newName.trim();
+        if (!name) {
           setModal({ ...sp, newName: null });
           return;
         }
-        if (k.ctrl && k.name === "c") {
-          setModal(null);
-          return;
-        }
-        if (k.name === "return") {
-          const name = sp.newName.trim();
-          if (!name) {
-            setModal({ ...sp, newName: null });
-            return;
-          }
-          const slug = sp.slug;
-          setSection(slug, name).then(
-            () => toast(`moved to ${name}`, theme.info, 1500),
-            (err) => reportActionError("move", err),
-          );
-          setLastMoveTarget(name);
-          setModal(null);
-          return;
-        }
-        if (k.name === "backspace") {
-          // Backspace on empty input pops back to list mode — matches
-          // the new-worktree input convention.
-          if (sp.newName.length === 0) {
-            setModal({ ...sp, newName: null });
-            return;
-          }
-          setModal({ ...sp, newName: sp.newName.slice(0, -1) });
-          return;
-        }
-        const text = printableText(k.sequence);
-        if (text) setModal({ ...sp, newName: sp.newName + text });
+        const slug = sp.slug;
+        setSection(slug, name).then(
+          () => toast(`moved to ${name}`, theme.info, 1500),
+          (err) => reportActionError("move", err),
+        );
+        setLastMoveTarget(name);
+        setModal(null);
         return;
       }
+      if (k.name === "backspace") {
+        // Backspace on empty input pops back to list mode — matches
+        // the new-worktree input convention.
+        if (sp.newName.length === 0) {
+          setModal({ ...sp, newName: null });
+          return;
+        }
+        setModal({ ...sp, newName: sp.newName.slice(0, -1) });
+        return;
+      }
+      const text = printableText(k.sequence);
+      if (text) setModal({ ...sp, newName: sp.newName + text });
+      return;
+    }
+    if (k.name === "j" || k.name === "down") {
+      setModal({
+        ...sp,
+        index: Math.min(sp.index + 1, sp.items.length - 1),
+      });
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      setModal({ ...sp, index: Math.max(sp.index - 1, 0) });
+      return;
+    }
+    // `n` jumps straight to "+ new section" (chord shortcut: `l n`
+    // from normal mode lands directly in the create-name input).
+    if (isPlainLetter(k, "n")) {
+      const createIdx = sp.items.findIndex((it) => it.kind === "create");
+      if (createIdx >= 0) {
+        commitSectionPick(sp.items[createIdx]!, sp.slug);
+      }
+      return;
+    }
+    // Quick-pick digits 1..9 jump straight to that item by display
+    // position. Mirrors the digit prefix the modal renders — which
+    // skips the `+ new section` (`n`) row. So we skip it here too
+    // rather than firing on a "phantom" digit.
+    if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+      const i = parseInt(k.sequence, 10) - 1;
+      const item = sp.items[i];
+      if (item && item.kind !== "create") {
+        commitSectionPick(item, sp.slug);
+      }
+      return;
+    }
+    // Trigger-key re-press confirms (`l l` chord). See the modal
+    // UX rules in CLAUDE.md.
+    if (k.name === "return" || isPlainLetter(k, "l")) {
+      const item = sp.items[sp.index];
+      if (item) commitSectionPick(item, sp.slug);
+      return;
+    }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Action picker — list of pre-built actions plus a trailing
+  // "Custom prompt..." entry. Two screens: list mode (j/k + return),
+  // then edit mode where the user types extras / a freeform prompt.
+  function handleActionPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "actionPicker" }>,
+  ): void {
+    const ap = modal.state;
+    if (ap.mode === "list") {
+      // Recompute items here rather than reading from state — they
+      // depend on live row state via `requires`, and a stale snapshot
+      // would block actions whose preconditions just flipped (or
+      // unblock ones that just stopped applying).
+      const items = buildActionPickerItems(ap.slug);
       if (k.name === "j" || k.name === "down") {
         setModal({
-          ...sp,
-          index: Math.min(sp.index + 1, sp.items.length - 1),
+          kind: "actionPicker",
+          state: { ...ap, index: Math.min(ap.index + 1, items.length - 1) },
         });
         return;
       }
       if (k.name === "k" || k.name === "up") {
-        setModal({ ...sp, index: Math.max(sp.index - 1, 0) });
+        setModal({
+          kind: "actionPicker",
+          state: { ...ap, index: Math.max(ap.index - 1, 0) },
+        });
         return;
       }
-      // `n` jumps straight to "+ new section" (chord shortcut: `l n`
-      // from normal mode lands directly in the create-name input).
-      if (isPlainLetter(k, "n")) {
-        const createIdx = sp.items.findIndex((it) => it.kind === "create");
-        if (createIdx >= 0) {
-          commitSectionPick(sp.items[createIdx]!, sp.slug);
+      const commitIndex = (i: number): void => {
+        const item = items[i];
+        if (!item) return;
+        if (!canPickAction(item)) return;
+        // Action declared `arg_prompt` — open the arg picker first.
+        // Applies to both shell and claude. Empty history short-
+        // circuits to input mode so the user doesn't see a one-row
+        // picker that's just "+ new value…".
+        if (item.kind === "action" && item.def.argPrompt) {
+          const history = recentValues(item.def.id);
+          setModal({
+            kind: "argPicker",
+            slug: ap.slug,
+            def: item.def,
+            history,
+            index: 0,
+            input: history.length === 0 ? "" : null,
+          });
+          return;
         }
-        return;
-      }
-      // Quick-pick digits 1..9 jump straight to that item by display
-      // position. Mirrors the digit prefix the modal renders — which
-      // skips the `+ new section` (`n`) row. So we skip it here too
-      // rather than firing on a "phantom" digit.
-      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-        const i = parseInt(k.sequence, 10) - 1;
-        const item = sp.items[i];
-        if (item && item.kind !== "create") {
-          commitSectionPick(item, sp.slug);
+        if (item.kind === "action" && item.def.kind === "shell") {
+          setModal(null);
+          void launchAction(ap.slug, item.def, "");
+          return;
         }
+        // Custom (no def) or claude action → into the edit modal.
+        const def = item.kind === "action" ? item.def : null;
+        setModal({
+          kind: "actionPicker",
+          state: {
+            mode: "edit",
+            slug: ap.slug,
+            def: def && def.kind === "claude" ? def : null,
+            extras: "",
+          },
+        });
+      };
+      // `c` jumps straight to the custom-prompt entry (chord
+      // shortcut: `! c` from normal mode lands in freeform-edit
+      // mode). Note: `c` is also the clean-confirm key in normal
+      // mode but the modal is the only context here.
+      if (k.sequence === "c") {
+        setModal({
+          kind: "actionPicker",
+          state: { mode: "edit", slug: ap.slug, def: null, extras: "" },
+        });
         return;
       }
-      // Trigger-key re-press confirms (`l l` chord). See the modal
+      // Quick-pick letter jumps straight to the action whose assigned
+      // key matches (the custom entry is reachable via `c`). Reserved
+      // keys (c/j/k/q) are handled above/below, so they never collide.
+      // An unmatched letter falls through to the confirm/cancel checks.
+      if (k.sequence && /^[a-z]$/.test(k.sequence)) {
+        const i = items.findIndex(
+          (it) => it.kind === "action" && it.key === k.sequence,
+        );
+        if (i >= 0) {
+          commitIndex(i);
+          return;
+        }
+      }
+      // Trigger-key re-press confirms (`! !` chord). See the modal
       // UX rules in CLAUDE.md.
-      if (k.name === "return" || isPlainLetter(k, "l")) {
-        const item = sp.items[sp.index];
-        if (item) commitSectionPick(item, sp.slug);
+      if (k.name === "return" || k.sequence === "!") {
+        commitIndex(ap.index);
         return;
       }
       if (
@@ -2864,750 +2975,718 @@ export function App({ onExit }: Props) {
       }
       return;
     }
-
-    // Action picker — list of pre-built actions plus a trailing
-    // "Custom prompt..." entry. Two screens: list mode (j/k + return),
-    // then edit mode where the user types extras / a freeform prompt.
-    if (modal?.kind === "actionPicker") {
-      const ap = modal.state;
-      if (ap.mode === "list") {
-        // Recompute items here rather than reading from state — they
-        // depend on live row state via `requires`, and a stale snapshot
-        // would block actions whose preconditions just flipped (or
-        // unblock ones that just stopped applying).
-        const items = buildActionPickerItems(ap.slug);
-        if (k.name === "j" || k.name === "down") {
-          setModal({
-            kind: "actionPicker",
-            state: { ...ap, index: Math.min(ap.index + 1, items.length - 1) },
-          });
-          return;
-        }
-        if (k.name === "k" || k.name === "up") {
-          setModal({
-            kind: "actionPicker",
-            state: { ...ap, index: Math.max(ap.index - 1, 0) },
-          });
-          return;
-        }
-        const commitIndex = (i: number): void => {
-          const item = items[i];
-          if (!item) return;
-          if (!canPickAction(item)) return;
-          // Action declared `arg_prompt` — open the arg picker first.
-          // Applies to both shell and claude. Empty history short-
-          // circuits to input mode so the user doesn't see a one-row
-          // picker that's just "+ new value…".
-          if (item.kind === "action" && item.def.argPrompt) {
-            const history = recentValues(item.def.id);
-            setModal({
-              kind: "argPicker",
-              slug: ap.slug,
-              def: item.def,
-              history,
-              index: 0,
-              input: history.length === 0 ? "" : null,
-            });
-            return;
-          }
-          if (item.kind === "action" && item.def.kind === "shell") {
-            setModal(null);
-            void launchAction(ap.slug, item.def, "");
-            return;
-          }
-          // Custom (no def) or claude action → into the edit modal.
-          const def = item.kind === "action" ? item.def : null;
-          setModal({
-            kind: "actionPicker",
-            state: {
-              mode: "edit",
-              slug: ap.slug,
-              def: def && def.kind === "claude" ? def : null,
-              extras: "",
-            },
-          });
-        };
-        // `c` jumps straight to the custom-prompt entry (chord
-        // shortcut: `! c` from normal mode lands in freeform-edit
-        // mode). Note: `c` is also the clean-confirm key in normal
-        // mode but the modal is the only context here.
-        if (k.sequence === "c") {
-          setModal({
-            kind: "actionPicker",
-            state: { mode: "edit", slug: ap.slug, def: null, extras: "" },
-          });
-          return;
-        }
-        // Quick-pick letter jumps straight to the action whose assigned
-        // key matches (the custom entry is reachable via `c`). Reserved
-        // keys (c/j/k/q) are handled above/below, so they never collide.
-        // An unmatched letter falls through to the confirm/cancel checks.
-        if (k.sequence && /^[a-z]$/.test(k.sequence)) {
-          const i = items.findIndex(
-            (it) => it.kind === "action" && it.key === k.sequence,
-          );
-          if (i >= 0) {
-            commitIndex(i);
-            return;
-          }
-        }
-        // Trigger-key re-press confirms (`! !` chord). See the modal
-        // UX rules in CLAUDE.md.
-        if (k.name === "return" || k.sequence === "!") {
-          commitIndex(ap.index);
-          return;
-        }
-        if (
-          k.name === "escape" ||
-          k.sequence === "q" ||
-          (k.ctrl && k.name === "c")
-        ) {
+    // mode === "edit"
+    if (k.ctrl && k.name === "c") {
+      setModal(null);
+      return;
+    }
+    if (k.name === "escape") {
+      // Pre-built path: pop back to the list at the same item the user
+      // selected. Custom path: there's no informative list state to
+      // restore (custom is the only entry there), so esc cancels out.
+      const def = ap.def;
+      if (def) {
+        // Worktree may have been destroyed while the edit modal was
+        // open. Bail to a clean exit rather than dropping the user
+        // into a phantom-slug list whose entries all read "no PR".
+        if (!rows.find((r) => r.wt.slug === ap.slug)) {
           setModal(null);
+          toast("worktree gone", theme.warn, 2000);
+          return;
         }
-        return;
-      }
-      // mode === "edit"
-      if (k.ctrl && k.name === "c") {
+        const items = buildActionPickerItems(ap.slug);
+        const idx = items.findIndex(
+          (it) => it.kind === "action" && it.def.id === def.id,
+        );
+        setModal({
+          kind: "actionPicker",
+          state: { mode: "list", slug: ap.slug, index: Math.max(0, idx) },
+        });
+      } else {
         setModal(null);
-        return;
       }
+      return;
+    }
+    if (k.name === "return") {
+      const { slug, def, extras } = ap;
+      setModal(null);
+      void launchAction(slug, def, extras);
+      return;
+    }
+    if (k.name === "backspace") {
+      if (ap.extras.length === 0) return;
+      setModal({
+        kind: "actionPicker",
+        state: { ...ap, extras: ap.extras.slice(0, -1) },
+      });
+      return;
+    }
+    const text = printableMultiline(k.sequence);
+    if (text) {
+      setModal({
+        kind: "actionPicker",
+        state: { ...ap, extras: ap.extras + text },
+      });
+    }
+  }
+
+  // Action arg picker — opened after a `arg_prompt`-equipped action
+  // is picked from the `!` menu. List mode shows recent values
+  // (`LABEL`-derived labels when available); trailing slot opens
+  // input mode for a fresh value. Reached mid-`!` flow so Enter/Esc
+  // are the only commit/cancel keys (no chord — see CLAUDE.md modal
+  // rules). Esc from input pops back to the list when history is
+  // non-empty; otherwise closes the modal.
+  function handleArgPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "argPicker" }>,
+  ): void {
+    const ap = modal;
+    const rowCount = ap.history.length + 1; // trailing "+ new"
+    const isInput = ap.input !== null;
+    const launch = (value: string): void => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      setModal(null);
+      void launchAction(ap.slug, ap.def, "", trimmed);
+    };
+    if (k.ctrl && k.name === "c") {
+      setModal(null);
+      return;
+    }
+    if (isInput) {
       if (k.name === "escape") {
-        // Pre-built path: pop back to the list at the same item the user
-        // selected. Custom path: there's no informative list state to
-        // restore (custom is the only entry there), so esc cancels out.
-        const def = ap.def;
-        if (def) {
-          // Worktree may have been destroyed while the edit modal was
-          // open. Bail to a clean exit rather than dropping the user
-          // into a phantom-slug list whose entries all read "no PR".
-          if (!rows.find((r) => r.wt.slug === ap.slug)) {
-            setModal(null);
-            toast("worktree gone", theme.warn, 2000);
-            return;
-          }
-          const items = buildActionPickerItems(ap.slug);
-          const idx = items.findIndex(
-            (it) => it.kind === "action" && it.def.id === def.id,
-          );
-          setModal({
-            kind: "actionPicker",
-            state: { mode: "list", slug: ap.slug, index: Math.max(0, idx) },
-          });
+        // Pop back to list when there was a history to return to;
+        // otherwise the input was the only screen the user ever saw.
+        if (ap.history.length > 0) {
+          setModal({ ...ap, input: null, index: 0 });
         } else {
           setModal(null);
         }
         return;
       }
       if (k.name === "return") {
-        const { slug, def, extras } = ap;
-        setModal(null);
-        void launchAction(slug, def, extras);
+        launch(ap.input ?? "");
         return;
       }
       if (k.name === "backspace") {
-        if (ap.extras.length === 0) return;
-        setModal({
-          kind: "actionPicker",
-          state: { ...ap, extras: ap.extras.slice(0, -1) },
-        });
+        setModal({ ...ap, input: (ap.input ?? "").slice(0, -1) });
         return;
       }
       const text = printableMultiline(k.sequence);
-      if (text) {
-        setModal({
-          kind: "actionPicker",
-          state: { ...ap, extras: ap.extras + text },
-        });
-      }
+      if (text) setModal({ ...ap, input: (ap.input ?? "") + text });
       return;
     }
-
-    // Action arg picker — opened after a `arg_prompt`-equipped action
-    // is picked from the `!` menu. List mode shows recent values
-    // (`LABEL`-derived labels when available); trailing slot opens
-    // input mode for a fresh value. Reached mid-`!` flow so Enter/Esc
-    // are the only commit/cancel keys (no chord — see CLAUDE.md modal
-    // rules). Esc from input pops back to the list when history is
-    // non-empty; otherwise closes the modal.
-    if (modal?.kind === "argPicker") {
-      const ap = modal;
-      const rowCount = ap.history.length + 1; // trailing "+ new"
-      const isInput = ap.input !== null;
-      const launch = (value: string): void => {
-        const trimmed = value.trim();
-        if (!trimmed) return;
-        setModal(null);
-        void launchAction(ap.slug, ap.def, "", trimmed);
-      };
-      if (k.ctrl && k.name === "c") {
-        setModal(null);
-        return;
-      }
-      if (isInput) {
-        if (k.name === "escape") {
-          // Pop back to list when there was a history to return to;
-          // otherwise the input was the only screen the user ever saw.
-          if (ap.history.length > 0) {
-            setModal({ ...ap, input: null, index: 0 });
-          } else {
-            setModal(null);
-          }
-          return;
-        }
-        if (k.name === "return") {
-          launch(ap.input ?? "");
-          return;
-        }
-        if (k.name === "backspace") {
-          setModal({ ...ap, input: (ap.input ?? "").slice(0, -1) });
-          return;
-        }
-        const text = printableMultiline(k.sequence);
-        if (text) setModal({ ...ap, input: (ap.input ?? "") + text });
-        return;
-      }
-      // list mode
-      if (k.name === "escape" || k.sequence === "q") {
-        setModal(null);
-        return;
-      }
-      if (k.name === "j" || k.name === "down") {
-        setModal({ ...ap, index: Math.min(ap.index + 1, rowCount - 1) });
-        return;
-      }
-      if (k.name === "k" || k.name === "up") {
-        setModal({ ...ap, index: Math.max(ap.index - 1, 0) });
-        return;
-      }
-      // Digit quick-pick over history rows (1..9) — confirms in one
-      // keystroke. Out-of-range digits silently ignored.
-      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-        const i = Number(k.sequence) - 1;
-        if (i < ap.history.length) {
-          const entry = ap.history[i];
-          if (entry) launch(entry.value);
-        }
-        return;
-      }
-      if (k.name === "return") {
-        // Trailing "+ new" row drops into input mode; history rows
-        // commit their value.
-        if (ap.index >= ap.history.length) {
-          setModal({ ...ap, input: "" });
-          return;
-        }
-        const entry = ap.history[ap.index];
+    // list mode
+    if (k.name === "escape" || k.sequence === "q") {
+      setModal(null);
+      return;
+    }
+    if (k.name === "j" || k.name === "down") {
+      setModal({ ...ap, index: Math.min(ap.index + 1, rowCount - 1) });
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      setModal({ ...ap, index: Math.max(ap.index - 1, 0) });
+      return;
+    }
+    // Digit quick-pick over history rows (1..9) — confirms in one
+    // keystroke. Out-of-range digits silently ignored.
+    if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+      const i = Number(k.sequence) - 1;
+      if (i < ap.history.length) {
+        const entry = ap.history[i];
         if (entry) launch(entry.value);
-        return;
       }
       return;
     }
-
-    // Outputs picker — vim-buffer-style list of this worktree's
-    // outputs (events + this slug's actions + this slug's claude
-    // session). j/k or arrows move AND commit focus immediately
-    // (live preview: ";jj;" lands on the third entry without a
-    // return press); 1-9 quick-pick by index; Enter just closes (the
-    // focus already matches); `'` toggles pin on the selected entry;
-    // esc/q cancels (without revert — live commit semantics). `idx`
-    // is clamped against the live `visibleOutputs` length on every
-    // keypress because the underlying list can shrink while the
-    // picker is open (FIFO eviction, session ending).
-    if (modal?.kind === "outputsPicker") {
-      const idx =
-        visibleOutputs.length === 0
-          ? 0
-          : Math.min(Math.max(0, modal.index), visibleOutputs.length - 1);
-      const moveTo = (next: number): void => {
-        setModal({ kind: "outputsPicker", index: next });
-        const patch = previewFocusPatch(visibleOutputs[next]?.id ?? null);
-        if (patch) setFocus(currentSlug ?? null, patch);
-      };
-      const commit = (i: number): void => {
-        const target = visibleOutputs[i];
-        if (target) setFocus(currentSlug ?? null, { focused: target.id });
-        setModal(null);
-      };
-      if (k.name === "j" || k.name === "down") {
-        moveTo(Math.min(idx + 1, visibleOutputs.length - 1));
+    if (k.name === "return") {
+      // Trailing "+ new" row drops into input mode; history rows
+      // commit their value.
+      if (ap.index >= ap.history.length) {
+        setModal({ ...ap, input: "" });
         return;
       }
-      if (k.name === "k" || k.name === "up") {
-        moveTo(Math.max(0, idx - 1));
-        return;
-      }
-      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-        const i = parseInt(k.sequence, 10) - 1;
-        if (visibleOutputs[i]) commit(i);
-        return;
-      }
-      // Trigger-key re-press confirms (`' '` chord) — see the modal
-      // UX rules in CLAUDE.md.
-      if (k.sequence === "'" || k.name === "return") {
-        commit(idx);
-        return;
-      }
-      if (
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
+      const entry = ap.history[ap.index];
+      if (entry) launch(entry.value);
       return;
     }
+  }
 
-    // Sessions picker — multi-harness list view. Rows: every live /
-    // dead session across all harnesses, then a "+ new X" affordance
-    // per harness. Per-harness letter shortcuts (`c`/`o`/`x`) jump to
-    // the matching "+ new" row; trigger-re-press (`;`) or Enter
-    // commits the highlight. `d` kills the highlighted live claude
-    // session (codex / opencode kills route via the harness selector
-    // -> kill flow, not v1).
-    if (modal?.kind === "claudeSessionsPicker") {
-      const slug = modal.slug;
-      const rowsLocal = pickerRows;
-      const totalRows = rowsLocal.length;
-      const idx = Math.min(Math.max(0, modal.index), Math.max(0, totalRows - 1));
-      const previewIdFor = (i: number): string | null => {
-        const r = rowsLocal[i];
-        if (!r || r.kind !== "session") return null;
-        if (!r.entry.isLive) return null;
-        if (r.entry.harnessId !== "claude") return null;
-        return sessionOutputId(slug, "claude", r.entry.extras.managedName);
-      };
-      const moveTo = (next: number): void => {
-        setModal({ ...modal, index: next });
-        const patch = previewFocusPatch(previewIdFor(next));
-        if (patch) setFocus(slug, patch);
-      };
-      const openNewClaude = (): void => {
-        setModal({
-          kind: "claudeSessionsNew",
-          slug,
-          input: "",
-          error: null,
-        });
-      };
-      const commitRow = (i: number): void => {
-        const r = rowsLocal[i];
-        if (!r) return;
-        if (r.kind === "new") {
-          if (r.harnessId === "claude") {
-            openNewClaude();
-          } else {
-            // Codex / OpenCode share one tmux slot per slug — force a
-            // fresh spawn so the slot's running CLI is replaced rather
-            // than re-attached to. Without this, "+ new" silently
-            // attaches to whatever was already running.
-            setModal(null);
-            doEnterHarnessSession(slug, r.harnessId, { freshSlot: true });
-          }
+  // Outputs picker — vim-buffer-style list of this worktree's
+  // outputs (events + this slug's actions + this slug's claude
+  // session). j/k or arrows move AND commit focus immediately
+  // (live preview: ";jj;" lands on the third entry without a
+  // return press); 1-9 quick-pick by index; Enter just closes (the
+  // focus already matches); `'` toggles pin on the selected entry;
+  // esc/q cancels (without revert — live commit semantics). `idx`
+  // is clamped against the live `visibleOutputs` length on every
+  // keypress because the underlying list can shrink while the
+  // picker is open (FIFO eviction, session ending).
+  function handleOutputsPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "outputsPicker" }>,
+  ): void {
+    const idx =
+      visibleOutputs.length === 0
+        ? 0
+        : Math.min(Math.max(0, modal.index), visibleOutputs.length - 1);
+    const moveTo = (next: number): void => {
+      setModal({ kind: "outputsPicker", index: next });
+      const patch = previewFocusPatch(visibleOutputs[next]?.id ?? null);
+      if (patch) setFocus(currentSlug ?? null, patch);
+    };
+    const commit = (i: number): void => {
+      const target = visibleOutputs[i];
+      if (target) setFocus(currentSlug ?? null, { focused: target.id });
+      setModal(null);
+    };
+    if (k.name === "j" || k.name === "down") {
+      moveTo(Math.min(idx + 1, visibleOutputs.length - 1));
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      moveTo(Math.max(0, idx - 1));
+      return;
+    }
+    if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+      const i = parseInt(k.sequence, 10) - 1;
+      if (visibleOutputs[i]) commit(i);
+      return;
+    }
+    // Trigger-key re-press confirms (`' '` chord) — see the modal
+    // UX rules in CLAUDE.md.
+    if (k.sequence === "'" || k.name === "return") {
+      commit(idx);
+      return;
+    }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Sessions picker — multi-harness list view. Rows: every live /
+  // dead session across all harnesses, then a "+ new X" affordance
+  // per harness. Per-harness letter shortcuts (`c`/`o`/`x`) jump to
+  // the matching "+ new" row; trigger-re-press (`;`) or Enter
+  // commits the highlight. `x` kills the highlighted live claude
+  // session (codex / opencode kills route via the harness selector
+  // -> kill flow, not v1).
+  function handleClaudeSessionsPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "claudeSessionsPicker" }>,
+  ): void {
+    const slug = modal.slug;
+    const rowsLocal = pickerRows;
+    const totalRows = rowsLocal.length;
+    const idx = Math.min(Math.max(0, modal.index), Math.max(0, totalRows - 1));
+    const previewIdFor = (i: number): string | null => {
+      const r = rowsLocal[i];
+      if (!r || r.kind !== "session") return null;
+      if (!r.entry.isLive) return null;
+      if (r.entry.harnessId !== "claude") return null;
+      return sessionOutputId(slug, "claude", r.entry.extras.managedName);
+    };
+    const moveTo = (next: number): void => {
+      setModal({ ...modal, index: next });
+      const patch = previewFocusPatch(previewIdFor(next));
+      if (patch) setFocus(slug, patch);
+    };
+    const openNewClaude = (): void => {
+      setModal({
+        kind: "claudeSessionsNew",
+        slug,
+        input: "",
+        error: null,
+      });
+    };
+    const commitRow = (i: number): void => {
+      const r = rowsLocal[i];
+      if (!r) return;
+      if (r.kind === "new") {
+        if (r.harnessId === "claude") {
+          openNewClaude();
+        } else {
+          // Codex / OpenCode share one tmux slot per slug — force a
+          // fresh spawn so the slot's running CLI is replaced rather
+          // than re-attached to. Without this, "+ new" silently
+          // attaches to whatever was already running.
+          setModal(null);
+          doEnterHarnessSession(slug, r.harnessId, { freshSlot: true });
+        }
+        return;
+      }
+      const e = r.entry;
+      // Synthesized "(fresh)" rows carry a sentinel sessionId — treat
+      // them as plain re-attach (no resume id, no slot kill). They
+      // exist precisely because the slot is alive but discovery
+      // hasn't seen anything yet, so attaching is exactly what the
+      // user wants.
+      const isSyntheticLive = isSyntheticLiveSessionId(e.sessionId);
+      const resumeSessionId =
+        e.isLive || isSyntheticLive ? null : e.sessionId;
+      // For codex/opencode, picking a dead session means "resume
+      // this specific one" — that only works if the slot starts
+      // fresh, otherwise `tmux -A` attaches to whatever's there and
+      // ignores our `<cli> resume <id>` argv.
+      const freshSlot =
+        getHarness(e.harnessId).singleSlot && resumeSessionId !== null;
+      setModal(null);
+      doEnterHarnessSession(slug, e.harnessId, {
+        managedName: e.extras.managedName,
+        resumeSessionId,
+        freshSlot,
+      });
+    };
+    const jumpToNew = (harnessId: HarnessId): void => {
+      const target = rowsLocal.findIndex(
+        (r) => r.kind === "new" && r.harnessId === harnessId,
+      );
+      if (target >= 0) moveTo(target);
+    };
+    if (k.name === "j" || k.name === "down") {
+      moveTo(Math.min(idx + 1, totalRows - 1));
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      moveTo(Math.max(0, idx - 1));
+      return;
+    }
+    // Digits address SESSION rows only (in their rendered order),
+    // matching the digit prefix the picker draws. The "+ new" rows
+    // are reached via per-harness letters.
+    if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+      const n = parseInt(k.sequence, 10) - 1;
+      let cursor = 0;
+      for (let i = 0; i < rowsLocal.length; i++) {
+        if (rowsLocal[i]!.kind !== "session") continue;
+        if (cursor === n) {
+          commitRow(i);
           return;
         }
+        cursor++;
+      }
+      return;
+    }
+    // `x` kills (CLAUDE.md modal UX rule). Codex's harness letter
+    // is also `x`, so we dispatch by row kind: on a session row,
+    // kill it and return; on anything else, fall through to the
+    // letter-shortcut loop below (which jumps the highlight to
+    // "+ new codex").
+    if (k.sequence === "x") {
+      const r = rowsLocal[idx];
+      if (r?.kind === "session") {
         const e = r.entry;
-        // Synthesized "(fresh)" rows carry a sentinel sessionId — treat
-        // them as plain re-attach (no resume id, no slot kill). They
-        // exist precisely because the slot is alive but discovery
-        // hasn't seen anything yet, so attaching is exactly what the
-        // user wants.
-        const isSyntheticLive = isSyntheticLiveSessionId(e.sessionId);
-        const resumeSessionId =
-          e.isLive || isSyntheticLive ? null : e.sessionId;
-        // For codex/opencode, picking a dead session means "resume
-        // this specific one" — that only works if the slot starts
-        // fresh, otherwise `tmux -A` attaches to whatever's there and
-        // ignores our `<cli> resume <id>` argv.
-        const freshSlot =
-          getHarness(e.harnessId).singleSlot && resumeSessionId !== null;
-        setModal(null);
-        doEnterHarnessSession(slug, e.harnessId, {
-          managedName: e.extras.managedName,
-          resumeSessionId,
-          freshSlot,
-        });
-      };
-      const jumpToNew = (harnessId: HarnessId): void => {
-        const target = rowsLocal.findIndex(
-          (r) => r.kind === "new" && r.harnessId === harnessId,
-        );
-        if (target >= 0) moveTo(target);
-      };
-      if (k.name === "j" || k.name === "down") {
-        moveTo(Math.min(idx + 1, totalRows - 1));
-        return;
-      }
-      if (k.name === "k" || k.name === "up") {
-        moveTo(Math.max(0, idx - 1));
-        return;
-      }
-      // Digits address SESSION rows only (in their rendered order),
-      // matching the digit prefix the picker draws. The "+ new" rows
-      // are reached via per-harness letters.
-      if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-        const n = parseInt(k.sequence, 10) - 1;
-        let cursor = 0;
-        for (let i = 0; i < rowsLocal.length; i++) {
-          if (rowsLocal[i]!.kind !== "session") continue;
-          if (cursor === n) {
-            commitRow(i);
-            return;
+        if (e.harnessId === "claude") {
+          if (e.isLive) {
+            doKillClaudeSession(slug, e.extras.managedName);
+          } else if (e.extras.managedName !== null) {
+            removeClaudeName(slug, e.extras.managedName);
+            void refreshClaudeSummaries(slug);
+            appLog.event.info(
+              `forgot ghost session "${e.extras.managedName}" on ${slug}`,
+            );
           }
-          cursor++;
-        }
-        return;
-      }
-      // `x` kills (CLAUDE.md modal UX rule). Codex's harness letter
-      // is also `x`, so we dispatch by row kind: on a session row,
-      // kill it and return; on anything else, fall through to the
-      // letter-shortcut loop below (which jumps the highlight to
-      // "+ new codex").
-      if (k.sequence === "x") {
-        const r = rowsLocal[idx];
-        if (r?.kind === "session") {
-          const e = r.entry;
-          if (e.harnessId === "claude") {
-            if (e.isLive) {
-              doKillClaudeSession(slug, e.extras.managedName);
-            } else if (e.extras.managedName !== null) {
-              removeClaudeName(slug, e.extras.managedName);
-              void refreshClaudeSummaries(slug);
-              appLog.event.info(
-                `forgot ghost session "${e.extras.managedName}" on ${slug}`,
+          setModal(null);
+        } else {
+          // Codex / opencode kill via tmux name (live only). Dead
+          // sessions are owned by the harness's own store and we
+          // don't write there — surface that as a toast so `x`
+          // doesn't read as a silent no-op (the picker dismisses
+          // either way; without the toast the user can't tell
+          // whether the kill landed or nothing happened).
+          if (e.isLive) {
+            void (async () => {
+              await killHarnessSession(slug, e.harnessId);
+              // Refresh both together — same reasoning as the
+              // post-detach path: avoid the transient state where
+              // tmux + discovery disagree about whether the slot
+              // is still alive.
+              await Promise.all([
+                refreshTmuxSessions(),
+                refreshHarnessSessions(slug),
+              ]);
+              appLog.event.warn(
+                `killed ${getHarness(e.harnessId).label} session on ${slug}`,
               );
-            }
+            })();
             setModal(null);
           } else {
-            // Codex / opencode kill via tmux name (live only). Dead
-            // sessions are owned by the harness's own store and we
-            // don't write there — surface that as a toast so `x`
-            // doesn't read as a silent no-op (the picker dismisses
-            // either way; without the toast the user can't tell
-            // whether the kill landed or nothing happened).
-            if (e.isLive) {
-              void (async () => {
-                await killHarnessSession(slug, e.harnessId);
-                // Refresh both together — same reasoning as the
-                // post-detach path: avoid the transient state where
-                // tmux + discovery disagree about whether the slot
-                // is still alive.
-                await Promise.all([
-                  refreshTmuxSessions(),
-                  refreshHarnessSessions(slug),
-                ]);
-                appLog.event.warn(
-                  `killed ${getHarness(e.harnessId).label} session on ${slug}`,
-                );
-              })();
-              setModal(null);
-            } else {
-              toast(
-                `${getHarness(e.harnessId).label} session is dead; remove via ${e.harnessId} CLI`,
-                theme.fgDim,
-                2000,
-              );
-            }
+            toast(
+              `${getHarness(e.harnessId).label} session is dead; remove via ${e.harnessId} CLI`,
+              theme.fgDim,
+              2000,
+            );
           }
-          return;
         }
-        // Highlight isn't on a session row — fall through so the
-        // letter-shortcut loop below treats `x` as the codex jump key.
-      }
-      // Per-harness letter — jump to the matching "+ new" row. The
-      // user then presses `;` (or Enter) to confirm and spawn.
-      for (const h of HARNESSES) {
-        if (k.sequence === h.letter && !k.shift && !k.ctrl && !k.meta) {
-          jumpToNew(h.id);
-          return;
-        }
-      }
-      // `;` re-press confirms (trigger-toggle convention).
-      if (k.sequence === ";" || k.name === "return") {
-        commitRow(idx);
         return;
       }
-      if (
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
+      // Highlight isn't on a session row — fall through so the
+      // letter-shortcut loop below treats `x` as the codex jump key.
+    }
+    // Per-harness letter — jump to the matching "+ new" row. The
+    // user then presses `;` (or Enter) to confirm and spawn.
+    for (const h of HARNESSES) {
+      if (k.sequence === h.letter && !k.shift && !k.ctrl && !k.meta) {
+        jumpToNew(h.id);
+        return;
       }
+    }
+    // `;` re-press confirms (trigger-toggle convention).
+    if (k.sequence === ";" || k.name === "return") {
+      commitRow(idx);
       return;
     }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
 
-    // Claude sessions picker — new-name input phase. Accepts the
-    // same chars `validateSessionName` accepts plus backspace; Enter
-    // commits, esc pops back to list, Ctrl+C closes the modal,
-    // backspace-on-empty pops back to list (parity with the section
-    // picker newName mode). Empty input on
-    // Enter spawns with the auto-numbered name (next free integer
-    // ≥ 2).
-    if (modal?.kind === "claudeSessionsNew") {
-      if (k.name === "escape") {
+  // Claude sessions picker — new-name input phase. Accepts the
+  // same chars `validateSessionName` accepts plus backspace; Enter
+  // commits, esc pops back to list, Ctrl+C closes the modal,
+  // backspace-on-empty pops back to list (parity with the section
+  // picker newName mode). Empty input on
+  // Enter spawns with the auto-numbered name (next free integer
+  // ≥ 2).
+  function handleClaudeSessionsNewKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "claudeSessionsNew" }>,
+  ): void {
+    if (k.name === "escape") {
+      setModal({ kind: "claudeSessionsPicker", slug: modal.slug, index: 0 });
+      return;
+    }
+    if (k.ctrl && k.name === "c") {
+      setModal(null);
+      return;
+    }
+    if (k.name === "return") {
+      const trimmed = modal.input.trim();
+      const name = trimmed === "" ? nextAutoName(modal.slug) : trimmed;
+      const err = validateSessionName(name);
+      if (err) {
+        setModal({ ...modal, error: err });
+        return;
+      }
+      setModal(null);
+      doSpawnNamedClaudeSession(modal.slug, name);
+      return;
+    }
+    if (k.name === "backspace") {
+      if (modal.input.length === 0) {
         setModal({ kind: "claudeSessionsPicker", slug: modal.slug, index: 0 });
         return;
       }
-      if (k.ctrl && k.name === "c") {
-        setModal(null);
-        return;
+      setModal({ ...modal, input: modal.input.slice(0, -1), error: null });
+      return;
+    }
+    if (k.sequence && /^[a-zA-Z0-9_-]$/.test(k.sequence)) {
+      setModal({
+        ...modal,
+        input: modal.input + k.sequence,
+        error: null,
+      });
+      return;
+    }
+  }
+
+  // Harness selector modal — Shift+F12 opens it; user picks which
+  // harness to spawn fresh on the current slug. The per-harness
+  // letter shortcut (`c`/`o`/`x`) jumps + commits in one keystroke;
+  // F12 re-press / Enter commits the highlighted row.
+  function handleHarnessSelectKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "harnessSelect" }>,
+  ): void {
+    const items = HARNESSES;
+    const idx = Math.min(Math.max(0, modal.index), items.length - 1);
+    const slug = modal.slug;
+    const commit = (chosen: HarnessId): void => {
+      setModal(null);
+      if (chosen === "claude") {
+        // Preserve the auto-named behavior the old Shift+F12 had:
+        // bare `claude` on Shift+F12 means "give me another claude
+        // here without making me name it".
+        doSpawnNamedClaudeSession(slug, nextAutoName(slug));
+      } else {
+        doEnterHarnessSession(slug, chosen, {});
       }
-      if (k.name === "return") {
-        const trimmed = modal.input.trim();
-        const name = trimmed === "" ? nextAutoName(modal.slug) : trimmed;
-        const err = validateSessionName(name);
-        if (err) {
-          setModal({ ...modal, error: err });
-          return;
+    };
+    if (k.name === "j" || k.name === "down") {
+      setModal({ ...modal, index: Math.min(idx + 1, items.length - 1) });
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      setModal({ ...modal, index: Math.max(0, idx - 1) });
+      return;
+    }
+    // Per-harness letter shortcut. Letters are unique across the
+    // registry by contract.
+    const letterMatch = items.find(
+      (h) => k.sequence === h.letter && !k.shift && !k.ctrl && !k.meta,
+    );
+    if (letterMatch) {
+      commit(letterMatch.id);
+      return;
+    }
+    // F12 re-press or Enter confirms the current highlight. Reject
+    // shift+F12 here since shift+F12 is what opened this modal —
+    // a stray re-press shouldn't re-trigger the open.
+    if (
+      (k.name === "f12" && !k.shift) ||
+      k.name === "return"
+    ) {
+      commit(items[idx]!.id);
+      return;
+    }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Kill-confirm for an in-flight `!` action on the selected
+  // worktree. Mirrors the y/N pattern used by clean-confirm; also
+  // accepts `!` (the opening key) per the modal toggle convention.
+  function handleKillActionConfirmKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "killActionConfirm" }>,
+  ): void {
+    if (k.name === "y" || k.name === "return") {
+      const { slug, actionName } = modal;
+      setModal(null);
+      void actionRegistry.kill(slug).then((killed) => {
+        if (killed) {
+          appLog.event.warn(`killed action "${actionName}" on ${slug}`);
         }
-        setModal(null);
-        doSpawnNamedClaudeSession(modal.slug, name);
-        return;
-      }
-      if (k.name === "backspace") {
-        if (modal.input.length === 0) {
-          setModal({ kind: "claudeSessionsPicker", slug: modal.slug, index: 0 });
-          return;
-        }
-        setModal({ ...modal, input: modal.input.slice(0, -1), error: null });
-        return;
-      }
-      if (k.sequence && /^[a-zA-Z0-9_-]$/.test(k.sequence)) {
-        setModal({
-          ...modal,
-          input: modal.input + k.sequence,
-          error: null,
+      });
+      return;
+    }
+    if (
+      k.name === "n" ||
+      k.name === "escape" ||
+      k.sequence === "!" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Kill-confirm for an interactive tmux session on the selected
+  // worktree. Mirrors `killActionConfirm`. For claude, the
+  // conversation jsonl is preserved — next F12 attaches via --resume
+  // to the same UUID. For diff, the next F11 opens fresh state.
+  function handleKillSessionConfirmKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "killSessionConfirm" }>,
+  ): void {
+    if (k.name === "y" || k.name === "return") {
+      const { slug, sessionKind } = modal;
+      setModal(null);
+      const kill = sessionKind === "diff" ? killDiffSession : killShellSession;
+      void kill(slug)
+        .then(() => {
+          appLog.event.warn(`killed ${sessionKind} session on ${slug}`);
+          void refreshTmuxSessions();
+        })
+        .catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          appLog.event.err(
+            `kill ${sessionKind} session failed for ${slug}: ${msg}`,
+          );
         });
-        return;
+      return;
+    }
+    if (
+      k.name === "n" ||
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Branch-picker modal (for --any multi-match). Swallows input
+  // until the user picks or cancels, resolving the promise that
+  // `parseInput` is awaiting inside `doNew`.
+  function handleBranchPickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "branchPicker" }>,
+  ): void {
+    const bp = modal;
+    if (k.name === "j" || k.name === "down") {
+      setModal({
+        ...bp,
+        index: Math.min(bp.index + 1, bp.items.length - 1),
+      });
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      setModal({ ...bp, index: Math.max(bp.index - 1, 0) });
+      return;
+    }
+    if (k.name === "return") {
+      const chosen = bp.items[bp.index]!;
+      bp.resolve(chosen);
+      setModal(null);
+      return;
+    }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      bp.resolve(null);
+      setModal(null);
+    }
+  }
+
+  // Yank chord: `y` opened the menu; the next key picks what to copy.
+  // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
+  // rather than re-entering normal mode, so a stray keystroke can't
+  // accidentally trigger a destructive action.
+  function handleYankKey(k: KeyEvent): void {
+    if (
+      k.name === "escape" ||
+      k.sequence === "y" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+      return;
+    }
+    if (current) {
+      const item = yankItemsFor(current).find((it) => it.key === k.sequence);
+      if (item) {
+        setModal(null);
+        doYank(current.wt.slug, item.label, item.value);
+      }
+    }
+  }
+
+  // Clean-confirm modal swallows input while open.
+  function handleCleanConfirmKey(k: KeyEvent): void {
+    if (k.name === "y" || k.name === "return") {
+      setModal(null);
+      void doClean();
+      return;
+    }
+    if (
+      k.name === "n" ||
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
+  // Generic y/N confirm. Dispatches on `pendingKey` (same codes the
+  // footer confirm used before it moved into the modal layer). The
+  // modal swallows input while open, so `current` is stable between
+  // open and confirm.
+  function handleConfirmKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "confirm" }>,
+  ): void {
+    if (k.name === "y" || k.name === "return") {
+      const pending = modal.pendingKey;
+      setModal(null);
+      if (pending === "d" && current) {
+        void doRemove(current.wt.slug);
+      } else if (pending === "d!" && current) {
+        void doRemove(current.wt.slug, { force: true });
+      } else if (pending === "m+" && current) {
+        void doAutoMerge(current.wt.slug, "enable");
+      } else if (pending === "m-" && current) {
+        void doAutoMerge(current.wt.slug, "disable");
+      } else if (pending === "e" && current) {
+        void doMarkReady(current.wt.slug);
+      } else if (pending === "E" && current) {
+        void doShipPr(current.wt.slug);
+      } else if (pending === "review-wt" && modal.reviewBranch) {
+        void doCheckoutReview(modal.reviewBranch);
+      } else if (pending === "R") {
+        appLog.event.warn("cleared all cached data; refetching from scratch");
+        void clearAll();
       }
       return;
     }
-
-    // Harness selector modal — Shift+F12 opens it; user picks which
-    // harness to spawn fresh on the current slug. The per-harness
-    // letter shortcut (`c`/`o`/`x`) jumps + commits in one keystroke;
-    // F12 re-press / Enter commits the highlighted row.
-    if (modal?.kind === "harnessSelect") {
-      const items = HARNESSES;
-      const idx = Math.min(Math.max(0, modal.index), items.length - 1);
-      const slug = modal.slug;
-      const commit = (chosen: HarnessId): void => {
-        setModal(null);
-        if (chosen === "claude") {
-          // Preserve the auto-named behavior the old Shift+F12 had:
-          // bare `claude` on Shift+F12 means "give me another claude
-          // here without making me name it".
-          doSpawnNamedClaudeSession(slug, nextAutoName(slug));
-        } else {
-          doEnterHarnessSession(slug, chosen, {});
-        }
-      };
-      if (k.name === "j" || k.name === "down") {
-        setModal({ ...modal, index: Math.min(idx + 1, items.length - 1) });
-        return;
-      }
-      if (k.name === "k" || k.name === "up") {
-        setModal({ ...modal, index: Math.max(0, idx - 1) });
-        return;
-      }
-      // Per-harness letter shortcut. Letters are unique across the
-      // registry by contract.
-      const letterMatch = items.find(
-        (h) => k.sequence === h.letter && !k.shift && !k.ctrl && !k.meta,
-      );
-      if (letterMatch) {
-        commit(letterMatch.id);
-        return;
-      }
-      // F12 re-press or Enter confirms the current highlight. Reject
-      // shift+F12 here since shift+F12 is what opened this modal —
-      // a stray re-press shouldn't re-trigger the open.
-      if (
-        (k.name === "f12" && !k.shift) ||
-        k.name === "return"
-      ) {
-        commit(items[idx]!.id);
-        return;
-      }
-      if (
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
-      return;
+    if (
+      k.name === "n" ||
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
     }
+  }
 
-    // Kill-confirm for an in-flight `!` action on the selected
-    // worktree. Mirrors the y/N pattern used by clean-confirm; also
-    // accepts `!` (the opening key) per the modal toggle convention.
-    if (modal?.kind === "killActionConfirm") {
-      if (k.name === "y" || k.name === "return") {
-        const { slug, actionName } = modal;
-        setModal(null);
-        void actionRegistry.kill(slug).then((killed) => {
-          if (killed) {
-            appLog.event.warn(`killed action "${actionName}" on ${slug}`);
-          }
-        });
-        return;
-      }
-      if (
-        k.name === "n" ||
-        k.name === "escape" ||
-        k.sequence === "!" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
-      return;
-    }
-
-    // Kill-confirm for an interactive tmux session on the selected
-    // worktree. Mirrors `killActionConfirm`. For claude, the
-    // conversation jsonl is preserved — next F12 attaches via --resume
-    // to the same UUID. For diff, the next F11 opens fresh state.
-    if (modal?.kind === "killSessionConfirm") {
-      if (k.name === "y" || k.name === "return") {
-        const { slug, sessionKind } = modal;
-        setModal(null);
-        const kill = sessionKind === "diff" ? killDiffSession : killShellSession;
-        void kill(slug)
-          .then(() => {
-            appLog.event.warn(`killed ${sessionKind} session on ${slug}`);
-            void refreshTmuxSessions();
-          })
-          .catch((err) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            appLog.event.err(
-              `kill ${sessionKind} session failed for ${slug}: ${msg}`,
-            );
-          });
-        return;
-      }
-      if (
-        k.name === "n" ||
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
-      return;
-    }
-
-    // Branch-picker modal (for --any multi-match). Swallows input
-    // until the user picks or cancels, resolving the promise that
-    // `parseInput` is awaiting inside `doNew`.
-    if (modal?.kind === "branchPicker") {
-      const bp = modal;
-      if (k.name === "j" || k.name === "down") {
-        setModal({
-          ...bp,
-          index: Math.min(bp.index + 1, bp.items.length - 1),
-        });
-        return;
-      }
-      if (k.name === "k" || k.name === "up") {
-        setModal({ ...bp, index: Math.max(bp.index - 1, 0) });
-        return;
-      }
-      if (k.name === "return") {
-        const chosen = bp.items[bp.index]!;
-        bp.resolve(chosen);
-        setModal(null);
-        return;
-      }
-      if (
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        bp.resolve(null);
-        setModal(null);
-      }
-      return;
-    }
-
-    // Yank chord: `y` opened the menu; the next key picks what to copy.
-    // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
-    // rather than re-entering normal mode, so a stray keystroke can't
-    // accidentally trigger a destructive action.
-    if (modal?.kind === "yank") {
-      if (
-        k.name === "escape" ||
-        k.sequence === "y" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-        return;
-      }
-      if (current) {
-        const item = yankItemsFor(current).find((it) => it.key === k.sequence);
-        if (item) {
-          setModal(null);
-          doYank(current.wt.slug, item.label, item.value);
-        }
-      }
-      return;
-    }
-
-    // Clean-confirm modal swallows input while open.
-    if (modal?.kind === "cleanConfirm") {
-      if (k.name === "y" || k.name === "return") {
-        setModal(null);
-        void doClean();
-        return;
-      }
-      if (
-        k.name === "n" ||
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
-      }
-      return;
-    }
-
-    // Generic y/N confirm. Dispatches on `pendingKey` (same codes the
-    // footer confirm used before it moved into the modal layer). The
-    // modal swallows input while open, so `current` is stable between
-    // open and confirm.
-    if (modal?.kind === "confirm") {
-      if (k.name === "y" || k.name === "return") {
-        const pending = modal.pendingKey;
-        setModal(null);
-        if (pending === "d" && current) {
-          void doRemove(current.wt.slug);
-        } else if (pending === "d!" && current) {
-          void doRemove(current.wt.slug, { force: true });
-        } else if (pending === "m+" && current) {
-          void doAutoMerge(current.wt.slug, "enable");
-        } else if (pending === "m-" && current) {
-          void doAutoMerge(current.wt.slug, "disable");
-        } else if (pending === "e" && current) {
-          void doMarkReady(current.wt.slug);
-        } else if (pending === "E" && current) {
-          void doShipPr(current.wt.slug);
-        } else if (pending === "review-wt" && modal.reviewBranch) {
-          void doCheckoutReview(modal.reviewBranch);
-        } else if (pending === "R") {
-          appLog.event.warn("cleared all cached data; refetching from scratch");
-          void clearAll();
-        }
-        return;
-      }
-      if (
-        k.name === "n" ||
-        k.name === "escape" ||
-        k.sequence === "q" ||
-        (k.ctrl && k.name === "c")
-      ) {
-        setModal(null);
+  useKeyboard((k) => {
+    // Exactly one modal is active at a time; dispatch to its handler
+    // and swallow the keypress — no modal mode falls through to the
+    // input/normal-mode handling below.
+    if (modal) {
+      switch (modal.kind) {
+        case "help":
+          handleHelpKey(k);
+          break;
+        case "reviewerPicker":
+          handleReviewerPickerKey(k, modal);
+          break;
+        case "sectionPicker":
+          handleSectionPickerKey(k, modal);
+          break;
+        case "actionPicker":
+          handleActionPickerKey(k, modal);
+          break;
+        case "argPicker":
+          handleArgPickerKey(k, modal);
+          break;
+        case "outputsPicker":
+          handleOutputsPickerKey(k, modal);
+          break;
+        case "claudeSessionsPicker":
+          handleClaudeSessionsPickerKey(k, modal);
+          break;
+        case "claudeSessionsNew":
+          handleClaudeSessionsNewKey(k, modal);
+          break;
+        case "harnessSelect":
+          handleHarnessSelectKey(k, modal);
+          break;
+        case "killActionConfirm":
+          handleKillActionConfirmKey(k, modal);
+          break;
+        case "killSessionConfirm":
+          handleKillSessionConfirmKey(k, modal);
+          break;
+        case "branchPicker":
+          handleBranchPickerKey(k, modal);
+          break;
+        case "yank":
+          handleYankKey(k);
+          break;
+        case "cleanConfirm":
+          handleCleanConfirmKey(k);
+          break;
+        case "confirm":
+          handleConfirmKey(k, modal);
+          break;
       }
       return;
     }

@@ -143,6 +143,28 @@ export function tryAcquireLock(
   };
 }
 
+/**
+ * Run `fn` while holding an exclusive flock on `<lockDir>/<name>.lock`,
+ * BLOCKING until the lock is free. For short synchronous critical
+ * sections only (e.g. a state-file read-modify-write): the kernel wait
+ * blocks this thread, which is fine when every holder releases in
+ * sub-millisecond time, and fd-close-on-crash means a dead holder can't
+ * wedge anyone. Long-held operation locks keep using `tryAcquireLock`.
+ * The lock file is never unlinked — competing processes reopen the same
+ * inode, which is what makes the flock handoff race-free.
+ */
+export function withFileLock<T>(name: string, fn: () => T): T {
+  ensureLockDir();
+  const fd = openSync(lockPath(name), "a+");
+  try {
+    flock(fd, LOCK_EX);
+    return fn();
+  } finally {
+    flock(fd, LOCK_UN);
+    closeSync(fd);
+  }
+}
+
 export function humanAge(seconds: number): string {
   if (seconds < 60) return `${Math.floor(seconds)}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;

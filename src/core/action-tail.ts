@@ -28,17 +28,15 @@
  */
 import {
   type FSWatcher,
-  closeSync,
   existsSync,
-  openSync,
   readFileSync,
-  readSync,
   statSync,
   watch,
 } from "node:fs";
 import { join } from "node:path";
 
 import { createLogger } from "./logger.ts";
+import { closeSilent, readFileSlice } from "./tail-util.ts";
 
 const log = createLogger("[action-tail]");
 
@@ -384,7 +382,7 @@ function readSeed(st: StreamState, onLine: (line: TailLine) => void): void {
     return;
   }
   const start = Math.max(0, size - SEED_TAIL_BYTES);
-  const body = readBytes(st.path, start, size - start);
+  const body = readFileSlice(st.path, start, size - start);
   const segments = body.split("\n");
   // Drop the first fragment if we didn't start at byte 0 — likely partial.
   const startIdx = start === 0 ? 0 : 1;
@@ -427,7 +425,7 @@ function readDelta(st: StreamState, onLine: (line: TailLine) => void): void {
     st.pending = "";
     return;
   }
-  const body = readBytes(st.path, st.lastByte, size - st.lastByte);
+  const body = readFileSlice(st.path, st.lastByte, size - st.lastByte);
   st.lastByte = size;
   const combined = st.pending + body;
   const segments = combined.split("\n");
@@ -463,26 +461,6 @@ function closeStream(st: StreamState): void {
   st.onLine = null;
   activeStreams.delete(st);
   stopPollerIfIdle();
-}
-
-function readBytes(path: string, start: number, len: number): string {
-  const fd = openSync(path, "r");
-  try {
-    const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, start);
-    return buf.toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function closeSilent(w: FSWatcher | null): void {
-  if (!w) return;
-  try {
-    w.close();
-  } catch {
-    // best-effort
-  }
 }
 
 function errMsg(err: unknown): string {

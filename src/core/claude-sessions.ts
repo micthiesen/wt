@@ -21,7 +21,7 @@
  * separator). The picker reserves `primary` and digits used by
  * `nextAutoName` so the auto-numbering ladder stays predictable.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -29,6 +29,7 @@ import { wtSessionUuid, type SessionTail } from "./claude.ts";
 import type { RegistryStatus } from "./claude-registry.ts";
 import { deriveSessionState, type DerivedState } from "./claude-status.ts";
 import type { SessionSummary } from "./claude-summaries.ts";
+import { withFileLock } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 
 const STATE_FILE = join(homedir(), ".cache", "wt", "claude-sessions.json");
@@ -84,11 +85,23 @@ function readFile(): FileShape {
 function writeFile(shape: FileShape): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true });
-    writeFileSync(STATE_FILE, `${JSON.stringify(shape, null, 2)}\n`);
+    // Write-then-rename so a concurrent reader never sees a torn file.
+    const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(shape, null, 2)}\n`);
+    renameSync(tmp, STATE_FILE);
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
     throw err;
   }
+}
+
+/**
+ * Serialize the read-modify-write across processes — same rationale as
+ * `withWtStateLock` in wtstate.ts: the atomic rename stops torn reads,
+ * the flock stops two writers dropping each other's update.
+ */
+function withNamesLock<T>(fn: () => T): T {
+  return withFileLock("__claude_names__", fn);
 }
 
 /** Names registered for `slug`, in insertion order. Empty when none. */
@@ -107,34 +120,40 @@ export function nameInUse(slug: string, name: string): boolean {
  * checks `nameInUse` if it wants to differentiate resume vs. fresh).
  */
 export function addClaudeName(slug: string, name: string): void {
-  const shape = readFile();
-  const existing = shape[slug] ?? [];
-  if (existing.includes(name)) return;
-  shape[slug] = [...existing, name];
-  writeFile(shape);
+  withNamesLock(() => {
+    const shape = readFile();
+    const existing = shape[slug] ?? [];
+    if (existing.includes(name)) return;
+    shape[slug] = [...existing, name];
+    writeFile(shape);
+  });
 }
 
 /** Drop one name. No-op when absent. */
 export function removeClaudeName(slug: string, name: string): void {
-  const shape = readFile();
-  const existing = shape[slug];
-  if (!existing) return;
-  const next = existing.filter((n) => n !== name);
-  if (next.length === existing.length) return;
-  if (next.length === 0) {
-    delete shape[slug];
-  } else {
-    shape[slug] = next;
-  }
-  writeFile(shape);
+  withNamesLock(() => {
+    const shape = readFile();
+    const existing = shape[slug];
+    if (!existing) return;
+    const next = existing.filter((n) => n !== name);
+    if (next.length === existing.length) return;
+    if (next.length === 0) {
+      delete shape[slug];
+    } else {
+      shape[slug] = next;
+    }
+    writeFile(shape);
+  });
 }
 
 /** Drop every name for `slug`. Called from worktree-destroy. */
 export function clearClaudeNames(slug: string): void {
-  const shape = readFile();
-  if (!(slug in shape)) return;
-  delete shape[slug];
-  writeFile(shape);
+  withNamesLock(() => {
+    const shape = readFile();
+    if (!(slug in shape)) return;
+    delete shape[slug];
+    writeFile(shape);
+  });
 }
 
 /**
@@ -297,13 +316,15 @@ export function buildClaudeSessionEntries(opts: {
  * destroys to keep the state file tidy. No-op when nothing to drop.
  */
 export function reapClaudeNames(liveSlugs: ReadonlySet<string>): void {
-  const shape = readFile();
-  let changed = false;
-  for (const slug of Object.keys(shape)) {
-    if (!liveSlugs.has(slug)) {
-      delete shape[slug];
-      changed = true;
+  withNamesLock(() => {
+    const shape = readFile();
+    let changed = false;
+    for (const slug of Object.keys(shape)) {
+      if (!liveSlugs.has(slug)) {
+        delete shape[slug];
+        changed = true;
+      }
     }
-  }
-  if (changed) writeFile(shape);
+    if (changed) writeFile(shape);
+  });
 }

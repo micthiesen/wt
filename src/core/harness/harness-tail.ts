@@ -19,7 +19,7 @@
  * `<slug>-opencode`), so the registry key is `${slug}:${harnessId}` and
  * there's at most one run per pair.
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 
 import type { Statement } from "bun:sqlite";
 
@@ -29,6 +29,7 @@ import {
   MAX_BUFFERED_LINES,
 } from "../claude-events.ts";
 import { createLogger } from "../logger.ts";
+import { jsonlTimestamp, readFileSlice } from "../tail-util.ts";
 
 import { latestRolloutForCwd } from "./codex.ts";
 import { openDb } from "./opencode.ts";
@@ -159,32 +160,12 @@ function oneLine(
 // Codex rollout parsing
 // ---------------------------------------------------------------------------
 
-function readBytes(path: string, start: number, len: number): string {
-  const fd = openSync(path, "r");
-  try {
-    const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, start);
-    return buf.toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function tsOf(obj: Record<string, unknown>): number {
-  const t = obj.timestamp;
-  if (typeof t === "string") {
-    const ms = Date.parse(t);
-    if (!Number.isNaN(ms)) return ms;
-  }
-  return Date.now();
-}
-
 /** Map one parsed codex rollout event to zero or more ActionLines. */
 function codexEventLines(
   obj: Record<string, unknown>,
   nextId: () => number,
 ): ActionLine[] {
-  const ts = tsOf(obj);
+  const ts = jsonlTimestamp(obj);
   const type = obj.type;
 
   if (type === "event_msg") {
@@ -297,7 +278,7 @@ function codexPump(entry: Entry): ActionLine[] {
 
   let body: string;
   try {
-    body = readBytes(rollout.path, cur.offset, size - cur.offset);
+    body = readFileSlice(rollout.path, cur.offset, size - cur.offset);
   } catch {
     return [];
   }

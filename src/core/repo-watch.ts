@@ -31,6 +31,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
 
 import { createLogger } from "./logger.ts";
+import { closeSilent } from "./tail-util.ts";
 
 const log = createLogger("[repo-watch]");
 
@@ -65,15 +66,6 @@ function makeDebounced(onChange: () => void, ms: number): Debounced {
       }
     },
   };
-}
-
-function closeSilent(w: FSWatcher | null): void {
-  if (!w) return;
-  try {
-    w.close();
-  } catch {
-    // already closed
-  }
 }
 
 /**

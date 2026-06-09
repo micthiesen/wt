@@ -10,12 +10,13 @@
  * newest one across the whole sessions tree is the freshest source
  * regardless of which worktree it belongs to.
  */
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { UsagePeriod } from "../claude-usage.ts";
 import { createLogger } from "../logger.ts";
+import { readFileSlice } from "../tail-util.ts";
 
 const log = createLogger("[codex-usage]");
 
@@ -116,15 +117,7 @@ export function readCodexUsage(): CodexUsage | null {
   const start = Math.max(0, latest.size - TAIL_BYTES);
   let text: string;
   try {
-    const fd = openSync(latest.path, "r");
-    try {
-      const len = latest.size - start;
-      const buf = Buffer.alloc(len);
-      readSync(fd, buf, 0, len, start);
-      text = buf.toString("utf8");
-    } finally {
-      closeSync(fd);
-    }
+    text = readFileSlice(latest.path, start, latest.size - start);
   } catch (err) {
     log.debug("rollout tail read failed", { err: String(err) });
     return null;

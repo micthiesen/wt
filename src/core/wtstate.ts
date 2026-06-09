@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { config } from "./config.ts";
+import { withFileLock } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 
 const STATE_FILE = join(homedir(), ".cache", "wt", "state.json");
@@ -433,9 +434,9 @@ function writeWtState(state: WtState): void {
     // Write-then-rename so a concurrent reader (the live TUI polls this
     // file) never observes a half-written file and silently falls back
     // to empty defaults. rename(2) is atomic within a filesystem. This
-    // closes the torn-read window; it does NOT serialise lost updates
-    // between two writers (that would need a cross-process lock spanning
-    // read-modify-write — out of scope here).
+    // closes the torn-read window; lost updates between two WRITERS are
+    // closed separately by `withWtStateLock` spanning each mutator's
+    // read-modify-write.
     const tmp = `${STATE_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
     renameSync(tmp, STATE_FILE);
@@ -446,6 +447,19 @@ function writeWtState(state: WtState): void {
     // present a successful move while the state file is unchanged.
     throw err;
   }
+}
+
+/**
+ * Serialize a state-file read-modify-write across processes. The atomic
+ * rename in `writeWtState` stops torn reads, but two concurrent WRITERS
+ * (the TUI's startup reap vs a CLI `wt stack` mutation) each write back
+ * from their own pre-write snapshot, silently dropping whichever update
+ * landed in between. Every mutator below wraps its read→mutate→write in
+ * this blocking flock; the critical sections are pure sync JSON work, so
+ * the kernel wait is sub-millisecond and crash-safe (fd close releases).
+ */
+function withWtStateLock<T>(fn: () => T): T {
+  return withFileLock("__wtstate__", fn);
 }
 
 /** Drop manual sections from `sectionsOrder` that no slug references. */
@@ -464,12 +478,14 @@ function ensureSection(state: WtState, section: string): WtState {
 
 /** Drop a single slug's entry. No-op if absent. */
 export function clearSlugState(slug: string): void {
-  const state = readWtState();
-  if (!(slug in state.slugs)) return;
-  const next = { ...state, slugs: { ...state.slugs } };
-  delete next.slugs[slug];
-  next.sectionsOrder = prunedSectionsOrder(next);
-  writeWtState(next);
+  withWtStateLock(() => {
+    const state = readWtState();
+    if (!(slug in state.slugs)) return;
+    const next = { ...state, slugs: { ...state.slugs } };
+    delete next.slugs[slug];
+    next.sectionsOrder = prunedSectionsOrder(next);
+    writeWtState(next);
+  });
 }
 
 /** Max order in a given section. Returns `null` when section is empty. */
@@ -502,20 +518,22 @@ export function placeSlug(
   section: string | null,
   position: "top" | "bottom",
 ): void {
-  let state = readWtState();
-  if (section !== null) state = ensureSection(state, section);
-  const next: WtState = { ...state, slugs: { ...state.slugs } };
-  let order: number;
-  if (position === "top") {
-    const min = minOrderIn(next, section);
-    order = min === null ? 0 : min - 1;
-  } else {
-    const max = maxOrderIn(next, section);
-    order = max === null ? 0 : max + 1;
-  }
-  next.slugs[slug] = { section, order };
-  next.sectionsOrder = prunedSectionsOrder(next);
-  writeWtState(next);
+  withWtStateLock(() => {
+    let state = readWtState();
+    if (section !== null) state = ensureSection(state, section);
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    let order: number;
+    if (position === "top") {
+      const min = minOrderIn(next, section);
+      order = min === null ? 0 : min - 1;
+    } else {
+      const max = maxOrderIn(next, section);
+      order = max === null ? 0 : max + 1;
+    }
+    next.slugs[slug] = { section, order };
+    next.sectionsOrder = prunedSectionsOrder(next);
+    writeWtState(next);
+  });
 }
 
 /**
@@ -539,21 +557,23 @@ export function swapOrders(
   section: string | null,
   bucketDisplay: readonly string[],
 ): void {
-  const state = readWtState();
-  const next: WtState = { ...state, slugs: { ...state.slugs } };
-  const min = minOrderIn(next, section);
-  const baseline = min === null ? 0 : min;
-  for (let i = 0; i < bucketDisplay.length; i++) {
-    const slug = bucketDisplay[i]!;
-    const prev = next.slugs[slug];
-    next.slugs[slug] = { ...prev, section, order: baseline + i };
-  }
-  const a = next.slugs[slugA];
-  const b = next.slugs[slugB];
-  if (!a || !b) return;
-  next.slugs[slugA] = { ...a, order: b.order };
-  next.slugs[slugB] = { ...b, order: a.order };
-  writeWtState(next);
+  withWtStateLock(() => {
+    const state = readWtState();
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    const min = minOrderIn(next, section);
+    const baseline = min === null ? 0 : min;
+    for (let i = 0; i < bucketDisplay.length; i++) {
+      const slug = bucketDisplay[i]!;
+      const prev = next.slugs[slug];
+      next.slugs[slug] = { ...prev, section, order: baseline + i };
+    }
+    const a = next.slugs[slugA];
+    const b = next.slugs[slugB];
+    if (!a || !b) return;
+    next.slugs[slugA] = { ...a, order: b.order };
+    next.slugs[slugB] = { ...b, order: a.order };
+    writeWtState(next);
+  });
 }
 
 /**
@@ -571,41 +591,43 @@ export function swapOrders(
 export function renameSection(oldName: string, newName: string): void {
   const trimmed = newName.trim();
   if (!trimmed || trimmed === oldName) return;
-  const state = readWtState();
-  const referenced = Object.values(state.slugs).some((v) => v.section === oldName);
-  if (!referenced && !state.sectionsOrder.includes(oldName)) return;
-  const next: WtState = { ...state, slugs: { ...state.slugs } };
-  const isMerge =
-    trimmed !== oldName &&
-    (next.sectionsOrder.includes(trimmed) ||
-      Object.values(next.slugs).some((v) => v.section === trimmed));
-  if (isMerge) {
-    // Source slugs in their current within-source display order
-    // (ascending by `order`), so the merge appends them after Y's
-    // existing items in a sensible sequence.
-    const sourceSlugs = Object.entries(next.slugs)
-      .filter(([, v]) => v.section === oldName)
-      .sort((a, b) => a[1].order - b[1].order);
-    const max = maxOrderIn(next, trimmed);
-    let cursor = max === null ? 0 : max + 1;
-    for (const [k, v] of sourceSlugs) {
-      next.slugs[k] = { ...v, section: trimmed, order: cursor++ };
+  withWtStateLock(() => {
+    const state = readWtState();
+    const referenced = Object.values(state.slugs).some((v) => v.section === oldName);
+    if (!referenced && !state.sectionsOrder.includes(oldName)) return;
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    const isMerge =
+      trimmed !== oldName &&
+      (next.sectionsOrder.includes(trimmed) ||
+        Object.values(next.slugs).some((v) => v.section === trimmed));
+    if (isMerge) {
+      // Source slugs in their current within-source display order
+      // (ascending by `order`), so the merge appends them after Y's
+      // existing items in a sensible sequence.
+      const sourceSlugs = Object.entries(next.slugs)
+        .filter(([, v]) => v.section === oldName)
+        .sort((a, b) => a[1].order - b[1].order);
+      const max = maxOrderIn(next, trimmed);
+      let cursor = max === null ? 0 : max + 1;
+      for (const [k, v] of sourceSlugs) {
+        next.slugs[k] = { ...v, section: trimmed, order: cursor++ };
+      }
+      // Drop oldName from the index; trimmed already lives there.
+      next.sectionsOrder = next.sectionsOrder.filter((s) => s !== oldName);
+      // The merged-away key is gone; keep the target's fold state as-is.
+      next.foldedSections = next.foldedSections.filter((s) => s !== oldName);
+    } else {
+      for (const [k, v] of Object.entries(next.slugs)) {
+        if (v.section === oldName) next.slugs[k] = { ...v, section: trimmed };
+      }
+      // Replace oldName with trimmed in-place so the section keeps its
+      // display position — and carries its folded state to the new name.
+      next.sectionsOrder = next.sectionsOrder.map((s) => (s === oldName ? trimmed : s));
+      next.foldedSections = next.foldedSections.map((s) => (s === oldName ? trimmed : s));
     }
-    // Drop oldName from the index; trimmed already lives there.
-    next.sectionsOrder = next.sectionsOrder.filter((s) => s !== oldName);
-    // The merged-away key is gone; keep the target's fold state as-is.
-    next.foldedSections = next.foldedSections.filter((s) => s !== oldName);
-  } else {
-    for (const [k, v] of Object.entries(next.slugs)) {
-      if (v.section === oldName) next.slugs[k] = { ...v, section: trimmed };
-    }
-    // Replace oldName with trimmed in-place so the section keeps its
-    // display position — and carries its folded state to the new name.
-    next.sectionsOrder = next.sectionsOrder.map((s) => (s === oldName ? trimmed : s));
-    next.foldedSections = next.foldedSections.map((s) => (s === oldName ? trimmed : s));
-  }
-  next.sectionsOrder = prunedSectionsOrder(next);
-  writeWtState(next);
+    next.sectionsOrder = prunedSectionsOrder(next);
+    writeWtState(next);
+  });
 }
 
 /**
@@ -615,20 +637,22 @@ export function renameSection(oldName: string, newName: string): void {
  * slugs keep their `order` values; only the index moves.
  */
 export function moveSection(name: string, dir: -1 | 1): boolean {
-  const state = readWtState();
-  const idx = state.sectionsOrder.indexOf(name);
-  if (idx < 0) return false;
-  const target = idx + dir;
-  if (target < 0 || target >= state.sectionsOrder.length) return false;
-  const next: WtState = {
-    ...state,
-    sectionsOrder: [...state.sectionsOrder],
-  };
-  const tmp = next.sectionsOrder[idx]!;
-  next.sectionsOrder[idx] = next.sectionsOrder[target]!;
-  next.sectionsOrder[target] = tmp;
-  writeWtState(next);
-  return true;
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const idx = state.sectionsOrder.indexOf(name);
+    if (idx < 0) return false;
+    const target = idx + dir;
+    if (target < 0 || target >= state.sectionsOrder.length) return false;
+    const next: WtState = {
+      ...state,
+      sectionsOrder: [...state.sectionsOrder],
+    };
+    const tmp = next.sectionsOrder[idx]!;
+    next.sectionsOrder[idx] = next.sectionsOrder[target]!;
+    next.sectionsOrder[target] = tmp;
+    writeWtState(next);
+    return true;
+  });
 }
 
 /**
@@ -641,16 +665,18 @@ export function moveSection(name: string, dir: -1 | 1): boolean {
  * a manual key so a rename doesn't silently unfold.
  */
 export function toggleSectionFolded(sectionKey: string): boolean {
-  const state = readWtState();
-  const folded = state.foldedSections.includes(sectionKey);
-  const next: WtState = {
-    ...state,
-    foldedSections: folded
-      ? state.foldedSections.filter((s) => s !== sectionKey)
-      : [...state.foldedSections, sectionKey],
-  };
-  writeWtState(next);
-  return !folded;
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const folded = state.foldedSections.includes(sectionKey);
+    const next: WtState = {
+      ...state,
+      foldedSections: folded
+        ? state.foldedSections.filter((s) => s !== sectionKey)
+        : [...state.foldedSections, sectionKey],
+    };
+    writeWtState(next);
+    return !folded;
+  });
 }
 
 // ---------- Stack manifests ----------
@@ -685,10 +711,12 @@ export function findStackIdByBranch(branch: string): string | null {
 
 /** Insert or replace a manifest wholesale. Keyed by `manifest.stackId`. */
 export function putStackManifest(manifest: StackManifest): void {
-  const state = readWtState();
-  writeWtState({
-    ...state,
-    stacks: { ...state.stacks, [manifest.stackId]: manifest },
+  withWtStateLock(() => {
+    const state = readWtState();
+    writeWtState({
+      ...state,
+      stacks: { ...state.stacks, [manifest.stackId]: manifest },
+    });
   });
 }
 
@@ -701,14 +729,16 @@ export function patchStackManifest(
   stackId: string,
   patch: Partial<StackManifest>,
 ): boolean {
-  const state = readWtState();
-  const prev = state.stacks[stackId];
-  if (!prev) return false;
-  writeWtState({
-    ...state,
-    stacks: { ...state.stacks, [stackId]: { ...prev, ...patch } },
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.stacks[stackId];
+    if (!prev) return false;
+    writeWtState({
+      ...state,
+      stacks: { ...state.stacks, [stackId]: { ...prev, ...patch } },
+    });
+    return true;
   });
-  return true;
 }
 
 /**
@@ -721,21 +751,23 @@ export function updateStackSlice(
   sliceId: string,
   patch: Partial<StackSlice>,
 ): boolean {
-  const state = readWtState();
-  const prev = state.stacks[stackId];
-  if (!prev) return false;
-  let hit = false;
-  const slices = prev.slices.map((s) => {
-    if (s.id !== sliceId) return s;
-    hit = true;
-    return { ...s, ...patch };
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.stacks[stackId];
+    if (!prev) return false;
+    let hit = false;
+    const slices = prev.slices.map((s) => {
+      if (s.id !== sliceId) return s;
+      hit = true;
+      return { ...s, ...patch };
+    });
+    if (!hit) return false;
+    writeWtState({
+      ...state,
+      stacks: { ...state.stacks, [stackId]: { ...prev, slices } },
+    });
+    return true;
   });
-  if (!hit) return false;
-  writeWtState({
-    ...state,
-    stacks: { ...state.stacks, [stackId]: { ...prev, slices } },
-  });
-  return true;
 }
 
 /**
@@ -743,19 +775,21 @@ export function updateStackSlice(
  * destroys to keep the state file tidy. No-op when nothing to drop.
  */
 export function reapWtState(liveSlugs: ReadonlySet<string>): void {
-  const state = readWtState();
-  let changed = false;
-  for (const k of Object.keys(state.slugs)) {
-    if (!liveSlugs.has(k)) {
-      changed = true;
-      break;
+  withWtStateLock(() => {
+    const state = readWtState();
+    let changed = false;
+    for (const k of Object.keys(state.slugs)) {
+      if (!liveSlugs.has(k)) {
+        changed = true;
+        break;
+      }
     }
-  }
-  if (!changed) return;
-  const next: WtState = { ...state, slugs: {} };
-  for (const [k, v] of Object.entries(state.slugs)) {
-    if (liveSlugs.has(k)) next.slugs[k] = v;
-  }
-  next.sectionsOrder = prunedSectionsOrder(next);
-  writeWtState(next);
+    if (!changed) return;
+    const next: WtState = { ...state, slugs: {} };
+    for (const [k, v] of Object.entries(state.slugs)) {
+      if (liveSlugs.has(k)) next.slugs[k] = v;
+    }
+    next.sectionsOrder = prunedSectionsOrder(next);
+    writeWtState(next);
+  });
 }

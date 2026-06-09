@@ -29,11 +29,12 @@
  * free; we never cache on error so a transient read failure can't
  * poison the entry.
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, statSync } from "node:fs";
 
 import { sessionJsonlPath } from "./claude.ts";
 import { AWAY_RECAP_HINT_RE, asObj } from "./claude-events.ts";
 import { createLogger } from "./logger.ts";
+import { readFdSlice } from "./tail-util.ts";
 
 const log = createLogger("[claude-summaries]");
 
@@ -83,15 +84,6 @@ function sanitize(s: string): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
-}
-
-function readChunk(fd: number, offset: number, len: number): string {
-  const buf = Buffer.alloc(len);
-  // `readSync` can return short under signal interrupts. Slice the
-  // buffer to actual bytes-read so the decoder doesn't see trailing
-  // zeros as a UTF-8 NUL byte.
-  const n = readSync(fd, buf, 0, len, offset);
-  return buf.toString("utf8", 0, n);
 }
 
 /**
@@ -203,7 +195,7 @@ function readSummary(path: string): SessionSummary | null {
     while (end > stopAt) {
       const start = Math.max(stopAt, end - CHUNK_BYTES);
       const len = end - start;
-      const found = findLatestSummary(readChunk(fd, start, len), start > 0);
+      const found = findLatestSummary(readFdSlice(fd, start, len), start > 0);
       if (found) {
         // Across chunks, promote to any strictly higher-priority
         // source. Within a chunk, `findLatestSummary` already returns

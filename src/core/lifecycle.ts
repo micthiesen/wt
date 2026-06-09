@@ -5,7 +5,7 @@ import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./claude-sessions.ts";
 import { clearSlugState } from "./wtstate.ts";
 import { config } from "./config.ts";
-import { branchExists, git, gitQuiet } from "./git.ts";
+import { branchExists, git, gitQuiet, originBranchExists } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
 import { lockStatus, tryAcquireLock } from "./locks.ts";
 import { run, runStreaming } from "./proc.ts";
@@ -177,9 +177,8 @@ export async function createWorktree(
       }
       opts.onLog?.(`checkout ${branch}`);
       await git(["worktree", "add", path, branch]);
-      const remoteRef = `refs/remotes/origin/${branch}`;
       if (
-        (await gitQuiet(["show-ref", "--verify", "--quiet", remoteRef], path)) &&
+        (await originBranchExists(branch, path)) &&
         !(await gitQuiet(["rev-parse", "--abbrev-ref", "@{u}"], path))
       ) {
         await gitQuiet(["branch", "--set-upstream-to", `origin/${branch}`], path);

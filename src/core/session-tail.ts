@@ -40,11 +40,8 @@
  */
 import {
   type FSWatcher,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
-  readSync,
   statSync,
   watch,
 } from "node:fs";
@@ -68,6 +65,7 @@ import {
   detectRefreshTriggers,
   type RefreshTarget,
 } from "./session-triggers.ts";
+import { closeSilent, jsonlTimestamp, readFileSlice } from "./tail-util.ts";
 import { claudeSessionName } from "./tmux.ts";
 
 const log = createLogger("[session-tail]");
@@ -481,7 +479,7 @@ class SessionTailRegistry {
       return;
     }
     const start = Math.max(0, size - SEED_TAIL_BYTES);
-    const body = readBytes(st.path, start, size - start);
+    const body = readFileSlice(st.path, start, size - start);
     const lines = body.split("\n");
     // Drop the first fragment if we didn't start at byte 0 — likely partial.
     // Tool_uses outside the seed window leave their tool_results in the
@@ -536,7 +534,7 @@ class SessionTailRegistry {
       st.pending = "";
       return;
     }
-    const body = readBytes(st.path, st.lastByte, size - st.lastByte);
+    const body = readFileSlice(st.path, st.lastByte, size - st.lastByte);
     st.lastByte = size;
     const combined = st.pending + body;
     const lines = combined.split("\n");
@@ -609,7 +607,7 @@ function parseEntry(
   const e = asObj(evt);
   if (!e) return EMPTY_EMIT;
   const t = e.type;
-  const ts = entryTs(e);
+  const ts = jsonlTimestamp(e);
   if (t === "assistant" || t === "user") {
     // The auto-injected post-compaction summary blob ("This session is
     // being continued from a previous conversation…") arrives as a
@@ -716,35 +714,6 @@ function parseEntry(
     return EMPTY_EMIT;
   }
   return EMPTY_EMIT;
-}
-
-function readBytes(path: string, start: number, len: number): string {
-  const fd = openSync(path, "r");
-  try {
-    const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, start);
-    return buf.toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function entryTs(e: Record<string, unknown>): number {
-  const ts = e.timestamp;
-  if (typeof ts === "string") {
-    const parsed = Date.parse(ts);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  return Date.now();
-}
-
-function closeSilent(w: FSWatcher | null): void {
-  if (!w) return;
-  try {
-    w.close();
-  } catch {
-    // best-effort
-  }
 }
 
 function errMsg(err: unknown): string {

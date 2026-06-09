@@ -22,7 +22,7 @@
 import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
-import { gitRun } from "./git.ts";
+import { gitRun, revParse } from "./git.ts";
 
 export type ReplayLogger = (line: string) => void;
 
@@ -51,13 +51,6 @@ export interface RestackEngine {
    * hands resolution to a human / skill. wt never auto-resolves conflicts.
    */
   replaySlice(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome>;
-}
-
-/** Resolve a ref to its SHA in `cwd`, or null if it doesn't resolve. */
-async function revParse(ref: string, cwd: string): Promise<string | null> {
-  const r = await gitRun(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
-  const sha = r.stdout.trim();
-  return r.exitCode === 0 && sha ? sha : null;
 }
 
 /**

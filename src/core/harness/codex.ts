@@ -13,18 +13,16 @@
  * and respawning; multi-tmux-per-slug is a followup.
  */
 import {
-  closeSync,
   existsSync,
-  openSync,
   readdirSync,
   readFileSync,
-  readSync,
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { createLogger } from "../logger.ts";
+import { readFileSlice } from "../tail-util.ts";
 import type { DerivedState } from "../claude-status.ts";
 
 import type { Harness, HarnessSession, HarnessSpawnArgs } from "./types.ts";
@@ -258,19 +256,12 @@ function readRolloutMeta(path: string): RolloutMetaRaw | null {
   }
   // Read only enough bytes to capture the first line. Session_meta
   // lines are big (full system prompt embedded) — 32 KB is plenty.
-  let buf: Uint8Array;
+  let text: string;
   try {
-    const fd = openSync(path, "r");
-    try {
-      buf = new Uint8Array(Math.min(stat.size, 64 * 1024));
-      readSync(fd, buf, 0, buf.length, 0);
-    } finally {
-      closeSync(fd);
-    }
+    text = readFileSlice(path, 0, Math.min(stat.size, 64 * 1024));
   } catch {
     return null;
   }
-  const text = new TextDecoder().decode(buf);
   const newlineIdx = text.indexOf("\n");
   const firstLine = newlineIdx >= 0 ? text.slice(0, newlineIdx) : text;
   try {
@@ -368,15 +359,7 @@ export function readCodexTail(
   let text: string;
   try {
     const start = Math.max(0, size - TAIL_BYTES);
-    const len = size - start;
-    const fd = openSync(path, "r");
-    try {
-      const buf = Buffer.alloc(len);
-      readSync(fd, buf, 0, len, start);
-      text = buf.toString("utf8");
-    } finally {
-      closeSync(fd);
-    }
+    text = readFileSlice(path, start, size - start);
   } catch {
     return null;
   }

@@ -9,7 +9,15 @@
  * hard part (anchored cherry-pick replay) lives in `RestackEngine`.
  */
 import { config } from "./config.ts";
-import { branchExists, gitQuiet, gitRun } from "./git.ts";
+import {
+  branchExists,
+  firstSha,
+  gitQuiet,
+  gitRun,
+  localOrOriginRef,
+  originBranchExists,
+  revParse,
+} from "./git.ts";
 import { createWorktree } from "./lifecycle.ts";
 import { tryAcquireLock, type LockHandle } from "./locks.ts";
 import { createLogger } from "./logger.ts";
@@ -231,10 +239,7 @@ async function applyStackLocked(
       // it, or it's the user's parent-PR worktree); fall back to the
       // remote-tracking ref when the parent exists only on origin, so
       // `git worktree add` resolves a real ref either way.
-      const localParent = await gitQuiet(
-        ["show-ref", "--verify", "--quiet", `refs/heads/${parentBranch}`],
-      );
-      parentRef = localParent ? parentBranch : `origin/${parentBranch}`;
+      parentRef = await localOrOriginRef(parentBranch);
     }
 
     // Idempotent re-run: if a PR already exists on this branch (a prior
@@ -270,7 +275,7 @@ async function applyStackLocked(
     // Record the squash-safe replay anchor: the parent tip this slice's
     // commit will sit on. `createWorktree` started the branch at `parentRef`,
     // so HEAD is that tip right now, before the slice commit lands on top.
-    const baseSha = await revParseAt(created.path, "HEAD");
+    const baseSha = await revParse("HEAD", created.path);
 
     // A re-split sub-slice reproduces its files from the original slice's
     // branch (`slice.source`) — which carries content the pre-split holistic
@@ -632,22 +637,6 @@ async function replayStackLocked(
   return { ok: true, output: `replayed ${replayed}/${live.length} slice(s)` };
 }
 
-/** rev-parse a ref to its commit SHA in `cwd`, or null if it doesn't resolve. */
-async function revParseAt(cwd: string, ref: string): Promise<string | null> {
-  const r = await gitRun(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
-  const sha = r.stdout.trim();
-  return r.exitCode === 0 && sha ? sha : null;
-}
-
-/** First resolvable ref among `refs`, as a SHA — local branch then origin. */
-async function firstSha(cwd: string, refs: string[]): Promise<string | null> {
-  for (const ref of refs) {
-    const sha = await revParseAt(cwd, ref);
-    if (sha) return sha;
-  }
-  return null;
-}
-
 /**
  * The parent-tip SHA a slice currently sits on (the `rebase --onto` anchor):
  * the stored `baseSha` when it's still honest, else the merge-base of the slice
@@ -721,11 +710,11 @@ async function resolveNewBaseSha(
   newTipById: Map<string, string>,
   cwd: string,
 ): Promise<string | null> {
-  if (isTrunkBase(slice)) return revParseAt(cwd, `origin/${trunk}`);
+  if (isTrunkBase(slice)) return revParse(`origin/${trunk}`, cwd);
   const sibling = byId.get(slice.base);
   if (sibling) {
     const replayed = newTipById.get(sibling.id);
-    return replayed ?? revParseAt(cwd, sibling.branch);
+    return replayed ?? revParse(sibling.branch, cwd);
   }
   // External parent branch: prefer the local checkout, fall back to origin.
   return firstSha(cwd, [slice.base, `origin/${slice.base}`]);
@@ -1028,12 +1017,6 @@ function titleFromBranch(branch: string): string {
   return stripped || tail;
 }
 
-/** The ref (`branch` or `origin/branch`) that resolves in the main clone. */
-async function localOrOriginRef(branch: string): Promise<string> {
-  const local = await gitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
-  return local ? branch : `origin/${branch}`;
-}
-
 /**
  * Append an EXISTING branch to a live stack as a new tip slice — the inverse
  * of `splitStack`'s reshape, and the registration path for "I `wt new --base
@@ -1161,7 +1144,7 @@ async function addSliceToStackLocked(
     title = title || existing.title;
     onLog(`adopted existing PR #${existing.number}`);
   } else {
-    if (!(await gitQuiet(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`]))) {
+    if (!(await originBranchExists(branch))) {
       const push = await gitRun(["push", "-u", "origin", branch]);
       if (push.exitCode !== 0) {
         return { ok: false, error: `push ${branch}: ${(push.stderr || push.stdout).trim()}` };

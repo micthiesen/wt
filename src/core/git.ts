@@ -34,22 +34,50 @@ export async function effectiveBaseOrTrunk(
 ): Promise<string> {
   const trunk = `origin/${config.branch.base}`;
   if (!effectiveBase || effectiveBase === trunk) return trunk;
-  const resolves = await gitQuiet(
-    ["rev-parse", "--verify", "--quiet", `${effectiveBase}^{commit}`],
-    wtPath,
-  );
-  return resolves ? effectiveBase : trunk;
+  return (await revParse(effectiveBase, wtPath)) ? effectiveBase : trunk;
+}
+
+/**
+ * Resolve a ref to its commit SHA in `cwd` (default: the main clone),
+ * or null when it doesn't resolve. The one canonical rev-parse helper —
+ * the engine, stack ops, and base resolution all share it.
+ */
+export async function revParse(ref: string, cwd?: string): Promise<string | null> {
+  const r = await gitRun(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
+  const sha = r.stdout.trim();
+  return r.exitCode === 0 && sha ? sha : null;
+}
+
+/** First ref among `refs` that resolves to a commit in `cwd`, as a SHA. */
+export async function firstSha(cwd: string, refs: string[]): Promise<string | null> {
+  for (const ref of refs) {
+    const sha = await revParse(ref, cwd);
+    if (sha) return sha;
+  }
+  return null;
+}
+
+/** Does `branch` exist as a local head? */
+export async function localBranchExists(branch: string, cwd?: string): Promise<boolean> {
+  return gitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], cwd);
+}
+
+/** Does `branch` exist as an origin remote-tracking ref? */
+export async function originBranchExists(branch: string, cwd?: string): Promise<boolean> {
+  return gitQuiet(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`], cwd);
 }
 
 export async function branchExists(branch: string): Promise<boolean> {
-  if (await gitQuiet(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]))
-    return true;
-  return gitQuiet([
-    "show-ref",
-    "--verify",
-    "--quiet",
-    `refs/remotes/origin/${branch}`,
-  ]);
+  return (await localBranchExists(branch)) || originBranchExists(branch);
+}
+
+/**
+ * `branch` itself when the local head exists, else `origin/<branch>` —
+ * a ref other git commands can resolve either way. Doesn't verify the
+ * origin ref; pair with `branchExists` when absence is an error.
+ */
+export async function localOrOriginRef(branch: string): Promise<string> {
+  return (await localBranchExists(branch)) ? branch : `origin/${branch}`;
 }
 
 export async function branchIsGone(branch: string): Promise<boolean> {
