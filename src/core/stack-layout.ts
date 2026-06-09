@@ -96,7 +96,7 @@ export function topoSortSlices(manifest: StackManifest): StackSlice[] {
 
 /**
  * Position of a node within its lane's vertical spine, used to pick the
- * tree-connector glyph: `single` = a one-slice lane (╶, a short stub),
+ * tree-connector glyph: `single` = a one-slice lane (blank, no spine),
  * `first` = a chain root with children (┌), `last` = a chain tip (└),
  * `middle` = a stacked link in between (├). The glyphs themselves live
  * in `STACK_CONNECTOR` (tui/panels/list.tsx).
