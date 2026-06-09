@@ -425,6 +425,14 @@ standalone skills — never as edits to `/start` or `/done`.
       with \`wt stack apply\` first`) instead of the old misleading
       "has no worktree" error, and the dirty-gate message names the slice id.
       `/restack` preconditions updated to "open slices only".
+- [x] skill: **non-linear PR-body stack sections**. `stack-section.py` now builds
+      the slice tree from `base`/`dependsOn` (already in `wt stack status --json`;
+      no wt change). A linear stack renders the flat ordinal-numbered list exactly
+      as before; a fork or multi-lane stack renders a nested bullet tree
+      (nesting = stacks on, siblings = parallel, one-line legend) with bare
+      `#refs` so GitHub keeps expanding live status. A stack-on-stack root gets a
+      one-time `*(stacked on #N)*` note resolved via `gh` at generation (fallback:
+      bare branch name). Cycle-safe (malformed bases fall back to the flat list).
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -782,3 +790,23 @@ Track friction here as the workflow gets used. Candidate adjustments:
   the old "has no worktree" misdirection. Dirty-gate error now names the slice
   id. `/restack` skill preconditions updated (open slices only; planned never
   blocks). Typecheck + smoke clean; no fixture run (gate-scope change only).
+- **2026-06-09** — Non-linear stack sections in PR bodies. The manifest already
+  expresses a forest/tree (`base` = trunk | sibling id | external branch; a
+  shared base = parallel siblings; joins are inexpressible since `base` is a
+  single string — nothing to render there), and `wt stack status --json`
+  already emits `base`/`dependsOn`, but `stack-section.py` flattened everything
+  into an ordinal-sorted numbered list, misrepresenting parallel lanes as a
+  sequence. Now the script builds the tree and picks a renderer: LINEAR (single
+  root, no fork) keeps the flat numbered list byte-for-byte — zero churn on the
+  common case; NON-LINEAR renders a nested bullet tree (nesting = stacks on,
+  siblings = parallel, short italic legend) still using bare `#refs` so
+  GitHub's live title+status expansion — the load-bearing "generate once,
+  never maintain" property — survives. Rejected mermaid/ASCII-tree for exactly
+  that reason (code blocks don't expand refs). A stack-on-stack ROOT gets a
+  one-time `*(stacked on #N)*` note: the parent PR isn't in the manifest, so
+  the script resolves the external base branch via `gh pr view` at generation
+  (best-effort; falls back to the backticked branch name; trunk-shaped bases
+  skipped). Skill-only change (`split/scripts/stack-section.py` + a step-7
+  sentence in SKILL.md); no wt code touched. Verified against synthetic
+  status JSON: linear unchanged, fork/lane/planned-slice/external-root all
+  render correctly.
