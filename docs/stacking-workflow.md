@@ -92,11 +92,15 @@ per-slice CI, never a re-ultracheck.
   `parseManifest`), so a malformed/typo'd manifest fails fast instead of
   materializing a subtly-wrong stack. No skill ever edits `~/.cache/wt/state.json`
   directly — that boundary is a CLI, not a private file format.
-- **Base detection asks, never assumes.** `/split` fetches first (main is always
-  current). If HEAD isn't on current `origin/main`, it asks: (a) parent merged /
-  main moved → rebase onto main (base = main); or (b) intentionally stacked on an
-  unmerged parent → base = that parent branch, slices stack on its PR, `/restack`
-  rebases onto main once the parent lands. Never silently rebase or split stale.
+- **Base detection asks, never guesses.** `/split` fetches first (main is always
+  current). A CONFIRMED recorded fork base (`wt new --base` persisted it and HEAD
+  is on top of it) is an explicit prior answer, not a guess — it resolves case (b)
+  without asking and outranks "HEAD is on top of origin/main" (also true whenever
+  the parent chain was just rebased onto main). Without one, if HEAD isn't on
+  current `origin/main`, it asks: (a) parent merged / main moved → rebase onto
+  main (base = main); or (b) intentionally stacked on an unmerged parent → base =
+  that parent branch, slices stack on its PR, `/restack` rebases onto main once
+  the parent lands. Never silently rebase or split stale.
 - **PR bodies = intent prose + a generate-once stack section.** `/split` writes
   bodies at materialize (improvement 3 — never leave wt's stubs). Top: intent
   prose per CLAUDE.md's PR rules, framed by the feature so a 1-file slice's
