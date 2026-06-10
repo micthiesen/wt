@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./claude-sessions.ts";
+import { clearCodexNames } from "./codex-sessions.ts";
 import { clearSlugState, setSlugBase } from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet, originBranchExists, revParse } from "./git.ts";
@@ -165,6 +166,7 @@ export async function createWorktree(
   clearArchived(slug);
   clearSlugState(slug);
   clearClaudeNames(slug);
+  clearCodexNames(slug);
 
   try {
     opts.onPhase?.("fetching origin");

@@ -3,7 +3,8 @@
  * `~/.codex/sessions/YYYY/MM/DD/rollout-<iso>-<uuid>.jsonl`, with the
  * first line a `session_meta` event carrying `payload.cwd` (the cwd
  * the user spawned codex from). We filter by exact cwd match against
- * the worktree path so each worktree shows its own session set.
+ * the worktree path and interactive-user provenance so internal
+ * subagents / `codex exec` runs don't masquerade as resumable sessions.
  *
  * Resume: `codex resume <uuid>`. Fresh: `codex` (no args). Codex
  * generates the new session id itself; we never specify one.
@@ -24,6 +25,10 @@ import { join } from "node:path";
 import { createLogger } from "../logger.ts";
 import { readFileSlice } from "../tail-util.ts";
 import type { DerivedState } from "../claude-status.ts";
+import {
+  reapCodexNames,
+  reconcileCodexNames,
+} from "../codex-sessions.ts";
 
 import type { Harness, HarnessSession, HarnessSpawnArgs } from "./types.ts";
 
@@ -63,7 +68,11 @@ export const codexHarness: Harness = {
 
   async discoverSessions({ slug, wtPath }) {
     const titles = readSessionIndex();
-    const rollouts = scanRollouts(wtPath);
+    const rollouts = scanRollouts(wtPath).sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const friendlyNames = reconcileCodexNames(
+      slug,
+      rollouts.map((r) => r.sessionId),
+    );
     // Single-tmux-per-slug for v1: every codex session reports the
     // bare `<slug>-codex` tmux name. `useHarnessSessions` re-annotates
     // `isLive` against the current tmux name set; here we set false.
@@ -72,7 +81,13 @@ export const codexHarness: Harness = {
     // can find the right file without its own scan.
     const out: HarnessSession[] = [];
     for (const r of rollouts) {
-      const title = titles.get(r.sessionId) ?? r.sessionId.slice(0, 8);
+      // A Codex-native `/rename` title wins when present. Otherwise use
+      // wt's stable friendly name; UUID prefixes are only a defensive
+      // fallback if persistence fails.
+      const title =
+        titles.get(r.sessionId) ??
+        friendlyNames[r.sessionId] ??
+        r.sessionId.slice(0, 8);
       const tail = readCodexTail(r.path, r.mtimeMs, r.size);
       out.push({
         displayName: title,
@@ -93,7 +108,6 @@ export const codexHarness: Harness = {
         },
       });
     }
-    out.sort((a, b) => (b.lastActiveMs ?? 0) - (a.lastActiveMs ?? 0));
     return out;
   },
 
@@ -104,9 +118,8 @@ export const codexHarness: Harness = {
     return ["codex"];
   },
 
-  reapState(_liveSlugs) {
-    // No-op: codex owns its session files; we don't write any wt
-    // state on its behalf, so nothing to reap.
+  reapState(liveSlugs) {
+    reapCodexNames(liveSlugs);
   },
 };
 
@@ -165,9 +178,9 @@ export function latestRolloutForCwd(cwd: string): { path: string; mtimeMs: numbe
 
 /**
  * Walk the codex sessions tree newest-first, parse the `session_meta`
- * line out of each rollout, and return rollouts whose cwd matches the
- * given worktree path. Caps at `SCAN_MAX_DAYS` days to keep the scan
- * bounded; very old sessions are dropped from the picker.
+ * line out of each rollout, and return interactive user sessions whose
+ * cwd matches the given worktree path. Caps at `SCAN_MAX_DAYS` days to
+ * keep the scan bounded; very old sessions are dropped from the picker.
  */
 function scanRollouts(wtPath: string): RolloutMeta[] {
   if (!existsSync(CODEX_SESSIONS_DIR)) return [];
@@ -238,10 +251,11 @@ const ROLLOUT_IDENTITY_CACHE_MAX = 8192;
 
 /**
  * Read only the first line of a rollout, parse the `session_meta`
- * event, and return its `payload.id` + `payload.cwd`. The file is
- * synthesised by codex so the first line is reliably session_meta.
- * Returns null on any read/parse failure — corrupt or empty rollouts
- * just don't surface in the picker.
+ * event, and return its `payload.id` + `payload.cwd` when it represents
+ * an interactive user thread. The same cwd also appears on Codex's
+ * internal guardian/subagent rollouts and `codex exec` runs; those are
+ * not resumable F12 conversations and must not enter discovery.
+ * Returns null on any read/parse failure or non-interactive rollout.
  */
 function readRolloutMeta(path: string): RolloutMetaRaw | null {
   let stat;
@@ -267,12 +281,26 @@ function readRolloutMeta(path: string): RolloutMetaRaw | null {
   try {
     const obj = JSON.parse(firstLine) as {
       type?: string;
-      payload?: { id?: string; cwd?: string };
+      payload?: {
+        id?: string;
+        cwd?: string;
+        originator?: string;
+        thread_source?: string;
+      };
     };
     if (obj.type !== "session_meta") return null;
     const id = obj.payload?.id;
     const cwd = obj.payload?.cwd;
     if (typeof id !== "string" || typeof cwd !== "string") return null;
+    // Match `codex resume`'s default interactive-session scope. Codex
+    // writes guardian/subagent rollouts with originator `codex-tui`,
+    // so checking cwd or originator alone is insufficient.
+    if (
+      obj.payload?.originator !== "codex-tui" ||
+      obj.payload?.thread_source !== "user"
+    ) {
+      return null;
+    }
     // Runaway backstop only — the 30-day window holds far fewer entries.
     if (rolloutIdentityCache.size >= ROLLOUT_IDENTITY_CACHE_MAX) {
       rolloutIdentityCache.clear();

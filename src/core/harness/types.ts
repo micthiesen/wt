@@ -22,9 +22,9 @@ export type HarnessId = "claude" | "codex" | "opencode";
  */
 export type HarnessExtras = {
   /**
-   * Wt-managed name for the session. Null = primary (Claude only).
-   * Codex / OpenCode have no "primary" concept — every session has a
-   * model-given id, so this is always null for them.
+   * Wt-managed name used for tmux/session identity where supported.
+   * Null = primary for Claude; Codex keeps its friendly name in a
+   * separate ID-to-name registry because its tmux slot is shared.
    */
   managedName: string | null;
   /**
