@@ -95,6 +95,14 @@ const EMPTY: readonly HarnessSession[] = [];
  * because they all funnel through here. `nowMs` only affects the
  * codex/opencode idle-vs-abandoned age cutoff and the synthetic
  * placeholder's recency.
+ *
+ * `harnessIds` scopes which harnesses are considered at all (default:
+ * every registered harness). This must match the set the caller actually
+ * ran discovery for: a harness with an undiscovered-but-empty raw list
+ * whose tmux slot is alive would otherwise synthesize a live "(fresh)"
+ * placeholder stamped `lastActiveMs: nowMs` — which permanently
+ * out-sorts every real session and pins `f12Target` (and the glyph
+ * tint) to a placeholder that never changes state.
  */
 export function computeHarnessSessions(
   rawByHarness: ReadonlyMap<HarnessId, ReadonlyArray<HarnessSession>>,
@@ -102,9 +110,11 @@ export function computeHarnessSessions(
   slug: string,
   primary: HarnessId,
   nowMs: number,
+  harnessIds?: readonly HarnessId[],
 ): UseHarnessSessionsResult {
   const all: HarnessSessionEntry[] = [];
   for (const h of HARNESSES) {
+    if (harnessIds && !harnessIds.includes(h.id)) continue;
     const raw = rawByHarness.get(h.id) ?? EMPTY;
     // Single-tmux-per-slug for codex/opencode means at most ONE
     // discovered session can actually be running in the slot at any
@@ -344,6 +354,12 @@ export function useActiveSessionsBySlug(
         w.slug,
         primary,
         now,
+        // Scope to the harnesses we actually ran discovery for. Without
+        // this, a `targetHarness`-restricted call (footer slots) sees an
+        // empty raw list for the OTHER harnesses while their tmux slot
+        // may be alive (e.g. an idle `wt-codex` next to the claude `wt`
+        // session) and pins f12Target to a synthetic placeholder.
+        harnessIds,
       );
       if (f12Target?.isLive) {
         map.set(w.slug, {
