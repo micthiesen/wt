@@ -741,7 +741,6 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
             // folded section's key) drives the divider/blank-line transitions.
             const prev = i > 0 ? items[i - 1] : undefined;
             const prevSection = prev ? (prev.kind === "wt" ? prev.row.section : prev.sectionKey) : null;
-            const prevIsStack = prev ? (prev.kind === "wt" ? prev.row.sectionIsStack : prev.isStack) : false;
 
             // A folded section collapses to one selectable header line — it IS
             // the section divider (a `[×NN]` chip + label in place of the rule),
@@ -758,32 +757,30 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
 
             // Section transition: a blank line above the divider, then the
             // divider, then the section's rows immediately — no blank
-            // between a header and its worktrees. Unsectioned rows at the
-            // top get no header — implicit "inbox". When the very first row
-            // belongs to a section (no inbox rows above it), the leading
+            // between a header and its worktrees. The inbox at the very
+            // top gets no header (implicit list); groups are freely
+            // reorderable though, so when the inbox sits anywhere BELOW
+            // another group its rows would visually attach to that
+            // group — it gets a labeled divider like everyone else then.
+            // When the very first row belongs to a section, the leading
             // blank still renders so the list opens with breathing room
             // above the first header rather than butting it to the border.
             const row = item.row;
             const sectionChanged = prevSection !== row.section;
-            const showDivider = sectionChanged && row.section !== null;
-            // A stack section is pinned to the top; the unsectioned inbox
-            // that follows it gets no divider of its own, so the rows would
-            // bunch right under the stack. Insert a blank line to break them
-            // off. (A following *manual* section already gets the divider's
-            // leading blank, so this only fires for the inbox case.)
-            const leavingStackToInbox =
-              prevIsStack && !row.sectionIsStack && !showDivider;
+            const showDivider =
+              sectionChanged && (row.section !== null || prev !== undefined);
             return (
               <Fragment key={row.wt.slug}>
-                {leavingStackToInbox ? <box height={1} flexShrink={0} /> : null}
                 {showDivider ? (
                   <>
                     <box height={1} flexShrink={0} />
                     <Divider
                       label={
-                        row.sectionIsStack
-                          ? stackSectionLabels.get(row.section!) ?? row.section!
-                          : row.section!
+                        row.section === null
+                          ? "inbox"
+                          : row.sectionIsStack
+                            ? stackSectionLabels.get(row.section) ?? row.section
+                            : row.section
                       }
                       width={width}
                     />

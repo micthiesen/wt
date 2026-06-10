@@ -9,6 +9,35 @@ import { createLogger } from "./logger.ts";
 const STATE_FILE = join(homedir(), ".cache", "wt", "state.json");
 const log = createLogger("[wtstate]");
 
+/**
+ * Synthetic section key for a manifest-driven stack. NUL-prefixed so
+ * it can never collide with a user's manual section name. The TUI
+ * re-exports these from `useWorktreeRows.ts`; they live here because
+ * `sectionsOrder` — the unified display order over ALL groups (stack
+ * sections, the inbox, manual sections) — is owned by this module.
+ * The value is persisted (foldedSections, sectionsOrder), so it must
+ * never change.
+ */
+export const STACK_SECTION_PREFIX = "\0stack:";
+export function stackSectionKey(stackId: string): string {
+  return `${STACK_SECTION_PREFIX}${stackId}`;
+}
+/** Inverse of `stackSectionKey`; `null` for non-stack keys. */
+export function stackIdFromSectionKey(key: string): string | null {
+  return key.startsWith(STACK_SECTION_PREFIX)
+    ? key.slice(STACK_SECTION_PREFIX.length)
+    : null;
+}
+
+/**
+ * Sentinel entry representing the unsectioned inbox in `sectionsOrder`.
+ * NUL-prefixed like stack keys so it can't collide with a manual
+ * name. Its presence doubles as the migration marker: a state file
+ * without it predates unified group ordering and gets seeded with the
+ * legacy layout (stacks, then inbox, then manual sections) on read.
+ */
+export const GROUP_INBOX = "\0inbox";
+
 export type WtSlugState = {
   /** Section name. `null` = unsectioned (rendered at top, no header). */
   section: string | null;
@@ -112,12 +141,21 @@ export type StackManifest = {
 /**
  * Persisted state for the worktree list:
  *  - `slugs`: per-worktree manual section + within-section order.
- *  - `sectionsOrder`: explicit display order for manual named sections.
+ *  - `sectionsOrder`: the unified display order over every GROUP in the
+ *    list — stack section keys (`stackSectionKey(stackId)`), the inbox
+ *    sentinel (`GROUP_INBOX`), and manual section names, all in one
+ *    ranked array. `readWtState` self-heals it: new stacks prepend
+ *    (top of the list), dead stack keys drop, slug-referenced manual
+ *    sections missing from the array append, and a pre-unification
+ *    file (no inbox sentinel) is seeded with the legacy layout
+ *    (stacks alphabetical, then inbox, then manual sections) so the
+ *    migration is visually a no-op.
  *  - `stacks`: per-feature stack manifests keyed by `stackId`. The
  *    single authoritative description of every managed stack's shape;
  *    everything else (engine links, draft PRs, and the worktree-list
- *    stack rendering — sections, order, tree) is DERIVED from it. There
- *    is no manual stack-section state: a stack exists iff a manifest does.
+ *    stack rendering — membership, within-stack order, tree) is DERIVED
+ *    from it. The stack's position among the other groups is the one
+ *    display-only bit that isn't: it lives in `sectionsOrder`.
  *
  * Why an explicit array instead of deriving section position from
  * `min(order)` of members: derived ordering causes a section to leap
@@ -406,15 +444,50 @@ export function readWtState(): WtState {
         }
       }
     }
-    const sectionsOrder: string[] = [];
+    // Stacks parse before the order array — the self-heal below needs
+    // the live manifest set to seed/prune stack section keys.
+    const stacks: Record<string, StackManifest> = {};
+    if (data?.stacks && typeof data.stacks === "object") {
+      for (const [k, v] of Object.entries(data.stacks)) {
+        const m = parseManifest(v);
+        if (m) stacks[k] = m;
+      }
+    }
+    const rawOrder: string[] = [];
     if (Array.isArray(data?.sectionsOrder)) {
       const seen = new Set<string>();
       for (const s of data.sectionsOrder) {
         if (typeof s !== "string" || s.trim() === "") continue;
         if (seen.has(s)) continue;
         seen.add(s);
-        sectionsOrder.push(s);
+        rawOrder.push(s);
       }
+    }
+    const liveStackKeys = Object.keys(stacks)
+      .map(stackSectionKey)
+      .sort((a, b) => a.localeCompare(b));
+    let sectionsOrder: string[];
+    if (!rawOrder.includes(GROUP_INBOX)) {
+      // Pre-unification file (manual names only): seed the unified order
+      // with the legacy bucket layout so the migration changes nothing
+      // visually — stacks (alphabetical, as the buckets sorted them),
+      // then the inbox, then the manual sections in their stored order.
+      sectionsOrder = [
+        ...liveStackKeys,
+        GROUP_INBOX,
+        ...rawOrder.filter((s) => !s.startsWith(STACK_SECTION_PREFIX)),
+      ];
+    } else {
+      // Drop stack keys whose manifest is gone; float new stacks to the
+      // very top (matching where stack sections always appeared before
+      // they were orderable). Deterministic in-memory heal — persisted
+      // whenever the next mutator writes the state back.
+      const kept = rawOrder.filter((s) => {
+        const sid = stackIdFromSectionKey(s);
+        return sid === null || sid in stacks;
+      });
+      const missing = liveStackKeys.filter((k) => !kept.includes(k));
+      sectionsOrder = [...missing, ...kept];
     }
     // Self-heal: any manual section referenced by a slug but missing from
     // sectionsOrder gets appended in discovery order.
@@ -423,13 +496,6 @@ export function readWtState(): WtState {
       if (v.section !== null && !known.has(v.section)) {
         sectionsOrder.push(v.section);
         known.add(v.section);
-      }
-    }
-    const stacks: Record<string, StackManifest> = {};
-    if (data?.stacks && typeof data.stacks === "object") {
-      for (const [k, v] of Object.entries(data.stacks)) {
-        const m = parseManifest(v);
-        if (m) stacks[k] = m;
       }
     }
     const foldedSections: string[] = [];
@@ -482,13 +548,23 @@ function withWtStateLock<T>(fn: () => T): T {
   return withFileLock("__wtstate__", fn);
 }
 
-/** Drop manual sections from `sectionsOrder` that no slug references. */
+/**
+ * Drop dead groups from `sectionsOrder`: manual sections no slug
+ * references and stack keys whose manifest is gone. The inbox sentinel
+ * always survives (it's the migration marker and the inbox is never
+ * deletable).
+ */
 function prunedSectionsOrder(state: WtState): string[] {
   const live = new Set<string>();
   for (const v of Object.values(state.slugs)) {
     if (v.section !== null) live.add(v.section);
   }
-  return state.sectionsOrder.filter((s) => live.has(s));
+  return state.sectionsOrder.filter((s) => {
+    if (s === GROUP_INBOX) return true;
+    const sid = stackIdFromSectionKey(s);
+    if (sid !== null) return sid in state.stacks;
+    return live.has(s);
+  });
 }
 
 function ensureSection(state: WtState, section: string): WtState {
@@ -677,26 +753,31 @@ export function renameSection(oldName: string, newName: string): void {
 }
 
 /**
- * Move a named section one slot up (`dir = -1`) or down (`dir = 1`)
- * in `sectionsOrder`. Returns true when the swap landed, false when it
- * was a no-op (section absent, or already at the boundary). Member
- * slugs keep their `order` values; only the index moves.
+ * Reorder the group list: remove `key` and reinsert it immediately
+ * before/after `pastKey`. Both keys must be present (groups are
+ * self-healed into `sectionsOrder` at read time); returns false when
+ * either is absent, they're equal, or the result is a no-op. "Place
+ * past" rather than "swap with array neighbor" so the caller can name
+ * the next VISIBLE group as the landmark — an invisible group sitting
+ * between (an empty inbox) gets jumped in one keypress instead of
+ * producing a phantom no-change move. Member slugs keep their `order`
+ * values; only the group's rank moves.
  */
-export function moveSection(name: string, dir: -1 | 1): boolean {
+export function moveGroupPast(
+  key: string,
+  pastKey: string,
+  side: "before" | "after",
+): boolean {
   return withWtStateLock(() => {
     const state = readWtState();
-    const idx = state.sectionsOrder.indexOf(name);
-    if (idx < 0) return false;
-    const target = idx + dir;
-    if (target < 0 || target >= state.sectionsOrder.length) return false;
-    const next: WtState = {
-      ...state,
-      sectionsOrder: [...state.sectionsOrder],
-    };
-    const tmp = next.sectionsOrder[idx]!;
-    next.sectionsOrder[idx] = next.sectionsOrder[target]!;
-    next.sectionsOrder[target] = tmp;
-    writeWtState(next);
+    if (key === pastKey) return false;
+    if (!state.sectionsOrder.includes(key)) return false;
+    const arr = state.sectionsOrder.filter((s) => s !== key);
+    const at = arr.indexOf(pastKey);
+    if (at < 0) return false;
+    arr.splice(side === "before" ? at : at + 1, 0, key);
+    if (arr.every((s, i) => s === state.sectionsOrder[i])) return false;
+    writeWtState({ ...state, sectionsOrder: arr });
     return true;
   });
 }

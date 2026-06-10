@@ -95,7 +95,7 @@ import { invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
 import type { PullRequest } from "../core/types.ts";
 import {
-  moveSection as moveSectionOnDisk,
+  moveGroupPast as moveGroupPastOnDisk,
   placeSlug as placeSlugOnDisk,
   renameSection as renameSectionOnDisk,
   setSlugSection as setSlugSectionOnDisk,
@@ -627,14 +627,20 @@ export function useWtActions() {
       await qc.invalidateQueries({ queryKey: qk.wtState() });
     },
     /**
-     * Move a section one slot up or down in `sectionsOrder`. Returns
-     * true when the swap landed, false when at boundary. Skips the
-     * invalidate on a no-op so the keypress is truly inert (no
-     * spurious re-fetch / re-render churn that could otherwise look
-     * like a phantom step to the user).
+     * Reorder the group list: place group `key` immediately before/
+     * after `pastKey` in `sectionsOrder` (Shift+J/K whole-group moves —
+     * stack sections, folded headers). Returns true when the move
+     * landed, false on a no-op (missing key / no position change).
+     * Skips the invalidate on a no-op so the keypress is truly inert
+     * (no spurious re-fetch / re-render churn that could otherwise
+     * look like a phantom step to the user).
      */
-    async moveSection(name: string, dir: -1 | 1): Promise<boolean> {
-      const moved = moveSectionOnDisk(name, dir);
+    async moveGroupPast(
+      key: string,
+      pastKey: string,
+      side: "before" | "after",
+    ): Promise<boolean> {
+      const moved = moveGroupPastOnDisk(key, pastKey, side);
       if (moved) {
         await qc.invalidateQueries({ queryKey: qk.wtState() });
       }

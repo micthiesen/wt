@@ -132,6 +132,7 @@ import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import {
+  GROUP_INBOX,
   STACK_SECTION_PREFIX,
   stackSectionKey,
   useWorktreeRows,
@@ -690,7 +691,7 @@ export function App({ onExit }: Props) {
     swapOrder,
     placeSlug,
     renameSection,
-    moveSection,
+    moveGroupPast,
     toggleSectionFold,
     mutate,
     cyclePrimaryHarness,
@@ -1507,52 +1508,78 @@ export function App({ onExit }: Props) {
   }
 
   /**
-   * Unified Shift+J/K. Walks the active-row list one step in `dir`:
-   *   - Same-section neighbor → swap orders (within-section reorder).
-   *   - Cross-section neighbor → move row to the adjacent edge of the
-   *     target section (top of next on `J`, bottom of prev on `K`),
-   *     so the row visually slides one position the way the user
-   *     expects rather than leaping to the far end of the target.
+   * Move a whole group (a stack section, a manual section, the inbox)
+   * one display slot in `dir`. The landmark is the adjacent group that
+   * currently RENDERS rows — `moveGroupPast` then jumps any invisible
+   * group sitting in between (an empty inbox) so one keypress is one
+   * visual step, never a phantom no-change move.
+   */
+  function doMoveGroup(groupKey: string, dir: -1 | 1, what: string): void {
+    const order = wtStateForStacks.data?.sectionsOrder ?? [];
+    const present = new Set<string>();
+    for (const r of rows) {
+      if (!r.archived) present.add(r.section ?? GROUP_INBOX);
+    }
+    const seq = order.filter((g) => present.has(g));
+    const idx = seq.indexOf(groupKey);
+    if (idx < 0) return; // unranked group mid-refresh; self-heals on next read
+    const neighbor = seq[idx + dir];
+    if (!neighbor) {
+      toast(
+        dir > 0 ? `${what} already at bottom` : `${what} already at top`,
+        theme.fgDim,
+        1500,
+      );
+      return;
+    }
+    moveGroupPast(groupKey, neighbor, dir > 0 ? "after" : "before").then(
+      (moved) => {
+        if (moved) toast(`moved ${what} ${dir > 0 ? "down" : "up"}`, theme.info, 1200);
+      },
+      (err) => reportActionError("move", err),
+    );
+  }
+
+  /**
+   * Unified Shift+J/K — moves the smallest movable thing under the
+   * cursor:
+   *   - A row in the inbox / a manual section: swap with its same-group
+   *     neighbor, or slide to the near edge of the adjacent group across
+   *     a boundary (top of next on `J`, bottom of prev on `K`). Stack
+   *     sections can't be joined (membership is manifest-derived), so a
+   *     sliding row hops over them in one keypress; the inbox is a valid
+   *     target even when empty.
+   *   - A row inside a stack section (slice or holistic origin): rows
+   *     there are ordered by the manifest topology, so the move applies
+   *     to the WHOLE stack — one group slot.
+   *   - A folded section header (stack or manual): the whole group moves.
    * The archive boundary is hard: rows can't cross into archived via
    * J/K — that's `a`'s job.
    */
   function doShiftMove(dir: -1 | 1): void {
+    if (selectedSection) {
+      doMoveGroup(
+        selectedSection.sectionKey,
+        dir,
+        selectedSection.isStack ? "stack" : "section",
+      );
+      return;
+    }
     if (!current) return;
     if (current.archived) {
       toast("archived rows don't reorder, use `a` to restore", theme.fgDim, 1500);
       return;
     }
     if (current.sectionIsStack) {
-      toast("stack section is auto-managed", theme.fgDim, 1500);
+      doMoveGroup(current.section!, dir, "stack");
       return;
     }
     const active = rows.filter((r) => !r.archived);
     const idx = active.indexOf(current);
     if (idx < 0) return;
-    const target = active[idx + dir];
-    if (!target) {
-      // Special case: at the top of a named section with nothing
-      // above. The cross-section branch normally handles "leave my
-      // section" by routing through the row above, but when there
-      // are no unsectioned rows and no other section preceding this
-      // one, there's no row above to route through. Manufacture the
-      // move into unsectioned so Shift+K can always escape a
-      // section. (No symmetric Shift+J fix: archived is the boundary
-      // below, and routing into archived via reorder would conflict
-      // with `a` being the only path there.)
-      if (dir < 0 && current.section !== null) {
-        const slug = current.wt.slug;
-        placeSlug(slug, null, "bottom").then(
-          () => toast("moved to (none)", theme.info, 1200),
-          (err) => reportActionError("move", err),
-        );
-        return;
-      }
-      toast(dir > 0 ? "already at bottom" : "already at top", theme.fgDim, 1500);
-      return;
-    }
     const slug = current.wt.slug;
-    if (target.section === current.section) {
+    const target = active[idx + dir];
+    if (target && target.section === current.section) {
       const bucket = active
         .filter((r) => r.section === current.section)
         .map((r) => r.wt.slug);
@@ -1561,59 +1588,30 @@ export function App({ onExit }: Props) {
       );
       return;
     }
-    // Refuse to move into a stack section — its membership is
-    // auto-derived from chain topology, not manual placement.
-    if (target.sectionIsStack) {
-      toast("can't move into a stack section", theme.fgDim, 1500);
+    // Crossing a group boundary: land at the near edge of the adjacent
+    // group in the ranked sequence. Built from `sectionsOrder` rather
+    // than the neighboring ROW so stack sections get skipped and the
+    // inbox is reachable even when it has no rows (the only way back
+    // out when every row is sectioned).
+    const order = wtStateForStacks.data?.sectionsOrder ?? [];
+    const present = new Set<string>();
+    for (const r of active) present.add(r.section ?? GROUP_INBOX);
+    const seq = order.filter((g) => g === GROUP_INBOX || present.has(g));
+    const start = seq.indexOf(current.section ?? GROUP_INBOX);
+    if (start < 0) return; // unranked mid-refresh; self-heals on next read
+    let i = start + dir;
+    while (i >= 0 && i < seq.length && seq[i]!.startsWith(STACK_SECTION_PREFIX)) {
+      i += dir;
+    }
+    const targetGroup = seq[i];
+    if (targetGroup === undefined) {
+      toast(dir > 0 ? "already at bottom" : "already at top", theme.fgDim, 1500);
       return;
     }
-    // Cross-section: place at the edge of `target.section` adjacent to
-    // the source section, so the row shifts one visual position.
-    const position: "top" | "bottom" = dir > 0 ? "top" : "bottom";
-    placeSlug(slug, target.section, position).then(
-      () => {
-        const label = target.section === null ? "(none)" : target.section;
-        toast(`moved to ${label}`, theme.info, 1200);
-      },
+    const sectionVal = targetGroup === GROUP_INBOX ? null : targetGroup;
+    placeSlug(slug, sectionVal, dir > 0 ? "top" : "bottom").then(
+      () => toast(`moved to ${sectionVal ?? "inbox"}`, theme.info, 1200),
       (err) => reportActionError("move", err),
-    );
-  }
-
-  /**
-   * `{` / `}` — shift the *section* containing the current row one
-   * slot up or down in `sectionsOrder`. Unsectioned rows can't move
-   * (they're pinned to the top); archived rows ignore section order.
-   * Boundary cases toast explicitly so a silent no-op can't read as a
-   * phantom move.
-   */
-  function doMoveSection(dir: -1 | 1): void {
-    if (!current) return;
-    if (current.archived) {
-      toast("archived rows don't have a section", theme.fgDim, 1500);
-      return;
-    }
-    if (current.sectionIsStack) {
-      toast("stack sections are auto-managed (pinned to the top)", theme.fgDim, 1800);
-      return;
-    }
-    if (current.section === null) {
-      toast("unsectioned rows are pinned to the top", theme.fgDim, 1500);
-      return;
-    }
-    const name = current.section;
-    appLog.event.dim(`moveSection enter name="${name}" dir=${dir}`);
-    moveSection(name, dir).then(
-      (moved) => {
-        appLog.event.dim(`moveSection result name="${name}" dir=${dir} moved=${moved}`);
-        if (!moved) {
-          toast(
-            dir > 0 ? "section already at bottom" : "section already at top",
-            theme.fgDim,
-            1500,
-          );
-        }
-      },
-      (err) => reportActionError("move section", err),
     );
   }
 
@@ -1652,7 +1650,7 @@ export function App({ onExit }: Props) {
   function commitSectionPick(item: SectionPickerItem, slug: string): void {
     if (item.kind === "none") {
       setSection(slug, null).then(
-        () => toast("moved to (none)", theme.info, 1500),
+        () => toast("moved to inbox", theme.info, 1500),
         (err) => reportActionError("move", err),
       );
       setLastMoveTarget(null);
@@ -1684,7 +1682,7 @@ export function App({ onExit }: Props) {
   function openSectionRename(): void {
     if (!current || current.archived) return;
     if (current.section === null) {
-      toast("cursor is in (none), nothing to rename", theme.fgDim, 1500);
+      toast("the inbox can't be renamed", theme.fgDim, 1500);
       return;
     }
     if (current.sectionIsStack) {
@@ -3838,11 +3836,12 @@ export function App({ onExit }: Props) {
       setFocus(currentSlug ?? null, { focused: eventsOutputId() });
       return;
     }
-    // Unified Shift+J/K — moves the current row one position in
-    // display order. Within a section that's a swap; across the
-    // section boundary it's an adjacent-edge placement (top of next,
-    // bottom of prev), so chord-holding J walks the row through the
-    // whole list including unsectioned, never crossing into archived.
+    // Unified Shift+J/K — moves the smallest movable thing under the
+    // cursor one display position: a row within/across manual sections
+    // and the inbox (chord-holding J walks it through the whole list,
+    // hopping over stack sections, never crossing into archived), the
+    // WHOLE stack when the cursor is on a stack row, and the whole
+    // group when it's on a folded section header.
     if (isShiftedLetter(k, "j")) {
       doShiftMove(1);
       return;
@@ -3854,17 +3853,6 @@ export function App({ onExit }: Props) {
     // Shift+L renames the current row's section.
     if (isShiftedLetter(k, "l")) {
       openSectionRename();
-      return;
-    }
-    // `{` / `}` — shift the current row's section up/down in the
-    // section list. Sibling rows move with it; member ordering within
-    // the section is preserved.
-    if (k.sequence === "{") {
-      doMoveSection(-1);
-      return;
-    }
-    if (k.sequence === "}") {
-      doMoveSection(1);
       return;
     }
     // Ctrl+J / Ctrl+K page the details pane (worktree or review request)
