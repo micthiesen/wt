@@ -9,6 +9,7 @@ import * as stagesCmd from "./commands/stages.ts";
 import * as logsCmd from "./commands/logs.ts";
 import * as openCmd from "./commands/open.ts";
 import * as baseCmd from "./commands/base.ts";
+import * as claudeCmd from "./commands/claude.ts";
 import * as sizeCmd from "./commands/size.ts";
 import * as stackCmd from "./commands/stack.ts";
 import * as destroyCmd from "./commands/_destroy.ts";
@@ -27,6 +28,7 @@ commands:
   size        production-LOC + file count for a diff
   stack       materialize / inspect / restack a stack manifest
   base        show / set / clear a worktree's recorded fork base
+  claude      drive a worktree's Claude Code session (send / ls / kill)
 
 Run \`wt <command> --help\` for per-command options where available.`;
 
@@ -44,6 +46,7 @@ const RUNNERS: Record<string, Runner> = {
   size: sizeCmd.run,
   stack: stackCmd.run,
   base: baseCmd.run,
+  claude: claudeCmd.run,
   _destroy: destroyCmd.run,
 };
 

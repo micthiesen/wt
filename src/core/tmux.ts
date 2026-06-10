@@ -252,6 +252,30 @@ export function writeConfig(): { path: string; changed: boolean } {
 }
 
 /**
+ * Ensure a tmux config exists on disk WITHOUT the change-detection
+ * kill-server dance, returning its path. For non-interactive codepaths
+ * (`startClaudeSessionDetached`, and via it `injectIntoSession` / the
+ * `wt claude send` CLI) that may run from an arbitrary environment —
+ * including from a claude session INSIDE the wt tmux server itself,
+ * where TERM is `tmux-256color` rather than the user's outer terminal.
+ * There `buildConfig()` renders differently than what the user's wt
+ * wrote, so the `writeConfig()` + `killServer()` path would (a) poison
+ * the on-disk config with the wrong terminal capabilities and (b) kill
+ * every live session, including the very session that invoked the CLI.
+ * The config only matters at server start anyway; an already-running
+ * server ignores `-f` entirely.
+ */
+function ensureConfig(): string {
+  const path = join(configDir(), "tmux.conf");
+  try {
+    readFileSync(path, "utf8");
+  } catch {
+    writeFileSync(path, buildConfig(), "utf8");
+  }
+  return path;
+}
+
+/**
  * Kill the entire wt tmux server (every session). Idempotent — exits
  * 0 when no server is running, after warning to stderr we discard.
  */
@@ -880,13 +904,11 @@ async function startClaudeSessionDetached(
   cwd: string,
 ): Promise<{ ok: boolean; reason?: string }> {
   const name = sessionName(slug, "claude");
-  const { path: configPath, changed } = writeConfig();
-  if (changed) {
-    log.info("config changed, killing server before detached claude start", {
-      slug,
-    });
-    await killServer();
-  }
+  // ensureConfig, NOT writeConfig: this can run from inside the wt tmux
+  // server (e.g. `wt claude send` issued by another claude session),
+  // where the rendered config differs and the kill-server-on-change
+  // dance would take down every live session including the caller's.
+  const configPath = ensureConfig();
   const stderrPath = join(sessionsDir(), `${name}.err`);
   const innerArgs = getHarness("claude").buildArgs({
     wtPath: cwd,
