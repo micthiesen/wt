@@ -14,6 +14,20 @@ export type WtSlugState = {
   section: string | null;
   /** Manual ordering scalar within (section, archived) bucket. Lower = earlier. */
   order: number;
+  /**
+   * Branch this worktree was forked from (`wt new --base <ref>`), when
+   * that ref isn't trunk. Display/diff hint only — the stack manifest
+   * stays the sole input to the restack engine; a manifest slice's
+   * parent always wins over this. Cleared when the branch is promoted
+   * into a stack (`wt stack add`) or via `wt base clear`.
+   */
+  baseBranch?: string;
+  /**
+   * Fork-point sha recorded alongside `baseBranch` at creation. Free to
+   * capture then, and gives a later `wt stack add` a squash-safe anchor
+   * even if the parent advances or lands first.
+   */
+  baseSha?: string;
 };
 
 /** Lifecycle of a single slice as it moves from plan to landed PR. */
@@ -384,6 +398,12 @@ export function readWtState(): WtState {
           : null;
         const order = typeof rec.order === "number" && Number.isFinite(rec.order) ? rec.order : 0;
         slugs[k] = { section, order };
+        if (typeof rec.baseBranch === "string" && rec.baseBranch.trim() !== "") {
+          slugs[k]!.baseBranch = rec.baseBranch;
+          if (typeof rec.baseSha === "string" && rec.baseSha.trim() !== "") {
+            slugs[k]!.baseSha = rec.baseSha;
+          }
+        }
       }
     }
     const sectionsOrder: string[] = [];
@@ -530,8 +550,34 @@ export function placeSlug(
       const max = maxOrderIn(next, section);
       order = max === null ? 0 : max + 1;
     }
-    next.slugs[slug] = { section, order };
+    next.slugs[slug] = { ...next.slugs[slug], section, order };
     next.sectionsOrder = prunedSectionsOrder(next);
+    writeWtState(next);
+  });
+}
+
+/**
+ * Record (or clear, with `base = null`) a worktree's fork base. Creates
+ * the slug entry on first write so a brand-new worktree (no manual
+ * section/order yet) can still carry its base.
+ */
+export function setSlugBase(
+  slug: string,
+  base: { branch: string; sha?: string } | null,
+): void {
+  withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.slugs[slug];
+    if (!prev && !base) return;
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    const entry: WtSlugState = { section: null, order: 0, ...prev };
+    delete entry.baseBranch;
+    delete entry.baseSha;
+    if (base) {
+      entry.baseBranch = base.branch;
+      if (base.sha) entry.baseSha = base.sha;
+    }
+    next.slugs[slug] = entry;
     writeWtState(next);
   });
 }

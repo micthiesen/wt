@@ -56,8 +56,10 @@ split options:
 add options:
   (branch defaults to the current worktree's branch; a positional with a "/" is
    the branch, without is the stackId — resolved from --onto's branch when omitted)
-  --onto <sliceId|branch>    parent to stack on (default: highest-ordinal live
-                             slice; pass ${config.branch.base} to root a new parallel lane)
+  --onto <sliceId|branch>    parent to stack on (default: the fork base recorded
+                             by \`wt new --base\` when it names a live slice, else
+                             the highest-ordinal live slice; pass
+                             ${config.branch.base} to root a new parallel lane)
   --title <t>                slice title (default: the PR's title, else derived
                              from the branch name)
 status options:

@@ -33,11 +33,14 @@ import {
   resolveParentBranch,
   topoSortSlices,
 } from "./stack-layout.ts";
+import { dirSlug } from "./stage.ts";
 import {
   findStackIdByBranch,
   getStackManifest,
   patchStackManifest,
   putStackManifest,
+  readWtState,
+  setSlugBase,
   updateStackSlice,
   validateStackManifest,
   type StackManifest,
@@ -1095,10 +1098,24 @@ async function addSliceToStackLocked(
       };
     }
   } else if (!opts.onto) {
-    parentSlice =
-      manifest.slices
-        .filter((s) => s.status !== "merged")
-        .sort((a, b) => b.ordinal - a.ordinal)[0] ?? null;
+    // Prefer the fork base `wt new --base` recorded for this branch's
+    // worktree, when it names a live slice of this stack — that's the
+    // actual parent the branch was cut from. Fall back to the stack tip.
+    const recorded = readWtState().slugs[dirSlug(branch)]?.baseBranch;
+    const recordedSlice = recorded
+      ? manifest.slices.find(
+          (s) => (s.branch === recorded || s.id === recorded) && s.status !== "merged",
+        )
+      : undefined;
+    if (recordedSlice) {
+      parentSlice = recordedSlice;
+      onLog(`parent ${recordedSlice.id} (${recordedSlice.branch}) from the recorded fork base`);
+    } else {
+      parentSlice =
+        manifest.slices
+          .filter((s) => s.status !== "merged")
+          .sort((a, b) => b.ordinal - a.ordinal)[0] ?? null;
+    }
     if (!parentSlice) {
       return {
         ok: false,
@@ -1199,6 +1216,11 @@ async function addSliceToStackLocked(
   // An adopted PR may target the wrong base (e.g. trunk, because `gh pr
   // create` defaulted there) — align it with the manifest like replay does.
   if (prAction === "adopted") await retargetIfNeeded(slice, parentBranch, onLog);
+
+  // The branch is a tracked slice now — the manifest owns its parent, so
+  // the `wt new --base` fork-base hint is superseded. (Stack lock is held;
+  // the wtstate flock nests inside it, consistent with every other mutator.)
+  setSlugBase(dirSlug(branch), null);
 
   log.info("added slice to stack", { stackId, slice: slice.id, branch, parentBranch, prNumber });
   return { ok: true, slice, parentBranch, prAction };

@@ -433,6 +433,17 @@ standalone skills — never as edits to `/start` or `/done`.
       `#refs` so GitHub keeps expanding live status. A stack-on-stack root gets a
       one-time `*(stacked on #N)*` note resolved via `gh` at generation (fallback:
       bare branch name). Cycle-safe (malformed bases fall back to the flat list).
+- [x] wt: **recorded fork base** (`wt new --base` is no longer amnesiac). A
+      non-trunk `--base` is persisted per-slug (`baseBranch` + fork-point
+      `baseSha` in wtstate), so the TUI's base row, sync counts, diff, and AI
+      summary all run against the real parent ("(forked)" suffix) instead of
+      main. Deliberately NOT a stack: a fresh fork can't be a valid slice
+      (no files/PR; `planned` would be re-materialized from the holistic
+      branch), so the hint stays lightweight and the manifest remains the only
+      engine input — a manifest slice ignores any vestigial fork record.
+      `wt stack add` defaults `--onto` from the record when it names a live
+      slice and clears it on promotion; `wt base <slug>` / `set` / `clear`
+      inspect + backfill.
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -810,3 +821,23 @@ Track friction here as the workflow gets used. Candidate adjustments:
   sentence in SKILL.md); no wt code touched. Verified against synthetic
   status JSON: linear unchanged, fork/lane/planned-slice/external-root all
   render correctly.
+- **2026-06-10** — Recorded fork base for `wt new --base`. Real friction: a
+  worktree forked off a stack tip (`wt new … --base michael/eng-5201-…`)
+  showed base "main" in the details pane and diffed fat against trunk — the
+  flag created the branch off the ref and then forgot it. Considered and
+  REJECTED the maximalist fix (make `--base` stack-only and auto-create a
+  single-slice manifest): a zero-commit fork can't satisfy the slice
+  invariants (non-empty `files`, `open` needs a PR, `planned` gets
+  re-materialized from the holistic branch and would clobber hand work), a
+  standalone parent would force inventing a fake `holisticBranch`, and
+  `wt stack add` was already designed as the deliberate, post-work
+  registration path. Built instead: per-slug `baseBranch`+`baseSha` in
+  wtstate (recorded at create, fork point captured for free as a future
+  squash-safe anchor), `resolveStackedOn` falls back to it for non-slice
+  worktrees (`via: "fork"`, manifest always wins), base row shows
+  "(forked)", `wt stack add` defaults `--onto` from the record and clears
+  it on promotion, and a `wt base` show/set/clear subcommand for backfill.
+  Lifecycle: forked → (work, PR) → `wt stack add` → tracked slice. A dead
+  recorded base degrades to trunk via the existing `effectiveBaseOrTrunk`
+  backstop. Mutators preserving unknown slug fields verified (placeSlug
+  spread bug fixed); end-to-end fixture-tested create/record/preserve/rm.
