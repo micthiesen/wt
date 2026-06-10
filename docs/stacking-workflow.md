@@ -434,9 +434,12 @@ standalone skills — never as edits to `/start` or `/done`.
       no wt change). A linear stack renders the flat ordinal-numbered list exactly
       as before; a fork or multi-lane stack renders a nested bullet tree
       (nesting = stacks on, siblings = parallel, one-line legend) with bare
-      `#refs` so GitHub keeps expanding live status. A stack-on-stack root gets a
-      one-time `*(stacked on #N)*` note resolved via `gh` at generation (fallback:
-      bare branch name). Cycle-safe (malformed bases fall back to the flat list).
+      `#refs` so GitHub keeps expanding live status. No stack-on-stack
+      annotation (a `*(stacked on #N)*` note existed briefly; Michael cut it
+      2026-06-10 — the external parent stays unmentioned). Cycle-safe
+      (malformed bases fall back to the flat list). The section opens with a
+      blank line before its `---` so a flush join with the prose can't turn
+      the last paragraph into a setext H2.
 - [x] wt: **recorded fork base** (`wt new --base` is no longer amnesiac). A
       non-trunk `--base` is persisted per-slug (`baseBranch` + fork-point
       `baseSha` in wtstate), so the TUI's base row, sync counts, diff, and AI
@@ -861,3 +864,16 @@ Track friction here as the workflow gets used. Candidate adjustments:
   record wins → else on-main OK → else the (a)/(b) ask. A drifted record
   (HEAD not on top of it) is surfaced but never trusted. Skill precondition
   text updated to match; no wt code change.
+- **2026-06-10** — Setext-heading bug in PR bodies + annotation cut. The
+  eng-5201 bodies rendered their last prose paragraph as a giant bold H2:
+  markdown parses `text\n---` as a setext heading, and the assembled body had
+  no blank line between the prose and the stack section's `---`. Fixed in
+  both layers: `stack-section.py` now emits a LEADING blank line (flush
+  joins are safe by construction) and `/split` step 7 spells out the
+  assembly as `prose + "\n\n" + section` with the why. Also removed the
+  `*(stacked on …)*` root annotation from the tree renderer same-day after
+  Michael saw it live on eng-5201 and didn't like it (it also leaked the
+  parent branch name; the design already says the PR body never mentions
+  the holistic/parent plumbing). All seven eng-5201 bodies regenerated
+  (prose kept, section swapped); eng-5184/5185 were assembled with the
+  blank line and main-rooted, so untouched.
