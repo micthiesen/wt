@@ -443,7 +443,11 @@ standalone skills — never as edits to `/start` or `/done`.
       engine input — a manifest slice ignores any vestigial fork record.
       `wt stack add` defaults `--onto` from the record when it names a live
       slice and clears it on promotion; `wt base <slug>` / `set` / `clear`
-      inspect + backfill.
+      inspect + backfill. `/split`'s context script reads it too: a confirmed
+      record (HEAD on top of it) resolves the base-detection question as
+      case (b) without asking — and it outranks "HEAD is on top of
+      origin/main", which is also true whenever the parent chain was just
+      rebased onto main.
 - [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
@@ -841,3 +845,15 @@ Track friction here as the workflow gets used. Candidate adjustments:
   recorded base degrades to trunk via the existing `effectiveBaseOrTrunk`
   backstop. Mutators preserving unknown slug fields verified (placeSlug
   spread bug fixed); end-to-end fixture-tested create/record/preserve/rm.
+- **2026-06-10** — `/split` reads the recorded fork base. The context script
+  resolves the diff base itself now: it asks `wt base <slug>` and, when the
+  record is CONFIRMED (`merge-base --is-ancestor <rec> HEAD`), declares case
+  (b) with that parent and diffs against it — no user prompt. Testing on the
+  real eng-5201 worktree exposed why the check must run BEFORE the
+  is-ancestor-of-main gate, not just inside its failure branch: the eng-5183
+  parent chain had just been rebased onto main, so HEAD was on top of
+  origin/main too and the old "base status: OK" path would have folded the
+  whole unmerged parent stack into the slices. Order is now: confirmed
+  record wins → else on-main OK → else the (a)/(b) ask. A drifted record
+  (HEAD not on top of it) is surfaced but never trusted. Skill precondition
+  text updated to match; no wt code change.
