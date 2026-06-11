@@ -30,7 +30,7 @@ import { stateColor } from "../claude-state.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import type { MergeQueueState } from "../../core/types.ts";
-import type { SpinePos } from "../../core/stack-layout.ts";
+import { STACK_CONNECTOR, stackOrdinalLabel } from "../../core/stack-layout.ts";
 import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -122,19 +122,6 @@ function StatusMarker({ row }: { row: WorktreeRow }) {
 }
 
 /**
- * Tree-spine connector glyph for a managed-stack row, by the slice's
- * position in its lane. `single` = a standalone lane (blank — no chain
- * above/below to draw, so draw nothing); `first` ┌ = chain root with
- * children; `middle` ├ = a stacked link; `last` └ = the chain tip.
- */
-const STACK_CONNECTOR: Record<SpinePos, string> = {
-  single: " ",
-  first: "┌",
-  middle: "├",
-  last: "└",
-};
-
-/**
  * Glyph for the holistic-origin row pinned at the bottom of a stack: a
  * hollow diamond (the slices are solid ◆) signalling "the whole this
  * stack was carved from", kept around until it's `wt rm`'d post-split.
@@ -166,7 +153,7 @@ function StackGutter({ row }: { row: WorktreeRow }) {
     );
   }
   const ordFg = row.archived ? theme.fgDim : statusBadge(row.status).fg;
-  const ord = String(info.ordinal).padStart(2, "0").slice(0, 2);
+  const ord = stackOrdinalLabel(info.ordinal);
   return (
     <box flexShrink={0} flexDirection="row">
       <box width={1} flexShrink={0}>

@@ -43,6 +43,12 @@ import { checkBadge, reviewBadge } from "../badges.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { StackManifest } from "../../core/wtstate.ts";
+import {
+  layoutStack,
+  STACK_CONNECTOR,
+  stackOrdinalLabel,
+  type SpinePos,
+} from "../../core/stack-layout.ts";
 
 /**
  * What the detail pane shows when a FOLDED section header is the cursor: the
@@ -591,23 +597,37 @@ function sliceGlyph(status: StackManifest["slices"][number]["status"]): {
   return { t: "·", fg: theme.fgDim };
 }
 
-/** The stack chain (ordinal · status · title · PR), like `wt stack status`. */
+/** The stack chain (spine · ordinal · status · title · PR), like `wt stack
+ *  status`. Rows come from `layoutStack` so the lane order, connector
+ *  glyphs, and ordinal labels match the expanded list gutter exactly. */
 function StackChain({ manifest }: { manifest: StackManifest }) {
-  const slices = [...manifest.slices].sort((a, b) => a.ordinal - b.ordinal);
   const count = (s: StackManifest["slices"][number]["status"]) =>
-    slices.filter((x) => x.status === s).length;
+    manifest.slices.filter((x) => x.status === s).length;
+  const nodes = layoutStack(manifest).nodes;
+  // layoutStack degrades gracefully on a malformed manifest (cycle /
+  // dangling parent) by dropping the affected slices; append those flat
+  // so the summary still lists every slice.
+  const laidOut = new Set(nodes.map((n) => n.slice.id));
+  const rows: { slice: StackManifest["slices"][number]; pos: SpinePos }[] = [
+    ...nodes.map((n) => ({ slice: n.slice, pos: n.pos })),
+    ...manifest.slices
+      .filter((s) => !laidOut.has(s.id))
+      .sort((a, b) => a.ordinal - b.ordinal)
+      .map((s) => ({ slice: s, pos: "single" as SpinePos })),
+  ];
   return (
     <>
       <text fg={theme.fgDim} wrapMode="none" truncate>
         {count("merged")} merged · {count("open")} open · {count("planned")} planned
       </text>
       <box height={1} flexShrink={0} />
-      {slices.map((s) => {
+      {rows.map(({ slice: s, pos }) => {
         const g = sliceGlyph(s.status);
         const pr = s.pr ? ` #${s.pr}` : "";
         return (
           <box key={s.id} flexDirection="row">
-            <text fg={theme.fgDim} wrapMode="none">{String(s.ordinal).padStart(2, "0")} </text>
+            <text fg={theme.fgDim} wrapMode="none">{STACK_CONNECTOR[pos]}</text>
+            <text fg={theme.fgDim} wrapMode="none">{`${stackOrdinalLabel(s.ordinal)} `}</text>
             <text fg={g.fg} wrapMode="none">{`${g.t} `}</text>
             {/* Flex-grow + overflow-hidden gives the title a bounded width so
                 `truncate` ellipsises a long slice title instead of overflowing

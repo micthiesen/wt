@@ -99,9 +99,30 @@ export function topoSortSlices(manifest: StackManifest): StackSlice[] {
  * tree-connector glyph: `single` = a one-slice lane (blank, no spine),
  * `first` = a chain root with children (┌), `last` = a chain tip (└),
  * `middle` = a stacked link in between (├). The glyphs themselves live
- * in `STACK_CONNECTOR` (tui/panels/list.tsx).
+ * in `STACK_CONNECTOR` below.
  */
 export type SpinePos = "single" | "first" | "middle" | "last";
+
+/**
+ * Tree-spine connector glyph for a managed-stack row, by the slice's
+ * position in its lane. `single` = a standalone lane (blank — no chain
+ * above/below to draw, so draw nothing); `first` ┌ = chain root with
+ * children; `middle` ├ = a stacked link; `last` └ = the chain tip.
+ * Shared by the worktree list gutter and the folded-stack summary in
+ * the details pane so the spine reads identically in both.
+ */
+export const STACK_CONNECTOR: Record<SpinePos, string> = {
+  single: " ",
+  first: "┌",
+  middle: "├",
+  last: "└",
+};
+
+/** Canonical 2-cell ordinal label (`01`, `02`, …) used wherever a stack
+ *  ordinal renders next to the connector glyph. */
+export function stackOrdinalLabel(ordinal: number): string {
+  return String(ordinal).padStart(2, "0").slice(0, 2);
+}
 
 export type StackNode = {
   stackId: string;
