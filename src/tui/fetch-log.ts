@@ -41,9 +41,15 @@ export function attachFetchLogs(client: QueryClient): () => void {
       log.event.dim(`fetching ${meta.label}...`);
     } else if (action.type === "success") {
       const start = starts.get(event.query.queryHash);
-      const dur = start ? ` (${formatDuration(Date.now() - start)})` : "";
+      // `success` also fires for non-fetch data writes — the persister's
+      // startup restore and optimistic `setQueriesData` patches dispatch
+      // one per matching cache entry (every stale `["github", <old
+      // branches>]` key included), which showed up as 80+ identical
+      // "fetched GitHub" lines in a single second. Only log the
+      // completion of a fetch we saw start.
+      if (start === undefined) return;
       starts.delete(event.query.queryHash);
-      log.event.dim(`fetched ${meta.label}${dur}`);
+      log.event.dim(`fetched ${meta.label} (${formatDuration(Date.now() - start)})`);
     } else if (action.type === "error") {
       starts.delete(event.query.queryHash);
       const err = action.error;
