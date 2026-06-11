@@ -797,8 +797,11 @@ export function App({ onExit }: Props) {
   // Stack section AI title pipeline. The title describes section
   // membership, so it reads from `rows` directly. Members preserve
   // `rows` order (chain depth from the row aggregator).
-  const stackSectionMembers = useMemo((): Map<string, StackMember[]> => {
-    const byName = new Map<string, StackMember[]>();
+  const stackSectionMembers = useMemo((): Map<
+    string,
+    { members: StackMember[]; ready: boolean }
+  > => {
+    const byName = new Map<string, { members: StackMember[]; ready: boolean }>();
     for (const r of rows) {
       if (!r.sectionIsStack || r.section === null) continue;
       // The holistic origin's brief is the whole-feature title; it would
@@ -810,17 +813,18 @@ export function App({ onExit }: Props) {
       // Skipping keeps the signature stable and the prompt clean.
       if (!r.wt.branch) continue;
       const { id, rest } = slugLabel(r.wt.slug);
-      // Brief is the LLM's pithy noun phrase. Falls back to the
-      // slug-derived label so a brand-new stack — no member has
-      // produced an AI summary yet — still gets a useful prompt.
-      // (Briefs aren't part of the cache key, only fetch-time flavor.)
+      // Brief is the LLM's pithy noun phrase, falling back to the
+      // slug-derived label. `ready` flips false while any member still
+      // lacks a real brief — the title fetch is gated on it (below)
+      // because slug fragments alone are too thin to name from.
       const brief = r.brief ?? (rest || id || r.wt.slug);
-      let arr = byName.get(r.section);
-      if (!arr) {
-        arr = [];
-        byName.set(r.section, arr);
+      let entry = byName.get(r.section);
+      if (!entry) {
+        entry = { members: [], ready: true };
+        byName.set(r.section, entry);
       }
-      arr.push({ branch: r.wt.branch, brief });
+      entry.members.push({ branch: r.wt.branch, brief });
+      if (r.brief == null) entry.ready = false;
     }
     return byName;
   }, [rows]);
@@ -832,8 +836,15 @@ export function App({ onExit }: Props) {
   // mid-session doesn't flicker the divider through the storage name
   // — the prior title stays on screen while the new key fetches.
   const stackTitleResults = useQueries({
-    queries: stackSectionEntries.map(([name, members]) => ({
+    queries: stackSectionEntries.map(([name, { members, ready }]) => ({
       ...stackTitleQuery(name, members),
+      // Hold the fetch until every member has a real LLM brief. Titles
+      // cache forever under the membership signature, so a cold fire
+      // with slug-fallback briefs bakes in a junk name — the model has
+      // nothing real to work with and leans on its own instructions
+      // (the "TUI Header Orchestration Stack" incident). A cached
+      // entry still renders while disabled; only generation waits.
+      enabled: ready && members.length > 0 && !!config.ai,
       placeholderData: keepPreviousData,
     })),
   });

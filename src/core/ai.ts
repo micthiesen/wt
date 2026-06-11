@@ -29,7 +29,7 @@ Rules:
 
 Return only the formatted output. Nothing before TITLE, nothing after the description.`;
 
-const STACK_SYSTEM_PROMPT = `You name a stack of related git branches for a developer's TUI section header.
+const STACK_SYSTEM_PROMPT = `You name a group of related git branches for a section header in a developer tool.
 
 Output exactly:
 TITLE: <name>
@@ -37,7 +37,8 @@ TITLE: <name>
 Rules:
 - Find the common theme — what unifies the branches. Often a feature, subsystem, or area they all touch.
 - TITLE: 4 words maximum. Caveman noun phrase, no leading verb ("Add", "Fix", "Refactor"...), no articles, no quotes, no trailing period.
-- Examples: "Auto-merge support", "Markdown link popover", "Reviewer picker UI", "Stack rebase + push".
+- Examples: "Auto-merge support", "Markdown link popover", "Reviewer picker UI", "Atomic builder claim".
+- Name the WORK, not its packaging: never echo words from these instructions ("stack", "branch", "section", "header", "TUI", "group") unless the changes themselves are about that concept.
 - If the branches look unrelated, pick the most prominent shared theme rather than listing them.
 
 Return only the TITLE line.`;

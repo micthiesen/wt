@@ -605,13 +605,21 @@ export type StackMember = { branch: string; brief: string };
  *
  * Sentinel `__empty__` for an empty list pairs with the `enabled`
  * guard so the queryFn never runs against it.
+ *
+ * The `v2` salt orphans every title generated before the briefs-ready
+ * gate existed: those fired with slug-fallback briefs and cached
+ * prompt-leakage junk ("TUI Header Orchestration Stack") forever.
+ * Orphaned entries age out of the persister via maxAge.
  */
 export function buildStackSignature(
   members: ReadonlyArray<StackMember>,
 ): string {
   if (members.length === 0) return "__empty__";
   const branches = members.map((m) => m.branch).sort();
-  return createHash("sha256").update(branches.join("\0")).digest("hex").slice(0, 16);
+  return createHash("sha256")
+    .update(["v2", ...branches].join("\0"))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 /**
