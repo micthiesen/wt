@@ -777,7 +777,7 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
                     <Divider
                       label={
                         row.section === null
-                          ? "inbox"
+                          ? "Inbox"
                           : row.sectionIsStack
                             ? stackSectionLabels.get(row.section) ?? row.section
                             : row.section

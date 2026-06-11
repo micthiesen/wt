@@ -19,7 +19,7 @@ type Props = {
 };
 
 function itemLabel(item: SectionPickerItem): string {
-  if (item.kind === "none") return "inbox";
+  if (item.kind === "none") return "Inbox";
   if (item.kind === "create") return "+ new section";
   return item.name;
 }

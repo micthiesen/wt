@@ -1610,7 +1610,7 @@ export function App({ onExit }: Props) {
     }
     const sectionVal = targetGroup === GROUP_INBOX ? null : targetGroup;
     placeSlug(slug, sectionVal, dir > 0 ? "top" : "bottom").then(
-      () => toast(`moved to ${sectionVal ?? "inbox"}`, theme.info, 1200),
+      () => toast(`moved to ${sectionVal ?? "Inbox"}`, theme.info, 1200),
       (err) => reportActionError("move", err),
     );
   }
@@ -1650,7 +1650,7 @@ export function App({ onExit }: Props) {
   function commitSectionPick(item: SectionPickerItem, slug: string): void {
     if (item.kind === "none") {
       setSection(slug, null).then(
-        () => toast("moved to inbox", theme.info, 1500),
+        () => toast("moved to Inbox", theme.info, 1500),
         (err) => reportActionError("move", err),
       );
       setLastMoveTarget(null);
@@ -1682,7 +1682,7 @@ export function App({ onExit }: Props) {
   function openSectionRename(): void {
     if (!current || current.archived) return;
     if (current.section === null) {
-      toast("the inbox can't be renamed", theme.fgDim, 1500);
+      toast("the Inbox can't be renamed", theme.fgDim, 1500);
       return;
     }
     if (current.sectionIsStack) {
