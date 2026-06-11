@@ -10,7 +10,7 @@
  * format that's robust to small-model formatting drift. Co-generation
  * shares one round trip and one diff-context build per cache key.
  */
-import { config } from "./config.ts";
+import { config, type AiConfig } from "./config.ts";
 import { chainSignal } from "./proc.ts";
 
 const SYSTEM_PROMPT = `You summarise git changes for a developer scanning their worktrees.
@@ -111,9 +111,33 @@ export async function summarizeStack(
 }
 
 /**
+ * Module-level serial queue over the LM Studio endpoint. A restack /
+ * rebase flips many diff hashes at once, and the resulting burst of
+ * concurrent summary fetches stampedes the single local model into
+ * request timeouts (observed ~23% failure rate, clustered in those
+ * windows). One in-flight request at a time keeps each call fast and
+ * the failure mode boring. Tasks run on settled predecessors, so one
+ * failure doesn't poison the queue.
+ */
+let chatQueueTail: Promise<unknown> = Promise.resolve();
+
+function enqueueChat<T>(task: () => Promise<T>): Promise<T> {
+  const next = chatQueueTail.then(task, task);
+  chatQueueTail = next.catch(noop);
+  return next;
+}
+
+/**
  * Single round-trip to the OpenAI-compatible `/v1/chat/completions`
  * endpoint. Shared by `summarizeDiff` and `summarizeStack` so both
  * use the same abort chaining, timeout handling, and error messages.
+ *
+ * Calls are serialized through `enqueueChat`, and the per-call timeout
+ * starts when the request actually goes out — not while it waits in the
+ * queue, which would re-create the stampede failure with extra steps.
+ * A failed attempt gets one retry (transient resets from a busy /
+ * model-swapping server recover on the spot); an external abort — the
+ * observer was cancelled, nobody wants the result — does not.
  */
 async function callChat(
   systemPrompt: string,
@@ -121,11 +145,39 @@ async function callChat(
   maxTokens: number,
   external?: AbortSignal,
 ): Promise<string> {
-  if (!config.ai) {
+  const ai = config.ai;
+  if (!ai) {
     throw new Error("AI is not configured ([ai] missing in config.toml)");
   }
+  return enqueueChat(async () => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // The caller may have been cancelled while this call sat in the
+      // queue (or during the retry pause) — bail before sending.
+      external?.throwIfAborted();
+      if (attempt > 0) await sleep(500);
+      try {
+        return await requestChat(ai, systemPrompt, userPrompt, maxTokens, external);
+      } catch (err) {
+        if (external?.aborted) throw err;
+        lastErr = err;
+      }
+    }
+    throw lastErr;
+  });
+}
+
+/** One HTTP attempt against the chat endpoint. Timeout + abort scoped
+ *  to this attempt; retry policy lives in `callChat`. */
+async function requestChat(
+  ai: AiConfig,
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number,
+  external?: AbortSignal,
+): Promise<string> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), config.ai.timeoutMs);
+  const timer = setTimeout(() => ctrl.abort(), ai.timeoutMs);
   // Forward an external abort (queryFn cancellation) into the same
   // controller so fetch sees a single signal.
   const cleanupAbort = external
@@ -133,12 +185,12 @@ async function callChat(
     : noop;
   let res: Response;
   try {
-    res = await fetch(`${config.ai.endpoint}/v1/chat/completions`, {
+    res = await fetch(`${ai.endpoint}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       signal: ctrl.signal,
       body: JSON.stringify({
-        model: config.ai.model,
+        model: ai.model,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
@@ -155,7 +207,7 @@ async function callChat(
     // (check LM Studio / bump the timeout) and the appended err.message
     // carries the distinction when it matters.
     throw new Error(
-      `LM Studio unreachable at ${config.ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
+      `LM Studio unreachable at ${ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
     );
   } finally {
     clearTimeout(timer);
@@ -164,7 +216,10 @@ async function callChat(
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`LM Studio HTTP ${res.status}: ${body.slice(0, 200) || res.statusText}`);
+    // Squash to one line — LM Studio 500s return a full HTML error
+    // page, which otherwise dumps line-by-line into the activity pane.
+    const oneLine = body.replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(`LM Studio HTTP ${res.status}: ${oneLine || res.statusText}`);
   }
 
   let parsed: ChatResponse;
@@ -232,6 +287,9 @@ export function parseTitleDescription(text: string): AiSummary {
 }
 
 const noop = (): void => {};
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 function cleanInline(t: string): string {
   return t

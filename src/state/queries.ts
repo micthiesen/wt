@@ -565,6 +565,10 @@ export const aiSummaryQuery = (
         aiLog.event.dim(`called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
         return out;
       } catch (err) {
+        // A cancelled observer (diff hash flipped again, row unmounted)
+        // aborts the in-flight call — routine supersession, not a
+        // failure worth an activity-pane line.
+        if (signal.aborted) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         aiLog.event.err(
           `LM Studio failed for ${slug} (${formatDuration(Date.now() - start)}): ${msg}`,
@@ -644,6 +648,9 @@ export const stackTitleQuery = (
         );
         return title;
       } catch (err) {
+        // Same cancellation gate as aiSummaryQuery: an aborted signal
+        // is supersession, not a failure.
+        if (signal.aborted) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         aiLog.event.err(
           `naming stack ${sectionName} failed (${formatDuration(Date.now() - start)}): ${msg}`,
