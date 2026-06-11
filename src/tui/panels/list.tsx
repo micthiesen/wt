@@ -514,8 +514,11 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
           {items.map((item, i) => {
             // Section context of the previous item (a worktree's section, or a
             // folded section's key) drives the divider/blank-line transitions.
+            // `undefined` (no previous item) is distinct from `null` (previous
+            // item is in the inbox) so the inbox divider still renders when an
+            // inbox row opens the list.
             const prev = i > 0 ? items[i - 1] : undefined;
-            const prevSection = prev ? (prev.kind === "wt" ? prev.row.section : prev.sectionKey) : null;
+            const prevSection = prev ? (prev.kind === "wt" ? prev.row.section : prev.sectionKey) : undefined;
 
             // A folded section collapses to one selectable header line — it IS
             // the section divider (a `[×NN]` chip + label in place of the rule),
@@ -532,18 +535,14 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
 
             // Section transition: a blank line above the divider, then the
             // divider, then the section's rows immediately — no blank
-            // between a header and its worktrees. The inbox at the very
-            // top gets no header (implicit list); groups are freely
-            // reorderable though, so when the inbox sits anywhere BELOW
-            // another group its rows would visually attach to that
-            // group — it gets a labeled divider like everyone else then.
-            // When the very first row belongs to a section, the leading
-            // blank still renders so the list opens with breathing room
-            // above the first header rather than butting it to the border.
+            // between a header and its worktrees. The inbox renders a
+            // labeled divider like every other group — even at the very
+            // top with nothing else around it — so the list always reads
+            // the same regardless of how many groups exist. The leading
+            // blank renders above the first header too, so the list opens
+            // with breathing room rather than butting it to the border.
             const row = item.row;
-            const sectionChanged = prevSection !== row.section;
-            const showDivider =
-              sectionChanged && (row.section !== null || prev !== undefined);
+            const showDivider = prevSection !== row.section;
             return (
               <Fragment key={row.wt.slug}>
                 {showDivider ? (
