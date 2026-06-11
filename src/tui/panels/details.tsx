@@ -27,7 +27,9 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
-import { StatusKind, type Status } from "../../core/types.ts";
+import { StatusKind } from "../../core/types.ts";
+import type { HarnessId } from "../../core/harness/index.ts";
+import type { DerivedState } from "../../core/claude-status.ts";
 import { useGithub } from "../../state/hooks.ts";
 import {
   aiSummaryQuery,
@@ -40,6 +42,7 @@ import { ageMsToText, ELLIPSIS } from "../text.ts";
 import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { NF } from "../icons.ts";
 import { checkBadge, reviewBadge, statusBadge } from "../badges.ts";
+import { BadgeCluster } from "../badge-cluster.tsx";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { StackManifest } from "../../core/wtstate.ts";
@@ -56,13 +59,18 @@ import {
  * the live manifest, so this pane stays free of state reads.
  */
 export type SectionMember = {
-  slug: string;
-  status: Status;
-  archived: boolean;
   /** Same label the list row shows (`rowLabel`), so the folded summary
    *  and the expanded rows read identically. */
   label: string;
-  pr: number | null;
+  /** The live list row — status/archived plus everything the shared
+   *  badge cluster reads (pr, mq, deploy). */
+  row: WorktreeRow;
+  /** Badge-cluster inputs the list pane computes per slug (action
+   *  glyph, harness session glyph + tint), passed through so the
+   *  folded summary shows the identical cluster. */
+  actionRunning: boolean;
+  activeHarnessId: HarnessId | undefined;
+  sessionState: DerivedState | undefined;
 };
 
 export type SectionDetail = {
@@ -607,10 +615,21 @@ function sliceGlyph(status: StackManifest["slices"][number]["status"]): {
   return { t: "·", fg: theme.fgDim };
 }
 
-/** The stack chain (spine · ordinal · status · title · PR), like `wt stack
- *  status`. Rows come from `layoutStack` so the lane order, connector
- *  glyphs, and ordinal labels match the expanded list gutter exactly. */
-function StackChain({ manifest }: { manifest: StackManifest }) {
+/** The stack chain (spine · ordinal · status · title · badges), like
+ *  `wt stack status`. Rows come from `layoutStack` so the lane order,
+ *  connector glyphs, and ordinal labels match the expanded list gutter
+ *  exactly; the right side renders the shared list-pane badge cluster
+ *  for slices with a live worktree (matched by branch), falling back
+ *  to the dim PR number for slices without one (planned, or merged +
+ *  cleaned). */
+function StackChain({
+  manifest,
+  members,
+}: {
+  manifest: StackManifest;
+  members: SectionMember[];
+}) {
+  const memberByBranch = new Map(members.map((m) => [m.row.wt.branch, m]));
   const count = (s: StackManifest["slices"][number]["status"]) =>
     manifest.slices.filter((x) => x.status === s).length;
   const nodes = layoutStack(manifest).nodes;
@@ -633,7 +652,7 @@ function StackChain({ manifest }: { manifest: StackManifest }) {
       <box height={1} flexShrink={0} />
       {rows.map(({ slice: s, pos }) => {
         const g = sliceGlyph(s.status);
-        const pr = s.pr ? ` #${s.pr}` : "";
+        const member = memberByBranch.get(s.branch);
         return (
           <box key={s.id} flexDirection="row">
             <text fg={theme.fgDim} wrapMode="none">{STACK_CONNECTOR[pos]}</text>
@@ -645,7 +664,16 @@ function StackChain({ manifest }: { manifest: StackManifest }) {
             <box flexGrow={1} flexShrink={1} overflow="hidden">
               <text fg={theme.fg} wrapMode="none" truncate>{s.title}</text>
             </box>
-            {pr ? <text fg={theme.fgDim} wrapMode="none">{pr}</text> : null}
+            {member ? (
+              <BadgeCluster
+                row={member.row}
+                actionRunning={member.actionRunning}
+                activeHarnessId={member.activeHarnessId}
+                sessionState={member.sessionState}
+              />
+            ) : s.pr ? (
+              <text fg={theme.fgDim} wrapMode="none">{` #${s.pr}`}</text>
+            ) : null}
           </box>
         );
       })}
@@ -653,14 +681,18 @@ function StackChain({ manifest }: { manifest: StackManifest }) {
   );
 }
 
-/** The manual-section member list (status · label · PR), mirroring the
- *  StackChain row format minus the spine — manual members have no
- *  dependency relationships, so there's no tree to draw. */
+/** The manual-section member list (status · label · badges), mirroring
+ *  the StackChain row format minus the spine — manual members have no
+ *  dependency relationships, so there's no tree to draw. The right side
+ *  is the shared list-pane badge cluster, identical per row. */
 function SectionMembers({ members }: { members: SectionMember[] }) {
   // Status breakdown in StatusKind declaration order, non-zero kinds
   // only — the kind values double as display words ("dirty", "clean").
   const breakdown = Object.values(StatusKind)
-    .map((k) => ({ k, n: members.filter((m) => m.status.kind === k).length }))
+    .map((k) => ({
+      k,
+      n: members.filter((m) => m.row.status.kind === k).length,
+    }))
     .filter(({ n }) => n > 0)
     .map(({ k, n }) => `${n} ${k}`)
     .join(" · ");
@@ -671,25 +703,31 @@ function SectionMembers({ members }: { members: SectionMember[] }) {
       </text>
       <box height={1} flexShrink={0} />
       {members.map((m) => {
-        const b = statusBadge(m.status);
+        const b = statusBadge(m.row.status);
+        const dim = m.row.archived;
         return (
-          <box key={m.slug} flexDirection="row">
+          <box key={m.row.wt.slug} flexDirection="row">
             <box width={2} flexShrink={0}>
-              <text fg={m.archived ? theme.fgDim : b.fg} wrapMode="none">{b.glyph}</text>
+              <text fg={dim ? theme.fgDim : b.fg} wrapMode="none">{b.glyph}</text>
             </box>
             <box width={1} flexShrink={0}>
               <text> </text>
             </box>
             <box flexGrow={1} flexShrink={1} overflow="hidden">
               <text
-                fg={m.archived ? theme.fgDim : theme.fg}
+                fg={dim ? theme.fgDim : theme.fg}
                 wrapMode="none"
                 truncate
               >
                 {m.label}
               </text>
             </box>
-            {m.pr ? <text fg={theme.fgDim} wrapMode="none">{` #${m.pr}`}</text> : null}
+            <BadgeCluster
+              row={m.row}
+              actionRunning={m.actionRunning}
+              activeHarnessId={m.activeHarnessId}
+              sessionState={m.sessionState}
+            />
           </box>
         );
       })}
@@ -718,7 +756,7 @@ function SectionSummaryBody({ section, width }: { section: SectionDetail; width:
       </box>
       <box height={1} flexShrink={0} />
       {section.manifest ? (
-        <StackChain manifest={section.manifest} />
+        <StackChain manifest={section.manifest} members={section.members} />
       ) : (
         <SectionMembers members={section.members} />
       )}

@@ -955,27 +955,6 @@ export function App({ onExit }: Props) {
     currentItem?.kind === "pr" ? currentItem.pr : undefined;
   const selectedSection =
     currentItem?.kind === "section" ? currentItem : undefined;
-  // Enrich the folded section with its live manifest for the detail-pane
-  // summary (kept out of `Details` so that pane stays free of state reads).
-  const sectionDetail = useMemo<SectionDetail | undefined>(() => {
-    if (!selectedSection) return undefined;
-    const stackId = selectedSection.isStack
-      ? selectedSection.sectionKey.slice(STACK_SECTION_PREFIX.length)
-      : null;
-    return {
-      sectionKey: selectedSection.sectionKey,
-      isStack: selectedSection.isStack,
-      label: selectedSection.label,
-      manifest: stackId ? wtStateForStacks.data?.stacks[stackId] ?? null : null,
-      members: selectedSection.rows.map((r) => ({
-        slug: r.wt.slug,
-        status: r.status,
-        archived: r.archived,
-        label: rowLabel(r),
-        pr: r.pr?.number ?? null,
-      })),
-    };
-  }, [selectedSection, wtStateForStacks.data]);
   // Stash the resolved index so it's available as a fallback the next
   // time the slug can't be found. Writing during render is safe — the
   // value is derived purely from this render's inputs, the write is
@@ -1033,6 +1012,32 @@ export function App({ onExit }: Props) {
     sessionWorktrees,
     primaryHarness,
   );
+  // Enrich the folded section with its live manifest + per-member
+  // badge-cluster inputs for the detail-pane summary (kept out of
+  // `Details` so that pane stays free of state reads). Members carry
+  // the full row plus the same action/session signals the list pane
+  // computes, so the summary's badge cluster can't drift from the
+  // expanded rows. Lives below `activeActions`/`activeSessionBySlug`
+  // since it closes over both.
+  const sectionDetail = useMemo<SectionDetail | undefined>(() => {
+    if (!selectedSection) return undefined;
+    const stackId = selectedSection.isStack
+      ? selectedSection.sectionKey.slice(STACK_SECTION_PREFIX.length)
+      : null;
+    return {
+      sectionKey: selectedSection.sectionKey,
+      isStack: selectedSection.isStack,
+      label: selectedSection.label,
+      manifest: stackId ? wtStateForStacks.data?.stacks[stackId] ?? null : null,
+      members: selectedSection.rows.map((r) => ({
+        label: rowLabel(r),
+        row: r,
+        actionRunning: activeActions.has(r.wt.slug),
+        activeHarnessId: activeSessionBySlug.get(r.wt.slug)?.harnessId,
+        sessionState: activeSessionBySlug.get(r.wt.slug)?.state ?? undefined,
+      })),
+    };
+  }, [selectedSection, wtStateForStacks.data, activeActions, activeSessionBySlug]);
   // LLM-authored summary snippets for the picker's currently-open
   // worktree. Only fetched when the picker is open (gated by
   // `enabled`); the queryFn does light tail-bounded disk reads
