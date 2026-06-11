@@ -659,6 +659,33 @@ export function setSlugBase(
 }
 
 /**
+ * Drop every slug's recorded fork base that points at `branch`. Called
+ * by destroy after the branch is deleted — a dangling record would
+ * keep rendering "(forked)" against a ref that no longer resolves
+ * (the diff layer degrades to trunk via `effectiveBaseOrTrunk`, but
+ * the stale label and sync counts linger). Returns the affected slugs
+ * for logging.
+ */
+export function clearBaseReferences(branch: string): string[] {
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const affected = Object.entries(state.slugs)
+      .filter(([, s]) => s.baseBranch === branch)
+      .map(([slug]) => slug);
+    if (affected.length === 0) return affected;
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    for (const slug of affected) {
+      const entry: WtSlugState = { ...next.slugs[slug]! };
+      delete entry.baseBranch;
+      delete entry.baseSha;
+      next.slugs[slug] = entry;
+    }
+    writeWtState(next);
+    return affected;
+  });
+}
+
+/**
  * Convenience for the common "assign this slug to that section, drop
  * it at the bottom" path used by the picker.
  */

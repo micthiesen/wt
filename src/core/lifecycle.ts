@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./claude-sessions.ts";
 import { clearCodexNames } from "./codex-sessions.ts";
-import { clearSlugState, setSlugBase } from "./wtstate.ts";
+import { clearBaseReferences, clearSlugState, setSlugBase } from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet, originBranchExists, revParse } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
@@ -341,6 +341,20 @@ export async function removeWorktree(
       }
     }
 
+    // The deleted branch may be some OTHER worktree's recorded fork
+    // base (`wt new --base`). Drop those records now so the dependents
+    // stop rendering "(forked)" against a ref that no longer exists —
+    // their diff/sync silently degrade to trunk, which is also what
+    // clearing makes explicit.
+    if (deletedBranch && wt.branch) {
+      const cleared = clearBaseReferences(wt.branch);
+      if (cleared.length > 0) {
+        opts.onLog?.(
+          `cleared fork base on ${cleared.join(", ")} (forked from the deleted ${wt.branch})`,
+        );
+      }
+    }
+
     // Note: archive.json / state.json entries for THIS slug are NOT
     // cleared here. Doing so from the child process while the parent
     // TUI's worktreesQuery cache still includes this slug causes the
@@ -354,8 +368,10 @@ export async function removeWorktree(
     // ghosts.
     //
     // Stack relationships live in the manifest (wtState.stacks), not in
-    // per-slug state, so there's nothing to clear on the dependents of a
-    // removed branch — `wt stack rebase` reconciles the manifest.
+    // per-slug state, so manifest dependents of a removed branch need no
+    // clearing here — `wt stack rebase` reconciles the manifest. (Fork-
+    // base records ARE per-slug and are swept above when the branch is
+    // deleted.)
 
     return {
       ok: true,

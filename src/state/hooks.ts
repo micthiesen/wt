@@ -91,13 +91,14 @@ import {
   toggleArchived as toggleArchivedOnDisk,
 } from "../core/archive.ts";
 import type { DiffContext } from "../core/diff/index.ts";
-import { invalidateMainFirstParents } from "../core/git.ts";
+import { gitRun, invalidateMainFirstParents } from "../core/git.ts";
 import { fetchAuthenticatedLogin } from "../core/github.ts";
-import type { PullRequest } from "../core/types.ts";
+import type { PullRequest, Worktree } from "../core/types.ts";
 import {
   moveGroupPast as moveGroupPastOnDisk,
   placeSlug as placeSlugOnDisk,
   renameSection as renameSectionOnDisk,
+  setSlugBase as setSlugBaseOnDisk,
   setSlugSection as setSlugSectionOnDisk,
   swapOrders as swapOrdersOnDisk,
   toggleSectionFolded as toggleSectionFoldedOnDisk,
@@ -588,6 +589,28 @@ export function useWtActions() {
     async setSection(slug: string, section: string | null): Promise<void> {
       setSlugSectionOnDisk(slug, section);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
+    },
+    /**
+     * Record (or clear, with `null`) a worktree's fork base — the same
+     * per-slug record `wt new --base` writes. Display/diff only: no
+     * rebase happens, a manifest slice's parent still wins. Anchors the
+     * fork-point sha at merge-base (best-effort, like `wt base set`).
+     * Invalidates wtState (row relationship) AND the slug's `["wt"]`
+     * queries — diff context and sync counts are computed against the
+     * base, so they must re-run under the new one.
+     */
+    async setBase(wt: Worktree, branch: string | null): Promise<void> {
+      if (branch) {
+        const mb = await gitRun(["merge-base", wt.branch, branch], wt.path);
+        const sha = mb.exitCode === 0 ? mb.stdout.trim() : "";
+        setSlugBaseOnDisk(wt.slug, { branch, sha: sha || undefined });
+      } else {
+        setSlugBaseOnDisk(wt.slug, null);
+      }
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.wtState() }),
+        qc.invalidateQueries({ queryKey: qk.wt(wt.slug).all() }),
+      ]);
     },
     /**
      * Place a slug at the top or bottom of a section. Used by the

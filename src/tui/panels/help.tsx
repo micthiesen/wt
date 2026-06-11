@@ -33,6 +33,7 @@ const SECTIONS: Section[] = [
       ["l l", "confirm highlighted section"],
       ["l n", "new section (chord)"],
       ["L", "rename current section"],
+      ["b", "set fork base (picker · b b confirms) · record only, never rebases"],
       ["J / K", "move row · stack/folded section: move whole group"],
       ["a", "archive / restore"],
     ],

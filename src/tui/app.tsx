@@ -358,6 +358,18 @@ type Modal =
       resolve: (picked: string | null) => void;
     }
   | {
+      /**
+       * Fork-base picker (`b`). Rewrites the per-slug `baseBranch`
+       * record (the thing `wt new --base` / `wt base set` write) —
+       * display/diff only, never rebases anything. `branch: null` is
+       * the leading "none" row, which clears back to trunk.
+       */
+      kind: "basePicker";
+      slug: string;
+      items: Array<{ label: string; branch: string | null }>;
+      index: number;
+    }
+  | {
       kind: "reviewerPicker";
       title: string;
       items: MultiPickerItem[];
@@ -688,6 +700,7 @@ export function App({ onExit }: Props) {
     toggleArchived,
     archive,
     setSection,
+    setBase,
     swapOrder,
     placeSlug,
     renameSection,
@@ -1693,6 +1706,64 @@ export function App({ onExit }: Props) {
     // keyboard handler.
     setModal((m) =>
       m?.kind === "sectionPicker" ? { ...m, newName: "" } : m,
+    );
+  }
+
+  function openBasePicker(): void {
+    if (!current) return;
+    if (current.archived) {
+      toast("archived rows have no live worktree to diff", theme.fgDim, 2000);
+      return;
+    }
+    if (current.stack && !current.stack.isHolistic) {
+      toast("stack slices get their base from the manifest — use /restack or `wt stack`", theme.fgDim, 2500);
+      return;
+    }
+    const recorded =
+      current.stackedOn?.via === "fork" ? current.stackedOn.branch : null;
+    const siblings = rows
+      .filter((r) => !r.archived && r.wt.slug !== current.wt.slug)
+      .map((r) => r.wt.branch);
+    // A recorded base whose worktree was already cleaned (branch kept)
+    // wouldn't show up via the rows scan — surface it anyway so the
+    // "(current)" marker is always visible.
+    if (recorded && !siblings.includes(recorded)) siblings.unshift(recorded);
+    const items = [
+      {
+        label: `none — diff against ${config.branch.base}`,
+        branch: null as string | null,
+      },
+      ...siblings.map((b) => ({
+        label: b === recorded ? `${b} (current)` : b,
+        branch: b as string | null,
+      })),
+    ];
+    const idx = recorded ? items.findIndex((it) => it.branch === recorded) : 0;
+    setModal({
+      kind: "basePicker",
+      slug: current.wt.slug,
+      items,
+      index: Math.max(0, idx),
+    });
+  }
+
+  function commitBasePick(
+    item: { label: string; branch: string | null },
+    slug: string,
+  ): void {
+    setModal(null);
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row) return;
+    setBase(row.wt, item.branch).then(
+      () =>
+        toast(
+          item.branch
+            ? `base → ${item.branch} (record only, no rebase)`
+            : `base cleared — diffing against ${config.branch.base}`,
+          theme.info,
+          2000,
+        ),
+      (err) => reportActionError("set base", err),
     );
   }
 
@@ -3585,6 +3656,43 @@ export function App({ onExit }: Props) {
     }
   }
 
+  // Fork-base picker. Standard list-picker chord: `b b` confirms the
+  // highlight, digits quick-pick, Enter confirms, esc/q cancel.
+  function handleBasePickerKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "basePicker" }>,
+  ): void {
+    const bp = modal;
+    if (k.name === "j" || k.name === "down") {
+      setModal({
+        ...bp,
+        index: Math.min(bp.index + 1, bp.items.length - 1),
+      });
+      return;
+    }
+    if (k.name === "k" || k.name === "up") {
+      setModal({ ...bp, index: Math.max(bp.index - 1, 0) });
+      return;
+    }
+    if (k.sequence && /^[1-9]$/.test(k.sequence)) {
+      const item = bp.items[parseInt(k.sequence, 10) - 1];
+      if (item) commitBasePick(item, bp.slug);
+      return;
+    }
+    if (k.name === "return" || isPlainLetter(k, "b")) {
+      const item = bp.items[bp.index];
+      if (item) commitBasePick(item, bp.slug);
+      return;
+    }
+    if (
+      k.name === "escape" ||
+      k.sequence === "q" ||
+      (k.ctrl && k.name === "c")
+    ) {
+      setModal(null);
+    }
+  }
+
   // Yank chord: `y` opened the menu; the next key picks what to copy.
   // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
   // rather than re-entering normal mode, so a stray keystroke can't
@@ -3709,6 +3817,9 @@ export function App({ onExit }: Props) {
           break;
         case "branchPicker":
           handleBranchPickerKey(k, modal);
+          break;
+        case "basePicker":
+          handleBasePickerKey(k, modal);
           break;
         case "yank":
           handleYankKey(k);
@@ -4532,6 +4643,10 @@ export function App({ onExit }: Props) {
       openSectionPicker();
       return;
     }
+    if (isPlainLetter(k, "b")) {
+      openBasePicker();
+      return;
+    }
     if (isPlainLetter(k, "t")) {
       if (!config.ai) {
         toast("AI summary not configured", theme.warn, 2000);
@@ -4682,6 +4797,14 @@ export function App({ onExit }: Props) {
           title={modal.title}
           items={modal.items}
           selectedIndex={modal.index}
+        />
+      ) : null}
+      {modal?.kind === "basePicker" ? (
+        <PickerModal
+          title={`fork base for ${modal.slug}`}
+          items={modal.items.map((it) => it.label)}
+          selectedIndex={modal.index}
+          toggleKey="b"
         />
       ) : null}
       {modal?.kind === "reviewerPicker" ? (
