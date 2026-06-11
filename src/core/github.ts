@@ -695,6 +695,11 @@ export async function fetchReviewRequests(
     { cwd: config.paths.mainClone, timeoutMs: 15_000, signal },
   );
   if (r.exitCode !== 0) {
+    // An aborted signal means the query was cancelled mid-flight (refs
+    // churn invalidates this query; `run` SIGTERMs the child → exit
+    // 143). TanStack discards the cancelled fetch's result, so this is
+    // routine supersession, not a failure — stay silent.
+    if (signal?.aborted) return [];
     // `gh api graphql` puts GraphQL errors / rate-limit bodies on
     // stdout, not stderr — and a timeout/abort leaves both empty with
     // only a non-zero exit code. Log all three so the failure is
