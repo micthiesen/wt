@@ -230,6 +230,33 @@ export async function runTui(): Promise<TuiExit> {
   ];
   for (const key of ORPHANED_KEYS) wtClient.evict(key);
 
+  // Prune superseded `["github", <branches>]` entries. The PR query is
+  // keyed by the full sorted branch list, so every worktree-set change
+  // strands the previous key. Stale entries are pure dead weight —
+  // reads are exact-key only (`keepPreviousData` feeds placeholders
+  // from the observer's own prior result, not the cache) — yet they
+  // persist for 30 days, re-hydrate on every boot, and get walked by
+  // every optimistic `["github"]` patch. Keep the newest entry (warm
+  // data for first paint; if the branch set changed while wt was down
+  // this converges on the next boot) plus anything actively observed.
+  // After `restored` so the sweep sees the fully hydrated set.
+  void wtClient.restored.then(() => {
+    const githubEntries = wtClient.client
+      .getQueryCache()
+      .findAll({ queryKey: ["github"] })
+      .sort((a, b) => b.state.dataUpdatedAt - a.state.dataUpdatedAt);
+    const stale = githubEntries
+      .slice(1)
+      .filter((q) => q.getObserversCount() === 0);
+    for (const query of stale) wtClient.evict(query.queryKey);
+    if (stale.length > 0) {
+      startupLog.debug("pruned superseded github cache entries", {
+        pruned: stale.length,
+        kept: githubEntries.length - stale.length,
+      });
+    }
+  });
+
   // Opt-in (`WT_PERF=1`) probe that logs whenever the single JS thread
   // is blocked long enough to drop a frame / stall a keypress. Used to
   // confirm the diff-pool offload actually unblocked the render thread.
