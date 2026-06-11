@@ -179,7 +179,7 @@ function StackGutter({ row }: { row: WorktreeRow }) {
  * First char is capitalized to match PR-title convention even when the
  * LLM emits lowercase.
  */
-function rowLabel(row: WorktreeRow): string {
+export function rowLabel(row: WorktreeRow): string {
   // The holistic origin's title is the feature title — already on the
   // section header — so showing it again is noise. Label it for what it
   // is instead; the dim glyph + text mark it as the carved-from source.

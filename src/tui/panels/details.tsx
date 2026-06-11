@@ -27,7 +27,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
-import { StatusKind } from "../../core/types.ts";
+import { StatusKind, type Status } from "../../core/types.ts";
 import { useGithub } from "../../state/hooks.ts";
 import {
   aiSummaryQuery,
@@ -39,7 +39,7 @@ import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
 import { ageMsToText, ELLIPSIS } from "../text.ts";
 import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { NF } from "../icons.ts";
-import { checkBadge, reviewBadge } from "../badges.ts";
+import { checkBadge, reviewBadge, statusBadge } from "../badges.ts";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { StackManifest } from "../../core/wtstate.ts";
@@ -55,6 +55,16 @@ import {
  * stack/section overview. Built by `app.tsx` from the folded section item +
  * the live manifest, so this pane stays free of state reads.
  */
+export type SectionMember = {
+  slug: string;
+  status: Status;
+  archived: boolean;
+  /** Same label the list row shows (`rowLabel`), so the folded summary
+   *  and the expanded rows read identically. */
+  label: string;
+  pr: number | null;
+};
+
 export type SectionDetail = {
   /** Stable section identity — keys the body so an AI-title label change
    *  doesn't remount the pane under a stationary cursor. */
@@ -62,7 +72,7 @@ export type SectionDetail = {
   isStack: boolean;
   label: string;
   manifest: StackManifest | null;
-  memberSlugs: string[];
+  members: SectionMember[];
 };
 
 type Props = {
@@ -643,6 +653,50 @@ function StackChain({ manifest }: { manifest: StackManifest }) {
   );
 }
 
+/** The manual-section member list (status · label · PR), mirroring the
+ *  StackChain row format minus the spine — manual members have no
+ *  dependency relationships, so there's no tree to draw. */
+function SectionMembers({ members }: { members: SectionMember[] }) {
+  // Status breakdown in StatusKind declaration order, non-zero kinds
+  // only — the kind values double as display words ("dirty", "clean").
+  const breakdown = Object.values(StatusKind)
+    .map((k) => ({ k, n: members.filter((m) => m.status.kind === k).length }))
+    .filter(({ n }) => n > 0)
+    .map(({ k, n }) => `${n} ${k}`)
+    .join(" · ");
+  return (
+    <>
+      <text fg={theme.fgDim} wrapMode="none" truncate>
+        {breakdown || "no worktrees"}
+      </text>
+      <box height={1} flexShrink={0} />
+      {members.map((m) => {
+        const b = statusBadge(m.status);
+        return (
+          <box key={m.slug} flexDirection="row">
+            <box width={2} flexShrink={0}>
+              <text fg={m.archived ? theme.fgDim : b.fg} wrapMode="none">{b.glyph}</text>
+            </box>
+            <box width={1} flexShrink={0}>
+              <text> </text>
+            </box>
+            <box flexGrow={1} flexShrink={1} overflow="hidden">
+              <text
+                fg={m.archived ? theme.fgDim : theme.fg}
+                wrapMode="none"
+                truncate
+              >
+                {m.label}
+              </text>
+            </box>
+            {m.pr ? <text fg={theme.fgDim} wrapMode="none">{` #${m.pr}`}</text> : null}
+          </box>
+        );
+      })}
+    </>
+  );
+}
+
 /** Detail-pane body for a folded section header (stack or manual section). */
 function SectionSummaryBody({ section, width }: { section: SectionDetail; width: number }) {
   return (
@@ -666,17 +720,7 @@ function SectionSummaryBody({ section, width }: { section: SectionDetail; width:
       {section.manifest ? (
         <StackChain manifest={section.manifest} />
       ) : (
-        <>
-          <text fg={theme.fgDim} wrapMode="none" truncate>
-            {section.memberSlugs.length} worktree{section.memberSlugs.length === 1 ? "" : "s"}
-          </text>
-          <box height={1} flexShrink={0} />
-          {section.memberSlugs.map((s) => (
-            <box key={s} flexShrink={0} overflow="hidden">
-              <text fg={theme.fg} wrapMode="none" truncate>{`  ${s}`}</text>
-            </box>
-          ))}
-        </>
+        <SectionMembers members={section.members} />
       )}
       <box flexGrow={1} flexShrink={1} minHeight={0} />
       <text fg={theme.fgDim} wrapMode="none">TAB to expand</text>

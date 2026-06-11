@@ -95,7 +95,7 @@ import {
   SessionsPickerList,
   SessionsPickerNew,
 } from "./panels/sessions-picker.tsx";
-import { WorktreeList, type ListActiveItem, type ListScrollHandle } from "./panels/list.tsx";
+import { WorktreeList, rowLabel, type ListActiveItem, type ListScrollHandle } from "./panels/list.tsx";
 import type { SectionDetail } from "./panels/details.tsx";
 import { YankModal, yankItemsFor } from "./panels/yank.tsx";
 import { enterHarnessSession } from "./harness-session.ts";
@@ -967,7 +967,13 @@ export function App({ onExit }: Props) {
       isStack: selectedSection.isStack,
       label: selectedSection.label,
       manifest: stackId ? wtStateForStacks.data?.stacks[stackId] ?? null : null,
-      memberSlugs: selectedSection.rows.map((r) => r.wt.slug),
+      members: selectedSection.rows.map((r) => ({
+        slug: r.wt.slug,
+        status: r.status,
+        archived: r.archived,
+        label: rowLabel(r),
+        pr: r.pr?.number ?? null,
+      })),
     };
   }, [selectedSection, wtStateForStacks.data]);
   // Stash the resolved index so it's available as a fallback the next
