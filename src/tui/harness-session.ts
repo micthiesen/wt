@@ -18,19 +18,9 @@ import {
   killHarnessSession,
   type AttachResult,
 } from "../core/tmux.ts";
+import { handoffTerminal } from "./renderer-handoff.ts";
 
 export type EnterResult = AttachResult;
-
-/**
- * Clear-screen + cursor-home. opentui's suspend emits `\x1b[?1049l`
- * which drops the terminal back to its main screen, briefly exposing
- * whatever was there before wt started. Painting a clean screen into
- * that brief window replaces the pre-wt scroll with a uniform black
- * gap so the F12 transition reads as a clean cut rather than a flash
- * of unrelated content. Symmetric on resume so the same window on the
- * way back doesn't reveal the harness's last frame either.
- */
-const CLEAR_SCREEN = "\x1b[2J\x1b[H";
 
 export async function enterHarnessSession(opts: {
   renderer: CliRenderer;
@@ -91,19 +81,14 @@ export async function enterHarnessSession(opts: {
     );
     await killHarnessSession(slug, harnessId);
   }
-  renderer.suspend();
-  process.stdout.write(CLEAR_SCREEN);
-  try {
-    return await attachOrCreate({
+  return await handoffTerminal(renderer, () =>
+    attachOrCreate({
       slug,
       cwd,
       kind: harnessId,
       managedName,
       resumeSessionId,
       claudeDisplayName,
-    });
-  } finally {
-    process.stdout.write(CLEAR_SCREEN);
-    renderer.resume();
-  }
+    }),
+  );
 }

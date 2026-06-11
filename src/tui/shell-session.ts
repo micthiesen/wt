@@ -11,10 +11,9 @@
 import type { CliRenderer } from "@opentui/core";
 
 import { attachOrCreate, type AttachResult } from "../core/tmux.ts";
+import { handoffTerminal } from "./renderer-handoff.ts";
 
 export type ShellResult = AttachResult;
-
-const CLEAR_SCREEN = "\x1b[2J\x1b[H";
 
 export async function enterShellSession(opts: {
   renderer: CliRenderer;
@@ -22,12 +21,7 @@ export async function enterShellSession(opts: {
   cwd: string;
 }): Promise<ShellResult> {
   const { renderer, slug, cwd } = opts;
-  renderer.suspend();
-  process.stdout.write(CLEAR_SCREEN);
-  try {
-    return await attachOrCreate({ slug, cwd, kind: "shell" });
-  } finally {
-    process.stdout.write(CLEAR_SCREEN);
-    renderer.resume();
-  }
+  return await handoffTerminal(renderer, () =>
+    attachOrCreate({ slug, cwd, kind: "shell" }),
+  );
 }

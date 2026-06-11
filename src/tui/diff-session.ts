@@ -14,10 +14,9 @@
 import type { CliRenderer } from "@opentui/core";
 
 import { attachOrCreate, type AttachResult } from "../core/tmux.ts";
+import { handoffTerminal } from "./renderer-handoff.ts";
 
 export type DiffResult = AttachResult;
-
-const CLEAR_SCREEN = "\x1b[2J\x1b[H";
 
 export async function enterDiffSession(opts: {
   renderer: CliRenderer;
@@ -33,12 +32,7 @@ export async function enterDiffSession(opts: {
   base: string;
 }): Promise<DiffResult> {
   const { renderer, slug, cwd, base } = opts;
-  renderer.suspend();
-  process.stdout.write(CLEAR_SCREEN);
-  try {
-    return await attachOrCreate({ slug, cwd, kind: "diff", base });
-  } finally {
-    process.stdout.write(CLEAR_SCREEN);
-    renderer.resume();
-  }
+  return await handoffTerminal(renderer, () =>
+    attachOrCreate({ slug, cwd, kind: "diff", base }),
+  );
 }
