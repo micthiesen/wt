@@ -56,6 +56,7 @@ import { removeShellLog, shellTailRegistry } from "../core/shell-tail.ts";
 import { slugLabel, stageUrl } from "../core/stage.ts";
 import {
   claudeSessionName,
+  closeHarnessSessionGracefully,
   diffCommandUsesBase,
   injectIntoSession,
   killAllSessionsFor,
@@ -4297,6 +4298,37 @@ export function App({ onExit }: Props) {
         slug,
         index: initialIdx >= 0 ? initialIdx : 0,
       });
+      return;
+    }
+    // Ctrl+D — gracefully close the selected row's F12-target session
+    // (the one the list glyph shows) by typing the harness's own exit
+    // gesture into the pane: ctrl+d twice, exactly what you'd press
+    // inside claude to end the convo. The conversation persists and is
+    // F12-resumable; the hard `; x` kill stays for stuck sessions.
+    if (k.ctrl && k.name === "d" && !k.shift && !k.option && !k.meta) {
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const target = currentHarnessSessions.f12Target;
+      if (!target?.isLive) {
+        toast("no live session to close", theme.fgDim, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      const label = getHarness(target.harnessId).label;
+      createLogger(slug).event.info(`closing ${label} session (ctrl+d ×2)`);
+      void closeHarnessSessionGracefully(
+        slug,
+        target.harnessId,
+        target.extras.managedName,
+      ).then(
+        // The exit isn't instant (the harness shuts down, then tmux
+        // reaps the session) — nudge the poll shortly after instead of
+        // immediately, so the glyph flips without waiting a full tick.
+        () => setTimeout(() => void refreshTmuxSessions(), 800),
+        (err) => reportActionError("close session", err),
+      );
       return;
     }
     // F12 — toggle into the selected worktree's "F12 target" harness

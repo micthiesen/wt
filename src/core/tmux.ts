@@ -316,6 +316,33 @@ export async function killHarnessSession(
   await killByName(sessionName(slug, harnessId, managedName));
 }
 
+/**
+ * Gracefully end a harness session by typing the harness's own exit
+ * gesture into its pane — Ctrl+D twice, the same "I'm done with this
+ * convo" keys you'd press inside claude — rather than `kill-session`
+ * yanking the slot out from under it. The harness shuts down cleanly
+ * (conversation persisted, terminal restored) and the tmux session
+ * ends when its command exits. Best-effort by design: a harness with
+ * text in its input box ignores EOF, so the session just stays up and
+ * nothing is lost. No-ops on a missing session (send-keys just fails;
+ * `run` swallows the exit code).
+ */
+export async function closeHarnessSessionGracefully(
+  slug: string,
+  harnessId: HarnessId,
+  managedName: string | null = null,
+): Promise<void> {
+  const name = sessionName(slug, harnessId, managedName);
+  const send = () =>
+    run(["tmux", "-L", TMUX_SOCKET, "send-keys", "-t", `=${name}`, "C-d"]);
+  await send();
+  // A beat between the two presses: claude arms its "press ctrl+d
+  // again to exit" confirm on the first and needs a render tick before
+  // the second registers as the confirmation.
+  await new Promise((r) => setTimeout(r, 200));
+  await send();
+}
+
 /** Kill one worktree's diff session. Idempotent. */
 export async function killDiffSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "diff"));
