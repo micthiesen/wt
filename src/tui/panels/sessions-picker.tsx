@@ -116,6 +116,7 @@ export function SessionsPickerList({
         // controls the rendered row order for the "+ new" affordances)
         // so the hint reads top-to-bottom.
         [HARNESSES.map((h) => h.letter).join(" / "), "new …"],
+        ["d", "close"],
         ["x", "kill"],
         ["; / ⏎", "select"],
         ["esc / q", "cancel"],

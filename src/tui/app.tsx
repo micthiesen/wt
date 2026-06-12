@@ -3439,6 +3439,40 @@ export function App({ onExit }: Props) {
       // Highlight isn't on a session row — fall through so the
       // letter-shortcut loop below treats `x` as the codex jump key.
     }
+    // `d` gracefully closes the highlighted live session — types the
+    // harness's own exit gesture (ctrl+d ×2) into the pane, same as
+    // normal-mode ctrl+d does for the F12 target. `x` stays the hard
+    // tmux kill for stuck sessions.
+    if (k.sequence === "d" && !k.ctrl && !k.meta) {
+      const r = rowsLocal[idx];
+      if (r?.kind === "session") {
+        const e = r.entry;
+        if (!e.isLive) {
+          toast("session isn't live — nothing to close", theme.fgDim, 1500);
+          return;
+        }
+        appLog.event.info(
+          `closing ${getHarness(e.harnessId).label} session on ${slug} (ctrl+d ×2)`,
+        );
+        void closeHarnessSessionGracefully(
+          slug,
+          e.harnessId,
+          e.extras.managedName,
+        ).then(
+          // Not instant — the harness shuts down, then tmux reaps the
+          // session. Nudge both polls shortly after so the picker /
+          // glyph state flips without waiting a full tick.
+          () =>
+            setTimeout(() => {
+              void refreshTmuxSessions();
+              void refreshHarnessSessions(slug);
+            }, 800),
+          (err) => reportActionError("close session", err),
+        );
+        setModal(null);
+      }
+      return;
+    }
     // Per-harness letter — jump to the matching "+ new" row. The
     // user then presses `;` (or Enter) to confirm and spawn.
     for (const h of HARNESSES) {

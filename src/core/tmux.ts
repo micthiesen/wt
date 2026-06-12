@@ -333,8 +333,12 @@ export async function closeHarnessSessionGracefully(
   managedName: string | null = null,
 ): Promise<void> {
   const name = sessionName(slug, harnessId, managedName);
+  // `=${name}` alone is a valid SESSION target (kill-session) but
+  // send-keys resolves a PANE target, where the bare exact-match form
+  // errors with "can't find pane". The trailing `:` makes it
+  // exact-session + active-window, which pane resolution accepts.
   const send = () =>
-    run(["tmux", "-L", TMUX_SOCKET, "send-keys", "-t", `=${name}`, "C-d"]);
+    run(["tmux", "-L", TMUX_SOCKET, "send-keys", "-t", `=${name}:`, "C-d"]);
   await send();
   // A beat between the two presses: claude arms its "press ctrl+d
   // again to exit" confirm on the first and needs a render tick before
