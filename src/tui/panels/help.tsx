@@ -60,7 +60,7 @@ const SECTIONS: Section[] = [
       ["F12", "enter F12-target session · F12 again to detach"],
       ["ctrl+d", "close F12-target session gracefully (types ctrl+d ×2)"],
       ["⇧F12", "harness picker (one-off spawn)"],
-      ["TAB", "fold / unfold the section under the cursor"],
+      ["TAB", "fold / unfold the section under the cursor (Inbox too)"],
       ["⇧TAB", "cycle primary harness (top-right)"],
       [";", "sessions picker (all harnesses for current row)"],
       ["; c / x / o", "jump to + new claude / codex / opencode"],

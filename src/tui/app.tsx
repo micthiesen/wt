@@ -923,16 +923,25 @@ export function App({ onExit }: Props) {
     const out: ListActiveItem[] = [];
     const emitted = new Set<string>();
     for (const r of activeRows) {
-      const sec = r.section;
-      if (sec !== null && foldedSections.has(sec)) {
+      // Inbox rows (`section: null`) fold under the GROUP_INBOX
+      // sentinel — the same key that ranks the inbox in
+      // `sectionsOrder`, so a folded inbox header moves with J/K like
+      // any other group.
+      const sec = r.section ?? GROUP_INBOX;
+      if (foldedSections.has(sec)) {
         if (emitted.has(sec)) continue; // one header per section
         emitted.add(sec);
         out.push({
           kind: "section",
           sectionKey: sec,
           isStack: r.sectionIsStack,
-          label: r.sectionIsStack ? stackSectionLabels.get(sec) ?? sec : sec,
-          rows: activeRows.filter((x) => x.section === sec),
+          label:
+            r.section === null
+              ? "Inbox"
+              : r.sectionIsStack
+                ? stackSectionLabels.get(sec) ?? sec
+                : sec,
+          rows: activeRows.filter((x) => (x.section ?? GROUP_INBOX) === sec),
         });
       } else {
         out.push({ kind: "wt", row: r });
@@ -4402,9 +4411,12 @@ export function App({ onExit }: Props) {
         void toggleSectionFold(item.sectionKey);
         return;
       }
-      if (item?.kind === "wt" && item.row.section !== null && !item.row.archived) {
-        setSel(`section:${item.row.section}`);
-        void toggleSectionFold(item.row.section);
+      if (item?.kind === "wt" && !item.row.archived) {
+        // Inbox rows fold too — under the sentinel key, mirroring the
+        // activeItems builder.
+        const key = item.row.section ?? GROUP_INBOX;
+        setSel(`section:${key}`);
+        void toggleSectionFold(key);
         return;
       }
       toast("no section here to fold", theme.fgDim, 1500);
