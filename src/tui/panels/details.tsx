@@ -655,9 +655,14 @@ function StackChain({
         const member = memberByBranch.get(s.branch);
         return (
           <box key={s.id} flexDirection="row">
-            <text fg={theme.fgDim} wrapMode="none">{STACK_CONNECTOR[pos]}</text>
-            <text fg={theme.fgDim} wrapMode="none">{`${stackOrdinalLabel(s.ordinal)} `}</text>
-            <text fg={g.fg} wrapMode="none">{`${g.t} `}</text>
+            {/* The lead glyphs must never shrink — when the row overflows,
+                yoga squeezing these texts garbles the spine; the title is
+                the only flexible (truncating) segment. */}
+            <box flexShrink={0} flexDirection="row">
+              <text fg={theme.fgDim} wrapMode="none">{STACK_CONNECTOR[pos]}</text>
+              <text fg={theme.fgDim} wrapMode="none">{`${stackOrdinalLabel(s.ordinal)} `}</text>
+              <text fg={g.fg} wrapMode="none">{`${g.t} `}</text>
+            </box>
             {/* Flex-grow + overflow-hidden gives the title a bounded width so
                 `truncate` ellipsises a long slice title instead of overflowing
                 the row and garbling the pane. */}
@@ -672,7 +677,9 @@ function StackChain({
                 sessionState={member.sessionState}
               />
             ) : s.pr ? (
-              <text fg={theme.fgDim} wrapMode="none">{` #${s.pr}`}</text>
+              <box flexShrink={0}>
+                <text fg={theme.fgDim} wrapMode="none">{` #${s.pr}`}</text>
+              </box>
             ) : null}
           </box>
         );
