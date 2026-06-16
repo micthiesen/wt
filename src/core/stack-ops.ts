@@ -8,6 +8,9 @@
  * `rebaseStack` is the thin reconcile-then-replay convenience. The genuinely
  * hard part (anchored cherry-pick replay) lives in `RestackEngine`.
  */
+import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
 import { config } from "./config.ts";
 import {
   branchExists,
@@ -18,6 +21,12 @@ import {
   originBranchExists,
   revParse,
 } from "./git.ts";
+import {
+  baseContent,
+  fileHunks,
+  holisticBase,
+  reconstructFile,
+} from "./hunks.ts";
 import { createWorktree } from "./lifecycle.ts";
 import { tryAcquireLock, type LockHandle } from "./locks.ts";
 import { createLogger } from "./logger.ts";
@@ -43,6 +52,7 @@ import {
   setSlugBase,
   updateStackSlice,
   validateStackManifest,
+  type PartialFile,
   type StackManifest,
   type StackSlice,
 } from "./wtstate.ts";
@@ -77,9 +87,10 @@ async function acquireStackLock(phase: string): Promise<LockHandle | null> {
 
 /**
  * Reproduce a slice's content as a single commit in its fresh worktree.
- * Slices are a file-level partition of the holistic diff, so checking
- * out each slice's files from the holistic branch on top of the parent
- * reproduces the holistic tree exactly across the chain.
+ * Whole-file slices (`slice.files`) are checked out from the holistic
+ * branch on top of the parent; hunk-level slices (`slice.partials`) are
+ * reconstructed from the holistic diff (see the partials block below).
+ * Cumulatively the chain reproduces the holistic tree exactly.
  *
  * Edge cases the holistic checkout doesn't cover on its own:
  *  - files the holistic diff DELETES aren't on `holisticBranch`, so
@@ -95,6 +106,8 @@ async function materializeSliceCommit(
   wtPath: string,
   holisticBranch: string,
   slice: StackSlice,
+  ancestorOwned: Map<string, Set<string>>,
+  baseBySource: Map<string, string>,
   onLog: Logger,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const present: string[] = [];
@@ -130,6 +143,54 @@ async function materializeSliceCommit(
     }
   }
   if (deleted.length > 0) onLog(`  removed ${deleted.length} deleted file(s)`);
+
+  // Hunk-level files: reconstruct the exact intermediate content (base +
+  // this slice's owned hunks + every ancestor's owned hunks) from the
+  // holistic diff and write it. Cumulatively this reproduces the holistic
+  // file at the slice that owns its last hunk. Pure text replay — no apply
+  // fuzz, so this materialize step never conflicts (replaying a partial
+  // slice onto a moved parent still can — that keeps its `/restack` bail).
+  const partials = slice.partials ?? [];
+  if (partials.length > 0) {
+    // Reuse the base the coverage gate resolved for this source so the two
+    // phases provably agree (linked worktrees share the object store, so a
+    // SHA resolved in the main clone resolves here too).
+    const base = baseBySource.get(holisticBranch) ?? (await holisticBase(wtPath, holisticBranch));
+    for (const p of partials) {
+      const fd = await fileHunks(wtPath, base, holisticBranch, p.file);
+      if (fd.binary) {
+        return { ok: false, error: `cannot hunk-split binary file ${p.file}` };
+      }
+      const known = new Set(fd.hunks.map((h) => h.id));
+      const owned = new Set<string>([...(ancestorOwned.get(p.file) ?? []), ...p.hunks]);
+      const unknown = p.hunks.filter((h) => !known.has(h));
+      if (unknown.length > 0) {
+        return {
+          ok: false,
+          error: `partial ${p.file}: hunk id(s) not in the holistic diff: ${unknown.join(", ")} (re-run \`wt stack hunks\`; the holistic branch may have changed)`,
+        };
+      }
+      const raw = await baseContent(wtPath, base, p.file);
+      // `git show`/`git diff` decode to UTF-8; a file with NUL bytes that git
+      // didn't flag binary (rare, but possible) would corrupt on round-trip.
+      // Refuse it rather than commit mangled content.
+      if (raw.includes("\0")) {
+        return { ok: false, error: `cannot hunk-split ${p.file}: base content is not valid UTF-8 text` };
+      }
+      const content = reconstructFile(raw, fd.hunks, owned);
+      try {
+        await mkdir(dirname(join(wtPath, p.file)), { recursive: true });
+        await Bun.write(join(wtPath, p.file), content);
+      } catch (e) {
+        return { ok: false, error: `write ${p.file}: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      const add = await gitRun(["add", "--", p.file], wtPath);
+      if (add.exitCode !== 0) {
+        return { ok: false, error: `git add ${p.file}: ${add.stderr.trim()}` };
+      }
+    }
+    onLog(`  reconstructed ${partials.length} partial file(s) by hunk`);
+  }
   // `checkout --` and `git rm` already stage every slice path, so no
   // extra `git add` is needed — and `add -A` would risk staging an
   // unrelated untracked file that happens to match a slice path.
@@ -147,6 +208,137 @@ async function materializeSliceCommit(
     };
   }
   return { ok: true };
+}
+
+/**
+ * Transitive ancestors of every slice, by id. Uses the SAME effective-edge
+ * set as `topoSortSlices`: explicit `dependsOn` PLUS `base` when it names a
+ * sibling slice id (the manifest may encode the parent either way). This must
+ * match the materialize parent (`resolveParentBranch`), because partial-file
+ * reconstruction applies "base + ancestor hunks" — if an ancestor reachable
+ * only through `base` were missed, the slice would silently drop the parent's
+ * hunks on a shared file.
+ */
+function transitiveAncestors(slices: StackSlice[]): Map<string, Set<string>> {
+  const byId = new Map(slices.map((s) => [s.id, s]));
+  const directDeps = (s: StackSlice): string[] => {
+    const set = new Set(s.dependsOn.filter((d) => byId.has(d)));
+    if (s.base !== s.id && byId.has(s.base)) set.add(s.base);
+    return [...set];
+  };
+  const cache = new Map<string, Set<string>>();
+  const visit = (id: string, stack: Set<string>): Set<string> => {
+    const hit = cache.get(id);
+    if (hit) return hit;
+    const acc = new Set<string>();
+    const s = byId.get(id);
+    if (s && !stack.has(id)) {
+      stack.add(id);
+      for (const dep of directDeps(s)) {
+        acc.add(dep);
+        for (const a of visit(dep, stack)) acc.add(a);
+      }
+      stack.delete(id);
+    }
+    cache.set(id, acc);
+    return acc;
+  };
+  for (const s of slices) visit(s.id, new Set());
+  return cache;
+}
+
+/** The hunks an ancestor chain already applied for each partial file, for one slice. */
+function ancestorOwnedHunks(
+  manifest: StackManifest,
+  slice: StackSlice,
+  ancestors: Map<string, Set<string>>,
+): Map<string, Set<string>> {
+  const owned = new Map<string, Set<string>>();
+  const anc = ancestors.get(slice.id) ?? new Set();
+  for (const s of manifest.slices) {
+    if (!anc.has(s.id)) continue;
+    for (const p of s.partials ?? []) {
+      const set = owned.get(p.file) ?? new Set<string>();
+      for (const h of p.hunks) set.add(h);
+      owned.set(p.file, set);
+    }
+  }
+  return owned;
+}
+
+/**
+ * Before materializing, prove every partial file is reconstructible into a
+ * correct stack tip. Three independent ways a manifest can be union-valid yet
+ * still drop or mis-place holistic content (none catchable by the structural
+ * `validateStackManifest`, which can't see the real diff):
+ *  1. COVERAGE — each holistic hunk of the file owned by exactly one slice,
+ *     no stale ids, not binary.
+ *  2. CHAIN — the slices owning a file must lie on a single dependency chain,
+ *     i.e. one owner ("tip") transitively descends from every other owner.
+ *     Materialize reconstructs "base + ancestor-owned + own" hunks, so only a
+ *     slice that depends on all other owners ends up with the COMPLETE file.
+ *     Two parallel-lane owners would each carry half and no tip the whole.
+ *  3. SINGLE SOURCE — a file partitioned under two different `source`
+ *     branches has two different holistic diffs; the owned-hunk maps merge by
+ *     path and would mismatch. Forbid it.
+ * Also resolves + caches each source's diff base SHA into `baseBySource` so
+ * materialize reconstructs against the SAME base this gate validated.
+ */
+async function validatePartialCoverage(
+  manifest: StackManifest,
+  cwd: string,
+  ancestors: Map<string, Set<string>>,
+  baseBySource: Map<string, string>,
+): Promise<string | null> {
+  // owners by file path (across the whole stack) and by (source, file).
+  const ownersByFile = new Map<string, string[]>(); // file -> slice ids
+  const sourcesByFile = new Map<string, Set<string>>(); // file -> source branches
+  const groups = new Map<string, { source: string; file: string; owned: Set<string> }>();
+  for (const s of manifest.slices) {
+    const source = s.source ?? manifest.holisticBranch;
+    for (const p of s.partials ?? []) {
+      (ownersByFile.get(p.file) ?? ownersByFile.set(p.file, []).get(p.file)!).push(s.id);
+      (sourcesByFile.get(p.file) ?? sourcesByFile.set(p.file, new Set()).get(p.file)!).add(source);
+      const key = `${source}\0${p.file}`;
+      const g = groups.get(key) ?? { source, file: p.file, owned: new Set<string>() };
+      for (const h of p.hunks) g.owned.add(h);
+      groups.set(key, g);
+    }
+  }
+  // (3) single source per file.
+  for (const [file, sources] of sourcesByFile) {
+    if (sources.size > 1) {
+      return `partial ${file}: split across ${sources.size} source branches (${[...sources].join(", ")}) — a file's hunks must all come from one source`;
+    }
+  }
+  // (2) owners of each file form a single dependency chain.
+  for (const [file, owners] of ownersByFile) {
+    const set = new Set(owners);
+    const tip = owners.find((o) => [...set].every((x) => x === o || ancestors.get(o)?.has(x)));
+    if (!tip) {
+      return `partial ${file}: owning slices (${owners.join(", ")}) don't form a dependency chain — no single slice descends from all of them, so no commit would carry the whole file`;
+    }
+  }
+  // (1) coverage against the real per-source diff.
+  for (const { source, file, owned } of groups.values()) {
+    let base = baseBySource.get(source);
+    if (base === undefined) {
+      base = await holisticBase(cwd, source);
+      baseBySource.set(source, base);
+    }
+    const fd = await fileHunks(cwd, base, source, file);
+    if (fd.binary) return `cannot hunk-split binary file ${file}`;
+    const known = new Set(fd.hunks.map((h) => h.id));
+    const missing = fd.hunks.filter((h) => !owned.has(h.id)).map((h) => h.id);
+    if (missing.length > 0) {
+      return `partial ${file}: ${missing.length} holistic hunk(s) unassigned (${missing.join(", ")}) — every hunk must be owned by a slice`;
+    }
+    const stale = [...owned].filter((h) => !known.has(h));
+    if (stale.length > 0) {
+      return `partial ${file}: hunk id(s) not in the holistic diff: ${stale.join(", ")}`;
+    }
+  }
+  return null;
 }
 
 /** A minimal-but-valid PR body. Richer bodies are authored by a skill later. */
@@ -219,6 +411,24 @@ async function applyStackLocked(
     return { materialized: [], skipped: [], error: e instanceof Error ? e.message : String(e) };
   }
 
+  // Gate on partial-file coverage/chain before touching any git state: a
+  // missing hunk or an off-chain owner would silently drop holistic content
+  // from the tip. Only runs when the stack uses hunk-level slices. The
+  // resolved diff bases are cached so materialize reconstructs against the
+  // SAME base this gate validated.
+  const ancestors = transitiveAncestors(manifest.slices);
+  const baseBySource = new Map<string, string>();
+  const hasPartials = manifest.slices.some((s) => (s.partials?.length ?? 0) > 0);
+  if (hasPartials) {
+    const coverageError = await validatePartialCoverage(
+      manifest,
+      config.paths.mainClone,
+      ancestors,
+      baseBySource,
+    );
+    if (coverageError) return { materialized: [], skipped: [], error: coverageError };
+  }
+
   const materialized: string[] = [];
   const skipped: string[] = [];
 
@@ -287,6 +497,8 @@ async function applyStackLocked(
       created.path,
       slice.source ?? manifest.holisticBranch,
       slice,
+      ancestorOwnedHunks(manifest, slice, ancestors),
+      baseBySource,
       onLog,
     );
     if (!mat.ok) {
@@ -854,6 +1066,7 @@ export type SubSliceSpec = {
   title: string;
   branch: string;
   files: string[];
+  partials?: PartialFile[];
   oversized?: boolean;
   oversizedReason?: string;
 };
@@ -950,6 +1163,7 @@ function splitStackLocked(
     base: i === 0 ? target.base : fragment[i - 1]!.id,
     dependsOn: i === 0 ? [...target.dependsOn] : [fragment[i - 1]!.id],
     files: spec.files,
+    ...(spec.partials && spec.partials.length > 0 ? { partials: spec.partials } : {}),
     pr: null,
     status: "planned" as const,
     oversized: spec.oversized === true,

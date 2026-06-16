@@ -15,7 +15,9 @@ import {
   type SubSliceSpec,
 } from "../../core/stack-ops.ts";
 import { git } from "../../core/git.ts";
+import { fileHunks, holisticBase, hunkLineCounts } from "../../core/hunks.ts";
 import {
+  coercePartials,
   findStackIdByBranch,
   getStackManifest,
   listStackManifests,
@@ -27,6 +29,8 @@ import { bold, cyan, dim, green, red, yellow } from "../colors.ts";
 const HELP = `usage: wt stack <subcommand> [options]
 
 subcommands:
+  hunks [--holistic <b>] <file>...   list a file's holistic-diff hunk ids (for
+                             hunk-level slice partitions; --json for /split)
   apply <stackId>            materialize an already-ingested manifest
   apply --from <file>        strict-validate + ingest a manifest, then materialize
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
@@ -452,15 +456,24 @@ function readFragment(file: string): SubSliceSpec[] | null {
     const r = v as Record<string, unknown>;
     if (typeof r.id !== "string" || r.id.trim() === "") errs.push(`into[${i}]: "id" required`);
     if (typeof r.branch !== "string" || r.branch.trim() === "") errs.push(`into[${i}]: "branch" required`);
-    if (!Array.isArray(r.files) || r.files.length === 0 || !r.files.every((f) => typeof f === "string")) {
-      errs.push(`into[${i}]: "files" must be a non-empty array of strings`);
+    const files = Array.isArray(r.files)
+      ? r.files.filter((f): f is string => typeof f === "string" && f.trim() !== "")
+      : [];
+    // Shared lenient coercion (same shape the schema read path uses);
+    // `validateStackManifest` is the strict net on the reshaped manifest.
+    const partials = coercePartials(r.partials);
+    // A sub-slice must own something — whole files or hunks. The strict
+    // `validateStackManifest` re-checks the reshaped manifest as the net.
+    if (files.length === 0 && partials.length === 0) {
+      errs.push(`into[${i}]: needs a non-empty "files" or "partials"`);
     }
-    if (typeof r.id !== "string" || typeof r.branch !== "string" || !Array.isArray(r.files)) return;
+    if (typeof r.id !== "string" || typeof r.branch !== "string") return;
     specs.push({
       id: r.id,
       title: typeof r.title === "string" ? r.title : r.id,
       branch: r.branch,
-      files: r.files.filter((f): f is string => typeof f === "string"),
+      files,
+      ...(partials.length > 0 ? { partials } : {}),
       oversized: r.oversized === true,
       ...(typeof r.oversizedReason === "string" ? { oversizedReason: r.oversizedReason } : {}),
     });
@@ -661,7 +674,7 @@ async function runAdd(argv: string[]): Promise<number> {
     ),
   );
   console.log(
-    `  ${dim(String(s.ordinal).padStart(2, "0"))} ${s.title}  ${dim(`anchor ${s.baseSha?.slice(0, 9) ?? "?"}, ${s.files.length} file(s)`)}`,
+    `  ${dim(String(s.ordinal).padStart(2, "0"))} ${s.title}  ${dim(`anchor ${s.baseSha?.slice(0, 9) ?? "?"}, ${s.files.length} file(s)${s.partials?.length ? ` + ${s.partials.length} partial` : ""}`)}`,
   );
   // Same staleness as a re-split, milder: existing PR bodies' stack sections
   // now list a slice set missing the new tip. wt never authors bodies.
@@ -707,6 +720,72 @@ async function runReconcile(argv: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * List the canonical hunk ids of a file's holistic diff, so `/split` can
+ * assign hunks to slices without re-implementing the content-hash scheme.
+ * The base is the holistic branch's fork point from trunk — the SAME base
+ * `materializeSliceCommit` reconstructs against, so ids line up.
+ */
+async function runHunks(rest: string[]): Promise<number> {
+  let holistic = "";
+  let json = false;
+  const files: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--holistic") {
+      const v = rest[++i];
+      if (v === undefined || v.startsWith("--")) {
+        console.error(red("--holistic needs a branch name"));
+        return 2;
+      }
+      holistic = v;
+    } else if (a === "--json") json = true;
+    else files.push(a);
+  }
+  if (files.length === 0) {
+    console.error(red("usage: wt stack hunks [--holistic <branch>] [--json] <file>..."));
+    return 2;
+  }
+  if (!holistic) {
+    const stackId = await stackIdFromCwd();
+    const manifest = stackId ? getStackManifest(stackId) : null;
+    if (manifest?.holisticBranch) holistic = manifest.holisticBranch;
+  }
+  if (!holistic) {
+    console.error(red("no --holistic branch given and none resolvable from the current branch's stack"));
+    return 2;
+  }
+  const cwd = config.paths.mainClone;
+  const base = await holisticBase(cwd, holistic);
+  type HunkInfo = { id: string; header: string; added: number; removed: number };
+  const out: Array<{ file: string; base: string; binary: boolean; hunks: HunkInfo[] }> = [];
+  for (const file of files) {
+    const fd = await fileHunks(cwd, base, holistic, file);
+    const hunks: HunkInfo[] = fd.hunks.map((h) => {
+      const { added, removed } = hunkLineCounts(h);
+      return { id: h.id, header: h.header, added, removed };
+    });
+    if (json) {
+      out.push({ file, base, binary: fd.binary, hunks });
+      continue;
+    }
+    if (fd.binary) {
+      console.log(`${bold(file)} ${red("(binary — cannot hunk-split)")}`);
+      continue;
+    }
+    if (hunks.length === 0) {
+      console.log(`${bold(file)} ${dim("(no hunks)")}`);
+      continue;
+    }
+    console.log(bold(file));
+    for (const h of hunks) {
+      console.log(`  ${cyan(h.id)}  ${green(`+${h.added}`)} ${red(`-${h.removed}`)}  ${dim(h.header)}`);
+    }
+  }
+  if (json) console.log(JSON.stringify(out, null, 2));
+  return 0;
+}
+
 export async function run(argv: string[]): Promise<number> {
   const [sub, ...rest] = argv;
   if (!sub || sub === "--help" || sub === "-h") {
@@ -714,6 +793,8 @@ export async function run(argv: string[]): Promise<number> {
     return sub ? 0 : 2;
   }
   switch (sub) {
+    case "hunks":
+      return runHunks(rest);
     case "apply":
       return runApply(rest);
     case "plan":

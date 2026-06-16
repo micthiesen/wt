@@ -459,6 +459,24 @@ standalone skills — never as edits to `/start` or `/done`.
       typecheck each cumulative prefix **in the holistic worktree** (it has deps —
       this is NOT a per-slice gate; slices stay install-free). Abort on a red
       prefix. Default off; CI is the normal gate.
+- [x] wt: **hunk-level slice partitions** (eng-5229 friction, 2026-06-16). Relaxed
+      the atomic-file rule: a `StackSlice` may now carry `partials: [{ file,
+      hunks }]` so a single changed file's hunks can span slices. New
+      `core/hunks.ts` parses the holistic diff into content-hashed (line-shift
+      stable) hunk ids, reconstructs a slice's exact intermediate content (base +
+      owned-by-self-and-ancestors hunks) as pure text replay, and counts owned
+      lines for sizing. `materializeSliceCommit` writes reconstructed partials
+      instead of a whole-file checkout — no `git apply`, so materialize never
+      conflicts; replay's conflict → `/restack` bail is unchanged. `applyStack`
+      gates on a coverage check (every holistic hunk owned exactly once, no stale
+      ids, not binary) before touching git. `validateStackManifest` adds the
+      structural net (file not both whole-and-hunk, no hunk owned twice, slice
+      must own something). `wt stack hunks [--holistic <b>] [--json] <file>...`
+      lists canonical ids so `/split` assigns without re-implementing the hash.
+      Whole-file slices unchanged; `partials` absent on every existing manifest.
+      Verified with git fixtures (reconstruct chain, new-file split, no-eol,
+      order-independence) + validation unit checks. **Skill side still TODO:**
+      `/split` must learn to detect separable hunks and author `partials`.
 
 ---
 
@@ -468,9 +486,26 @@ Track friction here as the workflow gets used. Candidate adjustments:
 
 - **Budget numbers** (≤3 files / ~150 prod LOC). If the vibe still fires, go
   smaller. These are guesses; tune against real reactions.
-- **File-level vs hunk-level.** File-level keeps slices compiling and is the
-  default. If too many "indivisible" files show up, revisit selective hunk
-  splitting — but it's where compiling-correctness gets hard.
+- **File-level vs hunk-level.** RESOLVED (2026-06-16): hunk-level is now
+  supported alongside file-level (which stays the default). A slice may own
+  whole files (`files`) AND/OR partial files by hunk (`partials: [{ file,
+  hunks }]`). The atomic-file rule — one changed file to one slice — was
+  blocking legitimately-clean stacks where a single file's hunks served
+  different slices (eng-5229: `createMessage.ts` had an actor hunk and a gate
+  hunk; three `*.spec.ts` had a fixture-stub hunk and a behavior hunk). Hunk
+  ids are content-hashed against the holistic diff (`core/hunks.ts`), so they
+  survive line-number shifts; `/split` lists canonical ids via `wt stack
+  hunks`. Materialize reconstructs the exact intermediate content (base + the
+  owned-by-this-slice-and-its-ancestors hunks) as pure text replay — no `git
+  apply`, no fuzz, so **materialize never conflicts**. The fragility the
+  file-level default avoided lives only in *replay* (rebasing an
+  already-authored partial slice onto a moved parent), which keeps its
+  existing conflict → bail → `/restack` path unchanged (Michael's chosen
+  semantics). Caveat surfaced while building: two edits within ~3 lines of
+  each other coalesce into ONE git hunk and can't be separated — `/split`
+  must treat that as an indivisible unit, not force it. Whole-file slices are
+  byte-for-byte unchanged; `partials` is optional and absent on every
+  existing manifest.
 - **Engine: keep `stack` or internalize into wt?** RESOLVED (2026-06-08): internalized.
   Native `NativeRestackEngine.replaySlice` replaced `@kitlangton/stack`. Scoped to
   this workflow only — GitHub, squash-merge, worktree-per-slice. The squash-safe
@@ -529,6 +564,32 @@ Track friction here as the workflow gets used. Candidate adjustments:
 
 ## Session log
 
+- **2026-06-16** — Relaxed the **atomic-file rule** to allow **hunk-level slice
+  partitions** (via `/improve-stacking`, prompted by eng-5229 where one file's
+  actor/gate hunks and three specs' fixture/behavior hunks couldn't be separated,
+  collapsing an otherwise-clean 4-slice stack into one indivisible blob). wt-side
+  only, all in `~/.wt`: new `core/hunks.ts` (content-hashed hunk ids,
+  base+owned-subset reconstruction as pure text replay, line counting);
+  `StackSlice.partials` schema + lenient parse + strict `validateStackManifest`
+  net; `materializeSliceCommit` reconstructs partials (never conflicts — replay
+  keeps its `/restack` bail); `applyStack` coverage gate (every holistic hunk
+  owned once); `wt stack hunks` CLI for `/split`; `splitStack`/fragment parser
+  thread `partials`. Verified via git fixtures + validation unit checks;
+  typecheck clean. Scope decisions (Michael): only the atomic-file rule (not the
+  size budget or indivisible-unit guidance); replay bails to `/restack` on
+  conflict (no 3-way). Then `/ultracheck` (12-agent swarm) caught a real
+  correctness hole pre-merge: `transitiveAncestors` walked `dependsOn` only,
+  but `topoSortSlices`/`resolveParentBranch` also treat `base`-as-sibling-id
+  as a parent edge — so a slice parented via `base` alone would reconstruct
+  partials without its parent's hunks, silently regressing the shared file.
+  Fixed to use the same effective-edge set. Also added: a chain-linearity gate
+  (a partial file's owners must form one dependency chain, else no tip carries
+  the whole file), a single-source-per-file gate, a worktree path-traversal
+  guard in `validateStackManifest`, a NUL-byte/binary guard, wrapped the
+  reconstruction write (+`mkdir -p`) so a failure can't half-push a stack, and
+  pinned the diff base across the coverage gate and materialize so they
+  provably agree. **Follow-up:** teach `/split` to author `partials` (it still
+  slices file-only today) — the engine is ready, the planner isn't.
 - **2026-06-08** — Designed the whole workflow (this doc, CLAUDE.md guidance,
   `/split`, `/restack`, `~/.wt/prompt.txt`). Researched `stack` + `wt` source in
   depth to settle the state-vs-engine split. Locked: advisory budgets,

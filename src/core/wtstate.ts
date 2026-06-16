@@ -63,6 +63,19 @@ export type WtSlugState = {
 export type StackSliceStatus = "planned" | "open" | "merged";
 
 /**
+ * A file this slice owns only PART of: the listed `hunks` (stable
+ * content-hash ids from the holistic diff, see `core/hunks.ts`) rather than
+ * the whole file. Lets a single changed file span multiple slices. A file is
+ * in a slice's `files` (whole) OR some slice's `partials` (by hunk), never
+ * both; across the stack the hunks of a partial file must cover its holistic
+ * diff exactly (checked at `apply` against the real diff).
+ */
+export type PartialFile = {
+  file: string;
+  hunks: string[];
+};
+
+/**
  * One slice of a holistic change — a small, reviewable unit that becomes
  * a single draft PR. `base` is one of: the trunk base name (a lane root,
  * independent PR off trunk); the `id` of another slice in the same
@@ -83,6 +96,13 @@ export type StackSlice = {
   dependsOn: string[];
   /** File-level partition of the holistic diff owned by this slice. */
   files: string[];
+  /**
+   * Hunk-level partition: files this slice owns only part of. Optional and
+   * usually absent — most slices are pure whole-file. When present, the
+   * listed files are reproduced by reconstructing the owned hunks at
+   * materialize instead of a whole-file checkout. See `PartialFile`.
+   */
+  partials?: PartialFile[];
   /** GitHub PR number once materialized; `null` while planned. */
   pr: number | null;
   status: StackSliceStatus;
@@ -181,6 +201,7 @@ function parseSlice(v: unknown): StackSlice | null {
   const ordinal = typeof rec.ordinal === "number" && Number.isFinite(rec.ordinal) ? rec.ordinal : 0;
   const status: StackSliceStatus =
     rec.status === "open" || rec.status === "merged" ? rec.status : "planned";
+  const partials = coercePartials(rec.partials);
   return {
     id: rec.id,
     ordinal,
@@ -195,7 +216,37 @@ function parseSlice(v: unknown): StackSlice | null {
     ...(typeof rec.oversizedReason === "string" ? { oversizedReason: rec.oversizedReason } : {}),
     ...(typeof rec.baseSha === "string" && rec.baseSha.trim() !== "" ? { baseSha: rec.baseSha } : {}),
     ...(typeof rec.source === "string" && rec.source.trim() !== "" ? { source: rec.source } : {}),
+    ...(partials.length > 0 ? { partials } : {}),
   };
+}
+
+/**
+ * A slice file path that would escape the worktree (absolute, or with a `..`
+ * segment). Manifests are skill-authored, but materialize writes
+ * reconstructed partial content straight to `join(wtPath, file)`, so a
+ * traversal path is rejected at the schema boundary. Repo paths are always
+ * relative with forward slashes.
+ */
+export function isUnsafeSlicePath(p: string): boolean {
+  if (p.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(p)) return true;
+  return p.split(/[\\/]/).includes("..");
+}
+
+/** Coerce a persisted/skill-authored `partials` array, dropping malformed entries. */
+export function coercePartials(v: unknown): PartialFile[] {
+  if (!Array.isArray(v)) return [];
+  const out: PartialFile[] = [];
+  for (const e of v) {
+    if (!e || typeof e !== "object") continue;
+    const rec = e as Record<string, unknown>;
+    if (typeof rec.file !== "string" || rec.file.trim() === "") continue;
+    const hunks = Array.isArray(rec.hunks)
+      ? rec.hunks.filter((h): h is string => typeof h === "string" && h.trim() !== "")
+      : [];
+    if (hunks.length === 0) continue;
+    out.push({ file: rec.file, hunks });
+  }
+  return out;
 }
 
 /** Coerce one persisted manifest, dropping anything malformed. */
@@ -237,7 +288,7 @@ const MANIFEST_KEYS = new Set([
 /** Per-slice keys a slice may carry. */
 const SLICE_KEYS = new Set([
   "id", "ordinal", "title", "branch", "base", "dependsOn", "files", "pr",
-  "status", "oversized", "oversizedReason", "baseSha", "source",
+  "status", "oversized", "oversizedReason", "baseSha", "source", "partials",
 ]);
 
 /**
@@ -328,11 +379,73 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
       const branch = typeof s.branch === "string" && s.branch.trim() !== "" ? s.branch : null;
       if (!branch) errors.push(`${at}: "branch" is required (non-empty string)`);
       else branchCounts.set(branch, (branchCounts.get(branch) ?? 0) + 1);
-      const filesOk =
-        Array.isArray(s.files) &&
-        s.files.length > 0 &&
-        s.files.every((f) => typeof f === "string" && f.trim() !== "");
-      if (!filesOk) errors.push(`${at}: "files" is required (non-empty array of paths)`);
+      // `partials` (hunk-level ownership) parsed first: a slice may own
+      // nothing whole-file as long as it owns hunks, so the `files`
+      // requirement relaxes to "files OR partials non-empty".
+      const partialsClean: PartialFile[] = [];
+      let partialsOk = true;
+      if (s.partials !== undefined) {
+        if (!Array.isArray(s.partials)) {
+          errors.push(`${at}: "partials" must be an array`);
+          partialsOk = false;
+        } else {
+          s.partials.forEach((pv, pi) => {
+            const pat = `${at}.partials[${pi}]`;
+            if (!pv || typeof pv !== "object" || Array.isArray(pv)) {
+              errors.push(`${pat} must be an object`);
+              partialsOk = false;
+              return;
+            }
+            const p = pv as Record<string, unknown>;
+            for (const k of Object.keys(p)) {
+              if (k !== "file" && k !== "hunks") errors.push(`${pat}: unknown key "${k}"`);
+            }
+            const file = typeof p.file === "string" && p.file.trim() !== "" ? p.file : null;
+            if (!file) {
+              errors.push(`${pat}: "file" is required (non-empty string)`);
+              partialsOk = false;
+            }
+            const hunksOk =
+              Array.isArray(p.hunks) &&
+              p.hunks.length > 0 &&
+              p.hunks.every((h) => typeof h === "string" && h.trim() !== "");
+            if (!hunksOk) {
+              errors.push(`${pat}: "hunks" is required (non-empty array of hunk ids)`);
+              partialsOk = false;
+            }
+            if (file && hunksOk) {
+              partialsClean.push({ file, hunks: (p.hunks as string[]).slice() });
+            }
+          });
+        }
+      }
+      const filesArrOk =
+        s.files === undefined ||
+        (Array.isArray(s.files) && s.files.every((f) => typeof f === "string" && f.trim() !== ""));
+      if (!filesArrOk) errors.push(`${at}: "files" must be an array of non-empty paths`);
+      const filesList = Array.isArray(s.files)
+        ? (s.files as unknown[]).filter((f): f is string => typeof f === "string" && f.trim() !== "")
+        : [];
+      // A slice must own SOMETHING — whole files or hunks.
+      const ownsSomething = filesList.length > 0 || partialsClean.length > 0;
+      if (!ownsSomething) {
+        errors.push(`${at}: a slice must own at least one whole file ("files") or hunk set ("partials")`);
+      }
+      // Within a slice, a file can't be both whole-owned and hunk-owned, and
+      // can't appear twice in partials.
+      const partialFilesHere = new Set<string>();
+      for (const p of partialsClean) {
+        if (partialFilesHere.has(p.file)) errors.push(`${at}: file "${p.file}" appears twice in "partials"`);
+        partialFilesHere.add(p.file);
+        if (filesList.includes(p.file)) {
+          errors.push(`${at}: file "${p.file}" is in both "files" (whole) and "partials" (hunks)`);
+        }
+      }
+      // Reject paths that would escape the worktree at materialize.
+      for (const f of [...filesList, ...partialsClean.map((p) => p.file)]) {
+        if (isUnsafeSlicePath(f)) errors.push(`${at}: file "${f}" must be a repo-relative path (no "..", not absolute)`);
+      }
+      const sliceShapeOk = filesArrOk && partialsOk && ownsSomething;
       const ordinalOk = typeof s.ordinal === "number" && Number.isFinite(s.ordinal);
       if (!ordinalOk) errors.push(`${at}: "ordinal" is required (finite number)`);
       const base = typeof s.base === "string" && s.base.trim() !== "" ? s.base : null;
@@ -363,7 +476,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
       }
       if (s.baseSha !== undefined && typeof s.baseSha !== "string") errors.push(`${at}: "baseSha" must be a string`);
       if (s.source !== undefined && typeof s.source !== "string") errors.push(`${at}: "source" must be a string`);
-      if (id && branch && filesOk && ordinalOk && base) {
+      if (id && branch && sliceShapeOk && ordinalOk && base) {
         slices.push({
           id,
           ordinal: s.ordinal as number,
@@ -373,19 +486,42 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
           dependsOn: Array.isArray(s.dependsOn)
             ? s.dependsOn.filter((d): d is string => typeof d === "string")
             : [],
-          files: (s.files as unknown[]).filter((f): f is string => typeof f === "string"),
+          files: filesList,
           pr: typeof s.pr === "number" ? s.pr : null,
           status: s.status === "open" || s.status === "merged" ? s.status : "planned",
           oversized: s.oversized === true,
           ...(typeof s.oversizedReason === "string" ? { oversizedReason: s.oversizedReason } : {}),
           ...(typeof s.baseSha === "string" && s.baseSha.trim() !== "" ? { baseSha: s.baseSha } : {}),
           ...(typeof s.source === "string" && s.source.trim() !== "" ? { source: s.source } : {}),
+          ...(partialsClean.length > 0 ? { partials: partialsClean } : {}),
         });
       }
     });
   }
   for (const [id, n] of idCounts) if (n > 1) errors.push(`duplicate slice id: "${id}" (${n}×)`);
   for (const [b, n] of branchCounts) if (n > 1) errors.push(`duplicate slice branch: "${b}" (${n}×)`);
+
+  // Cross-slice partition integrity. A file owned whole by one slice can't be
+  // hunk-split by another, and no (file, hunk) may be claimed twice. Coverage
+  // (every holistic hunk owned exactly once) needs the real diff, so it's
+  // checked at `apply`, not here.
+  const wholeFileOwner = new Map<string, string>();
+  for (const sl of slices) for (const f of sl.files) wholeFileOwner.set(f, sl.id);
+  const hunkOwner = new Map<string, string>(); // `${file}\0${hunkId}` -> sliceId
+  for (const sl of slices) {
+    for (const p of sl.partials ?? []) {
+      const whole = wholeFileOwner.get(p.file);
+      if (whole && whole !== sl.id) {
+        errors.push(`file "${p.file}" is owned whole by ${whole} and hunk-split by ${sl.id} — pick one`);
+      }
+      for (const hid of p.hunks) {
+        const key = `${p.file}\0${hid}`;
+        const prev = hunkOwner.get(key);
+        if (prev) errors.push(`hunk "${hid}" of "${p.file}" is owned by both ${prev} and ${sl.id}`);
+        else hunkOwner.set(key, sl.id);
+      }
+    }
+  }
   // `dependsOn` ids must reference another slice, and never self.
   const idSet = new Set(idCounts.keys());
   if (Array.isArray(slicesRaw)) {
