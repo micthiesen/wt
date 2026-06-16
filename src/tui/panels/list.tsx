@@ -475,14 +475,12 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
       paddingTop={0}
     >
       {!hasActive && !hasArchived && !hasReviewRequests ? (
-        <box padding={1}>
+        <box padding={1} flexDirection="row">
           {isLoading ? (
             <text fg={theme.fgDim}>Loading worktrees...</text>
           ) : (
             <>
-              <text fg={theme.fgDim}>No worktrees.</text>
-              <text> </text>
-              <text fg={theme.fgDim}>Press </text>
+              <text fg={theme.fgDim}>No worktrees. Press </text>
               <text fg={theme.accent} attributes={1}>
                 n
               </text>
