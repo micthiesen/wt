@@ -235,15 +235,36 @@ export async function holisticBase(cwd: string, holisticBranch: string): Promise
   return mb.exitCode === 0 && sha ? sha : trunk;
 }
 
-/** Compute + parse the holistic diff hunks for one file. */
+/** Default unified-context lines for hunk computation (git's own default). */
+export const DEFAULT_HUNK_CONTEXT = 3;
+
+/**
+ * Compute + parse the holistic diff hunks for one file. `context` is the
+ * unified-diff context-line count (`git diff -U<context>`); it must match
+ * across listing (`wt stack hunks`), the coverage gate, and materialize, or
+ * the content-hashed ids won't line up — so it's pinned per-stack by
+ * `manifest.hunkContext` and defaults to git's own 3. Lower context (down to
+ * 0) splits edits that would otherwise coalesce into one hunk.
+ */
 export async function fileHunks(
   cwd: string,
   base: string,
   holisticBranch: string,
   file: string,
+  context: number = DEFAULT_HUNK_CONTEXT,
 ): Promise<FileDiff> {
   const r = await gitRun(
-    ["-c", "core.quotePath=false", "diff", "--no-color", base, holisticBranch, "--", file],
+    [
+      "-c",
+      "core.quotePath=false",
+      "diff",
+      "--no-color",
+      `--unified=${context}`,
+      base,
+      holisticBranch,
+      "--",
+      file,
+    ],
     cwd,
   );
   return parseFileDiff(file, r.stdout);

@@ -112,9 +112,15 @@ per-slice CI, never a re-ultracheck.
   it never needs updating as slices land. **Never
   mention the holistic branch/PR** (closed implementation detail).
 - **Verify is opt-in; CI is the default gate.** Rely on per-slice CI and fix what
-  it surfaces. `wt stack apply --verify` typechecks each cumulative prefix in the
-  holistic worktree (which has deps) before opening any PR — worth it for a bigger
-  stack, skippable for a small one.
+  it surfaces. `wt stack apply --verify` reconstructs each slice's materialized
+  tree (base + its ancestor-closure) into a throwaway worktree at the holistic
+  base, symlinks the holistic worktree's deps in, and runs `[stack].verify_command`
+  against each before opening any PR — worth it for a bigger stack, skippable for a
+  small one. It's a fast early gate, not a CI replacement: deps are symlinked
+  wholesale (a slice importing a package the stack itself adds can pass even though
+  its PR won't have it), and it assumes a single-root project. Hunk-level slicing is
+  the reason it exists — a whole-file stack always compiled per slice; a hunk split
+  can take a body without its import.
 
 ---
 
@@ -455,10 +461,17 @@ standalone skills — never as edits to `/start` or `/done`.
       case (b) without asking — and it outranks "HEAD is on top of
       origin/main", which is also true whenever the parent chain was just
       rebased onto main.
-- [ ] wt: `wt stack apply --verify` (opt-in). Before creating any branch/PR,
-      typecheck each cumulative prefix **in the holistic worktree** (it has deps —
-      this is NOT a per-slice gate; slices stay install-free). Abort on a red
-      prefix. Default off; CI is the normal gate.
+- [x] wt: `wt stack apply --verify` (opt-in, 2026-06-16). Before creating any
+      branch/PR, reconstruct each slice's MATERIALIZED tree (base + its
+      ancestor-closure, via `transitiveAncestors` — NOT a monotonic prefix, which
+      would leak a parallel lane's content) into a throwaway detached worktree at
+      the holistic base, symlink the holistic worktree's deps in (`[stack]
+      verify_deps`, default `node_modules`), and run `[stack] verify_command`
+      against each, aborting on the first red. Slices stay install-free; the deps
+      live in the throwaway worktree. New `core/stack-verify.ts`. Documented
+      limitations: wholesale dep symlink can mask a missing-import failure, the
+      verify command/tsconfig are read per-prefix, single-root projects only, and
+      single-source stacks only (re-split mixed-source bails to CI). Default off.
 - [x] wt: **hunk-level slice partitions** (eng-5229 friction, 2026-06-16). Relaxed
       the atomic-file rule: a `StackSlice` may now carry `partials: [{ file,
       hunks }]` so a single changed file's hunks can span slices. New
@@ -502,10 +515,16 @@ Track friction here as the workflow gets used. Candidate adjustments:
   already-authored partial slice onto a moved parent), which keeps its
   existing conflict → bail → `/restack` path unchanged (Michael's chosen
   semantics). Caveat surfaced while building: two edits within ~3 lines of
-  each other coalesce into ONE git hunk and can't be separated — `/split`
-  must treat that as an indivisible unit, not force it. Whole-file slices are
-  byte-for-byte unchanged; `partials` is optional and absent on every
-  existing manifest.
+  each other coalesce into ONE git hunk and can't be separated at the default
+  context — `/split` treats that as an indivisible unit, OR drops the diff
+  context via `wt stack hunks --unified 0` and pins `hunkContext: 0` on the
+  manifest so the two split apart (the level is pinned per-stack because
+  content-hashed ids depend on it). Whole-file slices are byte-for-byte
+  unchanged; `partials` is optional and absent on every existing manifest.
+  Follow-up (2026-06-16): the compiling-at-every-slice property a whole-file
+  stack got for free is now restorable on hunk stacks via `apply --verify`
+  (see Status) — it reconstructs each slice's tree and typechecks it before
+  any PR opens.
 - **Engine: keep `stack` or internalize into wt?** RESOLVED (2026-06-08): internalized.
   Native `NativeRestackEngine.replaySlice` replaced `@kitlangton/stack`. Scoped to
   this workflow only — GitHub, squash-merge, worktree-per-slice. The squash-safe
@@ -590,6 +609,31 @@ Track friction here as the workflow gets used. Candidate adjustments:
   pinned the diff base across the coverage gate and materialize so they
   provably agree. **Follow-up:** teach `/split` to author `partials` (it still
   slices file-only today) — the engine is ready, the planner isn't.
+- **2026-06-16** — Hardened the hunk engine with three additions (asked "is it
+  good or should we improve anything"): (1) **`wt stack apply --verify`** (new
+  `core/stack-verify.ts`) restores the compiles-at-every-slice property
+  hunk-splitting forfeited — reconstructs each slice's materialized tree (base +
+  ancestor-closure) into a throwaway worktree at the holistic base with deps
+  symlinked from the holistic worktree, runs `[stack] verify_command` per slice,
+  aborts on the first red, all before any PR opens. (2) **Configurable diff
+  context** — a `context`/`manifest.hunkContext` value (default 3) threaded
+  through `fileHunks` so `wt stack hunks --unified 0` + `hunkContext: 0` split
+  edits the default context coalesces; pinned per-stack because content-hashed
+  ids depend on it. (3) **Golden tests** (`core/hunks.test.ts`, `bun test`)
+  pinning `parseFileDiff`/`reconstructFile` against real `git diff` output
+  (insert/delete/replace, no-EOL both sides, append-at-EOF, duplicate `~N` ids,
+  middle-subset of a 3-hunk file, id stability under line shifts). Then
+  `/ultracheck` (14-agent swarm) caught a **critical**: the verify path's first
+  cut used a monotonic prefix accumulator, which leaks a parallel lane's content
+  into a slice that doesn't descend from it (materialize uses the
+  ancestor-closure only). Rewrote verify to reset-to-base + reconstruct the
+  ancestor-closure per slice (correct for forests/diamonds, not just chains), and
+  hoisted `transitiveAncestors` into `stack-layout.ts` so verify and materialize
+  share one definition. Swarm also drove: a stale-hunk-id guard + path-traversal
+  guard in verify (match materialize), a `git worktree prune` + random-nonce tmp
+  path (no stale-registration wedge), timeout-vs-failure distinction, surfacing
+  the failing command's output, filtering `wt-verify-*` worktrees from the TUI
+  list, and honest dep-symlink/single-root limitation docs.
 - **2026-06-08** — Designed the whole workflow (this doc, CLAUDE.md guidance,
   `/split`, `/restack`, `~/.wt/prompt.txt`). Researched `stack` + `wt` source in
   depth to settle the state-vs-engine split. Locked: advisory budgets,

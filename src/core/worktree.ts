@@ -24,6 +24,14 @@ export async function listWorktrees(): Promise<Worktree[]> {
         const branch = (block.branch ?? "").replace(/^refs\/heads\//, "");
         const isMain = path === config.paths.mainClone;
         const slug = isMain ? "main" : path.split("/").pop()!;
+        // Skip the throwaway detached worktrees `wt stack apply --verify` adds
+        // (under tmpdir, registered in the main clone) — they're internal
+        // scaffolding, present only for the duration of a verify run, and must
+        // never surface as a worktree row.
+        if (!isMain && slug.startsWith("wt-verify-")) {
+          block = {};
+          continue;
+        }
         worktrees.push({
           path,
           branch,

@@ -15,7 +15,7 @@ import {
   type SubSliceSpec,
 } from "../../core/stack-ops.ts";
 import { git } from "../../core/git.ts";
-import { fileHunks, holisticBase, hunkLineCounts } from "../../core/hunks.ts";
+import { DEFAULT_HUNK_CONTEXT, fileHunks, holisticBase, hunkLineCounts } from "../../core/hunks.ts";
 import {
   coercePartials,
   findStackIdByBranch,
@@ -29,8 +29,10 @@ import { bold, cyan, dim, green, red, yellow } from "../colors.ts";
 const HELP = `usage: wt stack <subcommand> [options]
 
 subcommands:
-  hunks [--holistic <b>] <file>...   list a file's holistic-diff hunk ids (for
-                             hunk-level slice partitions; --json for /split)
+  hunks [--holistic <b>] [--unified <n>] <file>...   list a file's holistic-diff
+                             hunk ids (for hunk-level slice partitions; --json
+                             for /split). --unified pins the diff context (the
+                             stack's hunkContext, else 3); 0 splits coalesced edits
   apply <stackId>            materialize an already-ingested manifest
   apply --from <file>        strict-validate + ingest a manifest, then materialize
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
@@ -53,6 +55,9 @@ subcommands:
 apply options:
   --from <file>              ingest a skill-authored manifest JSON (strict validation)
   --install                  run install per slice (default off — slices are install-free)
+  --verify                   typecheck each cumulative slice prefix in a throwaway
+                             worktree before opening any PR (needs [stack]
+                             verify_command; aborts on the first red prefix)
 split options:
   --from <file>              fragment JSON: array of { id, title, branch, files[] } sub-slices
   --plan                     preview the reshape without writing
@@ -153,10 +158,12 @@ function ingestManifest(file: string): IngestResult {
 async function runApply(argv: string[]): Promise<number> {
   let stackId: string | undefined;
   let install = false;
+  let verify = false;
   let from: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--install") install = true;
+    else if (a === "--verify") verify = true;
     else if (a === "--from") {
       from = argv[++i];
       if (!from) {
@@ -185,10 +192,10 @@ async function runApply(argv: string[]): Promise<number> {
     );
   }
   if (!stackId) {
-    console.error(red("usage: wt stack apply <stackId> | --from <manifest.json> [--install]"));
+    console.error(red("usage: wt stack apply <stackId> | --from <manifest.json> [--install] [--verify]"));
     return 2;
   }
-  const result = await applyStack(stackId, { install }, logLine);
+  const result = await applyStack(stackId, { install, verify }, logLine);
   if (result.error) {
     console.error(red(result.error));
     if (result.materialized.length > 0) {
@@ -729,6 +736,7 @@ async function runReconcile(argv: string[]): Promise<number> {
 async function runHunks(rest: string[]): Promise<number> {
   let holistic = "";
   let json = false;
+  let context: number | undefined;
   const files: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
@@ -739,28 +747,42 @@ async function runHunks(rest: string[]): Promise<number> {
         return 2;
       }
       holistic = v;
+    } else if (a === "--unified" || a === "-U") {
+      const v = rest[++i];
+      // Strict decimal only — `Number()` would quietly accept "", "0x4", "1e1".
+      if (v === undefined || !/^\d+$/.test(v)) {
+        console.error(red("--unified needs a non-negative integer"));
+        return 2;
+      }
+      context = Number(v);
     } else if (a === "--json") json = true;
     else files.push(a);
   }
   if (files.length === 0) {
-    console.error(red("usage: wt stack hunks [--holistic <branch>] [--json] <file>..."));
+    console.error(red("usage: wt stack hunks [--holistic <branch>] [--unified <n>] [--json] <file>..."));
     return 2;
   }
+  // Default the context from the resolved stack's pinned `hunkContext` so a
+  // bare listing matches what `apply` will reconstruct against; an explicit
+  // --unified always wins.
+  let manifestContext: number | undefined;
   if (!holistic) {
     const stackId = await stackIdFromCwd();
     const manifest = stackId ? getStackManifest(stackId) : null;
     if (manifest?.holisticBranch) holistic = manifest.holisticBranch;
+    manifestContext = manifest?.hunkContext;
   }
   if (!holistic) {
     console.error(red("no --holistic branch given and none resolvable from the current branch's stack"));
     return 2;
   }
+  const effectiveContext = context ?? manifestContext ?? DEFAULT_HUNK_CONTEXT;
   const cwd = config.paths.mainClone;
   const base = await holisticBase(cwd, holistic);
   type HunkInfo = { id: string; header: string; added: number; removed: number };
   const out: Array<{ file: string; base: string; binary: boolean; hunks: HunkInfo[] }> = [];
   for (const file of files) {
-    const fd = await fileHunks(cwd, base, holistic, file);
+    const fd = await fileHunks(cwd, base, holistic, file, effectiveContext);
     const hunks: HunkInfo[] = fd.hunks.map((h) => {
       const { added, removed } = hunkLineCounts(h);
       return { id: h.id, header: h.header, added, removed };

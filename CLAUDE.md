@@ -73,7 +73,11 @@ When a picker doesn't naturally have a single trigger key (e.g. branchPicker is 
 
 - Runtime is **Bun**. No node, no pnpm. `bun install`, `bun src/main.ts`.
 - Typecheck: `bun run typecheck` (just `tsc --noEmit`).
-- No test suite yet.
+- Tests are opt-in, not comprehensive: `bun test` runs the few `*.test.ts` files. The
+  one that matters is `src/core/hunks.test.ts` — golden tests pinning the hunk
+  engine (`parseFileDiff`/`reconstructFile`) against real `git diff` output, since a
+  silent off-by-one there corrupts a slice's committed content. Add cases there when
+  touching `core/hunks.ts`. Most other modules still have no tests; smoke via the CLI.
 - The TUI takes over the terminal — smoke-test refactors via the CLI subcommands (`bun src/main.ts ls`) or check imports with `bun -e 'import("./src/path.tsx")'`.
 
 ## Traps

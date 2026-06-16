@@ -23,6 +23,7 @@ import {
 } from "./git.ts";
 import {
   baseContent,
+  DEFAULT_HUNK_CONTEXT,
   fileHunks,
   holisticBase,
   reconstructFile,
@@ -41,8 +42,10 @@ import {
   isTrunkBase,
   resolveParentBranch,
   topoSortSlices,
+  transitiveAncestors,
 } from "./stack-layout.ts";
 import { dirSlug } from "./stage.ts";
+import { verifyStack } from "./stack-verify.ts";
 import {
   findStackIdByBranch,
   getStackManifest,
@@ -108,6 +111,7 @@ async function materializeSliceCommit(
   slice: StackSlice,
   ancestorOwned: Map<string, Set<string>>,
   baseBySource: Map<string, string>,
+  context: number,
   onLog: Logger,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const present: string[] = [];
@@ -157,7 +161,7 @@ async function materializeSliceCommit(
     // SHA resolved in the main clone resolves here too).
     const base = baseBySource.get(holisticBranch) ?? (await holisticBase(wtPath, holisticBranch));
     for (const p of partials) {
-      const fd = await fileHunks(wtPath, base, holisticBranch, p.file);
+      const fd = await fileHunks(wtPath, base, holisticBranch, p.file, context);
       if (fd.binary) {
         return { ok: false, error: `cannot hunk-split binary file ${p.file}` };
       }
@@ -210,43 +214,6 @@ async function materializeSliceCommit(
   return { ok: true };
 }
 
-/**
- * Transitive ancestors of every slice, by id. Uses the SAME effective-edge
- * set as `topoSortSlices`: explicit `dependsOn` PLUS `base` when it names a
- * sibling slice id (the manifest may encode the parent either way). This must
- * match the materialize parent (`resolveParentBranch`), because partial-file
- * reconstruction applies "base + ancestor hunks" — if an ancestor reachable
- * only through `base` were missed, the slice would silently drop the parent's
- * hunks on a shared file.
- */
-function transitiveAncestors(slices: StackSlice[]): Map<string, Set<string>> {
-  const byId = new Map(slices.map((s) => [s.id, s]));
-  const directDeps = (s: StackSlice): string[] => {
-    const set = new Set(s.dependsOn.filter((d) => byId.has(d)));
-    if (s.base !== s.id && byId.has(s.base)) set.add(s.base);
-    return [...set];
-  };
-  const cache = new Map<string, Set<string>>();
-  const visit = (id: string, stack: Set<string>): Set<string> => {
-    const hit = cache.get(id);
-    if (hit) return hit;
-    const acc = new Set<string>();
-    const s = byId.get(id);
-    if (s && !stack.has(id)) {
-      stack.add(id);
-      for (const dep of directDeps(s)) {
-        acc.add(dep);
-        for (const a of visit(dep, stack)) acc.add(a);
-      }
-      stack.delete(id);
-    }
-    cache.set(id, acc);
-    return acc;
-  };
-  for (const s of slices) visit(s.id, new Set());
-  return cache;
-}
-
 /** The hunks an ancestor chain already applied for each partial file, for one slice. */
 function ancestorOwnedHunks(
   manifest: StackManifest,
@@ -290,6 +257,7 @@ async function validatePartialCoverage(
   ancestors: Map<string, Set<string>>,
   baseBySource: Map<string, string>,
 ): Promise<string | null> {
+  const context = manifest.hunkContext ?? DEFAULT_HUNK_CONTEXT;
   // owners by file path (across the whole stack) and by (source, file).
   const ownersByFile = new Map<string, string[]>(); // file -> slice ids
   const sourcesByFile = new Map<string, Set<string>>(); // file -> source branches
@@ -326,7 +294,7 @@ async function validatePartialCoverage(
       base = await holisticBase(cwd, source);
       baseBySource.set(source, base);
     }
-    const fd = await fileHunks(cwd, base, source, file);
+    const fd = await fileHunks(cwd, base, source, file, context);
     if (fd.binary) return `cannot hunk-split binary file ${file}`;
     const known = new Set(fd.hunks.map((h) => h.id));
     const missing = fd.hunks.filter((h) => !owned.has(h.id)).map((h) => h.id);
@@ -357,6 +325,13 @@ function sliceBody(manifest: StackManifest, slice: StackSlice): string {
 export type ApplyOptions = {
   /** Run `pnpm install` per slice. Default false — slow; install where needed. */
   install?: boolean;
+  /**
+   * Before creating any branch/PR, reconstruct each cumulative slice prefix in
+   * a throwaway worktree and run `config.stack.verifyCommand` against it; abort
+   * on the first red prefix. Default false (CI is the normal gate). Restores
+   * the compiles-at-every-slice guarantee that hunk-splitting forfeits.
+   */
+  verify?: boolean;
 };
 
 export type ApplyResult = {
@@ -429,6 +404,18 @@ async function applyStackLocked(
     if (coverageError) return { materialized: [], skipped: [], error: coverageError };
   }
 
+  // Opt-in compile gate: reconstruct each cumulative prefix in a throwaway
+  // worktree and run the configured verify command, BEFORE any branch/PR is
+  // created. Hunk-splitting can produce a prefix that doesn't compile (a slice
+  // takes a body but not its import); this catches it without waiting for CI.
+  if (opts.verify) {
+    const verdict = await verifyStack(stackId, onLog);
+    if (!verdict.ok) {
+      return { materialized: [], skipped: [], error: verdict.error };
+    }
+    onLog(`verify: all ${verdict.prefixes.length} prefix(es) passed`);
+  }
+
   const materialized: string[] = [];
   const skipped: string[] = [];
 
@@ -499,6 +486,7 @@ async function applyStackLocked(
       slice,
       ancestorOwnedHunks(manifest, slice, ancestors),
       baseBySource,
+      manifest.hunkContext ?? DEFAULT_HUNK_CONTEXT,
       onLog,
     );
     if (!mat.ok) {

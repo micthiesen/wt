@@ -82,6 +82,28 @@ export type DiffConfig = {
   command: string;
 };
 
+export type StackConfig = {
+  /**
+   * Shell command `wt stack apply --verify` runs against each cumulative
+   * slice prefix (reconstructed in a throwaway worktree with deps symlinked
+   * from the holistic worktree) before any branch/PR is created. A non-zero
+   * exit fails the prefix and aborts apply. Null ⇒ `--verify` errors asking
+   * for it. Typically `bun run typecheck` or `tsc --noEmit`.
+   */
+  verifyCommand: string | null;
+  /**
+   * Gitignored dependency dirs symlinked into the verify worktree so the
+   * command resolves modules/types. Default `["node_modules"]`. Each is
+   * linked from the holistic branch's live worktree when one exists, else
+   * the main clone. Caveat: the link is WHOLESALE (the full feature's deps),
+   * so a slice importing a package the stack itself adds can verify green even
+   * though its own PR won't have it — verify is a fast early gate, not a
+   * replacement for CI. Single-root projects only (one root-level link; no
+   * per-package monorepo installs).
+   */
+  verifyDeps: readonly string[];
+};
+
 export type AiConfig = {
   /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
   endpoint: string;
@@ -241,6 +263,7 @@ export type Config = {
   sst: SstConfig | null;
   linear: LinearConfig | null;
   ai: AiConfig | null;
+  stack: StackConfig;
   diff: DiffConfig;
   github: GithubConfig;
   actions: readonly ActionDef[];
@@ -260,6 +283,9 @@ const GENERIC_DEFAULTS = {
   },
   lifecycle: {
     envFilesToCopy: [".env"] as const,
+  },
+  stack: {
+    verifyDeps: ["node_modules"] as const,
   },
   paths: {
     logDir: join(HOME, ".cache", "wt", "logs"),
@@ -499,6 +525,12 @@ function build(raw: Raw, errs: Errors): Config {
     command: errs.optStr(diffRaw, "command", GENERIC_DEFAULTS.diff.command),
   };
 
+  const stackRaw = obj(raw.stack);
+  const stack: StackConfig = {
+    verifyCommand: errs.optStrOrNull(stackRaw, "verify_command"),
+    verifyDeps: strArr(stackRaw?.verify_deps, GENERIC_DEFAULTS.stack.verifyDeps),
+  };
+
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   const githubRaw = obj(raw.github);
@@ -521,6 +553,7 @@ function build(raw: Raw, errs: Errors): Config {
     sst,
     linear,
     ai,
+    stack,
     diff,
     github,
     actions,

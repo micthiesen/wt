@@ -95,6 +95,44 @@ export function topoSortSlices(manifest: StackManifest): StackSlice[] {
 }
 
 /**
+ * Transitive ancestors of every slice, by id, over the SAME effective-edge
+ * set as `topoSortSlices`: explicit `dependsOn` PLUS `base` when it names a
+ * sibling slice id (the manifest may encode the parent either way). This must
+ * match the materialize parent (`resolveParentBranch`), because partial-file
+ * reconstruction applies "base + ancestor-owned + own" hunks — an ancestor
+ * reachable only through `base` that were missed would silently drop the
+ * parent's hunks on a shared file. Shared by `applyStack` (materialize) and
+ * the `apply --verify` gate so both reason about identical closures.
+ */
+export function transitiveAncestors(slices: StackSlice[]): Map<string, Set<string>> {
+  const byId = new Map(slices.map((s) => [s.id, s]));
+  const directDeps = (s: StackSlice): string[] => {
+    const set = new Set(s.dependsOn.filter((d) => byId.has(d)));
+    if (s.base !== s.id && byId.has(s.base)) set.add(s.base);
+    return [...set];
+  };
+  const cache = new Map<string, Set<string>>();
+  const visit = (id: string, stack: Set<string>): Set<string> => {
+    const hit = cache.get(id);
+    if (hit) return hit;
+    const acc = new Set<string>();
+    const s = byId.get(id);
+    if (s && !stack.has(id)) {
+      stack.add(id);
+      for (const dep of directDeps(s)) {
+        acc.add(dep);
+        for (const a of visit(dep, stack)) acc.add(a);
+      }
+      stack.delete(id);
+    }
+    cache.set(id, acc);
+    return acc;
+  };
+  for (const s of slices) visit(s.id, new Set());
+  return cache;
+}
+
+/**
  * Position of a node within its lane's vertical spine, used to pick the
  * tree-connector glyph: `single` = a one-slice lane (blank, no spine),
  * `first` = a chain root with children (┌), `last` = a chain tip (└),

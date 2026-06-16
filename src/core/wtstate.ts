@@ -155,6 +155,15 @@ export type StackManifest = {
    * stored manifests and skill-authored ingest JSON stay valid.
    */
   engine: string;
+  /**
+   * Unified-diff context-line count for hunk-level partitioning. Pins the
+   * `git diff -U<n>` setting so the content-hashed hunk ids `/split` assigns
+   * line up with what materialize reconstructs. Omitted ⇒ git's default of 3.
+   * Set to 0 to split edits that 3 lines of shared context would otherwise
+   * coalesce into a single inseparable hunk. Stack-wide (a file's ids are
+   * computed at one level); harmless on whole-file-only stacks.
+   */
+  hunkContext?: number;
   slices: StackSlice[];
 };
 
@@ -232,6 +241,11 @@ export function isUnsafeSlicePath(p: string): boolean {
   return p.split(/[\\/]/).includes("..");
 }
 
+/** A valid hunk context (non-negative integer), or `undefined` to mean "use the default". */
+export function coerceHunkContext(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined;
+}
+
 /** Coerce a persisted/skill-authored `partials` array, dropping malformed entries. */
 export function coercePartials(v: unknown): PartialFile[] {
   if (!Array.isArray(v)) return [];
@@ -272,8 +286,15 @@ function parseManifest(v: unknown): StackManifest | null {
     ...(typeof rec.archivedTag === "string" ? { archivedTag: rec.archivedTag } : {}),
     limits,
     engine: typeof rec.engine === "string" ? rec.engine : "stack",
+    ...spreadHunkContext(rec.hunkContext),
     slices,
   };
+}
+
+/** The conditional `{ hunkContext }` spread (omitted when absent/invalid). */
+function spreadHunkContext(v: unknown): { hunkContext?: number } {
+  const hc = coerceHunkContext(v);
+  return hc !== undefined ? { hunkContext: hc } : {};
 }
 
 export type ManifestValidation =
@@ -283,7 +304,7 @@ export type ManifestValidation =
 /** Top-level keys a manifest may carry. Anything else is a typo / drift. */
 const MANIFEST_KEYS = new Set([
   "stackId", "issue", "holisticBranch", "holisticSlug", "holisticSessionId",
-  "archivedTag", "limits", "engine", "slices",
+  "archivedTag", "limits", "engine", "hunkContext", "slices",
 ]);
 /** Per-slice keys a slice may carry. */
 const SLICE_KEYS = new Set([
@@ -334,6 +355,9 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
   const holisticSlug = reqStr("holisticSlug");
   for (const key of ["holisticSessionId", "archivedTag", "engine"] as const) {
     if (key in rec && typeof rec[key] !== "string") errors.push(`"${key}" must be a string`);
+  }
+  if ("hunkContext" in rec && coerceHunkContext(rec.hunkContext) === undefined) {
+    errors.push(`"hunkContext" must be a non-negative integer`);
   }
 
   let limits: StackLimits = { files: 0, prodLines: 0, hard: false };
@@ -552,6 +576,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
     ...(typeof rec.archivedTag === "string" ? { archivedTag: rec.archivedTag } : {}),
     limits,
     engine: typeof rec.engine === "string" ? rec.engine : "stack",
+    ...spreadHunkContext(rec.hunkContext),
     slices,
   };
   return { ok: true, manifest };
