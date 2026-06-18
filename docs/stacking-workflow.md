@@ -2,7 +2,7 @@
 
 > Living design doc. When something in this workflow needs tweaking, read this
 > first for full context, then update it (decisions, what works, what to change).
-> Last updated: 2026-06-09.
+> Last updated: 2026-06-18.
 
 Full design conversation (deep context, the back-and-forth that produced this):
 `/Users/michael/.claude/projects/-Users-michael-Code-client-wt-eng-5182-metric-builder-tools-and-v2-instructions/9323e329-e087-59be-a2cf-7ffd88e9ab4e.jsonl`
@@ -490,6 +490,38 @@ standalone skills — never as edits to `/start` or `/done`.
       Verified with git fixtures (reconstruct chain, new-file split, no-eol,
       order-independence) + validation unit checks. **Skill side still TODO:**
       `/split` must learn to detect separable hunks and author `partials`.
+- [x] wt: **mid-stack re-split robustness pass** (eng-5238 re-split post-mortem,
+      2026-06-18). Four engine gaps that turned a live-slice re-split into manual
+      `state.json` surgery, all in `~/.wt`: (1) **`wt stack split --apply --verify`** —
+      `split --apply` couldn't plumb the compile gate, so a re-split materialized PRs
+      without typechecking any prefix; a bad partition (a sub-slice ordered ahead of the
+      exhaustive consumer that must compile against it) shipped before anyone noticed.
+      `--verify` now chains into the apply, and `verifyStack` honors a single uniform
+      `slice.source` (a re-split IS single-source) — it reconstructs against that branch +
+      its base instead of bailing, and only a genuinely MIXED-source stack falls to CI.
+      (2) **Merged partial co-owner tolerated** — the partial-file coverage/chain gate
+      counted a `merged` slice as a live owner, so a file hunk-split between a landed
+      slice and an open slice (`useChatThread.ts`: merged s1 + open s4, no chain) bailed
+      even though s1 was already in trunk. Merged slices are now excluded from the chain
+      check and their hunks count as covered-by-base in coverage; `ancestorOwnedHunks`
+      folds them into the open slice's reconstruction so the absolute content matches
+      trunk (omitting them would silently REVERT the landed hunk). Status-driven,
+      mirroring how `replayStack` already drops merged slices — `reconcileStack`'s
+      existing merged-marking IS the self-heal; no partials-clearing (that would break
+      both the gate and reconstruction). (3) **Adopt only OPEN/MERGED PRs** —
+      `applyStack`'s adopt path grabbed ANY PR matched by branch name, so re-applying onto
+      a reused branch whose prior PR was CLOSED adopted the dead PR (#4943) and never
+      pushed/created a fresh one. Now guarded by `isAdoptablePr` (same rule
+      `addSliceToStack` already used); a CLOSED PR falls through to push + `gh pr create`.
+      (4) Recovery-without-`state.json`-surgery evaluated + DEFERRED (see Open questions).
+      Fixture-verified (`core/stack-ops.test.ts`): merged+open co-owners pass the gate,
+      dropping the merged owner re-flags the landed hunk unassigned, two LIVE parallel
+      owners still fail the chain, reconstruction folds the merged hunk; adopt-guard unit
+      asserts OPEN/MERGED adoptable, CLOSED not. Typecheck + smoke clean. Companion
+      `/split` skill edit (parallel session, Michael's main `~/.dotfiles` session):
+      re-split section recommends `wt stack split --apply --verify` and adds teardown
+      safety (never delete a branch that's a live PR base — it auto-closes the descendant
+      PR — use fresh branch names on a redo).
 
 ---
 
@@ -499,6 +531,24 @@ Track friction here as the workflow gets used. Candidate adjustments:
 
 - **Budget numbers** (≤3 files / ~150 prod LOC). If the vibe still fires, go
   smaller. These are guesses; tune against real reactions.
+- **Recovery without `state.json` surgery** (DEFERRED 2026-06-18, eng-5238). The
+  re-split post-mortem needed a hand-edit of `~/.cache/wt/state.json` to reset
+  already-materialized slices (status open→planned, clear `pr`/`baseSha`,
+  change `files`) so `applyStack` would re-materialize them. With the FIX 1/2/4
+  robustness pass in place that surgery is rarely needed — the bad-partition,
+  merged-co-owner, and adopt-a-CLOSED-PR cases that forced it are all handled —
+  so a recovery affordance is NOT built. The sketch if it ever recurs: a
+  `wt stack reslice --reset <sliceId...>` that flips the named slices back to
+  `planned` and clears `pr`/`baseSha` (one new mutator mirroring
+  `updateStackSlice`; `planned`-without-`pr` already satisfies
+  `validateStackManifest`). The reason it isn't trivial — and why it stays
+  deferred rather than half-built: a *safe* reset must not strand a live PR. A
+  reset to `planned` followed by `apply` would either re-adopt the still-OPEN PR
+  (FIX 4) or, post-teardown, push + open a duplicate; so a safe command would
+  have to verify the branch/PR are actually gone (or refuse), which is real
+  feature surface, not a natural fall-out of existing code. Defer until a
+  concrete recurrence justifies that surface; document the manual reset shape
+  here meanwhile.
 - **File-level vs hunk-level.** RESOLVED (2026-06-16): hunk-level is now
   supported alongside file-level (which stays the default). A slice may own
   whole files (`files`) AND/OR partial files by hunk (`partials: [{ file,
@@ -524,7 +574,11 @@ Track friction here as the workflow gets used. Candidate adjustments:
   Follow-up (2026-06-16): the compiling-at-every-slice property a whole-file
   stack got for free is now restorable on hunk stacks via `apply --verify`
   (see Status) — it reconstructs each slice's tree and typechecks it before
-  any PR opens.
+  any PR opens. Follow-up (2026-06-18): `apply --verify` no longer bails on a
+  re-split. It reconstructs against a single uniform `slice.source` (a re-split
+  is single-source by construction); only a genuinely mixed-source stack (two
+  different `source` branches) falls to CI. `wt stack split --apply --verify`
+  now gates a mid-stack re-split too.
 - **Engine: keep `stack` or internalize into wt?** RESOLVED (2026-06-08): internalized.
   Native `NativeRestackEngine.replaySlice` replaced `@kitlangton/stack`. Scoped to
   this workflow only — GitHub, squash-merge, worktree-per-slice. The squash-safe
@@ -982,3 +1036,58 @@ Track friction here as the workflow gets used. Candidate adjustments:
   the holistic/parent plumbing). All seven eng-5201 bodies regenerated
   (prose kept, section swapped); eng-5184/5185 were assembled with the
   blank line and main-rooted, so untouched.
+- **2026-06-18** — Mid-stack re-split robustness pass, from the eng-5238
+  post-mortem (re-splitting a live slice cascaded through four engine gaps and
+  ended in hand-editing `~/.cache/wt/state.json`). All wt-side, all in `~/.wt`;
+  three fixes + one deferral. (1) **Compile gate on `split --apply`**: the
+  root-cause gap — `applyStack` already accepted `--verify`, but `wt stack split
+  --apply` couldn't plumb it, so a re-split materialized PRs without typechecking
+  any slice prefix, and a bad ordering (a sub-slice that extends a discriminated
+  union placed BEFORE the exhaustive consumer that must compile against it)
+  shipped as open PRs before anyone noticed. Added `--verify` to the `split`
+  subcommand (`runSplit` in `cli/commands/stack.ts`), gated to `--apply` and
+  passed into the chained `applyStack({ verify })`. The harder half was
+  `verifyStack` (`core/stack-verify.ts`): it BAILED on any `slice.source !==
+  holisticBranch`, which is every re-split — exactly the case `--verify` most
+  needs. Reworked it to resolve a single reconstruction branch: a re-split is
+  single-source by construction (all sub-slices carry the original slice's
+  branch), so verify now reconstructs against that uniform `source` + its
+  `holisticBase`, deps from that branch's worktree; only a genuinely MIXED-source
+  stack (two different `source` branches, which can't be one base-plus-closure
+  tree) still falls to CI. (2) **Merged partial co-owner**: the partial-file
+  coverage/chain gate (`validatePartialCoverage`) counted a `merged` slice as a
+  live owner. Concretely `useChatThread.ts` was hunk-split between merged s1 (1
+  hunk) and open s4 (9 hunks) with no dependency chain, so the gate bailed
+  ("don't form a dependency chain") even though s1 had landed in trunk. Now
+  merged slices are dropped from the chain check and their hunks count as
+  covered-by-base in coverage (only a hunk NO slice claims is "unassigned").
+  Subtle correctness catch verified by fixture: the open slice's reconstruction
+  must STILL fold in the merged hunk — materialize writes ABSOLUTE file content
+  (`base + owned`) and diffs against the trunk parent that already has the hunk,
+  so omitting it would silently revert the landed hunk. `ancestorOwnedHunks` now
+  includes merged slices' hunks unconditionally (not just dependsOn-ancestors).
+  Chose status-driven logic over the briefed "clear the merged slice's partials
+  at reconcile": clearing them would make the gate flag the landed hunk
+  unassigned AND make reconstruction revert it — keeping them as the "already in
+  base" record is load-bearing, and `reconcileStack`'s existing merged-marking is
+  itself the self-heal (same pattern `replayStack` uses to drop merged slices).
+  (3) **Adopt only OPEN/MERGED PRs**: `applyStack`'s adopt path grabbed ANY PR
+  matched by branch name; when a re-split reused a branch whose prior PR was
+  CLOSED, apply adopted the dead closed PR (#4943) and skipped push + create,
+  leaving the slice broken. Extracted `isAdoptablePr(state)` (OPEN | MERGED) —
+  the same guard `addSliceToStack` already applied — so a CLOSED PR falls through
+  to push + `gh pr create`. (4) **Recovery without `state.json` surgery**:
+  evaluated, DEFERRED (now an Open question with the `reslice --reset` sketch).
+  With 1/2/3 in place the manual reset is rarely needed, and a SAFE reset has to
+  avoid stranding a live PR (verify the branch/PR are gone, or refuse) — real
+  feature surface, not a fall-out of existing code, so documenting beat
+  half-building. Fixtures: new `core/stack-ops.test.ts` (5 tests) — merged+open
+  co-owners pass the gate, dropping the merged owner re-flags the hunk
+  unassigned, two LIVE parallel owners still fail the chain, reconstruction folds
+  the merged hunk, adopt-guard OPEN/MERGED-yes-CLOSED-no — plus the existing
+  `hunks.test.ts` still green; `bun run typecheck` + `bun src/main.ts ls` clean.
+  Companion `/split` skill edit is a PARALLEL, separate change in Michael's main
+  `~/.dotfiles` session (NOT touched here): its re-split section now recommends
+  `wt stack split --apply --verify` and adds teardown safety (never delete a
+  branch that's a live PR base — GitHub auto-closes the descendant PR — and use
+  fresh branch names on a redo).
