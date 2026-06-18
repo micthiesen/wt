@@ -36,7 +36,8 @@ subcommands:
   apply <stackId>            materialize an already-ingested manifest
   apply --from <file>        strict-validate + ingest a manifest, then materialize
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
-  status [stackId]           render the manifest DAG + drift vs reality
+  status [stackId]           render the manifest DAG + drift vs reality (defaults
+                             to the current branch's stack; --all for every stack)
   split <stackId> <sliceId> --from <frag>   reshape: replace an open slice with N
                              sub-slices (re-threads descendants). Manifest only;
                              prints the apply/replay/retire next steps (or --apply
@@ -77,6 +78,8 @@ add options:
                              from the branch name)
 status options:
   --json                     machine-readable output
+  --all                      every stack manifest (default: the current branch's
+                             stack, or all stacks when cwd is in no stack)
 reconcile/replay/rebase options:
   --onto <ref>               trunk landed roots reparent onto (default ${config.branch.base})`;
 
@@ -272,8 +275,10 @@ async function runPlan(argv: string[]): Promise<number> {
 async function runStatus(argv: string[]): Promise<number> {
   let stackId: string | undefined;
   let json = false;
+  let all = false;
   for (const a of argv) {
     if (a === "--json") json = true;
+    else if (a === "--all") all = true;
     else if (a.startsWith("--")) {
       console.error(red(`unknown flag: ${a}`));
       return 2;
@@ -291,7 +296,12 @@ async function runStatus(argv: string[]): Promise<number> {
     return 0;
   }
 
-  const ids = stackId ? [stackId] : manifests.map((m) => m.stackId);
+  // Default to the current branch's stack (mirrors rebase/replay/reconcile);
+  // `--all` or running from outside any stack falls back to every manifest.
+  // Scoping by default keeps cross-stack slice references ("slice 04") from
+  // colliding — every stack has a slice 04.
+  const resolvedId = stackId ?? (all ? undefined : ((await stackIdFromCwd()) ?? undefined));
+  const ids = resolvedId ? [resolvedId] : manifests.map((m) => m.stackId);
   const reports: StackStatusReport[] = [];
   for (const id of ids) {
     const r = await stackStatus(id);

@@ -550,6 +550,16 @@ standalone skills — never as edits to `/start` or `/done`.
       "Mirrors `addSliceToStack`" — but apply ADOPTS a MERGED PR (re-records + skips) while
       `addSliceToStack` REJECTS it ("nothing left to stack"); they agree only on CLOSED.
       Comment corrected at both sites. Typecheck + `bun test` (21 pass) clean.
+- [x] wt + skill: **`wt stack status` defaults to the current stack** (eng-5240
+      restack friction, 2026-06-18). No-arg `runStatus` dumped every manifest, which
+      (a) contradicted the `/restack` precondition that claimed status resolves the
+      stackId from cwd (only rebase/replay/reconcile did) and (b) put unrelated
+      stacks in view, so a cross-stack bare "slice 04" reference collided with the
+      user's own slice 04. `runStatus` now resolves from cwd when no id and no
+      `--all` (falls back to all stacks outside any stack); `--all` keeps the global
+      dump; help updated. `/restack` precondition documents the scoped default; its
+      Report step bans bare cross-stack "slice N" (pair stack id + PR#). No caller
+      depended on no-arg=all. Typecheck + smoke clean.
 
 ---
 
@@ -665,6 +675,26 @@ Track friction here as the workflow gets used. Candidate adjustments:
 
 ## Session log
 
+- **2026-06-18** — **`wt stack status` defaults to the current stack** (via
+  `/improve-stacking`, prompted by an eng-5240 restack where the no-arg status
+  dumped all ~15 stacks, an unrelated stack's drift (eng-5238) landed in the
+  report, and a bare "slice 04 #4945" reference collided with the user's own
+  slice 04 (#4934) — every stack has a slice 04). Two root causes: (1) no-arg
+  `runStatus` rendered every manifest; (2) the `/restack` skill's precondition
+  *claimed* status resolved the stackId from the current branch, but only
+  rebase/replay/reconcile (`parseStackTarget` → `stackIdFromCwd`) did — status
+  did not, so the doc lied. Fix lands the behavior the doc already promised:
+  `runStatus` now resolves from cwd when no id and no `--all` (falls back to all
+  stacks when cwd is in no stack, since there's no current stack to scope to);
+  new `--all` flag preserves the global dump; help + status-options updated. No
+  programmatic caller depended on no-arg=all (the `/split` `stack-section.{sh,py}`
+  pass an explicit id; the two skill context scripts and the `/restack`
+  instruction are the only no-arg callers, and scoping is exactly what they want).
+  Skill side: `/restack` precondition now notes the scoped default + `--all`; the
+  Report step gained a guardrail — report only the restacked stack, and never use
+  a bare "slice N" for another stack (always pair stack id + PR#, e.g.
+  "eng-5238 / #4945"). Typecheck clean; smoke-verified scoped default, `--all`,
+  and explicit id.
 - **2026-06-16** — Relaxed the **atomic-file rule** to allow **hunk-level slice
   partitions** (via `/improve-stacking`, prompted by eng-5229 where one file's
   actor/gate hunks and three specs' fixture/behavior hunks couldn't be separated,
