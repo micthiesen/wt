@@ -72,6 +72,19 @@ export type Logger = (line: string) => void;
 const STACK_BUSY = "another wt stack operation is already running";
 
 /**
+ * Whether an existing PR matched by branch name should be ADOPTED on a
+ * re-apply rather than triggering a fresh push + `gh pr create`. Only OPEN
+ * (a prior run that pushed + opened but failed before recording) and MERGED
+ * (already landed) qualify. A CLOSED PR must NOT be adopted: `gh` opens a
+ * brand-new PR on the same branch, and a closed PR (e.g. a superseded re-split
+ * slice whose branch name got reused) isn't tracking this work — adopting it
+ * records a dead PR and skips materialization. Mirrors `addSliceToStack`.
+ */
+export function isAdoptablePr(state: LivePrInfo["state"]): boolean {
+  return state === "OPEN" || state === "MERGED";
+}
+
+/**
  * Acquire the cross-process stack lock, waiting briefly for a live holder
  * to finish. EVERY manifest mutator takes this — not just replay. Each
  * mutator does read-manifest → async git/gh work → write-manifest-back, so
@@ -214,8 +227,17 @@ async function materializeSliceCommit(
   return { ok: true };
 }
 
-/** The hunks an ancestor chain already applied for each partial file, for one slice. */
-function ancestorOwnedHunks(
+/**
+ * The hunks ALREADY present in this slice's base for each partial file: every
+ * hunk owned by a transitive ancestor (which the chain commits below this
+ * slice carry) PLUS every hunk owned by a MERGED slice (which trunk/base
+ * already holds, even if that slice isn't a dependsOn-ancestor — e.g. an
+ * earlier landed sibling that hunk-split the same file). Reconstruction writes
+ * ABSOLUTE file content (base + this set + the slice's own hunks), so the
+ * merged hunks must be in it or the commit would spuriously REVERT a landed
+ * hunk when it diffs against the trunk parent that already contains it.
+ */
+export function ancestorOwnedHunks(
   manifest: StackManifest,
   slice: StackSlice,
   ancestors: Map<string, Set<string>>,
@@ -223,7 +245,8 @@ function ancestorOwnedHunks(
   const owned = new Map<string, Set<string>>();
   const anc = ancestors.get(slice.id) ?? new Set();
   for (const s of manifest.slices) {
-    if (!anc.has(s.id)) continue;
+    const include = anc.has(s.id) || s.status === "merged";
+    if (!include) continue;
     for (const p of s.partials ?? []) {
       const set = owned.get(p.file) ?? new Set<string>();
       for (const h of p.hunks) set.add(h);
@@ -238,57 +261,82 @@ function ancestorOwnedHunks(
  * correct stack tip. Three independent ways a manifest can be union-valid yet
  * still drop or mis-place holistic content (none catchable by the structural
  * `validateStackManifest`, which can't see the real diff):
- *  1. COVERAGE — each holistic hunk of the file owned by exactly one slice,
- *     no stale ids, not binary.
- *  2. CHAIN — the slices owning a file must lie on a single dependency chain,
- *     i.e. one owner ("tip") transitively descends from every other owner.
- *     Materialize reconstructs "base + ancestor-owned + own" hunks, so only a
- *     slice that depends on all other owners ends up with the COMPLETE file.
- *     Two parallel-lane owners would each carry half and no tip the whole.
+ *  1. COVERAGE — each holistic hunk of the file owned by exactly one LIVE
+ *     slice, OR already landed (owned by a MERGED slice → satisfied by base/
+ *     trunk, which now contains it). No stale ids, not binary.
+ *  2. CHAIN — the LIVE slices owning a file must lie on a single dependency
+ *     chain, i.e. one owner ("tip") transitively descends from every other
+ *     live owner. Materialize reconstructs "base + ancestor-owned + own"
+ *     hunks, so only a slice that depends on all other owners ends up with the
+ *     COMPLETE file. Two parallel-lane owners would each carry half and no tip
+ *     the whole.
  *  3. SINGLE SOURCE — a file partitioned under two different `source`
  *     branches has two different holistic diffs; the owned-hunk maps merge by
  *     path and would mismatch. Forbid it.
+ *
+ * A MERGED slice's hunks are already in trunk/base, so it is NOT a live
+ * reconstruction owner: it's excluded from the chain check (a live tip needn't
+ * descend from a landed slice) and its hunks count as covered-by-base in the
+ * coverage check (not "unassigned"). This is the partial-file analogue of how
+ * `replayStack` already drops merged slices — the open slice reconstructs base
+ * + its own hunks, and base (trunk) holds the merged slice's hunk, so the tip
+ * is whole.
+ *
  * Also resolves + caches each source's diff base SHA into `baseBySource` so
  * materialize reconstructs against the SAME base this gate validated.
  */
-async function validatePartialCoverage(
+export async function validatePartialCoverage(
   manifest: StackManifest,
   cwd: string,
   ancestors: Map<string, Set<string>>,
   baseBySource: Map<string, string>,
 ): Promise<string | null> {
   const context = manifest.hunkContext ?? DEFAULT_HUNK_CONTEXT;
-  // owners by file path (across the whole stack) and by (source, file).
-  const ownersByFile = new Map<string, string[]>(); // file -> slice ids
-  const sourcesByFile = new Map<string, Set<string>>(); // file -> source branches
-  const groups = new Map<string, { source: string; file: string; owned: Set<string> }>();
+  const mergedIds = new Set(
+    manifest.slices.filter((s) => s.status === "merged").map((s) => s.id),
+  );
+  // owners by file path. `liveOwners` drives the chain + coverage gates;
+  // `mergedOwned` records hunks already in base so coverage doesn't flag them.
+  const liveOwnersByFile = new Map<string, string[]>(); // file -> live slice ids
+  const sourcesByFile = new Map<string, Set<string>>(); // file -> source branches (live only)
+  const groups = new Map<string, { source: string; file: string; owned: Set<string>; mergedOwned: Set<string> }>();
   for (const s of manifest.slices) {
     const source = s.source ?? manifest.holisticBranch;
+    const merged = mergedIds.has(s.id);
     for (const p of s.partials ?? []) {
-      (ownersByFile.get(p.file) ?? ownersByFile.set(p.file, []).get(p.file)!).push(s.id);
-      (sourcesByFile.get(p.file) ?? sourcesByFile.set(p.file, new Set()).get(p.file)!).add(source);
       const key = `${source}\0${p.file}`;
-      const g = groups.get(key) ?? { source, file: p.file, owned: new Set<string>() };
-      for (const h of p.hunks) g.owned.add(h);
+      const g =
+        groups.get(key) ??
+        { source, file: p.file, owned: new Set<string>(), mergedOwned: new Set<string>() };
       groups.set(key, g);
+      if (merged) {
+        for (const h of p.hunks) g.mergedOwned.add(h);
+        continue;
+      }
+      (liveOwnersByFile.get(p.file) ?? liveOwnersByFile.set(p.file, []).get(p.file)!).push(s.id);
+      (sourcesByFile.get(p.file) ?? sourcesByFile.set(p.file, new Set()).get(p.file)!).add(source);
+      for (const h of p.hunks) g.owned.add(h);
     }
   }
-  // (3) single source per file.
+  // (3) single source per file (across live owners).
   for (const [file, sources] of sourcesByFile) {
     if (sources.size > 1) {
       return `partial ${file}: split across ${sources.size} source branches (${[...sources].join(", ")}) — a file's hunks must all come from one source`;
     }
   }
-  // (2) owners of each file form a single dependency chain.
-  for (const [file, owners] of ownersByFile) {
+  // (2) LIVE owners of each file form a single dependency chain. Merged owners
+  // dropped out above — a live tip needn't descend from a landed slice.
+  for (const [file, owners] of liveOwnersByFile) {
     const set = new Set(owners);
     const tip = owners.find((o) => [...set].every((x) => x === o || ancestors.get(o)?.has(x)));
     if (!tip) {
       return `partial ${file}: owning slices (${owners.join(", ")}) don't form a dependency chain — no single slice descends from all of them, so no commit would carry the whole file`;
     }
   }
-  // (1) coverage against the real per-source diff.
-  for (const { source, file, owned } of groups.values()) {
+  // (1) coverage against the real per-source diff. A holistic hunk is covered
+  // when a LIVE slice owns it OR a MERGED slice already landed it (it's in
+  // base/trunk now). Only a hunk no slice claims at all is truly unassigned.
+  for (const { source, file, owned, mergedOwned } of groups.values()) {
     let base = baseBySource.get(source);
     if (base === undefined) {
       base = await holisticBase(cwd, source);
@@ -297,11 +345,13 @@ async function validatePartialCoverage(
     const fd = await fileHunks(cwd, base, source, file, context);
     if (fd.binary) return `cannot hunk-split binary file ${file}`;
     const known = new Set(fd.hunks.map((h) => h.id));
-    const missing = fd.hunks.filter((h) => !owned.has(h.id)).map((h) => h.id);
+    const missing = fd.hunks
+      .filter((h) => !owned.has(h.id) && !mergedOwned.has(h.id))
+      .map((h) => h.id);
     if (missing.length > 0) {
       return `partial ${file}: ${missing.length} holistic hunk(s) unassigned (${missing.join(", ")}) — every hunk must be owned by a slice`;
     }
-    const stale = [...owned].filter((h) => !known.has(h));
+    const stale = [...owned, ...mergedOwned].filter((h) => !known.has(h));
     if (stale.length > 0) {
       return `partial ${file}: hunk id(s) not in the holistic diff: ${stale.join(", ")}`;
     }
@@ -442,11 +492,16 @@ async function applyStackLocked(
       parentRef = await localOrOriginRef(parentBranch);
     }
 
-    // Idempotent re-run: if a PR already exists on this branch (a prior
-    // run materialized + pushed + opened the PR but failed before
-    // recording it), adopt it instead of creating a duplicate.
+    // Idempotent re-run: if an OPEN (or already-merged) PR exists on this
+    // branch (a prior run materialized + pushed + opened the PR but failed
+    // before recording it), adopt it instead of creating a duplicate. A
+    // CLOSED PR is NOT adopted — `gh` happily opens a fresh PR on the same
+    // branch, and the closed one (e.g. a superseded re-split slice that reused
+    // this branch name) wasn't tracking this work. Adopting it would record a
+    // dead PR and skip the push+create, leaving the slice unmaterialized. Same
+    // guard `addSliceToStack` already applies; fall through to create otherwise.
     const existingPr = await viewPrInfo(slice.branch);
-    if (existingPr) {
+    if (existingPr && isAdoptablePr(existingPr.state)) {
       onLog(`adopt ${slice.id} → existing PR #${existingPr.number}`);
       updateStackSlice(stackId, slice.id, {
         pr: existingPr.number,
@@ -454,6 +509,9 @@ async function applyStackLocked(
       });
       materialized.push(slice.id);
       continue;
+    }
+    if (existingPr) {
+      onLog(`existing PR #${existingPr.number} on ${slice.branch} is ${existingPr.state.toLowerCase()} — opening a fresh PR`);
     }
 
     onLog(`apply ${slice.id} → ${slice.branch} (off ${parentRef})`);

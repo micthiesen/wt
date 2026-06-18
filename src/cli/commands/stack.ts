@@ -39,7 +39,8 @@ subcommands:
   status [stackId]           render the manifest DAG + drift vs reality
   split <stackId> <sliceId> --from <frag>   reshape: replace an open slice with N
                              sub-slices (re-threads descendants). Manifest only;
-                             prints the apply/replay/retire next steps (or --apply)
+                             prints the apply/replay/retire next steps (or --apply
+                             [--verify] to chain reshape → apply → replay)
   add [<branch>] [<stackId>] append an EXISTING branch to a live stack as a new
                              tip slice (adopts its open PR, or opens a draft PR);
                              never creates branches/worktrees — \`wt new\` does that
@@ -62,6 +63,9 @@ split options:
   --from <file>              fragment JSON: array of { id, title, branch, files[] } sub-slices
   --plan                     preview the reshape without writing
   --apply                    chain reshape → apply → replay (still prints the PR-retire step)
+  --verify                   with --apply: typecheck each new sub-slice prefix in a
+                             throwaway worktree before opening any PR (needs [stack]
+                             verify_command; aborts the chain on the first red prefix)
 add options:
   (branch defaults to the current worktree's branch; a positional with a "/" is
    the branch, without is the stackId — resolved from --onto's branch when omitted)
@@ -499,10 +503,12 @@ async function runSplit(argv: string[]): Promise<number> {
   let from: string | undefined;
   let plan = false;
   let apply = false;
+  let verify = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--plan") plan = true;
     else if (a === "--apply") apply = true;
+    else if (a === "--verify") verify = true;
     else if (a === "--from") {
       from = argv[++i];
       if (!from) {
@@ -521,6 +527,10 @@ async function runSplit(argv: string[]): Promise<number> {
   }
   if (plan && apply) {
     console.error(red("--plan and --apply are mutually exclusive"));
+    return 2;
+  }
+  if (verify && !apply) {
+    console.error(red("--verify only applies with --apply (it gates the chained apply)"));
     return 2;
   }
   if (!stackId || !sliceId || !from) {
@@ -576,9 +586,14 @@ async function runSplit(argv: string[]): Promise<number> {
 
   // --apply: chain the mechanical happy-path (reshape → materialize → replay).
   // PR retirement stays an explicit printed step — it closes a PR + deletes a
-  // branch, which wt won't do behind the user's back.
-  console.log(`\n${bold("apply:")} materializing new sub-slices from ${res.sourceBranch}`);
-  const applied = await applyStack(stackId, { install: false }, logLine);
+  // branch, which wt won't do behind the user's back. With --verify the
+  // chained apply typechecks each new sub-slice prefix BEFORE any PR opens —
+  // the root-cause gate for a re-split whose ordering breaks compilation
+  // (a sub-slice ordered ahead of the exhaustive consumer that needs it).
+  console.log(
+    `\n${bold("apply:")} materializing new sub-slices from ${res.sourceBranch}${verify ? " (verify)" : ""}`,
+  );
+  const applied = await applyStack(stackId, { install: false, verify }, logLine);
   if (applied.error) {
     console.error(red(applied.error));
     if (applied.materialized.length > 0) {

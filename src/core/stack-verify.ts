@@ -36,8 +36,11 @@
  *  - Single-root projects only: the command runs at the worktree ROOT with one
  *    root-level dep symlink, so workspace/monorepo per-package installs aren't
  *    reproduced.
- *  - Single-source stacks only: a re-split slice reproduces from its own
- *    `source` branch (which the holistic base predates), so verify bails there.
+ *  - Single reconstruction branch only: every source-bearing slice must share
+ *    one `source`. A re-split is single-source by construction (all sub-slices
+ *    carry the original slice's branch), so it verifies against that branch +
+ *    its base. A stack mixing two different `source` branches can't be one
+ *    base-plus-closure tree and bails to CI.
  * CI remains the authoritative gate; this catches the common breakages early.
  */
 import { randomUUID } from "node:crypto";
@@ -115,17 +118,28 @@ export async function verifyStack(stackId: string, onLog: Logger): Promise<Verif
   }
   const holisticBranch = manifest.holisticBranch;
 
-  // Single-source only: a re-split slice reproduces from its own `source`
-  // branch, so a base-plus-closure tree wouldn't reflect what materialize
-  // builds. Refuse rather than verify a tree that doesn't exist.
-  const mixed = manifest.slices.find((s) => s.source && s.source !== holisticBranch);
-  if (mixed) {
+  // Resolve the SINGLE branch the closure trees reconstruct from. Materialize
+  // sources each slice from `slice.source ?? holisticBranch`; the closure
+  // reconstruction here uses one branch + one base for the whole stack, so it
+  // can faithfully mirror materialize only when every source-bearing slice
+  // agrees. A re-split is single-source by construction (its sub-slices all
+  // carry the SAME original-slice branch), so it verifies fine — but a stack
+  // whose slices source from two DIFFERENT branches can't be reconstructed as
+  // one base-plus-closure and bails to CI.
+  const sources = new Set(
+    manifest.slices.map((s) => s.source).filter((s): s is string => !!s && s !== holisticBranch),
+  );
+  if (sources.size > 1) {
     return {
       ok: false,
       prefixes: [],
-      error: `verify unsupported for re-split stacks (slice ${mixed.id} sources from ${mixed.source}, not the holistic branch) — rely on per-PR CI`,
+      error: `verify unsupported for mixed-source stacks (slices source from ${[...sources].join(", ")}) — rely on per-PR CI`,
     };
   }
+  // The uniform re-split source when present, else the holistic branch. Both
+  // the reconstruction branch and the verify worktree base derive from this so
+  // the tree matches what `materializeSliceCommit` would commit.
+  const reconBranch = sources.size === 1 ? [...sources][0]! : holisticBranch;
 
   let ordered: StackSlice[];
   try {
@@ -136,19 +150,25 @@ export async function verifyStack(stackId: string, onLog: Logger): Promise<Verif
 
   const context = manifest.hunkContext ?? DEFAULT_HUNK_CONTEXT;
   const mainClone = config.paths.mainClone;
-  const base = await holisticBase(mainClone, holisticBranch);
+  const base = await holisticBase(mainClone, reconBranch);
   if (!(await revParse(base, mainClone))) {
-    return { ok: false, prefixes: [], error: `holistic base ${base} does not resolve` };
+    return { ok: false, prefixes: [], error: `reconstruction base ${base} (of ${reconBranch}) does not resolve` };
   }
   const ancestors = transitiveAncestors(manifest.slices);
 
-  // Deps come from the holistic branch's live worktree when it has one (it's
-  // where the user installed them), else the main clone. `listWorktrees`
-  // parses `git worktree list`; guard it so a parse hiccup degrades to the
-  // main clone instead of throwing past the structured-result contract.
+  // Deps come from the reconstruction branch's live worktree when it has one
+  // (it's where the user installed them) — for a re-split that's the original
+  // slice's worktree; for a plain stack it's the holistic worktree — falling
+  // back to the holistic worktree, then the main clone. `listWorktrees` parses
+  // `git worktree list`; guard it so a parse hiccup degrades to the main clone
+  // instead of throwing past the structured-result contract.
   let depsSource = mainClone;
   try {
-    depsSource = (await listWorktrees()).find((w) => w.branch === holisticBranch)?.path ?? mainClone;
+    const wts = await listWorktrees();
+    depsSource =
+      wts.find((w) => w.branch === reconBranch)?.path ??
+      wts.find((w) => w.branch === holisticBranch)?.path ??
+      mainClone;
   } catch (e) {
     onLog(`verify: worktree lookup failed (${e instanceof Error ? e.message : String(e)}); deps from ${mainClone}`);
   }
@@ -222,7 +242,7 @@ export async function verifyStack(stackId: string, onLog: Logger): Promise<Verif
         }
       }
 
-      const built = await applyClosure(tmp, holisticBranch, base, context, wholeFiles, partialOwned);
+      const built = await applyClosure(tmp, reconBranch, base, context, wholeFiles, partialOwned);
       if (!built.ok) {
         return {
           ok: false,
@@ -266,16 +286,17 @@ export async function verifyStack(stackId: string, onLog: Logger): Promise<Verif
 
 /**
  * Write one slice's ancestor-closure tree into the (already base-reset) verify
- * worktree: whole files checked out from (or removed per) the holistic branch,
+ * worktree: whole files checked out from (or removed per) the reconstruction
+ * branch (the holistic branch, or a re-split's single `source` branch),
  * partials reconstructed from their accumulated owned-hunk set. Mirrors
  * `materializeSliceCommit` so verify checks the same content apply commits —
  * including the unknown-id guard, so a manifest whose ids drifted off the
- * holistic branch fails loudly here too rather than reconstructing a stale tree.
+ * branch fails loudly here too rather than reconstructing a stale tree.
  * No commit — the verify command reads the working tree.
  */
 async function applyClosure(
   tmp: string,
-  holisticBranch: string,
+  reconBranch: string,
   base: string,
   context: number,
   wholeFiles: ReadonlySet<string>,
@@ -284,12 +305,12 @@ async function applyClosure(
   const present: string[] = [];
   const deleted: string[] = [];
   for (const f of wholeFiles) {
-    if (await gitQuiet(["cat-file", "-e", `${holisticBranch}:${f}`], tmp)) present.push(f);
+    if (await gitQuiet(["cat-file", "-e", `${reconBranch}:${f}`], tmp)) present.push(f);
     else if (await gitQuiet(["cat-file", "-e", `${base}:${f}`], tmp)) deleted.push(f);
-    else return { ok: false, error: `file ${f} is on neither ${holisticBranch} nor the base` };
+    else return { ok: false, error: `file ${f} is on neither ${reconBranch} nor the base` };
   }
   if (present.length > 0) {
-    const co = await gitRun(["checkout", holisticBranch, "--", ...present], tmp);
+    const co = await gitRun(["checkout", reconBranch, "--", ...present], tmp);
     if (co.exitCode !== 0) return { ok: false, error: co.stderr.trim() || "checkout failed" };
   }
   for (const f of deleted) {
@@ -300,7 +321,7 @@ async function applyClosure(
     // Defense in depth: the strict ingest already rejects traversal paths, but
     // this is the one spot that writes a manifest path outside git's pathspec.
     if (isUnsafeSlicePath(file)) return { ok: false, error: `unsafe partial path: ${file}` };
-    const fd = await fileHunks(tmp, base, holisticBranch, file, context);
+    const fd = await fileHunks(tmp, base, reconBranch, file, context);
     if (fd.binary) return { ok: false, error: `cannot hunk-split binary file ${file}` };
     const known = new Set(fd.hunks.map((h) => h.id));
     const unknown = [...owned].filter((h) => !known.has(h));
