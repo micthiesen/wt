@@ -36,3 +36,17 @@ export const theme = {
   opencode: "#a78bfa",
   opencodeAlt: "#9ccf6e",
 };
+
+/**
+ * Connector color for a stack row's parallel-lane index (`StackNode.lane`).
+ * Lane 0 (the main spine, and every linear stack) stays dim; each forked
+ * sibling lane picks a distinct hue from a small palette so the eye can
+ * tell parallel branches apart without any extra indentation. The palette
+ * deliberately avoids `ok`/`err` (status colors) so a lane tint never reads
+ * as a state.
+ */
+const LANE_PALETTE = [theme.info, theme.teal, theme.accentAlt, theme.warn];
+export function laneColor(lane: number): string {
+  if (lane <= 0) return theme.fgDim;
+  return LANE_PALETTE[(lane - 1) % LANE_PALETTE.length]!;
+}

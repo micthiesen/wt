@@ -43,7 +43,7 @@ import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { NF } from "../icons.ts";
 import { checkBadge, reviewBadge, statusBadge } from "../badges.ts";
 import { BadgeCluster } from "../badge-cluster.tsx";
-import { theme } from "../theme.ts";
+import { laneColor, theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { StackManifest } from "../../core/wtstate.ts";
 import {
@@ -637,12 +637,12 @@ function StackChain({
   // dangling parent) by dropping the affected slices; append those flat
   // so the summary still lists every slice.
   const laidOut = new Set(nodes.map((n) => n.slice.id));
-  const rows: { slice: StackManifest["slices"][number]; pos: SpinePos }[] = [
-    ...nodes.map((n) => ({ slice: n.slice, pos: n.pos })),
+  const rows: { slice: StackManifest["slices"][number]; pos: SpinePos; lane: number }[] = [
+    ...nodes.map((n) => ({ slice: n.slice, pos: n.pos, lane: n.lane })),
     ...manifest.slices
       .filter((s) => !laidOut.has(s.id))
       .sort((a, b) => a.ordinal - b.ordinal)
-      .map((s) => ({ slice: s, pos: "single" as SpinePos })),
+      .map((s) => ({ slice: s, pos: "single" as SpinePos, lane: 0 })),
   ];
   return (
     <>
@@ -650,7 +650,7 @@ function StackChain({
         {count("merged")} merged · {count("open")} open · {count("planned")} planned
       </text>
       <box height={1} flexShrink={0} />
-      {rows.map(({ slice: s, pos }) => {
+      {rows.map(({ slice: s, pos, lane }) => {
         const g = sliceGlyph(s.status);
         const member = memberByBranch.get(s.branch);
         return (
@@ -659,7 +659,7 @@ function StackChain({
                 yoga squeezing these texts garbles the spine; the title is
                 the only flexible (truncating) segment. */}
             <box flexShrink={0} flexDirection="row">
-              <text fg={theme.fgDim} wrapMode="none">{STACK_CONNECTOR[pos]}</text>
+              <text fg={laneColor(lane)} wrapMode="none">{STACK_CONNECTOR[pos]}</text>
               <text fg={theme.fgDim} wrapMode="none">{`${stackOrdinalLabel(s.ordinal)} `}</text>
               <text fg={g.fg} wrapMode="none">{`${g.t} `}</text>
             </box>

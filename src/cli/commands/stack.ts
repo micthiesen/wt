@@ -11,6 +11,7 @@ import {
   splitStack,
   stackStatus,
   type RebaseResult,
+  type SliceStatusRow,
   type StackStatusReport,
   type SubSliceSpec,
 } from "../../core/stack-ops.ts";
@@ -24,7 +25,8 @@ import {
   putStackManifest,
   validateStackManifest,
 } from "../../core/wtstate.ts";
-import { bold, cyan, dim, green, red, yellow } from "../colors.ts";
+import { layoutStack, STACK_CONNECTOR } from "../../core/stack-layout.ts";
+import { blue, bold, cyan, dim, green, magenta, red, yellow } from "../colors.ts";
 
 const HELP = `usage: wt stack <subcommand> [options]
 
@@ -220,12 +222,26 @@ async function runApply(argv: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * Connector color for a forked lane (mirrors `laneColor` in the TUI theme,
+ * with ansi instead of hex). Lane 0 — the main spine and every linear
+ * stack — stays dim; forked siblings each pick a distinct hue. Avoids
+ * green/red so a lane tint never reads as a status/drift marker.
+ */
+const CLI_LANE_PALETTE = [magenta, cyan, blue, yellow] as const;
+function laneColor(lane: number, glyph: string): string {
+  if (lane <= 0) return dim(glyph);
+  return CLI_LANE_PALETTE[(lane - 1) % CLI_LANE_PALETTE.length]!(glyph);
+}
+
 function renderStatus(report: StackStatusReport): void {
   const { manifest, rows } = report;
   console.log(`${bold("stack")} ${cyan(manifest.stackId)} ${dim(`· ${manifest.issue}`)}`);
   const tag = manifest.archivedTag ? dim(` [${manifest.archivedTag}]`) : dim(" (not yet tagged)");
   console.log(`  ${dim("origin")} ${manifest.holisticBranch}${tag}`);
-  for (const { slice, expectedBase, live, drift } of rows) {
+
+  const printRow = (r: SliceStatusRow, connector: string | null): void => {
+    const { slice, expectedBase, live, drift } = r;
     const ord = cyan(String(slice.ordinal).padStart(2, "0"));
     const pr = slice.pr ? cyan(`#${slice.pr}`) : dim("(no pr)");
     const state =
@@ -237,9 +253,26 @@ function renderStatus(report: StackStatusReport): void {
     const baseStr = expectedBase === config.branch.base ? dim(expectedBase) : expectedBase;
     const driftMark = drift ? red(`  ✗ ${drift}`) : green("  ✓");
     const over = slice.oversized ? dim(" (oversized)") : "";
+    const spine = connector ? `${connector} ` : "";
     console.log(
-      `  ${ord} ${bold(slice.title)}${over}  ${pr} ${state}  ${dim("base:")} ${baseStr}${driftMark}`,
+      `  ${spine}${ord} ${bold(slice.title)}${over}  ${pr} ${state}  ${dim("base:")} ${baseStr}${driftMark}`,
     );
+  };
+
+  // Render the manifest DAG as a tree: `layoutStack` orders rows by lane
+  // (a fork's branches stay contiguous) and hands each one a connector
+  // glyph + lane index, identical to the TUI gutter. A malformed manifest
+  // (cycle / dangling parent) drops the affected slices from `nodes`, so
+  // fall back to the flat ordinal list rather than hiding them.
+  const layout = layoutStack(manifest);
+  const rowById = new Map(rows.map((r) => [r.slice.id, r]));
+  if (layout.nodes.length === rows.length) {
+    for (const n of layout.nodes) {
+      const r = rowById.get(n.slice.id);
+      if (r) printRow(r, laneColor(n.lane, STACK_CONNECTOR[n.pos]));
+    }
+  } else {
+    for (const r of rows) printRow(r, null);
   }
 }
 

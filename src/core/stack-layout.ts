@@ -134,26 +134,35 @@ export function transitiveAncestors(slices: StackSlice[]): Map<string, Set<strin
 
 /**
  * Position of a node within its lane's vertical spine, used to pick the
- * tree-connector glyph: `single` = a one-slice lane (blank, no spine),
- * `first` = a chain root with children (┌), `last` = a chain tip (└),
- * `middle` = a stacked link in between (├). The glyphs themselves live
- * in `STACK_CONNECTOR` below.
+ * tree-connector glyph. Computed from the slice's REAL child structure
+ * (not its linear position), so a fork reads as a fork:
+ *   - `single` = a standalone one-slice lane (blank, no spine)
+ *   - `first`  = a forest root with a single child (┌)
+ *   - `middle` = an interior single-child link (├)
+ *   - `last`   = a branch tip / leaf (└)
+ *   - `fork`   = a node with ≥2 children, where the stack splits (┯)
+ * The glyphs themselves live in `STACK_CONNECTOR` below. Because a single
+ * gutter column can't draw a 2D tree, lane *identity* (which parallel
+ * branch a row belongs to) is carried by `StackNode.lane` → color, not by
+ * indentation; the glyph just marks where the split happens.
  */
-export type SpinePos = "single" | "first" | "middle" | "last";
+export type SpinePos = "single" | "first" | "middle" | "last" | "fork";
 
 /**
  * Tree-spine connector glyph for a managed-stack row, by the slice's
  * position in its lane. `single` = a standalone lane (blank — no chain
- * above/below to draw, so draw nothing); `first` ┌ = chain root with
- * children; `middle` ├ = a stacked link; `last` └ = the chain tip.
- * Shared by the worktree list gutter and the folded-stack summary in
- * the details pane so the spine reads identically in both.
+ * above/below to draw, so draw nothing); `first` ┌ = chain root with a
+ * child; `middle` ├ = a stacked link; `last` └ = a branch tip; `fork` ┯ =
+ * a split point (≥2 children). Shared by the worktree list gutter, the
+ * CLI `wt stack status`, and the folded-stack summary in the details pane
+ * so the spine reads identically across all three.
  */
 export const STACK_CONNECTOR: Record<SpinePos, string> = {
   single: " ",
   first: "┌",
   middle: "├",
   last: "└",
+  fork: "┯",
 };
 
 /** Canonical 2-cell ordinal label (`01`, `02`, …) used wherever a stack
@@ -170,6 +179,15 @@ export type StackNode = {
   /** Distance from this node's lane root (root = 0). */
   depth: number;
   pos: SpinePos;
+  /**
+   * Parallel-lane index → connector color. The forest's first root path is
+   * lane 0 (rendered dim, the "main" spine). At every fork the FIRST child
+   * continues its parent's lane; each additional child opens a fresh lane,
+   * as does each additional forest root. A purely linear stack stays lane 0
+   * throughout (so it renders exactly as before). Renderers map the index
+   * to a color (TUI: `laneColor` in theme; CLI: its own ansi palette).
+   */
+  lane: number;
   /**
    * Branch to diff/label against. `null` only for a trunk-based slice; an
    * external-base lane root (stack-on-stack) carries its real parent branch
@@ -246,36 +264,43 @@ export function layoutStack(manifest: StackManifest): StackLayout {
 
   const nodes: StackNode[] = [];
   let index = 0;
+  // Monotonic across the whole forest: lane 0 is the first root's main
+  // path; every fork sibling and every extra root claims the next id.
+  let nextLane = 0;
   for (const root of roots) {
-    // Pre-order DFS over this lane's spine.
-    const group: { slice: StackSlice; depth: number }[] = [];
+    // Pre-order DFS over this lane's spine. `pos` comes from the node's
+    // real child count + depth (so a fork reads as a fork, not a chain
+    // link); `lane` is threaded down the spine, branching at each fork.
     const seen = new Set<string>();
-    const walk = (s: StackSlice, depth: number): void => {
+    const walk = (s: StackSlice, depth: number, lane: number): void => {
       if (seen.has(s.id)) return; // cycle guard (shouldn't happen post-topo)
       seen.add(s.id);
-      group.push({ slice: s, depth });
-      for (const c of children.get(s.id) ?? []) walk(c, depth + 1);
-    };
-    walk(root, 0);
-    group.forEach(({ slice, depth }, i) => {
+      const kids = children.get(s.id) ?? [];
       const pos: SpinePos =
-        group.length === 1
-          ? "single"
-          : i === 0
-            ? "first"
-            : i === group.length - 1
-              ? "last"
-              : "middle";
+        kids.length >= 2
+          ? "fork"
+          : kids.length === 0
+            ? depth === 0
+              ? "single" // standalone one-slice lane — draw nothing
+              : "last" // a branch tip / leaf
+            : depth === 0
+              ? "first" // forest root with a single child
+              : "middle"; // interior single-child link
       nodes.push({
         stackId: manifest.stackId,
-        slice,
-        ordinal: slice.ordinal,
+        slice: s,
+        ordinal: s.ordinal,
         depth,
         pos,
-        parentBranch: parentBranchOf.get(slice.id) ?? null,
+        lane,
+        parentBranch: parentBranchOf.get(s.id) ?? null,
         index: index++,
       });
-    });
+      // First child stays on this node's lane; each extra child at a fork
+      // opens a fresh lane so parallel siblings get distinct colors.
+      kids.forEach((c, ci) => walk(c, depth + 1, ci === 0 ? lane : ++nextLane));
+    };
+    walk(root, 0, root === roots[0] ? 0 : ++nextLane);
   }
   return {
     stackId: manifest.stackId,

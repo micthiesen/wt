@@ -341,6 +341,19 @@ standalone skills — never as edits to `/start` or `/done`.
       classification. A stack-on-stack root now labels + diffs against its real
       parent instead of degrading to trunk. Safe because a dead external ref falls
       back to trunk downstream via `effectiveBaseOrTrunk`.
+- [x] wt: **forked-stack tree rendering** (2026-06-18). A non-linear stack used to
+      render as a flat descending `├` spine on every surface — the fork was invisible
+      (only the `base:` column hinted at it). The spine glyph was computed from a
+      slice's *linear* position in the DFS, so a fork point and a mid-chain link got
+      the identical `├`. Now `layoutStack` derives `pos` from real child structure
+      (`┯` at a ≥2-child fork, `└` at each leaf tip) and tags each node with a `lane`
+      index (forest root = lane 0; each fork sibling + each extra root opens a fresh
+      lane). One gutter column can't draw a 2D tree, so lane *identity* rides a color,
+      not indentation: `laneColor` (TUI theme) / a CLI ansi palette tint the connector
+      per lane. All three surfaces share `layoutStack` now — TUI list gutter, the
+      details-pane folded summary, and `wt stack status` (which previously rendered its
+      own flat list). Linear + single-slice stacks render byte-identically (lane 0
+      throughout); `--json` untouched; malformed manifests fall back to the flat list.
 - [x] wt: `wt stack split <stackId> <sliceId> --from <fragment> [--plan]` — reshape a
       LIVE stack. Replaces one open (or planned) slice with N sub-slices, chains them,
       and re-threads the replaced slice's descendants onto the new tip. Manifest
@@ -675,6 +688,29 @@ Track friction here as the workflow gets used. Candidate adjustments:
 
 ## Session log
 
+- **2026-06-18** — **forked stacks render as a tree, not a flat list.** A fork
+  (the eng-5240 stack: 03/04 one lane, 05/06 two more, all off slice 02) read as
+  one linear 01..06 column on every surface, because the spine glyph came from a
+  slice's linear DFS position — fork point and chain link both got `├`. The shape
+  was always derivable (the manifest carries `base`/`dependsOn`; `stack-section.py`
+  already builds the same tree for PR bodies), the renderers just discarded it.
+  Fix is at the shared layer: `layoutStack` now computes `pos` from real child
+  count (`┯` fork / `└` leaf / `┌` root / `├` link) and threads a `lane` index down
+  the spine (first child continues the lane, each extra fork-child + extra root
+  opens a new one). Constraint from the user: no extra indentation columns — so lane
+  identity is carried by *color* (`laneColor` in the TUI theme, an ansi palette in
+  the CLI) on the 1-cell connector, not by horizontal nesting (a single column
+  can't draw a 2D tree, and with two forks can't disambiguate which ancestor a lane
+  rejoins anyway — color is the honest signal). Wired into all three consumers off
+  the one `layoutStack` change: the list gutter (`StackGutter`), the details-pane
+  folded summary (`StackChain`), and `wt stack status` (`renderStatus`, which had
+  its own flat loop — now orders by `layout.nodes` and prefixes the tinted
+  connector). Linear/single stacks are byte-identical (lane 0, glyphs unchanged);
+  `--json` and `stack-section.py` untouched; a malformed base graph falls back to
+  the flat ordinal list, same defensive posture as the layout's graceful
+  degradation. Typecheck clean, 21 tests pass, smoke-verified the eng-5240 shape
+  (`┌02 ┯02 ├03 └04 └05 └06`, lanes 0/0/0/0/1/2). The user picked the glyphs+color
+  combo over glyphs-only / color-only via an explicit option preview.
 - **2026-06-18** — **`wt stack status` defaults to the current stack** (via
   `/improve-stacking`, prompted by an eng-5240 restack where the no-arg status
   dumped all ~15 stacks, an unrelated stack's drift (eng-5238) landed in the

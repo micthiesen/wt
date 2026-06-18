@@ -16,7 +16,7 @@ import { BadgeCluster, badgeClusterCells } from "../badge-cluster.tsx";
 import { NF } from "../icons.ts";
 import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
 import { truncateEnd } from "../text.ts";
-import { theme } from "../theme.ts";
+import { laneColor, theme } from "../theme.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
@@ -148,7 +148,7 @@ function StackGutter({ row }: { row: WorktreeRow }) {
   return (
     <box flexShrink={0} flexDirection="row">
       <box width={1} flexShrink={0}>
-        <text fg={theme.fgDim}>{STACK_CONNECTOR[info.pos]}</text>
+        <text fg={laneColor(info.lane)}>{STACK_CONNECTOR[info.pos]}</text>
       </box>
       <box width={2} flexShrink={0}>
         <text fg={ordFg}>{ord}</text>

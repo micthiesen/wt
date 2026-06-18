@@ -101,8 +101,10 @@ export type StackRowInfo = {
   stackId: string;
   /** Stack ordinal (1-based) shown in the row gutter. */
   ordinal: number;
-  /** Spine position → connector glyph (single ◆ / first ┌ / middle ├ / last └). */
+  /** Spine position → connector glyph (single / first ┌ / middle ├ / last └ / fork ┯). */
   pos: SpinePos;
+  /** Parallel-lane index → connector color (0 = main spine, dim). */
+  lane: number;
   /** Depth from the lane root (root = 0). */
   depth: number;
   /** Display index within the stack (lane order, then depth). */
@@ -262,6 +264,7 @@ function stackInfoEq(a: StackRowInfo | null, b: StackRowInfo | null): boolean {
     a.stackId === b.stackId &&
     a.ordinal === b.ordinal &&
     a.pos === b.pos &&
+    a.lane === b.lane &&
     a.depth === b.depth &&
     a.index === b.index &&
     a.isHolistic === b.isHolistic
@@ -614,6 +617,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
           stackId: node.stackId,
           ordinal: node.ordinal,
           pos: node.pos,
+          lane: node.lane,
           depth: node.depth,
           index: node.index,
           isHolistic: false,
@@ -623,6 +627,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
             stackId: holistic.stackId,
             ordinal: 0,
             pos: "single",
+            lane: 0,
             depth: 0,
             index: holistic.sliceCount,
             isHolistic: true,
