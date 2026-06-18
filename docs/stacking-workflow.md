@@ -522,6 +522,34 @@ standalone skills — never as edits to `/start` or `/done`.
       re-split section recommends `wt stack split --apply --verify` and adds teardown
       safety (never delete a branch that's a live PR base — it auto-closes the descendant
       PR — use fresh branch names on a redo).
+- [x] wt: **ultracheck follow-up to the re-split pass** (eng-5238, 2026-06-18). Two
+      correctness holes the post-mortem pass itself introduced, plus one comment nit, all
+      in `~/.wt`: (1) **Stale-id gate re-broke post-merge re-apply.** `validatePartialCoverage`
+      checked `[...owned, ...mergedOwned]` for hunk ids absent from the live diff. But
+      `base` is recomputed each apply and `/restack` rebases the source branch onto
+      post-merge trunk — once the fork point advances past a merged hunk, that hunk is
+      absorbed into base and drops out of `fileHunks(base, source)`, so its content-hashed
+      id is no longer `known`. The merged id then read as "stale" and failed the whole
+      apply, re-creating the manual-`state.json`-surgery situation FIX-2 killed. Fixed by
+      checking ONLY live `owned` ids for staleness; an absent merged hunk is the expected
+      end state (it migrated into base), which the coverage + reconstruction halves already
+      tolerate. New fixture pins a SHIFTED `baseBySource` (base advanced past the merged
+      hunk) — it fails under the old `[...owned, ...mergedOwned]` line, passes now. (2)
+      **Closed-PR fall-through built on a stale branch.** FIX-4 correctly declines to adopt
+      a CLOSED PR and falls through to create, but `createWorktree(slice.branch, {base})`
+      takes the branchExists path — checking out the STALE reused-branch tip and IGNORING
+      `base`. `baseSha = revParse("HEAD")` then recorded the stale tip (corrupting the
+      replay anchor) and `materializeSliceCommit` built on stale content, so the fresh PR's
+      diff carried superseded content. Chose RESET over refuse: the slice's content is
+      authoritative from `source`/the manifest, so a reused branch with no adoptable PR is
+      genuinely discardable. `applyStack` now detects `branchExists` before create and
+      `git reset --hard <parentRef>` in the new worktree before recording `baseSha` /
+      materializing — `baseSha` and content are correct, no human "use a fresh branch name"
+      mitigation required. New git-fixture test proves the reset discards stale content and
+      lands HEAD on the fresh parent. (3) **Comment nit:** `isAdoptablePr`'s doc claimed it
+      "Mirrors `addSliceToStack`" — but apply ADOPTS a MERGED PR (re-records + skips) while
+      `addSliceToStack` REJECTS it ("nothing left to stack"); they agree only on CLOSED.
+      Comment corrected at both sites. Typecheck + `bun test` (21 pass) clean.
 
 ---
 
@@ -1074,9 +1102,11 @@ Track friction here as the workflow gets used. Candidate adjustments:
   (3) **Adopt only OPEN/MERGED PRs**: `applyStack`'s adopt path grabbed ANY PR
   matched by branch name; when a re-split reused a branch whose prior PR was
   CLOSED, apply adopted the dead closed PR (#4943) and skipped push + create,
-  leaving the slice broken. Extracted `isAdoptablePr(state)` (OPEN | MERGED) —
-  the same guard `addSliceToStack` already applied — so a CLOSED PR falls through
-  to push + `gh pr create`. (4) **Recovery without `state.json` surgery**:
+  leaving the slice broken. Extracted `isAdoptablePr(state)` (OPEN | MERGED) so a
+  CLOSED PR falls through to push + `gh pr create`. (`addSliceToStack` shares only
+  the CLOSED rejection; it goes further and rejects MERGED too — adding a new tip
+  on a landed branch is nonsensical — whereas apply must adopt MERGED to
+  re-record + skip a landed slice.) (4) **Recovery without `state.json` surgery**:
   evaluated, DEFERRED (now an Open question with the `reslice --reset` sketch).
   With 1/2/3 in place the manual reset is rarely needed, and a SAFE reset has to
   avoid stranding a live PR (verify the branch/PR are gone, or refuse) — real

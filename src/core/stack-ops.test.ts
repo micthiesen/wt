@@ -14,11 +14,12 @@
  */
 import { afterAll, expect, test } from "bun:test";
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ancestorOwnedHunks, isAdoptablePr, validatePartialCoverage } from "./stack-ops.ts";
+import { gitRun } from "./git.ts";
 import { fileHunks } from "./hunks.ts";
 import { transitiveAncestors } from "./stack-layout.ts";
 import type { StackManifest, StackSlice } from "./wtstate.ts";
@@ -121,6 +122,41 @@ test("merged + open co-owners (no chain) pass the coverage gate", async () => {
   expect(err).toBeNull();
 });
 
+test("merged hunk absorbed into an advanced base still passes the gate", async () => {
+  // The FIX-1 regression: `base` is recomputed live each apply, and the source
+  // branch gets rebased onto post-merge trunk (`/restack`). Once the fork point
+  // advances PAST the merged hunk, that hunk is in base and DROPS OUT of
+  // `fileHunks(base, source)` — so the merged slice's content-hashed id is no
+  // longer in `known`. That's the expected end state (the hunk migrated into
+  // base), not drift. The stale check must NOT flag it.
+  const { dir, base } = scenario({ [FILE]: BASE_BODY }, { [FILE]: HOL_BODY });
+  const [h1, h2] = await twoHunks(dir, base, FILE);
+  // Build an ADVANCED base: a commit off `base` that already carries h1's edit
+  // (the merged slice's content), as if it had landed and trunk moved past it.
+  // Diffing this advanced base against holistic shows ONLY h2 — h1 is absorbed.
+  git(dir, ["checkout", "-q", "-b", "advanced", base]);
+  writeFileSync(join(dir, FILE), lines("H", "1", "2", "3", "4", "5", "6", "7", "8", "9", "t"));
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "advanced base (h1 landed)"]);
+  const advancedBase = git(dir, ["rev-parse", "HEAD"]).trim();
+  git(dir, ["checkout", "-q", "holistic"]);
+  // Confirm the advanced base only diffs by h2 (h1 is gone from the diff).
+  const fd = await fileHunks(dir, advancedBase, "holistic", FILE);
+  expect(fd.hunks.map((h) => h.id)).toEqual([h2]);
+  const m = manifest([
+    slice({ id: "s1", ordinal: 1, status: "merged", pr: 1, partials: [{ file: FILE, hunks: [h1] }] }),
+    slice({ id: "s4", ordinal: 2, status: "open", pr: 4, partials: [{ file: FILE, hunks: [h2] }] }),
+  ]);
+  // Pin the resolved base to the advanced SHA (what a post-merge re-apply sees).
+  const err = await validatePartialCoverage(
+    m,
+    dir,
+    transitiveAncestors(m.slices),
+    new Map([["holistic", advancedBase]]),
+  );
+  expect(err).toBeNull();
+});
+
 test("dropping the merged owner makes the gate flag the landed hunk as unassigned", async () => {
   // Sanity: without the merged co-owner the gate SHOULD complain — proves the
   // pass above is the merged-aware path, not a no-op.
@@ -170,4 +206,39 @@ test("adopt guard: OPEN and MERGED adoptable, CLOSED is not", () => {
   expect(isAdoptablePr("OPEN")).toBe(true);
   expect(isAdoptablePr("MERGED")).toBe(true);
   expect(isAdoptablePr("CLOSED")).toBe(false);
+});
+
+test("reused branch (closed PR) is reset onto parent before materialize", async () => {
+  // FIX-2 at the git level: when `applyStack` falls through to create on a
+  // branch that already exists (its prior PR was CLOSED, name reused), the
+  // create path checks out the STALE tip and ignores `base`. Without the
+  // hard-reset the engine adds, `baseSha = HEAD` would be the stale tip and
+  // the slice would be committed on top of stale content. Reset onto the
+  // fresh parent fixes both: HEAD == parent tip, and a fresh commit diffs
+  // ONLY the slice's content against the parent.
+  const dir = mkdtempSync(join(tmpdir(), "wt-stackops-reset-"));
+  dirs.push(dir);
+  git(dir, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(dir, "a.ts"), "base\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "base"]);
+  // The fresh parent advances past the fork point (e.g. a sibling slice landed).
+  writeFileSync(join(dir, "parent.ts"), "parent\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "parent"]);
+  const parentRef = git(dir, ["rev-parse", "HEAD"]).trim();
+  // A reused branch sitting at a STALE tip (the superseded slice's old work).
+  git(dir, ["checkout", "-q", "-b", "michael/eng-5238-s4", "main"]);
+  writeFileSync(join(dir, "stale.ts"), "stale superseded content\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "stale superseded slice"]);
+
+  // The production fall-through path: reset the reused branch onto parentRef.
+  const reset = await gitRun(["reset", "--hard", parentRef], dir);
+  expect(reset.exitCode).toBe(0);
+  // HEAD now == the fresh parent (correct squash-safe anchor).
+  expect(git(dir, ["rev-parse", "HEAD"]).trim()).toBe(parentRef);
+  // Stale content is gone; parent content is present.
+  expect(existsSync(join(dir, "stale.ts"))).toBe(false);
+  expect(existsSync(join(dir, "parent.ts"))).toBe(true);
 });

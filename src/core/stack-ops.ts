@@ -78,7 +78,14 @@ const STACK_BUSY = "another wt stack operation is already running";
  * (already landed) qualify. A CLOSED PR must NOT be adopted: `gh` opens a
  * brand-new PR on the same branch, and a closed PR (e.g. a superseded re-split
  * slice whose branch name got reused) isn't tracking this work — adopting it
- * records a dead PR and skips materialization. Mirrors `addSliceToStack`.
+ * records a dead PR and skips materialization.
+ *
+ * `applyStack` MUST adopt MERGED here: a landed slice is re-recorded as merged
+ * and skipped, never re-pushed. `addSliceToStack` is stricter — it REJECTS a
+ * MERGED PR outright ("nothing left to stack"), because adding a brand-new tip
+ * slice on an already-merged branch is nonsensical. The two paths agree only on
+ * the negative case (CLOSED is never adoptable); they deliberately diverge on
+ * MERGED, so this is not a shared predicate with `addSliceToStack`.
  */
 export function isAdoptablePr(state: LivePrInfo["state"]): boolean {
   return state === "OPEN" || state === "MERGED";
@@ -351,7 +358,16 @@ export async function validatePartialCoverage(
     if (missing.length > 0) {
       return `partial ${file}: ${missing.length} holistic hunk(s) unassigned (${missing.join(", ")}) — every hunk must be owned by a slice`;
     }
-    const stale = [...owned, ...mergedOwned].filter((h) => !known.has(h));
+    // Only LIVE-owned ids are checked for staleness. A MERGED slice's hunk is
+    // content-hashed against the ORIGINAL fork point, but `base` is recomputed
+    // live each apply and the source branch gets rebased onto post-merge trunk
+    // (`/restack`). Once the fork point advances past the landed content, the
+    // merged hunk is absorbed into base and DROPS OUT of `fileHunks(base,
+    // source)` → it's no longer in `known`. That's the EXPECTED end state (the
+    // hunk migrated into base), not drift, and the coverage/reconstruction
+    // halves already tolerate it (base carries it). Flagging `mergedOwned` here
+    // would re-fail every post-merge re-apply with a bogus "not in the diff".
+    const stale = [...owned].filter((h) => !known.has(h));
     if (stale.length > 0) {
       return `partial ${file}: hunk id(s) not in the holistic diff: ${stale.join(", ")}`;
     }
@@ -498,8 +514,10 @@ async function applyStackLocked(
     // CLOSED PR is NOT adopted — `gh` happily opens a fresh PR on the same
     // branch, and the closed one (e.g. a superseded re-split slice that reused
     // this branch name) wasn't tracking this work. Adopting it would record a
-    // dead PR and skip the push+create, leaving the slice unmaterialized. Same
-    // guard `addSliceToStack` already applies; fall through to create otherwise.
+    // dead PR and skip the push+create, leaving the slice unmaterialized.
+    // (`addSliceToStack` shares only this CLOSED-rejection; it goes further and
+    // rejects MERGED too, whereas apply re-records a merged slice.) Fall through
+    // to create otherwise — see the FIX-4 reset below for the stale-branch case.
     const existingPr = await viewPrInfo(slice.branch);
     if (existingPr && isAdoptablePr(existingPr.state)) {
       onLog(`adopt ${slice.id} → existing PR #${existingPr.number}`);
@@ -516,6 +534,19 @@ async function applyStackLocked(
 
     onLog(`apply ${slice.id} → ${slice.branch} (off ${parentRef})`);
 
+    // We're on the create/fall-through path: no adoptable PR, so this slice
+    // must be materialized fresh from `parentRef`. If the branch already
+    // exists (a superseded re-split slice whose CLOSED PR we just declined to
+    // adopt, reusing the same name), `createWorktree` takes its branchExists
+    // path — checking out the STALE tip and IGNORING `base`. Left uncorrected
+    // that poisons everything below: `baseSha` would record the stale tip
+    // (corrupting the squash-safe replay anchor) and `materializeSliceCommit`
+    // would build the slice's files on top of stale content, so the fresh PR's
+    // diff against `prBase` carries superseded content. The slice's content is
+    // authoritative from `source`/the manifest, so discarding the stale branch
+    // state is intended — reset the worktree HEAD to `parentRef` after create.
+    const branchPreexisted = await branchExists(slice.branch);
+
     // Slices are install-free by design (a slice == a light worktree, no
     // node_modules), so do NOT add a per-slice typecheck/build gate here —
     // it can't run. Verification is the skill's job, done BEFORE apply in a
@@ -530,9 +561,25 @@ async function applyStackLocked(
       return { materialized, skipped, error: `create ${slice.branch}: ${created.reason}` };
     }
 
+    if (branchPreexisted) {
+      // Hard-reset the reused branch onto the fresh parent so HEAD == parent
+      // tip, exactly as if `createWorktree` had honored `base`. Without this
+      // the branchExists path leaves HEAD at the stale tip (see above).
+      const reset = await gitRun(["reset", "--hard", parentRef], created.path);
+      if (reset.exitCode !== 0) {
+        return {
+          materialized,
+          skipped,
+          error: `reset reused branch ${slice.branch} onto ${parentRef}: ${(reset.stderr || reset.stdout).trim()}`,
+        };
+      }
+      onLog(`  reset reused branch ${slice.branch} → ${parentRef} (discarded stale tip)`);
+    }
+
     // Record the squash-safe replay anchor: the parent tip this slice's
-    // commit will sit on. `createWorktree` started the branch at `parentRef`,
-    // so HEAD is that tip right now, before the slice commit lands on top.
+    // commit will sit on. `createWorktree` started the branch at `parentRef`
+    // (and we reset a reused branch back to it above), so HEAD is that tip
+    // right now, before the slice commit lands on top.
     const baseSha = await revParse("HEAD", created.path);
 
     // A re-split sub-slice reproduces its files from the original slice's
