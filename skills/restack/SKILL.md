@@ -101,10 +101,17 @@ If the engine exits with a conflict, it names the failing slice branch and a
    no rebase but whose remote lags the local tip gets pushed automatically —
    but pushing here keeps the remote state obvious while you work.)
 5. Re-run `wt stack replay` to continue descendants (the manifest is already
-   reconciled; no need to reconcile again). Repeat until clean. Replay re-reads
-   each slice's anchor from the live merge-base when your hand-rebase moved the
-   branch off the stored one, so it won't re-conflict on the slice you just
-   fixed — no need to touch the manifest after a manual resolve.
+   reconciled; no need to reconcile again). Repeat until clean. Replay anchors
+   each slice at the *descendant-most* of its stored anchor and the live
+   merge-base with its parent, so a hand-resolve is safe two ways: whether you
+   rebased the slice *off* the stored anchor, or *onto newer trunk* that still
+   descends from it (e.g. `main` advanced mid-restack). Either way it cuts at the
+   true fork point — it won't re-apply trunk's already-landed history — and no
+   manifest edit is needed. If `main` moved while you were resolving, just run
+   `wt stack rebase` again: it re-fetches and the same anchor logic keeps the
+   replay clean. (If you ever must rebase a slice fully by hand, the equivalent
+   is `git rebase --onto <currentParentTip> <merge-base(branch,parent)> <branch>`
+   — cut at the live fork point, not the stale stored base.)
 
 Keep resolutions minimal and faithful; never resolve blindly to make it pass.
 

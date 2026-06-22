@@ -22,6 +22,7 @@ import {
   ancestorOwnedHunks,
   isAdoptablePr,
   parseNameStatus,
+  resolveAnchor,
   validateFileCoverage,
   validatePartialCoverage,
 } from "./stack-ops.ts";
@@ -302,4 +303,53 @@ test("validateFileCoverage flags a plain unclaimed addition", async () => {
   const m = manifest([slice({ id: "s1", files: ["old.ts", "renamed.ts"] })]);
   const err = await validateFileCoverage(m, dir, new Map([["holistic", base]]));
   expect(err).toContain("brandnew.ts");
+});
+
+// resolveAnchor: the squash-safe replay cut point survives a hand-rebase. Two
+// stale-anchor shapes a bare `--is-ancestor` guard couldn't tell apart.
+
+test("resolveAnchor uses the live merge-base when a slice was rebased onto newer trunk", async () => {
+  // eng-5244 reproduction: the slice was hand-rebased onto newer trunk, so the
+  // OLD baseSha (p1) is STILL an ancestor of the branch — the naive guard trusts
+  // it and replays all of trunk's history. The real fork point advanced to p2.
+  const dir = mkdtempSync(join(tmpdir(), "wt-anchor-test-"));
+  dirs.push(dir);
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "M0"]);
+  git(dir, ["checkout", "-q", "-b", "p"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "P1"]);
+  const p1 = git(dir, ["rev-parse", "HEAD"]).trim();
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "P2"]);
+  const p2 = git(dir, ["rev-parse", "HEAD"]).trim();
+  git(dir, ["checkout", "-q", "-b", "c"]); // c built on the advanced parent tip
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "C"]);
+
+  const s = slice({ id: "c", branch: "c", base: "p", baseSha: p1, status: "open" });
+  const anchor = await resolveAnchor(s, new Map(), "main", dir);
+  expect(anchor).toBe(p2); // the true fork point, so only C replays
+  expect(anchor).not.toBe(p1); // not the stale stored anchor
+});
+
+test("resolveAnchor keeps baseSha when the live merge-base is older (squash-merged parent)", async () => {
+  // The healthy squash case: the parent squash-merged into the integration
+  // branch as one commit, so merge-base(child, parent) drops to M0 — BELOW the
+  // recorded baseSha. baseSha must stand, or the squashed parent's commits get
+  // re-applied.
+  const dir = mkdtempSync(join(tmpdir(), "wt-anchor-test-"));
+  dirs.push(dir);
+  git(dir, ["init", "-q", "-b", "main"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "M0"]);
+  const m0 = git(dir, ["rev-parse", "HEAD"]).trim();
+  git(dir, ["checkout", "-q", "-b", "p"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "P1"]);
+  const p1 = git(dir, ["rev-parse", "HEAD"]).trim();
+  git(dir, ["checkout", "-q", "-b", "c"]); // child built on the parent tip
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "C"]);
+  git(dir, ["checkout", "-q", "-b", "released", "main"]);
+  git(dir, ["commit", "-q", "--allow-empty", "-m", "squash of p"]);
+
+  const s = slice({ id: "c", branch: "c", base: "released", baseSha: p1, status: "open" });
+  const anchor = await resolveAnchor(s, new Map(), "main", dir);
+  expect(anchor).toBe(p1); // squash-safe anchor preserved
+  expect(anchor).not.toBe(m0);
 });

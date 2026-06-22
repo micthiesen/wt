@@ -598,6 +598,20 @@ standalone skills — never as edits to `/start` or `/done`.
       so renames/deletions surface as two paths, plus an explicit "a rename and a
       deletion must be claimed, in full" rule. Smoke: full coverage → null, drop the
       rename old-half → errors naming it + its counterpart's owner. Typecheck clean.
+- [x] wt + skill: **replay anchor self-heal handles rebase-onto-newer-trunk**
+      (eng-5244 restack post-mortem, 2026-06-22). The eng-5182 self-heal trusted
+      `baseSha` whenever it stayed an ancestor of the branch — too weak when `main`
+      advances mid-restack and the slice is hand-rebased onto the fresh main: the
+      old anchor is still a valid ancestor (new trunk descends from it), so replay
+      cut there and re-applied every squash-merged commit between old and new trunk
+      (bogus conflicts on an already-correct slice; forced a full manual
+      `git rebase --onto` of the stack). `resolveAnchor` now picks the
+      **descendant-most** of `{baseSha, merge-base(branch, parent)}`: the live
+      merge-base wins after a rebase onto newer trunk, `baseSha` wins in the squash
+      case (its commits sit above the pre-squash merge-base). Exported + two
+      git-fixture tests (rebased-onto-newer-trunk → live merge-base; squash → keep
+      `baseSha`). `/restack` step 5 reworded (descendant-most anchor, re-run
+      `wt stack rebase` if main moved). 13/13 tests, typecheck + smoke clean.
 
 ---
 
@@ -712,6 +726,35 @@ Track friction here as the workflow gets used. Candidate adjustments:
 ---
 
 ## Session log
+
+- **2026-06-22** — **replay anchor self-heal extended to rebase-onto-newer-trunk
+  (descendant-most anchor).** The earlier stale-anchor self-heal (eng-5182) trusted
+  `baseSha` whenever it was *still an ancestor* of the branch, falling back to the
+  live merge-base only when it wasn't. Dogfooding the `eng-5244` restack exposed the
+  gap that guard misses: `origin/main` advanced **mid-restack** (a second PR merged
+  while I was resolving slice 01's conflict), so after I hand-rebased the slice onto
+  the fresh main and re-ran `wt stack replay`, the stored anchor (the *old* trunk
+  commit) was still a perfectly valid ancestor of the branch — the new trunk
+  descends from it — so the guard trusted it and cut there, re-applying every
+  squash-merged commit between the old and new trunk → bogus conflicts in the just-
+  merged PR's files on an already-correct slice. I fell back to a manual per-slice
+  `git rebase --onto` for the whole stack. Root cause: "still an ancestor" is too
+  weak; the real fork point had advanced to the live merge-base, which sits ABOVE
+  the stored anchor. Fix (`resolveAnchor`, stack-ops.ts): when both the stored
+  `baseSha` and the live merge-base anchor the branch, pick the **descendant-most**
+  — the live merge-base wins after a rebase onto newer trunk (case here), `baseSha`
+  wins in the healthy squash case (its commits sit above the pre-squash merge-base,
+  so it stays the cut point excluding a squash-merged parent). Self-healing, no
+  manifest edit. Exported `resolveAnchor` + two git-fixture tests
+  (`stack-ops.test.ts`): rebased-onto-newer-trunk picks the live merge-base (not the
+  stale base), squash-merged-parent keeps `baseSha` (live merge-base is older).
+  13/13 pass, typecheck + `wt ls` smoke clean. `/restack` step 5 reworded: replay
+  anchors at the descendant-most of the two, safe whether you rebased *off* the
+  anchor or *onto newer trunk*; if `main` moved mid-restack, just re-run `wt stack
+  rebase` (it re-fetches). The two restack runs the engine bailed on were both this
+  bug, not real conflicts — the only genuine conflicts that session were the
+  additive `reconcile.spec.ts` describe blocks (slice 01) and the
+  `saveMetric.ts`/`saveMetricSchema.ts` result-field merge (slice 04).
 
 - **2026-06-22** — **whole-file coverage gate closes the rename/deletion hole.**
   Dogfooding `/split` on `eng-5244` (6-slice fork), slice 04's CI went red:

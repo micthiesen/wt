@@ -1093,39 +1093,64 @@ async function replayStackLocked(
 
 /**
  * The parent-tip SHA a slice currently sits on (the `rebase --onto` anchor):
- * the stored `baseSha` when it's still honest, else the merge-base of the slice
- * and its current parent ref — computed before any replay so siblings haven't moved.
+ * the *descendant-most* of the stored `baseSha` and the live merge-base of the
+ * slice with its current parent ref — computed before any replay so siblings
+ * haven't moved.
  *
- * The stored `baseSha` is the squash-safe cut point (the parent tip this
- * slice's commits were last based on) and is trusted ONLY while it's still an
- * ancestor of the branch. A conflict bail hands resolution to a human, who
- * rebases the slice by hand and force-pushes WITHOUT updating the manifest — so
- * the stored anchor now points at a tip the branch no longer descends from.
- * Replaying off that stale anchor re-applies the parent's already-present
- * commits onto themselves, a bogus conflict on an already-correct slice (this
- * bit the eng-5182 restack + re-split twice). When the anchor is stale, fall
- * back to the live merge-base with the current parent, which post-rebase is
- * exactly the parent tip the slice now sits on — self-healing, no manual
- * bookkeeping. (The healthy squash case keeps `baseSha`: it's still an ancestor
- * of the unrewritten child, so a squash-merged parent's commits stay excluded.)
+ * The stored `baseSha` is the squash-safe cut point (the parent tip this slice's
+ * commits were last based on). A conflict bail hands resolution to a human, who
+ * rebases the slice by hand and force-pushes WITHOUT updating the manifest, so
+ * the stored anchor goes stale. Replaying off a stale anchor re-applies the
+ * parent's already-present commits onto themselves, a bogus conflict on an
+ * already-correct slice.
+ *
+ * Two ways the stored anchor goes stale, and why a bare `--is-ancestor` guard is
+ * not enough (it bit eng-5182 twice, then eng-5244 again):
+ *
+ *  1. Hand-rebased OFF the anchor entirely → `baseSha` is no longer an ancestor
+ *     of the branch. Caught by the ancestor check; fall back to the merge-base.
+ *  2. Hand-rebased onto NEWER trunk that itself descends from `baseSha` (main
+ *     advanced mid-restack, or a fix-then-rebase-onto-fresh-main). `baseSha` is
+ *     STILL an ancestor of the branch, so the ancestor check passes — but the
+ *     real fork point has moved up to the live merge-base, which sits ABOVE
+ *     `baseSha`. Cutting at the old anchor replays all of trunk's squashed
+ *     history. The naive guard misses this.
+ *
+ * So when BOTH `baseSha` and the live merge-base are ancestors of the branch,
+ * pick whichever is the descendant: the live merge-base wins after a rebase onto
+ * newer trunk (case 2), `baseSha` wins in the healthy squash-merge case (its
+ * commits sit ABOVE the pre-squash merge-base, so it stays the cut point that
+ * excludes the squash-merged parent). Self-healing, no manual bookkeeping.
  */
-async function resolveAnchor(
+export async function resolveAnchor(
   slice: StackSlice,
   byId: Map<string, StackSlice>,
   trunk: string,
   cwd: string,
 ): Promise<string | null> {
+  const parentRef = currentParentRef(slice, byId, trunk);
+  const mb = await gitRun(["merge-base", slice.branch, parentRef], cwd);
+  const liveAnchor = mb.exitCode === 0 && mb.stdout.trim() ? mb.stdout.trim() : null;
+
   if (slice.baseSha) {
-    const stillAncestor = await gitQuiet(
+    const storedIsAncestor = await gitQuiet(
       ["merge-base", "--is-ancestor", slice.baseSha, slice.branch],
       cwd,
     );
-    if (stillAncestor) return slice.baseSha;
+    if (storedIsAncestor) {
+      if (!liveAnchor) return slice.baseSha;
+      // Both anchor the branch; use the more recent cut point. `baseSha` below
+      // the live merge-base means the branch was rebased onto newer trunk —
+      // the live merge-base is the true fork point (case 2). Otherwise the live
+      // merge-base is at/below `baseSha` (squash case), so `baseSha` stands.
+      const baseShaBelowLive = await gitQuiet(
+        ["merge-base", "--is-ancestor", slice.baseSha, liveAnchor],
+        cwd,
+      );
+      return baseShaBelowLive ? liveAnchor : slice.baseSha;
+    }
   }
-  const parentRef = currentParentRef(slice, byId, trunk);
-  const r = await gitRun(["merge-base", slice.branch, parentRef], cwd);
-  const sha = r.stdout.trim();
-  return r.exitCode === 0 && sha ? sha : null;
+  return liveAnchor;
 }
 
 /**
