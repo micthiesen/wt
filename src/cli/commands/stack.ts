@@ -1,4 +1,5 @@
 import { readFileSync, statSync } from "node:fs";
+import { basename } from "node:path";
 
 import { config } from "../../core/config.ts";
 import {
@@ -15,7 +16,7 @@ import {
   type StackStatusReport,
   type SubSliceSpec,
 } from "../../core/stack-ops.ts";
-import { git } from "../../core/git.ts";
+import { git, gitRun } from "../../core/git.ts";
 import { DEFAULT_HUNK_CONTEXT, fileHunks, holisticBase, hunkLineCounts } from "../../core/hunks.ts";
 import {
   coercePartials,
@@ -23,9 +24,11 @@ import {
   getStackManifest,
   listStackManifests,
   putStackManifest,
+  readWtState,
   validateStackManifest,
 } from "../../core/wtstate.ts";
 import { layoutStack, STACK_CONNECTOR } from "../../core/stack-layout.ts";
+import { run as sizeRun } from "./size.ts";
 import { blue, bold, cyan, dim, green, magenta, red, yellow } from "../colors.ts";
 
 const HELP = `usage: wt stack <subcommand> [options]
@@ -40,6 +43,11 @@ subcommands:
   plan --from <file>         strict-validate + ingest only (no materialize); prints stackId
   status [stackId]           render the manifest DAG + drift vs reality (defaults
                              to the current branch's stack; --all for every stack)
+  context                    read-only pre-split context for /split (branch, base
+                             decision, changed files, wt size); runs in the cwd
+                             worktree, not the main clone
+  section <stackId> <sliceIdOrPr> [label]   print one slice's static PR-body
+                             "Stack" section (flat list, or a tree for a fork)
   split <stackId> <sliceId> --from <frag>   reshape: replace an open slice with N
                              sub-slices (re-threads descendants). Manifest only;
                              prints the apply/replay/retire next steps (or --apply
@@ -866,6 +874,154 @@ async function runHunks(rest: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * Read-only pre-split context, printed for the /split skill to consume.
+ * Folds the old `split/scripts/context.sh`: fetch origin (so trunk isn't
+ * stale right after a parent merge), then report branch / cleanliness /
+ * the base decision / changed-file inventory / `wt size`. Runs against the
+ * CURRENT directory (the holistic worktree), not the main clone.
+ *
+ * The base decision mirrors the recorded-fork-base precedence: a freshly
+ * rebased parent chain puts HEAD on top of trunk too, so the bare
+ * is-ancestor check would fold an unmerged parent's work into the slices —
+ * consult `wt base` (the `wt new --base` record) first.
+ */
+async function runContext(_argv: string[]): Promise<number> {
+  const cwd = process.cwd();
+  // /split often runs right after merging a parent PR, when origin/<trunk>
+  // is stale; a stale base folds already-merged work into the slices. Surface
+  // a failed fetch so the base decision below isn't silently trusted offline.
+  const fetchR = await gitRun(["fetch", "origin", "--quiet"], cwd);
+  if (fetchR.exitCode !== 0) console.log("(git fetch failed — base may be stale)");
+
+  const branchR = await gitRun(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+  const branch = branchR.exitCode === 0 ? branchR.stdout.trim() : "?";
+  let base = `origin/${config.branch.base}`;
+
+  const statusR = await gitRun(["status", "--porcelain"], cwd);
+  const clean = statusR.exitCode === 0 && statusR.stdout.trim() === "";
+  console.log(`branch:     ${branch}`);
+  console.log(`tree clean: ${clean ? "yes" : "NO"}`);
+
+  const topR = await gitRun(["rev-parse", "--show-toplevel"], cwd);
+  const slug = topR.exitCode === 0 ? basename(topR.stdout.trim()) : "";
+  const rec = (slug && readWtState().slugs[slug]?.baseBranch) || "";
+  const isAncestor = async (ref: string): Promise<boolean> =>
+    ref.length > 0 &&
+    (await gitRun(["merge-base", "--is-ancestor", ref, "HEAD"], cwd)).exitCode === 0;
+
+  if (rec && (await isAncestor(rec))) {
+    console.log(`recorded fork base: ${rec} — CONFIRMED (HEAD is on top of it).`);
+    console.log("  -> stacked on this unmerged parent (case b). Use it as the base for the");
+    console.log("     diff and every root slice; no need to ask.");
+    base = rec;
+  } else if (await isAncestor(base)) {
+    console.log(`base status: OK — HEAD is on top of current ${base}`);
+  } else {
+    console.log(`base status: HEAD is NOT on current ${base}`);
+    if (rec) console.log(`  recorded fork base: ${rec} — but HEAD is NOT on top of it (drifted?).`);
+    console.log("  Do NOT assume. Either:");
+    console.log(`  (a) main moved / a parent PR merged -> 'git rebase ${base}' (base = main)`);
+    console.log("  (b) stacked on an unmerged parent    -> base = that parent branch");
+    console.log("  The skill asks which before slicing (never silently rebase or split stale).");
+  }
+  console.log(`base:       ${base}`);
+
+  const mb = await gitRun(["merge-base", base, "HEAD"], cwd);
+  console.log(`merge-base: ${mb.exitCode === 0 ? mb.stdout.trim() : "?"}`);
+  console.log("");
+  console.log(`changed files (vs ${base}):`);
+  const diff = await gitRun(["diff", "--stat", `${base}...HEAD`], cwd);
+  if (diff.exitCode === 0 && diff.stdout.trim() !== "") {
+    // mirror the old script's `tail -60`
+    console.log(diff.stdout.replace(/\n+$/, "").split("\n").slice(-60).join("\n"));
+  }
+  console.log("");
+  console.log("wt size:");
+  // Size against the SAME resolved base as the inventory above — otherwise a
+  // slice stacked on an unmerged parent would be measured vs trunk and fold the
+  // parent's already-stacked work into the budget read.
+  await sizeRun(["--base", base, "--json"]);
+  return 0;
+}
+
+/**
+ * Print the static PR-body "Stack" section for one slice (folds
+ * `split/scripts/stack-section.{sh,py}`). Reads the manifest directly (no
+ * gh round-trip): a linear stack renders as the flat ordinal list, a fork
+ * as a nested bullet tree. Bare `#refs` only, so GitHub keeps the merge
+ * status live and the section never needs maintaining. The leading blank
+ * line before `---` is load-bearing (keeps a flush prose join from turning
+ * the last paragraph into a setext H2).
+ */
+async function runSection(argv: string[]): Promise<number> {
+  const [stackId, thisRef, ...labelParts] = argv;
+  if (!stackId || !thisRef) {
+    console.error(red("usage: wt stack section <stackId> <sliceIdOrPr> [label]"));
+    return 2;
+  }
+  const manifest = getStackManifest(stackId);
+  if (!manifest) {
+    console.error(red(`no stack manifest: ${stackId}`));
+    return 1;
+  }
+  const label = labelParts.join(" ") || stackId;
+  const slices = [...manifest.slices].sort((a, b) => a.ordinal - b.ordinal);
+  // Match a slice by its id or PR number; tolerate a `#`-prefixed PR arg.
+  const wantPr = thisRef.replace(/^#/, "");
+  const isThis = (s: (typeof slices)[number]): boolean =>
+    s.id === thisRef || String(s.pr) === wantPr;
+  const ref = (s: (typeof slices)[number]): string => (s.pr ? `#${s.pr}` : s.branch);
+
+  // Build the slice tree from `base` ALONE (id or branch), deliberately NOT via
+  // `layoutStack` (which also follows `dependsOn`). This mirrors the original
+  // `stack-section.py` exactly so existing PR bodies stay byte-identical; the
+  // PR-body tree and the TUI/status tree are intentionally separate renderers.
+  // `base` is trunk, a sibling id, a sibling branch, or an external branch
+  // (stack-on-stack root). In-stack parents resolve by id or branch; anything
+  // else makes the slice a root.
+  const byId = new Map(slices.map((s) => [s.id, s]));
+  const byBranch = new Map(slices.map((s) => [s.branch, s]));
+  const children = new Map<string, typeof slices>();
+  const roots: typeof slices = [];
+  for (const s of slices) {
+    const parent = byId.get(s.base) ?? byBranch.get(s.base);
+    if (parent && parent !== s) {
+      const arr = children.get(parent.id) ?? [];
+      arr.push(s);
+      children.set(parent.id, arr);
+    } else {
+      roots.push(s);
+    }
+  }
+  // Linear = one root, no slice with two children: rendered as the flat list.
+  // `roots.length === 0` only happens on a malformed base cycle; fall back to
+  // flat rather than render nothing.
+  const linear = roots.length === 1 && [...children.values()].every((c) => c.length <= 1);
+
+  const out: string[] = ["", "---", "", `Stack: **${label}**`, ""];
+  if (linear || roots.length === 0) {
+    for (const s of slices) {
+      out.push(`${s.ordinal}. ${ref(s)}${isThis(s) ? " 👈" : ""}`);
+    }
+  } else {
+    const seen = new Set<string>();
+    const emit = (s: (typeof slices)[number], depth: number): void => {
+      if (seen.has(s.id)) return;
+      seen.add(s.id);
+      out.push(`${"  ".repeat(depth)}- ${ref(s)}${isThis(s) ? " 👈" : ""}`);
+      for (const c of (children.get(s.id) ?? []).sort((a, b) => a.ordinal - b.ordinal)) {
+        emit(c, depth + 1);
+      }
+    };
+    for (const r of roots) emit(r, 0);
+    out.push("");
+    out.push("*(nesting = stacks on, siblings = parallel)*");
+  }
+  console.log(out.join("\n"));
+  return 0;
+}
+
 export async function run(argv: string[]): Promise<number> {
   const [sub, ...rest] = argv;
   if (!sub || sub === "--help" || sub === "-h") {
@@ -881,6 +1037,10 @@ export async function run(argv: string[]): Promise<number> {
       return runPlan(rest);
     case "status":
       return runStatus(rest);
+    case "context":
+      return runContext(rest);
+    case "section":
+      return runSection(rest);
     case "split":
       return runSplit(rest);
     case "add":

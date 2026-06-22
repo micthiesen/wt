@@ -12,6 +12,7 @@ import * as baseCmd from "./commands/base.ts";
 import * as claudeCmd from "./commands/claude.ts";
 import * as sizeCmd from "./commands/size.ts";
 import * as stackCmd from "./commands/stack.ts";
+import * as skillsCmd from "./commands/skills.ts";
 import * as destroyCmd from "./commands/_destroy.ts";
 
 const HELP = `usage: wt <command> [options]
@@ -27,6 +28,7 @@ commands:
   open        open a worktree in Zed
   size        production-LOC + file count for a diff
   stack       materialize / inspect / restack a stack manifest
+  skills      install wt's bundled workflow skills into a harness
   base        show / set / clear a worktree's recorded fork base
   claude      drive a worktree's Claude Code session (send / ls / kill)
 
@@ -45,6 +47,7 @@ const RUNNERS: Record<string, Runner> = {
   open: openCmd.run,
   size: sizeCmd.run,
   stack: stackCmd.run,
+  skills: skillsCmd.run,
   base: baseCmd.run,
   claude: claudeCmd.run,
   _destroy: destroyCmd.run,
