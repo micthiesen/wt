@@ -296,9 +296,13 @@ standalone skills — never as edits to `/start` or `/done`.
 ## Status
 
 - [x] CLAUDE.md `## PR Size & Stacking` guidance
-- [x] `/split` skill (+ context script)
-- [x] `/restack` skill (+ context script)
+- [x] `/split` skill (canonical now `~/.wt/skills/split`; helper folded into `wt stack context`/`section`)
+- [x] `/restack` skill (canonical now `~/.wt/skills/restack`)
 - [x] `/improve-stacking` meta-skill (routes any workflow tweak to the right place)
+- [x] wt: skills ship with the repo (`~/.wt/skills/{split,restack,wt}`) + `wt skills
+      install` (`--harness` native dirs / `--rulesync` + `--build`); shareable to a
+      Codex coworker with one command. Helper scripts folded into `wt stack
+      context` + `wt stack section`.
 - [x] wt implementation brief (was `~/.wt/prompt.txt`; consumed + deleted once built)
 - [x] This design doc
 - [x] wt: gut reflog heuristics → explicit-only (manifest-driven)
@@ -688,6 +692,33 @@ Track friction here as the workflow gets used. Candidate adjustments:
 
 ## Session log
 
+- **2026-06-22** — **stacking skills now ship with wt; helper scripts folded into
+  the CLI.** To let a coworker (on Codex) use the split/restack workflow, the
+  skills moved out of personal dotfiles into the wt repo (`~/.wt/skills/{split,
+  restack,wt}`), decoupled from client-app / ultracheck / absolute paths. The two
+  bundled helper scripts became subcommands so a skill only ever shells out to
+  `wt`: `split/scripts/context.sh` → `wt stack context` (the /split pre-flight,
+  run against the cwd worktree; faithful port that also fixes a latent bug — the
+  old script's `wt size` block was dead code because `command -v wt` fails for the
+  alias-only install) and `stack-section.{sh,py}` → `wt stack section` (byte-
+  identical PR-body "Stack" section, verified across 5 live stacks). New
+  `wt skills install [--harness claude|codex|opencode] [--rulesync] [--build]`:
+  one Claude-style source serves every harness (Claude/OpenCode auto-run the
+  `!`-block; Codex reads it as a plain command — no per-harness rendering),
+  copied into the harness's native dir (stripping the rulesync-only `targets:`
+  key) or into a rulesync source dir with an optional `--build` that shells the
+  user's own `rulesync.sh` (so wt itself stays node-free). The auto-injection
+  resolves wt via `WT=$(command -v wt || echo "$HOME/.wt/bin/wt")` since the
+  documented install is alias-only (not on PATH in a non-interactive `!` shell).
+  Distribution split: the coworker runs `wt skills install --harness codex`; this
+  machine keeps rulesync as the aggregation layer and re-stages via
+  `wt skills install --rulesync split restack --build` (canonical lives in wt,
+  so `improve-stacking`'s routing now points there). Ran a 11-agent ultracheck;
+  applied the real findings (size measured against the resolved base not trunk;
+  surfaced fetch failure; atomic install swap + error guards; replaced a double-
+  executing `|| fallback` with a single-resolve form). Kept `wt stack section`'s
+  own tree-builder (deliberately base-only, byte-parity with the old generator)
+  rather than reusing `layoutStack` (which also follows `dependsOn`).
 - **2026-06-18** — **forked stacks render as a tree, not a flat list.** A fork
   (the eng-5240 stack: 03/04 one lane, 05/06 two more, all off slice 02) read as
   one linear 01..06 column on every surface, because the spine glyph came from a
