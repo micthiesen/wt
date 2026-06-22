@@ -590,9 +590,11 @@ standalone skills — never as edits to `/start` or `/done`.
       `--name-status -M base..source`, require every changed path (incl. `D` and
       BOTH halves of `R`) to be claimed by some slice's `files`/`partials`, with
       the same merged-slice tolerance as the hunk gate. ERROR (not auto-attach) on
-      an unclaimed path, naming the slice that owns its rename counterpart. Wired
-      into `applyStackLocked` (always, before any git state) and `runPlan` (early
-      catch). `/split` skill: inventory now cross-checks `git diff --name-status -M`
+      an unclaimed path, naming the slice that owns its rename counterpart. Run
+      inside `ingestManifest` BEFORE the manifest is persisted (so a bad partition
+      never enters state — `plan` on a buggy manifest now leaves nothing behind),
+      and re-checked in `applyStackLocked` at materialize time as the backstop.
+      `/split` skill: inventory now cross-checks `git diff --name-status -M`
       so renames/deletions surface as two paths, plus an explicit "a rename and a
       deletion must be claimed, in full" rule. Smoke: full coverage → null, drop the
       rename old-half → errors naming it + its counterpart's owner. Typecheck clean.
@@ -725,8 +727,9 @@ Track friction here as the workflow gets used. Candidate adjustments:
   base..source` per source and requires every changed path — incl. `D` and BOTH
   halves of `R` — to be owned by a slice's `files`/`partials`, mirroring the hunk
   gate's merged-slice tolerance; it ERRORs (the user's call, over auto-attach) and
-  names the slice owning the unclaimed path's rename counterpart. Wired into
-  `applyStackLocked` (every stack, before any git state) and `runPlan` (early).
+  names the slice owning the unclaimed path's rename counterpart. Validated in
+  `ingestManifest` before the manifest is persisted (a buggy `plan` leaves
+  nothing in state) and re-checked in `applyStackLocked` at materialize time.
   `/split` skill gained a `--name-status -M` cross-check in the inventory and an
   explicit "a rename and a deletion must be claimed, in full" rule. Smoke proved
   both directions (full → null; drop old-half → precise error). The immediate

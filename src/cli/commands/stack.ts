@@ -121,10 +121,13 @@ type IngestResult =
 /**
  * Read + STRICT-validate a skill-authored manifest file, then store it
  * via `putStackManifest`. This is the ONLY boundary by which a manifest
- * enters wt state — skills never write `state.json`. Validation errors
- * print verbatim (all of them) and the manifest is NOT stored.
+ * enters wt state — skills never write `state.json`. Validation is two-stage:
+ * structural (`validateStackManifest`) then real-diff whole-file coverage
+ * (`validateFileCoverage`), both BEFORE the write, so a mis-partitioned manifest
+ * (e.g. a rename whose delete-half no slice claims) never enters state. Any
+ * error prints verbatim and the manifest is NOT stored.
  */
-function ingestManifest(file: string): IngestResult {
+async function ingestManifest(file: string): Promise<IngestResult> {
   let text: string;
   try {
     if (!statSync(file).isFile()) {
@@ -162,6 +165,19 @@ function ingestManifest(file: string): IngestResult {
           `re-ingesting would discard recorded PRs. Run \`wt stack apply ${v.manifest.stackId}\` instead.`,
       ),
     );
+    return { ok: false };
+  }
+  // Real-diff gate before persisting: every changed path (incl. deletions and
+  // both halves of a rename) must be claimed by a slice, else it lingers from
+  // base and breaks the slice that removes what depends on it. `apply` re-checks
+  // at materialize time; running it here keeps an invalid manifest out of state.
+  const coverageError = await validateFileCoverage(
+    v.manifest,
+    config.paths.mainClone,
+    new Map(),
+  );
+  if (coverageError) {
+    console.error(red(`whole-file coverage check failed: ${coverageError}`));
     return { ok: false };
   }
   try {
@@ -202,7 +218,7 @@ async function runApply(argv: string[]): Promise<number> {
       console.error(red("pass either --from <file> or <stackId>, not both"));
       return 2;
     }
-    const ingested = ingestManifest(from);
+    const ingested = await ingestManifest(from);
     if (!ingested.ok) return 1;
     stackId = ingested.stackId;
     console.log(
@@ -304,23 +320,8 @@ async function runPlan(argv: string[]): Promise<number> {
     console.error(red("usage: wt stack plan --from <manifest.json>"));
     return 2;
   }
-  const ingested = ingestManifest(from);
+  const ingested = await ingestManifest(from);
   if (!ingested.ok) return 1;
-  // Real-diff coverage gate, run here too (apply enforces it again) so a
-  // mis-partitioned manifest — classically a rename whose delete-half no slice
-  // claims — is caught at plan time, before any branch or PR is created.
-  const manifest = getStackManifest(ingested.stackId);
-  if (manifest) {
-    const coverageError = await validateFileCoverage(
-      manifest,
-      config.paths.mainClone,
-      new Map(),
-    );
-    if (coverageError) {
-      console.error(red(`whole-file coverage check failed: ${coverageError}`));
-      return 1;
-    }
-  }
   console.log(
     green(
       `✓ ingested ${bold(ingested.stackId)} (${ingested.sliceCount} slices) — run \`wt stack apply ${ingested.stackId}\` to materialize`,
