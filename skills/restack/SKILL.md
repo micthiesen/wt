@@ -16,7 +16,7 @@ conflicts the engine can't.
 
 ## Current State
 
-!`WT=$(command -v wt || echo "$HOME/.wt/bin/wt"); "$WT" stack status`
+!`WT="$HOME/.wt/bin/wt"; [ -x "$WT" ] || WT=wt; "$WT" stack status`
 
 ## Mental model
 

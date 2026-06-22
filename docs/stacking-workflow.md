@@ -708,8 +708,10 @@ Track friction here as the workflow gets used. Candidate adjustments:
   copied into the harness's native dir (stripping the rulesync-only `targets:`
   key) or into a rulesync source dir with an optional `--build` that shells the
   user's own `rulesync.sh` (so wt itself stays node-free). The auto-injection
-  resolves wt via `WT=$(command -v wt || echo "$HOME/.wt/bin/wt")` since the
-  documented install is alias-only (not on PATH in a non-interactive `!` shell).
+  resolves wt via `WT="$HOME/.wt/bin/wt"; [ -x "$WT" ] || WT=wt` — alias-immune,
+  since the documented install is an alias (`command -v wt` returns the alias
+  definition, not a path, in an interactive shell; bare `wt` isn't on PATH in a
+  non-interactive `!` shell).
   Distribution split: the coworker runs `wt skills install --harness codex`; this
   machine keeps rulesync as the aggregation layer and re-stages via
   `wt skills install --rulesync split restack --build` (canonical lives in wt,

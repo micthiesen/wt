@@ -15,7 +15,7 @@ Turn one validated holistic branch into several small, reviewable PRs.
 
 ## Current State
 
-!`WT=$(command -v wt || echo "$HOME/.wt/bin/wt"); "$WT" stack context`
+!`WT="$HOME/.wt/bin/wt"; [ -x "$WT" ] || WT=wt; "$WT" stack context`
 
 ## Mental model
 
