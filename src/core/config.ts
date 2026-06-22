@@ -67,12 +67,12 @@ export type DiffConfig = {
    * Supports a single `{{base}}` placeholder that's substituted at
    * spawn time with the worktree's resolved diff base — `origin/<trunk>`
    * for un-stacked worktrees, the parent branch ref for stacked /
-   * non-trunk-PR worktrees. The default is `hunk diff {{base}} --watch`,
-   * which renders a live working-tree-vs-base diff (untracked files
-   * included) and reflows on commits, edits, and base-tip movement.
-   * When the base wt resolved against changes (PR base flip, stack
-   * reroot), the existing diff session is killed so the next F11
-   * reopens against the new ref.
+   * non-trunk-PR worktrees. The default is
+   * `revdiff --vim-motion --compact {{base}}`, a stacked diff TUI with
+   * vim motions whose view spans commits + staged + unstaged (untracked
+   * is one keypress away via `u`). When the base wt resolved against
+   * changes (PR base flip, stack reroot), the existing diff session is
+   * killed so the next F11 reopens against the new ref.
    *
    * Users can swap in any other diff TUI: `gitu`, `lazygit`, `tig
    * status`, `delta`-piped commands, or a custom script. Commands

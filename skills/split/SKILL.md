@@ -66,7 +66,8 @@ session id (for `holisticSessionId`, so slices can find this convo later).
 **See renames and deletions as two paths, not one.** A `--stat` (and `wt size`)
 view collapses a rename to a single `{old => new}` line, which reads as one file
 to assign and hides the delete-half. Always cross-check with
-`git diff --name-status -M <base>...HEAD`: a `D` is a deletion you must claim, an
+`git -c core.quotePath=false diff --name-status -M <base>...HEAD` (quotePath off so
+non-ASCII paths come back literal): a `D` is a deletion you must claim, an
 `R old new` is a deletion (`old`) **and** an addition (`new`) that BOTH need a
 slice. Missing the `old` half is the classic split bug — it lingers from base and
 red-CIs the one slice that removes what it depends on. (`wt stack apply`/`plan`
