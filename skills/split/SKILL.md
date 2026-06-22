@@ -63,6 +63,15 @@ tests/snapshots/generated/lockfiles). Prefer `wt size --json`; fall back to git.
 Note the `holisticBranch`, `holisticSlug`, the issue id, and this conversation's
 session id (for `holisticSessionId`, so slices can find this convo later).
 
+**See renames and deletions as two paths, not one.** A `--stat` (and `wt size`)
+view collapses a rename to a single `{old => new}` line, which reads as one file
+to assign and hides the delete-half. Always cross-check with
+`git diff --name-status -M <base>...HEAD`: a `D` is a deletion you must claim, an
+`R old new` is a deletion (`old`) **and** an addition (`new`) that BOTH need a
+slice. Missing the `old` half is the classic split bug — it lingers from base and
+red-CIs the one slice that removes what it depends on. (`wt stack apply`/`plan`
+now hard-fail on an unclaimed path, but author it right and skip the round-trip.)
+
 ### 2. Build the dependency picture
 For each changed file, find which other changed files/symbols it imports or
 references. Use the codebase's layering as the topological backbone (e.g. a
@@ -74,6 +83,14 @@ layered repo: core → domain → UI). Keep each `X.spec.ts` with its `X.ts`.
 - **File-level is the default.** A changed file belongs wholly to one slice
   (`files: [...]`). Reach for hunk-level (below) only when whole-file ownership
   would force an otherwise-clean stack into one indivisible blob.
+- **A rename and a deletion must be claimed, in full.** Every changed path the
+  inventory surfaced — including each `D` deletion and BOTH halves of an `R`
+  rename — must appear in exactly one slice's `files`. For a relocation (move a
+  function + its test, split a module), list the **old** (deleted) path in the
+  slice that removes the symbol it depends on, or any earlier slice; list the
+  **new** path wherever its content belongs. They needn't be the same slice, but
+  neither may be dropped. `wt stack plan`/`apply` enforce full coverage and name
+  any unclaimed path, so a miss is caught before PRs — but get it right up front.
 - **Maximize parallelism.** Two slices that are file-disjoint AND
   symbol-independent become **parallel lanes** (each branches off `main`,
   `dependsOn: []`). Slices on a dependency chain **stack** in order. If two

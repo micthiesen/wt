@@ -15,6 +15,7 @@ import { config } from "./config.ts";
 import {
   branchExists,
   firstSha,
+  git,
   gitQuiet,
   gitRun,
   localOrOriginRef,
@@ -375,6 +376,113 @@ export async function validatePartialCoverage(
   return null;
 }
 
+/**
+ * Before materializing, prove the manifest covers the ENTIRE holistic diff at
+ * the file level: every changed path — a modify, an add, a DELETE, and BOTH
+ * halves of a RENAME — is claimed by some slice's `files` or `partials`.
+ *
+ * `validateStackManifest` checks listed files are well-formed but can't see the
+ * real diff, and the materializer reproduces only the paths a slice lists — so a
+ * changed path no slice claims silently lingers from base on every slice and
+ * breaks the one slice that removes whatever depended on it. The classic miss is
+ * the delete-half of a rename: the planner lists the new path and forgets the
+ * old one (the inventory collapses a rename to a single `{old => new}` line). The
+ * hunk gate ({@link validatePartialCoverage}) enforces this for partial files;
+ * this is its whole-file analogue, closing the asymmetry. We ERROR on an
+ * unclaimed path (naming the slice that owns its rename counterpart) rather than
+ * auto-attaching, so the partition stays explicit.
+ *
+ * Per source (a re-split sub-slice can carry its own `source`), the diff is
+ * `git diff --name-status -M <base>..<source>`. A MERGED slice's files are in
+ * trunk/base, so they count as covered, and a post-merge-absorbed path that fell
+ * out of the live diff is tolerated — mirroring the hunk gate's merged handling.
+ */
+export async function validateFileCoverage(
+  manifest: StackManifest,
+  cwd: string,
+  baseBySource: Map<string, string>,
+): Promise<string | null> {
+  const mergedIds = new Set(
+    manifest.slices.filter((s) => s.status === "merged").map((s) => s.id),
+  );
+  // Per source: claimed paths split live (owner id for the hint) vs merged.
+  const bySource = new Map<string, { live: Map<string, string>; merged: Set<string> }>();
+  for (const s of manifest.slices) {
+    const source = s.source ?? manifest.holisticBranch;
+    const claims =
+      bySource.get(source) ??
+      bySource.set(source, { live: new Map(), merged: new Set() }).get(source)!;
+    const paths = [...(s.files ?? []), ...(s.partials ?? []).map((p) => p.file)];
+    for (const f of paths) {
+      if (mergedIds.has(s.id)) claims.merged.add(f);
+      else claims.live.set(f, s.id);
+    }
+  }
+
+  for (const [source, claims] of bySource) {
+    let base = baseBySource.get(source);
+    if (base === undefined) {
+      base = await holisticBase(cwd, source);
+      baseBySource.set(source, base);
+    }
+    const changed = await changedPaths(cwd, base, source);
+    const unassigned = [...changed.keys()].filter(
+      (p) => !claims.live.has(p) && !claims.merged.has(p),
+    );
+    if (unassigned.length === 0) continue;
+
+    const detail = unassigned.map((p) => {
+      const counterpart = changed.get(p);
+      if (counterpart) {
+        const owner = claims.live.get(counterpart);
+        return owner
+          ? `${p} (rename of ${counterpart}, owned by slice ${owner} — add ${p} to that slice)`
+          : `${p} (rename counterpart of ${counterpart})`;
+      }
+      return p;
+    });
+    const where = source === manifest.holisticBranch ? "" : ` [source ${source}]`;
+    return (
+      `${unassigned.length} changed path(s) unassigned${where}: ${detail.join("; ")} — ` +
+      "every changed file (including deletions and both halves of a rename) must be " +
+      "claimed by exactly one slice's `files` or `partials`"
+    );
+  }
+  return null;
+}
+
+/**
+ * The paths the holistic diff touches between `base` and `source`, each mapped
+ * to its rename counterpart (the other half) or null. A rename contributes BOTH
+ * its old (deleted) and new (added) path, each pointing at the other; an
+ * add/modify/delete/type-change contributes its single path with no counterpart;
+ * a copy contributes only its new path (the source is unchanged).
+ */
+async function changedPaths(
+  cwd: string,
+  base: string,
+  source: string,
+): Promise<Map<string, string | null>> {
+  const out = await git(["diff", "--name-status", "-M", `${base}..${source}`], cwd);
+  const map = new Map<string, string | null>();
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    const parts = line.split("\t");
+    const status = parts[0] ?? "";
+    if (status.startsWith("R") && parts.length >= 3) {
+      const oldP = parts[1]!;
+      const newP = parts[2]!;
+      map.set(oldP, newP);
+      map.set(newP, oldP);
+    } else if (status.startsWith("C") && parts.length >= 3) {
+      map.set(parts[2]!, null);
+    } else if (parts.length >= 2) {
+      map.set(parts[1]!, null);
+    }
+  }
+  return map;
+}
+
 /** A minimal-but-valid PR body. Richer bodies are authored by a skill later. */
 function sliceBody(manifest: StackManifest, slice: StackSlice): string {
   const lines = [
@@ -468,6 +576,19 @@ async function applyStackLocked(
       baseBySource,
     );
     if (coverageError) return { materialized: [], skipped: [], error: coverageError };
+  }
+
+  // Whole-file coverage gate: every changed path (incl. deletions + both halves
+  // of a rename) must be claimed by some slice, else it lingers from base and
+  // breaks the slice that removes whatever depended on it. Runs for every stack
+  // (not just hunk-split ones); shares the resolved bases with the gate above.
+  const fileCoverageError = await validateFileCoverage(
+    manifest,
+    config.paths.mainClone,
+    baseBySource,
+  );
+  if (fileCoverageError) {
+    return { materialized: [], skipped: [], error: fileCoverageError };
   }
 
   // Opt-in compile gate: reconstruct each cumulative prefix in a throwaway

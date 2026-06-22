@@ -577,6 +577,25 @@ standalone skills — never as edits to `/start` or `/done`.
       dump; help updated. `/restack` precondition documents the scoped default; its
       Report step bans bare cross-stack "slice N" (pair stack id + PR#). No caller
       depended on no-arg=all. Typecheck + smoke clean.
+- [x] wt + skill: **whole-file coverage gate** (eng-5244 split post-mortem,
+      2026-06-22). A relocation is a git rename = delete-old + add-new; `/split`
+      listed only the new path, the old-spec deletion was claimed by no slice, it
+      lingered from base on every slice and red-CI'd the one slice that removed the
+      function it imported. Root cause: the materializer handles deletions/renames
+      but delegated rename completeness to the planner ("a rename a->b must list
+      BOTH paths ... The planner owns that; this only reproduces") and never
+      verified it; wt gated HUNK coverage (`validatePartialCoverage`) but had **no
+      whole-file analogue**, so an unclaimed whole-file path passed plan + apply
+      silently. Added `validateFileCoverage` (stack-ops): per source, diff
+      `--name-status -M base..source`, require every changed path (incl. `D` and
+      BOTH halves of `R`) to be claimed by some slice's `files`/`partials`, with
+      the same merged-slice tolerance as the hunk gate. ERROR (not auto-attach) on
+      an unclaimed path, naming the slice that owns its rename counterpart. Wired
+      into `applyStackLocked` (always, before any git state) and `runPlan` (early
+      catch). `/split` skill: inventory now cross-checks `git diff --name-status -M`
+      so renames/deletions surface as two paths, plus an explicit "a rename and a
+      deletion must be claimed, in full" rule. Smoke: full coverage → null, drop the
+      rename old-half → errors naming it + its counterpart's owner. Typecheck clean.
 
 ---
 
@@ -691,6 +710,28 @@ Track friction here as the workflow gets used. Candidate adjustments:
 ---
 
 ## Session log
+
+- **2026-06-22** — **whole-file coverage gate closes the rename/deletion hole.**
+  Dogfooding `/split` on `eng-5244` (6-slice fork), slice 04's CI went red:
+  relocating `resolveSheetLatestReported` was a git rename
+  (`saveMetricDerivation.spec.ts` → `summaryColumns.spec.ts`), the manifest listed
+  only the new path, and the old-spec deletion — claimed by no slice — lingered
+  from base and broke the one slice that removed the function it imported. The
+  materializer already handles deletions/renames (`git rm` + checkout) but its
+  docstring delegated rename completeness to the planner and nothing verified it;
+  meanwhile wt gated HUNK coverage (`validatePartialCoverage`) but had no
+  whole-file equivalent, so an unclaimed whole-file path sailed through `plan` +
+  `apply`. Fix: `validateFileCoverage` (stack-ops.ts) diffs `--name-status -M
+  base..source` per source and requires every changed path — incl. `D` and BOTH
+  halves of `R` — to be owned by a slice's `files`/`partials`, mirroring the hunk
+  gate's merged-slice tolerance; it ERRORs (the user's call, over auto-attach) and
+  names the slice owning the unclaimed path's rename counterpart. Wired into
+  `applyStackLocked` (every stack, before any git state) and `runPlan` (early).
+  `/split` skill gained a `--name-status -M` cross-check in the inventory and an
+  explicit "a rename and a deletion must be claimed, in full" rule. Smoke proved
+  both directions (full → null; drop old-half → precise error). The immediate
+  `eng-5244` breakage was hand-fixed on the slice branch first (amend + restack);
+  this gate prevents the class. Typecheck + `wt ls` smoke clean.
 
 - **2026-06-22** — **stacking skills now ship with wt; helper scripts folded into
   the CLI.** To let a coworker (on Codex) use the split/restack workflow, the

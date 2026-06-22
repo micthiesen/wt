@@ -11,6 +11,7 @@ import {
   replayStack,
   splitStack,
   stackStatus,
+  validateFileCoverage,
   type RebaseResult,
   type SliceStatusRow,
   type StackStatusReport,
@@ -305,6 +306,21 @@ async function runPlan(argv: string[]): Promise<number> {
   }
   const ingested = ingestManifest(from);
   if (!ingested.ok) return 1;
+  // Real-diff coverage gate, run here too (apply enforces it again) so a
+  // mis-partitioned manifest — classically a rename whose delete-half no slice
+  // claims — is caught at plan time, before any branch or PR is created.
+  const manifest = getStackManifest(ingested.stackId);
+  if (manifest) {
+    const coverageError = await validateFileCoverage(
+      manifest,
+      config.paths.mainClone,
+      new Map(),
+    );
+    if (coverageError) {
+      console.error(red(`whole-file coverage check failed: ${coverageError}`));
+      return 1;
+    }
+  }
   console.log(
     green(
       `✓ ingested ${bold(ingested.stackId)} (${ingested.sliceCount} slices) — run \`wt stack apply ${ingested.stackId}\` to materialize`,
