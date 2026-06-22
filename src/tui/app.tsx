@@ -508,8 +508,8 @@ function buildActionVars(row: WorktreeRow): ActionVars {
     cwd: row.wt.path,
     pr: row.pr ? String(row.pr.number) : "",
     // The stage this worktree owns — the pinned `.sst/stage` (prefix-
-    // guarded), else the slug-derived default. Built-in remove-local +
-    // any user shell action that wants a stage handle reads through this.
+    // guarded), else the slug-derived default. Any user shell action that
+    // wants a stage handle (e.g. `sst remove --stage {{stage}}`) reads this.
     stage: expectedStage(row.wt),
   };
 }

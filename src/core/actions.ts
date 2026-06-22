@@ -100,7 +100,7 @@ export type ActionRowState = {
   /**
    * `isOurStageDeployed` result for the row. Strict gate (matches
    * the safe-stage rules); used by `requires: ["deployed"]` actions
-   * like the built-in `remove-local`.
+   * (e.g. a user-configured `pnpm sst remove --stage {{stage}}`).
    */
   deployed: boolean;
 };
@@ -147,32 +147,20 @@ export function evaluateActionRequirements(
 }
 
 /**
- * Built-in shell actions appended after `config.actions` in the
- * picker. They behave exactly like user-configured shell actions —
- * the `actionRegistry` doesn't distinguish, the only difference is
- * they're defined in code rather than read from `config.toml`.
- * Adding one: declare it here, no other wiring needed. The picker
- * places these between user actions and the trailing "Custom prompt…"
- * sentinel.
+ * Built-in actions appended after `config.actions` in the picker. They
+ * behave exactly like user-configured actions — the `actionRegistry`
+ * doesn't distinguish, the only difference is they're defined in code
+ * rather than read from `config.toml`. Adding one: declare it here, no
+ * other wiring needed; the picker places these between user actions and
+ * the trailing "Custom prompt…" sentinel.
+ *
+ * Intentionally EMPTY: every built-in candidate so far has been
+ * project-specific (e.g. the old `pnpm sst remove` "Remove local"), which
+ * belongs in the user's `config.toml`, not baked into the OSS app — the
+ * same "no client-app defaults in code" rule the config loader enforces.
+ * Keep this for a genuinely repo-agnostic action if one ever earns it.
  */
-export const BUILTIN_ACTIONS: readonly ActionDef[] = [
-  {
-    kind: "shell",
-    id: "remove-local",
-    name: "Remove local",
-    group: "Deploy",
-    // `{{stage}}` resolves to the stage this worktree owns — the pinned
-    // `.sst/stage` (prefix-guarded) — so remove targets what's actually
-    // deployed. The `requires: ["deployed"]` gate runs the same
-    // `safeStage` prefix check, so a foreign/unprefixed pin never gets
-    // here.
-    shell: "pnpm sst remove --stage {{stage}}",
-    affects: ["git"],
-    requires: ["deployed"],
-    argPrompt: null,
-    labelExtract: null,
-  },
-];
+export const BUILTIN_ACTIONS: readonly ActionDef[] = [];
 
 const log = createLogger("[actions]");
 
