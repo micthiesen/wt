@@ -18,7 +18,13 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ancestorOwnedHunks, isAdoptablePr, validatePartialCoverage } from "./stack-ops.ts";
+import {
+  ancestorOwnedHunks,
+  isAdoptablePr,
+  parseNameStatus,
+  validateFileCoverage,
+  validatePartialCoverage,
+} from "./stack-ops.ts";
 import { gitRun } from "./git.ts";
 import { fileHunks } from "./hunks.ts";
 import { transitiveAncestors } from "./stack-layout.ts";
@@ -241,4 +247,59 @@ test("reused branch (closed PR) is reset onto parent before materialize", async 
   // Stale content is gone; parent content is present.
   expect(existsSync(join(dir, "stale.ts"))).toBe(false);
   expect(existsSync(join(dir, "parent.ts"))).toBe(true);
+});
+
+// ── whole-file coverage gate (validateFileCoverage / parseNameStatus) ──
+
+test("parseNameStatus maps a rename to both halves and others to null", () => {
+  const out = lines("M\tkept.ts", "A\tadded.ts", "D\tgone.ts", "R100\told.ts\tnew.ts");
+  const m = parseNameStatus(out);
+  expect(m.get("kept.ts")).toBeNull();
+  expect(m.get("added.ts")).toBeNull();
+  expect(m.get("gone.ts")).toBeNull();
+  expect(m.get("old.ts")).toBe("new.ts");
+  expect(m.get("new.ts")).toBe("old.ts");
+  expect(m.size).toBe(5);
+});
+
+/** A `holistic` branch that renames `old.ts`→`renamed.ts` and adds `brandnew.ts`. */
+function renameScenario(): { dir: string; base: string } {
+  const dir = mkdtempSync(join(tmpdir(), "wt-stackops-fc-"));
+  dirs.push(dir);
+  git(dir, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(dir, "old.ts"), BASE_BODY);
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "base"]);
+  const base = git(dir, ["rev-parse", "HEAD"]).trim();
+  git(dir, ["checkout", "-q", "-b", "holistic"]);
+  git(dir, ["mv", "old.ts", "renamed.ts"]);
+  writeFileSync(join(dir, "brandnew.ts"), "added\n");
+  git(dir, ["add", "-A"]);
+  git(dir, ["commit", "-q", "-m", "holistic"]);
+  return { dir, base };
+}
+
+test("validateFileCoverage passes when every changed path (both rename halves) is claimed", async () => {
+  const { dir, base } = renameScenario();
+  const m = manifest([slice({ id: "s1", files: ["old.ts", "renamed.ts", "brandnew.ts"] })]);
+  const err = await validateFileCoverage(m, dir, new Map([["holistic", base]]));
+  expect(err).toBeNull();
+});
+
+test("validateFileCoverage flags a rename's unclaimed delete-half, naming the counterpart owner", async () => {
+  const { dir, base } = renameScenario();
+  // Claims the rename NEW half + the add, but forgets the OLD (delete) half.
+  const m = manifest([slice({ id: "s2", files: ["renamed.ts", "brandnew.ts"] })]);
+  const err = await validateFileCoverage(m, dir, new Map([["holistic", base]]));
+  expect(err).toContain("old.ts");
+  expect(err).toContain("rename of renamed.ts");
+  expect(err).toContain("slice s2");
+});
+
+test("validateFileCoverage flags a plain unclaimed addition", async () => {
+  const { dir, base } = renameScenario();
+  // Forgets `brandnew.ts` entirely (a non-rename unclaimed path).
+  const m = manifest([slice({ id: "s1", files: ["old.ts", "renamed.ts"] })]);
+  const err = await validateFileCoverage(m, dir, new Map([["holistic", base]]));
+  expect(err).toContain("brandnew.ts");
 });

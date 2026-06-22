@@ -735,6 +735,17 @@ Track friction here as the workflow gets used. Candidate adjustments:
   both directions (full → null; drop old-half → precise error). The immediate
   `eng-5244` breakage was hand-fixed on the slice branch first (amend + restack);
   this gate prevents the class. Typecheck + `wt ls` smoke clean.
+  **Hardening (same day, ultracheck swarm on the gate):** (1) the per-source diff
+  base was `holisticBase` (trunk merge-base) unconditionally, which over-enumerates
+  for a stack on an unmerged parent PR or a re-split source (ancestor commits' files
+  read as falsely "unassigned"); replaced with `coverageBase`, the merge-base of
+  `source` with the group lane root's resolved parent (`resolveParentBranch`),
+  equal to `holisticBase` for the common trunk-rooted case so no regression there.
+  (2) `changedPaths` → pure, unit-tested `parseNameStatus`; the diff now runs via
+  `gitRun` with `-c core.quotePath=false` (non-ASCII paths matched literally, no
+  thrown stack trace on a bad ref — returns a clean coverage error). (3) dropped a
+  dead `C`-status branch (`-C` isn't passed). (4) added `stack-ops.test.ts` cases
+  (parse + full-coverage + unclaimed rename-half + unclaimed add). 25/25 tests pass.
 
 - **2026-06-22** — **stacking skills now ship with wt; helper scripts folded into
   the CLI.** To let a coworker (on Codex) use the split/restack workflow, the

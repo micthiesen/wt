@@ -15,7 +15,6 @@ import { config } from "./config.ts";
 import {
   branchExists,
   firstSha,
-  git,
   gitQuiet,
   gitRun,
   localOrOriginRef,
@@ -400,7 +399,8 @@ export async function validatePartialCoverage(
 export async function validateFileCoverage(
   manifest: StackManifest,
   cwd: string,
-  baseBySource: Map<string, string>,
+  /** Test-only: pin a source's diff base, bypassing {@link coverageBase}. */
+  baseOverride?: Map<string, string>,
 ): Promise<string | null> {
   const mergedIds = new Set(
     manifest.slices.filter((s) => s.status === "merged").map((s) => s.id),
@@ -420,12 +420,18 @@ export async function validateFileCoverage(
   }
 
   for (const [source, claims] of bySource) {
-    let base = baseBySource.get(source);
-    if (base === undefined) {
-      base = await holisticBase(cwd, source);
-      baseBySource.set(source, base);
+    const base = baseOverride?.get(source) ?? (await coverageBase(manifest, source, cwd));
+    // `core.quotePath=false` so non-ASCII paths come back literal and match the
+    // manifest's raw paths (cf. `fileHunks`); `gitRun` (not `git`) so an
+    // unresolvable ref returns a clean error instead of throwing a stack trace.
+    const r = await gitRun(
+      ["-c", "core.quotePath=false", "diff", "--name-status", "-M", `${base}..${source}`],
+      cwd,
+    );
+    if (r.exitCode !== 0) {
+      return `whole-file coverage: cannot diff ${source} against its base — ${r.stderr.trim() || "git diff failed"}`;
     }
-    const changed = await changedPaths(cwd, base, source);
+    const changed = parseNameStatus(r.stdout);
     const unassigned = [...changed.keys()].filter(
       (p) => !claims.live.has(p) && !claims.merged.has(p),
     );
@@ -445,37 +451,60 @@ export async function validateFileCoverage(
     return (
       `${unassigned.length} changed path(s) unassigned${where}: ${detail.join("; ")} — ` +
       "every changed file (including deletions and both halves of a rename) must be " +
-      "claimed by exactly one slice's `files` or `partials`"
+      "claimed by a slice's `files` or `partials`"
     );
   }
   return null;
 }
 
 /**
- * The paths the holistic diff touches between `base` and `source`, each mapped
- * to its rename counterpart (the other half) or null. A rename contributes BOTH
- * its old (deleted) and new (added) path, each pointing at the other; an
- * add/modify/delete/type-change contributes its single path with no counterpart;
- * a copy contributes only its new path (the source is unchanged).
+ * The base a source's slices were partitioned against, i.e. where the whole
+ * source-group forks from everything else: the merge-base of `source` with the
+ * branch the group's lane root sits on. For a trunk-rooted stack this is the
+ * trunk fork point (= {@link holisticBase}); for a stack on an unmerged parent
+ * PR it's the parent branch; for a re-split source it's the original slice's
+ * parent. Using the group's actual fork point (not trunk unconditionally) keeps
+ * the coverage diff to exactly what these slices add, so ancestor commits' files
+ * aren't surfaced as falsely "unassigned". Degrades to {@link holisticBase} if
+ * the parent ref can't be resolved.
  */
-async function changedPaths(
-  cwd: string,
-  base: string,
+async function coverageBase(
+  manifest: StackManifest,
   source: string,
-): Promise<Map<string, string | null>> {
-  const out = await git(["diff", "--name-status", "-M", `${base}..${source}`], cwd);
+  cwd: string,
+): Promise<string> {
+  const group = manifest.slices.filter(
+    (s) => (s.source ?? manifest.holisticBranch) === source,
+  );
+  const ids = new Set(group.map((s) => s.id));
+  // The lane root is the group slice whose base points OUTSIDE the group (trunk,
+  // an external parent branch, or — for a re-split — a slice in another group).
+  const root = group.find((s) => !ids.has(s.base)) ?? group[0];
+  if (!root) return holisticBase(cwd, source);
+  const parentRef = isTrunkBase(root)
+    ? `origin/${config.branch.base}`
+    : await localOrOriginRef(resolveParentBranch(manifest, root));
+  const mb = await gitRun(["merge-base", parentRef, source], cwd);
+  const sha = mb.stdout.trim();
+  return mb.exitCode === 0 && sha ? sha : holisticBase(cwd, source);
+}
+
+/**
+ * Parse `git diff --name-status -M` output into `path -> rename counterpart`
+ * (the other half of a rename) or `null`. A rename (`R<score>`) contributes BOTH
+ * its old (deleted) and new (added) path, each pointing at the other; every other
+ * status (`A`/`M`/`D`/`T`) contributes its single path with no counterpart. Pure
+ * (no I/O) so the parsing is unit-testable; `-C` is not passed, so no `C` lines.
+ */
+export function parseNameStatus(out: string): Map<string, string | null> {
   const map = new Map<string, string | null>();
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
     const parts = line.split("\t");
     const status = parts[0] ?? "";
     if (status.startsWith("R") && parts.length >= 3) {
-      const oldP = parts[1]!;
-      const newP = parts[2]!;
-      map.set(oldP, newP);
-      map.set(newP, oldP);
-    } else if (status.startsWith("C") && parts.length >= 3) {
-      map.set(parts[2]!, null);
+      map.set(parts[1]!, parts[2]!);
+      map.set(parts[2]!, parts[1]!);
     } else if (parts.length >= 2) {
       map.set(parts[1]!, null);
     }
@@ -582,11 +611,7 @@ async function applyStackLocked(
   // of a rename) must be claimed by some slice, else it lingers from base and
   // breaks the slice that removes whatever depended on it. Runs for every stack
   // (not just hunk-split ones); shares the resolved bases with the gate above.
-  const fileCoverageError = await validateFileCoverage(
-    manifest,
-    config.paths.mainClone,
-    baseBySource,
-  );
+  const fileCoverageError = await validateFileCoverage(manifest, config.paths.mainClone);
   if (fileCoverageError) {
     return { materialized: [], skipped: [], error: fileCoverageError };
   }

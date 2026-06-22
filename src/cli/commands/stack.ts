@@ -171,11 +171,7 @@ async function ingestManifest(file: string): Promise<IngestResult> {
   // both halves of a rename) must be claimed by a slice, else it lingers from
   // base and breaks the slice that removes what depends on it. `apply` re-checks
   // at materialize time; running it here keeps an invalid manifest out of state.
-  const coverageError = await validateFileCoverage(
-    v.manifest,
-    config.paths.mainClone,
-    new Map(),
-  );
+  const coverageError = await validateFileCoverage(v.manifest, config.paths.mainClone);
   if (coverageError) {
     console.error(red(`whole-file coverage check failed: ${coverageError}`));
     return { ok: false };
