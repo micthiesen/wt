@@ -42,6 +42,35 @@ export type LinearConfig = {
   workspace: string;
 };
 
+/**
+ * Optional webhook-receiver augmentation (`[github.events]`). When the
+ * section is present, the long-lived `wt events` daemon accepts GitHub
+ * webhook deliveries on a loopback port and the TUI refreshes the github
+ * query on each delivery (reading the daemon's warm snapshot) instead of
+ * polling on the 60s timer. Absent ⇒ classic poll-only behavior, zero
+ * change. The daemon is the only thing that needs the secret; the TUI
+ * just reads the snapshot + marker, so a missing secret is a daemon-start
+ * error, not a config-load error.
+ */
+export type GithubEventsConfig = {
+  /** Loopback port the webhook daemon listens on. */
+  port: number;
+  /**
+   * Inline HMAC secret for verifying `X-Hub-Signature-256`. Prefer
+   * `secretFile` so the secret isn't sat in config.toml; inline wins when
+   * both are set.
+   */
+  secret: string | null;
+  /** Path to a file holding the HMAC secret (home-expanded). */
+  secretFile: string | null;
+  /**
+   * staleTime backstop for the github query while events are configured.
+   * The webhook marker drives freshness; this only bounds staleness if the
+   * daemon dies or a delivery is dropped. Default 10 min.
+   */
+  backstopPollMs: number;
+};
+
 export type GithubConfig = {
   /**
    * Glob patterns matched against check context names (CheckRun.name /
@@ -56,6 +85,8 @@ export type GithubConfig = {
    * keystroke. Null disables the reviewer-request leg of the chord.
    */
   defaultReviewer: string | null;
+  /** Webhook-receiver augmentation; null when `[github.events]` is absent. */
+  events: GithubEventsConfig | null;
 };
 
 export type DiffConfig = {
@@ -534,9 +565,22 @@ function build(raw: Raw, errs: Errors): Config {
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   const githubRaw = obj(raw.github);
+  const githubEventsRaw = githubRaw ? obj(githubRaw.events) : null;
+  const githubEventsSecretFile = githubEventsRaw
+    ? errs.optStrOrNull(githubEventsRaw, "secret_file")
+    : null;
+  const githubEvents: GithubEventsConfig | null = githubEventsRaw === null
+    ? null
+    : {
+      port: errs.optNum(githubEventsRaw, "port", 8765),
+      secret: errs.optStrOrNull(githubEventsRaw, "secret"),
+      secretFile: githubEventsSecretFile ? expandHome(githubEventsSecretFile) : null,
+      backstopPollMs: errs.optNum(githubEventsRaw, "backstop_poll_ms", 600_000),
+    };
   const github: GithubConfig = {
     ignoredChecks: strArr(githubRaw?.ignored_checks, []),
     defaultReviewer: errs.optStrOrNull(githubRaw, "default_reviewer"),
+    events: githubEvents,
   };
 
   // [[actions]] is fully replaced when the user provides any entries

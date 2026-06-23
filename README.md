@@ -66,9 +66,27 @@ endpoint         = "http://127.0.0.1:1234"   # OpenAI-compatible /v1
 model            = "gemma-3-e4b-it-mlx"      # whatever the endpoint calls it
 max_input_tokens = 8000                       # optional; default 8000
 timeout_ms       = 120000                     # optional; default 120000 (local LLMs cold-start slowly)
+
+[github.events]                               # optional; push PR/CI updates instead of polling
+port        = 8765                            # loopback port the webhook daemon listens on
+secret_file = "~/.config/wt/gh-webhook-secret"  # HMAC secret (or inline `secret = "…"`)
 ```
 
 The loader prints every missing or malformed field at once. See [`src/core/config.ts`](src/core/config.ts) for the full schema, defaults, and the row-ordering knob (`[ui] rows`).
+
+## GitHub webhooks (optional)
+
+By default the PR / checks / merge-queue badges refresh by polling `gh` on a 60s timer. Add a `[github.events]` section and run a small local daemon to have GitHub *push* updates instead — faster badges, far fewer polls, and a warm snapshot so a freshly-opened TUI already shows current state.
+
+It's a plain repo webhook (no GitHub App). The daemon listens on a loopback port; you map a public URL to it however you forward traffic into your network.
+
+```sh
+wt events install     # writes a launchd agent + generates the HMAC secret
+wt events start       # load the daemon
+wt events status      # liveness, last delivery, snapshot age
+```
+
+`install` prints the exact values to paste into the repo's **Settings → Webhooks** (Payload URL, content type `application/json`, the secret, and the event checklist: `pull_request`, `pull_request_review`, `check_suite`, `check_run`, `status`, `merge_group`). The daemon verifies GitHub's `X-Hub-Signature-256` HMAC and only ever runs the same read-only `gh` fetch the TUI already uses — webhook payloads are a refresh *signal*, never a data source. Omit the section entirely and nothing changes (poll-only).
 
 ## Usage
 

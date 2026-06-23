@@ -20,6 +20,7 @@ import { wtSessionUuid } from "../core/claude.ts";
 import { listClaudeNames } from "../core/claude-sessions.ts";
 import { readSummariesForSessions, type SessionSummary } from "../core/claude-summaries.ts";
 import { config } from "../core/config.ts";
+import { snapshotForBranches } from "../core/events/store.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents } from "../core/git.ts";
@@ -258,13 +259,25 @@ export const githubQuery = (branches: readonly string[]) =>
   queryOptions({
     queryKey: qk.github(branches),
     queryFn: async ({ signal }): Promise<GithubData> => {
+      // Events mode: serve the daemon's warm snapshot when it's fresh and
+      // covers these branches, skipping the gh round-trip entirely. The
+      // marker watcher (runtime.tsx) drives invalidation; this read is the
+      // payoff. Falls back to a live fetch when the snapshot is stale or a
+      // worktree was just added (see `snapshotForBranches`).
+      if (config.github.events) {
+        const snap = snapshotForBranches(branches);
+        if (snap) return snap;
+      }
       const { prs, mergeQueue } = await fetchGithub([...branches], signal);
       return {
         prs: Object.fromEntries(prs),
         mergeQueue: Object.fromEntries(mergeQueue),
       };
     },
-    staleTime: STALE.slow,
+    // With events configured the webhook marker is the freshness driver, so
+    // relax the timer to a backstop that only covers a dead daemon / dropped
+    // delivery. Poll-only setups keep the 60s cadence.
+    staleTime: config.github.events?.backstopPollMs ?? STALE.slow,
     ...KEEP_PREV,
   });
 

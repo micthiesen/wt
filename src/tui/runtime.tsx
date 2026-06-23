@@ -7,6 +7,7 @@ import { reapArchived } from "../core/archive.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
 import { config } from "../core/config.ts";
 import { disposeDiffPool } from "../core/diff/pool.ts";
+import { watchGithubEvents } from "../core/events/store.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { startCodexEventPolling } from "../core/harness/codex-events.ts";
 import { harnessTailRegistry } from "../core/harness/harness-tail.ts";
@@ -127,6 +128,20 @@ export async function runTui(): Promise<TuiExit> {
       wtClient.client.invalidateQueries({ queryKey: qk.wtState() }),
     ]).catch(() => {});
   });
+  // GitHub webhook deliveries → query invalidation. The `wt events` daemon
+  // rewrites a marker file after each refetch; watching it is the push
+  // counterpart to the refs watcher above, scoped to PR / check / merge-
+  // queue state. Only armed when `[github.events]` is configured; otherwise
+  // the github query stays on its poll cadence. `keepPreviousData` keeps the
+  // pane painted across the refetch.
+  const stopGithubEventsWatch = config.github.events
+    ? watchGithubEvents(() => {
+        Promise.all([
+          wtClient.client.invalidateQueries({ queryKey: ["github"] }),
+          wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
+        ]).catch(() => {});
+      })
+    : null;
   const worktreeWatchSet = new WorktreeWatchSet((slug) => {
     wtClient.client
       .invalidateQueries({ queryKey: qk.wt(slug).dirty() })
@@ -292,6 +307,7 @@ export async function runTui(): Promise<TuiExit> {
     disposeDiffPool();
     stopRegistryWatch();
     stopRefsWatch();
+    stopGithubEventsWatch?.();
     unsubWorktrees();
     worktreeWatchSet.dispose();
     stopCodexEvents();

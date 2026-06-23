@@ -44,9 +44,14 @@ const REFS_DEBOUNCE_MS = 300;
  *  window than refs so we don't refetch dirty mid-burst. */
 const WT_DEBOUNCE_MS = 500;
 
-type Debounced = { trigger: () => void; cancel: () => void };
+export type Debounced = { trigger: () => void; cancel: () => void };
 
-function makeDebounced(onChange: () => void, ms: number): Debounced {
+/**
+ * Trailing-edge debounce shared by the fs watchers in this module and the
+ * github-events marker watcher (`core/events/store.ts`) — FSEvents bursts,
+ * one invalidation pass per burst is enough.
+ */
+export function makeDebounced(onChange: () => void, ms: number): Debounced {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   return {
