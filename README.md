@@ -68,7 +68,8 @@ max_input_tokens = 8000                       # optional; default 8000
 timeout_ms       = 120000                     # optional; default 120000 (local LLMs cold-start slowly)
 
 [github.events]                               # optional; push PR/CI updates instead of polling
-port        = 8765                            # loopback port the webhook daemon listens on
+port        = 8765                            # port the webhook daemon listens on
+host        = "127.0.0.1"                     # default loopback; set to a LAN IP / 0.0.0.0 only if a separate proxy box must reach it
 secret_file = "~/.config/wt/gh-webhook-secret"  # HMAC secret (or inline `secret = "…"`)
 ```
 
@@ -78,7 +79,7 @@ The loader prints every missing or malformed field at once. See [`src/core/confi
 
 By default the PR / checks / merge-queue badges refresh by polling `gh` on a 60s timer. Add a `[github.events]` section and run a small local daemon to have GitHub *push* updates instead — faster badges, far fewer polls, and a warm snapshot so a freshly-opened TUI already shows current state.
 
-It's a plain repo webhook (no GitHub App). The daemon listens on a loopback port; you map a public URL to it however you forward traffic into your network.
+It's a plain repo webhook (no GitHub App). The daemon listens on `[github.events].host` (default loopback); map a public HTTPS URL to it however you route traffic into your network. If a reverse proxy on a *different* host has to reach this machine, set `host` to a LAN IP or `0.0.0.0` — the HMAC secret is then the only auth boundary, so keep it on a trusted network.
 
 ```sh
 wt events install     # writes a launchd agent + generates the HMAC secret

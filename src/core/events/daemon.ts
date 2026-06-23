@@ -33,6 +33,13 @@ const log = createLogger("[events]");
 
 /** Coalesce check_run/check_suite bursts into one fetch per CI step storm. */
 const FETCH_DEBOUNCE_MS = 1_500;
+/**
+ * Reject webhook bodies larger than this before buffering them. GitHub
+ * payloads are well under this (typically <1MB, hard-capped ~25MB), so the
+ * cap only bites a malformed or hostile request — which matters once the
+ * listener binds beyond loopback (a non-`127.0.0.1` `host`).
+ */
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** Re-read the worktree branch set at most this often when deciding relevance. */
 const LOCAL_BRANCHES_TTL_MS = 30_000;
 
@@ -238,7 +245,8 @@ export function startDaemon(events: GithubEventsConfig, secret: string): Daemon 
 
   const server = Bun.serve({
     port: events.port,
-    hostname: "127.0.0.1",
+    hostname: events.host,
+    maxRequestBodySize: MAX_BODY_BYTES,
     async fetch(req): Promise<Response> {
       const url = new URL(req.url);
       if (req.method === "GET" && url.pathname === "/health") {
@@ -246,6 +254,12 @@ export function startDaemon(events: GithubEventsConfig, secret: string): Daemon 
       }
       if (req.method !== "POST" || url.pathname !== "/webhook") {
         return new Response("not found", { status: 404 });
+      }
+      // Early reject oversized bodies (the `maxRequestBodySize` above is the
+      // backstop for chunked / no-Content-Length requests).
+      const len = Number(req.headers.get("content-length") ?? 0);
+      if (Number.isFinite(len) && len > MAX_BODY_BYTES) {
+        return new Response("payload too large", { status: 413 });
       }
       const body = await req.text();
       if (!verifySignature(body, req.headers.get("x-hub-signature-256"), secret)) {
@@ -266,7 +280,7 @@ export function startDaemon(events: GithubEventsConfig, secret: string): Daemon 
     },
   });
 
-  log.info("events daemon listening", { port: events.port });
+  log.info("events daemon listening", { host: events.host, port: events.port });
   // Warm the snapshot immediately so a TUI opened right after start has data.
   void runFetch();
 

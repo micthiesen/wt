@@ -112,9 +112,9 @@ ${envLines}
 }
 
 /** Print the values to paste into the repo's GitHub webhook settings. */
-function printWebhookSetup(port: number, secretLine: string): void {
+function printWebhookSetup(host: string, port: number, secretLine: string): void {
   console.log(`\n${bold("GitHub webhook settings")} (repo → Settings → Webhooks → Add webhook):`);
-  console.log(`  ${dim("Payload URL")}    https://<your-domain>/webhook   ${dim(`(forward → 127.0.0.1:${port}/webhook)`)}`);
+  console.log(`  ${dim("Payload URL")}    https://<your-domain>/webhook   ${dim(`(forward → ${host}:${port}/webhook)`)}`);
   console.log(`  ${dim("Content type")}   application/json`);
   console.log(`  ${dim("Secret")}         ${secretLine}`);
   console.log(`  ${dim("SSL")}            enabled`);
@@ -193,7 +193,7 @@ function cmdStatus(): number {
   const snap = readSnapshot();
   console.log(bold("wt events"));
   console.log(`  status        ${alive ? green("running") : red("not running")}`);
-  console.log(`  port          ${events.port}`);
+  console.log(`  bind          ${events.host}:${events.port}`);
   console.log(`  secret        ${resolveWebhookSecret(events) ? green("set") : red("missing")}`);
   if (state) {
     if (alive) console.log(`  pid           ${state.pid}`);
@@ -216,8 +216,8 @@ function cmdInstall(): number {
   mkdirSync(dirname(plist), { recursive: true });
   writeFileSync(plist, plistContents());
   console.log(`${green("✓")} launchd agent ${dim("→")} ${plist}`);
-  if (secret) printWebhookSetup(events.port, secretDisplay(secret));
-  console.log(`\nNext: ${cyan("wt events start")} to load the daemon, then forward your domain to 127.0.0.1:${events.port}.`);
+  if (secret) printWebhookSetup(events.host, events.port, secretDisplay(secret));
+  console.log(`\nNext: ${cyan("wt events start")} to load the daemon, then forward your domain to ${events.host}:${events.port}.`);
   return 0;
 }
 
@@ -241,7 +241,7 @@ function cmdSecret(): number {
   const secret = ensureSecret();
   if (!secret) return 1;
   console.log(`${green("✓")} webhook secret ${secret.statusLine}`);
-  printWebhookSetup(events.port, secretDisplay(secret));
+  printWebhookSetup(events.host, events.port, secretDisplay(secret));
   return 0;
 }
 

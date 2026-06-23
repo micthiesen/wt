@@ -53,11 +53,20 @@ export type LinearConfig = {
  * error, not a config-load error.
  */
 export type GithubEventsConfig = {
-  /** Loopback port the webhook daemon listens on. */
+  /** Port the webhook daemon listens on. */
   port: number;
   /**
+   * Address the daemon binds. Default `127.0.0.1` (loopback) is correct when
+   * the public URL terminates on this machine (a reverse proxy / tunnel here
+   * forwards to localhost). Set to a LAN IP or `0.0.0.0` only when another
+   * host must reach it directly (e.g. a separate reverse-proxy box); the HMAC
+   * secret is then the sole auth boundary, so keep the listener behind a
+   * trusted network.
+   */
+  host: string;
+  /**
    * Inline HMAC secret for verifying `X-Hub-Signature-256`. Prefer
-   * `secretFile` so the secret isn't sat in config.toml; inline wins when
+   * `secretFile` so the secret isn't stored in config.toml; inline wins when
    * both are set.
    */
   secret: string | null;
@@ -573,6 +582,7 @@ function build(raw: Raw, errs: Errors): Config {
     ? null
     : {
       port: errs.optNum(githubEventsRaw, "port", 8765),
+      host: errs.optStr(githubEventsRaw, "host", "127.0.0.1"),
       secret: errs.optStrOrNull(githubEventsRaw, "secret"),
       secretFile: githubEventsSecretFile ? expandHome(githubEventsSecretFile) : null,
       backstopPollMs: errs.optNum(githubEventsRaw, "backstop_poll_ms", 600_000),
