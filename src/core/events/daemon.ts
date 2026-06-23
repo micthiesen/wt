@@ -47,6 +47,9 @@ const LOCAL_BRANCHES_TTL_MS = 30_000;
 const RELEVANT_EVENTS = new Set([
   "pull_request",
   "pull_request_review",
+  // Thread resolve/unresolve drives the CodeRabbit "unresolved" badge and
+  // doesn't fire pull_request_review.
+  "pull_request_review_thread",
   "check_suite",
   "check_run",
   "status",
@@ -95,7 +98,9 @@ export function extractBranches(event: string, payload: unknown): string[] | nul
   try {
     switch (event) {
       case "pull_request":
-      case "pull_request_review": {
+      case "pull_request_review":
+      case "pull_request_review_thread": {
+        // All three carry a top-level `pull_request` with `head.ref`.
         const ref = p.pull_request?.head?.ref;
         return typeof ref === "string" ? [ref] : null;
       }

@@ -87,7 +87,7 @@ wt events start       # load the daemon
 wt events status      # liveness, last delivery, snapshot age
 ```
 
-`install` prints the exact values to paste into the repo's **Settings → Webhooks** (Payload URL, content type `application/json`, the secret, and the event checklist: `pull_request`, `pull_request_review`, `check_suite`, `check_run`, `status`, `merge_group`). The daemon verifies GitHub's `X-Hub-Signature-256` HMAC and only ever runs the same read-only `gh` fetch the TUI already uses — webhook payloads are a refresh *signal*, never a data source. Omit the section entirely and nothing changes (poll-only).
+`install` prints the exact values to paste into the repo's **Settings → Webhooks** (Payload URL, content type `application/json`, the secret, and the event checklist: `pull_request`, `pull_request_review`, `pull_request_review_thread`, `check_suite`, `check_run`, `status`, `merge_group`). The daemon verifies GitHub's `X-Hub-Signature-256` HMAC and only ever runs the same read-only `gh` fetch the TUI already uses — webhook payloads are a refresh *signal*, never a data source. Omit the section entirely and nothing changes (poll-only).
 
 ## Usage
 
