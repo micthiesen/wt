@@ -275,9 +275,15 @@ export const githubQuery = (branches: readonly string[]) =>
       };
     },
     // With events configured the webhook marker is the freshness driver, so
-    // relax the timer to a backstop that only covers a dead daemon / dropped
-    // delivery. Poll-only setups keep the 60s cadence.
+    // relax the staleTime to a backstop. The `refetchInterval` is a genuine
+    // periodic safety net: a dropped fs event (FSEvents coalescing the
+    // snapshot + marker writes) must not be able to pin a stale badge until
+    // the next unrelated trigger. The interval refetch still serves the warm
+    // snapshot when it's fresh, so idle cost is ~one gh fetch per interval.
+    // Poll-only setups keep the 60s staleTime and no interval (the refs
+    // watcher + manual refresh drive them).
     staleTime: config.github.events?.backstopPollMs ?? STALE.slow,
+    refetchInterval: config.github.events ? config.github.events.backstopPollMs : false,
     ...KEEP_PREV,
   });
 

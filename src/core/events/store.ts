@@ -28,7 +28,8 @@ const log = createLogger("[events]");
 
 /** Events dir sits beside the persisted query cache so it follows a moved `cache_db`. */
 export const EVENTS_DIR = join(dirname(config.paths.cacheDb), "events");
-export const SNAPSHOT_PATH = join(EVENTS_DIR, "github.json");
+export const SNAPSHOT_NAME = "github.json";
+export const SNAPSHOT_PATH = join(EVENTS_DIR, SNAPSHOT_NAME);
 export const MARKER_NAME = "github.touch";
 export const MARKER_PATH = join(EVENTS_DIR, MARKER_NAME);
 export const STATE_PATH = join(EVENTS_DIR, "state.json");
@@ -175,9 +176,16 @@ export function watchGithubEvents(onChange: () => void): () => void {
   let watcher: FSWatcher | null = null;
   try {
     watcher = watch(EVENTS_DIR, { persistent: false }, (_event, filename) => {
-      // `filename` can be null on some macOS event types — treat unknown
-      // as "fire" so we never miss a marker rewrite.
-      if (filename == null || filename === MARKER_NAME) debounced.trigger();
+      // Fire on the snapshot OR the marker. The daemon writes github.json
+      // then github.touch back-to-back, and macOS FSEvents can coalesce the
+      // two into a single delivered event — often reporting only github.json
+      // — so keying on the marker alone silently misses the update. Reacting
+      // to github.json directly is safe: writeAtomic renames it into place, so
+      // its event only fires once the full document is on disk. `filename` can
+      // also be null on some macOS event types — fire then too.
+      if (filename == null || filename === MARKER_NAME || filename === SNAPSHOT_NAME) {
+        debounced.trigger();
+      }
     });
     watcher.on("error", (err) => {
       log.warn("events watcher error", { err: String(err), dir: EVENTS_DIR });
