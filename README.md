@@ -21,7 +21,7 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 - [`hunk`](https://github.com/modem-dev/hunk) (`npm i -g hunkdiff`) — needed for the default F11 diff command (`hunk diff {{base}} --watch`). Override `[diff].command` in `config.toml` if you'd rather use `gitu`, `lazygit`, etc.
 - Linear — no CLI; the integration only constructs URLs from issue IDs in your branch slug.
 - Claude Code — no CLI; the integration reads `~/.claude/projects/*` directly to surface live session state.
-- An OpenAI-compatible LLM endpoint (LM Studio, Ollama with the OpenAI bridge, llama.cpp's server, etc.) — needed for the AI title + description in the details pane. `wt` runs a single graceful-degradation diff through `/v1/chat/completions`; results are content-addressed so identical diffs (across rebase / amend / branch rename) share a cached summary.
+- An AI provider — optional; needed for the generated title + description in the details pane. `wt` supports OpenAI-compatible endpoints (LM Studio, Ollama with the OpenAI bridge, llama.cpp's server, etc.) and Google's Gemini API. Results are content-addressed so identical diffs (across rebase / amend / branch rename) share a cached summary.
 
 ## Install
 
@@ -66,6 +66,15 @@ endpoint         = "http://127.0.0.1:1234"   # OpenAI-compatible /v1
 model            = "gemma-3-e4b-it-mlx"      # whatever the endpoint calls it
 max_input_tokens = 8000                       # optional; default 8000
 timeout_ms       = 120000                     # optional; default 120000 (local LLMs cold-start slowly)
+
+# Or use Gemini instead:
+#
+# [ai]
+# provider         = "gemini"
+# model            = "gemini-3.5-flash"
+# api_key_env      = "GEMINI_API_KEY"
+# max_input_tokens = 8000
+# timeout_ms       = 120000
 
 [github.events]                               # optional; push PR/CI updates instead of polling
 port        = 8765                            # port the webhook daemon listens on

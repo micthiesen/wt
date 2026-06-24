@@ -144,16 +144,33 @@ export type StackConfig = {
   verifyDeps: readonly string[];
 };
 
-export type AiConfig = {
-  /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
-  endpoint: string;
-  /** Model id as exposed by the endpoint (LM Studio shows it verbatim). */
+export type AiProvider = "openai" | "gemini";
+
+type BaseAiConfig = {
+  provider: AiProvider;
+  /** Model id as exposed by the provider. */
   model: string;
   /** Soft budget for the prompt; we drop diff hunks largest-first to stay under it. */
   maxInputTokens: number;
   /** Per-request timeout in ms. */
   timeoutMs: number;
 };
+
+export type OpenAiAiConfig = BaseAiConfig & {
+  provider: "openai";
+  /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
+  endpoint: string;
+};
+
+export type GeminiAiConfig = BaseAiConfig & {
+  provider: "gemini";
+  /** Gemini API base endpoint (no trailing slash). */
+  endpoint: string;
+  /** Environment variable containing the Gemini API key. */
+  apiKeyEnv: string;
+};
+
+export type AiConfig = OpenAiAiConfig | GeminiAiConfig;
 
 /**
  * Pre-built action surfaced by the `!` modal. Two flavors:
@@ -357,6 +374,8 @@ const GENERIC_DEFAULTS = {
     command: "revdiff --vim-motion --compact {{base}}",
   },
   ai: {
+    provider: "openai" as const satisfies AiProvider,
+    geminiEndpoint: "https://generativelanguage.googleapis.com/v1beta",
     maxInputTokens: 8000,
     // Local LLMs running on CPU/Metal can take 30s+ on a cold cache,
     // and the first request after model load is slower still. 2 min
@@ -551,14 +570,46 @@ function build(raw: Raw, errs: Errors): Config {
     : { workspace: errs.reqStr(linearRaw, "issue_tracker.linear", "workspace") };
 
   const aiRaw = obj(raw.ai);
-  const ai: AiConfig | null = aiRaw === null
+  const aiProvider = errs.optEnum(
+    aiRaw,
+    "ai",
+    "provider",
+    ["openai", "gemini"] as const satisfies readonly AiProvider[],
+    GENERIC_DEFAULTS.ai.provider,
+  );
+  const aiBase = aiRaw === null
     ? null
     : {
-      endpoint: errs.reqStr(aiRaw, "ai", "endpoint").replace(/\/+$/, ""),
       model: errs.reqStr(aiRaw, "ai", "model"),
-      maxInputTokens: errs.optNum(aiRaw, "max_input_tokens", GENERIC_DEFAULTS.ai.maxInputTokens),
-      timeoutMs: errs.optNum(aiRaw, "timeout_ms", GENERIC_DEFAULTS.ai.timeoutMs),
+      maxInputTokens: errs.optNum(
+        aiRaw,
+        "max_input_tokens",
+        GENERIC_DEFAULTS.ai.maxInputTokens,
+      ),
+      timeoutMs: errs.optNum(
+        aiRaw,
+        "timeout_ms",
+        GENERIC_DEFAULTS.ai.timeoutMs,
+      ),
     };
+  const ai: AiConfig | null = aiBase === null
+    ? null
+    : aiProvider === "gemini"
+      ? {
+        provider: "gemini",
+        endpoint: errs.optStr(
+          aiRaw,
+          "endpoint",
+          GENERIC_DEFAULTS.ai.geminiEndpoint,
+        ).replace(/\/+$/, ""),
+        apiKeyEnv: errs.reqStr(aiRaw, "ai", "api_key_env"),
+        ...aiBase,
+      }
+      : {
+        provider: "openai",
+        endpoint: errs.reqStr(aiRaw, "ai", "endpoint").replace(/\/+$/, ""),
+        ...aiBase,
+      };
 
   const diffRaw = obj(raw.diff);
   const diff: DiffConfig = {
