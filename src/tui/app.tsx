@@ -256,6 +256,12 @@ function isShiftedLetter(
  */
 function printableText(sequence: string | undefined): string {
   if (!sequence) return "";
+  // Escape-sequence keypresses (function/arrow/nav keys — F10 arrives as
+  // "\x1b[21~", arrows as "\x1b[A") lead with ESC. Stripping control chars
+  // alone would leak the printable tail ("[21~", "[A") into the text, so
+  // bail on a leading ESC outright — real typed text and pastes never
+  // start with one.
+  if (sequence.charCodeAt(0) === 0x1b) return "";
   let out = "";
   for (let i = 0; i < sequence.length; i++) {
     const ch = sequence[i]!;
@@ -271,6 +277,9 @@ function printableText(sequence: string | undefined): string {
  */
 function printableMultiline(sequence: string | undefined): string {
   if (!sequence) return "";
+  // Same escape-sequence guard as `printableText` (see there): a leading
+  // ESC means a function/arrow/nav key, not text — drop it whole.
+  if (sequence.charCodeAt(0) === 0x1b) return "";
   let out = "";
   for (let i = 0; i < sequence.length; i++) {
     const ch = sequence[i]!;
@@ -326,7 +335,17 @@ function parseNewInput(raw: string, defaultBase?: string): NewInput {
  * clears `modal`.
  */
 type Modal =
-  | { kind: "help" }
+  | {
+      /**
+       * Help overlay. `searching` is the in-overlay `/` filter mode
+       * (distinct from the normal-mode `/` keybind); `query` is the live
+       * filter string. While searching, the scrollbox releases keyboard
+       * focus so typed chars build the query instead of scrolling.
+       */
+      kind: "help";
+      query: string;
+      searching: boolean;
+    }
   | { kind: "cleanConfirm" }
   | {
       /**
@@ -2822,11 +2841,55 @@ export function App({ onExit }: Props) {
   // `useKeyboard` below dispatches on `modal.kind` and each handler
   // owns its modal's full key map, swallowing the keypress.
 
-  // Help overlay swallows input while open. The close keys match on
-  // bare `name`/`sequence` without the modifier guard some other
-  // handlers use — known and accepted: a modified chord at worst
-  // closes a help overlay, so the guard buys nothing here.
-  function handleHelpKey(k: KeyEvent): void {
+  // Help overlay swallows input while open. Two modes: a normal mode
+  // where j/k (and arrows / page / home / end) scroll the focused
+  // scrollbox and the close keys dismiss, and a `/` search mode where
+  // printable chars build the filter query (the scrollbox is unfocused
+  // in search mode so it can't steal j/k). Close keys match on bare
+  // `name`/`sequence` without the modifier guard some other handlers
+  // use — accepted: a modified chord at worst closes the overlay.
+  function handleHelpKey(
+    k: KeyEvent,
+    modal: Extract<Modal, { kind: "help" }>,
+  ): void {
+    if (modal.searching) {
+      if (k.ctrl && k.name === "c") {
+        setModal(null);
+        return;
+      }
+      if (k.name === "escape") {
+        // Cancel search: drop the filter and return to the full list.
+        setModal({ ...modal, searching: false, query: "" });
+        return;
+      }
+      if (k.name === "return") {
+        // Apply: keep the filter but hand focus back to the scrollbox.
+        setModal({ ...modal, searching: false });
+        return;
+      }
+      if (k.name === "backspace") {
+        // Backspace on an empty query exits search, matching the
+        // filter convention the new-worktree / section inputs follow.
+        if (modal.query.length === 0) {
+          setModal({ ...modal, searching: false });
+          return;
+        }
+        setModal({ ...modal, query: modal.query.slice(0, -1) });
+        return;
+      }
+      const text = printableText(k.sequence);
+      if (text) setModal({ ...modal, query: modal.query + text });
+      return;
+    }
+    if (k.sequence === "/") {
+      setModal({ ...modal, searching: true });
+      return;
+    }
+    if (k.name === "escape" && modal.query) {
+      // First esc clears an applied filter; a second one closes.
+      setModal({ ...modal, query: "" });
+      return;
+    }
     if (
       k.name === "escape" ||
       k.sequence === "?" ||
@@ -2835,6 +2898,8 @@ export function App({ onExit }: Props) {
     ) {
       setModal(null);
     }
+    // j/k (and arrows / page / home / end) fall through to the focused
+    // scrollbox's own scroll handling.
   }
 
   // Reviewer multi-picker. Space toggles the cursor item, enter or
@@ -3827,7 +3892,7 @@ export function App({ onExit }: Props) {
     if (modal) {
       switch (modal.kind) {
         case "help":
-          handleHelpKey(k);
+          handleHelpKey(k, modal);
           break;
         case "reviewerPicker":
           handleReviewerPickerKey(k, modal);
@@ -4091,7 +4156,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (k.sequence === "?") {
-      setModal({ kind: "help" });
+      setModal({ kind: "help", query: "", searching: false });
       return;
     }
     if (k.sequence === "r") {
@@ -4865,7 +4930,9 @@ export function App({ onExit }: Props) {
         />
       ) : null}
       <Footer mode={footer} hint={footerHint} />
-      {modal?.kind === "help" ? <HelpOverlay /> : null}
+      {modal?.kind === "help" ? (
+        <HelpOverlay query={modal.query} searching={modal.searching} />
+      ) : null}
       {modal?.kind === "cleanConfirm" ? (
         <CleanConfirmModal candidates={cleanCandidates} />
       ) : null}
