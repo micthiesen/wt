@@ -1,10 +1,10 @@
 /**
- * LM Studio client for worktree summaries.
+ * AI client for worktree summaries.
  *
- * LM Studio exposes an OpenAI-compatible `/v1/chat/completions` endpoint;
- * we keep the call shape generic so any compatible local server (Ollama
- * with OpenAI bridge, llama.cpp's server, etc.) works with the same
- * config. No streaming — the TUI just waits for the full response.
+ * Supports OpenAI-compatible `/v1/chat/completions` endpoints (LM Studio,
+ * Ollama with OpenAI bridge, llama.cpp's server, etc.) and Google's Gemini
+ * `models.generateContent` endpoint. No streaming — the TUI just waits for
+ * the full response.
  *
  * One call produces both a title and a description via a line-prefixed
  * format that's robust to small-model formatting drift. Co-generation
@@ -45,6 +45,15 @@ Return only the TITLE line.`;
 
 type ChatResponse = {
   choices?: Array<{ message?: { content?: string } }>;
+  error?: { message?: string };
+};
+
+type GeminiResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+  }>;
   error?: { message?: string };
 };
 
@@ -112,13 +121,12 @@ export async function summarizeStack(
 }
 
 /**
- * Module-level serial queue over the LM Studio endpoint. A restack /
+ * Module-level serial queue over the configured AI endpoint. A restack /
  * rebase flips many diff hashes at once, and the resulting burst of
- * concurrent summary fetches stampedes the single local model into
- * request timeouts (observed ~23% failure rate, clustered in those
- * windows). One in-flight request at a time keeps each call fast and
- * the failure mode boring. Tasks run on settled predecessors, so one
- * failure doesn't poison the queue.
+ * concurrent summary fetches can stampede the model into request timeouts.
+ * One in-flight request at a time keeps each call fast and the failure mode
+ * boring. Tasks run on settled predecessors, so one failure doesn't poison
+ * the queue.
  */
 let chatQueueTail: Promise<unknown> = Promise.resolve();
 
@@ -129,8 +137,8 @@ function enqueueChat<T>(task: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Single round-trip to the OpenAI-compatible `/v1/chat/completions`
- * endpoint. Shared by `summarizeDiff` and `summarizeStack` so both
+ * Single round-trip to the configured AI endpoint. Shared by
+ * `summarizeDiff` and `summarizeStack` so both
  * use the same abort chaining, timeout handling, and error messages.
  *
  * Calls are serialized through `enqueueChat`, and the per-call timeout
@@ -158,7 +166,9 @@ async function callChat(
       external?.throwIfAborted();
       if (attempt > 0) await sleep(500);
       try {
-        return await requestChat(ai, systemPrompt, userPrompt, maxTokens, external);
+        return ai.provider === "gemini"
+          ? await requestGeminiChat(ai, systemPrompt, userPrompt, maxTokens, external)
+          : await requestOpenAiChat(ai, systemPrompt, userPrompt, maxTokens, external);
       } catch (err) {
         if (external?.aborted) throw err;
         lastErr = err;
@@ -170,8 +180,8 @@ async function callChat(
 
 /** One HTTP attempt against the chat endpoint. Timeout + abort scoped
  *  to this attempt; retry policy lives in `callChat`. */
-async function requestChat(
-  ai: AiConfig,
+async function requestOpenAiChat(
+  ai: Extract<AiConfig, { provider: "openai" }>,
   systemPrompt: string,
   userPrompt: string,
   maxTokens: number,
@@ -208,7 +218,7 @@ async function requestChat(
     // (check LM Studio / bump the timeout) and the appended err.message
     // carries the distinction when it matters.
     throw new Error(
-      `LM Studio unreachable at ${ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
+      `AI endpoint unreachable at ${ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
     );
   } finally {
     clearTimeout(timer);
@@ -220,7 +230,7 @@ async function requestChat(
     // Squash to one line — LM Studio 500s return a full HTML error
     // page, which otherwise dumps line-by-line into the activity pane.
     const oneLine = body.replace(/\s+/g, " ").trim().slice(0, 160);
-    throw new Error(`LM Studio HTTP ${res.status}: ${oneLine || res.statusText}`);
+    throw new Error(`AI endpoint HTTP ${res.status}: ${oneLine || res.statusText}`);
   }
 
   let parsed: ChatResponse;
@@ -228,17 +238,98 @@ async function requestChat(
     parsed = (await res.json()) as ChatResponse;
   } catch (err) {
     throw new Error(
-      `LM Studio returned non-JSON: ${err instanceof Error ? err.message : String(err)}`,
+      `AI endpoint returned non-JSON: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
   if (parsed.error?.message) {
-    throw new Error(`LM Studio: ${parsed.error.message}`);
+    throw new Error(`AI endpoint: ${parsed.error.message}`);
   }
   const content = parsed.choices?.[0]?.message?.content?.trim();
   if (!content) {
-    throw new Error("LM Studio returned no content");
+    throw new Error("AI endpoint returned no content");
   }
   return content;
+}
+
+async function requestGeminiChat(
+  ai: Extract<AiConfig, { provider: "gemini" }>,
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens: number,
+  external?: AbortSignal,
+): Promise<string> {
+  const apiKey = process.env[ai.apiKeyEnv];
+  if (!apiKey) {
+    throw new Error(`Gemini API key env var ${ai.apiKeyEnv} is not set`);
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ai.timeoutMs);
+  const cleanupAbort = external
+    ? chainSignal(external, () => ctrl.abort())
+    : noop;
+  let res: Response;
+  try {
+    res = await fetch(
+      `${ai.endpoint}/${geminiModelPath(ai.model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemPrompt }],
+          },
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: userPrompt }],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: maxTokens,
+          },
+        }),
+      },
+    );
+  } catch (err) {
+    throw new Error(
+      `Gemini unreachable at ${ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  } finally {
+    clearTimeout(timer);
+    cleanupAbort();
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    const oneLine = body.replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(`Gemini HTTP ${res.status}: ${oneLine || res.statusText}`);
+  }
+
+  let parsed: GeminiResponse;
+  try {
+    parsed = (await res.json()) as GeminiResponse;
+  } catch (err) {
+    throw new Error(
+      `Gemini returned non-JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (parsed.error?.message) {
+    throw new Error(`Gemini: ${parsed.error.message}`);
+  }
+  const content = parsed.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text ?? "")
+    .join("")
+    .trim();
+  if (!content) {
+    throw new Error("Gemini returned no content");
+  }
+  return content;
+}
+
+function geminiModelPath(model: string): string {
+  return model.startsWith("models/") ? model : `models/${model}`;
 }
 
 /**
