@@ -965,10 +965,15 @@ export async function disableAutoMerge(
 }
 
 /**
- * Edit a PR's review requests via `gh pr edit`. Both `add` and
- * `remove` may be passed in the same call — gh accepts both flag
- * sets at once. Logins are users; team slugs use the `org/team-slug`
- * form. Empty changes is a no-op.
+ * Edit a PR's review requests via GitHub's REST reviewer endpoint.
+ *
+ * Avoid `gh pr edit --add-reviewer`: gh 2.64 still performs an internal
+ * GraphQL query that touches deprecated Projects (classic) fields
+ * (`repository.pullRequest.projectCards`) and can fail before the reviewer
+ * mutation runs. The REST endpoint only edits requested reviewers.
+ *
+ * Logins are users; team slugs may arrive as either `team-slug` or
+ * `org/team-slug` from GraphQL's `Team.combinedSlug`.
  */
 export async function editReviewers(
   prNumber: number,
@@ -978,16 +983,83 @@ export async function editReviewers(
     return { ok: true };
   }
   if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
-  const argv = ["gh", "pr", "edit", String(prNumber)];
-  for (const l of changes.add) argv.push("--add-reviewer", l);
-  for (const l of changes.remove) argv.push("--remove-reviewer", l);
-  const r = await run(argv, { cwd: config.paths.mainClone, timeoutMs: 15_000 });
+  const slug = await repoSlug();
+  if (!slug) return { ok: false, error: "could not resolve GitHub repo" };
+
+  if (changes.remove.length > 0) {
+    const r = await editReviewersViaRest(slug, prNumber, "DELETE", changes.remove);
+    if (!r.ok) return r;
+  }
+  if (changes.add.length > 0) {
+    const r = await editReviewersViaRest(slug, prNumber, "POST", changes.add);
+    if (!r.ok) return r;
+  }
+  return { ok: true };
+}
+
+async function editReviewersViaRest(
+  repo: string,
+  prNumber: number,
+  method: "POST" | "DELETE",
+  reviewers: readonly string[],
+): Promise<GhActionResult> {
+  const body = reviewRequestBody(reviewers);
+  const r = await run(
+    [
+      "gh",
+      "api",
+      "-X",
+      method,
+      `repos/${repo}/pulls/${prNumber}/requested_reviewers`,
+      "--input",
+      "-",
+    ],
+    {
+      cwd: config.paths.mainClone,
+      input: JSON.stringify(body),
+      timeoutMs: 15_000,
+    },
+  );
   if (r.exitCode !== 0) {
-    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
-    log.error("edit reviewers failed", { prNumber, changes, msg });
+    const msg = apiErrorMessage(r) || `gh exited ${r.exitCode}`;
+    log.error("edit reviewers failed", {
+      prNumber,
+      method,
+      reviewers,
+      msg,
+    });
     return { ok: false, error: msg };
   }
   return { ok: true };
+}
+
+function reviewRequestBody(
+  reviewers: readonly string[],
+): { reviewers: string[]; team_reviewers: string[] } {
+  const users: string[] = [];
+  const teams: string[] = [];
+  for (const reviewer of reviewers) {
+    if (reviewer.includes("/")) {
+      teams.push(reviewer.split("/").filter(Boolean).at(-1) ?? reviewer);
+    } else {
+      users.push(reviewer);
+    }
+  }
+  return { reviewers: users, team_reviewers: teams };
+}
+
+function apiErrorMessage(r: { stdout: string; stderr: string }): string | null {
+  const raw = (r.stderr || r.stdout).trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { message?: string; errors?: Array<{ message?: string }> };
+    const details = parsed.errors
+      ?.map((e) => e.message)
+      .filter((s): s is string => !!s);
+    return [parsed.message, ...(details ?? [])].filter(Boolean).join(": ") || raw;
+  } catch {
+    return raw;
+  }
 }
 
 /**
