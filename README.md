@@ -130,8 +130,6 @@ wt events status      # liveness, last delivery, snapshot age
 wt skills install --harness claude     # or codex / opencode
 ```
 
-The full design and rationale live in [`docs/stacking-workflow.md`](docs/stacking-workflow.md).
-
 ## Logs
 
 Every action (and every error) goes to a daily file at `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log` for post-hoc debugging — a strict superset of what the activity pane shows. Files older than 14 days are pruned automatically. Per-worktree destroy logs are still at `~/.cache/wt/logs/<slug>-*.log` and `wt logs <slug>` tails the latest one.
