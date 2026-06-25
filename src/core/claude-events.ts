@@ -541,12 +541,11 @@ export function messageToLines(opts: {
       // its id (the live case); fall through to appending a standalone
       // result line when the call was never seen (seed-window orphan).
       const arrow = isErr ? "✗" : "✓";
-      const dur = start ? formatDuration(durMs) : "—";
       const errBody = isErr ? briefToolResultBody(b.content) : null;
       if (start && start.lineId !== null) {
         const label = start.label;
         const errPart = errBody ? ` err: ${errBody}` : "";
-        const text = `  ${arrow} ${label}${errPart} ${dur}`;
+        const text = `  ${arrow} ${label}${errPart} ${formatDuration(durMs)}`;
         emit.patch.push({
           id: start.lineId,
           line: {
@@ -558,16 +557,20 @@ export function messageToLines(opts: {
         });
         continue;
       }
-      // Orphan path: no call line to patch. Synthesize a standalone
-      // result so the user still sees that *something* finished.
-      const label = start?.label ?? start?.toolName ?? "?";
+      // Orphan path: no call line to patch because the matching tool_use
+      // sits before the seed window (its 64 KB lookback didn't reach the
+      // call). We can't name the tool or time it, so label it
+      // `(earlier call)` and drop the always-unknown `—` duration —
+      // still surfacing that *something* finished, without the cryptic
+      // `? —`. Errors keep their result body so failures stay visible.
+      const label = start?.label ?? start?.toolName ?? "(earlier call)";
       const errPart = errBody ? ` err: ${errBody}` : "";
       const orphanId = nextId();
       emit.append.push({
         id: orphanId,
         ts,
         kind: isErr ? "tool-err" : "tool-ok",
-        text: `  ${arrow} ${label}${errPart} ${dur}`,
+        text: `  ${arrow} ${label}${errPart}`,
       });
     }
   }

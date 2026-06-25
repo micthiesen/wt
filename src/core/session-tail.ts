@@ -21,7 +21,8 @@
  * `toolStarts` populates as we walk so tool_results that arrive after
  * the seed compute correct durations against pre-end-of-seed tool_uses.
  * Older entries beyond the seed window are not surfaced; tool_results
- * inside the window whose tool_use sits outside it render with `(—)`.
+ * inside the window whose tool_use sits outside it render as
+ * `✓ (earlier call)` (no tool name or duration to recover).
  *
  * # Live tail
  *
