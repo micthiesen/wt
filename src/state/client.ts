@@ -27,7 +27,9 @@ export const CACHE_DB = config.paths.cacheDb;
 // v7: TmuxSessionsData replaced the `claudeSlugs`/`codex`/`opencode`
 // fields with a single `slugsByHarness` record; a restored v6 entry
 // would lack it and break consumers that index `slugsByHarness[id]`.
-const CACHE_BUSTER = "v7";
+// v8: worktree discovery now ignores non-main worktrees outside the
+// configured worktree_root; old external-tool rows should not restore.
+const CACHE_BUSTER = "v8";
 const STORAGE_PREFIX = "wt";
 const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
