@@ -461,11 +461,15 @@ export function HelpOverlay({
     >
       {searching || query ? (
         <box flexShrink={0} flexDirection="row" marginBottom={1}>
-          <text fg={searching ? theme.accent : theme.fgDim} attributes={1}>
-            /
+          {/* One text node so the `/`, query, and cursor sit flush — separate
+              siblings leave a spacer cell when the query is empty. */}
+          <text>
+            <span fg={searching ? theme.accent : theme.fgDim} attributes={1}>
+              /
+            </span>
+            <span fg={theme.fg}>{query}</span>
+            {searching ? <span fg={theme.accent}>▌</span> : null}
           </text>
-          <text fg={theme.fg}>{query}</text>
-          {searching ? <text fg={theme.accent}>▌</text> : null}
           {!empty ? (
             <text fg={theme.fgDim}>
               {"  "}
