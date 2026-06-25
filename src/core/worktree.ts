@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, isAbsolute, join, relative } from "node:path";
 
 import { config } from "./config.ts";
 import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitRun, localBranchExists } from "./git.ts";
@@ -23,7 +23,15 @@ export async function listWorktrees(): Promise<Worktree[]> {
         const path = block.worktree;
         const branch = (block.branch ?? "").replace(/^refs\/heads\//, "");
         const isMain = path === config.paths.mainClone;
-        const slug = isMain ? "main" : path.split("/").pop()!;
+        const slug = isMain ? "main" : basename(path);
+        // `git worktree list` includes worktrees created by other tools
+        // against the same repo. Codex Desktop, for example, uses
+        // `~/.codex/worktrees/<id>/<repo-name>`, which gives every row the
+        // same leaf slug. wt owns only the configured worktree root.
+        if (!isMain && !isManagedWorktreePath(path)) {
+          block = {};
+          continue;
+        }
         // Skip the throwaway detached worktrees `wt stack apply --verify` adds
         // (under tmpdir, registered in the main clone) — they're internal
         // scaffolding, present only for the duration of a verify run, and must
@@ -48,6 +56,11 @@ export async function listWorktrees(): Promise<Worktree[]> {
     else block[line.slice(0, sp)] = line.slice(sp + 1);
   }
   return worktrees;
+}
+
+function isManagedWorktreePath(path: string): boolean {
+  const rel = relative(config.paths.worktreeRoot, path);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 /**
