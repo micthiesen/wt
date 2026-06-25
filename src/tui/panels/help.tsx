@@ -26,17 +26,29 @@ type GlyphItem = {
 };
 
 /**
- * Both columns are built from the same `Block` union so the `/` filter
- * can walk one list. `keys` blocks render with `KeyRow` (left column,
- * the keymap); `glyphs` blocks render with `GlyphRow` (right column,
- * the visual reference).
+ * Every section is a `Block`. The overlay renders one full-width column
+ * of these so prose-heavy rows get the whole modal width to wrap into
+ * (no side-by-side columns clobbering each other). `cols: 2` opts a
+ * section into a 2-up grid *under its own header* — reserved for short,
+ * single-line lists (state dots, flags) where stacking would waste space.
+ *
+ * `keys` blocks render with `KeyRow` (the keymap); `glyphs` blocks render
+ * with `GlyphRow` (the visual reference). The single `/` filter walks the
+ * one combined list.
  */
 type Block =
-  | { kind: "keys"; title: string; note?: string; items: KeyItem[] }
+  | {
+      kind: "keys";
+      title: string;
+      note?: string;
+      cols?: 1 | 2;
+      items: KeyItem[];
+    }
   | {
       kind: "glyphs";
       title: string;
       note?: string;
+      cols?: 1 | 2;
       /** Width reserved for the glyph column; widen for multi-cell notation. */
       glyphWidth?: number;
       items: GlyphItem[];
@@ -47,7 +59,7 @@ type Block =
  *  wraps within the column (wrapMode) rather than overrunning the label. */
 const KEY_W = 16;
 
-// ── Left column: the keymap, grouped by what you're acting on ──────────
+// ── The keymap, grouped by what you're acting on ───────────────────────
 
 const KEY_BLOCKS: Block[] = [
   {
@@ -172,7 +184,7 @@ const KEY_BLOCKS: Block[] = [
   },
 ];
 
-// ── Right column: the visual reference ─────────────────────────────────
+// ── The visual reference ───────────────────────────────────────────────
 
 const STATUS_GLYPHS: GlyphItem[] = [
   { glyph: NF.rocket, color: theme.accent, label: "busy (init/install)" },
@@ -204,13 +216,18 @@ const BADGES: GlyphItem[] = [
     label: "AI session live (list pane shows the F12-target harness glyph)",
     search: "ai session live harness",
   },
-  { glyph: STATE_DOT.working, color: STATE_FG.working, label: "AI session · working", search: "ai session working" },
-  { glyph: STATE_DOT.asking, color: STATE_FG.asking, label: "AI session · asking", search: "ai session asking" },
-  { glyph: STATE_DOT.polling, color: STATE_FG.polling, label: "AI session · polling", search: "ai session polling" },
-  { glyph: STATE_DOT.unknown, color: STATE_FG.unknown, label: "AI session · unknown", search: "ai session unknown" },
-  { glyph: STATE_DOT.waiting, color: STATE_FG.waiting, label: "AI session · waiting", search: "ai session waiting" },
-  { glyph: STATE_DOT.idle, color: STATE_FG.idle, label: "AI session · idle", search: "ai session idle" },
-  { glyph: STATE_DOT.abandoned, color: STATE_FG.abandoned, label: "AI session · abandoned", search: "ai session abandoned" },
+];
+
+// Short, uniform labels → 2-up grid. The header already says "AI session",
+// so the dots just name the state; `search` keeps the longer phrase findable.
+const AI_STATES: GlyphItem[] = [
+  { glyph: STATE_DOT.working, color: STATE_FG.working, label: "working", search: "ai session working" },
+  { glyph: STATE_DOT.asking, color: STATE_FG.asking, label: "asking", search: "ai session asking" },
+  { glyph: STATE_DOT.polling, color: STATE_FG.polling, label: "polling", search: "ai session polling" },
+  { glyph: STATE_DOT.unknown, color: STATE_FG.unknown, label: "unknown", search: "ai session unknown" },
+  { glyph: STATE_DOT.waiting, color: STATE_FG.waiting, label: "waiting", search: "ai session waiting" },
+  { glyph: STATE_DOT.idle, color: STATE_FG.idle, label: "idle", search: "ai session idle" },
+  { glyph: STATE_DOT.abandoned, color: STATE_FG.abandoned, label: "abandoned", search: "ai session abandoned" },
 ];
 
 const SYNC: GlyphItem[] = [
@@ -240,11 +257,13 @@ const SYNC: GlyphItem[] = [
 
 const REFERENCE_BLOCKS: Block[] = [
   { kind: "glyphs", title: "status glyphs", items: STATUS_GLYPHS },
-  { kind: "glyphs", title: "row badges", items: BADGES },
+  { kind: "glyphs", title: "PR / CI badges", items: BADGES },
+  { kind: "glyphs", title: "AI session states", cols: 2, glyphWidth: 3, items: AI_STATES },
   { kind: "glyphs", title: "sync notation", glyphWidth: 8, items: SYNC },
   {
     kind: "keys",
     title: "new: prompt flags",
+    cols: 2,
     items: [
       { key: "--any", label: "match any author" },
       { key: "--base <ref>", label: "branch off <ref>" },
@@ -256,6 +275,8 @@ const REFERENCE_BLOCKS: Block[] = [
     items: [{ key: "mouse drag", label: "selects + auto-copies to clipboard" }],
   },
 ];
+
+const ALL_BLOCKS: Block[] = [...KEY_BLOCKS, ...REFERENCE_BLOCKS];
 
 // ── Filtering ──────────────────────────────────────────────────────────
 
@@ -279,7 +300,7 @@ function filterBlock(block: Block, q: string): Block | null {
   return items.length ? { ...block, items } : null;
 }
 
-function filterColumn(blocks: Block[], q: string): Block[] {
+function filterBlocks(blocks: Block[], q: string): Block[] {
   if (!q) return blocks;
   return blocks
     .map((b) => filterBlock(b, q))
@@ -334,40 +355,66 @@ function GlyphRow({
   );
 }
 
+/** Render a block's rows as the bare list (no header). */
+function blockRows(block: Block): ReactNode[] {
+  if (block.kind === "keys") {
+    return block.items.map((it) => (
+      <KeyRow key={it.key} keyText={it.key} label={it.label} />
+    ));
+  }
+  const width = block.glyphWidth ?? 5;
+  return block.items.map((it) => (
+    <GlyphRow key={it.label} glyph={it.glyph} color={it.color} label={it.label} width={width} />
+  ));
+}
+
+/** Two balanced columns, filled top-to-bottom then left-to-right.
+ *  `overflow="hidden"` guards each cell so a slightly-too-long row can
+ *  never bleed into its neighbour. Only used for short, single-line
+ *  lists, so wrapping shouldn't trigger in practice. */
+function Grid({ rows }: { rows: ReactNode[] }) {
+  const per = Math.ceil(rows.length / 2);
+  const left = rows.slice(0, per);
+  const right = rows.slice(per);
+  return (
+    <box flexDirection="row" gap={3}>
+      <box flexDirection="column" flexGrow={1} flexBasis={0} overflow="hidden">
+        {left}
+      </box>
+      <box flexDirection="column" flexGrow={1} flexBasis={0} overflow="hidden">
+        {right}
+      </box>
+    </box>
+  );
+}
+
+/** Section header: a full-width filled bar so the title block is obvious
+ *  and the empty tail of the line reads as a solid rectangle. */
+function SectionHeader({ title }: { title: string }) {
+  return (
+    <box backgroundColor={theme.rowSelectedBg} paddingLeft={1} marginBottom={1}>
+      <text fg={theme.fgBright} attributes={1}>
+        {title}
+      </text>
+    </box>
+  );
+}
+
 function BlockView({ block }: { block: Block }) {
+  const rows = blockRows(block);
   return (
     <box flexDirection="column" marginBottom={1}>
-      <text fg={theme.fgDim} attributes={1}>
-        {block.title}
-      </text>
+      <SectionHeader title={block.title} />
       {block.note ? (
         <text fg={theme.fgDim} wrapMode="word">
           {block.note}
         </text>
       ) : null}
-      {block.kind === "keys"
-        ? block.items.map((it) => (
-            <KeyRow key={it.key} keyText={it.key} label={it.label} />
-          ))
-        : block.items.map((it) => (
-            <GlyphRow
-              key={it.label}
-              glyph={it.glyph}
-              color={it.color}
-              label={it.label}
-              width={block.glyphWidth ?? 5}
-            />
-          ))}
-    </box>
-  );
-}
-
-function Column({ blocks }: { blocks: Block[] }) {
-  return (
-    <box flexDirection="column" flexGrow={1} flexBasis={0}>
-      {blocks.map((b) => (
-        <BlockView key={b.title} block={b} />
-      ))}
+      {block.cols === 2 ? (
+        <Grid rows={rows} />
+      ) : (
+        <box flexDirection="column">{rows}</box>
+      )}
     </box>
   );
 }
@@ -382,9 +429,8 @@ export function HelpOverlay({
   searching: boolean;
 }) {
   const q = query.trim().toLowerCase();
-  const left = filterColumn(KEY_BLOCKS, q);
-  const right = filterColumn(REFERENCE_BLOCKS, q);
-  const matches = countRows(left) + countRows(right);
+  const blocks = filterBlocks(ALL_BLOCKS, q);
+  const matches = countRows(blocks);
   const empty = q.length > 0 && matches === 0;
 
   const hints: KeyHintPair[] = searching
@@ -433,14 +479,10 @@ export function HelpOverlay({
           <text fg={theme.fgDim}>no matches for "{query.trim()}"</text>
         </box>
       ) : (
-        <scrollbox
-          focused={!searching}
-          scrollY
-          flexGrow={1}
-          contentOptions={{ flexDirection: "row", gap: 2 }}
-        >
-          <Column blocks={left} />
-          <Column blocks={right} />
+        <scrollbox focused={!searching} scrollY flexGrow={1}>
+          {blocks.map((b) => (
+            <BlockView key={b.title} block={b} />
+          ))}
         </scrollbox>
       )}
     </Modal>
