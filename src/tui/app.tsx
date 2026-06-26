@@ -2725,8 +2725,11 @@ export function App({ onExit }: Props) {
       recordHistoryRun(def.id, arg, null);
       pendingArgs.current.set(`${slug}/${def.id}`, arg);
     }
-    // Session-target claude actions bypass the headless `-p` runner and
-    // type the prompt into the live F12 session (starting it if needed).
+    // Session-target prompt actions bypass the headless `-p` runner and
+    // type the prompt into the live primary F12 harness session (starting
+    // it if needed). This follows the Shift+TAB-selected primary harness,
+    // so actions like `/rabbit` land in Codex/OpenCode when that is the
+    // row's default AI.
     // Fire-and-forget: there's no run to track or focus, so we just log
     // progress to the activity pane. The cold-start path can take a few
     // seconds, hence the immediate "sending…" toast.
@@ -2737,15 +2740,21 @@ export function App({ onExit }: Props) {
         ? `${renderedPrompt}\n\n${trimmedExtras}`
         : renderedPrompt;
       const sessionLog = createLogger(slug);
-      sessionLog.event.info(`${def.name} → live claude session`);
+      const harness = getHarness(primaryHarness);
+      sessionLog.event.info(`${def.name} → live ${harness.label} session`);
       toast(`sending ${def.name} to session…`, theme.info, 2000);
-      void injectIntoSession({ slug, cwd: row.wt.path, text: fullPrompt }).then(
+      void injectIntoSession({
+        slug,
+        cwd: row.wt.path,
+        harnessId: primaryHarness,
+        text: fullPrompt,
+      }).then(
         (res) => {
           if (res.ok) {
             sessionLog.event.ok(
               res.coldStarted
-                ? `started session and sent ${def.name}`
-                : `sent ${def.name} to session`,
+                ? `started ${harness.label} session and sent ${def.name}`
+                : `sent ${def.name} to ${harness.label} session`,
             );
           } else {
             sessionLog.event.err(`inject failed: ${res.reason}`);
