@@ -36,12 +36,14 @@ export const NF = {
 	checkFail: "\u{F52F}", // nf-oct-x_circle
 	checkPend: "\u{F43A}", // nf-oct-clock
 
-	// Review badges. Approved/changes get distinct shapes (thumbs); the
-	// eye covers both `pending` and `unrequested`, told apart by color
-	// (orange vs dim). Kept off the CI clock (`checkPend`) so review and
-	// check signals don't collide on one row.
-	thumbsUp: "\u{F164}", // nf-fa-thumbs_up    — review approved
-	thumbsDown: "\u{F165}", // nf-fa-thumbs_down — review changes_requested
+	// Review badges. Approved gets a thumbs-up; changes-requested gets a
+	// lightbulb — it reads as "the reviewer left some suggestions," which
+	// is friendlier than a thumbs-down for what's really just "needs
+	// another pass." The eye covers both `pending` and `unrequested`, told
+	// apart by color (orange vs dim). Kept off the CI clock (`checkPend`)
+	// so review and check signals don't collide on one row.
+	thumbsUp: "\u{F164}", // nf-fa-thumbs_up     — review approved
+	lightbulb: "\u{F0EB}", // nf-fa-lightbulb_o  — review changes_requested (suggestions)
 	eye: "\u{F441}", // nf-oct-eye               — review pending (orange) / unrequested (dim)
 
 	// CodeRabbit badge — single whimsy glyph (carrot, on-theme with the

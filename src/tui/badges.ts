@@ -99,23 +99,23 @@ export function checkBadge(c: PrChecks): Badge | null {
 }
 
 /**
- * Glyph + color for human review state. Approved / changes-requested get
- * distinct shapes (thumbs up/down); `pending` and `unrequested` share
- * the eye glyph and are told apart by color (warn = asked + waiting, dim
- * = nobody asked yet) — the eye rather than a clock so review-pending
- * doesn't collide with the CI pending clock (`checkPend`). Null for the
- * quiet `none` state.
+ * Glyph + color for human review state. Approved gets a thumbs-up;
+ * changes-requested gets a lightbulb (suggestions). `pending` and
+ * `unrequested` share the eye glyph and are told apart by color (warn =
+ * asked + waiting, dim = nobody asked yet) — the eye rather than a clock
+ * so review-pending doesn't collide with the CI pending clock
+ * (`checkPend`). Null for the quiet `none` state.
  *
  * `changes_requested` is intentionally amber (`theme.warn`), not alarm-red
  * (`theme.err`): "needs another pass" reads softer than "rejected." It
- * shares amber with `pending` but stays distinct via the thumbs-down glyph.
+ * shares amber with `pending` but stays distinct via the lightbulb glyph.
  */
 export function reviewBadge(r: PrReview): Badge | null {
   switch (r) {
     case "approved":
       return { glyph: NF.thumbsUp, fg: theme.ok };
     case "changes_requested":
-      return { glyph: NF.thumbsDown, fg: theme.warn };
+      return { glyph: NF.lightbulb, fg: theme.warn };
     case "pending":
       return { glyph: NF.eye, fg: theme.warn };
     case "unrequested":
