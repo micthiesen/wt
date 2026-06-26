@@ -176,14 +176,23 @@ export function watchGithubEvents(onChange: () => void): () => void {
   let watcher: FSWatcher | null = null;
   try {
     watcher = watch(EVENTS_DIR, { persistent: false }, (_event, filename) => {
-      // Fire on the snapshot OR the marker. The daemon writes github.json
-      // then github.touch back-to-back, and macOS FSEvents can coalesce the
-      // two into a single delivered event — often reporting only github.json
-      // — so keying on the marker alone silently misses the update. Reacting
-      // to github.json directly is safe: writeAtomic renames it into place, so
-      // its event only fires once the full document is on disk. `filename` can
-      // also be null on some macOS event types — fire then too.
-      if (filename == null || filename === MARKER_NAME || filename === SNAPSHOT_NAME) {
+      // Fire on the snapshot OR the marker. Critically, match by PREFIX:
+      // `writeAtomic` writes `github.touch.tmp-<pid>` then renames it into
+      // place, and Bun's fs.watch reports the rename event under the *temp*
+      // source name (`github.touch.tmp-88032`), not the final `github.touch`.
+      // An exact `=== MARKER_NAME` check therefore never matched and the
+      // marker watch was silently dead — the TUI only refreshed via the slow
+      // backstop poll. `startsWith` catches both the temp and final names, and
+      // both files (`github.json`/`github.touch`). The rename only completes —
+      // and the event only fires — once the full document is on disk, so this
+      // never reads a half-written file. `filename` can also be null on some
+      // macOS event types — fire then too. `state.json` and the daemon logs
+      // don't share these prefixes, so per-event state writes don't over-fire.
+      if (
+        filename == null ||
+        filename.startsWith(MARKER_NAME) ||
+        filename.startsWith(SNAPSHOT_NAME)
+      ) {
         debounced.trigger();
       }
     });
