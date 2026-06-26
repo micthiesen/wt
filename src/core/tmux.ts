@@ -254,7 +254,7 @@ export function writeConfig(): { path: string; changed: boolean } {
 /**
  * Ensure a tmux config exists on disk WITHOUT the change-detection
  * kill-server dance, returning its path. For non-interactive codepaths
- * (`startClaudeSessionDetached`, and via it `injectIntoSession` / the
+ * (`startHarnessSessionDetached`, and via it `injectIntoSession` / the
  * `wt claude send` CLI) that may run from an arbitrary environment —
  * including from a claude session INSIDE the wt tmux server itself,
  * where TERM is `tmux-256color` rather than the user's outer terminal.
@@ -898,10 +898,10 @@ async function capturePane(name: string): Promise<string | null> {
 }
 
 /**
- * Wait until a freshly-started claude pane stops changing — meaning it
+ * Wait until a freshly-started harness pane stops changing — meaning it
  * has finished its initial render and is sitting at an idle prompt — or
  * the cap elapses. Stability (two identical, non-trivial snapshots) is
- * version-agnostic: we never scrape claude's exact prompt string, we
+ * version-agnostic: we never scrape the harness's exact prompt string, we
  * just watch for the screen to settle. A startup spinner keeps the pane
  * changing, so the loop naturally waits out a slow boot instead of
  * guessing a fixed delay. Returns whether it settled (false = hit the
@@ -910,7 +910,7 @@ async function capturePane(name: string): Promise<string | null> {
 async function waitForPaneReady(name: string): Promise<boolean> {
   const deadline = Date.now() + READY_MAX_MS;
   let prev: string | null = null;
-  // Initial grace — claude writes nothing for the first beat after spawn.
+  // Initial grace — harnesses often write nothing for the first beat after spawn.
   await sleep(READY_POLL_MS);
   while (Date.now() < deadline) {
     const cur = (await capturePane(name))?.trim() ?? "";
@@ -922,26 +922,28 @@ async function waitForPaneReady(name: string): Promise<boolean> {
 }
 
 /**
- * Create the worktree's primary claude session detached (no client
- * attach). Byte-for-byte the session `attachOrCreate({kind:"claude"})`
- * would make — same name (`<slug>`), same `buildArgs` argv, same stderr
+ * Create the worktree's primary harness session detached (no client
+ * attach). Byte-for-byte the session `attachOrCreate({kind:harnessId})`
+ * would make — same name, same `buildArgs` argv, same stderr
  * wrapper and TMUX-stripping env — so a later F12 `new-session -A` just
  * attaches to this one rather than spawning a second. Sized generously
- * so claude doesn't render cramped before the user attaches; tmux
+ * so the harness doesn't render cramped before the user attaches; tmux
  * resizes to the client on attach.
  */
-async function startClaudeSessionDetached(
+async function startHarnessSessionDetached(
   slug: string,
   cwd: string,
+  harnessId: HarnessId,
 ): Promise<{ ok: boolean; reason?: string }> {
-  const name = sessionName(slug, "claude");
+  const harness = getHarness(harnessId);
+  const name = sessionName(slug, harnessId);
   // ensureConfig, NOT writeConfig: this can run from inside the wt tmux
   // server (e.g. `wt claude send` issued by another claude session),
   // where the rendered config differs and the kill-server-on-change
   // dance would take down every live session including the caller's.
   const configPath = ensureConfig();
   const stderrPath = join(sessionsDir(), `${name}.err`);
-  const innerArgs = getHarness("claude").buildArgs({
+  const innerArgs = harness.buildArgs({
     wtPath: cwd,
     managedName: null,
     resumeSessionId: null,
@@ -994,7 +996,11 @@ async function startClaudeSessionDetached(
     );
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    log.error("detached claude start spawn failed", { slug, reason });
+    log.error("detached harness start spawn failed", {
+      slug,
+      harnessId,
+      reason,
+    });
     return { ok: false, reason };
   }
   const [code, stderr] = await Promise.all([
@@ -1003,7 +1009,12 @@ async function startClaudeSessionDetached(
   ]);
   if (code !== 0) {
     const reason = stderr.trim() || `tmux new-session exited ${code}`;
-    log.warn("detached claude start failed", { slug, code, reason });
+    log.warn("detached harness start failed", {
+      slug,
+      harnessId,
+      code,
+      reason,
+    });
     return { ok: false, reason };
   }
   return { ok: true };
@@ -1043,16 +1054,16 @@ async function pasteBuffer(name: string, text: string): Promise<void> {
 }
 
 /**
- * Send `text` to a worktree's primary (F12) claude session as if typed
+ * Send `text` to a worktree's primary (F12) harness session as if typed
  * at the prompt, then submit it. Starts the session first if it isn't
  * running, waiting for it to finish booting before pasting. The prompt
  * lands in the live conversation — with its existing context and history
- * — rather than a fresh headless `claude -p` run.
+ * — rather than a fresh headless action run.
  *
- * Fire-and-forget by nature: there's no completion sentinel the way a
- * `claude -p` action has, so callers can't observe when claude finishes.
+ * Fire-and-forget by nature: there's no completion sentinel, so callers
+ * can't observe when the harness finishes.
  *
- * Known edge: a brand-new worktree directory claude has never run in may
+ * Known edge: a brand-new worktree directory the harness has never run in may
  * show its trust prompt on cold start; the paste+Enter would answer that
  * dialog instead of submitting. Attaching via F12 once (to accept trust)
  * before injecting avoids it.
@@ -1060,20 +1071,22 @@ async function pasteBuffer(name: string, text: string): Promise<void> {
 export async function injectIntoSession(opts: {
   slug: string;
   cwd: string;
+  harnessId?: HarnessId;
   text: string;
 }): Promise<{ ok: true; coldStarted: boolean } | { ok: false; reason: string }> {
   const { slug, cwd, text } = opts;
-  const name = sessionName(slug, "claude");
+  const harnessId = opts.harnessId ?? "claude";
+  const name = sessionName(slug, harnessId);
   const running = (
     await listAllSessionsRaw().catch(() => new Set<string>())
   ).has(name);
   let coldStarted = false;
   if (!running) {
-    const started = await startClaudeSessionDetached(slug, cwd);
+    const started = await startHarnessSessionDetached(slug, cwd, harnessId);
     if (!started.ok) {
       return {
         ok: false,
-        reason: started.reason ?? "failed to start claude session",
+        reason: started.reason ?? `failed to start ${harnessId} session`,
       };
     }
     coldStarted = true;
