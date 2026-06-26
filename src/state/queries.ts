@@ -301,7 +301,15 @@ export const reviewRequestsQuery = () =>
     queryKey: qk.reviewRequests(),
     queryFn: async ({ signal }): Promise<ReviewRequestPr[]> =>
       fetchReviewRequests(signal),
-    staleTime: STALE.slow,
+    // Same freshness model as `githubQuery`: with the webhook daemon
+    // configured the marker drives invalidation, so relax staleTime to the
+    // backstop and keep a periodic safety net so a dropped fs event or
+    // missed delivery can't pin a stale review list (e.g. an approved PR
+    // lingering in the section) until the next unrelated trigger. Poll-only
+    // setups keep the 60s staleTime and no interval.
+    staleTime: config.github.events?.backstopPollMs ?? STALE.slow,
+    refetchInterval: config.github.events ? config.github.events.backstopPollMs : false,
+    ...KEEP_PREV,
   });
 
 /**

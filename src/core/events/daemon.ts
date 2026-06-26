@@ -87,23 +87,29 @@ function verifySignature(body: string, header: string | null, secret: string): b
 }
 
 /**
- * Candidate head branches an event concerns, or null when the shape is
- * unknown / intentionally unscoped (merge_group). Null means "don't try to
- * skip — just refetch", so a payload-shape change degrades to more fetches,
- * never to missed updates.
+ * Candidate head branches an event concerns, or null when the event is
+ * intentionally unscoped. Null means "don't try to skip — just refetch", so
+ * the local-branch gate never drops it; a payload-shape change (or a
+ * cross-cutting event) degrades to more fetches, never to missed updates.
  */
 export function extractBranches(event: string, payload: unknown): string[] | null {
   const p = payload as Record<string, any> | null;
   if (!p) return null;
   try {
     switch (event) {
+      // PR-surface events drive TWO things: the per-worktree github query
+      // (when the PR is on a branch you have checked out) AND the
+      // cross-cutting "review requests" list — PRs awaiting *your* review,
+      // which by definition live on other people's branches, never local
+      // worktrees. Branch-skipping them would silently drop every
+      // review-requests update (e.g. an approval you submit never clears the
+      // item until a manual `r`). So never skip them: the marker is what
+      // re-pulls the review-requests list, and the worktree snapshot refetch
+      // is bounded and serves its warm cache when nothing local changed.
       case "pull_request":
       case "pull_request_review":
-      case "pull_request_review_thread": {
-        // All three carry a top-level `pull_request` with `head.ref`.
-        const ref = p.pull_request?.head?.ref;
-        return typeof ref === "string" ? [ref] : null;
-      }
+      case "pull_request_review_thread":
+        return null;
       case "check_suite": {
         const ref = p.check_suite?.head_branch;
         return typeof ref === "string" ? [ref] : null;
