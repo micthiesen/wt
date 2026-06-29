@@ -98,7 +98,7 @@ export type GithubConfig = {
   defaultReviewer: string | null;
   /**
    * Where PR browser opens should land. `github` preserves GitHub's URL;
-   * `linear` rewrites GitHub PR URLs to Linear Reviews (`linear.review`).
+   * `linear` rewrites GitHub PR URLs to Linear Reviews via the `linear://` deep-link scheme.
    */
   prTarget: PullRequestTarget;
   /** Webhook-receiver augmentation; null when `[github.events]` is absent. */

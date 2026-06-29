@@ -68,8 +68,9 @@ export function pullRequestOpenUrlForTarget(
 }
 
 /**
- * Linear Reviews can open an existing GitHub PR by replacing
- * `github.com` with `linear.review`, preserving `/owner/repo/pull/123`.
+ * Linear Reviews can open an existing GitHub PR by rewriting the URL
+ * to the `linear://` deep-link scheme, preserving `/owner/repo/pull/123`.
+ * Mirrors the `https://linear.review/<owner>/<repo>/pull/<N>` redirect host.
  */
 function linearReviewUrl(githubUrl: string): string | null {
   try {
@@ -77,7 +78,7 @@ function linearReviewUrl(githubUrl: string): string | null {
     if (url.hostname !== "github.com") return null;
     const parts = url.pathname.split("/").filter(Boolean);
     if (parts.length < 4 || parts[2] !== "pull") return null;
-    return `https://linear.review/${parts[0]}/${parts[1]}/pull/${parts[3]}`;
+    return `linear://review/${parts[0]}/${parts[1]}/pull/${parts[3]}`;
   } catch {
     return null;
   }
