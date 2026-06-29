@@ -17,7 +17,7 @@ import {
   recordRun as recordHistoryRun,
   type HistoryEntry,
 } from "../core/action-history.ts";
-import { config } from "../core/config.ts";
+import { config, type PullRequestTarget } from "../core/config.ts";
 import {
   createWorktree,
   parseInput,
@@ -29,6 +29,8 @@ import {
   editReviewers,
   enableAutoMerge,
   markPullRequestReady,
+  pullRequestOpenUrl,
+  pullRequestOpenUrlForTarget,
 } from "../core/github.ts";
 import { expectedStage } from "../core/stage-safety.ts";
 import {
@@ -178,6 +180,7 @@ const EMPTY_FOCUS: SlugFocus = { focused: null };
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
 const wtSourceLog = createLogger(WT_SOURCE_SLOT.label);
+const PR_TARGET_CHORD_MS = 1_200;
 
 /** Section a review-requested PR lands in when checked out via `w`. */
 const REVIEW_SECTION = "Reviews";
@@ -186,6 +189,14 @@ export type TuiExit = { kind: "quit" };
 
 type Props = {
   onExit: (e: TuiExit) => void;
+};
+
+type PendingPrTargetChord = {
+  target: PullRequestTarget;
+  url: string;
+  number: number;
+  logName: string;
+  timer: Timer;
 };
 
 /**
@@ -780,6 +791,7 @@ export function App({ onExit }: Props) {
   // the global pane shows there.
   const [slugFocus, setSlugFocus] = useState<Record<string, SlugFocus>>({});
   const toastTimer = useRef<Timer | null>(null);
+  const pendingPrTargetChordRef = useRef<PendingPrTargetChord | null>(null);
 
   // Auto-tail every busy worktree so logs surface in the activity pane
   // without user intervention. Returns the active set so rows can flag
@@ -1014,6 +1026,53 @@ export function App({ onExit }: Props) {
   // idempotent, and reading it elsewhere happens in the same render.
   if (cursorIndex >= 0 && cursorIndex !== lastIndexRef.current) {
     lastIndexRef.current = cursorIndex;
+  }
+
+  function clearPendingPrTargetChord(): void {
+    const pending = pendingPrTargetChordRef.current;
+    if (pending) clearTimeout(pending.timer);
+    pendingPrTargetChordRef.current = null;
+  }
+
+  function rememberPrTargetChord(target: PullRequestTarget): boolean {
+    const pr = selectedPr ?? current?.pr;
+    if (!pr) return false;
+    clearPendingPrTargetChord();
+    const logName = selectedPr ? "[review]" : current?.wt.slug ?? "[app]";
+    const timer = setTimeout(() => {
+      pendingPrTargetChordRef.current = null;
+    }, PR_TARGET_CHORD_MS);
+    pendingPrTargetChordRef.current = {
+      target,
+      url: pr.url,
+      number: pr.number,
+      logName,
+      timer,
+    };
+    return true;
+  }
+
+  function openPrUrl(
+    url: string,
+    number: number,
+    target: PullRequestTarget | null,
+    logName: string,
+  ): void {
+    const resolved = target
+      ? pullRequestOpenUrlForTarget(url, target)
+      : pullRequestOpenUrl(url);
+    const label = target ?? config.github.prTarget;
+    void openUrlHidingAlacritty(resolved);
+    createLogger(logName).event.info(`opened PR #${number} in ${label}`);
+  }
+
+  function consumePrTargetChord(k: KeyEvent): boolean {
+    if (!isPlainLetter(k, "p")) return false;
+    const pending = pendingPrTargetChordRef.current;
+    if (!pending) return false;
+    clearPendingPrTargetChord();
+    openPrUrl(pending.url, pending.number, pending.target, pending.logName);
+    return true;
   }
 
   const listWidth = Math.max(32, Math.min(52, Math.floor(width * 0.44)));
@@ -2964,6 +3023,10 @@ export function App({ onExit }: Props) {
     k: KeyEvent,
     modal: Extract<Modal, { kind: "sectionPicker" }>,
   ): void {
+    if (consumePrTargetChord(k)) {
+      setModal(null);
+      return;
+    }
     const sp = modal;
     if (sp.newName !== null) {
       if (k.name === "escape") {
@@ -4007,6 +4070,7 @@ export function App({ onExit }: Props) {
       setFocus(currentSlug ?? null, { focused: null });
       return;
     }
+    if (consumePrTargetChord(k)) return;
     // `'` opens the Outputs picker — vim-`:ls` flavor for the bottom
     // pane. Cursor lands on the displayed output within this
     // worktree's filtered list. Outputs is the rarer chord; sessions
@@ -4151,6 +4215,7 @@ export function App({ onExit }: Props) {
     // `shift: true`, so case-sensitive bindings (`g`/`G`, `r`/`R`) have
     // to disambiguate on `sequence` rather than `name`.
     if (k.sequence === "g") {
+      rememberPrTargetChord("github");
       const first = visualItems[0];
       setSel(first ? visualKey(first) : null);
       return;
@@ -4587,8 +4652,11 @@ export function App({ onExit }: Props) {
     if (selectedPr) {
       const prLog = createLogger("[review]");
       if (isPlainLetter(k, "p") || k.name === "return") {
-        void openUrlHidingAlacritty(selectedPr.url);
-        prLog.event.info(`opened review #${selectedPr.number}`);
+        openPrUrl(selectedPr.url, selectedPr.number, null, "[review]");
+        return;
+      }
+      if (isPlainLetter(k, "l")) {
+        rememberPrTargetChord("linear");
         return;
       }
       // `w` — check out this PR's branch as a worktree in "Reviews".
@@ -4624,8 +4692,7 @@ export function App({ onExit }: Props) {
         rowLog.event.warn("no PR for this branch");
         return;
       }
-      void openUrlHidingAlacritty(current.pr.url);
-      rowLog.event.info(`opened PR #${current.pr.number}`);
+      openPrUrl(current.pr.url, current.pr.number, null, current.wt.slug);
       return;
     }
     if (isPlainLetter(k, "i")) {
@@ -4792,6 +4859,7 @@ export function App({ onExit }: Props) {
       return;
     }
     if (isPlainLetter(k, "l")) {
+      rememberPrTargetChord("linear");
       openSectionPicker();
       return;
     }
