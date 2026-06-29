@@ -1,4 +1,4 @@
-import { pickPrForWorktree } from "../core/github.ts";
+import { pickPrForWorktree, pullRequestOpenUrl } from "../core/github.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { isOurStageDeployed } from "../core/stage-safety.ts";
 import { stageUrl } from "../core/stage.ts";
@@ -29,7 +29,7 @@ export function renderPrCell(
   if (pr.state === "MERGED") parts.push(dim("(merged)"));
   else if (pr.state === "CLOSED") parts.push(dim("(closed)"));
   else if (pr.isDraft) parts.push(dim("(draft)"));
-  return link(parts.join(" "), pr.url);
+  return link(parts.join(" "), pullRequestOpenUrl(pr.url));
 }
 
 export function renderStatusCell(status: Status): string {

@@ -80,6 +80,8 @@ export type GithubEventsConfig = {
   backstopPollMs: number;
 };
 
+export type PullRequestTarget = "github" | "linear";
+
 export type GithubConfig = {
   /**
    * Glob patterns matched against check context names (CheckRun.name /
@@ -94,6 +96,11 @@ export type GithubConfig = {
    * keystroke. Null disables the reviewer-request leg of the chord.
    */
   defaultReviewer: string | null;
+  /**
+   * Where PR browser opens should land. `github` preserves GitHub's URL;
+   * `linear` rewrites GitHub PR URLs to Linear Reviews (`linear.review`).
+   */
+  prTarget: PullRequestTarget;
   /** Webhook-receiver augmentation; null when `[github.events]` is absent. */
   events: GithubEventsConfig | null;
 };
@@ -383,6 +390,9 @@ const GENERIC_DEFAULTS = {
     // dial down via [ai].timeout_ms.
     timeoutMs: 120_000,
   },
+  github: {
+    prTarget: "github" as const satisfies PullRequestTarget,
+  },
   ui: {
     rows: ["branch", "base", "linear", "stage", "pr", "claude", "git"] as const,
   },
@@ -641,6 +651,13 @@ function build(raw: Raw, errs: Errors): Config {
   const github: GithubConfig = {
     ignoredChecks: strArr(githubRaw?.ignored_checks, []),
     defaultReviewer: errs.optStrOrNull(githubRaw, "default_reviewer"),
+    prTarget: errs.optEnum(
+      githubRaw,
+      "github",
+      "pr_target",
+      ["github", "linear"] as const satisfies readonly PullRequestTarget[],
+      GENERIC_DEFAULTS.github.prTarget,
+    ),
     events: githubEvents,
   };
 

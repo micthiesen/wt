@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 
-import { config } from "./config.ts";
+import { config, type PullRequestTarget } from "./config.ts";
 import { createLogger } from "./logger.ts";
 import { run } from "./proc.ts";
 import type {
@@ -51,6 +51,36 @@ export async function repoSlug(): Promise<string | null> {
     return null;
   }
   return _repoSlug;
+}
+
+/** Browser target for a PR URL, honoring `[github].pr_target`. */
+export function pullRequestOpenUrl(githubUrl: string): string {
+  return pullRequestOpenUrlForTarget(githubUrl, config.github.prTarget);
+}
+
+/** Browser target for a PR URL, ignoring config and using an explicit target. */
+export function pullRequestOpenUrlForTarget(
+  githubUrl: string,
+  target: PullRequestTarget,
+): string {
+  if (target !== "linear") return githubUrl;
+  return linearReviewUrl(githubUrl) ?? githubUrl;
+}
+
+/**
+ * Linear Reviews can open an existing GitHub PR by replacing
+ * `github.com` with `linear.review`, preserving `/owner/repo/pull/123`.
+ */
+function linearReviewUrl(githubUrl: string): string | null {
+  try {
+    const url = new URL(githubUrl);
+    if (url.hostname !== "github.com") return null;
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 4 || parts[2] !== "pull") return null;
+    return `https://linear.review/${parts[0]}/${parts[1]}/pull/${parts[3]}`;
+  } catch {
+    return null;
+  }
 }
 
 type RawCheck =

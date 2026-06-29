@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 
+import { config } from "../../core/config.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import { STATE_DOT, STATE_FG } from "../claude-state.ts";
 import { NF } from "../icons.ts";
@@ -58,6 +59,7 @@ type Block =
  *  (`ctrl+j / ctrl+k`, 15 cells) plus a one-cell gutter; anything longer
  *  wraps within the column (wrapMode) rather than overrunning the label. */
 const KEY_W = 16;
+const PR_TARGET_LABEL = config.github.prTarget === "linear" ? "Linear" : "GitHub";
 
 // ── The keymap, grouped by what you're acting on ───────────────────────
 
@@ -79,7 +81,9 @@ const KEY_BLOCKS: Block[] = [
     title: "worktree",
     items: [
       { key: "o", label: "open in zed" },
-      { key: "p", label: "open PR in browser" },
+      { key: "p", label: `open PR in ${PR_TARGET_LABEL}` },
+      { key: "g p", label: "open PR in GitHub" },
+      { key: "l p", label: "open PR in Linear" },
       { key: "i", label: "open linear issue" },
       { key: "s", label: "open deployed app" },
       { key: "y", label: "yank menu (b/s/S/p/n/i/r)" },
@@ -154,7 +158,9 @@ const KEY_BLOCKS: Block[] = [
     title: "review requests (pinned section)",
     note: "PRs awaiting your review, pulled from GitHub. Not worktrees — only these keys apply.",
     items: [
-      { key: "p / ⏎", label: "open PR on GitHub" },
+      { key: "p / ⏎", label: `open PR in ${PR_TARGET_LABEL}` },
+      { key: "g p", label: "open PR in GitHub" },
+      { key: "l p", label: "open PR in Linear" },
       { key: "w", label: "check out branch as worktree → Reviews" },
     ],
   },
