@@ -384,7 +384,23 @@ export async function removeWorktree(
   }
 }
 
-/** Spawn a detached background process to run the destroy tail. */
+/**
+ * Spawn a detached background process to run the destroy tail (including
+ * `pnpm sst remove` when `destroyStage` is set).
+ *
+ * `detached: true` is load-bearing, not cosmetic. Without it the child shares
+ * wt's process group + controlling terminal, so closing the terminal window
+ * (or an SSH drop) delivers SIGHUP to the whole group and kills an in-flight
+ * `sst remove` mid-teardown — a half-removed, stranded stage. setsid (what
+ * `detached` triggers) gives the child its own session so the hangup can't
+ * reach it; it runs to completion writing into the already-opened log fd.
+ * `.unref()` then frees the child from wt's event loop (fire-and-forget; we
+ * never await it). A clean wt quit was already survivable (the child reparents
+ * to launchd), and a hard kill mid-remove just leaves an orphaned stage that
+ * `categorizeStages` re-flags on next launch — the terminal-hangup hole was the
+ * one that silently stranded work. This mirrors why actions run under tmux
+ * (`core/action-tmux.ts`): destroy work must outlive the TUI.
+ */
 export function spawnBackgroundRemove(slug: string, opts: {
   force: boolean;
   destroyStage: boolean;
@@ -402,7 +418,7 @@ export function spawnBackgroundRemove(slug: string, opts: {
   // without leaking into the TUI's terminal.
   const fd = openSync(logPath, "a");
   try {
-    Bun.spawn(
+    const child = Bun.spawn(
       [
         exe,
         "_destroy",
@@ -418,8 +434,13 @@ export function spawnBackgroundRemove(slug: string, opts: {
         stdin: "ignore",
         stdout: fd,
         stderr: fd,
+        // Own session (setsid) so a terminal hangup can't SIGHUP the
+        // in-flight `sst remove`. See the docstring above.
+        detached: true,
       },
     );
+    // Fire-and-forget: don't let the child hold wt's event loop open.
+    child.unref();
   } finally {
     // Parent doesn't need the fd — the child has its own dup.
     closeSync(fd);
