@@ -124,6 +124,8 @@ export const opencodeHarness: Harness = {
   singleSlot: true,
   // OpenCode skills are invoked with a `$` prefix (e.g. $restack).
   skillPrefix: "$",
+  // OpenCode commits a pasted prompt on a single Enter.
+  injectSubmitKeys: ["Enter"],
 
   tmuxSessionName(slug, _managedName) {
     // Single-tmux-per-slug for v1 — same model as codex. The opencode

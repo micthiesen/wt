@@ -862,6 +862,8 @@ const READY_POLL_MS = 350;
 const READY_MAX_MS = 12_000;
 /** Gap between the paste landing and the Enter that submits it. */
 const SUBMIT_DELAY_MS = 500;
+/** Gap between successive submit keys (e.g. claude's double Enter). */
+const SUBMIT_KEY_GAP_MS = 250;
 
 /**
  * Exact-match target for the *pane* commands below (capture-pane,
@@ -1097,17 +1099,27 @@ export async function injectIntoSession(opts: {
   try {
     await pasteBuffer(name, text);
     await sleep(SUBMIT_DELAY_MS);
-    const { code, stderr } = await runTmux([
-      "send-keys",
-      "-t",
-      paneTarget(name),
-      "Enter",
-    ]);
-    if (code !== 0) {
-      return {
-        ok: false,
-        reason: stderr.trim() || `tmux send-keys exited ${code}`,
-      };
+    // Harnesses declare their own submit-key sequence: most take a
+    // single Enter, but Claude Code and Codex receive the bracketed
+    // paste as a multi-line input blob whose first Enter only exits
+    // that state, so they need a second to actually submit. Keys are
+    // sent in order with a small gap so the harness processes each
+    // before the next lands.
+    const submitKeys = getHarness(harnessId).injectSubmitKeys;
+    for (let i = 0; i < submitKeys.length; i++) {
+      if (i > 0) await sleep(SUBMIT_KEY_GAP_MS);
+      const { code, stderr } = await runTmux([
+        "send-keys",
+        "-t",
+        paneTarget(name),
+        submitKeys[i]!,
+      ]);
+      if (code !== 0) {
+        return {
+          ok: false,
+          reason: stderr.trim() || `tmux send-keys exited ${code}`,
+        };
+      }
     }
   } catch (err) {
     return {

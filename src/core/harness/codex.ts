@@ -59,6 +59,10 @@ export const codexHarness: Harness = {
   singleSlot: true,
   // Codex skills are invoked with a `$` prefix (e.g. $restack).
   skillPrefix: "$",
+  // Codex receives a bracketed paste as a multi-line input blob; the
+  // first Enter only exits that state, so a second is needed to
+  // actually submit the prompt.
+  injectSubmitKeys: ["Enter", "Enter"],
 
   tmuxSessionName(slug, _managedName) {
     // Single-tmux-per-slug for v1. The managedName is ignored — codex

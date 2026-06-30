@@ -64,6 +64,10 @@ export const claudeHarness: Harness = {
   singleSlot: false,
   // Claude Code skills are invoked with a `/` prefix (e.g. /restack).
   skillPrefix: "/",
+  // Claude Code receives a bracketed paste as a multi-line input blob;
+  // the first Enter only exits that state, so a second is needed to
+  // actually submit the prompt.
+  injectSubmitKeys: ["Enter", "Enter"],
 
   tmuxSessionName(slug, managedName) {
     return claudeTmuxName(slug, managedName);

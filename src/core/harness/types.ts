@@ -136,6 +136,17 @@ export interface Harness {
    * selected primary.
    */
   readonly skillPrefix: string;
+  /**
+   * tmux `send-keys` key sequence submitted after a bracketed-paste
+   * inject (see `injectIntoSession` in `core/tmux.ts`) to commit the
+   * pasted prompt. Most harnesses take a single `Enter`; Claude Code
+   * and Codex receive the bracketed paste as a multi-line input blob
+   * whose first `Enter` only exits that state, so they need a second
+   * to actually submit. Keys are sent in order with a small gap
+   * between each. Override per harness when a different sequence
+   * (e.g. `C-d`, `C-j`) turns out to fit better.
+   */
+  readonly injectSubmitKeys: readonly string[];
 
   /**
    * Tmux session name for a (slug, managedName). Each impl encodes its
