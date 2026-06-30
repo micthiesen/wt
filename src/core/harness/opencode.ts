@@ -122,6 +122,8 @@ export const opencodeHarness: Harness = {
   glyph: OPENCODE_GLYPH,
   color: OPENCODE_COLOR,
   singleSlot: true,
+  // OpenCode skills are invoked with a `$` prefix (e.g. $restack).
+  skillPrefix: "$",
 
   tmuxSessionName(slug, _managedName) {
     // Single-tmux-per-slug for v1 — same model as codex. The opencode

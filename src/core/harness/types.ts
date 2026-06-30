@@ -125,6 +125,17 @@ export interface Harness {
    * every call site.
    */
   readonly singleSlot: boolean;
+  /**
+   * Prefix this harness uses to invoke named skills / slash commands in
+   * a prompt. Claude Code uses `/`; OpenCode and Codex use `$`.
+   * Substituted into action prompts as `{{skill_prefix}}` at launch
+   * time (see `buildActionVars` in `tui/app.tsx`), so a single prompt
+   * like `{{skill_prefix}}restack` lands correctly regardless of which
+   * harness is the row's primary. Headless `claude -p` actions always
+   * use claude's prefix since the binary is claude regardless of the
+   * selected primary.
+   */
+  readonly skillPrefix: string;
 
   /**
    * Tmux session name for a (slug, managedName). Each impl encodes its

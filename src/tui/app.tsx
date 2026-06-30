@@ -527,7 +527,7 @@ function extractLabel(
   return found;
 }
 
-function buildActionVars(row: WorktreeRow): ActionVars {
+function buildActionVars(row: WorktreeRow, skillPrefix: string): ActionVars {
   const baseBranch = row.stackedOn?.branch ?? config.branch.base;
   const base = row.stackedOn?.diffBase ?? config.branch.base;
   return {
@@ -541,7 +541,38 @@ function buildActionVars(row: WorktreeRow): ActionVars {
     // guarded), else the slug-derived default. Any user shell action that
     // wants a stage handle (e.g. `sst remove --stage {{stage}}`) reads this.
     stage: expectedStage(row.wt),
+    // Harness skill-invocation prefix (`/` for Claude Code, `$` for
+    // OpenCode / Codex). Lets a prompt like `{{skill_prefix}}restack`
+    // route to the right skill regardless of which harness receives it.
+    // See `actionSkillPrefix` for how the target harness is picked.
+    skill_prefix: skillPrefix,
   };
+}
+
+/**
+ * Pick the harness whose skill-invocation prefix goes into `{{skill_prefix}}`
+ * for this action launch.
+ *
+ *  - `target: "session"` prompts are injected into the row's live primary
+ *    harness session, so the prefix must match that harness's skill syntax.
+ *  - `kind: "shell"` actions run raw shell; if they reference
+ *    `{{skill_prefix}}` at all it's to construct a skill call for the
+ *    operator's current harness, so primary is the best guess.
+ *  - Headless claude actions (the default `target`) always run `claude -p`,
+ *    so the prefix is claude's regardless of the selected primary — a
+ *    `/restack` prompt sent to the claude binary stays `/restack` even when
+ *    the row's primary is Codex.
+ *  - `def === null` is the "Custom prompt…" entry, which is also headless
+ *    claude, so it uses claude's prefix too.
+ */
+function actionSkillPrefix(
+  def: ActionDef | null,
+  primaryHarness: HarnessId,
+): string {
+  if (def?.kind === "shell" || (def?.kind === "claude" && def.target === "session")) {
+    return getHarness(primaryHarness).skillPrefix;
+  }
+  return getHarness("claude").skillPrefix;
 }
 
 /**
@@ -2770,7 +2801,7 @@ export function App({ onExit }: Props) {
         return;
       }
     }
-    const baseVars = buildActionVars(row);
+    const baseVars = buildActionVars(row, actionSkillPrefix(def, primaryHarness));
     // `{{arg}}` substitution lives alongside the row-derived vars. The
     // value, when present, came from the action-arg picker; gets folded
     // in for both shell and claude actions (including session-target).
@@ -5060,7 +5091,12 @@ export function App({ onExit }: Props) {
           extras={modal.state.extras}
           vars={(() => {
             const row = rows.find((r) => r.wt.slug === modal.state.slug);
-            return row ? buildActionVars(row) : {};
+            return row
+              ? buildActionVars(
+                  row,
+                  actionSkillPrefix(modal.state.def, primaryHarness),
+                )
+              : {};
           })()}
         />
       ) : null}

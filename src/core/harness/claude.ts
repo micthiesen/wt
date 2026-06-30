@@ -62,6 +62,8 @@ export const claudeHarness: Harness = {
   // Claude gets a unique tmux name per managed session, so multiple
   // sessions coexist per slug — not a single shared slot.
   singleSlot: false,
+  // Claude Code skills are invoked with a `/` prefix (e.g. /restack).
+  skillPrefix: "/",
 
   tmuxSessionName(slug, managedName) {
     return claudeTmuxName(slug, managedName);

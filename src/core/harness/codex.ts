@@ -57,6 +57,8 @@ export const codexHarness: Harness = {
   glyph: CODEX_GLYPH,
   color: CODEX_COLOR,
   singleSlot: true,
+  // Codex skills are invoked with a `$` prefix (e.g. $restack).
+  skillPrefix: "$",
 
   tmuxSessionName(slug, _managedName) {
     // Single-tmux-per-slug for v1. The managedName is ignored — codex

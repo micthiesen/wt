@@ -169,8 +169,13 @@ const log = createLogger("[actions]");
  * (no braces); the renderer wraps them as `{{name}}` when scanning.
  *
  * Currently produced at `tui/app.tsx`'s `launchAction` from the row +
- * config. Kept loose (`Record<string, string>`) so adding a new var is
- * a one-liner at the callsite — no schema dance.
+ * config. The full set: `base`, `base_branch`, `branch`, `slug`, `cwd`,
+ * `pr`, `stage`, `arg` (when the action collects one), and
+ * `skill_prefix` (the harness skill-invocation prefix — `/` for Claude
+ * Code, `$` for OpenCode / Codex; see `actionSkillPrefix` in
+ * `tui/app.tsx` for how the target harness is picked per launch).
+ * Kept loose (`Record<string, string>`) so adding a new var is a
+ * one-liner at the callsite — no schema dance.
  */
 export type ActionVars = Readonly<Record<string, string>>;
 

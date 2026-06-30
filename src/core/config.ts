@@ -192,6 +192,12 @@ export type AiConfig = OpenAiAiConfig | GeminiAiConfig;
  * — see `buildActionVars` in `tui/app.tsx` for the full set. Unknown
  * vars pass through unchanged so typos surface in the rendered prompt.
  *
+ * `{{skill_prefix}}` is the harness skill-invocation prefix (`/` for
+ * Claude Code, `$` for OpenCode / Codex), chosen per launch based on
+ * the action's target — session-target actions follow the row's
+ * primary harness, headless `claude -p` actions always use claude's.
+ * Use it for any prompt that invokes a named skill: `{{skill_prefix}}restack`.
+ *
  * When `[[actions]]` is absent the built-in defaults take effect; when
  * it's present (even with one entry), the user's list is authoritative
  * — the way to drop a default is to list everything except it.
