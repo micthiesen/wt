@@ -202,6 +202,11 @@ function configDir(): string {
  *    `allow-passthrough on` lets desktop notifications + the progress
  *    bar reach the outer terminal instead of being swallowed by tmux.
  *    All three are the official Anthropic-recommended tmux config.
+ *  - Clipboard: the `MouseDragEnd1Pane` bindings pipe a finished mouse
+ *    selection to `pbcopy` so drag-and-release lands in the macOS
+ *    clipboard instead of only tmux's internal buffer (macOS-only,
+ *    like the rest of wt). `set-clipboard on` + the `:clipboard`
+ *    feature enable the OSC 52 path for inner programs' own copy keys.
  *  - `unbind C-b` + F10/F11/F12 all bound to detach-client: kill the
  *    tmux prefix entirely; each F-key is a single-press detach.
  *    Symmetric with the wt-side bindings — whichever F-key the user
@@ -225,6 +230,10 @@ set -ag update-environment "COLORTERM"
 set -g allow-passthrough on
 set -s extended-keys on
 set -as terminal-features ",${outerTerm}:extkeys"
+set -s set-clipboard on
+set -as terminal-features ",${outerTerm}:clipboard"
+bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel pbcopy
+bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel pbcopy
 unbind C-b
 bind-key -n F10 detach-client
 bind-key -n F11 detach-client
