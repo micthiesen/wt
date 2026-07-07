@@ -7,27 +7,35 @@ import {
 } from "./zed-windows.ts";
 
 /**
- * If Alacritty is frontmost, send Cmd+H so the window hides — matches
- * the manual shortcut. No-op from other terminals. Best-effort; any
- * error (missing osascript, no accessibility perms, sandboxed
- * terminal) is swallowed because this is purely cosmetic UX.
+ * If Alacritty is frontmost, hide it — same visual effect as Cmd+H.
+ * No-op from other terminals. Best-effort; any error (missing osascript,
+ * no automation perms, sandboxed terminal) is swallowed because this is
+ * purely cosmetic UX.
+ *
+ * Hides via a process-property write (`set visible ... to false`) rather
+ * than a synthetic Cmd+H keystroke. Sending keystrokes needs the stricter
+ * Accessibility TCC permission, which a macOS or Alacritty update can
+ * silently reset — leaving the frontmost read working (that only needs
+ * Automation) while the keystroke fails with "not allowed to send
+ * keystrokes (1002)", which the catch swallowed, so the hide quietly
+ * no-oped. Setting `visible` needs only Automation, the same bucket the
+ * frontmost query already relies on, so the two can't drift apart.
+ *
+ * One osascript call does both the frontmost check and the hide, closing
+ * the window where focus could change between two separate invocations.
+ * `ignoring case` covers osascript returning either `alacritty` or the
+ * marketing-name `Alacritty` across macOS versions.
  */
 export async function hideFrontmostAlacritty(): Promise<void> {
   try {
-    const frontmostProc = await run([
-      "osascript",
-      "-e",
-      'tell application "System Events" to name of first application process whose frontmost is true',
-    ]);
-    // osascript on some macOS versions returns the lowercased process
-    // name (`alacritty`) and on others returns the marketing name
-    // (`Alacritty`). Compare case-insensitively.
-    const frontmost = frontmostProc.stdout.trim().toLowerCase();
-    if (frontmost !== "alacritty") return;
     await run([
       "osascript",
-      "-e",
-      'tell application "System Events" to key code 4 using {command down}',
+      "-e", 'tell application "System Events"',
+      "-e", "set p to first application process whose frontmost is true",
+      "-e", "ignoring case",
+      "-e", 'if name of p is "alacritty" then set visible of p to false',
+      "-e", "end ignoring",
+      "-e", "end tell",
     ]);
   } catch (err) {
     void err;
