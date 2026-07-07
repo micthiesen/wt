@@ -19,7 +19,12 @@ import {
   setSessionSlugChangeSink,
   setSessionTriggerSink,
 } from "../core/session-tail.ts";
-import { WorktreeWatchSet, watchRefs } from "../core/repo-watch.ts";
+import {
+  WorktreeWatchSet,
+  watchRefs,
+  watchWorktreesAdmin,
+  watchWtStateFiles,
+} from "../core/repo-watch.ts";
 import { startLoopLagProbe } from "../core/perf.ts";
 import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
 import { reapOrphanedSessions } from "../core/tmux.ts";
@@ -27,7 +32,7 @@ import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
 import { qk } from "../state/keys.ts";
-import type { TmuxSessionsData } from "../state/queries.ts";
+import { fetchOriginQuery, type TmuxSessionsData } from "../state/queries.ts";
 import type { Worktree } from "../core/types.ts";
 
 import { App, type TuiExit } from "./app.tsx";
@@ -134,18 +139,48 @@ export async function runTui(): Promise<TuiExit> {
   // queue state. Only armed when `[github.events]` is configured; otherwise
   // the github query stays on its poll cadence. `keepPreviousData` keeps the
   // pane painted across the refetch.
+  //
+  // Each delivery also kicks a `git fetch origin` (staleTime-gated to at
+  // most one per minute): a PR merging advances origin/main, and without a
+  // fetch the behind-counts and merged/gone badges sit on stale local refs
+  // until a manual `r`. The fetch's ref updates then flow back through the
+  // refs watcher above — one push event drives the whole cascade.
   const stopGithubEventsWatch = config.github.events
     ? watchGithubEvents(() => {
         Promise.all([
           wtClient.client.invalidateQueries({ queryKey: ["github"] }),
           wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
         ]).catch(() => {});
+        wtClient.client.fetchQuery(fetchOriginQuery()).catch(() => {});
       })
     : null;
-  const worktreeWatchSet = new WorktreeWatchSet((slug) => {
-    wtClient.client
-      .invalidateQueries({ queryKey: qk.wt(slug).dirty() })
-      .catch(() => {});
+  // Worktree membership changes (`git worktree add/remove` from any
+  // process — `wt new` in a shell, `/split` in a Claude session, the
+  // detached destroy finishing) → refresh the worktree list. The refs
+  // watcher can't see these: worktree admin lives under `.git/worktrees/`,
+  // not `refs/`.
+  const stopWorktreesAdminWatch = watchWorktreesAdmin(
+    config.paths.mainClone,
+    () => {
+      wtClient.client
+        .invalidateQueries({ queryKey: qk.worktrees() })
+        .catch(() => {});
+    },
+  );
+  // Cross-process state.json / archive.json writes (CLI stack ops, `wt
+  // base set`, another wt instance) → refresh the matching query so
+  // sections, stack manifests, and the archived set track external
+  // mutations live.
+  const stopWtStateWatch = watchWtStateFiles((file) => {
+    const key = file === "state" ? qk.wtState() : qk.archive();
+    wtClient.client.invalidateQueries({ queryKey: key }).catch(() => {});
+  });
+  const worktreeWatchSet = new WorktreeWatchSet((slug, area) => {
+    // `.sst/` writes flip the deploy badge (deploys + removes always
+    // write there); everything else is a working-tree edit → dirty.
+    const key =
+      area === "sst" ? qk.wt(slug).deploy() : qk.wt(slug).dirty();
+    wtClient.client.invalidateQueries({ queryKey: key }).catch(() => {});
   });
   // Reconcile the per-worktree watcher set against the worktrees query.
   // Skip `isMain` — the main clone's tree is heavy (node_modules) and
@@ -272,6 +307,20 @@ export async function runTui(): Promise<TuiExit> {
     }
   });
 
+  // Periodic `git fetch origin` backstop so origin-relative state
+  // (behind counts, merged/gone badges) tracks the remote without a
+  // manual `r`. Complements the webhook-marker fetch above: the marker
+  // covers PR activity on the user's own branches, this interval covers
+  // everything else (teammates pushing to main, repos without the
+  // events daemon). The fetch itself is silent when nothing changed;
+  // when refs DO move, the refs watcher fans out the invalidations —
+  // no extra plumbing here. Errors (offline, transient network) are
+  // swallowed; the next tick retries.
+  const FETCH_ORIGIN_INTERVAL_MS = 3 * 60 * 1000;
+  const fetchOriginTimer = setInterval(() => {
+    wtClient.client.fetchQuery(fetchOriginQuery()).catch(() => {});
+  }, FETCH_ORIGIN_INTERVAL_MS);
+
   // Opt-in (`WT_PERF=1`) probe that logs whenever the single JS thread
   // is blocked long enough to drop a frame / stall a keypress. Used to
   // confirm the diff-pool offload actually unblocked the render thread.
@@ -303,11 +352,14 @@ export async function runTui(): Promise<TuiExit> {
       void err;
     }
     detachFetchLogs();
+    clearInterval(fetchOriginTimer);
     stopLoopLagProbe();
     disposeDiffPool();
     stopRegistryWatch();
     stopRefsWatch();
     stopGithubEventsWatch?.();
+    stopWorktreesAdminWatch();
+    stopWtStateWatch();
     unsubWorktrees();
     worktreeWatchSet.dispose();
     stopCodexEvents();

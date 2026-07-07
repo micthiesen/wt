@@ -6,7 +6,14 @@ import { config } from "./config.ts";
 import { withFileLock } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 
-const STATE_FILE = join(homedir(), ".cache", "wt", "state.json");
+/**
+ * Directory holding the cross-process state files (`state.json` here,
+ * `archive.json` in archive.ts). Exported so the TUI's state-file
+ * watcher (`watchWtStateFiles` in repo-watch.ts) observes the same
+ * location these writers target.
+ */
+export const WT_STATE_DIR = join(homedir(), ".cache", "wt");
+const STATE_FILE = join(WT_STATE_DIR, "state.json");
 const log = createLogger("[wtstate]");
 
 /**

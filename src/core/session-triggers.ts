@@ -40,9 +40,11 @@ type TriggerRule = {
 const TRIGGER_RULES: readonly TriggerRule[] = [
   // PR lifecycle — create / merge / ready / edit / close / reopen all
   // change GitHub-side state the slow `["github"]` poll won't surface
-  // for a while.
+  // for a while. review / comment cover reviews submitted from a
+  // session (e.g. /review-pr), which move PRs out of the
+  // review-requests section.
   {
-    match: /\bgh\s+pr\s+(?:create|merge|ready|edit|close|reopen)\b/,
+    match: /\bgh\s+pr\s+(?:create|merge|ready|edit|close|reopen|review|comment)\b/,
     target: "github",
   },
   // A push starts CI remotely; the checks badge should refetch.
