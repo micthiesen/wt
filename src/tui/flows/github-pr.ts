@@ -13,6 +13,7 @@ import {
   editReviewers,
   enableAutoMerge,
   markPullRequestReady,
+  streamFailedRunLog,
 } from "../../core/github.ts";
 import { createLogger } from "../../core/logger.ts";
 import type { PullRequest } from "../../core/types.ts";
@@ -259,5 +260,46 @@ export function makeGithubPrFlows(ctx: GithubPrFlowsCtx) {
     toast(`shipped #${prNumber}`, theme.ok, 2500);
   }
 
-  return { doMarkReady, doAutoMerge, doShipPr };
+  /**
+   * `f` — tail the failed-job logs of this PR's most recent failed CI run
+   * into the activity pane (`gh run view --log-failed`), so a red check
+   * can be diagnosed without a browser trip. Refuses when the PR's checks
+   * aren't failing. Output is capped so a giant log can't flood the pane;
+   * the tail keeps draining silently past the cap.
+   */
+  async function doTailFailedChecks(slug: string): Promise<void> {
+    const log = createLogger(slug);
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (!row?.pr) {
+      toast("no PR for this row", theme.warn, 2000);
+      return;
+    }
+    if (row.pr.checks !== "fail") {
+      toast("no failing checks", theme.info, 2000);
+      return;
+    }
+    const branch = row.wt.branch;
+    const names = row.pr.failedChecks;
+    log.event.warn(
+      `failing: ${names.length > 0 ? names.join(", ") : "checks"} — fetching logs…`,
+    );
+    toast("fetching failed CI logs…", theme.info, 2500);
+    const CAP = 200;
+    let emitted = 0;
+    const res = await streamFailedRunLog(branch, (line) => {
+      if (emitted < CAP) log.event.dim(line);
+      else if (emitted === CAP) {
+        log.event.dim(`… (truncated at ${CAP} lines; \`gh run view --log-failed\` for the rest)`);
+      }
+      emitted++;
+    });
+    if (!res.ok) {
+      log.event.err(`failed CI logs: ${res.reason}`);
+      toast(`failed logs: ${res.reason}`, theme.err, 4000);
+      return;
+    }
+    log.event.ok(`failed CI logs for ${branch} (${Math.min(emitted, CAP)} shown)`);
+  }
+
+  return { doMarkReady, doAutoMerge, doShipPr, doTailFailedChecks };
 }

@@ -1573,7 +1573,7 @@ export function App({ onExit }: Props) {
 
   // GitHub PR mutation flows — extracted to `flows/github-pr.ts`.
   // Rebuilt per render so the closures see fresh rows.
-  const { doMarkReady, doAutoMerge, doShipPr } = makeGithubPrFlows({
+  const { doMarkReady, doAutoMerge, doShipPr, doTailFailedChecks } = makeGithubPrFlows({
     rows,
     toast,
     mutate,
@@ -3638,6 +3638,12 @@ export function App({ onExit }: Props) {
         message: `Enable merge-when-ready for #${current.pr.number}?`,
         confirmLabel: "enable",
       });
+      return;
+    }
+    if (isPlainLetter(k, "f")) {
+      // Tail the failing PR's `--log-failed` CI logs into the activity
+      // pane. The flow refuses cleanly when checks aren't red.
+      void doTailFailedChecks(current.wt.slug);
       return;
     }
     if (isPlainLetter(k, "a")) {

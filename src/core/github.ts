@@ -2,7 +2,7 @@ import { statSync } from "node:fs";
 
 import { config, type PullRequestTarget } from "./config.ts";
 import { createLogger } from "./logger.ts";
-import { run } from "./proc.ts";
+import { run, runStreaming } from "./proc.ts";
 import type {
   AutoMergeMethod,
   Contributor,
@@ -136,6 +136,27 @@ function rollupChecks(raw: RawCheck[] | null | undefined): PrChecks {
   if (fail) return "fail";
   if (pending) return "pending";
   return "pass";
+}
+
+/**
+ * Names of the checks currently failing, using the same fail set +
+ * ignore filter as `rollupChecks`. Order preserved from the rollup;
+ * powers the details-pane "which checks failed" line and the
+ * `--log-failed` tail keybind. Empty unless something actually failed.
+ */
+function failingCheckNames(raw: RawCheck[] | null | undefined): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const c of raw) {
+    const name = checkName(c);
+    if (isIgnoredCheck(name)) continue;
+    const failed =
+      c.__typename === "CheckRun"
+        ? !!(c.conclusion && CHECK_FAIL_CONCLUSIONS.has(c.conclusion))
+        : c.state === "FAILURE" || c.state === "ERROR";
+    if (failed && name) out.push(name);
+  }
+  return out;
 }
 
 /**
@@ -588,6 +609,7 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
     isDraft: pr.isDraft,
     state: pr.state,
     checks: openPrChecks(pr.state, rollupChecks(contexts)),
+    failedChecks: pr.state === "OPEN" ? failingCheckNames(contexts) : [],
     review: rollupReview(
       pr.state,
       pr.reviewDecision,
@@ -1122,6 +1144,47 @@ export async function markPullRequestReady(
     log.error("mark ready failed", { prNumber, msg });
     return { ok: false, error: msg };
   }
+  return { ok: true };
+}
+
+/**
+ * Stream the failed-job logs of the most recent failed CI run for
+ * `branch` to `onLine`, via `gh run view <id> --log-failed`. Resolves
+ * the count of lines emitted, or a reason when gh is missing, no failed
+ * run exists (a check can fail as a bare `StatusContext` with no Actions
+ * run behind it), or gh errors. Read-only; safe to fire from a keybind.
+ */
+export async function streamFailedRunLog(
+  branch: string,
+  onLine: (line: string) => void,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!(await hasGh())) return { ok: false, reason: "gh CLI not found" };
+  const listed = await run(
+    [
+      "gh", "run", "list",
+      "--branch", branch,
+      "--status", "failure",
+      "--limit", "1",
+      "--json", "databaseId",
+    ],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  );
+  if (listed.exitCode !== 0) {
+    return { ok: false, reason: (listed.stderr || listed.stdout).trim() || "gh run list failed" };
+  }
+  let runs: Array<{ databaseId?: number }>;
+  try {
+    runs = JSON.parse(listed.stdout) as typeof runs;
+  } catch {
+    return { ok: false, reason: "could not parse gh run list" };
+  }
+  const runId = runs[0]?.databaseId;
+  if (runId === undefined) return { ok: false, reason: "no failed workflow run" };
+  const code = await runStreaming(
+    ["gh", "run", "view", String(runId), "--log-failed"],
+    { cwd: config.paths.mainClone, onLine },
+  );
+  if (code !== 0) return { ok: false, reason: `gh run view exited ${code}` };
   return { ok: true };
 }
 

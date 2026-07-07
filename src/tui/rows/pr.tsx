@@ -183,21 +183,32 @@ function buildPrSegments(
   if (pr.state === "OPEN") {
     const ck = checksLabel(pr.checks);
     if (ck) {
-      segs.push({
-        key: "checks",
-        tier: 3,
-        modes: [
-          {
-            width: 3 + Bun.stringWidth(ck.text),
-            render: () => (
-              <span fg={ck.fg}>
-                {ck.glyph}  {ck.text}
-              </span>
-            ),
-          },
-          { width: 0, render: () => null },
-        ],
+      const modes: Segment["modes"] = [];
+      // When checks are failing, name the culprits if we know them — but
+      // only as the widest mode, so `fitSegments` drops back to a bare
+      // "checks" (glyph still red) before it starts dropping other
+      // segments. The `--log-failed` keybind (`f`) tails their logs.
+      if (pr.checks === "fail" && pr.failedChecks.length > 0) {
+        const named = `checks: ${pr.failedChecks.join(", ")}`;
+        modes.push({
+          width: 3 + Bun.stringWidth(named),
+          render: () => (
+            <span fg={ck.fg}>
+              {ck.glyph}  {named}
+            </span>
+          ),
+        });
+      }
+      modes.push({
+        width: 3 + Bun.stringWidth(ck.text),
+        render: () => (
+          <span fg={ck.fg}>
+            {ck.glyph}  {ck.text}
+          </span>
+        ),
       });
+      modes.push({ width: 0, render: () => null });
+      segs.push({ key: "checks", tier: 3, modes });
     }
 
     // Review before rabbit: human review is the primary signal, CR

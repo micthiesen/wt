@@ -99,6 +99,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "m", label: "merge when ready (toggle auto-merge)" },
       { key: "e", label: "exit draft (mark ready for review)" },
       { key: "E", label: "ship: mark ready + request default_reviewer + arm auto-merge" },
+      { key: "f", label: "tail failed CI logs (gh run view --log-failed)" },
       { key: "v", label: "edit reviewers (picker · v v submits)" },
     ],
   },

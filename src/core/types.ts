@@ -117,6 +117,13 @@ export type PullRequest = {
   isDraft: boolean;
   state: "OPEN" | "CLOSED" | "MERGED";
   checks: PrChecks;
+  /**
+   * Names of the checks currently failing on this PR. Empty unless
+   * `checks === "fail"`. Drives the details-pane failing-check line and
+   * the `--log-failed` log tail; a `StatusContext` failure with no
+   * associated Actions run still appears here even though it has no log.
+   */
+  failedChecks: readonly string[];
   /** Aggregated review state. `none` for terminal PRs (merged/closed). */
   review: PrReview;
   /** Outstanding review requests (humans + bots). */
