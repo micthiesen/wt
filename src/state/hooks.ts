@@ -80,6 +80,8 @@
  */
 import { useMemo } from "react";
 import {
+  MutationObserver,
+  matchQuery,
   useQuery,
   useQueryClient,
   type QueryFilters,
@@ -170,110 +172,123 @@ export function useGithub(): UseQueryResult<GithubData, Error> {
 }
 
 /**
- * Per-filter serialization chain. Two `mutate()` calls against the same
- * filter prefix must run sequentially — call B snapshots the cache
- * AFTER call A's optimistic patch, so A's rollback would clobber B's
- * state. The TUI used to rely on "one mutation per keypress" but the
- * modal closes synchronously before the gh round-trip, so a fast user
- * could fire mark-ready then immediately reopen the reviewer picker
- * and submit while the first mutation was still mid-flight.
+ * Run a mutation with an optimistic cache patch and reconcile-on-settle.
+ * Module-level (takes the QueryClient explicitly) so it's directly
+ * testable; the TUI calls it through `useWtActions().mutate`.
  *
- * Module-scope so the chain survives across `useWtActions()` calls
- * (which return a fresh object every render). Map keys are
- * JSON-serialised filter prefixes; entries are deleted once the chain
- * settles to avoid unbounded growth.
+ * Pipeline: serialize against same-filter mutations (TanStack's
+ * mutation `scope` — same `scope.id` → the MutationCache runs them
+ * in submission order), cancel any in-flight refetches against
+ * `filter` (so they can't clobber the optimistic state on
+ * completion), snapshot every matching cache entry, write the patch
+ * (synchronous — the badge flips before the network call lands),
+ * await `run`, then invalidate the same filter (active refetch
+ * reconciles against server truth).
+ *
+ * Serialization matters: call B must snapshot the cache AFTER call
+ * A settles, or A's rollback would clobber B's state. That's also
+ * why the cancel/snapshot/patch live in the `mutationFn` rather
+ * than `onMutate` — TanStack fires `onMutate` immediately even for
+ * a scope-queued mutation (only the mutationFn waits its turn via
+ * `canRun`), which would snapshot A's optimistic state into B.
+ *
+ * Both success and failure paths invalidate (`onSettled`): on throw,
+ * rollback every captured snapshot to its prior value AND invalidate
+ * so a network error after server commit (rare but possible) gets
+ * reconciled rather than leaving the UI lying indefinitely. The
+ * settling invalidate is fire-and-forget so the next keypress isn't
+ * gated on a network round-trip; the architecture's "active refetch
+ * always" promise is best-effort if the refetch itself fails.
+ *
+ * `filter` is a queryKey prefix. The patch runs against every
+ * matching entry — for queries keyed by inputs the call site
+ * doesn't have (e.g. the github query keyed by sorted branch list,
+ * not PR number), this is what makes the helper work, but it also
+ * means the patch fn must be safe against entries that don't
+ * contain the target row (see `patchPullRequest`'s "no PR for
+ * branch → return data unchanged" path). Reconcile only happens
+ * for entries with active observers; cache entries observed by no
+ * one stay patched until eviction.
+ *
+ * Clobber guard: `cancelQueries` only cancels refetches in flight at
+ * call time — a background refetch that STARTS during the await
+ * window (e.g. an action-completion subscriber firing
+ * `refreshGithub()` mid-mutation) can resolve with pre-mutation
+ * server data and overwrite the patch. While `run` is in flight we
+ * subscribe to the query cache and re-apply the patch on top of any
+ * matching fetch-driven update (`manual` updates — i.e. our own
+ * `setQueryData` — are skipped, which is also what prevents the
+ * guard from recursing on itself). The settling invalidate still
+ * reconciles against true server state afterwards.
+ *
+ * `run` must throw on failure; mutations that return `{ ok: false,
+ * error }` should be wrapped to throw at the call site.
  */
-const mutationChains = new Map<string, Promise<void>>();
+export async function runOptimisticMutation<TData>(
+  qc: import("@tanstack/react-query").QueryClient,
+  opts: {
+    filter: QueryFilters;
+    patch: (prev: TData | undefined) => TData | undefined;
+    run: () => Promise<void>;
+  },
+): Promise<void> {
+  const { filter, patch, run } = opts;
+  // scope.id is the filter's queryKey serialized — falls back to a
+  // sentinel when no queryKey was supplied (no current callers omit
+  // it, but `QueryFilters` types it as optional).
+  const scopeId = filter.queryKey
+    ? JSON.stringify(filter.queryKey)
+    : "__nokey__";
+  let snapshots: Array<readonly [readonly unknown[], TData | undefined]> = [];
+  const observer = new MutationObserver<void, Error, void>(qc, {
+    scope: { id: scopeId },
+    // No `navigator.onLine` signal in a TUI — never let the retryer
+    // pause a mutation waiting for an "online" event that can't come.
+    networkMode: "always",
+    retry: false,
+    mutationFn: async () => {
+      await qc.cancelQueries(filter);
+      snapshots = qc.getQueriesData<TData>(filter);
+      qc.setQueriesData<TData>(filter, patch);
+      // Clobber guard (see docstring). `matchQuery` is the same
+      // predicate `invalidateQueries` uses, so guard coverage is
+      // exactly the entries the patch covered.
+      const unsubscribe = qc.getQueryCache().subscribe((event) => {
+        if (event.type !== "updated") return;
+        if (event.action.type !== "success") return;
+        if ((event.action as { manual?: boolean }).manual) return;
+        if (!matchQuery(filter, event.query)) return;
+        qc.setQueryData<TData>(event.query.queryKey, patch);
+      });
+      try {
+        await run();
+      } finally {
+        unsubscribe();
+      }
+    },
+    onError: () => {
+      for (const [key, value] of snapshots) {
+        qc.setQueryData([...key], value);
+      }
+    },
+    onSettled: () => {
+      void qc.invalidateQueries(filter);
+    },
+  });
+  await observer.mutate();
+}
 
 /** Imperative helpers that wrap the raw QueryClient for common ops. */
 export function useWtActions() {
   const qc = useQueryClient();
 
-  /**
-   * Run a mutation with an optimistic cache patch and reconcile-on-settle.
-   *
-   * Pipeline: serialize against the per-filter chain (so concurrent
-   * calls run in submission order), cancel any in-flight refetches
-   * against `filter` (so they can't clobber the optimistic state on
-   * completion), snapshot every matching cache entry, write the patch
-   * (synchronous — the badge flips before the network call lands),
-   * await `run`, then invalidate the same filter (active refetch
-   * reconciles against server truth).
-   *
-   * Both success and failure paths invalidate: on throw, rollback every
-   * captured snapshot to its prior value AND invalidate so a network
-   * error after server commit (rare but possible) gets reconciled
-   * rather than leaving the UI lying indefinitely. The trailing
-   * invalidates are fire-and-forget so the next keypress isn't gated
-   * on a network round-trip; the architecture's "active refetch
-   * always" promise is best-effort if the refetch itself fails.
-   *
-   * `filter` is a queryKey prefix. The patch runs against every
-   * matching entry — for queries keyed by inputs the call site
-   * doesn't have (e.g. the github query keyed by sorted branch list,
-   * not PR number), this is what makes the helper work, but it also
-   * means the patch fn must be safe against entries that don't
-   * contain the target row (see `patchPullRequest`'s "no PR for
-   * branch → return data unchanged" path). Reconcile only happens
-   * for entries with active observers; cache entries observed by no
-   * one stay patched until eviction.
-   *
-   * `run` must throw on failure; mutations that return `{ ok: false,
-   * error }` should be wrapped to throw at the call site.
-   *
-   * Caveat: `cancelQueries` only cancels in-flight refetches at call
-   * time. A new background refetch that starts during the await
-   * window (e.g. an action-completion subscriber firing
-   * `refreshGithub()` while a PR mutation is mid-flight) can resolve
-   * with pre-mutation server data and overwrite the optimistic patch.
-   * The settling invalidate eventually reconciles, so any drift is
-   * transient. Full immunity would require migrating to TanStack's
-   * `useMutation` with `mutationKey`-scoped optimistic updates.
-   */
-  async function mutate<TData>(opts: {
+  /** See `runOptimisticMutation` — this just binds the hook's client. */
+  function mutate<TData>(opts: {
     filter: QueryFilters;
     patch: (prev: TData | undefined) => TData | undefined;
     run: () => Promise<void>;
   }): Promise<void> {
-    const { filter, patch, run } = opts;
-    // chainKey is the filter's queryKey serialized — falls back to a
-    // sentinel when no queryKey was supplied (no current callers omit
-    // it, but `QueryFilters` types it as optional).
-    const chainKey = filter.queryKey
-      ? JSON.stringify(filter.queryKey)
-      : "__nokey__";
-    const prev = mutationChains.get(chainKey);
-    let release!: () => void;
-    const released = new Promise<void>((r) => {
-      release = r;
-    });
-    mutationChains.set(chainKey, released);
-    try {
-      // Wait for the prior call's settle, but don't propagate its error
-      // — each caller gets its own throw via `next` below. `prev` is
-      // already a `Promise<void>` so the `.catch(() => {})` here just
-      // turns a rejection into a no-op resolution.
-      if (prev) await prev.catch(() => {});
-      await qc.cancelQueries(filter);
-      const snapshots = qc.getQueriesData<TData>(filter);
-      qc.setQueriesData<TData>(filter, patch);
-      try {
-        await run();
-      } catch (err) {
-        for (const [key, value] of snapshots) qc.setQueryData(key, value);
-        void qc.invalidateQueries(filter);
-        throw err;
-      }
-      void qc.invalidateQueries(filter);
-    } finally {
-      release();
-      // Only delete if we're still the tail. A later call may have
-      // chained onto our `released` promise already; in that case
-      // they own the slot.
-      if (mutationChains.get(chainKey) === released) {
-        mutationChains.delete(chainKey);
-      }
-    }
+    return runOptimisticMutation(qc, opts);
   }
 
   return {
