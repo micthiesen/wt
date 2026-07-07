@@ -22,6 +22,8 @@ The TUI is split into three layers; respect the boundaries:
 - **Rows** — `src/tui/rows/*.tsx`. Pure-presentational modules declaring `{id, label, sources, render, visible?}`. Multiple rows can read from the same source; the source still fetches once.
 - **Driver** — `src/tui/panels/details.tsx`. Iterates the configured row list, computes the trailing staleness glyph, and renders the inline error message verbatim once retries are exhausted. Also owns the AI title/description band rendered above and below the row stack — the AI pipeline lives here, not in the row registry, because it's pane-level chrome rather than a row.
 
+`src/tui/app.tsx` holds the keyboard dispatcher, the modal union, and the picker key handlers — deliberately. The imperative flows it dispatches live in `src/tui/flows/` (`destroy.ts`, `sessions.ts`, `github-pr.ts` — per-render factories over a context object) and `src/tui/hooks/useActionDispatch.ts` (action launch + completion subscriber); pure helpers in `src/tui/app-helpers.ts`; title-bar badges in `src/tui/usage-badge.tsx`. New flow logic goes in a flows module, not back into app.tsx.
+
 User config in `~/.config/wt/config.toml` selects + orders rows. A row hides itself automatically when its source isn't configured (e.g. the `linear` row hides when `[issue_tracker.linear]` is absent).
 
 ## Stable files
