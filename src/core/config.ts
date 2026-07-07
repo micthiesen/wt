@@ -400,7 +400,7 @@ const GENERIC_DEFAULTS = {
     prTarget: "github" as const satisfies PullRequestTarget,
   },
   ui: {
-    rows: ["branch", "base", "linear", "stage", "pr", "claude", "git"] as const,
+    rows: ["branch", "base", "linear", "stage", "pr", "conflict", "claude", "git"] as const,
   },
   actions: [
     {

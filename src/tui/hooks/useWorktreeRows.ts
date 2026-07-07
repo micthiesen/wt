@@ -3,6 +3,7 @@ import { keepPreviousData, useQueries, useQuery, useQueryClient } from "@tanstac
 
 import type { ClaudeStatus } from "../../core/claude.ts";
 import { config } from "../../core/config.ts";
+import type { MergeConflictProbe } from "../../core/git.ts";
 import type { GitActivity } from "../../core/git-activity.ts";
 import { pickPrForWorktree } from "../../core/github.ts";
 import { lockAge, lockLabel } from "../../core/locks.ts";
@@ -32,6 +33,7 @@ import {
   wtDiffContextQuery,
   wtDirtyQuery,
   wtFirstCommitQuery,
+  wtConflictQuery,
   wtGitActivityQuery,
   wtGoneQuery,
   wtLockQuery,
@@ -67,6 +69,7 @@ export type WorktreeFields = {
   sync: FieldState<SyncState>;
   claude: FieldState<ClaudeStatus>;
   gitActivity: FieldState<GitActivity>;
+  conflict: FieldState<MergeConflictProbe>;
 };
 
 /**
@@ -185,6 +188,7 @@ const FIELD_ORDER = [
   "sync",
   "claude",
   "gitActivity",
+  "conflict",
 ] as const;
 
 export type WorktreeRowsResult = {
@@ -514,6 +518,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     wtSyncQuery(wt, bases[i]!),
     wtClaudeQuery(wt),
     wtGitActivityQuery(wt, bases[i]!),
+    wtConflictQuery(wt, bases[i]!),
   ]);
 
   // `combine` runs on every render with the latest results — cheap since
@@ -598,6 +603,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       sync: reuseField(prev?.fields.sync, toFieldState(fieldArr[5] as FieldState<SyncState>)),
       claude: reuseField(prev?.fields.claude, toFieldState(fieldArr[6] as FieldState<ClaudeStatus>)),
       gitActivity: reuseField(prev?.fields.gitActivity, toFieldState(fieldArr[7] as FieldState<GitActivity>)),
+      conflict: reuseField(prev?.fields.conflict, toFieldState(fieldArr[8] as FieldState<MergeConflictProbe>)),
     };
     const nextStatus = deriveStatus(wt, fields);
     const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
@@ -664,6 +670,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
       prev.fields.sync === fields.sync &&
       prev.fields.claude === fields.claude &&
       prev.fields.gitActivity === fields.gitActivity &&
+      prev.fields.conflict === fields.conflict &&
       prev.status === status &&
       prev.pr === pr &&
       prev.mq === mq &&

@@ -37,6 +37,52 @@ export async function effectiveBaseOrTrunk(
   return (await revParse(effectiveBase, wtPath)) ? effectiveBase : trunk;
 }
 
+export type MergeConflictProbe =
+  | { status: "clean"; base: string }
+  | { status: "conflict"; base: string; files: readonly string[] }
+  | { status: "unknown"; base: string };
+
+/**
+ * Dry-run merge of `headRef` against `base` via `git merge-tree
+ * --write-tree` — a real 3-way merge in the object database that never
+ * touches a working tree or index. Approximates "will `headRef` rebase
+ * cleanly onto `base`": exit 0 = clean, exit 1 = conflict, anything else
+ * = unknown (rendered without any glyph).
+ *
+ * The exit-1 case is overloaded: git returns it BOTH for a real conflict
+ * AND for an unresolvable ref ("not something we can merge", which it
+ * prints to stderr with an empty stdout). A genuine conflict always
+ * writes the result tree OID to stdout first, so non-empty stdout is
+ * what tells the two apart — a bare exit code would false-positive a
+ * conflict glyph onto any worktree whose base ref has gone missing.
+ *
+ * It's a merge, not a rebase replay, so for a multi-commit branch it's a
+ * strong hint rather than a guarantee — good enough to warn before a
+ * restack, cheap enough to run per row.
+ */
+export async function mergeConflictProbe(
+  headRef: string,
+  base: string,
+  cwd?: string,
+): Promise<MergeConflictProbe> {
+  const r = await gitRun(
+    ["merge-tree", "--write-tree", "--name-only", "--no-messages", base, headRef],
+    cwd,
+  );
+  if (r.exitCode === 0) return { status: "clean", base };
+  if (r.exitCode === 1 && r.stdout.trim()) {
+    // stdout: "<tree-oid>\n<file>\n<file>…" — first line is the result
+    // tree OID, the rest are the conflicting paths.
+    const files = r.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(1);
+    return { status: "conflict", base, files };
+  }
+  return { status: "unknown", base };
+}
+
 /**
  * Resolve a ref to its commit SHA in `cwd` (default: the main clone),
  * or null when it doesn't resolve. The one canonical rev-parse helper —

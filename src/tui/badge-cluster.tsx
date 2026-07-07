@@ -41,14 +41,17 @@ export function badgeClusterCells(
   // Action and harness-glyph slots coexist (e.g. a row running an
   // action while hosting a live session shows both glyphs).
   const showSessionSlot = activeHarnessId !== undefined;
+  const conflict = hasConflict(row);
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
+    conflict ||
     !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (actionRunning) cells += 2;
   if (showSessionSlot) cells += 2;
+  if (conflict) cells += 2;
   if (rabbitHint(row)) cells += 2;
   if (reviewHint(row)) cells += 2;
   // The PR-state slot doubles as the merge-queue slot: a queued PR
@@ -105,6 +108,16 @@ function checkGlyph(row: WorktreeRow): Badge {
   const pr = row.pr;
   if (!pr || pr.state !== "OPEN") return { glyph: "  ", fg: theme.fgDim };
   return checkBadge(pr.checks) ?? { glyph: "  ", fg: theme.fgDim };
+}
+
+/**
+ * True when the rebase-conflict pre-flight determined HEAD won't merge
+ * cleanly onto its base. Only the `conflict` verdict shows a glyph —
+ * `clean` and `unknown` (unresolved ref, ancient git, still loading)
+ * stay silent, so the cluster reads "absence == fine".
+ */
+function hasConflict(row: WorktreeRow): boolean {
+  return row.fields.conflict.data?.status === "conflict";
 }
 
 /**
@@ -180,9 +193,11 @@ export function BadgeCluster({
   // harness glyph (tinted with the harness's own color). They coexist
   // so a row running an action while hosting a live session shows both.
   const showSessionSlot = activeHarnessId !== undefined;
+  const conflict = hasConflict(row);
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
+    conflict ||
     !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return null;
   return (
@@ -191,6 +206,14 @@ export function BadgeCluster({
       {actionRunning ? (
         <box width={2} flexShrink={0}>
           <text fg={theme.ok}>{NF.comment}</text>
+        </box>
+      ) : null}
+      {/* Rebase-conflict warning — sits just left of the PR-signal
+          sub-cluster so it reads as "this branch/PR won't land cleanly".
+          Dimmed on archived rows like the rest of the cluster. */}
+      {conflict ? (
+        <box width={2} flexShrink={0}>
+          <text fg={row.archived ? theme.fgDim : theme.err}>{NF.conflict}</text>
         </box>
       ) : null}
       {/* Ephemeral / scattered badges are left-anchored so they don't

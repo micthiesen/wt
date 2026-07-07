@@ -123,6 +123,13 @@ export const qk = {
        */
       diffContext: (base: string) =>
         ["wt", slug, "diffContext", base] as const,
+      /**
+       * Rebase-conflict pre-flight vs the effective base (a `git
+       * merge-tree` dry-run). Base in the key for the same reason as
+       * `sync` / `gitActivity` / `diffContext`: the answer depends on
+       * which base we'd rebase onto.
+       */
+      conflict: (base: string) => ["wt", slug, "conflict", base] as const,
     }) as const,
   /**
    * AI summary keyed by content hash of the diff. Equivalent diffs

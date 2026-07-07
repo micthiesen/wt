@@ -53,6 +53,11 @@ export const NF = {
 	// `badges.ts` rule #1's "if possible" caveat.
 	carrot: "\u{EF3B}", // nf-md-carrot
 
+	// Rebase-conflict pre-flight: HEAD won't merge/rebase cleanly onto its
+	// base. Warning triangle (distinct from the CI `checkFail` x_circle so
+	// a red conflict glyph doesn't read as a failed check).
+	conflict: "\u{F421}", // nf-oct-alert
+
 	// Other badges
 	mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — merge-queue position badge
 	bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed

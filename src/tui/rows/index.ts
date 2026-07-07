@@ -9,6 +9,7 @@
 import { baseRow } from "./base.tsx";
 import { branchRow } from "./branch.tsx";
 import { claudeRow } from "./claude.tsx";
+import { conflictRow } from "./conflict.tsx";
 import { gitRow } from "./git.tsx";
 import { linearRow } from "./linear.tsx";
 import { pathRow } from "./path.tsx";
@@ -23,6 +24,7 @@ const REGISTRY: readonly RowModule[] = [
   linearRow,
   stageRow,
   prRow,
+  conflictRow,
   claudeRow,
   gitRow,
 ];

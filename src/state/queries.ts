@@ -23,7 +23,7 @@ import { config } from "../core/config.ts";
 import { snapshotForBranches } from "../core/events/store.ts";
 import { readWtState, type WtState } from "../core/wtstate.ts";
 import { claudeStatus, type ClaudeStatus } from "../core/claude.ts";
-import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents } from "../core/git.ts";
+import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mergeConflictProbe, type MergeConflictProbe } from "../core/git.ts";
 import { gitActivity, type GitActivity } from "../core/git-activity.ts";
 import type { DiffContext } from "../core/diff/index.ts";
 import { buildDiffContextViaPool } from "../core/diff/pool.ts";
@@ -505,6 +505,28 @@ export const wtGitActivityQuery = (
     queryKey: qk.wt(wt.slug).gitActivity(base),
     queryFn: async (): Promise<GitActivity> =>
       gitActivity({ path: wt.path, branch: wt.branch }, base),
+    staleTime: STALE.mid,
+    ...KEEP_PREV,
+  });
+};
+
+/**
+ * Rebase-conflict pre-flight: a `git merge-tree` dry-run of this
+ * worktree's HEAD against its effective base (the parent branch for a
+ * stacked slice, `origin/<trunk>` otherwise). Side-effect-free — never
+ * touches the working tree. Keyed by base like `sync` / `gitActivity`;
+ * the `.git/refs` watcher's `["wt"]` invalidation refetches it on any
+ * commit / fetch / push, so it tracks reality without its own trigger.
+ */
+export const wtConflictQuery = (
+  wt: Pick<Worktree, "slug" | "path">,
+  effectiveBase?: string | null,
+) => {
+  const base = effectiveBase ?? `origin/${config.branch.base}`;
+  return queryOptions({
+    queryKey: qk.wt(wt.slug).conflict(base),
+    queryFn: async (): Promise<MergeConflictProbe> =>
+      mergeConflictProbe("HEAD", base, wt.path),
     staleTime: STALE.mid,
     ...KEEP_PREV,
   });
