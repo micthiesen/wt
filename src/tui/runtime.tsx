@@ -34,6 +34,7 @@ import { createWtQueryClient } from "../state/index.ts";
 import { qk } from "../state/keys.ts";
 import { fetchOriginQuery, type TmuxSessionsData } from "../state/queries.ts";
 import type { Worktree } from "../core/types.ts";
+import type { QueryClient } from "@tanstack/react-query";
 
 import { App, type TuiExit } from "./app.tsx";
 import { events } from "./events.ts";
@@ -41,6 +42,69 @@ import { attachFetchLogs } from "./fetch-log.ts";
 import { SLOT_SLUGS } from "./session-slots.ts";
 
 const startupLog = createLogger("[startup]");
+
+const INVALIDATION_FLUSH_MS = 50;
+
+type InvalidationJob =
+  | { kind: "key"; key: readonly unknown[] }
+  | { kind: "claudeHarnessSessions" }
+  | { kind: "fetchOrigin" };
+
+class InvalidationScheduler {
+  private readonly jobs = new Map<string, InvalidationJob>();
+  private timer: Timer | null = null;
+  private disposed = false;
+
+  constructor(private readonly client: QueryClient) {}
+
+  key(key: readonly unknown[]): void {
+    this.enqueue({ kind: "key", key }, `key:${JSON.stringify(key)}`);
+  }
+
+  claudeHarnessSessions(): void {
+    this.enqueue({ kind: "claudeHarnessSessions" }, "claudeHarnessSessions");
+  }
+
+  fetchOrigin(): void {
+    this.enqueue({ kind: "fetchOrigin" }, "fetchOrigin");
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    this.jobs.clear();
+  }
+
+  private enqueue(job: InvalidationJob, id: string): void {
+    if (this.disposed) return;
+    this.jobs.set(id, job);
+    if (this.timer !== null) return;
+    this.timer = setTimeout(() => this.flush(), INVALIDATION_FLUSH_MS);
+  }
+
+  private flush(): void {
+    this.timer = null;
+    if (this.disposed) return;
+    const jobs = [...this.jobs.values()];
+    this.jobs.clear();
+    for (const job of jobs) {
+      if (job.kind === "key") {
+        this.client.invalidateQueries({ queryKey: job.key }).catch(() => {});
+      } else if (job.kind === "claudeHarnessSessions") {
+        this.client
+          .invalidateQueries({
+            predicate: (q) =>
+              q.queryKey[0] === "harnessSessions" &&
+              q.queryKey[1] === "claude",
+          })
+          .catch(() => {});
+      } else {
+        this.client.fetchQuery(fetchOriginQuery()).catch(() => {});
+      }
+    }
+  }
+}
 
 /**
  * Drop state.json + archive.json entries whose slug no longer exists
@@ -96,6 +160,7 @@ export async function runTui(): Promise<TuiExit> {
   });
 
   const wtClient = createWtQueryClient();
+  const invalidations = new InvalidationScheduler(wtClient.client);
   const detachFetchLogs = attachFetchLogs(wtClient.client);
   // fs-watch the claude session registry so the per-session "busy /
   // idle" indicator in the claude row flips the instant claude rewrites
@@ -104,26 +169,21 @@ export async function runTui(): Promise<TuiExit> {
   // top-level dir, no recursion. `.catch(noop)` swallows rejections
   // from invalidations that race a torn-down client during shutdown.
   const stopRegistryWatch = watchRegistry(() => {
-    Promise.all([
-      wtClient.client.invalidateQueries({ queryKey: qk.claudeRegistry() }),
-      // Claude's working/asking/waiting state is baked into the
-      // `harnessSessions` discovery cache (it reads the registry inside
-      // its queryFn), and that cache — not `claudeRegistry` — now drives
-      // the list-pane glyph tint and the details AI row. The registry
-      // write that just fired IS that state changing, so refresh the
-      // claude discovery too; otherwise the tint would only update on
-      // spawn/kill/manual-refresh. Scoped to claude + active observers
-      // (the live-slug fan-out), so it stays cheap.
-      wtClient.client.invalidateQueries({
-        predicate: (q) =>
-          q.queryKey[0] === "harnessSessions" && q.queryKey[1] === "claude",
-      }),
-      // A registry write also means a claude process started or exited,
-      // which is exactly when the tmux session set changes — refresh it
-      // here so the session badges flip on the event instead of the
-      // (now slower) polling backstop.
-      wtClient.client.invalidateQueries({ queryKey: qk.tmuxSessions() }),
-    ]).catch(() => {});
+    invalidations.key(qk.claudeRegistry());
+    // Claude's working/asking/waiting state is baked into the
+    // `harnessSessions` discovery cache (it reads the registry inside
+    // its queryFn), and that cache — not `claudeRegistry` — now drives
+    // the list-pane glyph tint and the details AI row. The registry
+    // write that just fired IS that state changing, so refresh the
+    // claude discovery too; otherwise the tint would only update on
+    // spawn/kill/manual-refresh. Scoped to claude + active observers
+    // (the live-slug fan-out), so it stays cheap.
+    invalidations.claudeHarnessSessions();
+    // A registry write also means a claude process started or exited,
+    // which is exactly when the tmux session set changes — refresh it
+    // here so the session badges flip on the event instead of the
+    // (now slower) polling backstop.
+    invalidations.key(qk.tmuxSessions());
   });
   // Local git activity → query invalidations. Coarse refs watcher fires
   // on commits, fetches, pushes, branch creates/deletes (anything that
@@ -131,12 +191,10 @@ export async function runTui(): Promise<TuiExit> {
   // working-tree edits and flip the dirty badge without waiting for
   // staleTime. Active observers refetch; cold queries stay cold.
   const stopRefsWatch = watchRefs(config.paths.mainClone, () => {
-    Promise.all([
-      wtClient.client.invalidateQueries({ queryKey: ["github"] }),
-      wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
-      wtClient.client.invalidateQueries({ queryKey: ["wt"] }),
-      wtClient.client.invalidateQueries({ queryKey: qk.wtState() }),
-    ]).catch(() => {});
+    invalidations.key(["github"]);
+    invalidations.key(qk.reviewRequests());
+    invalidations.key(["wt"]);
+    invalidations.key(qk.wtState());
   });
   // GitHub webhook deliveries → query invalidation. The `wt events` daemon
   // rewrites a marker file after each refetch; watching it is the push
@@ -152,11 +210,9 @@ export async function runTui(): Promise<TuiExit> {
   // refs watcher above — one push event drives the whole cascade.
   const stopGithubEventsWatch = config.github.events
     ? watchGithubEvents(() => {
-        Promise.all([
-          wtClient.client.invalidateQueries({ queryKey: ["github"] }),
-          wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
-        ]).catch(() => {});
-        wtClient.client.fetchQuery(fetchOriginQuery()).catch(() => {});
+        invalidations.key(["github"]);
+        invalidations.key(qk.reviewRequests());
+        invalidations.fetchOrigin();
       })
     : null;
   // Worktree membership changes (`git worktree add/remove` from any
@@ -167,9 +223,7 @@ export async function runTui(): Promise<TuiExit> {
   const stopWorktreesAdminWatch = watchWorktreesAdmin(
     config.paths.mainClone,
     () => {
-      wtClient.client
-        .invalidateQueries({ queryKey: qk.worktrees() })
-        .catch(() => {});
+      invalidations.key(qk.worktrees());
     },
   );
   // Cross-process state.json / archive.json writes (CLI stack ops, `wt
@@ -178,14 +232,14 @@ export async function runTui(): Promise<TuiExit> {
   // mutations live.
   const stopWtStateWatch = watchWtStateFiles((file) => {
     const key = file === "state" ? qk.wtState() : qk.archive();
-    wtClient.client.invalidateQueries({ queryKey: key }).catch(() => {});
+    invalidations.key(key);
   });
   const worktreeWatchSet = new WorktreeWatchSet((slug, area) => {
     // `.sst/` writes flip the deploy badge (deploys + removes always
     // write there); everything else is a working-tree edit → dirty.
     const key =
       area === "sst" ? qk.wt(slug).deploy() : qk.wt(slug).dirty();
-    wtClient.client.invalidateQueries({ queryKey: key }).catch(() => {});
+    invalidations.key(key);
   });
   // Reconcile the per-worktree watcher set against the worktrees query.
   // Skip `isMain` — the main clone's tree is heavy (node_modules) and
@@ -253,10 +307,8 @@ export async function runTui(): Promise<TuiExit> {
   // the race against a torn-down client during shutdown.
   setSessionTriggerSink((target) => {
     if (target === "github") {
-      Promise.all([
-        wtClient.client.invalidateQueries({ queryKey: ["github"] }),
-        wtClient.client.invalidateQueries({ queryKey: qk.reviewRequests() }),
-      ]).catch(() => {});
+      invalidations.key(["github"]);
+      invalidations.key(qk.reviewRequests());
     }
   });
   // The session tail already watches every live claude jsonl for the
@@ -265,9 +317,7 @@ export async function runTui(): Promise<TuiExit> {
   // count snap on turn end instead of waiting out the 5s poll. Scoped
   // tightly — only `qk.wt(slug).claude()`, nothing global.
   setSessionSlugChangeSink((slug) => {
-    wtClient.client
-      .invalidateQueries({ queryKey: qk.wt(slug).claude() })
-      .catch(() => {});
+    invalidations.key(qk.wt(slug).claude());
   });
 
   // Evict orphaned cache entries whose key shape changed across a wt
@@ -357,6 +407,7 @@ export async function runTui(): Promise<TuiExit> {
       void err;
     }
     detachFetchLogs();
+    invalidations.dispose();
     clearInterval(fetchOriginTimer);
     stopLoopLagProbe();
     disposeDiffPool();

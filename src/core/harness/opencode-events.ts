@@ -25,6 +25,7 @@ import { openDb } from "./opencode.ts";
 const log = createLogger("[opencode]");
 
 const POLL_INTERVAL_MS = 2_500;
+const POLL_SLUG_SPACING_MS = 25;
 /** Max per-session snapshot entries before LRU-trim. See `tick`. */
 const SNAPSHOT_CAP = 256;
 
@@ -124,21 +125,7 @@ let baselineEstablished = false;
 
 // ---------- tick logic ----------
 
-function tick(getActiveSlugs: () => Array<{ slug: string; wtPath: string }>): void {
-  const s = ensureStmts();
-  if (!s) return;
-
-  const activeSlugs = getActiveSlugs();
-  const isBaseline = !baselineEstablished;
-
-  for (const { slug, wtPath } of activeSlugs) {
-    try {
-      processSlug(s, slug, wtPath, isBaseline);
-    } catch (err) {
-      log.warn("opencode event poll error", { slug, err: String(err) });
-    }
-  }
-
+function trimSnapshots(): void {
   // Cap `snapshots` to keep memory bounded across long-running wt
   // processes. OpenCode sessions persist in the DB forever (until
   // archived), so each kill-and-respawn cycle adds a new entry that
@@ -152,8 +139,6 @@ function tick(getActiveSlugs: () => Array<{ slug: string; wtPath: string }>): vo
     if (oldest === undefined) break;
     snapshots.delete(oldest);
   }
-
-  baselineEstablished = true;
 }
 
 function seedSnapshot(s: Stmts, snapKey: string, session: SessionRow): void {
@@ -311,15 +296,58 @@ function emitResponseDone(
 export function startOpencodeEventPolling(
   getActiveSlugs: () => Array<{ slug: string; wtPath: string }>,
 ): () => void {
+  const timers = new Set<Timer>();
+  let running = false;
+
+  const schedule = (fn: () => void, delay: number): void => {
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      fn();
+    }, delay);
+    timers.add(timer);
+  };
+
+  const runTick = (): void => {
+    if (running) return;
+    const s = ensureStmts();
+    if (!s) return;
+    const activeSlugs = getActiveSlugs();
+    const isBaseline = !baselineEstablished;
+    if (activeSlugs.length === 0) {
+      trimSnapshots();
+      baselineEstablished = true;
+      return;
+    }
+    running = true;
+    activeSlugs.forEach(({ slug, wtPath }, i) => {
+      schedule(() => {
+        try {
+          processSlug(s, slug, wtPath, isBaseline);
+        } catch (err) {
+          log.warn("opencode event poll error", { slug, err: String(err) });
+        } finally {
+          if (i === activeSlugs.length - 1) {
+            trimSnapshots();
+            baselineEstablished = true;
+            running = false;
+          }
+        }
+      }, i * POLL_SLUG_SPACING_MS);
+    });
+  };
+
   const timer = setInterval(() => {
     try {
-      tick(getActiveSlugs);
+      runTick();
     } catch (err) {
       log.warn("opencode event tick threw", { err: String(err) });
+      running = false;
     }
   }, POLL_INTERVAL_MS);
 
   return () => {
     clearInterval(timer);
+    for (const pending of timers) clearTimeout(pending);
+    timers.clear();
   };
 }

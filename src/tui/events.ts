@@ -18,12 +18,13 @@ class EventLog {
   private events: readonly WtEvent[] = [];
   private listeners = new Set<Listener>();
   private nextId = 1;
+  private notifyTimer: Timer | null = null;
 
   append(partial: Omit<WtEvent, "id" | "ts">): WtEvent {
     const full: WtEvent = { id: this.nextId++, ts: Date.now(), ...partial };
     const next = [...this.events, full];
     this.events = next.length > MAX_EVENTS ? next.slice(-MAX_EVENTS) : next;
-    this.notify();
+    this.scheduleNotify();
     return full;
   }
 
@@ -36,6 +37,14 @@ class EventLog {
       this.listeners.delete(fn);
     };
   };
+
+  private scheduleNotify(): void {
+    if (this.notifyTimer !== null) return;
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
+      this.notify();
+    }, 16);
+  }
 
   private notify(): void {
     for (const l of this.listeners) l();

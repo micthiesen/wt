@@ -331,9 +331,13 @@ export function useWtActions() {
       ]);
       // The first-parent SHA set is not a TanStack query — it's a
       // module-level promise cache in core/git.ts, already dropped by
-      // invalidateMainFirstParents() inside fetchOriginQuery. Only the
-      // real per-worktree ["wt"] queries need invalidating here.
-      await qc.invalidateQueries({ queryKey: ["wt"] });
+      // invalidateMainFirstParents() inside fetchOriginQuery. The
+      // per-worktree ["wt"] wave is the expensive part, so start it on
+      // the next timer turn instead of keeping the key handler/caller
+      // parked behind every row's git/fs probes.
+      setTimeout(() => {
+        void qc.invalidateQueries({ queryKey: ["wt"] });
+      }, 50);
     },
     /**
      * Nuke every cached query — in-memory *and* the SQLite blob on

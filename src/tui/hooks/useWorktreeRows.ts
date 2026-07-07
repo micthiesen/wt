@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { keepPreviousData, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { ClaudeStatus } from "../../core/claude.ts";
@@ -21,6 +21,7 @@ import {
   GROUP_INBOX,
   STACK_SECTION_PREFIX,
   stackSectionKey,
+  type WtState,
 } from "../../core/wtstate.ts";
 import { useGithub } from "../../state/hooks.ts";
 import { qk } from "../../state/keys.ts";
@@ -191,6 +192,8 @@ const FIELD_ORDER = [
   "conflict",
 ] as const;
 
+const EMPTY_STATE_SLUGS: WtState["slugs"] = {};
+
 export type WorktreeRowsResult = {
   rows: WorktreeRow[];
   isLoading: boolean;
@@ -210,6 +213,32 @@ function toFieldState<T>(r: {
     isLoading: r.isLoading,
     error: r.error,
   };
+}
+
+type QuerySnapshot<T = unknown> = {
+  data: T | undefined;
+  isStale: boolean;
+  isFetching: boolean;
+  isLoading: boolean;
+  error: Error | null;
+};
+
+function combineQuerySnapshots(
+  results: readonly QuerySnapshot[],
+): readonly QuerySnapshot[] {
+  return results.map((r) => ({
+    data: r.data,
+    isStale: r.isStale,
+    isFetching: r.isFetching,
+    isLoading: r.isLoading,
+    error: r.error,
+  }));
+}
+
+function combineQueryData<T>(
+  results: readonly { data: T | undefined }[],
+): readonly (T | undefined)[] {
+  return results.map((r) => r.data);
 }
 
 /**
@@ -462,8 +491,8 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const github = useGithub();
   const archive = useQuery(archiveQuery());
   const wtState = useQuery(wtStateQuery());
-  const archivedSet = new Set(archive.data ?? []);
-  const stateSlugs = wtState.data?.slugs ?? {};
+  const archivedSet = useMemo(() => new Set(archive.data ?? []), [archive.data]);
+  const stateSlugs = wtState.data?.slugs ?? EMPTY_STATE_SLUGS;
   // Keyed by slug; lets us return the same `WorktreeRow` reference
   // across renders when nothing observable has changed. Without this,
   // every poll-driven refresh produces all-new row identities and
@@ -471,43 +500,53 @@ export function useWorktreeRows(): WorktreeRowsResult {
   const rowCache = useRef<Map<string, WorktreeRow>>(new Map());
   const rowsRef = useRef<WorktreeRow[]>([]);
 
-  const worktrees = (wtList.data ?? []).filter((w) => !w.isMain);
-
-  // Per-worktree PR lookup — used for the row's `pr` field further
-  // down. Hoisted so the GitHub map is only walked once per worktree
-  // per render.
-  const prsByIndex = worktrees.map((wt) =>
-    pickPrForWorktree(wt, github.data?.prs),
+  const worktrees = useMemo(
+    () => (wtList.data ?? []).filter((w) => !w.isMain),
+    [wtList.data],
   );
 
-  // Build the manifest layout index once per render: branch → (layout,
-  // node). This is the SOLE source of stack membership, order, and the
-  // diff base. A worktree whose branch isn't a manifest slice is flat.
-  const stackIndex = buildStackIndex(Object.values(wtState.data?.stacks ?? {}));
-  const stackEntryByIndex = worktrees.map((wt) => stackIndex.byBranch.get(wt.branch));
+  const rowLayout = useMemo(() => {
+    // Per-worktree PR lookup — used for the row's `pr` field further
+    // down. Hoisted so the GitHub map is only walked once per worktree
+    // per actual row-input change.
+    const prsByIndex = worktrees.map((wt) =>
+      pickPrForWorktree(wt, github.data?.prs),
+    );
 
-  // Holistic-origin worktrees: the branch a stack was carved from. Held
-  // separately from slices in the manifest, so it never appears in
-  // `byBranch`. We pin it to the bottom of its stack section (index past
-  // the last slice) and tag it `isHolistic` so the list renders it as a
-  // dim source node rather than a slice. `sliceCount` = node count, which
-  // is one past the last slice's `index`.
-  const holisticByBranch = new Map<string, { stackId: string; sliceCount: number }>();
-  for (const layout of stackIndex.layouts) {
-    const hb = layout.manifest.holisticBranch;
-    if (hb) holisticByBranch.set(hb, { stackId: layout.stackId, sliceCount: layout.nodes.length });
-  }
+    // Build the manifest layout index once per row-input change:
+    // branch → (layout, node). This is the SOLE source of stack
+    // membership, order, and the diff base. A worktree whose branch
+    // isn't a manifest slice is flat.
+    const stackIndex = buildStackIndex(Object.values(wtState.data?.stacks ?? {}));
+    const stackEntryByIndex = worktrees.map((wt) => stackIndex.byBranch.get(wt.branch));
 
-  // Resolve `stackedOn` (the diff base) once per render from the manifest
-  // entry (or the recorded fork base for non-slice worktrees). Single
-  // source of truth — every consumer (sync/git-activity/
-  // diff-context queries here, the diff query in `details.tsx`) reads
-  // through `row.stackedOn`, so they all land queries in the same
-  // per-(slug, base) cache slot.
-  const stackedOnByIndex = worktrees.map((wt, i) =>
-    resolveStackedOn(stackEntryByIndex[i], worktrees, stateSlugs[wt.slug]?.baseBranch),
-  );
-  const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
+    // Holistic-origin worktrees: the branch a stack was carved from.
+    // Held separately from slices in the manifest, so it never appears
+    // in `byBranch`. We pin it to the bottom of its stack section
+    // (index past the last slice) and tag it `isHolistic` so the list
+    // renders it as a dim source node rather than a slice.
+    const holisticByBranch = new Map<string, { stackId: string; sliceCount: number }>();
+    for (const layout of stackIndex.layouts) {
+      const hb = layout.manifest.holisticBranch;
+      if (hb) holisticByBranch.set(hb, { stackId: layout.stackId, sliceCount: layout.nodes.length });
+    }
+
+    // Resolve `stackedOn` (the diff base) once per row-input change
+    // from the manifest entry (or the recorded fork base for non-slice
+    // worktrees). Single source of truth — every consumer lands in the
+    // same per-(slug, base) cache slot.
+    const stackedOnByIndex = worktrees.map((wt, i) =>
+      resolveStackedOn(stackEntryByIndex[i], worktrees, stateSlugs[wt.slug]?.baseBranch),
+    );
+    const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
+    return {
+      prsByIndex,
+      stackEntryByIndex,
+      holisticByBranch,
+      stackedOnByIndex,
+      bases,
+    };
+  }, [worktrees, github.data?.prs, wtState.data?.stacks, stateSlugs]);
 
   const queries = worktrees.flatMap((wt, i) => [
     wtDirtyQuery(wt),
@@ -515,15 +554,17 @@ export function useWorktreeRows(): WorktreeRowsResult {
     wtDeployQuery(wt),
     wtMergedQuery(wt),
     wtGoneQuery(wt),
-    wtSyncQuery(wt, bases[i]!),
+    wtSyncQuery(wt, rowLayout.bases[i]!),
     wtClaudeQuery(wt),
-    wtGitActivityQuery(wt, bases[i]!),
-    wtConflictQuery(wt, bases[i]!),
+    wtGitActivityQuery(wt, rowLayout.bases[i]!),
+    wtConflictQuery(wt, rowLayout.bases[i]!),
   ]);
 
-  // `combine` runs on every render with the latest results — cheap since
-  // `useQueries` caches identity.
-  const results = useQueries({ queries });
+  // `combine` projects each query observer to the exact fields row
+  // derivation consumes. TanStack structurally shares this combined
+  // array, so unrelated App renders don't force the whole row pipeline
+  // to reconstruct.
+  const results = useQueries({ queries, combine: combineQuerySnapshots });
 
   // Diff context + AI summary observers for every worktree, so the list
   // panel can render LLM-generated titles next to each row. The cache is
@@ -555,9 +596,10 @@ export function useWorktreeRows(): WorktreeRowsResult {
   // worktree just to compute a hash nothing reads.
   const diffResults = useQueries({
     queries: worktrees.map((wt, i) => ({
-      ...wtDiffContextQuery(wt, bases[i]!),
+      ...wtDiffContextQuery(wt, rowLayout.bases[i]!),
       enabled: aiEnabled && !busyByIndex[i],
     })),
+    combine: combineQueryData,
   });
 
   // Hash-keyed AI summary: a diff change re-keys the query, the
@@ -566,13 +608,14 @@ export function useWorktreeRows(): WorktreeRowsResult {
   // mismatch effect required — the cache key change *is* the trigger.
   const aiResults = useQueries({
     queries: worktrees.map((wt, i) => {
-      const ctx = diffResults[i]?.data ?? null;
+      const ctx = diffResults[i] ?? null;
       return {
         ...aiSummaryQuery(wt.slug, ctx),
         enabled: aiEnabled && !busyByIndex[i] && !!ctx,
         placeholderData: keepPreviousData,
       };
     }),
+    combine: combineQueryData,
   });
 
   // First-commit subject — non-AI fallback for the title resolution
@@ -583,169 +626,183 @@ export function useWorktreeRows(): WorktreeRowsResult {
       ...wtFirstCommitQuery(wt),
       enabled: !busyByIndex[i],
     })),
+    combine: combineQueryData,
   });
 
-  // Effective order map populated during row construction so the
-  // section-aware sorter below can read it without re-walking the
-  // stack-section topology.
-  const effectiveOrders = new Map<string, number>();
+  const rows = useMemo(() => {
+    // Effective order map populated during row construction so the
+    // section-aware sorter below can read it without re-walking the
+    // stack-section topology.
+    const effectiveOrders = new Map<string, number>();
 
-  const unsorted: WorktreeRow[] = worktrees.map((wt, i) => {
-    const base = i * FIELD_ORDER.length;
-    const fieldArr = FIELD_ORDER.map((_, j) => results[base + j]!);
-    const prev = rowCache.current.get(wt.slug);
-    const fields: WorktreeFields = {
-      dirty: reuseField(prev?.fields.dirty, toFieldState(fieldArr[0] as FieldState<readonly string[]>)),
-      lock: reuseField(prev?.fields.lock, toFieldState(fieldArr[1] as FieldState<Partial<LockMeta> | null>)),
-      deploy: reuseField(prev?.fields.deploy, toFieldState(fieldArr[2] as FieldState<boolean>)),
-      merged: reuseField(prev?.fields.merged, toFieldState(fieldArr[3] as FieldState<boolean>)),
-      gone: reuseField(prev?.fields.gone, toFieldState(fieldArr[4] as FieldState<boolean>)),
-      sync: reuseField(prev?.fields.sync, toFieldState(fieldArr[5] as FieldState<SyncState>)),
-      claude: reuseField(prev?.fields.claude, toFieldState(fieldArr[6] as FieldState<ClaudeStatus>)),
-      gitActivity: reuseField(prev?.fields.gitActivity, toFieldState(fieldArr[7] as FieldState<GitActivity>)),
-      conflict: reuseField(prev?.fields.conflict, toFieldState(fieldArr[8] as FieldState<MergeConflictProbe>)),
-    };
-    const nextStatus = deriveStatus(wt, fields);
-    const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
-    const pr = prsByIndex[i];
-    const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
-    const stackedOn = stackedOnByIndex[i] ?? null;
-    const archived = archivedSet.has(wt.slug);
-    // Effective section: a manifest slice's stack section overrides the
-    // stored manual section. Archived rows skip the override so the
-    // archived bucket stays homogeneous at the bottom of the list.
-    const manualSection = stateSlugs[wt.slug]?.section ?? null;
-    const entry = archived ? undefined : stackEntryByIndex[i];
-    const node = entry?.node;
-    const holistic = archived || node ? undefined : holisticByBranch.get(wt.branch);
-    const stack: StackRowInfo | null = node
-      ? {
-          stackId: node.stackId,
-          ordinal: node.ordinal,
-          pos: node.pos,
-          lane: node.lane,
-          depth: node.depth,
-          index: node.index,
-          isHolistic: false,
-        }
-      : holistic
+    const unsorted: WorktreeRow[] = worktrees.map((wt, i) => {
+      const base = i * FIELD_ORDER.length;
+      const fieldArr = FIELD_ORDER.map((_, j) => results[base + j]!);
+      const prev = rowCache.current.get(wt.slug);
+      const fields: WorktreeFields = {
+        dirty: reuseField(prev?.fields.dirty, toFieldState(fieldArr[0] as FieldState<readonly string[]>)),
+        lock: reuseField(prev?.fields.lock, toFieldState(fieldArr[1] as FieldState<Partial<LockMeta> | null>)),
+        deploy: reuseField(prev?.fields.deploy, toFieldState(fieldArr[2] as FieldState<boolean>)),
+        merged: reuseField(prev?.fields.merged, toFieldState(fieldArr[3] as FieldState<boolean>)),
+        gone: reuseField(prev?.fields.gone, toFieldState(fieldArr[4] as FieldState<boolean>)),
+        sync: reuseField(prev?.fields.sync, toFieldState(fieldArr[5] as FieldState<SyncState>)),
+        claude: reuseField(prev?.fields.claude, toFieldState(fieldArr[6] as FieldState<ClaudeStatus>)),
+        gitActivity: reuseField(prev?.fields.gitActivity, toFieldState(fieldArr[7] as FieldState<GitActivity>)),
+        conflict: reuseField(prev?.fields.conflict, toFieldState(fieldArr[8] as FieldState<MergeConflictProbe>)),
+      };
+      const nextStatus = deriveStatus(wt, fields);
+      const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
+      const pr = rowLayout.prsByIndex[i];
+      const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
+      const stackedOn = rowLayout.stackedOnByIndex[i] ?? null;
+      const archived = archivedSet.has(wt.slug);
+      // Effective section: a manifest slice's stack section overrides the
+      // stored manual section. Archived rows skip the override so the
+      // archived bucket stays homogeneous at the bottom of the list.
+      const manualSection = stateSlugs[wt.slug]?.section ?? null;
+      const entry = archived ? undefined : rowLayout.stackEntryByIndex[i];
+      const node = entry?.node;
+      const holistic = archived || node ? undefined : rowLayout.holisticByBranch.get(wt.branch);
+      const stack: StackRowInfo | null = node
         ? {
-            stackId: holistic.stackId,
-            ordinal: 0,
-            pos: "single",
-            lane: 0,
-            depth: 0,
-            index: holistic.sliceCount,
-            isHolistic: true,
+            stackId: node.stackId,
+            ordinal: node.ordinal,
+            pos: node.pos,
+            lane: node.lane,
+            depth: node.depth,
+            index: node.index,
+            isHolistic: false,
           }
-        : null;
-    const section = stack ? stackSectionKey(stack.stackId) : manualSection;
-    const sectionIsStack = stack !== null;
-    effectiveOrders.set(
-      wt.slug,
-      stack?.index ?? stateSlugs[wt.slug]?.order ?? -Infinity,
-    );
-    const llmTitle = aiResults[i]?.data?.title ?? null;
-    const llmBrief = aiResults[i]?.data?.brief ?? null;
-    const prTitle = pr?.title ?? null;
-    const commitTitle = firstCommitResults[i]?.data ?? null;
-    const { title, source: titleSource } = resolveTitle(
-      wt.slug,
-      llmTitle,
-      prTitle,
-      commitTitle,
-    );
-    // After per-field reuse above, identity-equality on each `fields.X`,
-    // `status`, `pr`, `mq` plus primitives is sufficient — anything
-    // observable changing produces a fresh reference at one of those
-    // levels, which falls through to a new row.
-    if (
-      prev &&
-      prev.wt === wt &&
-      prev.fields.dirty === fields.dirty &&
-      prev.fields.lock === fields.lock &&
-      prev.fields.deploy === fields.deploy &&
-      prev.fields.merged === fields.merged &&
-      prev.fields.gone === fields.gone &&
-      prev.fields.sync === fields.sync &&
-      prev.fields.claude === fields.claude &&
-      prev.fields.gitActivity === fields.gitActivity &&
-      prev.fields.conflict === fields.conflict &&
-      prev.status === status &&
-      prev.pr === pr &&
-      prev.mq === mq &&
-      prev.archived === archived &&
-      prev.title === title &&
-      prev.titleSource === titleSource &&
-      prev.brief === llmBrief &&
-      prev.section === section &&
-      prev.sectionIsStack === sectionIsStack &&
-      stackInfoEq(prev.stack, stack) &&
-      stackedOnEq(prev.stackedOn, stackedOn)
-    ) {
-      return prev;
-    }
-    // Reuse prev's stackedOn / stack references when value-equal so
-    // memoized children downstream skip the work.
-    const stackedOnOut = prev && stackedOnEq(prev.stackedOn, stackedOn)
-      ? prev.stackedOn
-      : stackedOn;
-    const stackOut = prev && stackInfoEq(prev.stack, stack) ? prev.stack : stack;
-    const next: WorktreeRow = {
-      wt,
-      fields,
-      status,
-      pr,
-      mq,
-      stackedOn: stackedOnOut,
-      stack: stackOut,
-      archived,
-      title,
-      titleSource,
-      brief: llmBrief,
-      section,
-      sectionIsStack,
-    };
-    rowCache.current.set(wt.slug, next);
-    return next;
-  });
+        : holistic
+          ? {
+              stackId: holistic.stackId,
+              ordinal: 0,
+              pos: "single",
+              lane: 0,
+              depth: 0,
+              index: holistic.sliceCount,
+              isHolistic: true,
+            }
+          : null;
+      const section = stack ? stackSectionKey(stack.stackId) : manualSection;
+      const sectionIsStack = stack !== null;
+      effectiveOrders.set(
+        wt.slug,
+        stack?.index ?? stateSlugs[wt.slug]?.order ?? -Infinity,
+      );
+      const llmTitle = aiResults[i]?.title ?? null;
+      const llmBrief = aiResults[i]?.brief ?? null;
+      const prTitle = pr?.title ?? null;
+      const commitTitle = firstCommitResults[i] ?? null;
+      const { title, source: titleSource } = resolveTitle(
+        wt.slug,
+        llmTitle,
+        prTitle,
+        commitTitle,
+      );
+      // After per-field reuse above, identity-equality on each `fields.X`,
+      // `status`, `pr`, `mq` plus primitives is sufficient — anything
+      // observable changing produces a fresh reference at one of those
+      // levels, which falls through to a new row.
+      if (
+        prev &&
+        prev.wt === wt &&
+        prev.fields.dirty === fields.dirty &&
+        prev.fields.lock === fields.lock &&
+        prev.fields.deploy === fields.deploy &&
+        prev.fields.merged === fields.merged &&
+        prev.fields.gone === fields.gone &&
+        prev.fields.sync === fields.sync &&
+        prev.fields.claude === fields.claude &&
+        prev.fields.gitActivity === fields.gitActivity &&
+        prev.fields.conflict === fields.conflict &&
+        prev.status === status &&
+        prev.pr === pr &&
+        prev.mq === mq &&
+        prev.archived === archived &&
+        prev.title === title &&
+        prev.titleSource === titleSource &&
+        prev.brief === llmBrief &&
+        prev.section === section &&
+        prev.sectionIsStack === sectionIsStack &&
+        stackInfoEq(prev.stack, stack) &&
+        stackedOnEq(prev.stackedOn, stackedOn)
+      ) {
+        return prev;
+      }
+      // Reuse prev's stackedOn / stack references when value-equal so
+      // memoized children downstream skip the work.
+      const stackedOnOut = prev && stackedOnEq(prev.stackedOn, stackedOn)
+        ? prev.stackedOn
+        : stackedOn;
+      const stackOut = prev && stackInfoEq(prev.stack, stack) ? prev.stack : stack;
+      const next: WorktreeRow = {
+        wt,
+        fields,
+        status,
+        pr,
+        mq,
+        stackedOn: stackedOnOut,
+        stack: stackOut,
+        archived,
+        title,
+        titleSource,
+        brief: llmBrief,
+        section,
+        sectionIsStack,
+      };
+      rowCache.current.set(wt.slug, next);
+      return next;
+    });
 
-  // Drop cache entries for slugs that no longer exist so the map
-  // doesn't grow unboundedly across the session.
-  if (rowCache.current.size > worktrees.length) {
-    const live = new Set(worktrees.map((w) => w.slug));
-    for (const slug of rowCache.current.keys()) {
-      if (!live.has(slug)) rowCache.current.delete(slug);
-    }
-  }
-
-  // Section-aware sort lives in `sortActiveRows`. Archived rows are
-  // flat at the bottom in original list order — the archive divider is
-  // a hard visual break, secondary grouping there would be noise.
-  const listIndexOf = new Map<string, number>();
-  for (let i = 0; i < unsorted.length; i++) {
-    listIndexOf.set(unsorted[i]!.wt.slug, i);
-  }
-  const sectionsOrder = wtState.data?.sectionsOrder ?? [];
-  const active = sortActiveRows(
-    unsorted.filter((r) => !r.archived),
-    listIndexOf,
-    effectiveOrders,
-    sectionsOrder,
-  );
-  const archived = unsorted.filter((r) => r.archived);
-  const nextRows: WorktreeRow[] = [...active, ...archived];
-  const prevRows = rowsRef.current;
-  let rowsUnchanged = prevRows.length === nextRows.length;
-  if (rowsUnchanged) {
-    for (let i = 0; i < nextRows.length; i++) {
-      if (prevRows[i] !== nextRows[i]) {
-        rowsUnchanged = false;
-        break;
+    // Drop cache entries for slugs that no longer exist so the map
+    // doesn't grow unboundedly across the session.
+    if (rowCache.current.size > worktrees.length) {
+      const live = new Set(worktrees.map((w) => w.slug));
+      for (const slug of rowCache.current.keys()) {
+        if (!live.has(slug)) rowCache.current.delete(slug);
       }
     }
-  }
-  const rows = rowsUnchanged ? prevRows : (rowsRef.current = nextRows);
+
+    // Section-aware sort lives in `sortActiveRows`. Archived rows are
+    // flat at the bottom in original list order — the archive divider is
+    // a hard visual break, secondary grouping there would be noise.
+    const listIndexOf = new Map<string, number>();
+    for (let i = 0; i < unsorted.length; i++) {
+      listIndexOf.set(unsorted[i]!.wt.slug, i);
+    }
+    const sectionsOrder = wtState.data?.sectionsOrder ?? [];
+    const active = sortActiveRows(
+      unsorted.filter((r) => !r.archived),
+      listIndexOf,
+      effectiveOrders,
+      sectionsOrder,
+    );
+    const archived = unsorted.filter((r) => r.archived);
+    const nextRows: WorktreeRow[] = [...active, ...archived];
+    const prevRows = rowsRef.current;
+    let rowsUnchanged = prevRows.length === nextRows.length;
+    if (rowsUnchanged) {
+      for (let i = 0; i < nextRows.length; i++) {
+        if (prevRows[i] !== nextRows[i]) {
+          rowsUnchanged = false;
+          break;
+        }
+      }
+    }
+    const rows = rowsUnchanged ? prevRows : (rowsRef.current = nextRows);
+    return rows;
+  }, [
+    worktrees,
+    results,
+    github.data?.mergeQueue,
+    rowLayout,
+    archivedSet,
+    stateSlugs,
+    aiResults,
+    firstCommitResults,
+    wtState.data?.sectionsOrder,
+  ]);
 
   return {
     rows,
