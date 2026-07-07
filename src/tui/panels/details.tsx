@@ -27,7 +27,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
-import { StatusKind } from "../../core/types.ts";
+import { StatusKind, type PrComment } from "../../core/types.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import type { DerivedState } from "../../core/claude-status.ts";
 import { useGithub } from "../../state/hooks.ts";
@@ -257,24 +257,52 @@ function TitleLine({
 }
 
 /**
- * Most recent top-level review message, formatted as `@author: body`.
- * Sits between the row stack and the AI description so it's adjacent to
- * the review badge above and the LLM-generated context below. Renders
- * nothing when there's no review or no body — the reviewer hit Approve
- * without typing anything.
+ * One comment: a `@author · 2h ago` meta line, then the body on the
+ * lines below (bodies can be long / multi-line, so they get their own
+ * line rather than flowing after a colon). A malformed timestamp just
+ * drops the age suffix.
  */
-function ReviewBlock({
-  review,
-}: {
-  review: { author: string; body: string } | null;
-}) {
-  if (!review) return null;
+function CommentLine({ comment, first }: { comment: PrComment; first: boolean }) {
+  const ts = Date.parse(comment.createdAt);
+  const age = Number.isFinite(ts) ? ` · ${ageMsToText(Date.now() - ts)} ago` : "";
   return (
-    <box marginTop={1}>
+    <box marginTop={first ? 0 : 1}>
       <text fg={theme.fg} wrapMode="word">
-        <span attributes={TextAttributes.BOLD}>@{review.author}</span>
-        {`: ${review.body}`}
+        <span attributes={TextAttributes.BOLD}>@{comment.author}</span>
+        <span fg={theme.fgDim}>{age}</span>
+        {`\n${comment.body}`}
       </text>
+    </box>
+  );
+}
+
+/**
+ * The PR's human conversation, newest-first: issue comments + review
+ * bodies (bots already filtered out upstream). A trailing dim line
+ * reports unresolved review threads, whose bodies we deliberately don't
+ * inline. Renders nothing when there's neither a comment nor an open
+ * thread. Sits at the bottom of the pane, below the AI description.
+ */
+function CommentsBlock({
+  comments,
+  unresolvedThreads,
+}: {
+  comments: readonly PrComment[];
+  unresolvedThreads: number;
+}) {
+  if (comments.length === 0 && unresolvedThreads === 0) return null;
+  return (
+    <box marginTop={1} flexDirection="column">
+      {comments.map((c, i) => (
+        <CommentLine key={`${c.author}-${c.createdAt}-${i}`} comment={c} first={i === 0} />
+      ))}
+      {unresolvedThreads > 0 ? (
+        <box marginTop={comments.length > 0 ? 1 : 0}>
+          <text fg={theme.fgDim}>
+            {`+${unresolvedThreads} unresolved ${unresolvedThreads === 1 ? "thread" : "threads"}`}
+          </text>
+        </box>
+      ) : null}
     </box>
   );
 }
@@ -426,13 +454,16 @@ const DetailsBody = memo(function DetailsBody({
         {RESOLVED_ROWS.map((m) => (
           <RenderedRow key={m.id} module={m} ctx={ctx} />
         ))}
-        <ReviewBlock review={row.pr?.latestReview ?? null} />
         <DescriptionBlock
           summary={summary.data?.description ?? null}
           isLlmRunning={summary.isFetching}
           hasContext={!!diffCtx.data}
           blockedReason={blockedReason}
           error={summary.error ?? diffCtx.error ?? null}
+        />
+        <CommentsBlock
+          comments={row.pr?.comments ?? []}
+          unresolvedThreads={row.pr?.unresolvedThreads ?? 0}
         />
       </scrollbox>
     </box>

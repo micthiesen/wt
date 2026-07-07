@@ -6,10 +6,10 @@ import { run } from "./proc.ts";
 import type {
   AutoMergeMethod,
   Contributor,
-  LatestReview,
   MergeQueueEntry,
   MergeQueueState,
   PrChecks,
+  PrComment,
   PrReview,
   PullRequest,
   RabbitStatus,
@@ -203,15 +203,23 @@ fragment PrFields on PullRequest {
     nodes {
       isResolved
       comments(first: 1) {
-        nodes { author { login } }
+        nodes { author { login __typename } }
       }
+    }
+  }
+  comments(last: 10) {
+    nodes {
+      author { login __typename }
+      body
+      createdAt
     }
   }
   reviews(last: 10) {
     nodes {
-      author { login }
+      author { login __typename }
       body
       state
+      createdAt
     }
   }
 }`;
@@ -223,9 +231,11 @@ fragment PrFields on PullRequest {
 const CR_CONTEXT = "CodeRabbit";
 const CR_LOGIN = "coderabbitai";
 
+type GqlCommentAuthor = { login: string | null; __typename?: string } | null;
+
 type GqlReviewThread = {
   isResolved: boolean;
-  comments: { nodes: Array<{ author: { login: string | null } | null }> };
+  comments: { nodes: Array<{ author: GqlCommentAuthor }> };
 };
 
 function rollupRabbit(
@@ -344,11 +354,19 @@ type GqlPrNode = {
     }>;
   };
   reviewThreads: { nodes: GqlReviewThread[] } | null;
+  comments: {
+    nodes: Array<{
+      author: GqlCommentAuthor;
+      body: string;
+      createdAt: string;
+    }>;
+  } | null;
   reviews: {
     nodes: Array<{
-      author: { login: string | null } | null;
+      author: GqlCommentAuthor;
       body: string;
       state: GqlReviewSubmissionState;
+      createdAt: string;
     }>;
   } | null;
 };
@@ -495,26 +513,65 @@ function extractSuggestedReviewers(
   return out;
 }
 
+/** Most comments the details pane keeps; older ones drop off the tail. */
+const COMMENT_LIMIT = 10;
+
 /**
- * Most recent human review with a non-empty body. Walks newest-to-oldest
- * (graphql `reviews(last:N)` orders ascending, so the freshest entry is
- * at the end of the array) and skips empties, missing authors, and
- * CodeRabbit — its activity has its own badge / unresolved-thread count
- * and would otherwise drown out the human review message.
+ * A human authored this — has a login, isn't a GraphQL `Bot`, and isn't
+ * CodeRabbit (which posts as a user-shaped app on some installs, so the
+ * `Bot` check alone can miss it). CR has its own badge + thread count and
+ * would otherwise drown the human conversation.
  */
-function extractLatestReview(
-  reviews: GqlPrNode["reviews"],
-): LatestReview | null {
-  const nodes = reviews?.nodes ?? [];
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const r = nodes[i];
-    const body = r?.body?.trim();
-    const author = r?.author?.login;
-    if (!body || !author) continue;
-    if (author === CR_LOGIN) continue;
-    return { author, body };
+function isHumanAuthor(
+  a: GqlCommentAuthor,
+): a is { login: string; __typename?: string } {
+  if (!a?.login) return false;
+  if (a.__typename === "Bot") return false;
+  if (a.login === CR_LOGIN) return false;
+  return true;
+}
+
+/**
+ * The PR's human conversation: issue comments + non-empty review bodies,
+ * merged and sorted newest-first, bots excluded, capped at
+ * `COMMENT_LIMIT`. Inline review-thread comments are deliberately left
+ * out — they're summarized by `countUnresolvedHumanThreads` instead of
+ * inlined, which would flood the pane. ISO timestamps sort
+ * lexicographically, so a string compare orders them chronologically.
+ */
+function extractComments(pr: GqlPrNode): PrComment[] {
+  const out: PrComment[] = [];
+  for (const c of pr.comments?.nodes ?? []) {
+    const body = c?.body?.trim();
+    if (!body || !isHumanAuthor(c.author)) continue;
+    out.push({ author: c.author.login, body, createdAt: c.createdAt });
   }
-  return null;
+  for (const r of pr.reviews?.nodes ?? []) {
+    const body = r?.body?.trim();
+    if (!body || !isHumanAuthor(r.author)) continue;
+    out.push({ author: r.author.login, body, createdAt: r.createdAt });
+  }
+  out.sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+  );
+  return out.slice(0, COMMENT_LIMIT);
+}
+
+/**
+ * Count of unresolved review threads opened by a human. Reuses the
+ * thread nodes already fetched for the CR rollup; a thread's opener is
+ * its first comment's author.
+ */
+function countUnresolvedHumanThreads(
+  threads: GqlReviewThread[] | null | undefined,
+): number {
+  let n = 0;
+  for (const t of threads ?? []) {
+    if (t.isResolved) continue;
+    if (!isHumanAuthor(t.comments.nodes[0]?.author ?? null)) continue;
+    n++;
+  }
+  return n;
 }
 
 function nodeToPr(pr: GqlPrNode): PullRequest {
@@ -547,7 +604,8 @@ function nodeToPr(pr: GqlPrNode): PullRequest {
           mergeMethod: pr.autoMergeRequest.mergeMethod,
         }
       : null,
-    latestReview: extractLatestReview(pr.reviews),
+    comments: extractComments(pr),
+    unresolvedThreads: countUnresolvedHumanThreads(threads),
     mergedAt: pr.mergedAt ?? null,
     closedAt: pr.closedAt ?? null,
   };

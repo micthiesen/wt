@@ -60,16 +60,18 @@ export type Contributor = {
 };
 
 /**
- * Top-level body of the most recent submitted review that carried a
- * non-empty message. Distinct from `reviewThreads` — this is what the
- * reviewer types into the "Review changes" textarea on the Files tab,
- * not their inline line-anchored comments.
+ * One entry in a PR's human conversation — either a plain issue comment
+ * or the top-level body of a submitted review, flattened into a single
+ * shape. Inline line-anchored review-thread comments are NOT represented
+ * here (they're summarized as an unresolved-thread count instead).
  */
-export type LatestReview = {
-  /** GitHub login of the reviewer. */
+export type PrComment = {
+  /** GitHub login of the author (bots already filtered out upstream). */
   author: string;
-  /** The textarea body — may contain markdown and newlines. */
+  /** The comment / review-textarea body; may contain markdown and newlines. */
   body: string;
+  /** ISO timestamp. The list is sorted newest-first on this. */
+  createdAt: string;
 };
 
 export type AutoMergeMethod = "SQUASH" | "MERGE" | "REBASE";
@@ -128,11 +130,18 @@ export type PullRequest = {
   /** "Merge when ready" arming state. `null` when not enabled. */
   autoMerge: AutoMerge | null;
   /**
-   * Most recent submitted review with a non-empty body. `null` when
-   * nobody has left a top-level review message yet. Comment-only and
-   * empty-body reviews are skipped at parse time.
+   * The PR's human conversation: issue comments + non-empty review
+   * bodies, merged and sorted newest-first, bots (CodeRabbit et al.)
+   * excluded, capped at the most recent few. Empty when nobody human has
+   * commented. Inline review-thread comments are not included here.
    */
-  latestReview: LatestReview | null;
+  comments: readonly PrComment[];
+  /**
+   * Count of unresolved review threads opened by humans (CR / bot threads
+   * excluded). Surfaced as a "+N unresolved threads" summary line rather
+   * than inlining every thread comment.
+   */
+  unresolvedThreads: number;
   // ISO timestamps. Terminal PRs carry at least one of these; OPEN
   // PRs have neither. Used to dismiss pre-existing merged/closed PRs
   // when a worktree for the same branch is recreated from scratch.
