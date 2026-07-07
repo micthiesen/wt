@@ -111,13 +111,59 @@ export async function summarizeStack(
   const userPrompt = `Branches in this stack:\n${members
     .map((m) => `- ${m.branch}: ${m.brief}`)
     .join("\n")}`;
-  const content = await callChat(STACK_SYSTEM_PROMPT, userPrompt, 30, external);
-  const titleMatch = content.match(/^TITLE:\s*(.+?)\s*$/m);
-  const raw = (titleMatch?.[1] ?? content).trim();
-  const cleaned = cleanInline(raw);
-  // Hard ceiling — 4 prompted, slight slack for small-model drift.
-  const capped = cleaned.split(/\s+/).slice(0, 6).join(" ");
-  return capped;
+  // A small local model routinely ignores the "never echo TUI/stack/…"
+  // rule and hands back a title made purely of the prompt's own
+  // packaging vocabulary ("TUI", "Header Stack Section", …). Because
+  // titles cache forever under the membership signature, one such answer
+  // sticks permanently. Detect a meta-only title, nudge once with the
+  // rejected text quoted back, and if it still won't name the work,
+  // throw — the section falls back to its bare issue label (ENG-5202)
+  // rather than baking in junk.
+  let lastRejected: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    external?.throwIfAborted();
+    const prompt = lastRejected
+      ? `${userPrompt}\n\nYour previous answer "${lastRejected}" just echoed words from the instructions. Name the actual WORK these branches do, not the tool or the grouping.`
+      : userPrompt;
+    const content = await callChat(STACK_SYSTEM_PROMPT, prompt, 30, external);
+    const titleMatch = content.match(/^TITLE:\s*(.+?)\s*$/m);
+    const raw = (titleMatch?.[1] ?? content).trim();
+    const cleaned = cleanInline(raw);
+    // Hard ceiling — 4 prompted, slight slack for small-model drift.
+    const capped = cleaned.split(/\s+/).slice(0, 6).join(" ");
+    if (capped && !isStackTitleMetaOnly(capped)) return capped;
+    lastRejected = capped || raw;
+  }
+  throw new Error(
+    `stack title: model only echoed meta-vocabulary ("${lastRejected}")`,
+  );
+}
+
+/**
+ * Words the stack-naming prompt uses to describe *itself* (the tool, the
+ * packaging, the grouping) rather than any change. A leaked title is one
+ * built entirely from these — "TUI", "Header Stack Section" — with no
+ * domain word to anchor it.
+ *
+ * The test is all-or-nothing on purpose: reject only when *every* token
+ * is meta. A single real word saves the title, so "Header Stamp" survives
+ * even though "header" is on the list (eng-5202-02 genuinely stamps a
+ * header) — we never strip individual tokens, which would corrupt a
+ * legitimately header-themed stack down to "Stamp".
+ */
+const STACK_TITLE_META_WORDS = new Set([
+  "tui", "stack", "stacks", "branch", "branches", "section", "sections",
+  "header", "headers", "group", "groups", "grouping", "developer", "tool",
+  "tools", "feature", "features", "subsystem", "subsystems", "area", "areas",
+]);
+
+export function isStackTitleMetaOnly(title: string): boolean {
+  const tokens = title
+    .toLowerCase()
+    .split(/\s+/)
+    .map((t) => t.replace(/[^a-z]/g, ""))
+    .filter(Boolean);
+  return tokens.length > 0 && tokens.every((t) => STACK_TITLE_META_WORDS.has(t));
 }
 
 /**
