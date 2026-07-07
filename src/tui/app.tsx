@@ -19,11 +19,7 @@ import {
 import { config, type PullRequestTarget } from "../core/config.ts";
 import { createWorktree, parseInput } from "../core/lifecycle.ts";
 import {
-  AUTO_MERGE_METHOD,
-  disableAutoMerge,
   editReviewers,
-  enableAutoMerge,
-  markPullRequestReady,
   pullRequestOpenUrl,
   pullRequestOpenUrlForTarget,
 } from "../core/github.ts";
@@ -54,7 +50,7 @@ import {
   killHarnessSession,
   killShellSession,
 } from "../core/tmux.ts";
-import { StatusKind, type PullRequest } from "../core/types.ts";
+import { StatusKind } from "../core/types.ts";
 import { claudeSummariesQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, wtStateQuery, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
 
 import {
@@ -139,6 +135,7 @@ import {
   resolveDiffBase,
 } from "./app-helpers.ts";
 import { makeDestroyFlows } from "./flows/destroy.ts";
+import { makeGithubPrFlows } from "./flows/github-pr.ts";
 import { makeSessionFlows } from "./flows/sessions.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "./usage-badge.tsx";
 import { openInZed, openUrlHidingAlacritty, writeClipboard } from "./helpers.ts";
@@ -1680,229 +1677,13 @@ export function App({ onExit }: Props) {
     toast(summary, theme.ok, 2500);
   }
 
-  async function doMarkReady(slug: string): Promise<void> {
-    const log = createLogger(slug);
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row?.pr) {
-      toast("no PR for this row", theme.warn, 2000);
-      return;
-    }
-    const prNumber = row.pr.number;
-    const branch = row.wt.branch;
-    try {
-      await mutate<GithubData>({
-        filter: { queryKey: ["github"] },
-        patch: (data) =>
-          patchPullRequest(data, branch, (pr) => ({ ...pr, isDraft: false })),
-        run: async () => {
-          const result = await markPullRequestReady(prNumber);
-          if (!result.ok) throw new Error(result.error);
-        },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.event.err(`mark ready failed for #${prNumber}: ${msg}`);
-      toast(`mark ready failed: ${msg}`, theme.err, 4000);
-      return;
-    }
-    log.event.ok(`marked #${prNumber} ready for review`);
-    toast(`marked #${prNumber} ready`, theme.ok, 2500);
-  }
-
-  /**
-   * Toggle GitHub "merge when ready" (auto-merge) on the PR. `gh pr
-   * merge --auto` enqueues into the repo's merge queue when one is
-   * configured, or arms classic auto-merge otherwise; `--disable-auto`
-   * cancels it. Optimistically flips `pr.autoMerge` so the badge
-   * updates before the round-trip; the settling invalidate reconciles
-   * against the merge-method GitHub actually lands on.
-   */
-  async function doAutoMerge(
-    slug: string,
-    action: "enable" | "disable",
-  ): Promise<void> {
-    const log = createLogger(slug);
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row?.pr) {
-      toast("no PR for this row", theme.warn, 2000);
-      return;
-    }
-    if (action === "enable" && row.pr.autoMerge) {
-      toast("auto-merge already enabled", theme.info, 2000);
-      return;
-    }
-    if (action === "disable" && !row.pr.autoMerge) {
-      toast("auto-merge not enabled", theme.info, 2000);
-      return;
-    }
-    const prNumber = row.pr.number;
-    const branch = row.wt.branch;
-    // Optimistic shape for enable: seed the method the gh call will arm
-    // (shared AUTO_MERGE_METHOD constant, so this can't drift from
-    // enableAutoMerge). The invalidate that fires on success replaces it
-    // with truth on the next refetch — what matters for UX is that the
-    // badge flips immediately.
-    const optimisticAutoMerge: PullRequest["autoMerge"] | null =
-      action === "enable"
-        ? { enabledAt: new Date().toISOString(), mergeMethod: AUTO_MERGE_METHOD }
-        : null;
-    try {
-      await mutate<GithubData>({
-        filter: { queryKey: ["github"] },
-        patch: (data) =>
-          patchPullRequest(data, branch, (pr) => ({
-            ...pr,
-            autoMerge: optimisticAutoMerge,
-          })),
-        run: async () => {
-          const result =
-            action === "enable"
-              ? await enableAutoMerge(prNumber)
-              : await disableAutoMerge(prNumber);
-          if (!result.ok) throw new Error(result.error);
-        },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const verb = action === "enable" ? "auto-merge" : "disable auto-merge";
-      log.event.err(`${verb} failed for #${prNumber}: ${msg}`);
-      toast(`${verb} failed: ${msg}`, theme.err, 4000);
-      return;
-    }
-    const past = action === "enable" ? "enabled" : "disabled";
-    log.event.ok(`auto-merge ${past} for #${prNumber}`);
-    toast(`auto-merge ${past} for #${prNumber}`, theme.ok, 2500);
-  }
-
-  /**
-   * One-keystroke "ship it" (`E`): mark the PR ready, request
-   * `config.github.defaultReviewer` if set, and arm auto-merge — in
-   * the right order so GitHub doesn't reject the chain. Mark-ready
-   * and reviewer-request run in parallel (no dependency); auto-merge
-   * awaits mark-ready since `gh pr merge --auto` rejects drafts.
-   * Each leg is idempotent: a re-press after partial failure only
-   * re-runs the still-pending legs.
-   */
-  async function doShipPr(slug: string): Promise<void> {
-    const log = createLogger(slug);
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row?.pr) {
-      toast("no PR for this row", theme.warn, 2000);
-      return;
-    }
-    if (row.pr.state !== "OPEN") {
-      toast("PR is not open", theme.warn, 2000);
-      return;
-    }
-    const prNumber = row.pr.number;
-    const branch = row.wt.branch;
-    const wasDraft = row.pr.isDraft;
-    const reviewerToAdd =
-      config.github.defaultReviewer &&
-      !row.pr.requestedReviewers.includes(config.github.defaultReviewer)
-        ? config.github.defaultReviewer
-        : null;
-    const needsAutoMerge = !row.pr.autoMerge;
-
-    if (!wasDraft && !reviewerToAdd && !needsAutoMerge) {
-      toast(`#${prNumber} already shipped`, theme.info, 2000);
-      return;
-    }
-    const steps: string[] = [];
-    if (wasDraft) steps.push("mark ready");
-    if (reviewerToAdd) steps.push(`request ${reviewerToAdd}`);
-    if (needsAutoMerge) steps.push("arm auto-merge");
-    log.event.info(`ship #${prNumber}: ${steps.join(" + ")}`);
-
-    const markReadyP: Promise<unknown> = wasDraft
-      ? mutate<GithubData>({
-          filter: { queryKey: ["github"] },
-          patch: (data) =>
-            patchPullRequest(data, branch, (pr) => ({ ...pr, isDraft: false })),
-          run: async () => {
-            const r = await markPullRequestReady(prNumber);
-            if (!r.ok) throw new Error(r.error);
-          },
-        })
-      : Promise.resolve();
-    const reviewerP: Promise<unknown> = reviewerToAdd
-      ? mutate<GithubData>({
-          filter: { queryKey: ["github"] },
-          patch: (data) =>
-            patchPullRequest(data, branch, (pr) => ({
-              ...pr,
-              requestedReviewers: [...pr.requestedReviewers, reviewerToAdd],
-              reviewRequests: pr.reviewRequests + 1,
-            })),
-          run: async () => {
-            const r = await editReviewers(prNumber, {
-              add: [reviewerToAdd],
-              remove: [],
-            });
-            if (!r.ok) throw new Error(r.error);
-          },
-        })
-      : Promise.resolve();
-
-    const [readyRes, reviewerRes] = await Promise.allSettled([
-      markReadyP,
-      reviewerP,
-    ]);
-
-    if (readyRes.status === "rejected") {
-      const msg =
-        readyRes.reason instanceof Error
-          ? readyRes.reason.message
-          : String(readyRes.reason);
-      log.event.err(`mark ready failed for #${prNumber}: ${msg}`);
-      toast(`mark ready failed: ${msg}`, theme.err, 4000);
-      // Bail: auto-merge would fail on the still-draft PR.
-      return;
-    }
-    if (wasDraft) log.event.ok(`marked #${prNumber} ready`);
-
-    if (reviewerRes.status === "rejected") {
-      const msg =
-        reviewerRes.reason instanceof Error
-          ? reviewerRes.reason.message
-          : String(reviewerRes.reason);
-      log.event.err(
-        `request reviewer ${reviewerToAdd} failed for #${prNumber}: ${msg}`,
-      );
-      toast(`reviewer request failed: ${msg}`, theme.err, 4000);
-      // Don't bail — auto-merge is independent of the reviewer request.
-    } else if (reviewerToAdd) {
-      log.event.ok(`requested ${reviewerToAdd} for #${prNumber}`);
-    }
-
-    if (needsAutoMerge) {
-      try {
-        await mutate<GithubData>({
-          filter: { queryKey: ["github"] },
-          patch: (data) =>
-            patchPullRequest(data, branch, (pr) => ({
-              ...pr,
-              autoMerge: {
-                enabledAt: new Date().toISOString(),
-                mergeMethod: AUTO_MERGE_METHOD,
-              },
-            })),
-          run: async () => {
-            const r = await enableAutoMerge(prNumber);
-            if (!r.ok) throw new Error(r.error);
-          },
-        });
-        log.event.ok(`auto-merge enabled for #${prNumber}`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log.event.err(`auto-merge failed for #${prNumber}: ${msg}`);
-        toast(`auto-merge failed: ${msg}`, theme.err, 4000);
-        return;
-      }
-    }
-
-    toast(`shipped #${prNumber}`, theme.ok, 2500);
-  }
+  // GitHub PR mutation flows — extracted to `flows/github-pr.ts`.
+  // Rebuilt per render so the closures see fresh rows.
+  const { doMarkReady, doAutoMerge, doShipPr } = makeGithubPrFlows({
+    rows,
+    toast,
+    mutate,
+  });
 
   function buildActionPickerItems(slug: string): PickerItem[] {
     const row = rows.find((r) => r.wt.slug === slug);
