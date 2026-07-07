@@ -279,7 +279,9 @@ export function makeGithubPrFlows(ctx: GithubPrFlowsCtx) {
       return;
     }
     const branch = row.wt.branch;
-    const names = row.pr.failedChecks;
+    // `?? []` guards a stale persisted PR (disk cache) from before this
+    // field existed; the log fetch below still works off the branch alone.
+    const names = row.pr.failedChecks ?? [];
     log.event.warn(
       `failing: ${names.length > 0 ? names.join(", ") : "checks"} — fetching logs…`,
     );

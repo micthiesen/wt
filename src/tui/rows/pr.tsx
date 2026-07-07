@@ -188,8 +188,12 @@ function buildPrSegments(
       // only as the widest mode, so `fitSegments` drops back to a bare
       // "checks" (glyph still red) before it starts dropping other
       // segments. The `--log-failed` keybind (`f`) tails their logs.
-      if (pr.checks === "fail" && pr.failedChecks.length > 0) {
-        const named = `checks: ${pr.failedChecks.join(", ")}`;
+      // `?? []` guards a stale persisted PR from before this field existed
+      // (the github query is cached to disk; old entries lack it until the
+      // next live refetch overwrites them).
+      const failed = pr.failedChecks ?? [];
+      if (pr.checks === "fail" && failed.length > 0) {
+        const named = `checks: ${failed.join(", ")}`;
         modes.push({
           width: 3 + Bun.stringWidth(named),
           render: () => (
