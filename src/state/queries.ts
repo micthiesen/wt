@@ -163,9 +163,11 @@ export type TmuxSessionsData = {
  * Slugs with live wt-private tmux sessions, partitioned by kind. One
  * CLI shell-out per refresh covers every worktree and both kinds at
  * once — far cheaper than per-row `has-session` polling or two
- * parallel queries. The 2s refetch keeps both indicators in sync;
- * explicit invalidation still fires on enter/detach so the badges
- * flip immediately rather than waiting up to 2s.
+ * parallel queries. Push triggers do the fast work: explicit
+ * invalidation fires on enter/detach/kill, and the claude-registry
+ * watcher invalidates on claude process start/exit. The 5s interval is
+ * a backstop for lifecycle events with no trigger (a shell/diff
+ * session's process exiting on its own, external `tmux kill-session`).
  */
 export const tmuxSessionsQuery = () =>
   queryOptions({
@@ -187,7 +189,7 @@ export const tmuxSessionsQuery = () =>
       };
     },
     staleTime: STALE.fast,
-    refetchInterval: 2_000,
+    refetchInterval: 5_000,
   });
 
 /**
@@ -377,6 +379,8 @@ export type ClaudeRegistryData = {
  * this query on file events for near-instant updates; the polling
  * backstop catches anything FSEvents coalesces away and bounds staleness
  * when the watcher isn't installed (CLI mode, watch setup failure).
+ * Sized generously — the watcher is the mechanism, this only bounds a
+ * missed event.
  */
 export const claudeRegistryQuery = () =>
   queryOptions({
@@ -388,7 +392,7 @@ export const claudeRegistryQuery = () =>
       return { sessions, bySessionId };
     },
     staleTime: 1_000,
-    refetchInterval: 5_000,
+    refetchInterval: 15_000,
   });
 
 /**
@@ -480,14 +484,16 @@ export const wtClaudeQuery = (wt: Pick<Worktree, "slug" | "path">) =>
     queryFn: async (): Promise<ClaudeStatus> =>
       claudeStatus({ slug: wt.slug, path: wt.path }),
     staleTime: STALE.fast,
-    // The session jsonls update every time claude writes a turn or
-    // tool-call boundary; polling on a short loop keeps the per-
-    // session age + queue counts honest. State (working/waiting/
-    // abandoned/idle) is derived in the row via
-    // `useClaudeSessionsForSlug`, which subscribes to
+    // The session-tail slug sink is the primary trigger: it invalidates
+    // this query the moment a live session's jsonl grows, so turn ends
+    // and queue-count changes snap immediately. The interval only keeps
+    // the *displayed age* ("2m ago") ticking and covers sessions the
+    // tailer isn't watching — minute-granularity display needs no 5s
+    // loop. State (working/waiting/abandoned/idle) is derived in the
+    // row via `useClaudeSessionsForSlug`, which subscribes to
     // `tmuxSessionsQuery` (its own poll loop). A tmux state change
     // re-renders the row without rerunning this query.
-    refetchInterval: 5_000,
+    refetchInterval: 15_000,
   });
 
 export const wtGitActivityQuery = (

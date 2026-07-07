@@ -118,6 +118,11 @@ export async function runTui(): Promise<TuiExit> {
         predicate: (q) =>
           q.queryKey[0] === "harnessSessions" && q.queryKey[1] === "claude",
       }),
+      // A registry write also means a claude process started or exited,
+      // which is exactly when the tmux session set changes — refresh it
+      // here so the session badges flip on the event instead of the
+      // (now slower) polling backstop.
+      wtClient.client.invalidateQueries({ queryKey: qk.tmuxSessions() }),
     ]).catch(() => {});
   });
   // Local git activity → query invalidations. Coarse refs watcher fires

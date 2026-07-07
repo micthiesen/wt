@@ -3,7 +3,7 @@
  *   - Per-harness `discoverSessions` queries (one per impl in
  *     `HARNESSES`), each cached by `(harnessId, slug)`. Liveness is
  *     NOT baked into the cached value — we re-annotate against the
- *     live tmux name set so a 2s tmux flip doesn't invalidate the
+ *     live tmux name set so a tmux flip doesn't invalidate the
  *     potentially-slow discovery cache (sqlite query, rollout scan).
  *   - The tmux name set from `tmuxSessionsQuery` for liveness.
  *

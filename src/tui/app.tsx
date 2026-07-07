@@ -2213,7 +2213,7 @@ export function App({ onExit }: Props) {
         claudeDisplayName: slot.label,
       });
       // Refresh tmux sessions so the bottom-bar tail picks up the new
-      // session immediately rather than waiting for the next 2s poll
+      // session immediately rather than waiting for the next poll
       // tick. `allSettled` (not `all`) so a refresh-rejection — e.g.
       // a torn-down query client during shutdown — doesn't bubble up
       // and swallow the result-feedback below.
@@ -4365,9 +4365,9 @@ export function App({ onExit }: Props) {
         shellLog.event.info("entering shell (F10 to detach)");
         const result = await enterShellSession({ renderer, slug, cwd });
         // Flip the indicator + spin up the shell-tail tailer
-        // immediately rather than waiting for the 2s tmux-sessions
-        // poll. Without this, lines written in the first ~2s arrive
-        // only via seed-on-late-ensure, not as live deltas.
+        // immediately rather than waiting for the tmux-sessions
+        // poll. Without this, lines written in the first seconds
+        // arrive only via seed-on-late-ensure, not as live deltas.
         void refreshTmuxSessions();
         if (result.kind === "spawn-failed") {
           shellLog.event.err(`shell failed to start: ${result.reason}`);

@@ -22,7 +22,7 @@ export const qk = {
    * `opencode.db`. Live-status is annotated on top by the consumer
    * hook against `tmuxSessionsQuery.all`, so the key intentionally
    * does NOT include the tmux name set — that would invalidate this
-   * query on every 2s tmux refresh.
+   * query on every tmux-sessions refresh.
    */
   harnessSessions: (harnessId: string, slug: string) =>
     ["harnessSessions", harnessId, slug] as const,

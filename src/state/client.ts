@@ -63,7 +63,7 @@ export function createWtQueryClient(): WtQueryClient {
     maxAge: MAX_CACHE_AGE_MS,
     prefix: STORAGE_PREFIX,
     // Persister wraps every queryFn invocation; high-frequency
-    // polling queries (lock: 2s while held, claude: 5s) would
+    // polling queries (lock: 2s while held, claude: 15s) would
     // otherwise burn one INSERT OR REPLACE per poll for data with
     // zero cross-session value. Worse, restoring stale lock state on
     // startup mis-classifies the worktree as "busy" until the first

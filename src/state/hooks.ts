@@ -25,9 +25,9 @@
  *    inputs — PR draft→ready, auto-merge on/off, reviewer add/remove,
  *    archive toggle, section move. Skip the patch and just invalidate
  *    when the post-state cascades unpredictably (kick CI, free-form
- *    shell action). Skip both when polling already covers it (tmux
- *    session lifecycle ticks every 2s, lock state every 2s while
- *    held).
+ *    shell action). Skip both when a push trigger or poll already
+ *    covers it (tmux lifecycle: explicit invalidations + registry
+ *    watcher + 5s backstop; lock state polls every 2s while held).
  *
  *    The interaction with synchronous preconditions is the punchline:
  *    optimistic patches show up in row state immediately, so any
@@ -408,7 +408,7 @@ export function useWtActions() {
     /**
      * Invalidate the tmux-sessions query. Call after entering or
      * detaching from a session so the per-row indicator flips
-     * immediately rather than waiting for the 2s polling tick.
+     * immediately rather than waiting for the polling backstop.
      */
     async refreshTmuxSessions(): Promise<void> {
       await qc.invalidateQueries({ queryKey: tmuxSessionsQuery().queryKey });
@@ -458,8 +458,8 @@ export function useWtActions() {
      * Optimistically remove a single (slug, name) claude entry from
      * the tmux-sessions cache. Used by the kill flow so the picker
      * stops listing the dying session as live the instant `x` is
-     * pressed — without waiting for the kill to land or the 2s poll
-     * to refetch. `slugsByHarness.claude` is recomputed from the
+     * pressed — without waiting for the kill to land or a refetch.
+     * `slugsByHarness.claude` is recomputed from the
      * filtered `claude` array. No-op if no cache entry exists.
      */
     optimisticRemoveClaude(slug: string, name: string | null): void {
