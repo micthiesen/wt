@@ -102,14 +102,16 @@ export const worktreesQuery = () =>
     staleTime: STALE.mid,
   });
 
+export async function fetchOriginNow(): Promise<number> {
+  await fetchOrigin();
+  invalidateMainFirstParents();
+  return Date.now();
+}
+
 export const fetchOriginQuery = () =>
   queryOptions({
     queryKey: qk.fetchOrigin(),
-    queryFn: async (): Promise<number> => {
-      await fetchOrigin();
-      invalidateMainFirstParents();
-      return Date.now();
-    },
+    queryFn: fetchOriginNow,
     staleTime: STALE.slow,
   });
 

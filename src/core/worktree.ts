@@ -3,7 +3,7 @@ import { basename, isAbsolute, join, relative } from "node:path";
 
 import { config } from "./config.ts";
 import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitRun, localBranchExists } from "./git.ts";
-import { lockAge, lockLabel, lockStatus } from "./locks.ts";
+import { lockAge, lockLabel, lockStatus, tryAcquireLock, type LockHandle } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 import { latestLogFor } from "./logs.ts";
 import { runOk, runQuiet } from "./proc.ts";
@@ -11,6 +11,8 @@ import { computeStage } from "./stage.ts";
 import { type Status, StatusKind, type Worktree } from "./types.ts";
 
 const log = createLogger("[worktree]");
+const FETCH_ORIGIN_LOCK = "__fetch_origin__";
+let fetchOriginInFlight: Promise<void> | null = null;
 
 export async function listWorktrees(): Promise<Worktree[]> {
   const out = await git(["worktree", "list", "--porcelain"]);
@@ -242,46 +244,78 @@ export async function worktreeStatus(wt: Worktree): Promise<Status> {
  * so a routine `sst deploy/delete` write doesn't push us into the skip
  * path.
  */
-export async function fetchOrigin(opts: { onWarn?: (msg: string) => void } = {}): Promise<void> {
-  await gitRun(["fetch", "origin", "--prune"]);
-  const base = config.branch.base;
-  const main = config.paths.mainClone;
-  const localRef = `refs/heads/${base}`;
-  const remoteRef = `origin/${base}`;
-  if (!(await localBranchExists(base, main))) {
-    return;
-  }
-  if (
-    !(await gitQuiet([
-      "merge-base",
-      "--is-ancestor",
-      base,
-      remoteRef,
-    ], main))
-  ) {
-    opts.onWarn?.(
-      `Local ${base} has diverged from ${remoteRef}; not updating.`,
-    );
-    return;
-  }
-
-  let onMain = false;
-  if (await gitQuiet(["symbolic-ref", "--quiet", "HEAD"], main)) {
-    const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], main);
-    onMain = head.trim() === base;
-  }
-
-  if (onMain) {
-    await restoreAutoRegen(main);
-    const status = await runOk(["git", "status", "--porcelain"], { cwd: main });
-    if (!status.trim()) {
-      await gitRun(["merge", "--ff-only", "--quiet", remoteRef], main);
+async function acquireFetchOriginLock(): Promise<LockHandle> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const handle = tryAcquireLock(FETCH_ORIGIN_LOCK, "fetch-origin", {
+      phase: "fetch origin",
+    });
+    if (handle) return handle;
+    if (Date.now() >= deadline) {
+      throw new Error("another origin fetch is still running");
     }
-    // else: genuinely dirty — leave local main behind; origin/main is
-    // already up-to-date from the fetch.
-  } else {
-    await gitRun(["update-ref", localRef, remoteRef], main);
+    await Bun.sleep(250);
   }
+}
+
+async function fetchOriginLocked(opts: { onWarn?: (msg: string) => void } = {}): Promise<void> {
+  const handle = await acquireFetchOriginLock();
+  try {
+    const fetch = await gitRun(["fetch", "origin", "--prune"]);
+    if (fetch.exitCode !== 0) {
+      throw new Error(
+        `git fetch origin failed: ${(fetch.stderr || fetch.stdout).trim() || `exit ${fetch.exitCode}`}`,
+      );
+    }
+    const base = config.branch.base;
+    const main = config.paths.mainClone;
+    const localRef = `refs/heads/${base}`;
+    const remoteRef = `origin/${base}`;
+    if (!(await localBranchExists(base, main))) {
+      return;
+    }
+    if (
+      !(await gitQuiet([
+        "merge-base",
+        "--is-ancestor",
+        base,
+        remoteRef,
+      ], main))
+    ) {
+      opts.onWarn?.(
+        `Local ${base} has diverged from ${remoteRef}; not updating.`,
+      );
+      return;
+    }
+
+    let onMain = false;
+    if (await gitQuiet(["symbolic-ref", "--quiet", "HEAD"], main)) {
+      const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], main);
+      onMain = head.trim() === base;
+    }
+
+    if (onMain) {
+      await restoreAutoRegen(main);
+      const status = await runOk(["git", "status", "--porcelain"], { cwd: main });
+      if (!status.trim()) {
+        await gitRun(["merge", "--ff-only", "--quiet", remoteRef], main);
+      }
+      // else: genuinely dirty — leave local main behind; origin/main is
+      // already up-to-date from the fetch.
+    } else {
+      await gitRun(["update-ref", localRef, remoteRef], main);
+    }
+  } finally {
+    handle.release();
+  }
+}
+
+export async function fetchOrigin(opts: { onWarn?: (msg: string) => void } = {}): Promise<void> {
+  if (fetchOriginInFlight) return fetchOriginInFlight;
+  fetchOriginInFlight = fetchOriginLocked(opts).finally(() => {
+    fetchOriginInFlight = null;
+  });
+  return fetchOriginInFlight;
 }
 
 async function restoreAutoRegen(cwd: string): Promise<void> {

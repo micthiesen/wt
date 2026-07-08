@@ -120,7 +120,7 @@ function printWebhookSetup(host: string, port: number, secretLine: string): void
   console.log(`  ${dim("SSL")}            enabled`);
   console.log(`  ${dim("Events")}         pull_request, pull_request_review,`);
   console.log(`                 pull_request_review_thread, check_suite, check_run,`);
-  console.log(`                 status, merge_group`);
+  console.log(`                 status, merge_group, push`);
   console.log(dim("\nAfter saving, use the webhook's \"Recent Deliveries\" → Redeliver to test."));
 }
 

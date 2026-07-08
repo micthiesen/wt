@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { config, type GithubEventsConfig } from "../config.ts";
 import { fetchGithub } from "../github.ts";
 import { createLogger } from "../logger.ts";
-import { listWorktrees } from "../worktree.ts";
+import { fetchOrigin, listWorktrees } from "../worktree.ts";
 
 import {
   ensureEventsDir,
@@ -54,6 +54,7 @@ const RELEVANT_EVENTS = new Set([
   "check_run",
   "status",
   "merge_group",
+  "push",
 ]);
 
 /**
@@ -129,6 +130,14 @@ export function extractBranches(event: string, payload: unknown): string[] | nul
       // a worktree branch — never skippable, always refetch for the queue.
       case "merge_group":
         return null;
+      case "push": {
+        const ref = p.ref;
+        if (typeof ref !== "string") return null;
+        const prefix = "refs/heads/";
+        if (!ref.startsWith(prefix)) return null;
+        const branch = ref.slice(prefix.length);
+        return branch === config.branch.base ? null : [branch];
+      }
       default:
         return null;
     }
@@ -186,6 +195,13 @@ export function startDaemon(events: GithubEventsConfig, secret: string): Daemon 
     }
     fetching = true;
     try {
+      try {
+        await fetchOrigin();
+      } catch (err) {
+        log.warn("origin refresh after webhook failed", {
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
       const branches = await currentBranches();
       localBranches = new Set(branches);
       localBranchesAt = Date.now();

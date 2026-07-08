@@ -32,7 +32,7 @@ import { listWorktrees } from "../core/worktree.ts";
 import { reapWtState } from "../core/wtstate.ts";
 import { createWtQueryClient } from "../state/index.ts";
 import { qk } from "../state/keys.ts";
-import { fetchOriginQuery, type TmuxSessionsData } from "../state/queries.ts";
+import { fetchOriginNow, fetchOriginQuery, type TmuxSessionsData } from "../state/queries.ts";
 import type { Worktree } from "../core/types.ts";
 import type { QueryClient } from "@tanstack/react-query";
 
@@ -48,7 +48,7 @@ const INVALIDATION_FLUSH_MS = 50;
 type InvalidationJob =
   | { kind: "key"; key: readonly unknown[] }
   | { kind: "claudeHarnessSessions" }
-  | { kind: "fetchOrigin" };
+  | { kind: "fetchOrigin"; force: boolean };
 
 class InvalidationScheduler {
   private readonly jobs = new Map<string, InvalidationJob>();
@@ -65,8 +65,8 @@ class InvalidationScheduler {
     this.enqueue({ kind: "claudeHarnessSessions" }, "claudeHarnessSessions");
   }
 
-  fetchOrigin(): void {
-    this.enqueue({ kind: "fetchOrigin" }, "fetchOrigin");
+  fetchOrigin(opts: { force?: boolean } = {}): void {
+    this.enqueue({ kind: "fetchOrigin", force: opts.force ?? false }, "fetchOrigin");
   }
 
   dispose(): void {
@@ -99,6 +99,8 @@ class InvalidationScheduler {
               q.queryKey[1] === "claude",
           })
           .catch(() => {});
+      } else if (job.force) {
+        fetchOriginNow().catch(() => {});
       } else {
         this.client.fetchQuery(fetchOriginQuery()).catch(() => {});
       }
@@ -203,16 +205,16 @@ export async function runTui(): Promise<TuiExit> {
   // the github query stays on its poll cadence. `keepPreviousData` keeps the
   // pane painted across the refetch.
   //
-  // Each delivery also kicks a `git fetch origin` (staleTime-gated to at
-  // most one per minute): a PR merging advances origin/main, and without a
-  // fetch the behind-counts and merged/gone badges sit on stale local refs
-  // until a manual `r`. The fetch's ref updates then flow back through the
-  // refs watcher above — one push event drives the whole cascade.
+  // Each delivery also forces an origin refresh: a PR merge or default-branch
+  // push advances origin/main, and without a fetch the behind-counts and
+  // merged/gone badges sit on stale local refs until a manual `r`. The
+  // fetch's ref updates then flow back through the refs watcher above — one
+  // push event drives the whole cascade.
   const stopGithubEventsWatch = config.github.events
     ? watchGithubEvents(() => {
         invalidations.key(["github"]);
         invalidations.key(qk.reviewRequests());
-        invalidations.fetchOrigin();
+        invalidations.fetchOrigin({ force: true });
       })
     : null;
   // Worktree membership changes (`git worktree add/remove` from any
@@ -373,7 +375,7 @@ export async function runTui(): Promise<TuiExit> {
   // swallowed; the next tick retries.
   const FETCH_ORIGIN_INTERVAL_MS = 3 * 60 * 1000;
   const fetchOriginTimer = setInterval(() => {
-    wtClient.client.fetchQuery(fetchOriginQuery()).catch(() => {});
+    fetchOriginNow().catch(() => {});
   }, FETCH_ORIGIN_INTERVAL_MS);
 
   // Opt-in (`WT_PERF=1`) probe that logs whenever the single JS thread

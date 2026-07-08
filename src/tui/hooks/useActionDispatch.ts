@@ -41,6 +41,7 @@ export type ActionDispatchOpts = {
   /** Clear a worktree's output focus so auto-rules surface the run. */
   setFocus: (slug: string, patch: { focused: string | null }) => void;
   invalidateWorktree: (slug: string) => Promise<void>;
+  refreshOrigin: () => Promise<void>;
   refreshGithub: () => Promise<void>;
   refreshStack: () => Promise<void>;
 };
@@ -68,11 +69,13 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
   // dispatch runs.
   const helpersRef = useRef({
     invalidateWorktree: opts.invalidateWorktree,
+    refreshOrigin: opts.refreshOrigin,
     refreshGithub: opts.refreshGithub,
     refreshStack: opts.refreshStack,
   });
   helpersRef.current = {
     invalidateWorktree: opts.invalidateWorktree,
+    refreshOrigin: opts.refreshOrigin,
     refreshGithub: opts.refreshGithub,
     refreshStack: opts.refreshStack,
   };
@@ -106,12 +109,14 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
         handled.add(key);
         const {
           invalidateWorktree: inv,
+          refreshOrigin: ro,
           refreshGithub: rg,
           refreshStack: rs,
         } = helpersRef.current;
         for (const tag of run.affects) {
           switch (tag) {
             case "git":
+              void ro();
               void inv(run.slug);
               // History-rewriting actions (rebase, modify, …) rewrite
               // commits under a fixed explicit parent, so the per-base

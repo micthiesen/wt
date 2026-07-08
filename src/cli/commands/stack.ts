@@ -19,6 +19,7 @@ import {
 } from "../../core/stack-ops.ts";
 import { git, gitRun } from "../../core/git.ts";
 import { DEFAULT_HUNK_CONTEXT, fileHunks, holisticBase, hunkLineCounts } from "../../core/hunks.ts";
+import { fetchOrigin } from "../../core/worktree.ts";
 import {
   coercePartials,
   findStackIdByBranch,
@@ -904,8 +905,11 @@ async function runContext(_argv: string[]): Promise<number> {
   // /split often runs right after merging a parent PR, when origin/<trunk>
   // is stale; a stale base folds already-merged work into the slices. Surface
   // a failed fetch so the base decision below isn't silently trusted offline.
-  const fetchR = await gitRun(["fetch", "origin", "--quiet"], cwd);
-  if (fetchR.exitCode !== 0) console.log("(git fetch failed — base may be stale)");
+  try {
+    await fetchOrigin();
+  } catch {
+    console.log("(git fetch failed — base may be stale)");
+  }
 
   const branchR = await gitRun(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
   const branch = branchR.exitCode === 0 ? branchR.stdout.trim() : "?";

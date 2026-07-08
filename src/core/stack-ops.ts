@@ -59,7 +59,7 @@ import {
   type StackManifest,
   type StackSlice,
 } from "./wtstate.ts";
-import { listWorktrees, worktreeHasTrackedChanges } from "./worktree.ts";
+import { fetchOrigin, listWorktrees, worktreeHasTrackedChanges } from "./worktree.ts";
 
 const log = createLogger("[stack-ops]");
 
@@ -982,15 +982,16 @@ async function replayStackLocked(
     }
   }
 
-  // Freshen origin so `origin/<trunk>` and any external-parent ref resolve to
-  // their live tips before we rebase onto them. A failed fetch would silently
-  // leave stale refs and replay every slice onto an outdated base, so bail.
-  const fetched = await gitRun(["fetch", "origin", "--quiet"]);
-  if (fetched.exitCode !== 0) {
+  // Freshen origin and advance the local trunk branch before replaying. A
+  // failed fetch would silently leave stale refs and replay every slice onto
+  // an outdated base, so bail.
+  try {
+    await fetchOrigin();
+  } catch (err) {
     return {
       ok: false,
       conflict: false,
-      error: `git fetch origin failed (${(fetched.stderr || fetched.stdout).trim() || `exit ${fetched.exitCode}`}) — refusing to replay onto possibly-stale refs`,
+      error: `${err instanceof Error ? err.message : String(err)}; refusing to replay onto possibly-stale refs`,
     };
   }
 

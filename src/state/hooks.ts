@@ -49,8 +49,9 @@
  *    `[[actions]]` entries in `config.toml` carry two tag arrays:
  *
  *    - `affects` (`"git"`, `"github"`) — state domains the action
- *      mutates. The TUI subscribes to action completions and
- *      invalidates the matching state domains on any terminal status.
+ *      mutates. The TUI subscribes to action completions, refreshes
+ *      origin/main for git-affecting actions, and invalidates the matching
+ *      state domains on any terminal status.
  *      Defaults: claude actions push commits → `["git", "github"]`;
  *      shell actions are opaque → `[]` (opt in explicitly, e.g. a
  *      `git checkout` shell action sets `affects = ["git"]`).
@@ -111,6 +112,7 @@ import { qk } from "./keys.ts";
 import { clearPersistedCache } from "./persister.ts";
 import {
   contributorsQuery,
+  fetchOriginNow,
   fetchOriginQuery,
   githubQuery,
   tmuxSessionsQuery,
@@ -338,6 +340,14 @@ export function useWtActions() {
       setTimeout(() => {
         void qc.invalidateQueries({ queryKey: ["wt"] });
       }, 50);
+    },
+    /**
+     * Force an origin refresh even if the marker query is still fresh.
+     * Passive triggers use this so webhook/action events can advance local
+     * main immediately instead of waiting out fetchOriginQuery's staleTime.
+     */
+    async refreshOrigin(): Promise<void> {
+      await fetchOriginNow();
     },
     /**
      * Nuke every cached query — in-memory *and* the SQLite blob on

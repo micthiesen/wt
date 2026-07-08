@@ -144,6 +144,7 @@ export function App({ onExit }: Props) {
   const {
     refreshAll,
     refreshStale,
+    refreshOrigin,
     refreshGithub,
     refreshTmuxSessions,
     optimisticRemoveClaude,
@@ -464,6 +465,7 @@ export function App({ onExit }: Props) {
     toast,
     setFocus,
     invalidateWorktree,
+    refreshOrigin,
     refreshGithub,
     refreshStack,
   });
