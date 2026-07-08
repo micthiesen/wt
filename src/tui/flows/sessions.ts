@@ -11,9 +11,18 @@ import {
   nameInUse,
   removeClaudeName,
 } from "../../core/claude-sessions.ts";
-import { getHarness, type HarnessId } from "../../core/harness/index.ts";
+import {
+  getHarness,
+  type Harness,
+  type HarnessId,
+  type HarnessSession,
+} from "../../core/harness/index.ts";
 import { createLogger } from "../../core/logger.ts";
-import { claudeSessionName, killHarnessSession } from "../../core/tmux.ts";
+import {
+  claudeSessionName,
+  killHarnessSession,
+  listSessions as listTmuxSessions,
+} from "../../core/tmux.ts";
 import { StatusKind } from "../../core/types.ts";
 
 import { enterHarnessSession } from "../harness-session.ts";
@@ -22,6 +31,29 @@ import type { SessionSlot } from "../session-slots.ts";
 import { theme } from "../theme.ts";
 
 const appLog = createLogger("[app]");
+
+export function slotSessionResumeTarget(
+  harness: Pick<Harness, "singleSlot">,
+  slotAlive: boolean,
+  sessions: readonly HarnessSession[],
+): { resumeSessionId: string | null; freshSlot: boolean } {
+  if (!harness.singleSlot || slotAlive) {
+    return { resumeSessionId: null, freshSlot: false };
+  }
+  let latest: HarnessSession | null = null;
+  for (const session of sessions) {
+    if (
+      !latest ||
+      (session.lastActiveMs ?? 0) > (latest.lastActiveMs ?? 0)
+    ) {
+      latest = session;
+    }
+  }
+  return {
+    resumeSessionId: latest?.sessionId ?? null,
+    freshSlot: latest !== null,
+  };
+}
 
 export type SessionFlowsCtx = {
   rows: readonly WorktreeRow[];
@@ -124,6 +156,29 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     const slotLog = createLogger(slot.label);
     void (async () => {
       slotLog.event.info(`entering ${harness.label} session (F12 to detach)`);
+      let resumeSessionId: string | null = null;
+      let freshSlot = false;
+      if (harness.singleSlot) {
+        const tmuxName = harness.tmuxSessionName(slot.slug, null);
+        const liveTmux = await listTmuxSessions().catch(() => null);
+        const slotAlive = liveTmux?.all.has(tmuxName) ?? false;
+        let sessions: readonly HarnessSession[] = [];
+        if (!slotAlive) {
+          sessions = await harness
+            .discoverSessions({ slug: slot.slug, wtPath: slot.path })
+            .catch((err: unknown) => {
+              slotLog.event.warn(
+                `${harness.label} session discovery failed: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+              return [];
+            });
+        }
+        const target = slotSessionResumeTarget(harness, slotAlive, sessions);
+        resumeSessionId = target.resumeSessionId;
+        freshSlot = target.freshSlot;
+      }
       const result = await enterHarnessSession({
         renderer,
         slug: slot.slug,
@@ -133,6 +188,8 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
         // conversation is recognizable by name; ignored by codex /
         // opencode (their tmux name is the discriminator).
         claudeDisplayName: slot.label,
+        resumeSessionId,
+        freshSlot,
       });
       // Refresh tmux sessions so the bottom-bar tail picks up the new
       // session immediately rather than waiting for the next poll
