@@ -122,9 +122,11 @@ async function reapStartup(): Promise<void> {
   try {
     const wts = await listWorktrees();
     const live = new Set(wts.map((w) => w.slug));
+    const liveHarnessSlugs = new Set(live);
+    for (const slug of SLOT_SLUGS) liveHarnessSlugs.add(slug);
     reapWtState(live);
     reapArchived(live);
-    for (const harness of HARNESSES) harness.reapState(live);
+    for (const harness of HARNESSES) harness.reapState(liveHarnessSlugs);
     // Drop pipe-pane shell logs and `<slug>-*.log` destroy logs whose
     // slug no longer exists — keeps `~/.cache/wt/` from accumulating
     // ghosts from worktrees long since destroyed. Live-slug logs are

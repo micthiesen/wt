@@ -25,6 +25,10 @@ import { Database } from "bun:sqlite";
 
 import { createLogger } from "../logger.ts";
 import type { DerivedState } from "../claude-status.ts";
+import {
+  reapOpencodeNames,
+  reconcileOpencodeNames,
+} from "../opencode-sessions.ts";
 
 import type { Harness, HarnessSession, HarnessSpawnArgs } from "./types.ts";
 
@@ -170,6 +174,10 @@ export const opencodeHarness: Harness = {
       }
     }
 
+    const friendlyNames = reconcileOpencodeNames(
+      slug,
+      rows.map((r) => r.id),
+    );
     const tmuxName = `${slug}${OPENCODE_TMUX_INFIX}`;
     const out: HarnessSession[] = rows.map((row) => {
       // Check state cache before querying the message table.
@@ -194,7 +202,10 @@ export const opencodeHarness: Harness = {
       }
 
       return {
-        displayName: row.title || row.id.slice(0, 8),
+        displayName:
+          opencodeDisplayTitle(row.title, row.id) ??
+          friendlyNames[row.id] ??
+          row.id.slice(0, 8),
         sessionId: row.id,
         tmuxSessionName: tmuxName,
         // SQLite stores time_updated as ms-since-epoch (per opencode schema).
@@ -221,10 +232,27 @@ export const opencodeHarness: Harness = {
     return ["opencode"];
   },
 
-  reapState(_liveSlugs) {
-    // No-op: opencode owns its DB; we don't write to it.
+  reapState(liveSlugs) {
+    reapOpencodeNames(liveSlugs);
   },
 };
+
+/**
+ * OpenCode's DB title is worth showing when it is genuinely descriptive,
+ * but newly-spawned sessions often carry a generated timestamp title.
+ * Treat those as unnamed so wt's stable `primary` / `2` fallback wins.
+ */
+export function opencodeDisplayTitle(
+  title: string | null | undefined,
+  sessionId: string,
+): string | null {
+  const trimmed = title?.trim();
+  if (!trimmed) return null;
+  if (trimmed === sessionId) return null;
+  if (trimmed.startsWith("ses_")) return null;
+  if (/^new session(?:\s*-\s*.+)?$/i.test(trimmed)) return null;
+  return trimmed;
+}
 
 /** Recognise an opencode tmux session for a slug. */
 export function isOpencodeTmuxName(name: string, slug: string): boolean {
