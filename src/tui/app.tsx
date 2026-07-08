@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { keepPreviousData, useIsFetching, useQueries, useQuery } from "@tanstack/react-query";
+import { useMemo, useRef, useState } from "react";
+import { useIsFetching, useQuery } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
@@ -7,9 +7,8 @@ import {
   actionRegistry,
   BUILTIN_ACTIONS,
   evaluateActionRequirements,
-  type ActionDef,
 } from "../core/actions.ts";
-import { recentValues, type HistoryEntry } from "../core/action-history.ts";
+import { recentValues } from "../core/action-history.ts";
 import { config, type PullRequestTarget } from "../core/config.ts";
 import { createWorktree, parseInput } from "../core/lifecycle.ts";
 import {
@@ -23,33 +22,20 @@ import {
   validateSessionName,
 } from "../core/claude-sessions.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
-import {
-  type LiveHarnessSlot,
-  harnessTailRegistry,
-} from "../core/harness/harness-tail.ts";
 import { effectiveBaseOrTrunk } from "../core/git.ts";
 import { createLogger } from "../core/logger.ts";
-import {
-  type LiveSessionDesc,
-  sessionTailRegistry,
-} from "../core/session-tail.ts";
-import { shellTailRegistry } from "../core/shell-tail.ts";
-import { slugLabel, stageUrl } from "../core/stage.ts";
+import { stageUrl } from "../core/stage.ts";
 import {
   closeHarnessSessionGracefully,
-  diffCommandUsesBase,
-  killDiffSession,
   killHarnessSession,
-  killShellSession,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
-import { claudeSummariesQuery, patchPullRequest, reviewRequestsQuery, stackTitleQuery, useWtActions, wtStateQuery, type GithubData, type ReviewRequestPr, type StackMember } from "../state/index.ts";
+import { claudeSummariesQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
 
 import {
   ActionEditModal,
   ActionPickerModal,
   assignActionKeys,
-  type ActionPickerState,
   type PickerItem,
 } from "./panels/action-picker.tsx";
 import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
@@ -72,9 +58,8 @@ import {
   SessionsPickerList,
   SessionsPickerNew,
 } from "./panels/sessions-picker.tsx";
-import { WorktreeList, rowLabel, type ListActiveItem, type ListScrollHandle } from "./panels/list.tsx";
-import type { SectionDetail } from "./panels/details.tsx";
-import { YankModal, yankItemsFor } from "./panels/yank.tsx";
+import { WorktreeList, type ListScrollHandle } from "./panels/list.tsx";
+import { YankModal } from "./panels/yank.tsx";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
 import {
   isSyntheticLiveSessionId,
@@ -84,6 +69,8 @@ import {
 import { getHarness, HARNESSES, type HarnessId } from "../core/harness/index.ts";
 import { HarnessPickerModal } from "./panels/harness-picker.tsx";
 import type { PickerRow } from "./panels/sessions-picker.tsx";
+import type { Modal } from "./modal.ts";
+import { handleSimpleModalKey } from "./modal-key-handlers.ts";
 import { enterDiffSession } from "./diff-session.ts";
 import { enterShellSession } from "./shell-session.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
@@ -94,16 +81,7 @@ import {
   useActiveShellSessions,
   useClaudeSessionsBySlug,
 } from "./hooks/useActiveSessions.ts";
-import { useOutputs } from "./hooks/useOutputs.ts";
-import {
-  type Output,
-  actionOutputId,
-  destroyOutputId,
-  eventsOutputId,
-  indexOfOutput,
-  outputsForSlug,
-  sessionOutputId,
-} from "../core/outputs.ts";
+import { eventsOutputId, indexOfOutput, sessionOutputId } from "../core/outputs.ts";
 import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
@@ -111,10 +89,14 @@ import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import {
   GROUP_INBOX,
   STACK_SECTION_PREFIX,
-  stackSectionKey,
   useWorktreeRows,
   type WorktreeRow,
 } from "./hooks/useWorktreeRows.ts";
+import { useStackSections } from "./hooks/useStackSections.ts";
+import { useVisualItems, visualKey } from "./hooks/useVisualItems.ts";
+import { useSectionDetail } from "./hooks/useSectionDetail.ts";
+import { useSessionTailReconcile } from "./hooks/useSessionTailReconcile.ts";
+import { useOutputFocus } from "./hooks/useOutputFocus.ts";
 import {
   actionSkillPrefix,
   buildActionVars,
@@ -134,18 +116,9 @@ import { openInZed, openUrlHidingAlacritty, writeClipboard } from "./helpers.ts"
 import {
   DOTFILES_SLOT,
   MAIN_CLONE_SLOT,
-  SESSION_SLOTS,
   WT_SOURCE_SLOT,
 } from "./session-slots.ts";
 import { theme } from "./theme.ts";
-
-/** Per-worktree focus state for the Outputs system. */
-type SlugFocus = { focused: string | null };
-/** Bucket key for the "no row selected" state. Slugs are user-
- *  generated branch names with limited charset; this sentinel can't
- *  collide. */
-const NO_ROW_KEY = "__no_row__";
-const EMPTY_FOCUS: SlugFocus = { focused: null };
 
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
@@ -168,145 +141,6 @@ type PendingPrTargetChord = {
   logName: string;
   timer: Timer;
 };
-
-/**
- * Every overlay/modal the TUI can display. Exactly one is active at
- * a time (or `null`); the keyboard handler dispatches by `kind` and
- * the JSX renders by `kind`. New overlays should add a variant here
- * rather than a parallel `useState<boolean>`.
- *
- * `branchPicker` suspends a caller (`doNew`'s `parseInput` awaits the
- * resolver). Everything else is fire-and-forget: opening sets state,
- * the user picks/cancels, the handler fires the side-effect and
- * clears `modal`.
- */
-type Modal =
-  | {
-      /**
-       * Help overlay. `searching` is the in-overlay `/` filter mode
-       * (distinct from the normal-mode `/` keybind); `query` is the live
-       * filter string. While searching, the scrollbox releases keyboard
-       * focus so typed chars build the query instead of scrolling.
-       */
-      kind: "help";
-      query: string;
-      searching: boolean;
-    }
-  | { kind: "cleanConfirm" }
-  | {
-      /**
-       * Generic y/N confirmation. `pendingKey` selects the action to run
-       * on `y` (dispatched in the key handler, same string codes the
-       * footer confirm used). Rendered by `ConfirmModal`. Lives in the
-       * modal layer so async toasts can't clobber a pending prompt.
-       */
-      kind: "confirm";
-      pendingKey: string;
-      title: string;
-      message: string;
-      detail?: string;
-      confirmLabel?: string;
-      danger?: boolean;
-      /**
-       * Captured payload for `pendingKey === "review-wt"`: the PR branch
-       * to check out. Held on the modal (not read from `selectedPr` at
-       * confirm time) so a background review-requests refetch can't shift
-       * the selection out from under the pending action.
-       */
-      reviewBranch?: string;
-    }
-  | { kind: "yank" }
-  | {
-      kind: "branchPicker";
-      title: string;
-      items: string[];
-      index: number;
-      resolve: (picked: string | null) => void;
-    }
-  | {
-      /**
-       * Fork-base picker (`b`). Rewrites the per-slug `baseBranch`
-       * record (the thing `wt new --base` / `wt base set` write) —
-       * display/diff only, never rebases anything. `branch: null` is
-       * the leading "none" row, which clears back to trunk.
-       */
-      kind: "basePicker";
-      slug: string;
-      items: Array<{ label: string; branch: string | null }>;
-      index: number;
-    }
-  | {
-      kind: "reviewerPicker";
-      title: string;
-      items: MultiPickerItem[];
-      index: number;
-      checked: Set<string>;
-      /** Snapshot of currently-requested logins; diffed on submit. */
-      original: Set<string>;
-      slug: string;
-      prNumber: number;
-    }
-  | {
-      kind: "sectionPicker";
-      title: string;
-      slug: string;
-      items: SectionPickerItem[];
-      index: number;
-      /**
-       * When non-null, the modal is in "+ new section" name-input mode.
-       * Typed characters append here instead of navigating the list.
-       */
-      newName: string | null;
-    }
-  | { kind: "actionPicker"; state: ActionPickerState }
-  | {
-      /**
-       * Action arg picker — opened after the `!` picker confirms an
-       * action whose def has `argPrompt`. Shows recent values for that
-       * action with `LABEL`-derived labels; trailing slot opens a
-       * single-line input for a fresh value. Empty history skips
-       * straight to input mode (`input: ""`, `index: 0`).
-       */
-      kind: "argPicker";
-      slug: string;
-      def: ActionDef;
-      history: readonly HistoryEntry[];
-      index: number;
-      /** null = list mode, string = typing a new value. */
-      input: string | null;
-    }
-  | { kind: "outputsPicker"; index: number }
-  | {
-      kind: "claudeSessionsPicker";
-      slug: string;
-      /** Index into the list view (live sessions + a trailing "+ new"). */
-      index: number;
-    }
-  | {
-      kind: "claudeSessionsNew";
-      slug: string;
-      input: string;
-      error: string | null;
-    }
-  | {
-      /**
-       * Pick a harness to spawn fresh. Opened by Shift+F12 — gives the
-       * user a one-off override of the primary selection without
-       * changing the global Shift+TAB-cycled primary.
-       */
-      kind: "harnessSelect";
-      slug: string;
-      index: number;
-    }
-  | { kind: "killActionConfirm"; slug: string; actionName: string }
-  | {
-      kind: "killSessionConfirm";
-      slug: string;
-      // Claude kill is reachable only via the picker (`x`), which
-      // bypasses this modal entirely; only diff and shell still use
-      // the y/N confirm.
-      sessionKind: "diff" | "shell";
-    };
 
 export function App({ onExit }: Props) {
   const { width, height } = useTerminalDimensions();
@@ -339,17 +173,9 @@ export function App({ onExit }: Props) {
     refreshHarnessSessions,
   } = useWtActions();
   const primaryHarness = usePrimaryHarness();
-  // Cursor is tracked by a stable key (a worktree slug, `section:<key>` for a
-  // folded header, or `pr:<url>`), not an index. Key identity survives row
-  // moves (archive, section change, manual reorder, fold/unfold) without any
-  // explicit "follow this row" plumbing — the visual index falls out
-  // of `visualItems.findIndex(v => visualKey(v) === sel)` on each
-  // render. When
-  // the selected slug disappears (destroy), `lastIndexRef` snaps the
-  // cursor to the row that took its place rather than jumping to the
-  // top of the list.
+  // Cursor is tracked by a stable key (slug, folded section, or PR URL), not an
+  // index. The visual list hook resolves that key against the current rows.
   const [sel, setSel] = useState<string | null>(null);
-  const lastIndexRef = useRef(0);
   // Guards the `R` replay-stack action against re-entry while a rebase is
   // in flight (the engine flock is the real lock; this just avoids spamming
   // it from the UI). Reset in `doReplayStack`'s finally.
@@ -379,14 +205,6 @@ export function App({ onExit }: Props) {
   // identity of the thing being renamed). Not folded into `modal`
   // because the rename UX uses the footer, not an overlay.
   const [pendingRename, setPendingRename] = useState<string | null>(null);
-  // Per-worktree bottom-pane state. Each slug has its own focused
-  // (explicit pick from picker / cycle keys) output. Switching rows
-  // restores that worktree's last selection — so monitoring an
-  // action on one slug and a CC session on another stays mutually
-  // independent. The `__no_row__` bucket covers the "nothing
-  // selected" edge (brand-new repo, no rows yet) and pins down what
-  // the global pane shows there.
-  const [slugFocus, setSlugFocus] = useState<Record<string, SlugFocus>>({});
   const toastTimer = useRef<Timer | null>(null);
   const pendingPrTargetChordRef = useRef<PendingPrTargetChord | null>(null);
 
@@ -436,194 +254,30 @@ export function App({ onExit }: Props) {
     }
   });
 
-  // Stack section AI title pipeline. The title describes section
-  // membership, so it reads from `rows` directly. Members preserve
-  // `rows` order (chain depth from the row aggregator).
-  const stackSectionMembers = useMemo((): Map<
-    string,
-    { members: StackMember[]; ready: boolean }
-  > => {
-    const byName = new Map<string, { members: StackMember[]; ready: boolean }>();
-    for (const r of rows) {
-      if (!r.sectionIsStack || r.section === null) continue;
-      // The holistic origin's brief is the whole-feature title; it would
-      // bias the section title toward describing the feature rather than
-      // the slices, so it never joins the prompt.
-      if (r.stack?.isHolistic) continue;
-      // A detached HEAD wouldn't legitimately be part of a stack
-      // (stacks walk branch-parent chains), but the type allows it.
-      // Skipping keeps the signature stable and the prompt clean.
-      if (!r.wt.branch) continue;
-      const { id, rest } = slugLabel(r.wt.slug);
-      // Brief is the LLM's pithy noun phrase, falling back to the
-      // slug-derived label. `ready` flips false while any member still
-      // lacks a real brief — the title fetch is gated on it (below)
-      // because slug fragments alone are too thin to name from.
-      const brief = r.brief ?? (rest || id || r.wt.slug);
-      let entry = byName.get(r.section);
-      if (!entry) {
-        entry = { members: [], ready: true };
-        byName.set(r.section, entry);
-      }
-      entry.members.push({ branch: r.wt.branch, brief });
-      if (r.brief == null) entry.ready = false;
-    }
-    return byName;
-  }, [rows]);
-  const stackSectionEntries = useMemo(
-    () => Array.from(stackSectionMembers.entries()),
-    [stackSectionMembers],
-  );
-  // `placeholderData: keepPreviousData` so adding/removing a member
-  // mid-session doesn't flicker the divider through the storage name
-  // — the prior title stays on screen while the new key fetches.
-  const stackTitleResults = useQueries({
-    queries: stackSectionEntries.map(([name, { members, ready }]) => ({
-      ...stackTitleQuery(name, members),
-      // Hold the fetch until every member has a real LLM brief. Titles
-      // cache forever under the membership signature, so a cold fire
-      // with slug-fallback briefs bakes in a junk name — the model has
-      // nothing real to work with and leans on its own instructions
-      // (the "TUI Header Orchestration Stack" incident). A cached
-      // entry still renders while disabled; only generation waits.
-      enabled: ready && members.length > 0 && !!config.ai,
-      placeholderData: keepPreviousData,
-    })),
-  });
-  // Stack section header labels, keyed by the synthetic section key.
-  // Every managed stack gets an entry (issue + progress); the AI title,
-  // when resolved, is woven in between. The list divider reads this so a
-  // stack section never falls back to rendering its raw `\0stack:` key.
-  const wtStateForStacks = useQuery(wtStateQuery());
-  // Folded section keys, persisted in wtState (TAB toggles via
-  // `toggleSectionFold`, which writes + invalidates this query).
-  const foldedSections = useMemo<ReadonlySet<string>>(
-    () => new Set(wtStateForStacks.data?.foldedSections ?? []),
-    [wtStateForStacks.data?.foldedSections],
-  );
-  const stackSectionLabels = useMemo((): Map<string, string> => {
-    const aiByKey = new Map<string, string>();
-    for (let i = 0; i < stackSectionEntries.length; i++) {
-      const [name] = stackSectionEntries[i]!;
-      const title = stackTitleResults[i]?.data;
-      if (typeof title === "string" && title.trim() !== "") {
-        aiByKey.set(name, title);
-      }
-    }
-    const m = new Map<string, string>();
-    for (const man of Object.values(wtStateForStacks.data?.stacks ?? {})) {
-      const key = stackSectionKey(man.stackId);
-      const title = aiByKey.get(key);
-      m.set(key, title ? `${man.issue} · ${title}` : man.issue);
-    }
-    return m;
-  }, [wtStateForStacks.data, stackSectionEntries, stackTitleResults]);
+  const { wtStateForStacks, foldedSections, stackSectionLabels } =
+    useStackSections(rows);
 
   const cleanCandidates = useMemo(
     () => rows.filter((r) => isCleanCandidate(r)),
     [rows],
   );
 
-  // Review-requested PRs are a pinned section at the bottom of the
-  // list. Not worktrees (no slug, no per-slug state) so they render
-  // through a stripped-down row component.
-  const reviewRequests = useQuery(reviewRequestsQuery());
-  const reviewRequestRows = useMemo<readonly ReviewRequestPr[]>(
-    () => reviewRequests.data ?? [],
-    [reviewRequests.data],
-  );
-
-  // Unified cursor space: active wts → review-request PRs → archived
-  // wts. j/k/g/G traverse this list as a single sequence so the user
-  // can navigate into the pinned sections without an extra chord.
-  // Selection identity is the slug for wt rows and `pr:<url>` for PR
-  // rows so it survives row reordering and PR list churn.
-  type VisualItem = ListActiveItem | { kind: "pr"; pr: ReviewRequestPr };
-  const archivedRows = useMemo(() => rows.filter((r) => r.archived), [rows]);
-  // Active portion, with folded sections collapsed to one `section` item each.
-  // This is the SINGLE source of truth shared by the cursor model (below) and
-  // the list panel, so a fold is exactly one cursor stop, not N hidden rows.
-  // Relies on `rows` keeping each section's rows contiguous (the sort in
-  // `useWorktreeRows`); the `emitted` guard collapses a section to one header
-  // even if that ever weakens.
-  const activeItems = useMemo<ListActiveItem[]>(() => {
-    const activeRows = rows.filter((r) => !r.archived);
-    const out: ListActiveItem[] = [];
-    const emitted = new Set<string>();
-    for (const r of activeRows) {
-      // Inbox rows (`section: null`) fold under the GROUP_INBOX
-      // sentinel — the same key that ranks the inbox in
-      // `sectionsOrder`, so a folded inbox header moves with J/K like
-      // any other group.
-      const sec = r.section ?? GROUP_INBOX;
-      if (foldedSections.has(sec)) {
-        if (emitted.has(sec)) continue; // one header per section
-        emitted.add(sec);
-        out.push({
-          kind: "section",
-          sectionKey: sec,
-          isStack: r.sectionIsStack,
-          label:
-            r.section === null
-              ? "Inbox"
-              : r.sectionIsStack
-                ? stackSectionLabels.get(sec) ?? sec
-                : sec,
-          rows: activeRows.filter((x) => (x.section ?? GROUP_INBOX) === sec),
-        });
-      } else {
-        out.push({ kind: "wt", row: r });
-      }
-    }
-    return out;
-  }, [rows, foldedSections, stackSectionLabels]);
-  const visualItems = useMemo<VisualItem[]>(() => {
-    const prs: VisualItem[] = reviewRequestRows.map((pr) => ({ kind: "pr", pr }));
-    const archived: VisualItem[] = archivedRows.map((r) => ({ kind: "wt", row: r }));
-    return [...activeItems, ...prs, ...archived];
-  }, [activeItems, reviewRequestRows, archivedRows]);
-
-  const visualKey = (item: VisualItem): string =>
-    item.kind === "wt"
-      ? item.row.wt.slug
-      : item.kind === "section"
-        ? `section:${item.sectionKey}`
-        : `pr:${item.pr.url}`;
-
-  // Resolve the selected key to a visual index. When the key isn't in
-  // the current visible set (destroyed, never set), fall
-  // back to the last known visual index, clamped to the new length.
-  // That fallback is what makes "destroy the selected row" land the
-  // cursor on the row that took its place. Cold launch (`sel === null`,
-  // ref still at its initial 0) deliberately biases toward worktree
-  // rows so a fresh repo with pinned review-requests doesn't open with
-  // the cursor parked on a PR — `p` / Enter there would silently open
-  // a PR in the browser the user wasn't aiming at.
-  const lookupIndex =
-    sel === null ? -1 : visualItems.findIndex((v) => visualKey(v) === sel);
-  const cursorIndex = (() => {
-    if (visualItems.length === 0) return -1;
-    if (lookupIndex >= 0) return lookupIndex;
-    if (sel === null) {
-      const firstWt = visualItems.findIndex((v) => v.kind === "wt");
-      return firstWt >= 0 ? firstWt : -1;
-    }
-    return Math.min(lastIndexRef.current, visualItems.length - 1);
-  })();
-  const currentItem = cursorIndex >= 0 ? visualItems[cursorIndex] : undefined;
-  const current =
-    currentItem?.kind === "wt" ? currentItem.row : undefined;
-  const selectedPr =
-    currentItem?.kind === "pr" ? currentItem.pr : undefined;
-  const selectedSection =
-    currentItem?.kind === "section" ? currentItem : undefined;
-  // Stash the resolved index so it's available as a fallback the next
-  // time the slug can't be found. Writing during render is safe — the
-  // value is derived purely from this render's inputs, the write is
-  // idempotent, and reading it elsewhere happens in the same render.
-  if (cursorIndex >= 0 && cursorIndex !== lastIndexRef.current) {
-    lastIndexRef.current = cursorIndex;
-  }
+  const {
+    activeItems,
+    archivedRows,
+    reviewRequestRows,
+    visualItems,
+    cursorIndex,
+    currentItem,
+    current,
+    selectedPr,
+    selectedSection,
+  } = useVisualItems({
+    rows,
+    foldedSections,
+    stackSectionLabels,
+    selectedKey: sel,
+  });
 
   function clearPendingPrTargetChord(): void {
     const pending = pendingPrTargetChordRef.current;
@@ -721,32 +375,12 @@ export function App({ onExit }: Props) {
     sessionWorktrees,
     primaryHarness,
   );
-  // Enrich the folded section with its live manifest + per-member
-  // badge-cluster inputs for the detail-pane summary (kept out of
-  // `Details` so that pane stays free of state reads). Members carry
-  // the full row plus the same action/session signals the list pane
-  // computes, so the summary's badge cluster can't drift from the
-  // expanded rows. Lives below `activeActions`/`activeSessionBySlug`
-  // since it closes over both.
-  const sectionDetail = useMemo<SectionDetail | undefined>(() => {
-    if (!selectedSection) return undefined;
-    const stackId = selectedSection.isStack
-      ? selectedSection.sectionKey.slice(STACK_SECTION_PREFIX.length)
-      : null;
-    return {
-      sectionKey: selectedSection.sectionKey,
-      isStack: selectedSection.isStack,
-      label: selectedSection.label,
-      manifest: stackId ? wtStateForStacks.data?.stacks[stackId] ?? null : null,
-      members: selectedSection.rows.map((r) => ({
-        label: rowLabel(r),
-        row: r,
-        actionRunning: activeActions.has(r.wt.slug),
-        activeHarnessId: activeSessionBySlug.get(r.wt.slug)?.harnessId,
-        sessionState: activeSessionBySlug.get(r.wt.slug)?.state ?? undefined,
-      })),
-    };
-  }, [selectedSection, wtStateForStacks.data, activeActions, activeSessionBySlug]);
+  const sectionDetail = useSectionDetail({
+    selectedSection,
+    wtState: wtStateForStacks.data,
+    activeActions,
+    activeSessionBySlug,
+  });
   // LLM-authored summary snippets for the picker's currently-open
   // worktree. Only fetched when the picker is open (gated by
   // `enabled`); the queryFn does light tail-bounded disk reads
@@ -801,93 +435,29 @@ export function App({ onExit }: Props) {
   const activeCodexSessions = useActiveHarnessSessions("codex");
   const activeOpencodeSessions = useActiveHarnessSessions("opencode");
 
-  // Reconcile session tailers against the live (slug, name) set so the
-  // jsonl-watch lifecycle tracks the daemon. Re-runs whenever the live
-  // set changes; the registry is otherwise idempotent so this is safe
-  // to call on every render-driven change. Path comes from `rows` for
-  // worktrees and from `SESSION_SLOTS` for the `.` / `,` slot bindings
-  // — claude derives its project dir from cwd, so a slot's tailer
-  // reads from the same jsonl claude wrote for the slot's path. Slots
-  // are seeded first so a real row's path wins on the (extremely
-  // narrow) slug collision case.
-  useEffect(() => {
-    const pathBySlug = new Map<string, string>();
-    for (const slot of SESSION_SLOTS) pathBySlug.set(slot.slug, slot.path);
-    for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
-    const live: LiveSessionDesc[] = [];
-    for (const [slug, names] of claudeSessionsBySlug) {
-      const wtPath = pathBySlug.get(slug);
-      if (!wtPath) continue;
-      for (const name of names) live.push({ slug, name, wtPath });
-    }
-    sessionTailRegistry.reconcile(live);
-  }, [rows, claudeSessionsBySlug]);
+  useSessionTailReconcile({
+    rows,
+    claudeSessionsBySlug,
+    activeShellSessions,
+    activeCodexSessions,
+    activeOpencodeSessions,
+    activeDiffSessions,
+    refreshTmuxSessions,
+  });
 
-  // Same shape for the F10 shell tail: spin a tailer per live shell
-  // session, drop tailers for sessions that ended. The shell registry
-  // doesn't need the worktree path — its log file is keyed on the
-  // bare slug under wt's cache dir.
-  useEffect(() => {
-    const live = new Set<string>();
-    for (const r of rows) {
-      if (activeShellSessions.has(r.wt.slug)) live.add(r.wt.slug);
-    }
-    shellTailRegistry.reconcile(live);
-  }, [rows, activeShellSessions]);
-
-  // Codex/opencode session trails for the bottom pane. Like the shell
-  // reconcile but per-harness and path-bearing — the rollout/SQLite
-  // tailers resolve their source from the worktree cwd. Slot paths
-  // come from `SESSION_SLOTS`, real rows override on slug collision.
-  useEffect(() => {
-    const pathBySlug = new Map<string, string>();
-    for (const slot of SESSION_SLOTS) pathBySlug.set(slot.slug, slot.path);
-    for (const r of rows) pathBySlug.set(r.wt.slug, r.wt.path);
-    const live: LiveHarnessSlot[] = [];
-    const add = (slugs: ReadonlySet<string>, harnessId: "codex" | "opencode") => {
-      for (const slug of slugs) {
-        const wtPath = pathBySlug.get(slug);
-        if (wtPath) live.push({ slug, wtPath, harnessId });
-      }
-    };
-    add(activeCodexSessions, "codex");
-    add(activeOpencodeSessions, "opencode");
-    harnessTailRegistry.reconcile(live);
-  }, [rows, activeCodexSessions, activeOpencodeSessions]);
-
-  // Kill any live `<slug>-diff` tmux session whose resolved base ref
-  // has changed since the session was opened, so the next F11 spawns
-  // fresh against the new ref instead of leaving the user staring at a
-  // diff vs the prior parent. Triggered when the manifest-derived base
-  // changes (the only thing that moves the resolved base now). Only
-  // runs when the user's diff command actually depends on `{{base}}` —
-  // commands like `gitu` ignore the base and shouldn't be torn down on
-  // unrelated re-resolutions.
-  const lastDiffBase = useRef<Map<string, string>>(new Map());
-  useEffect(() => {
-    if (!diffCommandUsesBase(config.diff.command)) return;
-    const seen = new Set<string>();
-    for (const r of rows) {
-      const slug = r.wt.slug;
-      seen.add(slug);
-      const next = resolveDiffBase(r);
-      const prev = lastDiffBase.current.get(slug);
-      lastDiffBase.current.set(slug, next);
-      if (prev === undefined || prev === next) continue;
-      if (!activeDiffSessions.has(slug)) continue;
-      const log = createLogger(slug);
-      log.event.info(`diff base changed (${prev} → ${next}); killing diff session`);
-      void (async () => {
-        await killDiffSession(slug);
-        await refreshTmuxSessions();
-      })();
-    }
-    // Drop entries for slugs that no longer exist so the map doesn't
-    // grow unboundedly across the session.
-    for (const slug of [...lastDiffBase.current.keys()]) {
-      if (!seen.has(slug)) lastDiffBase.current.delete(slug);
-    }
-  }, [rows, activeDiffSessions, refreshTmuxSessions]);
+  const {
+    visibleOutputs,
+    displayedOutput,
+    focusedOutputId,
+    setFocus,
+  } = useOutputFocus({
+    rows,
+    currentSlug,
+    currentRun,
+    showActionViewer,
+    claudeSessionsBySlug,
+    activeSessionBySlug,
+  });
 
   // Action launch + completion dispatch — extracted to
   // `hooks/useActionDispatch.ts`. Subscribes once to the action
@@ -902,180 +472,6 @@ export function App({ onExit }: Props) {
     refreshGithub,
     refreshStack,
   });
-
-  // Slugs whose lock op is `"remove"` — drives the destroy outputs
-  // surfaced in the picker. Computed from `rows` (each busy row
-  // exposes the lock's `op`) so it tracks the same source the
-  // worktree list uses for its own busy state, no extra query.
-  const destroyingSlugs = useMemo(
-    () =>
-      rows
-        .filter(
-          (r) => r.status.kind === StatusKind.Busy && r.status.op === "remove",
-        )
-        .map((r) => r.wt.slug),
-    [rows],
-  );
-  // Global, slug-tagged list of everything renderable in the bottom
-  // pane. Filtered per worktree at the consumption site — see
-  // `visibleOutputs` below.
-  const outputs = useOutputs({ destroyingSlugs });
-  // Bucket key for the current worktree's pin/focus state. Stays in
-  // sync with the selected row; falls back to `NO_ROW_KEY` when
-  // nothing is selected so the picker / pin still have a place to
-  // store state.
-  const focusKey = currentSlug ?? NO_ROW_KEY;
-  const focusBucket = slugFocus[focusKey] ?? EMPTY_FOCUS;
-  // Outputs visible while sitting on this worktree: the global ones
-  // (events) plus this worktree's actions and sessions. Picker, cycle
-  // keys, and the displayed-output resolver all see the same filtered
-  // universe — that's what makes the per-worktree experience
-  // coherent.
-  const visibleOutputs = useMemo(
-    () => outputsForSlug(outputs, currentSlug ?? null),
-    [outputs, currentSlug],
-  );
-  // Auto-rule for the bottom pane when the user hasn't explicitly
-  // picked anything for this worktree: prefer the selected row's
-  // in-flight destroy, then its running/recent action, then a live
-  // claude tmux session, then events. Destroy beats action because
-  // when a worktree is being torn down the user almost certainly
-  // wants to watch progress (and an action can't run during destroy
-  // — the lock is exclusive — so the precedence isn't really
-  // contested). Depends on `currentRun?.startedAt` (not the whole
-  // run object) so a stream of line appends doesn't re-run the memo
-  // for an unchanged id.
-  const isDestroying =
-    currentSlug !== undefined && destroyingSlugs.includes(currentSlug);
-  const autoOutputId = useMemo<string>(() => {
-    if (currentSlug && isDestroying) {
-      return destroyOutputId(currentSlug);
-    }
-    if (currentSlug && currentRun && showActionViewer) {
-      return actionOutputId(currentSlug, currentRun.startedAt);
-    }
-    if (currentSlug) {
-      // Codex/opencode are single-slot per slug. When the session F12
-      // would attach to (the cross-harness `activeSessionBySlug` target,
-      // same as the list glyph) is one of these, auto-focus its trail so
-      // the bottom pane follows what the user is actually running.
-      const active = activeSessionBySlug.get(currentSlug);
-      if (active && active.harnessId !== "claude") {
-        const id = sessionOutputId(currentSlug, active.harnessId);
-        if (visibleOutputs.some((o) => o.id === id)) return id;
-      }
-      // Multi-session claude: prefer primary when live, otherwise the
-      // most-recently-active named session — same sort `;` and the
-      // outputs picker use, so the auto-pick lines up with what the
-      // user sees up top in `:`. Only ids that exist in
-      // `visibleOutputs` win the auto-rule (the lookup at
-      // `displayedOutput` enforces that), so refusing to invent an
-      // id for a dead session keeps the events fallback reachable.
-      const liveNames = claudeSessionsBySlug.get(currentSlug);
-      if (liveNames && liveNames.length > 0) {
-        if (liveNames.includes(null)) {
-          return sessionOutputId(currentSlug, "claude", null);
-        }
-        const liveClaude = visibleOutputs.find(
-          (o) =>
-            o.kind === "session" &&
-            o.sessionKind === "claude" &&
-            o.sessionName !== null,
-        );
-        if (liveClaude) return liveClaude.id;
-      }
-    }
-    return eventsOutputId();
-  }, [
-    currentSlug,
-    isDestroying,
-    currentRun?.startedAt,
-    showActionViewer,
-    claudeSessionsBySlug,
-    activeSessionBySlug,
-    visibleOutputs,
-  ]);
-  // Explicit user pick > auto, scoped to the current worktree's
-  // bucket. If the chosen id has evicted from the visible list
-  // (action FIFO'd, session ended, or this slug's id belongs to a
-  // different slug after a row change) drop back to auto.
-  const desiredOutputId = focusBucket.focused ?? autoOutputId;
-  const displayedOutput: Output =
-    visibleOutputs.find((o) => o.id === desiredOutputId) ??
-    visibleOutputs.find((o) => o.id === autoOutputId) ??
-    visibleOutputs[0]!; // events always present in the filtered list
-  // GC stale per-slug state: drop the `focused` field when its target
-  // output is no longer in `outputs`, and drop entire buckets for
-  // slugs that are no longer worktrees. Without the second sweep, a
-  // long wt session destroying and recreating worktrees would
-  // accumulate dead entries forever. Surface a dim event line
-  // whenever a non-empty bucket evicts so a user who explicitly
-  // focused an action and then destroyed the worktree gets a
-  // breadcrumb instead of a silent disappearance.
-  //
-  // Implementation note: the diff (which buckets to drop, which to
-  // log about) is computed in a non-updater pass first, then the
-  // event log emit + state update fire outside `setSlugFocus`.
-  // Emitting `appLog.event.dim` from inside an updater would mutate
-  // the events store, which feeds back into this effect via
-  // `outputs` → `useOutputs` and trip the same effect on the next
-  // render. Cleaner to keep the side effect out of the updater.
-  useEffect(() => {
-    const liveSlugs = new Set<string>([NO_ROW_KEY]);
-    for (const r of rows) liveSlugs.add(r.wt.slug);
-    const liveOutputIds = new Set<string>();
-    for (const o of outputs) liveOutputIds.add(o.id);
-
-    let changed = false;
-    const next: Record<string, SlugFocus> = {};
-    const evictedSlugs: string[] = [];
-    for (const [key, bucket] of Object.entries(slugFocus)) {
-      if (!liveSlugs.has(key)) {
-        if (bucket.focused !== null) evictedSlugs.push(key);
-        changed = true;
-        continue;
-      }
-      const focused =
-        bucket.focused && liveOutputIds.has(bucket.focused)
-          ? bucket.focused
-          : null;
-      if (focused !== bucket.focused) changed = true;
-      if (focused === null) {
-        // Drop empty buckets so the map doesn't grow unbounded
-        // through ordinary navigation. `setFocus` already prevents
-        // writing all-null buckets, but defending the invariant
-        // here means the GC sweep is correct even if some other
-        // code path ever inserts one.
-        changed = true;
-        continue;
-      }
-      next[key] = { focused };
-    }
-
-    if (!changed) return;
-    for (const key of evictedSlugs) {
-      appLog.event.dim(`dropped output state for ${key} (worktree gone)`);
-    }
-    setSlugFocus(next);
-  }, [outputs, rows, slugFocus]);
-
-  // Helper — applies a partial update to the current worktree's
-  // bucket without forcing every callsite to spell out the spread.
-  function setFocus(slug: string | null, patch: Partial<SlugFocus>): void {
-    const key = slug ?? NO_ROW_KEY;
-    setSlugFocus((prev) => {
-      const cur = prev[key] ?? EMPTY_FOCUS;
-      const next = { ...cur, ...patch };
-      // Drop the bucket entirely when focused collapses to null
-      // (parity with the GC effect; keeps the map tight).
-      if (next.focused === null) {
-        if (!(key in prev)) return prev;
-        const { [key]: _, ...rest } = prev;
-        return rest;
-      }
-      return { ...prev, [key]: next };
-    });
-  }
 
   function toast(message: string, color = theme.ok, ms = 2500): void {
     if (toastTimer.current) clearTimeout(toastTimer.current);
@@ -2532,229 +1928,31 @@ export function App({ onExit }: Props) {
     }
   }
 
-  // Kill-confirm for an in-flight `!` action on the selected
-  // worktree. Mirrors the y/N pattern used by clean-confirm; also
-  // accepts `!` (the opening key) per the modal toggle convention.
-  function handleKillActionConfirmKey(
-    k: KeyEvent,
-    modal: Extract<Modal, { kind: "killActionConfirm" }>,
-  ): void {
-    if (k.name === "y" || k.name === "return") {
-      const { slug, actionName } = modal;
-      setModal(null);
-      void actionRegistry.kill(slug).then((killed) => {
-        if (killed) {
-          appLog.event.warn(`killed action "${actionName}" on ${slug}`);
-        }
-      });
-      return;
-    }
-    if (
-      k.name === "n" ||
-      k.name === "escape" ||
-      k.sequence === "!" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      setModal(null);
-    }
-  }
-
-  // Kill-confirm for an interactive tmux session on the selected
-  // worktree. Mirrors `killActionConfirm`. For claude, the
-  // conversation jsonl is preserved — next F12 attaches via --resume
-  // to the same UUID. For diff, the next F11 opens fresh state.
-  function handleKillSessionConfirmKey(
-    k: KeyEvent,
-    modal: Extract<Modal, { kind: "killSessionConfirm" }>,
-  ): void {
-    if (k.name === "y" || k.name === "return") {
-      const { slug, sessionKind } = modal;
-      setModal(null);
-      const kill = sessionKind === "diff" ? killDiffSession : killShellSession;
-      void kill(slug)
-        .then(() => {
-          appLog.event.warn(`killed ${sessionKind} session on ${slug}`);
-          void refreshTmuxSessions();
-        })
-        .catch((err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          appLog.event.err(
-            `kill ${sessionKind} session failed for ${slug}: ${msg}`,
-          );
-        });
-      return;
-    }
-    if (
-      k.name === "n" ||
-      k.name === "escape" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      setModal(null);
-    }
-  }
-
-  // Branch-picker modal (for --any multi-match). Swallows input
-  // until the user picks or cancels, resolving the promise that
-  // `parseInput` is awaiting inside `doNew`.
-  function handleBranchPickerKey(
-    k: KeyEvent,
-    modal: Extract<Modal, { kind: "branchPicker" }>,
-  ): void {
-    const bp = modal;
-    if (k.name === "j" || k.name === "down") {
-      setModal({
-        ...bp,
-        index: Math.min(bp.index + 1, bp.items.length - 1),
-      });
-      return;
-    }
-    if (k.name === "k" || k.name === "up") {
-      setModal({ ...bp, index: Math.max(bp.index - 1, 0) });
-      return;
-    }
-    if (k.name === "return") {
-      const chosen = bp.items[bp.index]!;
-      bp.resolve(chosen);
-      setModal(null);
-      return;
-    }
-    if (
-      k.name === "escape" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      bp.resolve(null);
-      setModal(null);
-    }
-  }
-
-  // Fork-base picker. Standard list-picker chord: `b b` confirms the
-  // highlight, digits quick-pick, Enter confirms, esc/q cancel.
-  function handleBasePickerKey(
-    k: KeyEvent,
-    modal: Extract<Modal, { kind: "basePicker" }>,
-  ): void {
-    const bp = modal;
-    if (k.name === "j" || k.name === "down") {
-      setModal({
-        ...bp,
-        index: Math.min(bp.index + 1, bp.items.length - 1),
-      });
-      return;
-    }
-    if (k.name === "k" || k.name === "up") {
-      setModal({ ...bp, index: Math.max(bp.index - 1, 0) });
-      return;
-    }
-    if (k.sequence && /^[1-9]$/.test(k.sequence)) {
-      const item = bp.items[parseInt(k.sequence, 10) - 1];
-      if (item) commitBasePick(item, bp.slug);
-      return;
-    }
-    if (k.name === "return" || isPlainLetter(k, "b")) {
-      const item = bp.items[bp.index];
-      if (item) commitBasePick(item, bp.slug);
-      return;
-    }
-    if (
-      k.name === "escape" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      setModal(null);
-    }
-  }
-
-  // Yank chord: `y` opened the menu; the next key picks what to copy.
-  // `y` again, esc, or ctrl+c cancels. Unmapped keys are ignored
-  // rather than re-entering normal mode, so a stray keystroke can't
-  // accidentally trigger a destructive action. Same when no row is
-  // selected: mapped keys are silently ignored and the modal stays
-  // open (intentional — only the cancel keys dismiss it).
-  function handleYankKey(k: KeyEvent): void {
-    if (
-      k.name === "escape" ||
-      k.sequence === "y" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      setModal(null);
-      return;
-    }
-    if (current) {
-      const item = yankItemsFor(current).find((it) => it.key === k.sequence);
-      if (item) {
-        setModal(null);
-        doYank(current.wt.slug, item.label, item.value);
-      }
-    }
-  }
-
-  // Clean-confirm modal swallows input while open.
-  function handleCleanConfirmKey(k: KeyEvent): void {
-    if (k.name === "y" || k.name === "return") {
-      setModal(null);
-      void doClean();
-      return;
-    }
-    if (
-      k.name === "n" ||
-      k.name === "escape" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      setModal(null);
-    }
-  }
-
-  // Generic y/N confirm. Dispatches on `pendingKey` (same codes the
-  // footer confirm used before it moved into the modal layer). The
-  // modal swallows input while open, so `current` is stable between
-  // open and confirm.
-  function handleConfirmKey(
-    k: KeyEvent,
-    modal: Extract<Modal, { kind: "confirm" }>,
-  ): void {
-    if (k.name === "y" || k.name === "return") {
-      const pending = modal.pendingKey;
-      setModal(null);
-      if (pending === "d" && current) {
-        void doRemove(current.wt.slug);
-      } else if (pending === "d!" && current) {
-        void doRemove(current.wt.slug, { force: true });
-      } else if (pending === "m+" && current) {
-        void doAutoMerge(current.wt.slug, "enable");
-      } else if (pending === "m-" && current) {
-        void doAutoMerge(current.wt.slug, "disable");
-      } else if (pending === "e" && current) {
-        void doMarkReady(current.wt.slug);
-      } else if (pending === "E" && current) {
-        void doShipPr(current.wt.slug);
-      } else if (pending === "review-wt" && modal.reviewBranch) {
-        void doCheckoutReview(modal.reviewBranch);
-      } else if (pending === "R") {
-        appLog.event.warn("cleared all cached data; refetching from scratch");
-        void clearAll();
-      }
-      return;
-    }
-    if (
-      k.name === "n" ||
-      k.name === "escape" ||
-      k.sequence === "q" ||
-      (k.ctrl && k.name === "c")
-    ) {
-      setModal(null);
-    }
-  }
-
   useKeyboard((k) => {
     // Exactly one modal is active at a time; dispatch to its handler
     // and swallow the keypress — no modal mode falls through to the
     // input/normal-mode handling below.
     if (modal) {
+      if (
+        handleSimpleModalKey(k, modal, {
+          setModal,
+          current,
+          refreshTmuxSessions,
+          commitBasePick,
+          doYank,
+          doClean,
+          doRemove,
+          doAutoMerge,
+          doMarkReady,
+          doShipPr,
+          doCheckoutReview,
+          clearAll,
+          logWarn: (message) => appLog.event.warn(message),
+          logErr: (message) => appLog.event.err(message),
+        })
+      ) {
+        return;
+      }
       switch (modal.kind) {
         case "help":
           handleHelpKey(k, modal);
@@ -2782,27 +1980,6 @@ export function App({ onExit }: Props) {
           break;
         case "harnessSelect":
           handleHarnessSelectKey(k, modal);
-          break;
-        case "killActionConfirm":
-          handleKillActionConfirmKey(k, modal);
-          break;
-        case "killSessionConfirm":
-          handleKillSessionConfirmKey(k, modal);
-          break;
-        case "branchPicker":
-          handleBranchPickerKey(k, modal);
-          break;
-        case "basePicker":
-          handleBasePickerKey(k, modal);
-          break;
-        case "yank":
-          handleYankKey(k);
-          break;
-        case "cleanConfirm":
-          handleCleanConfirmKey(k);
-          break;
-        case "confirm":
-          handleConfirmKey(k, modal);
           break;
       }
       return;
@@ -2859,7 +2036,7 @@ export function App({ onExit }: Props) {
     // Normal mode.
     // Escape clears this worktree's explicit focus so the bottom
     // pane returns to follow-row auto-rules.
-    if (k.name === "escape" && focusBucket.focused) {
+    if (k.name === "escape" && focusedOutputId) {
       setFocus(currentSlug ?? null, { focused: null });
       return;
     }
