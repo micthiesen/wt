@@ -81,6 +81,7 @@ import {
   type RequireTag,
   config,
 } from "./config.ts";
+import type { HarnessId } from "./harness/index.ts";
 import { createLogger } from "./logger.ts";
 import { sanitizeLine } from "./proc.ts";
 import { listSessions } from "./tmux.ts";
@@ -220,12 +221,15 @@ export const MAX_RETAINED_RUNS = 20;
 export const CUSTOM_ACTION_ID = "__custom__";
 
 export type ActionStatus = "running" | "succeeded" | "failed" | "killed";
+type ActionRunKind = "claude" | "shell" | "harness";
 
 export type ActionRun = {
   slug: string;
-  /** Mirrors `ActionDef["kind"]`; used by the parser to decide between
-   *  stream-json and raw stdout handling. */
-  kind: "claude" | "shell";
+  /**
+   * Runtime output parser kind. Claude headless actions use stream-json;
+   * shell and non-Claude headless harnesses are tailed as raw text.
+   */
+  kind: ActionRunKind;
   actionId: string;
   actionName: string;
   prompt: string;
@@ -259,7 +263,7 @@ type ActionMeta = {
   version: 1;
   slug: string;
   runId: string;
-  kind: "claude" | "shell";
+  kind: ActionRunKind;
   actionId: string;
   actionName: string;
   prompt: string;
@@ -317,6 +321,7 @@ class ActionRegistry {
     cwd: string,
     extras: string,
     vars: ActionVars = {},
+    harnessId: HarnessId = "claude",
   ): Promise<ActionStartResult> {
     const existing = this.runs.get(slug);
     if (existing?.status === "running" || this.starting.has(slug)) {
@@ -327,7 +332,7 @@ class ActionRegistry {
     // the guard above before this run lands in `runs`.
     this.starting.add(slug);
     try {
-      return await this.startInner(def, slug, cwd, extras, vars);
+      return await this.startInner(def, slug, cwd, extras, vars, harnessId);
     } finally {
       this.starting.delete(slug);
     }
@@ -339,6 +344,7 @@ class ActionRegistry {
     cwd: string,
     extras: string,
     vars: ActionVars,
+    harnessId: HarnessId,
   ): Promise<ActionStartResult> {
     // `kill()` synchronously closes the prior run's tail + done
     // watcher and tmux-kills the session, so by the time we reach
@@ -365,38 +371,35 @@ class ActionRegistry {
 
     const renderedExtras = applyVars(extras, vars);
     const userShell = process.env.SHELL || "bash";
+    const renderedPrompt =
+      def.kind === "claude" ? applyVars(def.prompt, vars) : "";
+    const trimmed = renderedExtras.trim();
+    const fullPrompt =
+      def.kind === "claude"
+        ? trimmed
+          ? `${renderedPrompt}\n\n${trimmed}`
+          : renderedPrompt
+        : "";
+    const promptRunner =
+      def.kind === "claude"
+        ? headlessPromptRunner(harnessId, fullPrompt, cwd)
+        : null;
     const argv =
       def.kind === "shell"
         ? [userShell, "-lc", applyVars(def.shell, vars)]
-        : (() => {
-            const renderedPrompt = applyVars(def.prompt, vars);
-            const trimmed = renderedExtras.trim();
-            const fullPrompt = trimmed ? `${renderedPrompt}\n\n${trimmed}` : renderedPrompt;
-            return [
-              "claude",
-              "-p",
-              "--permission-mode",
-              "auto",
-              "--verbose",
-              "--output-format",
-              "stream-json",
-              fullPrompt,
-            ];
-          })();
+        : promptRunner!.argv;
+    const runKind: ActionRunKind =
+      def.kind === "shell" ? "shell" : promptRunner!.kind;
     const promptForRun =
       def.kind === "shell"
         ? applyVars(def.shell, vars)
-        : (() => {
-            const renderedPrompt = applyVars(def.prompt, vars);
-            const trimmed = renderedExtras.trim();
-            return trimmed ? `${renderedPrompt}\n\n${trimmed}` : renderedPrompt;
-          })();
+        : fullPrompt;
 
     const meta: ActionMeta = {
       version: 1,
       slug,
       runId,
-      kind: def.kind,
+      kind: runKind,
       actionId: def.id,
       actionName: def.name,
       prompt: promptForRun,
@@ -431,7 +434,7 @@ class ActionRegistry {
     };
     const run: ActionRun = {
       slug,
-      kind: def.kind,
+      kind: runKind,
       actionId: def.id,
       actionName: def.name,
       prompt: promptForRun,
@@ -446,7 +449,7 @@ class ActionRegistry {
 
     // Live tail with seed=false: the wrapper just opened the log files,
     // there's nothing to seed, and snapping `lastByte` to 0 is correct.
-    this.attachLive(slug, runDir, def.kind, false);
+    this.attachLive(slug, runDir, runKind, false);
     this.scheduleCleanup();
     return { ok: true, run };
   }
@@ -456,6 +459,7 @@ class ActionRegistry {
     cwd: string,
     prompt: string,
     vars: ActionVars = {},
+    harnessId: HarnessId = "claude",
   ): Promise<ActionStartResult> {
     return this.start(
       {
@@ -473,6 +477,7 @@ class ActionRegistry {
       cwd,
       prompt,
       vars,
+      harnessId,
     );
   }
 
@@ -836,7 +841,7 @@ class ActionRegistry {
   private attachLive(
     slug: string,
     runDir: string,
-    kind: "claude" | "shell",
+    kind: ActionRunKind,
     seed: boolean,
   ): void {
     this.attachLiveWithHandles(slug, runDir, kind, makeFreshHandles(), seed);
@@ -845,7 +850,7 @@ class ActionRegistry {
   private attachLiveWithHandles(
     slug: string,
     runDir: string,
-    kind: "claude" | "shell",
+    kind: ActionRunKind,
     handles: { toolStarts: ToolStartMap; resultEventSeen: boolean },
     seed = false,
   ): void {
@@ -876,10 +881,11 @@ class ActionRegistry {
    * Convert one raw tail line into a parser delta. The two branches
    * mirror the per-kind handlers from the pre-tmux runner: claude
    * stdout is stream-json (parsed for tool/result events), shell
-   * stdout/stderr and claude stderr are raw text appended directly.
+   * stdout/stderr, non-Claude harness output, and claude stderr are
+   * raw text appended directly.
    */
   private parseLine(
-    kind: "claude" | "shell",
+    kind: ActionRunKind,
     line: TailLine,
     handles: { toolStarts: ToolStartMap; resultEventSeen: boolean },
   ): MessageEmit {
@@ -1108,6 +1114,43 @@ class ActionRegistry {
 
 function actionsDir(): string {
   return join(config.paths.logDir, "actions");
+}
+
+function headlessPromptRunner(
+  harnessId: HarnessId,
+  prompt: string,
+  cwd: string,
+): { kind: ActionRunKind; argv: string[] } {
+  switch (harnessId) {
+    case "claude":
+      return {
+        kind: "claude",
+        argv: [
+          "claude",
+          "-p",
+          "--permission-mode",
+          "auto",
+          "--verbose",
+          "--output-format",
+          "stream-json",
+          prompt,
+        ],
+      };
+    case "codex":
+      return {
+        kind: "harness",
+        argv: ["codex", "exec", "--color", "never", "--", prompt],
+      };
+    case "opencode":
+      return {
+        kind: "harness",
+        argv: ["opencode", "run", "--dir", cwd, "--", prompt],
+      };
+    default: {
+      const _exhaustive: never = harnessId;
+      throw new Error(`unhandled harness id: ${String(_exhaustive)}`);
+    }
+  }
 }
 
 /** Filesystem-safe per-run directory id: `<slug>-<iso>` with `:`/`.`

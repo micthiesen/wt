@@ -77,7 +77,7 @@ type Props = {
   selectedIndex: number;
   width: number;
   activeTails: Set<string>;
-  /** Slugs with an in-flight `claude -p` action. Renders the comment
+  /** Slugs with an in-flight tracked headless action. Renders the comment
    *  glyph in the badge cluster while running. */
   activeActions: ReadonlySet<string>;
   /**
@@ -196,7 +196,7 @@ const RowView = memo(function RowView({
   row: WorktreeRow;
   selected: boolean;
   isTailing: boolean;
-  /** Whether a `claude -p` action is currently running on this slug. */
+  /** Whether a tracked headless action is currently running on this slug. */
   actionRunning: boolean;
   /** The harness of this slug's active (F12-target) session, or
    *  undefined when no session is live. Renders the harness glyph in the

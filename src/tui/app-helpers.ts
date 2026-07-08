@@ -251,19 +251,15 @@ export function buildActionVars(row: WorktreeRow, skillPrefix: string): ActionVa
  *  - `kind: "shell"` actions run raw shell; if they reference
  *    `{{skill_prefix}}` at all it's to construct a skill call for the
  *    operator's current harness, so primary is the best guess.
- *  - Headless claude actions (the default `target`) always run `claude -p`,
- *    so the prefix is claude's regardless of the selected primary — a
- *    `/restack` prompt sent to the claude binary stays `/restack` even when
- *    the row's primary is Codex.
- *  - `def === null` is the "Custom prompt…" entry, which is also headless
- *    claude, so it uses claude's prefix too.
+ *  - Headless prompt actions (the default `target`) run the selected
+ *    primary harness's non-interactive CLI (`claude -p`, `codex exec`,
+ *    `opencode run`), so the prefix follows that harness too.
+ *  - `def === null` is the "Custom prompt…" entry, which is also a
+ *    headless prompt action.
  */
 export function actionSkillPrefix(
-  def: ActionDef | null,
+  _def: ActionDef | null,
   primaryHarness: HarnessId,
 ): string {
-  if (def?.kind === "shell" || (def?.kind === "claude" && def.target === "session")) {
-    return getHarness(primaryHarness).skillPrefix;
-  }
-  return getHarness("claude").skillPrefix;
+  return getHarness(primaryHarness).skillPrefix;
 }

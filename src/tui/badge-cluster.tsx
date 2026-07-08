@@ -160,7 +160,7 @@ export function BadgeCluster({
   sessionState,
 }: {
   row: WorktreeRow;
-  /** Whether a `claude -p` action is currently running on this slug. */
+  /** Whether a tracked headless action is currently running on this slug. */
   actionRunning: boolean;
   /** The harness of this slug's active (F12-target) session, or
    *  undefined when no session is live. */

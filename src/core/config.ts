@@ -182,8 +182,10 @@ export type AiConfig = OpenAiAiConfig | GeminiAiConfig;
 /**
  * Pre-built action surfaced by the `!` modal. Two flavors:
  *
- *   - `claude`: launches `claude -p` with the configured prompt; the
- *     edit modal exposes an extras textarea that gets appended.
+ *   - `claude`: prompt action; headless launches the selected primary
+ *     harness's non-interactive CLI (`claude -p`, `codex exec`, or
+ *     `opencode run`) with the configured prompt; the edit modal
+ *     exposes an extras textarea that gets appended.
  *   - `shell`: launches `$SHELL -lc <shell>` in the worktree path; the
  *     edit modal is skipped and Enter launches directly.
  *
@@ -193,9 +195,8 @@ export type AiConfig = OpenAiAiConfig | GeminiAiConfig;
  * vars pass through unchanged so typos surface in the rendered prompt.
  *
  * `{{skill_prefix}}` is the harness skill-invocation prefix (`/` for
- * Claude Code, `$` for OpenCode / Codex), chosen per launch based on
- * the action's target — session-target actions follow the row's
- * primary harness, headless `claude -p` actions always use claude's.
+ * Claude Code, `$` for OpenCode / Codex), chosen per launch from the
+ * row's primary harness.
  * Use it for any prompt that invokes a named skill: `{{skill_prefix}}restack`.
  *
  * When `[[actions]]` is absent the built-in defaults take effect; when
@@ -241,10 +242,10 @@ type ActionUi = {
 };
 
 /**
- * Where a claude action's prompt is delivered. `headless` (default) spawns
- * a tracked `claude -p` run via the action registry. `session` injects the
- * prompt into the worktree's live primary (F12) claude session — starting
- * it first if it isn't running — so the prompt lands in a conversation with
+ * Where a prompt action is delivered. `headless` (default) spawns a tracked
+ * non-interactive run for the selected primary harness. `session` injects
+ * the prompt into the worktree's live primary (F12) harness session, starting
+ * it first if it isn't running, so the prompt lands in a conversation with
  * existing context and history. Session delivery is fire-and-forget: there's
  * no completion sentinel, so `affects` does not auto-refresh on finish.
  */
@@ -754,9 +755,10 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     const ui: { key?: string; group?: string } = {};
     if (typeof keyRaw === "string") ui.key = keyRaw;
     if (typeof groupRaw === "string") ui.group = groupRaw;
-    // `target` is claude-only: it selects headless `claude -p` (default)
-    // vs injecting into the live F12 session. Reject it on shell actions
-    // so a misplaced field fails loud instead of silently doing nothing.
+    // `target` is prompt-action-only: it selects a supervised headless
+    // primary-harness run (default) vs injecting into the live F12 session.
+    // Reject it on shell actions so a misplaced field fails loud instead
+    // of silently doing nothing.
     const targetRaw = entry.target;
     if (targetRaw !== undefined) {
       if (!hasPrompt) {

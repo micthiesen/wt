@@ -261,8 +261,21 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
       return;
     }
     const result = def
-      ? await actionRegistry.start(def, slug, row.wt.path, extras, vars)
-      : await actionRegistry.startCustom(slug, row.wt.path, extras, vars);
+      ? await actionRegistry.start(
+          def,
+          slug,
+          row.wt.path,
+          extras,
+          vars,
+          primaryHarness,
+        )
+      : await actionRegistry.startCustom(
+          slug,
+          row.wt.path,
+          extras,
+          vars,
+          primaryHarness,
+        );
     if (!result.ok) {
       toast(`action: ${result.reason}`, theme.err, 3000);
       return;

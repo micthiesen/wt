@@ -131,9 +131,9 @@ export interface Harness {
    * Substituted into action prompts as `{{skill_prefix}}` at launch
    * time (see `buildActionVars` in `tui/app.tsx`), so a single prompt
    * like `{{skill_prefix}}restack` lands correctly regardless of which
-   * harness is the row's primary. Headless `claude -p` actions always
-   * use claude's prefix since the binary is claude regardless of the
-   * selected primary.
+   * harness is the row's primary. Headless prompt actions use the
+   * selected primary harness's non-interactive CLI, so they use the
+   * same prefix as session-injected prompts.
    */
   readonly skillPrefix: string;
   /**
