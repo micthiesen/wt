@@ -26,6 +26,7 @@ import {
   closeHarnessSessionGracefully,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
+import { stackIdFromSectionKey } from "../core/wtstate.ts";
 import { claudeSummariesQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
 
 import {
@@ -166,6 +167,7 @@ export function App({ onExit }: Props) {
     moveGroupPast,
     toggleSectionFold,
     toggleAutomationsPaused,
+    toggleStackAutomationsPaused,
     mutate,
     cyclePrimaryHarness,
     refreshHarnessSessions,
@@ -1318,37 +1320,64 @@ export function App({ onExit }: Props) {
       openSectionRename();
       return;
     }
-    // Shift+A — pause / resume ALL automations for this session. The
-    // pending intent queue is dropped on pause; conditions that still
-    // hold re-derive it on resume.
+    // Shift+A — pause / resume ALL automations. Persisted in wtstate,
+    // so the pause survives restarts. The pending intent queue is
+    // dropped on pause; conditions that still hold re-derive it on
+    // resume.
     if (isShiftedLetter(k, "a")) {
       if (!automations.configured) {
         toast("no [[automations]] configured", theme.fgDim, 2000);
         return;
       }
-      const nowPaused = automations.togglePaused();
-      toast(
-        nowPaused ? "automations paused" : "automations resumed",
-        nowPaused ? theme.warn : theme.ok,
-        2000,
+      void automations.togglePaused().then(
+        (nowPaused) => {
+          toast(
+            nowPaused ? "automations paused" : "automations resumed",
+            nowPaused ? theme.warn : theme.ok,
+            2000,
+          );
+        },
+        (err) => reportActionError("automations toggle", err),
       );
       return;
     }
-    // Ctrl+A — toggle automations for the CURRENT worktree (persisted
-    // in wtstate, survives restarts). The per-wt escape hatch when a
-    // branch is under manual surgery.
+    // Ctrl+A — toggle automations for the thing under the cursor
+    // (persisted in wtstate, survives restarts). A stack member or a
+    // folded stack header pauses/resumes the WHOLE stack as one, keyed
+    // by stackId so slices added or re-split later stay covered; a
+    // non-stack row toggles just itself. The escape hatch when a
+    // branch (or stack) is under manual surgery.
     if (k.ctrl && k.name === "a" && !k.shift && !k.option && !k.meta) {
       if (!automations.configured) {
         toast("no [[automations]] configured", theme.fgDim, 2000);
         return;
       }
-      if (!current) {
+      const stackId = selectedSection?.isStack
+        ? stackIdFromSectionKey(selectedSection.sectionKey)
+        : current?.stack?.stackId ?? null;
+      if (!stackId && !current) {
         toast("select a worktree first", theme.warn, 1500);
         return;
       }
-      const slug = current.wt.slug;
       void (async () => {
         try {
+          if (stackId) {
+            const nowPaused = await toggleStackAutomationsPaused(stackId);
+            appLog.event.info(
+              nowPaused
+                ? `automations paused for stack ${stackId}`
+                : `automations resumed for stack ${stackId}`,
+            );
+            toast(
+              nowPaused
+                ? `automations paused for stack ${stackId}`
+                : `automations resumed for stack ${stackId}`,
+              nowPaused ? theme.warn : theme.ok,
+              2000,
+            );
+            return;
+          }
+          const slug = current!.wt.slug;
           const nowPaused = await toggleAutomationsPaused(slug);
           createLogger(slug).event.info(
             nowPaused ? "automations paused for this worktree" : "automations resumed for this worktree",

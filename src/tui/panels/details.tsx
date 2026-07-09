@@ -34,6 +34,7 @@ import { useGithub } from "../../state/hooks.ts";
 import {
   aiSummaryQuery,
   wtDiffContextQuery,
+  wtStateQuery,
 } from "../../state/queries.ts";
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
@@ -81,6 +82,8 @@ export type SectionDetail = {
   label: string;
   manifest: StackManifest | null;
   members: SectionMember[];
+  /** Whole-stack automations pause (Ctrl+A); always false for manual sections. */
+  automationsPaused: boolean;
 };
 
 type Props = {
@@ -308,6 +311,27 @@ function CommentsBlock({
 }
 
 /**
+ * Dim one-liner flagging that automations are paused for this scope
+ * (worktree, or its whole stack). Deliberately details-pane-only — the
+ * list stays free of automation chrome; the global pause has its own
+ * title-bar indicator.
+ */
+function AutomationsPausedLine({ scope }: { scope: "worktree" | "stack" }) {
+  return (
+    <box marginTop={1}>
+      <text wrapMode="none" truncate>
+        <span fg={theme.warn}>{"⏸ "}</span>
+        <span fg={theme.fgDim}>
+          {scope === "stack"
+            ? "automations paused for this stack (ctrl+a resumes)"
+            : "automations paused for this worktree (ctrl+a resumes)"}
+        </span>
+      </text>
+    </box>
+  );
+}
+
+/**
  * Multi-line AI summary below the rows. Renders muted text, falls back
  * to a placeholder while the first generation is in flight, and stays
  * silent on errors / when the row is dirty-but-uncached (avoid noise).
@@ -405,6 +429,29 @@ const DetailsBody = memo(function DetailsBody({
     enabled: allowFetch,
   });
 
+  // Per-worktree / per-stack automations pause indicator. Joins the
+  // wtState observer already alive in `useWorktreeRows` (cache-shared).
+  // Stack pause wins the label — it explains why a slice with no flag
+  // of its own is still protected. The global pause is title-bar chrome,
+  // not repeated here.
+  const wtState = useQuery({
+    ...wtStateQuery(),
+    enabled: config.automations.length > 0,
+  });
+  const stackPaused =
+    !!row.stack &&
+    (wtState.data?.pausedStacks ?? []).includes(row.stack.stackId);
+  const slugPaused =
+    wtState.data?.slugs[row.wt.slug]?.automationsPaused === true;
+  const pausedScope: "stack" | "worktree" | null =
+    config.automations.length === 0
+      ? null
+      : stackPaused
+        ? "stack"
+        : slugPaused
+          ? "worktree"
+          : null;
+
   // Hash-keyed AI summary: when the diff hash changes, the queryKey
   // changes; `keepPreviousData` keeps the prior summary on screen
   // while the new fetch runs. The mismatch-detect effect that lived
@@ -454,6 +501,7 @@ const DetailsBody = memo(function DetailsBody({
         {RESOLVED_ROWS.map((m) => (
           <RenderedRow key={m.id} module={m} ctx={ctx} />
         ))}
+        {pausedScope ? <AutomationsPausedLine scope={pausedScope} /> : null}
         <DescriptionBlock
           summary={summary.data?.description ?? null}
           isLlmRunning={summary.isFetching}
@@ -792,6 +840,16 @@ function SectionSummaryBody({ section, width }: { section: SectionDetail; width:
           {section.label}
         </text>
       </box>
+      {section.automationsPaused ? (
+        <box flexShrink={0} overflow="hidden">
+          <text wrapMode="none" truncate>
+            <span fg={theme.warn}>{"⏸ "}</span>
+            <span fg={theme.fgDim}>
+              automations paused for this stack (ctrl+a resumes)
+            </span>
+          </text>
+        </box>
+      ) : null}
       <box height={1} flexShrink={0} />
       {section.manifest ? (
         <StackChain manifest={section.manifest} members={section.members} />

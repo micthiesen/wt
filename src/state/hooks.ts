@@ -106,6 +106,7 @@ import {
   swapOrders as swapOrdersOnDisk,
   toggleSectionFolded as toggleSectionFoldedOnDisk,
   toggleSlugAutomationsPaused as toggleSlugAutomationsPausedOnDisk,
+  toggleStackAutomationsPaused as toggleStackAutomationsPausedOnDisk,
 } from "../core/wtstate.ts";
 
 import { CACHE_DB } from "./client.ts";
@@ -701,12 +702,22 @@ export function useWtActions() {
     },
     /**
      * Toggle the per-worktree automations pause flag (persisted in
-     * wtstate; Ctrl+A). Returns the new paused state. The automations
-     * engine reads the flag through the wtState query, so the
-     * invalidation is what makes the toggle take effect.
+     * wtstate; Ctrl+A on a non-stack row). Returns the new paused
+     * state. The automations engine reads the flag through the wtState
+     * query, so the invalidation is what makes the toggle take effect.
      */
     async toggleAutomationsPaused(slug: string): Promise<boolean> {
       const paused = toggleSlugAutomationsPausedOnDisk(slug);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+      return paused;
+    },
+    /**
+     * Toggle the whole-stack automations pause (Ctrl+A on a stack
+     * member or its folded header). Keyed by stackId so slices added
+     * or re-split later are covered by the same pause.
+     */
+    async toggleStackAutomationsPaused(stackId: string): Promise<boolean> {
+      const paused = toggleStackAutomationsPausedOnDisk(stackId);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
       return paused;
     },

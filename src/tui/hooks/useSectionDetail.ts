@@ -30,6 +30,8 @@ export function useSectionDetail({
       isStack: selectedSection.isStack,
       label: selectedSection.label,
       manifest: stackId ? wtState?.stacks[stackId] ?? null : null,
+      automationsPaused:
+        stackId !== null && (wtState?.pausedStacks ?? []).includes(stackId),
       members: selectedSection.rows.map((r) => ({
         label: rowLabel(r),
         row: r,

@@ -85,7 +85,7 @@ host        = "127.0.0.1"                     # default loopback; set to a LAN I
 secret_file = "~/.config/wt/gh-webhook-secret"  # HMAC secret (or inline `secret = "…"`)
 ```
 
-The loader prints every missing or malformed field at once. See [`src/core/config.ts`](src/core/config.ts) for the full schema and defaults, including the row-ordering knob (`[ui] rows`), the `[[actions]]` tables that populate the `!` action menu, and the opt-in `[[automations]]` tables that fire those actions (or the built-in clean/restack flows) automatically off PR and stack state — once per failure instance, only after the worktree settles, with a per-worktree circuit breaker. `A` pauses all automations for the session; `Ctrl+A` pauses one worktree persistently.
+The loader prints every missing or malformed field at once. See [`src/core/config.ts`](src/core/config.ts) for the full schema and defaults, including the row-ordering knob (`[ui] rows`), the `[[actions]]` tables that populate the `!` action menu, and the opt-in `[[automations]]` tables that fire those actions (or the built-in clean/restack flows) automatically off PR and stack state — once per failure instance, only after the worktree settles, with a per-worktree circuit breaker. `A` pauses all automations; `Ctrl+A` pauses the selected worktree, or its whole stack when it's a slice. Both persist across restarts.
 
 ## Usage
 

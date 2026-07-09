@@ -212,6 +212,16 @@ export type WtState = {
   stacks: Record<string, StackManifest>;
   /** Section keys the user has folded in the list (persisted across restarts). */
   foldedSections: string[];
+  /**
+   * Stack ids whose automations are paused (Ctrl+A on any stack member
+   * or its folded header). Keyed by stackId rather than member slugs so
+   * the pause survives stack mutation — slices added, re-split, or
+   * cleaned later are covered/released together. Ids whose manifest is
+   * gone are pruned on the next pause write.
+   */
+  pausedStacks: string[];
+  /** Global automations pause (Shift+A). Persisted across restarts. */
+  automationsPaused: boolean;
 };
 
 /** Coerce one persisted slice entry, dropping anything malformed. */
@@ -596,7 +606,7 @@ export function validateStackManifest(raw: unknown): ManifestValidation {
 }
 
 export function readWtState(): WtState {
-  if (!existsSync(STATE_FILE)) return { slugs: {}, sectionsOrder: [], stacks: {}, foldedSections: [] };
+  if (!existsSync(STATE_FILE)) return emptyWtState();
   try {
     const raw = readFileSync(STATE_FILE, "utf8");
     const data = JSON.parse(raw) as Partial<WtState>;
@@ -684,11 +694,38 @@ export function readWtState(): WtState {
         foldedSections.push(s);
       }
     }
-    return { slugs, sectionsOrder, stacks, foldedSections };
+    const pausedStacks: string[] = [];
+    if (Array.isArray(data?.pausedStacks)) {
+      const seen = new Set<string>();
+      for (const s of data.pausedStacks) {
+        if (typeof s !== "string" || s.trim() === "" || seen.has(s)) continue;
+        seen.add(s);
+        pausedStacks.push(s);
+      }
+    }
+    return {
+      slugs,
+      sectionsOrder,
+      stacks,
+      foldedSections,
+      pausedStacks,
+      automationsPaused: data?.automationsPaused === true,
+    };
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
-    return { slugs: {}, sectionsOrder: [], stacks: {}, foldedSections: [] };
+    return emptyWtState();
   }
+}
+
+function emptyWtState(): WtState {
+  return {
+    slugs: {},
+    sectionsOrder: [],
+    stacks: {},
+    foldedSections: [],
+    pausedStacks: [],
+    automationsPaused: false,
+  };
 }
 
 function writeWtState(state: WtState): void {
@@ -879,6 +916,34 @@ export function toggleSlugAutomationsPaused(slug: string): boolean {
     else delete entry.automationsPaused;
     next.slugs[slug] = entry;
     writeWtState(next);
+    return paused;
+  });
+}
+
+/**
+ * Toggle the whole-stack automations pause (Ctrl+A on a stack member or
+ * its folded header). Returns the new paused state. Prunes ids whose
+ * manifest is gone while it's writing anyway, so the list can't grow
+ * stale entries forever.
+ */
+export function toggleStackAutomationsPaused(stackId: string): boolean {
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const paused = !state.pausedStacks.includes(stackId);
+    const pausedStacks = state.pausedStacks
+      .filter((id) => id !== stackId && id in state.stacks)
+      .concat(paused ? [stackId] : []);
+    writeWtState({ ...state, pausedStacks });
+    return paused;
+  });
+}
+
+/** Toggle the persisted GLOBAL automations pause (Shift+A). Returns the new state. */
+export function toggleGlobalAutomationsPaused(): boolean {
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const paused = !state.automationsPaused;
+    writeWtState({ ...state, automationsPaused: paused });
     return paused;
   });
 }

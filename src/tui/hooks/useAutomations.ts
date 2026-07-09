@@ -68,6 +68,7 @@ import { config, type AutomationTrigger } from "../../core/config.ts";
 import { lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { StatusKind } from "../../core/types.ts";
+import { toggleGlobalAutomationsPaused } from "../../core/wtstate.ts";
 import { wtStateQuery } from "../../state/queries.ts";
 
 import {
@@ -149,9 +150,9 @@ export type AutomationsOpts = {
 export type AutomationsState = {
   /** True when the config defines any [[automations]] rules. */
   configured: boolean;
-  /** Global session pause (the `A` keybind). */
+  /** Global pause (Shift+A). Persisted in wtstate across restarts. */
   paused: boolean;
-  togglePaused: () => boolean;
+  togglePaused: () => Promise<boolean>;
   /** Queued (not yet dispatched) intents, for the title-bar indicator. */
   pendingCount: number;
 };
@@ -173,11 +174,15 @@ function resolveActionDef(runId: string): ActionDef | null {
 export function useAutomations(opts: AutomationsOpts): AutomationsState {
   const rules = config.automations;
   const configured = rules.length > 0;
-  const [paused, setPaused] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
 
   const qc = useQueryClient();
   const wtState = useQuery(wtStateQuery());
+  // Global pause lives in wtstate (persisted across restarts, toggled
+  // via Shift+A). Until the state file loads, treat as paused — the
+  // engine must not fire before it knows the pause flags.
+  const wtStateReady = wtState.data !== undefined;
+  const paused = !wtStateReady || wtState.data.automationsPaused === true;
   // "Fresh" = a FETCH-driven success on the github query this session.
   // Deliberately not `dataUpdatedAt > appStart`: optimistic patches
   // (`setQueriesData` in the mark-ready / auto-merge / reviewer flows)
@@ -213,9 +218,20 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     pausedSlugs: new Set<string>(),
     paused,
   });
+  // Effective per-worktree pause set: individually-paused slugs plus
+  // every member of a paused STACK (Ctrl+A on any stack row pauses by
+  // stackId, so slices added or re-split later are covered too).
   const pausedSlugs = new Set<string>();
   for (const [slug, st] of Object.entries(wtState.data?.slugs ?? {})) {
     if (st.automationsPaused === true) pausedSlugs.add(slug);
+  }
+  const pausedStackIds = new Set(wtState.data?.pausedStacks ?? []);
+  if (pausedStackIds.size > 0) {
+    for (const row of opts.rows) {
+      if (row.stack && pausedStackIds.has(row.stack.stackId)) {
+        pausedSlugs.add(row.wt.slug);
+      }
+    }
   }
   latest.current = {
     rows: opts.rows,
@@ -640,10 +656,10 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
   return {
     configured,
     paused,
-    togglePaused: () => {
-      const next = !paused;
-      setPaused(next);
+    togglePaused: async () => {
+      const next = toggleGlobalAutomationsPaused();
       log.event.info(next ? "automations paused" : "automations resumed");
+      await qc.invalidateQueries({ queryKey: wtStateQuery().queryKey });
       schedulePass();
       return next;
     },
