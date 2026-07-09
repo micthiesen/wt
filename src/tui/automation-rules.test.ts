@@ -109,7 +109,7 @@ describe("pr.checks.failed", () => {
     });
     const fires = evaluateAutomations([r], [row], FRESH);
     expect(fires).toHaveLength(1);
-    expect(fires[0]!.fireKeys).toEqual(["ci:a:abc123"]);
+    expect(fires[0]!.fireKeys).toEqual(["fix-ci:ci:a:abc123"]);
     expect(fires[0]!.slug).toBe("a");
     expect(fires[0]!.detail).toContain("typecheck");
     expect(fireIdentity(fires[0]!)).toBe("fix-ci|a");
@@ -154,7 +154,7 @@ describe("rabbit.unresolved", () => {
     });
     const fires = evaluateAutomations([r], [carrots], FRESH);
     expect(fires).toHaveLength(1);
-    expect(fires[0]!.fireKeys).toEqual(["rabbit:a:abc123"]);
+    expect(fires[0]!.fireKeys).toEqual(["auto-rabbit:rabbit:a:abc123"]);
     const clean = makeRow("a", {
       pr: makePr({ rabbit: { state: "clean", unresolved: 0 } }),
     });
@@ -169,7 +169,7 @@ describe("wt.merged", () => {
     const row = makeRow("a", { pr: makePr({ state: "MERGED" }) });
     const fires = evaluateAutomations([r], [row], FRESH);
     expect(fires).toHaveLength(1);
-    expect(fires[0]!.fireKeys).toEqual(["merged:a:101"]);
+    expect(fires[0]!.fireKeys).toEqual(["auto-clean:merged:a:101"]);
   });
 
   test("locally-merged branch fires without github freshness", () => {
@@ -182,7 +182,7 @@ describe("wt.merged", () => {
       githubFresh: false,
     });
     expect(fires).toHaveLength(1);
-    expect(fires[0]!.fireKeys).toEqual(["merged:a:local"]);
+    expect(fires[0]!.fireKeys).toEqual(["auto-clean:merged:a:local"]);
   });
 
   test("never fires for stack slices (restack owns their cleanup)", () => {
@@ -220,9 +220,26 @@ describe("stack.parent_merged", () => {
     expect(fires).toHaveLength(1);
     expect(fires[0]!.stackId).toBe("eng-9");
     expect(fires[0]!.slug).toBe("s2");
-    expect(fires[0]!.fireKeys).toEqual(["restack:eng-9:1"]);
+    expect(fires[0]!.fireKeys).toEqual(["auto-restack:restack:eng-9:1"]);
     expect(fires[0]!.quiesceSlugs).toEqual(["s1", "s2", "s3"]);
     expect(fireIdentity(fires[0]!)).toBe("auto-restack|eng-9");
+  });
+
+  test("a single paused member protects the whole stack from restacks", () => {
+    const merged = makeRow("s1", {
+      pr: makePr({ number: 1, state: "MERGED" }),
+      stack: stackInfo("eng-9", 1),
+      status: { kind: StatusKind.Merged, label: "merged" },
+    });
+    const open = makeRow("s2", {
+      pr: makePr({ number: 2 }),
+      stack: stackInfo("eng-9", 2),
+    });
+    const fires = evaluateAutomations([r], [merged, open], {
+      ...FRESH,
+      isPausedSlug: (s) => s === "s2",
+    });
+    expect(fires).toHaveLength(0);
   });
 
   test("silent when nothing merged or nothing open", () => {

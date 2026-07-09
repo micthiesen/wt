@@ -7,6 +7,7 @@ import {
   __setLedgerPathForTests,
   breakerState,
   bumpBreaker,
+  dropFires,
   hasHandledFire,
   lastDispatchAt,
   markFiresDelivered,
@@ -37,6 +38,13 @@ describe("fire ledger", () => {
     __setLedgerPathForTests(join(dir, "automations.json"));
     expect(hasHandledFire("ci:a:sha1")).toBe(true);
     expect(lastDispatchAt("fix-ci", "a")).not.toBeNull();
+  });
+
+  test("dropFires un-consumes declined dispatches so the condition can re-fire", () => {
+    markFiresDispatched(["ci:a:sha1"], "fix-ci", "a");
+    expect(hasHandledFire("ci:a:sha1")).toBe(true);
+    dropFires(["ci:a:sha1", "never-recorded"]);
+    expect(hasHandledFire("ci:a:sha1")).toBe(false);
   });
 
   test("boot reconcile flips matched dispatches and drops unmatched ones", () => {

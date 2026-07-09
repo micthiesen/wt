@@ -179,6 +179,27 @@ export function markFiresDispatched(
   saveLedger();
 }
 
+/**
+ * Un-consume keys whose dispatch was DECLINED by a contention guard
+ * before anything ran (action already running for the slug, restack
+ * mutex held by a manual `R`, …). Deleting the entries lets the
+ * still-true condition re-derive an intent on the next pass — the
+ * declined dispatch never happened, so it must not count as handled.
+ * Distinct from a run that launched and failed, which stays delivered
+ * (no auto-retry).
+ */
+export function dropFires(keys: readonly string[]): void {
+  const l = loadLedger();
+  let changed = false;
+  for (const k of keys) {
+    if (k in l.fired) {
+      delete l.fired[k];
+      changed = true;
+    }
+  }
+  if (changed) saveLedger();
+}
+
 /** Flip keys to delivered once the launch handed off successfully. */
 export function markFiresDelivered(keys: readonly string[]): void {
   const l = loadLedger();

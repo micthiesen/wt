@@ -254,15 +254,19 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
   /**
    * The stack-resolved half of `doReplayStack`, shared with the
    * automations engine (`builtin:restack` dispatches here after
-   * pre-cleaning the merged slices via `doCleanSlugs`). Returns whether
-   * the replay landed clean so the caller can decide how loudly to
-   * report; the conflict-bail escalation to /restack stays manual
-   * either way.
+   * pre-cleaning the merged slices via `doCleanSlugs`). "busy" means
+   * the app-wide restack mutex was held (a manual `R` or another
+   * auto-restack) and NOTHING ran — the automations engine un-consumes
+   * the fire on that outcome instead of recording a restack that never
+   * happened. "clean" / "failed" report the replay itself; the
+   * conflict-bail escalation to /restack stays manual either way.
    */
-  async function doRestackStack(stackId: string): Promise<boolean> {
+  async function doRestackStack(
+    stackId: string,
+  ): Promise<"clean" | "failed" | "busy"> {
     if (restackBusyRef.current) {
       toast("restack already running", theme.warn, 2000);
-      return false;
+      return "busy";
     }
     restackBusyRef.current = true;
     let clean = false;
@@ -297,8 +301,20 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     // branch list, not slug) alongside the worktree state.
     void refreshGithub();
     void refreshAll();
-    return clean;
+    return clean ? "clean" : "failed";
   }
 
-  return { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack };
+  /**
+   * Non-mutating peek at the app-wide restack mutex, for the
+   * automations engine's dispatch gate: a restack intent stays queued
+   * while a manual `R` (or another auto-restack) holds the engine,
+   * BEFORE it pre-cleans anything — cleaning first and then finding
+   * the mutex held would strand the stack with its trigger condition
+   * already consumed by the clean.
+   */
+  function isRestackBusy(): boolean {
+    return restackBusyRef.current;
+  }
+
+  return { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack, isRestackBusy };
 }

@@ -56,6 +56,17 @@ export type LaunchActionOpts = {
   autoFireKeys?: readonly string[];
 };
 
+/**
+ * Did the launch actually hand work off? `launched: false` means a
+ * guard declined it BEFORE anything ran (busy worktree, action already
+ * running, unmet requirements, …) — for manual launches the toast is
+ * the whole story, but the automations engine uses the distinction to
+ * un-consume the fire instead of recording a run that never happened.
+ * Session-target injections report `launched: true` at hand-off (the
+ * paste is fire-and-forget by design).
+ */
+export type LaunchOutcome = { launched: boolean; reason?: string };
+
 export function useActionDispatch(opts: ActionDispatchOpts): {
   launchAction: (
     slug: string,
@@ -63,7 +74,7 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
     extras: string,
     arg?: string,
     launchOpts?: LaunchActionOpts,
-  ) => Promise<void>;
+  ) => Promise<LaunchOutcome>;
 } {
   // Custom action effect dispatch — each action carries an `affects`
   // tag set captured at start time; on every transition from
@@ -186,16 +197,16 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
     extras: string,
     arg?: string,
     launchOpts: LaunchActionOpts = {},
-  ): Promise<void> {
+  ): Promise<LaunchOutcome> {
     const { rows, primaryHarness, toast, setFocus } = opts;
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) {
       toast("worktree gone", theme.warn, 1500);
-      return;
+      return { launched: false, reason: "worktree gone" };
     }
     if (!def && !extras.trim()) {
       toast("prompt is empty", theme.warn, 1500);
-      return;
+      return { launched: false, reason: "prompt is empty" };
     }
     // Refuse if the worktree is mid-destroy / mid-init — claude would
     // race the cleanup and leave the tree in a confusing state. Mirrors
@@ -203,11 +214,11 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
     const lock = lockStatus(slug);
     if (lock) {
       toast(`${slug} is ${lockLabel(lock)}`, theme.warn, 2000);
-      return;
+      return { launched: false, reason: `${slug} is ${lockLabel(lock)}` };
     }
     if (row.status.kind === StatusKind.Busy) {
       toast(`${slug} is busy`, theme.warn, 2000);
-      return;
+      return { launched: false, reason: `${slug} is busy` };
     }
     if (def) {
       const avail = evaluateActionRequirements(def.requires, {
@@ -216,7 +227,7 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
       });
       if (!avail.ok) {
         toast(`${def.name}: ${avail.reason}`, theme.warn, 2500);
-        return;
+        return { launched: false, reason: avail.reason };
       }
     }
     const baseVars = buildActionVars(row, actionSkillPrefix(def, primaryHarness));
@@ -270,7 +281,7 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
           }
         },
       );
-      return;
+      return { launched: true };
     }
     const result = def
       ? await actionRegistry.start(
@@ -291,12 +302,13 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
         );
     if (!result.ok) {
       toast(`action: ${result.reason}`, theme.err, 3000);
-      return;
+      return { launched: false, reason: result.reason };
     }
     // Clear this worktree's focus so the auto-rules surface the
     // just-launched action.
     setFocus(slug, { focused: null });
     toast(`launched ${result.run.actionName}`, theme.info, 2000);
+    return { launched: true };
   }
 
   return { launchAction };

@@ -32,9 +32,17 @@
  * cancellation grace) → per-rule cooldown → circuit breaker (two
  * consecutive dispatches without the condition ever clearing trips the
  * rule for that worktree until someone actually fixes it).
+ *
+ * Known asymmetry: push-scoped triggers (checks / rabbit / review /
+ * conflict) get a natural retry on the next push (new SHA = new key),
+ * but `wt.merged` / `stack.parent_merged` keys never change — a run
+ * that launched and FAILED consumes them for good, and the activity
+ * pane error line is the escalation (run `c` / `R` by hand). Declined
+ * dispatches (contention with a manual launch) are different: those
+ * un-consume the fire and retry once the contention clears.
  */
 import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   actionRegistry,
@@ -46,6 +54,7 @@ import {
   BREAKER_LIMIT,
   breakerState,
   bumpBreaker,
+  dropFires,
   hasHandledFire,
   lastDispatchAt,
   lastWorktreeEditAt,
@@ -55,11 +64,10 @@ import {
   resetBreaker,
   tripBreaker,
 } from "../../core/automations.ts";
-import { config } from "../../core/config.ts";
+import { config, type AutomationTrigger } from "../../core/config.ts";
 import { lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { StatusKind } from "../../core/types.ts";
-import { useGithub } from "../../state/hooks.ts";
 import { wtStateQuery } from "../../state/queries.ts";
 
 import {
@@ -69,13 +77,10 @@ import {
 } from "../automation-rules.ts";
 import { isCleanCandidate } from "../app-helpers.ts";
 import type { ActiveSessionGlyph } from "./useHarnessSessions.ts";
-import type { LaunchActionOpts } from "./useActionDispatch.ts";
+import type { LaunchActionOpts, LaunchOutcome } from "./useActionDispatch.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 const log = createLogger("[auto]");
-
-/** Live fetch marker: github data older than this process isn't trusted. */
-const APP_START = Date.now();
 
 /** Cap on concurrently-executing auto dispatches across all worktrees. */
 const MAX_CONCURRENT = 2;
@@ -98,10 +103,32 @@ type Intent = {
 
 type Executing = {
   slug: string;
+  /** All slugs the dispatch may touch (quiesceSlugs at dispatch time). */
+  slugs: readonly string[];
   kind: "builtin" | "headless" | "session";
+  /** True for builtin:restack — at most one may execute at a time
+   *  (the restack engine mutex is app-wide). */
+  isRestack: boolean;
   promiseDone: boolean;
   dispatchedAt: number;
 };
+
+/** Outcome of one dispatch's async half. `declined` = a contention
+ *  guard refused BEFORE anything ran; the fire gets un-consumed. */
+type ExecuteOutcome = { declined: string | null };
+
+/** Triggers whose condition needs fresh github data to evaluate at all.
+ *  Their breaker resets are gated on freshness too — a boot-stale pass
+ *  can't observe "condition cleared". `pr.conflict` is fully local, so
+ *  its breaker must reset even when github never fetches this session
+ *  (offline, no token), or a trip would wedge forever. */
+const GITHUB_DRIVEN: ReadonlySet<AutomationTrigger> = new Set([
+  "pr.checks.failed",
+  "rabbit.unresolved",
+  "review.changes_requested",
+  "wt.merged",
+  "stack.parent_merged",
+]);
 
 export type AutomationsOpts = {
   rows: readonly WorktreeRow[];
@@ -112,9 +139,11 @@ export type AutomationsOpts = {
     extras: string,
     arg?: string,
     launchOpts?: LaunchActionOpts,
-  ) => Promise<void>;
+  ) => Promise<LaunchOutcome>;
   doCleanSlugs: (slugs: readonly string[]) => Promise<void>;
-  doRestackStack: (stackId: string) => Promise<boolean>;
+  doRestackStack: (stackId: string) => Promise<"clean" | "failed" | "busy">;
+  /** Peek at the app-wide restack mutex (manual `R` shares it). */
+  isRestackBusy: () => boolean;
 };
 
 export type AutomationsState = {
@@ -147,9 +176,28 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
   const [paused, setPaused] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
 
-  const github = useGithub();
+  const qc = useQueryClient();
   const wtState = useQuery(wtStateQuery());
-  const githubFresh = (github.dataUpdatedAt ?? 0) > APP_START;
+  // "Fresh" = a FETCH-driven success on the github query this session.
+  // Deliberately not `dataUpdatedAt > appStart`: optimistic patches
+  // (`setQueriesData` in the mark-ready / auto-merge / reviewer flows)
+  // bump `dataUpdatedAt` on the whole cached blob without any network
+  // round-trip, which would forge freshness for every OTHER PR still
+  // sitting on restored persisted data. The cache subscription filters
+  // to non-manual successes — the same manual-flag discrimination the
+  // clobber guard in `runOptimisticMutation` uses.
+  const [githubFresh, setGithubFresh] = useState(false);
+  useEffect(() => {
+    if (!configured || githubFresh) return;
+    const unsubscribe = qc.getQueryCache().subscribe((event) => {
+      if (event.type !== "updated") return;
+      if (event.action.type !== "success") return;
+      if ((event.action as { manual?: boolean }).manual) return;
+      if (event.query.queryKey[0] !== "github") return;
+      setGithubFresh(true);
+    });
+    return unsubscribe;
+  }, [configured, githubFresh, qc]);
 
   // Everything the pass reads lives in a ref so the effects subscribe
   // once and never tear down mid-flight (same pattern as
@@ -160,6 +208,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     launchAction: opts.launchAction,
     doCleanSlugs: opts.doCleanSlugs,
     doRestackStack: opts.doRestackStack,
+    isRestackBusy: opts.isRestackBusy,
     githubFresh,
     pausedSlugs: new Set<string>(),
     paused,
@@ -174,6 +223,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     launchAction: opts.launchAction,
     doCleanSlugs: opts.doCleanSlugs,
     doRestackStack: opts.doRestackStack,
+    isRestackBusy: opts.isRestackBusy,
     githubFresh,
     pausedSlugs,
     paused,
@@ -259,15 +309,24 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     }
   }
 
-  async function execute(fire: AutomationFire): Promise<void> {
+  async function execute(fire: AutomationFire): Promise<ExecuteOutcome> {
     const { rule, slug, stackId } = fire;
     const wtLog = createLogger(slug);
     if (rule.run === "builtin:restack") {
       if (!stackId) throw new Error("builtin:restack fire without a stackId");
+      // Mutex check FIRST, before the pre-clean: a manual `R` holding
+      // the engine means nothing ran, so decline (un-consume the fire)
+      // while the trigger condition is still intact. After the
+      // pre-clean the condition is consumed (merged slices destroyed),
+      // so a busy mutex there is a loud FAILURE, not a decline —
+      // re-deriving the fire is no longer possible.
+      if (latest.current.isRestackBusy()) {
+        return { declined: "restack already running" };
+      }
       // Pre-clean the landed slices (recomputed against CURRENT rows,
-      // not the rows the fire was born under), then reconcile + replay.
-      // doCleanSlugs re-filters through isCleanCandidate, so a slice
-      // that un-merged in between can't be destroyed.
+      // not the rows the fire was born under — doCleanSlugs re-filters
+      // through isCleanCandidate, so a slice that un-merged can't be
+      // destroyed), then reconcile + replay.
       const mergedSlugs = latest.current.rows
         .filter(
           (r) =>
@@ -282,18 +341,32 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
         );
         await latest.current.doCleanSlugs(mergedSlugs);
       }
-      await latest.current.doRestackStack(stackId);
-      return;
+      const outcome = await latest.current.doRestackStack(stackId);
+      if (outcome === "busy") {
+        // Lost the mutex in the window between the peek above and the
+        // engine acquiring it (a manual `R` mid-dispatch). The merged
+        // slices are already cleaned, so surface it as a failure that
+        // names the manual follow-up instead of silently retrying.
+        throw new Error(
+          "restack engine grabbed by another run after the pre-clean — press R (or /restack) once it's free",
+        );
+      }
+      return { declined: null };
     }
     if (rule.run === "builtin:clean") {
       await latest.current.doCleanSlugs([slug]);
-      return;
+      return { declined: null };
     }
     const def = resolveActionDef(rule.run);
     if (!def) throw new Error(`action "${rule.run}" not found in config`);
-    await latest.current.launchAction(slug, def, "", undefined, {
+    const outcome = await latest.current.launchAction(slug, def, "", undefined, {
       autoFireKeys: fire.fireKeys,
     });
+    // A launch the guards refused (action already running, busy row,
+    // unmet requirements at the last instant) never ran — un-consume.
+    return {
+      declined: outcome.launched ? null : (outcome.reason ?? "launch declined"),
+    };
   }
 
   function dispatchKind(rule: AutomationFire["rule"]): Executing["kind"] {
@@ -332,20 +405,22 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
 
     // Breaker resets: a (rule, target) with breaker state whose
     // condition is now observed FALSE means the failure actually
-    // cleared — the consecutive count starts over. Gated on fresh
-    // github data so a boot-stale pass can't reset a real trip.
-    if (ctx.githubFresh) {
-      for (const rule of rules) {
-        if (rule.on === "stack.parent_merged") {
-          for (const row of ctx.rows) {
-            const sid = row.stack?.stackId;
-            if (sid && !byId.has(`${rule.id}|${sid}`)) resetBreaker(rule.id, sid);
-          }
-        } else {
-          for (const row of ctx.rows) {
-            if (!byId.has(`${rule.id}|${row.wt.slug}`)) {
-              resetBreaker(rule.id, row.wt.slug);
-            }
+    // cleared — the consecutive count starts over. Github-driven
+    // triggers gate the reset on freshness (a boot-stale pass can't
+    // observe "cleared"); purely local ones (pr.conflict) reset
+    // unconditionally, or an offline session could wedge a trip
+    // forever.
+    for (const rule of rules) {
+      if (GITHUB_DRIVEN.has(rule.on) && !ctx.githubFresh) continue;
+      if (rule.on === "stack.parent_merged") {
+        for (const row of ctx.rows) {
+          const sid = row.stack?.stackId;
+          if (sid && !byId.has(`${rule.id}|${sid}`)) resetBreaker(rule.id, sid);
+        }
+      } else {
+        for (const row of ctx.rows) {
+          if (!byId.has(`${rule.id}|${row.wt.slug}`)) {
+            resetBreaker(rule.id, row.wt.slug);
           }
         }
       }
@@ -353,7 +428,10 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
 
     // Upsert intents for fires with at least one unseen key; refresh
     // the fire payload on existing intents so delivery always uses
-    // current keys/details.
+    // current keys/details. A fire whose KEY SET changed is a new
+    // failure instance (a fresh push while the old one was queued) —
+    // its settle clock and announcement restart so the grace period is
+    // real for the thing that will actually be remediated.
     for (const [id, fire] of byId) {
       if (executing.current.has(id)) continue;
       const unseen = fire.fireKeys.some((k) => !hasHandledFire(k));
@@ -362,8 +440,18 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
         continue;
       }
       const existing = intents.current.get(id);
-      if (existing) existing.fire = fire;
-      else intents.current.set(id, { id, fire, createdAt: now, announced: false });
+      if (existing) {
+        const sameKeys =
+          existing.fire.fireKeys.length === fire.fireKeys.length &&
+          existing.fire.fireKeys.every((k, i) => fire.fireKeys[i] === k);
+        if (!sameKeys) {
+          existing.createdAt = now;
+          existing.announced = false;
+        }
+        existing.fire = fire;
+      } else {
+        intents.current.set(id, { id, fire, createdAt: now, announced: false });
+      }
     }
 
     // Drop superseded intents — the condition cleared while queued.
@@ -379,6 +467,17 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     }
 
     // Delivery, FIFO by intent age, bounded by the concurrency cap.
+    // Two contention gates keep dispatches from racing each other into
+    // the non-throwing guards downstream (which would consume fires
+    // for work that never ran): no two in-flight dispatches may touch
+    // the same slug, and at most one builtin:restack runs at a time
+    // (the restack engine mutex is app-wide, shared with manual `R`).
+    const occupiedSlugs = new Set<string>();
+    let restackInFlight = false;
+    for (const ex of executing.current.values()) {
+      for (const s of ex.slugs) occupiedSlugs.add(s);
+      if (ex.isRestack) restackInFlight = true;
+    }
     const queue = [...intents.current.values()].sort(
       (a, b) => a.createdAt - b.createdAt,
     );
@@ -387,6 +486,9 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       const { fire } = intent;
       const { rule } = fire;
       const wtLog = createLogger(fire.slug);
+      const isRestack = rule.run === "builtin:restack";
+      if (fire.quiesceSlugs.some((s) => occupiedSlugs.has(s))) continue;
+      if (isRestack && (restackInFlight || ctx.isRestackBusy())) continue;
       if (!intent.announced) {
         intent.announced = true;
         wtLog.event.info(`auto ${rule.id}: ${fire.detail} — queued`);
@@ -441,27 +543,48 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       }
 
       // Dispatch. Ledger write is synchronous BEFORE the async launch —
-      // the once-only guarantee lives on this line.
+      // the once-only guarantee lives on this line. The breaker bump
+      // waits for the settle handler: a dispatch a downstream guard
+      // DECLINES (contention with a manual launch in the sub-second
+      // window after the gates above) never ran, so it must count
+      // toward neither the ledger nor the breaker.
       markFiresDispatched(fire.fireKeys, rule.id, target);
-      bumpBreaker(rule.id, target);
       intents.current.delete(intent.id);
       const entry: Executing = {
         slug: fire.slug,
+        slugs: fire.quiesceSlugs,
         kind: dispatchKind(rule),
+        isRestack,
         promiseDone: false,
         dispatchedAt: now,
       };
       executing.current.set(intent.id, entry);
+      for (const s of fire.quiesceSlugs) occupiedSlugs.add(s);
+      if (isRestack) restackInFlight = true;
       wtLog.event.info(`auto ${rule.id}: ${fire.detail} — running ${rule.run}`);
       void execute(fire)
         .then(
-          () => {
+          (outcome) => {
+            if (outcome.declined) {
+              // Un-consume: the fire never ran. The still-true
+              // condition re-derives an intent (with a fresh settle
+              // window) on a later pass.
+              dropFires(fire.fireKeys);
+              executing.current.delete(intent.id);
+              wtLog.event.dim(
+                `auto ${rule.id}: declined (${outcome.declined}) — will retry once clear`,
+              );
+              return;
+            }
             markFiresDelivered(fire.fireKeys);
+            bumpBreaker(rule.id, target);
           },
           (err) => {
-            // Failure does NOT retry: keys stay handled; a new push
-            // (new fire key) is the sanctioned retry path.
+            // A run that LAUNCHED and failed does NOT retry: keys stay
+            // handled; a new push (new fire key) is the sanctioned
+            // retry path.
             markFiresDelivered(fire.fireKeys);
+            bumpBreaker(rule.id, target);
             const msg = err instanceof Error ? err.message : String(err);
             wtLog.event.err(`auto ${rule.id} failed: ${msg}`);
           },
@@ -483,11 +606,22 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     }, PASS_DEBOUNCE_MS);
   }
 
-  // Re-evaluate whenever the observable inputs change…
+  // Re-evaluate whenever the observable inputs change. `rows` and the
+  // session map are identity-stabilized upstream (useWorktreeRows'
+  // rowCache, useActiveSessionsBySlug's memo), so this fires on real
+  // state churn, not render noise; the heartbeat below covers pure
+  // time-based aging (settle windows, cooldowns).
   useEffect(() => {
     if (!configured) return;
     schedulePass();
-  });
+  }, [
+    configured,
+    opts.rows,
+    opts.activeSessionBySlug,
+    wtState.data,
+    githubFresh,
+    paused,
+  ]);
 
   // …and on a heartbeat, so queued intents age past their settle
   // window / cooldowns without needing external churn.

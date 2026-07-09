@@ -99,8 +99,10 @@ function singleRowFire(
 /**
  * Evaluate one single-worktree trigger against one row. Returns null
  * when the condition doesn't hold (or isn't evaluable yet). The fire
- * key encodes the failure INSTANCE — head SHA for push-scoped
- * conditions — so the same failure never re-fires but a new push does.
+ * key encodes the RULE plus the failure INSTANCE — head SHA for
+ * push-scoped conditions — so the same failure never re-fires the same
+ * rule, a new push does, and two rules bound to the same trigger can't
+ * starve each other by consuming a shared key.
  */
 function evaluateRowTrigger(
   trigger: AutomationTrigger,
@@ -118,7 +120,7 @@ function evaluateRowTrigger(
       return singleRowFire(
         rule,
         row,
-        `ci:${slug}:${pr.headRefOid}`,
+        `${rule.id}:ci:${slug}:${pr.headRefOid}`,
         `checks failing on #${pr.number} (${names})`,
       );
     }
@@ -128,7 +130,7 @@ function evaluateRowTrigger(
       return singleRowFire(
         rule,
         row,
-        `rabbit:${slug}:${pr.headRefOid}`,
+        `${rule.id}:rabbit:${slug}:${pr.headRefOid}`,
         `${pluralize(pr.rabbit.unresolved, "unresolved carrot")} on #${pr.number}`,
       );
     }
@@ -138,23 +140,27 @@ function evaluateRowTrigger(
       return singleRowFire(
         rule,
         row,
-        `review:${slug}:${pr.headRefOid}`,
+        `${rule.id}:review:${slug}:${pr.headRefOid}`,
         `changes requested on #${pr.number}`,
       );
     }
     case "pr.conflict": {
       const conflict = row.fields.conflict;
       if (conflict.isLoading || conflict.data?.status !== "conflict") return null;
-      // The probe is computed locally (never persisted), so no boot-
-      // staleness gate. The head oid rides in when a PR exists so a
-      // conflict that reappears after a fixing push re-fires; without a
-      // PR the base alone has to do.
+      // The probe is computed locally (never persisted), so it needs no
+      // boot-staleness gate of its own — but the fire key does. With a
+      // PR, the head oid is the instance marker (a conflict that
+      // reappears after a fixing push re-fires), so wait for a live oid
+      // rather than baking a stale persisted one into the key (which
+      // would double-fire the same conflict once the live oid lands).
+      // Without a PR the base alone has to do.
+      if (row.pr && (!ctx.githubFresh || !row.pr.headRefOid)) return null;
       const head = row.pr?.headRefOid ?? "local";
       const base = conflict.data.base;
       return singleRowFire(
         rule,
         row,
-        `conflict:${slug}:${base}:${head}`,
+        `${rule.id}:conflict:${slug}:${base}:${head}`,
         `conflicts with ${base.replace(/^origin\//, "")}`,
       );
     }
@@ -174,7 +180,7 @@ function evaluateRowTrigger(
       return singleRowFire(
         rule,
         row,
-        `merged:${slug}:${row.pr?.number ?? "local"}`,
+        `${rule.id}:merged:${slug}:${row.pr?.number ?? "local"}`,
         row.pr ? `#${row.pr.number} merged` : "branch landed on trunk",
       );
     }
@@ -206,8 +212,16 @@ function evaluateStackTrigger(
   ctx: AutomationEvalCtx,
 ): AutomationFire[] {
   const byStack = new Map<string, WorktreeRow[]>();
+  // Stacks with ANY individually-paused member are skipped entirely —
+  // a restack rebases the whole stack, so a Ctrl+A on one slice must
+  // protect it from sibling-triggered fires too, not just its own.
+  const pausedStacks = new Set<string>();
   for (const row of rows) {
     if (!row.stack || row.stack.isHolistic) continue;
+    if (ctx.isPausedSlug(row.wt.slug)) {
+      pausedStacks.add(row.stack.stackId);
+      continue;
+    }
     if (!isEligible(row, ctx)) continue;
     const arr = byStack.get(row.stack.stackId);
     if (arr) arr.push(row);
@@ -215,6 +229,7 @@ function evaluateStackTrigger(
   }
   const fires: AutomationFire[] = [];
   for (const [stackId, members] of byStack) {
+    if (pausedStacks.has(stackId)) continue;
     const merged = members.filter(
       (r) =>
         isCleanCandidate(r) &&
@@ -228,7 +243,7 @@ function evaluateStackTrigger(
       slug: open[0]!.wt.slug,
       quiesceSlugs: members.map((r) => r.wt.slug),
       fireKeys: merged.map(
-        (r) => `restack:${stackId}:${r.pr?.number ?? r.wt.branch}`,
+        (r) => `${rule.id}:restack:${stackId}:${r.pr?.number ?? r.wt.branch}`,
       ),
       stackId,
       detail: `${pluralize(merged.length, "merged slice")} under ${pluralize(open.length, "open slice")}`,

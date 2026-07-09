@@ -775,7 +775,7 @@ export function App({ onExit }: Props) {
 
   // Destroy / clean / restack flows — extracted to `flows/destroy.ts`.
   // Rebuilt per render so the closures see fresh rows / selection.
-  const { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack } = makeDestroyFlows({
+  const { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack, isRestackBusy } = makeDestroyFlows({
     rows,
     current,
     toast,
@@ -798,6 +798,7 @@ export function App({ onExit }: Props) {
     launchAction,
     doCleanSlugs,
     doRestackStack,
+    isRestackBusy,
   });
 
   // Harness-session flows — extracted to `flows/sessions.ts`. Rebuilt

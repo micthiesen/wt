@@ -56,12 +56,14 @@ type SimpleModalContext = {
   rows: readonly WorktreeRow[];
   buildActionPickerItems: (slug: string) => PickerItem[];
   canPickAction: (item: PickerItem) => boolean;
+  // Return is deliberately loose: callers here fire-and-forget, and the
+  // real impl returns a `LaunchOutcome` the automations engine consumes.
   launchAction: (
     slug: string,
     def: ActionDef | null,
     extras: string,
     arg?: string,
-  ) => void | Promise<void>;
+  ) => void | Promise<unknown>;
   doSpawnNamedClaudeSession: (slug: string, name: string) => void;
   doEnterHarnessSession: (
     slug: string,
