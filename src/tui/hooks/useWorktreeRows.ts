@@ -569,7 +569,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
   // Diff context + AI summary observers for every worktree, so the list
   // panel can render LLM-generated titles next to each row. The cache is
   // content-addressed and persisted, so steady-state these are no-op
-  // hits; only new/changed worktrees trigger an LM Studio call. Gated on
+  // hits; only new/changed worktrees trigger an AI endpoint call. Gated on
   // the lock state from the batch above so we don't race a destroying
   // worktree's git state.
   const aiEnabled = !!config.ai;

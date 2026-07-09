@@ -1,8 +1,7 @@
 /**
  * AI client for worktree summaries.
  *
- * Supports OpenAI-compatible `/v1/chat/completions` endpoints (LM Studio,
- * Ollama with OpenAI bridge, llama.cpp's server, etc.) and Google's Gemini
+ * Supports OpenAI-compatible `/v1/chat/completions` endpoints and Google's Gemini
  * `models.generateContent` endpoint. No streaming — the TUI just waits for
  * the full response.
  *
@@ -80,7 +79,7 @@ export type AiSummary = {
  * When `external` is provided (queryFn `signal`), it's chained with
  * the timeout so observer cancellation aborts the in-flight LM call.
  * Without this, switching worktrees fast leaves the prior
- * megabyte-prompt request running to completion against LM Studio,
+ * megabyte-prompt request running to completion against the AI endpoint,
  * burning latency on a result nobody sees.
  */
 export async function summarizeDiff(
@@ -261,7 +260,7 @@ async function requestOpenAiChat(
     // One message for every fetch failure, including the timeout abort —
     // so "unreachable" can also mean "timed out after ai.timeout_ms".
     // Known conflation, accepted: both cases have the same user remedy
-    // (check LM Studio / bump the timeout) and the appended err.message
+    // (check the endpoint / bump the timeout) and the appended err.message
     // carries the distinction when it matters.
     throw new Error(
       `AI endpoint unreachable at ${ai.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
@@ -273,7 +272,7 @@ async function requestOpenAiChat(
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    // Squash to one line — LM Studio 500s return a full HTML error
+    // Squash to one line because some local endpoints return full HTML error
     // page, which otherwise dumps line-by-line into the activity pane.
     const oneLine = body.replace(/\s+/g, " ").trim().slice(0, 160);
     throw new Error(`AI endpoint HTTP ${res.status}: ${oneLine || res.statusText}`);

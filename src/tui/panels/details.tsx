@@ -323,7 +323,7 @@ function DescriptionBlock({
 }: {
   summary: string | null;
   /**
-   * True only while the LM Studio call itself is in flight — *not* for
+   * True only while the AI endpoint call itself is in flight — *not* for
    * the cheap diff-context revalidation. Drives the refresh glyph and
    * the "generating summary…" placeholder. Intentionally narrower than
    * the per-row staleness glyph elsewhere: a hash-stable cache check

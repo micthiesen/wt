@@ -8,7 +8,7 @@ import { config } from "./config.ts";
  * handler fires synchronously and no listener is registered.
  *
  * Exported so callers that chain external signals into per-call
- * controllers (LM Studio fetch, subprocess kill) share one
+ * controllers (AI endpoint fetch, subprocess kill) share one
  * implementation. Without it, the same five-line dance was repeated
  * in two files with subtly different semantics.
  */

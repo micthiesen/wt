@@ -109,7 +109,7 @@ export async function buildDiffContext(
   // excluded files (lockfiles &c). There's no content worth a model
   // call, so return null: `aiSummaryQuery` is gated `enabled: !!ctx`,
   // so this lands in the exact same "no summary" state as an
-  // unconfigured pipeline rather than firing LM Studio with an empty
+  // unconfigured pipeline rather than firing the AI endpoint with an empty
   // `File summary:` prompt.
   if (!stat && !log && !rawDiff.trim()) return null;
 

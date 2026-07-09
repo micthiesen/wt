@@ -165,7 +165,7 @@ type BaseAiConfig = {
 
 export type OpenAiAiConfig = BaseAiConfig & {
   provider: "openai";
-  /** OpenAI-compatible endpoint (no trailing slash). LM Studio defaults to http://127.0.0.1:1234. */
+  /** OpenAI-compatible endpoint (no trailing slash). */
   endpoint: string;
 };
 

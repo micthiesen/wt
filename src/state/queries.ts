@@ -615,11 +615,11 @@ export const aiSummaryQuery = (
       if (!ctx) {
         throw new Error("aiSummaryQuery: ctx is null (enabled guard missed)");
       }
-      aiLog.event.dim(`calling LM Studio for ${slug} (${pluralize(ctx.prompt.length, "char")})...`);
+      aiLog.event.dim(`calling AI endpoint for ${slug} (${pluralize(ctx.prompt.length, "char")})...`);
       const start = Date.now();
       try {
         const out = await summarizeDiff(ctx.prompt, signal);
-        aiLog.event.dim(`called LM Studio for ${slug} (${formatDuration(Date.now() - start)})`);
+        aiLog.event.dim(`called AI endpoint for ${slug} (${formatDuration(Date.now() - start)})`);
         return out;
       } catch (err) {
         // A cancelled observer (diff hash flipped again, row unmounted)
@@ -628,7 +628,7 @@ export const aiSummaryQuery = (
         if (signal.aborted) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         aiLog.event.err(
-          `LM Studio failed for ${slug} (${formatDuration(Date.now() - start)}): ${msg}`,
+          `AI endpoint failed for ${slug} (${formatDuration(Date.now() - start)}): ${msg}`,
         );
         throw err;
       }

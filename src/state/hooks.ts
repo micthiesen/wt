@@ -508,7 +508,7 @@ export function useWtActions() {
       });
     },
     /**
-     * Force the LM Studio call to re-run for one worktree. Returns
+     * Force the AI summary call to re-run for one worktree. Returns
      * false when there's no cached diff context yet — the caller
      * decides how to message that (we don't want the gesture to mean
      * "warm up cold").
@@ -516,7 +516,7 @@ export function useWtActions() {
      * `aiSummary` is hash-keyed; force regen refetches the diff
      * context, then `invalidateQueries` on the AI summary entry for
      * the resulting hash. The active observer refetches the queryFn
-     * (calling LM Studio), and `placeholderData: keepPreviousData`
+     * (calling the AI endpoint), and `placeholderData: keepPreviousData`
      * keeps the prior summary on screen during the gap. Using
      * `invalidateQueries` instead of `removeQueries` is deliberate:
      * deleting the entry blanks the display because the observer's

@@ -1,6 +1,6 @@
 # wt
 
-Terminal UI for keeping multiple git worktrees in flight at once. Each row shows live status, PR state, preview deployment, issue link, and coding-agent session activity (Claude Code, Codex, OpenCode) for one worktree, so the whole pile of in-progress work is visible on one screen. The details pane can also pull an AI-generated title and 1–3 sentence description for each branch from a local OpenAI-compatible LLM endpoint (LM Studio etc.) or Google's Gemini API.
+Terminal UI for keeping multiple git worktrees in flight at once. Each row shows live status, PR state, preview deployment, issue link, and coding-agent session activity (Claude Code, Codex, OpenCode) for one worktree, so the whole pile of in-progress work is visible on one screen. The details pane can also pull an AI-generated title and 1–3 sentence description for each branch from a local OpenAI-compatible LLM endpoint or Google's Gemini API.
 
 ![screenshot](docs/screenshot.png)
 
@@ -21,7 +21,7 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 - [`hunk`](https://github.com/modem-dev/hunk) (`npm i -g hunkdiff`) — needed for the default F11 diff command (`hunk diff {{base}} --watch`). Override `[diff].command` in `config.toml` if you'd rather use `gitu`, `lazygit`, etc.
 - Linear — no CLI; the integration constructs issue URLs from branch slugs and can open PRs in Linear Reviews.
 - Coding-agent sessions — `wt` *detects* live sessions by reading each agent's local files (Claude Code `~/.claude/projects/*`, Codex `~/.codex/sessions/*`, OpenCode `~/.local/share/opencode`), so no CLI is needed just to surface state. To *spawn* sessions from the TUI you need that agent's CLI on PATH (`claude`, `codex`, `opencode`). Claude is the most complete integration (busy/idle state, AI summaries); Codex and OpenCode are partial today.
-- An AI provider — optional; needed for the generated title + description in the details pane. `wt` supports OpenAI-compatible endpoints (LM Studio, Ollama with the OpenAI bridge, llama.cpp's server, etc.) and Google's Gemini API. Results are content-addressed so identical diffs (across rebase / amend / branch rename) share a cached summary.
+- An AI provider — optional; needed for the generated title + description in the details pane. `wt` supports OpenAI-compatible endpoints and Google's Gemini API. Results are content-addressed so identical diffs (across rebase / amend / branch rename) share a cached summary.
 
 ## Install
 
