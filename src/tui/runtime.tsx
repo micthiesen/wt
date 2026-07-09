@@ -4,6 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
+import { recordWorktreeEdit } from "../core/automations.ts";
 import { watchRegistry } from "../core/claude-registry.ts";
 import { config } from "../core/config.ts";
 import { disposeDiffPool } from "../core/diff/pool.ts";
@@ -244,6 +245,9 @@ export async function runTui(): Promise<TuiExit> {
     const key =
       area === "sst" ? qk.wt(slug).deploy() : qk.wt(slug).dirty();
     invalidations.key(key);
+    // Feed the automations engine's settle window: any observed write
+    // (tree edit or deploy churn) counts as "someone is working here".
+    recordWorktreeEdit(slug);
   });
   // Reconcile the per-worktree watcher set against the worktrees query.
   // Skip `isMain` — the main clone's tree is heavy (node_modules) and

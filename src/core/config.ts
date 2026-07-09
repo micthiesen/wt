@@ -303,6 +303,66 @@ export type ActionDef =
       labelExtract: string | null;
     } & ActionUi);
 
+/**
+ * Trigger vocabulary for `[[automations]]`. Each is a LEVEL condition
+ * evaluated against the aggregated row state (see
+ * `tui/automation-rules.ts` for the exact predicate + fire-key shape):
+ *
+ *   "pr.checks.failed"        — open PR's checks rollup is failing.
+ *   "rabbit.unresolved"       — CodeRabbit has unresolved threads.
+ *   "review.changes_requested"— a human review requested changes.
+ *   "pr.conflict"             — merge-tree probe says the branch
+ *                               conflicts with its effective base.
+ *   "wt.merged"               — a NON-stack worktree's branch landed
+ *                               (merged / gone / PR merged — same set
+ *                               the `c` clean sweep uses).
+ *   "stack.parent_merged"     — a stack has a merged slice with open
+ *                               slices still stacked above it.
+ */
+export type AutomationTrigger =
+  | "pr.checks.failed"
+  | "rabbit.unresolved"
+  | "review.changes_requested"
+  | "pr.conflict"
+  | "wt.merged"
+  | "stack.parent_merged";
+
+/**
+ * What to do when the target worktree isn't quiescent at delivery time
+ * (live session working/asking, action running, recent edits):
+ * `queue` (default) holds the intent and delivers once things settle;
+ * `skip` marks the fire handled and does nothing. There is deliberately
+ * no "force" — injecting into an `asking` session would answer its
+ * permission dialog with the paste's trailing Enter.
+ */
+export type AutomationBusyPolicy = "queue" | "skip";
+
+/** `run` targets that dispatch built-in flows instead of an [[actions]] def. */
+export const AUTOMATION_BUILTINS = ["builtin:restack", "builtin:clean"] as const;
+export type AutomationBuiltin = (typeof AUTOMATION_BUILTINS)[number];
+
+/**
+ * One `[[automations]]` binding: when `on` holds for a worktree (and
+ * the fire key is unseen), run `run` — an `[[actions]]` id (inheriting
+ * its target/affects/requires) or a `builtin:` flow. No defaults ship;
+ * an absent section means nothing is automated.
+ */
+export type AutomationDef = {
+  id: string;
+  on: AutomationTrigger;
+  /** An [[actions]] id, or one of AUTOMATION_BUILTINS. */
+  run: string;
+  busy: AutomationBusyPolicy;
+  /** Minimum minutes between dispatches per (rule, worktree). Null = none. */
+  cooldownMinutes: number | null;
+  /**
+   * Quiescence window: the intent must be at least this old AND the
+   * worktree free of edits for this long before delivery. Doubles as
+   * the human-cancellation grace period.
+   */
+  settleSeconds: number;
+};
+
 export type Config = {
   paths: {
     mainClone: string;
@@ -338,6 +398,7 @@ export type Config = {
   diff: DiffConfig;
   github: GithubConfig;
   actions: readonly ActionDef[];
+  automations: readonly AutomationDef[];
   ui: {
     /** Detail-pane row order. Unknown ids are ignored, missing ones hidden. */
     rows: readonly string[];
@@ -673,6 +734,10 @@ function build(raw: Raw, errs: Errors): Config {
   // a user can drop a default they don't want simply by listing the
   // ones they keep.
   const actions = parseActions(raw.actions, errs);
+  // [[automations]] has NO defaults — automation is strictly opt-in.
+  // Parsed after actions so `run` references validate against the
+  // final action list.
+  const automations = parseAutomations(raw.automations, actions, errs);
 
   return {
     paths: { mainClone, worktreeRoot, logDir, appLogDir, lockDir, cacheDb },
@@ -686,8 +751,108 @@ function build(raw: Raw, errs: Errors): Config {
     diff,
     github,
     actions,
+    automations,
     ui: { rows },
   };
+}
+
+const VALID_TRIGGERS = new Set<AutomationTrigger>([
+  "pr.checks.failed",
+  "rabbit.unresolved",
+  "review.changes_requested",
+  "pr.conflict",
+  "wt.merged",
+  "stack.parent_merged",
+]);
+const DEFAULT_SETTLE_SECONDS = 120;
+
+function parseAutomations(
+  raw: unknown,
+  actions: readonly ActionDef[],
+  errs: Errors,
+): readonly AutomationDef[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    errs.add("automations must be a TOML array of [[automations]] tables");
+    return [];
+  }
+  const actionIds = new Set(actions.map((a) => a.id));
+  const builtins = new Set<string>(AUTOMATION_BUILTINS);
+  const out: AutomationDef[] = [];
+  const seenIds = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const entry = obj(raw[i]);
+    const tag = `automations[${i}]`;
+    if (!entry) {
+      errs.add(`${tag} must be a table`);
+      continue;
+    }
+    const id = errs.reqStr(entry, tag, "id");
+    if (!id) continue;
+    if (seenIds.has(id)) {
+      errs.add(`${tag}.id "${id}" is duplicated`);
+      continue;
+    }
+    const on = entry.on;
+    if (typeof on !== "string" || !VALID_TRIGGERS.has(on as AutomationTrigger)) {
+      errs.add(`${tag}.on must be one of: ${[...VALID_TRIGGERS].join(", ")}`);
+      continue;
+    }
+    const run = errs.reqStr(entry, tag, "run");
+    if (!run) continue;
+    if (!actionIds.has(run) && !builtins.has(run)) {
+      errs.add(
+        `${tag}.run "${run}" is neither an [[actions]] id nor one of: ${AUTOMATION_BUILTINS.join(", ")}`,
+      );
+      continue;
+    }
+    // builtin:restack is the only run that targets a STACK rather than a
+    // single worktree, and stack.parent_merged is the only trigger that
+    // produces one — reject the mismatched pairings loudly.
+    if (run === "builtin:restack" && on !== "stack.parent_merged") {
+      errs.add(`${tag}: run "builtin:restack" requires on = "stack.parent_merged"`);
+      continue;
+    }
+    if (run === "builtin:clean" && on === "stack.parent_merged") {
+      errs.add(
+        `${tag}: run "builtin:clean" targets one worktree; use "builtin:restack" for stack.parent_merged (it cleans merged slices first)`,
+      );
+      continue;
+    }
+    const busy = errs.optEnum(
+      entry,
+      tag,
+      "busy",
+      ["queue", "skip"] as const satisfies readonly AutomationBusyPolicy[],
+      "queue",
+    );
+    const cooldownRaw = entry.cooldown_minutes;
+    if (
+      cooldownRaw !== undefined &&
+      !(typeof cooldownRaw === "number" && Number.isFinite(cooldownRaw) && cooldownRaw > 0)
+    ) {
+      errs.add(`${tag}.cooldown_minutes must be a positive number`);
+      continue;
+    }
+    const settleRaw = entry.settle_seconds;
+    if (
+      settleRaw !== undefined &&
+      !(typeof settleRaw === "number" && Number.isFinite(settleRaw) && settleRaw >= 0)
+    ) {
+      errs.add(`${tag}.settle_seconds must be a non-negative number`);
+      continue;
+    }
+    seenIds.add(id);
+    out.push({
+      id,
+      on: on as AutomationTrigger,
+      run,
+      busy,
+      cooldownMinutes: typeof cooldownRaw === "number" ? cooldownRaw : null,
+      settleSeconds: typeof settleRaw === "number" ? settleRaw : DEFAULT_SETTLE_SECONDS,
+    });
+  }
+  return out;
 }
 
 function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {

@@ -64,6 +64,12 @@ export type WtSlugState = {
    * even if the parent advances or lands first.
    */
   baseSha?: string;
+  /**
+   * Per-worktree opt-out from `[[automations]]` (Ctrl+A in the TUI).
+   * Present only when true; the engine skips paused slugs entirely
+   * (no fires, no queued intents).
+   */
+  automationsPaused?: boolean;
 };
 
 /** Lifecycle of a single slice as it moves from plan to landed PR. */
@@ -610,6 +616,9 @@ export function readWtState(): WtState {
             slugs[k]!.baseSha = rec.baseSha;
           }
         }
+        if (rec.automationsPaused === true) {
+          slugs[k]!.automationsPaused = true;
+        }
       }
     }
     // Stacks parse before the order array — the self-heal below needs
@@ -850,6 +859,27 @@ export function clearBaseReferences(branch: string): string[] {
     }
     writeWtState(next);
     return affected;
+  });
+}
+
+/**
+ * Toggle the per-worktree automations pause flag. Returns the new
+ * paused state. Creates the slug entry on first write (like
+ * `setSlugBase`) so a brand-new worktree can be paused before it has
+ * any section/order state.
+ */
+export function toggleSlugAutomationsPaused(slug: string): boolean {
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.slugs[slug];
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    const entry: WtSlugState = { section: null, order: 0, ...prev };
+    const paused = entry.automationsPaused !== true;
+    if (paused) entry.automationsPaused = true;
+    else delete entry.automationsPaused;
+    next.slugs[slug] = entry;
+    writeWtState(next);
+    return paused;
   });
 }
 

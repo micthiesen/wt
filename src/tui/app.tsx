@@ -89,6 +89,7 @@ import {
 } from "./hooks/useWorktreeRows.ts";
 import { useStackSections } from "./hooks/useStackSections.ts";
 import { useVisualItems, visualKey } from "./hooks/useVisualItems.ts";
+import { useAutomations } from "./hooks/useAutomations.ts";
 import { useSectionDetail } from "./hooks/useSectionDetail.ts";
 import { useSessionTailReconcile } from "./hooks/useSessionTailReconcile.ts";
 import { useOutputFocus } from "./hooks/useOutputFocus.ts";
@@ -164,6 +165,7 @@ export function App({ onExit }: Props) {
     renameSection,
     moveGroupPast,
     toggleSectionFold,
+    toggleAutomationsPaused,
     mutate,
     cyclePrimaryHarness,
     refreshHarnessSessions,
@@ -773,7 +775,7 @@ export function App({ onExit }: Props) {
 
   // Destroy / clean / restack flows — extracted to `flows/destroy.ts`.
   // Rebuilt per render so the closures see fresh rows / selection.
-  const { doRemove, doClean, doReplayStack } = makeDestroyFlows({
+  const { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack } = makeDestroyFlows({
     rows,
     current,
     toast,
@@ -783,6 +785,19 @@ export function App({ onExit }: Props) {
     refreshAll,
     refreshGithub,
     restackBusyRef,
+  });
+
+  // Automated actions — evaluates `[[automations]]` triggers against
+  // the same row state the panes render and dispatches through
+  // `launchAction` / the clean flow / the algorithmic restack. Inert
+  // (no fires, no timers beyond a cheap early return) when the config
+  // defines no rules.
+  const automations = useAutomations({
+    rows,
+    activeSessionBySlug,
+    launchAction,
+    doCleanSlugs,
+    doRestackStack,
   });
 
   // Harness-session flows — extracted to `flows/sessions.ts`. Rebuilt
@@ -1300,6 +1315,52 @@ export function App({ onExit }: Props) {
     // Shift+L renames the current row's section.
     if (isShiftedLetter(k, "l")) {
       openSectionRename();
+      return;
+    }
+    // Shift+A — pause / resume ALL automations for this session. The
+    // pending intent queue is dropped on pause; conditions that still
+    // hold re-derive it on resume.
+    if (isShiftedLetter(k, "a")) {
+      if (!automations.configured) {
+        toast("no [[automations]] configured", theme.fgDim, 2000);
+        return;
+      }
+      const nowPaused = automations.togglePaused();
+      toast(
+        nowPaused ? "automations paused" : "automations resumed",
+        nowPaused ? theme.warn : theme.ok,
+        2000,
+      );
+      return;
+    }
+    // Ctrl+A — toggle automations for the CURRENT worktree (persisted
+    // in wtstate, survives restarts). The per-wt escape hatch when a
+    // branch is under manual surgery.
+    if (k.ctrl && k.name === "a" && !k.shift && !k.option && !k.meta) {
+      if (!automations.configured) {
+        toast("no [[automations]] configured", theme.fgDim, 2000);
+        return;
+      }
+      if (!current) {
+        toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const slug = current.wt.slug;
+      void (async () => {
+        try {
+          const nowPaused = await toggleAutomationsPaused(slug);
+          createLogger(slug).event.info(
+            nowPaused ? "automations paused for this worktree" : "automations resumed for this worktree",
+          );
+          toast(
+            nowPaused ? `automations paused for ${slug}` : `automations resumed for ${slug}`,
+            nowPaused ? theme.warn : theme.ok,
+            2000,
+          );
+        } catch (err) {
+          reportActionError("automations toggle", err);
+        }
+      })();
       return;
     }
     // Ctrl+J / Ctrl+K page the details pane (worktree or review request)
@@ -2064,6 +2125,11 @@ export function App({ onExit }: Props) {
           </text>
           <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
         </box>
+        {automations.configured && automations.paused ? (
+          <text fg={theme.warn}>{"auto ⏸  "}</text>
+        ) : automations.pendingCount > 0 ? (
+          <text fg={theme.fgDim}>{`auto ${automations.pendingCount} queued  `}</text>
+        ) : null}
         <UsageBadge primary={primaryHarness} />
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>

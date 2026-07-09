@@ -105,6 +105,7 @@ import {
   setSlugSection as setSlugSectionOnDisk,
   swapOrders as swapOrdersOnDisk,
   toggleSectionFolded as toggleSectionFoldedOnDisk,
+  toggleSlugAutomationsPaused as toggleSlugAutomationsPausedOnDisk,
 } from "../core/wtstate.ts";
 
 import { CACHE_DB } from "./client.ts";
@@ -697,6 +698,17 @@ export function useWtActions() {
         await qc.invalidateQueries({ queryKey: qk.wtState() });
       }
       return moved;
+    },
+    /**
+     * Toggle the per-worktree automations pause flag (persisted in
+     * wtstate; Ctrl+A). Returns the new paused state. The automations
+     * engine reads the flag through the wtState query, so the
+     * invalidation is what makes the toggle take effect.
+     */
+    async toggleAutomationsPaused(slug: string): Promise<boolean> {
+      const paused = toggleSlugAutomationsPausedOnDisk(slug);
+      await qc.invalidateQueries({ queryKey: qk.wtState() });
+      return paused;
     },
     /**
      * Fold or unfold a section in the list (persisted). Returns the new

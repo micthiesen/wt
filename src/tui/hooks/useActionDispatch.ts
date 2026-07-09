@@ -46,12 +46,23 @@ export type ActionDispatchOpts = {
   refreshStack: () => Promise<void>;
 };
 
+export type LaunchActionOpts = {
+  /**
+   * Fire keys of the automation dispatch launching this run. Stamped
+   * into the headless run's meta.json so the automation ledger's boot
+   * reconciliation can match a `dispatched` entry against a run that
+   * really launched. Absent for manual launches.
+   */
+  autoFireKeys?: readonly string[];
+};
+
 export function useActionDispatch(opts: ActionDispatchOpts): {
   launchAction: (
     slug: string,
     def: ActionDef | null,
     extras: string,
     arg?: string,
+    launchOpts?: LaunchActionOpts,
   ) => Promise<void>;
 } {
   // Custom action effect dispatch — each action carries an `affects`
@@ -174,6 +185,7 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
     def: ActionDef | null,
     extras: string,
     arg?: string,
+    launchOpts: LaunchActionOpts = {},
   ): Promise<void> {
     const { rows, primaryHarness, toast, setFocus } = opts;
     const row = rows.find((r) => r.wt.slug === slug);
@@ -268,6 +280,7 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
           extras,
           vars,
           primaryHarness,
+          { autoFireKeys: launchOpts.autoFireKeys },
         )
       : await actionRegistry.startCustom(
           slug,

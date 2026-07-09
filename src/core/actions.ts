@@ -248,6 +248,14 @@ export type ActionRun = {
    * status — see the architecture block in `state/hooks.ts`.
    */
   affects: readonly EffectTag[];
+  /**
+   * Fire keys of the automation dispatch that launched this run, when
+   * it was auto-launched (absent for manual runs). Persisted in
+   * meta.json so the automation ledger's boot reconciliation can match
+   * a `dispatched` entry against a run that really launched — see
+   * `reconcileDispatchedFires` in `core/automations.ts`.
+   */
+  autoFireKeys?: readonly string[];
 };
 
 export type ActionStartResult =
@@ -268,6 +276,7 @@ type ActionMeta = {
   actionName: string;
   prompt: string;
   affects: readonly EffectTag[];
+  autoFireKeys?: readonly string[];
   startedAt: number;
   endedAt?: number;
   exitCode?: number;
@@ -322,6 +331,7 @@ class ActionRegistry {
     extras: string,
     vars: ActionVars = {},
     harnessId: HarnessId = "claude",
+    opts: { autoFireKeys?: readonly string[] } = {},
   ): Promise<ActionStartResult> {
     const existing = this.runs.get(slug);
     if (existing?.status === "running" || this.starting.has(slug)) {
@@ -332,7 +342,7 @@ class ActionRegistry {
     // the guard above before this run lands in `runs`.
     this.starting.add(slug);
     try {
-      return await this.startInner(def, slug, cwd, extras, vars, harnessId);
+      return await this.startInner(def, slug, cwd, extras, vars, harnessId, opts);
     } finally {
       this.starting.delete(slug);
     }
@@ -345,6 +355,7 @@ class ActionRegistry {
     extras: string,
     vars: ActionVars,
     harnessId: HarnessId,
+    opts: { autoFireKeys?: readonly string[] },
   ): Promise<ActionStartResult> {
     // `kill()` synchronously closes the prior run's tail + done
     // watcher and tmux-kills the session, so by the time we reach
@@ -404,6 +415,9 @@ class ActionRegistry {
       actionName: def.name,
       prompt: promptForRun,
       affects: def.affects,
+      ...(opts.autoFireKeys && opts.autoFireKeys.length > 0
+        ? { autoFireKeys: opts.autoFireKeys }
+        : {}),
       startedAt,
       status: "running",
     };
@@ -443,6 +457,9 @@ class ActionRegistry {
       lines: [initialLine],
       runDir,
       affects: def.affects,
+      ...(opts.autoFireKeys && opts.autoFireKeys.length > 0
+        ? { autoFireKeys: opts.autoFireKeys }
+        : {}),
     };
     this.commit((m) => m.set(slug, run));
     log.event.info(`${slug}: ${def.name} → ${runDir}`);
@@ -1271,6 +1288,9 @@ function materializeRun(
     lines,
     runDir,
     affects: meta.affects,
+    ...(meta.autoFireKeys && meta.autoFireKeys.length > 0
+      ? { autoFireKeys: meta.autoFireKeys }
+      : {}),
   };
 }
 

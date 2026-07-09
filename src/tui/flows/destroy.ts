@@ -144,6 +144,25 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       toast("nothing to clean", theme.fgDim, 1500);
       return;
     }
+    await doCleanRows(candidates);
+  }
+
+  /**
+   * Scoped clean for the automations engine: destroy just the listed
+   * slugs, re-filtered through `isCleanCandidate` against CURRENT rows
+   * so a fire computed a render ago can't destroy something that
+   * un-merged in between. Silently no-ops on an empty survivor set.
+   */
+  async function doCleanSlugs(slugs: readonly string[]): Promise<void> {
+    const want = new Set(slugs);
+    const candidates = rows.filter(
+      (r) => want.has(r.wt.slug) && isCleanCandidate(r),
+    );
+    if (candidates.length === 0) return;
+    await doCleanRows(candidates);
+  }
+
+  async function doCleanRows(candidates: readonly WorktreeRow[]): Promise<void> {
     appLog.event.info(
       `clean: dispatching ${candidates.length} destroy${candidates.length === 1 ? "" : "s"}`,
     );
@@ -229,17 +248,31 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       toast("not a stack slice", theme.warn, 2000);
       return;
     }
+    await doRestackStack(stackId);
+  }
+
+  /**
+   * The stack-resolved half of `doReplayStack`, shared with the
+   * automations engine (`builtin:restack` dispatches here after
+   * pre-cleaning the merged slices via `doCleanSlugs`). Returns whether
+   * the replay landed clean so the caller can decide how loudly to
+   * report; the conflict-bail escalation to /restack stays manual
+   * either way.
+   */
+  async function doRestackStack(stackId: string): Promise<boolean> {
     if (restackBusyRef.current) {
       toast("restack already running", theme.warn, 2000);
-      return;
+      return false;
     }
     restackBusyRef.current = true;
+    let clean = false;
     appLog.event.info(`restack ${stackId}: fetch + reconcile + replay`);
     try {
       const res = await rebaseStack(stackId, {}, (line) =>
         appLog.event.dim(`restack ${stackId}: ${line}`),
       );
       if (res.ok) {
+        clean = true;
         appLog.event.ok(`restacked ${stackId}: ${res.output}`);
         toast(`restacked ${stackId}`, theme.ok, 2500);
       } else if (res.conflict) {
@@ -264,7 +297,8 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     // branch list, not slug) alongside the worktree state.
     void refreshGithub();
     void refreshAll();
+    return clean;
   }
 
-  return { doRemove, doClean, doReplayStack };
+  return { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack };
 }

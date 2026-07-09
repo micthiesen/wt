@@ -107,6 +107,14 @@ export type PullRequest = {
   url: string;
   headRefName: string;
   /**
+   * Head commit SHA at fetch time. The automations engine keys its
+   * once-only fire ledger on this (a new push = a new failure instance).
+   * Optional: entries restored from the persisted cache or an
+   * older-daemon snapshot predate the field — the engine treats a
+   * missing oid as "not fresh enough to evaluate".
+   */
+  headRefOid?: string;
+  /**
    * The branch this PR targets. `config.branch.base` for trunk-targeted PRs;
    * another worktree's branch for stacked PRs. Used as a fallback signal for
    * `stackedOn` when commit-walk detection (the stronger signal) finds nothing.
