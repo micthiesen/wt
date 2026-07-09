@@ -72,6 +72,27 @@ export type WtSlugState = {
   automationsPaused?: boolean;
 };
 
+/**
+ * History entry for a destroyed worktree — powers the TUI's removed-
+ * worktrees view (`h`) and its restore action. Snapshotted at destroy
+ * dispatch by the TUI flows (rich: title + PR) and confirmed by
+ * `removeWorktree` itself on success (minimal: slug + branch), so CLI
+ * removes are tracked too. Merged by slug: defined fields of a newer
+ * record win, rich fields survive a later minimal write.
+ */
+export type RemovedWorktree = {
+  slug: string;
+  branch: string;
+  /** ISO timestamp of the latest destroy dispatch / completion. */
+  removedAt: string;
+  /** Display title at removal (AI/PR/commit-derived; absent when it was just the slug). */
+  title?: string;
+  /** PR snapshot at removal, when the branch had one. */
+  prNumber?: number;
+  prUrl?: string;
+  prState?: string;
+};
+
 /** Lifecycle of a single slice as it moves from plan to landed PR. */
 export type StackSliceStatus = "planned" | "open" | "merged";
 
@@ -222,6 +243,12 @@ export type WtState = {
   pausedStacks: string[];
   /** Global automations pause (Shift+A). Persisted across restarts. */
   automationsPaused: boolean;
+  /**
+   * Recently destroyed worktrees, newest first. Capped + age-pruned at
+   * write time (`recordRemovedWorktrees`); an entry whose slug is live
+   * again is display-filtered by the TUI and cleared by `createWorktree`.
+   */
+  removed: RemovedWorktree[];
 };
 
 /** Coerce one persisted slice entry, dropping anything malformed. */
@@ -703,6 +730,24 @@ export function readWtState(): WtState {
         pausedStacks.push(s);
       }
     }
+    const removed: RemovedWorktree[] = [];
+    if (Array.isArray(data?.removed)) {
+      for (const v of data.removed) {
+        if (!v || typeof v !== "object") continue;
+        const rec = v as Partial<RemovedWorktree>;
+        if (typeof rec.slug !== "string" || rec.slug.trim() === "") continue;
+        if (typeof rec.branch !== "string" || rec.branch.trim() === "") continue;
+        removed.push({
+          slug: rec.slug,
+          branch: rec.branch,
+          removedAt: typeof rec.removedAt === "string" ? rec.removedAt : "",
+          ...(typeof rec.title === "string" && rec.title.trim() !== "" ? { title: rec.title } : {}),
+          ...(typeof rec.prNumber === "number" && Number.isFinite(rec.prNumber) ? { prNumber: rec.prNumber } : {}),
+          ...(typeof rec.prUrl === "string" && rec.prUrl.trim() !== "" ? { prUrl: rec.prUrl } : {}),
+          ...(typeof rec.prState === "string" && rec.prState.trim() !== "" ? { prState: rec.prState } : {}),
+        });
+      }
+    }
     return {
       slugs,
       sectionsOrder,
@@ -710,6 +755,7 @@ export function readWtState(): WtState {
       foldedSections,
       pausedStacks,
       automationsPaused: data?.automationsPaused === true,
+      removed,
     };
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
@@ -725,6 +771,7 @@ function emptyWtState(): WtState {
     foldedSections: [],
     pausedStacks: [],
     automationsPaused: false,
+    removed: [],
   };
 }
 
@@ -896,6 +943,61 @@ export function clearBaseReferences(branch: string): string[] {
     }
     writeWtState(next);
     return affected;
+  });
+}
+
+/** Bounds on the removed-worktrees history, enforced at write time. */
+const REMOVED_MAX_ENTRIES = 100;
+const REMOVED_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+
+/**
+ * Record destroyed worktrees into the removed history. Upserts by slug:
+ * defined fields of the incoming entry win, existing rich fields (title,
+ * PR snapshot) survive a later minimal write — so the TUI's dispatch-time
+ * snapshot and `removeWorktree`'s on-success confirmation compose in
+ * either order. Prunes by age and caps the list, newest first.
+ */
+export function recordRemovedWorktrees(
+  entries: readonly RemovedWorktree[],
+): void {
+  if (entries.length === 0) return;
+  withWtStateLock(() => {
+    const state = readWtState();
+    const bySlug = new Map(state.removed.map((e) => [e.slug, e]));
+    for (const e of entries) {
+      const prev = bySlug.get(e.slug);
+      bySlug.set(e.slug, {
+        ...prev,
+        slug: e.slug,
+        branch: e.branch,
+        removedAt: e.removedAt,
+        ...(e.title !== undefined ? { title: e.title } : {}),
+        ...(e.prNumber !== undefined ? { prNumber: e.prNumber } : {}),
+        ...(e.prUrl !== undefined ? { prUrl: e.prUrl } : {}),
+        ...(e.prState !== undefined ? { prState: e.prState } : {}),
+      });
+    }
+    const cutoff = Date.now() - REMOVED_MAX_AGE_MS;
+    const removed = [...bySlug.values()]
+      .filter((e) => (Date.parse(e.removedAt) || 0) >= cutoff)
+      .sort((a, b) => b.removedAt.localeCompare(a.removedAt))
+      .slice(0, REMOVED_MAX_ENTRIES);
+    writeWtState({ ...state, removed });
+  });
+}
+
+/**
+ * Drop a slug from the removed history. Called by `createWorktree` so a
+ * restored / re-created slug stops appearing as removed. No-op when absent.
+ */
+export function clearRemovedWorktree(slug: string): void {
+  withWtStateLock(() => {
+    const state = readWtState();
+    if (!state.removed.some((e) => e.slug === slug)) return;
+    writeWtState({
+      ...state,
+      removed: state.removed.filter((e) => e.slug !== slug),
+    });
   });
 }
 

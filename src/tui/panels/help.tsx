@@ -151,6 +151,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "n", label: "new worktree" },
       { key: "N", label: "new worktree · base = selected" },
       { key: "c", label: "clean merged/gone" },
+      { key: "h", label: "show / hide removed-worktree history" },
       { key: "r", label: "refresh (fetch + recompute)" },
       { key: "R", label: "restack this stack (replay; /restack on conflict)" },
       { key: "^R", label: "clear all cached data" },
@@ -172,6 +173,18 @@ const KEY_BLOCKS: Block[] = [
       { key: "g p", label: "open PR in GitHub" },
       { key: "l p", label: "open PR in Linear" },
       { key: "w", label: "check out branch as worktree → Reviews" },
+    ],
+  },
+  {
+    kind: "keys",
+    title: "removed worktrees (h)",
+    note: "history of destroyed worktrees (snapshot at removal). Only these keys apply while it's shown.",
+    items: [
+      { key: "⏎", label: "restore — create a real worktree for the branch again" },
+      { key: "p", label: "open recorded PR" },
+      { key: "i", label: "open issue" },
+      { key: "y", label: "copy branch name" },
+      { key: "h / esc", label: "back to worktrees" },
     ],
   },
   {

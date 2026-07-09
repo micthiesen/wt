@@ -5,7 +5,13 @@ import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./claude-sessions.ts";
 import { clearCodexNames } from "./codex-sessions.ts";
 import { clearOpencodeNames } from "./opencode-sessions.ts";
-import { clearBaseReferences, clearSlugState, setSlugBase } from "./wtstate.ts";
+import {
+  clearBaseReferences,
+  clearRemovedWorktree,
+  clearSlugState,
+  recordRemovedWorktrees,
+  setSlugBase,
+} from "./wtstate.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet, originBranchExists, revParse } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
@@ -166,6 +172,7 @@ export async function createWorktree(
   // destroy is in flight, is the race-free counterpart.
   clearArchived(slug);
   clearSlugState(slug);
+  clearRemovedWorktree(slug);
   clearClaudeNames(slug);
   clearCodexNames(slug);
   clearOpencodeNames(slug);
@@ -374,6 +381,23 @@ export async function removeWorktree(
     // clearing here — `wt stack rebase` reconciles the manifest. (Fork-
     // base records ARE per-slug and are swept above when the branch is
     // deleted.)
+
+    // Confirm the removal in the removed-worktrees history. The TUI's
+    // destroy flows already wrote a rich snapshot (title, PR) at
+    // dispatch; this minimal upsert preserves those fields and covers
+    // the CLI paths that never went through the TUI. Best-effort — a
+    // state-file IO failure must not fail an already-completed remove.
+    if (wt.branch) {
+      try {
+        recordRemovedWorktrees([
+          { slug: wt.slug, branch: wt.branch, removedAt: new Date().toISOString() },
+        ]);
+      } catch (err) {
+        opts.onLog?.(
+          `could not record removed-worktree entry: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     return {
       ok: true,

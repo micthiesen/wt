@@ -1,5 +1,6 @@
 import type { ActionDef } from "../core/actions.ts";
 import type { HistoryEntry } from "../core/action-history.ts";
+import type { RemovedWorktree } from "../core/wtstate.ts";
 import type { ActionPickerState } from "./panels/action-picker.tsx";
 import type { MultiPickerItem } from "./panels/picker.tsx";
 import type { SectionPickerItem } from "./panels/section-picker.tsx";
@@ -21,6 +22,8 @@ export type Modal =
       confirmLabel?: string;
       danger?: boolean;
       reviewBranch?: string;
+      /** Payload for the `restore` pendingKey (removed-worktrees view). */
+      restoreEntry?: RemovedWorktree;
     }
   | { kind: "yank" }
   | {

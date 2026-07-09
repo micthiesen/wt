@@ -13,13 +13,49 @@ import { createLogger } from "../../core/logger.ts";
 import { removeShellLog } from "../../core/shell-tail.ts";
 import { rebaseStack, reconcileStack } from "../../core/stack-ops.ts";
 import { killAllSessionsFor } from "../../core/tmux.ts";
-import { findStackIdByBranch } from "../../core/wtstate.ts";
+import {
+  findStackIdByBranch,
+  recordRemovedWorktrees,
+  type RemovedWorktree,
+} from "../../core/wtstate.ts";
 
 import { isCleanCandidate } from "../app-helpers.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { theme } from "../theme.ts";
 
 const appLog = createLogger("[app]");
+
+/**
+ * Rich removed-history snapshot taken at destroy DISPATCH, while the
+ * row's PR + AI title are still in hand — `removeWorktree` later
+ * confirms with a minimal upsert that preserves these fields. A
+ * slug-derived title is omitted (the slug is already on the entry).
+ */
+function removedSnapshot(row: WorktreeRow): RemovedWorktree {
+  return {
+    slug: row.wt.slug,
+    branch: row.wt.branch,
+    removedAt: new Date().toISOString(),
+    ...(row.titleSource !== "slug" ? { title: row.title } : {}),
+    ...(row.pr
+      ? { prNumber: row.pr.number, prUrl: row.pr.url, prState: row.pr.state }
+      : {}),
+  };
+}
+
+/**
+ * Best-effort history write — a state-file IO failure must never block
+ * a destroy the user already confirmed.
+ */
+function recordRemovedSnapshots(rows: readonly WorktreeRow[]): void {
+  try {
+    recordRemovedWorktrees(rows.map(removedSnapshot));
+  } catch (err) {
+    appLog.warn("could not record removed-worktree history", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 export type DestroyFlowsCtx = {
   rows: readonly WorktreeRow[];
@@ -97,6 +133,7 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     // at next startup; re-creating the same slug clears the entry via
     // createWorktree.
     archive(slug);
+    recordRemovedSnapshots([row]);
     // Mark any in-flight action as killed in the registry first, so
     // the activity pane reads "killed" rather than the "failed" the
     // wrapper's exit code would otherwise produce. Has to happen
@@ -173,6 +210,7 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     // Notify the action registry first (synchronous, fast) so the
     // activity pane reads "killed" rather than the "failed" the
     // wrapper's exit code would otherwise produce.
+    recordRemovedSnapshots(candidates);
     for (const row of candidates) void actionRegistry.kill(row.wt.slug);
     await Promise.allSettled(
       candidates.map((row) => killAllSessionsFor(row.wt.slug)),

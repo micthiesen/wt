@@ -89,7 +89,7 @@ The loader prints every missing or malformed field at once. See [`src/core/confi
 
 ## Usage
 
-`wt` with no arguments launches the TUI. Press `?` inside for the full keymap and glyph legend, and `/` to filter that help. The `p` key opens a PR in `[github].pr_target`; `g p` and `l p` explicitly open the same PR in GitHub or Linear Reviews.
+`wt` with no arguments launches the TUI. Press `?` inside for the full keymap and glyph legend, and `/` to filter that help. The `p` key opens a PR in `[github].pr_target`; `g p` and `l p` explicitly open the same PR in GitHub or Linear Reviews. `h` flips the list into a history of removed worktrees (branch, issue, and PR snapshotted at destroy time) — Enter restores one as a real worktree again.
 
 Subcommands run one-shot CLI ops:
 

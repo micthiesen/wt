@@ -26,7 +26,7 @@ import {
   closeHarnessSessionGracefully,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
-import { stackIdFromSectionKey } from "../core/wtstate.ts";
+import { stackIdFromSectionKey, type RemovedWorktree } from "../core/wtstate.ts";
 import { claudeSummariesQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
 
 import {
@@ -55,6 +55,7 @@ import {
   SessionsPickerNew,
 } from "./panels/sessions-picker.tsx";
 import { WorktreeList, type ListScrollHandle } from "./panels/list.tsx";
+import { RemovedList } from "./panels/removed-list.tsx";
 import { YankModal } from "./panels/yank.tsx";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
 import {
@@ -261,6 +262,30 @@ export function App({ onExit }: Props) {
     () => rows.filter((r) => isCleanCandidate(r)),
     [rows],
   );
+
+  // Removed-worktrees history view (`h` toggles the left pane into it).
+  // The cursor is a plain index over the filtered entries — the list is
+  // static-ish and has no sections/folding, so the key-based cursor
+  // model of the live list would be overkill here.
+  const [removedView, setRemovedView] = useState(false);
+  const [removedIndex, setRemovedIndex] = useState(0);
+  // Hide entries whose slug is live again: a failed destroy leaves the
+  // worktree in place (the record self-heals into view only if it ever
+  // actually disappears), and a restored slug drops out immediately even
+  // before `createWorktree` clears its record.
+  const removedEntries = useMemo(() => {
+    const live = new Set(rows.map((r) => r.wt.slug));
+    return (wtStateForStacks.data?.removed ?? []).filter(
+      (e) => !live.has(e.slug),
+    );
+  }, [rows, wtStateForStacks.data?.removed]);
+  const removedCursor = Math.min(
+    removedIndex,
+    Math.max(0, removedEntries.length - 1),
+  );
+  const currentRemoved = removedView
+    ? removedEntries[removedCursor]
+    : undefined;
 
   const {
     activeItems,
@@ -1109,6 +1134,31 @@ export function App({ onExit }: Props) {
     void refreshAll();
   }
 
+  // Restore a removed worktree: a real `createWorktree` for the recorded
+  // branch. If the branch still exists (locally or on origin) this checks
+  // it out; if it's fully gone (merged + deleted) it starts a fresh branch
+  // of the same name off trunk. `createWorktree` clears the removed-history
+  // entry itself, so success just needs to land the cursor on the new row.
+  async function doRestoreRemoved(entry: RemovedWorktree): Promise<void> {
+    const log = createLogger("[restore]");
+    log.event.info(`restoring ${entry.slug} (${entry.branch})`);
+    const result = await createWorktree(entry.branch, {
+      onPhase: (p) => log.event.info(`phase: ${p}`),
+      onLog: (line) => log.event.dim(line),
+      runInstall: true,
+    });
+    if (!result.ok) {
+      log.event.err(result.reason);
+      toast(`restore failed: ${result.reason}`, theme.err, 3000);
+      return;
+    }
+    log.event.ok(`restored at ${result.path}`);
+    toast(`restored ${result.slug}`, theme.ok, 2500);
+    setRemovedView(false);
+    setSel(result.slug);
+    void refreshAll();
+  }
+
   // Per-modal key handlers. Exactly one modal is active at a time;
   // `useKeyboard` below dispatches on `modal.kind` and each handler
   // owns its modal's full key map, swallowing the keypress.
@@ -1131,6 +1181,7 @@ export function App({ onExit }: Props) {
           doMarkReady,
           doShipPr,
           doCheckoutReview,
+          doRestoreRemoved,
           clearAll,
           submitReviewerPicker,
           commitSectionPick,
@@ -1210,6 +1261,88 @@ export function App({ onExit }: Props) {
       // ASCII so control chars in the middle of a paste don't corrupt.
       const text = printableText(k.sequence);
       if (text) setFooter({ ...footer, value: footer.value + text });
+      return;
+    }
+
+    // Removed-worktrees view: the left pane shows destroy history
+    // instead of live rows. Its own small key map — navigation, the
+    // PR/issue/yank carryovers, and Enter-to-restore — and everything
+    // else is swallowed so worktree-keyed actions can't fire against
+    // the hidden live selection.
+    if (removedView) {
+      if (k.name === "escape" || isPlainLetter(k, "h")) {
+        setRemovedView(false);
+        return;
+      }
+      if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
+        quit();
+        return;
+      }
+      if (k.sequence === "?") {
+        setModal({ kind: "help", query: "", searching: false });
+        return;
+      }
+      if (k.name === "j" || k.name === "down") {
+        setRemovedIndex(
+          Math.min(removedCursor + 1, Math.max(0, removedEntries.length - 1)),
+        );
+        return;
+      }
+      if (k.name === "k" || k.name === "up") {
+        setRemovedIndex(Math.max(0, removedCursor - 1));
+        return;
+      }
+      if (k.sequence === "g") {
+        setRemovedIndex(0);
+        return;
+      }
+      if (k.sequence === "G") {
+        setRemovedIndex(Math.max(0, removedEntries.length - 1));
+        return;
+      }
+      const entry = removedEntries[removedCursor];
+      if (!entry) return;
+      const removedLog = createLogger(entry.slug);
+      if (isPlainLetter(k, "p")) {
+        if (!entry.prUrl) {
+          removedLog.event.warn("no PR recorded for this branch");
+          toast("no PR recorded", theme.fgDim, 1500);
+          return;
+        }
+        openPrUrl(entry.prUrl, entry.prNumber ?? 0, null, entry.slug);
+        return;
+      }
+      if (isPlainLetter(k, "i")) {
+        const url = linearUrlForSlug(entry.slug);
+        if (!url) {
+          removedLog.event.warn("no linear id in slug");
+          return;
+        }
+        void openUrlHidingAlacritty(url);
+        removedLog.event.info("opened linear");
+        return;
+      }
+      if (k.sequence === "y") {
+        doYank(entry.slug, "branch", entry.branch);
+        return;
+      }
+      if (k.name === "return") {
+        setModal({
+          kind: "confirm",
+          pendingKey: "restore",
+          restoreEntry: entry,
+          title: "restore worktree",
+          message: `Restore ${entry.slug}?`,
+          detail: `Creates a worktree for ${entry.branch} (checked out if the branch still exists, fresh off ${config.branch.base} otherwise).`,
+          confirmLabel: "restore",
+        });
+        return;
+      }
+      return;
+    }
+    // `h` — flip the left pane to the removed-worktrees history.
+    if (isPlainLetter(k, "h")) {
+      setRemovedView(true);
       return;
     }
 
@@ -2164,23 +2297,32 @@ export function App({ onExit }: Props) {
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>
       <box flexDirection="row" flexGrow={1}>
-        <WorktreeList
-          items={activeItems}
-          archivedRows={archivedRows}
-          reviewRequests={reviewRequestRows}
-          selectedIndex={cursorIndex}
-          width={listWidth}
-          activeTails={activeTails}
-          activeActions={activeActions}
-          activeSessionBySlug={activeSessionBySlug}
-          stackSectionLabels={stackSectionLabels}
-          isLoading={isLoading}
-          scrollHandle={listScrollHandleRef}
-        />
+        {removedView ? (
+          <RemovedList
+            entries={removedEntries}
+            selectedIndex={removedCursor}
+            width={listWidth}
+          />
+        ) : (
+          <WorktreeList
+            items={activeItems}
+            archivedRows={archivedRows}
+            reviewRequests={reviewRequestRows}
+            selectedIndex={cursorIndex}
+            width={listWidth}
+            activeTails={activeTails}
+            activeActions={activeActions}
+            activeSessionBySlug={activeSessionBySlug}
+            stackSectionLabels={stackSectionLabels}
+            isLoading={isLoading}
+            scrollHandle={listScrollHandleRef}
+          />
+        )}
         <Details
-          row={current}
-          reviewRequest={selectedPr}
-          section={sectionDetail}
+          row={removedView ? undefined : current}
+          reviewRequest={removedView ? undefined : selectedPr}
+          section={removedView ? undefined : sectionDetail}
+          removed={currentRemoved}
           width={Math.max(0, width - listWidth)}
           scrollRef={detailsScrollRef}
         />

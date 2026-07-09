@@ -17,6 +17,7 @@ import {
   killHarnessSession,
   killShellSession,
 } from "../core/tmux.ts";
+import type { RemovedWorktree } from "../core/wtstate.ts";
 import { isPlainLetter, printableMultiline, printableText } from "./app-helpers.ts";
 import type { Modal } from "./modal.ts";
 import { previewFocusPatch } from "./picker-preview.ts";
@@ -42,6 +43,7 @@ type SimpleModalContext = {
   doMarkReady: (slug: string) => Promise<void>;
   doShipPr: (slug: string) => Promise<void>;
   doCheckoutReview: (branch: string) => Promise<void>;
+  doRestoreRemoved: (entry: RemovedWorktree) => Promise<void>;
   clearAll: () => Promise<void>;
   submitReviewerPicker: () => Promise<void>;
   commitSectionPick: (item: SectionPickerItem, slug: string) => void;
@@ -980,6 +982,7 @@ function handleConfirmKey(
     doMarkReady,
     doShipPr,
     doCheckoutReview,
+    doRestoreRemoved,
     clearAll,
     logWarn,
   } = ctx;
@@ -1000,6 +1003,8 @@ function handleConfirmKey(
       void doShipPr(current.wt.slug);
     } else if (pending === "review-wt" && modal.reviewBranch) {
       void doCheckoutReview(modal.reviewBranch);
+    } else if (pending === "restore" && modal.restoreEntry) {
+      void doRestoreRemoved(modal.restoreEntry);
     } else if (pending === "R") {
       logWarn("cleared all cached data; refetching from scratch");
       void clearAll();
