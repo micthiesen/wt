@@ -1,20 +1,10 @@
 import { useMemo, useRef, useState } from "react";
-import { useIsFetching, useQuery } from "@tanstack/react-query";
+import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
-import {
-  actionRegistry,
-  BUILTIN_ACTIONS,
-  evaluateActionRequirements,
-} from "../core/actions.ts";
-import { config, type PullRequestTarget } from "../core/config.ts";
-import { createWorktree, parseInput } from "../core/lifecycle.ts";
-import {
-  editReviewers,
-  pullRequestOpenUrl,
-  pullRequestOpenUrlForTarget,
-} from "../core/github.ts";
+import { actionRegistry } from "../core/actions.ts";
+import { config } from "../core/config.ts";
 import {
   nextAutoName,
 } from "../core/harness/claude/names.ts";
@@ -26,14 +16,12 @@ import {
   closeHarnessSessionGracefully,
 } from "../core/tmux.ts";
 import { StatusKind } from "../core/types.ts";
-import { stackIdFromSectionKey, type RemovedWorktree } from "../core/wtstate.ts";
-import { claudeSummariesQuery, patchPullRequest, useWtActions, type GithubData } from "../state/index.ts";
+import { stackIdFromSectionKey } from "../core/wtstate.ts";
+import { useWtActions } from "../state/index.ts";
 
 import {
   ActionEditModal,
   ActionPickerModal,
-  assignActionKeys,
-  type PickerItem,
 } from "./panels/action-picker.tsx";
 import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
 import { ConfirmModal } from "./panels/confirm-modal.tsx";
@@ -42,14 +30,11 @@ import { Footer, type FooterMode } from "./panels/footer.tsx";
 import { HelpOverlay } from "./panels/help.tsx";
 import { KillActionConfirmModal } from "./panels/kill-action-confirm.tsx";
 import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
-import { ArgPickerModal, MultiPickerModal, PickerModal, type MultiPickerItem } from "./panels/picker.tsx";
+import { ArgPickerModal, MultiPickerModal, PickerModal } from "./panels/picker.tsx";
 import { OutputsPicker } from "./panels/outputs-picker.tsx";
 import { OutputViewer } from "./panels/output-viewer.tsx";
 import { RefreshWave } from "./spinner.tsx";
-import {
-  SectionPickerModal,
-  type SectionPickerItem,
-} from "./panels/section-picker.tsx";
+import { SectionPickerModal } from "./panels/section-picker.tsx";
 import {
   SessionsPickerList,
   SessionsPickerNew,
@@ -65,7 +50,6 @@ import {
 } from "./hooks/useHarnessSessions.ts";
 import { getHarness, HARNESSES } from "../core/harness/index.ts";
 import { HarnessPickerModal } from "./panels/harness-picker.tsx";
-import type { PickerRow } from "./panels/sessions-picker.tsx";
 import type { Modal } from "./modal.ts";
 import { handleSimpleModalKey } from "./modal-key-handlers.ts";
 import { enterDiffSession } from "./diff-session.ts";
@@ -83,12 +67,7 @@ import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
-import {
-  GROUP_INBOX,
-  STACK_SECTION_PREFIX,
-  useWorktreeRows,
-  type WorktreeRow,
-} from "./hooks/useWorktreeRows.ts";
+import { GROUP_INBOX, useWorktreeRows } from "./hooks/useWorktreeRows.ts";
 import { useStackSections } from "./hooks/useStackSections.ts";
 import { useVisualItems, visualKey } from "./hooks/useVisualItems.ts";
 import { useAutomations } from "./hooks/useAutomations.ts";
@@ -101,14 +80,21 @@ import {
   isCleanCandidate,
   isPlainLetter,
   isShiftedLetter,
-  parseNewInput,
   printableMultiline,
   printableText,
   resolveDiffBase,
 } from "./app-helpers.ts";
+import { makeActionPickerFlows } from "./flows/action-picker.ts";
+import { makeBaseFlows } from "./flows/base.ts";
 import { makeDestroyFlows } from "./flows/destroy.ts";
 import { makeGithubPrFlows } from "./flows/github-pr.ts";
+import { makeWorktreeCreateFlows, REVIEW_SECTION } from "./flows/new-worktree.ts";
+import { makeReviewerFlows } from "./flows/reviewers.ts";
+import { makeSectionFlows } from "./flows/sections.ts";
 import { makeSessionFlows } from "./flows/sessions.ts";
+import { usePrTargetChord } from "./hooks/usePrTargetChord.ts";
+import { useRemovedView } from "./hooks/useRemovedView.ts";
+import { useSessionsPickerData } from "./hooks/useSessionsPickerData.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "./usage-badge.tsx";
 import { openInZed, openUrlHidingAlacritty, writeClipboard } from "./helpers.ts";
 import {
@@ -121,23 +107,11 @@ import { theme } from "./theme.ts";
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
 const wtSourceLog = createLogger(WT_SOURCE_SLOT.label);
-const PR_TARGET_CHORD_MS = 1_200;
-
-/** Section a review-requested PR lands in when checked out via `w`. */
-const REVIEW_SECTION = "Reviews";
 
 export type TuiExit = { kind: "quit" };
 
 type Props = {
   onExit: (e: TuiExit) => void;
-};
-
-type PendingPrTargetChord = {
-  target: PullRequestTarget;
-  url: string;
-  number: number;
-  logName: string;
-  timer: Timer;
 };
 
 export function App({ onExit }: Props) {
@@ -207,7 +181,6 @@ export function App({ onExit }: Props) {
   // because the rename UX uses the footer, not an overlay.
   const [pendingRename, setPendingRename] = useState<string | null>(null);
   const toastTimer = useRef<Timer | null>(null);
-  const pendingPrTargetChordRef = useRef<PendingPrTargetChord | null>(null);
 
   // Auto-tail every busy worktree so logs surface in the activity pane
   // without user intervention. Returns the active set so rows can flag
@@ -264,28 +237,14 @@ export function App({ onExit }: Props) {
   );
 
   // Removed-worktrees history view (`h` toggles the left pane into it).
-  // The cursor is a plain index over the filtered entries — the list is
-  // static-ish and has no sections/folding, so the key-based cursor
-  // model of the live list would be overkill here.
-  const [removedView, setRemovedView] = useState(false);
-  const [removedIndex, setRemovedIndex] = useState(0);
-  // Hide entries whose slug is live again: a failed destroy leaves the
-  // worktree in place (the record self-heals into view only if it ever
-  // actually disappears), and a restored slug drops out immediately even
-  // before `createWorktree` clears its record.
-  const removedEntries = useMemo(() => {
-    const live = new Set(rows.map((r) => r.wt.slug));
-    return (wtStateForStacks.data?.removed ?? []).filter(
-      (e) => !live.has(e.slug),
-    );
-  }, [rows, wtStateForStacks.data?.removed]);
-  const removedCursor = Math.min(
-    removedIndex,
-    Math.max(0, removedEntries.length - 1),
-  );
-  const currentRemoved = removedView
-    ? removedEntries[removedCursor]
-    : undefined;
+  const {
+    removedView,
+    setRemovedView,
+    setRemovedIndex,
+    removedEntries,
+    removedCursor,
+    currentRemoved,
+  } = useRemovedView({ rows, wtState: wtStateForStacks.data });
 
   const {
     activeItems,
@@ -304,52 +263,10 @@ export function App({ onExit }: Props) {
     selectedKey: sel,
   });
 
-  function clearPendingPrTargetChord(): void {
-    const pending = pendingPrTargetChordRef.current;
-    if (pending) clearTimeout(pending.timer);
-    pendingPrTargetChordRef.current = null;
-  }
-
-  function rememberPrTargetChord(target: PullRequestTarget): boolean {
-    const pr = selectedPr ?? current?.pr;
-    if (!pr) return false;
-    clearPendingPrTargetChord();
-    const logName = selectedPr ? "[review]" : current?.wt.slug ?? "[app]";
-    const timer = setTimeout(() => {
-      pendingPrTargetChordRef.current = null;
-    }, PR_TARGET_CHORD_MS);
-    pendingPrTargetChordRef.current = {
-      target,
-      url: pr.url,
-      number: pr.number,
-      logName,
-      timer,
-    };
-    return true;
-  }
-
-  function openPrUrl(
-    url: string,
-    number: number,
-    target: PullRequestTarget | null,
-    logName: string,
-  ): void {
-    const resolved = target
-      ? pullRequestOpenUrlForTarget(url, target)
-      : pullRequestOpenUrl(url);
-    const label = target ?? config.github.prTarget;
-    void openUrlHidingAlacritty(resolved);
-    createLogger(logName).event.info(`opened PR #${number} in ${label}`);
-  }
-
-  function consumePrTargetChord(k: KeyEvent): boolean {
-    if (!isPlainLetter(k, "p")) return false;
-    const pending = pendingPrTargetChordRef.current;
-    if (!pending) return false;
-    clearPendingPrTargetChord();
-    openPrUrl(pending.url, pending.number, pending.target, pending.logName);
-    return true;
-  }
+  // `g p` / `l p` PR-target chord — extracted to
+  // `hooks/usePrTargetChord.ts`.
+  const { rememberPrTargetChord, openPrUrl, consumePrTargetChord } =
+    usePrTargetChord({ selectedPr, current });
 
   const listWidth = Math.max(32, Math.min(52, Math.floor(width * 0.44)));
   // Middle (list + details) is capped; activity absorbs the rest. Title
@@ -406,49 +323,13 @@ export function App({ onExit }: Props) {
     activeActions,
     activeSessionBySlug,
   });
-  // LLM-authored summary snippets for the picker's currently-open
-  // worktree. Only fetched when the picker is open (gated by
-  // `enabled`); the queryFn does light tail-bounded disk reads
-  // cached by (mtime, size) so repeat opens are essentially free.
-  const pickerWt = (modal?.kind === "claudeSessionsPicker"
-    ? rows.find((r) => r.wt.slug === modal.slug)?.wt
-    : undefined);
-  const pickerWtForQuery = pickerWt ?? { slug: "__none__", path: "" };
-  const summariesQuery = useQuery({
-    ...claudeSummariesQuery(pickerWtForQuery),
-    enabled: !!pickerWt,
+  // Sessions-picker derived data (row list + summaries) — extracted to
+  // `hooks/useSessionsPickerData.ts`.
+  const { pickerRows, pickerSummaries } = useSessionsPickerData({
+    modal,
+    rows,
+    currentHarnessSessions,
   });
-  // Sessions-picker rows for the current modal slug. Built from
-  // `currentHarnessSessions` so claude/codex/opencode entries surface
-  // in one list. Trailing "+ new" affordances are appended one per
-  // harness so per-harness letters (`c`/`o`/`x`) land on distinct
-  // rows. Index space: [sessions...] [new-claude] [new-codex] [new-opencode].
-  const pickerSlug =
-    modal?.kind === "claudeSessionsPicker" ? modal.slug : null;
-  const pickerRows = useMemo<ReadonlyArray<PickerRow>>(() => {
-    if (pickerSlug === null) return [];
-    // `sessions` is already sorted live-first then recency-desc by
-    // `compareSessionsForDisplay` inside the hook.
-    const out: PickerRow[] = currentHarnessSessions.sessions.map((entry) => ({
-      kind: "session",
-      entry,
-    }));
-    for (const h of HARNESSES) {
-      out.push({ kind: "new", harnessId: h.id });
-    }
-    return out;
-  }, [pickerSlug, currentHarnessSessions.sessions]);
-  // Summaries keyed by session id for the picker's bottom panel.
-  // Claude-only today; codex / opencode entries fall back to the
-  // "(no summary yet)" placeholder.
-  const pickerSummaries = useMemo(() => {
-    const m = new Map<string, { text: string } | null>();
-    const raw = summariesQuery.data ?? {};
-    for (const [id, value] of Object.entries(raw)) {
-      m.set(id, value);
-    }
-    return m;
-  }, [summariesQuery.data]);
 
   // Parallel set for diff sessions — used by the Shift+F11 hint so
   // the kill-confirm only opens when there's something to kill.
@@ -523,282 +404,37 @@ export function App({ onExit }: Props) {
     toast(`${label} failed: ${msg}`, theme.err, 3000);
   }
 
-  /**
-   * Build the section-picker item list. Excludes the current row's
-   * section since "move this row to where it already is" is never
-   * useful (the user explicitly asked to drop that as clutter).
-   * "+ new section" sits at the bottom with `l` as its quick chord
-   * trigger so `l l` creates a fresh section in two keystrokes.
-   */
-  function buildSectionItems(
-    currentRow: WorktreeRow,
-  ): SectionPickerItem[] {
-    const items: SectionPickerItem[] = [];
-    const currentSection = currentRow.section;
-    if (currentSection !== null) items.push({ kind: "none" });
-    const seen = new Set<string>();
-    for (const r of rows) {
-      if (r.archived) continue;
-      if (r.section === null || seen.has(r.section)) continue;
-      seen.add(r.section);
-      if (r.section === currentSection) continue;
-      // Manifest-driven stack sections aren't manually joinable — skip
-      // them so the picker only lists manual named sections.
-      if (r.sectionIsStack) continue;
-      items.push({ kind: "section", name: r.section });
-    }
-    items.push({ kind: "create" });
-    return items;
-  }
-
-  /**
-   * Move a whole group (a stack section, a manual section, the inbox)
-   * one display slot in `dir`. The landmark is the adjacent group that
-   * currently RENDERS rows — `moveGroupPast` then jumps any invisible
-   * group sitting in between (an empty inbox) so one keypress is one
-   * visual step, never a phantom no-change move.
-   */
-  function doMoveGroup(groupKey: string, dir: -1 | 1, what: string): void {
-    const order = wtStateForStacks.data?.sectionsOrder ?? [];
-    const present = new Set<string>();
-    for (const r of rows) {
-      if (!r.archived) present.add(r.section ?? GROUP_INBOX);
-    }
-    const seq = order.filter((g) => present.has(g));
-    const idx = seq.indexOf(groupKey);
-    if (idx < 0) return; // unranked group mid-refresh; self-heals on next read
-    const neighbor = seq[idx + dir];
-    if (!neighbor) {
-      toast(
-        dir > 0 ? `${what} already at bottom` : `${what} already at top`,
-        theme.fgDim,
-        1500,
-      );
-      return;
-    }
-    moveGroupPast(groupKey, neighbor, dir > 0 ? "after" : "before").then(
-      (moved) => {
-        if (moved) toast(`moved ${what} ${dir > 0 ? "down" : "up"}`, theme.info, 1200);
-      },
-      (err) => reportActionError("move", err),
-    );
-  }
-
-  /**
-   * Unified Shift+J/K — moves the smallest movable thing under the
-   * cursor:
-   *   - A row in the inbox / a manual section: swap with its same-group
-   *     neighbor, or slide to the near edge of the adjacent group across
-   *     a boundary (top of next on `J`, bottom of prev on `K`). Stack
-   *     sections can't be joined (membership is manifest-derived), so a
-   *     sliding row hops over them in one keypress; the inbox is a valid
-   *     target even when empty.
-   *   - A row inside a stack section (slice or holistic origin): rows
-   *     there are ordered by the manifest topology, so the move applies
-   *     to the WHOLE stack — one group slot.
-   *   - A folded section header (stack or manual): the whole group moves.
-   * The archive boundary is hard: rows can't cross into archived via
-   * J/K — that's `a`'s job.
-   */
-  function doShiftMove(dir: -1 | 1): void {
-    if (selectedSection) {
-      doMoveGroup(
-        selectedSection.sectionKey,
-        dir,
-        selectedSection.isStack ? "stack" : "section",
-      );
-      return;
-    }
-    if (!current) return;
-    if (current.archived) {
-      toast("archived rows don't reorder, use `a` to restore", theme.fgDim, 1500);
-      return;
-    }
-    if (current.sectionIsStack) {
-      doMoveGroup(current.section!, dir, "stack");
-      return;
-    }
-    const active = rows.filter((r) => !r.archived);
-    const idx = active.indexOf(current);
-    if (idx < 0) return;
-    const slug = current.wt.slug;
-    const target = active[idx + dir];
-    if (target && target.section === current.section) {
-      const bucket = active
-        .filter((r) => r.section === current.section)
-        .map((r) => r.wt.slug);
-      swapOrder(slug, target.wt.slug, current.section, bucket).catch((err) =>
-        reportActionError("reorder", err),
-      );
-      return;
-    }
-    // Crossing a group boundary: land at the near edge of the adjacent
-    // group in the ranked sequence. Built from `sectionsOrder` rather
-    // than the neighboring ROW so stack sections get skipped and the
-    // inbox is reachable even when it has no rows (the only way back
-    // out when every row is sectioned).
-    const order = wtStateForStacks.data?.sectionsOrder ?? [];
-    const present = new Set<string>();
-    for (const r of active) present.add(r.section ?? GROUP_INBOX);
-    const seq = order.filter((g) => g === GROUP_INBOX || present.has(g));
-    const start = seq.indexOf(current.section ?? GROUP_INBOX);
-    if (start < 0) return; // unranked mid-refresh; self-heals on next read
-    let i = start + dir;
-    while (i >= 0 && i < seq.length && seq[i]!.startsWith(STACK_SECTION_PREFIX)) {
-      i += dir;
-    }
-    const targetGroup = seq[i];
-    if (targetGroup === undefined) {
-      toast(dir > 0 ? "already at bottom" : "already at top", theme.fgDim, 1500);
-      return;
-    }
-    const sectionVal = targetGroup === GROUP_INBOX ? null : targetGroup;
-    placeSlug(slug, sectionVal, dir > 0 ? "top" : "bottom").then(
-      () => toast(`moved to ${sectionVal ?? "Inbox"}`, theme.info, 1200),
-      (err) => reportActionError("move", err),
-    );
-  }
-
-  function openSectionPicker(): void {
-    if (!current) return;
-    if (current.archived) {
-      toast("archived rows don't have a section context, use `a` to restore", theme.fgDim, 2000);
-      return;
-    }
-    if (current.sectionIsStack) {
-      toast("stack rows are auto-managed (manifest-driven)", theme.fgDim, 1800);
-      return;
-    }
-    const items = buildSectionItems(current);
-    // Default cursor: sticky last-move-target if it's still in the
-    // list (and isn't the current section), else the first item.
-    // The user's most common workflow is "move several rows into the
-    // same section", and forcing them to re-aim every time eats keys.
-    let initial = 0;
-    if (lastMoveTarget !== null && lastMoveTarget !== current.section) {
-      const i = items.findIndex(
-        (it) => it.kind === "section" && it.name === lastMoveTarget,
-      );
-      if (i >= 0) initial = i;
-    }
-    setModal({
-      kind: "sectionPicker",
-      title: `move ${current.wt.slug} to section`,
-      slug: current.wt.slug,
-      items,
-      index: initial,
-      newName: null,
+  // Section-management flows (Shift+J/K moves, the section picker,
+  // rename) — extracted to `flows/sections.ts`. Rebuilt per render so
+  // the closures see fresh rows / selection / wtstate.
+  const { doShiftMove, openSectionPicker, commitSectionPick, openSectionRename } =
+    makeSectionFlows({
+      rows,
+      current,
+      selectedSection,
+      wtState: wtStateForStacks.data,
+      lastMoveTarget,
+      setLastMoveTarget,
+      setModal,
+      setFooter,
+      setPendingRename,
+      toast,
+      reportActionError,
+      setSection,
+      placeSlug,
+      swapOrder,
+      moveGroupPast,
     });
-  }
 
-  function commitSectionPick(item: SectionPickerItem, slug: string): void {
-    if (item.kind === "none") {
-      setSection(slug, null).then(
-        () => toast("moved to Inbox", theme.info, 1500),
-        (err) => reportActionError("move", err),
-      );
-      setLastMoveTarget(null);
-      setModal(null);
-      return;
-    }
-    if (item.kind === "section") {
-      const target = item.name;
-      setSection(slug, target).then(
-        () => toast(`moved to ${target}`, theme.info, 1500),
-        (err) => reportActionError("move", err),
-      );
-      setLastMoveTarget(target);
-      setModal(null);
-      return;
-    }
-    // "+ new section" — switch to input mode. Submission lives in the
-    // keyboard handler.
-    setModal((m) =>
-      m?.kind === "sectionPicker" ? { ...m, newName: "" } : m,
-    );
-  }
-
-  function openBasePicker(): void {
-    if (!current) return;
-    if (current.archived) {
-      toast("archived rows have no live worktree to diff", theme.fgDim, 2000);
-      return;
-    }
-    if (current.stack && !current.stack.isHolistic) {
-      toast("stack slices get their base from the manifest — use /restack or `wt stack`", theme.fgDim, 2500);
-      return;
-    }
-    const recorded =
-      current.stackedOn?.via === "fork" ? current.stackedOn.branch : null;
-    const siblings = rows
-      .filter((r) => !r.archived && r.wt.slug !== current.wt.slug)
-      .map((r) => r.wt.branch);
-    // A recorded base whose worktree was already cleaned (branch kept)
-    // wouldn't show up via the rows scan — surface it anyway so the
-    // "(current)" marker is always visible.
-    if (recorded && !siblings.includes(recorded)) siblings.unshift(recorded);
-    const items = [
-      {
-        label: `none — diff against ${config.branch.base}`,
-        branch: null as string | null,
-      },
-      ...siblings.map((b) => ({
-        label: b === recorded ? `${b} (current)` : b,
-        branch: b as string | null,
-      })),
-    ];
-    const idx = recorded ? items.findIndex((it) => it.branch === recorded) : 0;
-    setModal({
-      kind: "basePicker",
-      slug: current.wt.slug,
-      items,
-      index: Math.max(0, idx),
-    });
-  }
-
-  function commitBasePick(
-    item: { label: string; branch: string | null },
-    slug: string,
-  ): void {
-    setModal(null);
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row) return;
-    setBase(row.wt, item.branch).then(
-      () =>
-        toast(
-          item.branch
-            ? `base → ${item.branch} (record only, no rebase)`
-            : `base cleared — diffing against ${config.branch.base}`,
-          theme.info,
-          2000,
-        ),
-      (err) => reportActionError("set base", err),
-    );
-  }
-
-  /**
-   * Open the rename prompt for the current row's section. No-op for
-   * unsectioned and archived rows — there's no nameable section to
-   * rename in those contexts.
-   */
-  function openSectionRename(): void {
-    if (!current || current.archived) return;
-    if (current.section === null) {
-      toast("the Inbox can't be renamed", theme.fgDim, 1500);
-      return;
-    }
-    if (current.sectionIsStack) {
-      toast("stack section name is auto-derived", theme.fgDim, 1500);
-      return;
-    }
-    setPendingRename(current.section);
-    setFooter({
-      kind: "input",
-      prompt: `rename "${current.section}":`,
-      value: current.section,
-      purpose: "rename-section",
-    });
-  }
+  // Fork-base picker flow (`b`) — extracted to `flows/base.ts`.
+  const { openBasePicker, commitBasePick } = makeBaseFlows({
+    rows,
+    current,
+    setModal,
+    toast,
+    reportActionError,
+    setBase,
+  });
 
   // Destroy / clean / restack flows — extracted to `flows/destroy.ts`.
   // Rebuilt per render so the closures see fresh rows / selection.
@@ -870,142 +506,16 @@ export function App({ onExit }: Props) {
     toast(`copied ${label}`, theme.info, 1500);
   }
 
-  async function openReviewerPicker(slug: string): Promise<void> {
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row?.pr) {
-      toast("no PR for this row", theme.warn, 2000);
-      return;
-    }
-    if (row.pr.state !== "OPEN") {
-      toast("PR is not open", theme.warn, 2000);
-      return;
-    }
-    if (row.pr.isDraft) {
-      toast("PR is a draft (mark ready first)", theme.warn, 2000);
-      return;
-    }
-    // `fetchContributors` returns cached data without awaiting when
-    // warm (background refresh when stale). Only the first-ever open
-    // pays a fetch; after that the picker opens instantly even when
-    // the cached list is stale. `fetchMe` is process-cached after
-    // first call.
-    const [contributors, me] = await Promise.all([
-      fetchContributors(),
-      fetchMe(),
-    ]);
-    const requested = new Set(row.pr.requestedReviewers);
-    // Three-tier candidate list:
-    //   1. PR-scoped suggestions (highest signal — file ownership +
-    //      history). Often empty on small diffs.
-    //   2. Already-requested logins/teams not in (1), so the picker
-    //      doubles as a way to *remove* them.
-    //   3. Repo-wide contributors as the fallback so the picker is
-    //      never empty just because (1) was. Cached for 24h.
-    const items: MultiPickerItem[] = [];
-    const seen = new Set<string>();
-    const skipSelf = (login: string) => me !== null && login === me;
-    for (const s of row.pr.suggestedReviewers) {
-      if (skipSelf(s.login)) continue;
-      const already = requested.has(s.login);
-      const tags: string[] = [];
-      if (already) tags.push("requested");
-      tags.push("suggested");
-      if (s.isAuthor) tags.push("author");
-      if (s.isCommenter) tags.push("commenter");
-      items.push({
-        key: s.login,
-        label: s.login,
-        hint: `(${tags.join(", ")})`,
-      });
-      seen.add(s.login);
-    }
-    for (const login of row.pr.requestedReviewers) {
-      if (seen.has(login)) continue;
-      if (skipSelf(login)) continue;
-      items.push({ key: login, label: login, hint: "(requested)" });
-      seen.add(login);
-    }
-    for (const c of contributors) {
-      if (seen.has(c.login)) continue;
-      if (skipSelf(c.login)) continue;
-      items.push({
-        key: c.login,
-        label: c.login,
-        hint: `(${c.contributions} commits)`,
-      });
-      seen.add(c.login);
-    }
-    if (items.length === 0) {
-      toast("no reviewer candidates", theme.warn, 2000);
-      return;
-    }
-    setModal({
-      kind: "reviewerPicker",
-      title: `edit reviewers for #${row.pr.number}`,
-      items,
-      index: 0,
-      checked: new Set(requested),
-      original: new Set(requested),
-      slug,
-      prNumber: row.pr.number,
-    });
-  }
-
-  async function submitReviewerPicker(): Promise<void> {
-    if (modal?.kind !== "reviewerPicker") return;
-    const { slug, prNumber, checked, original } = modal;
-    const log = createLogger(slug);
-    const branch = rows.find((r) => r.wt.slug === slug)?.wt.branch;
-    setModal(null);
-    if (!branch) {
-      // Slug disappeared between picker open and submit (race against
-      // a destroy). The mutation would still succeed at the gh layer,
-      // but the optimistic patch has nothing to target — bail rather
-      // than silently dropping the cache update.
-      log.event.warn(`slug ${slug} no longer present; aborting reviewer edit`);
-      toast("worktree gone, edit aborted", theme.warn, 2500);
-      return;
-    }
-    const add: string[] = [];
-    const remove: string[] = [];
-    for (const k of checked) if (!original.has(k)) add.push(k);
-    for (const k of original) if (!checked.has(k)) remove.push(k);
-    if (add.length === 0 && remove.length === 0) {
-      toast("no changes", theme.fgDim, 1500);
-      return;
-    }
-    try {
-      await mutate<GithubData>({
-        filter: { queryKey: ["github"] },
-        patch: (data) =>
-          patchPullRequest(data, branch, (pr) => ({
-            ...pr,
-            requestedReviewers: [...checked],
-            reviewRequests: pr.reviewRequests + add.length - remove.length,
-          })),
-        run: async () => {
-          const result = await editReviewers(prNumber, { add, remove });
-          if (!result.ok) throw new Error(result.error);
-        },
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.event.err(`edit reviewers failed for #${prNumber}: ${msg}`);
-      toast(`edit reviewers failed: ${msg}`, theme.err, 4000);
-      return;
-    }
-    const parts: string[] = [];
-    if (add.length > 0) parts.push(`+${add.join(", ")}`);
-    if (remove.length > 0) parts.push(`-${remove.join(", ")}`);
-    log.event.ok(`edited reviewers for #${prNumber}: ${parts.join("; ")}`);
-    const summary = [
-      add.length > 0 ? `added ${add.length}` : null,
-      remove.length > 0 ? `removed ${remove.length}` : null,
-    ]
-      .filter(Boolean)
-      .join(", ");
-    toast(summary, theme.ok, 2500);
-  }
+  // Reviewer-picker flows (`v`) — extracted to `flows/reviewers.ts`.
+  const { openReviewerPicker, submitReviewerPicker } = makeReviewerFlows({
+    rows,
+    modal,
+    setModal,
+    toast,
+    fetchContributors,
+    fetchMe,
+    mutate,
+  });
 
   // GitHub PR mutation flows — extracted to `flows/github-pr.ts`.
   // Rebuilt per render so the closures see fresh rows.
@@ -1015,149 +525,20 @@ export function App({ onExit }: Props) {
     mutate,
   });
 
-  function buildActionPickerItems(slug: string): PickerItem[] {
-    const row = rows.find((r) => r.wt.slug === slug);
-    const rowState = {
-      pr: row?.pr,
-      deployed: row?.fields.deploy.data ?? false,
-    };
-    const defs = [...config.actions, ...BUILTIN_ACTIONS];
-    const keyById = assignActionKeys(defs);
-    const actionItems = defs.map((def) => ({
-      kind: "action" as const,
-      def,
-      key: keyById.get(def.id) ?? "",
-      availability: evaluateActionRequirements(def.requires, rowState),
-    }));
-    // Cluster by group: group order by first appearance, original order
-    // within a group, so the picker shows one header per section. Keys
-    // are assigned over the unclustered list above so they stay stable
-    // regardless of grouping. The custom-prompt entry always trails.
-    const buckets = new Map<string, typeof actionItems>();
-    for (const it of actionItems) {
-      const g = it.def.group ?? "";
-      const arr = buckets.get(g);
-      if (arr) arr.push(it);
-      else buckets.set(g, [it]);
-    }
-    return [...[...buckets.values()].flat(), { kind: "custom" as const }];
-  }
+  // Action-picker helpers (`!`) — extracted to `flows/action-picker.ts`.
+  const { buildActionPickerItems, canPickAction, openActionPicker } =
+    makeActionPickerFlows({ rows, setModal, toast });
 
-  /**
-   * Returns true if the item is launchable. For unavailable actions
-   * toasts the reason so the user understands the no-op without
-   * having to scan the dim subtitle in the picker. Used at both the
-   * Enter and quick-pick-digit handlers so an unavailable action
-   * can't slip into the edit modal.
-   */
-  function canPickAction(item: PickerItem): boolean {
-    if (item.kind === "custom") return true;
-    if (item.availability.ok) return true;
-    toast(`${item.def.name}: ${item.availability.reason}`, theme.warn, 2500);
-    return false;
-  }
-
-  function openActionPicker(slug: string): void {
-    setModal({
-      kind: "actionPicker",
-      state: { mode: "list", slug, index: 0 },
-    });
-  }
-
-
-  async function doNew(raw: string, defaultBase?: string): Promise<void> {
-    const parsed = parseNewInput(raw, defaultBase);
-    if ("error" in parsed) {
-      newLog.event.err(parsed.error);
-      return;
-    }
-    newLog.event.info(`resolving ${parsed.input}`);
-    if (parsed.anyAuthor) newLog.event.info("searching all authors (--any)");
-    if (parsed.base) newLog.event.info(`base: ${parsed.base}`);
-    let branch: string;
-    try {
-      branch = await parseInput(parsed.input, {
-        anyAuthor: parsed.anyAuthor,
-        promptForChoice: (id, branches) =>
-          new Promise<string | null>((resolve) => {
-            setModal({
-              kind: "branchPicker",
-              title: `multiple branches for ${id}`,
-              items: branches,
-              index: 0,
-              resolve,
-            });
-          }),
-      });
-    } catch (err) {
-      newLog.event.err(err instanceof Error ? err.message : String(err));
-      newLog.error(err instanceof Error ? err : String(err));
-      return;
-    }
-    newLog.event.info(`branch = ${branch}`);
-    const result = await createWorktree(branch, {
-      onPhase: (p) => newLog.event.info(`phase: ${p}`),
-      onLog: (line) => newLog.event.dim(line),
-      runInstall: true,
-      base: parsed.base,
-    });
-    if (!result.ok) {
-      newLog.event.err(result.reason);
-      return;
-    }
-    newLog.event.ok(`ready at ${result.path}`);
-    void refreshAll();
-  }
-
-  // Check out a review-requested PR's branch as a worktree and drop it
-  // into the "Reviews" section. The branch already exists on origin, so
-  // `createWorktree` takes the checkout-existing path (sets upstream,
-  // installs packages); `setSection` materializes the section by simply
-  // assigning the new slug to it. Leaves the review-request row in place
-  // — this spawns a worktree, it doesn't consume the PR.
-  async function doCheckoutReview(branch: string): Promise<void> {
-    const log = createLogger("[review]");
-    log.event.info(`creating review worktree for ${branch}`);
-    const result = await createWorktree(branch, {
-      onPhase: (p) => log.event.info(`phase: ${p}`),
-      onLog: (line) => log.event.dim(line),
-      runInstall: true,
-    });
-    if (!result.ok) {
-      log.event.err(result.reason);
-      toast(`worktree failed: ${result.reason}`, theme.err, 3000);
-      return;
-    }
-    await setSection(result.slug, REVIEW_SECTION);
-    log.event.ok(`ready at ${result.path} → ${REVIEW_SECTION}`);
-    toast(`created ${result.slug} in ${REVIEW_SECTION}`, theme.info, 2200);
-    void refreshAll();
-  }
-
-  // Restore a removed worktree: a real `createWorktree` for the recorded
-  // branch. If the branch still exists (locally or on origin) this checks
-  // it out; if it's fully gone (merged + deleted) it starts a fresh branch
-  // of the same name off trunk. `createWorktree` clears the removed-history
-  // entry itself, so success just needs to land the cursor on the new row.
-  async function doRestoreRemoved(entry: RemovedWorktree): Promise<void> {
-    const log = createLogger("[restore]");
-    log.event.info(`restoring ${entry.slug} (${entry.branch})`);
-    const result = await createWorktree(entry.branch, {
-      onPhase: (p) => log.event.info(`phase: ${p}`),
-      onLog: (line) => log.event.dim(line),
-      runInstall: true,
-    });
-    if (!result.ok) {
-      log.event.err(result.reason);
-      toast(`restore failed: ${result.reason}`, theme.err, 3000);
-      return;
-    }
-    log.event.ok(`restored at ${result.path}`);
-    toast(`restored ${result.slug}`, theme.ok, 2500);
-    setRemovedView(false);
-    setSel(result.slug);
-    void refreshAll();
-  }
+  // Worktree-creation flows (`n`/`N`, review checkout, removed-history
+  // restore) — extracted to `flows/new-worktree.ts`.
+  const { doNew, doCheckoutReview, doRestoreRemoved } = makeWorktreeCreateFlows({
+    setModal,
+    setSection,
+    setSel,
+    setRemovedView,
+    refreshAll,
+    toast,
+  });
 
   /**
    * App-level keys that work in BOTH list views — the normal worktree
