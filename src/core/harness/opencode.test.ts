@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { opencodeDisplayTitle } from "./opencode.ts";
+import { opencodeDisplayTitle } from "./opencode/harness.ts";
 
 describe("opencodeDisplayTitle", () => {
   test("keeps meaningful OpenCode titles", () => {

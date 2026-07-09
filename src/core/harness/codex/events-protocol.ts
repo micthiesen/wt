@@ -1,4 +1,4 @@
-import type { EventKind } from "../logger.ts";
+import type { EventKind } from "../../logger.ts";
 
 /** One active codex tmux slot: the wt slug and its cwd. */
 export type ActiveCodexSlug = { slug: string; wtPath: string };

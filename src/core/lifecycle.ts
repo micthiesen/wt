@@ -2,9 +2,9 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, writeFileSync
 import { join } from "node:path";
 
 import { clearArchived } from "./archive.ts";
-import { clearClaudeNames } from "./claude-sessions.ts";
-import { clearCodexNames } from "./codex-sessions.ts";
-import { clearOpencodeNames } from "./opencode-sessions.ts";
+import { clearClaudeNames } from "./harness/claude/names.ts";
+import { clearCodexNames } from "./harness/codex/names.ts";
+import { clearOpencodeNames } from "./harness/opencode/names.ts";
 import {
   clearBaseReferences,
   clearRemovedWorktree,

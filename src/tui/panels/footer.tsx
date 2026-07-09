@@ -1,4 +1,4 @@
-import type { DerivedState } from "../../core/claude-status.ts";
+import type { DerivedState } from "../../core/harness/status.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
 import { stateColor } from "../claude-state.ts";

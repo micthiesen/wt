@@ -8,8 +8,8 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { asObj } from "./claude-events.ts";
-import { listClaudeNames } from "./claude-sessions.ts";
+import { asObj } from "./events.ts";
+import { listClaudeNames } from "./names.ts";
 
 /**
  * Last meaningful entry in a session jsonl, classified for the per-
@@ -81,7 +81,7 @@ export type ClaudeStatus = {
   sessions: readonly SessionTail[];
 };
 
-// Sized to match `SEED_TAIL_BYTES` in `core/session-tail.ts`; large
+// Sized to match `SEED_TAIL_BYTES` in `core/harness/claude/tail.ts`; large
 // assistant turns (multi-tool blocks, sub-agent inlines) regularly
 // exceed 16 KiB and would truncate the most-recent envelope's
 // `stop_reason` line. 64 KiB is still cheap and covers typical max-

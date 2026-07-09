@@ -18,7 +18,7 @@
  * color encodes harness + state together.
  */
 import type { HarnessId } from "../core/harness/types.ts";
-import type { DerivedState } from "../core/claude-status.ts";
+import type { DerivedState } from "../core/harness/status.ts";
 
 import { theme } from "./theme.ts";
 

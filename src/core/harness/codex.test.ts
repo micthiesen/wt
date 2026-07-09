@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
-import { readCodexTail } from "./codex.ts";
+import { readCodexTail } from "./codex/harness.ts";
 
 function event(type: string, timestamp: string): string {
   return JSON.stringify({

@@ -18,8 +18,8 @@
  * registry write failed). It loses to the registry when both are
  * present.
  */
-import type { SessionTail } from "./claude.ts";
-import type { RegistryStatus } from "./claude-registry.ts";
+import type { SessionTail } from "./claude/jsonl.ts";
+import type { RegistryStatus } from "./claude/registry.ts";
 
 export type DerivedState =
   | "working"

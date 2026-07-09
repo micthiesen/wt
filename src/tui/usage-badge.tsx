@@ -14,8 +14,8 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import type { ClaudeUsage } from "../core/claude-usage.ts";
-import type { CodexUsage } from "../core/harness/codex-usage.ts";
+import type { ClaudeUsage } from "../core/harness/claude/usage.ts";
+import type { CodexUsage } from "../core/harness/codex/usage.ts";
 import { getHarness, type HarnessId } from "../core/harness/index.ts";
 import {
   claudeUsageQuery,

@@ -9,7 +9,7 @@ import { createLogger } from "../../core/logger.ts";
 import {
   sessionTailRegistry,
   type LiveSessionDesc,
-} from "../../core/session-tail.ts";
+} from "../../core/harness/claude/tail.ts";
 import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { diffCommandUsesBase, killDiffSession } from "../../core/tmux.ts";
 import { resolveDiffBase } from "../app-helpers.ts";

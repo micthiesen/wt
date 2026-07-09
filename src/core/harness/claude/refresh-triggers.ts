@@ -1,7 +1,7 @@
 /**
  * Refresh triggers for the interactive Claude session tail.
  *
- * `session-tail.ts` already tails every live wt-managed `claude` jsonl
+ * `core/harness/claude/tail.ts` already tails every live wt-managed `claude` jsonl
  * for the activity pane. This module is the "while we're reading the
  * stream anyway" addition: scan each new entry for Bash tool calls
  * that change *remote* state we can't cheaply poll — chiefly GitHub —

@@ -18,7 +18,7 @@ import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
 import { truncateEnd } from "../text.ts";
 import { laneColor, theme } from "../theme.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
-import type { DerivedState } from "../../core/claude-status.ts";
+import type { DerivedState } from "../../core/harness/status.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { STACK_CONNECTOR, stackOrdinalLabel } from "../../core/stack-layout.ts";

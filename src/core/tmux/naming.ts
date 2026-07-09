@@ -59,7 +59,7 @@ export function harnessIdForKind(kind: SessionKind): HarnessId | null {
  * appears in slugs (derived from branch names — git accepts most
  * ASCII but `~` collides with reflog syntax in practice) and never in
  * validated session names (see `validateSessionName` in
- * `claude-sessions.ts`). Stripping is unambiguous: rightmost `~`
+ * `harness/claude/names.ts`). Stripping is unambiguous: rightmost `~`
  * splits slug from name.
  */
 export const CLAUDE_NAMED_SEP = "~";

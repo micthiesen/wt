@@ -7,13 +7,13 @@
  * worker-emitted event records through the normal logger so file +
  * activity-pane output stay unchanged.
  */
-import { createLogger } from "../logger.ts";
+import { createLogger } from "../../logger.ts";
 
 import type {
   ActiveCodexSlug,
   CodexEventsWorkerMessage,
   CodexEventsWorkerResult,
-} from "./codex-events-protocol.ts";
+} from "./events-protocol.ts";
 
 export type { ActiveCodexSlug };
 
@@ -46,7 +46,7 @@ function emit(result: CodexEventsWorkerResult): void {
 export function startCodexEventPolling(
   getActiveSlugs: () => ReadonlyArray<ActiveCodexSlug>,
 ): () => void {
-  const worker = new Worker(new URL("./codex-events-worker.ts", import.meta.url).href);
+  const worker = new Worker(new URL("./events-worker.ts", import.meta.url).href);
   let disposed = false;
   let inFlight = false;
 

@@ -17,7 +17,7 @@ import {
 } from "../core/github.ts";
 import {
   nextAutoName,
-} from "../core/claude-sessions.ts";
+} from "../core/harness/claude/names.ts";
 import { linearUrlForSlug } from "../core/linear.ts";
 import { effectiveBaseOrTrunk } from "../core/git.ts";
 import { createLogger } from "../core/logger.ts";

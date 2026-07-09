@@ -1,4 +1,4 @@
-import type { ActionLine, ToolStartMap } from "../claude-events.ts";
+import type { ActionLine, ToolStartMap } from "../harness/claude/events.ts";
 import type { ActionTailHandle } from "../action-tail.ts";
 import type { EffectTag } from "../config.ts";
 import type { PullRequest } from "../types.ts";

@@ -11,6 +11,6 @@ export type {
   HarnessSession,
   HarnessSpawnArgs,
 } from "./types.ts";
-export { claudeSessionId, claudeTmuxName, parseClaudeTmuxName } from "./claude.ts";
-export { isCodexTmuxName } from "./codex.ts";
-export { closeOpencodeDb, isOpencodeTmuxName } from "./opencode.ts";
+export { claudeSessionId, claudeTmuxName, parseClaudeTmuxName } from "./claude/harness.ts";
+export { isCodexTmuxName } from "./codex/harness.ts";
+export { closeOpencodeDb, isOpencodeTmuxName } from "./opencode/harness.ts";

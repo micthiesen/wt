@@ -31,10 +31,10 @@
  */
 import { closeSync, openSync, statSync } from "node:fs";
 
-import { sessionJsonlPath } from "./claude.ts";
-import { AWAY_RECAP_HINT_RE, asObj } from "./claude-events.ts";
-import { createLogger } from "./logger.ts";
-import { readFdSlice } from "./tail-util.ts";
+import { sessionJsonlPath } from "./jsonl.ts";
+import { AWAY_RECAP_HINT_RE, asObj } from "./events.ts";
+import { createLogger } from "../../logger.ts";
+import { readFdSlice } from "../../tail-util.ts";
 
 const log = createLogger("[claude-summaries]");
 

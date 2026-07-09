@@ -6,7 +6,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import type { ActionLine } from "../claude-events.ts";
+import type { ActionLine } from "../harness/claude/events.ts";
 import { type DoneSentinel, readDoneFile } from "../action-tail.ts";
 import { createLogger } from "../logger.ts";
 import type { ActionMeta, ActionRun } from "./types.ts";

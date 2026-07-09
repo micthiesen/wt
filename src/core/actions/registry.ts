@@ -55,7 +55,7 @@ import {
   formatDuration,
   formatTokens,
   messageToLines,
-} from "../claude-events.ts";
+} from "../harness/claude/events.ts";
 import {
   type DoneSentinel,
   type TailLine,

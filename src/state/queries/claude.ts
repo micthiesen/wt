@@ -1,9 +1,9 @@
 import { queryOptions } from "@tanstack/react-query";
 
-import { readRegistry, type RegistrySession } from "../../core/claude-registry.ts";
-import { wtSessionUuid } from "../../core/claude.ts";
-import { listClaudeNames } from "../../core/claude-sessions.ts";
-import { readSummariesForSessions, type SessionSummary } from "../../core/claude-summaries.ts";
+import { readRegistry, type RegistrySession } from "../../core/harness/claude/registry.ts";
+import { wtSessionUuid } from "../../core/harness/claude/jsonl.ts";
+import { listClaudeNames } from "../../core/harness/claude/names.ts";
+import { readSummariesForSessions, type SessionSummary } from "../../core/harness/claude/summaries.ts";
 import type {
   Worktree,
 } from "../../core/types.ts";

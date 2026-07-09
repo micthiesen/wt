@@ -11,8 +11,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { withFileLock } from "./locks.ts";
-import { createLogger } from "./logger.ts";
+import { withFileLock } from "../../locks.ts";
+import { createLogger } from "../../logger.ts";
 
 const STATE_FILE = join(homedir(), ".cache", "wt", "opencode-sessions.json");
 const log = createLogger("[opencode-sessions]");

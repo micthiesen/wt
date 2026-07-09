@@ -5,13 +5,13 @@
  */
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 
-import { latestRolloutForCwd } from "./codex.ts";
+import { latestRolloutForCwd } from "./harness.ts";
 import type {
   ActiveCodexSlug,
   CodexEventsWorkerEvent,
   CodexEventsWorkerMessage,
   CodexEventsWorkerResult,
-} from "./codex-events-protocol.ts";
+} from "./events-protocol.ts";
 
 declare var self: Worker;
 

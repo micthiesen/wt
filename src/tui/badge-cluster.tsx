@@ -18,7 +18,7 @@ import { NF } from "./icons.ts";
 import { theme } from "./theme.ts";
 import { getHarness } from "../core/harness/index.ts";
 import type { HarnessId } from "../core/harness/index.ts";
-import type { DerivedState } from "../core/claude-status.ts";
+import type { DerivedState } from "../core/harness/status.ts";
 import { stateColor } from "./claude-state.ts";
 import type { MergeQueueState } from "../core/types.ts";
 import type { WorktreeRow } from "./hooks/useWorktreeRows.ts";

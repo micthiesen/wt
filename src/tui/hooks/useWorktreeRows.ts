@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import { keepPreviousData, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import type { ClaudeStatus } from "../../core/claude.ts";
+import type { ClaudeStatus } from "../../core/harness/claude/jsonl.ts";
 import { config } from "../../core/config.ts";
 import type { MergeConflictProbe } from "../../core/git.ts";
 import type { GitActivity } from "../../core/git-activity.ts";

@@ -7,9 +7,9 @@
  * and the most feature-complete impl; Codex / OpenCode after because
  * they're partial-feature impls today (no busy/idle, no summaries).
  */
-import { claudeHarness } from "./claude.ts";
-import { codexHarness } from "./codex.ts";
-import { opencodeHarness } from "./opencode.ts";
+import { claudeHarness } from "./claude/harness.ts";
+import { codexHarness } from "./codex/harness.ts";
+import { opencodeHarness } from "./opencode/harness.ts";
 import type { Harness, HarnessId } from "./types.ts";
 
 export const HARNESSES: readonly Harness[] = [

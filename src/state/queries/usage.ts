@@ -1,11 +1,11 @@
 import { queryOptions } from "@tanstack/react-query";
 
-import { readClaudeUsage, type ClaudeUsage } from "../../core/claude-usage.ts";
-import { readCodexUsage, type CodexUsage } from "../../core/harness/codex-usage.ts";
+import { readClaudeUsage, type ClaudeUsage } from "../../core/harness/claude/usage.ts";
+import { readCodexUsage, type CodexUsage } from "../../core/harness/codex/usage.ts";
 import {
   readOpencodeCost,
   type OpencodeCost,
-} from "../../core/harness/opencode-usage.ts";
+} from "../../core/harness/opencode/usage.ts";
 
 import { qk } from "../keys.ts";
 

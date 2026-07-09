@@ -23,7 +23,7 @@ export type OutputKind = "events" | "action" | "session" | "destroy";
 /**
  * Subkind of a `kind: "session"` output. Drives both the title label
  * and the OutputViewer's content dispatch. claude/shell tail via
- * `core/session-tail.ts` (stream-json / pipe-pane); codex + opencode
+ * `core/harness/claude/tail.ts` (stream-json / pipe-pane); codex + opencode
  * tail via `core/harness/harness-tail.ts` (rollout jsonl / SQLite).
  * F11 diff is deliberately excluded (see file header).
  */
@@ -171,7 +171,7 @@ export function destroyOutput(
 
 /**
  * Live tmux session for a slug. Both F10 shell and F12 claude have a
- * content tail registered in `core/session-tail.ts`, so the
+ * content tail registered in `core/harness/claude/tail.ts`, so the
  * OutputViewer renders running content for both. F11 diff is not an
  * output kind — see the file header.
  *

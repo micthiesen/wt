@@ -2,7 +2,7 @@ import {
   type ActionLine,
   type MessageEmit,
   MAX_BUFFERED_LINES,
-} from "../claude-events.ts";
+} from "../harness/claude/events.ts";
 
 /**
  * Apply one parser delta to a buffer snapshot. Patches by id (no-op

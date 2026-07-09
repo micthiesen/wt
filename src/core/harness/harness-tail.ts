@@ -1,6 +1,6 @@
 /**
  * Per-(slug, harness) tail for Codex and OpenCode sessions — the
- * non-claude analogue of `core/session-tail.ts`. Produces the same
+ * non-claude analogue of `core/harness/claude/tail.ts`. Produces the same
  * `ActionLine[]` shape the claude tailer and action runner produce, so
  * the bottom pane (OutputViewer / footer) renders codex/opencode
  * sessions with the exact same row components.
@@ -10,8 +10,8 @@
  * jsonl under `~/.codex/sessions/`, OpenCode in a SQLite DB — and have
  * no per-line push signal, so this registry just polls each live slot
  * on a shared interval, seeding history on first sight and appending
- * deltas after. The event-pane pollers (`codex-events.ts` /
- * `opencode-events.ts`) stay as-is: they emit terse global one-liners
+ * deltas after. The event-pane pollers (`codex/events.ts` /
+ * `opencode/events.ts`) stay as-is: they emit terse global one-liners
  * and skip history, which is a different job from this detailed,
  * history-seeded per-session trail.
  *
@@ -27,17 +27,17 @@ import {
   type ActionLine,
   type ActionLineKind,
   MAX_BUFFERED_LINES,
-} from "../claude-events.ts";
+} from "./claude/events.ts";
 import { createLogger } from "../logger.ts";
 import { jsonlTimestamp, readFileSlice } from "../tail-util.ts";
 
-import { latestRolloutForCwd } from "./codex.ts";
-import { openDb } from "./opencode.ts";
+import { latestRolloutForCwd } from "./codex/harness.ts";
+import { openDb } from "./opencode/harness.ts";
 import type { HarnessId } from "./types.ts";
 
 const log = createLogger("[harness-tail]");
 
-/** Harnesses this registry tails. Claude has its own (`session-tail.ts`). */
+/** Harnesses this registry tails. Claude has its own (`claude/tail.ts`). */
 export type TailHarnessId = Extract<HarnessId, "codex" | "opencode">;
 
 export type HarnessRun = {

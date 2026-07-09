@@ -23,7 +23,7 @@ import {
   harnessTailRegistry,
   type TailHarnessId,
 } from "../../core/harness/harness-tail.ts";
-import { sessionTailRegistry, tailKey } from "../../core/session-tail.ts";
+import { sessionTailRegistry, tailKey } from "../../core/harness/claude/tail.ts";
 import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
 import { events as eventsLog } from "../events.ts";

@@ -4,7 +4,7 @@
  * and the bottom-bar tail (single line in the footer) so both surfaces
  * agree on per-envelope coloring.
  */
-import type { ActionLine } from "../core/claude-events.ts";
+import type { ActionLine } from "../core/harness/claude/events.ts";
 
 import { theme } from "./theme.ts";
 

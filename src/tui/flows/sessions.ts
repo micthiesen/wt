@@ -10,7 +10,7 @@ import {
   addClaudeName,
   nameInUse,
   removeClaudeName,
-} from "../../core/claude-sessions.ts";
+} from "../../core/harness/claude/names.ts";
 import {
   getHarness,
   type Harness,

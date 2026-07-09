@@ -15,18 +15,18 @@
  * fast and lets the picker render the entry list before the summary
  * scan resolves.
  */
-import { claudeStatus, wtSessionArgs, wtSessionUuid } from "../claude.ts";
-import { readRegistry, type RegistryStatus } from "../claude-registry.ts";
+import { claudeStatus, wtSessionArgs, wtSessionUuid } from "./jsonl.ts";
+import { readRegistry, type RegistryStatus } from "./registry.ts";
 import {
   buildClaudeSessionEntries,
   reapClaudeNames,
-} from "../claude-sessions.ts";
+} from "./names.ts";
 
 import type {
   Harness,
   HarnessSession,
   HarnessSpawnArgs,
-} from "./types.ts";
+} from "../types.ts";
 
 /**
  * Separator between slug and named-claude name in the tmux session

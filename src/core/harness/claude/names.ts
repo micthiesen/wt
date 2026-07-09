@@ -25,12 +25,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { wtSessionUuid, type SessionTail } from "./claude.ts";
-import type { RegistryStatus } from "./claude-registry.ts";
-import { deriveSessionState, type DerivedState } from "./claude-status.ts";
-import type { SessionSummary } from "./claude-summaries.ts";
-import { withFileLock } from "./locks.ts";
-import { createLogger } from "./logger.ts";
+import { wtSessionUuid, type SessionTail } from "./jsonl.ts";
+import type { RegistryStatus } from "./registry.ts";
+import { deriveSessionState, type DerivedState } from "../status.ts";
+import type { SessionSummary } from "./summaries.ts";
+import { withFileLock } from "../../locks.ts";
+import { createLogger } from "../../logger.ts";
 
 const STATE_FILE = join(homedir(), ".cache", "wt", "claude-sessions.json");
 const log = createLogger("[claude-sessions]");

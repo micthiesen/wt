@@ -19,8 +19,8 @@
  */
 import type { Statement } from "bun:sqlite";
 
-import { createLogger } from "../logger.ts";
-import { openDb } from "./opencode.ts";
+import { createLogger } from "../../logger.ts";
+import { openDb } from "./harness.ts";
 
 const log = createLogger("[opencode]");
 

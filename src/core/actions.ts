@@ -1,5 +1,5 @@
 export type { ActionDef, EffectTag, RequireTag } from "./config.ts";
-export type { ActionLine, ActionLineKind } from "./claude-events.ts";
+export type { ActionLine, ActionLineKind } from "./harness/claude/events.ts";
 
 export type {
   ActionRowState,

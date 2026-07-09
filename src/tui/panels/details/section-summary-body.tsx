@@ -2,7 +2,7 @@ import { TextAttributes } from "@opentui/core";
 
 import { StatusKind } from "../../../core/types.ts";
 import type { HarnessId } from "../../../core/harness/index.ts";
-import type { DerivedState } from "../../../core/claude-status.ts";
+import type { DerivedState } from "../../../core/harness/status.ts";
 import type { StackManifest } from "../../../core/wtstate.ts";
 import {
   layoutStack,

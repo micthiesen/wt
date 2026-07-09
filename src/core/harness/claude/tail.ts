@@ -59,15 +59,15 @@ import {
   formatTokens,
   messageToLines,
   splitMessage,
-} from "./claude-events.ts";
-import { projectDir as claudeProjectDir, wtSessionUuid } from "./claude.ts";
-import { createLogger } from "./logger.ts";
+} from "./events.ts";
+import { projectDir as claudeProjectDir, wtSessionUuid } from "./jsonl.ts";
+import { createLogger } from "../../logger.ts";
 import {
   detectRefreshTriggers,
   type RefreshTarget,
-} from "./session-triggers.ts";
-import { closeSilent, jsonlTimestamp, readFileSlice } from "./tail-util.ts";
-import { claudeSessionName } from "./tmux.ts";
+} from "./refresh-triggers.ts";
+import { closeSilent, jsonlTimestamp, readFileSlice } from "../../tail-util.ts";
+import { claudeSessionName } from "../../tmux.ts";
 
 const log = createLogger("[session-tail]");
 
@@ -77,7 +77,7 @@ const log = createLogger("[session-tail]");
 // While the live tail is reading the jsonl anyway, it scans each new
 // entry for Bash tool calls (`gh pr create`, `git push`, …) that change
 // GitHub-side state and asks the runtime to invalidate the matching
-// query — see `session-triggers.ts`. Detection is per-line; delivery is
+// query — see `refresh-triggers.ts`. Detection is per-line; delivery is
 // debounced per target so a burst of git/gh calls collapses to one
 // refresh, and so the triggering command has finished by the time the
 // refetch fires (we match on tool_use, not tool_result).

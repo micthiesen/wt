@@ -1,6 +1,6 @@
 import type { KeyEvent } from "@opentui/core";
 
-import { nextAutoName, removeClaudeName, validateSessionName } from "../../core/claude-sessions.ts";
+import { nextAutoName, removeClaudeName, validateSessionName } from "../../core/harness/claude/names.ts";
 import { getHarness, HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import { sessionOutputId } from "../../core/outputs.ts";
 import {

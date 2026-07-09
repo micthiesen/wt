@@ -5,21 +5,21 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { actionRegistry } from "../core/actions.ts";
 import { reapArchived } from "../core/archive.ts";
 import { recordWorktreeEdit } from "../core/automations.ts";
-import { watchRegistry } from "../core/claude-registry.ts";
+import { watchRegistry } from "../core/harness/claude/registry.ts";
 import { config } from "../core/config.ts";
 import { disposeDiffPool } from "../core/diff/pool.ts";
 import { watchGithubEvents } from "../core/events/store.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
-import { startCodexEventPolling } from "../core/harness/codex-events.ts";
+import { startCodexEventPolling } from "../core/harness/codex/events.ts";
 import { harnessTailRegistry } from "../core/harness/harness-tail.ts";
-import { startOpencodeEventPolling } from "../core/harness/opencode-events.ts";
+import { startOpencodeEventPolling } from "../core/harness/opencode/events.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
 import {
   sessionTailRegistry,
   setSessionSlugChangeSink,
   setSessionTriggerSink,
-} from "../core/session-tail.ts";
+} from "../core/harness/claude/tail.ts";
 import {
   WorktreeWatchSet,
   watchRefs,

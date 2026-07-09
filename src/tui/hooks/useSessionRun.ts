@@ -16,7 +16,7 @@ import {
   type SessionRun,
   sessionTailRegistry,
   tailKey,
-} from "../../core/session-tail.ts";
+} from "../../core/harness/claude/tail.ts";
 import {
   type ShellRun,
   shellTailRegistry,

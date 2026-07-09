@@ -1,7 +1,7 @@
 import { queryOptions } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
-import { claudeStatus, type ClaudeStatus } from "../../core/claude.ts";
+import { claudeStatus, type ClaudeStatus } from "../../core/harness/claude/jsonl.ts";
 import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mergeConflictProbe, type MergeConflictProbe } from "../../core/git.ts";
 import { gitActivity, type GitActivity } from "../../core/git-activity.ts";
 import { lockStatus } from "../../core/locks.ts";

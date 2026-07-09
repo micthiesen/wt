@@ -8,7 +8,7 @@
  * tail is its own little state machine, started and stopped explicitly
  * by the action registry. The tradeoff is a third copy of the seed +
  * dir-watch + readDelta scaffolding; factoring shared with
- * `shell-tail.ts` and `session-tail.ts` is a worthwhile cleanup that
+ * `shell-tail.ts` and `harness/claude/tail.ts` is a worthwhile cleanup that
  * we deliberately don't do here to keep this PR focused.
  *
  * # Why no MAX_BUFFERED_LINES cap

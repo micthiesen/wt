@@ -32,7 +32,7 @@
  */
 import { TextAttributes } from "@opentui/core";
 
-import type { DerivedState } from "../../core/claude-status.ts";
+import type { DerivedState } from "../../core/harness/status.ts";
 import { HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import { STATE_DOT, stateColor } from "../claude-state.ts";
 import type { HarnessSessionEntry } from "../hooks/useHarnessSessions.ts";

@@ -14,9 +14,9 @@ import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { UsagePeriod } from "../claude-usage.ts";
-import { createLogger } from "../logger.ts";
-import { readFileSlice } from "../tail-util.ts";
+import type { UsagePeriod } from "../claude/usage.ts";
+import { createLogger } from "../../logger.ts";
+import { readFileSlice } from "../../tail-util.ts";
 
 const log = createLogger("[codex-usage]");
 

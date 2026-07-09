@@ -22,15 +22,15 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { createLogger } from "../logger.ts";
-import { readFileSlice } from "../tail-util.ts";
-import type { DerivedState } from "../claude-status.ts";
+import { createLogger } from "../../logger.ts";
+import { readFileSlice } from "../../tail-util.ts";
+import type { DerivedState } from "../status.ts";
 import {
   reapCodexNames,
   reconcileCodexNames,
-} from "../codex-sessions.ts";
+} from "./names.ts";
 
-import type { Harness, HarnessSession, HarnessSpawnArgs } from "./types.ts";
+import type { Harness, HarnessSession, HarnessSpawnArgs } from "../types.ts";
 
 const log = createLogger("[codex]");
 

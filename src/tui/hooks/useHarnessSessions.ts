@@ -26,7 +26,7 @@ import {
   type HarnessId,
   type HarnessSession,
 } from "../../core/harness/index.ts";
-import type { DerivedState } from "../../core/claude-status.ts";
+import type { DerivedState } from "../../core/harness/status.ts";
 import {
   harnessSessionsQuery,
   tmuxSessionsQuery,

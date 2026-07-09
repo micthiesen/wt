@@ -1,6 +1,6 @@
 /**
  * Per-worktree tailer for the wt-managed F10 shell tmux session. Symmetric
- * to `core/session-tail.ts` (which tails F12 claude's jsonl), but the
+ * to `core/harness/claude/tail.ts` (which tails F12 claude's jsonl), but the
  * source is a plain pipe-pane log file rather than structured stream-json.
  *
  * # Capture pipeline
@@ -41,7 +41,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { MAX_BUFFERED_LINES } from "./claude-events.ts";
+import { MAX_BUFFERED_LINES } from "./harness/claude/events.ts";
 import { createLogger } from "./logger.ts";
 import { closeSilent, readFileSlice } from "./tail-util.ts";
 

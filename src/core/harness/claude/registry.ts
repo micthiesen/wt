@@ -24,7 +24,7 @@ import { readdirSync, readFileSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { createLogger } from "./logger.ts";
+import { createLogger } from "../../logger.ts";
 
 const log = createLogger("[claude-registry]");
 

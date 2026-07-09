@@ -11,7 +11,7 @@
  * extras are missing. The `extras` field exposes the optional Claude-
  * only data without bloating the core interface.
  */
-import type { DerivedState } from "../claude-status.ts";
+import type { DerivedState } from "./status.ts";
 
 export type HarnessId = "claude" | "codex" | "opencode";
 

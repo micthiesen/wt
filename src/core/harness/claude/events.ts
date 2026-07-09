@@ -1,7 +1,7 @@
 /**
  * Shared event-to-line converters used by both the `claude -p` action
  * runner (`core/actions.ts`, stream-json from a child process) and the
- * interactive session tailer (`core/session-tail.ts`, jsonl appended to
+ * interactive session tailer (`core/harness/claude/tail.ts`, jsonl appended to
  * disk by claude).
  *
  * The two formats differ at the envelope level — action stream-json has
@@ -11,7 +11,7 @@
  * at and below `messageToLines` is therefore shared; envelope-specific
  * logic stays in the caller.
  */
-import { sanitizeLine } from "./proc.ts";
+import { sanitizeLine } from "../../proc.ts";
 
 export type ActionLineKind =
   | "info" // synthesized — start, kill, error, truncation hints

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 
-import type { ToolStartMap } from "../claude-events.ts";
+import type { ToolStartMap } from "../harness/claude/events.ts";
 import { config } from "../config.ts";
 import type { HarnessId } from "../harness/index.ts";
 import type { ActionRunKind } from "./types.ts";
