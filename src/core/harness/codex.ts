@@ -40,8 +40,10 @@ const CODEX_TMUX_INFIX = "-codex";
 
 const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const CODEX_SESSION_INDEX = join(homedir(), ".codex", "session_index.jsonl");
-/** How far back from end-of-file to read for state derivation. */
+/** Initial backwards window for state derivation. Expanded when a large
+ * response/tool line pushed the latest task lifecycle marker farther back. */
 const TAIL_BYTES = 64 * 1024;
+const MAX_TAIL_SCAN_BYTES = 8 * 1024 * 1024;
 /**
  * How far back to walk the date-partitioned sessions tree. Codex names
  * directories `YYYY/MM/DD` so we list the year dirs, then month, then
@@ -104,12 +106,11 @@ export const codexHarness: Harness = {
         extras: {
           managedName: null,
           // Liveness-independent best guess; `useHarnessSessions`
-          // finalizes it against the live tmux set (dead slot → abandoned/
-          // idle by age, live slot keeps working/waiting).
+          // finalizes it against the live tmux set (dead cleanly → idle,
+          // dead mid-turn → abandoned, live slot keeps working/waiting).
           derivedState: tail ? deriveCodexState(tail) : null,
           queued: 0,
-          // Stash last-event time so the re-annotator can compute
-          // abandoned vs idle when tmux flips dead.
+          // Stash last-event time for displays that care about message age.
           tailEndedAt: tail?.lastEventMs ?? null,
         },
       });
@@ -372,8 +373,11 @@ const tailCache = new Map<string, TailCacheEntry>();
 const TAIL_CACHE_MAX = 128;
 
 /**
- * Read the last TAIL_BYTES of a rollout and derive whether the most
- * recent turn ended cleanly. Cached on (path, mtimeMs, size).
+ * Read the rollout tail and derive whether the most recent turn ended
+ * cleanly. Cached on (path, mtimeMs, size). Starts with a small tail read
+ * and expands backwards only when no task lifecycle marker is found; Codex
+ * writes very large `response_item` lines while working, and those can push
+ * `task_started` outside a fixed 64KB tail before `task_complete` appears.
  *
  * Returns null when the file is empty, unreadable, or has no
  * task_started events at all (very short sessions).
@@ -390,22 +394,46 @@ export function readCodexTail(
     return cached.result;
   }
 
-  let text: string;
-  try {
-    const start = Math.max(0, size - TAIL_BYTES);
-    text = readFileSlice(path, start, size - start);
-  } catch {
-    return null;
+  let latest: ParsedCodexTaskEvent | null = null;
+  let windowBytes = Math.min(TAIL_BYTES, size);
+  while (true) {
+    try {
+      latest = latestTaskEventInWindow(path, size, windowBytes);
+    } catch {
+      return null;
+    }
+    if (latest !== null || windowBytes >= size || windowBytes >= MAX_TAIL_SCAN_BYTES) {
+      break;
+    }
+    windowBytes = Math.min(size, windowBytes * 4, MAX_TAIL_SCAN_BYTES);
   }
 
-  // If we didn't start at byte 0, the first line is likely partial — drop it.
+  const tailClosedCleanly =
+    latest === null || latest.kind === "task_complete" || latest.kind === "turn_aborted";
+  const result: CodexTailResult = {
+    tailClosedCleanly,
+    lastEventMs: latest?.ts ?? mtimeMs,
+  };
+  setCached(path, mtimeMs, size, result);
+  return result;
+}
+
+type ParsedCodexTaskEvent = {
+  kind: "task_started" | "task_complete" | "turn_aborted";
+  ts: number | null;
+};
+
+function latestTaskEventInWindow(
+  path: string,
+  size: number,
+  windowBytes: number,
+): ParsedCodexTaskEvent | null {
+  const start = Math.max(0, size - windowBytes);
+  const text = readFileSlice(path, start, size - start);
+  // If we didn't start at byte 0, the first line is likely partial.
   const lines = text.split("\n");
-  const startIdx = size > TAIL_BYTES ? 1 : 0;
-
-  let lastStartedTurnId: string | null = null;
-  let lastStartedTs: number | null = null;
-  let lastClosedTurnId: string | null = null;
-
+  const startIdx = start > 0 ? 1 : 0;
+  let latest: ParsedCodexTaskEvent | null = null;
   for (let i = startIdx; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
@@ -420,38 +448,20 @@ export function readCodexTail(
     if (typeof payload !== "object" || payload === null) continue;
     const p = payload as Record<string, unknown>;
     const ptype = p.type;
-    if (ptype === "task_started") {
-      const turnId = p.turn_id;
-      if (typeof turnId === "string") {
-        lastStartedTurnId = turnId;
-        const ts = obj.timestamp;
-        lastStartedTs = typeof ts === "string" ? Date.parse(ts) : null;
-      }
-    } else if (ptype === "task_complete" || ptype === "turn_aborted") {
-      const turnId = p.turn_id;
-      if (typeof turnId === "string") {
-        lastClosedTurnId = turnId;
-      }
+    if (
+      ptype !== "task_started" &&
+      ptype !== "task_complete" &&
+      ptype !== "turn_aborted"
+    ) {
+      continue;
     }
-  }
-
-  if (lastStartedTurnId === null) {
-    // No task_started in tail at all — treat as cleanly closed.
-    const result: CodexTailResult = {
-      tailClosedCleanly: true,
-      lastEventMs: lastStartedTs ?? mtimeMs,
+    const ts = obj.timestamp;
+    latest = {
+      kind: ptype,
+      ts: typeof ts === "string" ? Date.parse(ts) : null,
     };
-    setCached(path, mtimeMs, size, result);
-    return result;
   }
-
-  const tailClosedCleanly = lastClosedTurnId === lastStartedTurnId;
-  const result: CodexTailResult = {
-    tailClosedCleanly,
-    lastEventMs: lastStartedTs ?? mtimeMs,
-  };
-  setCached(path, mtimeMs, size, result);
-  return result;
+  return latest;
 }
 
 function setCached(
@@ -472,9 +482,10 @@ function setCached(
  * rollout tail: an unmatched `task_started` (mid-turn) reads as `working`,
  * a cleanly-closed turn as `waiting`. This mirrors opencode's
  * `deriveOpencodeState` — `computeHarnessSessions` finalizes it against
- * real tmux liveness, demoting a dead slot to `abandoned`/`idle` by age
- * while a live slot keeps this guess (so a working codex reads `working`,
- * not the floor-`waiting` the old isLive-baked path produced).
+ * real tmux liveness, demoting a cleanly closed dead slot to `idle` and
+ * a mid-turn dead slot to `abandoned` while a live slot keeps this guess
+ * (so a working codex reads `working`, not the floor-`waiting` the old
+ * isLive-baked path produced).
  */
 export function deriveCodexState(tail: CodexTailResult): DerivedState {
   return tail.tailClosedCleanly ? "waiting" : "working";

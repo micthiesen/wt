@@ -92,8 +92,7 @@ const EMPTY: readonly HarnessSession[] = [];
  * identically whether driven by the per-current-row {@link
  * useHarnessSessions} or the all-rows {@link useActiveSessionsBySlug};
  * neither the list pane, the details pane, nor the F12 keybind can drift
- * because they all funnel through here. `nowMs` only affects the
- * codex/opencode idle-vs-abandoned age cutoff and the synthetic
+ * because they all funnel through here. `nowMs` only affects the synthetic
  * placeholder's recency.
  *
  * `harnessIds` scopes which harnesses are considered at all (default:
@@ -146,18 +145,20 @@ export function computeHarnessSessions(
       // Finalize codex/opencode derived state now that we know liveness.
       // discoverSessions() returns a liveness-independent best guess
       // (working = mid-turn/streaming, waiting = turn closed). A live slot
-      // keeps that guess; a dead slot is abandoned (recent) or idle (old),
-      // by the last-activity age — so a working session reads `working`
-      // rather than being floored to `waiting`.
+      // keeps that guess, falling back to `waiting` when no tail/DB message
+      // exists yet; a dead slot reads as `idle` unless it died mid-turn.
+      // That matches Claude's semantics: closed cleanly is quiet, closed
+      // while work was in flight is the only red "abandoned" state.
       let extras = s.extras;
-      if (isSingleSlot && extras.derivedState !== null) {
+      if (isSingleSlot) {
         if (!isLive) {
-          const tailMs = extras.tailEndedAt ?? 0;
-          const ageMs = nowMs - tailMs;
           extras = {
             ...extras,
-            derivedState: ageMs < 10 * 60 * 1000 ? "abandoned" : "idle",
+            derivedState:
+              extras.derivedState === "working" ? "abandoned" : "idle",
           };
+        } else if (extras.derivedState === null) {
+          extras = { ...extras, derivedState: "waiting" };
         }
       } else if (!isSingleSlot && isLive) {
         // Claude: discoverSessions derives state with isTmuxLive=false

@@ -2,9 +2,9 @@
  * AI row — generalized from the original claude-specific row. Shows
  * the F12-target session's state for the row's worktree, with the
  * harness identity rendered via its glyph + color. Claude entries
- * surface their derived state (working / waiting / abandoned / idle);
- * Codex / OpenCode entries fall back to "live" / "dead" since they
- * don't expose a busy/idle registry yet.
+ * surface their derived state (working / waiting / abandoned / idle).
+ * Claude gets this from its registry/jsonl tail; Codex and OpenCode use
+ * their local rollout/DB tails plus tmux liveness.
  *
  * Empty state (no discoverable session on any harness): show
  * "Primary: <harness> · F12 to start" as a hint so the row stays

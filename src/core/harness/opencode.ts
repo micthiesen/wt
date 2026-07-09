@@ -85,8 +85,7 @@ type LastMsgRow = {
 type StateCacheEntry = {
   timeUpdated: number;
   derivedState: DerivedState | null;
-  /** time_updated of the latest message row, ms-since-epoch. Used by
-   * useHarnessSessions to decide abandoned vs. idle when isLive flips. */
+  /** time_updated of the latest message row, ms-since-epoch. */
   tailEndedAt: number | null;
 };
 const stateCache = new Map<string, StateCacheEntry>();
@@ -216,8 +215,7 @@ export const opencodeHarness: Harness = {
           managedName: null,
           derivedState,
           queued: 0,
-          // Stash tailEndedAt for the re-annotator in useHarnessSessions:
-          // used to decide idle vs. abandoned when not live.
+          // Stash message age separately from the session metadata age.
           tailEndedAt,
         },
       };

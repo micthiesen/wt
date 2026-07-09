@@ -9,10 +9,10 @@
  * color and `working` its complement, so a glance reads vendor *and*
  * state through a contrasting hue pair (claude cyan/orange, codex
  * amber/indigo, opencode lime/violet). The remaining states stay
- * semantic and shared: `abandoned` is always red
- * (crashed is crashed) and `idle` always dim, while `asking`/`polling`/
- * `unknown` come only from claude's registry — codex/opencode never
- * emit them — so they keep claude's values everywhere for exhaustiveness.
+ * semantic and shared: `abandoned` is always red (the process exited
+ * mid-turn) and `idle` always dim, while `asking`/`polling`/`unknown`
+ * come only from claude's registry — codex/opencode never emit them —
+ * so they keep claude's values everywhere for exhaustiveness.
  *
  * The glyph table ({@link STATE_DOT}) stays shared: shape encodes state,
  * color encodes harness + state together.
@@ -25,9 +25,9 @@ import { theme } from "./theme.ts";
 // States that read the same across every harness. `asking` is magenta
 // ("blocked on you, look here"), `polling` muted teal ("backgrounded
 // work in flight"), `unknown` muted blue ("alive but indeterminate"),
-// `abandoned` red (a crashed session is a crashed session regardless of
-// vendor), and `idle` shares fgDim with the empty-state `—` (a ghost
-// session reads as "nothing happening", not a warning).
+// `abandoned` red (the process exited mid-turn regardless of vendor),
+// and `idle` shares fgDim with the empty-state `—` (a ghost session
+// reads as "nothing happening", not a warning).
 const SHARED: Pick<
   Record<DerivedState, string>,
   "asking" | "polling" | "unknown" | "abandoned" | "idle"

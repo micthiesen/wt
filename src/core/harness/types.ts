@@ -56,9 +56,9 @@ export type HarnessExtras = {
    * Timestamp (ms-since-epoch) of the last message row seen, used by
    * `useHarnessSessions` to finalize `derivedState` once liveness is
    * known. OpenCode populates this; Claude / Codex leave it undefined.
-   * When `derivedState === "waiting"` and the session is not live, the
-   * re-annotator uses this to decide between `idle` (old tail) and
-   * `abandoned` (fresh tail — tmux died recently).
+   * Timestamp of the latest harness-native event/message. Kept separate
+   * from `lastActiveMs` because some stores update session metadata and
+   * message rows independently.
    */
   tailEndedAt?: number | null;
 };

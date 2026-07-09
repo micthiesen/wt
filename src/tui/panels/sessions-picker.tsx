@@ -167,9 +167,8 @@ export function SessionsPickerList({
               ? ageMsToText(Date.now() - e.lastActiveMs)
               : null;
           const state: DerivedState | null = e.extras.derivedState;
-          // Claude entries show derived state + state-tinted dot;
-          // codex / opencode entries show simple "live" / "dead" in
-          // dim color. Picker is the only place this differs.
+          // Derived states are normalized across harnesses; fall back to
+          // simple live/dead only when a harness has no state signal yet.
           const labelFg = selected
             ? theme.fgBright
             : state === "idle"
