@@ -342,12 +342,28 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       // Pre-clean the landed slices (recomputed against CURRENT rows,
       // not the rows the fire was born under — doCleanSlugs re-filters
       // through isCleanCandidate, so a slice that un-merged can't be
-      // destroyed), then reconcile + replay.
+      // destroyed), then reconcile + replay. Landed slices include a
+      // merged EXTERNAL parent (stack-on-stack boundary): its own
+      // stack's manifest gets reconciled by the clean flow, and this
+      // stack's reconcile reparents onto trunk. Paused rows are never
+      // touched.
+      const memberRows = latest.current.rows.filter(
+        (r) => r.stack?.stackId === stackId && !r.stack.isHolistic,
+      );
+      const memberBranches = new Set(memberRows.map((r) => r.wt.branch));
+      const externalParentSlugs = new Set<string>();
+      for (const m of memberRows) {
+        const so = m.stackedOn;
+        if (so?.slug && !memberBranches.has(so.branch)) {
+          externalParentSlugs.add(so.slug);
+        }
+      }
       const mergedSlugs = latest.current.rows
         .filter(
           (r) =>
-            r.stack?.stackId === stackId &&
-            !r.stack.isHolistic &&
+            ((r.stack?.stackId === stackId && !r.stack.isHolistic) ||
+              externalParentSlugs.has(r.wt.slug)) &&
+            !latest.current.pausedSlugs.has(r.wt.slug) &&
             isCleanCandidate(r),
         )
         .map((r) => r.wt.slug);

@@ -196,15 +196,27 @@ function evaluateRowTrigger(
 }
 
 /**
- * `stack.parent_merged`: a stack has ≥1 merged slice with ≥1 open slice
- * remaining. One fire per stack, keyed per merged parent PR so a second
- * parent landing later re-fires. Targets the first open slice (event
- * attribution + action target); quiesces the WHOLE stack since the
- * restack pre-cleans the merged slices and replays everything else.
+ * `stack.parent_merged`: a stack needs a restack because a parent
+ * landed. Three parent shapes, unioned into one fire per stack:
  *
- * Only sees merged parents that still have a live worktree row — a
- * parent already cleaned by hand is invisible here, but its bookkeeping
- * lands via `reconcileStack` inside the next replay anyway.
+ *  - an in-manifest slice merged with open slices remaining (keyed per
+ *    merged parent PR so a second landing later re-fires);
+ *  - a STACK-ON-STACK external parent merged — an open slice whose
+ *    resolved base branch lives outside this manifest (another stack's
+ *    tip, or a plain PR branch) and whose row shows merged. The
+ *    restack's `reconcileStack` external-parent pass reparents the
+ *    slice onto trunk, and the pre-clean covers the parent's worktree
+ *    (its own stack's manifest gets reconciled by the clean flow);
+ *  - an external parent with NO live worktree row at all (`extgone`) —
+ *    covers the race where the parent was cleaned before this fire
+ *    delivered, and heals pre-existing stale boundaries at boot. Fires
+ *    once per (stack, branch); the reconcile probes the branch's PR
+ *    directly and no-ops when the parent is actually still open, so a
+ *    false positive costs one idle reconcile+replay.
+ *
+ * Targets the first open slice (event attribution + action target);
+ * quiesces the whole stack plus any merged external parent, since the
+ * restack pre-cleans those and replays everything else.
  */
 function evaluateStackTrigger(
   rule: AutomationDef,
@@ -228,6 +240,7 @@ function evaluateStackTrigger(
     else byStack.set(row.stack.stackId, [row]);
   }
   const fires: AutomationFire[] = [];
+  const rowBySlug = new Map(rows.map((r) => [r.wt.slug, r] as const));
   for (const [stackId, members] of byStack) {
     if (pausedStacks.has(stackId)) continue;
     const merged = members.filter(
@@ -237,16 +250,67 @@ function evaluateStackTrigger(
         (r.pr?.state !== "MERGED" || ctx.githubFresh),
     );
     const open = members.filter((r) => !merged.includes(r));
-    if (merged.length === 0 || open.length === 0) continue;
+    if (open.length === 0) continue;
+    // Cross-stack boundary: open slices whose resolved base branch is
+    // outside this manifest. `stackedOn` is already resolved against
+    // the live worktree list (slug null = no worktree for that branch).
+    const memberBranches = new Set(members.map((r) => r.wt.branch));
+    const extMerged: WorktreeRow[] = [];
+    const extGone: string[] = [];
+    const seenParents = new Set<string>();
+    for (const m of open) {
+      const so = m.stackedOn;
+      if (!so || memberBranches.has(so.branch) || seenParents.has(so.branch)) {
+        continue;
+      }
+      seenParents.add(so.branch);
+      if (so.slug === null) {
+        extGone.push(so.branch);
+        continue;
+      }
+      const parentRow = rowBySlug.get(so.slug);
+      if (!parentRow || parentRow.archived) continue;
+      if (parentRow.status.kind === StatusKind.Busy) continue;
+      // A paused parent means hands-off its worktree AND the boundary —
+      // whoever paused it is mid-surgery there.
+      if (ctx.isPausedSlug(parentRow.wt.slug)) continue;
+      if (
+        isCleanCandidate(parentRow) &&
+        (parentRow.pr?.state !== "MERGED" || ctx.githubFresh)
+      ) {
+        extMerged.push(parentRow);
+      }
+    }
+    const fireKeys = [
+      ...merged.map(
+        (r) => `${rule.id}:restack:${stackId}:${r.pr?.number ?? r.wt.branch}`,
+      ),
+      ...extMerged.map(
+        (r) => `${rule.id}:restack:${stackId}:ext:${r.pr?.number ?? r.wt.branch}`,
+      ),
+      ...extGone.map((b) => `${rule.id}:restack:${stackId}:extgone:${b}`),
+    ];
+    if (fireKeys.length === 0) continue;
+    const parts: string[] = [];
+    if (merged.length > 0) parts.push(pluralize(merged.length, "merged slice"));
+    if (extMerged.length > 0) {
+      parts.push(
+        `merged external parent ${extMerged.map((r) => (r.pr ? `#${r.pr.number}` : r.wt.branch)).join(", ")}`,
+      );
+    }
+    if (extGone.length > 0) {
+      parts.push(`external parent gone (${extGone.join(", ")})`);
+    }
     fires.push({
       rule,
       slug: open[0]!.wt.slug,
-      quiesceSlugs: members.map((r) => r.wt.slug),
-      fireKeys: merged.map(
-        (r) => `${rule.id}:restack:${stackId}:${r.pr?.number ?? r.wt.branch}`,
-      ),
+      quiesceSlugs: [
+        ...members.map((r) => r.wt.slug),
+        ...extMerged.map((r) => r.wt.slug),
+      ],
+      fireKeys,
       stackId,
-      detail: `${pluralize(merged.length, "merged slice")} under ${pluralize(open.length, "open slice")}`,
+      detail: `${parts.join(" + ")} under ${pluralize(open.length, "open slice")}`,
     });
   }
   return fires;

@@ -841,7 +841,7 @@ function SectionSummaryBody({ section, width }: { section: SectionDetail; width:
         </text>
       </box>
       {section.automationsPaused ? (
-        <box flexShrink={0} overflow="hidden">
+        <box flexShrink={0} overflow="hidden" marginTop={1}>
           <text wrapMode="none" truncate>
             <span fg={theme.warn}>{"⏸ "}</span>
             <span fg={theme.fgDim}>

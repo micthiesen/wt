@@ -252,4 +252,89 @@ describe("stack.parent_merged", () => {
     });
     expect(evaluateAutomations([r], [merged], FRESH)).toHaveLength(0);
   });
+
+  test("stack-on-stack: fires when the external parent's PR merged", () => {
+    // Stack A's only slice merged — A itself has nothing open, so A
+    // must NOT fire. Stack B's root is based on A's branch and must.
+    const aTip = makeRow("a-tip", {
+      pr: makePr({ number: 10, state: "MERGED" }),
+      stack: stackInfo("eng-a", 1),
+      status: { kind: StatusKind.Merged, label: "merged" },
+    });
+    const bRoot = makeRow("b-root", {
+      pr: makePr({ number: 20 }),
+      stack: stackInfo("eng-b", 1),
+      stackedOn: {
+        slug: "a-tip",
+        branch: aTip.wt.branch,
+        via: "stack",
+        diffBase: aTip.wt.branch,
+      },
+    });
+    const fires = evaluateAutomations([r], [aTip, bRoot], FRESH);
+    expect(fires).toHaveLength(1);
+    expect(fires[0]!.stackId).toBe("eng-b");
+    expect(fires[0]!.fireKeys).toEqual(["auto-restack:restack:eng-b:ext:10"]);
+    expect(fires[0]!.quiesceSlugs).toEqual(["b-root", "a-tip"]);
+  });
+
+  test("stack-on-stack: silent while the external parent is still open", () => {
+    const aTip = makeRow("a-tip", {
+      pr: makePr({ number: 10 }),
+      stack: stackInfo("eng-a", 1),
+    });
+    const bRoot = makeRow("b-root", {
+      pr: makePr({ number: 20 }),
+      stack: stackInfo("eng-b", 1),
+      stackedOn: {
+        slug: "a-tip",
+        branch: aTip.wt.branch,
+        via: "stack",
+        diffBase: aTip.wt.branch,
+      },
+    });
+    expect(evaluateAutomations([r], [aTip, bRoot], FRESH)).toHaveLength(0);
+  });
+
+  test("stack-on-stack: fires once when the external parent has no worktree left", () => {
+    const bRoot = makeRow("b-root", {
+      pr: makePr({ number: 20 }),
+      stack: stackInfo("eng-b", 1),
+      stackedOn: {
+        slug: null,
+        branch: "michael/a-tip",
+        via: "stack",
+        diffBase: "michael/a-tip",
+      },
+    });
+    const fires = evaluateAutomations([r], [bRoot], FRESH);
+    expect(fires).toHaveLength(1);
+    expect(fires[0]!.fireKeys).toEqual([
+      "auto-restack:restack:eng-b:extgone:michael/a-tip",
+    ]);
+    expect(fires[0]!.quiesceSlugs).toEqual(["b-root"]);
+  });
+
+  test("stack-on-stack: a paused external parent blocks the boundary fire", () => {
+    const aTip = makeRow("a-tip", {
+      pr: makePr({ number: 10, state: "MERGED" }),
+      stack: stackInfo("eng-a", 1),
+      status: { kind: StatusKind.Merged, label: "merged" },
+    });
+    const bRoot = makeRow("b-root", {
+      pr: makePr({ number: 20 }),
+      stack: stackInfo("eng-b", 1),
+      stackedOn: {
+        slug: "a-tip",
+        branch: aTip.wt.branch,
+        via: "stack",
+        diffBase: aTip.wt.branch,
+      },
+    });
+    const fires = evaluateAutomations([r], [aTip, bRoot], {
+      ...FRESH,
+      isPausedSlug: (s) => s === "a-tip",
+    });
+    expect(fires).toHaveLength(0);
+  });
 });
