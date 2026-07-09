@@ -947,8 +947,8 @@ export function clearBaseReferences(branch: string): string[] {
 }
 
 /** Bounds on the removed-worktrees history, enforced at write time. */
-const REMOVED_MAX_ENTRIES = 100;
-const REMOVED_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+const REMOVED_MAX_ENTRIES = 30;
+const REMOVED_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
  * Record destroyed worktrees into the removed history. Upserts by slug:

@@ -178,7 +178,7 @@ const KEY_BLOCKS: Block[] = [
   {
     kind: "keys",
     title: "removed worktrees (h)",
-    note: "history of destroyed worktrees (snapshot at removal). Only these keys apply while it's shown.",
+    note: "history of destroyed worktrees (snapshot at removal). Global keys (n, c, r, slot sessions, …) still work; worktree-row keys don't.",
     items: [
       { key: "⏎", label: "restore — create a real worktree for the branch again" },
       { key: "p", label: "open recorded PR" },

@@ -1159,6 +1159,126 @@ export function App({ onExit }: Props) {
     void refreshAll();
   }
 
+  /**
+   * App-level keys that work in BOTH list views — the normal worktree
+   * list and the removed-worktrees history (`h`). Anything keyed off the
+   * selected row / section / PR stays in the normal-mode handler below;
+   * this is only the stuff with no per-row context: help, quit, refresh,
+   * cache clear, new/clean, the global automations pause, the primary-
+   * harness cycle, and the slot sessions / zed opens.
+   */
+  function handleGlobalKey(k: KeyEvent): boolean {
+    if (k.sequence === "?") {
+      setModal({ kind: "help", query: "", searching: false });
+      return true;
+    }
+    if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
+      quit();
+      return true;
+    }
+    if (k.sequence === "r") {
+      appLog.event.dim("refresh");
+      void refreshAll();
+      return true;
+    }
+    // Ctrl+R: clear all caches. Moved off bare R when R lost its
+    // single-letter slot; same confirm flow, same handler.
+    if (k.ctrl && k.name === "r") {
+      setModal({
+        kind: "confirm",
+        pendingKey: "R",
+        title: "clear caches",
+        message: "Clear all cached data and refetch from scratch?",
+        confirmLabel: "clear",
+      });
+      return true;
+    }
+    if (k.sequence === "n") {
+      newLog.event.dim("tip: --any to match any author, --base <ref> to branch off");
+      setFooter({ kind: "input", prompt: "new:", value: "", purpose: "new" });
+      return true;
+    }
+    if (isPlainLetter(k, "c")) {
+      if (cleanCandidates.length === 0) {
+        toast("nothing to clean", theme.fgDim, 1500);
+        return true;
+      }
+      setModal({ kind: "cleanConfirm" });
+      return true;
+    }
+    // Shift+A — pause / resume ALL automations. Persisted in wtstate,
+    // so the pause survives restarts. The pending intent queue is
+    // dropped on pause; conditions that still hold re-derive it on
+    // resume.
+    if (isShiftedLetter(k, "a")) {
+      if (!automations.configured) {
+        toast("no [[automations]] configured", theme.fgDim, 2000);
+        return true;
+      }
+      void automations.togglePaused().then(
+        (nowPaused) => {
+          toast(
+            nowPaused ? "automations paused" : "automations resumed",
+            nowPaused ? theme.warn : theme.ok,
+            2000,
+          );
+        },
+        (err) => reportActionError("automations toggle", err),
+      );
+      return true;
+    }
+    // Shift+TAB — cycle the primary harness selection. Re-rendered top-
+    // right indicator reflects the new primary; subsequent F12 spawns
+    // pick it up.
+    if (
+      k.name === "tab" &&
+      k.shift &&
+      !k.ctrl &&
+      !k.option &&
+      !k.super &&
+      !k.hyper &&
+      !k.meta
+    ) {
+      void (async () => {
+        const next = await cyclePrimaryHarness();
+        appLog.event.info(`primary harness → ${getHarness(next).label}`);
+      })();
+      return true;
+    }
+    // Toggle into a persistent harness session for a session slot —
+    // `,` is the wt source repo (config/self edits), `.` is the
+    // configured main clone, `/` the dotfiles. Same model as F12 on a
+    // worktree row: tmux's `new-session -A` makes re-entry idempotent,
+    // and F12 (bound to detach-client in the wt-private tmux config)
+    // takes the user back out. The selected primary harness (TAB to
+    // cycle) is the spawned kind, mirroring how row F12 picks a harness.
+    if (k.sequence === ",") {
+      doEnterSlotSession(WT_SOURCE_SLOT);
+      return true;
+    }
+    if (k.sequence === ".") {
+      doEnterSlotSession(MAIN_CLONE_SLOT);
+      return true;
+    }
+    if (k.sequence === "/") {
+      doEnterSlotSession(DOTFILES_SLOT);
+      return true;
+    }
+    if (k.sequence === ">") {
+      openInZed(WT_SOURCE_SLOT.path);
+      wtSourceLog.event.info(`opened ${WT_SOURCE_SLOT.path}`);
+      return true;
+    }
+    if (k.sequence === "O") {
+      openInZed(MAIN_CLONE_SLOT.path);
+      createLogger(MAIN_CLONE_SLOT.label).event.info(
+        `opened ${MAIN_CLONE_SLOT.path}`,
+      );
+      return true;
+    }
+    return false;
+  }
+
   // Per-modal key handlers. Exactly one modal is active at a time;
   // `useKeyboard` below dispatches on `modal.kind` and each handler
   // owns its modal's full key map, swallowing the keypress.
@@ -1274,14 +1394,7 @@ export function App({ onExit }: Props) {
         setRemovedView(false);
         return;
       }
-      if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
-        quit();
-        return;
-      }
-      if (k.sequence === "?") {
-        setModal({ kind: "help", query: "", searching: false });
-        return;
-      }
+      if (handleGlobalKey(k)) return;
       if (k.name === "j" || k.name === "down") {
         setRemovedIndex(
           Math.min(removedCursor + 1, Math.max(0, removedEntries.length - 1)),
@@ -1453,27 +1566,9 @@ export function App({ onExit }: Props) {
       openSectionRename();
       return;
     }
-    // Shift+A — pause / resume ALL automations. Persisted in wtstate,
-    // so the pause survives restarts. The pending intent queue is
-    // dropped on pause; conditions that still hold re-derive it on
-    // resume.
-    if (isShiftedLetter(k, "a")) {
-      if (!automations.configured) {
-        toast("no [[automations]] configured", theme.fgDim, 2000);
-        return;
-      }
-      void automations.togglePaused().then(
-        (nowPaused) => {
-          toast(
-            nowPaused ? "automations paused" : "automations resumed",
-            nowPaused ? theme.warn : theme.ok,
-            2000,
-          );
-        },
-        (err) => reportActionError("automations toggle", err),
-      );
-      return;
-    }
+    // App-level keys shared with the removed-worktrees view (help,
+    // quit, refresh, ^R, n, c, Shift+A, Shift+Tab, slot sessions, zed).
+    if (handleGlobalKey(k)) return;
     // Ctrl+A — toggle automations for the thing under the cursor
     // (persisted in wtstate, survives restarts). A stack member or a
     // folded stack header pauses/resumes the WHOLE stack as one, keyed
@@ -1581,40 +1676,10 @@ export function App({ onExit }: Props) {
       setSel(last ? visualKey(last) : null);
       return;
     }
-    if (isPlainLetter(k, "q") || (k.ctrl && k.name === "c")) {
-      quit();
-      return;
-    }
-    if (k.sequence === "?") {
-      setModal({ kind: "help", query: "", searching: false });
-      return;
-    }
-    if (k.sequence === "r") {
-      appLog.event.dim("refresh");
-      void refreshAll();
-      return;
-    }
     // `R` — restack the stack the selected worktree belongs to (whole stack,
     // algorithmic; escalates to /restack only on a conflict bail).
     if (k.sequence === "R") {
       void doReplayStack();
-      return;
-    }
-    // Ctrl+R: clear all caches. Moved off bare R when R lost its
-    // single-letter slot; same confirm flow, same handler.
-    if (k.ctrl && k.name === "r") {
-      setModal({
-        kind: "confirm",
-        pendingKey: "R",
-        title: "clear caches",
-        message: "Clear all cached data and refetch from scratch?",
-        confirmLabel: "clear",
-      });
-      return;
-    }
-    if (k.sequence === "n") {
-      newLog.event.dim("tip: --any to match any author, --base <ref> to branch off");
-      setFooter({ kind: "input", prompt: "new:", value: "", purpose: "new" });
       return;
     }
     if (k.sequence === "N") {
@@ -1634,14 +1699,6 @@ export function App({ onExit }: Props) {
         purpose: "new",
         base: current.wt.branch,
       });
-      return;
-    }
-    if (isPlainLetter(k, "c")) {
-      if (cleanCandidates.length === 0) {
-        toast("nothing to clean", theme.fgDim, 1500);
-        return;
-      }
-      setModal({ kind: "cleanConfirm" });
       return;
     }
     // `!` — open the action picker for the selected worktree, OR
@@ -1951,56 +2008,6 @@ export function App({ onExit }: Props) {
       toast("no section here to fold", theme.fgDim, 1500);
       return;
     }
-    // Shift+TAB — cycle the primary harness selection. Re-rendered top-
-    // right indicator reflects the new primary; subsequent F12 spawns
-    // pick it up.
-    if (
-      k.name === "tab" &&
-      k.shift &&
-      !k.ctrl &&
-      !k.option &&
-      !k.super &&
-      !k.hyper &&
-      !k.meta
-    ) {
-      void (async () => {
-        const next = await cyclePrimaryHarness();
-        appLog.event.info(`primary harness → ${getHarness(next).label}`);
-      })();
-      return;
-    }
-    // Toggle into a persistent harness session for a session slot —
-    // `,` is the wt source repo (config/self edits), `.` is the
-    // configured main clone. Same model as F12 on a worktree row:
-    // tmux's `new-session -A` makes re-entry idempotent, and F12
-    // (bound to detach-client in the wt-private tmux config) takes
-    // the user back out. The selected primary harness (TAB to cycle)
-    // is the spawned kind, mirroring how row F12 picks a harness.
-    if (k.sequence === ",") {
-      doEnterSlotSession(WT_SOURCE_SLOT);
-      return;
-    }
-    if (k.sequence === ".") {
-      doEnterSlotSession(MAIN_CLONE_SLOT);
-      return;
-    }
-    if (k.sequence === "/") {
-      doEnterSlotSession(DOTFILES_SLOT);
-      return;
-    }
-    if (k.sequence === ">") {
-      openInZed(WT_SOURCE_SLOT.path);
-      wtSourceLog.event.info(`opened ${WT_SOURCE_SLOT.path}`);
-      return;
-    }
-    if (k.sequence === "O") {
-      openInZed(MAIN_CLONE_SLOT.path);
-      createLogger(MAIN_CLONE_SLOT.label).event.info(
-        `opened ${MAIN_CLONE_SLOT.path}`,
-      );
-      return;
-    }
-
     // Review-request rows: a tiny set of PR-only keybinds, no
     // worktree-keyed actions. Unmapped keys fall through to the wt
     // per-row block below, which is gated on `current` (undefined for
