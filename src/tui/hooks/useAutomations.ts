@@ -158,7 +158,8 @@ export type AutomationsState = {
 };
 
 /** The breaker/cooldown identity: stacks key on stackId (the target
- *  slug — "first open slice" — shifts as slices land). */
+ *  slug — "first open member" — shifts as members land; the id churns
+ *  when the root itself lands, resetting that pair's state). */
 function pairTarget(fire: AutomationFire): string {
   return fire.stackId ?? fire.slug;
 }
@@ -220,7 +221,8 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
   });
   // Effective per-worktree pause set: individually-paused slugs plus
   // every member of a paused STACK (Ctrl+A on any stack row pauses by
-  // stackId, so slices added or re-split later are covered too).
+  // stackId, so members stacked on later are covered too; the toggle
+  // also mirrors per-slug flags so the pause survives a re-root).
   const pausedSlugs = new Set<string>();
   for (const [slug, st] of Object.entries(wtState.data?.slugs ?? {})) {
     if (st.automationsPaused === true) pausedSlugs.add(slug);
@@ -333,22 +335,22 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       // Mutex check FIRST, before the pre-clean: a manual `R` holding
       // the engine means nothing ran, so decline (un-consume the fire)
       // while the trigger condition is still intact. After the
-      // pre-clean the condition is consumed (merged slices destroyed),
+      // pre-clean the condition is consumed (merged members destroyed),
       // so a busy mutex there is a loud FAILURE, not a decline —
       // re-deriving the fire is no longer possible.
       if (latest.current.isRestackBusy()) {
         return { declined: "restack already running" };
       }
-      // Pre-clean the landed slices (recomputed against CURRENT rows,
+      // Pre-clean the landed members (recomputed against CURRENT rows,
       // not the rows the fire was born under — doCleanSlugs re-filters
-      // through isCleanCandidate, so a slice that un-merged can't be
-      // destroyed), then reconcile + replay. Landed slices include a
+      // through isCleanCandidate, so a member that un-merged can't be
+      // destroyed), then reconcile + replay. Landed members include a
       // merged EXTERNAL parent (stack-on-stack boundary): its own
-      // stack's manifest gets reconciled by the clean flow, and this
+      // stack's records get reparented by the clean flow, and this
       // stack's reconcile reparents onto trunk. Paused rows are never
       // touched.
       const memberRows = latest.current.rows.filter(
-        (r) => r.stack?.stackId === stackId && !r.stack.isHolistic,
+        (r) => r.stack?.stackId === stackId,
       );
       const memberBranches = new Set(memberRows.map((r) => r.wt.branch));
       const externalParentSlugs = new Set<string>();
@@ -361,7 +363,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       const mergedSlugs = latest.current.rows
         .filter(
           (r) =>
-            ((r.stack?.stackId === stackId && !r.stack.isHolistic) ||
+            (r.stack?.stackId === stackId ||
               externalParentSlugs.has(r.wt.slug)) &&
             !latest.current.pausedSlugs.has(r.wt.slug) &&
             isCleanCandidate(r),
@@ -369,15 +371,24 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
         .map((r) => r.wt.slug);
       if (mergedSlugs.length > 0) {
         wtLog.event.info(
-          `auto ${rule.id}: cleaning merged slice${mergedSlugs.length === 1 ? "" : "s"} ${mergedSlugs.join(", ")}`,
+          `auto ${rule.id}: cleaning merged member${mergedSlugs.length === 1 ? "" : "s"} ${mergedSlugs.join(", ")}`,
         );
         await latest.current.doCleanSlugs(mergedSlugs);
       }
-      const outcome = await latest.current.doRestackStack(stackId);
+      // Target the restack at a SURVIVING member's branch, never the
+      // stack id: the id is the ROOT's branch, and when the merged
+      // member is the root (the common bottom-up landing) the pre-clean
+      // just destroyed that branch — it no longer resolves a chain.
+      // `fire.slug` is the first open member, which the pre-clean never
+      // touches; the engine resolves the whole surviving stack from it.
+      const targetRow = latest.current.rows.find((r) => r.wt.slug === slug);
+      const outcome = await latest.current.doRestackStack(
+        targetRow?.wt.branch ?? stackId,
+      );
       if (outcome === "busy") {
         // Lost the mutex in the window between the peek above and the
         // engine acquiring it (a manual `R` mid-dispatch). The merged
-        // slices are already cleaned, so surface it as a failure that
+        // members are already cleaned, so surface it as a failure that
         // names the manual follow-up instead of silently retrying.
         throw new Error(
           "restack engine grabbed by another run after the pre-clean — press R (or /restack) once it's free",

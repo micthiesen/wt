@@ -149,8 +149,8 @@ export const qk = {
   /** Manually-archived slug set (fs-backed). */
   archive: () => ["archive"] as const,
   /**
-   * Per-slug section + manual order + stack manifests (fs-backed). The
-   * `stacks` manifests here are the single source for stack
+   * Per-slug section + manual order + fork-base records (fs-backed).
+   * The `baseBranch` records here are the single source for stack
    * relationships (membership, order, diff base) — `refreshStack`
    * invalidates this key.
    */

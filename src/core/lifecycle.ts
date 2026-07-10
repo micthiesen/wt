@@ -6,10 +6,10 @@ import { clearClaudeNames } from "./harness/claude/names.ts";
 import { clearCodexNames } from "./harness/codex/names.ts";
 import { clearOpencodeNames } from "./harness/opencode/names.ts";
 import {
-  clearBaseReferences,
   clearRemovedWorktree,
   clearSlugState,
   recordRemovedWorktrees,
+  reparentBaseReferences,
   setSlugBase,
 } from "./wtstate.ts";
 import { config } from "./config.ts";
@@ -198,17 +198,16 @@ export async function createWorktree(
       const baseRef = opts.base ?? `origin/${config.branch.base}`;
       opts.onLog?.(`new branch ${branch} off ${baseRef}`);
       await git(["worktree", "add", "--no-track", "-b", branch, path, baseRef]);
-      // Remember a non-trunk fork base (display/diff hint; the stack
-      // manifest still owns engine behavior). Stored as a plain branch
-      // name so it can match a sibling worktree; the fork-point sha is
-      // free to capture now and seeds a later `wt stack add` anchor.
+      // Remember a non-trunk fork base. This record IS the stack
+      // primitive: it drives the TUI's stack grouping, the diff base,
+      // and the restack replay. Stored as a plain branch name so it can
+      // match a sibling worktree; the fork-point sha captured now is
+      // the squash-safe anchor a later restack replays from.
       const baseBranch = baseRef.replace(/^origin\//, "");
       if (baseBranch !== config.branch.base) {
         const sha = await revParse("HEAD", path);
         setSlugBase(slug, { branch: baseBranch, sha: sha ?? undefined });
-        opts.onLog?.(
-          `recorded fork base ${baseBranch} — register with \`wt stack add\` once it has work + a PR`,
-        );
+        opts.onLog?.(`recorded fork base ${baseBranch}`);
       }
     }
 
@@ -351,15 +350,17 @@ export async function removeWorktree(
     }
 
     // The deleted branch may be some OTHER worktree's recorded fork
-    // base (`wt new --base`). Drop those records now so the dependents
-    // stop rendering "(forked)" against a ref that no longer exists —
-    // their diff/sync silently degrade to trunk, which is also what
-    // clearing makes explicit.
+    // base. Reparent those records onto the deleted branch's own
+    // recorded base (or trunk), PRESERVING their baseSha anchors — the
+    // usual reason a parent disappears is that it merged and got
+    // cleaned, and the kept anchor is what lets the next restack replay
+    // the dependents squash-safely instead of re-applying the landed
+    // parent's commits.
     if (deletedBranch && wt.branch) {
-      const cleared = clearBaseReferences(wt.branch);
-      if (cleared.length > 0) {
+      const reparented = reparentBaseReferences(wt.branch, config.branch.base, wt.slug);
+      if (reparented.length > 0) {
         opts.onLog?.(
-          `cleared fork base on ${cleared.join(", ")} (forked from the deleted ${wt.branch})`,
+          `reparented fork base on ${reparented.join(", ")} (was the deleted ${wt.branch})`,
         );
       }
     }
@@ -374,13 +375,8 @@ export async function removeWorktree(
     // re-creates lives in createWorktree (which clears both files for
     // the new slug); the stale-entry sweep for external destroys lives
     // in `reapStartup` so archive.json/state.json don't accumulate
-    // ghosts.
-    //
-    // Stack relationships live in the manifest (wtState.stacks), not in
-    // per-slug state, so manifest dependents of a removed branch need no
-    // clearing here — `wt stack rebase` reconciles the manifest. (Fork-
-    // base records ARE per-slug and are swept above when the branch is
-    // deleted.)
+    // ghosts. (Dependents' fork-base records were already reparented
+    // above when the branch was deleted.)
 
     // Confirm the removal in the removed-worktrees history. The TUI's
     // destroy flows already wrote a rich snapshot (title, PR) at

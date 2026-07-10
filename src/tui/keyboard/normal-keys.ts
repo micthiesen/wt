@@ -103,7 +103,7 @@ export type NormalKeysCtx = {
   // Automations
   automations: { configured: boolean };
   toggleAutomationsPaused: (slug: string) => Promise<boolean>;
-  toggleStackAutomationsPaused: (stackId: string) => Promise<boolean>;
+  toggleStackAutomationsPaused: (stackId: string, memberSlugs: readonly string[]) => Promise<boolean>;
   // Actions on the row
   toggleArchived: (slug: string) => Promise<{ archived: boolean }>;
   toggleSectionFold: (key: string) => Promise<boolean>;
@@ -272,9 +272,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     // Ctrl+A — toggle automations for the thing under the cursor
     // (persisted in wtstate, survives restarts). A stack member or a
     // folded stack header pauses/resumes the WHOLE stack as one, keyed
-    // by stackId so slices added or re-split later stay covered; a
-    // non-stack row toggles just itself. The escape hatch when a
-    // branch (or stack) is under manual surgery.
+    // by stackId (the root branch) so members stacked on later stay
+    // covered; a non-stack row toggles just itself. The escape hatch
+    // when a branch (or stack) is under manual surgery.
     if (k.ctrl && k.name === "a" && !k.shift && !k.option && !k.meta) {
       if (!automations.configured) {
         toast("no [[automations]] configured", theme.fgDim, 2000);
@@ -290,7 +290,14 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       void (async () => {
         try {
           if (stackId) {
-            const nowPaused = await toggleStackAutomationsPaused(stackId);
+            const memberSlugs = selectedSection?.isStack
+              ? selectedSection.rows.map((r) => r.wt.slug)
+              : visualItems.flatMap((v) =>
+                  v.kind === "wt" && v.row.stack?.stackId === stackId
+                    ? [v.row.wt.slug]
+                    : [],
+                );
+            const nowPaused = await toggleStackAutomationsPaused(stackId, memberSlugs);
             appLog.event.info(
               nowPaused
                 ? `automations paused for stack ${stackId}`

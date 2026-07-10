@@ -55,7 +55,7 @@ The full reference — every option, default, the `[[actions]]` menu, and `[[aut
 
 ## Use
 
-`wt` with no arguments launches the TUI; press `?` inside for the full keymap and glyph legend. Subcommands (`wt new`, `wt rm`, `wt clean`, `wt stack`, …) run the same operations one-shot from a shell.
+`wt` with no arguments launches the TUI; press `?` inside for the full keymap and glyph legend. Subcommands (`wt new`, `wt rm`, `wt clean`, `wt restack`, …) run the same operations one-shot from a shell.
 
 State is push-based: filesystem watchers on git refs, worktree dirs, and wt's own state feed the UI, so it tracks commits, pushes, installs, and deploys without manual refreshing. An optional webhook daemon extends that to GitHub-side events.
 
@@ -68,7 +68,7 @@ State is push-based: filesystem watchers on git refs, worktree dirs, and wt's ow
 | [docs/configuration.md](docs/configuration.md) | complete config.toml reference |
 | [docs/automations.md](docs/automations.md) | the `[[automations]]` engine: triggers, settle windows, breaker |
 | [docs/github-events.md](docs/github-events.md) | push-based PR/CI updates via a repo webhook |
-| [docs/stacking.md](docs/stacking.md) | the small-stacked-PR workflow (`wt stack`, `/split`, `/restack`) |
+| [docs/stacked-prs.md](docs/stacked-prs.md) | stacked PRs: fork-base records, inferred stacks, `wt restack` |
 | [docs/architecture.md](docs/architecture.md) | internals: layers, freshness model, module conventions |
 
 ## Logs

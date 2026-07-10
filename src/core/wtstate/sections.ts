@@ -4,9 +4,11 @@ import type { WtSlugState, WtState } from "./types.ts";
 
 /**
  * Drop dead groups from `sectionsOrder`: manual sections no slug
- * references and stack keys whose manifest is gone. The inbox sentinel
- * always survives (it's the migration marker and the inbox is never
- * deletable).
+ * references. The inbox sentinel always survives (it's the migration
+ * marker and the inbox is never deletable), and stack keys are kept
+ * unconditionally — stacks are inferred from the live worktree list,
+ * which this module doesn't see, so a stale key can't be told from a
+ * momentarily-empty one. Stale stack keys are inert and tiny.
  */
 function prunedSectionsOrder(state: WtState): string[] {
   const live = new Set<string>();
@@ -15,8 +17,7 @@ function prunedSectionsOrder(state: WtState): string[] {
   }
   return state.sectionsOrder.filter((s) => {
     if (s === GROUP_INBOX) return true;
-    const sid = stackIdFromSectionKey(s);
-    if (sid !== null) return sid in state.stacks;
+    if (stackIdFromSectionKey(s) !== null) return true;
     return live.has(s);
   });
 }
@@ -113,25 +114,65 @@ export function setSlugBase(
 }
 
 /**
- * Drop every slug's recorded fork base that points at `branch`. Called
- * by destroy after the branch is deleted — a dangling record would
- * keep rendering "(forked)" against a ref that no longer resolves
- * (the diff layer degrades to trunk via `effectiveBaseOrTrunk`, but
- * the stale label and sync counts linger). Returns the affected slugs
- * for logging.
+ * Advance a slug's replay anchor, but only while its recorded parent
+ * still matches what the replay resolved at chain time. A concurrent
+ * writer — typically a background destroy reparenting this slug off a
+ * just-deleted parent — wins: clobbering its rewrite with the stale
+ * pre-destroy parent would leave the record pointing at a dead branch.
+ * Returns false when the record moved and the anchor was left alone
+ * (still valid — it names a tip that's an ancestor of the branch either
+ * way; the next reconcile/replay recomputes from it).
  */
-export function clearBaseReferences(branch: string): string[] {
+export function advanceBaseAnchor(
+  slug: string,
+  expectedParent: string,
+  sha: string,
+): boolean {
+  return withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.slugs[slug];
+    if (prev?.baseBranch !== expectedParent) return false;
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    next.slugs[slug] = { ...prev, baseSha: sha };
+    writeWtState(next);
+    return true;
+  });
+}
+
+/**
+ * Reparent every slug's recorded fork base that points at `branch` onto
+ * the deleted branch's OWN recorded base (falling back to `trunk`).
+ * Called by destroy after the branch is deleted — a dangling record
+ * would keep rendering the stack against a ref that no longer resolves.
+ * Each dependent's `baseSha` anchor is PRESERVED: it still names the
+ * tip the dependent's own commits sit on, which is what keeps the next
+ * replay squash-safe after the parent landed. Returns the affected
+ * slugs for logging.
+ *
+ * When `deletedSlug` is given, the deleted branch's own record (still
+ * in the state file — per-slug entries are reaped later, at startup) is
+ * consulted for the new parent, so a mid-chain removal re-links
+ * grandchildren to their grandparent instead of flattening them to
+ * trunk.
+ */
+export function reparentBaseReferences(
+  branch: string,
+  trunk: string,
+  deletedSlug?: string,
+): string[] {
   return withWtStateLock(() => {
     const state = readWtState();
     const affected = Object.entries(state.slugs)
-      .filter(([, s]) => s.baseBranch === branch)
+      .filter(([slug, s]) => s.baseBranch === branch && slug !== deletedSlug)
       .map(([slug]) => slug);
     if (affected.length === 0) return affected;
+    const deletedBase = deletedSlug ? state.slugs[deletedSlug]?.baseBranch : undefined;
+    const newParent = deletedBase && deletedBase !== branch ? deletedBase : trunk;
     const next: WtState = { ...state, slugs: { ...state.slugs } };
     for (const slug of affected) {
       const entry: WtSlugState = { ...next.slugs[slug]! };
-      delete entry.baseBranch;
-      delete entry.baseSha;
+      entry.baseBranch = newParent;
+      // baseSha intentionally kept — the squash-safe anchor.
       next.slugs[slug] = entry;
     }
     writeWtState(next);
@@ -235,14 +276,16 @@ export function renameSection(oldName: string, newName: string): void {
 
 /**
  * Reorder the group list: remove `key` and reinsert it immediately
- * before/after `pastKey`. Both keys must be present (groups are
- * self-healed into `sectionsOrder` at read time); returns false when
- * either is absent, they're equal, or the result is a no-op. "Place
- * past" rather than "swap with array neighbor" so the caller can name
- * the next VISIBLE group as the landmark — an invisible group sitting
- * between (an empty inbox) gets jumped in one keypress instead of
- * producing a phantom no-change move. Member slugs keep their `order`
- * values; only the group's rank moves.
+ * before/after `pastKey`. Manual keys must already be present (they're
+ * self-healed into `sectionsOrder` at read time); a STACK key is
+ * inserted lazily here — inferred stacks never pre-register, an
+ * unranked one just sorts to the top of the list until its first move.
+ * Returns false when a manual key is absent, the keys are equal, or the
+ * result is a no-op. "Place past" rather than "swap with array
+ * neighbor" so the caller can name the next VISIBLE group as the
+ * landmark — an invisible group sitting between (an empty inbox) gets
+ * jumped in one keypress instead of producing a phantom no-change move.
+ * Member slugs keep their `order` values; only the group's rank moves.
  */
 export function moveGroupPast(
   key: string,
@@ -252,12 +295,23 @@ export function moveGroupPast(
   return withWtStateLock(() => {
     const state = readWtState();
     if (key === pastKey) return false;
-    if (!state.sectionsOrder.includes(key)) return false;
-    const arr = state.sectionsOrder.filter((s) => s !== key);
+    let order = state.sectionsOrder;
+    // Lazy registration for inferred-stack keys, at the front — where
+    // an unranked stack sorts anyway — so the subsequent move is
+    // relative to what the user sees.
+    for (const k of [key, pastKey]) {
+      if (!order.includes(k) && stackIdFromSectionKey(k) !== null) {
+        order = [k, ...order];
+      }
+    }
+    if (!order.includes(key)) return false;
+    const arr = order.filter((s) => s !== key);
     const at = arr.indexOf(pastKey);
     if (at < 0) return false;
     arr.splice(side === "before" ? at : at + 1, 0, key);
-    if (arr.every((s, i) => s === state.sectionsOrder[i])) return false;
+    if (arr.every((s, i) => s === state.sectionsOrder[i]) && arr.length === state.sectionsOrder.length) {
+      return false;
+    }
     writeWtState({ ...state, sectionsOrder: arr });
     return true;
   });

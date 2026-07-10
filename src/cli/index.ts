@@ -10,8 +10,7 @@ import * as logsCmd from "./commands/logs.ts";
 import * as openCmd from "./commands/open.ts";
 import * as baseCmd from "./commands/base.ts";
 import * as claudeCmd from "./commands/claude.ts";
-import * as sizeCmd from "./commands/size.ts";
-import * as stackCmd from "./commands/stack/index.ts";
+import * as restackCmd from "./commands/restack.ts";
 import * as skillsCmd from "./commands/skills.ts";
 import * as eventsCmd from "./commands/events.ts";
 import * as destroyCmd from "./commands/_destroy.ts";
@@ -27,8 +26,7 @@ commands:
   stages      list SST stages, optionally clean orphans
   logs        tail a destroy log
   open        open a worktree in Zed
-  size        production-LOC + file count for a diff
-  stack       materialize / inspect / restack a stack manifest
+  restack     rebase a stack of worktrees onto its updated parents
   skills      install wt's bundled workflow skills into a harness
   events      manage the optional GitHub webhook daemon
   base        show / set / clear a worktree's recorded fork base
@@ -47,8 +45,7 @@ const RUNNERS: Record<string, Runner> = {
   stages: stagesCmd.run,
   logs: logsCmd.run,
   open: openCmd.run,
-  size: sizeCmd.run,
-  stack: stackCmd.run,
+  restack: restackCmd.run,
   skills: skillsCmd.run,
   events: eventsCmd.run,
   base: baseCmd.run,

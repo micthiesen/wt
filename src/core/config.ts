@@ -129,28 +129,6 @@ export type DiffConfig = {
   command: string;
 };
 
-export type StackConfig = {
-  /**
-   * Shell command `wt stack apply --verify` runs against each cumulative
-   * slice prefix (reconstructed in a throwaway worktree with deps symlinked
-   * from the holistic worktree) before any branch/PR is created. A non-zero
-   * exit fails the prefix and aborts apply. Null ⇒ `--verify` errors asking
-   * for it. Typically `bun run typecheck` or `tsc --noEmit`.
-   */
-  verifyCommand: string | null;
-  /**
-   * Gitignored dependency dirs symlinked into the verify worktree so the
-   * command resolves modules/types. Default `["node_modules"]`. Each is
-   * linked from the holistic branch's live worktree when one exists, else
-   * the main clone. Caveat: the link is WHOLESALE (the full feature's deps),
-   * so a slice importing a package the stack itself adds can verify green even
-   * though its own PR won't have it — verify is a fast early gate, not a
-   * replacement for CI. Single-root projects only (one root-level link; no
-   * per-package monorepo installs).
-   */
-  verifyDeps: readonly string[];
-};
-
 export type AiProvider = "openai" | "gemini";
 
 type BaseAiConfig = {
@@ -313,11 +291,12 @@ export type ActionDef =
  *   "review.changes_requested"— a human review requested changes.
  *   "pr.conflict"             — merge-tree probe says the branch
  *                               conflicts with its effective base.
- *   "wt.merged"               — a NON-stack worktree's branch landed
+ *   "wt.merged"               — a NON-stacked worktree's branch landed
  *                               (merged / gone / PR merged — same set
  *                               the `c` clean sweep uses).
- *   "stack.parent_merged"     — a stack has a merged slice with open
- *                               slices still stacked above it.
+ *   "stack.parent_merged"     — a stack (worktrees chained by their
+ *                               recorded fork bases) has a merged
+ *                               member with open members stacked on it.
  */
 export type AutomationTrigger =
   | "pr.checks.failed"
@@ -397,7 +376,6 @@ export type Config = {
   sst: SstConfig | null;
   linear: LinearConfig | null;
   ai: AiConfig | null;
-  stack: StackConfig;
   diff: DiffConfig;
   github: GithubConfig;
   actions: readonly ActionDef[];
@@ -418,9 +396,6 @@ const GENERIC_DEFAULTS = {
   },
   lifecycle: {
     envFilesToCopy: [".env"] as const,
-  },
-  stack: {
-    verifyDeps: ["node_modules"] as const,
   },
   paths: {
     logDir: join(HOME, ".cache", "wt", "logs"),
@@ -697,12 +672,6 @@ function build(raw: Raw, errs: Errors): Config {
     command: errs.optStr(diffRaw, "command", GENERIC_DEFAULTS.diff.command),
   };
 
-  const stackRaw = obj(raw.stack);
-  const stack: StackConfig = {
-    verifyCommand: errs.optStrOrNull(stackRaw, "verify_command"),
-    verifyDeps: strArr(stackRaw?.verify_deps, GENERIC_DEFAULTS.stack.verifyDeps),
-  };
-
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
 
   const githubRaw = obj(raw.github);
@@ -750,7 +719,6 @@ function build(raw: Raw, errs: Errors): Config {
     sst,
     linear,
     ai,
-    stack,
     diff,
     github,
     actions,
@@ -769,7 +737,7 @@ const VALID_TRIGGERS = new Set<AutomationTrigger>([
 ]);
 const DEFAULT_SETTLE_SECONDS = 120;
 // Merge-driven triggers are un-flappy, and the typical next step (review
-// the next slice, mark it ready) wants the restack done promptly — keep
+// the next member, mark it ready) wants the restack done promptly — keep
 // only a token cancellation window.
 const MERGED_SETTLE_SECONDS = 10;
 const MERGE_TRIGGERS: ReadonlySet<AutomationTrigger> = new Set([
@@ -829,7 +797,7 @@ function parseAutomations(
     }
     if (run === "builtin:clean" && on === "stack.parent_merged") {
       errs.add(
-        `${tag}: run "builtin:clean" targets one worktree; use "builtin:restack" for stack.parent_merged (it cleans merged slices first)`,
+        `${tag}: run "builtin:clean" targets one worktree; use "builtin:restack" for stack.parent_merged (it cleans merged members first)`,
       );
       continue;
     }

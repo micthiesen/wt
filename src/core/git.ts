@@ -24,7 +24,7 @@ export async function gitRun(
  * out (e.g. `git rev-list` via `runOk` throws a raw `fatal: bad revision`).
  * Fall back to trunk so the row degrades to a (fat) trunk diff instead of
  * surfacing that error. `reconcileStack` is the real fix — it reparents the
- * orphan onto trunk in the manifest — so this only covers the window before
+ * orphan onto trunk in its fork-base record — so this only covers the window before
  * reconcile runs (or if the PR-merged probe hasn't landed yet). An external
  * base (stack-on-stack) still resolves, so it's left untouched.
  */

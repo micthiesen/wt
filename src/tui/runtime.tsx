@@ -234,7 +234,7 @@ export async function runTui(): Promise<TuiExit> {
   );
   // Cross-process state.json / archive.json writes (CLI stack ops, `wt
   // base set`, another wt instance) → refresh the matching query so
-  // sections, stack manifests, and the archived set track external
+  // sections, fork-base records, and the archived set track external
   // mutations live.
   const stopWtStateWatch = watchWtStateFiles((file) => {
     const key = file === "state" ? qk.wtState() : qk.archive();

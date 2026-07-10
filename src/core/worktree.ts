@@ -34,7 +34,7 @@ export async function listWorktrees(): Promise<Worktree[]> {
           block = {};
           continue;
         }
-        // Skip the throwaway detached worktrees `wt stack apply --verify` adds
+        // Skip throwaway detached worktrees (e.g. tooling-created)
         // (under tmpdir, registered in the main clone) — they're internal
         // scaffolding, present only for the duration of a verify run, and must
         // never surface as a worktree row.

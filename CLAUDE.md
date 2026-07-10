@@ -21,8 +21,7 @@ Commit and push directly to `main`. Don't create feature branches, don't open PR
 - `docs/configuration.md` — mirrors the `src/core/config.ts` schema. Any schema/default change updates it.
 - `docs/tui.md` — keymap + panes. Any keybinding change updates it (and `src/tui/panels/help.tsx`, the in-app source of truth).
 - `docs/cli.md` — subcommands + flags. Any CLI change updates it.
-- `docs/automations.md`, `docs/github-events.md`, `docs/stacking.md` — per-feature semantics.
-- `docs/stacking-workflow.md` — the stacking *design doc* (rationale, locked decisions, session log); maintained via `/improve-stacking`, not routine doc passes.
+- `docs/automations.md`, `docs/github-events.md`, `docs/stacked-prs.md` — per-feature semantics.
 - `README.md` — concise front door; it links out rather than duplicating. Keep it short.
 
 ## Architecture (rules; map in docs/architecture.md)
@@ -40,6 +39,7 @@ Commit and push directly to `main`. Don't create feature branches, don't open PR
 - **No client-app defaults in code.** `paths.main_clone`, `paths.worktree_root`, `branch.prefix` are required and the loader refuses to start without them. New required fields go through `Errors.reqStr`; add a derivation when one's natural (see `stage.prefix` defaulting from `branch.prefix`).
 - **Errors render verbatim, gated on retries-exhausted.** `firstError` in `details.tsx` already handles the gate (`error && !isFetching`) — don't duplicate it elsewhere. The same error showing on every row that depends on a broken source is intentional.
 - **Convention over configuration for the niche stuff.** `branch.id_pattern` exists but most users will never set it; the default matches Linear/Jira/Shortcut conventions.
+- **Stacks are inferred, never stored.** The per-slug fork-base record (`baseBranch` + `baseSha` in wtstate) is the ONLY stack state; grouping, diff bases, and the restack engine all derive from it (`core/stack-layout.ts` infers, `core/stack-ops/` replays). Don't add stack registries, manifests, or membership caches — and never drop a `baseSha` when rewriting a record's branch: it's the squash-safe replay anchor (see docs/stacked-prs.md).
 - **Mutating GitHub state? Invalidate `["github"]`, not the worktree.** Write-path `gh` calls must trigger `refreshGithub()` from `state/hooks.ts`. `invalidateWorktree(slug)` looks plausible but the github query is keyed by branch list, not slug — it silently misses.
 - **Automations are level + ledger, never edge-triggered.** The `[[automations]]` engine (`core/automations.ts` ledger, `tui/automation-rules.ts` pure evaluation, `tui/hooks/useAutomations.ts` queue + dispatch) re-derives conditions from row state every pass; once-only comes from persistent fire keys keyed on head SHA. Hard rules: `markFiresDispatched` runs synchronously before any await in a dispatch; PR-driven conditions require `githubFresh` plus `pr.headRefOid` (persisted-cache data must never fire); failures mark delivered and never retry (new SHA = the retry); the per-(rule, target) breaker trips after `BREAKER_LIMIT` consecutive no-clear dispatches and resets only when the condition is observed false. New triggers: add to `AutomationTrigger` in config.ts + a case in `automation-rules.ts` with a documented fire key. Runs dispatch through the same paths keystrokes use, never bespoke ones. Semantics doc: docs/automations.md.
 - **Freshness is push-based; `r` is a backstop, not the mechanism.** Every external state source has an event trigger that invalidates the matching query — the full trigger inventory is in docs/architecture.md#freshness-model. When adding a state source or mutation path, wire a watcher or an explicit invalidation at the call site rather than shortening a staleTime or telling the user to press `r`; staleTimes only bound how wrong things can be when a trigger is missed.
@@ -54,7 +54,7 @@ Commit and push directly to `main`. Don't create feature branches, don't open PR
 
 - Runtime is **Bun**. No node, no pnpm. `bun install`, `bun src/main.ts`.
 - Typecheck: `bun run typecheck` (just `tsc --noEmit`).
-- Tests are opt-in, not comprehensive: `bun test`. The one that matters is `src/core/stack-ops/hunks.test.ts` — golden tests pinning the hunk engine against real `git diff` output, since a silent off-by-one there corrupts a slice's committed content. Add cases there when touching `core/stack-ops/hunks.ts`. Most other modules have no tests; smoke via the CLI.
+- Tests are opt-in, not comprehensive: `bun test`. The restack anchor tests (`src/core/stack-ops.test.ts`) pin the squash-safe cut-point logic against real git repos — add cases there when touching `resolveAnchor`. Most other modules have no tests; smoke via the CLI.
 - The TUI takes over the terminal — smoke-test refactors via the CLI subcommands (`bun src/main.ts ls`) or check imports with `bun -e 'import("./src/path.tsx")'`.
 
 ## Traps

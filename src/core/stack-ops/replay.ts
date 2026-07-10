@@ -1,9 +1,9 @@
 import { config } from "../config.ts";
 import { firstSha, gitQuiet, gitRun, revParse } from "../git.ts";
 import { rebaseInProgress, restackEngine } from "./engine.ts";
-import { isTrunkBase, resolveParentBranch, topoSortSlices } from "../stack-layout.ts";
-import { getStackManifest, updateStackSlice, type StackSlice } from "../wtstate.ts";
-import { fetchOrigin, listWorktrees, worktreeHasTrackedChanges } from "../worktree.ts";
+import { resolveChain, type ChainStep } from "./chain.ts";
+import { advanceBaseAnchor } from "../wtstate.ts";
+import { fetchOrigin, worktreeHasTrackedChanges } from "../worktree.ts";
 import { acquireStackLock, log, retargetIfNeeded, STACK_BUSY, type Logger } from "./shared.ts";
 import { reconcileStack } from "./reconcile.ts";
 
@@ -25,36 +25,60 @@ export type RebaseResult =
     };
 
 /**
- * The one-shot /restack convenience: reconcile the manifest against landed
- * PRs, then replay every surviving slice onto its (possibly rewritten)
- * parent. `reconcileStack` and `replayStack` are exposed separately so the
- * skill can drive them step-by-step around a conflict (reconcile once,
- * replay → resolve → replay again).
+ * The one-shot restack convenience: reconcile the chain's fork-base
+ * records against landed PRs, then replay every member onto its
+ * (possibly rewritten) parent. `reconcileStack` and `replayStack` are
+ * exposed separately so `/restack` can drive them step-by-step around a
+ * conflict (reconcile once, replay → resolve → replay again).
+ *
+ * The membership is snapshotted BEFORE the reconcile: when the named
+ * branch's own PR merged (the common bottom-up landing), reconcile
+ * reparents its dependents away from it, after which that branch alone
+ * no longer resolves the work that needs replaying — and a landed root
+ * can split its children into several independent chains. So the replay
+ * walks every distinct surviving chain the old membership maps to,
+ * instead of trusting the original name to still be the handle.
  */
 export async function rebaseStack(
-  stackId: string,
+  branch: string,
   opts: RebaseOptions,
   onLog: Logger,
 ): Promise<RebaseResult> {
-  const manifest = getStackManifest(stackId);
-  if (!manifest) {
-    return { ok: false, conflict: false, error: `no stack manifest: ${stackId}` };
-  }
   const trunk = opts.onto ?? config.branch.base;
-  await reconcileStack(stackId, trunk, onLog);
-  return replayStack(stackId, { onto: trunk }, onLog);
+  const pre = await resolveChain(branch);
+  await reconcileStack(branch, trunk, onLog);
+  const candidates = pre ? pre.steps.map((s) => s.branch) : [branch];
+  const replayedRoots = new Set<string>();
+  const outputs: string[] = [];
+  for (const candidate of candidates) {
+    const chain = await resolveChain(candidate);
+    if (!chain || replayedRoots.has(chain.root)) continue;
+    replayedRoots.add(chain.root);
+    const res = await replayStack(candidate, { onto: trunk }, onLog);
+    if (!res.ok) return res;
+    outputs.push(res.output);
+  }
+  if (replayedRoots.size === 0) {
+    return {
+      ok: false,
+      conflict: false,
+      error: `${branch} isn't stacked — no recorded base (wt base) and no dependent worktrees`,
+    };
+  }
+  return { ok: true, output: outputs.join("; ") };
 }
 
 /**
- * Replay every surviving slice onto its parent, squash-safe, in topological
- * order: rebase the slice's own commits in its own worktree, force-push, and
- * retarget its PR base to match the manifest. Bails clean on the first
- * conflict, naming the slice + the backup branch the engine left — wt never
- * auto-resolves. Pure git + gh; does NOT reconcile (run `reconcileStack`
- * first for a post-merge restack). Serialized across processes by a flock.
+ * Replay every member of the stack containing `branch` onto its parent,
+ * squash-safe, parents before children: rebase each member's own
+ * commits in its own worktree, force-push, and retarget its PR base to
+ * match the recorded parent. Bails clean on the first conflict, naming
+ * the branch + the backup ref the engine left — wt never auto-resolves.
+ * Pure git + gh; does NOT reconcile (run `reconcileStack` first for a
+ * post-merge restack). Serialized across processes by a flock.
  */
 export async function replayStack(
-  stackId: string,
+  branch: string,
   opts: RebaseOptions,
   onLog: Logger,
 ): Promise<RebaseResult> {
@@ -63,80 +87,59 @@ export async function replayStack(
     return { ok: false, conflict: false, error: STACK_BUSY };
   }
   try {
-    return await replayStackLocked(stackId, opts, onLog);
+    return await replayStackLocked(branch, opts, onLog);
   } finally {
     handle.release();
   }
 }
 
 async function replayStackLocked(
-  stackId: string,
+  branch: string,
   opts: RebaseOptions,
   onLog: Logger,
 ): Promise<RebaseResult> {
-  const manifest = getStackManifest(stackId);
-  if (!manifest) {
-    return { ok: false, conflict: false, error: `no stack manifest: ${stackId}` };
-  }
   const trunk = opts.onto ?? config.branch.base;
 
-  // Topo order so each parent is replayed before its children; merged slices
-  // drop out (their branch is gone, their children already reparented).
-  let ordered: StackSlice[];
-  try {
-    ordered = topoSortSlices(manifest);
-  } catch (e) {
-    return { ok: false, conflict: false, error: e instanceof Error ? e.message : String(e) };
+  // The chain is re-resolved fresh from worktrees + records (a
+  // reconcile that just reparented members must be visible), parents
+  // before children so each parent replays before its dependents.
+  const chain = await resolveChain(branch);
+  if (!chain) {
+    return {
+      ok: false,
+      conflict: false,
+      error: `${branch} isn't stacked — no recorded base (wt base) and no dependent worktrees`,
+    };
   }
-  // Only OPEN slices replay. Merged ones dropped out at reconcile, and a
-  // `planned` slice isn't materialized — no PR, and any branch/worktree
-  // already sitting under it is hand-authored WIP the engine must neither
-  // rebase nor gate on (a dirty planned tip used to block the whole stack).
-  // Skip it loudly; it catches up at `wt stack apply` / `wt stack add`.
-  const live = ordered.filter((s) => s.status === "open");
-  for (const s of ordered) {
-    if (s.status === "planned") {
-      onLog(`skip ${s.id} (${s.branch}) — planned slice, not yet materialized`);
-    }
-  }
-  const byId = new Map(manifest.slices.map((s) => [s.id, s]));
 
-  // Each slice replays IN ITS OWN WORKTREE (HEAD rebases in place), so map
-  // branch → path and refuse any dirty one up front — a rebase would clobber.
-  // Only TRACKED changes block: untracked files ride through a rebase safely
-  // (git refuses cleanly if one would be overwritten), and the workflow itself
-  // drops untracked files like `prompt.txt` into slice worktrees.
-  const pathByBranch = new Map(
-    (await listWorktrees())
-      .filter((w) => !w.isMain && w.branch)
-      .map((w) => [w.branch, w.path] as const),
-  );
-  for (const s of live) {
-    const p = pathByBranch.get(s.branch);
-    if (!p) continue;
-    if (await worktreeHasTrackedChanges(p)) {
+  // Every member replays IN ITS OWN WORKTREE (HEAD rebases in place);
+  // refuse any dirty one up front — a rebase would clobber. Only
+  // TRACKED changes block: untracked files ride through a rebase safely
+  // (git refuses cleanly if one would be overwritten).
+  for (const s of chain.steps) {
+    if (await worktreeHasTrackedChanges(s.worktreePath)) {
       return {
         ok: false,
         conflict: false,
-        error: `slice ${s.id} worktree ${p} (${s.branch}) has uncommitted changes to tracked files — commit or stash before restacking`,
+        error: `worktree ${s.worktreePath} (${s.branch}) has uncommitted changes to tracked files — commit or stash before restacking`,
       };
     }
-    // A worktree left mid-rebase by an earlier interrupted run can read clean
-    // via `git status --porcelain` (no unmerged paths), so the dirty check
-    // alone misses it. Replaying into it would make the engine abort and
-    // silently discard that in-flight state — refuse up front instead.
-    if (await rebaseInProgress(p)) {
+    // A worktree left mid-rebase by an earlier interrupted run can read
+    // clean via `git status --porcelain` (no unmerged paths), so the
+    // dirty check alone misses it. Replaying into it would make the
+    // engine abort and silently discard that in-flight state — refuse
+    // up front instead.
+    if (await rebaseInProgress(s.worktreePath)) {
       return {
         ok: false,
         conflict: false,
-        error: `slice worktree ${p} (${s.branch}) is mid-rebase from an unfinished run — finish or \`git rebase --abort\` it there before restacking`,
+        error: `worktree ${s.worktreePath} (${s.branch}) is mid-rebase from an unfinished run — finish or \`git rebase --abort\` it there before restacking`,
       };
     }
   }
 
-  // Freshen origin and advance the local trunk branch before replaying. A
-  // failed fetch would silently leave stale refs and replay every slice onto
-  // an outdated base, so bail.
+  // Freshen origin before replaying. A failed fetch would silently
+  // leave stale refs and replay every member onto an outdated base.
   try {
     await fetchOrigin();
   } catch (err) {
@@ -147,62 +150,52 @@ async function replayStackLocked(
     };
   }
 
-  // Pass 1: resolve each slice's worktree + anchor (the old parent tip its
-  // commits sit on) BEFORE any rewrite — so the merge-base fallback sees
-  // pre-replay tips, AND so a missing worktree or unresolvable anchor fails
-  // the whole run before a single slice has been pushed.
-  const anchorById = new Map<string, string>();
-  for (const s of live) {
-    const p = pathByBranch.get(s.branch);
-    if (!p) {
-      return {
-        ok: false,
-        conflict: false,
-        error: `slice ${s.id} (${s.branch}) has no worktree — recreate it with \`wt stack apply ${stackId}\``,
-      };
-    }
-    const anchor = await resolveAnchor(s, byId, trunk, p);
+  // Pass 1: resolve each member's anchor (the old parent tip its
+  // commits sit on) BEFORE any rewrite — so the merge-base fallback
+  // sees pre-replay tips, AND so an unresolvable anchor fails the whole
+  // run before a single branch has been pushed.
+  const anchorByBranch = new Map<string, string>();
+  for (const s of chain.steps) {
+    const anchor = await resolveAnchor(s, parentRefOf(s, trunk), s.worktreePath);
     if (!anchor) {
       return {
         ok: false,
         conflict: false,
-        error: `could not resolve a replay anchor for ${s.branch} (no baseSha and no merge-base)${plannedParentHint(s, byId)}`,
+        error: `could not resolve a replay anchor for ${s.branch} (no recorded base sha and no merge-base with ${parentRefOf(s, trunk)})`,
       };
     }
-    anchorById.set(s.id, anchor);
+    anchorByBranch.set(s.branch, anchor);
   }
 
-  // Pass 2: replay top-down, threading each slice's new tip to its children.
-  // Worktree + anchor are guaranteed present from pass 1.
-  const newTipById = new Map<string, string>();
+  // Pass 2: replay top-down, threading each member's new tip to its
+  // children.
+  const newTipByBranch = new Map<string, string>();
   let replayed = 0;
-  for (const s of live) {
-    const worktreePath = pathByBranch.get(s.branch)!;
-    const anchor = anchorById.get(s.id)!;
-    const newBase = await resolveNewBaseSha(s, byId, trunk, newTipById, worktreePath);
+  for (const s of chain.steps) {
+    const anchor = anchorByBranch.get(s.branch)!;
+    const newBase = await resolveNewBaseSha(s, trunk, newTipByBranch, s.worktreePath);
     if (!newBase) {
       return {
         ok: false,
         conflict: false,
-        error: `could not resolve the new base for ${s.branch}${plannedParentHint(s, byId)}`,
+        error: `could not resolve the new base for ${s.branch} (parent ${s.parentBranch ?? trunk})`,
       };
     }
 
-    onLog(`replay ${s.id} (${s.branch})`);
-    const out = await restackEngine.replaySlice(
-      { branch: s.branch, worktreePath, anchor, newBase },
+    onLog(`replay ${s.branch}`);
+    const out = await restackEngine.replayStep(
+      { branch: s.branch, worktreePath: s.worktreePath, anchor, newBase },
       onLog,
     );
     if (!out.ok) {
       // Persist the failure to the daily app log — the engine only streams to
       // the console `onLog`, so a replay run from the CLI would otherwise leave
       // nothing to diagnose after the fact.
-      log.warn("replay slice failed", {
-        stackId,
-        slice: s.id,
+      log.warn("replay failed", {
+        stack: chain.root,
         branch: s.branch,
         conflict: out.conflict,
-        worktree: worktreePath,
+        worktree: s.worktreePath,
         anchor,
         newBase,
         error: out.error,
@@ -224,38 +217,52 @@ async function replayStackLocked(
       }
       return { ok: false, conflict: false, error: out.error };
     }
-    newTipById.set(s.id, out.newTip);
-    // Advance the stored anchor to the parent we just landed on, so the next
-    // restack is a cheap no-op when nothing has moved.
-    updateStackSlice(stackId, s.id, { baseSha: out.newBaseSha });
+    newTipByBranch.set(s.branch, out.newTip);
+    // Advance the stored anchor to the parent tip we just landed on, so
+    // the next restack is a cheap no-op when nothing has moved. A
+    // trunk-based member that never had a record stays record-free —
+    // its live merge-base with trunk IS the anchor. Compare-and-set: a
+    // background destroy may have reparented this record mid-replay
+    // (its writer isn't under the stack lock); when the record moved,
+    // leave it alone rather than clobbering the reparent with the
+    // stale pre-destroy parent.
+    if (s.parentBranch !== null || s.hasRecord) {
+      const advanced = advanceBaseAnchor(s.slug, s.parentBranch ?? trunk, out.newBaseSha);
+      if (!advanced) {
+        onLog(`  ${s.branch}: base record changed mid-replay — left for the next reconcile`);
+      }
+    }
 
-    // Keep the PR base aligned with the manifest when the slice actually
-    // moved (a parent that landed/rewrote shifts the child onto a new base)
-    // OR when the engine synced a stale remote — a hand-resolved conflict may
-    // have changed the parent too. A slice that neither moved nor pushed has
-    // a correct base already, so we skip the `gh pr view` probe — any
-    // residual drift still surfaces in `wt stack status`.
+    // Keep the PR base aligned with the recorded parent when the member
+    // actually moved (a parent that landed/rewrote shifts the child onto
+    // a new base) OR when the engine synced a stale remote — a
+    // hand-resolved conflict may have changed the parent too.
     if (out.moved) replayed++;
     if (out.moved || out.pushed) {
-      await retargetIfNeeded(s, resolveParentBranch(manifest, s), onLog);
+      await retargetIfNeeded(s.branch, s.parentBranch ?? trunk, onLog);
     }
   }
 
-  return { ok: true, output: `replayed ${replayed}/${live.length} slice(s)` };
+  return { ok: true, output: `replayed ${replayed}/${chain.steps.length} worktree(s)` };
+}
+
+/** The ref naming a member's parent tip as it stands now (pre-replay). */
+function parentRefOf(step: ChainStep, trunk: string): string {
+  return step.parentBranch ?? `origin/${trunk}`;
 }
 
 /**
- * The parent-tip SHA a slice currently sits on (the `rebase --onto` anchor):
- * the *descendant-most* of the stored `baseSha` and the live merge-base of the
- * slice with its current parent ref — computed before any replay so siblings
- * haven't moved.
+ * The parent-tip SHA a member currently sits on (the `rebase --onto`
+ * anchor): the *descendant-most* of the stored `baseSha` and the live
+ * merge-base of the branch with its current parent ref — computed before
+ * any replay so parents haven't moved.
  *
- * The stored `baseSha` is the squash-safe cut point (the parent tip this slice's
- * commits were last based on). A conflict bail hands resolution to a human, who
- * rebases the slice by hand and force-pushes WITHOUT updating the manifest, so
- * the stored anchor goes stale. Replaying off a stale anchor re-applies the
- * parent's already-present commits onto themselves, a bogus conflict on an
- * already-correct slice.
+ * The stored `baseSha` is the squash-safe cut point (the parent tip this
+ * branch's commits were last based on). A conflict bail hands resolution to a
+ * human, who rebases the branch by hand and force-pushes WITHOUT updating the
+ * record, so the stored anchor goes stale. Replaying off a stale anchor
+ * re-applies the parent's already-present commits onto themselves, a bogus
+ * conflict on an already-correct branch.
  *
  * Two ways the stored anchor goes stale, and why a bare `--is-ancestor` guard is
  * not enough (it bit eng-5182 twice, then eng-5244 again):
@@ -276,78 +283,49 @@ async function replayStackLocked(
  * excludes the squash-merged parent). Self-healing, no manual bookkeeping.
  */
 export async function resolveAnchor(
-  slice: StackSlice,
-  byId: Map<string, StackSlice>,
-  trunk: string,
+  step: Pick<ChainStep, "branch" | "baseSha">,
+  parentRef: string,
   cwd: string,
 ): Promise<string | null> {
-  const parentRef = currentParentRef(slice, byId, trunk);
-  const mb = await gitRun(["merge-base", slice.branch, parentRef], cwd);
+  const mb = await gitRun(["merge-base", step.branch, parentRef], cwd);
   const liveAnchor = mb.exitCode === 0 && mb.stdout.trim() ? mb.stdout.trim() : null;
 
-  if (slice.baseSha) {
+  if (step.baseSha) {
     const storedIsAncestor = await gitQuiet(
-      ["merge-base", "--is-ancestor", slice.baseSha, slice.branch],
+      ["merge-base", "--is-ancestor", step.baseSha, step.branch],
       cwd,
     );
     if (storedIsAncestor) {
-      if (!liveAnchor) return slice.baseSha;
+      if (!liveAnchor) return step.baseSha;
       // Both anchor the branch; use the more recent cut point. `baseSha` below
       // the live merge-base means the branch was rebased onto newer trunk —
       // the live merge-base is the true fork point (case 2). Otherwise the live
       // merge-base is at/below `baseSha` (squash case), so `baseSha` stands.
       const baseShaBelowLive = await gitQuiet(
-        ["merge-base", "--is-ancestor", slice.baseSha, liveAnchor],
+        ["merge-base", "--is-ancestor", step.baseSha, liveAnchor],
         cwd,
       );
-      return baseShaBelowLive ? liveAnchor : slice.baseSha;
+      return baseShaBelowLive ? liveAnchor : step.baseSha;
     }
   }
   return liveAnchor;
 }
 
 /**
- * Failure hint for a slice whose parent is still `planned`: replay skips
- * planned slices, so the parent's branch may not exist yet — the likely
- * reason an anchor or new base failed to resolve.
- */
-function plannedParentHint(slice: StackSlice, byId: Map<string, StackSlice>): string {
-  const parent = byId.get(slice.base);
-  return parent?.status === "planned"
-    ? ` — parent ${parent.id} is still planned; materialize it with \`wt stack apply\` first`
-    : "";
-}
-
-/** The ref naming a slice's parent tip as it stands now (pre-replay). */
-function currentParentRef(
-  slice: StackSlice,
-  byId: Map<string, StackSlice>,
-  trunk: string,
-): string {
-  if (isTrunkBase(slice)) return `origin/${trunk}`;
-  const sibling = byId.get(slice.base);
-  if (sibling) return sibling.branch;
-  return slice.base; // external parent branch
-}
-
-/**
- * The SHA to rebase a slice ONTO this run: trunk's freshly-fetched tip, the
- * parent sibling's just-replayed tip, or an external parent branch's live
- * tip (a stack stacked on an unmerged parent PR / another stack's tip).
+ * The SHA to rebase a member ONTO this run: trunk's freshly-fetched tip,
+ * an in-chain parent's just-replayed tip, or an external parent branch's
+ * live tip (a branch stacked on a parent with no live worktree).
  */
 async function resolveNewBaseSha(
-  slice: StackSlice,
-  byId: Map<string, StackSlice>,
+  step: ChainStep,
   trunk: string,
-  newTipById: Map<string, string>,
+  newTipByBranch: Map<string, string>,
   cwd: string,
 ): Promise<string | null> {
-  if (isTrunkBase(slice)) return revParse(`origin/${trunk}`, cwd);
-  const sibling = byId.get(slice.base);
-  if (sibling) {
-    const replayed = newTipById.get(sibling.id);
-    return replayed ?? revParse(sibling.branch, cwd);
-  }
-  // External parent branch: prefer the local checkout, fall back to origin.
-  return firstSha(cwd, [slice.base, `origin/${slice.base}`]);
+  if (step.parentBranch === null) return revParse(`origin/${trunk}`, cwd);
+  const replayed = newTipByBranch.get(step.parentBranch);
+  if (replayed) return replayed;
+  // Parent outside this run (external ref, or the standalone fallback):
+  // prefer the local checkout, fall back to origin.
+  return firstSha(cwd, [step.parentBranch, `origin/${step.parentBranch}`]);
 }

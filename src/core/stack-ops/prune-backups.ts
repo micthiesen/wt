@@ -9,7 +9,7 @@ export type PruneBackupsResult = { deleted: string[]; kept: string[] };
 /**
  * Delete restack backup branches (`backup/restack-*` and the retired stack
  * CLI's `backup/stack-sync-*`) older than `olderThanDays` (0 = all of them).
- * Backups exist to recover an in-flight conflict bail; once a slice replays
+ * Backups exist to recover an in-flight conflict bail; once a branch replays
  * clean the engine prunes its own, but conflict leftovers and pre-pruning
  * history pile up — this is the manual sweep. `git branch -D` doesn't destroy
  * commits; everything stays reachable via the reflog. Refs under `backup/`

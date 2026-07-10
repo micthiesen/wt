@@ -1,17 +1,15 @@
 /**
- * Materialization + maintenance for stack manifests. wt owns the
- * manifest (truth); this module turns a planned manifest into real
- * worktrees, commits, and draft PRs (`applyStack`), reports the manifest
- * DAG against live reality (`stackStatus`), reconciles the manifest with
- * landed PRs (`reconcileStack`), and drives the native squash-safe engine
- * to replay slices onto their (possibly rewritten) parents (`replayStack`).
- * `rebaseStack` is the thin reconcile-then-replay convenience. The genuinely
- * hard part (anchored cherry-pick replay) lives in `RestackEngine`.
+ * Restack maintenance over inferred stacks. `chain.ts` resolves which
+ * worktrees a restack walks (from live worktrees + fork-base records),
+ * `reconcile.ts` rewrites records when parents land, `replay.ts` drives
+ * the native squash-safe engine to replay members onto their (possibly
+ * rewritten) parents, and `rebaseStack` is the thin
+ * reconcile-then-replay convenience. The genuinely hard part (anchored
+ * rebase replay) lives in `RestackEngine`.
  */
 import { tryAcquireLock, type LockHandle } from "../locks.ts";
 import { createLogger } from "../logger.ts";
 import { retargetPrBase, viewPrInfo } from "../github.ts";
-import type { StackSlice } from "../wtstate.ts";
 
 export const log = createLogger("[stack-ops]");
 
@@ -21,14 +19,14 @@ export const STACK_LOCK_SLUG = "__stack__";
 export type Logger = (line: string) => void;
 
 /** Error every mutator returns/logs when the stack lock can't be had. */
-export const STACK_BUSY = "another wt stack operation is already running";
+export const STACK_BUSY = "another wt restack operation is already running";
 
 /**
  * Acquire the cross-process stack lock, waiting briefly for a live holder
- * to finish. EVERY manifest mutator takes this — not just replay. Each
- * mutator does read-manifest → async git/gh work → write-manifest-back, so
- * two unserialized writers (a CLI `wt stack apply` racing the TUI's
- * reconcile) would silently lose whichever write lands first.
+ * to finish. Both restack mutators take this — reconcile and replay each
+ * do read-records → async git/gh work → write-records-back, so two
+ * unserialized writers (a CLI `wt restack` racing the TUI's `R`) would
+ * silently lose whichever write lands first.
  */
 export async function acquireStackLock(phase: string): Promise<LockHandle | null> {
   const deadline = Date.now() + 5_000;
@@ -40,16 +38,17 @@ export async function acquireStackLock(phase: string): Promise<LockHandle | null
   }
 }
 
-/** Retarget a slice's PR base to `expectedBase` when GitHub disagrees. */
+/** Retarget a branch's PR base to `expectedBase` when GitHub disagrees.
+ *  The PR is resolved live (no cached number exists anymore); a branch
+ *  with no PR, or a PR that already left OPEN, is left alone. */
 export async function retargetIfNeeded(
-  slice: StackSlice,
+  branch: string,
   expectedBase: string,
   onLog: Logger,
 ): Promise<void> {
-  if (!slice.pr) return;
-  const live = await viewPrInfo(slice.branch);
-  if (!live || live.baseRefName === expectedBase) return;
-  const r = await retargetPrBase(slice.pr, expectedBase);
-  if (r.ok) onLog(`  retargeted PR #${slice.pr} base → ${expectedBase}`);
-  else onLog(`  warn: retarget PR #${slice.pr} base: ${r.error}`);
+  const live = await viewPrInfo(branch);
+  if (!live || live.state !== "OPEN" || live.baseRefName === expectedBase) return;
+  const r = await retargetPrBase(live.number, expectedBase);
+  if (r.ok) onLog(`  retargeted PR #${live.number} base → ${expectedBase}`);
+  else onLog(`  warn: retarget PR #${live.number} base: ${r.error}`);
 }

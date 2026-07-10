@@ -2,10 +2,11 @@
 name: wt
 description: >-
   Use the `wt` CLI/TUI to manage git worktrees: create, list, inspect, remove,
-  and drive per-worktree Claude Code sessions, plus the stacked-PR workflow
-  (`wt stack`). TRIGGER when the user mentions wt, worktrees, "a wt", or the
-  stack/split/restack workflow. For the full split or restack flows use the
-  dedicated /split and /restack skills; this is general orientation.
+  and drive per-worktree Claude Code sessions, plus stacked PRs (worktrees
+  based on other worktrees, restacked with `wt restack`). TRIGGER when the
+  user mentions wt, worktrees, "a wt", stacking, or restacking. For conflict
+  resolution during a restack use the dedicated /restack skill; this is
+  general orientation.
 targets:
   - '*'
 ---
@@ -26,49 +27,32 @@ the loader reports every missing field at once). The standard install aliases
 - `wt` — interactive TUI (vim keys: `j`/`k`/Enter, `?` for help).
 - `wt ls` — list worktrees.
 - `wt new <input>` — create a worktree (and branch). `--base <ref>` forks from a
-  non-trunk parent and records it (used as the worktree's diff/display base).
+  non-trunk parent and records it — the record that stacks the new worktree on
+  that parent (diff base, TUI grouping, restack target).
 - `wt rm [slug]` — remove a worktree (optionally its branch).
 - `wt clean` — bulk-remove merged/gone worktrees.
 - `wt doctor [slug]` — health report (dirty, sync, PR, merged).
 - `wt open [slug]` — open a worktree in the editor.
-- `wt size [paths…] [--json]` — production-LOC + file count for a diff (excludes
-  tests/snapshots/generated/lockfiles). On a holistic branch with a manifest it
-  breaks size down per slice.
 - `wt base <slug> | set <slug> <ref> | clear <slug>` — show/set/clear a
-  worktree's recorded fork base.
+  worktree's recorded fork base (the stack primitive).
+- `wt restack [<branch>] [--onto <ref>]` — rebase the stack containing a branch
+  onto its updated parents: reconcile records against landed PRs, squash-safe
+  replay, force-push, retarget PR bases. `wt restack prune-backups` sweeps the
+  engine's `backup/*` refs.
 - `wt logs [slug]` — tail background-destroy logs.
 
 Every subcommand runs non-interactively when stdout isn't a TTY. Run
 `wt <command> --help` for per-command options.
 
-## The stacked-PR workflow (`wt stack`)
+## Stacked PRs
 
-`wt` turns one validated branch into a stack (or parallel lanes) of small,
-reviewable draft PRs, then keeps them rebased. The manifest in wt's state is the
-single source of truth; the engine materializes and replays from it.
-
-- `wt stack context` — read-only pre-split context for the current worktree
-  (branch, base decision, changed files, `wt size`). Used by /split.
-- `wt stack hunks [--holistic <b>] [--unified <n>] <file>…` — content-hashed hunk
-  ids for hunk-level slice partitions.
-- `wt stack plan --from <file>` / `apply [--from <file>] [--verify]` — strict-
-  ingest a manifest, then materialize worktrees + draft PRs (`--verify`
-  typechecks each cumulative prefix in a throwaway worktree first).
-- `wt stack status [stackId] [--all]` — render the manifest DAG (a fork renders
-  as a tree) + drift vs reality. Defaults to the current branch's stack.
-- `wt stack section <stackId> <idOrPr> [label]` — the static PR-body "Stack"
-  section for one slice.
-- `wt stack reconcile` / `replay` / `rebase` — manifest bookkeeping, squash-safe
-  replay, and the combined one-shot used by /restack.
-- `wt stack split` / `add` — reshape a live slice into sub-slices, or append an
-  existing branch as a new tip slice.
-
-For the end-to-end flows, prefer the dedicated skills:
-- **/split** — carve a holistic branch into a stack and open the draft PRs.
-- **/restack** — rebase the stack on main, repair drift, resolve conflicts.
-
-Design rationale + the manifest contract: the wt repo's
-`docs/stacking-workflow.md`.
+There is no managed stack state: a worktree whose recorded base names another
+live worktree's branch is stacked on it, and chains of those records render as
+a stack in the TUI (tree spine, shared section, AI-titled header). Merged
+parents reparent their children automatically (clean/destroy and restack both
+preserve each child's squash-safe anchor), and `wt restack` / the TUI's `R`
+realign the commits. When a restack hits a conflict, use **/restack** to
+resolve it faithfully.
 
 ## User Instructions
 

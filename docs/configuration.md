@@ -127,16 +127,7 @@ Omit for classic poll-only behavior. When present, the `wt events` daemon accept
 
 | key | required | default | meaning |
 |---|---|---|---|
-| `command` | no | `"revdiff --vim-motion --compact {{base}}"` | Shell command F11 launches inside the selected worktree (via `$SHELL -lc`, so pipes and aliases work). `{{base}}` substitutes the worktree's resolved diff base: `origin/<trunk>` normally, the parent branch for stacked slices. Swap in `gitu`, `lazygit`, `tig status`, a `delta` pipe, or any script. Commands using `{{base}}` get their session killed when the resolved base changes (PR base flip, stack reroot) so the next F11 reopens against the right ref. |
-
-## `[stack]`
-
-Knobs for the stacked-PR engine (`wt stack`). See [stacking.md](stacking.md).
-
-| key | required | default | meaning |
-|---|---|---|---|
-| `verify_command` | no | *(unset)* | Command `wt stack apply --verify` runs against each cumulative slice prefix before creating branches/PRs (e.g. `"bun run typecheck"`). Unset ⇒ `--verify` errors asking for it. |
-| `verify_deps` | no | `["node_modules"]` | Gitignored dependency dirs symlinked into the throwaway verify worktree so the command can resolve modules. |
+| `command` | no | `"revdiff --vim-motion --compact {{base}}"` | Shell command F11 launches inside the selected worktree (via `$SHELL -lc`, so pipes and aliases work). `{{base}}` substitutes the worktree's resolved diff base: `origin/<trunk>` normally, the parent branch for stacked worktrees. Swap in `gitu`, `lazygit`, `tig status`, a `delta` pipe, or any script. Commands using `{{base}}` get their session killed when the resolved base changes (PR base flip, stack reroot) so the next F11 reopens against the right ref. |
 
 ## `[ui]`
 
@@ -191,7 +182,7 @@ Fields:
 
 ## `[[automations]]` — optional, strictly opt-in
 
-Rules that fire actions (or built-in flows) automatically off PR and stack state. No defaults ship; an absent section means nothing is automated. Deep dive on the semantics (fire keys, settle windows, circuit breaker): [automations.md](automations.md).
+Rules that fire actions (or built-in flows) automatically off PR and stack state ([stacked-prs.md](stacked-prs.md)). No defaults ship; an absent section means nothing is automated. Deep dive on the semantics (fire keys, settle windows, circuit breaker): [automations.md](automations.md).
 
 ```toml
 [[automations]]
@@ -211,7 +202,7 @@ settle_seconds   = 300
 | key | required | default | meaning |
 |---|---|---|---|
 | `id` | **yes** | — | Unique rule id (used in fire-key bookkeeping and logs). |
-| `on` | **yes** | — | Trigger: `pr.checks.failed`, `rabbit.unresolved` (CodeRabbit threads), `review.changes_requested`, `pr.conflict`, `wt.merged`, `stack.parent_merged`. |
+| `on` | **yes** | — | Trigger: `pr.checks.failed`, `rabbit.unresolved` (CodeRabbit threads), `review.changes_requested`, `pr.conflict`, `wt.merged` (a non-stacked worktree landed), `stack.parent_merged` (a stack member's parent landed). |
 | `run` | **yes** | — | An `[[actions]]` id, or a builtin: `builtin:restack` (only valid with `stack.parent_merged`), `builtin:clean` (any single-worktree trigger). |
 | `busy` | no | `"queue"` | When the worktree isn't quiescent at delivery time: `queue` holds the intent until it settles, `skip` drops it. |
 | `cooldown_minutes` | no | *(none)* | Minimum minutes between dispatches per (rule, worktree). |

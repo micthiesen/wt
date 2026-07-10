@@ -1,7 +1,9 @@
 /**
- * Fork-base picker flow (`b`): record / clear a worktree's diff base.
- * Extracted from `app.tsx`; rebuilt per render so the closures see
- * fresh rows / selection.
+ * Fork-base picker flow (`b`): record / clear a worktree's base — the
+ * record stacks are inferred from, so this is also how a worktree is
+ * stacked on (or unstacked from) a sibling by hand. Extracted from
+ * `app.tsx`; rebuilt per render so the closures see fresh rows /
+ * selection.
  */
 import { config } from "../../core/config.ts";
 import type { Worktree } from "../../core/types.ts";
@@ -27,14 +29,32 @@ export function makeBaseFlows(ctx: BaseFlowsCtx) {
       toast("archived rows have no live worktree to diff", theme.fgDim, 2000);
       return;
     }
-    if (current.stack && !current.stack.isHolistic) {
-      toast("stack slices get their base from the manifest — use /restack or `wt stack`", theme.fgDim, 2500);
-      return;
-    }
-    const recorded =
-      current.stackedOn?.via === "fork" ? current.stackedOn.branch : null;
+    const recorded = current.stackedOn?.branch ?? null;
+    // A branch already based on THIS worktree (directly or transitively)
+    // is excluded: picking a descendant as the base would close a record
+    // cycle, which the layout degrades to flat rows — a silent trap.
+    const parentOf = new Map(
+      rows
+        .filter((r) => !r.archived && r.stackedOn)
+        .map((r) => [r.wt.branch, r.stackedOn!.branch] as const),
+    );
+    const basedOnCurrent = (branch: string): boolean => {
+      const seen = new Set<string>();
+      let b: string | undefined = branch;
+      while (b && !seen.has(b)) {
+        if (b === current.wt.branch) return true;
+        seen.add(b);
+        b = parentOf.get(b);
+      }
+      return false;
+    };
     const siblings = rows
-      .filter((r) => !r.archived && r.wt.slug !== current.wt.slug)
+      .filter(
+        (r) =>
+          !r.archived &&
+          r.wt.slug !== current.wt.slug &&
+          !basedOnCurrent(r.wt.branch),
+      )
       .map((r) => r.wt.branch);
     // A recorded base whose worktree was already cleaned (branch kept)
     // wouldn't show up via the rows scan — surface it anyway so the

@@ -112,36 +112,13 @@ function StatusMarker({ row }: { row: WorktreeRow }) {
 }
 
 /**
- * Glyph for the holistic-origin row pinned at the bottom of a stack: a
- * hollow diamond (the slices are solid ◆) signalling "the whole this
- * stack was carved from", kept around until it's `wt rm`'d post-split.
- */
-const HOLISTIC_GLYPH = "◇";
-
-/**
- * Left gutter for a managed-stack row, repurposing the status-marker
- * slot: a 1-cell tree connector (structural, dim) followed by the 2-cell
- * stack ordinal colored by the slice's worktree status (so dirty/merged/
- * busy still read at a glance without a separate status glyph). The
- * holistic-origin row carries no ordinal — just the distinct dim glyph.
+ * Left gutter for a stacked row, repurposing the status-marker slot: a
+ * 1-cell tree connector (structural, dim) followed by the 2-cell stack
+ * ordinal colored by the member's worktree status (so dirty/merged/
+ * busy still read at a glance without a separate status glyph).
  */
 function StackGutter({ row }: { row: WorktreeRow }) {
   const info = row.stack!;
-  if (info.isHolistic) {
-    return (
-      <box flexShrink={0} flexDirection="row">
-        <box width={2} flexShrink={0}>
-          <text> </text>
-        </box>
-        <box width={1} flexShrink={0}>
-          <text fg={theme.fgDim}>{HOLISTIC_GLYPH}</text>
-        </box>
-        <box width={1} flexShrink={0}>
-          <text> </text>
-        </box>
-      </box>
-    );
-  }
   const ordFg = row.archived ? theme.fgDim : statusBadge(row.status).fg;
   const ord = stackOrdinalLabel(info.ordinal);
   return (
@@ -170,13 +147,9 @@ function StackGutter({ row }: { row: WorktreeRow }) {
  * LLM emits lowercase.
  */
 export function rowLabel(row: WorktreeRow): string {
-  // The holistic origin's title is the feature title — already on the
-  // section header — so showing it again is noise. Label it for what it
-  // is instead; the dim glyph + text mark it as the carved-from source.
-  if (row.stack?.isHolistic) return "holistic source";
   const text = capitalizeFirst(row.brief ?? row.title);
   // Inside a stack section the issue ID is on the section header, so the
-  // row drops the redundant `<id>: ` prefix and shows just the slice.
+  // row drops the redundant `<id>: ` prefix and shows just the member.
   if (row.stack) return text;
   const { id } = slugLabel(row.wt.slug);
   const numId = id ? id.replace(/^[A-Z]+-/, "") : null;
@@ -208,10 +181,9 @@ const RowView = memo(function RowView({
   panelWidth: number;
 }) {
   const bg = selected ? theme.rowSelectedBg : undefined;
-  // Archived rows and the holistic-origin row render dim (unless selected,
-  // where we still want contrast). The holistic row is a kept-around
-  // source, not active work, so it recedes the same way archived does.
-  const dimRow = row.archived || (row.stack?.isHolistic ?? false);
+  // Archived rows render dim (unless selected, where we still want
+  // contrast).
+  const dimRow = row.archived;
   const slugFg = dimRow
     ? selected
       ? theme.fg

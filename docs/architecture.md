@@ -23,7 +23,7 @@ The list panel (`src/tui/panels/list.tsx`) is deliberately **not** row-driven �
 
 ## Module layout conventions
 
-The big core modules are directories behind a same-named flat barrel: `core/github.ts` → `core/github/`, `core/wtstate.ts` → `core/wtstate/`, `core/stack-ops.ts` → `core/stack-ops/`, `core/actions.ts` → `core/actions/`, `core/tmux.ts` → `core/tmux/`, `state/queries.ts` → `state/queries/`. The barrel re-exports the module's public surface with explicit named re-exports — importers keep using the flat path; only names in the barrel are public. (`tui/modal-keys/` and `cli/commands/stack/` are plain directories — their single consumers import `index.ts` directly.)
+The big core modules are directories behind a same-named flat barrel: `core/github.ts` → `core/github/`, `core/wtstate.ts` → `core/wtstate/`, `core/stack-ops.ts` → `core/stack-ops/`, `core/actions.ts` → `core/actions/`, `core/tmux.ts` → `core/tmux/`, `state/queries.ts` → `state/queries/`. The barrel re-exports the module's public surface with explicit named re-exports — importers keep using the flat path; only names in the barrel are public. (`tui/modal-keys/` is a plain directory — its single consumer imports `index.ts` directly.)
 
 Per-harness code (claude/codex/opencode session discovery, naming, events, usage, tails) lives under `core/harness/<harness>/` behind the generic `Harness` interface (`core/harness/types.ts`); `core/harness/status.ts` is the shared `DerivedState` vocabulary.
 
@@ -36,7 +36,7 @@ Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. E
 | `.git/refs/` watcher (commits, fetches, pushes) | github + per-worktree fields + wtState |
 | `.git/worktrees/` watcher (worktree add/remove) | worktree list |
 | per-worktree dir watchers | edits → dirty; `.sst/` writes → deploy |
-| `~/.cache/wt/state.json` + `archive.json` watcher | cross-process stack / section / archive writes |
+| `~/.cache/wt/state.json` + `archive.json` watcher | cross-process fork-base / section / archive writes |
 | `~/.cache/wt/locks/` watcher | per-slug busy state from any process; a release also fans out a per-slug field refresh (`useLockReleasedInvalidator`) |
 | github-events webhook marker | github + a staleTime-gated `git fetch origin` |
 | 3-minute `fetch origin` interval | backstop for remote drift |

@@ -4,14 +4,8 @@ import { dirname, join } from "node:path";
 
 import { withFileLock } from "../locks.ts";
 import { createLogger } from "../logger.ts";
-import {
-  GROUP_INBOX,
-  STACK_SECTION_PREFIX,
-  parseManifest,
-  stackIdFromSectionKey,
-  stackSectionKey,
-} from "./types.ts";
-import type { RemovedWorktree, StackManifest, WtSlugState, WtState } from "./types.ts";
+import { GROUP_INBOX, STACK_SECTION_PREFIX } from "./types.ts";
+import type { RemovedWorktree, WtSlugState, WtState } from "./types.ts";
 
 /**
  * Directory holding the cross-process state files (`state.json` here,
@@ -49,15 +43,6 @@ export function readWtState(): WtState {
         }
       }
     }
-    // Stacks parse before the order array — the self-heal below needs
-    // the live manifest set to seed/prune stack section keys.
-    const stacks: Record<string, StackManifest> = {};
-    if (data?.stacks && typeof data.stacks === "object") {
-      for (const [k, v] of Object.entries(data.stacks)) {
-        const m = parseManifest(v);
-        if (m) stacks[k] = m;
-      }
-    }
     const rawOrder: string[] = [];
     if (Array.isArray(data?.sectionsOrder)) {
       const seen = new Set<string>();
@@ -68,31 +53,21 @@ export function readWtState(): WtState {
         rawOrder.push(s);
       }
     }
-    const liveStackKeys = Object.keys(stacks)
-      .map(stackSectionKey)
-      .sort((a, b) => a.localeCompare(b));
     let sectionsOrder: string[];
     if (!rawOrder.includes(GROUP_INBOX)) {
       // Pre-unification file (manual names only): seed the unified order
       // with the legacy bucket layout so the migration changes nothing
-      // visually — stacks (alphabetical, as the buckets sorted them),
-      // then the inbox, then the manual sections in their stored order.
+      // visually — the inbox, then the manual sections in their stored
+      // order. Stack keys (inferred at runtime) enter lazily on a move.
       sectionsOrder = [
-        ...liveStackKeys,
         GROUP_INBOX,
         ...rawOrder.filter((s) => !s.startsWith(STACK_SECTION_PREFIX)),
       ];
     } else {
-      // Drop stack keys whose manifest is gone; float new stacks to the
-      // very top (matching where stack sections always appeared before
-      // they were orderable). Deterministic in-memory heal — persisted
-      // whenever the next mutator writes the state back.
-      const kept = rawOrder.filter((s) => {
-        const sid = stackIdFromSectionKey(s);
-        return sid === null || sid in stacks;
-      });
-      const missing = liveStackKeys.filter((k) => !kept.includes(k));
-      sectionsOrder = [...missing, ...kept];
+      // Stack liveness can't be checked here (stacks are inferred from
+      // the live worktree list, which this module doesn't see); stale
+      // stack keys are inert — nothing renders for them — and cheap.
+      sectionsOrder = rawOrder;
     }
     // Self-heal: any manual section referenced by a slug but missing from
     // sectionsOrder gets appended in discovery order.
@@ -142,7 +117,6 @@ export function readWtState(): WtState {
     return {
       slugs,
       sectionsOrder,
-      stacks,
       foldedSections,
       pausedStacks,
       automationsPaused: data?.automationsPaused === true,
@@ -158,7 +132,6 @@ export function emptyWtState(): WtState {
   return {
     slugs: {},
     sectionsOrder: [],
-    stacks: {},
     foldedSections: [],
     pausedStacks: [],
     automationsPaused: false,
@@ -190,7 +163,7 @@ export function writeWtState(state: WtState): void {
 /**
  * Serialize a state-file read-modify-write across processes. The atomic
  * rename in `writeWtState` stops torn reads, but two concurrent WRITERS
- * (the TUI's startup reap vs a CLI `wt stack` mutation) each write back
+ * (the TUI's startup reap vs a CLI `wt base` mutation) each write back
  * from their own pre-write snapshot, silently dropping whichever update
  * landed in between. Every mutator below wraps its read→mutate→write in
  * this blocking flock; the critical sections are pure sync JSON work, so

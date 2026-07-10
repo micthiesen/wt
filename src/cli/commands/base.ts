@@ -10,10 +10,11 @@ const USAGE = `usage: wt base <slug>                show the recorded fork base
        wt base clear <slug>         forget the recorded fork base
 
 The fork base is what \`wt new --base <ref>\` records: the branch a
-worktree was forked from, used as its display/diff base in the TUI.
-A stack-manifest slice ignores it (the manifest wins). \`set\` exists
-for backfill — worktrees created before recording existed, or whose
-base changed by hand.`;
+worktree is based on. It is THE stack primitive — worktrees whose
+records chain into each other render as a stack, diff against their
+parent, and replay onto it on \`wt restack\`. \`set\` exists for
+backfill — worktrees created before recording existed, or whose base
+changed by hand.`;
 
 async function findWorktree(slug: string): Promise<Worktree | null> {
   const wts = (await listWorktrees()).filter((w) => !w.isMain);
@@ -39,6 +40,10 @@ async function set(slug: string, ref: string): Promise<number> {
   const branch = ref.replace(/^origin\//, "");
   if (branch === config.branch.base) {
     console.error(red(`${branch} is trunk — that's the default; use \`wt base clear\` instead`));
+    return 2;
+  }
+  if (branch === wt.branch) {
+    console.error(red(`${branch} is ${slug}'s own branch — a worktree can't be based on itself`));
     return 2;
   }
   if (!(await revParse(ref)) && !(await revParse(`origin/${branch}`))) {

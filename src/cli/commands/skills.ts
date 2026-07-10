@@ -19,7 +19,7 @@ const SKILLS_ROOT = join(import.meta.dir, "..", "..", "..", "skills");
 
 const USAGE = `usage: wt skills install [--harness claude|codex|opencode] [--rulesync] [options] [<name>...]
 
-Install wt's bundled workflow skills (split, restack, wt) into a harness's
+Install wt's bundled workflow skills (restack, wt) into a harness's
 skills directory. With no <name>, installs all of them.
 
 modes (pick one):

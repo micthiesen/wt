@@ -69,42 +69,23 @@ Tail a destroy log (`tail -F`). No slug ⇒ the most recently modified log.
 
 ### `wt base <slug>` / `wt base set <slug> <ref>` / `wt base clear <slug>`
 
-Show / record / forget a worktree's fork base — the branch it forked from when that isn't trunk. The TUI's base row, sync counts, diff, and AI summary all resolve against it. A stack manifest, when one exists, wins over this record.
-
-### `wt size [<path>...]`
-
-Production-LOC + file count for a diff (excludes tests, snapshots, generated files, lockfiles) — the budget you split stacks against.
-
-- `--base <ref>` — diff base (default `origin/<branch.base>`).
-- `--stack <stackId>` — per-slice breakdown for a stack (auto-selected when run on a holistic branch with a manifest).
-- `--json` — machine-readable.
+Show / record / forget a worktree's fork base — the branch it's based on when that isn't trunk. This record is the stack primitive (see [stacked-prs.md](stacked-prs.md)): the TUI's base row, stack grouping, sync counts, diff, and AI summary all resolve against it, and `wt restack` replays onto it.
 
 ## Stacked PRs
 
-### `wt stack <sub>`
+### `wt restack [<branch>] [--onto <ref>]`
 
-The stacked-PR manifest engine — see [stacking.md](stacking.md) for the workflow it powers.
+Rebase the stack containing `<branch>` (default: the current worktree's branch) onto its updated parents — see [stacked-prs.md](stacked-prs.md). Fetches, reconciles each member's fork-base record against landed PRs (a merged parent reparents its children, anchors preserved), then squash-safe-replays every member onto its parent, force-pushes, and retargets PR bases. `--onto <ref>` overrides the trunk the roots land on.
 
-| sub | what it does |
-|---|---|
-| `plan --from <file>` | strict-validate + ingest a manifest JSON (no side effects); prints the `stackId` |
-| `apply <stackId>` (or `--from <file>`) | materialize the manifest: a worktree + draft PR per slice. `--install` runs installs per slice (default off); `--verify` typechecks each cumulative prefix first (needs `[stack].verify_command`) |
-| `status [stackId]` | render the stack DAG + drift vs live PR state. `--json`, `--all` |
-| `rebase [stackId]` | `reconcile` + `replay` in one shot — the post-merge restack. `--onto <ref>` |
-| `reconcile [stackId]` | bookkeeping only: mark merged slices, reparent children (incl. a landed stack-on-stack parent) |
-| `replay [stackId]` | squash-safe replay of each slice onto its moved parent + PR base retarget |
-| `add [<branch>] [<stackId>]` | append an existing branch to a live stack as a new tip slice (adopts its open PR or opens a draft). `--onto <sliceId\|branch>`, `--title <t>` |
-| `split <stackId> <sliceId> --from <frag>` | reshape: replace one slice with N sub-slices, re-threading descendants. `--plan` previews; `--apply` chains apply + replay |
-| `hunks <file>...` | list a file's holistic-diff hunk ids for hunk-level partitioning (consumed by `/split`). `--holistic <branch>`, `-U <n>`, `--json` |
-| `section <stackId> <sliceIdOrPr> [label]` | print a slice's static PR-body "Stack" section |
-| `context` | read-only pre-`/split` dump: base decision, changed files, `wt size` |
-| `prune-backups` | delete `backup/restack-*` branches older than `--days <n>` (default all) |
+On a merge conflict it exits 3 and names the failing branch + backup branch — `wt` never auto-resolves conflicts; the `/restack` skill (or you) does.
 
-On a merge conflict, `replay`/`rebase` exit 3 and name the failing branch + backup branch — `wt` never auto-resolves conflicts; the `/restack` skill (or you) does.
+### `wt restack prune-backups [--days <n>]`
+
+Delete the engine's `backup/restack-*` branches older than `--days` (default all).
 
 ### `wt skills install [<name>...]`
 
-Install wt's bundled agent skills (`split`, `restack`, a `wt` reference skill). No names ⇒ all.
+Install wt's bundled agent skills (`restack`, a `wt` reference skill). No names ⇒ all.
 
 - `--harness <claude|codex|opencode>` — copy into that harness's native skills dir.
 - `--rulesync` — copy into a rulesync source dir instead (`--dest` overrides, `--build` regenerates immediately). Mutually exclusive with `--harness`.

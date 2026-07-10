@@ -6,15 +6,13 @@
  * semantics as when these lived inline).
  */
 import { actionRegistry } from "../../core/actions.ts";
-import { config } from "../../core/config.ts";
 import { spawnBackgroundRemove } from "../../core/lifecycle.ts";
 import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { removeShellLog } from "../../core/shell-tail.ts";
-import { rebaseStack, reconcileStack } from "../../core/stack-ops.ts";
+import { rebaseStack } from "../../core/stack-ops.ts";
 import { killAllSessionsFor } from "../../core/tmux.ts";
 import {
-  findStackIdByBranch,
   recordRemovedWorktrees,
   type RemovedWorktree,
 } from "../../core/wtstate.ts";
@@ -239,78 +237,49 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       });
       createLogger(row.wt.slug).event.info("dispatched destroy (clean)");
     }
-    // Cleaning a merged stack slice orphans its children: their recorded
-    // base is the branch we just deleted, so the list would diff/sync
-    // against a dead ref and surface a raw rev-parse error. Reconcile the
-    // affected manifests now — pure bookkeeping (mark merged, reparent the
-    // orphans onto trunk), no rebase/push — so the children re-root and the
-    // error clears. The actual replay (rebasing commits off the squashed
-    // parent) stays an explicit `/restack`.
-    void reconcileCleanedStacks(candidates.map((r) => r.wt.branch));
+    // Cleaning a merged stack member reparents its children's fork-base
+    // records inside the background remove itself (the branch delete
+    // triggers `reparentBaseReferences`, anchors preserved), so no
+    // TUI-side bookkeeping is needed here. The actual replay (rebasing
+    // commits off the squashed parent) stays an explicit `R`/`/restack`.
     setTimeout(() => void refreshAll(), 600);
   }
 
   /**
-   * Manifest-only reconcile of every stack a just-cleaned branch belonged
-   * to. Local + idempotent (no git history rewrite, no force-push), so it's
-   * safe to run automatically off the `c` keystroke; it probes live PR
-   * state to mark merged slices and reparents their orphaned children onto
-   * trunk. Best-effort: a failure logs and leaves the manifest as-is for an
-   * explicit `/restack` to repair.
-   */
-  async function reconcileCleanedStacks(branches: readonly string[]): Promise<void> {
-    const stackIds = new Set<string>();
-    for (const branch of branches) {
-      const id = findStackIdByBranch(branch);
-      if (id) stackIds.add(id);
-    }
-    if (stackIds.size === 0) return;
-    for (const stackId of stackIds) {
-      try {
-        await reconcileStack(stackId, config.branch.base, (line) =>
-          appLog.event.dim(`reconcile ${stackId}: ${line}`),
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        appLog.event.warn(`reconcile ${stackId} failed: ${msg}`);
-      }
-    }
-    void refreshAll();
-  }
-
-  /**
-   * `R` — the algorithmic fast path for restacking. Resolves the stack the
-   * selected worktree belongs to (its branch → `findStackIdByBranch`) and
-   * runs the whole stack through `rebaseStack`: fetch, reconcile, then
-   * squash-safe replay of every slice onto its parent (already-based slices
-   * are cheap no-ops). No model input — it streams progress to the activity
-   * pane. On a clean conflict bail it stops and points at `/restack`, which
-   * owns the judgment the engine can't do. Whole-stack on purpose: restack is
-   * a coherence operation, and the worktree only selects *which* stack.
+   * `R` — the algorithmic fast path for restacking. Runs the whole
+   * stack containing the selected worktree through `rebaseStack`:
+   * fetch, reconcile the fork-base records against landed PRs, then
+   * squash-safe replay of every member onto its parent (already-based
+   * members are cheap no-ops). No model input — it streams progress to
+   * the activity pane. On a clean conflict bail it stops and points at
+   * `/restack`, which owns the judgment the engine can't do.
+   * Whole-stack on purpose: restack is a coherence operation, and the
+   * worktree only selects *which* stack.
    */
   async function doReplayStack(): Promise<void> {
     const { current } = ctx;
     if (!current?.wt.branch) {
-      toast("select a stack slice first", theme.warn, 2000);
+      toast("select a stacked worktree first", theme.warn, 2000);
       return;
     }
-    const stackId = findStackIdByBranch(current.wt.branch);
-    if (!stackId) {
-      toast("not a stack slice", theme.warn, 2000);
+    if (!current.stack && !current.stackedOn) {
+      toast("not stacked — no recorded base (b) and no dependents", theme.warn, 2500);
       return;
     }
-    await doRestackStack(stackId);
+    await doRestackStack(current.wt.branch);
   }
 
   /**
-   * The stack-resolved half of `doReplayStack`, shared with the
+   * The branch-resolved half of `doReplayStack`, shared with the
    * automations engine (`builtin:restack` dispatches here after
-   * pre-cleaning the merged slices via `doCleanSlugs`). "busy" means
-   * the app-wide restack mutex was held (a manual `R` or another
-   * auto-restack) and NOTHING ran — the automations engine un-consumes
-   * the fire on that outcome instead of recording a restack that never
-   * happened. "clean" / "failed" report the replay itself; the
-   * conflict-bail escalation to /restack stays manual either way.
+   * pre-cleaning the merged members via `doCleanSlugs`). `stackId` is
+   * any branch in the target stack (the engine resolves the whole
+   * chain from it). "busy" means the app-wide restack mutex was held
+   * (a manual `R` or another auto-restack) and NOTHING ran — the
+   * automations engine un-consumes the fire on that outcome instead of
+   * recording a restack that never happened. "clean" / "failed" report
+   * the replay itself; the conflict-bail escalation to /restack stays
+   * manual either way.
    */
   async function doRestackStack(
     stackId: string,

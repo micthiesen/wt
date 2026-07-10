@@ -30,7 +30,7 @@ import type { WorktreeRow } from "./hooks/useWorktreeRows.ts";
 
 export type AutomationFire = {
   rule: AutomationDef;
-  /** Worktree the run targets (for stack triggers: the first open slice). */
+  /** Worktree the run targets (for stack triggers: the first open member). */
   slug: string;
   /**
    * Every slug that must be quiescent before delivery. Single-worktree
@@ -44,7 +44,7 @@ export type AutomationFire = {
    * is fresh while ANY key is unseen; dispatch records ALL of them.
    */
   fireKeys: readonly string[];
-  /** Stack id for `builtin:restack` dispatches; null otherwise. */
+  /** Stack id (root branch) for `builtin:restack` dispatches; null otherwise. */
   stackId: string | null;
   /** Human-readable trigger summary for the activity-pane event line. */
   detail: string;
@@ -165,8 +165,8 @@ function evaluateRowTrigger(
       );
     }
     case "wt.merged": {
-      // Non-stack worktrees only — merged stack slices are cleaned by
-      // the stack.parent_merged → builtin:restack path, and letting
+      // Non-stacked worktrees only — merged stack members are cleaned
+      // by the stack.parent_merged → builtin:restack path, and letting
       // both fire would race a clean against a whole-stack restack.
       if (row.stack) return null;
       // The PR-merged leg of isCleanCandidate needs fresh github data;
@@ -199,14 +199,12 @@ function evaluateRowTrigger(
  * `stack.parent_merged`: a stack needs a restack because a parent
  * landed. Three parent shapes, unioned into one fire per stack:
  *
- *  - an in-manifest slice merged with open slices remaining (keyed per
- *    merged parent PR so a second landing later re-fires);
- *  - a STACK-ON-STACK external parent merged — an open slice whose
- *    resolved base branch lives outside this manifest (another stack's
- *    tip, or a plain PR branch) and whose row shows merged. The
- *    restack's `reconcileStack` external-parent pass reparents the
- *    slice onto trunk, and the pre-clean covers the parent's worktree
- *    (its own stack's manifest gets reconciled by the clean flow);
+ *  - an in-stack member merged with open members stacked on it (keyed
+ *    per merged parent PR so a second landing later re-fires);
+ *  - an external parent merged — an open member whose recorded base
+ *    branch lives outside this stack's members and whose row shows
+ *    merged. The restack's `reconcileStack` reparents the member, and
+ *    the pre-clean covers the parent's worktree;
  *  - an external parent with NO live worktree row at all (`extgone`) —
  *    covers the race where the parent was cleaned before this fire
  *    delivered, and heals pre-existing stale boundaries at boot. Fires
@@ -214,7 +212,7 @@ function evaluateRowTrigger(
  *    directly and no-ops when the parent is actually still open, so a
  *    false positive costs one idle reconcile+replay.
  *
- * Targets the first open slice (event attribution + action target);
+ * Targets the first open member (event attribution + action target);
  * quiesces the whole stack plus any merged external parent, since the
  * restack pre-cleans those and replays everything else.
  */
@@ -225,11 +223,11 @@ function evaluateStackTrigger(
 ): AutomationFire[] {
   const byStack = new Map<string, WorktreeRow[]>();
   // Stacks with ANY individually-paused member are skipped entirely —
-  // a restack rebases the whole stack, so a Ctrl+A on one slice must
+  // a restack rebases the whole stack, so a Ctrl+A on one member must
   // protect it from sibling-triggered fires too, not just its own.
   const pausedStacks = new Set<string>();
   for (const row of rows) {
-    if (!row.stack || row.stack.isHolistic) continue;
+    if (!row.stack) continue;
     if (ctx.isPausedSlug(row.wt.slug)) {
       pausedStacks.add(row.stack.stackId);
       continue;
@@ -251,8 +249,8 @@ function evaluateStackTrigger(
     );
     const open = members.filter((r) => !merged.includes(r));
     if (open.length === 0) continue;
-    // Cross-stack boundary: open slices whose resolved base branch is
-    // outside this manifest. `stackedOn` is already resolved against
+    // Cross-stack boundary: open members whose recorded base branch is
+    // outside this stack's members. `stackedOn` is already resolved against
     // the live worktree list (slug null = no worktree for that branch).
     const memberBranches = new Set(members.map((r) => r.wt.branch));
     const extMerged: WorktreeRow[] = [];
@@ -292,7 +290,7 @@ function evaluateStackTrigger(
     ];
     if (fireKeys.length === 0) continue;
     const parts: string[] = [];
-    if (merged.length > 0) parts.push(pluralize(merged.length, "merged slice"));
+    if (merged.length > 0) parts.push(pluralize(merged.length, "merged member"));
     if (extMerged.length > 0) {
       parts.push(
         `merged external parent ${extMerged.map((r) => (r.pr ? `#${r.pr.number}` : r.wt.branch)).join(", ")}`,
@@ -310,7 +308,7 @@ function evaluateStackTrigger(
       ],
       fireKeys,
       stackId,
-      detail: `${parts.join(" + ")} under ${pluralize(open.length, "open slice")}`,
+      detail: `${parts.join(" + ")} under ${pluralize(open.length, "open member")}`,
     });
   }
   return fires;

@@ -1,20 +1,20 @@
 /**
- * The native squash-safe restack ENGINE. wt owns the stack manifest
- * (the truth); this is the one genuinely hard mechanical piece —
- * replaying a slice's own commits onto a rewritten parent without
- * double-applying — done in pure git, no external `stack` CLI.
+ * The native squash-safe restack ENGINE — the one genuinely hard
+ * mechanical piece: replaying a branch's own commits onto a rewritten
+ * parent without double-applying, done in pure git.
  *
  * Squash-safe replay, in one line: `git rebase --onto <newParentTip>
- * <anchor> <branch>`, where `anchor` is the parent-tip SHA the slice's
- * commits were last based on (`StackSlice.baseSha`). Only `anchor..branch`
- * — the slice's OWN commits — moves; a parent that squash-merged (its
- * commit no longer present as-is on the new base) is simply excluded,
- * with no patch-id guessing. Each slice is replayed IN ITS OWN WORKTREE
- * (HEAD rebases in place), so there's no `git branch -f` on a
- * checked-out branch and thus no worktree "parking" to do.
+ * <anchor> <branch>`, where `anchor` is the parent-tip SHA the branch's
+ * commits were last based on (the slug's recorded `baseSha`). Only
+ * `anchor..branch` — the branch's OWN commits — moves; a parent that
+ * squash-merged (its commit no longer present as-is on the new base) is
+ * simply excluded, with no patch-id guessing. Each branch is replayed
+ * IN ITS OWN WORKTREE (HEAD rebases in place), so there's no
+ * `git branch -f` on a checked-out branch and thus no worktree
+ * "parking" to do.
  *
- * The engine is per-slice and stateless. Ordering, anchor resolution,
- * manifest reconcile, and PR-base retargeting live in `stack-ops.ts`;
+ * The engine is per-branch and stateless. Ordering, anchor resolution,
+ * record reconcile, and PR-base retargeting live in `stack-ops.ts`;
  * cross-run serialization (the flock) is taken there too, around the
  * whole replay. The `RestackEngine` seam stays so the replay mechanism
  * can be swapped or tested in isolation.
@@ -26,14 +26,14 @@ import { gitRun, revParse } from "../git.ts";
 
 export type ReplayLogger = (line: string) => void;
 
-/** One slice's replay request. */
+/** One branch's replay request. */
 export type ReplayStep = {
   branch: string;
-  /** The slice's own worktree; the rebase happens here, in place. */
+  /** The branch's own worktree; the rebase happens here, in place. */
   worktreePath: string;
-  /** Old parent-tip SHA the slice's commits sit on (the `--onto` cut point). */
+  /** Old parent-tip SHA the branch's commits sit on (the `--onto` cut point). */
   anchor: string;
-  /** New parent tip to land the slice's commits on — a sha or a resolvable ref. */
+  /** New parent tip to land the branch's commits on — a sha or a resolvable ref. */
   newBase: string;
 };
 
@@ -44,13 +44,13 @@ export type ReplayOutcome =
 
 export interface RestackEngine {
   /**
-   * Squash-safe replay of ONE slice in its worktree, then force-with-lease
-   * push. A no-op (`moved: false`) when the slice already sits on `newBase`.
+   * Squash-safe replay of ONE branch in its worktree, then force-with-lease
+   * push. A no-op (`moved: false`) when the branch already sits on `newBase`.
    * Bails clean on a cherry-pick conflict: aborts the rebase, leaves a
    * `backup/...` branch at the pre-rebase tip, and returns it so the caller
    * hands resolution to a human / skill. wt never auto-resolves conflicts.
    */
-  replaySlice(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome>;
+  replayStep(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome>;
 }
 
 /**
@@ -114,7 +114,7 @@ async function abortRebaseWithRetry(cwd: string): Promise<{ ok: true } | { ok: f
 }
 
 export class NativeRestackEngine implements RestackEngine {
-  async replaySlice(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome> {
+  async replayStep(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome> {
     const { branch, worktreePath, anchor, newBase } = step;
     const newBaseSha = await revParse(newBase, worktreePath);
     if (!newBaseSha) {
@@ -125,7 +125,7 @@ export class NativeRestackEngine implements RestackEngine {
       return { ok: false, conflict: false, error: `cannot resolve branch ${branch}` };
     }
 
-    // Parent tip unchanged → the slice already sits on the right base.
+    // Parent tip unchanged → the branch already sits on the right base.
     // Nothing to replay; report the current tip so the chain continues.
     // Still push if the remote lags the local tip — the common case is a
     // hand-resolved conflict the operator rebased but forgot to push.
@@ -243,7 +243,7 @@ export class NativeRestackEngine implements RestackEngine {
       return { ok: false, conflict: false, error: `lost ${branch} tip after rebase` };
     }
 
-    // Already correct and unmoved by the rebase (e.g. all of the slice's
+    // Already correct and unmoved by the rebase (e.g. all of the branch's
     // commits were already present on the new base). Still sync a stale
     // remote, same as the skip path above.
     if (newTip === beforeTip) {
@@ -275,9 +275,9 @@ export class NativeRestackEngine implements RestackEngine {
 
 /**
  * Push `branch` when `origin/<branch>` exists but lags the local tip — the
- * slice positionally needed no replay, but a hand-resolved conflict (or any
+ * branch positionally needed no replay, but a hand-resolved conflict (or any
  * out-of-band local rebase) left the remote behind. A branch with no origin
- * ref is left alone (a planned slice has no PR yet; don't invent a remote).
+ * ref is left alone (don't invent a remote for a branch never pushed).
  * The caller fetched origin up front, so the comparison is against live state.
  *
  * No `backup/...` ref is taken here (audited, accepted): backups snapshot a
@@ -326,13 +326,13 @@ export function backupTimestamp(ref: string): number | null {
 }
 
 /**
- * A slice that just replayed clean (tip correct, remote in sync) supersedes
- * every older backup of that branch — drop them so `git branch` stays sane.
- * Backups exist to recover an in-flight bail; once the slice lands clean
+ * A branch that just replayed clean (tip correct, remote in sync) supersedes
+ * every older backup of it — drop them so `git branch` stays sane.
+ * Backups exist to recover an in-flight bail; once the branch lands clean
  * they're dead weight (and the commits stay reachable via the reflog anyway).
  * Best-effort by design (audited, accepted): a failed `for-each-ref` or a
  * per-ref delete failure is silently skipped — a leftover backup is harmless
- * and `wt stack prune-backups` sweeps stragglers.
+ * and `wt restack prune-backups` sweeps stragglers.
  */
 async function pruneSupersededBackups(
   branch: string,

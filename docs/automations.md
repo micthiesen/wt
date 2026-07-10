@@ -18,8 +18,8 @@ Fire keys embed the PR's head SHA where relevant: a new push produces a new key 
 | `rabbit.unresolved` | CodeRabbit has unresolved review threads |
 | `review.changes_requested` | a human review requested changes |
 | `pr.conflict` | the merge-tree probe says the branch conflicts with its effective base |
-| `wt.merged` | a non-stack worktree's branch landed (merged / upstream gone / PR merged — the same set the `c` clean sweep uses) |
-| `stack.parent_merged` | a stack has a merged slice with open slices still stacked above it |
+| `wt.merged` | a non-stacked worktree's branch landed (merged / upstream gone / PR merged — the same set the `c` clean sweep uses) |
+| `stack.parent_merged` | a stack (worktrees chained by their recorded fork bases — see [stacked-prs.md](stacked-prs.md)) has a merged member with open members stacked on it |
 
 PR-driven conditions additionally require a **live GitHub fetch this session** — data restored from the persisted cache never fires a rule — and a known `pr.headRefOid` to key the fire against.
 
@@ -41,6 +41,8 @@ Dispatch goes through the exact same paths keystrokes use (`launchAction`, the c
 ## Pausing
 
 - `A` toggles a global pause of all automations.
-- `Ctrl+A` pauses the selected worktree — or its whole stack when it's a slice.
+- `Ctrl+A` pauses the selected worktree — or its whole stack when it's a stack member. A stack pause is stored both under the stack's id (the root branch — covers members stacked on later) and as per-member flags (covers the survivors when the root lands and the stack re-roots under a new id).
+
+One identity caveat: the circuit breaker and cooldown for `stack.parent_merged` are keyed by the stack id, which changes when the root lands and is cleaned — their accumulated state starts fresh for the re-rooted stack.
 
 Both persist across restarts. Paused rules still evaluate (so state stays current); they just don't dispatch.

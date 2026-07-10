@@ -84,7 +84,7 @@ export function makeSectionFlows(ctx: SectionFlowsCtx) {
       if (r.section === null || seen.has(r.section)) continue;
       seen.add(r.section);
       if (r.section === currentSection) continue;
-      // Manifest-driven stack sections aren't manually joinable — skip
+      // Inferred stack sections aren't manually joinable — skip
       // them so the picker only lists manual named sections.
       if (r.sectionIsStack) continue;
       items.push({ kind: "section", name: r.section });
@@ -132,12 +132,12 @@ export function makeSectionFlows(ctx: SectionFlowsCtx) {
    *   - A row in the inbox / a manual section: swap with its same-group
    *     neighbor, or slide to the near edge of the adjacent group across
    *     a boundary (top of next on `J`, bottom of prev on `K`). Stack
-   *     sections can't be joined (membership is manifest-derived), so a
-   *     sliding row hops over them in one keypress; the inbox is a valid
-   *     target even when empty.
-   *   - A row inside a stack section (slice or holistic origin): rows
-   *     there are ordered by the manifest topology, so the move applies
-   *     to the WHOLE stack — one group slot.
+   *     sections can't be joined (membership is inferred from the
+   *     fork-base records), so a sliding row hops over them in one
+   *     keypress; the inbox is a valid target even when empty.
+   *   - A row inside a stack section: rows there are ordered by the
+   *     base-record topology, so the move applies to the WHOLE stack —
+   *     one group slot.
    *   - A folded section header (stack or manual): the whole group moves.
    * The archive boundary is hard: rows can't cross into archived via
    * J/K — that's `a`'s job.
@@ -208,7 +208,7 @@ export function makeSectionFlows(ctx: SectionFlowsCtx) {
       return;
     }
     if (current.sectionIsStack) {
-      toast("stack rows are auto-managed (manifest-driven)", theme.fgDim, 1800);
+      toast("stack rows are ordered by their base records — move the whole stack", theme.fgDim, 1800);
       return;
     }
     const items = buildSectionItems(current);

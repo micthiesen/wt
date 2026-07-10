@@ -82,7 +82,6 @@ function stackInfo(stackId: string, ordinal: number): StackRowInfo {
     lane: 0,
     depth: ordinal - 1,
     index: ordinal - 1,
-    isHolistic: false,
   };
 }
 
@@ -267,7 +266,6 @@ describe("stack.parent_merged", () => {
       stackedOn: {
         slug: "a-tip",
         branch: aTip.wt.branch,
-        via: "stack",
         diffBase: aTip.wt.branch,
       },
     });
@@ -289,7 +287,6 @@ describe("stack.parent_merged", () => {
       stackedOn: {
         slug: "a-tip",
         branch: aTip.wt.branch,
-        via: "stack",
         diffBase: aTip.wt.branch,
       },
     });
@@ -303,7 +300,6 @@ describe("stack.parent_merged", () => {
       stackedOn: {
         slug: null,
         branch: "michael/a-tip",
-        via: "stack",
         diffBase: "michael/a-tip",
       },
     });
@@ -327,7 +323,6 @@ describe("stack.parent_merged", () => {
       stackedOn: {
         slug: "a-tip",
         branch: aTip.wt.branch,
-        via: "stack",
         diffBase: aTip.wt.branch,
       },
     });

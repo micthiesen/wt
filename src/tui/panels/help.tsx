@@ -144,7 +144,7 @@ const KEY_BLOCKS: Block[] = [
     note: "Config-driven [[automations]] fire actions off PR/stack state. Runs appear as normal action output (killable with !).",
     items: [
       { key: "A", label: "pause / resume all automations (persisted)" },
-      { key: "ctrl+a", label: "pause / resume automations for current worktree — whole stack if it's a slice or stack header (persisted)" },
+      { key: "ctrl+a", label: "pause / resume automations for current worktree — whole stack if it's a stack member or header (persisted)" },
     ],
   },
   {

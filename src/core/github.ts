@@ -5,7 +5,6 @@ export type {
   ReviewRequestPr,
   GhActionResult,
   EnableAutoMergeResult,
-  CreatePrResult,
   LivePrInfo,
 } from "./github/types.ts";
 export { fetchGithub, fetchPrs } from "./github/fetch.ts";
@@ -19,7 +18,6 @@ export {
   retargetPrBase,
   markPullRequestReady,
   streamFailedRunLog,
-  createDraftPr,
   viewPrInfo,
 } from "./github/mutations.ts";
 export { pickPrForWorktree } from "./github/pick.ts";

@@ -1,114 +1,105 @@
 import { branchExists } from "../git.ts";
 import { viewPrInfo } from "../github.ts";
-import { isTrunkBase } from "../stack-layout.ts";
-import { getStackManifest, updateStackSlice, type StackSlice } from "../wtstate.ts";
+import { setSlugBase } from "../wtstate.ts";
+import { resolveChain, type ChainStep } from "./chain.ts";
 import { acquireStackLock, STACK_BUSY, type Logger } from "./shared.ts";
 
 /**
- * Reconcile the manifest against landed reality: flip merged slices to
- * `merged`, reparent each orphaned child onto its deepest surviving
- * dependency (or trunk), and reparent a slice whose EXTERNAL parent
- * (stack-on-stack) has landed onto trunk. Manifest bookkeeping only — reads
- * GitHub/git state but never rewrites branches — so the skill can run it on
- * its own before deciding to replay.
+ * Reconcile the fork-base records of the stack containing `branch`
+ * against landed reality: a member whose recorded parent has MERGED (or,
+ * for a parent with no live worktree, whose branch is gone everywhere)
+ * is reparented onto the nearest surviving ancestor — the landed
+ * parent's own recorded parent, walking up through consecutive landings,
+ * falling to trunk. The member's `baseSha` anchor is PRESERVED across
+ * the reparent: the landed parent's commits sit below the anchor and are
+ * excluded from the next replay by construction, which is exactly what
+ * makes the squash-merge case safe. Record bookkeeping only — reads
+ * GitHub/git state but never rewrites branches — so `/restack` can run
+ * it on its own before deciding to replay.
  */
 export async function reconcileStack(
-  stackId: string,
+  branch: string,
   trunk: string,
   onLog: Logger,
 ): Promise<void> {
   const lock = await acquireStackLock("reconcile");
   if (!lock) {
-    onLog(`skipped reconcile of ${stackId} — ${STACK_BUSY}`);
+    onLog(`skipped reconcile of ${branch} — ${STACK_BUSY}`);
     return;
   }
   try {
-    await reconcileStackLocked(stackId, trunk, onLog);
+    await reconcileStackLocked(branch, trunk, onLog);
   } finally {
     lock.release();
   }
 }
 
 async function reconcileStackLocked(
-  stackId: string,
+  branch: string,
   trunk: string,
   onLog: Logger,
 ): Promise<void> {
-  const manifest = getStackManifest(stackId);
-  if (!manifest) return;
-  // Probe live PR state for every candidate slice in parallel.
-  const candidates = manifest.slices.filter(
-    (s) => s.pr && s.status !== "merged",
+  const chain = await resolveChain(branch);
+  if (!chain) return;
+  const stepByBranch = new Map<string, ChainStep>(
+    chain.steps.map((s) => [s.branch, s]),
   );
-  const probed = await Promise.all(
-    candidates.map(async (s) => ({ s, live: await viewPrInfo(s.branch) })),
-  );
-  const mergedIds = new Set<string>(
-    manifest.slices.filter((s) => s.status === "merged").map((s) => s.id),
-  );
-  for (const { s, live } of probed) {
-    if (live?.state === "MERGED") {
-      mergedIds.add(s.id);
-      updateStackSlice(stackId, s.id, { status: "merged" });
-      onLog(`slice ${s.id} merged (#${s.pr})`);
-    }
-  }
-  if (mergedIds.size > 0) {
-    // Reparent each surviving slice that lost a dependency onto its
-    // deepest STILL-OPEN dependency (highest ordinal), falling to trunk
-    // only when none survive. Reparenting straight to trunk would flatten
-    // a slice that still has a live ancestor (diamond / multi-parent).
-    const fresh = getStackManifest(stackId);
-    if (!fresh) return;
-    const byId = new Map(fresh.slices.map((s) => [s.id, s]));
-    for (const slice of fresh.slices) {
-      if (slice.status === "merged") continue;
-      const dependsOn = slice.dependsOn.filter((d) => !mergedIds.has(d));
-      const baseMerged = mergedIds.has(slice.base);
-      if (dependsOn.length === slice.dependsOn.length && !baseMerged) continue;
-      const survivingParent = dependsOn
-        .map((d) => byId.get(d))
-        .filter((s): s is StackSlice => !!s)
-        .sort((a, b) => b.ordinal - a.ordinal)[0];
-      const base = survivingParent ? survivingParent.id : trunk;
-      // The list reads the parent straight from the manifest, so updating
-      // `base`/`dependsOn` is all that's needed — no separate display state.
-      updateStackSlice(stackId, slice.id, { dependsOn, base });
-      onLog(`reparented ${slice.id} onto ${base}`);
-    }
-  }
 
-  // Cross-stack reconcile: a slice stacked on an EXTERNAL parent (another
-  // stack's tip, or a standalone parent PR branch) keeps a dead `base` once
-  // that parent lands — the own-slice probe above only sees THIS manifest's
-  // PRs, so it can't notice. Detect the external parent merged (or its
-  // branch gone) and reparent onto trunk. The slice's `baseSha` anchor keeps
-  // the subsequent replay squash-safe: the landed parent's commits sit below
-  // the anchor and are excluded by construction, exactly like a sibling
-  // squash-merge. Runs unconditionally — the external parent merging is
-  // invisible to `mergedIds`.
-  const after = getStackManifest(stackId);
-  if (!after) return;
-  const siblingIds = new Set(after.slices.map((s) => s.id));
-  const siblingBranches = new Set(after.slices.map((s) => s.branch));
-  for (const slice of after.slices) {
-    if (slice.status === "merged") continue;
-    if (slice.base === trunk || isTrunkBase(slice)) continue;
-    if (siblingIds.has(slice.base) || siblingBranches.has(slice.base)) continue;
-    const live = await viewPrInfo(slice.base);
+  // Probe every distinct non-trunk parent's PR state in parallel.
+  const parents = [
+    ...new Set(
+      chain.steps
+        .map((s) => s.parentBranch)
+        .filter((p): p is string => p !== null),
+    ),
+  ];
+  const probed = await Promise.all(
+    parents.map(async (p) => ({ parent: p, live: await viewPrInfo(p) })),
+  );
+
+  const landed = new Set<string>();
+  for (const { parent, live } of probed) {
     if (live?.state === "MERGED") {
-      updateStackSlice(stackId, slice.id, { base: trunk });
-      onLog(`external parent ${slice.base} merged (#${live.number}) — reparented ${slice.id} onto ${trunk}`);
-    } else if (!live && !(await branchExists(slice.base))) {
-      // No PR and no branch anywhere — the parent is gone. (A CLOSED PR or a
-      // still-open parent leaves the link alone.) The `branchExists`
-      // corroboration is LOAD-BEARING, not belt-and-braces: `viewPrInfo`
-      // returns null for a transient gh failure exactly as it does for
-      // "no PR", and without the second check a gh hiccup would reparent
-      // a slice whose parent is alive. (The MERGED branch above needs no
-      // such guard — a failed probe can never read as MERGED.)
-      updateStackSlice(stackId, slice.id, { base: trunk });
-      onLog(`external parent ${slice.base} is gone — reparented ${slice.id} onto ${trunk}`);
+      landed.add(parent);
+      onLog(`parent ${parent} merged (#${live.number})`);
+      continue;
     }
+    // A parent that IS a live worktree obviously still exists; the
+    // gone-branch case only applies to external parents. No PR and no
+    // branch anywhere — the parent is gone. (A CLOSED PR or a still-open
+    // parent leaves the link alone.) The `branchExists` corroboration is
+    // LOAD-BEARING, not belt-and-braces: `viewPrInfo` returns null for a
+    // transient gh failure exactly as it does for "no PR", and without
+    // the second check a gh hiccup would reparent a member whose parent
+    // is alive.
+    if (!live && !stepByBranch.has(parent) && !(await branchExists(parent))) {
+      landed.add(parent);
+      onLog(`parent ${parent} is gone`);
+    }
+  }
+  if (landed.size === 0) return;
+
+  for (const s of chain.steps) {
+    if (s.parentBranch === null || !landed.has(s.parentBranch)) continue;
+    // A member that itself landed will be cleaned; don't bother
+    // rewriting its record.
+    if (landed.has(s.branch)) continue;
+    // Walk up through consecutively-landed ancestors: the new parent is
+    // the first survivor (an in-chain parent's own recorded parent), or
+    // trunk when the walk runs off the chain (external parents can't be
+    // walked past — their records live in another checkout, if anywhere).
+    let candidate: string | null = s.parentBranch;
+    while (candidate !== null && landed.has(candidate)) {
+      candidate = stepByBranch.get(candidate)?.parentBranch ?? null;
+    }
+    const newParent = candidate ?? trunk;
+    // Reparent the RECORD, preserving the anchor. `baseSha` stays valid:
+    // it still names the tip this member's own commits sit on, which is
+    // what keeps the subsequent replay squash-safe.
+    setSlugBase(s.slug, {
+      branch: newParent,
+      ...(s.baseSha ? { sha: s.baseSha } : {}),
+    });
+    onLog(`reparented ${s.branch} onto ${newParent}`);
   }
 }

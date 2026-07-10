@@ -21,7 +21,7 @@
  *      HEAD) churn constantly during normal git use and only the
  *      membership set matters here.
  *   4. `~/.cache/wt/` non-recursive, filtered to `state.json` /
- *      `archive.json` — cross-process state writes (CLI `wt stack`
+ *      `archive.json` — cross-process state writes (CLI `wt base`
  *      ops, `wt base set`, the detached destroy, another wt instance).
  *      Prefix-matched because both writers go through a
  *      `<file>.<pid>.tmp` → rename dance (see the marker watcher in

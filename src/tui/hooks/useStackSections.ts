@@ -3,7 +3,6 @@ import { keepPreviousData, useQueries, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import { slugLabel } from "../../core/stage.ts";
-import { stackSectionKey } from "../../core/wtstate.ts";
 import {
   stackTitleQuery,
   wtStateQuery,
@@ -17,15 +16,14 @@ export function useStackSections(rows: readonly WorktreeRow[]) {
   // `rows` order (chain depth from the row aggregator).
   const stackSectionMembers = useMemo((): Map<
     string,
-    { members: StackMember[]; ready: boolean }
+    { members: StackMember[]; ready: boolean; rootSlug: string | null; firstSlug: string }
   > => {
-    const byName = new Map<string, { members: StackMember[]; ready: boolean }>();
+    const byName = new Map<
+      string,
+      { members: StackMember[]; ready: boolean; rootSlug: string | null; firstSlug: string }
+    >();
     for (const r of rows) {
       if (!r.sectionIsStack || r.section === null) continue;
-      // The holistic origin's brief is the whole-feature title; it would
-      // bias the section title toward describing the feature rather than
-      // the slices, so it never joins the prompt.
-      if (r.stack?.isHolistic) continue;
       // A detached HEAD wouldn't legitimately be part of a stack
       // (stacks walk branch-parent chains), but the type allows it.
       // Skipping keeps the signature stable and the prompt clean.
@@ -37,10 +35,11 @@ export function useStackSections(rows: readonly WorktreeRow[]) {
       const brief = r.brief ?? (rest || id || r.wt.slug);
       let entry = byName.get(r.section);
       if (!entry) {
-        entry = { members: [], ready: true };
+        entry = { members: [], ready: true, rootSlug: null, firstSlug: r.wt.slug };
         byName.set(r.section, entry);
       }
       entry.members.push({ branch: r.wt.branch, brief });
+      if (r.stack?.depth === 0) entry.rootSlug = r.wt.slug;
       if (r.brief == null) entry.ready = false;
     }
     return byName;
@@ -65,30 +64,32 @@ export function useStackSections(rows: readonly WorktreeRow[]) {
     })),
   });
 
-  // Every managed stack gets a label entry (issue + progress); the AI
-  // title, when resolved, is woven in between.
+  // Every inferred stack gets a label entry (the root's issue id, from
+  // its slug); the AI title, when resolved, is woven in between.
   const wtStateForStacks = useQuery(wtStateQuery());
   const foldedSections = useMemo<ReadonlySet<string>>(
     () => new Set(wtStateForStacks.data?.foldedSections ?? []),
     [wtStateForStacks.data?.foldedSections],
   );
   const stackSectionLabels = useMemo((): Map<string, string> => {
-    const aiByKey = new Map<string, string>();
-    for (let i = 0; i < stackSectionEntries.length; i++) {
-      const [name] = stackSectionEntries[i]!;
-      const title = stackTitleResults[i]?.data;
-      if (typeof title === "string" && title.trim() !== "") {
-        aiByKey.set(name, title);
-      }
-    }
     const m = new Map<string, string>();
-    for (const man of Object.values(wtStateForStacks.data?.stacks ?? {})) {
-      const key = stackSectionKey(man.stackId);
-      const title = aiByKey.get(key);
-      m.set(key, title ? `${man.issue} · ${title}` : man.issue);
+    for (let i = 0; i < stackSectionEntries.length; i++) {
+      const [name, { rootSlug, firstSlug }] = stackSectionEntries[i]!;
+      const title = stackTitleResults[i]?.data;
+      // The root's issue id, falling back to the first member's (an
+      // archived root loses its `stack` info and never registers as
+      // depth 0) and finally a generic marker.
+      const issue = slugLabel(rootSlug ?? firstSlug).id;
+      const label = issue || "stack";
+      m.set(
+        name,
+        typeof title === "string" && title.trim() !== ""
+          ? `${label} · ${title}`
+          : label,
+      );
     }
     return m;
-  }, [wtStateForStacks.data, stackSectionEntries, stackTitleResults]);
+  }, [stackSectionEntries, stackTitleResults]);
 
   return { wtStateForStacks, foldedSections, stackSectionLabels };
 }

@@ -8,11 +8,7 @@ import type { GitActivity } from "../../core/git-activity.ts";
 import { pickPrForWorktree } from "../../core/github.ts";
 import { lockAge, lockLabel } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
-import {
-  buildStackIndex,
-  type SpinePos,
-  type StackIndexEntry,
-} from "../../core/stack-layout.ts";
+import { buildStackIndex, type SpinePos } from "../../core/stack-layout.ts";
 import { slugLabel } from "../../core/stage.ts";
 import type { LockMeta, MergeQueueEntry, PullRequest, Status, Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
@@ -74,15 +70,10 @@ export type WorktreeFields = {
 };
 
 /**
- * Stack relationship for a worktree, with the resolved diff base.
- *
- * Two explicit sources, no inference (no reflog / PR-base guessing):
- * `"stack"` — the MANIFEST (`wtState.stacks`): a worktree whose branch
- * matches a manifest slice with a non-trunk parent stacks on that
- * parent; `"fork"` — the per-slug `baseBranch` recorded by
- * `wt new --base` for worktrees that aren't (yet) manifest slices.
- * A manifest slice always resolves from the manifest alone — a lane
- * root renders flat even if a vestigial fork base is recorded.
+ * Stack relationship for a worktree, with the resolved diff base. One
+ * explicit source, no inference beyond it (no reflog / PR-base
+ * guessing): the per-slug `baseBranch` recorded by `wt new --base` /
+ * `wt base` / restack reconciles.
  *
  * `slug` is `null` when the parent branch isn't materialized as a live
  * worktree; the consumer can still use the diff base for diffing but
@@ -91,17 +82,17 @@ export type WorktreeFields = {
 export type StackedOn = {
   slug: string | null;
   branch: string;
-  via: "stack" | "fork";
   /** Ref to use for `git diff <diffBase>...HEAD`. */
   diffBase: string;
 };
 
 /**
- * Placement of a managed slice within its stack, derived from the
- * manifest layout. Drives the list's tree spine + ordinal. `null` for
- * any worktree that isn't a manifest slice.
+ * Placement of a worktree within its inferred stack (worktrees chained
+ * by their recorded fork bases). Drives the list's tree spine +
+ * ordinal. `null` for any worktree that isn't part of a stack.
  */
 export type StackRowInfo = {
+  /** Stack identity: the root member's branch. */
   stackId: string;
   /** Stack ordinal (1-based) shown in the row gutter. */
   ordinal: number;
@@ -109,17 +100,10 @@ export type StackRowInfo = {
   pos: SpinePos;
   /** Parallel-lane index → connector color (0 = main spine, dim). */
   lane: number;
-  /** Depth from the lane root (root = 0). */
+  /** Depth from the stack root (root = 0). */
   depth: number;
-  /** Display index within the stack (lane order, then depth). */
+  /** Display index within the stack (spine order). */
   index: number;
-  /**
-   * True for the holistic-origin worktree pinned at the bottom of its
-   * stack section, not a slice. It carries no ordinal and renders with a
-   * distinct dim glyph so it reads as "the source this stack was carved
-   * from", kept around until the user `wt rm`s it post-split.
-   */
-  isHolistic: boolean;
 };
 
 export type WorktreeRow = {
@@ -135,17 +119,17 @@ export type WorktreeRow = {
    */
   mq?: MergeQueueEntry;
   /**
-   * Resolved stack parent (manifest-derived). `null` for trunk-targeted
-   * worktrees. Drives the diff base for `wtDiffContextQuery` (so the AI
-   * summary describes only what this slice adds on top of its parent);
-   * the relationship is shown by the tree spine in the list (see
-   * `row.stack`), not a separate badge.
+   * Resolved stack parent (from the recorded fork base). `null` for
+   * trunk-targeted worktrees. Drives the diff base for
+   * `wtDiffContextQuery` (so the AI summary describes only what this
+   * worktree adds on top of its parent); the relationship is shown by
+   * the tree spine in the list (see `row.stack`), not a separate badge.
    */
   stackedOn: StackedOn | null;
   /**
-   * Placement within a managed stack (manifest-derived), or `null` when
-   * this worktree isn't a slice of any manifest. When set, `section` is
-   * the stack's synthetic key and `sectionIsStack` is true.
+   * Placement within an inferred stack, or `null` when this worktree
+   * isn't part of one. When set, `section` is the stack's synthetic key
+   * and `sectionIsStack` is true.
    */
   stack: StackRowInfo | null;
   archived: boolean;
@@ -166,16 +150,16 @@ export type WorktreeRow = {
    */
   brief: string | null;
   /**
-   * Effective section. A managed slice's section is the synthetic stack
+   * Effective section. A stack member's section is the synthetic stack
    * key (`STACK_SECTION_PREFIX + stackId`), which overrides any manual
    * placement; otherwise it's the slug's stored `slugs[slug].section`.
    * `null` means the unsectioned inbox.
    */
   section: string | null;
   /**
-   * True when `section` is a manifest-driven stack section. Drives the
-   * spine rendering in the list pane and the J/K/move-into refusals in
-   * the action layer (stack order is locked to the manifest).
+   * True when `section` is an inferred stack section. Drives the spine
+   * rendering in the list pane and the J/K/move-into refusals in the
+   * action layer (stack order follows the base-record chain).
    */
   sectionIsStack: boolean;
 };
@@ -288,7 +272,6 @@ function stackedOnEq(a: StackedOn | null, b: StackedOn | null): boolean {
   return (
     a.slug === b.slug &&
     a.branch === b.branch &&
-    a.via === b.via &&
     a.diffBase === b.diffBase
   );
 }
@@ -302,41 +285,30 @@ function stackInfoEq(a: StackRowInfo | null, b: StackRowInfo | null): boolean {
     a.pos === b.pos &&
     a.lane === b.lane &&
     a.depth === b.depth &&
-    a.index === b.index &&
-    a.isHolistic === b.isHolistic
+    a.index === b.index
   );
 }
 
 /**
- * Resolve `stackedOn` (the diff base) for a worktree. A managed slice
- * resolves from its manifest layout entry alone: a non-trunk parent
- * diffs against that parent's branch, a lane root renders flat (null).
- * A non-slice worktree falls back to its recorded fork base
- * (`wt new --base` → slug-state `baseBranch`). The parent's live
- * worktree slug (when materialized) lets the list draw the relationship.
+ * Resolve `stackedOn` (the diff base) for a worktree from its recorded
+ * fork base (`wt new --base` → slug-state `baseBranch`). A trunk-based
+ * (or record-free) worktree renders flat (null), as does a nonsense
+ * self-referential record (same guard `buildStackIndex` applies — the
+ * two paths must agree or the row would diff against itself while the
+ * tree shows it flat). The parent's live worktree slug (when it exists)
+ * lets the list draw the relationship.
  */
 function resolveStackedOn(
-  entry: StackIndexEntry | undefined,
+  ownBranch: string,
   worktrees: readonly Worktree[],
   forkBase: string | undefined,
 ): StackedOn | null {
-  if (entry) {
-    const parentBranch = entry.node.parentBranch;
-    if (!parentBranch || parentBranch === config.branch.base) return null;
-    const parentWt = worktrees.find((w) => w.branch === parentBranch);
-    return {
-      slug: parentWt?.slug ?? null,
-      branch: parentBranch,
-      via: "stack",
-      diffBase: parentBranch,
-    };
-  }
   if (!forkBase || forkBase === config.branch.base) return null;
+  if (forkBase === ownBranch) return null; // self-loop guard
   const parentWt = worktrees.find((w) => w.branch === forkBase);
   return {
     slug: parentWt?.slug ?? null,
     branch: forkBase,
-    via: "fork",
     diffBase: forkBase,
   };
 }
@@ -404,10 +376,10 @@ function resolveTitle(
  * is one unified ranked list of GROUPS — stack sections, the
  * unsectioned inbox (`GROUP_INBOX` sentinel), and manual named
  * sections — exactly as they appear in `sectionsOrder` (readWtState
- * self-heals it: new stacks float to the top, dead groups drop, and a
- * pre-unification file is seeded with the legacy stacks/inbox/manual
- * layout). Within each group, rows sort by `state.order` ascending
- * (stack rows by manifest layout index via `effectiveOrders`); unstated
+ * self-heals it: dead manual groups drop, and a pre-unification file is
+ * seeded with the legacy inbox/manual layout). Within each group, rows
+ * sort by `state.order` ascending
+ * (stack rows by inferred layout index via `effectiveOrders`); unstated
  * entries float to the top (-Infinity) so brand-new worktrees always
  * land at the top of the inbox. Groups not yet ranked (a freshly
  * created stack mid-render, post-rename quirk) degrade predictably:
@@ -484,8 +456,8 @@ function useLockReleasedInvalidator(lockedSig: string): void {
       void qc.invalidateQueries({ queryKey: qk.worktrees() });
       // Destroys (and `init`) mutate state.json from the child process
       // — refresh the wtState query so the row aggregator sees those
-      // mutations (slug-state reap, manifest updates) without waiting
-      // for the staleTime to expire.
+      // mutations (slug-state reap, fork-base reparents) without
+      // waiting for the staleTime to expire.
       void qc.invalidateQueries({ queryKey: qk.wtState() });
     }
   }, [lockedSig, qc]);
@@ -523,40 +495,34 @@ export function useWorktreeRows(): WorktreeRowsResult {
       pickPrForWorktree(wt, github.data?.prs),
     );
 
-    // Build the manifest layout index once per row-input change:
-    // branch → (layout, node). This is the SOLE source of stack
-    // membership, order, and the diff base. A worktree whose branch
-    // isn't a manifest slice is flat.
-    const stackIndex = buildStackIndex(Object.values(wtState.data?.stacks ?? {}));
+    // Build the inferred-stack index once per row-input change:
+    // branch → (layout, node), derived from the live worktrees + their
+    // recorded fork bases. This is the SOLE source of stack membership
+    // and order. A worktree whose base chain doesn't reach another live
+    // worktree is flat.
+    const stackIndex = buildStackIndex(
+      worktrees.map((wt) => ({
+        slug: wt.slug,
+        branch: wt.branch,
+        baseBranch: stateSlugs[wt.slug]?.baseBranch,
+      })),
+    );
     const stackEntryByIndex = worktrees.map((wt) => stackIndex.byBranch.get(wt.branch));
 
-    // Holistic-origin worktrees: the branch a stack was carved from.
-    // Held separately from slices in the manifest, so it never appears
-    // in `byBranch`. We pin it to the bottom of its stack section
-    // (index past the last slice) and tag it `isHolistic` so the list
-    // renders it as a dim source node rather than a slice.
-    const holisticByBranch = new Map<string, { stackId: string; sliceCount: number }>();
-    for (const layout of stackIndex.layouts) {
-      const hb = layout.manifest.holisticBranch;
-      if (hb) holisticByBranch.set(hb, { stackId: layout.stackId, sliceCount: layout.nodes.length });
-    }
-
-    // Resolve `stackedOn` (the diff base) once per row-input change
-    // from the manifest entry (or the recorded fork base for non-slice
-    // worktrees). Single source of truth — every consumer lands in the
-    // same per-(slug, base) cache slot.
-    const stackedOnByIndex = worktrees.map((wt, i) =>
-      resolveStackedOn(stackEntryByIndex[i], worktrees, stateSlugs[wt.slug]?.baseBranch),
+    // Resolve `stackedOn` (the diff base) once per row-input change from
+    // the recorded fork base. Single source of truth — every consumer
+    // lands in the same per-(slug, base) cache slot.
+    const stackedOnByIndex = worktrees.map((wt) =>
+      resolveStackedOn(wt.branch, worktrees, stateSlugs[wt.slug]?.baseBranch),
     );
     const bases = stackedOnByIndex.map((s) => s?.diffBase ?? null);
     return {
       prsByIndex,
       stackEntryByIndex,
-      holisticByBranch,
       stackedOnByIndex,
       bases,
     };
-  }, [worktrees, github.data?.prs, wtState.data?.stacks, stateSlugs]);
+  }, [worktrees, github.data?.prs, stateSlugs]);
 
   const queries = worktrees.flatMap((wt, i) => [
     wtDirtyQuery(wt),
@@ -666,13 +632,12 @@ export function useWorktreeRows(): WorktreeRowsResult {
       const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
       const stackedOn = rowLayout.stackedOnByIndex[i] ?? null;
       const archived = archivedSet.has(wt.slug);
-      // Effective section: a manifest slice's stack section overrides the
+      // Effective section: a stack member's stack section overrides the
       // stored manual section. Archived rows skip the override so the
       // archived bucket stays homogeneous at the bottom of the list.
       const manualSection = stateSlugs[wt.slug]?.section ?? null;
       const entry = archived ? undefined : rowLayout.stackEntryByIndex[i];
       const node = entry?.node;
-      const holistic = archived || node ? undefined : rowLayout.holisticByBranch.get(wt.branch);
       const stack: StackRowInfo | null = node
         ? {
             stackId: node.stackId,
@@ -681,19 +646,8 @@ export function useWorktreeRows(): WorktreeRowsResult {
             lane: node.lane,
             depth: node.depth,
             index: node.index,
-            isHolistic: false,
           }
-        : holistic
-          ? {
-              stackId: holistic.stackId,
-              ordinal: 0,
-              pos: "single",
-              lane: 0,
-              depth: 0,
-              index: holistic.sliceCount,
-              isHolistic: true,
-            }
-          : null;
+        : null;
       const section = stack ? stackSectionKey(stack.stackId) : manualSection;
       const sectionIsStack = stack !== null;
       effectiveOrders.set(

@@ -379,8 +379,8 @@ export function useWtActions() {
     },
     /**
      * Refresh stack relationships and the per-worktree diff queries.
-     * Stack shape lives in the wtState `stacks` manifests, so re-reading
-     * wtState surfaces a freshly-applied or rebased manifest;
+     * Stack shape lives in the per-slug fork-base records, so
+     * re-reading wtState surfaces a reparent or a restacked anchor;
      * invalidating `["wt"]` re-runs the per-base diff / sync queries
      * after a rebase rewrites history under a fixed parent.
      */
@@ -623,8 +623,8 @@ export function useWtActions() {
     },
     /**
      * Record (or clear, with `null`) a worktree's fork base — the same
-     * per-slug record `wt new --base` writes. Display/diff only: no
-     * rebase happens, a manifest slice's parent still wins. Anchors the
+     * per-slug record `wt new --base` writes, and the record stacks are
+     * inferred from. Record only: no rebase happens. Anchors the
      * fork-point sha at merge-base (best-effort, like `wt base set`).
      * Invalidates wtState (row relationship) AND the slug's `["wt"]`
      * queries — diff context and sync counts are computed against the
@@ -713,11 +713,16 @@ export function useWtActions() {
     },
     /**
      * Toggle the whole-stack automations pause (Ctrl+A on a stack
-     * member or its folded header). Keyed by stackId so slices added
-     * or re-split later are covered by the same pause.
+     * member or its folded header). Keyed by stackId (the root branch)
+     * so members stacked on later are covered by the same pause; the
+     * current members' per-slug flags are mirrored too, so the pause
+     * survives the stack re-rooting when the root lands.
      */
-    async toggleStackAutomationsPaused(stackId: string): Promise<boolean> {
-      const paused = toggleStackAutomationsPausedOnDisk(stackId);
+    async toggleStackAutomationsPaused(
+      stackId: string,
+      memberSlugs: readonly string[],
+    ): Promise<boolean> {
+      const paused = toggleStackAutomationsPausedOnDisk(stackId, memberSlugs);
       await qc.invalidateQueries({ queryKey: qk.wtState() });
       return paused;
     },

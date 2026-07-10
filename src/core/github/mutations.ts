@@ -4,7 +4,6 @@ import { run, runStreaming } from "../proc.ts";
 import type { AutoMergeMethod } from "../types.ts";
 import { hasGh } from "./gh-cli.ts";
 import type {
-  CreatePrResult,
   EnableAutoMergeResult,
   GhActionResult,
   LivePrInfo,
@@ -91,9 +90,9 @@ export async function editReviewers(
 
 /**
  * Retarget a PR's base branch via `gh pr edit --base`. The native restack
- * engine calls this after replaying a slice whose parent moved (e.g. a
+ * engine calls this after replaying a branch whose parent moved (e.g. a
  * child reparented onto trunk once its parent landed), so the PR's base on
- * GitHub matches the manifest. No-op-safe: gh is idempotent if the base
+ * GitHub matches the recorded parent. No-op-safe: gh is idempotent if the base
  * already matches. Runs from the main clone so gh resolves the right repo.
  */
 export async function retargetPrBase(
@@ -177,56 +176,9 @@ export async function streamFailedRunLog(
 }
 
 /**
- * Create a draft PR for `head` targeting `base`, via `gh pr create`.
- * Used by `wt stack apply` to materialize a manifest slice. The body is
- * kept minimal but valid — a richer body is authored later by a skill.
- * `cwd` should be the slice's worktree so gh resolves head/base from
- * the right checkout. Returns the new PR number parsed from gh's output.
- */
-export async function createDraftPr(opts: {
-  cwd: string;
-  head: string;
-  base: string;
-  title: string;
-  body: string;
-}): Promise<CreatePrResult> {
-  if (!(await hasGh())) return { ok: false, error: "gh CLI not found" };
-  const r = await run(
-    [
-      "gh",
-      "pr",
-      "create",
-      "--draft",
-      "--base",
-      opts.base,
-      "--head",
-      opts.head,
-      "--title",
-      opts.title,
-      "--body",
-      opts.body,
-    ],
-    { cwd: opts.cwd, timeoutMs: 30_000 },
-  );
-  if (r.exitCode !== 0) {
-    const msg = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
-    log.error("pr create failed", { head: opts.head, base: opts.base, msg });
-    return { ok: false, error: msg };
-  }
-  // gh prints the new PR URL on success, but may emit warnings / tips on
-  // other lines (before or after). Scan all of stdout for the first
-  // `/pull/<n>` rather than trusting the last line.
-  const m = r.stdout.match(/https?:\/\/\S+\/pull\/(\d+)/);
-  if (!m) {
-    return { ok: false, error: `could not parse PR number from gh output: ${r.stdout.trim()}` };
-  }
-  return { ok: true, number: Number.parseInt(m[1]!, 10), url: m[0] };
-}
-
-/**
  * Read the live `baseRefName` / `state` for a branch's PR via
- * `gh pr view`. Used by `wt stack status` to detect drift between the
- * manifest's intended parent and the PR's actual base. Returns null when
+ * `gh pr view`. The restack reconcile/retarget paths use it to compare
+ * the recorded parent against the PR's actual base. Returns null when
  * there's no PR (or gh is unavailable).
  */
 export async function viewPrInfo(branch: string): Promise<LivePrInfo | null> {
