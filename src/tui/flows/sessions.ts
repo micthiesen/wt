@@ -25,9 +25,9 @@ import {
 } from "../../core/tmux.ts";
 import { StatusKind } from "../../core/types.ts";
 
-import { enterHarnessSession } from "../harness-session.ts";
+import { enterHarnessSession } from "../sessions/harness.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
-import type { SessionSlot } from "../session-slots.ts";
+import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
 const appLog = createLogger("[app]");

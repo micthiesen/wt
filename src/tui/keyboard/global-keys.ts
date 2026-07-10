@@ -19,7 +19,7 @@ import {
   MAIN_CLONE_SLOT,
   WT_SOURCE_SLOT,
   type SessionSlot,
-} from "../session-slots.ts";
+} from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 

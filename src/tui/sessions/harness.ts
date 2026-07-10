@@ -11,13 +11,13 @@
  */
 import type { CliRenderer } from "@opentui/core";
 
-import { getHarness, type HarnessId } from "../core/harness/index.ts";
-import { createLogger } from "../core/logger.ts";
+import { getHarness, type HarnessId } from "../../core/harness/index.ts";
+import { createLogger } from "../../core/logger.ts";
 import {
   attachOrCreate,
   killHarnessSession,
   type AttachResult,
-} from "../core/tmux.ts";
+} from "../../core/tmux.ts";
 import { handoffTerminal } from "./renderer-handoff.ts";
 
 export type EnterResult = AttachResult;

@@ -10,7 +10,7 @@ import {
   MAIN_CLONE_SLOT,
   SESSION_SLOTS,
   WT_SOURCE_SLOT,
-} from "../session-slots.ts";
+} from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
 export type FooterMode =

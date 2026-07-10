@@ -13,7 +13,7 @@ import {
 import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { diffCommandUsesBase, killDiffSession } from "../../core/tmux.ts";
 import { resolveDiffBase } from "../app-helpers.ts";
-import { SESSION_SLOTS } from "../session-slots.ts";
+import { SESSION_SLOTS } from "../sessions/slots.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 type Args = {

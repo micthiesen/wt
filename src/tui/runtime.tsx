@@ -40,7 +40,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import { App, type TuiExit } from "./app.tsx";
 import { events } from "./events.ts";
 import { attachFetchLogs } from "./fetch-log.ts";
-import { SLOT_SLUGS } from "./session-slots.ts";
+import { SLOT_SLUGS } from "./sessions/slots.ts";
 
 const startupLog = createLogger("[startup]");
 

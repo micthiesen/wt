@@ -33,10 +33,10 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { config } from "../core/config.ts";
-import { WT_SOURCE_SLUG } from "../core/tmux.ts";
+import { config } from "../../core/config.ts";
+import { WT_SOURCE_SLUG } from "../../core/tmux.ts";
 
-import { WT_REPO_PATH } from "./helpers.ts";
+import { WT_REPO_PATH } from "../helpers.ts";
 
 export type SessionSlot = {
   /** Tmux slug. Shares the namespace with worktree slugs. */

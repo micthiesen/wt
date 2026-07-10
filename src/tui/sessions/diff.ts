@@ -13,7 +13,7 @@
  */
 import type { CliRenderer } from "@opentui/core";
 
-import { attachOrCreate, type AttachResult } from "../core/tmux.ts";
+import { attachOrCreate, type AttachResult } from "../../core/tmux.ts";
 import { handoffTerminal } from "./renderer-handoff.ts";
 
 export type DiffResult = AttachResult;
