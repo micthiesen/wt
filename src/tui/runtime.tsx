@@ -11,7 +11,7 @@ import { disposeDiffPool } from "../core/diff/pool.ts";
 import { watchGithubEvents } from "../core/events/store.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { startCodexEventPolling } from "../core/harness/codex/events.ts";
-import { harnessTailRegistry } from "../core/harness/harness-tail.ts";
+import { harnessTailRegistry } from "../core/harness/tail.ts";
 import { startOpencodeEventPolling } from "../core/harness/opencode/events.ts";
 import { createLogger, flushLogger, setEventSink } from "../core/logger.ts";
 import { reapDestroyLogs } from "../core/logs.ts";
@@ -38,7 +38,7 @@ import type { Worktree } from "../core/types.ts";
 import type { QueryClient } from "@tanstack/react-query";
 
 import { App, type TuiExit } from "./app.tsx";
-import { events } from "./events.ts";
+import { events } from "./activity-log.ts";
 import { attachFetchLogs } from "./fetch-log.ts";
 import { SLOT_SLUGS } from "./sessions/slots.ts";
 

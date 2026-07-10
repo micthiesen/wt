@@ -22,11 +22,11 @@ import {
   harnessTailKey,
   harnessTailRegistry,
   type TailHarnessId,
-} from "../../core/harness/harness-tail.ts";
+} from "../../core/harness/tail.ts";
 import { sessionTailRegistry, tailKey } from "../../core/harness/claude/tail.ts";
 import { shellTailRegistry } from "../../core/shell-tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
-import { events as eventsLog } from "../events.ts";
+import { events as eventsLog } from "../activity-log.ts";
 
 /**
  * Per-slug first-seen timestamp for destroy entries (the fallback

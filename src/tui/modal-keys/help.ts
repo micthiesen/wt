@@ -1,7 +1,7 @@
 import type { KeyEvent } from "@opentui/core";
 
 import { printableText } from "../app-helpers.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { SimpleModalContext } from "./ctx.ts";
 
 export function handleHelpKey(

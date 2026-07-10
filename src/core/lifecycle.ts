@@ -425,7 +425,7 @@ export async function removeWorktree(
  * to launchd), and a hard kill mid-remove just leaves an orphaned stage that
  * `categorizeStages` re-flags on next launch — the terminal-hangup hole was the
  * one that silently stranded work. This mirrors why actions run under tmux
- * (`core/action-tmux.ts`): destroy work must outlive the TUI.
+ * (`core/tmux/action-sessions.ts`): destroy work must outlive the TUI.
  */
 export function spawnBackgroundRemove(slug: string, opts: {
   force: boolean;

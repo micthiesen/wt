@@ -11,7 +11,7 @@ import {
   type TailHarnessId,
   harnessTailKey,
   harnessTailRegistry,
-} from "../../core/harness/harness-tail.ts";
+} from "../../core/harness/tail.ts";
 import {
   type SessionRun,
   sessionTailRegistry,

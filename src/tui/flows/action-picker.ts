@@ -8,7 +8,7 @@ import {
   evaluateActionRequirements,
 } from "../../core/actions.ts";
 import { config } from "../../core/config.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import { assignActionKeys, type PickerItem } from "../panels/action-picker.tsx";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { theme } from "../theme.ts";

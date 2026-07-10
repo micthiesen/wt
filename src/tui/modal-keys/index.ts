@@ -1,6 +1,6 @@
 import type { KeyEvent } from "@opentui/core";
 
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { SimpleModalContext } from "./ctx.ts";
 import { handleHelpKey } from "./help.ts";
 import {

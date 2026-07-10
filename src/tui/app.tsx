@@ -17,9 +17,9 @@ import {
   useActiveSessionsBySlug,
   useHarnessSessions,
 } from "./hooks/useHarnessSessions.ts";
-import type { Modal } from "./modal.ts";
+import type { Modal } from "./modal-state.ts";
 import { PostFooterModals, PreFooterModals } from "./modal-host.tsx";
-import { handleSimpleModalKey } from "./modal-key-handlers.ts";
+import { handleSimpleModalKey } from "./modal-keys/index.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
 import { useActionDispatch } from "./hooks/useActionDispatch.ts";
 import {

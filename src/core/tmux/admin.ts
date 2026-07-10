@@ -89,7 +89,7 @@ export async function killShellSession(slug: string): Promise<void> {
   await killByName(sessionName(slug, "shell"));
 }
 
-// Action session kills go through `core/action-tmux.ts` —
+// Action session kills go through `core/tmux/action-sessions.ts` —
 // `killAllSessionsFor` below imports the sync helper there. Keeping a
 // duplicate definition here would invite drift between two sources of
 // truth for the same tmux command.
@@ -103,7 +103,7 @@ export async function killAllSessionsFor(slug: string): Promise<void> {
   // List once and pick out any session whose bareSlug matches —
   // covers primary, named claudes, diff, shell, and action without
   // hardcoding the named-claude list. The action kill goes via
-  // action-tmux.ts (now async like the rest).
+  // action-sessions.ts (now async like the rest).
   const all = await listAllSessionsRaw().catch(() => new Set<string>());
   const ours = [...all].filter((n) => bareSlug(n) === slug);
   await Promise.allSettled([

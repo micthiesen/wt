@@ -9,7 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { HARNESSES } from "../../core/harness/index.ts";
 import { claudeSummariesQuery } from "../../state/index.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { PickerRow } from "../panels/sessions-picker.tsx";
 import type { useHarnessSessions } from "./useHarnessSessions.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";

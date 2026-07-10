@@ -9,7 +9,7 @@ import type { Dispatch, SetStateAction } from "react";
 import type { WtState } from "../../core/wtstate.ts";
 import type { FooterMode } from "../panels/footer.tsx";
 import type { SectionPickerItem } from "../panels/section-picker.tsx";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import {
   GROUP_INBOX,
   STACK_SECTION_PREFIX,

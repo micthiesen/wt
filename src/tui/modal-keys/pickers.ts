@@ -1,7 +1,7 @@
 import type { KeyEvent } from "@opentui/core";
 
 import { isPlainLetter } from "../app-helpers.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import { previewFocusPatch } from "../picker-preview.ts";
 import type { SimpleModalContext } from "./ctx.ts";
 

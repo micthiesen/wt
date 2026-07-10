@@ -82,7 +82,7 @@ export type StackSliceStatus = "planned" | "open" | "merged";
 
 /**
  * A file this slice owns only PART of: the listed `hunks` (stable
- * content-hash ids from the holistic diff, see `core/hunks.ts`) rather than
+ * content-hash ids from the holistic diff, see `core/stack-ops/hunks.ts`) rather than
  * the whole file. Lets a single changed file span multiple slices. A file is
  * in a slice's `files` (whole) OR some slice's `partials` (by hunk), never
  * both; across the stack the hunks of a partial file must cover its holistic

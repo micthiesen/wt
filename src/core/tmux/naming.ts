@@ -6,7 +6,7 @@ export const TMUX_SOCKET = "wt";
 /**
  * Slug for the persistent harness session at the wt source repo (the
  * `.` keybinding — one of two session slots, see
- * `tui/session-slots.ts`). Tmux session name is just `wt`; for the
+ * `tui/sessions/slots.ts`). Tmux session name is just `wt`; for the
  * claude harness the conversation also surfaces as `wt` in `/resume`
  * listings. The startup orphan reaper whitelists every slot slug so
  * this session survives the per-slug cleanup sweep.
@@ -28,7 +28,7 @@ export const WT_SOURCE_SLUG = "wt";
  *  - `<slug>-diff` / `<slug>-shell` / `<slug>-action` for non-AI kinds
  *
  * Action sessions are not user-attachable and are not driven by the
- * F-key codepath in this module — `core/action-tmux.ts` owns their
+ * F-key codepath in this module — `core/tmux/action-sessions.ts` owns their
  * lifecycle. The kind is registered here so `listSessions` and
  * `reapOrphanedSessions` see them uniformly with the other kinds.
  */

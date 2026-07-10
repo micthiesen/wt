@@ -10,7 +10,7 @@
 import { nextAutoName } from "../core/harness/claude/names.ts";
 import { HARNESSES, type HarnessId } from "../core/harness/index.ts";
 import { actionSkillPrefix, buildActionVars } from "./app-helpers.ts";
-import type { Modal } from "./modal.ts";
+import type { Modal } from "./modal-state.ts";
 import {
   ActionEditModal,
   ActionPickerModal,

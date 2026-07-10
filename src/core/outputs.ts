@@ -24,7 +24,7 @@ export type OutputKind = "events" | "action" | "session" | "destroy";
  * Subkind of a `kind: "session"` output. Drives both the title label
  * and the OutputViewer's content dispatch. claude/shell tail via
  * `core/harness/claude/tail.ts` (stream-json / pipe-pane); codex + opencode
- * tail via `core/harness/harness-tail.ts` (rollout jsonl / SQLite).
+ * tail via `core/harness/tail.ts` (rollout jsonl / SQLite).
  * F11 diff is deliberately excluded (see file header).
  */
 export type OutputSessionKind = "claude" | "shell" | "codex" | "opencode";

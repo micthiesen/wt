@@ -5,7 +5,7 @@ import type { ActionDef } from "../../core/actions.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import type { Output } from "../../core/outputs.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { PickerItem } from "../panels/action-picker.tsx";
 import type { PickerRow } from "../panels/sessions-picker.tsx";
 import type { SectionPickerItem } from "../panels/section-picker.tsx";

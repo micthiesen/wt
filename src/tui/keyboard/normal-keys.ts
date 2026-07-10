@@ -43,7 +43,7 @@ import {
 import type { useOutputFocus } from "../hooks/useOutputFocus.ts";
 import { GROUP_INBOX } from "../hooks/useWorktreeRows.ts";
 import { visualKey, type useVisualItems } from "../hooks/useVisualItems.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { FooterMode } from "../panels/footer.tsx";
 import type { ListScrollHandle } from "../panels/list.tsx";
 import { theme } from "../theme.ts";

@@ -15,7 +15,7 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import type { TailHarnessId } from "../../core/harness/harness-tail.ts";
+import type { TailHarnessId } from "../../core/harness/tail.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
 
 const EMPTY: ReadonlySet<string> = new Set();

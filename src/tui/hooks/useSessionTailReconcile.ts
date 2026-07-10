@@ -4,7 +4,7 @@ import { config } from "../../core/config.ts";
 import {
   harnessTailRegistry,
   type LiveHarnessSlot,
-} from "../../core/harness/harness-tail.ts";
+} from "../../core/harness/tail.ts";
 import { createLogger } from "../../core/logger.ts";
 import {
   sessionTailRegistry,

@@ -13,7 +13,7 @@ import { linearUrlForSlug } from "../../core/linear.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { isPlainLetter } from "../app-helpers.ts";
 import { openUrlHidingAlacritty } from "../../core/macos.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import { theme } from "../theme.ts";
 
 export type RemovedViewKeysCtx = {

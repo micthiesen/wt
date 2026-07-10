@@ -11,7 +11,7 @@ import * as openCmd from "./commands/open.ts";
 import * as baseCmd from "./commands/base.ts";
 import * as claudeCmd from "./commands/claude.ts";
 import * as sizeCmd from "./commands/size.ts";
-import * as stackCmd from "./commands/stack.ts";
+import * as stackCmd from "./commands/stack/index.ts";
 import * as skillsCmd from "./commands/skills.ts";
 import * as eventsCmd from "./commands/events.ts";
 import * as destroyCmd from "./commands/_destroy.ts";

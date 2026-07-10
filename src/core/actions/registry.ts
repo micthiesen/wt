@@ -4,7 +4,7 @@
  * # Why tmux supervises actions
  *
  * Action runs are wrapped in a small bash supervisor (see
- * `core/action-tmux.ts`) hosted inside a `<slug>-action` tmux session.
+ * `core/tmux/action-sessions.ts`) hosted inside a `<slug>-action` tmux session.
  * The wrapper redirects stdout/stderr to per-run log files and writes
  * a `done.json` sentinel on exit. Because tmux is the wrapper's parent
  * (not wt), action runs survive a wt restart: the next `wt` invocation

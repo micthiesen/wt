@@ -8,7 +8,7 @@ import { createWorktree, parseInput } from "../../core/lifecycle.ts";
 import { createLogger } from "../../core/logger.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { parseNewInput } from "../app-helpers.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import { theme } from "../theme.ts";
 
 const newLog = createLogger("[new]");

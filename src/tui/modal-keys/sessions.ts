@@ -7,7 +7,7 @@ import {
   closeHarnessSessionGracefully,
   killHarnessSession,
 } from "../../core/tmux.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import { previewFocusPatch } from "../picker-preview.ts";
 import { isSyntheticLiveSessionId } from "../hooks/useHarnessSessions.ts";
 import type { SimpleModalContext } from "./ctx.ts";

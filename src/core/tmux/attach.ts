@@ -70,7 +70,7 @@ function scrubStderr(raw: string): string | null {
  *
  * Action sessions are intentionally excluded — they're not user-
  * attachable and have no inner-program-from-config story; their
- * lifecycle lives in `core/action-tmux.ts`.
+ * lifecycle lives in `core/tmux/action-sessions.ts`.
  *
  * Caller is responsible for suspending/resuming any UI renderer around
  * this call — this function makes no assumptions about who owns the

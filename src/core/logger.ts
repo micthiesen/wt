@@ -6,7 +6,7 @@
  *     blocks. Writes structured ctx (`{key: value}`) inline as JSON.
  *   - `event.{info,ok,warn,err,dim}` — file AND the activity pane (when
  *     a sink is registered). Replaces the old free emitters in
- *     `tui/events.ts`. Each event-pane line is a strict subset of the
+ *     `tui/activity-log.ts`. Each event-pane line is a strict subset of the
  *     file, tagged `EVENT` so `grep '^[^ ]* EVENT'` recovers exactly
  *     what the user saw.
  *

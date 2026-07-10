@@ -5,7 +5,7 @@
  */
 import { config } from "../../core/config.ts";
 import type { Worktree } from "../../core/types.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { theme } from "../theme.ts";
 

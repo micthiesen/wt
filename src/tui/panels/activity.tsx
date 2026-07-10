@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 
-import { useEvents, type WtEvent } from "../events.ts";
+import { useEvents, type WtEvent } from "../activity-log.ts";
 import { theme } from "../theme.ts";
 
 function levelFg(level: WtEvent["level"]): string {

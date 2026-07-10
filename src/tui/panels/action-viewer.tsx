@@ -4,7 +4,7 @@
  * OutputViewer; these emit just the line rows.
  */
 import type { ActionLine, ActionRun } from "../../core/actions.ts";
-import type { TailHarnessId } from "../../core/harness/harness-tail.ts";
+import type { TailHarnessId } from "../../core/harness/tail.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import { actionLineFg } from "../action-line-style.ts";
 import {

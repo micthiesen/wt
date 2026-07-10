@@ -9,7 +9,7 @@ import { editReviewers } from "../../core/github.ts";
 import { createLogger } from "../../core/logger.ts";
 import type { Contributor } from "../../core/types.ts";
 import { patchPullRequest, type GithubData } from "../../state/index.ts";
-import type { Modal } from "../modal.ts";
+import type { Modal } from "../modal-state.ts";
 import type { MultiPickerItem } from "../panels/picker.tsx";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { theme } from "../theme.ts";
