@@ -103,7 +103,7 @@ export async function attachOrCreate(opts: {
   /**
    * Resolved diff base ref for `{{base}}` substitution in
    * `config.diff.command`. Required by callers using a base-aware diff
-   * command (the shipped default `hunk diff {{base}} --watch`); ignored
+   * command (the shipped default `revdiff --vim-motion --compact {{base}}`); ignored
    * for non-diff kinds and for diff commands that don't reference
    * `{{base}}`. Substitution is verbatim — caller is responsible for
    * providing a ref that's safe to splice into a shell-quoted command

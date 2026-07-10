@@ -464,11 +464,11 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       return;
     }
     // F11 — toggle into the selected worktree's diff TUI
-    // (`[diff].command`, default `gitu`). tmux's `new-session -A`
+    // (`[diff].command`, default `revdiff`). tmux's `new-session -A`
     // makes this idempotent (creates or attaches), and the
     // wt-private tmux config binds F11 to detach-client → the same
     // physical key flips between contexts. Sessions persist (named
-    // `<slug>-diff`) so detach-then-reattach keeps gitu's scroll +
+    // `<slug>-diff`) so detach-then-reattach keeps the diff TUI's scroll +
     // expansion state. Refuse on busy worktrees so we don't race a
     // destroy.
     if (
@@ -539,7 +539,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     }
     // Shift+F11 — kill-confirm for the selected worktree's diff
     // session. Mirrors Shift+F12. No-op (with a hint) when there's no
-    // session. Killing throws away gitu's scroll/expansion state, so
+    // session. Killing throws away the diff TUI's scroll/expansion state, so
     // next F11 opens fresh.
     if (
       k.name === "f11" &&

@@ -118,7 +118,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "F10", label: "enter shell · F10 again to detach" },
       { key: "⇧F10", label: "kill shell session (ends background procs)" },
       { key: "F11", label: "enter diff TUI · F11 again to detach" },
-      { key: "⇧F11", label: "kill diff session (resets gitu state)" },
+      { key: "⇧F11", label: "kill diff session (resets its view state)" },
       { key: "F12", label: "enter F12-target session · F12 again to detach" },
       { key: "ctrl+d", label: "close F12-target session gracefully (ctrl+d ×2)" },
     ],

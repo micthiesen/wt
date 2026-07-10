@@ -24,7 +24,7 @@ export async function enterDiffSession(opts: {
   cwd: string;
   /**
    * Resolved diff base ref to splice into `{{base}}` in
-   * `[diff].command` (default `hunk diff {{base}} --watch`). For
+   * `[diff].command` (default `revdiff --vim-motion --compact {{base}}`). For
    * trunk-targeted worktrees this is `origin/<config.branch.base>`;
    * for stack-detected or non-trunk-PR worktrees it's the parent
    * branch ref. Forwarded verbatim to `attachOrCreate`.
