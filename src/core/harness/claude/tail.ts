@@ -6,7 +6,7 @@
  *
  * # Lifecycle
  *
- * `ensure(slug, wtPath)` is idempotent. The driver (`tui/app.tsx`)
+ * `ensure(slug, wtPath)` is idempotent. The driver (`tui/hooks/useSessionTailReconcile.ts`)
  * calls it for every slug in the live tmux-session set on every
  * `useEffect`; new entries spin up a tailer, the rest no-op. `stop`
  * unwinds one tailer; `reconcile` runs ensure-and-stop together against

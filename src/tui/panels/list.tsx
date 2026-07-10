@@ -27,8 +27,7 @@ import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
 /**
  * One entry in the ACTIVE portion of the list. Either a worktree row, or a
- * folded section collapsed to a single selectable header line. The parent
- * (`app.tsx`) builds this so the cursor model and the render share one source
+ * folded section collapsed to a single selectable header line. The parent * (via `tui/hooks/useVisualItems.ts`) builds this so the cursor model and the render share one source
  * of truth — a folded section is one cursor stop, not N hidden rows.
  */
 export type ListActiveItem =

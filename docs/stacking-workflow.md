@@ -485,14 +485,14 @@ standalone skills — never as edits to `/start` or `/done`.
       the holistic base, symlink the holistic worktree's deps in (`[stack]
       verify_deps`, default `node_modules`), and run `[stack] verify_command`
       against each, aborting on the first red. Slices stay install-free; the deps
-      live in the throwaway worktree. New `core/stack-verify.ts`. Documented
+      live in the throwaway worktree. New `core/stack-ops/verify.ts`. Documented
       limitations: wholesale dep symlink can mask a missing-import failure, the
       verify command/tsconfig are read per-prefix, single-root projects only, and
       single-source stacks only (re-split mixed-source bails to CI). Default off.
 - [x] wt: **hunk-level slice partitions** (eng-5229 friction, 2026-06-16). Relaxed
       the atomic-file rule: a `StackSlice` may now carry `partials: [{ file,
       hunks }]` so a single changed file's hunks can span slices. New
-      `core/hunks.ts` parses the holistic diff into content-hashed (line-shift
+      `core/stack-ops/hunks.ts` parses the holistic diff into content-hashed (line-shift
       stable) hunk ids, reconstructs a slice's exact intermediate content (base +
       owned-by-self-and-ancestors hunks) as pure text replay, and counts owned
       lines for sizing. `materializeSliceCommit` writes reconstructed partials
@@ -646,7 +646,7 @@ Track friction here as the workflow gets used. Candidate adjustments:
   blocking legitimately-clean stacks where a single file's hunks served
   different slices (eng-5229: `createMessage.ts` had an actor hunk and a gate
   hunk; three `*.spec.ts` had a fixture-stub hunk and a behavior hunk). Hunk
-  ids are content-hashed against the holistic diff (`core/hunks.ts`), so they
+  ids are content-hashed against the holistic diff (`core/stack-ops/hunks.ts`), so they
   survive line-number shifts; `/split` lists canonical ids via `wt stack
   hunks`. Materialize reconstructs the exact intermediate content (base + the
   owned-by-this-slice-and-its-ancestors hunks) as pure text replay — no `git

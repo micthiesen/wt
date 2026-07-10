@@ -17,7 +17,7 @@ import { laneColor, theme } from "../../theme.ts";
 
 /**
  * What the detail pane shows when a FOLDED section header is the cursor: the
- * stack/section overview. Built by `app.tsx` from the folded section item +
+ * stack/section overview. Built by `tui/hooks/useSectionDetail.ts` from the folded section item +
  * the live manifest, so this pane stays free of state reads.
  */
 export type SectionMember = {

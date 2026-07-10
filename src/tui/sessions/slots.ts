@@ -14,21 +14,21 @@
  * listings. The current values (`"wt"`, `"main"`) are short and can
  * in theory collide with a user-created worktree whose directory
  * basename happens to match — vanishingly unlikely in practice, but
- * the `pathBySlug` build in `app.tsx`'s session-tail reconcile is
+ * the `pathBySlug` build in `useSessionTailReconcile`'s reconcile is
  * ordered so a real row's path wins on tie.
  *
  * Consumers:
- *  - `tui/app.tsx` — `,` / `.` / `/` keybind handlers enter the slot
- *    via `enterHarnessSession` with the slot's path as `cwd`, picking
- *    the Shift+TAB-cycled primary harness so the choice mirrors a row's
- *    F12 default.
+ *  - `tui/keyboard/global-keys.ts` — `,` / `.` / `/` keybind handlers
+ *    enter the slot via `enterHarnessSession` with the slot's path as
+ *    `cwd`, picking the Shift+TAB-cycled primary harness so the choice
+ *    mirrors a row's F12 default.
  *  - `tui/runtime.tsx` — the startup orphan reaper whitelists
  *    `SLOT_SLUGS` so slot-owned tmux sessions survive the per-slug
  *    cleanup sweep.
  *  - `tui/panels/footer.tsx` — subscribes to `MAIN_CLONE_SLOT`'s tail
  *    via `useSessionRun` and renders the last line in the bottom bar.
- *  - `tui/app.tsx`'s session-tail reconcile effect — adds slot paths
- *    to `pathBySlug` so a slot's live claude session gets a tailer.
+ *  - `tui/hooks/useSessionTailReconcile.ts` — adds slot paths to
+ *    `pathBySlug` so a slot's live claude session gets a tailer.
  */
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";

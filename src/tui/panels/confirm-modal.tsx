@@ -18,7 +18,7 @@ type Props = {
  * an async toast — e.g. a delayed "1 reviewer set" landing while the user
  * lines up `y` — can't clobber the pending prompt the way it did when
  * confirms shared the footer's single state slot. Driven by the
- * `{ kind: "confirm" }` modal in app.tsx, which dispatches on `pendingKey`.
+ * `{ kind: "confirm" }` modal (mounted in `modal-host.tsx`); `modal-keys/confirm.ts` dispatches on `pendingKey`.
  */
 export function ConfirmModal({
   title,

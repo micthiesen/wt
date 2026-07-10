@@ -129,7 +129,7 @@ export interface Harness {
    * Prefix this harness uses to invoke named skills / slash commands in
    * a prompt. Claude Code uses `/`; OpenCode and Codex use `$`.
    * Substituted into action prompts as `{{skill_prefix}}` at launch
-   * time (see `buildActionVars` in `tui/app.tsx`), so a single prompt
+   * time (see `buildActionVars` in `tui/app-helpers.ts`), so a single prompt
    * like `{{skill_prefix}}restack` lands correctly regardless of which
    * harness is the row's primary. Headless prompt actions use the
    * selected primary harness's non-interactive CLI, so they use the

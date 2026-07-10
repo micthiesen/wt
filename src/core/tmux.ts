@@ -4,9 +4,9 @@
  * restart; never visible to the user as tmux (no status bar, no
  * keybindings the user touches).
  *
- * The user-facing entry point is `tui/claude-session.ts`, which
+ * The user-facing entry point is `tui/sessions/harness.ts`, which
  * suspends the renderer and shells out to `attachOrCreate` here. Status
- * polling lives in `tmuxSessionsQuery` (state/queries.ts).
+ * polling lives in `tmuxSessionsQuery` (state/queries/sessions.ts).
  *
  * # Why TMUX gets stripped from the spawn env
  *

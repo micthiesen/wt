@@ -191,7 +191,7 @@ export type AiConfig = OpenAiAiConfig | GeminiAiConfig;
  *
  * Both `prompt` and `shell` (and the user-typed extras) support
  * `{{var}}` substitution. Vars are populated per-launch from the row
- * — see `buildActionVars` in `tui/app.tsx` for the full set. Unknown
+ * — see `buildActionVars` in `tui/app-helpers.ts` for the full set. Unknown
  * vars pass through unchanged so typos surface in the rendered prompt.
  *
  * `{{skill_prefix}}` is the harness skill-invocation prefix (`/` for
