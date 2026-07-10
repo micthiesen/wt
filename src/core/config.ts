@@ -358,7 +358,10 @@ export type AutomationDef = {
   /**
    * Quiescence window: the intent must be at least this old AND the
    * worktree free of edits for this long before delivery. Doubles as
-   * the human-cancellation grace period.
+   * the human-cancellation grace period. Defaults per trigger: merge
+   * triggers (`wt.merged`, `stack.parent_merged`) can't flap — a merge
+   * doesn't un-happen — so they default short; the rest default long
+   * enough to ride out CI/review churn.
    */
   settleSeconds: number;
 };
@@ -765,6 +768,17 @@ const VALID_TRIGGERS = new Set<AutomationTrigger>([
   "stack.parent_merged",
 ]);
 const DEFAULT_SETTLE_SECONDS = 120;
+// Merge-driven triggers are un-flappy, and the typical next step (review
+// the next slice, mark it ready) wants the restack done promptly — keep
+// only a token cancellation window.
+const MERGED_SETTLE_SECONDS = 10;
+const MERGE_TRIGGERS: ReadonlySet<AutomationTrigger> = new Set([
+  "wt.merged",
+  "stack.parent_merged",
+]);
+function defaultSettleSeconds(on: AutomationTrigger): number {
+  return MERGE_TRIGGERS.has(on) ? MERGED_SETTLE_SECONDS : DEFAULT_SETTLE_SECONDS;
+}
 
 function parseAutomations(
   raw: unknown,
@@ -849,7 +863,8 @@ function parseAutomations(
       run,
       busy,
       cooldownMinutes: typeof cooldownRaw === "number" ? cooldownRaw : null,
-      settleSeconds: typeof settleRaw === "number" ? settleRaw : DEFAULT_SETTLE_SECONDS,
+      settleSeconds:
+        typeof settleRaw === "number" ? settleRaw : defaultSettleSeconds(on as AutomationTrigger),
     });
   }
   return out;
