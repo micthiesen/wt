@@ -31,12 +31,18 @@
  *    to `pathBySlug` so a slot's live claude session gets a tailer.
  */
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { config } from "../../core/config.ts";
 import { WT_SOURCE_SLUG } from "../../core/tmux.ts";
 
-import { WT_REPO_PATH } from "../helpers.ts";
+/**
+ * Path of the wt source tree itself. This file lives at
+ * `<repo>/src/tui/sessions/slots.ts`, so the repo root is three levels
+ * up from `import.meta.dir`. Resolves consistently whether wt is
+ * invoked through the bin shim or directly via `bun src/main.ts`.
+ */
+const WT_REPO_PATH: string = resolve(import.meta.dir, "..", "..", "..");
 
 export type SessionSlot = {
   /** Tmux slug. Shares the namespace with worktree slugs. */

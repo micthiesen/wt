@@ -61,7 +61,7 @@ import { usePrTargetChord } from "./hooks/usePrTargetChord.ts";
 import { useRemovedView } from "./hooks/useRemovedView.ts";
 import { useSessionsPickerData } from "./hooks/useSessionsPickerData.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "./usage-badge.tsx";
-import { writeClipboard } from "./helpers.ts";
+import { writeClipboard } from "../core/macos.ts";
 import { theme } from "./theme.ts";
 
 const appLog = createLogger("[app]");

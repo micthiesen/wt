@@ -11,7 +11,7 @@ import type { KeyEvent } from "@opentui/core";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { createLogger } from "../../core/logger.ts";
 import { isPlainLetter, isShiftedLetter } from "../app-helpers.ts";
-import { openInZed } from "../helpers.ts";
+import { openInZed } from "../../core/zed.ts";
 import type { Modal } from "../modal.ts";
 import type { FooterMode } from "../panels/footer.tsx";
 import {

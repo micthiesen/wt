@@ -1,16 +1,8 @@
-import { resolve } from "node:path";
-
-import { hideFrontmostAlacritty, openInZed } from "../core/zed.ts";
-
-export { hideFrontmostAlacritty, openInZed };
-
 /**
- * Path of the wt source tree itself. This file lives at
- * `<repo>/src/tui/helpers.ts`, so the repo root is two levels up
- * from `import.meta.dir`. Resolves consistently whether wt is
- * invoked through the bin shim or directly via `bun src/main.ts`.
+ * macOS-only process utilities (`open`, `pbcopy`) — part of the macOS
+ * assumption noted in the README.
  */
-export const WT_REPO_PATH: string = resolve(import.meta.dir, "..", "..");
+import { hideFrontmostAlacritty } from "./zed.ts";
 
 /** Fire-and-forget `open <url>`. The macOS `open` binary returns immediately. */
 export function openUrl(url: string): void {

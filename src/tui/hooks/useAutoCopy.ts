@@ -4,7 +4,7 @@ import { useRenderer } from "@opentui/react";
 
 import { createLogger } from "../../core/logger.ts";
 import { pluralize } from "../../core/text.ts";
-import { writeClipboard } from "../helpers.ts";
+import { writeClipboard } from "../../core/macos.ts";
 
 const log = createLogger("app");
 

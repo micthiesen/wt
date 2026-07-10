@@ -34,7 +34,8 @@ import type { makeGithubPrFlows } from "../flows/github-pr.ts";
 import { REVIEW_SECTION } from "../flows/new-worktree.ts";
 import type { makeSectionFlows } from "../flows/sections.ts";
 import type { makeSessionFlows } from "../flows/sessions.ts";
-import { openInZed, openUrlHidingAlacritty } from "../helpers.ts";
+import { openUrlHidingAlacritty } from "../../core/macos.ts";
+import { openInZed } from "../../core/zed.ts";
 import {
   isSyntheticLiveSessionId,
   type useHarnessSessions,

@@ -12,7 +12,7 @@ import { createLogger } from "../../core/logger.ts";
 import { linearUrlForSlug } from "../../core/linear.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { isPlainLetter } from "../app-helpers.ts";
-import { openUrlHidingAlacritty } from "../helpers.ts";
+import { openUrlHidingAlacritty } from "../../core/macos.ts";
 import type { Modal } from "../modal.ts";
 import { theme } from "../theme.ts";
 

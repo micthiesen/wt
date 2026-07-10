@@ -16,7 +16,7 @@ import {
 import { createLogger } from "../../core/logger.ts";
 import type { ReviewRequestPr } from "../../state/index.ts";
 import { isPlainLetter } from "../app-helpers.ts";
-import { openUrlHidingAlacritty } from "../helpers.ts";
+import { openUrlHidingAlacritty } from "../../core/macos.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 const PR_TARGET_CHORD_MS = 1_200;
