@@ -452,7 +452,14 @@ function sortActiveRows(
  * Watch the set of slugs that currently hold a lock. When a slug
  * transitions from held → released, invalidate the worktree list so
  * a destroyed slug drops promptly instead of lingering as a stale
- * merged/gone candidate until its 15s staleTime expires.
+ * merged/gone candidate until its 15s staleTime expires — and refresh
+ * the released slug's own field queries. Everything a lock-holding op
+ * touches (upstream set after `git worktree add`, install churn, sst
+ * writes, branch deletes) was fetched mid-op by whichever field
+ * queries mounted while the row was busy; without this wave those
+ * fields keep the mid-op answer until something else happens to
+ * invalidate `["wt"]`. The per-slug prefix also covers `diffContext`,
+ * so a fresh create's AI title kicks off right when setup finishes.
  *
  * The signal arrives as a JSON-encoded sorted slug list so React
  * compares by string identity (cheap, stable). A foreign-author slug
@@ -465,15 +472,15 @@ function useLockReleasedInvalidator(lockedSig: string): void {
   useEffect(() => {
     const curr = new Set<string>(JSON.parse(lockedSig) as string[]);
     const prev = prevLockedRef.current;
-    let released = false;
+    const released: string[] = [];
     for (const slug of prev) {
-      if (!curr.has(slug)) {
-        released = true;
-        break;
-      }
+      if (!curr.has(slug)) released.push(slug);
     }
     prevLockedRef.current = curr;
-    if (released) {
+    if (released.length > 0) {
+      for (const slug of released) {
+        void qc.invalidateQueries({ queryKey: qk.wt(slug).all() });
+      }
       void qc.invalidateQueries({ queryKey: qk.worktrees() });
       // Destroys (and `init`) mutate state.json from the child process
       // — refresh the wtState query so the row aggregator sees those

@@ -51,8 +51,11 @@ export const wtLockQuery = (wt: Pick<Worktree, "slug">) =>
     queryKey: qk.wt(wt.slug).lock(),
     queryFn: async (): Promise<Partial<LockMeta> | null> => lockStatus(wt.slug),
     staleTime: STALE.fast,
-    // Poll more aggressively while a lock is held so "busy" phase text
-    // updates without pressing `r`.
+    // The lock-dir watcher (`watchLockDir` in the TUI runtime) is the
+    // primary trigger — acquire, phase writes, and release all fire it,
+    // so busy state tracks any process's lock churn push-based. This
+    // while-held poll is the backstop for a missed fs event and keeps
+    // the displayed lock age ticking.
     refetchInterval: (query) => (query.state.data ? 2_000 : false),
   });
 

@@ -275,6 +275,73 @@ export function watchWtStateFiles(
   };
 }
 
+/**
+ * Subscribe to per-slug lock churn under `<lockDir>/`. `tryAcquireLock`
+ * writes `<slug>.lock` on acquire and every `phase()` update, and
+ * unlinks it on release — so this is the push signal for the busy
+ * state in BOTH directions: a lock appearing (external destroy, stack
+ * replay, `wt new` in a shell) and a lock releasing (setup done). The
+ * lock query's while-held poll stays as a backstop, but it only helps
+ * once it has already seen the lock; this watcher is what makes the
+ * acquire visible in the first place, and what flips "busy: pnpm
+ * install" to done the moment the create finishes instead of on the
+ * next poll tick.
+ *
+ * Internal mutex locks (`__fetch_origin__`, `__stack__`, `__wtstate__`,
+ * …) share the directory under the `__name__` convention and are
+ * filtered out — they're process plumbing, not worktree state. The
+ * `withFileLock` mutexes also never rewrite or unlink their files, so
+ * they generate no events after first creation anyway.
+ *
+ * `slug === "*"` means the event carried no filename (rare on macOS);
+ * the caller should invalidate coarsely rather than miss a release.
+ */
+export function watchLockDir(
+  lockDir: string,
+  onChange: (slug: string) => void,
+): () => void {
+  const debouncers = new Map<string, Debounced>();
+  let disposed = false;
+  const debouncerFor = (slug: string): Debounced => {
+    let d = debouncers.get(slug);
+    if (!d) {
+      d = makeDebounced(() => onChange(slug), REFS_DEBOUNCE_MS);
+      debouncers.set(slug, d);
+    }
+    return d;
+  };
+  const cancelAll = (): void => {
+    disposed = true;
+    for (const d of debouncers.values()) d.cancel();
+    debouncers.clear();
+  };
+  let watcher: FSWatcher | null = null;
+  try {
+    mkdirSync(lockDir, { recursive: true });
+    watcher = watch(lockDir, { persistent: false }, (_event, filename) => {
+      if (disposed) return;
+      if (filename == null) {
+        debouncerFor("*").trigger();
+        return;
+      }
+      if (!filename.endsWith(".lock")) return;
+      const slug = filename.slice(0, -".lock".length);
+      if (slug.startsWith("__")) return;
+      debouncerFor(slug).trigger();
+    });
+    watcher.on("error", (err) => {
+      log.warn("lock watcher error", { err: String(err), lockDir });
+    });
+  } catch (err) {
+    log.warn("lock watcher failed", { err: String(err), lockDir });
+    return cancelAll;
+  }
+  return () => {
+    cancelAll();
+    closeSilent(watcher);
+  };
+}
+
 export type WatchTarget = { slug: string; path: string };
 
 /**

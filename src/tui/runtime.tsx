@@ -22,6 +22,7 @@ import {
 } from "../core/harness/claude/tail.ts";
 import {
   WorktreeWatchSet,
+  watchLockDir,
   watchRefs,
   watchWorktreesAdmin,
   watchWtStateFiles,
@@ -239,6 +240,23 @@ export async function runTui(): Promise<TuiExit> {
     const key = file === "state" ? qk.wtState() : qk.archive();
     invalidations.key(key);
   });
+  // Per-slug lock churn → refresh that slug's lock query. Acquire /
+  // phase writes / release all land here, so the busy state is push-
+  // based in both directions: a create's "pnpm install" phase appears
+  // and clears the moment it happens (any process), instead of waiting
+  // on the lock query's while-held poll — which never arms at all when
+  // the lock appears after the query last fetched null. The release
+  // side then chains through `useLockReleasedInvalidator`, which
+  // refreshes the released slug's field queries.
+  const stopLockWatch = watchLockDir(config.paths.lockDir, (slug) => {
+    if (slug === "*") {
+      // Event without a filename — can't target one slug; refresh the
+      // whole per-worktree namespace rather than risk a stuck "busy".
+      invalidations.key(["wt"]);
+      return;
+    }
+    invalidations.key(qk.wt(slug).lock());
+  });
   const worktreeWatchSet = new WorktreeWatchSet((slug, area) => {
     // `.sst/` writes flip the deploy badge (deploys + removes always
     // write there); everything else is a working-tree edit → dirty.
@@ -424,6 +442,7 @@ export async function runTui(): Promise<TuiExit> {
     stopGithubEventsWatch?.();
     stopWorktreesAdminWatch();
     stopWtStateWatch();
+    stopLockWatch();
     unsubWorktrees();
     worktreeWatchSet.dispose();
     stopCodexEvents();
