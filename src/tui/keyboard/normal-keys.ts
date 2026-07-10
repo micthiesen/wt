@@ -795,8 +795,10 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       // time. When any of them would refuse the destroy, switch the
       // confirm to a force-variant so the user can opt into the
       // destructive path inline instead of bouncing out to the shell.
-      const dirty = current.fields.dirty.data?.length ?? 0;
-      const ahead = current.fields.sync.data?.remote?.ahead ?? 0;
+      const dirtyData = current.fields.dirty.data;
+      const syncData = current.fields.sync.data;
+      const dirty = dirtyData?.length ?? 0;
+      const ahead = syncData?.remote?.ahead ?? 0;
       const reasons: string[] = [];
       if (dirty > 0) {
         reasons.push(`${dirty} uncommitted file${dirty === 1 ? "" : "s"}`);
@@ -804,13 +806,23 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       if (ahead > 0) {
         reasons.push(`${ahead} unpushed commit${ahead === 1 ? "" : "s"}`);
       }
-      if (reasons.length > 0) {
+      // Unknown ≠ clean: while dirty/sync are still loading the checks
+      // above can't clear the row, and doRemove's non-force guard would
+      // refuse anyway — offer the force variant with an honest caveat so
+      // the user can proceed deliberately or wait a beat and re-prompt.
+      const stateUnknown = dirtyData === undefined || syncData === undefined;
+      if (reasons.length > 0 || stateUnknown) {
+        const lost =
+          reasons.length > 0 ? `${reasons.join(", ")} will be lost.` : null;
+        const caveat = stateUnknown
+          ? "Dirty/unpushed state hasn't loaded yet — anything uncommitted or unpushed will be lost."
+          : null;
         setModal({
           kind: "confirm",
           pendingKey: "d!",
           title: "force remove",
           message: `Force remove ${current.wt.slug}?`,
-          detail: `${reasons.join(", ")} will be lost.`,
+          detail: [lost, caveat].filter(Boolean).join(" "),
           confirmLabel: "remove",
           danger: true,
         });

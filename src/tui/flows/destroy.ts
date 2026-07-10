@@ -106,6 +106,19 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     }
     const force = opts.force ?? false;
     if (!force) {
+      // Unknown ≠ clean: both fields default to "no data" while their
+      // queries load (or after an error), and the destroy deletes the
+      // branch with -D — treating that window as clean could drop
+      // uncommitted files or unpushed commits. Force skips this, and the
+      // `d` prompt offers the force variant whenever state is unknown.
+      if (
+        row.fields.dirty.data === undefined ||
+        row.fields.sync.data === undefined
+      ) {
+        log.event.warn("refused: dirty/unpushed state still loading, retry in a moment");
+        toast(`${slug} state still loading, retry in a moment`, theme.warn, 2500);
+        return;
+      }
       if ((row.fields.dirty.data?.length ?? 0) > 0) {
         log.event.err("refused: uncommitted changes, press d again to force");
         toast(`${slug} has uncommitted changes`, theme.err, 3000);

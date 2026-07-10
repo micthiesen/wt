@@ -12,6 +12,7 @@ import {
   type StackManifest,
   type StackSlice,
 } from "../wtstate.ts";
+import { fetchOrigin } from "../worktree.ts";
 import { acquireStackLock, log, retargetIfNeeded, STACK_BUSY, type Logger } from "./shared.ts";
 
 // ---------- add (append an existing branch to a live stack) ----------
@@ -77,6 +78,19 @@ async function addSliceToStackLocked(
 ): Promise<AddSliceResult> {
   const manifest = getStackManifest(stackId);
   if (!manifest) return { ok: false, error: `no stack manifest: ${stackId}` };
+  // Freshen origin before resolving refs, mirroring replay's
+  // fetch-before-anchor discipline: the squash-safe `baseSha` anchor and
+  // the derived `files` list are computed from merge-base against the
+  // parent (or origin trunk for a lane root) — stale origin refs would
+  // bake a wrong anchor into the manifest.
+  try {
+    await fetchOrigin();
+  } catch (err) {
+    return {
+      ok: false,
+      error: `${err instanceof Error ? err.message : String(err)}; refusing to anchor against possibly-stale refs`,
+    };
+  }
   const owner = findStackIdByBranch(branch);
   if (owner) {
     return { ok: false, error: `${branch} is already tracked by stack ${owner}` };
