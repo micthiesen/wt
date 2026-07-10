@@ -35,8 +35,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import { createLogger } from "./logger.ts";
-import { closeSilent, readFileSlice } from "./tail-util.ts";
+import { createLogger } from "../logger.ts";
+import { closeSilent, readFileSlice } from "../tail-util.ts";
 
 const log = createLogger("[action-tail]");
 

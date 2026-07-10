@@ -48,8 +48,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { config } from "./config.ts";
-import { createLogger } from "./logger.ts";
+import { config } from "../config.ts";
+import { createLogger } from "../logger.ts";
 
 const log = createLogger("[action-history]");
 

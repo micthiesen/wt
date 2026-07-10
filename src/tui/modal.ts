@@ -1,5 +1,5 @@
 import type { ActionDef } from "../core/actions.ts";
-import type { HistoryEntry } from "../core/action-history.ts";
+import type { HistoryEntry } from "../core/actions.ts";
 import type { RemovedWorktree } from "../core/wtstate.ts";
 import type { ActionPickerState } from "./panels/action-picker.tsx";
 import type { MultiPickerItem } from "./panels/picker.tsx";

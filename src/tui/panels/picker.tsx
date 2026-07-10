@@ -1,4 +1,4 @@
-import type { HistoryEntry } from "../../core/action-history.ts";
+import type { HistoryEntry } from "../../core/actions.ts";
 import { Modal } from "../modal.tsx";
 import { theme } from "../theme.ts";
 

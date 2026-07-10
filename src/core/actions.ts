@@ -9,6 +9,8 @@ export type {
   ActionRun,
   ActionStartResult,
 } from "./actions/types.ts";
+export { recentValues, recordRun } from "./actions/history.ts";
+export type { HistoryEntry } from "./actions/history.ts";
 export { evaluateActionRequirements } from "./actions/requirements.ts";
 export { applyVars } from "./actions/template.ts";
 export {

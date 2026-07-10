@@ -22,7 +22,7 @@ import {
   type ActionDef,
   type ActionVars,
 } from "../../core/actions.ts";
-import { recordRun as recordHistoryRun } from "../../core/action-history.ts";
+import { recordRun as recordHistoryRun } from "../../core/actions.ts";
 import { config } from "../../core/config.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { lockLabel, lockStatus } from "../../core/locks.ts";

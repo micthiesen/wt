@@ -48,6 +48,8 @@ export {
 } from "./tmux/admin.ts";
 export type { ClaudeSessionEntry } from "./tmux/admin.ts";
 
+export { killActionSession, startActionSession } from "./tmux/action-sessions.ts";
+
 export { attachOrCreate } from "./tmux/attach.ts";
 export type { AttachResult } from "./tmux/attach.ts";
 

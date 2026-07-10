@@ -1,6 +1,6 @@
 import type { KeyEvent } from "@opentui/core";
 
-import { recentValues } from "../../core/action-history.ts";
+import { recentValues } from "../../core/actions.ts";
 import { printableMultiline } from "../app-helpers.ts";
 import type { Modal } from "../modal.ts";
 import type { SimpleModalContext } from "./ctx.ts";

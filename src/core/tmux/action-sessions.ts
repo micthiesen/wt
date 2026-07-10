@@ -29,8 +29,8 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { createLogger } from "./logger.ts";
-import { run } from "./proc.ts";
+import { createLogger } from "../logger.ts";
+import { run } from "../proc.ts";
 
 const log = createLogger("[action-tmux]");
 

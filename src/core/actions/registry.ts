@@ -62,11 +62,7 @@ import {
   seedActionDir,
   startActionTail,
   watchDoneSentinel,
-} from "../action-tail.ts";
-import {
-  killActionSession as killActionTmuxSession,
-  startActionSession,
-} from "../action-tmux.ts";
+} from "./tail.ts";
 import {
   DEFAULT_CLAUDE_AFFECTS,
   DEFAULT_REQUIRES,
@@ -74,7 +70,11 @@ import {
 } from "../config.ts";
 import type { HarnessId } from "../harness/index.ts";
 import { sanitizeLine } from "../proc.ts";
-import { listSessions } from "../tmux.ts";
+import {
+  killActionSession as killActionTmuxSession,
+  listSessions,
+  startActionSession,
+} from "../tmux.ts";
 import { CUSTOM_ACTION_ID, MAX_RETAINED_RUNS, RECENT_WINDOW_MS } from "./builtins.ts";
 import { actionsDir, formatRunId, headlessPromptRunner, makeFreshHandles } from "./launch.ts";
 import { applyEmit, capLines } from "./lines.ts";

@@ -1,4 +1,4 @@
-import { killActionSession } from "../action-tmux.ts";
+import { killActionSession } from "./action-sessions.ts";
 import type { HarnessId } from "../harness/index.ts";
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
