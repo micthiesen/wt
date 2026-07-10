@@ -60,6 +60,7 @@ type Block =
  *  wraps within the column (wrapMode) rather than overrunning the label. */
 const KEY_W = 16;
 const PR_TARGET_LABEL = config.github.prTarget === "linear" ? "Linear" : "GitHub";
+const TRUNK = `origin/${config.branch.base}`;
 
 // ── The keymap, grouped by what you're acting on ───────────────────────
 
@@ -107,7 +108,8 @@ const KEY_BLOCKS: Block[] = [
     kind: "keys",
     title: "sessions",
     items: [
-      { key: "!", label: "run claude action · kill if running" },
+      { key: "!", label: "run action (picker) · kill if one's running" },
+      { key: "! <key>", label: "run action by its quick-pick letter" },
       { key: "! c", label: "open action picker, jump to custom prompt" },
       { key: ";", label: "sessions picker (all harnesses for current row)" },
       { key: "; c / x / o", label: "jump to + new claude / codex / opencode" },
@@ -132,6 +134,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "l n", label: "new section (chord)" },
       { key: "L", label: "rename current section" },
       { key: "b", label: "set fork base (picker · b b confirms) · record only, never rebases" },
+      { key: "R", label: "restack selected row's stack (replay; /restack on conflict)" },
       { key: "J / K", label: "move row · stack/folded section: move whole group" },
     ],
   },
@@ -153,7 +156,6 @@ const KEY_BLOCKS: Block[] = [
       { key: "c", label: "clean merged/gone" },
       { key: "h", label: "show / hide removed-worktree history" },
       { key: "r", label: "refresh (fetch + recompute)" },
-      { key: "R", label: "restack this stack (replay; /restack on conflict)" },
       { key: "^R", label: "clear all cached data" },
       { key: ",", label: "enter wt source session · F12 to detach" },
       { key: ".", label: "enter main repo session · F12 to detach" },
@@ -202,7 +204,7 @@ const KEY_BLOCKS: Block[] = [
   {
     kind: "keys",
     title: "modals",
-    note: "every list picker follows the same trigger-key-confirm pattern. esc cancels; j/k or arrows move; the bottom pane previews the highlight when applicable. CLAUDE.md has the full rules.",
+    note: "every list picker follows the same trigger-key-confirm pattern. esc cancels; j/k or arrows move; the bottom pane previews the highlight when applicable. docs/architecture.md has the full rules.",
     items: [
       { key: "key", label: "open picker (l, ;, ', !, v …)" },
       { key: "key key", label: "confirm highlighted (trigger re-press)" },
@@ -220,7 +222,7 @@ const STATUS_GLYPHS: GlyphItem[] = [
   { glyph: NF.trash, color: theme.err, label: "busy (removing)" },
   { glyph: NF.unlink, color: theme.err, label: "missing (path vanished)" },
   { glyph: NF.slash, color: theme.warn, label: "gone (branch deleted upstream)" },
-  { glyph: NF.merge, color: theme.ok, label: "merged into origin/main" },
+  { glyph: NF.merge, color: theme.ok, label: `merged into ${TRUNK}` },
   { glyph: NF.pencil, color: theme.warn, label: "uncommitted changes" },
   { glyph: "  ", color: theme.fgDim, label: "idle / clean", search: "idle clean" },
 ];
@@ -238,7 +240,7 @@ const BADGES: GlyphItem[] = [
   { glyph: `${NF.mergeQueue} N`, color: theme.err, label: "merge queue pos N · blocked" },
   { glyph: NF.mergeQueue, color: theme.info, label: "auto-merge armed (waiting)" },
   { glyph: NF.bolt, color: theme.warn, label: "SST stage deployed" },
-  { glyph: NF.comment, color: theme.ok, label: "Claude · `!` action running" },
+  { glyph: NF.comment, color: theme.ok, label: "`!` action running", search: "action running claude" },
   {
     glyph: getHarness("claude").glyph,
     color: getHarness("claude").color,
@@ -269,8 +271,8 @@ const SYNC: GlyphItem[] = [
   {
     glyph: <text fg={theme.fgDim}>[↑N ↓M]</text>,
     color: theme.fgDim,
-    label: "ahead/behind vs origin/main",
-    search: "[↑n ↓m] ahead behind origin main",
+    label: `ahead/behind vs ${TRUNK}`,
+    search: "[↑n ↓m] ahead behind origin main trunk",
   },
   {
     glyph: (
