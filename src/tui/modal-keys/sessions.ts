@@ -102,7 +102,7 @@ export function handleClaudeSessionsPickerKey(
     }
     return true;
   }
-  if (k.sequence === "x") {
+  if (k.sequence === "x" && !k.ctrl && !k.meta) {
     const r = rowsLocal[idx];
     if (r?.kind === "session") {
       const e = r.entry;
@@ -143,7 +143,7 @@ export function handleClaudeSessionsPickerKey(
         toast("session isn't live, nothing to close", fgDimColor, 1500);
         return true;
       }
-      logInfo(`closing ${getHarness(e.harnessId).label} session on ${slug} (ctrl+d x2)`);
+      logInfo(`closing ${getHarness(e.harnessId).label} session on ${slug}`);
       void closeHarnessSessionGracefully(
         slug,
         e.harnessId,

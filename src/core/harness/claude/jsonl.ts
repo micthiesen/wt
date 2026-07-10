@@ -1,13 +1,8 @@
-import {
-  closeSync,
-  existsSync,
-  openSync,
-  readSync,
-  statSync,
-} from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { readFileSlice } from "../../tail-util.ts";
 import { asObj } from "./events.ts";
 import { listClaudeNames } from "./names.ts";
 
@@ -169,15 +164,7 @@ export function wtSessionArgs(opts: {
 
 function readTail(filePath: string, size: number): string {
   const start = Math.max(0, size - TAIL_BYTES);
-  const len = size - start;
-  const fd = openSync(filePath, "r");
-  try {
-    const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, start);
-    return buf.toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
+  return readFileSlice(filePath, start, size - start);
 }
 
 type Entry = { type: string; raw: Record<string, unknown> };

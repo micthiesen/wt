@@ -173,7 +173,17 @@ export async function fetchGithub(
   }
 
   const r = await run(args, { cwd: config.paths.mainClone, timeoutMs: 15_000, signal });
-  if (r.exitCode !== 0) return empty;
+  if (r.exitCode !== 0) {
+    // The primary batched fetch failing silently means "empty state
+    // everywhere" with nothing to diagnose — log like the sibling
+    // fetchers do.
+    log.error("gh api graphql failed", {
+      exitCode: r.exitCode,
+      stderr: r.stderr.slice(0, 400),
+      branchCount: branches.length,
+    });
+    return empty;
+  }
   let parsed: GqlResponse;
   try {
     parsed = JSON.parse(r.stdout);
@@ -185,7 +195,16 @@ export async function fetchGithub(
     return empty;
   }
   const repo = parsed.data?.repository;
-  if (!repo) return empty;
+  if (!repo) {
+    // Exit 0 with no repository payload = a GraphQL-level error
+    // response (partial errors land in an `errors` array we don't
+    // model). Surface it instead of returning empty silently.
+    log.error("gh api graphql returned no repository payload", {
+      stdout: r.stdout.slice(0, 400),
+      branchCount: branches.length,
+    });
+    return empty;
+  }
 
   const prs = new Map<string, PullRequest>();
   for (let i = 0; i < branches.length; i++) {

@@ -192,6 +192,9 @@ const FIELD_ORDER = [
   "conflict",
 ] as const;
 
+/** Index of the lock field in the flat `useQueries` result array. */
+const LOCK_FIELD_INDEX = FIELD_ORDER.indexOf("lock");
+
 const EMPTY_STATE_SLUGS: WtState["slugs"] = {};
 
 export type WorktreeRowsResult = {
@@ -574,7 +577,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
   // worktree's git state.
   const aiEnabled = !!config.ai;
   const busyByIndex = worktrees.map((_, i) => {
-    const lock = results[i * FIELD_ORDER.length + 1]?.data as
+    const lock = results[i * FIELD_ORDER.length + LOCK_FIELD_INDEX]?.data as
       | Partial<LockMeta>
       | null
       | undefined;

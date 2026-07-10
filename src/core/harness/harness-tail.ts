@@ -566,7 +566,10 @@ class HarnessTailRegistry {
         harness: entry.harnessId,
         err: String(err),
       });
-      appended = [];
+      // Leave `seeded` untouched: a throw before the cursor baselined
+      // must not count as a completed seed, or the retry would treat
+      // the whole rollout/part history as fresh delta (or skip it).
+      return;
     }
     entry.seeded = true;
     if (appended.length === 0) return;
