@@ -3,43 +3,22 @@ import { useIsFetching } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
-import {
-  nextAutoName,
-} from "../core/harness/claude/names.ts";
 import { createLogger } from "../core/logger.ts";
 import { useWtActions } from "../state/index.ts";
 
-import {
-  ActionEditModal,
-  ActionPickerModal,
-} from "./panels/action-picker.tsx";
-import { CleanConfirmModal } from "./panels/clean-confirm.tsx";
-import { ConfirmModal } from "./panels/confirm-modal.tsx";
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
-import { HelpOverlay } from "./panels/help.tsx";
-import { KillActionConfirmModal } from "./panels/kill-action-confirm.tsx";
-import { KillSessionConfirmModal } from "./panels/kill-session-confirm.tsx";
-import { ArgPickerModal, MultiPickerModal, PickerModal } from "./panels/picker.tsx";
-import { OutputsPicker } from "./panels/outputs-picker.tsx";
 import { OutputViewer } from "./panels/output-viewer.tsx";
 import { RefreshWave } from "./spinner.tsx";
-import { SectionPickerModal } from "./panels/section-picker.tsx";
-import {
-  SessionsPickerList,
-  SessionsPickerNew,
-} from "./panels/sessions-picker.tsx";
 import { WorktreeList, type ListScrollHandle } from "./panels/list.tsx";
 import { RemovedList } from "./panels/removed-list.tsx";
-import { YankModal } from "./panels/yank.tsx";
 import { usePrimaryHarness } from "./hooks/usePrimaryHarness.ts";
 import {
   useActiveSessionsBySlug,
   useHarnessSessions,
 } from "./hooks/useHarnessSessions.ts";
-import { HARNESSES } from "../core/harness/index.ts";
-import { HarnessPickerModal } from "./panels/harness-picker.tsx";
 import type { Modal } from "./modal.ts";
+import { PostFooterModals, PreFooterModals } from "./modal-host.tsx";
 import { handleSimpleModalKey } from "./modal-key-handlers.ts";
 import { useAction, useActionVisible, useActiveActions } from "./hooks/useAction.ts";
 import { useActionDispatch } from "./hooks/useActionDispatch.ts";
@@ -61,8 +40,6 @@ import { useSectionDetail } from "./hooks/useSectionDetail.ts";
 import { useSessionTailReconcile } from "./hooks/useSessionTailReconcile.ts";
 import { useOutputFocus } from "./hooks/useOutputFocus.ts";
 import {
-  actionSkillPrefix,
-  buildActionVars,
   isCleanCandidate,
   isPlainLetter,
   printableMultiline,
@@ -759,141 +736,22 @@ export function App({ onExit }: Props) {
         />
       </box>
       <OutputViewer output={displayedOutput} height={activityHeight} />
-      {modal?.kind === "outputsPicker" ? (
-        <OutputsPicker
-          slug={currentSlug ?? null}
-          items={visibleOutputs}
-          selectedIndex={
-            visibleOutputs.length === 0
-              ? 0
-              : Math.min(
-                  Math.max(0, modal.index),
-                  visibleOutputs.length - 1,
-                )
-          }
-        />
-      ) : null}
-      {modal?.kind === "claudeSessionsPicker" ? (
-        <SessionsPickerList
-          slug={modal.slug}
-          rows={pickerRows}
-          selectedIndex={Math.min(
-            Math.max(0, modal.index),
-            Math.max(0, pickerRows.length - 1),
-          )}
-          summaries={pickerSummaries}
-        />
-      ) : null}
-      {modal?.kind === "claudeSessionsNew" ? (
-        <SessionsPickerNew
-          slug={modal.slug}
-          input={modal.input}
-          autoName={nextAutoName(modal.slug)}
-          error={modal.error}
-        />
-      ) : null}
-      {modal?.kind === "argPicker" ? (
-        <ArgPickerModal
-          title={modal.def.name}
-          prompt={modal.def.argPrompt?.label ?? ""}
-          history={modal.history}
-          index={Math.min(
-            Math.max(0, modal.index),
-            modal.history.length, // trailing "+ new"
-          )}
-          input={modal.input}
-        />
-      ) : null}
-      {modal?.kind === "harnessSelect" ? (
-        <HarnessPickerModal
-          slug={modal.slug}
-          selectedIndex={Math.min(
-            Math.max(0, modal.index),
-            HARNESSES.length - 1,
-          )}
-        />
-      ) : null}
+      <PreFooterModals
+        modal={modal}
+        currentSlug={currentSlug}
+        visibleOutputs={visibleOutputs}
+        pickerRows={pickerRows}
+        pickerSummaries={pickerSummaries}
+      />
       <Footer mode={footer} hint={footerHint} />
-      {modal?.kind === "help" ? (
-        <HelpOverlay query={modal.query} searching={modal.searching} />
-      ) : null}
-      {modal?.kind === "cleanConfirm" ? (
-        <CleanConfirmModal candidates={cleanCandidates} />
-      ) : null}
-      {modal?.kind === "yank" && current ? <YankModal row={current} /> : null}
-      {modal?.kind === "branchPicker" ? (
-        <PickerModal
-          title={modal.title}
-          items={modal.items}
-          selectedIndex={modal.index}
-        />
-      ) : null}
-      {modal?.kind === "basePicker" ? (
-        <PickerModal
-          title={`fork base for ${modal.slug}`}
-          items={modal.items.map((it) => it.label)}
-          selectedIndex={modal.index}
-          toggleKey="b"
-        />
-      ) : null}
-      {modal?.kind === "reviewerPicker" ? (
-        <MultiPickerModal
-          title={modal.title}
-          items={modal.items}
-          selectedIndex={modal.index}
-          checked={modal.checked}
-          toggleKey="v"
-        />
-      ) : null}
-      {modal?.kind === "sectionPicker" ? (
-        <SectionPickerModal
-          title={modal.title}
-          items={modal.items}
-          selectedIndex={modal.index}
-          newName={modal.newName}
-        />
-      ) : null}
-      {modal?.kind === "actionPicker" && modal.state.mode === "list" ? (
-        <ActionPickerModal
-          slug={modal.state.slug}
-          items={buildActionPickerItems(modal.state.slug)}
-          selectedIndex={modal.state.index}
-        />
-      ) : null}
-      {modal?.kind === "actionPicker" && modal.state.mode === "edit" ? (
-        <ActionEditModal
-          slug={modal.state.slug}
-          def={modal.state.def}
-          extras={modal.state.extras}
-          vars={(() => {
-            const row = rows.find((r) => r.wt.slug === modal.state.slug);
-            return row
-              ? buildActionVars(
-                  row,
-                  actionSkillPrefix(modal.state.def, primaryHarness),
-                )
-              : {};
-          })()}
-        />
-      ) : null}
-      {modal?.kind === "killActionConfirm" ? (
-        <KillActionConfirmModal
-          slug={modal.slug}
-          actionName={modal.actionName}
-        />
-      ) : null}
-      {modal?.kind === "killSessionConfirm" ? (
-        <KillSessionConfirmModal slug={modal.slug} sessionKind={modal.sessionKind} />
-      ) : null}
-      {modal?.kind === "confirm" ? (
-        <ConfirmModal
-          title={modal.title}
-          message={modal.message}
-          detail={modal.detail}
-          confirmLabel={modal.confirmLabel}
-          danger={modal.danger}
-        />
-      ) : null}
+      <PostFooterModals
+        modal={modal}
+        current={current}
+        rows={rows}
+        cleanCandidates={cleanCandidates}
+        primaryHarness={primaryHarness}
+        buildActionPickerItems={buildActionPickerItems}
+      />
     </box>
   );
 }
