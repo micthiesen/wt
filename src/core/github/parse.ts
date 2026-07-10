@@ -5,11 +5,8 @@ import type {
   GqlPrNode,
   GqlReviewDecision,
   GqlReviewThread,
+  RawCheck,
 } from "./types.ts";
-
-export type RawCheck =
-  | { __typename: "CheckRun"; name?: string | null; status?: string | null; conclusion?: string | null }
-  | { __typename: "StatusContext"; context?: string | null; state?: string | null };
 
 const CHECK_FAIL_CONCLUSIONS = new Set([
   "FAILURE",

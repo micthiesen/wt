@@ -2,7 +2,8 @@ import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
 import { hasGh } from "./gh-cli.ts";
-import { openPrChecks, rollupChecks, type RawCheck } from "./parse.ts";
+import { openPrChecks, rollupChecks } from "./parse.ts";
+import type { RawCheck } from "./types.ts";
 import type { ReviewRequestPr } from "./types.ts";
 
 const log = createLogger("[gh]");

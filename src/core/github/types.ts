@@ -5,7 +5,11 @@ import type {
   PrChecks,
   PullRequest,
 } from "../types.ts";
-import type { RawCheck } from "./parse.ts";
+
+/** One raw status-check node off the GraphQL statusCheckRollup. */
+export type RawCheck =
+  | { __typename: "CheckRun"; name?: string | null; status?: string | null; conclusion?: string | null }
+  | { __typename: "StatusContext"; context?: string | null; state?: string | null };
 
 export type GqlReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
 
