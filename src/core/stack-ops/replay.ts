@@ -1,6 +1,6 @@
 import { config } from "../config.ts";
 import { firstSha, gitQuiet, gitRun, revParse } from "../git.ts";
-import { rebaseInProgress, restackEngine } from "../restack-engine.ts";
+import { rebaseInProgress, restackEngine } from "./engine.ts";
 import { isTrunkBase, resolveParentBranch, topoSortSlices } from "../stack-layout.ts";
 import { getStackManifest, updateStackSlice, type StackSlice } from "../wtstate.ts";
 import { fetchOrigin, listWorktrees, worktreeHasTrackedChanges } from "../worktree.ts";

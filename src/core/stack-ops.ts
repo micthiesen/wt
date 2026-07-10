@@ -5,6 +5,13 @@
 export type { Logger } from "./stack-ops/shared.ts";
 
 export {
+  DEFAULT_HUNK_CONTEXT,
+  fileHunks,
+  holisticBase,
+  hunkLineCounts,
+} from "./stack-ops/hunks.ts";
+
+export {
   ancestorOwnedHunks,
   isAdoptablePr,
   parseNameStatus,

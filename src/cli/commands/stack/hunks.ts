@@ -1,5 +1,5 @@
 import { config } from "../../../core/config.ts";
-import { DEFAULT_HUNK_CONTEXT, fileHunks, holisticBase, hunkLineCounts } from "../../../core/hunks.ts";
+import { DEFAULT_HUNK_CONTEXT, fileHunks, holisticBase, hunkLineCounts } from "../../../core/stack-ops.ts";
 import { getStackManifest } from "../../../core/wtstate.ts";
 import { bold, cyan, dim, green, red } from "../../colors.ts";
 import { stackIdFromCwd } from "./shared.ts";

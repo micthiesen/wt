@@ -22,8 +22,8 @@
  */
 import { createHash } from "node:crypto";
 
-import { config } from "./config.ts";
-import { gitRun } from "./git.ts";
+import { config } from "../config.ts";
+import { gitRun } from "../git.ts";
 
 export type HunkLineKind = " " | "+" | "-";
 

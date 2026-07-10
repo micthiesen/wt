@@ -22,7 +22,7 @@
 import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
-import { gitRun, revParse } from "./git.ts";
+import { gitRun, revParse } from "../git.ts";
 
 export type ReplayLogger = (line: string) => void;
 

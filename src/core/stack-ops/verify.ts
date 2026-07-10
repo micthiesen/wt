@@ -49,8 +49,8 @@ import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { config } from "./config.ts";
-import { gitQuiet, gitRun, revParse } from "./git.ts";
+import { config } from "../config.ts";
+import { gitQuiet, gitRun, revParse } from "../git.ts";
 import {
   baseContent,
   DEFAULT_HUNK_CONTEXT,
@@ -58,11 +58,11 @@ import {
   holisticBase,
   reconstructFile,
 } from "./hunks.ts";
-import { createLogger } from "./logger.ts";
-import { run } from "./proc.ts";
-import { topoSortSlices, transitiveAncestors } from "./stack-layout.ts";
-import { getStackManifest, isUnsafeSlicePath, type StackSlice } from "./wtstate.ts";
-import { listWorktrees } from "./worktree.ts";
+import { createLogger } from "../logger.ts";
+import { run } from "../proc.ts";
+import { topoSortSlices, transitiveAncestors } from "../stack-layout.ts";
+import { getStackManifest, isUnsafeSlicePath, type StackSlice } from "../wtstate.ts";
+import { listWorktrees } from "../worktree.ts";
 
 const log = createLogger("[stack-verify]");
 

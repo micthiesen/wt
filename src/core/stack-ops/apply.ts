@@ -15,7 +15,7 @@ import {
   fileHunks,
   holisticBase,
   reconstructFile,
-} from "../hunks.ts";
+} from "./hunks.ts";
 import { createWorktree } from "../lifecycle.ts";
 import {
   createDraftPr,
@@ -28,7 +28,7 @@ import {
   topoSortSlices,
   transitiveAncestors,
 } from "../stack-layout.ts";
-import { verifyStack } from "../stack-verify.ts";
+import { verifyStack } from "./verify.ts";
 import {
   getStackManifest,
   patchStackManifest,

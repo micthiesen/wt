@@ -1,5 +1,5 @@
 import { gitRun } from "../git.ts";
-import { backupBranchOwner, backupTimestamp } from "../restack-engine.ts";
+import { backupBranchOwner, backupTimestamp } from "./engine.ts";
 import type { Logger } from "./shared.ts";
 
 // ---------- backup pruning ----------

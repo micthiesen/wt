@@ -27,7 +27,7 @@ import {
   validatePartialCoverage,
 } from "./stack-ops.ts";
 import { gitRun } from "./git.ts";
-import { fileHunks } from "./hunks.ts";
+import { fileHunks } from "./stack-ops/hunks.ts";
 import { transitiveAncestors } from "./stack-layout.ts";
 import type { StackManifest, StackSlice } from "./wtstate.ts";
 
