@@ -6,12 +6,13 @@
  * semantics as when these lived inline).
  */
 import { actionRegistry } from "../../core/actions.ts";
+import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { spawnBackgroundRemove } from "../../core/lifecycle.ts";
 import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { removeShellLog } from "../../core/shell-tail.ts";
 import { rebaseStack, STACK_BUSY } from "../../core/stack-ops.ts";
-import { killAllSessionsFor } from "../../core/tmux.ts";
+import { injectIntoSession, killAllSessionsFor } from "../../core/tmux.ts";
 import {
   recordRemovedWorktrees,
   type RemovedWorktree,
@@ -73,6 +74,10 @@ export type DestroyFlowsCtx = {
    * the real locks; this just avoids spamming them from the UI).
    */
   restackBusyRef: { current: Set<string> };
+  /** Shift+TAB-selected primary harness — the conflict handoff injects
+   *  the restack skill into this harness's session, same as a
+   *  session-target action would. */
+  primaryHarness: HarnessId;
 };
 
 export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
@@ -85,6 +90,7 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     refreshAll,
     refreshGithub,
     restackBusyRef,
+    primaryHarness,
   } = ctx;
 
   async function doRemove(
@@ -256,9 +262,10 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
    * restacks the WHOLE stack (restack is a coherence operation; the
    * worktree only selects which stack); a standalone worktree is a
    * one-member chain that rebases onto its recorded base or trunk with
-   * the same engine. No model input — it streams progress to the
-   * activity pane. On a clean conflict bail it stops and points at
-   * `/restack`, which owns the judgment the engine can't do.
+   * the same engine. Algorithmic while it can be — it streams progress
+   * to the activity pane — and on a conflict bail it hands the failing
+   * worktree to the LLM automatically (the restack skill, injected into
+   * its session), which owns the judgment the engine can't do.
    */
   async function doReplayStack(): Promise<void> {
     const { current } = ctx;
@@ -291,6 +298,57 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
   }
 
   /**
+   * Conflict-bail handoff: inject the restack skill into the failing
+   * worktree's primary harness session (cold-starting it if needed),
+   * so `R` completes the same loop `/restack` runs by hand — the
+   * engine does the mechanical replay, the LLM takes over exactly at
+   * the judgment call the engine refuses to make. Same
+   * `injectIntoSession` primitive session-target actions use, minus
+   * `launchAction`'s busy guards: the row's cached lock state still
+   * reads busy for a beat after the engine released its flocks, and
+   * we KNOW the true state here — the bail itself just freed the
+   * locks and left the tree clean. Fire-and-forget like every session
+   * inject; progress lands in the activity pane. Returns whether the
+   * handoff was dispatched (false = no live row for the branch; the
+   * caller falls back to the manual-toast wording).
+   */
+  function handOffConflictToSession(
+    failedBranch: string,
+    detail: string,
+    backupBranch: string | undefined,
+  ): boolean {
+    const row = rows.find((r) => r.wt.branch === failedBranch);
+    if (!row) return false;
+    const slug = row.wt.slug;
+    const log = createLogger(slug);
+    const harness = getHarness(primaryHarness);
+    const skill = `${harness.skillPrefix}restack`;
+    const backup = backupBranch
+      ? ` The pre-rebase tip is backed up at ${backupBranch}.`
+      : "";
+    const text = `${skill}\n\nwt's restack engine just bailed on this worktree: ${detail}.${backup} Resolve the conflict and finish the restack.`;
+    log.event.info(`conflict — sending ${skill} to ${harness.label} session`);
+    void injectIntoSession({
+      slug,
+      cwd: row.wt.path,
+      harnessId: primaryHarness,
+      text,
+    }).then((res) => {
+      if (res.ok) {
+        log.event.ok(
+          res.coldStarted
+            ? `started ${harness.label} session and sent ${skill}`
+            : `sent ${skill} to ${harness.label} session`,
+        );
+      } else {
+        log.event.err(`${skill} handoff failed: ${res.reason} — run it by hand`);
+        toast(`${skill} handoff failed: ${res.reason}`, theme.err, 5000);
+      }
+    });
+    return true;
+  }
+
+  /**
    * The branch-resolved half of `doReplayStack`, shared with the
    * automations engine (`builtin:restack` dispatches here after
    * pre-cleaning the merged members via `doCleanSlugs`). `stackId` is
@@ -301,8 +359,10 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
    * process's restack) — and the automations engine un-consumes the
    * fire on that outcome instead of recording a restack that never
    * happened. Other chains restack concurrently. "clean" / "failed"
-   * report the replay itself; the conflict-bail escalation to /restack
-   * stays manual either way.
+   * report the replay itself; a conflict bail reports "failed" AND
+   * hands the failing worktree off to the restack skill in its session
+   * (see `handOffConflictToSession`), for the manual and automation
+   * paths alike.
    */
   async function doRestackStack(
     stackId: string,
@@ -332,10 +392,20 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       } else if (res.conflict) {
         const where = res.failedBranch ? ` on ${res.failedBranch}` : "";
         const backup = res.backupBranch ? ` (backup ${res.backupBranch})` : "";
-        appLog.event.warn(
-          `restack ${stackId}: conflict${where}${backup} — run /restack to resolve`,
+        appLog.event.warn(`restack ${stackId}: conflict${where}${backup}`);
+        // Hand the judgment call to the LLM: inject the restack skill
+        // into the failing worktree's session. Falls back to the manual
+        // hint only when the branch has no live row to inject into.
+        const handedOff = res.failedBranch
+          ? handOffConflictToSession(res.failedBranch, res.error, res.backupBranch)
+          : false;
+        toast(
+          handedOff
+            ? `conflict${where} — handing off to /restack in its session`
+            : `conflict${where} — run /restack`,
+          theme.warn,
+          6000,
         );
-        toast(`conflict${where} — run /restack`, theme.warn, 6000);
       } else {
         appLog.event.err(`restack ${stackId} failed: ${res.error}`);
         toast(`restack failed: ${res.error}`, theme.err, 6000);

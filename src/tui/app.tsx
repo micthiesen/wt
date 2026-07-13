@@ -409,6 +409,7 @@ export function App({ onExit }: Props) {
     refreshAll,
     refreshGithub,
     restackBusyRef,
+    primaryHarness,
   });
 
   // Automated actions — evaluates `[[automations]]` triggers against

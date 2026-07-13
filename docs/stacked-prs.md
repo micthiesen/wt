@@ -69,11 +69,14 @@ resolving rebase in the bailed worktree, the same glyph shows in warn until
 that rebase finishes or aborts — the bail itself leaves the tree clean (see
 below), so right after it the row shows the red conflict triangle instead.
 
-Conflicts are never auto-resolved: the engine aborts the rebase, leaves a
-`backup/restack-*` ref at the old tip, and names the failing branch (exit 3 at
-the CLI). Resolve it in that worktree — or run the bundled `/restack` skill,
-which knows the full recovery loop — then re-run; the anchor logic
-self-heals around hand-rebases. Leftover backups: `wt restack prune-backups`.
+Conflicts are never auto-resolved by the **engine**: it aborts the rebase,
+leaves a `backup/restack-*` ref at the old tip, and names the failing branch
+(exit 3 at the CLI). From the TUI (`R`, or an auto-restack) the bail hands off
+automatically — the bundled `/restack` skill, which knows the full recovery
+loop, is injected into the failing worktree's harness session (cold-started if
+needed) with the bail context. From the CLI, run it yourself or resolve by
+hand, then re-run; the anchor logic self-heals around hand-rebases. Leftover
+backups: `wt restack prune-backups`.
 
 The `stack.parent_merged` automation trigger paired with `builtin:restack`
 makes the whole loop hands-off: when a parent merges under open members, wt
