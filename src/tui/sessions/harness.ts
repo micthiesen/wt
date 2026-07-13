@@ -11,16 +11,13 @@
  */
 import type { CliRenderer } from "@opentui/core";
 
-import { getHarness, type HarnessId } from "../../core/harness/index.ts";
-import { createLogger } from "../../core/logger.ts";
+import type { HarnessId } from "../../core/harness/index.ts";
 import {
-  attachOrCreate,
-  killHarnessSession,
-  type AttachResult,
-} from "../../core/tmux.ts";
-import { handoffTerminal } from "./renderer-handoff.ts";
+  enterWorktreeSession,
+  type WorktreeSessionResult,
+} from "./worktree.ts";
 
-export type EnterResult = AttachResult;
+export type EnterResult = WorktreeSessionResult;
 
 export async function enterHarnessSession(opts: {
   renderer: CliRenderer;
@@ -57,6 +54,8 @@ export async function enterHarnessSession(opts: {
    * it never needs this; the flag is ignored for `harnessId === claude`.
    */
   freshSlot?: boolean;
+  /** Resolved base used if F11 is pressed while inside the harness. */
+  diffBase: string;
 }): Promise<EnterResult> {
   const {
     renderer,
@@ -67,28 +66,20 @@ export async function enterHarnessSession(opts: {
     resumeSessionId,
     claudeDisplayName,
     freshSlot,
+    diffBase,
   } = opts;
-  // Kill the single-slot tmux before suspending the renderer so (a)
-  // the user sees the activity event in the still-rendered pane
-  // rather than a black screen during the kill, and (b) the
-  // subsequent `tmux new-session -A` always lands on a clean slot
-  // and our buildArgs argv actually runs. Single-slot semantics are
-  // codex/opencode only — claude already gets a unique tmux name
-  // per managedName so the flag is a no-op there.
-  if (freshSlot && getHarness(harnessId).singleSlot) {
-    createLogger(slug).event.warn(
-      `replacing ${getHarness(harnessId).label} slot`,
-    );
-    await killHarnessSession(slug, harnessId);
-  }
-  return await handoffTerminal(renderer, () =>
-    attachOrCreate({
-      slug,
-      cwd,
-      kind: harnessId,
+  return await enterWorktreeSession({
+    renderer,
+    slug,
+    cwd,
+    initial: "harness",
+    diffBase,
+    harness: {
+      harnessId,
       managedName,
       resumeSessionId,
       claudeDisplayName,
-    }),
-  );
+      freshSlot,
+    },
+  });
 }

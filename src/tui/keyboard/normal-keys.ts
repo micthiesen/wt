@@ -28,6 +28,7 @@ import { stackIdFromSectionKey } from "../../core/wtstate.ts";
 import { isPlainLetter, isShiftedLetter, resolveDiffBase } from "../app-helpers.ts";
 import { enterDiffSession } from "../sessions/diff.ts";
 import { enterShellSession } from "../sessions/shell.ts";
+import type { HarnessRoute } from "../sessions/worktree.ts";
 import type { makeBaseFlows } from "../flows/base.ts";
 import type { makeDestroyFlows } from "../flows/destroy.ts";
 import type { makeGithubPrFlows } from "../flows/github-pr.ts";
@@ -160,6 +161,19 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     toast,
     reportActionError,
   } = ctx;
+
+  const f12Route = (): HarnessRoute => {
+    const target = currentHarnessSessions.f12Target;
+    if (!target) return { harnessId: primaryHarness };
+    const isSyntheticLive = isSyntheticLiveSessionId(target.sessionId);
+    const resumeSessionId = target.isLive || isSyntheticLive ? null : target.sessionId;
+    return {
+      harnessId: target.harnessId,
+      managedName: target.extras.managedName,
+      resumeSessionId,
+      freshSlot: getHarness(target.harnessId).singleSlot && resumeSessionId !== null,
+    };
+  };
     // Escape clears this worktree's explicit focus so the bottom
     // pane returns to follow-row auto-rules.
     if (k.name === "escape" && focusedOutputId) {
@@ -449,10 +463,18 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const cwd = current.wt.path;
+      const rawBase = resolveDiffBase(current);
       const shellLog = createLogger(slug);
       void (async () => {
+        const diffBase = await effectiveBaseOrTrunk(cwd, rawBase);
         shellLog.event.info("entering shell (F10 to detach)");
-        const result = await enterShellSession({ renderer, slug, cwd });
+        const result = await enterShellSession({
+          renderer,
+          slug,
+          cwd,
+          diffBase,
+          harness: f12Route(),
+        });
         // Flip the indicator + spin up the shell-tail tailer
         // immediately rather than waiting for the tmux-sessions
         // poll. Without this, lines written in the first seconds
@@ -506,7 +528,13 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         // session. Mirrors the render diff/sync paths' `effectiveBaseOrTrunk`.
         const base = await effectiveBaseOrTrunk(cwd, rawBase);
         diffLog.event.info(`opening diff vs ${base} (F11 to detach)`);
-        const result = await enterDiffSession({ renderer, slug, cwd, base });
+        const result = await enterDiffSession({
+          renderer,
+          slug,
+          cwd,
+          base,
+          harness: f12Route(),
+        });
         if (result.kind === "spawn-failed") {
           diffLog.event.err(`diff failed to start: ${result.reason}`);
           toast(`diff failed: ${result.reason}`, theme.err, 3000);

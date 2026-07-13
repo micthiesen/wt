@@ -24,8 +24,11 @@ import {
   listSessions as listTmuxSessions,
 } from "../../core/tmux.ts";
 import { StatusKind } from "../../core/types.ts";
+import { effectiveBaseOrTrunk } from "../../core/git.ts";
+import { config } from "../../core/config.ts";
 
 import { enterHarnessSession } from "../sessions/harness.ts";
+import { resolveDiffBase } from "../app-helpers.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
@@ -112,6 +115,10 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     const harness = getHarness(harnessId);
     const sessionLog = createLogger(slug);
     void (async () => {
+      const diffBase = await effectiveBaseOrTrunk(
+        row.wt.path,
+        resolveDiffBase(row),
+      );
       sessionLog.event.info(
         `entering ${harness.label} session (F12 to detach)`,
       );
@@ -123,6 +130,7 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
         managedName: opts.managedName ?? null,
         resumeSessionId: opts.resumeSessionId ?? null,
         freshSlot: opts.freshSlot,
+        diffBase,
       });
       // Refresh both together so the picker doesn't see a transient
       // state where tmux says "slot dead" but discovery still has the
@@ -190,6 +198,7 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
         claudeDisplayName: slot.label,
         resumeSessionId,
         freshSlot,
+        diffBase: `origin/${config.branch.base}`,
       });
       // Refresh tmux sessions so the bottom-bar tail picks up the new
       // session immediately rather than waiting for the next poll
@@ -244,6 +253,10 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     void refreshClaudeSummaries(slug);
     const sessionLog = createLogger(slug);
     void (async () => {
+      const diffBase = await effectiveBaseOrTrunk(
+        row.wt.path,
+        resolveDiffBase(row),
+      );
       sessionLog.event.info(`entering claude session "${name}" (F12 to detach)`);
       const result = await enterHarnessSession({
         renderer,
@@ -251,6 +264,7 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
         cwd: row.wt.path,
         harnessId: "claude",
         managedName: name,
+        diffBase,
       });
       void refreshTmuxSessions();
       if (result.kind === "spawn-failed") {

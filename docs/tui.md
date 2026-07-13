@@ -57,11 +57,11 @@ Sessions live in a dedicated tmux server; "enter" takes over the terminal, and t
 
 | key | action |
 |---|---|
-| `F12` | enter the row's coding-agent session (most recent live one, else spawn the primary harness); `Ctrl+D` closes it gracefully |
+| `F12` | enter the row's coding-agent session (most recent live one, else spawn the primary harness); from another worktree session, switch straight to it; press again to return home; `Ctrl+D` closes it gracefully |
 | `Shift+F12` | pick a harness (claude / codex / opencode) for a fresh spawn |
 | `Shift+Tab` | cycle the primary harness |
-| `F11` | enter the row's diff session (`[diff].command`, default `revdiff`, against the resolved diff base) |
-| `F10` | enter the row's plain shell session |
+| `F11` | enter the row's diff session (`[diff].command`, default `revdiff`, against the resolved diff base); from another session, switch straight to it; press again to return home |
+| `F10` | enter the row's plain shell session; from another session, switch straight to it; press again to return home |
 | `Shift+F10` / `Shift+F11` | kill the shell / diff session (confirm) |
 | `;` | sessions picker — attach (`; ;`), new named claude (`; c`), new codex/opencode (`; x` / `; o`), graceful close (`; d`), kill (`; x` on a session row) |
 | `!` | action picker — run a configured `[[actions]]` entry, `! c` for a custom prompt; `!` on a running action offers to kill it |

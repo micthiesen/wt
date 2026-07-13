@@ -8,7 +8,15 @@ import { createLogger } from "../logger.ts";
 import { shellLogPath } from "../shell-tail.ts";
 import { killServer, resolveDiffCommand } from "./admin.ts";
 import { writeConfig } from "./config.ts";
-import { harnessIdForKind, sessionName, type SessionKind, shQuote, TMUX_SOCKET } from "./naming.ts";
+import {
+  harnessIdForKind,
+  sessionSwitchTarget,
+  sessionName,
+  type SessionKind,
+  type SessionShortcut,
+  shQuote,
+  TMUX_SOCKET,
+} from "./naming.ts";
 import { listAllSessionsRaw } from "./process.ts";
 
 const log = createLogger("[tmux]");
@@ -16,6 +24,7 @@ const log = createLogger("[tmux]");
 export type AttachResult =
   | { kind: "exited"; code: number | null; stderr: string | null }
   | { kind: "detached" }
+  | { kind: "switch"; target: SessionShortcut }
   | { kind: "spawn-failed"; reason: string };
 
 /**
@@ -124,6 +133,11 @@ export async function attachOrCreate(opts: {
   const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
   const managedNameNorm = harness ? (managedName ?? null) : null;
   const name = sessionName(slug, kind, managedNameNorm);
+  const shortcut: SessionShortcut = harness
+    ? "harness"
+    : kind === "diff"
+      ? "diff"
+      : "shell";
   const { path: configPath, changed } = writeConfig();
   if (changed) {
     log.info("config changed, killing server before attach", { slug, kind });
@@ -236,6 +250,27 @@ export async function attachOrCreate(opts: {
     }
   }
 
+  // Record which physical shortcut owns this session. The tmux config uses
+  // this option to make the owning key detach while the other F-keys request
+  // an in-place switch. Set it on every attach so sessions created by older
+  // wt versions are upgraded automatically.
+  const tag = Bun.spawn(
+    [
+      "tmux",
+      "-L",
+      TMUX_SOCKET,
+      "-f",
+      configPath,
+      "set-option",
+      "-t",
+      name,
+      "@wt-shortcut",
+      shortcut,
+    ],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  await tag.exited;
+
   let proc: Bun.Subprocess;
   try {
     proc = Bun.spawn(
@@ -271,6 +306,12 @@ export async function attachOrCreate(opts: {
         "_wt_wrap",
         stderrPath,
         ...innerArgs,
+        ";",
+        "set-option",
+        "-t",
+        name,
+        "@wt-shortcut",
+        shortcut,
       ],
       {
         cwd,
@@ -324,7 +365,11 @@ export async function attachOrCreate(opts: {
   // exited and tmux cleaned up.
   const sessions = await listAllSessionsRaw();
   const stillRunning = sessions.has(name);
-  if (stillRunning) return { kind: "detached" };
+  if (stillRunning) {
+    const target = sessionSwitchTarget(code);
+    if (target) return { kind: "switch", target };
+    return { kind: "detached" };
+  }
   // Inner program died. Read whatever it wrote to stderr so the
   // caller can surface the actual reason instead of just "exited (N)".
   // ENOENT here just means the bash redirect never produced any

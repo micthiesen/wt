@@ -13,10 +13,13 @@
  */
 import type { CliRenderer } from "@opentui/core";
 
-import { attachOrCreate, type AttachResult } from "../../core/tmux.ts";
-import { handoffTerminal } from "./renderer-handoff.ts";
+import {
+  enterWorktreeSession,
+  type HarnessRoute,
+  type WorktreeSessionResult,
+} from "./worktree.ts";
 
-export type DiffResult = AttachResult;
+export type DiffResult = WorktreeSessionResult;
 
 export async function enterDiffSession(opts: {
   renderer: CliRenderer;
@@ -30,9 +33,12 @@ export async function enterDiffSession(opts: {
    * branch ref. Forwarded verbatim to `attachOrCreate`.
    */
   base: string;
+  harness: HarnessRoute;
 }): Promise<DiffResult> {
-  const { renderer, slug, cwd, base } = opts;
-  return await handoffTerminal(renderer, () =>
-    attachOrCreate({ slug, cwd, kind: "diff", base }),
-  );
+  const { base, ...rest } = opts;
+  return await enterWorktreeSession({
+    ...rest,
+    initial: "diff",
+    diffBase: base,
+  });
 }

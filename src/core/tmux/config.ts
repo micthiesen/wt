@@ -2,6 +2,8 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { SESSION_SWITCH_EXIT_CODE } from "./naming.ts";
+
 /** Path to the generated tmux.conf. */
 function configDir(): string {
   const dir = join(homedir(), ".cache", "wt");
@@ -27,13 +29,10 @@ function configDir(): string {
  *    `allow-passthrough on` lets desktop notifications + the progress
  *    bar reach the outer terminal instead of being swallowed by tmux.
  *    All three are the official Anthropic-recommended tmux config.
- *  - `unbind C-b` + F10/F11/F12 all bound to detach-client: kill the
- *    tmux prefix entirely; each F-key is a single-press detach.
- *    Symmetric with the wt-side bindings — whichever F-key the user
- *    pressed to enter (F10 shell, F11 diff, F12 claude) takes them
- *    back out. Binding all three to detach in any context is
- *    harmless: an accidental F11 inside a claude session just exits,
- *    same as F12.
+ *  - `unbind C-b` + F10/F11/F12 are context-aware. The key that owns
+ *    the current session detaches back to wt; either other key exits
+ *    the tmux client with a private status that asks the renderer-side
+ *    navigator to attach the corresponding session immediately.
  */
 export function buildConfig(): string {
   const outerTerm = process.env.TERM ?? "xterm-256color";
@@ -51,9 +50,9 @@ set -g allow-passthrough on
 set -s extended-keys on
 set -as terminal-features ",${outerTerm}:extkeys"
 unbind C-b
-bind-key -n F10 detach-client
-bind-key -n F11 detach-client
-bind-key -n F12 detach-client
+bind-key -n F10 if-shell -F '#{==:#{@wt-shortcut},shell}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.shell}"'
+bind-key -n F11 if-shell -F '#{==:#{@wt-shortcut},diff}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.diff}"'
+bind-key -n F12 if-shell -F '#{==:#{@wt-shortcut},harness}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.harness}"'
 `;
 }
 

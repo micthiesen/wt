@@ -4,6 +4,31 @@ import type { HarnessId } from "../harness/index.ts";
 export const TMUX_SOCKET = "wt";
 
 /**
+ * Exit statuses used by the tmux client's `detach-client -E` bindings to
+ * request an in-place jump to another worktree session. Keep these away from
+ * ordinary command exit statuses so attach failures cannot be mistaken for a
+ * navigation request.
+ */
+export const SESSION_SWITCH_EXIT_CODE = {
+  shell: 110,
+  diff: 111,
+  harness: 112,
+} as const;
+
+export type SessionShortcut = keyof typeof SESSION_SWITCH_EXIT_CODE;
+
+export function sessionSwitchTarget(
+  code: number | null,
+): SessionShortcut | null {
+  for (const [target, switchCode] of Object.entries(
+    SESSION_SWITCH_EXIT_CODE,
+  ) as [SessionShortcut, number][]) {
+    if (code === switchCode) return target;
+  }
+  return null;
+}
+
+/**
  * Slug for the persistent harness session at the wt source repo (the
  * `.` keybinding — one of two session slots, see
  * `tui/sessions/slots.ts`). Tmux session name is just `wt`; for the
