@@ -255,6 +255,16 @@ export class NativeRestackEngine implements RestackEngine {
       return { ok: true, newTip, newBaseSha, moved: false, pushed: sync.pushed };
     }
 
+    // A branch that was never pushed stays local: rebasing it (the
+    // standalone `R` case) must not invent a remote as a side effect.
+    // The caller fetched origin up front, so this read is current.
+    const remoteExists = await revParse(`origin/${branch}`, worktreePath);
+    if (!remoteExists) {
+      await deleteBackup(backupBranch, worktreePath);
+      onLog(`  rebased ${branch} (not pushed — no origin branch)`);
+      await pruneSupersededBackups(branch, worktreePath, onLog);
+      return { ok: true, newTip, newBaseSha, moved: true, pushed: false };
+    }
     const push = await gitRun(
       ["push", "--force-with-lease", "origin", branch],
       worktreePath,

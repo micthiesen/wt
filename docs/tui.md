@@ -76,7 +76,7 @@ Sessions live in a dedicated tmux server; "enter" takes over the terminal, and t
 | `L` | rename the current section |
 | `J` / `K` | move the row (or its whole stack / folded group) down / up |
 | `b` | base picker — record which branch this worktree forked from (`b b` confirms; record-only, never rebases) |
-| `R` | restack the selected row's whole stack — same engine as [`wt restack`](stacked-prs.md) (fetch + reconcile + squash-safe replay; bails to `/restack` on conflict) |
+| `R` | rebase/restack the selected row — a stack member restacks the whole stack, a standalone worktree rebases onto its recorded base or trunk; same engine as [`wt restack`](stacked-prs.md) (fetch + reconcile + squash-safe replay; bails to `/restack` on conflict) |
 
 ### Automations
 

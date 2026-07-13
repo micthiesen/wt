@@ -39,8 +39,11 @@ automation pauses keyed to the old root start fresh.
 
 ## Restacking
 
-`wt restack` (CLI) or `R` (TUI, on any member) realigns a whole stack after
-parents move:
+`wt restack` (CLI) or `R` (TUI) realigns a whole stack after parents
+move — and works identically on a standalone worktree, which resolves
+as a one-member chain rebasing onto its recorded base or plain trunk
+(local-only branches are rebased but never pushed). Press it anywhere;
+it does the right thing for the shape under the cursor:
 
 1. **Fetch** origin.
 2. **Reconcile** records against landed PRs: a member whose parent's PR merged

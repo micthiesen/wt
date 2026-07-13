@@ -35,9 +35,11 @@ the loader reports every missing field at once). The standard install aliases
 - `wt open [slug]` — open a worktree in the editor.
 - `wt base <slug> | set <slug> <ref> | clear <slug>` — show/set/clear a
   worktree's recorded fork base (the stack primitive).
-- `wt restack [<branch>] [--onto <ref>]` — rebase the stack containing a branch
-  onto its updated parents: reconcile records against landed PRs, squash-safe
-  replay, force-push, retarget PR bases. `wt restack prune-backups` sweeps the
+- `wt restack [<branch>] [--onto <ref>]` — rebase a worktree (or the whole
+  stack containing it) onto its updated parents: reconcile records against
+  landed PRs, squash-safe replay, force-push, retarget PR bases. Standalone
+  worktrees rebase onto their recorded base or plain trunk — it works on
+  every worktree, not only stacks. `wt restack prune-backups` sweeps the
   engine's `backup/*` refs.
 - `wt logs [slug]` — tail background-destroy logs.
 

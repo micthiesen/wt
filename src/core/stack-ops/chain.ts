@@ -33,13 +33,12 @@ export type RestackChain = {
 };
 
 /**
- * Resolve the stack containing `branch`. A branch inside an inferred
- * stack resolves the WHOLE stack (restack is a coherence operation; the
- * branch only selects which stack). A standalone worktree with a
- * recorded base — its parent isn't a live worktree — resolves as a
- * single-step chain so it can still replay onto its recorded parent (or
- * trunk, after a reconcile reparented it). Returns null when the branch
- * has no live worktree, or has neither a record nor dependents.
+ * Resolve the restack chain containing `branch`. A branch inside an
+ * inferred stack resolves the WHOLE stack (restack is a coherence
+ * operation; the branch only selects which stack). Any other live
+ * worktree resolves as a single-step chain — onto its recorded parent
+ * when one exists, else onto trunk — so every worktree is restackable.
+ * Returns null only when the branch has no live worktree.
  */
 export async function resolveChain(branch: string): Promise<RestackChain | null> {
   const state = readWtState();
@@ -75,14 +74,36 @@ export async function resolveChain(branch: string): Promise<RestackChain | null>
     };
   }
 
-  // Standalone fallback: a worktree with a record but no live parent
-  // worktree and no dependents. A self-referential record is nonsense —
-  // treat it like no record (same guard `buildStackIndex` applies).
+  // Standalone fallback: ANY live worktree resolves as a single-step
+  // chain, so `R` / `wt restack` is the universal "get me current" verb
+  // rather than a stacks-only one. A recorded base (an external parent,
+  // or trunk after a reconcile reparented it) replays onto it; a
+  // record-free worktree replays onto trunk — a plain rebase-on-main
+  // with the same engine (conflict bail, backups, retarget). A
+  // self-referential record is nonsense — treated like no record (same
+  // guard `buildStackIndex` applies), INCLUDING its anchor: a sha
+  // recorded against a bogus parent can't be trusted as a cut point.
   const self = members.find((m) => m.branch === branch);
   if (!self) return null;
   const rec = state.slugs[self.slug];
-  if (!rec?.baseBranch || rec.baseBranch === branch) return null;
+  const selfLoop = rec?.baseBranch === branch;
+  if (selfLoop) {
+    return {
+      root: branch,
+      steps: [
+        {
+          slug: self.slug,
+          branch,
+          parentBranch: null,
+          hasRecord: false,
+          worktreePath: pathByBranch.get(branch)!,
+        },
+      ],
+    };
+  }
   const parentBranch =
-    rec.baseBranch === config.branch.base ? null : rec.baseBranch;
+    !rec?.baseBranch || rec.baseBranch === config.branch.base
+      ? null
+      : rec.baseBranch;
   return { root: branch, steps: [toStep(self, parentBranch)] };
 }

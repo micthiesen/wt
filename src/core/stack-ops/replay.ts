@@ -62,7 +62,7 @@ export async function rebaseStack(
     return {
       ok: false,
       conflict: false,
-      error: `${branch} isn't stacked — no recorded base (wt base) and no dependent worktrees`,
+      error: `${branch} has no live worktree to restack`,
     };
   }
   return { ok: true, output: outputs.join("; ") };
@@ -108,7 +108,7 @@ async function replayStackLocked(
     return {
       ok: false,
       conflict: false,
-      error: `${branch} isn't stacked — no recorded base (wt base) and no dependent worktrees`,
+      error: `${branch} has no live worktree to restack`,
     };
   }
 

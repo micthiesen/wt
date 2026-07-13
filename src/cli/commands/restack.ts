@@ -9,12 +9,15 @@ import { bold, dim, green, red, yellow } from "../colors.ts";
 const USAGE = `usage: wt restack [<branch>] [--onto <ref>]
        wt restack prune-backups [--days <n>]
 
-Rebase a stack of worktrees onto its updated parents: reconcile each
-member's recorded fork base against landed PRs (a merged parent
-reparents its children), then squash-safe-replay every member onto its
-parent, force-push, and retarget PR bases. Stacks are inferred from the
-fork-base records (\`wt new --base\` / \`wt base\`); any member's branch
-selects the whole stack. With no <branch>, the current worktree's
+Rebase a worktree — or the whole stack containing it — onto its
+updated parents: reconcile each member's recorded fork base against
+landed PRs (a merged parent reparents its children), then
+squash-safe-replay every member onto its parent, force-push (branches
+with no origin counterpart are rebased but not pushed), and retarget PR
+bases. Stacks are inferred from the fork-base records (\`wt new
+--base\` / \`wt base\`); any member's branch selects the whole stack,
+and a standalone worktree is a one-member chain rebasing onto its
+recorded base or plain trunk. With no <branch>, the current worktree's
 branch is used.
 
 Conflicts are never auto-resolved: the run bails naming the failing

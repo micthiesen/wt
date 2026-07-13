@@ -134,7 +134,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "l n", label: "new section (chord)" },
       { key: "L", label: "rename current section" },
       { key: "b", label: "set fork base (picker · b b confirms) · record only, never rebases" },
-      { key: "R", label: "restack selected row's stack (replay; /restack on conflict)" },
+      { key: "R", label: "rebase/restack row — whole stack, or standalone onto base/main (/restack on conflict)" },
       { key: "J / K", label: "move row · stack/folded section: move whole group" },
     ],
   },

@@ -1,9 +1,10 @@
 ---
 name: restack
 description: >-
-  Rebase a stack of worktrees after a parent lands or moves, and resolve the
-  merge conflicts wt's squash-safe engine can't. User-initiated via /restack,
-  usually after the TUI's `R` bailed on a conflict.
+  Rebase a worktree or stack of worktrees after a parent (or trunk) moves,
+  and resolve the merge conflicts wt's squash-safe engine can't.
+  User-initiated via /restack, usually after the TUI's `R` bailed on a
+  conflict.
 targets:
   - '*'
 argument-hint: [optional branch or notes]
@@ -18,7 +19,10 @@ the engine can't.
 
 Stacks are **inferred**: each worktree records the branch it's based on (its
 fork base, set by `wt new --base` / `wt base`), and worktrees whose records
-chain into each other form a stack. There is no other stack state.
+chain into each other form a stack. There is no other stack state. A
+standalone worktree (no record, or a record pointing at trunk) is just a
+one-member chain that rebases onto trunk — same command, same engine, so
+everything below applies to it too.
 
 wt's native squash-safe engine does the mechanical part — `wt restack` from any
 member's worktree: it fetches, **reconciles** the records against landed PRs (a
@@ -31,10 +35,11 @@ retarget the PR base. Your job is the judgment part it can't do: **resolving
 conflicts**. The engine bails *clean* on conflict (aborts the rebase, leaves a
 `backup/...` branch), so resolution is a normal in-tree rebase, not a rescue.
 
-The TUI's `R` keybind runs the same `wt restack` with no model input and
-escalates here — to `/restack` — when it hits a conflict bail. So by the time
-this skill runs after an `R`, the clean members are already replayed and you're
-here specifically for the conflict on the named branch.
+The TUI's `R` keybind runs the same `wt restack` with no model input — on
+stacks and standalone worktrees alike — and escalates here, to `/restack`,
+when it hits a conflict bail. So by the time this skill runs after an `R`,
+the clean members are already replayed and you're here specifically for the
+conflict on the named branch.
 
 ## Preconditions
 

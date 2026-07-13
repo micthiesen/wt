@@ -397,8 +397,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       setSel(last ? visualKey(last) : null);
       return;
     }
-    // `R` — restack the stack the selected worktree belongs to (whole stack,
-    // algorithmic; escalates to /restack only on a conflict bail).
+    // `R` — rebase/restack whatever's selected: a stack member restacks
+    // the whole stack, a standalone worktree rebases onto its recorded
+    // base or trunk (algorithmic; escalates to /restack on a conflict bail).
     if (k.sequence === "R") {
       void doReplayStack();
       return;

@@ -246,24 +246,22 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
   }
 
   /**
-   * `R` — the algorithmic fast path for restacking. Runs the whole
-   * stack containing the selected worktree through `rebaseStack`:
-   * fetch, reconcile the fork-base records against landed PRs, then
-   * squash-safe replay of every member onto its parent (already-based
-   * members are cheap no-ops). No model input — it streams progress to
-   * the activity pane. On a clean conflict bail it stops and points at
+   * `R` — the algorithmic fast path for getting the selected worktree
+   * current, whatever its shape. Runs the chain containing it through
+   * `rebaseStack`: fetch, reconcile the fork-base records against
+   * landed PRs, then squash-safe replay of every member onto its
+   * parent (already-based members are cheap no-ops). A stack member
+   * restacks the WHOLE stack (restack is a coherence operation; the
+   * worktree only selects which stack); a standalone worktree is a
+   * one-member chain that rebases onto its recorded base or trunk with
+   * the same engine. No model input — it streams progress to the
+   * activity pane. On a clean conflict bail it stops and points at
    * `/restack`, which owns the judgment the engine can't do.
-   * Whole-stack on purpose: restack is a coherence operation, and the
-   * worktree only selects *which* stack.
    */
   async function doReplayStack(): Promise<void> {
     const { current } = ctx;
     if (!current?.wt.branch) {
-      toast("select a stacked worktree first", theme.warn, 2000);
-      return;
-    }
-    if (!current.stack && !current.stackedOn) {
-      toast("not stacked — no recorded base (b) and no dependents", theme.warn, 2500);
+      toast("select a worktree first", theme.warn, 2000);
       return;
     }
     await doRestackStack(current.wt.branch);
