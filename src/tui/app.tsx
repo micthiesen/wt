@@ -109,10 +109,13 @@ export function App({ onExit }: Props) {
   // Cursor is tracked by a stable key (slug, folded section, or PR URL), not an
   // index. The visual list hook resolves that key against the current rows.
   const [sel, setSel] = useState<string | null>(null);
-  // Guards the `R` replay-stack action against re-entry while a rebase is
-  // in flight (the engine flock is the real lock; this just avoids spamming
-  // it from the UI). Reset in `doReplayStack`'s finally.
-  const restackBusyRef = useRef(false);
+  // In-flight restack keys (a stack's id, or a standalone worktree's
+  // branch) — guards the `R` replay action against re-entry on the SAME
+  // chain while letting different chains restack concurrently (the
+  // engine's per-slug flocks are the real locks; this just avoids
+  // spamming them from the UI). Keys are removed in `doRestackStack`'s
+  // finally.
+  const restackBusyRef = useRef<Set<string>>(new Set());
   // Inner scrollbox of the details pane (worktree or review-request
   // body, whichever is mounted). PageUp/PageDown page it from the
   // global key handler so tall panes that overflow the viewport stay

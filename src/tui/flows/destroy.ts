@@ -10,7 +10,7 @@ import { spawnBackgroundRemove } from "../../core/lifecycle.ts";
 import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { removeShellLog } from "../../core/shell-tail.ts";
-import { rebaseStack } from "../../core/stack-ops.ts";
+import { rebaseStack, STACK_BUSY } from "../../core/stack-ops.ts";
 import { killAllSessionsFor } from "../../core/tmux.ts";
 import {
   recordRemovedWorktrees,
@@ -67,10 +67,12 @@ export type DestroyFlowsCtx = {
   refreshAll: () => Promise<void>;
   refreshGithub: () => Promise<void>;
   /**
-   * Re-entry guard for `R` while a rebase is in flight (the engine
-   * flock is the real lock; this just avoids spamming it from the UI).
+   * Re-entry guard for `R`: the set of chains (stack id or standalone
+   * branch) with a restack in flight. Same-chain re-presses are refused;
+   * different chains run concurrently (the engine's per-slug flocks are
+   * the real locks; this just avoids spamming them from the UI).
    */
-  restackBusyRef: { current: boolean };
+  restackBusyRef: { current: Set<string> };
 };
 
 export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
@@ -277,35 +279,56 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
   }
 
   /**
+   * The chain identity a restack of `branch` occupies in the UI-level
+   * busy set: the containing stack's id when the row is a member, else
+   * the branch itself (a standalone one-member chain). Matches the
+   * `stackId` the automations engine gates on, so a manual `R` and an
+   * auto-restack of the same stack exclude each other.
+   */
+  function restackKeyFor(branch: string): string {
+    const row = rows.find((r) => r.wt.branch === branch);
+    return row?.stack?.stackId ?? branch;
+  }
+
+  /**
    * The branch-resolved half of `doReplayStack`, shared with the
    * automations engine (`builtin:restack` dispatches here after
    * pre-cleaning the merged members via `doCleanSlugs`). `stackId` is
    * any branch in the target stack (the engine resolves the whole
-   * chain from it). "busy" means the app-wide restack mutex was held
-   * (a manual `R` or another auto-restack) and NOTHING ran — the
-   * automations engine un-consumes the fire on that outcome instead of
-   * recording a restack that never happened. "clean" / "failed" report
-   * the replay itself; the conflict-bail escalation to /restack stays
-   * manual either way.
+   * chain from it). "busy" means NOTHING ran — this chain already has a
+   * restack in flight (a manual `R` or another auto-restack), or the
+   * engine found a member's per-slug lock held (a destroy, another
+   * process's restack) — and the automations engine un-consumes the
+   * fire on that outcome instead of recording a restack that never
+   * happened. Other chains restack concurrently. "clean" / "failed"
+   * report the replay itself; the conflict-bail escalation to /restack
+   * stays manual either way.
    */
   async function doRestackStack(
     stackId: string,
   ): Promise<"clean" | "failed" | "busy"> {
-    if (restackBusyRef.current) {
-      toast("restack already running", theme.warn, 2000);
+    const key = restackKeyFor(stackId);
+    if (restackBusyRef.current.has(key)) {
+      toast("restack already running for this stack", theme.warn, 2000);
       return "busy";
     }
-    restackBusyRef.current = true;
-    let clean = false;
+    restackBusyRef.current.add(key);
+    let outcome: "clean" | "failed" | "busy" = "failed";
     appLog.event.info(`restack ${stackId}: fetch + reconcile + replay`);
     try {
       const res = await rebaseStack(stackId, {}, (line) =>
         appLog.event.dim(`restack ${stackId}: ${line}`),
       );
       if (res.ok) {
-        clean = true;
+        outcome = "clean";
         appLog.event.ok(`restacked ${stackId}: ${res.output}`);
         toast(`restacked ${stackId}`, theme.ok, 2500);
+      } else if (!res.conflict && res.error === STACK_BUSY) {
+        // A member's per-slug lock was held the whole acquire window —
+        // nothing ran. Report busy so automations un-consume the fire.
+        outcome = "busy";
+        appLog.event.warn(`restack ${stackId}: ${res.error}`);
+        toast(`restack: ${res.error}`, theme.warn, 4000);
       } else if (res.conflict) {
         const where = res.failedBranch ? ` on ${res.failedBranch}` : "";
         const backup = res.backupBranch ? ` (backup ${res.backupBranch})` : "";
@@ -322,25 +345,26 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       appLog.event.err(`restack ${stackId} crashed: ${msg}`);
       toast(`restack crashed: ${msg}`, theme.err, 6000);
     } finally {
-      restackBusyRef.current = false;
+      restackBusyRef.current.delete(key);
     }
     // PR bases shift when slices move, so refresh the github query (keyed by
     // branch list, not slug) alongside the worktree state.
     void refreshGithub();
     void refreshAll();
-    return clean ? "clean" : "failed";
+    return outcome;
   }
 
   /**
-   * Non-mutating peek at the app-wide restack mutex, for the
-   * automations engine's dispatch gate: a restack intent stays queued
-   * while a manual `R` (or another auto-restack) holds the engine,
-   * BEFORE it pre-cleans anything — cleaning first and then finding
-   * the mutex held would strand the stack with its trigger condition
-   * already consumed by the clean.
+   * Non-mutating peek at one chain's restack-in-flight state, for the
+   * automations engine's dispatch gate: a restack intent for a stack
+   * stays queued while a manual `R` (or another auto-restack) runs on
+   * THAT stack, BEFORE it pre-cleans anything — cleaning first and then
+   * finding the chain busy would strand the stack with its trigger
+   * condition already consumed by the clean. Other stacks' restacks
+   * don't block it.
    */
-  function isRestackBusy(): boolean {
-    return restackBusyRef.current;
+  function isRestackBusy(stackId: string): boolean {
+    return restackBusyRef.current.has(restackKeyFor(stackId));
   }
 
   return { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack, isRestackBusy };

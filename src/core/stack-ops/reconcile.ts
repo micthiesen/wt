@@ -1,8 +1,8 @@
 import { branchExists } from "../git.ts";
 import { viewPrInfo } from "../github.ts";
 import { setSlugBase } from "../wtstate.ts";
-import { resolveChain, type ChainStep } from "./chain.ts";
-import { acquireStackLock, STACK_BUSY, type Logger } from "./shared.ts";
+import { type ChainStep, type RestackChain } from "./chain.ts";
+import { lockChain, STACK_BUSY, type Logger } from "./shared.ts";
 
 /**
  * Reconcile the fork-base records of the stack containing `branch`
@@ -22,25 +22,24 @@ export async function reconcileStack(
   trunk: string,
   onLog: Logger,
 ): Promise<void> {
-  const lock = await acquireStackLock("reconcile");
-  if (!lock) {
+  const locked = await lockChain(branch, "reconcile");
+  if (locked.status === "busy") {
     onLog(`skipped reconcile of ${branch} — ${STACK_BUSY}`);
     return;
   }
+  if (locked.status === "gone") return;
   try {
-    await reconcileStackLocked(branch, trunk, onLog);
+    await reconcileStackLocked(locked.chain, trunk, onLog);
   } finally {
-    lock.release();
+    for (const h of locked.handles) h.release();
   }
 }
 
 async function reconcileStackLocked(
-  branch: string,
+  chain: RestackChain,
   trunk: string,
   onLog: Logger,
 ): Promise<void> {
-  const chain = await resolveChain(branch);
-  if (!chain) return;
   const stepByBranch = new Map<string, ChainStep>(
     chain.steps.map((s) => [s.branch, s]),
   );

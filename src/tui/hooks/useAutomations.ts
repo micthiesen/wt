@@ -107,9 +107,13 @@ type Executing = {
   /** All slugs the dispatch may touch (quiesceSlugs at dispatch time). */
   slugs: readonly string[];
   kind: "builtin" | "headless" | "session";
-  /** True for builtin:restack — at most one may execute at a time
-   *  (the restack engine mutex is app-wide). */
+  /** True for builtin:restack — at most one may execute PER STACK at a
+   *  time (the engine locks per chain, so different stacks restack
+   *  concurrently). */
   isRestack: boolean;
+  /** The restack's stack id (fire.stackId) — the per-stack in-flight
+   *  key. Null for non-restack dispatches. */
+  stackId: string | null;
   promiseDone: boolean;
   dispatchedAt: number;
 };
@@ -143,8 +147,8 @@ export type AutomationsOpts = {
   ) => Promise<LaunchOutcome>;
   doCleanSlugs: (slugs: readonly string[]) => Promise<void>;
   doRestackStack: (stackId: string) => Promise<"clean" | "failed" | "busy">;
-  /** Peek at the app-wide restack mutex (manual `R` shares it). */
-  isRestackBusy: () => boolean;
+  /** Peek at one stack's restack-in-flight state (manual `R` shares it). */
+  isRestackBusy: (stackId: string) => boolean;
 };
 
 export type AutomationsState = {
@@ -332,14 +336,15 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     const wtLog = createLogger(slug);
     if (rule.run === "builtin:restack") {
       if (!stackId) throw new Error("builtin:restack fire without a stackId");
-      // Mutex check FIRST, before the pre-clean: a manual `R` holding
-      // the engine means nothing ran, so decline (un-consume the fire)
+      // Busy check FIRST, before the pre-clean: a manual `R` running on
+      // THIS stack means nothing ran, so decline (un-consume the fire)
       // while the trigger condition is still intact. After the
       // pre-clean the condition is consumed (merged members destroyed),
-      // so a busy mutex there is a loud FAILURE, not a decline —
-      // re-deriving the fire is no longer possible.
-      if (latest.current.isRestackBusy()) {
-        return { declined: "restack already running" };
+      // so a busy chain there is a loud FAILURE, not a decline —
+      // re-deriving the fire is no longer possible. Restacks of other
+      // stacks run concurrently and don't block this one.
+      if (latest.current.isRestackBusy(stackId)) {
+        return { declined: "restack already running on this stack" };
       }
       // Pre-clean the landed members (recomputed against CURRENT rows,
       // not the rows the fire was born under — doCleanSlugs re-filters
@@ -513,13 +518,14 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     // Two contention gates keep dispatches from racing each other into
     // the non-throwing guards downstream (which would consume fires
     // for work that never ran): no two in-flight dispatches may touch
-    // the same slug, and at most one builtin:restack runs at a time
-    // (the restack engine mutex is app-wide, shared with manual `R`).
+    // the same slug, and at most one builtin:restack runs PER STACK at
+    // a time (the engine locks per chain — shared with manual `R` —
+    // so different stacks restack concurrently).
     const occupiedSlugs = new Set<string>();
-    let restackInFlight = false;
+    const restackStacksInFlight = new Set<string>();
     for (const ex of executing.current.values()) {
       for (const s of ex.slugs) occupiedSlugs.add(s);
-      if (ex.isRestack) restackInFlight = true;
+      if (ex.isRestack && ex.stackId) restackStacksInFlight.add(ex.stackId);
     }
     const queue = [...intents.current.values()].sort(
       (a, b) => a.createdAt - b.createdAt,
@@ -531,7 +537,14 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       const wtLog = createLogger(fire.slug);
       const isRestack = rule.run === "builtin:restack";
       if (fire.quiesceSlugs.some((s) => occupiedSlugs.has(s))) continue;
-      if (isRestack && (restackInFlight || ctx.isRestackBusy())) continue;
+      if (
+        isRestack &&
+        fire.stackId !== null &&
+        (restackStacksInFlight.has(fire.stackId) ||
+          ctx.isRestackBusy(fire.stackId))
+      ) {
+        continue;
+      }
       if (!intent.announced) {
         intent.announced = true;
         wtLog.event.info(`auto ${rule.id}: ${fire.detail} — queued`);
@@ -598,12 +611,13 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
         slugs: fire.quiesceSlugs,
         kind: dispatchKind(rule),
         isRestack,
+        stackId: isRestack ? fire.stackId : null,
         promiseDone: false,
         dispatchedAt: now,
       };
       executing.current.set(intent.id, entry);
       for (const s of fire.quiesceSlugs) occupiedSlugs.add(s);
-      if (isRestack) restackInFlight = true;
+      if (isRestack && fire.stackId) restackStacksInFlight.add(fire.stackId);
       wtLog.event.info(`auto ${rule.id}: ${fire.detail} — running ${rule.run}`);
       void execute(fire)
         .then(

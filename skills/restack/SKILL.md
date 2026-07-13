@@ -48,7 +48,10 @@ conflict on the named branch.
 - No uncommitted **tracked** changes in any member's worktree — replay rebases
   each in place, so it refuses if any has staged/unstaged tracked edits.
   Untracked files do NOT block; leave them alone.
-- **One restack at a time**: replay takes a cross-process lock.
+- **One restack per stack at a time**: replay takes every member's
+  cross-process per-worktree lock, so a busy refusal means another operation
+  (a restack, create, or destroy) is touching one of THIS stack's worktrees;
+  unrelated stacks restack concurrently.
 
 ## Steps
 

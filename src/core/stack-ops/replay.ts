@@ -1,10 +1,10 @@
 import { config } from "../config.ts";
-import { firstSha, gitQuiet, gitRun, revParse } from "../git.ts";
-import { rebaseInProgress, restackEngine } from "./engine.ts";
-import { resolveChain, type ChainStep } from "./chain.ts";
+import { firstSha, gitQuiet, gitRun, rebaseInProgress, revParse } from "../git.ts";
+import { restackEngine } from "./engine.ts";
+import { resolveChain, type ChainStep, type RestackChain } from "./chain.ts";
 import { advanceBaseAnchor } from "../wtstate.ts";
 import { fetchOrigin, worktreeHasTrackedChanges } from "../worktree.ts";
-import { acquireStackLock, log, retargetIfNeeded, STACK_BUSY, type Logger } from "./shared.ts";
+import { lockChain, log, retargetIfNeeded, STACK_BUSY, type Logger } from "./shared.ts";
 import { reconcileStack } from "./reconcile.ts";
 
 // ---------- reconcile / replay / rebase ----------
@@ -75,42 +75,42 @@ export async function rebaseStack(
  * match the recorded parent. Bails clean on the first conflict, naming
  * the branch + the backup ref the engine left — wt never auto-resolves.
  * Pure git + gh; does NOT reconcile (run `reconcileStack` first for a
- * post-merge restack). Serialized across processes by a flock.
+ * post-merge restack). Serialized against other writers on the same
+ * worktrees by the members' per-slug flocks (see `lockChain`); disjoint
+ * chains replay concurrently.
  */
 export async function replayStack(
   branch: string,
   opts: RebaseOptions,
   onLog: Logger,
 ): Promise<RebaseResult> {
-  const handle = await acquireStackLock("replay");
-  if (!handle) {
+  const locked = await lockChain(branch, "replay");
+  if (locked.status === "busy") {
     return { ok: false, conflict: false, error: STACK_BUSY };
   }
-  try {
-    return await replayStackLocked(branch, opts, onLog);
-  } finally {
-    handle.release();
-  }
-}
-
-async function replayStackLocked(
-  branch: string,
-  opts: RebaseOptions,
-  onLog: Logger,
-): Promise<RebaseResult> {
-  const trunk = opts.onto ?? config.branch.base;
-
-  // The chain is re-resolved fresh from worktrees + records (a
-  // reconcile that just reparented members must be visible), parents
-  // before children so each parent replays before its dependents.
-  const chain = await resolveChain(branch);
-  if (!chain) {
+  if (locked.status === "gone") {
     return {
       ok: false,
       conflict: false,
       error: `${branch} has no live worktree to restack`,
     };
   }
+  try {
+    return await replayStackLocked(locked.chain, opts, onLog);
+  } finally {
+    for (const h of locked.handles) h.release();
+  }
+}
+
+async function replayStackLocked(
+  // Resolved under the chain's locks by `lockChain` — post-reconcile
+  // reparents are already visible, parents before children so each
+  // parent replays before its dependents.
+  chain: RestackChain,
+  opts: RebaseOptions,
+  onLog: Logger,
+): Promise<RebaseResult> {
+  const trunk = opts.onto ?? config.branch.base;
 
   // Every member replays IN ITS OWN WORKTREE (HEAD rebases in place);
   // refuse any dirty one up front — a rebase would clobber. Only

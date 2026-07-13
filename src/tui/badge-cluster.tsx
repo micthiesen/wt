@@ -12,6 +12,7 @@ import {
   checkBadge,
   prStateBadge,
   rabbitBadge,
+  rebaseBadge,
   reviewBadge,
 } from "./badges.ts";
 import { NF } from "./icons.ts";
@@ -41,17 +42,17 @@ export function badgeClusterCells(
   // Action and harness-glyph slots coexist (e.g. a row running an
   // action while hosting a live session shows both glyphs).
   const showSessionSlot = activeHarnessId !== undefined;
-  const conflict = hasConflict(row);
+  const rebase = rebaseHint(row);
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
-    conflict ||
+    !!rebase ||
     !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return 0;
   let cells = 2; // leading gap
   if (actionRunning) cells += 2;
   if (showSessionSlot) cells += 2;
-  if (conflict) cells += 2;
+  if (rebase) cells += 2;
   if (rabbitHint(row)) cells += 2;
   if (reviewHint(row)) cells += 2;
   // The PR-state slot doubles as the merge-queue slot: a queued PR
@@ -111,13 +112,13 @@ function checkGlyph(row: WorktreeRow): Badge {
 }
 
 /**
- * True when the rebase-conflict pre-flight determined HEAD won't merge
- * cleanly onto its base. Only the `conflict` verdict shows a glyph —
- * `clean` and `unknown` (unresolved ref, ancient git, still loading)
- * stay silent, so the cluster reads "absence == fine".
+ * Rebase-lifecycle hint: restack running (accent) / mid-rebase awaiting
+ * resolution (warn) / pre-flight conflict (err). Glyph/color from
+ * `rebaseBadge`; `clean` and `unknown` (unresolved ref, ancient git,
+ * still loading) stay silent, so the cluster reads "absence == fine".
  */
-function hasConflict(row: WorktreeRow): boolean {
-  return row.fields.conflict.data?.status === "conflict";
+function rebaseHint(row: WorktreeRow): Badge | null {
+  return rebaseBadge(row.fields.lock.data, row.fields.conflict.data);
 }
 
 /**
@@ -193,11 +194,11 @@ export function BadgeCluster({
   // harness glyph (tinted with the harness's own color). They coexist
   // so a row running an action while hosting a live session shows both.
   const showSessionSlot = activeHarnessId !== undefined;
-  const conflict = hasConflict(row);
+  const rebase = rebaseHint(row);
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||
-    conflict ||
+    !!rebase ||
     !!(row.pr || row.mq || isDeployed);
   if (!hasAnyBadge) return null;
   return (
@@ -208,12 +209,13 @@ export function BadgeCluster({
           <text fg={theme.ok}>{NF.comment}</text>
         </box>
       ) : null}
-      {/* Rebase-conflict warning — sits just left of the PR-signal
-          sub-cluster so it reads as "this branch/PR won't land cleanly".
-          Dimmed on archived rows like the rest of the cluster. */}
-      {conflict ? (
+      {/* Rebase-lifecycle slot (restacking / mid-rebase / conflict) —
+          sits just left of the PR-signal sub-cluster so it reads as
+          "this branch/PR is moving (or won't land cleanly)". Dimmed on
+          archived rows like the rest of the cluster. */}
+      {rebase ? (
         <box width={2} flexShrink={0}>
-          <text fg={row.archived ? theme.fgDim : theme.err}>{NF.conflict}</text>
+          <text fg={row.archived ? theme.fgDim : rebase.fg}>{rebase.glyph}</text>
         </box>
       ) : null}
       {/* Ephemeral / scattered badges are left-anchored so they don't

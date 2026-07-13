@@ -130,6 +130,12 @@ export const qk = {
        * which base we'd rebase onto.
        */
       conflict: (base: string) => ["wt", slug, "conflict", base] as const,
+      /**
+       * Prefix over every base's conflict entry — for push
+       * invalidation from the rebase-state watcher, which knows the
+       * slug but not which base the observer is currently keyed on.
+       */
+      conflictAny: () => ["wt", slug, "conflict"] as const,
     }) as const,
   /**
    * AI summary keyed by content hash of the diff. Equivalent diffs

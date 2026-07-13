@@ -19,10 +19,7 @@
  * whole replay. The `RestackEngine` seam stays so the replay mechanism
  * can be swapped or tested in isolation.
  */
-import { existsSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
-
-import { gitRun, revParse } from "../git.ts";
+import { gitRun, rebaseInProgress, revParse } from "../git.ts";
 
 export type ReplayLogger = (line: string) => void;
 
@@ -51,26 +48,6 @@ export interface RestackEngine {
    * hands resolution to a human / skill. wt never auto-resolves conflicts.
    */
   replayStep(step: ReplayStep, onLog: ReplayLogger): Promise<ReplayOutcome>;
-}
-
-/**
- * Is a rebase actually in progress in `cwd`? This is the authoritative test —
- * the presence of git's per-worktree `rebase-merge`/`rebase-apply` state dir —
- * NOT the exit code of `git rebase --abort` (which also fails when there's
- * nothing to abort, the exact ambiguity that produced false "left mid-rebase"
- * reports on slices whose rebase failed at preflight without ever starting).
- */
-export async function rebaseInProgress(cwd: string): Promise<boolean> {
-  for (const dir of ["rebase-merge", "rebase-apply"]) {
-    const r = await gitRun(["rev-parse", "--git-path", dir], cwd);
-    const p = r.stdout.trim();
-    // `--git-path` is ABSOLUTE for a linked worktree (the common case here) and
-    // relative to `cwd` only for the main clone. `resolvePath(cwd, p)` is
-    // correct for both — Node's `resolve` returns an absolute second arg
-    // unchanged and joins a relative one onto `cwd`. Don't "simplify" this.
-    if (p && existsSync(resolvePath(cwd, p))) return true;
-  }
-  return false;
 }
 
 /** Collapse git's multi-line / `\r`-laden stderr into one clean line so it

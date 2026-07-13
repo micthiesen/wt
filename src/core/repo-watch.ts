@@ -4,7 +4,7 @@
  * model. Press-`r` becomes a backstop instead of the primary way to see
  * a fresh commit, push, or working-tree edit.
  *
- * Four watch points:
+ * Five watch points:
  *   1. `<main>/.git/refs/` recursive — branch + remote ref churn.
  *      Catches commits (refs/heads/*), fetches + pushes (refs/remotes/*),
  *      branch creates / deletes. Shared across the whole repo, one
@@ -20,7 +20,11 @@
  *      Deliberately non-recursive: per-worktree admin files (index.lock,
  *      HEAD) churn constantly during normal git use and only the
  *      membership set matters here.
- *   4. `~/.cache/wt/` non-recursive, filtered to `state.json` /
+ *   4. `<main>/.git/worktrees/` recursive, filtered to
+ *      `<slug>/rebase-{merge,apply}` — a rebase starting/ending in any
+ *      worktree, for the conflict probe's mid-rebase state (see
+ *      `watchRebaseState`).
+ *   5. `~/.cache/wt/` non-recursive, filtered to `state.json` /
  *      `archive.json` — cross-process state writes (CLI `wt base`
  *      ops, `wt base set`, the detached destroy, another wt instance).
  *      Prefix-matched because both writers go through a
@@ -218,6 +222,73 @@ export function watchWorktreesAdmin(
   };
 }
 
+/**
+ * Subscribe to rebase state appearing/disappearing in any linked
+ * worktree: git keeps an in-progress rebase's control files under
+ * `<main>/.git/worktrees/<slug>/rebase-merge/` (or `rebase-apply/`).
+ * This is the push signal for the conflict probe's "rebasing" state —
+ * the restack ENGINE never leaves a worktree mid-rebase (it aborts
+ * before bailing), so the state comes from rebases started outside the
+ * engine (a `/restack` conflict resolution, a hand rebase), which no
+ * other watcher sees: refs don't move until the rebase finishes, and
+ * the per-worktree dir watcher filters `.git/*`.
+ *
+ * Recursive on the same admin dir `watchWorktreesAdmin` watches
+ * non-recursively — the constant per-worktree churn its docstring
+ * warns about (index.lock, HEAD) is discarded here by the path filter
+ * before any debounce fires, so the cost is one extra FSEvents stream,
+ * not extra invalidations. The first path segment is the worktree's
+ * admin name, which for wt-created worktrees is the slug (git derives
+ * it from the checkout's directory basename).
+ */
+export function watchRebaseState(
+  mainClonePath: string,
+  onChange: (slug: string) => void,
+): () => void {
+  const dir = join(mainClonePath, ".git", "worktrees");
+  const debouncers = new Map<string, Debounced>();
+  let disposed = false;
+  const debouncerFor = (slug: string): Debounced => {
+    let d = debouncers.get(slug);
+    if (!d) {
+      d = makeDebounced(() => onChange(slug), REFS_DEBOUNCE_MS);
+      debouncers.set(slug, d);
+    }
+    return d;
+  };
+  const cancelAll = (): void => {
+    disposed = true;
+    for (const d of debouncers.values()) d.cancel();
+    debouncers.clear();
+  };
+  let watcher: FSWatcher | null = null;
+  try {
+    mkdirSync(dir, { recursive: true });
+    watcher = watch(
+      dir,
+      { persistent: false, recursive: true },
+      (_event, filename) => {
+        if (disposed || filename == null) return;
+        const m = /^([^/]+)\/(?:rebase-merge|rebase-apply)(?:\/|$)/.exec(
+          filename,
+        );
+        if (!m) return;
+        debouncerFor(m[1]!).trigger();
+      },
+    );
+    watcher.on("error", (err) => {
+      log.warn("rebase-state watcher error", { err: String(err), dir });
+    });
+  } catch (err) {
+    log.warn("rebase-state watcher failed", { err: String(err), dir });
+    return cancelAll;
+  }
+  return () => {
+    cancelAll();
+    closeSilent(watcher);
+  };
+}
+
 /** Which cross-process state file changed. */
 export type WtStateFile = "state" | "archive";
 
@@ -287,9 +358,9 @@ export function watchWtStateFiles(
  * install" to done the moment the create finishes instead of on the
  * next poll tick.
  *
- * Internal mutex locks (`__fetch_origin__`, `__stack__`, `__wtstate__`,
- * …) share the directory under the `__name__` convention and are
- * filtered out — they're process plumbing, not worktree state. The
+ * Internal mutex locks (`__fetch_origin__`, `__wtstate__`, …) share
+ * the directory under the `__name__` convention and are filtered
+ * out — they're process plumbing, not worktree state. The
  * `withFileLock` mutexes also never rewrite or unlink their files, so
  * they generate no events after first creation anyway.
  *

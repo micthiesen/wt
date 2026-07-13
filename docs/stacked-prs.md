@@ -59,6 +59,16 @@ automations) reparents its children automatically when the branch is deleted —
 onto the deleted branch's own recorded base, anchors kept — so the stack heals
 itself as PRs land; the replay stays an explicit `R`/`wt restack`.
 
+Restacks lock **per chain**, not globally: the engine takes every member's
+per-slug flock (the same locks creates/destroys use) for the duration, so
+disjoint stacks — and unrelated standalone worktrees — restack concurrently,
+while two operations touching the same worktrees (a second `R`, a CLI run, a
+destroy) refuse with "busy". While the locks are held every member row shows
+the restack glyph (accent sync icon). Once you (or `/restack`) start the
+resolving rebase in the bailed worktree, the same glyph shows in warn until
+that rebase finishes or aborts — the bail itself leaves the tree clean (see
+below), so right after it the row shows the red conflict triangle instead.
+
 Conflicts are never auto-resolved: the engine aborts the rebase, leaves a
 `backup/restack-*` ref at the old tip, and names the failing branch (exit 3 at
 the CLI). Resolve it in that worktree — or run the bundled `/restack` skill,

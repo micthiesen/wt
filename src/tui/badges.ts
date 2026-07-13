@@ -45,7 +45,9 @@
  *    font renders them 2-cell. The extra space prevents the icon's
  *    right half from overlapping the next char.
  */
+import type { MergeConflictProbe } from "../core/git.ts";
 import {
+  type LockMeta,
   type PrChecks,
   type PrReview,
   type PullRequest,
@@ -63,6 +65,7 @@ export type Badge = { glyph: string; fg: string };
 export function statusBadge(s: Status): Badge {
   if (s.kind === StatusKind.Busy) {
     if (s.op === "remove") return { glyph: NF.trash, fg: theme.err };
+    if (s.op === "restack") return { glyph: NF.restack, fg: theme.accent };
     return { glyph: NF.rocket, fg: theme.accent };
   }
   if (s.kind === StatusKind.Missing) return { glyph: NF.unlink, fg: theme.err };
@@ -123,6 +126,35 @@ export function reviewBadge(r: PrReview): Badge | null {
     default:
       return null;
   }
+}
+
+/**
+ * Glyph + color for the rebase-lifecycle slot the list cluster and the
+ * details "rebase" row share. One slot, three states, priority order:
+ *
+ *  - **restacking** (accent sync glyph): the engine holds this
+ *    worktree's per-slug lock (`op: "restack"`) — reconcile/replay in
+ *    flight across the whole chain.
+ *  - **rebasing** (warn sync glyph): the worktree sits mid-rebase — a
+ *    `/restack` or hand rebase resolving a conflict. (The engine itself
+ *    always aborts before bailing, so right after a bail the row shows
+ *    the conflict triangle; this state appears once the resolving
+ *    rebase starts.) Same glyph as restacking; color carries the stage.
+ *  - **conflict** (err alert triangle): the pre-flight `merge-tree`
+ *    dry-run says HEAD won't land cleanly on its base.
+ *
+ * Null for clean/unknown so both panes keep absence-as-signal. The
+ * engine's own transient rebases never flash warn: the lock is held for
+ * the duration, and restacking outranks rebasing.
+ */
+export function rebaseBadge(
+  lock: Partial<LockMeta> | null | undefined,
+  probe: MergeConflictProbe | undefined,
+): Badge | null {
+  if (lock?.op === "restack") return { glyph: NF.restack, fg: theme.accent };
+  if (probe?.status === "rebasing") return { glyph: NF.restack, fg: theme.warn };
+  if (probe?.status === "conflict") return { glyph: NF.conflict, fg: theme.err };
+  return null;
 }
 
 /**

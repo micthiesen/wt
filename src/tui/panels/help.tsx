@@ -220,6 +220,7 @@ const KEY_BLOCKS: Block[] = [
 const STATUS_GLYPHS: GlyphItem[] = [
   { glyph: NF.rocket, color: theme.accent, label: "busy (init/install)" },
   { glyph: NF.trash, color: theme.err, label: "busy (removing)" },
+  { glyph: NF.restack, color: theme.accent, label: "busy (restacking)" },
   { glyph: NF.unlink, color: theme.err, label: "missing (path vanished)" },
   { glyph: NF.slash, color: theme.warn, label: "gone (branch deleted upstream)" },
   { glyph: NF.merge, color: theme.ok, label: `merged into ${TRUNK}` },
@@ -240,6 +241,9 @@ const BADGES: GlyphItem[] = [
   { glyph: `${NF.mergeQueue} N`, color: theme.err, label: "merge queue pos N · blocked" },
   { glyph: NF.mergeQueue, color: theme.info, label: "auto-merge armed (waiting)" },
   { glyph: NF.bolt, color: theme.warn, label: "SST stage deployed" },
+  { glyph: NF.restack, color: theme.accent, label: "restack running (whole chain)", search: "restack rebase running" },
+  { glyph: NF.restack, color: theme.warn, label: "mid-rebase — resolve + continue (/restack)", search: "rebase in progress conflict resolving" },
+  { glyph: NF.conflict, color: theme.err, label: "won't rebase cleanly onto base", search: "conflict preflight merge" },
   { glyph: NF.comment, color: theme.ok, label: "`!` action running", search: "action running claude" },
   {
     glyph: getHarness("claude").glyph,

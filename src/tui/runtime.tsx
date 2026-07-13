@@ -23,6 +23,7 @@ import {
 import {
   WorktreeWatchSet,
   watchLockDir,
+  watchRebaseState,
   watchRefs,
   watchWorktreesAdmin,
   watchWtStateFiles,
@@ -230,6 +231,19 @@ export async function runTui(): Promise<TuiExit> {
     config.paths.mainClone,
     () => {
       invalidations.key(qk.worktrees());
+    },
+  );
+  // Rebase state appearing/disappearing in a worktree (`rebase-merge/`
+  // under its `.git/worktrees/<slug>/` admin dir) → refresh that slug's
+  // conflict probe so the mid-rebase glyph flips on the event. This is
+  // the only push signal for a rebase started OUTSIDE the engine (a
+  // `/restack` conflict resolution, a hand rebase): refs don't move
+  // until it finishes, and the engine's own runs are covered by the
+  // lock watcher instead.
+  const stopRebaseStateWatch = watchRebaseState(
+    config.paths.mainClone,
+    (slug) => {
+      invalidations.key(qk.wt(slug).conflictAny());
     },
   );
   // Cross-process state.json / archive.json writes (CLI stack ops, `wt
@@ -441,6 +455,7 @@ export async function runTui(): Promise<TuiExit> {
     stopRefsWatch();
     stopGithubEventsWatch?.();
     stopWorktreesAdminWatch();
+    stopRebaseStateWatch();
     stopWtStateWatch();
     stopLockWatch();
     unsubWorktrees();

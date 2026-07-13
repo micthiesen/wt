@@ -57,6 +57,10 @@ export const NF = {
 	// base. Warning triangle (distinct from the CI `checkFail` x_circle so
 	// a red conflict glyph doesn't read as a failed check).
 	conflict: "\u{F421}", // nf-oct-alert
+	// Rebase lifecycle: restack engine replaying (accent) or worktree
+	// mid-rebase awaiting conflict resolution (warn) — same glyph, color
+	// carries the stage (see `rebaseBadge` in badges.ts).
+	restack: "\u{F46A}", // nf-oct-sync
 
 	// Other badges
 	mergeQueue: "\u{F4DB}", // nf-oct-git_merge_queue — merge-queue position badge
