@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, relative } from "node:path";
 
 import { config } from "./config.ts";
@@ -23,7 +23,21 @@ export async function listWorktrees(): Promise<Worktree[]> {
     if (!line) {
       if (block.worktree) {
         const path = block.worktree;
-        const branch = (block.branch ?? "").replace(/^refs\/heads\//, "");
+        let branch = (block.branch ?? "").replace(/^refs\/heads\//, "");
+        // A rebase detaches HEAD, so mid-rebase (the engine replaying, or
+        // a `/restack`/hand resolve sitting on a conflict) the porcelain
+        // reports `detached` and the branch would read "" — which strips
+        // the row of everything keyed by branch: the PR lookup
+        // (`pickPrForWorktree` bails on a branchless worktree, blanking
+        // the PR/checks/review badges), the github query's branch-list
+        // key, and stack membership (`buildStackIndex`). Git records
+        // which branch the rebase is rewriting in its own state
+        // (`rebase-merge/head-name`); recover it so the row keeps its
+        // identity for the duration instead of dissolving and snapping
+        // back when the rebase finishes.
+        if (!branch && "detached" in block) {
+          branch = rebasingBranch(path);
+        }
         const isMain = path === config.paths.mainClone;
         const slug = isMain ? "main" : basename(path);
         // `git worktree list` includes worktrees created by other tools
@@ -63,6 +77,48 @@ export async function listWorktrees(): Promise<Worktree[]> {
 function isManagedWorktreePath(path: string): boolean {
   const rel = relative(config.paths.worktreeRoot, path);
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * The private git dir behind a checkout: `.git` itself for the main
+ * clone, the `gitdir:` pointer's target for a linked worktree. Null
+ * when unreadable (racing a destroy).
+ */
+function gitDirOf(wtPath: string): string | null {
+  const dotGit = join(wtPath, ".git");
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
+    if (!m) return null;
+    const target = m[1]!;
+    return isAbsolute(target) ? target : join(wtPath, target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The branch an in-progress rebase is rewriting in `wtPath`, or "" when
+ * no rebase is running (or it's rebasing a genuinely detached HEAD).
+ * Read from git's rebase state — `head-name` under `rebase-merge/`
+ * (merge backend, the default) or `rebase-apply/` (am backend) holds
+ * the full ref of the branch that will be reattached when the rebase
+ * finishes. Sync fs reads, only reached for detached worktrees.
+ */
+function rebasingBranch(wtPath: string): string {
+  const gitdir = gitDirOf(wtPath);
+  if (!gitdir) return "";
+  for (const dir of ["rebase-merge", "rebase-apply"]) {
+    try {
+      const name = readFileSync(join(gitdir, dir, "head-name"), "utf8").trim();
+      if (name.startsWith("refs/heads/")) {
+        return name.replace(/^refs\/heads\//, "");
+      }
+    } catch {
+      // No state for this backend — try the other, then give up.
+    }
+  }
+  return "";
 }
 
 /**

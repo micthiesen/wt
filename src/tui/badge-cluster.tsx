@@ -112,13 +112,19 @@ function checkGlyph(row: WorktreeRow): Badge {
 }
 
 /**
- * Rebase-lifecycle hint: restack running (accent) / mid-rebase awaiting
- * resolution (warn) / pre-flight conflict (err). Glyph/color from
- * `rebaseBadge`; `clean` and `unknown` (unresolved ref, ancient git,
- * still loading) stay silent, so the cluster reads "absence == fine".
+ * Rebase-lifecycle hint: restack running (accent) / mid-rebase or
+ * conflict-being-resolved (warn) / unattended pre-flight conflict
+ * (err). Glyph/color from `rebaseBadge`; `clean` and `unknown`
+ * (unresolved ref, ancient git, still loading) stay silent, so the
+ * cluster reads "absence == fine". `sessionState` only shifts the
+ * conflict color (red ↔ warn), never presence — `badgeClusterCells`
+ * relies on that and omits it.
  */
-function rebaseHint(row: WorktreeRow): Badge | null {
-  return rebaseBadge(row.fields.lock.data, row.fields.conflict.data);
+function rebaseHint(
+  row: WorktreeRow,
+  sessionState?: DerivedState,
+): Badge | null {
+  return rebaseBadge(row.fields.lock.data, row.fields.conflict.data, sessionState);
 }
 
 /**
@@ -194,7 +200,7 @@ export function BadgeCluster({
   // harness glyph (tinted with the harness's own color). They coexist
   // so a row running an action while hosting a live session shows both.
   const showSessionSlot = activeHarnessId !== undefined;
-  const rebase = rebaseHint(row);
+  const rebase = rebaseHint(row, sessionState);
   const hasAnyBadge =
     actionRunning ||
     showSessionSlot ||

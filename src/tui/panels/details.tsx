@@ -27,6 +27,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
+import type { DerivedState } from "../../core/harness/status.ts";
 import { StatusKind, type PrComment } from "../../core/types.ts";
 import { useGithub } from "../../state/hooks.ts";
 import {
@@ -70,6 +71,12 @@ type Props = {
    * scroll to the top.
    */
   scrollRef?: RefObject<ScrollBoxRenderable | null>;
+  /**
+   * Derived state of the selected row's active (F12-target) session,
+   * when one is live. Feeds the rebase block's "conflict being
+   * resolved" tint — same signal the list cluster reads.
+   */
+  sessionState?: DerivedState;
 };
 
 const RESOLVED_ROWS: readonly RowModule[] = resolveRows(config.ui.rows);
@@ -328,10 +335,12 @@ const DetailsBody = memo(function DetailsBody({
   row,
   width,
   scrollRef,
+  sessionState,
 }: {
   row: WorktreeRow;
   width: number;
   scrollRef?: RefObject<ScrollBoxRenderable | null>;
+  sessionState?: DerivedState;
 }) {
   // Subscribe to the combined GitHub fetch so per-row indicators
   // reflect its fetch state. Observers dedupe by key — this doesn't
@@ -436,10 +445,11 @@ const DetailsBody = memo(function DetailsBody({
         {RESOLVED_ROWS.map((m) => (
           <RenderedRow key={m.id} module={m} ctx={ctx} />
         ))}
-        {/* Rebase lifecycle (restacking / mid-rebase / conflict + files)
-            renders as a block below the definitions — the conflict file
-            list never fit the one-line definition format. */}
-        <RebaseBlock row={row} />
+        {/* Rebase lifecycle (restacking / mid-rebase / resolving /
+            conflict + files) renders as a block below the definitions —
+            the conflict file list never fit the one-line definition
+            format. */}
+        <RebaseBlock row={row} sessionState={sessionState} />
         {pausedScope ? <AutomationsPausedLine scope={pausedScope} /> : null}
         <DescriptionBlock
           summary={summary.data?.description ?? null}
@@ -457,7 +467,7 @@ const DetailsBody = memo(function DetailsBody({
   );
 });
 
-export function Details({ row, reviewRequest, section, removed, width, scrollRef }: Props) {
+export function Details({ row, reviewRequest, section, removed, width, scrollRef, sessionState }: Props) {
   if (removed) {
     // Key by slug so cursor moves across history entries remount cleanly.
     return <RemovedBody key={`removed:${removed.slug}`} entry={removed} />;
@@ -504,6 +514,7 @@ export function Details({ row, reviewRequest, section, removed, width, scrollRef
       row={row}
       width={width}
       scrollRef={scrollRef}
+      sessionState={sessionState}
     />
   );
 }

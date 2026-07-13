@@ -737,6 +737,11 @@ export function App({ onExit }: Props) {
           removed={currentRemoved}
           width={Math.max(0, width - listWidth)}
           scrollRef={detailsScrollRef}
+          sessionState={
+            current
+              ? activeSessionBySlug.get(current.wt.slug)?.state ?? undefined
+              : undefined
+          }
         />
       </box>
       <OutputViewer output={displayedOutput} height={activityHeight} />

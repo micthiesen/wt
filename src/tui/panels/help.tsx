@@ -242,8 +242,8 @@ const BADGES: GlyphItem[] = [
   { glyph: NF.mergeQueue, color: theme.info, label: "auto-merge armed (waiting)" },
   { glyph: NF.bolt, color: theme.warn, label: "SST stage deployed" },
   { glyph: NF.restack, color: theme.accent, label: "restack running (whole chain)", search: "restack rebase running" },
-  { glyph: NF.restack, color: theme.warn, label: "mid-rebase — resolve + continue (/restack)", search: "rebase in progress conflict resolving" },
-  { glyph: NF.conflict, color: theme.err, label: "won't rebase cleanly onto base", search: "conflict preflight merge" },
+  { glyph: NF.restack, color: theme.warn, label: "conflict being resolved / mid-rebase", search: "rebase in progress conflict resolving session" },
+  { glyph: NF.conflict, color: theme.err, label: "won't rebase cleanly onto base (unattended)", search: "conflict preflight merge" },
   { glyph: NF.comment, color: theme.ok, label: "`!` action running", search: "action running claude" },
   {
     glyph: getHarness("claude").glyph,

@@ -46,6 +46,7 @@
  *    right half from overlapping the next char.
  */
 import type { MergeConflictProbe } from "../core/git.ts";
+import type { DerivedState } from "../core/harness/status.ts";
 import {
   type LockMeta,
   type PrChecks,
@@ -129,8 +130,21 @@ export function reviewBadge(r: PrReview): Badge | null {
 }
 
 /**
+ * Session states that count as "the AI is actively engaged here" for
+ * the rebase slot: a conflicted row whose session is in one of these
+ * renders as being-resolved (warn sync) instead of raw conflict (red).
+ * `asking` counts — a `/restack` pausing on a question is mid-task.
+ * `unknown` does not: a live session we can't read stays honest-red.
+ */
+const ENGAGED_SESSION_STATES: ReadonlySet<DerivedState> = new Set([
+  "working",
+  "polling",
+  "asking",
+]);
+
+/**
  * Glyph + color for the rebase-lifecycle slot the list cluster and the
- * details-pane rebase block share. One slot, three states, priority order:
+ * details-pane rebase block share. One slot, four states, priority order:
  *
  *  - **restacking** (accent sync glyph): the engine holds this
  *    worktree's per-slug lock (`op: "restack"`) — reconcile/replay in
@@ -138,10 +152,19 @@ export function reviewBadge(r: PrReview): Badge | null {
  *  - **rebasing** (warn sync glyph): the worktree sits mid-rebase — a
  *    `/restack` or hand rebase resolving a conflict. (The engine itself
  *    always aborts before bailing, so right after a bail the row shows
- *    the conflict triangle; this state appears once the resolving
+ *    resolving or conflict; this state appears once the resolving
  *    rebase starts.) Same glyph as restacking; color carries the stage.
+ *  - **resolving** (warn sync glyph): the branch still conflicts with
+ *    its base AND the row's active session is engaged (working /
+ *    polling / asking) — the conflict-bail handoff's cold start,
+ *    context reading, and `wt restack` re-runs all land here, so the
+ *    slot doesn't flash red mid-handoff. Level-derived from live
+ *    session state rather than "did wt dispatch a handoff", so a
+ *    hand-typed `/restack` reads identically; when the session goes
+ *    idle without fixing the conflict, red returns — the honest state.
  *  - **conflict** (err alert triangle): the pre-flight `merge-tree`
- *    dry-run says HEAD won't land cleanly on its base.
+ *    dry-run says HEAD won't land cleanly on its base and nothing is
+ *    working on it.
  *
  * Null for clean/unknown so both panes keep absence-as-signal. The
  * engine's own transient rebases never flash warn: the lock is held for
@@ -150,10 +173,16 @@ export function reviewBadge(r: PrReview): Badge | null {
 export function rebaseBadge(
   lock: Partial<LockMeta> | null | undefined,
   probe: MergeConflictProbe | undefined,
+  sessionState?: DerivedState,
 ): Badge | null {
   if (lock?.op === "restack") return { glyph: NF.restack, fg: theme.accent };
   if (probe?.status === "rebasing") return { glyph: NF.restack, fg: theme.warn };
-  if (probe?.status === "conflict") return { glyph: NF.conflict, fg: theme.err };
+  if (probe?.status === "conflict") {
+    if (sessionState && ENGAGED_SESSION_STATES.has(sessionState)) {
+      return { glyph: NF.restack, fg: theme.warn };
+    }
+    return { glyph: NF.conflict, fg: theme.err };
+  }
   return null;
 }
 
