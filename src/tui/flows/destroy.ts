@@ -264,6 +264,15 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       toast("select a worktree first", theme.warn, 2000);
       return;
     }
+    // A landed-but-not-yet-cleaned row has nothing useful to rebase —
+    // replaying it onto trunk drops its already-merged commits and
+    // force-pushes an empty diff to the PR branch. `c` is the verb for
+    // it. (A merged member elsewhere in a stack is fine: reconcile
+    // handles it when R is pressed on a surviving member.)
+    if (isCleanCandidate(current)) {
+      toast("branch already landed — clean it (c) instead of rebasing", theme.warn, 3000);
+      return;
+    }
     await doRestackStack(current.wt.branch);
   }
 
