@@ -440,7 +440,11 @@ const GENERIC_DEFAULTS = {
     prTarget: "github" as const satisfies PullRequestTarget,
   },
   ui: {
-    rows: ["branch", "base", "linear", "stage", "pr", "conflict", "claude", "git"] as const,
+    // No "conflict" entry: the rebase lifecycle renders as a dedicated
+    // block below the rows, not a definition row (see
+    // `panels/details/rebase-block.tsx`). Old configs listing it are
+    // harmless — unknown ids drop silently at resolve time.
+    rows: ["branch", "base", "linear", "stage", "pr", "claude", "git"] as const,
   },
   actions: [
     {

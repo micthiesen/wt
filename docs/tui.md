@@ -5,7 +5,7 @@
 ## Layout
 
 - **List pane** (left): one line per worktree — slug, status glyphs, PR/CI badges, session indicators — grouped into sections, with stacks rendered as trees. A pinned "review requests" section surfaces PRs waiting on your review.
-- **Details pane** (right): the configured rows (`[ui].rows` in [configuration.md](configuration.md#ui)) for the selected worktree — branch, base, Linear issue, stage, PR, rebase state (restacking / mid-rebase / conflict probe), sessions, git state — plus the AI-generated title/description band when `[ai]` is configured.
+- **Details pane** (right): the configured rows (`[ui].rows` in [configuration.md](configuration.md#ui)) for the selected worktree — branch, base, Linear issue, stage, PR, sessions, git state — then a rebase-state block (restacking / mid-rebase / conflict with the clashing files) when something is moving, plus the AI-generated title/description band when `[ai]` is configured.
 - **Bottom pane**: live outputs — harness sessions, action runs, event feeds. Auto-follows the selected row; `'` picks an output explicitly, `[` / `]` cycle, `Esc` returns to auto-follow.
 - **Footer**: key legend, or a text prompt when one is active (`n` new-worktree, `L` rename section).
 

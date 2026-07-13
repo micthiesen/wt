@@ -9,7 +9,6 @@
 import { baseRow } from "./base.tsx";
 import { branchRow } from "./branch.tsx";
 import { claudeRow } from "./claude.tsx";
-import { conflictRow } from "./conflict.tsx";
 import { gitRow } from "./git.tsx";
 import { linearRow } from "./linear.tsx";
 import { pathRow } from "./path.tsx";
@@ -17,6 +16,12 @@ import { prRow } from "./pr.tsx";
 import { stageRow } from "./stage.tsx";
 import type { RowModule } from "./types.ts";
 
+// The rebase lifecycle (restacking / mid-rebase / conflict) is NOT a
+// row module: its conflict state carries a file list that never fit
+// the one-line definition format, so it renders as a dedicated block
+// below the rows (`panels/details/rebase-block.tsx`). A configured
+// "conflict" id from an older config resolves to nothing (unknown ids
+// drop silently below).
 const REGISTRY: readonly RowModule[] = [
   branchRow,
   baseRow,
@@ -24,7 +29,6 @@ const REGISTRY: readonly RowModule[] = [
   linearRow,
   stageRow,
   prRow,
-  conflictRow,
   claudeRow,
   gitRow,
 ];

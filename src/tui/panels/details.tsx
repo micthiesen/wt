@@ -43,6 +43,7 @@ import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { Row } from "./details/row-cell.tsx";
+import { RebaseBlock } from "./details/rebase-block.tsx";
 import { RemovedBody } from "./details/removed-body.tsx";
 import { ReviewRequestBody } from "./details/review-request-body.tsx";
 import {
@@ -435,6 +436,10 @@ const DetailsBody = memo(function DetailsBody({
         {RESOLVED_ROWS.map((m) => (
           <RenderedRow key={m.id} module={m} ctx={ctx} />
         ))}
+        {/* Rebase lifecycle (restacking / mid-rebase / conflict + files)
+            renders as a block below the definitions — the conflict file
+            list never fit the one-line definition format. */}
+        <RebaseBlock row={row} />
         {pausedScope ? <AutomationsPausedLine scope={pausedScope} /> : null}
         <DescriptionBlock
           summary={summary.data?.description ?? null}

@@ -130,7 +130,7 @@ export function reviewBadge(r: PrReview): Badge | null {
 
 /**
  * Glyph + color for the rebase-lifecycle slot the list cluster and the
- * details "rebase" row share. One slot, three states, priority order:
+ * details-pane rebase block share. One slot, three states, priority order:
  *
  *  - **restacking** (accent sync glyph): the engine holds this
  *    worktree's per-slug lock (`op: "restack"`) — reconcile/replay in
