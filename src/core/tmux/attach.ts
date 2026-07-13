@@ -28,6 +28,22 @@ export type AttachResult =
   | { kind: "spawn-failed"; reason: string };
 
 /**
+ * Working directory for every tmux *client* process we spawn. The first
+ * client to touch the socket forks the tmux server, and the daemonized
+ * server keeps that client's cwd for its whole life. If that cwd is a
+ * worktree that later gets destroyed, the server is left sitting in a
+ * deleted directory — and tmux then silently fails to apply `-c` on new
+ * panes (its save-and-restore `open(".")` fails), so every new session
+ * starts in the dead directory. Bun-based inner programs (claude) call
+ * getcwd() at startup and die instantly with a bare ENOENT. Pane cwd
+ * always comes from `-c`, never from the client, so pinning clients to
+ * $HOME costs nothing and makes the server's cwd immortal.
+ */
+export function tmuxClientCwd(): string {
+  return homedir();
+}
+
+/**
  * Where the per-session stderr capture file lives. Stable name keyed
  * on the tmux session name so re-attaches share the same file the
  * original `bash` is still appending to. Created lazily on first attach.
@@ -231,7 +247,11 @@ export async function attachOrCreate(opts: {
           ";",
           ...pipePaneArgs,
         ];
-    const setup = Bun.spawn(setupArgs, { stdout: "ignore", stderr: "pipe" });
+    const setup = Bun.spawn(setupArgs, {
+      cwd: tmuxClientCwd(),
+      stdout: "ignore",
+      stderr: "pipe",
+    });
     const [setupCode, setupErr] = await Promise.all([
       setup.exited,
       new Response(setup.stderr).text(),
@@ -267,7 +287,7 @@ export async function attachOrCreate(opts: {
       "@wt-shortcut",
       shortcut,
     ],
-    { stdout: "ignore", stderr: "ignore" },
+    { cwd: tmuxClientCwd(), stdout: "ignore", stderr: "ignore" },
   );
   await tag.exited;
 
@@ -314,7 +334,10 @@ export async function attachOrCreate(opts: {
         shortcut,
       ],
       {
-        cwd,
+        // NOT the worktree — see tmuxClientCwd. The session's start
+        // directory comes from `-c` above; the client cwd only matters
+        // as the potential birth cwd of the tmux server.
+        cwd: tmuxClientCwd(),
         stdin: "inherit",
         stdout: "inherit",
         // Pipe (not inherit) so tmux client noise like

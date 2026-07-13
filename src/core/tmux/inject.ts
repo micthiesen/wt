@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 import { getHarness, type HarnessId } from "../harness/index.ts";
 import { createLogger } from "../logger.ts";
-import { sessionsDir } from "./attach.ts";
+import { sessionsDir, tmuxClientCwd } from "./attach.ts";
 import { ensureConfig } from "./config.ts";
 import { sessionName, TMUX_SOCKET } from "./naming.ts";
 import { capturePane, listAllSessionsRaw, paneTarget, runTmux } from "./process.ts";
@@ -111,7 +111,9 @@ async function startHarnessSessionDetached(
         ...innerArgs,
       ],
       {
-        cwd,
+        // NOT the worktree — the pane cwd comes from `-c`; the client
+        // cwd only matters as the server's birth cwd (see tmuxClientCwd).
+        cwd: tmuxClientCwd(),
         stdout: "ignore",
         stderr: "pipe",
         env: {
