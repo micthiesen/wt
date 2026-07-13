@@ -10,18 +10,20 @@
  */
 import type { CliRenderer } from "@opentui/core";
 
-import { attachOrCreate, type AttachResult } from "../../core/tmux.ts";
-import { handoffTerminal } from "./renderer-handoff.ts";
+import {
+  enterWorktreeSession,
+  type HarnessRoute,
+  type WorktreeSessionResult,
+} from "./worktree.ts";
 
-export type ShellResult = AttachResult;
+export type ShellResult = WorktreeSessionResult;
 
 export async function enterShellSession(opts: {
   renderer: CliRenderer;
   slug: string;
   cwd: string;
+  diffBase: string;
+  harness: HarnessRoute;
 }): Promise<ShellResult> {
-  const { renderer, slug, cwd } = opts;
-  return await handoffTerminal(renderer, () =>
-    attachOrCreate({ slug, cwd, kind: "shell" }),
-  );
+  return await enterWorktreeSession({ ...opts, initial: "shell" });
 }
