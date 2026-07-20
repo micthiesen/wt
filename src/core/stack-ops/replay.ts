@@ -38,6 +38,15 @@ export type RebaseResult =
  * can split its children into several independent chains. So the replay
  * walks every distinct surviving chain the old membership maps to,
  * instead of trusting the original name to still be the handle.
+ *
+ * A member reconcile observed LANDED (a merged parent that is itself
+ * still a live, uncleaned worktree) is dropped from the replay set:
+ * resolving its now-childless chain would replay its squash-merged
+ * commits onto trunk and force-push, resurrecting the landed branch (or
+ * spuriously conflicting). Cleaning it (`c`) is the verb for a landed
+ * member; the engine leaves it alone. This is what makes pressing `R` on
+ * a surviving sibling safe while a merged member is still on disk, and
+ * makes the automation pre-clean's dispatch-then-restack ordering benign.
  */
 export async function rebaseStack(
   branch: string,
@@ -46,8 +55,10 @@ export async function rebaseStack(
 ): Promise<RebaseResult> {
   const trunk = opts.onto ?? config.branch.base;
   const pre = await resolveChain(branch);
-  await reconcileStack(branch, trunk, onLog);
-  const candidates = pre ? pre.steps.map((s) => s.branch) : [branch];
+  const landed = await reconcileStack(branch, trunk, onLog);
+  const candidates = (pre ? pre.steps.map((s) => s.branch) : [branch]).filter(
+    (b) => !landed.has(b),
+  );
   const replayedRoots = new Set<string>();
   const outputs: string[] = [];
   for (const candidate of candidates) {
@@ -59,10 +70,15 @@ export async function rebaseStack(
     outputs.push(res.output);
   }
   if (replayedRoots.size === 0) {
+    // Distinguish "the branch is gone" from "every member has landed and
+    // was skipped" — the latter wants `c`, not a puzzled "no worktree".
+    const allLanded = candidates.length === 0 && landed.size > 0;
     return {
       ok: false,
       conflict: false,
-      error: `${branch} has no live worktree to restack`,
+      error: allLanded
+        ? `every member of ${branch} has landed — clean them with c`
+        : `${branch} has no live worktree to restack`,
     };
   }
   return { ok: true, output: outputs.join("; ") };

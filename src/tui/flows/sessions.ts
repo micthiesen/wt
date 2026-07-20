@@ -28,7 +28,7 @@ import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { config } from "../../core/config.ts";
 
 import { enterHarnessSession } from "../sessions/harness.ts";
-import { resolveDiffBase } from "../app-helpers.ts";
+import { launchBlockedReason, resolveDiffBase } from "../app-helpers.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
@@ -106,6 +106,11 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) {
       toast(`no row for ${slug}`, theme.warn, 1500);
+      return;
+    }
+    const blocked = launchBlockedReason(row);
+    if (blocked) {
+      toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
     }
     if (row.status.kind === StatusKind.Busy) {
@@ -242,6 +247,11 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     const row = rows.find((r) => r.wt.slug === slug);
     if (!row) {
       toast(`no row for ${slug}`, theme.warn, 1500);
+      return;
+    }
+    const blocked = launchBlockedReason(row);
+    if (blocked) {
+      toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
     }
     if (row.status.kind === StatusKind.Busy) {

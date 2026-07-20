@@ -15,12 +15,21 @@ import {
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet, originBranchExists, revParse } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
-import { lockStatus, tryAcquireLock } from "./locks.ts";
+import { lockLabel, lockStatus, tryAcquireLock } from "./locks.ts";
 import { run, runStreaming } from "./proc.ts";
 import { computeStage, dirSlug, slugify } from "./stage.ts";
 import { safeStage } from "./stage-safety.ts";
 import type { Worktree } from "./types.ts";
 import { fetchOrigin } from "./worktree.ts";
+
+/**
+ * How long `removeWorktree` waits out a transient lock holder before
+ * giving up. Sized to outlast a restack `reconcileStack`'s live `gh pr
+ * view` probes (held under the chain lock), which the automation
+ * clean-then-restack path races. Well short of a genuinely long-held
+ * operation lock, which still fails so the destroy doesn't hang.
+ */
+const LOCK_ACQUIRE_WAIT_MS = 8000;
 
 export type CreateResult =
   | { ok: true; path: string; branch: string; stage: string; slug: string }
@@ -270,21 +279,32 @@ export async function removeWorktree(
 ): Promise<RemoveResult> {
   const { force = false, destroyStage = false, deleteBranch = false } = opts;
 
-  const existing = lockStatus(wt.slug);
-  if (existing) {
-    return {
-      ok: false,
-      message: `${wt.slug} is busy: ${existing.op ?? "op"} / ${existing.phase ?? "?"}`,
-      destroyedStage: false,
-      deletedBranch: false,
-    };
-  }
-
-  const handle = tryAcquireLock(wt.slug, "remove", { phase: "preparing" });
+  // Acquire the per-slug lock, retrying briefly rather than failing on the
+  // first miss. A concurrent reader can hold this flock transiently — most
+  // notably a restack's `reconcileStack`, which probes each parent's PR
+  // state with a LIVE `gh pr view` while holding the whole chain's locks.
+  // When an automation cleans a merged member and restacks the survivor in
+  // the same dispatch, the detached `wt _destroy` child reaches this line
+  // right as reconcile is mid-probe on that member; a single try loses the
+  // race and strands the worktree (its clean-fire already consumed). A
+  // teardown about to run for seconds shouldn't abort over a sub-second
+  // race, so wait out a transient holder. Bounded so a genuinely long-held
+  // lock (another destroy, a replay of this very worktree) still fails.
+  let handle = tryAcquireLock(wt.slug, "remove", { phase: "preparing" });
   if (!handle) {
+    const deadline = Date.now() + LOCK_ACQUIRE_WAIT_MS;
+    while (!handle && Date.now() < deadline) {
+      await Bun.sleep(150 + Math.floor(Math.random() * 150));
+      handle = tryAcquireLock(wt.slug, "remove", { phase: "preparing" });
+    }
+  }
+  if (!handle) {
+    const existing = lockStatus(wt.slug);
     return {
       ok: false,
-      message: `could not lock ${wt.slug}`,
+      message: existing
+        ? `${wt.slug} is busy: ${lockLabel(existing)}`
+        : `could not lock ${wt.slug}`,
       destroyedStage: false,
       deletedBranch: false,
     };

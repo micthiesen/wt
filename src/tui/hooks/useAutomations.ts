@@ -467,6 +467,15 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
         }
       } else {
         for (const row of ctx.rows) {
+          // `pr.conflict` on a PR-carrying row is freshness-gated in the
+          // evaluator (a conflict can't be read off persisted cache), so
+          // an absent fire before the first github fetch is "unknown",
+          // not "cleared" — resetting here would wipe a PERSISTED trip on
+          // every boot-stale pass and hand the auto-fix loop two free
+          // strikes. A PR-less row's check is purely local and always
+          // observable, so it still resets unconditionally (the offline-
+          // wedge case the unconditional reset exists for).
+          if (rule.on === "pr.conflict" && row.pr && !ctx.githubFresh) continue;
           if (!byId.has(`${rule.id}|${row.wt.slug}`)) {
             resetBreaker(rule.id, row.wt.slug);
           }

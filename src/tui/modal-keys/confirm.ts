@@ -88,7 +88,6 @@ export function handleConfirmKey(
 ): boolean {
   const {
     setModal,
-    current,
     doRemove,
     doAutoMerge,
     doMarkReady,
@@ -101,18 +100,25 @@ export function handleConfirmKey(
   if (k.name === "y" || k.name === "return") {
     const pending = modal.pendingKey;
     setModal(null);
-    if (pending === "d" && current) {
-      void doRemove(current.wt.slug);
-    } else if (pending === "d!" && current) {
-      void doRemove(current.wt.slug, { force: true });
-    } else if (pending === "m+" && current) {
-      void doAutoMerge(current.wt.slug, "enable");
-    } else if (pending === "m-" && current) {
-      void doAutoMerge(current.wt.slug, "disable");
-    } else if (pending === "e" && current) {
-      void doMarkReady(current.wt.slug);
-    } else if (pending === "E" && current) {
-      void doShipPr(current.wt.slug);
+    // Row-scoped confirms act on the slug CAPTURED when the modal opened,
+    // not the live `current`: a background refetch can drop the original
+    // row while the modal is up, silently re-pointing `current` at a
+    // different worktree/PR (the modal text still names the first). The
+    // flows tolerate a slug whose row has since vanished — doRemove no-ops
+    // on an unknown slug, the gh flows surface a clear error.
+    const slug = modal.slug;
+    if (pending === "d" && slug) {
+      void doRemove(slug);
+    } else if (pending === "d!" && slug) {
+      void doRemove(slug, { force: true });
+    } else if (pending === "m+" && slug) {
+      void doAutoMerge(slug, "enable");
+    } else if (pending === "m-" && slug) {
+      void doAutoMerge(slug, "disable");
+    } else if (pending === "e" && slug) {
+      void doMarkReady(slug);
+    } else if (pending === "E" && slug) {
+      void doShipPr(slug);
     } else if (pending === "review-wt" && modal.reviewBranch) {
       void doCheckoutReview(modal.reviewBranch);
     } else if (pending === "restore" && modal.restoreEntry) {

@@ -19,13 +19,19 @@ import { config, type PullRequestTarget } from "../../core/config.ts";
 import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { getHarness, HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import { linearUrlForSlug } from "../../core/linear.ts";
+import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { eventsOutputId, indexOfOutput } from "../../core/outputs.ts";
 import { stageUrl } from "../../core/stage.ts";
 import { closeHarnessSessionGracefully } from "../../core/tmux.ts";
 import { StatusKind } from "../../core/types.ts";
 import { stackIdFromSectionKey } from "../../core/wtstate.ts";
-import { isPlainLetter, isShiftedLetter, resolveDiffBase } from "../app-helpers.ts";
+import {
+  isPlainLetter,
+  isShiftedLetter,
+  launchBlockedReason,
+  resolveDiffBase,
+} from "../app-helpers.ts";
 import { enterDiffSession } from "../sessions/diff.ts";
 import { enterShellSession } from "../sessions/shell.ts";
 import type { HarnessRoute } from "../sessions/worktree.ts";
@@ -206,6 +212,11 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     if (k.sequence === ";") {
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
+        return;
+      }
+      const pickerBlocked = launchBlockedReason(current);
+      if (pickerBlocked) {
+        toast(`${current.wt.slug} is ${pickerBlocked}`, theme.warn, 2000);
         return;
       }
       if (current.status.kind === StatusKind.Busy) {
@@ -459,6 +470,11 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const slug = current.wt.slug;
+      const shellBlocked = launchBlockedReason(current);
+      if (shellBlocked) {
+        toast(`${slug} is ${shellBlocked}`, theme.warn, 2000);
+        return;
+      }
       if (current.status.kind === StatusKind.Busy) {
         toast(`${slug} is busy`, theme.warn, 2000);
         return;
@@ -515,6 +531,11 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const slug = current.wt.slug;
+      const diffBlocked = launchBlockedReason(current);
+      if (diffBlocked) {
+        toast(`${slug} is ${diffBlocked}`, theme.warn, 2000);
+        return;
+      }
       if (current.status.kind === StatusKind.Busy) {
         toast(`${slug} is busy`, theme.warn, 2000);
         return;
@@ -857,6 +878,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         setModal({
           kind: "confirm",
           pendingKey: "d!",
+          slug: current.wt.slug,
           title: "force remove",
           message: `Force remove ${current.wt.slug}?`,
           detail: [lost, caveat].filter(Boolean).join(" "),
@@ -867,6 +889,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         setModal({
           kind: "confirm",
           pendingKey: "d",
+          slug: current.wt.slug,
           title: "remove worktree",
           message: `Remove ${current.wt.slug}?`,
           confirmLabel: "remove",
@@ -895,6 +918,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       setModal({
         kind: "confirm",
         pendingKey: "e",
+        slug: current.wt.slug,
         title: "mark ready",
         message: `Mark #${current.pr.number} ready for review?`,
         confirmLabel: "mark ready",
@@ -923,6 +947,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       setModal({
         kind: "confirm",
         pendingKey: "E",
+        slug: current.wt.slug,
         title: "ship PR",
         message: `Ship #${current.pr.number}? (${steps.join(", ")})`,
         confirmLabel: "ship",
@@ -943,6 +968,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         setModal({
           kind: "confirm",
           pendingKey: "m-",
+          slug: current.wt.slug,
           title: "disable auto-merge",
           message: `Disable auto-merge for #${current.pr.number}?`,
           confirmLabel: "disable",
@@ -952,6 +978,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       setModal({
         kind: "confirm",
         pendingKey: "m+",
+        slug: current.wt.slug,
         title: "merge when ready",
         message: `Enable merge-when-ready for #${current.pr.number}?`,
         confirmLabel: "enable",
@@ -966,6 +993,22 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     }
     if (isPlainLetter(k, "a")) {
       const slug = current.wt.slug;
+      // A clean/destroy archives the row itself, then tears it down in a
+      // detached child. Toggling the archive flag here fights that: an
+      // un-archive pops a being-removed worktree back into the active
+      // list (its dirty/sync/merged fields now read a vanishing dir), and
+      // other flows treat `archived` as authoritative teardown state.
+      // Refuse while the on-disk flock is held; the flag settles on its
+      // own when the remove finishes and the row disappears.
+      const archiveLock = lockStatus(slug);
+      if (archiveLock) {
+        toast(
+          `${slug} is ${lockLabel(archiveLock)} — can't change archive state`,
+          theme.warn,
+          2500,
+        );
+        return;
+      }
       toggleArchived(slug).then(
         ({ archived }) => {
           rowLog.event.info(archived ? "archived" : "restored from archive");

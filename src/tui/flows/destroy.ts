@@ -5,6 +5,8 @@
  * helpers, so the returned closures always see fresh state (same
  * semantics as when these lived inline).
  */
+import { existsSync } from "node:fs";
+
 import { actionRegistry } from "../../core/actions.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { spawnBackgroundRemove } from "../../core/lifecycle.ts";
@@ -218,7 +220,24 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     await doCleanRows(candidates);
   }
 
-  async function doCleanRows(candidates: readonly WorktreeRow[]): Promise<void> {
+  async function doCleanRows(input: readonly WorktreeRow[]): Promise<void> {
+    // Drop any row whose on-disk flock is already held — a prior `d`/`c`
+    // or an automation's clean already has a detached remove in flight on
+    // it. `doRemove` makes this authoritative check per-row; `doClean`
+    // fans out and must too, or a `c` racing a just-dispatched `d` (both
+    // see the same clean candidate before the cache reflects the lock)
+    // double-spawns `wt _destroy` on one slug. The loser only fails
+    // because it loses the flock race inside `removeWorktree` — skipping
+    // here makes the guard intentional instead of luck.
+    const candidates = input.filter((r) => {
+      const lock = lockStatus(r.wt.slug);
+      if (lock) {
+        createLogger(r.wt.slug).event.dim(`clean: skip — already ${lockLabel(lock)}`);
+        return false;
+      }
+      return true;
+    });
+    if (candidates.length === 0) return;
     appLog.event.info(
       `clean: dispatching ${candidates.length} destroy${candidates.length === 1 ? "" : "s"}`,
     );
@@ -273,6 +292,26 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
       toast("select a worktree first", theme.warn, 2000);
       return;
     }
+    // A row that's already being torn down must not be restacked. A
+    // clean (`c`) or destroy (`d`) archives the row and dispatches a
+    // detached background remove that deletes the worktree + branch;
+    // `isCleanCandidate` returns false the instant `archived` flips, so
+    // the landed-guard below stops covering it. Restacking here races
+    // the removal — the replay force-pushes an empty diff to a landed
+    // branch, and a conflict bail cold-starts a session in the worktree
+    // being deleted (the reported "R on a merging member breaks the
+    // remove and runs /restack anyway"). Refuse on the archive flag
+    // (survives the whole teardown window) and on the authoritative
+    // on-disk flock (covers a destroy the child already grabbed).
+    if (current.archived) {
+      toast(`${current.wt.slug} is being cleaned up — not restacking`, theme.warn, 3000);
+      return;
+    }
+    const busy = lockStatus(current.wt.slug);
+    if (busy) {
+      toast(`${current.wt.slug} is ${lockLabel(busy)} — not restacking`, theme.warn, 3000);
+      return;
+    }
     // A landed-but-not-yet-cleaned row has nothing useful to rebase —
     // replaying it onto trunk drops its already-merged commits and
     // force-pushes an empty diff to the PR branch. `c` is the verb for
@@ -321,6 +360,17 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     if (!row) return false;
     const slug = row.wt.slug;
     const log = createLogger(slug);
+    // Don't cold-start a harness session in a worktree that's gone or
+    // being torn down. A conflict usually means active work (so this is
+    // rare), but the fire-and-forget inject reads a per-render `rows`
+    // snapshot — if the worktree was cleaned in the meantime, injecting
+    // would spawn a session with cwd inside a deleted directory.
+    if (row.archived || lockStatus(slug) || !existsSync(row.wt.path)) {
+      log.event.warn(
+        `conflict on ${failedBranch}, but its worktree is gone/being cleaned — resolve by hand`,
+      );
+      return false;
+    }
     const harness = getHarness(primaryHarness);
     const skill = `${harness.skillPrefix}restack`;
     const backup = backupBranch

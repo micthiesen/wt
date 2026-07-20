@@ -52,7 +52,13 @@ it does the right thing for the shape under the cursor:
    replay stays squash-safe.
 3. **Replay** each member onto its (possibly rewritten) parent in its own
    worktree, parents before children; force-with-lease push; retarget the PR
-   base to match.
+   base to match. A member reconcile observed **landed** (a merged parent that
+   is itself still a live, uncleaned worktree) is skipped, not replayed —
+   replaying it would re-apply its squash-merged commits onto trunk and
+   force-push, resurrecting the landed branch. Landed members are `c`'s job.
+   So pressing `R` on a surviving sibling is safe while a merged member is
+   still on disk (and the `stack.parent_merged` automation's clean-then-restack
+   is unaffected by the order the two land in).
 
 Cleaning a merged member (`c`, or the `wt.merged`/`stack.parent_merged`
 automations) reparents its children automatically when the branch is deleted —

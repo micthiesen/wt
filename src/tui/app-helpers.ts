@@ -8,6 +8,7 @@
 import type { ActionDef, ActionLine, ActionVars } from "../core/actions.ts";
 import { config } from "../core/config.ts";
 import { getHarness, type HarnessId } from "../core/harness/index.ts";
+import { lockLabel, lockStatus } from "../core/locks.ts";
 import { expectedStage } from "../core/stage-safety.ts";
 import { StatusKind } from "../core/types.ts";
 
@@ -182,6 +183,27 @@ export function isCleanCandidate(row: WorktreeRow): boolean {
   if (row.status.kind === StatusKind.Gone) return true;
   if (row.pr?.state === "MERGED") return true;
   return false;
+}
+
+/**
+ * Reason a worktree can't accept a NEW interactive session or launch
+ * right now, or null when it's free. Checks the archived flag (a clean
+ * / destroy tucks the row into the archived section the instant it
+ * dispatches) and the authoritative on-disk flock (a remove/init/
+ * restack in flight). Both beat the cached `row.status.kind`, which lags
+ * a just-dispatched background remove by ~600ms (the fs-watch → debounce
+ * → refetch cycle). Every "start something in this worktree" path —
+ * F10 shell, F11 diff, F12 / `;` / named harness sessions — gates on
+ * this so a keystroke in that window can't spawn a shell or harness with
+ * cwd inside a directory being `git worktree remove --force`d out from
+ * under it (the inner program getcwd()s at startup and dies on ENOENT,
+ * and the live cwd can wedge the removal). Same authoritative check
+ * `doRemove` / `doReplayStack` / `launchAction` already use.
+ */
+export function launchBlockedReason(row: WorktreeRow): string | null {
+  if (row.archived) return "being cleaned up";
+  const lock = lockStatus(row.wt.slug);
+  return lock ? lockLabel(lock) : null;
 }
 
 /**

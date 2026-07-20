@@ -21,15 +21,15 @@ export async function reconcileStack(
   branch: string,
   trunk: string,
   onLog: Logger,
-): Promise<void> {
+): Promise<Set<string>> {
   const locked = await lockChain(branch, "reconcile");
   if (locked.status === "busy") {
     onLog(`skipped reconcile of ${branch} — ${STACK_BUSY}`);
-    return;
+    return new Set();
   }
-  if (locked.status === "gone") return;
+  if (locked.status === "gone") return new Set();
   try {
-    await reconcileStackLocked(locked.chain, trunk, onLog);
+    return await reconcileStackLocked(locked.chain, trunk, onLog);
   } finally {
     for (const h of locked.handles) h.release();
   }
@@ -39,7 +39,7 @@ async function reconcileStackLocked(
   chain: RestackChain,
   trunk: string,
   onLog: Logger,
-): Promise<void> {
+): Promise<Set<string>> {
   const stepByBranch = new Map<string, ChainStep>(
     chain.steps.map((s) => [s.branch, s]),
   );
@@ -76,7 +76,7 @@ async function reconcileStackLocked(
       onLog(`parent ${parent} is gone`);
     }
   }
-  if (landed.size === 0) return;
+  if (landed.size === 0) return landed;
 
   for (const s of chain.steps) {
     if (s.parentBranch === null || !landed.has(s.parentBranch)) continue;
@@ -101,4 +101,5 @@ async function reconcileStackLocked(
     });
     onLog(`reparented ${s.branch} onto ${newParent}`);
   }
+  return landed;
 }

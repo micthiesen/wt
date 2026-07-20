@@ -21,6 +21,16 @@ export type Modal =
       detail?: string;
       confirmLabel?: string;
       danger?: boolean;
+      /**
+       * Worktree slug the confirm targets, captured at open time for the
+       * row-scoped pendingKeys (`d`/`d!`/`e`/`E`/`m+`/`m-`). The dispatch
+       * MUST act on this, not the live-selected `current`: while the modal
+       * is open a background refetch can drop the original row from the
+       * list, and `current` then silently resolves to whatever row now
+       * occupies its slot — confirming would fire the destroy/ship/merge
+       * at the wrong worktree while the modal text still names the first.
+       */
+      slug?: string;
       reviewBranch?: string;
       /** Payload for the `restore` pendingKey (removed-worktrees view). */
       restoreEntry?: RemovedWorktree;
