@@ -22,6 +22,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isRiftWorktree } from "../../backend.ts";
 import { createLogger } from "../../logger.ts";
 import { readFileSlice } from "../../tail-util.ts";
 import type { DerivedState } from "../status.ts";
@@ -29,6 +30,7 @@ import {
   reapCodexNames,
   reconcileCodexNames,
 } from "./names.ts";
+import { trustCodexWorkspace } from "./trust.ts";
 
 import type { Harness, HarnessSession, HarnessSpawnArgs } from "../types.ts";
 
@@ -123,6 +125,13 @@ export const codexHarness: Harness = {
       return ["codex", "resume", args.resumeSessionId];
     }
     return ["codex"];
+  },
+
+  ensureTrusted(wtPath) {
+    // Same rationale as Claude's: only a rift checkout (an independent clone)
+    // trips Codex's per-project trust gate; a git worktree inherits the main
+    // repo's trust.
+    if (isRiftWorktree(wtPath)) trustCodexWorkspace(wtPath);
   },
 
   reapState(liveSlugs) {

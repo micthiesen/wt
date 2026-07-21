@@ -1,4 +1,4 @@
-import { branchExists } from "../../core/git.ts";
+import { branchExists, branchIsGone, branchIsMerged } from "../../core/git.ts";
 import {
   removeWorktree,
   spawnBackgroundRemove,
@@ -133,7 +133,16 @@ export async function run(argv: string[]): Promise<number> {
   let force = parsed.force;
   if (!force) {
     const dirty = await worktreeIsDirty(target.path);
-    const unpushed = dirty ? 0 : await unpushedCommits(target.path);
+    // A squash-merged branch keeps its pre-squash commits locally, which
+    // `unpushedCommits` counts as "unpushed" once origin prunes the branch —
+    // but the work IS landed. Suppress the unpushed guard when the branch
+    // reads as merged/gone (the same classification the row's status uses),
+    // so a landed worktree tears down without a spurious --force.
+    const landed =
+      !dirty && target.branch
+        ? (await branchIsMerged(target.branch)) || (await branchIsGone(target.branch))
+        : false;
+    const unpushed = dirty || landed ? 0 : await unpushedCommits(target.path);
     if (dirty || unpushed > 0) {
       const reason = dirty
         ? "uncommitted changes"

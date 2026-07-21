@@ -26,7 +26,7 @@ If the branch already has a worktree, prints its path instead of erroring.
 
 ### `wt rm [<slug>]`
 
-Remove a worktree (with dirty/unpushed guards, optional SST stage destroy, optional branch delete). No slug ⇒ interactive picker.
+Remove a worktree (with dirty/unpushed guards, optional SST stage destroy, optional branch delete). No slug ⇒ interactive picker. The unpushed guard is suppressed for a merged/gone branch — a squash-merged worktree keeps its pre-squash commits locally but the work is landed, so it removes without a spurious `--force`.
 
 - `--yes` / `-y` — skip confirmations.
 - `--force` — remove despite uncommitted / unpushed work.

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { clearArchived } from "./archive.ts";
 import { clearClaudeNames } from "./harness/claude/names.ts";
 import { clearCodexNames } from "./harness/codex/names.ts";
+import { untrustCodexWorkspace } from "./harness/codex/trust.ts";
 import { clearOpencodeNames } from "./harness/opencode/names.ts";
 import {
   clearRemovedWorktree,
@@ -431,6 +432,15 @@ export async function removeWorktree(
           `reparented fork base on ${reparented.join(", ")} (was the deleted ${wt.branch})`,
         );
       }
+    }
+
+    // A rift checkout may have persisted a Codex trust entry (config.toml, a
+    // stowed dotfiles file) when a codex session opened here; drop it so the
+    // tracked config doesn't accumulate dead-workspace drift. No-op if none
+    // was written. (Claude's ~/.claude.json entry is left — it's Claude's own
+    // churny, untracked file, matching the fleet's teardown.)
+    if (backend.id === "rift") {
+      untrustCodexWorkspace(wt.path);
     }
 
     // Note: archive.json / state.json entries for THIS slug are NOT

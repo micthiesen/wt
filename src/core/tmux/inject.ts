@@ -12,8 +12,10 @@ const log = createLogger("[tmux]");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Named tmux paste buffer used by `injectIntoSession`. */
+/** Prefix for the per-call tmux paste buffer used by `injectIntoSession`. */
 const INJECT_BUFFER = "wt-inject";
+/** Disambiguates concurrent injects sharing this process's pid. */
+let injectSeq = 0;
 /** Settle pause when the session is already running before pasting. */
 const WARM_SETTLE_MS = 300;
 /** capture-pane poll interval while waiting for a cold start to render. */
@@ -155,10 +157,17 @@ async function startHarnessSessionDetached(
 
 /** Pipe text into the inject buffer and paste it into a session's pane. */
 async function pasteBuffer(name: string, text: string): Promise<void> {
+  // A UNIQUE buffer name per call: `load-buffer` and `paste-buffer` hand off
+  // by buffer name, so a fixed name races when two injects overlap (two
+  // automations firing, or an automation + a manual `!` action) — the
+  // second `load-buffer` overwrites before the first `paste-buffer` reads,
+  // and a session gets the other's message. pid + monotonic seq is unique
+  // within this process and across processes; `-d` below drops it after.
+  const buffer = `${INJECT_BUFFER}-${process.pid}-${++injectSeq}`;
   // load-buffer reads stdin, so arbitrary text (quotes, `$`, newlines)
   // needs no shell escaping.
   const load = Bun.spawn(
-    ["tmux", "-L", TMUX_SOCKET, "load-buffer", "-b", INJECT_BUFFER, "-"],
+    ["tmux", "-L", TMUX_SOCKET, "load-buffer", "-b", buffer, "-"],
     {
       stdin: new TextEncoder().encode(text),
       stdout: "ignore",
@@ -180,7 +189,7 @@ async function pasteBuffer(name: string, text: string): Promise<void> {
     "-d",
     "-p",
     "-b",
-    INJECT_BUFFER,
+    buffer,
     "-t",
     paneTarget(name),
   ]);
