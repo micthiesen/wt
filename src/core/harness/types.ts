@@ -179,6 +179,17 @@ export interface Harness {
   buildArgs(args: HarnessSpawnArgs): string[];
 
   /**
+   * Optional: make `wtPath` trusted for this harness before a session is
+   * spawned there, so its one-time "trust this folder?" gate doesn't fire.
+   * Called at every spawn site right before `buildArgs`; must be
+   * idempotent and best-effort. Only harnesses whose trust is keyed by an
+   * independent path need it — Claude does, for rift worktrees (each is an
+   * independent clone Claude treats as a new project); omit for harnesses
+   * that inherit trust from the main repo or have no such gate.
+   */
+  ensureTrusted?(wtPath: string): void;
+
+  /**
    * Reap on-disk state for slugs no longer present. Called at startup.
    * No-op when impl has no on-disk state of its own.
    */

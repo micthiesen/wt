@@ -15,12 +15,14 @@
  * fast and lets the picker render the entry list before the summary
  * scan resolves.
  */
+import { isRiftWorktree } from "../../backend.ts";
 import { claudeStatus, wtSessionArgs, wtSessionUuid } from "./jsonl.ts";
 import { readRegistry, type RegistryStatus } from "./registry.ts";
 import {
   buildClaudeSessionEntries,
   reapClaudeNames,
 } from "./names.ts";
+import { trustClaudeWorkspace } from "./trust.ts";
 
 import type {
   Harness,
@@ -136,6 +138,13 @@ export const claudeHarness: Harness = {
         displayName,
       }),
     ];
+  },
+
+  ensureTrusted(wtPath) {
+    // Only rift checkouts trip Claude's trust gate — a git worktree
+    // resolves to the already-trusted main repo, but an independent rift
+    // clone reads as a brand-new project.
+    if (isRiftWorktree(wtPath)) trustClaudeWorkspace(wtPath);
   },
 
   reapState(liveSlugs) {

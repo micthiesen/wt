@@ -71,6 +71,9 @@ async function startHarnessSessionDetached(
   // dance would take down every live session including the caller's.
   const configPath = ensureConfig();
   const stderrPath = join(sessionsDir(), `${name}.err`);
+  // Trust the workspace before launch (see attach.ts) — rift checkouts
+  // otherwise trip Claude's per-project trust prompt. No-op otherwise.
+  harness.ensureTrusted?.(cwd);
   const innerArgs = harness.buildArgs({
     wtPath: cwd,
     managedName: null,

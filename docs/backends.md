@@ -77,6 +77,17 @@ git worktree, and it drives the rest of the design:
 - **Detection, not storage.** Which backend owns a checkout is derived
   from disk (`.rift` marker → rift) at removal time, never persisted. Flip
   `kind` freely; each checkout is torn down by whatever created it.
+- **AI-session trust.** Claude Code treats each independent clone as a
+  brand-new project and shows its "trust this folder?" gate (which also
+  suppresses the worktree's `.claude/settings.json` allow rules) — a git
+  worktree sidesteps this because it resolves to the already-trusted main
+  repo. So before spawning a Claude session in a rift checkout, wt marks
+  the path trusted in `~/.claude.json`
+  (`.projects["<path>"].hasTrustDialogAccepted = true`), via the harness's
+  optional `ensureTrusted` hook (`core/harness/claude/trust.ts`). Idempotent
+  and best-effort; the write is skipped once already trusted. Other
+  harnesses can add their own `ensureTrusted` (Codex's gate lives in
+  `$CODEX_HOME/config.toml`); today only Claude implements it.
 
 ## Self-healing registry
 

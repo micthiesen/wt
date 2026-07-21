@@ -178,6 +178,10 @@ export async function attachOrCreate(opts: {
   const userShell = process.env.SHELL || "bash";
   let innerArgs: string[];
   if (harness) {
+    // Trust the workspace for this harness before launch so its one-time
+    // "trust this folder?" gate doesn't fire (rift checkouts read as new
+    // projects to Claude). No-op for harnesses without such a gate.
+    harness.ensureTrusted?.(cwd);
     innerArgs = harness.buildArgs({
       wtPath: cwd,
       managedName: managedNameNorm,
