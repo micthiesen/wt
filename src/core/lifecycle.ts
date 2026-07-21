@@ -12,11 +12,12 @@ import {
   reparentBaseReferences,
   setSlugBase,
 } from "./wtstate.ts";
+import { getBackend, getBackendForPath } from "./backend.ts";
 import { config } from "./config.ts";
 import { branchExists, git, gitQuiet, originBranchExists, revParse } from "./git.ts";
 import { LINEAR_ID_RE, LINEAR_URL_RE } from "./linear.ts";
 import { lockLabel, lockStatus, tryAcquireLock } from "./locks.ts";
-import { run, runStreaming } from "./proc.ts";
+import { runStreaming } from "./proc.ts";
 import { computeStage, dirSlug, slugify } from "./stage.ts";
 import { safeStage } from "./stage-safety.ts";
 import type { Worktree } from "./types.ts";
@@ -190,23 +191,46 @@ export async function createWorktree(
     opts.onPhase?.("fetching origin");
     await fetchOrigin();
 
-    handle.phase("git worktree add");
-    if (await branchExists(branch)) {
-      if (opts.base) {
-        opts.onLog?.(`note: --base ignored, ${branch} already exists`);
-      }
-      opts.onLog?.(`checkout ${branch}`);
-      await git(["worktree", "add", path, branch]);
+    const backend = getBackend(config.backend.kind);
+    handle.phase(`creating worktree (${backend.id})`);
+    const existing = await branchExists(branch);
+    if (existing && opts.base) {
+      opts.onLog?.(`note: --base ignored, ${branch} already exists`);
+    }
+    // `null` baseRef == "check out the existing branch"; otherwise create
+    // a new branch off this ref. The backend materializes the checkout on
+    // the branch; wt does the upstream/fork-base wiring below (agnostic —
+    // it runs git inside the new checkout, which holds for both a linked
+    // worktree and an independent rift clone).
+    const baseRef = existing ? null : opts.base ?? `origin/${config.branch.base}`;
+    // When the base is a sibling branch (a stacked parent, i.e. not an
+    // `origin/` ref), point the backend at that parent's worktree — the
+    // rift backend fetches the base commits from it, since an independent
+    // clone won't already have them. undefined for trunk/origin bases and
+    // ignored by the git-worktree backend.
+    let baseSourcePath: string | undefined;
+    if (baseRef && !baseRef.startsWith("origin/")) {
+      const cand = join(config.paths.worktreeRoot, dirSlug(baseRef));
+      if (existsSync(cand)) baseSourcePath = cand;
+    }
+    await backend.create({
+      path,
+      branch,
+      slug,
+      baseRef,
+      baseSourcePath,
+      mainClone: config.paths.mainClone,
+      onLog: opts.onLog,
+    });
+
+    if (existing) {
       if (
         (await originBranchExists(branch, path)) &&
         !(await gitQuiet(["rev-parse", "--abbrev-ref", "@{u}"], path))
       ) {
         await gitQuiet(["branch", "--set-upstream-to", `origin/${branch}`], path);
       }
-    } else {
-      const baseRef = opts.base ?? `origin/${config.branch.base}`;
-      opts.onLog?.(`new branch ${branch} off ${baseRef}`);
-      await git(["worktree", "add", "--no-track", "-b", branch, path, baseRef]);
+    } else if (baseRef) {
       // Remember a non-trunk fork base. This record IS the stack
       // primitive: it drives the TUI's stack grouping, the diff base,
       // and the restack replay. Stored as a plain branch name so it can
@@ -236,7 +260,14 @@ export async function createWorktree(
     writeFileSync(join(sstDir, "stage"), `${stage}\n`);
     opts.onLog?.(`pinned sst stage → ${stage}`);
 
-    if (opts.runInstall !== false) {
+    // The rift backend copies packages across via its CoW clone
+    // (`--copy-all`), so wt's own install is redundant — packages are
+    // always present without a fresh `pnpm install`, and any lockfile
+    // sync is left to rift's `.rift.toml` postcreate hooks. `--no-install`
+    // / `runInstall` is therefore a no-op here (ignored, not an error).
+    if (backend.id === "rift") {
+      opts.onLog?.("packages copied via rift clone (skipping pnpm install)");
+    } else if (opts.runInstall !== false) {
       handle.phase("pnpm install");
       opts.onLog?.("pnpm install...");
       const code = await runStreaming(["pnpm", "install"], {
@@ -345,24 +376,41 @@ export async function removeWorktree(
       }
     }
 
-    opts.onPhase?.("git worktree remove");
-    handle.phase("git worktree remove");
-    const args = ["worktree", "remove", wt.path];
-    if (effectiveForce) args.push("--force");
-    const r = await run(["git", ...args], { cwd: config.paths.mainClone });
-    if (r.exitCode !== 0) {
-      await gitQuiet(["worktree", "prune"]);
-      if (existsSync(wt.path)) {
-        return {
-          ok: false,
-          message: (r.stderr || r.stdout || "failed").trim(),
-          destroyedStage,
-          deletedBranch,
-        };
-      }
+    // Dispatch on the checkout's ACTUAL backend (derived from disk), not
+    // the config's current `kind` — a rift checkout must be torn down
+    // with rift even after the user flips the default back to git, and
+    // vice versa.
+    const backend = getBackendForPath(wt.path);
+    opts.onPhase?.(`worktree remove (${backend.id})`);
+    handle.phase(`worktree remove (${backend.id})`);
+    const removed = await backend.remove({
+      path: wt.path,
+      slug: wt.slug,
+      force: effectiveForce,
+      mainClone: config.paths.mainClone,
+      onLog: opts.onLog,
+    });
+    if (!removed.ok) {
+      return {
+        ok: false,
+        message: removed.message ?? "failed",
+        destroyedStage,
+        deletedBranch,
+      };
     }
 
-    if (deleteBranch && wt.branch && (await branchExists(wt.branch))) {
+    if (wt.branch && backend.id === "rift") {
+      // A rift branch lives ONLY inside the (now-removed) clone's own
+      // `.git`, so it's gone with the checkout unconditionally — there's
+      // no shared main-clone ref, and `--keep-branch` can't preserve it
+      // (unlike a git-worktree branch, whose ref survives in the shared
+      // db). Mark it gone regardless of the deleteBranch flag so
+      // dependents always reparent below instead of dangling on a branch
+      // that no longer resolves. (The CLI's `decideDeleteBranch` also
+      // returns false for a rift branch, since it's not in the main
+      // clone — keying on the backend here makes this independent of it.)
+      deletedBranch = true;
+    } else if (deleteBranch && wt.branch && (await branchExists(wt.branch))) {
       handle.phase("deleting branch");
       if (await gitQuiet(["branch", "-D", wt.branch])) {
         deletedBranch = true;

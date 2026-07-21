@@ -14,13 +14,13 @@ List all non-main worktrees (slug, stage, PR, status).
 
 ### `wt new <linear-url|id|branch|slug>`
 
-Create a worktree from a Linear URL/ID, an existing branch name, or a bare slug. Runs the full setup: fetch, `git worktree add`, env-file copy, SST stage pin, package install.
+Create a worktree from a Linear URL/ID, an existing branch name, or a bare slug. Runs the full setup: fetch, checkout (`git worktree add`, or a `rift` clone — see [backends.md](backends.md)), env-file copy, SST stage pin, package install.
 
 - `--slug <s>` — explicit slug when creating from a Linear id.
 - `--base <ref>` — fork base to branch from (recorded; see `wt base`).
 - `--any` — match branches by any author, not just your `branch.prefix`.
 - `--open` / `--no-open` — open in Zed after creation (default: open when interactive).
-- `--no-install` — skip the package-install step.
+- `--no-install` — skip the package-install step. Ignored under the `rift` backend, which copies packages via its clone.
 
 If the branch already has a worktree, prints its path instead of erroring.
 

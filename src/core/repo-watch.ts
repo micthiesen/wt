@@ -223,6 +223,40 @@ export function watchWorktreesAdmin(
 }
 
 /**
+ * Subscribe to membership changes in the worktree ROOT directory itself
+ * — a subdir appears/disappears on create/remove. This is the push
+ * signal for backends that don't register with git's worktree admin
+ * dir: a `rift` checkout is an independent clone, so `watchWorktreesAdmin`
+ * (which watches `<main>/.git/worktrees/`) never sees it. Harmlessly
+ * redundant for git worktrees (they also land as subdirs here), and
+ * debounced, so the double-fire is just one coalesced refresh.
+ *
+ * Non-recursive: only the set of immediate children matters; per-checkout
+ * working-tree churn is the per-worktree dir watcher's job.
+ */
+export function watchWorktreeRoot(
+  worktreeRoot: string,
+  onChange: () => void,
+): () => void {
+  const debounced = makeDebounced(onChange, REFS_DEBOUNCE_MS);
+  let watcher: FSWatcher | null = null;
+  try {
+    mkdirSync(worktreeRoot, { recursive: true });
+    watcher = watch(worktreeRoot, { persistent: false }, () => debounced.trigger());
+    watcher.on("error", (err) => {
+      log.warn("worktree-root watcher error", { err: String(err), worktreeRoot });
+    });
+  } catch (err) {
+    log.warn("worktree-root watcher failed", { err: String(err), worktreeRoot });
+    return () => debounced.cancel();
+  }
+  return () => {
+    debounced.cancel();
+    closeSilent(watcher);
+  };
+}
+
+/**
  * Subscribe to rebase state appearing/disappearing in any linked
  * worktree: git keeps an in-progress rebase's control files under
  * `<main>/.git/worktrees/<slug>/rebase-merge/` (or `rebase-apply/`).

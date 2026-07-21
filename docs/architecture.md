@@ -27,6 +27,8 @@ The big core modules are directories behind a same-named flat barrel: `core/gith
 
 Per-harness code (claude/codex/opencode session discovery, naming, events, usage, tails) lives under `core/harness/<harness>/` behind the generic `Harness` interface (`core/harness/types.ts`); `core/harness/status.ts` is the shared `DerivedState` vocabulary.
 
+Worktree **backends** follow the same shape: `core/backend.ts` → `core/backend/` behind the narrow `WorktreeBackend` interface (`create` / `remove` — the only two filesystem mutation points, extracted from `lifecycle.ts`). Two built-ins: `git-worktree` (linked worktrees, one shared object db) and `rift` (copy-on-write clones). Everything else wt does to a worktree (fork-base record, `.env` copy, stage pin, upstream, status) stays backend-agnostic in `lifecycle.ts` / `worktree.ts`. `getBackend(kind)` picks the create backend from config; `getBackendForPath(path)` derives the owning backend from disk (a `.rift` marker) so removal is correct after a config flip. This is the LOCAL-materialization axis, orthogonal to any remote (SSH-host) axis. See [backends.md](backends.md).
+
 ## Freshness model
 
 Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. Every external state source has an event trigger that invalidates the matching query:
@@ -35,6 +37,7 @@ Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. E
 |---|---|
 | `.git/refs/` watcher (commits, fetches, pushes) | github + per-worktree fields + wtState |
 | `.git/worktrees/` watcher (worktree add/remove) | worktree list |
+| worktree-root watcher (subdir add/remove) | worktree list — catches `rift` checkouts, which are independent clones that never touch `.git/worktrees/`; harmlessly redundant for git worktrees |
 | `.git/worktrees/<slug>/rebase-{merge,apply}` watcher (hand/`/restack` rebase starts or ends) | that slug's conflict probe (the mid-rebase glyph) |
 | per-worktree dir watchers | edits → dirty; `.sst/` writes → deploy |
 | `~/.cache/wt/state.json` + `archive.json` watcher | cross-process fork-base / section / archive writes |

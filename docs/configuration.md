@@ -57,6 +57,21 @@ Preview-stage naming, used by the SST integration and stage URLs.
 |---|---|---|---|
 | `env_files_to_copy` | no | `[".env"]` | Files copied from the main clone into each new worktree during setup. |
 
+## `[backend]` — optional
+
+Selects how a new worktree is materialized on disk. Omit the whole section for the default. See [backends.md](backends.md) for the full semantics.
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `kind` | no | `"git-worktree"` | `"git-worktree"` uses `git worktree` (one shared object db). `"rift"` uses copy-on-write clones via the [`rift`](https://github.com/anomalyco/rift) binary — near-instant, `node_modules` copied for free, each checkout an independent clone. |
+
+```toml
+[backend]
+kind = "rift"
+```
+
+The `rift` backend needs the `rift` binary on `PATH` (`npm i -g rift-snapshot`); wt runs `rift init` on the main clone lazily at first create. Existing checkouts of the other kind keep working after a flip — the backend that owns a checkout is detected from disk (a `.rift` marker) at removal, never stored. Under `rift`, packages arrive via the CoW clone, so wt skips its own `pnpm install` and the `--no-install` flag is ignored.
+
 ## `[deploy.sst]` — optional integration
 
 Omit the whole section to disable SST awareness (the stage row, `wt stages`, deploy detection). When present, all three keys are required.

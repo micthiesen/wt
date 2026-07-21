@@ -22,6 +22,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { BackendKind } from "./backend/types.ts";
+
 const HOME = homedir();
 
 function expandHome(p: string): string {
@@ -375,6 +377,15 @@ export type Config = {
   lifecycle: {
     envFilesToCopy: readonly string[];
   };
+  /**
+   * How new worktrees are materialized on disk. `git-worktree` (default)
+   * uses `git worktree`; `rift` uses copy-on-write clones (needs the
+   * `rift` binary + `rift init` on the main clone). Orthogonal to any
+   * remote axis — this is the LOCAL materialization mechanism. Existing
+   * checkouts of the other kind keep working after a flip (the backend
+   * is detected from disk at removal, not stored).
+   */
+  backend: { kind: BackendKind };
   sst: SstConfig | null;
   linear: LinearConfig | null;
   ai: AiConfig | null;
@@ -622,6 +633,17 @@ function build(raw: Raw, errs: Errors): Config {
 
   const envFiles = strArr(lifecycle?.env_files_to_copy, GENERIC_DEFAULTS.lifecycle.envFilesToCopy);
 
+  // Worktree backend — opt-in. Absent section (or absent key) means the
+  // default `git-worktree`; `rift` switches new creates to CoW clones.
+  const backendRaw = obj(raw.backend);
+  const backendKind = errs.optEnum(
+    backendRaw,
+    "backend",
+    "kind",
+    ["git-worktree", "rift"] as const satisfies readonly BackendKind[],
+    "git-worktree",
+  );
+
   // SST and Linear are entirely optional — absence of the section
   // disables the integration. When the section IS present, every
   // required field within it must be set.
@@ -737,6 +759,7 @@ function build(raw: Raw, errs: Errors): Config {
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
     lifecycle: { envFilesToCopy: envFiles },
+    backend: { kind: backendKind },
     sst,
     linear,
     ai,

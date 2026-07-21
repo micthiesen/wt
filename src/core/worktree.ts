@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, relative } from "node:path";
 
+import { listRiftWorktreePaths } from "./backend.ts";
 import { config } from "./config.ts";
 import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitRun, localBranchExists } from "./git.ts";
 import { lockAge, lockLabel, lockStatus, tryAcquireLock, type LockHandle } from "./locks.ts";
@@ -71,7 +72,58 @@ export async function listWorktrees(): Promise<Worktree[]> {
     if (sp === -1) block[line] = "";
     else block[line.slice(0, sp)] = line.slice(sp + 1);
   }
+  appendRiftWorktrees(worktrees);
   return worktrees;
+}
+
+/**
+ * Rift checkouts are independent clones, so `git worktree list` never
+ * reports them — discovery scans the worktree root for `.rift` markers
+ * and synthesizes rows here. Done regardless of the configured backend
+ * so a rift checkout stays visible after the user flips the default
+ * back to git-worktree (the backend is detected, not stored). Branch
+ * resolution reads `.git/HEAD` directly (pure fs, no subprocess), with
+ * the same mid-rebase recovery the porcelain path uses.
+ */
+function appendRiftWorktrees(worktrees: Worktree[]): void {
+  // Dedup against the porcelain rows by path. Both sides are used raw (no
+  // realpath): git's porcelain output is already canonical and
+  // `listRiftWorktreePaths` joins the config's `worktree_root`, which wt
+  // assumes canonical throughout (same assumption `isManagedWorktreePath`
+  // makes). A checkout can't be both a linked worktree AND carry a `.rift`
+  // marker under normal operation, so the two sets don't actually overlap.
+  const seen = new Set(worktrees.map((w) => w.path));
+  for (const path of listRiftWorktreePaths(config.paths.worktreeRoot)) {
+    if (seen.has(path)) continue;
+    const slug = basename(path);
+    let branch = headBranch(path);
+    if (!branch) branch = rebasingBranch(path);
+    worktrees.push({
+      path,
+      branch,
+      isMain: false,
+      slug,
+      stage: resolveStage(path, slug),
+    });
+  }
+}
+
+/**
+ * The branch a checkout's `.git/HEAD` points at, or "" when HEAD is
+ * detached (mid-rebase, or a rift clone before its branch switch). Pure
+ * fs read — rift discovery runs on every worktree-list refresh, so it
+ * must not spawn a subprocess per checkout.
+ */
+function headBranch(wtPath: string): string {
+  const gitdir = gitDirOf(wtPath);
+  if (!gitdir) return "";
+  try {
+    const head = readFileSync(join(gitdir, "HEAD"), "utf8").trim();
+    const m = /^ref:\s*refs\/heads\/(.+)$/.exec(head);
+    return m ? m[1]! : "";
+  } catch {
+    return "";
+  }
 }
 
 function isManagedWorktreePath(path: string): boolean {

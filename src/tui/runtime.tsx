@@ -25,6 +25,7 @@ import {
   watchLockDir,
   watchRebaseState,
   watchRefs,
+  watchWorktreeRoot,
   watchWorktreesAdmin,
   watchWtStateFiles,
 } from "../core/repo-watch.ts";
@@ -229,6 +230,16 @@ export async function runTui(): Promise<TuiExit> {
   // not `refs/`.
   const stopWorktreesAdminWatch = watchWorktreesAdmin(
     config.paths.mainClone,
+    () => {
+      invalidations.key(qk.worktrees());
+    },
+  );
+  // Rift checkouts are independent clones that never touch
+  // `.git/worktrees/`, so the admin watcher above can't see them. Watch
+  // the worktree root itself for create/remove (harmlessly redundant for
+  // git worktrees, which also land as subdirs there).
+  const stopWorktreeRootWatch = watchWorktreeRoot(
+    config.paths.worktreeRoot,
     () => {
       invalidations.key(qk.worktrees());
     },
@@ -455,6 +466,7 @@ export async function runTui(): Promise<TuiExit> {
     stopRefsWatch();
     stopGithubEventsWatch?.();
     stopWorktreesAdminWatch();
+    stopWorktreeRootWatch();
     stopRebaseStateWatch();
     stopWtStateWatch();
     stopLockWatch();

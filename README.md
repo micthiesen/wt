@@ -69,6 +69,7 @@ State is push-based: filesystem watchers on git refs, worktree dirs, and wt's ow
 | [docs/automations.md](docs/automations.md) | the `[[automations]]` engine: triggers, settle windows, breaker |
 | [docs/github-events.md](docs/github-events.md) | push-based PR/CI updates via a repo webhook |
 | [docs/stacked-prs.md](docs/stacked-prs.md) | stacked PRs: fork-base records, inferred stacks, `wt restack` |
+| [docs/backends.md](docs/backends.md) | worktree backends: `git-worktree` (default) vs `rift` copy-on-write clones |
 | [docs/architecture.md](docs/architecture.md) | internals: layers, freshness model, module conventions |
 
 ## Logs
