@@ -30,6 +30,7 @@ The source of truth for the schema is [`src/core/config.ts`](../src/core/config.
 | `log_dir` | no | `~/.cache/wt/logs` | Per-worktree destroy logs live here; daily structured app logs go to the derived `<log_dir>/app` subdirectory. |
 | `lock_dir` | no | `~/.cache/wt/locks` | Per-slug operation locks (what drives the "setting up…" busy state). |
 | `cache_db` | no | `~/.cache/wt/cache.sqlite` | SQLite blob persisting the TanStack Query cache between runs. |
+| `wezterm_cli` | no | macOS: `/Applications/WezTerm.app/Contents/MacOS/wezterm`; elsewhere: `wezterm` from `PATH` | WezTerm CLI executable used to set the tab title to `wt` when `WEZTERM_PANE` is present. Supports `~` expansion. |
 
 ## `[branch]`
 

@@ -17,6 +17,8 @@
  * didn't change (`processResize` no-ops on equal dimensions).
  */
 import type { CliRenderer } from "@opentui/core";
+import { hostname } from "node:os";
+import { pathToFileURL } from "node:url";
 
 /**
  * Clear-screen + cursor-home. opentui's suspend emits `\x1b[?1049l`
@@ -29,12 +31,31 @@ import type { CliRenderer } from "@opentui/core";
  */
 const CLEAR_SCREEN = "\x1b[2J\x1b[H";
 
+/**
+ * Tell the outer terminal which cwd belongs to the pane. Shell integration
+ * normally emits OSC 7 from the prompt, but while F10/F11/F12 owns the pane
+ * the foreground process is a tmux client and the outer terminal otherwise
+ * keeps the cwd from which wt was launched. WezTerm uses this value when a
+ * native split omits `cwd`; terminals that do not implement OSC 7 ignore it.
+ *
+ * Build a real file URL so spaces, `#`, and other URI-significant path bytes
+ * cannot truncate or corrupt the directory recorded by the terminal.
+ */
+export function cwdOsc7(cwd: string, host = hostname()): string {
+  const url = pathToFileURL(cwd);
+  url.hostname = host;
+  return `\x1b]7;${url.href}\x1b\\`;
+}
+
 export async function handoffTerminal<T>(
   renderer: CliRenderer,
+  cwd: string,
   fn: () => Promise<T>,
 ): Promise<T> {
+  const returnCwd = process.cwd();
   renderer.suspend();
   process.stdout.write(CLEAR_SCREEN);
+  process.stdout.write(cwdOsc7(cwd));
   const winchListeners = process.listeners("SIGWINCH");
   for (const l of winchListeners) {
     process.removeListener("SIGWINCH", l as NodeJS.SignalsListener);
@@ -45,6 +66,7 @@ export async function handoffTerminal<T>(
     for (const l of winchListeners) {
       process.on("SIGWINCH", l as NodeJS.SignalsListener);
     }
+    process.stdout.write(cwdOsc7(returnCwd));
     process.stdout.write(CLEAR_SCREEN);
     renderer.resume();
     // Catch up on any resize that happened while the listeners were

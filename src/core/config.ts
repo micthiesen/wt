@@ -355,6 +355,8 @@ export type Config = {
     lockDir: string;
     /** SQLite blob holding the persisted TanStack Query cache. */
     cacheDb: string;
+    /** WezTerm CLI used for tab naming; null falls back to PATH lookup. */
+    weztermCli: string | null;
   };
   branch: {
     prefix: string;
@@ -401,6 +403,10 @@ const GENERIC_DEFAULTS = {
     logDir: join(HOME, ".cache", "wt", "logs"),
     lockDir: join(HOME, ".cache", "wt", "locks"),
     cacheDb: join(HOME, ".cache", "wt", "cache.sqlite"),
+    weztermCli:
+      process.platform === "darwin"
+        ? "/Applications/WezTerm.app/Contents/MacOS/wezterm"
+        : null,
   },
   // SST v3 convention: per-stage Pulumi state file lives at
   // `<state_prefix><stage>.json`. The default file regenerated per
@@ -603,6 +609,9 @@ function build(raw: Raw, errs: Errors): Config {
   const appLogDir = join(logDir, "app");
   const lockDir = expandHome(errs.optStr(paths, "lock_dir", GENERIC_DEFAULTS.paths.lockDir));
   const cacheDb = expandHome(errs.optStr(paths, "cache_db", GENERIC_DEFAULTS.paths.cacheDb));
+  const weztermCliRaw =
+    errs.optStrOrNull(paths, "wezterm_cli") ?? GENERIC_DEFAULTS.paths.weztermCli;
+  const weztermCli = weztermCliRaw ? expandHome(weztermCliRaw) : null;
 
   // Stage prefix derives from branch.prefix when omitted — the
   // overwhelmingly common shape is `<branch.prefix>-<stage>`. Same
@@ -716,7 +725,15 @@ function build(raw: Raw, errs: Errors): Config {
   const automations = parseAutomations(raw.automations, actions, errs);
 
   return {
-    paths: { mainClone, worktreeRoot, logDir, appLogDir, lockDir, cacheDb },
+    paths: {
+      mainClone,
+      worktreeRoot,
+      logDir,
+      appLogDir,
+      lockDir,
+      cacheDb,
+      weztermCli,
+    },
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
     lifecycle: { envFilesToCopy: envFiles },
