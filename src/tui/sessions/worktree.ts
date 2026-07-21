@@ -64,7 +64,7 @@ export async function enterWorktreeSession(opts: {
     });
   }
 
-  return await handoffTerminal(renderer, async () => {
+  return await handoffTerminal(renderer, cwd, async () => {
     for (;;) {
       const result = await attachTarget();
       if (result.kind !== "switch") return result;
