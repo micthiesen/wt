@@ -447,6 +447,89 @@ export function watchLockDir(
   };
 }
 
+/**
+ * Watch a single RIFT checkout's own `.git` for an in-progress rebase.
+ * A rift checkout is an independent clone, so — unlike a linked worktree,
+ * whose rebase state lives under the main clone's
+ * `.git/worktrees/<slug>/rebase-*` and is covered by `watchRebaseState` —
+ * its rebase control dir is `<slice>/.git/rebase-{merge,apply}`, which no
+ * other watcher sees (the per-worktree working-tree watcher filters
+ * `.git/*`). Non-recursive: the rebase dirs are direct children of
+ * `.git`, so their creation/removal reports as filename
+ * `rebase-merge`/`rebase-apply`. The name filter discards the `.git`
+ * root's own churn (HEAD, index.lock, ORIG_HEAD, …) so only a real rebase
+ * start/finish fires `onChange` — the push signal for the mid-rebase
+ * glyph on a hand / `/restack` rebase in a rift slice.
+ */
+export function watchRiftRebaseDir(
+  worktreePath: string,
+  onChange: () => void,
+): () => void {
+  const gitDir = join(worktreePath, ".git");
+  const debounced = makeDebounced(onChange, REFS_DEBOUNCE_MS);
+  let watcher: FSWatcher | null = null;
+  try {
+    watcher = watch(gitDir, { persistent: false }, (_event, filename) => {
+      if (filename == null) {
+        debounced.trigger();
+        return;
+      }
+      if (/^rebase-(merge|apply)(\/|$)/.test(filename)) debounced.trigger();
+    });
+    watcher.on("error", (err) => {
+      log.warn("rift rebase watcher error", { err: String(err), gitDir });
+    });
+  } catch (err) {
+    log.warn("rift rebase watcher failed", { err: String(err), gitDir });
+    return () => debounced.cancel();
+  }
+  return () => {
+    debounced.cancel();
+    closeSilent(watcher);
+  };
+}
+
+/**
+ * Per-slug rift-rebase watcher set. The linked-worktree rebase state is
+ * one recursive watch on the main clone (`watchRebaseState`), but rift
+ * clones each have their own `.git`, so they need one watcher apiece.
+ * Reconcile against the current RIFT worktrees (the caller filters) the
+ * same way `WorktreeWatchSet` does: add a watcher for a new slug, drop it
+ * for a vanished one, leave untouched slugs alone so FSEvents streams
+ * don't churn on every cache update.
+ */
+export class RiftRebaseWatchSet {
+  private readonly handles = new Map<string, () => void>();
+  private readonly onSlugChange: (slug: string) => void;
+
+  constructor(onSlugChange: (slug: string) => void) {
+    this.onSlugChange = onSlugChange;
+  }
+
+  reconcile(targets: ReadonlyArray<WatchTarget>): void {
+    const want = new Map<string, string>();
+    for (const t of targets) want.set(t.slug, t.path);
+    for (const slug of [...this.handles.keys()]) {
+      if (!want.has(slug)) {
+        this.handles.get(slug)?.();
+        this.handles.delete(slug);
+      }
+    }
+    for (const [slug, path] of want) {
+      if (this.handles.has(slug)) continue;
+      this.handles.set(
+        slug,
+        watchRiftRebaseDir(path, () => this.onSlugChange(slug)),
+      );
+    }
+  }
+
+  dispose(): void {
+    for (const dispose of this.handles.values()) dispose();
+    this.handles.clear();
+  }
+}
+
 export type WatchTarget = { slug: string; path: string };
 
 /**

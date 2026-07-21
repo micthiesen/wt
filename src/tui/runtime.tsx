@@ -22,6 +22,7 @@ import {
   setSessionTriggerSink,
 } from "../core/harness/claude/tail.ts";
 import {
+  RiftRebaseWatchSet,
   WorktreeWatchSet,
   watchLockDir,
   watchRebaseState,
@@ -30,6 +31,7 @@ import {
   watchWorktreesAdmin,
   watchWtStateFiles,
 } from "../core/repo-watch.ts";
+import { isRiftWorktree } from "../core/backend.ts";
 import { startLoopLagProbe } from "../core/perf.ts";
 import { reapShellLogs, shellTailRegistry } from "../core/shell-tail.ts";
 import { reapOrphanedSessions } from "../core/tmux.ts";
@@ -251,13 +253,21 @@ export async function runTui(): Promise<TuiExit> {
   // the only push signal for a rebase started OUTSIDE the engine (a
   // `/restack` conflict resolution, a hand rebase): refs don't move
   // until it finishes, and the engine's own runs are covered by the
-  // lock watcher instead.
+  // lock watcher instead. Covers LINKED worktrees only.
   const stopRebaseStateWatch = watchRebaseState(
     config.paths.mainClone,
     (slug) => {
       invalidations.key(qk.wt(slug).conflictAny());
     },
   );
+  // A rift checkout is an independent clone, so its rebase control dir is
+  // `<slice>/.git/rebase-*` — invisible to the main-clone watcher above.
+  // One watcher per rift slice on its own `.git`, reconciled below against
+  // the rift subset of the worktree list, so the mid-rebase glyph flips on
+  // a hand / `/restack` rebase there too.
+  const riftRebaseWatchSet = new RiftRebaseWatchSet((slug) => {
+    invalidations.key(qk.wt(slug).conflictAny());
+  });
   // Cross-process state.json / archive.json writes (CLI stack ops, `wt
   // base set`, another wt instance) → refresh the matching query so
   // sections, fork-base records, and the archived set track external
@@ -311,11 +321,13 @@ export async function runTui(): Promise<TuiExit> {
   // the boot case where the persister already restored data.
   const reconcileWatchers = (wts: readonly Worktree[] | undefined): void => {
     if (!wts) return;
-    worktreeWatchSet.reconcile(
-      wts
-        .filter((w) => !w.isMain && w.path)
-        .map((w) => ({ slug: w.slug, path: w.path })),
-    );
+    const targets = wts
+      .filter((w) => !w.isMain && w.path)
+      .map((w) => ({ slug: w.slug, path: w.path }));
+    worktreeWatchSet.reconcile(targets);
+    // Only rift slices carry their own `.git` rebase state; a `.rift`
+    // marker probe keeps the watcher set to the clones that need it.
+    riftRebaseWatchSet.reconcile(targets.filter((t) => isRiftWorktree(t.path)));
   };
   const unsubWorktrees = wtClient.client.getQueryCache().subscribe((event) => {
     if (event.type !== "updated") return;
@@ -480,6 +492,7 @@ export async function runTui(): Promise<TuiExit> {
     stopWorktreesAdminWatch();
     stopWorktreeRootWatch();
     stopRebaseStateWatch();
+    riftRebaseWatchSet.dispose();
     stopWtStateWatch();
     stopLockWatch();
     unsubWorktrees();
