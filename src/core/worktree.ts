@@ -7,7 +7,7 @@ import { git, branchIsGone, branchIsMerged, effectiveBaseOrTrunk, gitQuiet, gitR
 import { lockAge, lockLabel, lockStatus, tryAcquireLock, type LockHandle } from "./locks.ts";
 import { createLogger } from "./logger.ts";
 import { latestLogFor } from "./logs.ts";
-import { runOk, runQuiet } from "./proc.ts";
+import { runOk, runQuiet, runStreaming } from "./proc.ts";
 import { computeStage } from "./stage.ts";
 import { type Status, StatusKind, type Worktree } from "./types.ts";
 
@@ -406,7 +406,9 @@ async function fetchOriginLocked(opts: { onWarn?: (msg: string) => void } = {}):
       await restoreAutoRegen(main);
       const status = await runOk(["git", "status", "--porcelain"], { cwd: main });
       if (!status.trim()) {
+        const before = (await runOk(["git", "rev-parse", "HEAD"], { cwd: main })).trim();
         await gitRun(["merge", "--ff-only", "--quiet", remoteRef], main);
+        await syncMainDeps(main, before);
       }
       // else: genuinely dirty — leave local main behind; origin/main is
       // already up-to-date from the fetch.
@@ -424,6 +426,49 @@ export async function fetchOrigin(opts: { onWarn?: (msg: string) => void } = {})
     fetchOriginInFlight = null;
   });
   return fetchOriginInFlight;
+}
+
+/**
+ * The lockfile whose change gates a main-clone dependency sync. wt already
+ * assumes pnpm (createWorktree runs `pnpm install`); in a repo without this
+ * file the gate never fires, so the whole feature is inert there.
+ */
+const MAIN_DEPS_LOCKFILE = "pnpm-lock.yaml";
+
+/**
+ * After the main clone fast-forwards to fresh trunk, reinstall deps IF the
+ * pulled commits changed the pnpm lockfile — so the main clone's
+ * `node_modules` never drifts behind trunk. This matters most for the
+ * `rift` backend, which CoW-copies the main clone's `node_modules` into
+ * every new worktree (a stale main clone = stale worktrees); it's also
+ * plain hygiene for working in the main clone directly. Because the
+ * 3-minute fetch interval + webhook fetch both run through here, the main
+ * clone stays synced in the background, so a `wt new` right after usually
+ * finds nothing to install and stays fast.
+ *
+ * Gated on the lockfile actually changing, so the common no-dep-change
+ * pull pays only one cheap `git diff --name-only`. `--frozen-lockfile`
+ * keeps the install from rewriting the committed lockfile, which would
+ * dirty the main clone and break the next fast-forward. Best-effort: a
+ * failed install warns to the activity pane and never fails the fetch.
+ */
+async function syncMainDeps(cwd: string, beforeHead: string): Promise<void> {
+  const after = (await runOk(["git", "rev-parse", "HEAD"], { cwd })).trim();
+  if (!after || after === beforeHead) return; // nothing was pulled
+  const changed = await runOk(
+    ["git", "diff", "--name-only", beforeHead, after, "--", MAIN_DEPS_LOCKFILE],
+    { cwd },
+  );
+  if (!changed.trim()) return; // deps unchanged on trunk — skip the install
+
+  log.event.info(`${MAIN_DEPS_LOCKFILE} changed on trunk — syncing main clone deps`);
+  const code = await runStreaming(["pnpm", "install", "--frozen-lockfile"], { cwd });
+  if (code === 0) {
+    log.event.ok("main clone deps synced");
+  } else {
+    log.warn("main clone dependency sync failed", { cwd, code });
+    log.event.warn(`main clone deps sync failed (pnpm exit ${code}) — run pnpm install there`);
+  }
 }
 
 async function restoreAutoRegen(cwd: string): Promise<void> {

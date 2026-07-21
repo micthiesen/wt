@@ -23,9 +23,19 @@ near-instant even on a large repo, and with `--copy-all` it brings
 `node_modules` across **for free** — so a rift checkout has packages
 installed the moment it exists, with no `pnpm install`. wt passes
 `--copy-all` always; the `--no-install` flag (`runInstall`) is a no-op
-for this backend. If you want a lockfile sync anyway, add a `.rift.toml`
-postcreate hook in the main clone (`pnpm install --frozen-lockfile`) —
-rift runs it, and it's fast because the packages are already present.
+for this backend.
+
+The copy is only as fresh as the main clone it's cloned from, so wt keeps
+the main clone's `node_modules` in sync with trunk: whenever a fetch
+fast-forwards the main clone and the pulled commits changed
+`pnpm-lock.yaml`, wt runs `pnpm install --frozen-lockfile` there (see
+`syncMainDeps` in `core/worktree.ts`). It's gated on the lockfile actually
+changing, `--frozen-lockfile` keeps the main clone clean, and the
+background fetch interval does it ahead of time — so a rift checkout
+copies an up-to-date `node_modules` without any per-create install. (This
+runs for the git-worktree backend too; it's plain main-clone hygiene.) A
+`.rift.toml` postcreate hook still works if you want a per-checkout sync
+on top, but it's usually redundant.
 
 ## Setup
 
