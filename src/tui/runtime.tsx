@@ -8,6 +8,7 @@ import { recordWorktreeEdit } from "../core/automations.ts";
 import { watchRegistry } from "../core/harness/claude/registry.ts";
 import { config } from "../core/config.ts";
 import { disposeDiffPool } from "../core/diff/pool.ts";
+import { lockStatus } from "../core/locks.ts";
 import { watchGithubEvents } from "../core/events/store.ts";
 import { closeOpencodeDb, HARNESSES } from "../core/harness/index.ts";
 import { startCodexEventPolling } from "../core/harness/codex/events.ts";
@@ -276,11 +277,22 @@ export async function runTui(): Promise<TuiExit> {
   const stopLockWatch = watchLockDir(config.paths.lockDir, (slug) => {
     if (slug === "*") {
       // Event without a filename — can't target one slug; refresh the
-      // whole per-worktree namespace rather than risk a stuck "busy".
+      // whole per-worktree namespace rather than risk a stuck "busy". A
+      // create/destroy may also have completed, so refresh the list too.
       invalidations.key(["wt"]);
+      invalidations.key(qk.worktrees());
       return;
     }
     invalidations.key(qk.wt(slug).lock());
+    // A lock that's now GONE means a create or destroy just finished, so
+    // worktree membership may have changed — refresh the list. This is the
+    // completion signal the fs-dir watchers can't give for a rift create:
+    // its `.rift` marker (what makes the row discoverable) is written INSIDE
+    // the new dir, after the worktree-root watcher already fired on the bare
+    // dir appearing — so without this a CLI `wt new` row would only surface
+    // on the next interval. Gated on release (lock gone) so mid-op phase
+    // writes during a long restack don't churn the list.
+    if (!lockStatus(slug)) invalidations.key(qk.worktrees());
   });
   const worktreeWatchSet = new WorktreeWatchSet((slug, area) => {
     // `.sst/` writes flip the deploy badge (deploys + removes always

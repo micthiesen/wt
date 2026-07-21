@@ -41,7 +41,7 @@ Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. E
 | `.git/worktrees/<slug>/rebase-{merge,apply}` watcher (hand/`/restack` rebase starts or ends) | that slug's conflict probe (the mid-rebase glyph) |
 | per-worktree dir watchers | edits → dirty; `.sst/` writes → deploy |
 | `~/.cache/wt/state.json` + `archive.json` watcher | cross-process fork-base / section / archive writes |
-| `~/.cache/wt/locks/` watcher | per-slug busy state from any process (create/destroy, and every chain member during a restack — the restack glyph rides on this); a release also fans out a per-slug field refresh (`useLockReleasedInvalidator`) |
+| `~/.cache/wt/locks/` watcher | per-slug busy state from any process (create/destroy, and every chain member during a restack — the restack glyph rides on this); a release also fans out a per-slug field refresh (`useLockReleasedInvalidator`) **and refreshes the worktree list** — the reliable "a create/destroy just finished" signal, so a new (esp. `rift`) row surfaces immediately instead of waiting on the interval (a rift `.rift` marker is written inside the new dir, after the worktree-root watcher already fired on the bare dir) |
 | github-events webhook marker | github + a staleTime-gated `git fetch origin` |
 | 3-minute `fetch origin` interval | backstop for remote drift |
 | claude-registry fs.watch, session-tail triggers (`gh pr …` / `git push` inside a session) | sessions / github |

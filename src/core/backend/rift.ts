@@ -216,12 +216,18 @@ export const riftBackend: WorktreeBackend = {
   },
 
   async remove(input: BackendRemoveInput): Promise<BackendRemoveResult> {
-    const { path, mainClone, onLog } = input;
+    const { path, force, mainClone, onLog } = input;
     if (!riftAvailable()) {
       return { ok: false, message: "rift is not on PATH" };
     }
-    onLog?.(`rift remove ${basename(path)}`);
-    const r = await run(["rift", "remove", path], { cwd: mainClone });
+    // Mirror the git-worktree backend's force plumbing: when wt has already
+    // cleared its own dirty/unpushed guard (a forced `wt rm`), pass rift's
+    // `--force` too. rift trashes a dirty created checkout without it today,
+    // but this keeps the two backends symmetric and future-proofs against a
+    // rift version that refuses a dirty checkout. Harmless on a clean one.
+    const args = force ? ["rift", "remove", "--force", path] : ["rift", "remove", path];
+    onLog?.(`rift remove${force ? " --force" : ""} ${basename(path)}`);
+    const r = await run(args, { cwd: mainClone });
     if (r.exitCode !== 0 && existsSync(path)) {
       return { ok: false, message: (r.stderr || r.stdout || "rift remove failed").trim() };
     }
