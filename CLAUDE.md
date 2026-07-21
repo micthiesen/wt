@@ -61,5 +61,6 @@ Commit and push directly to `main`. Don't create feature branches, don't open PR
 
 - **The list panel (`src/tui/panels/list.tsx`) is NOT row-driven.** Different layout (single line of glyphs, no labels), intentionally not wired through `rows/`. Don't try to unify them.
 - **Config loads once at module init.** No hot reload — editing the TOML requires restarting `wt`.
+- **Remote argv never crosses SSH as raw arguments.** OpenSSH reparses its command through the remote login shell (Fish on the first supported host). Route commands through `core/remote-protocol.ts` + the `_remote` entrypoint; do not interpolate user input into the SSH command string.
 - **`Bun.TOML.parse` is built in.** No external TOML lib needed; don't add one.
 - **macOS-only utilities** (`open`, `pbcopy`, launchd) are assumed. Anything that shells out to them stays guarded by the macOS assumption noted in the README.

@@ -67,4 +67,5 @@ export const NF = {
 	bolt: "\u{F0E7}", // nf-fa-bolt              — SST stage deployed
 	boltOff: "\u{F05E}", // nf-fa-ban            — SST stage not deployed (no entry)
 	comment: "\u{F41F}", // nf-oct-comment        — claude action-running marker (list + details)
+	remote: "\u{F048B}", // nf-md-desktop_tower_monitor — remote wt / SSH host
 } as const;

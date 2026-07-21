@@ -22,6 +22,7 @@ export type FooterInputKeysCtx = {
   setLastMoveTarget: (updater: (prev: string | null) => string | null) => void;
   toast: (message: string, color?: string, ms?: number) => void;
   doNew: (raw: string, defaultBase?: string) => Promise<void>;
+  doRemoteNew: (raw: string) => Promise<void>;
 };
 
 export function handleFooterInputKey(k: KeyEvent, ctx: FooterInputKeysCtx): void {
@@ -34,6 +35,7 @@ export function handleFooterInputKey(k: KeyEvent, ctx: FooterInputKeysCtx): void
     setLastMoveTarget,
     toast,
     doNew,
+    doRemoteNew,
   } = ctx;
       if (k.name === "escape" || (k.ctrl && k.name === "c")) {
         setFooter({ kind: "legend" });
@@ -60,7 +62,10 @@ export function handleFooterInputKey(k: KeyEvent, ctx: FooterInputKeysCtx): void
           toast(`renamed "${oldName}" to "${raw}"`, theme.info, 1800);
           return;
         }
-        if (raw) void doNew(raw, base);
+        if (raw) {
+          if (purpose === "new-remote") void doRemoteNew(raw);
+          else void doNew(raw, base);
+        }
         return;
       }
       if (k.name === "backspace") {

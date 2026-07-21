@@ -20,7 +20,7 @@ export type FooterMode =
       kind: "input";
       prompt: string;
       value: string;
-      purpose: "new" | "rename-section";
+      purpose: "new" | "new-remote" | "rename-section";
       /**
        * Optional default `--base` ref for the new-worktree input (set
        * by the `N` keybinding). Not rendered in the prompt; the event

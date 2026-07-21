@@ -41,6 +41,38 @@ The source of truth for the schema is [`src/core/config.ts`](../src/core/config.
 | `id_pattern` | no | `"^[a-z]+-(\\d+)(?:-|$)"` | Regex (no flags) matching an issue ID at the start of a slug. The default matches Linear/Jira/Shortcut-style ids (`eng-1234`, `inf-99`). |
 | `slug_max_len` | no | `50` | Slugs generated from issue titles are truncated to this length. |
 
+## `[remote]` — optional SSH worktree host
+
+Configure a second machine whose own `wt` installation, clone, config, and
+worktree root remain authoritative. The local TUI polls that host's worktree
+summaries and renders them in the same Inbox with a remote glyph. `Ctrl+N`
+forwards the normal `wt new` lifecycle over SSH; F10/F11/F12 on one of those
+rows attach to that worktree's remote tmux shell, diff, or AI session. Ordinary
+`n` / `N` continue to create locally.
+
+The last successful remote inventory is persisted with the rest of wt's query
+cache. If the host sleeps or becomes unreachable, those rows remain visible as
+last-known state and are marked `host unavailable`; they are not interpreted as
+deleted worktrees.
+
+```toml
+[remote]
+host = "cachy"                 # SSH host or ~/.ssh/config alias
+label = "cachy"                # optional; defaults to host
+wt_path = "~/.wt/bin/wt"       # optional
+```
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `host` | **yes** | — | SSH destination or alias used by `ssh`. |
+| `label` | no | `host` | Short name in the prompt, event log, and remote WezTerm tab title. |
+| `wt_path` | no | `~/.wt/bin/wt` | Remote executable. The `~/` prefix expands in the remote account. |
+
+The remote machine needs its own `~/.config/wt/config.toml`; do not point the
+local process at a mounted remote filesystem. `wt remote [args…]` remains a
+diagnostic/admin escape hatch, but normal work happens from the unified local
+Inbox.
+
 ## `[stage]`
 
 Preview-stage naming, used by the SST integration and stage URLs.

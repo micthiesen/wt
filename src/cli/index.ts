@@ -13,6 +13,9 @@ import * as claudeCmd from "./commands/claude.ts";
 import * as restackCmd from "./commands/restack.ts";
 import * as skillsCmd from "./commands/skills.ts";
 import * as eventsCmd from "./commands/events.ts";
+import * as remoteCmd from "./commands/remote.ts";
+import * as remoteExecCmd from "./commands/_remote.ts";
+import * as sessionExecCmd from "./commands/_session.ts";
 import * as destroyCmd from "./commands/_destroy.ts";
 
 const HELP = `usage: wt <command> [options]
@@ -29,6 +32,7 @@ commands:
   restack     rebase a stack of worktrees onto its updated parents
   skills      install wt's bundled workflow skills into a harness
   events      manage the optional GitHub webhook daemon
+  remote      enter or run wt on the configured SSH remote
   base        show / set / clear a worktree's recorded fork base
   claude      drive a worktree's Claude Code session (send / ls / kill)
 
@@ -48,6 +52,9 @@ const RUNNERS: Record<string, Runner> = {
   restack: restackCmd.run,
   skills: skillsCmd.run,
   events: eventsCmd.run,
+  remote: remoteCmd.run,
+  _remote: remoteExecCmd.run,
+  _session: sessionExecCmd.run,
   base: baseCmd.run,
   claude: claudeCmd.run,
   _destroy: destroyCmd.run,

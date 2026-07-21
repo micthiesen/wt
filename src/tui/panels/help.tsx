@@ -153,6 +153,7 @@ const KEY_BLOCKS: Block[] = [
     items: [
       { key: "n", label: "new worktree" },
       { key: "N", label: "new worktree · base = selected" },
+      { key: "ctrl+n", label: "new worktree on SSH remote · stays in this Inbox" },
       { key: "c", label: "clean merged/gone" },
       { key: "h", label: "show / hide removed-worktree history" },
       { key: "r", label: "refresh (fetch + recompute)" },
@@ -245,6 +246,7 @@ const BADGES: GlyphItem[] = [
   { glyph: NF.restack, color: theme.warn, label: "conflict being resolved / mid-rebase", search: "rebase in progress conflict resolving session" },
   { glyph: NF.conflict, color: theme.err, label: "won't rebase cleanly onto base (unattended)", search: "conflict preflight merge" },
   { glyph: NF.comment, color: theme.ok, label: "`!` action running", search: "action running claude" },
+  { glyph: NF.remote, color: theme.info, label: "worktree hosted on SSH remote", search: "remote ssh cachy" },
   {
     glyph: getHarness("claude").glyph,
     color: getHarness("claude").color,

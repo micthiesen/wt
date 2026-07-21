@@ -1,10 +1,11 @@
 import { useMemo, useRef, useState } from "react";
-import { useIsFetching } from "@tanstack/react-query";
+import { useIsFetching, useQuery } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
 import { createLogger } from "../core/logger.ts";
-import { useWtActions } from "../state/index.ts";
+import { config } from "../core/config.ts";
+import { remoteWorktreesQuery, useWtActions } from "../state/index.ts";
 
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
@@ -63,6 +64,8 @@ import { useSessionsPickerData } from "./hooks/useSessionsPickerData.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "./usage-badge.tsx";
 import { writeClipboard } from "../core/macos.ts";
 import { theme } from "./theme.ts";
+import { isRemoteSummary, type RemoteCreation } from "./remote-creation.ts";
+import { enterRemoteWorktreeSession } from "./sessions/remote.ts";
 
 const appLog = createLogger("[app]");
 
@@ -76,6 +79,9 @@ export function App({ onExit }: Props) {
   const { width, height } = useTerminalDimensions();
   const renderer = useRenderer();
   const { rows, isLoading } = useWorktreeRows();
+  const remoteWorktreeList = useQuery(remoteWorktreesQuery());
+  const remoteUnavailable = remoteWorktreeList.isError;
+  const remoteError = remoteWorktreeList.error?.message ?? null;
   const {
     refreshAll,
     refreshStale,
@@ -124,6 +130,9 @@ export function App({ onExit }: Props) {
   // Scroll-to-edge control for the list pane, called by j/k at the boundary.
   const listScrollHandleRef = useRef<ListScrollHandle | null>(null);
   const [footer, setFooter] = useState<FooterMode>({ kind: "legend" });
+  // Remote checkouts are absent from this machine's `git worktree list`, so
+  // keep an explicit Inbox row visible while SSH creation/install is running.
+  const [remoteCreation, setRemoteCreation] = useState<RemoteCreation | null>(null);
   // All modal/overlay state collapsed into one discriminated union so
   // the "only one modal is open at a time" invariant is structural
   // rather than emergent. Per-modal payload (cursor index, picker
@@ -216,12 +225,15 @@ export function App({ onExit }: Props) {
     currentItem,
     current,
     selectedPr,
+    selectedRemote,
     selectedSection,
   } = useVisualItems({
     rows,
     foldedSections,
     stackSectionLabels,
     selectedKey: sel,
+    remoteCreation,
+    remoteWorktrees: remoteWorktreeList.data ?? [],
   });
 
   // `g p` / `l p` PR-target chord — extracted to
@@ -399,7 +411,15 @@ export function App({ onExit }: Props) {
 
   // Destroy / clean / restack flows — extracted to `flows/destroy.ts`.
   // Rebuilt per render so the closures see fresh rows / selection.
-  const { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack, isRestackBusy } = makeDestroyFlows({
+  const {
+    doRemove,
+    doRemoteRemove,
+    doClean,
+    doCleanSlugs,
+    doReplayStack,
+    doRestackStack,
+    isRestackBusy,
+  } = makeDestroyFlows({
     rows,
     current,
     toast,
@@ -408,6 +428,9 @@ export function App({ onExit }: Props) {
     invalidateWorktree,
     refreshAll,
     refreshGithub,
+    refreshRemoteWorktrees: async () => {
+      await remoteWorktreeList.refetch();
+    },
     restackBusyRef,
     primaryHarness,
   });
@@ -493,12 +516,16 @@ export function App({ onExit }: Props) {
 
   // Worktree-creation flows (`n`/`N`, review checkout, removed-history
   // restore) — extracted to `flows/new-worktree.ts`.
-  const { doNew, doCheckoutReview, doRestoreRemoved } = makeWorktreeCreateFlows({
+  const { doNew, doRemoteNew, doCheckoutReview, doRestoreRemoved } = makeWorktreeCreateFlows({
     setModal,
     setSection,
     setSel,
     setRemovedView,
+    setRemoteCreation,
     refreshAll,
+    refreshRemoteWorktrees: async () => {
+      await remoteWorktreeList.refetch();
+    },
     toast,
   });
 
@@ -537,6 +564,7 @@ export function App({ onExit }: Props) {
           doYank,
           doClean,
           doRemove,
+          doRemoteRemove,
           doAutoMerge,
           doMarkReady,
           doShipPr,
@@ -588,6 +616,7 @@ export function App({ onExit }: Props) {
         setLastMoveTarget,
         toast,
         doNew,
+        doRemoteNew,
       });
       return;
     }
@@ -621,6 +650,7 @@ export function App({ onExit }: Props) {
       current,
       currentItem,
       selectedPr,
+      selectedRemote,
       selectedSection,
       visualItems,
       cursorIndex,
@@ -638,6 +668,30 @@ export function App({ onExit }: Props) {
       activeShellSessions,
       activeDiffSessions,
       renderer,
+      doEnterRemoteSession: (target) => {
+        if (!selectedRemote || !isRemoteSummary(selectedRemote)) {
+          toast("remote worktree is still being created", theme.warn, 1800);
+          return;
+        }
+        if (remoteUnavailable) {
+          toast(`${selectedRemote.hostLabel} is unavailable`, theme.warn, 2200);
+          return;
+        }
+        if (selectedRemote.status === "busy") {
+          toast(`${selectedRemote.slug} is ${selectedRemote.statusLabel}`, theme.warn, 2200);
+          return;
+        }
+        void enterRemoteWorktreeSession({
+          renderer,
+          worktree: selectedRemote,
+          target,
+          harnessId: primaryHarness,
+        })
+          .then((code) => {
+            if (code !== 0) toast(`remote session exited ${code}`, theme.warn, 2500);
+          })
+          .catch((err) => reportActionError("remote session", err));
+      },
       doEnterHarnessSession,
       handleGlobalKey: globalKey,
       doShiftMove,
@@ -666,7 +720,13 @@ export function App({ onExit }: Props) {
   // at the tail of a refresh (after `git fetch origin` resolved) instead
   // of lighting up for the whole window.
   const fetchingCount = useIsFetching();
-  const activeCount = rows.filter((r) => !r.archived).length;
+  const remoteRows = remoteWorktreeList.data ?? [];
+  const pendingRemoteCount =
+    remoteCreation && !remoteRows.some((row) => row.slug === remoteCreation.input)
+      ? 1
+      : 0;
+  const activeCount =
+    rows.filter((r) => !r.archived).length + remoteRows.length + pendingRemoteCount;
   const archivedCount = rows.length - activeCount;
   // The "refreshing" signal is the animated `RefreshWave` rendered after
   // this string (width = in-flight count); the title itself stays static
@@ -699,6 +759,9 @@ export function App({ onExit }: Props) {
             {titleBar}
           </text>
           <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
+          {remoteUnavailable ? (
+            <text fg={theme.warn}>{` ⚠ ${config.remote?.label ?? "remote"} offline`}</text>
+          ) : null}
         </box>
         {automations.configured && automations.paused ? (
           <text fg={theme.warn}>{"auto ⏸  "}</text>
@@ -727,12 +790,16 @@ export function App({ onExit }: Props) {
             activeSessionBySlug={activeSessionBySlug}
             stackSectionLabels={stackSectionLabels}
             isLoading={isLoading}
+            remoteUnavailable={remoteUnavailable}
             scrollHandle={listScrollHandleRef}
           />
         )}
         <Details
           row={removedView ? undefined : current}
           reviewRequest={removedView ? undefined : selectedPr}
+          remote={removedView ? undefined : selectedRemote}
+          remoteUnavailable={remoteUnavailable}
+          remoteError={remoteError}
           section={removedView ? undefined : sectionDetail}
           removed={currentRemoved}
           width={Math.max(0, width - listWidth)}

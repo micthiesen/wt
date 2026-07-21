@@ -22,6 +22,7 @@ import {
 } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import { config } from "../../core/config.ts";
 
 const appLog = createLogger("[app]");
 const newLog = createLogger("[new]");
@@ -75,6 +76,21 @@ export function handleGlobalKey(k: KeyEvent, ctx: GlobalKeysCtx): boolean {
         title: "clear caches",
         message: "Clear all cached data and refetch from scratch?",
         confirmLabel: "clear",
+      });
+      return true;
+    }
+    if (k.ctrl && k.name === "n") {
+      const remote = config.remote;
+      if (!remote) {
+        toast("[remote] is not configured", theme.warn, 2200);
+        return true;
+      }
+      newLog.event.dim(`creating on ${remote.label}`);
+      setFooter({
+        kind: "input",
+        prompt: `new@${remote.label}:`,
+        value: "",
+        purpose: "new-remote",
       });
       return true;
     }

@@ -13,7 +13,12 @@ const log = createLogger("[locks]");
 // flock(2) via libc. Matches Python's fcntl.flock semantics: the
 // kernel releases the lock automatically on fd close / process death,
 // so a crashed process can't wedge other workers.
-const lib = dlopen(`libc.${suffix}`, {
+// Bun resolves the unversioned `libc.so` as a relative path on Linux, and
+// glibc's `/usr/lib/libc.so` is a linker script rather than a loadable shared
+// object anyway. Use glibc's stable runtime soname there; Darwin continues to
+// use Bun's platform suffix (`libc.dylib`).
+const libcName = process.platform === "linux" ? "libc.so.6" : `libc.${suffix}`;
+const lib = dlopen(libcName, {
   flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 });
 

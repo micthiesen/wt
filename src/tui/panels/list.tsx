@@ -24,6 +24,12 @@ import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
 import { STACK_CONNECTOR, stackOrdinalLabel } from "../../core/stack-layout.ts";
 import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import {
+  isRemoteSummary,
+  remoteEntryKey,
+  remoteEntryLabel,
+  type RemoteListEntry,
+} from "../remote-creation.ts";
 
 /**
  * One entry in the ACTIVE portion of the list. Either a worktree row, or a
@@ -32,6 +38,7 @@ import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
  */
 export type ListActiveItem =
   | { kind: "wt"; row: WorktreeRow }
+  | { kind: "remote"; entry: RemoteListEntry }
   | {
       kind: "section";
       /** Synthetic section key (`stackSectionKey(stackId)` or a manual name). */
@@ -97,6 +104,8 @@ type Props = {
    */
   stackSectionLabels: ReadonlyMap<string, string>;
   isLoading: boolean;
+  /** The SSH inventory refetch failed; last-known remote rows stay visible. */
+  remoteUnavailable: boolean;
 };
 
 /**
@@ -389,7 +398,58 @@ const FoldedSectionHeader = memo(function FoldedSectionHeader({
   );
 });
 
-export function WorktreeList({ items, archivedRows, reviewRequests, selectedIndex, width, activeTails, activeActions, activeSessionBySlug, stackSectionLabels, isLoading, scrollHandle }: Props) {
+/**
+ * Transient, non-interactive Inbox row for a checkout owned by the SSH host.
+ * It stays visible through install, then the renderer hands off to remote wt.
+ */
+const RemoteCreationRow = memo(function RemoteCreationRow({
+  entry,
+  selected,
+  unavailable,
+}: {
+  entry: RemoteListEntry;
+  selected: boolean;
+  unavailable: boolean;
+}) {
+  const suffix = unavailable
+    ? "host unavailable"
+    : isRemoteSummary(entry)
+    ? entry.statusLabel
+    : entry.status === "creating"
+      ? "creating…"
+      : "ready";
+  return (
+    <box
+      id={`remote:${remoteEntryKey(entry)}`}
+      flexDirection="row"
+      paddingLeft={1}
+      paddingRight={1}
+      backgroundColor={selected ? theme.rowSelectedBg : undefined}
+    >
+      <box width={2} flexShrink={0}>
+        <text fg={theme.info}>{NF.remote}</text>
+      </box>
+      <box width={1} flexShrink={0}>
+        <text> </text>
+      </box>
+      <box flexGrow={1} flexShrink={1} overflow="hidden">
+        <text
+          fg={selected ? theme.fgBright : theme.fg}
+          attributes={selected ? TextAttributes.BOLD : 0}
+          wrapMode="none"
+          truncate
+        >
+          {remoteEntryLabel(entry)}
+        </text>
+      </box>
+      <text fg={theme.fgDim} wrapMode="none">
+        {` ${entry.hostLabel} · ${suffix}`}
+      </text>
+    </box>
+  );
+});
+
+export function WorktreeList({ items, archivedRows, reviewRequests, selectedIndex, width, activeTails, activeActions, activeSessionBySlug, stackSectionLabels, isLoading, remoteUnavailable, scrollHandle }: Props) {
   const hasArchived = archivedRows.length > 0;
   const hasReviewRequests = reviewRequests.length > 0;
   const hasActive = items.length > 0;
@@ -421,7 +481,9 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
     selItem !== undefined
       ? selItem.kind === "wt"
         ? selItem.row.wt.slug
-        : `section:${selItem.sectionKey}`
+        : selItem.kind === "remote"
+          ? `remote:${remoteEntryKey(selItem.entry)}`
+          : `section:${selItem.sectionKey}`
       : selectedIndex < archivedOffset
         ? reviewRequests[selectedIndex - reviewOffset]?.url
         : archivedRows[selectedIndex - archivedOffset]?.wt.slug;
@@ -487,7 +549,31 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
             // item is in the inbox) so the inbox divider still renders when an
             // inbox row opens the list.
             const prev = i > 0 ? items[i - 1] : undefined;
-            const prevSection = prev ? (prev.kind === "wt" ? prev.row.section : prev.sectionKey) : undefined;
+            const prevSection = prev
+              ? prev.kind === "wt"
+                ? prev.row.section
+                : prev.kind === "remote"
+                  ? null
+                  : prev.sectionKey
+              : undefined;
+
+            if (item.kind === "remote") {
+              return (
+                <Fragment key={`remote:${remoteEntryKey(item.entry)}`}>
+                  {prevSection !== null ? (
+                    <>
+                      <box height={1} flexShrink={0} />
+                      <Divider label="Inbox" width={width} />
+                    </>
+                  ) : null}
+                  <RemoteCreationRow
+                    entry={item.entry}
+                    selected={i === selectedIndex}
+                    unavailable={remoteUnavailable}
+                  />
+                </Fragment>
+              );
+            }
 
             // A folded section collapses to one selectable header line — it IS
             // the section divider (a `[×NN]` chip + label in place of the rule),
