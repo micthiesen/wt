@@ -32,6 +32,8 @@ export type Modal =
        */
       slug?: string;
       reviewBranch?: string;
+      /** Remote target for the `remote-d` / `remote-d!` pending keys. */
+      remoteSlug?: string;
       /** Payload for the `restore` pendingKey (removed-worktrees view). */
       restoreEntry?: RemovedWorktree;
     }

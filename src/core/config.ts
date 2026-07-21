@@ -44,6 +44,16 @@ export type LinearConfig = {
   workspace: string;
 };
 
+/** Optional SSH target whose own wt instance owns remote worktrees. */
+export type RemoteConfig = {
+  /** SSH host or ~/.ssh/config alias. */
+  host: string;
+  /** Short human label used in prompts, logs, and the WezTerm tab title. */
+  label: string;
+  /** Path to the wt executable on the remote host. `~/` expands remotely. */
+  wtPath: string;
+};
+
 /**
  * Optional webhook-receiver augmentation (`[github.events]`). When the
  * section is present, the long-lived `wt events` daemon accepts GitHub
@@ -388,6 +398,7 @@ export type Config = {
   backend: { kind: BackendKind };
   sst: SstConfig | null;
   linear: LinearConfig | null;
+  remote: RemoteConfig | null;
   ai: AiConfig | null;
   diff: DiffConfig;
   github: GithubConfig;
@@ -603,6 +614,7 @@ function build(raw: Raw, errs: Errors): Config {
   const sstRaw = deploy ? obj(deploy.sst) : null;
   const tracker = obj(raw.issue_tracker);
   const linearRaw = tracker ? obj(tracker.linear) : null;
+  const remoteRaw = obj(raw.remote);
   const ui = obj(raw.ui);
 
   const branchPrefix = errs.reqStr(branch, "branch", "prefix");
@@ -659,6 +671,17 @@ function build(raw: Raw, errs: Errors): Config {
   const linear: LinearConfig | null = linearRaw === null
     ? null
     : { workspace: errs.reqStr(linearRaw, "issue_tracker.linear", "workspace") };
+
+  const remoteHost = remoteRaw === null
+    ? ""
+    : errs.reqStr(remoteRaw, "remote", "host");
+  const remote: RemoteConfig | null = remoteRaw === null
+    ? null
+    : {
+      host: remoteHost,
+      label: errs.optStr(remoteRaw, "label", remoteHost),
+      wtPath: errs.optStr(remoteRaw, "wt_path", "~/.wt/bin/wt"),
+    };
 
   const aiRaw = obj(raw.ai);
   const aiProvider = errs.optEnum(
@@ -762,6 +785,7 @@ function build(raw: Raw, errs: Errors): Config {
     backend: { kind: backendKind },
     sst,
     linear,
+    remote,
     ai,
     diff,
     github,

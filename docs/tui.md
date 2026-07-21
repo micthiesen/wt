@@ -7,7 +7,7 @@
 - **List pane** (left): one line per worktree — slug, status glyphs, PR/CI badges, session indicators — grouped into sections, with stacks rendered as trees. A pinned "review requests" section surfaces PRs waiting on your review.
 - **Details pane** (right): the configured rows (`[ui].rows` in [configuration.md](configuration.md#ui)) for the selected worktree — branch, base, Linear issue, stage, PR, sessions, git state — then a rebase-state block (restacking / mid-rebase / conflict with the clashing files) when something is moving, plus the AI-generated title/description band when `[ai]` is configured.
 - **Bottom pane**: live outputs — harness sessions, action runs, event feeds. Auto-follows the selected row; `'` picks an output explicitly, `[` / `]` cycle, `Esc` returns to auto-follow.
-- **Footer**: key legend, or a text prompt when one is active (`n` new-worktree, `L` rename section).
+- **Footer**: key legend, or a text prompt when one is active (`n` local new-worktree, `Ctrl+N` remote new-worktree, `L` rename section).
 
 Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the state files — plus the optional [GitHub webhook daemon](github-events.md) — invalidate exactly what changed. `r` re-fetches as a backstop; `Ctrl+R` (with confirm) nukes all cached data and refetches from scratch.
 
@@ -27,9 +27,10 @@ Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the 
 
 | key | action |
 |---|---|
-| `n` / `N` | new worktree prompt (accepts a Linear URL/id, branch, or slug, plus `--any`, `--base <ref>`); `N` pre-fills `--base` with the selected row's branch |
+| `n` / `N` | new local worktree prompt (accepts a Linear URL/id, branch, or slug, plus `--any`, `--base <ref>`); `N` pre-fills `--base` with the selected row's branch |
+| `Ctrl+N` | create on `[remote]`; the worktree stays in this Inbox with a remote glyph, and F10/F11/F12 route that row's sessions over SSH |
 | `o` | open the worktree in Zed |
-| `d` | remove (confirm; escalates to a force-remove warning when dirty/unpushed) |
+| `d` | remove locally or on the row's remote host (confirm; escalates to a force-remove warning when dirty) |
 | `c` | clean all merged/gone worktrees (confirm) |
 | `a` | archive / restore the row |
 | `i` | open the Linear issue |
@@ -37,6 +38,12 @@ Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the 
 | `t` | regenerate the AI summary |
 | `y` | yank menu — copy branch (`b`), stage (`s`), stage URL (`S`), path (`p`), slug (`n`), issue URL (`i`), PR URL (`r`) |
 | `r` / `Ctrl+R` | refresh / hard refresh (clear caches, confirm) |
+
+When the SSH host is sleeping or offline, its last-known worktrees remain in
+the Inbox with `host unavailable`. The title bar also shows an offline warning;
+F10/F11/F12 resume once a refresh reaches the host again.
+Remote deletion also stays disabled while the worktree holds a live operation
+lock. It deletes the remote branch but never destroys an SST stage implicitly.
 
 ### Pull request
 

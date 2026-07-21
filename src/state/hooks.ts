@@ -329,6 +329,7 @@ export function useWtActions() {
       await Promise.all([
         qc.fetchQuery(fetchOriginQuery()),
         qc.invalidateQueries({ queryKey: qk.worktrees() }),
+        qc.invalidateQueries({ queryKey: qk.remoteWorktrees() }),
         qc.invalidateQueries({ queryKey: ["github"] }),
         qc.invalidateQueries({ queryKey: qk.reviewRequests() }),
         qc.invalidateQueries({ queryKey: qk.wtState() }),

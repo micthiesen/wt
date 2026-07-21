@@ -53,6 +53,7 @@ import { visualKey, type useVisualItems } from "../hooks/useVisualItems.ts";
 import type { Modal } from "../modal-state.ts";
 import type { FooterMode } from "../panels/footer.tsx";
 import type { ListScrollHandle } from "../panels/list.tsx";
+import { isRemoteSummary } from "../remote-creation.ts";
 import { theme } from "../theme.ts";
 
 const appLog = createLogger("[app]");
@@ -71,6 +72,7 @@ export type NormalKeysCtx = {
   current: VisualItems["current"];
   currentItem: VisualItems["currentItem"];
   selectedPr: VisualItems["selectedPr"];
+  selectedRemote: VisualItems["selectedRemote"];
   selectedSection: VisualItems["selectedSection"];
   visualItems: VisualItems["visualItems"];
   cursorIndex: VisualItems["cursorIndex"];
@@ -96,6 +98,7 @@ export type NormalKeysCtx = {
   activeShellSessions: ReadonlySet<string>;
   activeDiffSessions: ReadonlySet<string>;
   renderer: Parameters<typeof enterShellSession>[0]["renderer"];
+  doEnterRemoteSession: (target: "shell" | "diff" | "harness") => void;
   doEnterHarnessSession: ReturnType<typeof makeSessionFlows>["doEnterHarnessSession"];
   // Flows
   handleGlobalKey: (k: KeyEvent) => boolean;
@@ -130,6 +133,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     current,
     currentItem,
     selectedPr,
+    selectedRemote,
     selectedSection,
     visualItems,
     cursorIndex,
@@ -147,6 +151,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     activeShellSessions,
     activeDiffSessions,
     renderer,
+    doEnterRemoteSession,
     doEnterHarnessSession,
     handleGlobalKey,
     doShiftMove,
@@ -465,6 +470,10 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       !k.hyper &&
       !k.meta
     ) {
+      if (selectedRemote) {
+        doEnterRemoteSession("shell");
+        return;
+      }
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
         return;
@@ -526,6 +535,10 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       !k.hyper &&
       !k.meta
     ) {
+      if (selectedRemote) {
+        doEnterRemoteSession("diff");
+        return;
+      }
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
         return;
@@ -633,6 +646,10 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       !k.hyper &&
       !k.meta
     ) {
+      if (selectedRemote) {
+        doEnterRemoteSession("harness");
+        return;
+      }
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
         return;
@@ -700,6 +717,10 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       !k.hyper &&
       !k.meta
     ) {
+      if (selectedRemote) {
+        doEnterRemoteSession("harness");
+        return;
+      }
       if (!current) {
         toast("select a worktree first", theme.warn, 1500);
         return;
@@ -763,6 +784,40 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       toast("no section here to fold", theme.fgDim, 1500);
+      return;
+    }
+    // Remote rows use the shared navigation keys and the F10/F11/F12 session
+    // routes above. Deletion is forwarded through the remote host's normal
+    // `wt rm` command so its lock, dirty, and unpushed-work checks stay
+    // authoritative.
+    if (selectedRemote) {
+      if (isPlainLetter(k, "d")) {
+        if (!isRemoteSummary(selectedRemote)) {
+          toast("remote worktree is still being created", theme.warn, 1800);
+          return;
+        }
+        if (selectedRemote.status === StatusKind.Busy) {
+          toast(
+            `${selectedRemote.slug} is ${selectedRemote.statusLabel}`,
+            theme.warn,
+            2200,
+          );
+          return;
+        }
+        const force = selectedRemote.dirty;
+        setModal({
+          kind: "confirm",
+          pendingKey: force ? "remote-d!" : "remote-d",
+          remoteSlug: selectedRemote.slug,
+          title: force ? "force remove remote worktree" : "remove remote worktree",
+          message: `Remove ${selectedRemote.slug} from ${selectedRemote.hostLabel}?`,
+          detail: force
+            ? "Uncommitted changes will be lost. The remote branch will also be deleted."
+            : "The remote branch will also be deleted.",
+          confirmLabel: "remove",
+          danger: true,
+        });
+      }
       return;
     }
     // Review-request rows: a tiny set of PR-only keybinds, no

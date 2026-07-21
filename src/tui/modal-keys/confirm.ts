@@ -89,6 +89,7 @@ export function handleConfirmKey(
   const {
     setModal,
     doRemove,
+    doRemoteRemove,
     doAutoMerge,
     doMarkReady,
     doShipPr,
@@ -111,6 +112,10 @@ export function handleConfirmKey(
       void doRemove(slug);
     } else if (pending === "d!" && slug) {
       void doRemove(slug, { force: true });
+    } else if (pending === "remote-d" && modal.remoteSlug) {
+      void doRemoteRemove(modal.remoteSlug);
+    } else if (pending === "remote-d!" && modal.remoteSlug) {
+      void doRemoteRemove(modal.remoteSlug, { force: true });
     } else if (pending === "m+" && slug) {
       void doAutoMerge(slug, "enable");
     } else if (pending === "m-" && slug) {

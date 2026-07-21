@@ -43,6 +43,13 @@ import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
+import {
+  isRemoteSummary,
+  remoteEntryKey,
+  remoteEntryLabel,
+  type RemoteListEntry,
+} from "../remote-creation.ts";
+import { NF } from "../icons.ts";
 import { Row } from "./details/row-cell.tsx";
 import { RebaseBlock } from "./details/rebase-block.tsx";
 import { RemovedBody } from "./details/removed-body.tsx";
@@ -62,6 +69,10 @@ type Props = {
   section?: SectionDetail;
   /** Set in the removed-worktrees view (`h`) — shows the history snapshot. */
   removed?: RemovedWorktree;
+  /** Transient SSH-hosted worktree selected in the local Inbox. */
+  remote?: RemoteListEntry;
+  remoteUnavailable?: boolean;
+  remoteError?: string | null;
   width: number;
   /**
    * Ref to the inner scrollbox of whichever body is mounted, so the
@@ -467,7 +478,72 @@ const DetailsBody = memo(function DetailsBody({
   );
 });
 
-export function Details({ row, reviewRequest, section, removed, width, scrollRef, sessionState }: Props) {
+function RemoteDetails({
+  entry,
+  unavailable,
+  error,
+}: {
+  entry: RemoteListEntry;
+  unavailable: boolean;
+  error: string | null;
+}) {
+  const status = unavailable
+    ? "host unavailable"
+    : isRemoteSummary(entry)
+      ? entry.statusLabel
+      : entry.status;
+  return (
+    <box
+      flexGrow={1}
+      border
+      borderStyle="single"
+      borderColor={theme.border}
+      title={` ${remoteEntryLabel(entry)} `}
+      titleAlignment="left"
+      padding={1}
+      flexDirection="column"
+    >
+      <text fg={theme.fg} attributes={TextAttributes.BOLD}>
+        {`${NF.remote} Remote worktree`}
+      </text>
+      <box marginTop={1} flexDirection="column">
+        <text><span fg={theme.fgDim}>host   </span>{entry.hostLabel}</text>
+        <text>
+          <span fg={theme.fgDim}>state  </span>
+          <span fg={unavailable ? theme.warn : theme.fg}>{status}</span>
+        </text>
+        {isRemoteSummary(entry) ? (
+          <>
+            <text><span fg={theme.fgDim}>branch </span>{entry.branch}</text>
+            <text><span fg={theme.fgDim}>path   </span>{entry.path}</text>
+          </>
+        ) : null}
+      </box>
+      <box marginTop={1}>
+        <text fg={unavailable ? theme.warn : theme.fgDim}>
+          {unavailable
+            ? error ?? "SSH host is offline; showing the last-known worktree state."
+            : isRemoteSummary(entry)
+            ? "F10 shell · F11 diff · F12 AI session"
+            : "Remote checkout is being prepared."}
+        </text>
+      </box>
+    </box>
+  );
+}
+
+export function Details({
+  row,
+  reviewRequest,
+  section,
+  removed,
+  remote,
+  remoteUnavailable = false,
+  remoteError = null,
+  width,
+  scrollRef,
+  sessionState,
+}: Props) {
   if (removed) {
     // Key by slug so cursor moves across history entries remount cleanly.
     return <RemovedBody key={`removed:${removed.slug}`} entry={removed} />;
@@ -484,6 +560,16 @@ export function Details({ row, reviewRequest, section, removed, width, scrollRef
         pr={reviewRequest}
         width={width}
         scrollRef={scrollRef}
+      />
+    );
+  }
+  if (remote) {
+    return (
+      <RemoteDetails
+        key={`remote:${remoteEntryKey(remote)}`}
+        entry={remote}
+        unavailable={remoteUnavailable}
+        error={remoteError}
       />
     );
   }

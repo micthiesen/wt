@@ -8,10 +8,12 @@
 import { existsSync } from "node:fs";
 
 import { actionRegistry } from "../../core/actions.ts";
+import { config } from "../../core/config.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { spawnBackgroundRemove } from "../../core/lifecycle.ts";
 import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
+import { runRemoteWt } from "../../core/remote.ts";
 import { removeShellLog } from "../../core/shell-tail.ts";
 import { rebaseStack, STACK_BUSY } from "../../core/stack-ops.ts";
 import { injectIntoSession, killAllSessionsFor } from "../../core/tmux.ts";
@@ -69,6 +71,7 @@ export type DestroyFlowsCtx = {
   invalidateWorktree: (slug: string) => Promise<void>;
   refreshAll: () => Promise<void>;
   refreshGithub: () => Promise<void>;
+  refreshRemoteWorktrees: () => Promise<void>;
   /**
    * Re-entry guard for `R`: the set of chains (stack id or standalone
    * branch) with a restack in flight. Same-chain re-presses are refused;
@@ -91,9 +94,51 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     invalidateWorktree,
     refreshAll,
     refreshGithub,
+    refreshRemoteWorktrees,
     restackBusyRef,
     primaryHarness,
   } = ctx;
+
+  async function doRemoteRemove(
+    slug: string,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
+    const remote = config.remote;
+    const log = createLogger(`[remote:${remote?.label ?? "remote"}]`);
+    if (!remote) {
+      toast("[remote] is not configured", theme.warn, 2200);
+      return;
+    }
+
+    const force = opts.force ?? false;
+    const args = [
+      "rm",
+      slug,
+      "--yes",
+      "--no-destroy-stage",
+      "--delete-branch",
+      ...(force ? ["--force"] : []),
+    ];
+    log.event.info(`removing ${slug}${force ? " (force)" : ""}`);
+    try {
+      const code = await runRemoteWt(remote, args, {
+        onLine: (line) => log.event.dim(line),
+      });
+      if (code !== 0) {
+        log.event.err(`remove failed (exit ${code})`);
+        toast(`remote remove failed (exit ${code})`, theme.err, 3000);
+        return;
+      }
+      log.event.ok(`removed ${slug} from ${remote.label}`);
+      toast(`removed ${slug} from ${remote.label}`, theme.ok, 2200);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.event.err(message);
+      toast(`remote remove failed: ${message}`, theme.err, 3500);
+    } finally {
+      await refreshRemoteWorktrees().catch(() => undefined);
+    }
+  }
 
   async function doRemove(
     slug: string,
@@ -487,5 +532,13 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     return restackBusyRef.current.has(restackKeyFor(stackId));
   }
 
-  return { doRemove, doClean, doCleanSlugs, doReplayStack, doRestackStack, isRestackBusy };
+  return {
+    doRemove,
+    doRemoteRemove,
+    doClean,
+    doCleanSlugs,
+    doReplayStack,
+    doRestackStack,
+    isRestackBusy,
+  };
 }

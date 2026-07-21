@@ -4,6 +4,14 @@
 
 Environment variables: `WT_CONFIG` points at an explicit config file; `XDG_CONFIG_HOME` relocates the default lookup (see [configuration.md](configuration.md)). Both are forwarded into the `wt events` launchd daemon so it loads the same config.
 
+### `wt remote [<command> ...]`
+
+With no arguments, allocate an SSH terminal and enter the `[remote]` host's
+interactive `wt`. With arguments, forward the exact argv through a shell-safe
+encoded transport to that installation—for example `wt remote ls --json` or
+`wt remote new eng-123 --no-install`. Requires the optional `[remote]` config
+and an independently configured `wt` on that host.
+
 ## Worktree lifecycle
 
 ### `wt ls`

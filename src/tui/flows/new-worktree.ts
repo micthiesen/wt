@@ -4,11 +4,14 @@
  * the `h` view). Extracted from `app.tsx`; rebuilt per render so the
  * closures see fresh setters.
  */
+import { config } from "../../core/config.ts";
 import { createWorktree, parseInput } from "../../core/lifecycle.ts";
 import { createLogger } from "../../core/logger.ts";
+import { runRemoteWt } from "../../core/remote.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { parseNewInput } from "../app-helpers.ts";
 import type { Modal } from "../modal-state.ts";
+import type { RemoteCreation } from "../remote-creation.ts";
 import { theme } from "../theme.ts";
 
 const newLog = createLogger("[new]");
@@ -21,12 +24,23 @@ type WorktreeCreateFlowsCtx = {
   setSection: (slug: string, section: string | null) => Promise<void>;
   setSel: (key: string | null) => void;
   setRemovedView: (v: boolean) => void;
+  setRemoteCreation: (creation: RemoteCreation | null) => void;
   refreshAll: () => Promise<void>;
+  refreshRemoteWorktrees: () => Promise<void>;
   toast: (message: string, color?: string, ms?: number) => void;
 };
 
 export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
-  const { setModal, setSection, setSel, setRemovedView, refreshAll, toast } = ctx;
+  const {
+    setModal,
+    setSection,
+    setSel,
+    setRemovedView,
+    setRemoteCreation,
+    refreshAll,
+    refreshRemoteWorktrees,
+    toast,
+  } = ctx;
 
   async function doNew(raw: string, defaultBase?: string): Promise<void> {
     const parsed = parseNewInput(raw, defaultBase);
@@ -70,6 +84,56 @@ export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
     }
     newLog.event.ok(`ready at ${result.path}`);
     void refreshAll();
+  }
+
+  /** Create on the remote host, then refresh its rows in this TUI. */
+  async function doRemoteNew(raw: string): Promise<void> {
+    const remote = config.remote;
+    if (!remote) {
+      toast("[remote] is not configured", theme.warn, 2200);
+      return;
+    }
+    const parsed = parseNewInput(raw);
+    if ("error" in parsed) {
+      newLog.event.err(parsed.error);
+      return;
+    }
+    const args = ["new", parsed.input, "--no-open"];
+    if (parsed.anyAuthor) args.push("--any");
+    if (parsed.base) args.push("--base", parsed.base);
+
+    const remoteLog = createLogger(`[remote:${remote.label}]`);
+    setRemoteCreation({
+      hostLabel: remote.label,
+      input: parsed.input,
+      status: "creating",
+    });
+    remoteLog.event.info(`creating ${parsed.input}`);
+    let code: number;
+    try {
+      code = await runRemoteWt(remote, args, {
+        onLine: (line) => remoteLog.event.dim(line),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      remoteLog.event.err(message);
+      toast(`remote create failed: ${message}`, theme.err, 3500);
+      setRemoteCreation(null);
+      return;
+    }
+    if (code !== 0) {
+      remoteLog.event.err(`create failed (exit ${code})`);
+      toast(`remote create failed (exit ${code})`, theme.err, 3000);
+      setRemoteCreation(null);
+      return;
+    }
+    remoteLog.event.ok(`ready on ${remote.label}`);
+    try {
+      await refreshRemoteWorktrees();
+      toast(`ready on ${remote.label}`, theme.ok, 1800);
+    } finally {
+      setRemoteCreation(null);
+    }
   }
 
   // Check out a review-requested PR's branch as a worktree and drop it
@@ -122,5 +186,5 @@ export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
     void refreshAll();
   }
 
-  return { doNew, doCheckoutReview, doRestoreRemoved };
+  return { doNew, doRemoteNew, doCheckoutReview, doRestoreRemoved };
 }

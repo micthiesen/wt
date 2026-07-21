@@ -54,6 +54,29 @@ Two related invariants:
 - The github source is **one GraphQL round-trip** aliasing every per-worktree PR field plus the repo merge-queue block. New PR fields go into `PR_FRAGMENT` in `core/github/fetch.ts`, never a separate query.
 - Anything that *mutates* GitHub state must invalidate `["github"]` (via `refreshGithub()` in `state/hooks.ts`), not the worktree — the github query is keyed by branch list, not slug.
 
+## Remote execution
+
+The optional `[remote]` host owns its clone, worktree paths, locks, and tmux
+processes, while the Mac owns the single visible TUI. `remoteWorktreesQuery`
+polls the host's `wt ls --json` and merges those summaries into the local
+Inbox; remote filesystem paths are never accessed as if they were local.
+The query's successful inventory is persisted for offline startup and retained
+across refetch failures. SSH failure changes host health only: rows render a
+warning and session keys are disabled until a later poll succeeds.
+
+`core/remote.ts` drives SSH, while `core/remote-protocol.ts` base64url-encodes
+the complete argv into a single shell-safe token. The remote `_remote` CLI
+entrypoint decodes that token and re-enters normal dispatch, avoiding any
+dependency on remote login-shell quoting.
+
+`Ctrl+N` forwards `wt new` and refreshes the remote-row query when creation
+finishes. F10/F11/F12 on a remote row use the hidden `_session` entrypoint;
+Cachy runs that one worktree's tmux session while `renderer-handoff.ts`
+suspends the Mac renderer. Detaching returns to the same Mac Inbox.
+`d` forwards the normal `wt rm` command after confirmation, preserving the
+remote installation's lock and dirty-work safeguards while explicitly leaving
+any SST stage intact.
+
 ## Modal UX rules
 
 Every list-picker modal follows the same shape so muscle memory carries across pickers. Hold to these when adding or modifying a picker:

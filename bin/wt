@@ -1,2 +1,16 @@
 #!/bin/sh
-exec bun "$(dirname "$0")/../src/main.ts" "$@"
+
+# Resolve symlinks so installs such as ~/bin/wt -> ~/.wt/bin/wt still find the
+# source tree relative to the real launcher rather than the symlink location.
+launcher=$0
+while [ -L "$launcher" ]; do
+  launcher_dir=$(CDPATH= cd -P -- "$(dirname -- "$launcher")" && pwd)
+  launcher_target=$(readlink "$launcher")
+  case $launcher_target in
+    /*) launcher=$launcher_target ;;
+    *) launcher=$launcher_dir/$launcher_target ;;
+  esac
+done
+
+launcher_dir=$(CDPATH= cd -P -- "$(dirname -- "$launcher")" && pwd)
+exec bun "$launcher_dir/../src/main.ts" "$@"

@@ -22,6 +22,7 @@ export type SimpleModalContext = {
   doYank: (slug: string, label: string, value: string | null) => void;
   doClean: () => void;
   doRemove: (slug: string, opts?: { force?: boolean }) => Promise<void>;
+  doRemoteRemove: (slug: string, opts?: { force?: boolean }) => Promise<void>;
   doAutoMerge: (slug: string, mode: "enable" | "disable") => Promise<void>;
   doMarkReady: (slug: string) => Promise<void>;
   doShipPr: (slug: string) => Promise<void>;

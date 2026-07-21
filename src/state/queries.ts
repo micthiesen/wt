@@ -8,6 +8,7 @@
  */
 
 export { worktreesQuery, fetchOriginNow, fetchOriginQuery, wtDirtyQuery, wtLockQuery, wtDeployQuery, wtMergedQuery, wtGoneQuery, wtSyncQuery, wtClaudeQuery, wtGitActivityQuery, wtConflictQuery, wtFirstCommitQuery } from "./queries/worktree.ts";
+export { remoteWorktreesQuery } from "./queries/remote.ts";
 
 export { archiveQuery, wtStateQuery } from "./queries/wtstate.ts";
 

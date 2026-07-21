@@ -57,6 +57,12 @@ The full reference — every option, default, the `[[actions]]` menu, and `[[aut
 
 `wt` with no arguments launches the TUI; press `?` inside for the full keymap and glyph legend. Subcommands (`wt new`, `wt rm`, `wt clean`, `wt restack`, …) run the same operations one-shot from a shell.
 
+An optional `[remote]` SSH target lets `Ctrl+N` create worktrees on a second
+machine while keeping them in the same Inbox; F10/F11/F12 route the selected
+row's shell, diff, or AI session over SSH, and `d` removes it on that host
+using the same safety checks as a local worktree. See
+[`docs/configuration.md`](docs/configuration.md#remote--optional-ssh-worktree-host).
+
 State is push-based: filesystem watchers on git refs, worktree dirs, and wt's own state feed the UI, so it tracks commits, pushes, installs, and deploys without manual refreshing. An optional webhook daemon extends that to GitHub-side events.
 
 ## Docs
