@@ -2,7 +2,7 @@ import { queryOptions } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
 import { claudeStatus, type ClaudeStatus } from "../../core/harness/claude/jsonl.ts";
-import { branchIsGone, branchIsMerged, firstCommitSubject, invalidateMainFirstParents, mergeConflictProbe, type MergeConflictProbe } from "../../core/git.ts";
+import { branchIsGone, branchIsMerged, effectiveBaseOrTrunk, firstCommitSubject, invalidateMainFirstParents, mergeConflictProbe, type MergeConflictProbe } from "../../core/git.ts";
 import { gitActivity, type GitActivity } from "../../core/git-activity.ts";
 import { lockStatus } from "../../core/locks.ts";
 import type {
@@ -134,6 +134,13 @@ export const wtGitActivityQuery = (
  * touches the working tree. Keyed by base like `sync` / `gitActivity`;
  * the `.git/refs` watcher's `["wt"]` invalidation refetches it on any
  * commit / fetch / push, so it tracks reality without its own trigger.
+ *
+ * The base is run through `effectiveBaseOrTrunk` (same as the diff /
+ * gitActivity) so a stacked slice's bare parent name resolves to the
+ * local branch OR `origin/<parent>` — the latter is the only ref a rift
+ * checkout has for a sibling slice. Without it a rift slice's probe
+ * either finds a stale/polluted local ref (a phantom conflict) or nothing
+ * at all; the shared resolution keeps the probe honest across backends.
  */
 export const wtConflictQuery = (
   wt: Pick<Worktree, "slug" | "path">,
@@ -143,7 +150,7 @@ export const wtConflictQuery = (
   return queryOptions({
     queryKey: qk.wt(wt.slug).conflict(base),
     queryFn: async (): Promise<MergeConflictProbe> =>
-      mergeConflictProbe("HEAD", base, wt.path),
+      mergeConflictProbe("HEAD", await effectiveBaseOrTrunk(wt.path, base), wt.path),
     staleTime: STALE.mid,
     ...KEEP_PREV,
   });

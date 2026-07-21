@@ -392,10 +392,17 @@ export async function resolveAnchor(
  * replayed this run, so its new tip is a commit written into the PARENT's
  * object store. When the slices share one (git-worktree) it's already
  * visible here. When the parent is an independent clone (rift), it isn't —
- * bring it over from the parent's own worktree with a local object fetch
- * (into `FETCH_HEAD`, creating no ref, so it doesn't disturb how rift
- * manages the clone). Gated on `hasCommit`, so the git-worktree path never
- * fetches; composes across a mixed chain.
+ * bring it over from the parent's own worktree.
+ *
+ * The fetch writes the parent's fresh tip into this clone's
+ * `refs/remotes/origin/<parent>` tracking ref (not `FETCH_HEAD`): the
+ * parent just force-pushed that tip to origin, so the tracking ref should
+ * mirror it, and keeping it fresh is what lets the post-restack conflict
+ * probe / diff (which resolve a rift slice's base through `origin/<parent>`)
+ * see reality instead of a stale tip. It's the remote-tracking namespace,
+ * NOT a `refs/heads/<parent>` local branch — creating those was the bug
+ * that left stale phantom-conflict refs behind. Gated on `hasCommit`, so
+ * the git-worktree path never fetches; composes across a mixed chain.
  */
 export async function resolveNewBaseSha(
   step: ChainStep,
@@ -407,14 +414,16 @@ export async function resolveNewBaseSha(
   if (step.parentBranch === null) {
     // Trunk root. A rift clone's `origin/<trunk>` is frozen at clone
     // time — the run's `fetchOrigin` only freshens the MAIN clone — so a
-    // rift root would otherwise rebase onto stale trunk. Take the fresh
-    // trunk tip from the main clone and bring it over when this clone
-    // lacks it (a no-op when they share a db, so git-worktree is
-    // unchanged).
+    // rift root would otherwise rebase onto stale trunk. Freshen this
+    // clone's `origin/<trunk>` from the main clone when it lags (a no-op
+    // when they share a db, so git-worktree is unchanged).
     const mainTrunk = await revParse(`origin/${trunk}`, config.paths.mainClone);
     if (mainTrunk && !(await hasCommit(cwd, mainTrunk))) {
       await run(
-        ["git", "fetch", "--no-tags", config.paths.mainClone, `refs/remotes/origin/${trunk}`],
+        [
+          "git", "fetch", "--no-tags", config.paths.mainClone,
+          `+refs/remotes/origin/${trunk}:refs/remotes/origin/${trunk}`,
+        ],
         { cwd },
       );
     }
@@ -425,9 +434,13 @@ export async function resolveNewBaseSha(
     if (await hasCommit(cwd, replayed)) return replayed;
     const parentPath = pathByBranch.get(step.parentBranch);
     if (parentPath) {
-      await run(["git", "fetch", "--no-tags", parentPath, step.parentBranch], {
-        cwd,
-      });
+      await run(
+        [
+          "git", "fetch", "--no-tags", parentPath,
+          `+refs/heads/${step.parentBranch}:refs/remotes/origin/${step.parentBranch}`,
+        ],
+        { cwd },
+      );
       if (await hasCommit(cwd, replayed)) return replayed;
     }
     return null;

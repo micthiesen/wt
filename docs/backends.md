@@ -84,12 +84,22 @@ git worktree, and it drives the rest of the design:
   rather than around it. For the Pass-2 rebase target — the parent's
   just-replayed tip, a commit that lives only in the parent's clone — the
   engine brings it over with a local object fetch from the parent's
-  worktree into `FETCH_HEAD` (no ref created), gated on the commit being
+  worktree into the clone's `origin/<parent>` remote-tracking ref (which
+  the parent just force-pushed, so the ref should mirror it) — NOT a
+  `refs/heads/<parent>` local branch, since creating those leaves stale
+  refs that later read as phantom conflicts. Gated on the commit being
   absent so the git-worktree path never fetches. Both compose across a
   MIXED chain (a plain linked worktree stacked on a rift clone, or vice
   versa — common right after flipping the backend on). `wt restack
   prune-backups` also sweeps each rift slice's own clone, since backups are
   created per-clone.
+- **Base resolution for reads.** The conflict-probe glyph and the diff /
+  sync counts resolve a stacked slice's base through `effectiveBaseOrTrunk`:
+  the local branch if present (git-worktree), else `origin/<parent>` (the
+  only ref a rift clone has for a sibling), else trunk. Keeping a rift
+  clone's `origin/<parent>` fresh (the restack does this on replay; it's
+  set at clone time otherwise) is what keeps that probe honest — against a
+  stale ref a just-restacked rift slice reads as a phantom conflict.
 - **Detection, not storage.** Which backend owns a checkout is derived
   from disk (`.rift` marker → rift) at removal time, never persisted. Flip
   `kind` freely; each checkout is torn down by whatever created it.

@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { effectiveBaseOrTrunk } from "./git.ts";
 import { resolveAnchor } from "./stack-ops.ts";
 import { anchorParentRef, resolveNewBaseSha } from "./stack-ops/replay.ts";
 import { restackEngine } from "./stack-ops/engine.ts";
@@ -97,6 +98,16 @@ test("rift: the anchor resolves via origin/<parent>, not the absent local branch
   // remote-tracking ref every clone carries — which resolves here.
   const parentRef = await anchorParentRef(step("p"), "main", child);
   expect(await resolveAnchor(step("p"), parentRef, child)).toBe(p1);
+});
+
+test("rift: a stacked base resolves through origin/<parent> when the local branch is absent", async () => {
+  const { parent, child } = buildClones();
+  // The parent has a local `p` (git-worktree analogue) → used directly.
+  expect(await effectiveBaseOrTrunk(parent, "p")).toBe("p");
+  // The child (independent clone) has no local `p`, only `origin/p` — the
+  // resolution the conflict probe / diff rely on so a rift slice bases on
+  // its real parent instead of a stale/polluted ref or a fat trunk diff.
+  expect(await effectiveBaseOrTrunk(child, "p")).toBe("origin/p");
 });
 
 test("rift: the new base is brought over from the parent clone when absent locally", async () => {

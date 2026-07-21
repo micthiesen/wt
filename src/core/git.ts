@@ -37,7 +37,17 @@ export async function effectiveBaseOrTrunk(
 ): Promise<string> {
   const trunk = `origin/${config.branch.base}`;
   if (!effectiveBase || effectiveBase === trunk) return trunk;
-  return (await revParse(effectiveBase, wtPath)) ? effectiveBase : trunk;
+  // Prefer the local branch: the git-worktree backend shares the main
+  // clone's object db, so a sibling slice's branch is a local ref (and
+  // carries any not-yet-pushed commits). A rift checkout is an independent
+  // clone where that branch ISN'T local — its only view of the sibling's
+  // tip is the `origin/<parent>` remote-tracking ref. Try that before
+  // degrading to a fat trunk diff, so a stacked rift slice bases on its
+  // real parent. Already-`origin/…` bases resolve on the first check.
+  if (await revParse(effectiveBase, wtPath)) return effectiveBase;
+  const originRef = `origin/${effectiveBase}`;
+  if (await revParse(originRef, wtPath)) return originRef;
+  return trunk;
 }
 
 /**
