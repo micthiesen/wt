@@ -5,7 +5,8 @@ import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
 import { createLogger } from "../core/logger.ts";
 import { config } from "../core/config.ts";
-import { remoteWorktreesQuery, useWtActions } from "../state/index.ts";
+import { qk, remoteWorktreesQuery, useWtActions } from "../state/index.ts";
+import type { RemoteWorktreeSummary } from "../core/remote-worktrees.ts";
 
 import { Details } from "./panels/details.tsx";
 import { Footer, type FooterMode } from "./panels/footer.tsx";
@@ -428,9 +429,12 @@ export function App({ onExit }: Props) {
     invalidateWorktree,
     refreshAll,
     refreshGithub,
-    refreshRemoteWorktrees: async () => {
-      await remoteWorktreeList.refetch();
-    },
+    optimisticRemoveRemoteWorktree: (slug, run) =>
+      mutate<RemoteWorktreeSummary[]>({
+        filter: { queryKey: qk.remoteWorktrees() },
+        patch: (prev) => prev?.filter((row) => row.slug !== slug),
+        run,
+      }),
     restackBusyRef,
     primaryHarness,
   });
@@ -727,7 +731,7 @@ export function App({ onExit }: Props) {
       : 0;
   const activeCount =
     rows.filter((r) => !r.archived).length + remoteRows.length + pendingRemoteCount;
-  const archivedCount = rows.length - activeCount;
+  const archivedCount = rows.filter((r) => r.archived).length;
   // The "refreshing" signal is the animated `RefreshWave` rendered after
   // this string (width = in-flight count); the title itself stays static
   // so it doesn't re-render on every count tick. `loading...` still wins

@@ -6,6 +6,7 @@ import {
 import { lockAge, lockLabel, lockStatus } from "../../core/locks.ts";
 import { latestLogFor } from "../../core/logs.ts";
 import { isOurStageDeployed } from "../../core/stage-safety.ts";
+import { killAllSessionsFor } from "../../core/tmux.ts";
 import type { Worktree } from "../../core/types.ts";
 import {
   listWorktrees,
@@ -154,6 +155,12 @@ export async function run(argv: string[]): Promise<number> {
 
   const destroyStage = await decideDestroyStage(target, parsed.destroyStage, parsed.yes);
   const deleteBranch = await decideDeleteBranch(target, parsed.deleteBranch);
+
+  // CLI callers do not have the TUI destroy flow's session teardown. In
+  // particular, SSH-backed rows enter remote shell/diff/harness sessions via
+  // this process but delete through `wt rm`, so clean them up here before the
+  // checkout disappears. This is idempotent when the TUI already did it.
+  await killAllSessionsFor(target.slug);
 
   if (parsed.background) {
     const logPath = spawnBackgroundRemove(target.slug, {

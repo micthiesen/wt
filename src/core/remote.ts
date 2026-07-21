@@ -29,7 +29,19 @@ export async function runRemoteWt(
   }
 
   return runStreaming(
-    ["ssh", remote.host, remoteWtCommand(remote, argv)],
+    [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=5",
+      "-o",
+      "ServerAliveInterval=5",
+      "-o",
+      "ServerAliveCountMax=3",
+      remote.host,
+      remoteWtCommand(remote, argv),
+    ],
     { cwd: process.cwd(), onLine: opts.onLine },
   );
 }

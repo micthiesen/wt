@@ -804,7 +804,10 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
           );
           return;
         }
-        const force = selectedRemote.dirty;
+        const force = selectedRemote.dirty || selectedRemote.unpushed > 0;
+        const forceDetail = selectedRemote.dirty
+          ? "Uncommitted changes will be lost. The remote branch will also be deleted."
+          : `${selectedRemote.unpushed} unpushed commit${selectedRemote.unpushed === 1 ? "" : "s"} will be lost. The remote branch will also be deleted.`;
         setModal({
           kind: "confirm",
           pendingKey: force ? "remote-d!" : "remote-d",
@@ -812,7 +815,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
           title: force ? "force remove remote worktree" : "remove remote worktree",
           message: `Remove ${selectedRemote.slug} from ${selectedRemote.hostLabel}?`,
           detail: force
-            ? "Uncommitted changes will be lost. The remote branch will also be deleted."
+            ? forceDetail
             : "The remote branch will also be deleted.",
           confirmLabel: "remove",
           danger: true,

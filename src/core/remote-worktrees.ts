@@ -14,6 +14,7 @@ export type RemoteWorktreeSummary = {
   statusLabel: string;
   statusAge: string | null;
   dirty: boolean;
+  unpushed: number;
   linearUrl: string | null;
 };
 
@@ -50,6 +51,12 @@ export function parseRemoteWorktrees(
       statusLabel: str("status_label"),
       statusAge: typeof row.status_age === "string" ? row.status_age : null,
       dirty: row.dirty === true,
+      unpushed:
+        typeof row.unpushed === "number" &&
+        Number.isInteger(row.unpushed) &&
+        row.unpushed >= 0
+          ? row.unpushed
+          : 0,
       linearUrl: typeof row.linear_url === "string" ? row.linear_url : null,
     };
   });
