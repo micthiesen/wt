@@ -75,18 +75,21 @@ git worktree, and it drives the rest of the design:
   fork-base reparenting of *dependents* is backend-agnostic (it edits
   wtstate) and still runs.
 - **Restacking.** `R` / `wt restack` replays each slice in its own
-  worktree, but a rift slice can't see a sibling slice's commits (separate
-  object stores). So before it anchors and replays a rift slice, the
-  engine fetches the refs it needs straight out of the sibling/main clone
-  into that slice — the same file-path `git fetch --no-tags <path>
-  <refspec>` the create path uses (`core/stack-ops/rift-refs.ts`): the
-  parent branch tip (for the squash-safe anchor's merge-base), the
-  parent's just-replayed new tip (the rebase target), fresh `origin/<trunk>`,
-  and the branch's own `origin/<branch>` ref (for the push-staleness read).
-  It's a no-op under git-worktree (the shared object db already has
-  everything), detected per-slice via the `.rift` marker so a mixed or
-  post-flip chain still works. `wt restack prune-backups` likewise sweeps
-  each rift slice's own clone, since backups are created per-clone.
+  worktree. A rift slice can't see a sibling slice's branch as a LOCAL ref
+  (separate object stores), so the engine resolves a parent through the
+  `origin/<parent>` remote-tracking ref every clone carries instead of the
+  bare branch name (`anchorParentRef` in `core/stack-ops/replay.ts`) — it
+  prefers the local branch when present (git-worktree, unpushed-safe) and
+  falls back to `origin/<parent>`, so it works with rift's own ref layout
+  rather than around it. For the Pass-2 rebase target — the parent's
+  just-replayed tip, a commit that lives only in the parent's clone — the
+  engine brings it over with a local object fetch from the parent's
+  worktree into `FETCH_HEAD` (no ref created), gated on the commit being
+  absent so the git-worktree path never fetches. Both compose across a
+  MIXED chain (a plain linked worktree stacked on a rift clone, or vice
+  versa — common right after flipping the backend on). `wt restack
+  prune-backups` also sweeps each rift slice's own clone, since backups are
+  created per-clone.
 - **Detection, not storage.** Which backend owns a checkout is derived
   from disk (`.rift` marker → rift) at removal time, never persisted. Flip
   `kind` freely; each checkout is torn down by whatever created it.
@@ -134,15 +137,17 @@ mutation points — don't spread backend branching across the flows.
   branch lives only in the clone's `.git`; removing the checkout destroys
   it regardless of the flag. A pushed branch survives on origin either way.
 - Each checkout duplicates the object db (cheap on disk via CoW, but the
-  refs are not shared): a `git fetch` in the main clone doesn't update a
-  rift checkout's remote-tracking refs. The restack engine handles this
-  explicitly (see **Restacking** above — it fetches the refs it needs into
-  each slice before anchoring/replaying), and push works per-clone. But
-  ad-hoc cross-checkout ref reads *outside* the engine don't propagate —
-  e.g. a sibling's just-merged/pushed state can lag a rift row until its
-  staleTime, and the mid-rebase conflict glyph (watched via
-  `.git/worktrees/<slug>/rebase-*`) doesn't fire for a rift clone's own
-  in-clone rebase, so it updates on the interval rather than instantly.
+  refs are not shared): a sibling slice's branch isn't a local ref in a
+  rift checkout. The restack engine handles this by resolving parents
+  through the shared `origin/<parent>` refs and a local object fetch for
+  the just-replayed tip (see **Restacking** above), and push works
+  per-clone. The
+  mid-rebase conflict glyph is push-based for rift too: a per-clone watcher
+  on each rift slice's own `.git/rebase-*` (`RiftRebaseWatchSet`) fires the
+  conflict probe, the independent-clone analogue of the linked-worktree
+  `.git/worktrees/<slug>/rebase-*` watcher. Other ad-hoc cross-checkout ref
+  reads *outside* these paths still don't propagate — e.g. a sibling's
+  just-merged/pushed state can lag a rift row until its staleTime.
 - `--copy-all` also brings other regenerable artifacts (`dist`, `.turbo`,
   caches) across via CoW — harmless for a fresh identical checkout, and
   free.

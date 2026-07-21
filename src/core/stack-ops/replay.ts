@@ -1,15 +1,12 @@
 import { config } from "../config.ts";
 import { firstSha, gitQuiet, gitRun, rebaseInProgress, revParse } from "../git.ts";
+import { run } from "../proc.ts";
 import { restackEngine } from "./engine.ts";
 import { resolveChain, type ChainStep, type RestackChain } from "./chain.ts";
 import { advanceBaseAnchor } from "../wtstate.ts";
 import { fetchOrigin, worktreeHasTrackedChanges } from "../worktree.ts";
 import { lockChain, log, retargetIfNeeded, STACK_BUSY, type Logger } from "./shared.ts";
 import { reconcileStack } from "./reconcile.ts";
-import {
-  materializeParentNewTip,
-  materializeSliceRefsPreAnchor,
-} from "./rift-refs.ts";
 
 // ---------- reconcile / replay / rebase ----------
 
@@ -170,8 +167,9 @@ async function replayStackLocked(
     };
   }
 
-  // Branch → its slice path, so a rift slice can fetch an in-chain
-  // parent's refs out of the parent's independent object store.
+  // Branch → its slice path, so a slice whose parent is an independent
+  // clone (rift) can bring the parent's just-replayed commits over from
+  // the parent's own worktree in Pass 2.
   const pathByBranch = new Map(
     chain.steps.map((s) => [s.branch, s.worktreePath] as const),
   );
@@ -182,11 +180,11 @@ async function replayStackLocked(
   // run before a single branch has been pushed.
   const anchorByBranch = new Map<string, string>();
   for (const s of chain.steps) {
-    // Under rift each slice is an independent clone; pull the parent
-    // tip + fresh trunk/origin refs into it so the anchor reads resolve
-    // (no-op under git-worktree — shared object db).
-    await materializeSliceRefsPreAnchor(s, trunk, pathByBranch, onLog);
-    const anchor = await resolveAnchor(s, parentRefOf(s, trunk), s.worktreePath);
+    const anchor = await resolveAnchor(
+      s,
+      await anchorParentRef(s, trunk, s.worktreePath),
+      s.worktreePath,
+    );
     if (!anchor) {
       return {
         ok: false,
@@ -203,12 +201,13 @@ async function replayStackLocked(
   let replayed = 0;
   for (const s of chain.steps) {
     const anchor = anchorByBranch.get(s.branch)!;
-    // Under rift, the parent replayed earlier in THIS loop and its new
-    // tip lives only in the parent's clone — fetch it into this slice so
-    // the child rebases onto a commit its object store actually has
-    // (no-op under git-worktree, and for trunk/external-parent slices).
-    await materializeParentNewTip(s, pathByBranch, onLog);
-    const newBase = await resolveNewBaseSha(s, trunk, newTipByBranch, s.worktreePath);
+    const newBase = await resolveNewBaseSha(
+      s,
+      trunk,
+      newTipByBranch,
+      pathByBranch,
+      s.worktreePath,
+    );
     if (!newBase) {
       return {
         ok: false,
@@ -281,9 +280,47 @@ async function replayStackLocked(
   return { ok: true, output: `replayed ${replayed}/${chain.steps.length} worktree(s)` };
 }
 
-/** The ref naming a member's parent tip as it stands now (pre-replay). */
+/** The ref naming a member's parent tip as it stands now (pre-replay).
+ *  Used only for the anchor-failure error message; the actual anchor
+ *  resolution goes through `anchorParentRef`. */
 function parentRefOf(step: ChainStep, trunk: string): string {
   return step.parentBranch ?? `origin/${trunk}`;
+}
+
+/**
+ * The ref `resolveAnchor` runs its merge-base against — resolved so it
+ * works regardless of which backend the slices use. A stacked child's
+ * parent branch is a LOCAL ref only when they share an object store (the
+ * git-worktree backend, where every worktree reads the main clone's db).
+ * When the parent is an independent clone (the rift backend), its branch
+ * isn't local to the child; the parent tip is reachable only through the
+ * `origin/<parent>` remote-tracking ref every clone fetches. A chain can
+ * mix the two (a plain worktree stacked on a rift clone, or vice versa),
+ * so prefer the local branch (unpushed-safe for git-worktree) and fall
+ * back to `origin/<parent>` (rift). Last resort: the bare name, letting
+ * `resolveAnchor` lean on the recorded `baseSha`. Trunk roots anchor on
+ * `origin/<trunk>`, which exists in every clone.
+ */
+export async function anchorParentRef(
+  step: ChainStep,
+  trunk: string,
+  cwd: string,
+): Promise<string> {
+  if (step.parentBranch === null) return `origin/${trunk}`;
+  const sha = await firstSha(cwd, [
+    step.parentBranch,
+    `origin/${step.parentBranch}`,
+  ]);
+  return sha ?? step.parentBranch;
+}
+
+/** Is `sha` a commit object present in `cwd`'s store? (`rev-parse` alone
+ *  validates syntax, not presence, so a bare SHA can't be trusted.) */
+async function hasCommit(cwd: string, sha: string): Promise<boolean> {
+  return (
+    (await run(["git", "cat-file", "-e", `${sha}^{commit}`], { cwd }))
+      .exitCode === 0
+  );
 }
 
 /**
@@ -350,17 +387,52 @@ export async function resolveAnchor(
  * The SHA to rebase a member ONTO this run: trunk's freshly-fetched tip,
  * an in-chain parent's just-replayed tip, or an external parent branch's
  * live tip (a branch stacked on a parent with no live worktree).
+ *
+ * The in-chain-parent case is where backends diverge. The parent already
+ * replayed this run, so its new tip is a commit written into the PARENT's
+ * object store. When the slices share one (git-worktree) it's already
+ * visible here. When the parent is an independent clone (rift), it isn't —
+ * bring it over from the parent's own worktree with a local object fetch
+ * (into `FETCH_HEAD`, creating no ref, so it doesn't disturb how rift
+ * manages the clone). Gated on `hasCommit`, so the git-worktree path never
+ * fetches; composes across a mixed chain.
  */
-async function resolveNewBaseSha(
+export async function resolveNewBaseSha(
   step: ChainStep,
   trunk: string,
   newTipByBranch: Map<string, string>,
+  pathByBranch: ReadonlyMap<string, string>,
   cwd: string,
 ): Promise<string | null> {
-  if (step.parentBranch === null) return revParse(`origin/${trunk}`, cwd);
+  if (step.parentBranch === null) {
+    // Trunk root. A rift clone's `origin/<trunk>` is frozen at clone
+    // time — the run's `fetchOrigin` only freshens the MAIN clone — so a
+    // rift root would otherwise rebase onto stale trunk. Take the fresh
+    // trunk tip from the main clone and bring it over when this clone
+    // lacks it (a no-op when they share a db, so git-worktree is
+    // unchanged).
+    const mainTrunk = await revParse(`origin/${trunk}`, config.paths.mainClone);
+    if (mainTrunk && !(await hasCommit(cwd, mainTrunk))) {
+      await run(
+        ["git", "fetch", "--no-tags", config.paths.mainClone, `refs/remotes/origin/${trunk}`],
+        { cwd },
+      );
+    }
+    return mainTrunk ?? revParse(`origin/${trunk}`, cwd);
+  }
   const replayed = newTipByBranch.get(step.parentBranch);
-  if (replayed) return replayed;
+  if (replayed) {
+    if (await hasCommit(cwd, replayed)) return replayed;
+    const parentPath = pathByBranch.get(step.parentBranch);
+    if (parentPath) {
+      await run(["git", "fetch", "--no-tags", parentPath, step.parentBranch], {
+        cwd,
+      });
+      if (await hasCommit(cwd, replayed)) return replayed;
+    }
+    return null;
+  }
   // Parent outside this run (external ref, or the standalone fallback):
-  // prefer the local checkout, fall back to origin.
+  // prefer the local checkout, fall back to the remote-tracking ref.
   return firstSha(cwd, [step.parentBranch, `origin/${step.parentBranch}`]);
 }
