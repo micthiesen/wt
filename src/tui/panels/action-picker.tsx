@@ -8,6 +8,7 @@ import {
 import type { ActionDef } from "../../core/config.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import { Modal } from "../modal.tsx";
+import { ScrollableList } from "./scroll-list.tsx";
 import { theme } from "../theme.ts";
 
 /** Claude-flavored action def — the only kind that uses the edit modal. */
@@ -115,6 +116,11 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
   // Claude Code's robot glyph, reused verbatim from the harness registry
   // so the action-kind marker matches the session badges.
   const claudeGlyph = getHarness("claude").glyph;
+  const rowId = (item: PickerItem): string =>
+    item.kind === "custom" ? "action:__custom__" : `action:${item.def.id}`;
+  const selectedId = items[selectedIndex]
+    ? rowId(items[selectedIndex]!)
+    : undefined;
   return (
     <Modal
       title={`action · ${slug}`}
@@ -127,6 +133,7 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
         ["esc / q", "cancel"],
       ]}
     >
+      <ScrollableList selectedId={selectedId} revision={items}>
       {items.map((item, i) => {
         const selected = i === selectedIndex;
         const bg = selected ? theme.rowSelectedBg : undefined;
@@ -190,6 +197,7 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
               </box>
             ) : null}
             <box
+              id={rowId(item)}
               flexDirection="row"
               backgroundColor={bg}
               paddingLeft={1}
@@ -213,6 +221,7 @@ export function ActionPickerModal({ slug, items, selectedIndex }: Props) {
           </Fragment>
         );
       })}
+      </ScrollableList>
     </Modal>
   );
 }
@@ -243,37 +252,42 @@ export function ActionEditModal({ slug, def, extras, vars }: EditProps) {
         ["^C", "cancel"],
       ]}
     >
-      {def ? (
-        <box flexDirection="column" marginBottom={1}>
+      {/* A long rendered prompt plus freeform extras can outgrow the
+          modal; scroll the region and keep the input (always at the end
+          of `extras`) in view as the user types. */}
+      <ScrollableList selectedId="edit:input" revision={extras}>
+        {def ? (
+          <box flexDirection="column" marginBottom={1}>
+            <text fg={theme.fgDim} attributes={1}>
+              prompt
+            </text>
+            <box flexDirection="column" marginTop={0}>
+              {renderedPrompt.split("\n").map((line, i) => (
+                <text key={i} fg={theme.fg} wrapMode="word">
+                  {line || " "}
+                </text>
+              ))}
+            </box>
+          </box>
+        ) : null}
+        <box id="edit:input" flexDirection="column">
           <text fg={theme.fgDim} attributes={1}>
-            prompt
+            {def ? "additional instructions" : "prompt"}
           </text>
           <box flexDirection="column" marginTop={0}>
-            {renderedPrompt.split("\n").map((line, i) => (
-              <text key={i} fg={theme.fg} wrapMode="word">
-                {line || " "}
+            {extras.length === 0 ? (
+              <text fg={theme.fgDim}>
+                <span fg={theme.accent}>█</span>
+                {def
+                  ? " (optional — type to append, ⏎ to launch)"
+                  : " (type your prompt, ⏎ to launch)"}
               </text>
-            ))}
+            ) : (
+              <ExtrasView text={extras} />
+            )}
           </box>
         </box>
-      ) : null}
-      <box flexDirection="column" flexGrow={1}>
-        <text fg={theme.fgDim} attributes={1}>
-          {def ? "additional instructions" : "prompt"}
-        </text>
-        <box flexDirection="column" marginTop={0} flexGrow={1}>
-          {extras.length === 0 ? (
-            <text fg={theme.fgDim}>
-              <span fg={theme.accent}>█</span>
-              {def
-                ? " (optional — type to append, ⏎ to launch)"
-                : " (type your prompt, ⏎ to launch)"}
-            </text>
-          ) : (
-            <ExtrasView text={extras} />
-          )}
-        </box>
-      </box>
+      </ScrollableList>
     </Modal>
   );
 }

@@ -4,6 +4,7 @@ import {
   outputStatusLabel,
 } from "../../core/outputs.ts";
 import { Modal } from "../modal.tsx";
+import { ScrollableList } from "./scroll-list.tsx";
 import { theme } from "../theme.ts";
 
 function statusFg(status: OutputStatus): string {
@@ -65,7 +66,11 @@ export function OutputsPicker({ slug, items, selectedIndex }: Props) {
       {items.length === 0 ? (
         <text fg={theme.fgDim}>(no outputs)</text>
       ) : (
-        items.map((o, i) => {
+        <ScrollableList
+          selectedId={items[selectedIndex] ? `out:${items[selectedIndex]!.id}` : undefined}
+          revision={items}
+        >
+        {items.map((o, i) => {
           const selected = i === selectedIndex;
           const bg = selected ? theme.rowSelectedBg : undefined;
           const fg = selected ? theme.fgBright : theme.fg;
@@ -80,6 +85,7 @@ export function OutputsPicker({ slug, items, selectedIndex }: Props) {
                 : relTime(o.lastActivity, now);
           return (
             <box
+              id={`out:${o.id}`}
               key={o.id}
               flexDirection="row"
               backgroundColor={bg}
@@ -103,7 +109,8 @@ export function OutputsPicker({ slug, items, selectedIndex }: Props) {
               <text fg={theme.fgDim}>{right}</text>
             </box>
           );
-        })
+        })}
+        </ScrollableList>
       )}
     </Modal>
   );

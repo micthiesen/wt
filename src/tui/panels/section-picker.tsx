@@ -1,4 +1,5 @@
 import { Modal } from "../modal.tsx";
+import { ScrollableList } from "./scroll-list.tsx";
 import { theme } from "../theme.ts";
 
 export type SectionPickerItem =
@@ -53,6 +54,7 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
         ["esc / q", "cancel"],
       ]}
     >
+      <ScrollableList selectedId={`sec:${selectedIndex}`} revision={items}>
       {items.map((item, i) => {
         const selected = i === selectedIndex;
         const bg = selected ? theme.rowSelectedBg : undefined;
@@ -71,6 +73,7 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
             : fg;
         return (
           <box
+            id={`sec:${i}`}
             key={i}
             flexDirection="row"
             backgroundColor={bg}
@@ -89,6 +92,7 @@ export function SectionPickerModal({ title, items, selectedIndex, newName }: Pro
           </box>
         );
       })}
+      </ScrollableList>
     </Modal>
   );
 }

@@ -1,5 +1,6 @@
 import type { HistoryEntry } from "../../core/actions.ts";
 import { Modal } from "../modal.tsx";
+import { ScrollableList } from "./scroll-list.tsx";
 import { theme } from "../theme.ts";
 
 type Props = {
@@ -30,27 +31,33 @@ export function PickerModal({
         ["esc / q", "cancel"],
       ]}
     >
-      {items.map((item, i) => {
-        const selected = i === selectedIndex;
-        const bg = selected ? theme.rowSelectedBg : undefined;
-        const fg = selected ? theme.fgBright : theme.fg;
-        return (
-          <box
-            key={item}
-            flexDirection="row"
-            backgroundColor={bg}
-            paddingLeft={1}
-            paddingRight={1}
-          >
-            <text fg={selected ? theme.accent : theme.fgDim}>
-              {selected ? "▸ " : "  "}
-            </text>
-            <text fg={fg} wrapMode="none" truncate>
-              {item}
-            </text>
-          </box>
-        );
-      })}
+      <ScrollableList
+        selectedId={items[selectedIndex] ? `pick:${items[selectedIndex]}` : undefined}
+        revision={items}
+      >
+        {items.map((item, i) => {
+          const selected = i === selectedIndex;
+          const bg = selected ? theme.rowSelectedBg : undefined;
+          const fg = selected ? theme.fgBright : theme.fg;
+          return (
+            <box
+              id={`pick:${item}`}
+              key={item}
+              flexDirection="row"
+              backgroundColor={bg}
+              paddingLeft={1}
+              paddingRight={1}
+            >
+              <text fg={selected ? theme.accent : theme.fgDim}>
+                {selected ? "▸ " : "  "}
+              </text>
+              <text fg={fg} wrapMode="none" truncate>
+                {item}
+              </text>
+            </box>
+          );
+        })}
+      </ScrollableList>
     </Modal>
   );
 }
@@ -98,34 +105,40 @@ export function MultiPickerModal({
       {items.length === 0 ? (
         <text fg={theme.fgDim}>no candidates</text>
       ) : null}
-      {items.map((item, i) => {
-        const cursor = i === selectedIndex;
-        const isChecked = checked.has(item.key);
-        const bg = cursor ? theme.rowSelectedBg : undefined;
-        const fg = cursor ? theme.fgBright : theme.fg;
-        const box = isChecked ? "[x]" : "[ ]";
-        const boxFg = isChecked ? theme.ok : theme.fgDim;
-        return (
-          <box
-            key={item.key}
-            flexDirection="row"
-            backgroundColor={bg}
-            paddingLeft={1}
-            paddingRight={1}
-          >
-            <text fg={cursor ? theme.accent : theme.fgDim}>
-              {cursor ? "▸ " : "  "}
-            </text>
-            <text fg={boxFg}>{box} </text>
-            <text fg={fg} wrapMode="none" truncate>
-              {item.label}
-              {item.hint ? (
-                <span fg={theme.fgDim}> {item.hint}</span>
-              ) : null}
-            </text>
-          </box>
-        );
-      })}
+      <ScrollableList
+        selectedId={items[selectedIndex] ? `multi:${items[selectedIndex]!.key}` : undefined}
+        revision={items}
+      >
+        {items.map((item, i) => {
+          const cursor = i === selectedIndex;
+          const isChecked = checked.has(item.key);
+          const bg = cursor ? theme.rowSelectedBg : undefined;
+          const fg = cursor ? theme.fgBright : theme.fg;
+          const box = isChecked ? "[x]" : "[ ]";
+          const boxFg = isChecked ? theme.ok : theme.fgDim;
+          return (
+            <box
+              id={`multi:${item.key}`}
+              key={item.key}
+              flexDirection="row"
+              backgroundColor={bg}
+              paddingLeft={1}
+              paddingRight={1}
+            >
+              <text fg={cursor ? theme.accent : theme.fgDim}>
+                {cursor ? "▸ " : "  "}
+              </text>
+              <text fg={boxFg}>{box} </text>
+              <text fg={fg} wrapMode="none" truncate>
+                {item.label}
+                {item.hint ? (
+                  <span fg={theme.fgDim}> {item.hint}</span>
+                ) : null}
+              </text>
+            </box>
+          );
+        })}
+      </ScrollableList>
     </Modal>
   );
 }
@@ -202,28 +215,31 @@ export function ArgPickerModal({
         ["esc / q", "cancel"],
       ]}
     >
-      {rows.map((row, i) => {
-        const selected = i === index;
-        const bg = selected ? theme.rowSelectedBg : undefined;
-        const labelFg = row.isNew ? theme.accent : (selected ? theme.fgBright : theme.fg);
-        return (
-          <box
-            key={`${i}-${row.label}`}
-            flexDirection="row"
-            backgroundColor={bg}
-            paddingLeft={1}
-            paddingRight={1}
-          >
-            <text fg={selected ? theme.accent : theme.fgDim}>
-              {selected ? "▸ " : "  "}
-            </text>
-            <text fg={labelFg} wrapMode="none" truncate>
-              {row.label}
-              {row.hint ? <span fg={theme.fgDim}> · {row.hint}</span> : null}
-            </text>
-          </box>
-        );
-      })}
+      <ScrollableList selectedId={`arg:${index}`} revision={rows.length}>
+        {rows.map((row, i) => {
+          const selected = i === index;
+          const bg = selected ? theme.rowSelectedBg : undefined;
+          const labelFg = row.isNew ? theme.accent : (selected ? theme.fgBright : theme.fg);
+          return (
+            <box
+              id={`arg:${i}`}
+              key={`${i}-${row.label}`}
+              flexDirection="row"
+              backgroundColor={bg}
+              paddingLeft={1}
+              paddingRight={1}
+            >
+              <text fg={selected ? theme.accent : theme.fgDim}>
+                {selected ? "▸ " : "  "}
+              </text>
+              <text fg={labelFg} wrapMode="none" truncate>
+                {row.label}
+                {row.hint ? <span fg={theme.fgDim}> · {row.hint}</span> : null}
+              </text>
+            </box>
+          );
+        })}
+      </ScrollableList>
     </Modal>
   );
 }

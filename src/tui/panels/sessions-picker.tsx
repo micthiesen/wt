@@ -37,8 +37,16 @@ import { HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import { STATE_DOT, stateColor } from "../claude-state.ts";
 import type { HarnessSessionEntry } from "../hooks/useHarnessSessions.ts";
 import { Modal } from "../modal.tsx";
+import { ScrollableList } from "./scroll-list.tsx";
 import { ageMsToText } from "../text.ts";
 import { theme } from "../theme.ts";
+
+/** Stable scroll-anchor id for a picker row. */
+function rowScrollId(row: PickerRow): string {
+  return row.kind === "new"
+    ? `sess:new:${row.harnessId}`
+    : `sess:${row.entry.harnessId}:${row.entry.sessionId}`;
+}
 
 export type PickerRow =
   | { kind: "session"; entry: HarnessSessionEntry }
@@ -123,6 +131,10 @@ export function SessionsPickerList({
       ]}
     >
       <box flexDirection="column" flexGrow={1} overflow="hidden">
+        <ScrollableList
+          selectedId={rows[selectedIndex] ? rowScrollId(rows[selectedIndex]!) : undefined}
+          revision={rows}
+        >
         {rows.map((row, i) => {
           const selected = i === selectedIndex;
           const bg = selected ? theme.rowSelectedBg : undefined;
@@ -137,6 +149,7 @@ export function SessionsPickerList({
               <>
                 {spacer}
                 <box
+                  id={`sess:new:${row.harnessId}`}
                   key={`new:${row.harnessId}`}
                   flexDirection="row"
                   backgroundColor={bg}
@@ -185,6 +198,7 @@ export function SessionsPickerList({
           if (showDigit) sessionDigitCursor++;
           return (
             <box
+              id={`sess:${e.harnessId}:${e.sessionId}`}
               key={`s:${e.harnessId}:${e.sessionId}`}
               flexDirection="row"
               backgroundColor={bg}
@@ -221,14 +235,16 @@ export function SessionsPickerList({
             </box>
           );
         })}
+        </ScrollableList>
+        {/* Summary stays pinned below the scrolling list (flexShrink={0});
+            summaries are short snippets, so natural height is fine. */}
         <box flexShrink={0} marginTop={1} flexDirection="row">
           <text fg={theme.fgDim}>
             {"─".repeat(2)} summary {"─".repeat(2)}
           </text>
         </box>
         <box
-          flexGrow={1}
-          flexShrink={1}
+          flexShrink={0}
           overflow="hidden"
           paddingLeft={1}
           paddingRight={1}

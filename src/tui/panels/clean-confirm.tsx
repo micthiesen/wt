@@ -1,6 +1,7 @@
 import { StatusKind } from "../../core/types.ts";
 import { NF } from "../icons.ts";
 import { Modal } from "../modal.tsx";
+import { ScrollableList } from "./scroll-list.tsx";
 import { theme } from "../theme.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 
@@ -51,7 +52,7 @@ export function CleanConfirmModal({ candidates }: Props) {
           . Branches will be deleted.
         </text>
       </box>
-      <box flexDirection="column" flexGrow={1} overflow="hidden">
+      <ScrollableList>
         {candidates.map((row) => {
           const deployed = row.fields.deploy.data ?? false;
           return (
@@ -80,7 +81,7 @@ export function CleanConfirmModal({ candidates }: Props) {
             </box>
           );
         })}
-      </box>
+      </ScrollableList>
     </Modal>
   );
 }
