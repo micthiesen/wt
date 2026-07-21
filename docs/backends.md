@@ -74,6 +74,19 @@ git worktree, and it drives the rest of the design:
   it. Branch deletion is moot — the branch vanishes with the clone. The
   fork-base reparenting of *dependents* is backend-agnostic (it edits
   wtstate) and still runs.
+- **Restacking.** `R` / `wt restack` replays each slice in its own
+  worktree, but a rift slice can't see a sibling slice's commits (separate
+  object stores). So before it anchors and replays a rift slice, the
+  engine fetches the refs it needs straight out of the sibling/main clone
+  into that slice — the same file-path `git fetch --no-tags <path>
+  <refspec>` the create path uses (`core/stack-ops/rift-refs.ts`): the
+  parent branch tip (for the squash-safe anchor's merge-base), the
+  parent's just-replayed new tip (the rebase target), fresh `origin/<trunk>`,
+  and the branch's own `origin/<branch>` ref (for the push-staleness read).
+  It's a no-op under git-worktree (the shared object db already has
+  everything), detected per-slice via the `.rift` marker so a mixed or
+  post-flip chain still works. `wt restack prune-backups` likewise sweeps
+  each rift slice's own clone, since backups are created per-clone.
 - **Detection, not storage.** Which backend owns a checkout is derived
   from disk (`.rift` marker → rift) at removal time, never persisted. Flip
   `kind` freely; each checkout is torn down by whatever created it.
@@ -122,9 +135,14 @@ mutation points — don't spread backend branching across the flows.
   it regardless of the flag. A pushed branch survives on origin either way.
 - Each checkout duplicates the object db (cheap on disk via CoW, but the
   refs are not shared): a `git fetch` in the main clone doesn't update a
-  rift checkout's remote-tracking refs. Per-checkout git operations
-  (restack replay, push, the stacking fetch above) work because each
-  clone has its own remotes; cross-checkout ref propagation does not.
+  rift checkout's remote-tracking refs. The restack engine handles this
+  explicitly (see **Restacking** above — it fetches the refs it needs into
+  each slice before anchoring/replaying), and push works per-clone. But
+  ad-hoc cross-checkout ref reads *outside* the engine don't propagate —
+  e.g. a sibling's just-merged/pushed state can lag a rift row until its
+  staleTime, and the mid-rebase conflict glyph (watched via
+  `.git/worktrees/<slug>/rebase-*`) doesn't fire for a rift clone's own
+  in-clone rebase, so it updates on the interval rather than instantly.
 - `--copy-all` also brings other regenerable artifacts (`dist`, `.turbo`,
   caches) across via CoW — harmless for a fresh identical checkout, and
   free.

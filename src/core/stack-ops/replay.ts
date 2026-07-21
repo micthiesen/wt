@@ -6,6 +6,10 @@ import { advanceBaseAnchor } from "../wtstate.ts";
 import { fetchOrigin, worktreeHasTrackedChanges } from "../worktree.ts";
 import { lockChain, log, retargetIfNeeded, STACK_BUSY, type Logger } from "./shared.ts";
 import { reconcileStack } from "./reconcile.ts";
+import {
+  materializeParentNewTip,
+  materializeSliceRefsPreAnchor,
+} from "./rift-refs.ts";
 
 // ---------- reconcile / replay / rebase ----------
 
@@ -166,12 +170,22 @@ async function replayStackLocked(
     };
   }
 
+  // Branch → its slice path, so a rift slice can fetch an in-chain
+  // parent's refs out of the parent's independent object store.
+  const pathByBranch = new Map(
+    chain.steps.map((s) => [s.branch, s.worktreePath] as const),
+  );
+
   // Pass 1: resolve each member's anchor (the old parent tip its
   // commits sit on) BEFORE any rewrite — so the merge-base fallback
   // sees pre-replay tips, AND so an unresolvable anchor fails the whole
   // run before a single branch has been pushed.
   const anchorByBranch = new Map<string, string>();
   for (const s of chain.steps) {
+    // Under rift each slice is an independent clone; pull the parent
+    // tip + fresh trunk/origin refs into it so the anchor reads resolve
+    // (no-op under git-worktree — shared object db).
+    await materializeSliceRefsPreAnchor(s, trunk, pathByBranch, onLog);
     const anchor = await resolveAnchor(s, parentRefOf(s, trunk), s.worktreePath);
     if (!anchor) {
       return {
@@ -189,6 +203,11 @@ async function replayStackLocked(
   let replayed = 0;
   for (const s of chain.steps) {
     const anchor = anchorByBranch.get(s.branch)!;
+    // Under rift, the parent replayed earlier in THIS loop and its new
+    // tip lives only in the parent's clone — fetch it into this slice so
+    // the child rebases onto a commit its object store actually has
+    // (no-op under git-worktree, and for trunk/external-parent slices).
+    await materializeParentNewTip(s, pathByBranch, onLog);
     const newBase = await resolveNewBaseSha(s, trunk, newTipByBranch, s.worktreePath);
     if (!newBase) {
       return {

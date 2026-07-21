@@ -22,6 +22,7 @@ Terminal UI for keeping multiple git worktrees in flight at once. Each row shows
 - Linear — no CLI or token; issue URLs are constructed from branch slugs, and PRs can open in Linear Reviews.
 - Coding agents — live sessions are *detected* by reading each agent's local files, no CLI needed; *spawning* from the TUI needs that agent's CLI on PATH (`claude`, `codex`, `opencode`). Claude is the most complete integration; Codex and OpenCode are partial today.
 - An AI provider (OpenAI-compatible endpoint or Gemini) — the generated title + description in the details pane.
+- [`rift`](https://github.com/anomalyco/rift) — an opt-in copy-on-write worktree backend (`[backend] kind = "rift"`): near-instant checkouts that bring `node_modules` across for free. See [docs/backends.md](docs/backends.md).
 
 ## Install
 
