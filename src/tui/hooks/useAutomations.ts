@@ -293,6 +293,10 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       const row = latest.current.rows.find((r) => r.wt.slug === slug);
       // A quiesce member that vanished (cleaned mid-queue) doesn't block.
       if (!row) continue;
+      // A member archived for cleanup but whose `_destroy` child hasn't
+      // grabbed the flock yet reads as unlocked and not-Busy — block on
+      // `archived` directly so a dispatch can't slip into that window.
+      if (row.archived) return `${slug} is being cleaned up`;
       if (row.status.kind === StatusKind.Busy) return `${slug} is busy`;
       if (lockStatus(slug)) return `${slug} is locked`;
       if (actionRegistry.get(slug)?.status === "running") {

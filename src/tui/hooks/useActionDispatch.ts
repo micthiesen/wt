@@ -25,12 +25,16 @@ import {
 import { recordRun as recordHistoryRun } from "../../core/actions.ts";
 import { config } from "../../core/config.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
-import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
 import { injectIntoSession } from "../../core/tmux.ts";
 import { StatusKind } from "../../core/types.ts";
 
-import { actionSkillPrefix, buildActionVars, extractLabel } from "../app-helpers.ts";
+import {
+  actionSkillPrefix,
+  buildActionVars,
+  extractLabel,
+  launchBlockedReason,
+} from "../app-helpers.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 import { theme } from "../theme.ts";
 
@@ -208,13 +212,18 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
       toast("prompt is empty", theme.warn, 1500);
       return { launched: false, reason: "prompt is empty" };
     }
-    // Refuse if the worktree is mid-destroy / mid-init — claude would
-    // race the cleanup and leave the tree in a confusing state. Mirrors
-    // the `doRemove` / `doNew` busy refusal pattern.
-    const lock = lockStatus(slug);
-    if (lock) {
-      toast(`${slug} is ${lockLabel(lock)}`, theme.warn, 2000);
-      return { launched: false, reason: `${slug} is ${lockLabel(lock)}` };
+    // Refuse if the worktree is being cleaned up (archived the instant a
+    // destroy/clean dispatches, before the flock exists) or mid-destroy /
+    // mid-init (flock held). The archived half matters: a clean/destroy
+    // flips `row.archived` synchronously but the detached `_destroy`
+    // child only grabs the flock a process-spawn later, so `lockStatus`
+    // alone leaves a window where an action would launch into a directory
+    // about to be `git worktree remove --force`d. `launchBlockedReason`
+    // checks both — the same gate every session launch uses.
+    const blocked = launchBlockedReason(row);
+    if (blocked) {
+      toast(`${slug} is ${blocked}`, theme.warn, 2000);
+      return { launched: false, reason: `${slug} is ${blocked}` };
     }
     if (row.status.kind === StatusKind.Busy) {
       toast(`${slug} is busy`, theme.warn, 2000);
