@@ -30,7 +30,7 @@ Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the 
 | `n` / `N` | new local worktree prompt (accepts a Linear URL/id, branch, or slug, plus `--any`, `--base <ref>`); `N` pre-fills `--base` with the selected row's branch |
 | `Ctrl+N` | create on `[remote]`; the worktree stays in this Inbox with a remote glyph, and F10/F11/F12 route that row's sessions over SSH |
 | `o` | open the worktree in Zed |
-| `d` | remove locally or on the row's remote host (confirm; escalates to a force-remove warning when dirty) |
+| `d` | remove locally or on the row's remote host (confirm; escalates to a force-remove warning when dirty/unpushed) |
 | `c` | clean all merged/gone worktrees (confirm) |
 | `a` | archive / restore the row |
 | `i` | open the Linear issue |

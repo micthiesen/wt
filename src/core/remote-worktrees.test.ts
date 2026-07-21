@@ -47,4 +47,20 @@ describe("parseRemoteWorktrees", () => {
       status: "wat", status_label: "wat", dirty: false,
     }]), "cachy")).toThrow("status is invalid");
   });
+
+  test("tolerates login-shell banner noise around the JSON payload", () => {
+    const payload = JSON.stringify([{
+      slug: "x", branch: "x", path: "/x", stage: "x", exists: true,
+      status: "clean", status_label: "clean", dirty: false, unpushed: 0,
+    }], null, 2);
+    const polluted = `Welcome to CachyOS!\ndirenv: loading .envrc\n${payload}\n`;
+    const [row] = parseRemoteWorktrees(polluted, "cachy");
+    expect(row?.slug).toBe("x");
+  });
+
+  test("gives a distinct diagnostic when stdout has no JSON at all", () => {
+    expect(() => parseRemoteWorktrees("command not found: wt\n", "cachy")).toThrow(
+      "did not return JSON",
+    );
+  });
 });

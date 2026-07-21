@@ -65,8 +65,7 @@ import { useSessionsPickerData } from "./hooks/useSessionsPickerData.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "./usage-badge.tsx";
 import { writeClipboard } from "../core/macos.ts";
 import { theme } from "./theme.ts";
-import { isRemoteSummary, type RemoteCreation } from "./remote-creation.ts";
-import { enterRemoteWorktreeSession } from "./sessions/remote.ts";
+import { type RemoteCreation } from "./remote-creation.ts";
 
 const appLog = createLogger("[app]");
 
@@ -460,6 +459,7 @@ export function App({ onExit }: Props) {
     doEnterSlotSession,
     doSpawnNamedClaudeSession,
     doKillClaudeSession,
+    doEnterRemoteSession,
   } = makeSessionFlows({
     rows,
     renderer,
@@ -469,6 +469,9 @@ export function App({ onExit }: Props) {
     refreshHarnessSessions,
     refreshClaudeSummaries,
     optimisticRemoveClaude,
+    selectedRemote,
+    remoteUnavailable,
+    reportActionError,
   });
 
 
@@ -655,6 +658,7 @@ export function App({ onExit }: Props) {
       currentItem,
       selectedPr,
       selectedRemote,
+      remoteUnavailable,
       selectedSection,
       visualItems,
       cursorIndex,
@@ -672,30 +676,7 @@ export function App({ onExit }: Props) {
       activeShellSessions,
       activeDiffSessions,
       renderer,
-      doEnterRemoteSession: (target) => {
-        if (!selectedRemote || !isRemoteSummary(selectedRemote)) {
-          toast("remote worktree is still being created", theme.warn, 1800);
-          return;
-        }
-        if (remoteUnavailable) {
-          toast(`${selectedRemote.hostLabel} is unavailable`, theme.warn, 2200);
-          return;
-        }
-        if (selectedRemote.status === "busy") {
-          toast(`${selectedRemote.slug} is ${selectedRemote.statusLabel}`, theme.warn, 2200);
-          return;
-        }
-        void enterRemoteWorktreeSession({
-          renderer,
-          worktree: selectedRemote,
-          target,
-          harnessId: primaryHarness,
-        })
-          .then((code) => {
-            if (code !== 0) toast(`remote session exited ${code}`, theme.warn, 2500);
-          })
-          .catch((err) => reportActionError("remote session", err));
-      },
+      doEnterRemoteSession,
       doEnterHarnessSession,
       handleGlobalKey: globalKey,
       doShiftMove,

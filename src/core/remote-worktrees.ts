@@ -20,11 +20,42 @@ export type RemoteWorktreeSummary = {
 
 const STATUS_KINDS = new Set<string>(Object.values(StatusKind));
 
+/**
+ * The remote `wt ls --json` runs through the account's login shell, which
+ * can prepend/append stray output (fish/bash startup banners, direnv,
+ * asdf/nvm, motd tooling) even for a non-interactive command. That noise
+ * corrupts a naive `JSON.parse`, and the resulting `SyntaxError` is
+ * indistinguishable in the UI from a genuine SSH failure. Only the argv-IN
+ * direction is base64-hardened; this hardens the JSON-OUT direction: parse
+ * the raw text, and on failure fall back to the outer `[...]` slice (the
+ * payload is pretty-printed and is the last real thing wt emits) before
+ * giving up with a diagnostic that names the actual cause.
+ */
+function parseWorktreeJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf("[");
+    const end = raw.lastIndexOf("]");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(raw.slice(start, end + 1));
+      } catch {
+        /* fall through to the diagnostic below */
+      }
+    }
+    const snippet = raw.trim().slice(0, 200);
+    throw new Error(
+      `remote wt ls did not return JSON — check the remote shell startup for stray output. Got: ${snippet || "(empty)"}`,
+    );
+  }
+}
+
 export function parseRemoteWorktrees(
   raw: string,
   hostLabel: string,
 ): RemoteWorktreeSummary[] {
-  const value: unknown = JSON.parse(raw);
+  const value: unknown = parseWorktreeJson(raw);
   if (!Array.isArray(value)) throw new Error("remote wt ls returned non-array JSON");
   return value.map((entry, index) => {
     if (!entry || typeof entry !== "object") {

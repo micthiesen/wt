@@ -20,6 +20,18 @@ export async function runRemoteWt(
       [
         "ssh",
         "-t",
+        // Bound the TCP connect + detect a mid-session drop. Without
+        // these, an unreachable host hangs on the OS connect timeout
+        // (often 60s+) AFTER the renderer is already suspended and the
+        // terminal handed off — a frozen blank screen. BatchMode is
+        // deliberately omitted here so interactive password/2FA auth
+        // still works; only the timeouts are added.
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=3",
         remote.host,
         remoteWtCommand(remote, argv.length > 0 ? argv : null),
       ],

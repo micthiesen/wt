@@ -73,6 +73,8 @@ export type NormalKeysCtx = {
   currentItem: VisualItems["currentItem"];
   selectedPr: VisualItems["selectedPr"];
   selectedRemote: VisualItems["selectedRemote"];
+  /** True when the selected remote's host is known-unreachable. */
+  remoteUnavailable: boolean;
   selectedSection: VisualItems["selectedSection"];
   visualItems: VisualItems["visualItems"];
   cursorIndex: VisualItems["cursorIndex"];
@@ -134,6 +136,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     currentItem,
     selectedPr,
     selectedRemote,
+    remoteUnavailable,
     selectedSection,
     visualItems,
     cursorIndex,
@@ -794,6 +797,12 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
       if (isPlainLetter(k, "d")) {
         if (!isRemoteSummary(selectedRemote)) {
           toast("remote worktree is still being created", theme.warn, 1800);
+          return;
+        }
+        if (remoteUnavailable) {
+          // Match the session path: skip the doomed SSH round-trip and
+          // the confusing "remove failed: <ssh error>" toast.
+          toast(`${selectedRemote.hostLabel} is unavailable`, theme.warn, 2200);
           return;
         }
         if (selectedRemote.status === StatusKind.Busy) {

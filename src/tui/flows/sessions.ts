@@ -28,8 +28,10 @@ import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { config } from "../../core/config.ts";
 
 import { enterHarnessSession } from "../sessions/harness.ts";
+import { enterRemoteWorktreeSession } from "../sessions/remote.ts";
 import { launchBlockedReason, resolveDiffBase } from "../app-helpers.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import { isRemoteSummary, type RemoteListEntry } from "../remote-creation.ts";
 import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
@@ -67,6 +69,11 @@ export type SessionFlowsCtx = {
   refreshHarnessSessions: (slug: string) => Promise<void>;
   refreshClaudeSummaries: (slug: string) => Promise<void>;
   optimisticRemoveClaude: (slug: string, name: string | null) => void;
+  /** The selected remote row (or in-flight creation), for remote sessions. */
+  selectedRemote: RemoteListEntry | undefined;
+  /** True when the selected remote's host is known-unreachable. */
+  remoteUnavailable: boolean;
+  reportActionError: (label: string, err: unknown) => void;
 };
 
 export function makeSessionFlows(ctx: SessionFlowsCtx) {
@@ -79,6 +86,9 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     refreshHarnessSessions,
     refreshClaudeSummaries,
     optimisticRemoveClaude,
+    selectedRemote,
+    remoteUnavailable,
+    reportActionError,
   } = ctx;
 
   /**
@@ -334,10 +344,44 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     })();
   }
 
+  /**
+   * Enter a shell / diff / harness session on the SELECTED remote
+   * worktree over SSH. Mirrors `doEnterHarnessSession`'s guard-then-run
+   * shape but for a remote target: refuses an in-flight creation, an
+   * unreachable host, or a busy remote before handing the terminal to
+   * `enterRemoteWorktreeSession`. Lives here (not app.tsx) so all
+   * session-entry logic shares one home.
+   */
+  function doEnterRemoteSession(target: "shell" | "diff" | "harness"): void {
+    if (!selectedRemote || !isRemoteSummary(selectedRemote)) {
+      toast("remote worktree is still being created", theme.warn, 1800);
+      return;
+    }
+    if (remoteUnavailable) {
+      toast(`${selectedRemote.hostLabel} is unavailable`, theme.warn, 2200);
+      return;
+    }
+    if (selectedRemote.status === "busy") {
+      toast(`${selectedRemote.slug} is ${selectedRemote.statusLabel}`, theme.warn, 2200);
+      return;
+    }
+    void enterRemoteWorktreeSession({
+      renderer,
+      worktree: selectedRemote,
+      target,
+      harnessId: primaryHarness,
+    })
+      .then((code) => {
+        if (code !== 0) toast(`remote session exited ${code}`, theme.warn, 2500);
+      })
+      .catch((err) => reportActionError("remote session", err));
+  }
+
   return {
     doEnterHarnessSession,
     doEnterSlotSession,
     doSpawnNamedClaudeSession,
     doKillClaudeSession,
+    doEnterRemoteSession,
   };
 }
