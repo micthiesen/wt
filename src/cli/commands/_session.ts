@@ -1,8 +1,9 @@
-import { config } from "../../core/config.ts";
+import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import { attachOrCreate } from "../../core/tmux.ts";
 import type { SessionShortcut } from "../../core/tmux/naming.ts";
 import { listWorktrees } from "../../core/worktree.ts";
+import { readWtState } from "../../core/wtstate.ts";
 
 const TARGETS = new Set<SessionShortcut>(["shell", "diff", "harness"]);
 
@@ -26,6 +27,8 @@ export async function run(argv: string[]): Promise<number> {
     console.error(`remote worktree not found: ${slug}`);
     return 1;
   }
+  const recordedBase = readWtState().slugs[slug]?.baseBranch;
+  const diffBase = await effectiveBaseOrTrunk(worktree.path, recordedBase);
 
   let target = rawTarget as SessionShortcut;
   for (;;) {
@@ -34,7 +37,7 @@ export async function run(argv: string[]): Promise<number> {
       slug,
       cwd: worktree.path,
       kind,
-      base: `origin/${config.branch.base}`,
+      base: diffBase,
     });
     if (result.kind === "switch") {
       target = result.target;

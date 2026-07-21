@@ -2,7 +2,12 @@ import { fetchPrs } from "../../core/github.ts";
 import { linearUrlForSlug } from "../../core/linear.ts";
 import type { Worktree } from "../../core/types.ts";
 import { StatusKind } from "../../core/types.ts";
-import { fetchOrigin, listWorktrees, worktreeStatus } from "../../core/worktree.ts";
+import {
+  fetchOrigin,
+  listWorktrees,
+  unpushedCommits,
+  worktreeStatus,
+} from "../../core/worktree.ts";
 import { dim } from "../colors.ts";
 import {
   renderPrCell,
@@ -22,6 +27,7 @@ export async function run(argv: string[]): Promise<number> {
     const payload = await Promise.all(
       rows.map(async (w) => {
         const st = await worktreeStatus(w);
+        const dirty = st.kind === StatusKind.Dirty;
         return {
           slug: w.slug,
           branch: w.branch,
@@ -31,7 +37,8 @@ export async function run(argv: string[]): Promise<number> {
           status: st.kind,
           status_label: st.label,
           status_age: st.age ?? null,
-          dirty: st.kind === StatusKind.Dirty,
+          dirty,
+          unpushed: dirty ? 0 : await unpushedCommits(w.path),
           linear_url: linearUrlForSlug(w.slug),
         };
       }),

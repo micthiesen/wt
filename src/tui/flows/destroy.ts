@@ -71,7 +71,10 @@ export type DestroyFlowsCtx = {
   invalidateWorktree: (slug: string) => Promise<void>;
   refreshAll: () => Promise<void>;
   refreshGithub: () => Promise<void>;
-  refreshRemoteWorktrees: () => Promise<void>;
+  optimisticRemoveRemoteWorktree: (
+    slug: string,
+    run: () => Promise<void>,
+  ) => Promise<void>;
   /**
    * Re-entry guard for `R`: the set of chains (stack id or standalone
    * branch) with a restack in flight. Same-chain re-presses are refused;
@@ -94,7 +97,7 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     invalidateWorktree,
     refreshAll,
     refreshGithub,
-    refreshRemoteWorktrees,
+    optimisticRemoveRemoteWorktree,
     restackBusyRef,
     primaryHarness,
   } = ctx;
@@ -121,22 +124,18 @@ export function makeDestroyFlows(ctx: DestroyFlowsCtx) {
     ];
     log.event.info(`removing ${slug}${force ? " (force)" : ""}`);
     try {
-      const code = await runRemoteWt(remote, args, {
-        onLine: (line) => log.event.dim(line),
+      await optimisticRemoveRemoteWorktree(slug, async () => {
+        const code = await runRemoteWt(remote, args, {
+          onLine: (line) => log.event.dim(line),
+        });
+        if (code !== 0) throw new Error(`remove failed (exit ${code})`);
       });
-      if (code !== 0) {
-        log.event.err(`remove failed (exit ${code})`);
-        toast(`remote remove failed (exit ${code})`, theme.err, 3000);
-        return;
-      }
       log.event.ok(`removed ${slug} from ${remote.label}`);
       toast(`removed ${slug} from ${remote.label}`, theme.ok, 2200);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log.event.err(message);
       toast(`remote remove failed: ${message}`, theme.err, 3500);
-    } finally {
-      await refreshRemoteWorktrees().catch(() => undefined);
     }
   }
 
