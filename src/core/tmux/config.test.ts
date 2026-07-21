@@ -17,6 +17,13 @@ describe("worktree session shortcut routing", () => {
     );
   });
 
+  test("modified keys are forwarded in CSI-u format", () => {
+    const config = buildConfig();
+    expect(config).toContain("set -s extended-keys always");
+    expect(config).toContain("set -s extended-keys-format csi-u");
+    expect(config).toContain(":extkeys");
+  });
+
   test("private tmux-client exit statuses decode to their targets", () => {
     expect(sessionSwitchTarget(110)).toBe("shell");
     expect(sessionSwitchTarget(111)).toBe("diff");

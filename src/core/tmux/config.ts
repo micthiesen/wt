@@ -24,18 +24,18 @@ function configDir(): string {
  *  - Truecolor declared two ways (modern `terminal-features :RGB` +
  *    legacy `terminal-overrides :Tc`) — different tools check
  *    different paths.
- *  - `extended-keys on` + `:extkeys` feature: lets tmux distinguish
- *    Shift+Enter from plain Enter so claude's newline shortcut works.
- *    `allow-passthrough on` lets desktop notifications + the progress
- *    bar reach the outer terminal instead of being swallowed by tmux.
- *    All three are the official Anthropic-recommended tmux config.
+ *  - `extended-keys always` + `extended-keys-format csi-u` + `:extkeys`
+ *    feature: lets tmux distinguish Shift+Enter from plain Enter so
+ *    multiline shortcuts work through nested tmux/Codex/Claude sessions.
+ *    `allow-passthrough on` lets desktop notifications + the progress bar
+ *    reach the outer terminal instead of being swallowed by tmux. These
+ *    mirror the user's global tmux config for modified-key forwarding.
  *  - `unbind C-b` + F10/F11/F12 are context-aware. The key that owns
  *    the current session detaches back to wt; either other key exits
  *    the tmux client with a private status that asks the renderer-side
  *    navigator to attach the corresponding session immediately.
  */
 export function buildConfig(): string {
-  const outerTerm = process.env.TERM ?? "xterm-256color";
   return `set -g status off
 set -g alternate-screen off
 set -g set-titles off
@@ -43,12 +43,13 @@ set -sg escape-time 0
 set -g mouse on
 set -g focus-events on
 set -g default-terminal "tmux-256color"
-set -as terminal-features ",${outerTerm}:RGB"
-set -ag terminal-overrides ",${outerTerm}:Tc"
+set -as terminal-features ",xterm*:RGB,tmux-256color:RGB"
+set -ag terminal-overrides ",xterm-256color:Tc,tmux-256color:Tc"
 set -ag update-environment "COLORTERM"
 set -g allow-passthrough on
-set -s extended-keys on
-set -as terminal-features ",${outerTerm}:extkeys"
+set -s extended-keys always
+set -s extended-keys-format csi-u
+set -as terminal-features ",xterm*:extkeys,tmux-256color:extkeys"
 unbind C-b
 bind-key -n F10 if-shell -F '#{==:#{@wt-shortcut},shell}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.shell}"'
 bind-key -n F11 if-shell -F '#{==:#{@wt-shortcut},diff}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.diff}"'
