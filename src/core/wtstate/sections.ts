@@ -275,30 +275,66 @@ export function renameSection(oldName: string, newName: string): void {
 }
 
 /**
+ * Insert any inferred-stack key that's in `visualOrder` but not yet in
+ * `order` at its real on-screen slot: right after its nearest preceding
+ * visual group that IS already ranked (front if none). Inferred stacks
+ * never pre-register in `sectionsOrder` (an unranked one sorts to the
+ * top), so a reorder that names one as a landmark would otherwise have
+ * no anchor. Seeding them at their visual position — rather than blindly
+ * at the front — keeps a move relative to exactly what the user sees,
+ * even with several never-moved stacks on screen at once. Only stack
+ * keys are seeded; manual names + the inbox are always self-healed into
+ * `sectionsOrder` at read time.
+ */
+function seedVisualStacks(
+  order: readonly string[],
+  visualOrder: readonly string[],
+): string[] {
+  const out = [...order];
+  for (let i = 0; i < visualOrder.length; i++) {
+    const g = visualOrder[i]!;
+    if (out.includes(g)) continue;
+    if (stackIdFromSectionKey(g) === null) continue;
+    let anchor = -1; // -1 → splice at 0 (front)
+    for (let j = i - 1; j >= 0; j--) {
+      const at = out.indexOf(visualOrder[j]!);
+      if (at >= 0) {
+        anchor = at;
+        break;
+      }
+    }
+    out.splice(anchor + 1, 0, g);
+  }
+  return out;
+}
+
+/**
  * Reorder the group list: remove `key` and reinsert it immediately
  * before/after `pastKey`. Manual keys must already be present (they're
- * self-healed into `sectionsOrder` at read time); a STACK key is
- * inserted lazily here — inferred stacks never pre-register, an
- * unranked one just sorts to the top of the list until its first move.
- * Returns false when a manual key is absent, the keys are equal, or the
- * result is a no-op. "Place past" rather than "swap with array
- * neighbor" so the caller can name the next VISIBLE group as the
- * landmark — an invisible group sitting between (an empty inbox) gets
- * jumped in one keypress instead of producing a phantom no-change move.
- * Member slugs keep their `order` values; only the group's rank moves.
+ * self-healed into `sectionsOrder` at read time); an inferred STACK key
+ * is registered on demand — seeded at its visual slot via `visualOrder`
+ * (the present groups in display order), so moving a never-moved stack
+ * section works the same as any manual one. Returns false when a manual
+ * key is absent, the keys are equal, or the result is a no-op. "Place
+ * past" rather than "swap with array neighbor" so the caller can name
+ * the next VISIBLE group as the landmark — an invisible group sitting
+ * between (an empty inbox) gets jumped in one keypress instead of
+ * producing a phantom no-change move. Member slugs keep their `order`
+ * values; only the group's rank moves.
  */
 export function moveGroupPast(
   key: string,
   pastKey: string,
   side: "before" | "after",
+  visualOrder: readonly string[] = [],
 ): boolean {
   return withWtStateLock(() => {
     const state = readWtState();
     if (key === pastKey) return false;
-    let order = state.sectionsOrder;
-    // Lazy registration for inferred-stack keys, at the front — where
-    // an unranked stack sorts anyway — so the subsequent move is
-    // relative to what the user sees.
+    let order = seedVisualStacks(state.sectionsOrder, visualOrder);
+    // Backstop: a stack key named as key/landmark but absent from
+    // `visualOrder` (shouldn't happen — the caller derives both from the
+    // same rows) still gets registered so the move can't silently fail.
     for (const k of [key, pastKey]) {
       if (!order.includes(k) && stackIdFromSectionKey(k) !== null) {
         order = [k, ...order];

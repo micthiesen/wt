@@ -694,8 +694,9 @@ export function useWtActions() {
       key: string,
       pastKey: string,
       side: "before" | "after",
+      visualOrder: readonly string[] = [],
     ): Promise<boolean> {
-      const moved = moveGroupPastOnDisk(key, pastKey, side);
+      const moved = moveGroupPastOnDisk(key, pastKey, side, visualOrder);
       if (moved) {
         await qc.invalidateQueries({ queryKey: qk.wtState() });
       }

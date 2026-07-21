@@ -45,6 +45,7 @@ type SectionFlowsCtx = {
     key: string,
     pastKey: string,
     side: "before" | "after",
+    visualOrder: readonly string[],
   ) => Promise<boolean>;
 };
 
@@ -101,15 +102,26 @@ export function makeSectionFlows(ctx: SectionFlowsCtx) {
    * visual step, never a phantom no-change move.
    */
   function doMoveGroup(groupKey: string, dir: -1 | 1, what: string): void {
-    const order = wtState?.sectionsOrder ?? [];
-    const present = new Set<string>();
+    // Drive the move off the ON-SCREEN group order (distinct group keys
+    // in display-sorted row order), not `sectionsOrder`. An inferred
+    // stack section isn't in `sectionsOrder` until its first move, so a
+    // `sectionsOrder`-derived sequence would never find it (idx = -1) and
+    // silently no-op — the exact reason stack sections couldn't be moved.
+    // `moveGroupPast` seeds the stack key at its visual slot using the
+    // `vseq` we pass, so the reorder is coherent with what the user sees.
+    const vseq: string[] = [];
+    const seen = new Set<string>();
     for (const r of rows) {
-      if (!r.archived) present.add(r.section ?? GROUP_INBOX);
+      if (r.archived) continue;
+      const g = r.section ?? GROUP_INBOX;
+      if (!seen.has(g)) {
+        seen.add(g);
+        vseq.push(g);
+      }
     }
-    const seq = order.filter((g) => present.has(g));
-    const idx = seq.indexOf(groupKey);
-    if (idx < 0) return; // unranked group mid-refresh; self-heals on next read
-    const neighbor = seq[idx + dir];
+    const idx = vseq.indexOf(groupKey);
+    if (idx < 0) return; // group mid-refresh; self-heals on next read
+    const neighbor = vseq[idx + dir];
     if (!neighbor) {
       toast(
         dir > 0 ? `${what} already at bottom` : `${what} already at top`,
@@ -118,7 +130,7 @@ export function makeSectionFlows(ctx: SectionFlowsCtx) {
       );
       return;
     }
-    moveGroupPast(groupKey, neighbor, dir > 0 ? "after" : "before").then(
+    moveGroupPast(groupKey, neighbor, dir > 0 ? "after" : "before", vseq).then(
       (moved) => {
         if (moved) toast(`moved ${what} ${dir > 0 ? "down" : "up"}`, theme.info, 1200);
       },
