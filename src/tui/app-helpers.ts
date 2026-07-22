@@ -67,10 +67,13 @@ export function isPlainLetter(
 
 /**
  * Plain Shift+letter guard — shift is the only modifier held. Used
- * by the section move/rename bindings (J/K/L). Excludes Hyper
- * explicitly because the kitty keyboard protocol exposes that as a
- * separate flag and Caps Lock-mapped Hyper layouts include shift in
- * the four-modifier combo, which would otherwise leak into these.
+ * by the section move/rename bindings (J/K/L) and the global Shift+A
+ * automations pause. Excludes every other modifier, including Meta
+ * (Cmd) and Hyper: the kitty keyboard protocol exposes Hyper as its
+ * own flag, but a Hyper key synthesized through skhd/yabai layers
+ * Cmd+Shift (± Ctrl/Option), so `hyper+a` can arrive as a plain
+ * `{shift, meta}` combo — guarding Meta keeps it from leaking into
+ * these single-letter actions.
  */
 export function isShiftedLetter(
   k: {
@@ -80,6 +83,7 @@ export function isShiftedLetter(
     option: boolean;
     super?: boolean;
     hyper?: boolean;
+    meta: boolean;
   },
   letter: string,
 ): boolean {
@@ -89,7 +93,8 @@ export function isShiftedLetter(
     !k.ctrl &&
     !k.option &&
     !k.super &&
-    !k.hyper
+    !k.hyper &&
+    !k.meta
   );
 }
 
