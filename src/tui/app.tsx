@@ -571,6 +571,7 @@ export function App({ onExit, hubPane = false }: Props) {
     refreshTmuxSessions,
     refreshClaudeSummaries,
     setShown: setHubShown,
+    setPaneFocused: setHubPaneFocused,
     onExit: quit,
   });
   // Hub mode swaps the renderer-suspending session entries for
@@ -987,24 +988,6 @@ export function App({ onExit, hubPane = false }: Props) {
               : `auto ${automations.pendingCount} queued  `}
           </text>
         ) : null}
-        {hubPane && hubShown.kind === "slot" ? (
-          // The right pane is showing a special (slot) session, not the
-          // selected task — flag it loudly; F9 back to tasks re-follows.
-          <text fg={theme.warn} attributes={1}>{`◂ ${hubShown.label}  `}</text>
-        ) : null}
-        {hubPane ? (
-          // Compact focus chip: solid accent block when typing lands in
-          // the task pane, dim glyph when it goes to the session. The
-          // tasks panel border/title carries the louder version.
-          hubPaneFocused ? (
-            <box backgroundColor={theme.accent} paddingLeft={1} paddingRight={1}>
-              <text fg={theme.bg} attributes={1}>{"⌨"}</text>
-            </box>
-          ) : (
-            <text fg={theme.fgDim}>{"⌨ "}</text>
-          )
-        ) : null}
-        {hubPane ? <text>{" "}</text> : null}
         <UsageBadge primary={primaryHarness} />
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>

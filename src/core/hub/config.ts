@@ -80,11 +80,12 @@ unbind C-b
 set -g remain-on-exit on
 set-hook -g pane-died respawn-pane
 # tmux cannot remove the divider column between panes, only recolor it.
-# Painting the border glyphs in wt's theme background (tui/theme.ts bg,
-# keep in sync) makes the bar visually disappear; focus is signaled
-# inside the task pane instead, so active/inactive get the same color.
-set -g pane-border-style "fg=#1b1d23"
-set -g pane-active-border-style "fg=#1b1d23"
+# Painting the border glyphs in the terminal's background (Alacritty
+# Catppuccin Mocha base, which applyTerminalTheme also uses as the task
+# pane's bg — keep the three in sync) makes the bar visually disappear;
+# focus is signaled inside the task pane, so active/inactive match.
+set -g pane-border-style "fg=#1E1E2E"
+set -g pane-active-border-style "fg=#1E1E2E"
 ${forwardLines}
 bind -n M-Enter send-keys -t ${HUB_LEFT_PANE} Enter
 bind -n M-Tab send-keys -t ${HUB_LEFT_PANE} Tab

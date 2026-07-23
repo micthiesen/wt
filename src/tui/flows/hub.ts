@@ -66,6 +66,14 @@ export type HubFlowsCtx = {
   refreshClaudeSummaries: (slug: string) => Promise<void>;
   /** Records what the right pane now shows (drives the task-pane indicator). */
   setShown: (shown: HubShown) => void;
+  /**
+   * Stamp the task pane's focus indicator. Every flow that moves tmux
+   * focus to the session pane must record it here in the same stroke —
+   * terminal focus events are an unreliable fallback (mouse only), so
+   * an unstamped `focusRight()` leaves the tasks pane styled focused
+   * while typing actually goes to the session (the F10/F11/`,` bug).
+   */
+  setPaneFocused: (focused: boolean) => void;
   onExit: () => void;
 };
 
@@ -79,8 +87,15 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     refreshTmuxSessions,
     refreshClaudeSummaries,
     setShown,
+    setPaneFocused,
     onExit,
   } = ctx;
+
+  /** Hand keyboard focus to the session pane AND stamp the indicator. */
+  async function focusSessionPane(): Promise<void> {
+    await focusRight();
+    setPaneFocused(false);
+  }
 
   /**
    * Point the right pane at `name`, record what it shows now, and
@@ -124,7 +139,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           const f12 = currentHarnessSessions.f12Target;
           if (f12?.isLive) {
             await switchTo(f12.tmuxSessionName, slug, { kind: "task", slug });
-            await focusRight();
+            await focusSessionPane();
             return;
           }
           // Match classic F12 exactly: resume the target's OWN slot —
@@ -156,7 +171,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
             kind: "task",
             slug,
           });
-          await focusRight();
+          await focusSessionPane();
           return;
         }
         // diff / shell: ensure the kind's single per-slug session, then
@@ -178,7 +193,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         }
         if (res.created) void refreshTmuxSessions();
         await switchTo(sessionName(slug, target), null, { kind: "task", slug });
-        await focusRight();
+        await focusSessionPane();
       } catch (err) {
         reportActionError(`${target} session`, err);
       }
@@ -209,7 +224,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           kind: "slot",
           label: slot.label,
         });
-        await focusRight();
+        await focusSessionPane();
       } catch (err) {
         reportActionError("slot session", err);
       }
@@ -269,7 +284,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           kind: "task",
           slug,
         });
-        await focusRight();
+        await focusSessionPane();
       } catch (err) {
         reportActionError("harness session", err);
       }
@@ -311,7 +326,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         }
         if (res.created) void refreshTmuxSessions();
         await switchTo(sessionName(slug, "claude", name), slug, { kind: "task", slug });
-        await focusRight();
+        await focusSessionPane();
       } catch (err) {
         if (!wasPersisted) removeClaudeName(slug, name);
         reportActionError("named claude session", err);
