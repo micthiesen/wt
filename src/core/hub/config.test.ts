@@ -56,6 +56,8 @@ describe("hub outer tmux config", () => {
     expect(config).toContain("bind -n M-f { resize-pane -Z");
     expect(config).toContain(`bind -n M-w { send-keys -t ${HUB_LEFT_PANE} C-d }`);
     expect(config).toContain(`bind -n M-BSpace { send-keys -t ${HUB_LEFT_PANE} d }`);
+    expect(config).toContain(`bind -n M-t { send-keys -t ${HUB_LEFT_PANE} n }`);
+    expect(config).not.toContain(`bind -n M-t { send-keys -t ${HUB_LEFT_PANE} t }`);
     // No plain forwards may remain for the rebound letters (a literal
     // `h` would open removed-history, `d` would destroy, …).
     expect(config).not.toContain(`bind -n M-h { send-keys -t ${HUB_LEFT_PANE} h }`);

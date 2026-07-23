@@ -181,7 +181,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "\u2318Z / \u2318P", label: "snooze until state changes / pin to top" },
       { key: "\u2318I", label: "toggle the details card" },
       { key: "\u2318O / \u2318M", label: "open PR / toggle auto-merge" },
-      { key: "\u2318N", label: "new worktree" },
+      { key: "\u2318T", label: "new worktree" },
       { key: "\u2318. / \u2318;", label: "action picker / sessions picker" },
       { key: "\u2318W", label: "close the task's session gracefully (\u2318W \u00d72)" },
       { key: "\u2318\u232b", label: "remove the worktree (confirm)" },

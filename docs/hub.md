@@ -59,9 +59,10 @@ reach the terminal), while the Cmd domain is free apart from a few
 overridden defaults. The overrides are GLOBAL to every Alacritty window
 (Alacritty can't scope per-process) — accepted deliberately, in full:
 Hide on `⌘H`, Minimize on `⌘M` (both fight yabai tiling anyway), search
-on `⌘F` (stays on `Ctrl+Shift+F`), new-window on `⌘N` (skhd's
-`cmd+return` spawns windows), close-window on `⌘W`, and clear-scrollback
-on `⌘K` (`Ctrl+L` covers it).
+on `⌘F` (stays on `Ctrl+Shift+F`), close-window on `⌘W`, and
+clear-scrollback on `⌘K` (`Ctrl+L` covers it). `⌘N` is deliberately
+untouched — it stays Alacritty's new-window; new-worktree rides `⌘T`
+("new task"), whose literal `t` (AI-regen, rare) moved behind `⌘H`.
 
 Most cmd chords forward the bare classic key; five have dedicated rebinds
 because the literal letter means something else in classic mode: `⌘H` →
@@ -197,7 +198,7 @@ under Review output.
 | `⌘Z` / `⌘P` | snooze until the bucket changes / pin to top |
 | `⌘I` | toggle the stacked details card |
 | `⌘O` / `⌘M` | open the PR / toggle auto-merge |
-| `⌘N` | new-worktree prompt |
+| `⌘T` | new-worktree prompt |
 | `⌘.` / `⌘;` | action picker / sessions picker |
 | `⌘W` | close the task's session gracefully (`⌘W` ×2 to confirm) |
 | `⌘⌫` | remove the worktree (confirm) |

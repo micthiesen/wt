@@ -58,7 +58,9 @@ export const WT_HUB_ENV_VALUE = "1";
  * reach the terminal). `h`/`d`/`s`/`f`/`w` are deliberately absent
  * here — they have dedicated rebinds in `buildHubConfig` (F7 focus /
  * F11 diff / F10 shell / zoom / C-d close) instead of forwarding the
- * literal letter. Digits 1-9 forward for the task quick-jump.
+ * literal letter, as does `t` (cmd+t = new worktree, rebound to `n`;
+ * cmd+n stays Alacritty's new-window). Digits 1-9 forward for the
+ * task quick-jump.
  */
 export const HUB_FORWARD_KEYS = [
   "j",
@@ -79,7 +81,6 @@ export const HUB_FORWARD_KEYS = [
   "c",
   "a",
   "i",
-  "t",
   "y",
   "r",
   "p",

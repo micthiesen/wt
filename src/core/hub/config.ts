@@ -76,8 +76,10 @@ export function tmuxQuote(token: string): string {
  * (diff; literal d is destroy — destroy moved to `M-BSpace`), `M-s`
  * → F10 (shell; literal s is stage URL), `M-f` → zoom (mirrors F8),
  * `M-w` → C-d (graceful session close; literal w is review-checkout).
- * `M-.` and `M-/` alias the action picker (!) and help (?) since
- * cmd+shift punctuation is awkward.
+ * `M-t` → n (new worktree; cmd+n must stay Alacritty's new-window, so
+ * "new task" rides t and the rare AI-regen literal `t` moved behind
+ * cmd+h). `M-.` and `M-/` alias the action picker (!) and help (?)
+ * since cmd+shift punctuation is awkward.
  */
 export function buildHubConfig(): string {
   const forwardLines = HUB_FORWARD_KEYS.map((key) => {
@@ -112,6 +114,7 @@ bind -n M-w { send-keys -t ${HUB_LEFT_PANE} C-d }
 bind -n M-. { send-keys -t ${HUB_LEFT_PANE} ! }
 bind -n M-/ { send-keys -t ${HUB_LEFT_PANE} ? }
 bind -n M-BSpace { send-keys -t ${HUB_LEFT_PANE} d }
+bind -n M-t { send-keys -t ${HUB_LEFT_PANE} n }
 `;
 }
 
