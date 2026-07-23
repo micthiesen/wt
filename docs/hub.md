@@ -127,7 +127,7 @@ first-match-wins precedence ladder (`computeBucket` in
 | bucket | meaning | example triggers (first match wins, top to bottom) |
 |---|---|---|
 | `needs-you` | a human is required right now | agent is asking a question · mid-rebase conflict · merge conflict with base · CI failing · changes requested |
-| `review-output` | a turn ended and you haven't looked since | the freshest session tail ended (`end_turn`/`paused`) more recently than your last recorded focus of that slug |
+| `review-output` | a turn ended and you haven't looked since | the freshest session tail ended its turn (`end_turn`) more recently than your last recorded focus of that slug |
 | `ready` | approved and green, just land it | open non-draft PR, review approved, checks passing or none |
 | `working` | something's actively running for you | worktree busy-locked · a tracked headless action is running · agent session state is `working`/`polling` · auto-merge armed with CI still pending |
 | `waiting` | blocked on others | in the merge queue · CI running · awaiting review |
