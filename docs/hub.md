@@ -166,6 +166,11 @@ individually.
 
 ## The unread-output bit
 
+Known limitation: the focus stamp is **per slug**, not per session. A
+worktree hosting several claude sessions (primary + named) has one clock;
+viewing any of its sessions marks the whole slug seen, even if a different
+named session produced the fresher unreviewed output.
+
 There's no separate "unread" flag — it *is* the `review-output` bucket
 (rendered as a dim-warn `●`). A task lands there when its freshest session
 tail ended in `end_turn` or `paused` more recently than the last time you

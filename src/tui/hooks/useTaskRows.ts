@@ -644,6 +644,10 @@ export function useTaskRows(opts: {
       // Not derived through `deriveTaskState` — review-request PRs have
       // no worktree, hence no signals to fold; the bucket is a direct
       // draft/non-draft split per the spec.
+      // Draft → waiting is a deliberate judgment call: the query is
+      // explicit review-requested:@me, so a human DID ask — but a
+      // draft signals the author isn't actually ready, and surfacing
+      // it needs-you would nag before there's anything reviewable.
       const state: TaskState = pr.isDraft
         ? { bucket: "waiting", reason: "draft review request", snoozed: false }
         : { bucket: "needs-you", reason: "review requested", snoozed: false };
