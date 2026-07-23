@@ -1,5 +1,5 @@
-import { useMemo, useRef, useState } from "react";
-import { useIsFetching, useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
 
@@ -49,8 +49,13 @@ import {
 } from "./app-helpers.ts";
 import { handleFooterInputKey } from "./keyboard/footer-input-keys.ts";
 import { handleGlobalKey } from "./keyboard/global-keys.ts";
-import { handleNormalKey } from "./keyboard/normal-keys.ts";
+import { handleHubKey } from "./keyboard/hub-keys.ts";
+import { handleNormalKey, type NormalKeysCtx } from "./keyboard/normal-keys.ts";
 import { handleRemovedViewKey } from "./keyboard/removed-view-keys.ts";
+import { focusLeft, focusRight } from "../core/hub.ts";
+import { makeHubFlows } from "./flows/hub.ts";
+import { useTaskRows } from "./hooks/useTaskRows.ts";
+import { TaskList } from "./panels/tasks.tsx";
 import { makeActionPickerFlows } from "./flows/action-picker.ts";
 import { makeBaseFlows } from "./flows/base.ts";
 import { makeDestroyFlows } from "./flows/destroy.ts";
@@ -73,9 +78,16 @@ export type TuiExit = { kind: "quit" };
 
 type Props = {
   onExit: (e: TuiExit) => void;
+  /**
+   * True when this process is the hub layout's left pane: render the
+   * task inbox instead of the worktree list, drop the outputs pane,
+   * and drive the hub's right pane (`core/hub`) from the F-keys /
+   * selection instead of full-screen tmux attaches.
+   */
+  hubPane?: boolean;
 };
 
-export function App({ onExit }: Props) {
+export function App({ onExit, hubPane = false }: Props) {
   const { width, height } = useTerminalDimensions();
   const renderer = useRenderer();
   const { rows, isLoading } = useWorktreeRows();
@@ -222,11 +234,11 @@ export function App({ onExit }: Props) {
     reviewRequestRows,
     visualItems,
     cursorIndex,
-    currentItem,
-    current,
-    selectedPr,
-    selectedRemote,
-    selectedSection,
+    currentItem: listCurrentItem,
+    current: listCurrent,
+    selectedPr: listSelectedPr,
+    selectedRemote: listSelectedRemote,
+    selectedSection: listSelectedSection,
   } = useVisualItems({
     rows,
     foldedSections,
@@ -235,6 +247,84 @@ export function App({ onExit }: Props) {
     remoteCreation,
     remoteWorktrees: remoteWorktreeList.data ?? [],
   });
+
+  // Set of slugs whose action is in flight RIGHT NOW (no recent-window
+  // tail). Drives the leftmost cluster glyph in `WorktreeList` so the
+  // user has at-a-glance awareness of what's running on rows they're
+  // not currently viewing. Hoisted above the hub task pipeline, which
+  // consumes it too.
+  const activeActions = useActiveActions();
+  // Per-slug "active session" for the list-pane harness glyph: the
+  // harness + derived state F12 would attach to, computed for EVERY
+  // worktree through the same `computeHarnessSessions` rule the
+  // current-row hook, the details-pane AI row, and the F12 keybind use.
+  // This is the single source of truth — the list glyph can't drift from
+  // what F12 does or what the details pane shows. Fans session discovery
+  // across all worktrees (cached at the query layer); codex/opencode get
+  // state tinting too, not just the brand color.
+  const sessionWorktrees = useMemo(
+    () => rows.map((r) => ({ slug: r.wt.slug, path: r.wt.path })),
+    [rows],
+  );
+  const activeSessionBySlug = useActiveSessionsBySlug(
+    sessionWorktrees,
+    primaryHarness,
+  );
+
+  // --- Hub task inbox ------------------------------------------------
+  // Always-mounted (hooks can't be conditional); classic mode pays one
+  // cheap memo. The task cursor reuses the SAME `sel` state the classic
+  // list uses, keyed by task key — which is a slug for standalone
+  // worktree tasks, so flows that `setSel(slug)` after creating a
+  // worktree keep working unchanged in hub mode.
+  const [expandedStacks, setExpandedStacks] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [showHubDetails, setShowHubDetails] = useState(true);
+  const { tasks } = useTaskRows({
+    rows,
+    reviewRequests: reviewRequestRows,
+    activeSessionBySlug,
+    activeActions,
+    wtState: wtStateForStacks.data,
+    stackSectionLabels,
+    expandedStacks,
+    isLoading,
+  });
+  const taskIndex = useMemo(() => {
+    if (!hubPane || tasks.length === 0) return 0;
+    if (sel !== null) {
+      const direct = tasks.findIndex((t) => t.key === sel);
+      if (direct >= 0) return direct;
+      // A slug key can point inside a collapsed stack — select the
+      // stack task that contains it.
+      const bySlug = tasks.findIndex((t) =>
+        t.kind === "wt"
+          ? t.row.wt.slug === sel
+          : t.kind === "stack"
+            ? t.members.some((m) => m.wt.slug === sel)
+            : false,
+      );
+      if (bySlug >= 0) return bySlug;
+    }
+    return 0;
+  }, [hubPane, tasks, sel]);
+  const hubTask = hubPane ? tasks[taskIndex] : undefined;
+  const hubRow = hubTask && hubTask.kind !== "pr" ? hubTask.row : undefined;
+  const hubPr = hubTask?.kind === "pr" ? hubTask.pr : undefined;
+
+  // Effective selection — hub mode derives it from the task cursor,
+  // classic mode from the visual list. Everything downstream (flows,
+  // keyboard ctx, details pane) consumes these and is mode-agnostic.
+  const current = hubPane ? hubRow : listCurrent;
+  const currentItem = hubPane
+    ? hubRow
+      ? ({ kind: "wt", row: hubRow } as const)
+      : undefined
+    : listCurrentItem;
+  const selectedPr = hubPane ? hubPr : listSelectedPr;
+  const selectedRemote = hubPane ? undefined : listSelectedRemote;
+  const selectedSection = hubPane ? undefined : listSelectedSection;
 
   // `g p` / `l p` PR-target chord — extracted to
   // `hooks/usePrTargetChord.ts`.
@@ -265,31 +355,10 @@ export function App({ onExit }: Props) {
     primaryHarness,
   );
   const showActionViewer = useActionVisible(currentSlug);
-  // Set of slugs whose action is in flight RIGHT NOW (no recent-window
-  // tail). Drives the leftmost cluster glyph in `WorktreeList` so the
-  // user has at-a-glance awareness of what's running on rows they're
-  // not currently viewing.
-  const activeActions = useActiveActions();
   // Per-slug list of live claude session names (`null` = primary).
   // Drives the tail-registry reconcile, the sessions picker, and the
   // auto-output focus rule.
   const claudeSessionsBySlug = useClaudeSessionsBySlug();
-  // Per-slug "active session" for the list-pane harness glyph: the
-  // harness + derived state F12 would attach to, computed for EVERY
-  // worktree through the same `computeHarnessSessions` rule the
-  // current-row hook, the details-pane AI row, and the F12 keybind use.
-  // This is the single source of truth — the list glyph can't drift from
-  // what F12 does or what the details pane shows. Fans session discovery
-  // across all worktrees (cached at the query layer); codex/opencode get
-  // state tinting too, not just the brand color.
-  const sessionWorktrees = useMemo(
-    () => rows.map((r) => ({ slug: r.wt.slug, path: r.wt.path })),
-    [rows],
-  );
-  const activeSessionBySlug = useActiveSessionsBySlug(
-    sessionWorktrees,
-    primaryHarness,
-  );
   const sectionDetail = useSectionDetail({
     selectedSection,
     wtState: wtStateForStacks.data,
@@ -474,6 +543,66 @@ export function App({ onExit }: Props) {
     reportActionError,
   });
 
+  // Hub-mode flows: retarget the right pane instead of attaching. Kept
+  // in a ref so the follow effect below can fire on selection changes
+  // without depending on the per-render flow identity.
+  const hubFlows = makeHubFlows({
+    rows,
+    primaryHarness,
+    currentHarnessSessions,
+    toast,
+    reportActionError,
+    refreshTmuxSessions,
+    refreshClaudeSummaries,
+    onExit: quit,
+  });
+  // Hub mode swaps the renderer-suspending session entries for
+  // right-pane retargets EVERYWHERE they're reachable — the sessions
+  // picker (`;`), harness-select (`Shift+F12`), and the slot keys —
+  // not just the intercepted F-keys. A full-screen attach inside the
+  // ~44-col task pane is never correct.
+  const effDoEnterHarnessSession = hubPane
+    ? hubFlows.enterHarnessSession
+    : doEnterHarnessSession;
+  const effDoSpawnNamedClaudeSession = hubPane
+    ? hubFlows.spawnNamedClaudeSession
+    : doSpawnNamedClaudeSession;
+  const effDoEnterSlotSession = hubPane
+    ? hubFlows.showSlotSession
+    : doEnterSlotSession;
+  const hubFlowsRef = useRef(hubFlows);
+  hubFlowsRef.current = hubFlows;
+  const hubRowRef = useRef(hubRow);
+  hubRowRef.current = hubRow;
+  const queryClient = useQueryClient();
+
+  // Live-follow: the right pane tracks the task cursor — a task with a
+  // live session shows it (stamping the focus clock: it's on screen),
+  // anything else shows the home dashboard. Debounced so holding j/k
+  // doesn't spray switch-clients; keyed on the resolved target so a
+  // session going live/dead re-follows without a cursor move.
+  const f12 = currentHarnessSessions.f12Target;
+  const followKey = hubPane
+    ? `${hubTask?.key ?? ""}:${f12?.isLive ? f12.tmuxSessionName : ""}`
+    : "";
+  useEffect(() => {
+    if (!hubPane) return;
+    const t = setTimeout(() => {
+      hubFlowsRef.current.followSelection(hubRowRef.current);
+    }, 150);
+    return () => clearTimeout(t);
+  }, [hubPane, followKey]);
+
+  // Focus dance: pickers and footer prompts need direct typing, so pull
+  // tmux focus onto this pane while one is open and hand it back to the
+  // harness pane on close. Everything else is Alt-driven and works
+  // regardless of pane focus.
+  const inputActive = modal !== null || footer.kind === "input";
+  useEffect(() => {
+    if (!hubPane) return;
+    void (inputActive ? focusLeft() : focusRight());
+  }, [hubPane, inputActive]);
+
 
   /**
    * Copy `value` to the clipboard, log + toast appropriately. Used by
@@ -550,7 +679,7 @@ export function App({ onExit }: Props) {
       reportActionError,
       automations,
       cyclePrimaryHarness,
-      doEnterSlotSession,
+      doEnterSlotSession: effDoEnterSlotSession,
     });
 
   // Keyboard dispatch. Layer order is load-bearing: modal swallows
@@ -592,8 +721,8 @@ export function App({ onExit }: Props) {
           buildActionPickerItems,
           canPickAction,
           launchAction,
-          doSpawnNamedClaudeSession,
-          doEnterHarnessSession,
+          doSpawnNamedClaudeSession: effDoSpawnNamedClaudeSession,
+          doEnterHarnessSession: effDoEnterHarnessSession,
           pickerRows,
           doKillClaudeSession,
           refreshHarnessSessions,
@@ -649,7 +778,7 @@ export function App({ onExit }: Props) {
       return;
     }
 
-    handleNormalKey(k, {
+    const normalCtx: NormalKeysCtx = {
       focusedOutputId,
       setFocus,
       visibleOutputs,
@@ -677,7 +806,7 @@ export function App({ onExit }: Props) {
       activeDiffSessions,
       renderer,
       doEnterRemoteSession,
-      doEnterHarnessSession,
+      doEnterHarnessSession: effDoEnterHarnessSession,
       handleGlobalKey: globalKey,
       doShiftMove,
       openSectionPicker,
@@ -696,7 +825,37 @@ export function App({ onExit }: Props) {
       refreshTmuxSessions,
       toast,
       reportActionError,
-    });
+    };
+
+    // Hub mode: task-cursor navigation + right-pane session targeting
+    // + manual states, with everything else falling through to the
+    // shared normal-mode handler above.
+    if (hubPane) {
+      handleHubKey(k, {
+        tasks,
+        taskIndex,
+        setSel,
+        toggleStackExpanded: (stackKey) =>
+          setExpandedStacks((prev) => {
+            const next = new Set(prev);
+            if (next.has(stackKey)) next.delete(stackKey);
+            else next.add(stackKey);
+            return next;
+          }),
+        hubFlows,
+        openPrUrl: (url, number) => openPrUrl(url, number, null, "pr"),
+        toggleDetails: () => setShowHubDetails((v) => !v),
+        refreshWtState: async () => {
+          await queryClient.invalidateQueries({ queryKey: qk.wtState() });
+        },
+        toast,
+        reportActionError,
+        fallthrough: (kk) => handleNormalKey(kk, normalCtx),
+      });
+      return;
+    }
+
+    handleNormalKey(k, normalCtx);
   });
 
   // Global in-flight count — covers the root queries and the imperative
@@ -756,47 +915,97 @@ export function App({ onExit }: Props) {
         <UsageBadge primary={primaryHarness} />
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>
-      <box flexDirection="row" flexGrow={1}>
-        {removedView ? (
-          <RemovedList
-            entries={removedEntries}
-            selectedIndex={removedCursor}
-            width={listWidth}
-          />
-        ) : (
-          <WorktreeList
-            items={activeItems}
-            archivedRows={archivedRows}
-            reviewRequests={reviewRequestRows}
-            selectedIndex={cursorIndex}
-            width={listWidth}
-            activeTails={activeTails}
-            activeActions={activeActions}
-            activeSessionBySlug={activeSessionBySlug}
-            stackSectionLabels={stackSectionLabels}
-            isLoading={isLoading}
-            remoteUnavailable={remoteUnavailable}
-            scrollHandle={listScrollHandleRef}
-          />
-        )}
-        <Details
-          row={removedView ? undefined : current}
-          reviewRequest={removedView ? undefined : selectedPr}
-          remote={removedView ? undefined : selectedRemote}
-          remoteUnavailable={remoteUnavailable}
-          remoteError={remoteError}
-          section={removedView ? undefined : sectionDetail}
-          removed={currentRemoved}
-          width={Math.max(0, width - listWidth)}
-          scrollRef={detailsScrollRef}
-          sessionState={
-            current
-              ? activeSessionBySlug.get(current.wt.slug)?.state ?? undefined
-              : undefined
-          }
-        />
-      </box>
-      <OutputViewer output={displayedOutput} height={activityHeight} />
+      {hubPane ? (
+        // Hub layout: this process IS the narrow left pane of the tmux
+        // hub — one column of tasks with an optional details card
+        // stacked below (`D` toggles). The live session lives in the
+        // hub's right pane, so no OutputViewer here.
+        <box flexDirection="column" flexGrow={1}>
+          {removedView ? (
+            <RemovedList
+              entries={removedEntries}
+              selectedIndex={removedCursor}
+              width={width}
+            />
+          ) : (
+            <TaskList
+              tasks={tasks}
+              selectedIndex={taskIndex}
+              width={width}
+              isLoading={isLoading}
+              activeSessionBySlug={activeSessionBySlug}
+              activeActions={activeActions}
+            />
+          )}
+          {showHubDetails ? (
+            <box
+              height={Math.max(10, Math.min(18, Math.floor(height * 0.45)))}
+              flexShrink={0}
+            >
+              <Details
+                row={removedView ? undefined : current}
+                reviewRequest={removedView ? undefined : selectedPr}
+                remote={undefined}
+                remoteUnavailable={remoteUnavailable}
+                remoteError={remoteError}
+                section={undefined}
+                removed={currentRemoved}
+                width={width}
+                scrollRef={detailsScrollRef}
+                sessionState={
+                  current
+                    ? activeSessionBySlug.get(current.wt.slug)?.state ?? undefined
+                    : undefined
+                }
+              />
+            </box>
+          ) : null}
+        </box>
+      ) : (
+        <>
+          <box flexDirection="row" flexGrow={1}>
+            {removedView ? (
+              <RemovedList
+                entries={removedEntries}
+                selectedIndex={removedCursor}
+                width={listWidth}
+              />
+            ) : (
+              <WorktreeList
+                items={activeItems}
+                archivedRows={archivedRows}
+                reviewRequests={reviewRequestRows}
+                selectedIndex={cursorIndex}
+                width={listWidth}
+                activeTails={activeTails}
+                activeActions={activeActions}
+                activeSessionBySlug={activeSessionBySlug}
+                stackSectionLabels={stackSectionLabels}
+                isLoading={isLoading}
+                remoteUnavailable={remoteUnavailable}
+                scrollHandle={listScrollHandleRef}
+              />
+            )}
+            <Details
+              row={removedView ? undefined : current}
+              reviewRequest={removedView ? undefined : selectedPr}
+              remote={removedView ? undefined : selectedRemote}
+              remoteUnavailable={remoteUnavailable}
+              remoteError={remoteError}
+              section={removedView ? undefined : sectionDetail}
+              removed={currentRemoved}
+              width={Math.max(0, width - listWidth)}
+              scrollRef={detailsScrollRef}
+              sessionState={
+                current
+                  ? activeSessionBySlug.get(current.wt.slug)?.state ?? undefined
+                  : undefined
+              }
+            />
+          </box>
+          <OutputViewer output={displayedOutput} height={activityHeight} />
+        </>
+      )}
       <PreFooterModals
         modal={modal}
         currentSlug={currentSlug}

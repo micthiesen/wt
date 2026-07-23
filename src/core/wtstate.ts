@@ -18,7 +18,7 @@ export type {
   WtState,
 } from "./wtstate/types.ts";
 
-export { WT_STATE_DIR, readWtState } from "./wtstate/io.ts";
+export { parseWtState, WT_STATE_DIR, readWtState } from "./wtstate/io.ts";
 
 export {
   advanceBaseAnchor,
@@ -30,6 +30,8 @@ export {
   reparentBaseReferences,
   setSlugBase,
   setSlugSection,
+  setTaskPinned,
+  setTaskSnooze,
   swapOrders,
   toggleSectionFolded,
 } from "./wtstate/sections.ts";

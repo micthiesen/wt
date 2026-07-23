@@ -2,7 +2,14 @@ import { killActionSession } from "./action-sessions.ts";
 import type { HarnessId } from "../harness/index.ts";
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
-import { bareSlug, CLAUDE_NAMED_SEP, sessionName, SUFFIX, TMUX_SOCKET } from "./naming.ts";
+import {
+  bareSlug,
+  CLAUDE_NAMED_SEP,
+  HUB_HOME_SESSION,
+  sessionName,
+  SUFFIX,
+  TMUX_SOCKET,
+} from "./naming.ts";
 import { killByName, listAllSessionsRaw } from "./process.ts";
 
 const log = createLogger("[tmux]");
@@ -152,24 +159,8 @@ export function resolveDiffCommand(template: string, base: string | undefined): 
  */
 export type ClaudeSessionEntry = { slug: string; name: string | null };
 
-/**
- * Bare slug sets (and named-claude entries) for the live sessions of
- * each kind. Partitioned so the indicators, kill-confirm hints, and
- * the sessions picker can each read what they need independently.
- * One CLI call regardless of worktree count.
- *
- * `claude` is a list of `(slug, name)` because a single worktree can
- * host multiple claude sessions (primary + N named). `codex` and
- * `opencode` are slug sets — for v1 they're single-tmux-per-slug.
- * The legacy `claudeSlugs` set is the unique-slug projection of
- * `claude` — preserved so "row has any live claude" checks stay a
- * Set lookup.
- *
- * Server-not-running exits non-zero with a "no server running"
- * stderr; we map that to empty sets rather than throwing — it's the
- * steady state when no worktree has been entered yet.
- */
-export async function listSessions(): Promise<{
+/** Classified-by-kind view of a set of raw tmux session names, minus `all`. */
+export type SessionClassification = {
   claude: ClaudeSessionEntry[];
   claudeSlugs: Set<string>;
   codex: Set<string>;
@@ -177,11 +168,17 @@ export async function listSessions(): Promise<{
   diff: Set<string>;
   shell: Set<string>;
   action: Set<string>;
-  /** Raw set of every live tmux session name. Used by harness impls
-   *  to compute `isLive` without a second `list-sessions` call. */
-  all: Set<string>;
-}> {
-  const all = await listAllSessionsRaw();
+};
+
+/**
+ * Pure classifier behind `listSessions` — split out so the
+ * (name → kind) logic is unit-testable without spawning a real tmux
+ * server. See `listSessions` for the full semantics; the one thing to
+ * know here is that `HUB_HOME_SESSION` (the reserved hub dashboard
+ * session, not a worktree session of any kind) is excluded from every
+ * returned set, including as a bare-slug claude entry.
+ */
+export function classifySessions(names: Iterable<string>): SessionClassification {
   const claude: ClaudeSessionEntry[] = [];
   const claudeSlugs = new Set<string>();
   const codex = new Set<string>();
@@ -189,7 +186,11 @@ export async function listSessions(): Promise<{
   const diff = new Set<string>();
   const shell = new Set<string>();
   const action = new Set<string>();
-  for (const name of all) {
+  for (const name of names) {
+    // The reserved hub-home dashboard session isn't a worktree session
+    // of any kind — it must not surface as a claude session for slug
+    // "wt-hub-home" (or any other classified set). See naming.ts.
+    if (name === HUB_HOME_SESSION) continue;
     if (name.endsWith(SUFFIX.codex)) {
       codex.add(name.slice(0, -SUFFIX.codex.length));
     } else if (name.endsWith(SUFFIX.opencode)) {
@@ -213,7 +214,35 @@ export async function listSessions(): Promise<{
       }
     }
   }
-  return { claude, claudeSlugs, codex, opencode, diff, shell, action, all };
+  return { claude, claudeSlugs, codex, opencode, diff, shell, action };
+}
+
+/**
+ * Bare slug sets (and named-claude entries) for the live sessions of
+ * each kind. Partitioned so the indicators, kill-confirm hints, and
+ * the sessions picker can each read what they need independently.
+ * One CLI call regardless of worktree count.
+ *
+ * `claude` is a list of `(slug, name)` because a single worktree can
+ * host multiple claude sessions (primary + N named). `codex` and
+ * `opencode` are slug sets — for v1 they're single-tmux-per-slug.
+ * The legacy `claudeSlugs` set is the unique-slug projection of
+ * `claude` — preserved so "row has any live claude" checks stay a
+ * Set lookup.
+ *
+ * Server-not-running exits non-zero with a "no server running"
+ * stderr; we map that to empty sets rather than throwing — it's the
+ * steady state when no worktree has been entered yet.
+ */
+export async function listSessions(): Promise<
+  SessionClassification & {
+    /** Raw set of every live tmux session name. Used by harness impls
+     *  to compute `isLive` without a second `list-sessions` call. */
+    all: Set<string>;
+  }
+> {
+  const all = await listAllSessionsRaw();
+  return { ...classifySessions(all), all };
 }
 
 /**
@@ -234,7 +263,13 @@ export async function reapOrphanedSessions(
   } catch {
     return;
   }
-  const orphans = [...sessions].filter((s) => !liveSlugs.has(bareSlug(s)));
+  // The reserved hub-home session isn't slug-owned, so it can never
+  // appear in a caller's `liveSlugs` set on its own merits — whitelist
+  // it directly rather than relying on every caller to remember to add
+  // it alongside the slot-slug whitelist.
+  const orphans = [...sessions].filter(
+    (s) => s !== HUB_HOME_SESSION && !liveSlugs.has(bareSlug(s)),
+  );
   if (orphans.length === 0) return;
   log.info(`reaping ${orphans.length} orphaned tmux session(s)`, {
     orphans,

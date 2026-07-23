@@ -29,11 +29,17 @@ async function main(): Promise<number> {
 
   // No args + TTY → interactive TUI. Every user action runs in-TUI now
   // (no CLI handoff for `new` or `clean`), so this is a single call.
+  // `[ui] mode = "hub"` reroutes a bare `wt` into the hub layout
+  // (`wt classic` / `wt hub` force a mode regardless).
   const { config } = await import("./core/config.ts");
+  if (config.ui.mode === "hub") {
+    const { dispatch } = await import("./cli/index.ts");
+    return dispatch(["hub"]);
+  }
   const { setWezTermTabTitle } = await import("./core/wezterm.ts");
   await setWezTermTabTitle("wt", config.paths.weztermCli);
   const { runTui } = await import("./tui/runtime.tsx");
-  await runTui();
+  await runTui({});
   return 0;
 }
 

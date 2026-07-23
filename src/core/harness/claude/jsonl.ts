@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { readFileSlice } from "../../tail-util.ts";
-import { asObj } from "./events.ts";
+import { asArr, asObj, briefToolInput } from "./events.ts";
 import { listClaudeNames } from "./names.ts";
 
 /**
@@ -63,6 +63,18 @@ export type SessionTail = {
    * tend to settle to small numbers within a turn or two.
    */
   queued: number;
+  /**
+   * Tool-aware description of what the last assistant tool_use is
+   * asking for, when the tail ends mid-turn on a tool_use (the shape a
+   * permission prompt has in the jsonl: the assistant emitted tool_use,
+   * no tool_result yet). Null otherwise. Rendered as the task row's
+   * "Needs you: …" second line — see describePendingToolUse for the
+   * per-tool special cases (ExitPlanMode's plan, AskUserQuestion's
+   * question) that the generic key-whitelist brief can't carry.
+   */
+  pendingAsk: string | null;
+  /** First non-empty line of the most recent assistant TEXT block in the tail window; null when none. */
+  lastAssistantText: string | null;
 };
 
 export type ClaudeStatus = {
@@ -167,7 +179,8 @@ function readTail(filePath: string, size: number): string {
   return readFileSlice(filePath, start, size - start);
 }
 
-type Entry = { type: string; raw: Record<string, unknown> };
+/** Exported so `extractPendingContext` is unit-testable on hand-built arrays without going through jsonl text. */
+export type Entry = { type: string; raw: Record<string, unknown> };
 
 function parseTailLines(tail: string, fileStart: boolean): Entry[] {
   // If we didn't start from byte 0, the first line is likely partial — drop it.
@@ -251,6 +264,116 @@ function classifyLast(entries: readonly Entry[]): {
 }
 
 /**
+ * First non-empty line of `text`, with internal whitespace/newlines-
+ * within-that-line collapsed to single spaces. Shared by the
+ * ExitPlanMode plan extraction and the "most recent assistant text"
+ * tracking below — both want a single display-ready line, not a raw
+ * multi-line blob. Returns null when every line is blank.
+ */
+function firstNonEmptyLine(text: string): string | null {
+  for (const raw of text.split("\n")) {
+    const trimmed = raw.trim();
+    if (trimmed.length > 0) return trimmed.replace(/\s+/g, " ");
+  }
+  return null;
+}
+
+/**
+ * Tool-aware brief for a pending (un-resolved) tool_use, used to fill
+ * `SessionTail.pendingAsk`. Most tools are adequately summarized by
+ * `briefToolInput`'s key whitelist (`allow Bash: npm test`), but two
+ * tools carry their real "what am I blocked on" payload in a shape
+ * the whitelist can't see:
+ *
+ *  - `ExitPlanMode` — the interesting content is `input.plan`, a
+ *    markdown blob. Show its first non-empty line (heading markers
+ *    stripped, since plans often lead with `# Title`) so the row
+ *    reads as "approve plan: <gist>" instead of the useless generic
+ *    `allow ExitPlanMode`.
+ *  - `AskUserQuestion` — the question text lives at
+ *    `input.questions[0].question` (current shape) or `input.question`
+ *    (tolerate older/alternate shape); surface it directly.
+ *
+ * Exported (rather than folded into the tail parser) so both are
+ * unit-testable without constructing a jsonl fixture.
+ */
+export function describePendingToolUse(name: string, input: unknown): string {
+  if (name === "ExitPlanMode") {
+    const obj = asObj(input);
+    const plan = obj && typeof obj.plan === "string" ? obj.plan : "";
+    const line = firstNonEmptyLine(plan);
+    const stripped = line ? line.replace(/^#{1,6}\s*/, "").trim() : "";
+    return stripped ? `approve plan: ${stripped}` : "approve plan";
+  }
+  if (name === "AskUserQuestion") {
+    const obj = asObj(input);
+    let question: string | null = null;
+    if (obj) {
+      const questions = asArr(obj.questions);
+      const first = questions && questions.length > 0 ? asObj(questions[0]) : null;
+      if (first && typeof first.question === "string") {
+        question = first.question;
+      } else if (typeof obj.question === "string") {
+        question = obj.question;
+      }
+    }
+    const line = question
+      ? question.replaceAll("\n", " ").replace(/\s+/g, " ").trim()
+      : "";
+    return line ? `question: ${line}` : "question";
+  }
+  const brief = briefToolInput(input);
+  return brief ? `allow ${name}: ${brief}` : `allow ${name}`;
+}
+
+/** Accumulated `pendingAsk` / `lastAssistantText` inputs — see `extractPendingContext`. */
+export type PendingContext = {
+  /** name + input of the last tool_use block of the last assistant entry in the window; null when none. */
+  lastToolUse: { name: string; input: unknown } | null;
+  /** First non-empty line of the most recent assistant text block in the window; null when none. */
+  lastAssistantText: string | null;
+};
+
+/**
+ * Single forward pass over the tail's parsed entries, tracking the two
+ * pieces of "what is the agent doing / blocked on" state the task-inbox
+ * row needs. Entries arrive in chronological order (see
+ * `parseTailLines`), so walking forward and always overwriting on a
+ * new match naturally lands on the *last* occurrence of each — the
+ * last tool_use block of the last assistant entry, and the last
+ * non-empty assistant text line — without needing a second backward
+ * pass or entry-boundary bookkeeping.
+ *
+ * Factored out of `tailSession` (rather than inlined into the single-
+ * pass classify/queue loop there) so it's unit-testable on hand-built
+ * `Entry[]` arrays without constructing jsonl fixture text.
+ */
+export function extractPendingContext(
+  entries: readonly Entry[],
+): PendingContext {
+  let lastToolUse: { name: string; input: unknown } | null = null;
+  let lastAssistantText: string | null = null;
+  for (const e of entries) {
+    if (e.type !== "assistant") continue;
+    const message = asObj(e.raw.message);
+    if (!message) continue;
+    const content = asArr(message.content);
+    if (!content) continue;
+    for (const block of content) {
+      const b = asObj(block);
+      if (!b) continue;
+      if (b.type === "tool_use" && typeof b.name === "string") {
+        lastToolUse = { name: b.name, input: b.input };
+      } else if (b.type === "text" && typeof b.text === "string") {
+        const line = firstNonEmptyLine(b.text);
+        if (line) lastAssistantText = line;
+      }
+    }
+  }
+  return { lastToolUse, lastAssistantText };
+}
+
+/**
  * Per-path memo of the last `tailSession` result keyed on
  * `(mtimeMs, size)`. The query polls every 5s and most worktrees
  * are idle most of the time — without this, every poll re-parses
@@ -268,7 +391,15 @@ const tailCache = new Map<string, TailCacheEntry>();
 const TAIL_CACHE_MAX = 256;
 
 function emptyTail(name: string | null, hasJsonl: boolean): SessionTail {
-  return { name, hasJsonl, lastEntryMs: null, lastEntryKind: null, queued: 0 };
+  return {
+    name,
+    hasJsonl,
+    lastEntryMs: null,
+    lastEntryKind: null,
+    queued: 0,
+    pendingAsk: null,
+    lastAssistantText: null,
+  };
 }
 
 function tailSession(wtPath: string, name: string | null): SessionTail {
@@ -314,12 +445,26 @@ function tailSession(wtPath: string, name: string | null): SessionTail {
     // mtime fallback when the entry has no `timestamp` (rare); it
     // beats returning null for a non-empty jsonl.
     const lastEntryMs = last.ts ?? mtimeMs;
+    const pending = extractPendingContext(parsed);
+    // Only meaningful when the tail actually ends on an unanswered
+    // tool_use — an end_turn/paused/tool_result tail has no live
+    // permission prompt to describe, even if an earlier tool_use is
+    // still the most recent one seen in the window.
+    const pendingAsk =
+      last.kind === "tool_use" && pending.lastToolUse
+        ? describePendingToolUse(
+            pending.lastToolUse.name,
+            pending.lastToolUse.input,
+          )
+        : null;
     result = {
       name,
       hasJsonl: true,
       lastEntryMs,
       lastEntryKind: last.kind,
       queued,
+      pendingAsk,
+      lastAssistantText: pending.lastAssistantText,
     };
   } catch {
     return emptyTail(name, true);

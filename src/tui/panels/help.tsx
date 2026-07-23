@@ -169,6 +169,21 @@ const KEY_BLOCKS: Block[] = [
   },
   {
     kind: "keys",
+    title: "hub mode (wt hub)",
+    note: "Tmux-hosted task inbox: left = tasks, right = live session. Typing goes to the session; every wt key above works as alt+<key>. These are hub-only:",
+    items: [
+      { key: "⏎ / F12", label: "start + show the task's agent session (PR task: open PR)" },
+      { key: "F11 / F10", label: "show diff / shell session in the right pane" },
+      { key: "z", label: "snooze task until its state changes" },
+      { key: "P", label: "pin task to the top" },
+      { key: "D", label: "toggle the details card" },
+      { key: "alt+space", label: "zoom the session pane" },
+      { key: "F9", label: "switch pane focus" },
+      { key: "q", label: "leave the hub (sessions keep running)" },
+    ],
+  },
+  {
+    kind: "keys",
     title: "review requests (pinned section)",
     note: "PRs awaiting your review, pulled from GitHub. Not worktrees — only these keys apply.",
     items: [

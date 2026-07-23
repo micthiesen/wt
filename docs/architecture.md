@@ -23,7 +23,7 @@ The list panel (`src/tui/panels/list.tsx`) is deliberately **not** row-driven �
 
 ## Module layout conventions
 
-The big core modules are directories behind a same-named flat barrel: `core/github.ts` → `core/github/`, `core/wtstate.ts` → `core/wtstate/`, `core/stack-ops.ts` → `core/stack-ops/`, `core/actions.ts` → `core/actions/`, `core/tmux.ts` → `core/tmux/`, `state/queries.ts` → `state/queries/`. The barrel re-exports the module's public surface with explicit named re-exports — importers keep using the flat path; only names in the barrel are public. (`tui/modal-keys/` is a plain directory — its single consumer imports `index.ts` directly.)
+The big core modules are directories behind a same-named flat barrel: `core/github.ts` → `core/github/`, `core/wtstate.ts` → `core/wtstate/`, `core/stack-ops.ts` → `core/stack-ops/`, `core/actions.ts` → `core/actions/`, `core/tmux.ts` → `core/tmux/`, `core/hub.ts` → `core/hub/`, `state/queries.ts` → `state/queries/`. The barrel re-exports the module's public surface with explicit named re-exports — importers keep using the flat path; only names in the barrel are public. (`tui/modal-keys/` is a plain directory — its single consumer imports `index.ts` directly.)
 
 Per-harness code (claude/codex/opencode session discovery, naming, events, usage, tails) lives under `core/harness/<harness>/` behind the generic `Harness` interface (`core/harness/types.ts`); `core/harness/status.ts` is the shared `DerivedState` vocabulary.
 
@@ -46,6 +46,7 @@ Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. E
 | 3-minute `fetch origin` interval | backstop for remote drift |
 | claude-registry fs.watch, session-tail triggers (`gh pr …` / `git push` inside a session) | sessions / github |
 | action `affects` tags on completion | the declared domains |
+| hub's `switchRight` (right-pane retarget on session entry) | `~/.cache/wt/task-focus.json` — the slug's last-focused stamp, which is what flips a task out of the `review-output` bucket; push-based, no polling |
 
 When adding a new state source or mutation path, wire one of these (or an explicit invalidation at the call site) rather than shortening a staleTime — staleTimes only bound how wrong things can be when a trigger is missed. Watchers live in `src/core/repo-watch.ts` and are wired in `src/tui/runtime.tsx` through a 50ms-coalescing invalidation scheduler.
 
@@ -76,6 +77,20 @@ suspends the Mac renderer. Detaching returns to the same Mac Inbox.
 `d` forwards the normal `wt rm` command after confirmation, preserving the
 remote installation's lock and dirty-work safeguards while explicitly leaving
 any SST stage intact.
+
+## Hub mode
+
+An opt-in second UI (`[ui] mode = "hub"` / `wt hub`) layered on top of the same
+worktree pipeline rather than a fork of it — see [hub.md](hub.md) for the full
+picture (tmux topology, bucket precedence, keymap). Two things worth knowing
+structurally:
+
+- `core/hub/` (behind the `core/hub.ts` barrel, alongside `core/tmux/`) owns
+  the outer `wt-hub` tmux server: layout (`layout.ts`), generated config
+  (`config.ts`), and the control surface the TUI drives it with —
+  `switchRight` retargeting the right pane, `focusLeft`/`focusRight`,
+  `killHub` (`control.ts`).
+- The task inbox gets its own pass at the sources/rows/driver split: `core/task-state.ts` is the pure bucket-precedence source (no queries, no fs — fully unit-tested), `src/tui/hooks/useTaskRows.ts` is the rows-equivalent glue that turns the existing worktree-row pipeline plus review-request PRs into sorted `TaskItem[]`, and `src/tui/panels/tasks.tsx` (`TaskList`) is the driver — purely presentational, same badge/glyph machinery as `panels/list.tsx`.
 
 ## Modal UX rules
 

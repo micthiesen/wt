@@ -56,7 +56,7 @@ The full reference — every option, default, the `[[actions]]` menu, and `[[aut
 
 ## Use
 
-`wt` with no arguments launches the TUI; press `?` inside for the full keymap and glyph legend. Subcommands (`wt new`, `wt rm`, `wt clean`, `wt restack`, …) run the same operations one-shot from a shell.
+`wt` with no arguments launches the TUI; press `?` inside for the full keymap and glyph legend. Subcommands (`wt new`, `wt rm`, `wt clean`, `wt restack`, …) run the same operations one-shot from a shell. An opt-in [hub mode](docs/hub.md) (`wt hub`, or `[ui] mode = "hub"`) swaps in a tmux-hosted task inbox next to an always-live coding-agent session; `wt classic` / `wt hub` switch freely since both share all on-disk state.
 
 An optional `[remote]` SSH target lets `Ctrl+N` create worktrees on a second
 machine while keeping them in the same Inbox; F10/F11/F12 route the selected
@@ -71,6 +71,7 @@ State is push-based: filesystem watchers on git refs, worktree dirs, and wt's ow
 | doc | contents |
 |---|---|
 | [docs/tui.md](docs/tui.md) | TUI tour: layout, full keymap, picker conventions |
+| [docs/hub.md](docs/hub.md) | hub mode: the opt-in task-inbox UI |
 | [docs/cli.md](docs/cli.md) | every subcommand and flag |
 | [docs/configuration.md](docs/configuration.md) | complete config.toml reference |
 | [docs/automations.md](docs/automations.md) | the `[[automations]]` engine: triggers, settle windows, breaker |

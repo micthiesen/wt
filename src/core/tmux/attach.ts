@@ -7,7 +7,7 @@ import { getHarness, type Harness } from "../harness/index.ts";
 import { createLogger } from "../logger.ts";
 import { shellLogPath } from "../shell-tail.ts";
 import { killServer, resolveDiffCommand } from "./admin.ts";
-import { writeConfig } from "./config.ts";
+import { ensureConfig, writeConfig } from "./config.ts";
 import {
   harnessIdForKind,
   sessionSwitchTarget,
@@ -87,6 +87,69 @@ function scrubStderr(raw: string): string | null {
 }
 
 /**
+ * Resolve the inner-program argv for a session: `harness.buildArgs` for
+ * AI harness kinds (claude/codex/opencode), the user's diff command via
+ * their login shell for `diff`, or a bare login shell for `shell`. Calls
+ * `harness.ensureTrusted?.(cwd)` as a side effect for harness kinds so
+ * the workspace-trust gate doesn't fire on first launch (rift checkouts
+ * otherwise read as new projects to Claude).
+ *
+ * Shared by `attachOrCreate` and `ensureSessionDetached` so the two
+ * creation paths can never drift on what argv a given (kind, opts)
+ * produces.
+ */
+export function buildInnerArgs(params: {
+  cwd: string;
+  kind: Exclude<SessionKind, "action">;
+  harness: Harness | null;
+  managedNameNorm: string | null;
+  resumeSessionId?: string | null;
+  claudeDisplayName?: string;
+  base?: string;
+}): string[] {
+  const { cwd, kind, harness, managedNameNorm, resumeSessionId, claudeDisplayName, base } =
+    params;
+  if (harness) {
+    harness.ensureTrusted?.(cwd);
+    return harness.buildArgs({
+      wtPath: cwd,
+      managedName: managedNameNorm,
+      resumeSessionId: resumeSessionId ?? null,
+      displayLabel: claudeDisplayName,
+    });
+  }
+  const userShell = process.env.SHELL || "bash";
+  if (kind === "diff") {
+    return [userShell, "-lc", resolveDiffCommand(config.diff.command, base)];
+  }
+  return [userShell, "-l"];
+}
+
+/**
+ * Wrap `innerArgs` in the TMUX-stripping + stderr-capture bash shim
+ * every tmux `new-session` spawn in this module uses (see the barrel's
+ * header comment for why `$TMUX` gets stripped). `exec` keeps the
+ * process tree flat — the inner program inherits bash's pid, no extra
+ * hop — and `stderrPath` is passed as `$1` so callers never have to
+ * shell-escape it. Shared by `attachOrCreate` and `ensureSessionDetached`.
+ */
+export function wrapInnerArgs(stderrPath: string, innerArgs: string[]): string[] {
+  return [
+    "env",
+    "-u",
+    "TMUX",
+    "-u",
+    "TMUX_PANE",
+    "bash",
+    "-c",
+    'p="$1"; shift; exec "$@" 2> "$p"',
+    "_wt_wrap",
+    stderrPath,
+    ...innerArgs,
+  ];
+}
+
+/**
  * Attach to (or create) the worktree's session and run the configured
  * inner program (claude for `kind: "claude"`, the user's diff TUI for
  * `kind: "diff"`). Stdio is inherited so tmux owns the user's
@@ -156,8 +219,46 @@ export async function attachOrCreate(opts: {
       : "shell";
   const { path: configPath, changed } = writeConfig();
   if (changed) {
-    log.info("config changed, killing server before attach", { slug, kind });
-    await killServer();
+    // tmux only reads its config at server start, so a changed render
+    // (different wt build, different outer TERM) only takes effect if
+    // the server restarts. Killing it is free when nothing's running —
+    // but once long-lived sessions exist (a hub keeping harness
+    // sessions attached, another terminal's F12 session), killServer()
+    // here would cross-kill every one of them just because THIS
+    // attach's config render happened to differ. Only kill on the
+    // empty-server path; otherwise apply what tmux can hot-reload via
+    // `source-file` and accept that server-start-only settings (e.g.
+    // `default-terminal`) lag until the next organic restart.
+    const liveSessions = await listAllSessionsRaw().catch(() => new Set<string>());
+    if (liveSessions.size === 0) {
+      log.info("config changed, killing server before attach (no live sessions)", {
+        slug,
+        kind,
+      });
+      await killServer();
+    } else {
+      const source = Bun.spawn(["tmux", "-L", TMUX_SOCKET, "source-file", configPath], {
+        cwd: tmuxClientCwd(),
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [sourceCode, sourceErr] = await Promise.all([
+        source.exited,
+        new Response(source.stderr).text(),
+      ]);
+      if (sourceCode !== 0) {
+        log.debug("config source-file (hot-reload) failed", {
+          slug,
+          kind,
+          code: sourceCode,
+          stderr: sourceErr.trim() || null,
+        });
+      }
+      log.info(
+        "config changed with live sessions present; applied via source-file, full config takes effect at next server restart",
+        { slug, kind, liveSessions: liveSessions.size },
+      );
+    }
   }
   // Stable per-session-name file for the inner program's stderr.
   // The bash wrapper below sets this up via `2>` so claude/diff/shell
@@ -175,24 +276,15 @@ export async function attachOrCreate(opts: {
   // to the configured command via the user's login shell so PATH/init
   // (pyenv, mise, …) apply. The shell branch is just the login shell
   // with no command — exit (Ctrl+D / `exit`) ends the session.
-  const userShell = process.env.SHELL || "bash";
-  let innerArgs: string[];
-  if (harness) {
-    // Trust the workspace for this harness before launch so its one-time
-    // "trust this folder?" gate doesn't fire (rift checkouts read as new
-    // projects to Claude). No-op for harnesses without such a gate.
-    harness.ensureTrusted?.(cwd);
-    innerArgs = harness.buildArgs({
-      wtPath: cwd,
-      managedName: managedNameNorm,
-      resumeSessionId: resumeSessionId ?? null,
-      displayLabel: claudeDisplayName,
-    });
-  } else if (kind === "diff") {
-    innerArgs = [userShell, "-lc", resolveDiffCommand(config.diff.command, base)];
-  } else {
-    innerArgs = [userShell, "-l"];
-  }
+  const innerArgs = buildInnerArgs({
+    cwd,
+    kind,
+    harness,
+    managedNameNorm,
+    resumeSessionId,
+    claudeDisplayName,
+    base,
+  });
 
   // Shell: pre-create the session detached and chain `pipe-pane` to a
   // per-slug log so every byte the shell writes is captured for the
@@ -237,17 +329,7 @@ export async function attachOrCreate(opts: {
           name,
           "-c",
           cwd,
-          "env",
-          "-u",
-          "TMUX",
-          "-u",
-          "TMUX_PANE",
-          "bash",
-          "-c",
-          'p="$1"; shift; exec "$@" 2> "$p"',
-          "_wt_wrap",
-          stderrPath,
-          ...innerArgs,
+          ...wrapInnerArgs(stderrPath, innerArgs),
           ";",
           ...pipePaneArgs,
         ];
@@ -311,25 +393,13 @@ export async function attachOrCreate(opts: {
         "-c",
         cwd,
         // See header: claude downgrades to 256-color when $TMUX is set.
-        "env",
-        "-u",
-        "TMUX",
-        "-u",
-        "TMUX_PANE",
         // Wrap the inner program in a tiny bash that redirects stderr
-        // to `stderrPath` before exec'ing. `exec` keeps the process
-        // tree flat (the inner program inherits bash's PID, no extra
-        // hop). `new-session -A` only runs this command on creation —
+        // to `stderrPath` before exec'ing (see `wrapInnerArgs`).
+        // `new-session -A` only runs this command on creation —
         // subsequent re-attaches share the file the original bash is
-        // still appending to. The redirect target is passed as $1 so
-        // we never have to shell-escape paths. Stdout stays on tmux's
-        // pty so the inner UI renders normally.
-        "bash",
-        "-c",
-        'p="$1"; shift; exec "$@" 2> "$p"',
-        "_wt_wrap",
-        stderrPath,
-        ...innerArgs,
+        // still appending to. Stdout stays on tmux's pty so the inner
+        // UI renders normally.
+        ...wrapInnerArgs(stderrPath, innerArgs),
         ";",
         "set-option",
         "-t",
@@ -409,4 +479,140 @@ export async function attachOrCreate(opts: {
     // no stderr file — bash never wrote anything, or it was already swept
   }
   return { kind: "exited", code, stderr: stderrText };
+}
+
+/**
+ * Ensure a session exists, creating it detached (`new-session -d`, no
+ * client attach) if it doesn't. Byte-for-byte the same inner-program
+ * construction `attachOrCreate` uses — same `sessionName`, same
+ * `buildInnerArgs` / `wrapInnerArgs` — so a later `attachOrCreate` on
+ * the same (slug, kind, managedName) just attaches to what this
+ * created rather than spawning a second session.
+ *
+ * For hub mode and any other non-interactive caller that needs a
+ * session to exist without taking over the terminal (unlike
+ * `attachOrCreate`, which inherits stdio and blocks until the client
+ * detaches). `kind: "action"` is excluded — action sessions have their
+ * own lifecycle in `core/tmux/action-sessions.ts`.
+ *
+ * Uses `ensureConfig()`, NOT `writeConfig()` + `killServer()`: this can
+ * run from arbitrary contexts (e.g. from inside the wt tmux server
+ * itself, or from a hub that's keeping other sessions alive), where the
+ * kill-server-on-config-change dance would be actively destructive. See
+ * `ensureConfig`'s header for the full rationale.
+ */
+export async function ensureSessionDetached(opts: {
+  slug: string;
+  cwd: string;
+  kind: Exclude<SessionKind, "action">;
+  managedName?: string | null;
+  resumeSessionId?: string | null;
+  claudeDisplayName?: string;
+  /** Resolved diff base for `{{base}}` in `[diff].command` (diff kind only). */
+  base?: string;
+}): Promise<{ ok: true; created: boolean } | { ok: false; reason: string }> {
+  const { slug, cwd, kind, managedName, resumeSessionId, claudeDisplayName, base } = opts;
+  const harnessId = harnessIdForKind(kind);
+  const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
+  const managedNameNorm = harness ? (managedName ?? null) : null;
+  const name = sessionName(slug, kind, managedNameNorm);
+  const shortcut: SessionShortcut = harness ? "harness" : kind === "diff" ? "diff" : "shell";
+  const configPath = ensureConfig();
+
+  const exists = (await listAllSessionsRaw().catch(() => new Set<string>())).has(name);
+  if (exists) {
+    if (kind === "shell") {
+      // Idempotent re-run of the pipe-pane chain (see attachOrCreate):
+      // `-o` makes this a no-op when the pipe's already attached, so
+      // it's safe to call on every ensure regardless of whether the
+      // tail was already wired up.
+      const shellLog = shellLogPath(slug);
+      const quotedLog = shQuote(shellLog);
+      const rerun = Bun.spawn(
+        [
+          "tmux",
+          "-L",
+          TMUX_SOCKET,
+          "-f",
+          configPath,
+          "pipe-pane",
+          "-o",
+          "-t",
+          name,
+          `cat > ${quotedLog}`,
+        ],
+        { cwd: tmuxClientCwd(), stdout: "ignore", stderr: "pipe" },
+      );
+      const [rerunCode, rerunErr] = await Promise.all([
+        rerun.exited,
+        new Response(rerun.stderr).text(),
+      ]);
+      if (rerunCode !== 0) {
+        log.warn("ensureSessionDetached: pipe-pane re-run failed", {
+          slug,
+          code: rerunCode,
+          stderr: rerunErr.trim() || null,
+        });
+      }
+    }
+    return { ok: true, created: false };
+  }
+
+  const stderrPath = join(sessionsDir(), `${name}.err`);
+  const innerArgs = buildInnerArgs({
+    cwd,
+    kind,
+    harness,
+    managedNameNorm,
+    resumeSessionId,
+    claudeDisplayName,
+    base,
+  });
+
+  const createBase = [
+    "tmux",
+    "-L",
+    TMUX_SOCKET,
+    "-f",
+    configPath,
+    "new-session",
+    "-d",
+    "-s",
+    name,
+    "-c",
+    cwd,
+    ...wrapInnerArgs(stderrPath, innerArgs),
+  ];
+  const tagArgs = ["set-option", "-t", name, "@wt-shortcut", shortcut];
+  // Chain every setup command onto the one `tmux` invocation (`;`
+  // separates commands within a single call) so there's no window
+  // between session-create and pipe-pane/tag where output could be
+  // lost or the session briefly appear untagged.
+  const createArgs =
+    kind === "shell"
+      ? [
+          ...createBase,
+          ";",
+          "pipe-pane",
+          "-o",
+          "-t",
+          name,
+          `cat > ${shQuote(shellLogPath(slug))}`,
+          ";",
+          ...tagArgs,
+        ]
+      : [...createBase, ";", ...tagArgs];
+
+  const proc = Bun.spawn(createArgs, {
+    cwd: tmuxClientCwd(),
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+  if (code !== 0) {
+    const reason = stderr.trim() || `tmux new-session exited ${code}`;
+    log.warn("ensureSessionDetached: create failed", { slug, kind, code, reason });
+    return { ok: false, reason };
+  }
+  return { ok: true, created: true };
 }

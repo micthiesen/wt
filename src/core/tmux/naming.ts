@@ -39,6 +39,15 @@ export function sessionSwitchTarget(
 export const WT_SOURCE_SLUG = "wt";
 
 /**
+ * Reserved inner-server session for hub mode's right pane to idle on
+ * when the selected task has no live session (see `core/hub.ts`). Runs
+ * `wt _home` (a static dashboard). Not a worktree session: session
+ * listing/classification and the orphan reaper must skip it, and it is
+ * never user-attachable through the F-key or picker paths.
+ */
+export const HUB_HOME_SESSION = "wt-hub-home";
+
+/**
  * Kinds of session this module manages. `claude` / `codex` / `opencode`
  * are AI harness sessions (each spawned for one worktree at a time);
  * `diff` is the F11 git-diff TUI; `shell` is the F10 plain login

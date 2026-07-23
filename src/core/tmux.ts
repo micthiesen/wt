@@ -28,7 +28,7 @@
 // This module has been split into src/core/tmux/*.ts; this file is now
 // a thin barrel reproducing the original export surface.
 
-export { TMUX_SOCKET, WT_SOURCE_SLUG, claudeSessionName } from "./tmux/naming.ts";
+export { HUB_HOME_SESSION, TMUX_SOCKET, WT_SOURCE_SLUG, claudeSessionName, sessionName } from "./tmux/naming.ts";
 export type { SessionKind } from "./tmux/naming.ts";
 
 export { buildConfig, writeConfig } from "./tmux/config.ts";
@@ -50,7 +50,7 @@ export type { ClaudeSessionEntry } from "./tmux/admin.ts";
 
 export { killActionSession, startActionSession } from "./tmux/action-sessions.ts";
 
-export { attachOrCreate } from "./tmux/attach.ts";
+export { attachOrCreate, ensureSessionDetached } from "./tmux/attach.ts";
 export type { AttachResult } from "./tmux/attach.ts";
 
 export { injectIntoSession } from "./tmux/inject.ts";

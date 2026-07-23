@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 import { getHarness, type HarnessId } from "../harness/index.ts";
 import { createLogger } from "../logger.ts";
-import { sessionsDir, tmuxClientCwd } from "./attach.ts";
+import { buildInnerArgs, sessionsDir, tmuxClientCwd, wrapInnerArgs } from "./attach.ts";
 import { ensureConfig } from "./config.ts";
 import { sessionName, TMUX_SOCKET } from "./naming.ts";
 import { capturePane, listAllSessionsRaw, paneTarget, runTmux } from "./process.ts";
@@ -54,7 +54,8 @@ async function waitForPaneReady(name: string): Promise<boolean> {
 /**
  * Create the worktree's primary harness session detached (no client
  * attach). Byte-for-byte the session `attachOrCreate({kind:harnessId})`
- * would make — same name, same `buildArgs` argv, same stderr
+ * would make — same name, same `buildArgs` argv (via the shared
+ * `buildInnerArgs`/`wrapInnerArgs` helpers in attach.ts), same stderr
  * wrapper and TMUX-stripping env — so a later F12 `new-session -A` just
  * attaches to this one rather than spawning a second. Sized generously
  * so the harness doesn't render cramped before the user attaches; tmux
@@ -73,12 +74,13 @@ async function startHarnessSessionDetached(
   // dance would take down every live session including the caller's.
   const configPath = ensureConfig();
   const stderrPath = join(sessionsDir(), `${name}.err`);
-  // Trust the workspace before launch (see attach.ts) — rift checkouts
-  // otherwise trip Claude's per-project trust prompt. No-op otherwise.
-  harness.ensureTrusted?.(cwd);
-  const innerArgs = harness.buildArgs({
-    wtPath: cwd,
-    managedName: null,
+  // buildInnerArgs also calls harness.ensureTrusted?.(cwd) — rift
+  // checkouts otherwise trip Claude's per-project trust prompt.
+  const innerArgs = buildInnerArgs({
+    cwd,
+    kind: harnessId,
+    harness,
+    managedNameNorm: null,
     resumeSessionId: null,
   });
   let proc: Bun.Subprocess;
@@ -103,17 +105,7 @@ async function startHarnessSessionDetached(
         // See attachOrCreate header: claude downgrades to 256-color when
         // $TMUX is set, so strip it before exec'ing. The bash wrapper
         // redirects stderr to a file so a spawn-and-die surfaces a reason.
-        "env",
-        "-u",
-        "TMUX",
-        "-u",
-        "TMUX_PANE",
-        "bash",
-        "-c",
-        'p="$1"; shift; exec "$@" 2> "$p"',
-        "_wt_wrap",
-        stderrPath,
-        ...innerArgs,
+        ...wrapInnerArgs(stderrPath, innerArgs),
       ],
       {
         // NOT the worktree — the pane cwd comes from `-c`; the client

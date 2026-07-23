@@ -189,6 +189,50 @@ export function setSlugSection(slug: string, section: string | null): void {
 }
 
 /**
+ * Set (or clear, with `pinned = false`) the task-inbox pin for a slug
+ * (hub mode: pinned tasks sort above everything else). Mirrors
+ * `setSlugBase`'s shape — creates the slug entry on first write so a
+ * brand-new worktree can be pinned before it has any section/order
+ * state, and is a no-op when clearing a slug with no existing record
+ * (nothing to persist).
+ */
+export function setTaskPinned(slug: string, pinned: boolean): void {
+  withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.slugs[slug];
+    if (!prev && !pinned) return;
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    const entry: WtSlugState = { section: null, order: 0, ...prev };
+    if (pinned) entry.taskPinned = true;
+    else delete entry.taskPinned;
+    next.slugs[slug] = entry;
+    writeWtState(next);
+  });
+}
+
+/**
+ * Set (or clear, with `bucket = null`) the bucket name a slug's task
+ * was snoozed at (hub mode). Readers compare this against the task's
+ * currently-derived bucket and treat a mismatch as an expired snooze —
+ * this setter just records the value, it doesn't validate `bucket`
+ * against anything. Mirrors `setSlugBase`'s create-on-first-write /
+ * no-op-when-absent shape.
+ */
+export function setTaskSnooze(slug: string, bucket: string | null): void {
+  withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.slugs[slug];
+    if (!prev && !bucket) return;
+    const next: WtState = { ...state, slugs: { ...state.slugs } };
+    const entry: WtSlugState = { section: null, order: 0, ...prev };
+    if (bucket) entry.taskSnoozedBucket = bucket;
+    else delete entry.taskSnoozedBucket;
+    next.slugs[slug] = entry;
+    writeWtState(next);
+  });
+}
+
+/**
  * Swap two slugs' order values within a single section bucket.
  * Renormalizes the bucket against `bucketDisplay` first so unstated
  * entries get materialized. The renormalization preserves the

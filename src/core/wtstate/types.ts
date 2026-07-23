@@ -62,6 +62,10 @@ export type WtSlugState = {
    * (no fires, no queued intents).
    */
   automationsPaused?: boolean;
+  /** Task-inbox pin (hub mode): pinned tasks sort above everything. Absent = unpinned. */
+  taskPinned?: true;
+  /** Bucket name the user snoozed this task at (hub mode). Stale when the derived bucket moves on; readers treat a mismatch as expired. */
+  taskSnoozedBucket?: string;
 };
 
 /**

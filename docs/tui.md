@@ -99,3 +99,7 @@ Sessions live in a dedicated tmux server; "enter" takes over the terminal, and t
 ## Picker conventions
 
 Every list picker follows the same shape: the key that opened it confirms the highlight when pressed again (`l l`, `; ;`, `' '`, `! !`, `b b`, `v v`), `Enter` always confirms, `Esc`/`q`/`Ctrl+C` always cancel, `j`/`k` move, and digits `1`–`9` quick-pick when the list is short. Special rows get their own letter (`l n` new section, `! c` custom prompt, `; c` new claude session).
+
+## Hub mode
+
+An opt-in alternate UI: a prioritized task inbox instead of the three-pane list, next to a pane that's always a live coding-agent session. Every key above still works (as `Alt+<key>`), plus a handful of hub-only bindings. `[ui] mode = "hub"` (see [configuration.md](configuration.md#ui)) makes it the default for a bare `wt`; `wt hub` / `wt classic` switch explicitly, and both views share all on-disk state. Full writeup: [docs/hub.md](hub.md).

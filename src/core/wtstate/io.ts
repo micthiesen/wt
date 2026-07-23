@@ -21,111 +21,130 @@ export function readWtState(): WtState {
   if (!existsSync(STATE_FILE)) return emptyWtState();
   try {
     const raw = readFileSync(STATE_FILE, "utf8");
-    const data = JSON.parse(raw) as Partial<WtState>;
-    const slugs: Record<string, WtSlugState> = {};
-    if (data?.slugs && typeof data.slugs === "object") {
-      for (const [k, v] of Object.entries(data.slugs)) {
-        if (!v || typeof v !== "object") continue;
-        const rec = v as Partial<WtSlugState>;
-        const section = typeof rec.section === "string" && rec.section.trim() !== ""
-          ? rec.section
-          : null;
-        const order = typeof rec.order === "number" && Number.isFinite(rec.order) ? rec.order : 0;
-        slugs[k] = { section, order };
-        if (typeof rec.baseBranch === "string" && rec.baseBranch.trim() !== "") {
-          slugs[k]!.baseBranch = rec.baseBranch;
-          if (typeof rec.baseSha === "string" && rec.baseSha.trim() !== "") {
-            slugs[k]!.baseSha = rec.baseSha;
-          }
-        }
-        if (rec.automationsPaused === true) {
-          slugs[k]!.automationsPaused = true;
-        }
-      }
-    }
-    const rawOrder: string[] = [];
-    if (Array.isArray(data?.sectionsOrder)) {
-      const seen = new Set<string>();
-      for (const s of data.sectionsOrder) {
-        if (typeof s !== "string" || s.trim() === "") continue;
-        if (seen.has(s)) continue;
-        seen.add(s);
-        rawOrder.push(s);
-      }
-    }
-    let sectionsOrder: string[];
-    if (!rawOrder.includes(GROUP_INBOX)) {
-      // Pre-unification file (manual names only): seed the unified order
-      // with the legacy bucket layout so the migration changes nothing
-      // visually — the inbox, then the manual sections in their stored
-      // order. Stack keys (inferred at runtime) enter lazily on a move.
-      sectionsOrder = [
-        GROUP_INBOX,
-        ...rawOrder.filter((s) => !s.startsWith(STACK_SECTION_PREFIX)),
-      ];
-    } else {
-      // Stack liveness can't be checked here (stacks are inferred from
-      // the live worktree list, which this module doesn't see); stale
-      // stack keys are inert — nothing renders for them — and cheap.
-      sectionsOrder = rawOrder;
-    }
-    // Self-heal: any manual section referenced by a slug but missing from
-    // sectionsOrder gets appended in discovery order.
-    const known = new Set(sectionsOrder);
-    for (const v of Object.values(slugs)) {
-      if (v.section !== null && !known.has(v.section)) {
-        sectionsOrder.push(v.section);
-        known.add(v.section);
-      }
-    }
-    const foldedSections: string[] = [];
-    if (Array.isArray(data?.foldedSections)) {
-      const seen = new Set<string>();
-      for (const s of data.foldedSections) {
-        if (typeof s !== "string" || s.trim() === "" || seen.has(s)) continue;
-        seen.add(s);
-        foldedSections.push(s);
-      }
-    }
-    const pausedStacks: string[] = [];
-    if (Array.isArray(data?.pausedStacks)) {
-      const seen = new Set<string>();
-      for (const s of data.pausedStacks) {
-        if (typeof s !== "string" || s.trim() === "" || seen.has(s)) continue;
-        seen.add(s);
-        pausedStacks.push(s);
-      }
-    }
-    const removed: RemovedWorktree[] = [];
-    if (Array.isArray(data?.removed)) {
-      for (const v of data.removed) {
-        if (!v || typeof v !== "object") continue;
-        const rec = v as Partial<RemovedWorktree>;
-        if (typeof rec.slug !== "string" || rec.slug.trim() === "") continue;
-        if (typeof rec.branch !== "string" || rec.branch.trim() === "") continue;
-        removed.push({
-          slug: rec.slug,
-          branch: rec.branch,
-          removedAt: typeof rec.removedAt === "string" ? rec.removedAt : "",
-          ...(typeof rec.title === "string" && rec.title.trim() !== "" ? { title: rec.title } : {}),
-          ...(typeof rec.prNumber === "number" && Number.isFinite(rec.prNumber) ? { prNumber: rec.prNumber } : {}),
-          ...(typeof rec.prUrl === "string" && rec.prUrl.trim() !== "" ? { prUrl: rec.prUrl } : {}),
-          ...(typeof rec.prState === "string" && rec.prState.trim() !== "" ? { prState: rec.prState } : {}),
-        });
-      }
-    }
-    return {
-      slugs,
-      sectionsOrder,
-      foldedSections,
-      pausedStacks,
-      automationsPaused: data?.automationsPaused === true,
-      removed,
-    };
+    return parseWtState(JSON.parse(raw));
   } catch (err) {
     log.error(err instanceof Error ? err : String(err), { file: STATE_FILE });
     return emptyWtState();
   }
+}
+
+/**
+ * Pure validation/coercion from parsed JSON to `WtState`, split out of
+ * `readWtState` so the field-by-field tolerance rules (unknown shapes
+ * degrade to defaults rather than throwing) are unit-testable without
+ * touching the real state file — `readWtState` hardcodes `STATE_FILE`
+ * to `~/.cache/wt/state.json` with no injection seam. Never throws:
+ * callers that already have a parsed JSON value (not raw text) can use
+ * this directly instead of round-tripping through `readWtState`.
+ */
+export function parseWtState(raw: unknown): WtState {
+  const data = raw as Partial<WtState>;
+  const slugs: Record<string, WtSlugState> = {};
+  if (data?.slugs && typeof data.slugs === "object") {
+    for (const [k, v] of Object.entries(data.slugs)) {
+      if (!v || typeof v !== "object") continue;
+      const rec = v as Partial<WtSlugState>;
+      const section = typeof rec.section === "string" && rec.section.trim() !== ""
+        ? rec.section
+        : null;
+      const order = typeof rec.order === "number" && Number.isFinite(rec.order) ? rec.order : 0;
+      slugs[k] = { section, order };
+      if (typeof rec.baseBranch === "string" && rec.baseBranch.trim() !== "") {
+        slugs[k]!.baseBranch = rec.baseBranch;
+        if (typeof rec.baseSha === "string" && rec.baseSha.trim() !== "") {
+          slugs[k]!.baseSha = rec.baseSha;
+        }
+      }
+      if (rec.automationsPaused === true) {
+        slugs[k]!.automationsPaused = true;
+      }
+      if (rec.taskPinned === true) {
+        slugs[k]!.taskPinned = true;
+      }
+      if (typeof rec.taskSnoozedBucket === "string" && rec.taskSnoozedBucket.trim() !== "") {
+        slugs[k]!.taskSnoozedBucket = rec.taskSnoozedBucket;
+      }
+    }
+  }
+  const rawOrder: string[] = [];
+  if (Array.isArray(data?.sectionsOrder)) {
+    const seen = new Set<string>();
+    for (const s of data.sectionsOrder) {
+      if (typeof s !== "string" || s.trim() === "") continue;
+      if (seen.has(s)) continue;
+      seen.add(s);
+      rawOrder.push(s);
+    }
+  }
+  let sectionsOrder: string[];
+  if (!rawOrder.includes(GROUP_INBOX)) {
+    // Pre-unification file (manual names only): seed the unified order
+    // with the legacy bucket layout so the migration changes nothing
+    // visually — the inbox, then the manual sections in their stored
+    // order. Stack keys (inferred at runtime) enter lazily on a move.
+    sectionsOrder = [
+      GROUP_INBOX,
+      ...rawOrder.filter((s) => !s.startsWith(STACK_SECTION_PREFIX)),
+    ];
+  } else {
+    // Stack liveness can't be checked here (stacks are inferred from
+    // the live worktree list, which this module doesn't see); stale
+    // stack keys are inert — nothing renders for them — and cheap.
+    sectionsOrder = rawOrder;
+  }
+  // Self-heal: any manual section referenced by a slug but missing from
+  // sectionsOrder gets appended in discovery order.
+  const known = new Set(sectionsOrder);
+  for (const v of Object.values(slugs)) {
+    if (v.section !== null && !known.has(v.section)) {
+      sectionsOrder.push(v.section);
+      known.add(v.section);
+    }
+  }
+  const foldedSections: string[] = [];
+  if (Array.isArray(data?.foldedSections)) {
+    const seen = new Set<string>();
+    for (const s of data.foldedSections) {
+      if (typeof s !== "string" || s.trim() === "" || seen.has(s)) continue;
+      seen.add(s);
+      foldedSections.push(s);
+    }
+  }
+  const pausedStacks: string[] = [];
+  if (Array.isArray(data?.pausedStacks)) {
+    const seen = new Set<string>();
+    for (const s of data.pausedStacks) {
+      if (typeof s !== "string" || s.trim() === "" || seen.has(s)) continue;
+      seen.add(s);
+      pausedStacks.push(s);
+    }
+  }
+  const removed: RemovedWorktree[] = [];
+  if (Array.isArray(data?.removed)) {
+    for (const v of data.removed) {
+      if (!v || typeof v !== "object") continue;
+      const rec = v as Partial<RemovedWorktree>;
+      if (typeof rec.slug !== "string" || rec.slug.trim() === "") continue;
+      if (typeof rec.branch !== "string" || rec.branch.trim() === "") continue;
+      removed.push({
+        slug: rec.slug,
+        branch: rec.branch,
+        removedAt: typeof rec.removedAt === "string" ? rec.removedAt : "",
+        ...(typeof rec.title === "string" && rec.title.trim() !== "" ? { title: rec.title } : {}),
+        ...(typeof rec.prNumber === "number" && Number.isFinite(rec.prNumber) ? { prNumber: rec.prNumber } : {}),
+        ...(typeof rec.prUrl === "string" && rec.prUrl.trim() !== "" ? { prUrl: rec.prUrl } : {}),
+        ...(typeof rec.prState === "string" && rec.prState.trim() !== "" ? { prState: rec.prState } : {}),
+      });
+    }
+  }
+  return {
+    slugs,
+    sectionsOrder,
+    foldedSections,
+    pausedStacks,
+    automationsPaused: data?.automationsPaused === true,
+    removed,
+  };
 }
 
 export function emptyWtState(): WtState {

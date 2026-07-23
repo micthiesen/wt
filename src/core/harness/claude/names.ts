@@ -272,6 +272,8 @@ export function buildClaudeSessionEntries(opts: {
         lastEntryMs: null,
         lastEntryKind: null,
         queued: 0,
+        pendingAsk: null,
+        lastAssistantText: null,
       } satisfies SessionTail);
     const regStatus = registryStatusBySessionId[sessionId] ?? null;
     const isLive = liveSet.has(name);

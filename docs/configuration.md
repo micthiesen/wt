@@ -182,6 +182,7 @@ Omit for classic poll-only behavior. When present, the `wt events` daemon accept
 | key | required | default | meaning |
 |---|---|---|---|
 | `rows` | no | `["branch", "base", "linear", "stage", "pr", "claude", "git"]` | Detail-pane row order. Available ids: `branch`, `base`, `path`, `linear`, `stage`, `pr`, `claude`, `git`. Unknown ids are ignored; omitted ones are hidden. A row also hides itself when its integration isn't configured (e.g. `linear` without `[issue_tracker.linear]`). The rebase state (restacking / mid-rebase / conflict + files) isn't a row — it renders as a fixed block below the rows, above the AI summary. |
+| `mode` | no | `"classic"` | Which TUI a bare `wt` launches: `"classic"` (the three-pane worktree TUI) or `"hub"` (the tmux-hosted task-inbox layout, see [hub.md](hub.md)). Both modes read/write identical on-disk state; `wt classic` / `wt hub` force a mode regardless of this setting. |
 
 ## `[[actions]]` — the `!` menu
 

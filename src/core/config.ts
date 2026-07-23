@@ -407,8 +407,18 @@ export type Config = {
   ui: {
     /** Detail-pane row order. Unknown ids are ignored, missing ones hidden. */
     rows: readonly string[];
+    /**
+     * Which TUI a bare `wt` launches. `classic` is the three-pane
+     * worktree TUI; `hub` boots the tmux-hosted task-inbox layout
+     * (left task pane + live harness pane, see docs/hub.md). Both modes
+     * share all on-disk state — swap freely. `wt classic` / `wt hub`
+     * force a mode regardless of this setting.
+     */
+    mode: TuiMode;
   };
 };
+
+export type TuiMode = "classic" | "hub";
 
 /** Generic-only defaults. Anything specific to a user/repo lives in `config.toml`. */
 const GENERIC_DEFAULTS = {
@@ -731,6 +741,13 @@ function build(raw: Raw, errs: Errors): Config {
   };
 
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
+  const uiMode = errs.optEnum(
+    ui,
+    "ui",
+    "mode",
+    ["classic", "hub"] as const satisfies readonly TuiMode[],
+    "classic",
+  );
 
   const githubRaw = obj(raw.github);
   const githubEventsRaw = githubRaw ? obj(githubRaw.events) : null;
@@ -791,7 +808,7 @@ function build(raw: Raw, errs: Errors): Config {
     github,
     actions,
     automations,
-    ui: { rows },
+    ui: { rows, mode: uiMode },
   };
 }
 
