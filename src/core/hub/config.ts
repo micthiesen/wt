@@ -71,8 +71,10 @@ export function tmuxQuote(token: string): string {
  * ~/.dotfiles/alacritty), which this server receives as `M-<key>` —
  * the same root-table space the Option forwards use. Most cmd keys
  * ride the plain forward list; five get REBINDS below because their
- * literal letter would hit the wrong classic action: `M-h` → F7
- * (focus task pane; literal h was removed-history), `M-d` → F11
+ * literal letter would hit the wrong classic action: `M-u` → F7
+ * (focus task pane — cmd+h/cmd+m can't be bound at all: macOS's menu
+ * bar consumes Hide/Minimize before Alacritty sees them, so merge
+ * rides cmd+shift+m → `M-M` → literal m), `M-d` → F11
  * (diff; literal d is destroy — destroy moved to `M-BSpace`), `M-s`
  * → F10 (shell; literal s is stage URL), `M-f` → zoom (mirrors F8),
  * `M-w` → C-d (graceful session close; literal w is review-checkout).
@@ -106,7 +108,7 @@ bind -n F11 { send-keys -t ${HUB_LEFT_PANE} F11 }
 bind -n F12 { send-keys -t ${HUB_LEFT_PANE} F12 }
 bind -n F8 { resize-pane -Z -t ${HUB_RIGHT_PANE} }
 bind -n F9 { send-keys -t ${HUB_LEFT_PANE} F9 }
-bind -n M-h { send-keys -t ${HUB_LEFT_PANE} F7 }
+bind -n M-u { send-keys -t ${HUB_LEFT_PANE} F7 }
 bind -n M-d { send-keys -t ${HUB_LEFT_PANE} F11 }
 bind -n M-s { send-keys -t ${HUB_LEFT_PANE} F10 }
 bind -n M-f { resize-pane -Z -t ${HUB_RIGHT_PANE} }
@@ -115,6 +117,7 @@ bind -n M-. { send-keys -t ${HUB_LEFT_PANE} ! }
 bind -n M-/ { send-keys -t ${HUB_LEFT_PANE} ? }
 bind -n M-BSpace { send-keys -t ${HUB_LEFT_PANE} d }
 bind -n M-t { send-keys -t ${HUB_LEFT_PANE} n }
+bind -n M-M { send-keys -t ${HUB_LEFT_PANE} m }
 `;
 }
 

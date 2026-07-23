@@ -50,7 +50,8 @@ describe("hub outer tmux config", () => {
     const config = buildHubConfig();
     // Five keys whose literal letter would hit the wrong classic
     // action get dedicated rebinds instead of plain forwards.
-    expect(config).toContain(`bind -n M-h { send-keys -t ${HUB_LEFT_PANE} F7 }`);
+    expect(config).toContain(`bind -n M-u { send-keys -t ${HUB_LEFT_PANE} F7 }`);
+    expect(config).toContain(`bind -n M-M { send-keys -t ${HUB_LEFT_PANE} m }`);
     expect(config).toContain(`bind -n M-d { send-keys -t ${HUB_LEFT_PANE} F11 }`);
     expect(config).toContain(`bind -n M-s { send-keys -t ${HUB_LEFT_PANE} F10 }`);
     expect(config).toContain("bind -n M-f { resize-pane -Z");
@@ -60,7 +61,7 @@ describe("hub outer tmux config", () => {
     expect(config).not.toContain(`bind -n M-t { send-keys -t ${HUB_LEFT_PANE} t }`);
     // No plain forwards may remain for the rebound letters (a literal
     // `h` would open removed-history, `d` would destroy, …).
-    expect(config).not.toContain(`bind -n M-h { send-keys -t ${HUB_LEFT_PANE} h }`);
+    expect(config).not.toContain(`bind -n M-h`);
     expect(config).not.toContain(`bind -n M-d { send-keys -t ${HUB_LEFT_PANE} d }`);
     expect(config).not.toContain(`bind -n M-w { send-keys -t ${HUB_LEFT_PANE} w }`);
     // Task quick-jump digits forward bare.

@@ -220,12 +220,23 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
 
+  // Ctrl+D (also cmd+W's relay) on a Sessions-slot entry — the classic
+  // close handler targets worktree rows only, so slots get their own
+  // graceful-close path here. Worktree tasks fall through to it below.
+  if (k.ctrl && k.name === "d" && task?.kind === "slot") {
+    hubFlows.closeSlotSession(task.slot);
+    return;
+  }
+
   // --- Manual task states ------------------------------------------
   // z — snooze toggle: records the CURRENT bucket; the snooze expires
   // by itself when the derived bucket moves on (level semantics, no
   // timers). Worktree-backed tasks only.
   if (isPlainLetter(k, "z")) {
-    if (!task || (task.kind !== "wt" && task.kind !== "stack")) return;
+    if (!task || (task.kind !== "wt" && task.kind !== "stack")) {
+      toast("snooze applies to worktree tasks", theme.fgDim, 1500);
+      return;
+    }
     const slug = task.row.wt.slug;
     try {
       if (task.state.snoozed) {
@@ -243,7 +254,10 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
   }
   // P — pin toggle.
   if (isShiftedLetter(k, "p")) {
-    if (!task || (task.kind !== "wt" && task.kind !== "stack")) return;
+    if (!task || (task.kind !== "wt" && task.kind !== "stack")) {
+      toast("pin applies to worktree tasks", theme.fgDim, 1500);
+      return;
+    }
     const slug = task.row.wt.slug;
     try {
       const next = !task.manual.pinned;

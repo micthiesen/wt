@@ -35,6 +35,7 @@ import {
 import { createLogger } from "../../core/logger.ts";
 import { taskFocusStore } from "../../core/task-focus.ts";
 import {
+  closeHarnessSessionGracefully,
   ensureSessionDetached,
   killHarnessSession,
   sessionName,
@@ -490,6 +491,20 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     }
   }
 
+  /**
+   * Gracefully close a Sessions-slot entry's live session (the hub's
+   * Ctrl+D / cmd+W path for slot tasks — `normal-keys`' close handler
+   * only knows worktree rows). The liveness watch flips the right pane
+   * back to home once tmux reaps the session.
+   */
+  function closeSlotSession(slot: SessionSlot): void {
+    hubLog.event.info(`closing ${slot.label} session (ctrl+d ×2)`);
+    void closeHarnessSessionGracefully(slot.slug, primaryHarness, null).then(
+      () => setTimeout(() => void refreshTmuxSessions(), 800),
+      (err) => reportActionError("close slot session", err),
+    );
+  }
+
   /** Point the right pane back at the home dashboard. */
   function showHomePane(): void {
     const seq = seqRef.current;
@@ -540,6 +555,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   return {
     showTaskSession,
     showSlotSession,
+    closeSlotSession,
     followSlot,
     enterHarnessSession,
     spawnNamedClaudeSession,

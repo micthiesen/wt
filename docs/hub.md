@@ -56,26 +56,30 @@ into the task pane — from either pane, no matter where focus sits. Cmd was
 chosen deliberately: skhd/yabai globally own the Alt, Shift+Alt, Ctrl+Alt,
 and Hyper spaces (so bare Option chords for `j`/`k`/`n`/`1-5` never even
 reach the terminal), while the Cmd domain is free apart from a few
-overridden defaults. The overrides are scoped to Alacritty's `Alt`
-(alternate-screen) binding mode: full-screen apps — the hub's tmux
-client, classic wt, vim — receive the chords, while at a bare shell
-prompt none of them bind, so the defaults all survive there (`⌘W`
-closes the window, `⌘K` clears scrollback, `⌘F` searches, `⌘H` hides,
-`⌘M` minimizes) and no Meta bytes leak into the shell's line editor.
-Inside the hub the overridden set is: Hide (`⌘H`), Minimize (`⌘M`),
-search (`⌘F` — stays on `Ctrl+Shift+F`), close-window (`⌘W`), and
-clear-scrollback (`⌘K` — `Ctrl+L` covers it). `⌘N` is never touched in
-any mode — it stays Alacritty's new-window; new-worktree rides `⌘T`
-("new task"), whose literal `t` (AI-regen, rare) moved behind `⌘H`.
+overridden defaults, with passthrough handled explicitly per context:
+inside the hub the outer tmux intercepts every chord; at a bare zsh
+prompt `⌘W` is caught by a zle widget (`~/.zshrc`) that exits the shell
+— i.e. closes the window, the macOS behavior you expect — while the
+other chords are inert; in other alt-screen apps (vim, a bare claude)
+they arrive as harmless Meta keystrokes. Two chords are impossible by
+platform: macOS's menu bar consumes `⌘H` (Hide) and `⌘M` (Minimize)
+before Alacritty ever sees them, so they keep their macOS meanings
+everywhere and the hub uses `⌘U` (focus tasks) and `⌘⇧M` (merge)
+instead. `⌘N` is never touched — it stays Alacritty's new-window;
+new-worktree rides `⌘T` ("new task"), whose literal `t` (AI-regen,
+rare) moved behind `⌘U`. Known cost inside the terminal: `⌘K`
+clear-scrollback and `⌘F` search are shadowed (`Ctrl+L` /
+`Ctrl+Shift+F` cover them).
 
 Most cmd chords forward the bare classic key; five have dedicated rebinds
-because the literal letter means something else in classic mode: `⌘H` →
-focus the task pane (literal `h` was removed-history, retired in hub),
+because the literal letter means something else in classic mode: `⌘U` →
+focus the task pane (literal `h` was removed-history, retired in hub;
+`⌘H` itself is macOS-reserved, see above),
 `⌘D` → diff view (literal `d` is destroy — destroy moved to `⌘⌫`), `⌘S` →
 shell view, `⌘F` → zoom, `⌘W` → graceful session close.
 
 Pane focus is not something you manage: `⌘L`/`⌘D`/`⌘S` land focus in the
-session; `⌘H` brings it to the inbox; **Esc** in the task pane (no picker
+session; `⌘U` brings it to the inbox; **Esc** in the task pane (no picker
 open) bounces it back to the session; pickers and prompts pull focus
 automatically and restore whichever pane held it before they opened. The
 tasks panel border tints accent while typing lands there and dims when it
@@ -85,7 +89,7 @@ something other than the selection re-asserts the selection follow.
 Rare classic actions (yank `y`, reviewers `v`, base `b`, restack `R`,
 archive `a`, clean `c`, AI regen `t`, ready/ship `e`/`E`, CI logs `f`,
 review-checkout `w`, zed opens, `Shift+Tab` harness cycle, `Ctrl+A`
-automations, `Shift+F10/F11/F12`) have no cmd chord: `⌘H`, type the
+automations, `Shift+F10/F11/F12`) have no cmd chord: `⌘U`, type the
 letter, `Esc` back.
 
 Outside the hub the cmd chords degrade to ordinary Meta keystrokes (`⌘D`
@@ -197,14 +201,14 @@ under Review output.
 | `⌘1`-`⌘9` | jump straight to task N (dim ordinals on the first nine rows) |
 | `⌘L` | start (or resume) and show the task's agent session; on a PR task, `Enter` opens the PR; repeat = toggle pane focus |
 | `⌘D` / `⌘S` | show the diff / shell session; repeat = toggle pane focus |
-| `⌘H` / `Esc` | focus the task pane / bounce back to the session |
+| `⌘U` / `Esc` | focus the task pane / bounce back to the session |
 | `⌘E` | expand/collapse the selected stack or the Sessions group |
 | `⌘Z` / `⌘P` | snooze until the bucket changes / pin to top |
 | `⌘I` | toggle the stacked details card |
-| `⌘O` / `⌘M` | open the PR / toggle auto-merge |
+| `⌘O` / `⌘⇧M` | open the PR / toggle auto-merge |
 | `⌘T` | new-worktree prompt |
 | `⌘.` / `⌘;` | action picker / sessions picker |
-| `⌘W` | close the task's session gracefully (`⌘W` ×2 to confirm) |
+| `⌘W` | close the task's session gracefully (×2 to confirm; works on Sessions entries too) — at a bare shell prompt it closes the window |
 | `⌘⌫` | remove the worktree (confirm) |
 | `⌘F` | zoom the session pane full-width |
 | `⌘R` / `⌘/` | refresh / help |
@@ -228,9 +232,8 @@ clock) or falls back to the home dashboard if it has none.
   layout, they just don't move anything in the inbox).
 - **Archived worktrees are hidden**, unlike classic mode's list, which can
   still show them via the archived section.
-- **The removed-worktrees history view is hub-less** (`h` is classic-only;
-  `⌘H` means focus-the-task-pane in hub) — use `wt classic` to browse or
-  restore removed worktrees.
+- **The removed-worktrees history view is hub-less** (`h` is classic-only)
+  — use `wt classic` to browse or restore removed worktrees.
 - Classic and hub mode are two views over identical state — nothing needs
   reconciling when you switch, so treat `wt hub` / `wt classic` as a
   free toggle rather than a mode commitment.
