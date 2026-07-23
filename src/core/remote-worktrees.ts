@@ -13,6 +13,7 @@ export type RemoteWorktreeSummary = {
   status: StatusKindValue;
   statusLabel: string;
   statusAge: string | null;
+  statusOp: string | null;
   dirty: boolean;
   unpushed: number;
   linearUrl: string | null;
@@ -71,6 +72,13 @@ export function parseRemoteWorktrees(
     if (!STATUS_KINDS.has(status)) {
       throw new Error(`remote worktree ${index}.status is invalid: ${status}`);
     }
+    const statusLabel = str("status_label");
+    const statusOp = typeof row.status_op === "string"
+      ? row.status_op
+      : status === StatusKind.Busy &&
+          (statusLabel === "init" || statusLabel.startsWith("init:"))
+        ? "init"
+        : null;
     return {
       hostLabel,
       slug: str("slug"),
@@ -79,8 +87,9 @@ export function parseRemoteWorktrees(
       stage: str("stage"),
       exists: row.exists === true,
       status: status as StatusKindValue,
-      statusLabel: str("status_label"),
+      statusLabel,
       statusAge: typeof row.status_age === "string" ? row.status_age : null,
+      statusOp,
       dirty: row.dirty === true,
       unpushed:
         typeof row.unpushed === "number" &&

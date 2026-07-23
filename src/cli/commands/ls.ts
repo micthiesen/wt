@@ -37,6 +37,7 @@ export async function run(argv: string[]): Promise<number> {
           status: st.kind,
           status_label: st.label,
           status_age: st.age ?? null,
+          status_op: st.op ?? null,
           dirty,
           unpushed: dirty ? 0 : await unpushedCommits(w.path),
           linear_url: linearUrlForSlug(w.slug),

@@ -18,18 +18,18 @@ import {
   type HarnessSession,
 } from "../../core/harness/index.ts";
 import { createLogger } from "../../core/logger.ts";
+import { canEnterSessionDuringLock } from "../../core/session-readiness.ts";
 import {
   claudeSessionName,
   killHarnessSession,
   listSessions as listTmuxSessions,
 } from "../../core/tmux.ts";
-import { StatusKind } from "../../core/types.ts";
 import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { config } from "../../core/config.ts";
 
 import { enterHarnessSession } from "../sessions/harness.ts";
 import { enterRemoteWorktreeSession } from "../sessions/remote.ts";
-import { launchBlockedReason, resolveDiffBase } from "../app-helpers.ts";
+import { resolveDiffBase, sessionLaunchBlockedReason } from "../app-helpers.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { isRemoteSummary, type RemoteListEntry } from "../remote-creation.ts";
 import type { SessionSlot } from "../sessions/slots.ts";
@@ -118,13 +118,9 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
       toast(`no row for ${slug}`, theme.warn, 1500);
       return;
     }
-    const blocked = launchBlockedReason(row);
+    const blocked = sessionLaunchBlockedReason(row);
     if (blocked) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
-      return;
-    }
-    if (row.status.kind === StatusKind.Busy) {
-      toast(`${slug} is busy`, theme.warn, 2000);
       return;
     }
     const harness = getHarness(harnessId);
@@ -259,13 +255,9 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
       toast(`no row for ${slug}`, theme.warn, 1500);
       return;
     }
-    const blocked = launchBlockedReason(row);
+    const blocked = sessionLaunchBlockedReason(row);
     if (blocked) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
-      return;
-    }
-    if (row.status.kind === StatusKind.Busy) {
-      toast(`${slug} is busy`, theme.warn, 2000);
       return;
     }
     const wasPersisted = nameInUse(slug, name);
@@ -348,8 +340,8 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
    * Enter a shell / diff / harness session on the SELECTED remote
    * worktree over SSH. Mirrors `doEnterHarnessSession`'s guard-then-run
    * shape but for a remote target: refuses an in-flight creation, an
-   * unreachable host, or a busy remote before handing the terminal to
-   * `enterRemoteWorktreeSession`. Lives here (not app.tsx) so all
+   * unreachable host, or a destructive remote operation before handing the
+   * terminal to `enterRemoteWorktreeSession`. Lives here (not app.tsx) so all
    * session-entry logic shares one home.
    */
   function doEnterRemoteSession(target: "shell" | "diff" | "harness"): void {
@@ -361,7 +353,13 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
       toast(`${selectedRemote.hostLabel} is unavailable`, theme.warn, 2200);
       return;
     }
-    if (selectedRemote.status === "busy") {
+    if (
+      selectedRemote.status === "busy" &&
+      !canEnterSessionDuringLock(
+        { op: selectedRemote.statusOp ?? "" },
+        selectedRemote.exists,
+      )
+    ) {
       toast(`${selectedRemote.slug} is ${selectedRemote.statusLabel}`, theme.warn, 2200);
       return;
     }

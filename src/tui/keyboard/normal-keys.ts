@@ -29,8 +29,8 @@ import { stackIdFromSectionKey } from "../../core/wtstate.ts";
 import {
   isPlainLetter,
   isShiftedLetter,
-  launchBlockedReason,
   resolveDiffBase,
+  sessionLaunchBlockedReason,
 } from "../app-helpers.ts";
 import { enterDiffSession } from "../sessions/diff.ts";
 import { enterShellSession } from "../sessions/shell.ts";
@@ -222,13 +222,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         toast("select a worktree first", theme.warn, 1500);
         return;
       }
-      const pickerBlocked = launchBlockedReason(current);
+      const pickerBlocked = sessionLaunchBlockedReason(current);
       if (pickerBlocked) {
         toast(`${current.wt.slug} is ${pickerBlocked}`, theme.warn, 2000);
-        return;
-      }
-      if (current.status.kind === StatusKind.Busy) {
-        toast(`${current.wt.slug} is busy`, theme.warn, 2000);
         return;
       }
       const slug = current.wt.slug;
@@ -482,13 +478,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const slug = current.wt.slug;
-      const shellBlocked = launchBlockedReason(current);
+      const shellBlocked = sessionLaunchBlockedReason(current);
       if (shellBlocked) {
         toast(`${slug} is ${shellBlocked}`, theme.warn, 2000);
-        return;
-      }
-      if (current.status.kind === StatusKind.Busy) {
-        toast(`${slug} is busy`, theme.warn, 2000);
         return;
       }
       const cwd = current.wt.path;
@@ -527,8 +519,8 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     // wt-private tmux config binds F11 to detach-client → the same
     // physical key flips between contexts. Sessions persist (named
     // `<slug>-diff`) so detach-then-reattach keeps the diff TUI's scroll +
-    // expansion state. Refuse on busy worktrees so we don't race a
-    // destroy.
+    // expansion state. Init locks are allowed once the checkout exists;
+    // destructive operations remain blocked so we don't race a destroy.
     if (
       k.name === "f11" &&
       !k.shift &&
@@ -547,13 +539,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const slug = current.wt.slug;
-      const diffBlocked = launchBlockedReason(current);
+      const diffBlocked = sessionLaunchBlockedReason(current);
       if (diffBlocked) {
         toast(`${slug} is ${diffBlocked}`, theme.warn, 2000);
-        return;
-      }
-      if (current.status.kind === StatusKind.Busy) {
-        toast(`${slug} is busy`, theme.warn, 2000);
         return;
       }
       const cwd = current.wt.path;
@@ -658,8 +646,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const slug = current.wt.slug;
-      if (current.status.kind === StatusKind.Busy) {
-        toast(`${slug} is busy`, theme.warn, 2000);
+      const blocked = sessionLaunchBlockedReason(current);
+      if (blocked) {
+        toast(`${slug} is ${blocked}`, theme.warn, 2000);
         return;
       }
       // Default highlight = current primary, so the muscle-memory
@@ -710,7 +699,8 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     // `new-session -A` makes attach-or-create idempotent. From inside
     // the session, the wt-private tmux config binds F12 to
     // detach-client so the same physical key flips between contexts.
-    // Refuse on busy worktrees so we don't race a destroy.
+    // Init locks are allowed once the checkout exists; destructive operations
+    // remain blocked so we don't race a destroy.
     if (
       k.name === "f12" &&
       !k.shift &&
@@ -729,8 +719,9 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       const slug = current.wt.slug;
-      if (current.status.kind === StatusKind.Busy) {
-        toast(`${slug} is busy`, theme.warn, 2000);
+      const blocked = sessionLaunchBlockedReason(current);
+      if (blocked) {
+        toast(`${slug} is ${blocked}`, theme.warn, 2000);
         return;
       }
       const target = currentHarnessSessions.f12Target;

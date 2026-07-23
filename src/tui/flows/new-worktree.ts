@@ -109,6 +109,19 @@ export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
       status: "creating",
     });
     remoteLog.event.info(`creating ${parsed.input}`);
+    // The normal remote inventory interval is 15s while no busy row is known.
+    // Probe eagerly during creation so the authoritative row replaces the
+    // placeholder as soon as the checkout exists; F10/F11/F12 can then enter
+    // it while the remaining init phases continue in the background.
+    let refreshStopped = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    const pollRemote = async (): Promise<void> => {
+      await refreshRemoteWorktrees().catch(() => undefined);
+      if (!refreshStopped) {
+        refreshTimer = setTimeout(() => void pollRemote(), 1_500);
+      }
+    };
+    void pollRemote();
     let code: number;
     try {
       code = await runRemoteWt(remote, args, {
@@ -120,6 +133,9 @@ export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
       toast(`remote create failed: ${message}`, theme.err, 3500);
       setRemoteCreation(null);
       return;
+    } finally {
+      refreshStopped = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
     }
     if (code !== 0) {
       remoteLog.event.err(`create failed (exit ${code})`);
