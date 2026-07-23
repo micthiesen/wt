@@ -5,10 +5,13 @@
  * closes over React state — which is what makes it safe to house
  * outside the component without changing behavior.
  */
+import { existsSync } from "node:fs";
+
 import type { ActionDef, ActionLine, ActionVars } from "../core/actions.ts";
 import { config } from "../core/config.ts";
 import { getHarness, type HarnessId } from "../core/harness/index.ts";
 import { lockLabel, lockStatus } from "../core/locks.ts";
+import { canEnterSessionDuringLock } from "../core/session-readiness.ts";
 import { expectedStage } from "../core/stage-safety.ts";
 import { StatusKind } from "../core/types.ts";
 
@@ -186,24 +189,32 @@ export function isCleanCandidate(row: WorktreeRow): boolean {
 }
 
 /**
- * Reason a worktree can't accept a NEW interactive session or launch
- * right now, or null when it's free. Checks the archived flag (a clean
+ * Reason a worktree can't accept a new action right now, or null when it's
+ * free. Checks the archived flag (a clean
  * / destroy tucks the row into the archived section the instant it
  * dispatches) and the authoritative on-disk flock (a remove/init/
  * restack in flight). Both beat the cached `row.status.kind`, which lags
  * a just-dispatched background remove by ~600ms (the fs-watch → debounce
- * → refetch cycle). Every "start something in this worktree" path —
- * F10 shell, F11 diff, F12 / `;` / named harness sessions — gates on
- * this so a keystroke in that window can't spawn a shell or harness with
- * cwd inside a directory being `git worktree remove --force`d out from
- * under it (the inner program getcwd()s at startup and dies on ENOENT,
- * and the live cwd can wedge the removal). Same authoritative check
- * `doRemove` / `doReplayStack` / `launchAction` already use.
+ * → refetch cycle). Actions retain this strict gate because they may require
+ * installed dependencies or mutate files while setup is still running.
  */
 export function launchBlockedReason(row: WorktreeRow): string | null {
   if (row.archived) return "being cleaned up";
   const lock = lockStatus(row.wt.slug);
   return lock ? lockLabel(lock) : null;
+}
+
+/**
+ * Session-specific lock gate. F10/F11/F12 are safe as soon as init has
+ * materialized the checkout, even while env setup or pnpm install continues.
+ * Other live locks remain blocked so a session cannot race removal/restacking.
+ */
+export function sessionLaunchBlockedReason(row: WorktreeRow): string | null {
+  if (row.archived) return "being cleaned up";
+  const lock = lockStatus(row.wt.slug);
+  return canEnterSessionDuringLock(lock, existsSync(row.wt.path))
+    ? null
+    : lockLabel(lock!);
 }
 
 /**

@@ -13,6 +13,7 @@ describe("parseRemoteWorktrees", () => {
       status: "busy",
       status_label: "init: pnpm install",
       status_age: "2m",
+      status_op: "init",
       dirty: false,
       unpushed: 2,
       linear_url: null,
@@ -27,6 +28,7 @@ describe("parseRemoteWorktrees", () => {
       status: "busy",
       statusLabel: "init: pnpm install",
       statusAge: "2m",
+      statusOp: "init",
       dirty: false,
       unpushed: 2,
       linearUrl: null,
@@ -38,7 +40,15 @@ describe("parseRemoteWorktrees", () => {
       slug: "x", branch: "x", path: "/x", stage: "x", exists: true,
       status: "clean", status_label: "clean", dirty: false,
     }]), "cachy");
-    expect(row?.unpushed).toBe(0);
+    expect(row).toMatchObject({ unpushed: 0, statusOp: null });
+  });
+
+  test("infers an init lock from older remote status labels", () => {
+    const [row] = parseRemoteWorktrees(JSON.stringify([{
+      slug: "x", branch: "x", path: "/x", stage: "x", exists: true,
+      status: "busy", status_label: "init: pnpm install", dirty: false,
+    }]), "cachy");
+    expect(row?.statusOp).toBe("init");
   });
 
   test("rejects malformed status values", () => {
