@@ -271,7 +271,7 @@ export function TaskList({
       border
       borderStyle="single"
       borderColor={paneFocused ? theme.accent : theme.borderDim}
-      title={paneFocused ? " ⌨ tasks " : " tasks "}
+      title=" tasks "
       titleAlignment="left"
       paddingTop={0}
     >
