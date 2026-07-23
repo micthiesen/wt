@@ -23,7 +23,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { focusLeft, focusRight } from "../../core/hub.ts";
+import { focusLeft, focusRight, unzoom, zoomLeft } from "../../core/hub.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import { taskFocusStore } from "../../core/task-focus.ts";
 import {
@@ -218,9 +218,22 @@ export function useHubController(opts: HubControllerOpts) {
   // Focus dance: pickers and footer prompts need direct typing, so pull
   // tmux focus onto this pane while one is open and restore the
   // PRE-modal pane on close (answering a picker must not dump you into
-  // a session pane you weren't in). Transition-only: acting on the
-  // mount value would immediately unfocus the task pane the startup
-  // layout deliberately selected.
+  // a session pane you weren't in). The dance also ZOOMS this pane to
+  // the full window for the modal's duration — a 20%-inset modal in a
+  // ~35-col strip is unusable, so modals render over the area of both
+  // panes and the split snaps back on close. Ops ride the same
+  // `focusOpRef` queue the flows use, so a picker commit's own
+  // focus-session op (enqueued later, when its switch completes) still
+  // lands after the restore instead of racing it. Transition-only:
+  // acting on the mount value would immediately unfocus the task pane
+  // the startup layout deliberately selected.
+  // A crash/restart mid-modal would leave the window zoomed with no
+  // modal to dismiss it — reassert the split once on startup (cheap
+  // state-checked no-op in the normal case).
+  useEffect(() => {
+    if (enabled) void unzoom();
+  }, [enabled]);
+
   const prevInputActiveRef = useRef<boolean | null>(null);
   const preModalFocusRef = useRef(true);
   useEffect(() => {
@@ -228,13 +241,22 @@ export function useHubController(opts: HubControllerOpts) {
     const prev = prevInputActiveRef.current;
     prevInputActiveRef.current = inputActive;
     if (prev === null || prev === inputActive) return;
+    const queue = (op: () => Promise<void>): void => {
+      focusOpRef.current = focusOpRef.current.then(op).catch(() => {});
+    };
     if (inputActive) {
       preModalFocusRef.current = paneFocusedRef.current;
-      void focusLeft();
+      queue(async () => {
+        await zoomLeft();
+        await focusLeft();
+      });
       setPaneFocused(true);
     } else {
       const restore = preModalFocusRef.current;
-      void (restore ? focusLeft() : focusRight());
+      queue(async () => {
+        await unzoom();
+        await (restore ? focusLeft() : focusRight());
+      });
       setPaneFocused(restore);
     }
   }, [enabled, inputActive, setPaneFocused]);

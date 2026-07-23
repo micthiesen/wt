@@ -43,4 +43,6 @@ export {
   resolveRightTty,
   showHome,
   switchRight,
+  unzoom,
+  zoomLeft,
 } from "./hub/control.ts";

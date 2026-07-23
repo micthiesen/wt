@@ -191,6 +191,54 @@ export async function showHome(): Promise<boolean> {
   return switchRight(HUB_HOME_SESSION);
 }
 
+/**
+ * Zoom the LEFT (`wt _taskpane`) pane to the full window — the hub's
+ * modal-overlay mechanism: while a modal or footer prompt is open, wt
+ * temporarily takes the whole terminal so the modal renders across the
+ * area of both panes instead of cramming into the ~35-col strip; the
+ * session pane keeps running underneath and comes back on `unzoom()`.
+ *
+ * tmux's `-Z` is a WINDOW-level toggle (zooming targets the named
+ * pane, un-zooming ignores it), so this reads the current state first:
+ * already zoomed on the left → no-op; zoomed on the right (the user's
+ * ⌘F) → toggle off, then zoom left.
+ */
+export async function zoomLeft(): Promise<void> {
+  const state = await zoomState();
+  if (state === "left") return;
+  if (state === "right") await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_LEFT_PANE]);
+  await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_LEFT_PANE]);
+}
+
+/** Restore the split layout if the window is zoomed (either pane). */
+export async function unzoom(): Promise<void> {
+  const state = await zoomState();
+  if (state === "none") return;
+  await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_LEFT_PANE]);
+}
+
+/**
+ * Current zoom state of the hub window. When a window is zoomed the
+ * zoomed pane IS the active pane, so `pane_active` on the left pane
+ * disambiguates which side holds the zoom.
+ */
+async function zoomState(): Promise<"none" | "left" | "right"> {
+  const r = await spawnTmux(HUB_SOCKET, [
+    "display-message",
+    "-p",
+    "-t",
+    HUB_LEFT_PANE,
+    "#{window_zoomed_flag} #{?pane_active,1,0}",
+  ]);
+  if (r.code !== 0) {
+    log.warn("zoomState: display-message failed", { stderr: r.stderr.trim() || null });
+    return "none";
+  }
+  const [zoomed, leftActive] = r.stdout.trim().split(" ");
+  if (zoomed !== "1") return "none";
+  return leftActive === "1" ? "left" : "right";
+}
+
 /** Focus the left (`wt _taskpane`) pane. */
 export async function focusLeft(): Promise<void> {
   await spawnTmux(HUB_SOCKET, ["select-pane", "-t", HUB_LEFT_PANE]);

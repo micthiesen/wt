@@ -277,6 +277,17 @@ the details card for the output viewer; `Esc` clears the focus and the
 details card returns (a second `Esc` bounces focus to the session
 pane, as usual).
 
+## Modals take the whole window
+
+Pickers, confirms, and footer prompts zoom the task pane to the full
+terminal for their duration (`zoomLeft`/`unzoom` in `core/hub/control.ts`,
+driven by the modal focus dance in `useHubController`): the modal renders
+over the area of both panes instead of cramming into the ~35-col strip,
+and the split snaps back the moment it closes. The session pane keeps
+running underneath — a picker commit's session switch still lands after
+the restore. A ⌘F/F8 zoom of the session pane yields to a modal and is
+not restored afterward (the window returns to the split).
+
 ## Limitations
 
 - **Manual sections and row ordering don't apply.** The inbox always sorts
