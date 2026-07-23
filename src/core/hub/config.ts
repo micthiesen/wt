@@ -14,7 +14,7 @@
  * the right (harness) pane and wt still needs a way to receive input.
  *
  * Two bindings are handled by tmux itself rather than forwarded:
- *   - `M-Space` zooms the right pane (a full-screen harness view).
+ *   - `F8` zooms the right pane (a full-screen harness view).
  *   - `F9` cycles pane focus (left <-> right).
  *
  * Pane resilience: `remain-on-exit` + a `pane-died` hook means a
@@ -77,13 +77,19 @@ set -as terminal-features ",xterm*:extkeys,tmux-256color:extkeys"
 unbind C-b
 set -g remain-on-exit on
 set-hook -g pane-died respawn-pane
+# tmux cannot remove the divider column between panes, only recolor it.
+# Painting the border glyphs in wt's theme background (tui/theme.ts bg,
+# keep in sync) makes the bar visually disappear; focus is signaled
+# inside the task pane instead, so active/inactive get the same color.
+set -g pane-border-style "fg=#1b1d23"
+set -g pane-active-border-style "fg=#1b1d23"
 ${forwardLines}
 bind -n M-Enter send-keys -t ${HUB_LEFT_PANE} Enter
 bind -n M-Tab send-keys -t ${HUB_LEFT_PANE} Tab
 bind -n F10 send-keys -t ${HUB_LEFT_PANE} F10
 bind -n F11 send-keys -t ${HUB_LEFT_PANE} F11
 bind -n F12 send-keys -t ${HUB_LEFT_PANE} F12
-bind -n M-Space resize-pane -Z -t ${HUB_RIGHT_PANE}
+bind -n F8 resize-pane -Z -t ${HUB_RIGHT_PANE}
 bind -n F9 select-pane -t :.+
 `;
 }

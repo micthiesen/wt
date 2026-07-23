@@ -41,6 +41,20 @@ import { theme } from "../theme.ts";
 
 const hubLog = createLogger("[hub]");
 
+/**
+ * What the hub's right pane is currently showing, as far as this
+ * process knows (it performs every switch, so this only drifts if
+ * someone drives the inner tmux server by hand). `task` = the selected
+ * task's own session — the steady state; `slot` = a special session
+ * (`,` / `.` / `/`), which the task pane surfaces prominently so the
+ * user isn't confused about what they're typing into; `home` = the
+ * dashboard.
+ */
+export type HubShown =
+  | { kind: "task"; slug: string }
+  | { kind: "slot"; label: string }
+  | { kind: "home" };
+
 export type HubFlowsCtx = {
   rows: readonly WorktreeRow[];
   primaryHarness: HarnessId;
@@ -50,6 +64,8 @@ export type HubFlowsCtx = {
   reportActionError: (label: string, err: unknown) => void;
   refreshTmuxSessions: () => Promise<void>;
   refreshClaudeSummaries: (slug: string) => Promise<void>;
+  /** Records what the right pane now shows (drives the task-pane indicator). */
+  setShown: (shown: HubShown) => void;
   onExit: () => void;
 };
 
@@ -62,20 +78,27 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     reportActionError,
     refreshTmuxSessions,
     refreshClaudeSummaries,
+    setShown,
     onExit,
   } = ctx;
 
   /**
-   * Point the right pane at `name`, optionally stamping the task-focus
-   * clock (harness views count as "looked at the output"; diff/shell
-   * views don't clear the unread bit).
+   * Point the right pane at `name`, record what it shows now, and
+   * optionally stamp the task-focus clock (harness views count as
+   * "looked at the output"; diff/shell views don't clear the unread
+   * bit).
    */
-  async function switchTo(name: string, focusSlug: string | null): Promise<void> {
+  async function switchTo(
+    name: string,
+    focusSlug: string | null,
+    shown: HubShown,
+  ): Promise<void> {
     const ok = await switchRight(name);
     if (!ok) {
       toast(`could not show ${name}`, theme.warn, 2000);
       return;
     }
+    setShown(shown);
     if (focusSlug) taskFocusStore.record(focusSlug);
   }
 
@@ -100,7 +123,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         if (target === "harness") {
           const f12 = currentHarnessSessions.f12Target;
           if (f12?.isLive) {
-            await switchTo(f12.tmuxSessionName, slug);
+            await switchTo(f12.tmuxSessionName, slug, { kind: "task", slug });
             await focusRight();
             return;
           }
@@ -129,7 +152,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
             hubLog.event.info(`started ${getHarness(harnessId).label} session for ${slug}`);
             void refreshTmuxSessions();
           }
-          await switchTo(sessionName(slug, harnessId, managedName), slug);
+          await switchTo(sessionName(slug, harnessId, managedName), slug, {
+            kind: "task",
+            slug,
+          });
           await focusRight();
           return;
         }
@@ -151,7 +177,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, target), null);
+        await switchTo(sessionName(slug, target), null, { kind: "task", slug });
         await focusRight();
       } catch (err) {
         reportActionError(`${target} session`, err);
@@ -179,7 +205,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slot.slug, primaryHarness, null), null);
+        await switchTo(sessionName(slot.slug, primaryHarness, null), null, {
+          kind: "slot",
+          label: slot.label,
+        });
         await focusRight();
       } catch (err) {
         reportActionError("slot session", err);
@@ -236,7 +265,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, harnessId, managedName), slug);
+        await switchTo(sessionName(slug, harnessId, managedName), slug, {
+          kind: "task",
+          slug,
+        });
         await focusRight();
       } catch (err) {
         reportActionError("harness session", err);
@@ -278,7 +310,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, "claude", name), slug);
+        await switchTo(sessionName(slug, "claude", name), slug, { kind: "task", slug });
         await focusRight();
       } catch (err) {
         if (!wasPersisted) removeClaudeName(slug, name);
@@ -289,7 +321,11 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
 
   /** Point the right pane back at the home dashboard. */
   function showHomePane(): void {
-    void showHome().catch((err) => reportActionError("hub home", err));
+    void showHome()
+      .then((ok) => {
+        if (ok) setShown({ kind: "home" });
+      })
+      .catch((err) => reportActionError("hub home", err));
   }
 
   /**
@@ -300,9 +336,16 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   function followSelection(row: WorktreeRow | undefined): void {
     const f12 = currentHarnessSessions.f12Target;
     if (row && f12?.isLive) {
-      void switchTo(f12.tmuxSessionName, row.wt.slug);
+      void switchTo(f12.tmuxSessionName, row.wt.slug, {
+        kind: "task",
+        slug: row.wt.slug,
+      });
     } else {
-      void showHome().catch(() => {});
+      void showHome()
+        .then((ok) => {
+          if (ok) setShown({ kind: "home" });
+        })
+        .catch(() => {});
     }
   }
 

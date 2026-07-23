@@ -146,7 +146,7 @@ export async function ensureHubLayout(): Promise<void> {
     log.warn("hub split-window failed", { stderr: split.stderr.trim() || null });
   }
 
-  await spawnTmux(HUB_SOCKET, ["resize-pane", "-t", `${HUB_SESSION}:0.0`, "-x", "44"]);
+  await spawnTmux(HUB_SOCKET, ["resize-pane", "-t", `${HUB_SESSION}:0.0`, "-x", "35"]);
   // Focus starts on the harness (right) pane — that's where the user's
   // attention belongs the moment hub mode comes up.
   await spawnTmux(HUB_SOCKET, ["select-pane", "-t", `${HUB_SESSION}:0.1`]);

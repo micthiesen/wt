@@ -42,6 +42,12 @@ type Props = {
   isLoading: boolean;
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   activeActions: ReadonlySet<string>;
+  /**
+   * Whether this tmux pane holds keyboard focus. Tints the panel border
+   * (accent = typing lands here) — the in-pane half of the hub's focus
+   * signal; the harness pane is deliberately left unmarked.
+   */
+  paneFocused?: boolean;
   scrollHandle?: RefObject<TaskListHandle | null>;
 };
 
@@ -235,6 +241,7 @@ export function TaskList({
   isLoading,
   activeSessionBySlug,
   activeActions,
+  paneFocused = false,
   scrollHandle,
 }: Props) {
   const hasTasks = tasks.length > 0;
@@ -263,7 +270,7 @@ export function TaskList({
       flexShrink={0}
       border
       borderStyle="single"
-      borderColor={theme.border}
+      borderColor={paneFocused ? theme.accent : theme.border}
       title=" tasks "
       titleAlignment="left"
       paddingTop={0}

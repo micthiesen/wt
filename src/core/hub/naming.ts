@@ -3,7 +3,7 @@
  *
  * Hub mode runs an OUTER tmux server (socket `wt-hub`, one session
  * named `hub`) that just holds a two-pane layout:
- *   - `hub:0.0` (left, ~44 cols) — `wt _taskpane`, the task-inbox TUI.
+ *   - `hub:0.0` (left, ~35 cols) — `wt _taskpane`, the task-inbox TUI.
  *   - `hub:0.1` (right) — a nested tmux CLIENT (with `TMUX` unset) into
  *     the EXISTING inner `-L wt` server where every harness/diff/shell
  *     session actually lives.

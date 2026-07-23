@@ -18,10 +18,12 @@ whenever.
 Hub mode is two nested tmux servers:
 
 - An **outer server** (socket `wt-hub`, one session named `hub`) that holds
-  nothing but a two-pane layout: the left pane runs `wt _taskpane` (wt itself,
-  in task-inbox mode); the right pane is a nested tmux *client* into the
-  **inner** `-L wt` server — the same server every classic-mode F10/F11/F12
-  session already lives on.
+  nothing but a two-pane layout: the left pane (~35 cols) runs `wt _taskpane`
+  (wt itself, in task-inbox mode); the right pane is a nested tmux *client*
+  into the **inner** `-L wt` server — the same server every classic-mode
+  F10/F11/F12 session already lives on. The divider between the panes is
+  painted in wt's theme background (tmux can't remove the column, only
+  recolor it), so there's no visible bar.
 - The **inner server** is untouched by hub mode's existence. It hosts every
   harness/diff/shell session exactly as it does in classic mode. When the
   right pane needs to show a different worktree's session, wt runs
@@ -63,7 +65,16 @@ Two bindings are exceptions with no Alt prefix, handled by tmux itself
 instead of relayed to wt:
 
 - **`F9`** cycles pane focus (left ↔ right) — `select-pane -t :.+`.
-- **`Alt+Space`** zooms the right pane to full-screen — `resize-pane -Z`.
+- **`F8`** zooms the right pane to full-screen — `resize-pane -Z`.
+
+Which pane holds focus is signaled **inside the task pane** (the session
+pane is left unmarked): the title bar shows `⌨ tasks` (accent) when typing
+lands in the task pane and `⌨ session` (dim) otherwise, and the tasks
+panel border tints accent while focused. When the right pane is showing a
+special slot session (`,` / `.` / `/`) instead of the selected task, the
+title bar flags it with a warn-colored `◂ <label>` badge — and manually
+refocusing the task pane (F9, mouse) snaps the right pane back to the
+selected task's session.
 
 `F10`/`F11`/`F12` are also forwarded un-prefixed (not `Alt+F10` etc.) since
 they're already dedicated function keys distinct from ordinary letters.
@@ -176,7 +187,7 @@ additional or hub-specific:
 | `,` / `.` / `/` | show the wt-repo / main-clone / dotfiles slot session in the right pane |
 | `q` / `Ctrl+C` | leave the hub — kills the outer layout session only; every inner-server session keeps running |
 | `F9` (tmux-level, no Alt) | cycle pane focus left ↔ right |
-| `Alt+Space` (tmux-level) | zoom the right pane full-screen |
+| `F8` (tmux-level) | zoom the right pane full-screen |
 
 Moving the task cursor auto-follows: after a 150ms debounce, the right pane
 switches to the newly-selected task's live session (stamping its focus

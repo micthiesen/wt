@@ -177,7 +177,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "z", label: "snooze task until its state changes" },
       { key: "P", label: "pin task to the top" },
       { key: "D", label: "toggle the details card" },
-      { key: "alt+space", label: "zoom the session pane" },
+      { key: "F8", label: "zoom the session pane" },
       { key: "F9", label: "switch pane focus" },
       { key: "q", label: "leave the hub (sessions keep running)" },
     ],

@@ -53,7 +53,8 @@ import { handleHubKey } from "./keyboard/hub-keys.ts";
 import { handleNormalKey, type NormalKeysCtx } from "./keyboard/normal-keys.ts";
 import { handleRemovedViewKey } from "./keyboard/removed-view-keys.ts";
 import { focusLeft, focusRight } from "../core/hub.ts";
-import { makeHubFlows } from "./flows/hub.ts";
+import { makeHubFlows, type HubShown } from "./flows/hub.ts";
+import { useHubPaneFocus } from "./hooks/useHubPaneFocus.ts";
 import { useTaskRows } from "./hooks/useTaskRows.ts";
 import { TaskList } from "./panels/tasks.tsx";
 import { makeActionPickerFlows } from "./flows/action-picker.ts";
@@ -281,6 +282,15 @@ export function App({ onExit, hubPane = false }: Props) {
     () => new Set(),
   );
   const [showHubDetails, setShowHubDetails] = useState(true);
+  // What the hub's right pane currently shows (task session / slot /
+  // home) — set by every hub-flow switch; drives the title-bar
+  // indicator so a slot session (`,`) can't be mistaken for the
+  // selected task's session.
+  const [hubShown, setHubShown] = useState<HubShown>({ kind: "home" });
+  // Whether THIS pane holds keyboard focus (hub only; F9 / select-pane
+  // flips it). Signaled in the task pane; the harness pane is left
+  // untouched.
+  const hubPaneFocused = useHubPaneFocus(hubPane);
   const { tasks } = useTaskRows({
     rows,
     reviewRequests: reviewRequestRows,
@@ -554,6 +564,7 @@ export function App({ onExit, hubPane = false }: Props) {
     reportActionError,
     refreshTmuxSessions,
     refreshClaudeSummaries,
+    setShown: setHubShown,
     onExit: quit,
   });
   // Hub mode swaps the renderer-suspending session entries for
@@ -602,6 +613,24 @@ export function App({ onExit, hubPane = false }: Props) {
     if (!hubPane) return;
     void (inputActive ? focusLeft() : focusRight());
   }, [hubPane, inputActive]);
+
+  // Refocusing the task pane by hand (F9, mouse) while the right pane
+  // shows something other than the selection (a slot session, home) is
+  // "I'm back to the inbox" — re-assert the selection follow so the
+  // right pane matches what's highlighted. Gated on `inputActive` so
+  // the modal focus dance (which also lands focus here) doesn't yank
+  // the right pane mid-picker, and on `hubShown` so the common case
+  // (already following) stays a no-op.
+  const inputActiveRef = useRef(inputActive);
+  inputActiveRef.current = inputActive;
+  const hubShownRef = useRef(hubShown);
+  hubShownRef.current = hubShown;
+  useEffect(() => {
+    if (!hubPane || !hubPaneFocused) return;
+    if (inputActiveRef.current) return;
+    if (hubShownRef.current.kind === "task") return;
+    hubFlowsRef.current.followSelection(hubRowRef.current);
+  }, [hubPane, hubPaneFocused]);
 
 
   /**
@@ -912,6 +941,18 @@ export function App({ onExit, hubPane = false }: Props) {
         ) : automations.pendingCount > 0 ? (
           <text fg={theme.fgDim}>{`auto ${automations.pendingCount} queued  `}</text>
         ) : null}
+        {hubPane && hubShown.kind === "slot" ? (
+          // The right pane is showing a special (slot) session, not the
+          // selected task — flag it loudly; F9 back to tasks re-follows.
+          <text fg={theme.warn} attributes={1}>{`◂ ${hubShown.label}  `}</text>
+        ) : null}
+        {hubPane ? (
+          hubPaneFocused ? (
+            <text fg={theme.accent} attributes={1}>{"⌨ tasks  "}</text>
+          ) : (
+            <text fg={theme.fgDim}>{"⌨ session  "}</text>
+          )
+        ) : null}
         <UsageBadge primary={primaryHarness} />
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>
@@ -935,6 +976,7 @@ export function App({ onExit, hubPane = false }: Props) {
               isLoading={isLoading}
               activeSessionBySlug={activeSessionBySlug}
               activeActions={activeActions}
+              paneFocused={hubPaneFocused}
             />
           )}
           {showHubDetails ? (

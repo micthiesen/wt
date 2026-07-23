@@ -24,7 +24,7 @@ export async function run(_argv: string[]): Promise<number> {
     line("Enter / F12", "start + show the task's agent session"),
     line("F11 / F10", "show the diff / shell session"),
     line("M-j / M-k", "move through the task inbox"),
-    line("M-Space", "zoom this pane"),
+    line("F8", "zoom this pane"),
     line("F9", "switch pane focus"),
     line("M-?", "full keymap"),
     "",
