@@ -23,6 +23,15 @@ export {
 
 export { buildHubConfig, writeHubConfig } from "./hub/config.ts";
 
+export {
+  bytesToTmuxKeyName,
+  COMMAND_LAYER,
+  type Chord,
+  type CommandLayerEntry,
+  renderAlacrittyBindings,
+  renderWezTermBindings,
+} from "./hub/command-layer.ts";
+
 export { ensureHubLayout, launchHub, wtArgv } from "./hub/layout.ts";
 
 export {

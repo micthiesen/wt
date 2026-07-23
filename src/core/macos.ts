@@ -2,7 +2,7 @@
  * macOS-only process utilities (`open`, `pbcopy`) — part of the macOS
  * assumption noted in the README.
  */
-import { hideFrontmostAlacritty } from "./zed.ts";
+import { hideFrontmostTerminal } from "./zed.ts";
 
 /** Fire-and-forget `open <url>`. The macOS `open` binary returns immediately. */
 export function openUrl(url: string): void {
@@ -14,17 +14,18 @@ export function openUrl(url: string): void {
 }
 
 /**
- * Hide a frontmost Alacritty window, *then* open the URL. Order matters:
- * `openUrl` brings the browser to the front, while `hideFrontmostAlacritty`
+ * Hide a frontmost terminal window, *then* open the URL. Order matters:
+ * `openUrl` brings the browser to the front, while `hideFrontmostTerminal`
  * shells out to `osascript` to sample the frontmost app and only sends
- * Cmd+H if it's Alacritty. Firing both without awaiting lets the browser
- * win the race — the frontmost query then sees the browser, not Alacritty,
- * and the hide no-ops. Awaiting the hide first keeps Alacritty frontmost
- * long enough to be detected and hidden. (Matters since the hide became
- * async; `openInZed` already sequences its own hide internally.)
+ * Cmd+H if it's a supported terminal (Alacritty or WezTerm). Firing both
+ * without awaiting lets the browser win the race — the frontmost query
+ * then sees the browser, not the terminal, and the hide no-ops. Awaiting
+ * the hide first keeps the terminal frontmost long enough to be detected
+ * and hidden. (Matters since the hide became async; `openInZed` already
+ * sequences its own hide internally.)
  */
-export async function openUrlHidingAlacritty(url: string): Promise<void> {
-  await hideFrontmostAlacritty();
+export async function openUrlHidingTerminal(url: string): Promise<void> {
+  await hideFrontmostTerminal();
   openUrl(url);
 }
 

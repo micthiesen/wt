@@ -41,7 +41,7 @@ import type { makeGithubPrFlows } from "../flows/github-pr.ts";
 import { REVIEW_SECTION } from "../flows/new-worktree.ts";
 import type { makeSectionFlows } from "../flows/sections.ts";
 import type { makeSessionFlows } from "../flows/sessions.ts";
-import { openUrlHidingAlacritty } from "../../core/macos.ts";
+import { openUrlHidingTerminal } from "../../core/macos.ts";
 import { openInZed } from "../../core/zed.ts";
 import {
   isSyntheticLiveSessionId,
@@ -879,7 +879,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         rowLog.event.warn("no linear id in slug");
         return;
       }
-      void openUrlHidingAlacritty(url);
+      void openUrlHidingTerminal(url);
       rowLog.event.info("opened linear");
       return;
     }
@@ -893,7 +893,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         rowLog.event.warn("no stage domain configured");
         return;
       }
-      void openUrlHidingAlacritty(url);
+      void openUrlHidingTerminal(url);
       rowLog.event.info(`opened ${current.wt.stage}`);
       return;
     }

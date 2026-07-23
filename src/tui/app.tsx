@@ -70,6 +70,7 @@ import { useRemovedView } from "./hooks/useRemovedView.ts";
 import { useSessionsPickerData } from "./hooks/useSessionsPickerData.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "./usage-badge.tsx";
 import { writeClipboard } from "../core/macos.ts";
+import { eventsOutputId } from "../core/outputs.ts";
 import { theme } from "./theme.ts";
 import { type RemoteCreation } from "./remote-creation.ts";
 
@@ -311,6 +312,8 @@ export function App({ onExit, hubPane = false }: Props) {
     stackSectionLabels,
     expandedStacks,
     slotsExpanded,
+    remoteWorktrees: remoteWorktreeList.data ?? [],
+    remoteCreation,
     githubFresh,
     isLoading,
   });
@@ -336,7 +339,14 @@ export function App({ onExit, hubPane = false }: Props) {
       : undefined
     : listCurrentItem;
   const selectedPr = hubPane ? hubPr : listSelectedPr;
-  const selectedRemote = hubPane ? undefined : listSelectedRemote;
+  // Remote selection follows the task cursor in hub mode, so the
+  // classic remote paths that key off it (the `d` removal confirm,
+  // details card) work unchanged from the inbox's Remote group.
+  const selectedRemote = hubPane
+    ? hubTask?.kind === "remote"
+      ? hubTask.entry
+      : undefined
+    : listSelectedRemote;
   const selectedSection = hubPane ? undefined : listSelectedSection;
 
   // `g p` / `l p` PR-target chord — extracted to
@@ -568,6 +578,7 @@ export function App({ onExit, hubPane = false }: Props) {
     currentHarnessSessions,
     primaryHarness,
     slotGlyphs,
+    remoteUnavailable,
     inputActive,
     toast,
     reportActionError,
@@ -769,10 +780,11 @@ export function App({ onExit, hubPane = false }: Props) {
       });
       return;
     }
-    // `h` — flip the left pane to the removed-worktrees history.
-    // Classic only: hub retired the view (cmd+h is focus-left there;
-    // use `wt classic` for removal history).
-    if (!hubPane && isPlainLetter(k, "h")) {
+    // `h` — flip the left pane to the removed-worktrees history. Works
+    // in both modes: the hub renders `RemovedList` in the task pane
+    // slot, and the plain `h` key is free again since the cmd layer's
+    // v2 dropped its M-h relay (macOS owns cmd+h).
+    if (isPlainLetter(k, "h")) {
       setRemovedView(true);
       return;
     }
@@ -845,6 +857,10 @@ export function App({ onExit, hubPane = false }: Props) {
         hubFlows,
         toggleFocus: hub.toggleFocus,
         openPrUrl: (url, number) => openPrUrl(url, number, null, "pr"),
+        rememberPrTargetChord,
+        focusedOutputId,
+        focusEventsOutput: () =>
+          setFocus(currentSlug ?? null, { focused: eventsOutputId() }),
         toggleDetails: () => setShowHubDetails((v) => !v),
         refreshWtState: async () => {
           await queryClient.invalidateQueries({ queryKey: qk.wtState() });
@@ -892,6 +908,24 @@ export function App({ onExit, hubPane = false }: Props) {
     return parts.length > 0 ? parts.join(" · ") : undefined;
   }, [activeTails.size]);
 
+  // Remote slugs with a live SSH wrapper session — tints the Remote
+  // group's glyphs. Memoized so `memo(TaskRowView)` sees a stable Set
+  // identity while the underlying map is unchanged.
+  const liveRemoteWrappers = useMemo(
+    () => new Set(hub.remoteWrapperBySlug.keys()),
+    [hub.remoteWrapperBySlug],
+  );
+  // Hub bottom-card slot: the output viewer takes over from the
+  // details card while an output demands attention — an explicit
+  // focus (`'`/`[`/`]`/`"`, or an action launch focusing its stream)
+  // or a live action/destroy stream the auto-selector surfaced. Esc
+  // clears an explicit focus and the details card returns.
+  const hubOutputVisible =
+    hubPane &&
+    (focusedOutputId !== null ||
+      displayedOutput.kind === "action" ||
+      displayedOutput.kind === "destroy");
+
   return (
     <box flexDirection="column" width={width} height={height} backgroundColor={theme.bg}>
       <box
@@ -930,9 +964,11 @@ export function App({ onExit, hubPane = false }: Props) {
       </box>
       {hubPane ? (
         // Hub layout: this process IS the narrow left pane of the tmux
-        // hub — one column of tasks with an optional details card
-        // stacked below (`I` toggles). The live session lives in the
-        // hub's right pane, so no OutputViewer here.
+        // hub — one column of tasks with a bottom card slot: the
+        // output viewer while an output demands attention (explicit
+        // focus via '/[/]/", or a live action/destroy stream), else
+        // the details card (`I` toggles). The live session lives in
+        // the hub's right pane.
         <box flexDirection="column" flexGrow={1}>
           {removedView ? (
             <RemovedList
@@ -948,11 +984,17 @@ export function App({ onExit, hubPane = false }: Props) {
               isLoading={isLoading}
               activeSessionBySlug={hubSessionGlyphs}
               activeActions={activeActions}
+              liveRemoteWrappers={liveRemoteWrappers}
               paneFocused={hub.paneFocused}
               primaryHarness={primaryHarness}
             />
           )}
-          {showHubDetails ? (
+          {hubOutputVisible && !removedView ? (
+            <OutputViewer
+              output={displayedOutput}
+              height={Math.max(10, Math.min(18, Math.floor(height * 0.45)))}
+            />
+          ) : showHubDetails ? (
             <box
               height={Math.max(10, Math.min(18, Math.floor(height * 0.45)))}
               flexShrink={0}
@@ -960,7 +1002,7 @@ export function App({ onExit, hubPane = false }: Props) {
               <Details
                 row={removedView ? undefined : current}
                 reviewRequest={removedView ? undefined : selectedPr}
-                remote={undefined}
+                remote={removedView ? undefined : selectedRemote}
                 remoteUnavailable={remoteUnavailable}
                 remoteError={remoteError}
                 section={undefined}

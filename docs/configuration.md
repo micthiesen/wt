@@ -183,6 +183,7 @@ Omit for classic poll-only behavior. When present, the `wt events` daemon accept
 |---|---|---|---|
 | `rows` | no | `["branch", "base", "linear", "stage", "pr", "claude", "git"]` | Detail-pane row order. Available ids: `branch`, `base`, `path`, `linear`, `stage`, `pr`, `claude`, `git`. Unknown ids are ignored; omitted ones are hidden. A row also hides itself when its integration isn't configured (e.g. `linear` without `[issue_tracker.linear]`). The rebase state (restacking / mid-rebase / conflict + files) isn't a row — it renders as a fixed block below the rows, above the AI summary. |
 | `mode` | no | `"classic"` | Which TUI a bare `wt` launches: `"classic"` (the three-pane worktree TUI) or `"hub"` (the tmux-hosted task-inbox layout, see [hub.md](hub.md)). Both modes read/write identical on-disk state; `wt classic` / `wt hub` force a mode regardless of this setting. |
+| `hub_background` | no | `"#1E1E2E"` | `#RRGGBB` background color for hub mode's task pane and the outer tmux server's pane-border paint (see [hub.md](hub.md)). Defaults to the built-in Catppuccin Mocha base; set it to match your own terminal theme if you don't use that palette. |
 
 ## `[[actions]]` — the `!` menu
 

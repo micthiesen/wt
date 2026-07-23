@@ -31,6 +31,7 @@ import { stackOrdinalLabel } from "../../core/stack-layout.ts";
 import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
 import type { DisplayBucket, TaskItem } from "../hooks/useTaskRows.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import { isRemoteSummary, remoteEntryLabel } from "../remote-creation.ts";
 import { rowLabel } from "./list.tsx";
 import { Divider } from "./section-divider.tsx";
 
@@ -44,6 +45,8 @@ type Props = {
   isLoading: boolean;
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   activeActions: ReadonlySet<string>;
+  /** Remote slugs with a live local SSH wrapper session (tints the remote glyph). */
+  liveRemoteWrappers: ReadonlySet<string>;
   /**
    * Whether this tmux pane holds keyboard focus. Tints the panel border
    * (accent = typing lands here) — the in-pane half of the hub's focus
@@ -82,11 +85,20 @@ function taskGlyph(
   item: TaskItem,
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>,
   primaryHarness: HarnessId,
+  liveRemoteWrappers: ReadonlySet<string>,
 ): Glyph {
   if (item.kind === "pr") {
     return item.pr.isDraft
       ? { glyph: NF.prDraft, fg: theme.fgDim }
       : { glyph: NF.prOpen, fg: theme.accentAlt };
+  }
+  if (item.kind === "remote") {
+    // Tinted while a local SSH wrapper session is live (this machine
+    // has a view into the remote session open); dim otherwise. Remote
+    // rows have no richer local state to encode.
+    const live =
+      isRemoteSummary(item.entry) && liveRemoteWrappers.has(item.entry.slug);
+    return { glyph: NF.remote, fg: live ? theme.info : theme.fgDim };
   }
   if (item.kind === "slot") {
     // Same robot the footer's slot glyphs used: live sessions tint by
@@ -143,6 +155,7 @@ function bucketGlyph(
  */
 function taskTitle(item: TaskItem): string {
   if (item.kind === "slot") return item.slot.label;
+  if (item.kind === "remote") return remoteEntryLabel(item.entry);
   if (item.kind === "pr") return capitalizeFirst(item.pr.title);
   if (item.kind === "stack") return item.label;
   const label = rowLabel(item.row);
@@ -157,6 +170,13 @@ function taskDetailLine(
   item: TaskItem,
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>,
 ): string {
+  if (item.kind === "remote") {
+    if (!isRemoteSummary(item.entry)) return `creating on ${item.entry.hostLabel}…`;
+    const bits = [item.entry.hostLabel, item.entry.statusLabel];
+    if (item.entry.dirty) bits.push("dirty");
+    if (item.entry.unpushed > 0) bits.push(`${item.entry.unpushed} unpushed`);
+    return bits.join(" · ");
+  }
   if (item.kind === "slot") {
     const state = activeSessionBySlug.get(item.slot.slug)?.state;
     const status = state ?? "no session";
@@ -172,6 +192,7 @@ const TaskRowView = memo(function TaskRowView({
   activeSessionBySlug,
   activeActions,
   primaryHarness,
+  liveRemoteWrappers,
   ordinal,
   panelWidth,
 }: {
@@ -180,6 +201,7 @@ const TaskRowView = memo(function TaskRowView({
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   activeActions: ReadonlySet<string>;
   primaryHarness: HarnessId;
+  liveRemoteWrappers: ReadonlySet<string>;
   /** 1-9 quick-jump ordinal (cmd+N), shown dim in the detail indent. */
   ordinal?: number;
   panelWidth: number;
@@ -187,7 +209,7 @@ const TaskRowView = memo(function TaskRowView({
   const bg = selected ? theme.rowSelectedBg : undefined;
   const titleFg = selected ? theme.fgBright : theme.fg;
   const attrs = selected ? TextAttributes.BOLD : 0;
-  const glyph = taskGlyph(item, activeSessionBySlug, primaryHarness);
+  const glyph = taskGlyph(item, activeSessionBySlug, primaryHarness, liveRemoteWrappers);
 
   const isRowKind = item.kind === "wt" || item.kind === "stack";
   const row = isRowKind ? item.row : undefined;
@@ -246,8 +268,10 @@ const TaskRowView = memo(function TaskRowView({
 function dividerLabel(displayBucket: DisplayBucket): string {
   if (displayBucket === "pinned") return "Pinned";
   if (displayBucket === "snoozed") return "Snoozed";
+  if (displayBucket === "remote") return "Remote";
+  if (displayBucket === "archived") return "Archived";
   if (displayBucket === "sessions") return "Sessions";
-  // Excluding the three literals above narrows `displayBucket` from
+  // Excluding the literals above narrows `displayBucket` from
   // `DisplayBucket` straight to `TaskBucket` — no `as` cast needed.
   return TASK_BUCKET_LABEL[displayBucket];
 }
@@ -259,11 +283,17 @@ export function TaskList({
   isLoading,
   activeSessionBySlug,
   activeActions,
+  liveRemoteWrappers,
   paneFocused = false,
   primaryHarness,
   scrollHandle,
 }: Props) {
-  const hasWork = tasks.some((t) => t.kind !== "slot");
+  // "Anything worth showing" = any live inbox item. Sessions slots are
+  // always present and Archived is cold storage — neither should
+  // suppress the "No tasks" hint when the live inbox is empty.
+  const hasWork = tasks.some(
+    (t) => t.kind !== "slot" && t.displayBucket !== "archived",
+  );
   const listRef = useRef<ScrollBoxRenderable>(null);
   const listScrollRef = useScrollbarNoFlash(listRef);
   useScrollToEdge(listRef, scrollHandle);
@@ -326,6 +356,7 @@ export function TaskList({
                 activeSessionBySlug={activeSessionBySlug}
                 activeActions={activeActions}
                 primaryHarness={primaryHarness}
+                liveRemoteWrappers={liveRemoteWrappers}
                 ordinal={i < 9 ? i + 1 : undefined}
                 panelWidth={width}
               />

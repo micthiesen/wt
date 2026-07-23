@@ -170,7 +170,7 @@ const KEY_BLOCKS: Block[] = [
   {
     kind: "keys",
     title: "hub mode (wt hub)",
-    note: "Tmux-hosted task inbox: left = tasks, right = live session. Typing always goes to the session; drive wt with the \u2318 layer (Alacritty-translated, works from either pane). For rare classic actions: \u2318U to focus the tasks pane, type the letter, Esc back. `wt classic` opens the three-pane TUI.",
+    note: "Tmux-hosted task inbox: left = tasks, right = live session. Typing always goes to the session; drive wt with the \u2318 layer (terminal-translated \u2014 `wt hub keys alacritty|wezterm` prints the config; works from either pane). For rare classic actions: \u2318U to focus the tasks pane, type the letter, Esc back. Bottom groups: Remote (SSH worktrees, opened through a local wrapper session), Archived, Sessions. `wt classic` opens the three-pane TUI.",
     items: [
       { key: "\u2318J / \u2318K", label: "move through the inbox (session pane follows)" },
       { key: "\u23181-9", label: "jump straight to task N (dim ordinals)" },
@@ -189,6 +189,8 @@ const KEY_BLOCKS: Block[] = [
       { key: "\u2318R / \u2318/", label: "refresh / this help" },
       { key: "q", label: "leave the hub, tasks pane focused (sessions keep running)" },
       { key: "F7-F12", label: "legacy layer still works (focus/zoom/shell/diff/agent)" },
+      { key: "' [ ] \"", label: "output card: picker / cycle / events feed · Esc dismisses" },
+      { key: "h", label: "removed-worktrees history (browse/restore), tasks pane focused" },
     ],
   },
   {

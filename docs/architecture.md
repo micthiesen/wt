@@ -78,6 +78,14 @@ suspends the Mac renderer. Detaching returns to the same Mac Inbox.
 remote installation's lock and dirty-work safeguards while explicitly leaving
 any SST stage intact.
 
+Hub mode can't hand off the terminal, so it bridges the same `_session`
+SSH command through a local **wrapper session** on the inner tmux server
+(`core/tmux/remote-wrapper.ts`, reserved names `wt-remote~<slug>~<target>`
+excluded from classification and the orphan reaper) and retargets the right
+pane at it; wrapper death (SSH drop) is observed by the hub's liveness watch
+through the same `tmuxSessionsQuery` every other session kind uses. See
+[hub.md](hub.md#remote-worktrees).
+
 ## Hub mode
 
 An opt-in second UI (`[ui] mode = "hub"` / `wt hub`) layered on top of the same

@@ -50,7 +50,18 @@ export type { ClaudeSessionEntry } from "./tmux/admin.ts";
 
 export { killActionSession, startActionSession } from "./tmux/action-sessions.ts";
 
+export { listAllSessionsRaw } from "./tmux/process.ts";
+
 export { attachOrCreate, ensureSessionDetached } from "./tmux/attach.ts";
 export type { AttachResult } from "./tmux/attach.ts";
+
+export {
+  ensureRemoteWrapperSession,
+  killRemoteWrapperSessions,
+  parseRemoteWrapper,
+  remoteWrapperName,
+  REMOTE_WRAPPER_PREFIX,
+} from "./tmux/remote-wrapper.ts";
+export type { RemoteSessionTarget, RemoteWrapperEntry } from "./tmux/remote-wrapper.ts";
 
 export { injectIntoSession } from "./tmux/inject.ts";

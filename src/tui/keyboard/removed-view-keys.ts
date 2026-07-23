@@ -12,7 +12,7 @@ import { createLogger } from "../../core/logger.ts";
 import { linearUrlForSlug } from "../../core/linear.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { isPlainLetter } from "../app-helpers.ts";
-import { openUrlHidingAlacritty } from "../../core/macos.ts";
+import { openUrlHidingTerminal } from "../../core/macos.ts";
 import type { Modal } from "../modal-state.ts";
 import { theme } from "../theme.ts";
 
@@ -86,7 +86,7 @@ export function handleRemovedViewKey(k: KeyEvent, ctx: RemovedViewKeysCtx): void
           removedLog.event.warn("no linear id in slug");
           return;
         }
-        void openUrlHidingAlacritty(url);
+        void openUrlHidingTerminal(url);
         removedLog.event.info("opened linear");
         return;
       }

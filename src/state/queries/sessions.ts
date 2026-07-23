@@ -7,6 +7,7 @@ import {
 } from "../../core/harness/index.ts";
 import {
   type ClaudeSessionEntry,
+  type RemoteWrapperEntry,
   listSessions as listTmuxSessions,
 } from "../../core/tmux.ts";
 
@@ -38,6 +39,12 @@ export type TmuxSessionsData = {
   /** Slugs with a live action session (wt-managed wrapper). */
   action: string[];
   /**
+   * Live local wrapper sessions for REMOTE worktree sessions (hub
+   * mode's SSH bridge; see `core/tmux/remote-wrapper.ts`). Plain
+   * objects because this query is persisted.
+   */
+  remote: RemoteWrapperEntry[];
+  /**
    * Raw set of every live tmux session name on the wt-private server.
    * Consumers that need to know whether a specific harness's tmux name
    * is live (e.g. `useHarnessSessions`) read this rather than running
@@ -61,7 +68,7 @@ export const tmuxSessionsQuery = () =>
   queryOptions({
     queryKey: qk.tmuxSessions(),
     queryFn: async (): Promise<TmuxSessionsData> => {
-      const { claude, claudeSlugs, codex, opencode, diff, shell, action, all } =
+      const { claude, claudeSlugs, codex, opencode, diff, shell, action, remote, all } =
         await listTmuxSessions();
       return {
         claude,
@@ -73,6 +80,7 @@ export const tmuxSessionsQuery = () =>
         diff: [...diff],
         shell: [...shell],
         action: [...action],
+        remote,
         all: [...all],
       };
     },

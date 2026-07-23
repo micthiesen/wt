@@ -1,3 +1,5 @@
+import { config } from "../core/config.ts";
+
 // Nord-ish palette. Keep the surface small so panels feel coherent.
 export const theme = {
   bg: "#1b1d23",
@@ -42,19 +44,22 @@ export const theme = {
  * palette (mirroring ~/.config/alacritty/alacritty.toml) — hub mode
  * only. This is NOT terminal-theme detection — the values below are
  * hardcoded to match the owner's Alacritty config, not read from the
- * terminal in any way. The hub's task pane lives INSIDE the terminal
- * next to a harness that renders on the terminal's own background, so
- * wt's Nord surface reads as a mismatched slab there; with `bg`/`bgAlt`
- * set to the same hardcoded background the pane blends in like Claude
- * Code does. Mutates the shared object in place BEFORE the first
- * render (theme values are read at render time) and only in the
- * `wt _taskpane` process — the classic TUI keeps Nord. Brand colors
- * (claude/codex/opencode) are identities, not theme, and stay put.
+ * terminal in any way (the one exception is `bg`/`bgAlt`, sourced from
+ * `config.ui.hubBackground` so a WezTerm/other-theme user can match
+ * their own terminal background — see docs/configuration.md#ui). The
+ * hub's task pane lives INSIDE the terminal next to a harness that
+ * renders on the terminal's own background, so wt's Nord surface reads
+ * as a mismatched slab there; with `bg`/`bgAlt` set to the same
+ * background the pane blends in like Claude Code does. Mutates the
+ * shared object in place BEFORE the first render (theme values are
+ * read at render time) and only in the `wt _taskpane` process — the
+ * classic TUI keeps Nord. Brand colors (claude/codex/opencode) are
+ * identities, not theme, and stay put.
  */
 export function applyHubPalette(): void {
   Object.assign(theme, {
-    bg: "#1E1E2E", // base — identical to the terminal background
-    bgAlt: "#1E1E2E", // bars blend into the terminal bg too
+    bg: config.ui.hubBackground, // base — identical to the terminal background
+    bgAlt: config.ui.hubBackground, // bars blend into the terminal bg too
     rowSelectedBg: "#313244", // surface0
     border: "#45475A", // surface1
     borderDim: "#313244", // surface0

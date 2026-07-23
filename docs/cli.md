@@ -98,6 +98,12 @@ Install wt's bundled agent skills (`restack`, a `wt` reference skill). No names 
 - `--harness <claude|codex|opencode>` — copy into that harness's native skills dir.
 - `--rulesync` — copy into a rulesync source dir instead (`--dest` overrides, `--build` regenerates immediately). Mutually exclusive with `--harness`.
 
+## Hub mode
+
+### `wt hub keys <alacritty|wezterm>`
+
+Print a ready-to-paste command-layer config snippet for the given terminal — the cmd+`<key>` chord table that drives hub mode from outside the task pane. See [hub.md](hub.md#the-command-layer) for the concept, and paste the output into `alacritty.toml`'s `[keyboard] bindings` or a WezTerm `config.keys`. No terminal or an unrecognized one prints usage and exits 1.
+
 ## Integrations
 
 ### `wt events <sub>`

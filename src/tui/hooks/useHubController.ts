@@ -26,9 +26,14 @@ import { useQuery } from "@tanstack/react-query";
 import { focusLeft, focusRight } from "../../core/hub.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import { taskFocusStore } from "../../core/task-focus.ts";
-import { claudeSessionName, sessionName } from "../../core/tmux.ts";
+import {
+  claudeSessionName,
+  listAllSessionsRaw,
+  sessionName,
+} from "../../core/tmux.ts";
 import { tmuxSessionsQuery } from "../../state/queries.ts";
 import { makeHubFlows, type HubShown } from "../flows/hub.ts";
+import { isRemoteSummary } from "../remote-creation.ts";
 import type { ActiveSessionGlyph } from "./useHarnessSessions.ts";
 import type { useHarnessSessions } from "./useHarnessSessions.ts";
 import { useHubPaneFocus } from "./useHubPaneFocus.ts";
@@ -44,6 +49,8 @@ export type HubControllerOpts = {
   primaryHarness: HarnessId;
   /** Live Sessions-slot glyphs (presence = live session for that slot). */
   slotGlyphs: ReadonlyMap<string, ActiveSessionGlyph>;
+  /** True when the configured `[remote]` host is known-unreachable. */
+  remoteUnavailable: boolean;
   /** True while a modal or footer prompt owns typing. */
   inputActive: boolean;
   toast: (message: string, color?: string, ms?: number) => void;
@@ -62,6 +69,7 @@ export function useHubController(opts: HubControllerOpts) {
     currentHarnessSessions,
     primaryHarness,
     slotGlyphs,
+    remoteUnavailable,
     inputActive,
     toast,
     reportActionError,
@@ -111,6 +119,7 @@ export function useHubController(opts: HubControllerOpts) {
     reportActionError,
     refreshTmuxSessions,
     refreshClaudeSummaries,
+    remoteUnavailable,
     setShown: setHubShown,
     setPaneFocused,
     getShown: () => hubShownRef.current,
@@ -135,7 +144,29 @@ export function useHubController(opts: HubControllerOpts) {
   const slotGlyphsRef = useRef(slotGlyphs);
   slotGlyphsRef.current = slotGlyphs;
 
-  /** Re-assert the right pane against the current selection (task OR slot). */
+  // Live tmux session inventory — drives both the remote-wrapper
+  // lookup (follow + glyphs) and the shown-session liveness watch
+  // below. Hoisted here because `followNow` needs the wrapper map.
+  const tmux = useQuery(tmuxSessionsQuery()).data;
+  // Per-remote-slug live wrapper, preferring the harness view over
+  // diff/shell when several are open (the follow shows the one you
+  // most likely care about; explicit F10/F11 still target the rest).
+  // `?? []` tolerates a persisted cache from before the field existed.
+  const remoteWrapperBySlug = useMemo(() => {
+    const map = new Map<string, { target: "harness" | "diff" | "shell"; name: string }>();
+    const rank = { harness: 0, diff: 1, shell: 2 } as const;
+    for (const entry of tmux?.remote ?? []) {
+      const prev = map.get(entry.slug);
+      if (!prev || rank[entry.target] < rank[prev.target]) {
+        map.set(entry.slug, { target: entry.target, name: entry.name });
+      }
+    }
+    return map;
+  }, [tmux]);
+  const remoteWrapperBySlugRef = useRef(remoteWrapperBySlug);
+  remoteWrapperBySlugRef.current = remoteWrapperBySlug;
+
+  /** Re-assert the right pane against the current selection (task, slot, or remote). */
   function followNow(): void {
     const t = hubTaskRef.current;
     if (t?.kind === "slot") {
@@ -143,6 +174,13 @@ export function useHubController(opts: HubControllerOpts) {
         t.slot,
         slotGlyphsRef.current.has(t.slot.slug),
       );
+      return;
+    }
+    if (t?.kind === "remote") {
+      const wrapper = isRemoteSummary(t.entry)
+        ? remoteWrapperBySlugRef.current.get(t.entry.slug) ?? null
+        : null;
+      hubFlowsRef.current.followRemote(t.entry, wrapper);
       return;
     }
     hubFlowsRef.current.followSelection(hubRowRef.current);
@@ -161,7 +199,13 @@ export function useHubController(opts: HubControllerOpts) {
   const followKey = enabled
     ? hubTask?.kind === "slot"
       ? `${hubTask.key}:${slotGlyphs.has(hubTask.slot.slug) ? "live" : ""}`
-      : `${hubTask?.key ?? ""}:${f12?.isLive ? f12.tmuxSessionName : ""}`
+      : hubTask?.kind === "remote"
+        ? `${hubTask.key}:${
+            isRemoteSummary(hubTask.entry)
+              ? remoteWrapperBySlug.get(hubTask.entry.slug)?.name ?? ""
+              : ""
+          }`
+        : `${hubTask?.key ?? ""}:${f12?.isLive ? f12.tmuxSessionName : ""}`
     : "";
   useEffect(() => {
     if (!enabled) return;
@@ -222,8 +266,9 @@ export function useHubController(opts: HubControllerOpts) {
   // respawning to home changes what's on screen without a switch. When
   // the recorded session name drops out of the live tmux set, reset to
   // home and re-follow — otherwise a repeat F-key press would "toggle
-  // focus" onto a dead pane instead of relaunching.
-  const tmux = useQuery(tmuxSessionsQuery()).data;
+  // focus" onto a dead pane instead of relaunching. Remote wrappers
+  // are in the set too: a dropped SSH (host asleep, remote session
+  // exited) reaps the wrapper and lands here like any other death.
   const liveNames = useMemo(() => {
     if (!enabled || !tmux) return null;
     const names = new Set<string>();
@@ -234,6 +279,7 @@ export function useHubController(opts: HubControllerOpts) {
     for (const slug of tmux.slugsByHarness.opencode) names.add(sessionName(slug, "opencode"));
     for (const slug of tmux.diff) names.add(sessionName(slug, "diff"));
     for (const slug of tmux.shell) names.add(sessionName(slug, "shell"));
+    for (const entry of tmux.remote ?? []) names.add(entry.name);
     return names;
   }, [enabled, tmux]);
   useEffect(() => {
@@ -241,8 +287,27 @@ export function useHubController(opts: HubControllerOpts) {
     const shown = hubShownRef.current;
     if (shown.kind === "home") return;
     if (liveNames.has(shown.name)) return;
-    setHubShown({ kind: "home" });
-    followNowRef.current();
+    // The polled snapshot says the shown session is gone — but a poll
+    // whose fetch STARTED before a just-created session was spawned can
+    // resolve after the switch landed, and resetting on that stale
+    // snapshot would visibly yank a live session off screen (the next
+    // poll would show it again 5s later). Death is rarer than
+    // switching, so pay one authoritative `list-sessions` re-check
+    // before acting; a rerun of this effect cancels a stale check.
+    let cancelled = false;
+    void listAllSessionsRaw()
+      .then((names) => {
+        if (cancelled) return;
+        const still = hubShownRef.current;
+        if (still.kind === "home" || still.name !== shown.name) return;
+        if (names.has(shown.name)) return; // stale poll — next refetch catches up
+        setHubShown({ kind: "home" });
+        followNowRef.current();
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [enabled, liveNames]);
 
   // On-screen = reviewed: while a task's HARNESS session is displayed,
@@ -276,5 +341,7 @@ export function useHubController(opts: HubControllerOpts) {
     isMuted,
     hubTask,
     hubRow,
+    /** Per-remote-slug live SSH wrapper (task-pane glyphs read the keys). */
+    remoteWrapperBySlug,
   };
 }

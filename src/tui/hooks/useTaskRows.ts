@@ -40,6 +40,12 @@ import {
 } from "../../core/types.ts";
 import type { WtState } from "../../core/wtstate.ts";
 import {
+  remoteEntryKey,
+  type RemoteCreation,
+  type RemoteListEntry,
+} from "../remote-creation.ts";
+import type { RemoteWorktreeSummary } from "../../core/remote-worktrees.ts";
+import {
   DOTFILES_SLOT,
   MAIN_CLONE_SLOT,
   WT_SOURCE_SLOT,
@@ -51,14 +57,21 @@ import type { WorktreeRow } from "./useWorktreeRows.ts";
 /**
  * Section-grouping key for a `TaskItem` — the two synthetic overlay
  * buckets ("pinned"/"snoozed", which outrank the derived bucket for
- * display per `displayBucketFor`) and the Sessions-group sentinel,
- * union'd with the real `TaskBucket`s. Typed as its own union (rather
- * than `string`) so consumers can switch on it without an `as
- * TaskBucket` cast — narrowing the three literals out of a `string`
- * left the residual as an untyped string, whereas narrowing them out
- * of this union leaves exactly `TaskBucket`.
+ * display per `displayBucketFor`), the three bottom-pinned group
+ * sentinels ("remote"/"archived"/"sessions"), union'd with the real
+ * `TaskBucket`s. Typed as its own union (rather than `string`) so
+ * consumers can switch on it without an `as TaskBucket` cast —
+ * narrowing the literals out of a `string` left the residual as an
+ * untyped string, whereas narrowing them out of this union leaves
+ * exactly `TaskBucket`.
  */
-export type DisplayBucket = "pinned" | "snoozed" | "sessions" | TaskBucket;
+export type DisplayBucket =
+  | "pinned"
+  | "snoozed"
+  | "remote"
+  | "archived"
+  | "sessions"
+  | TaskBucket;
 
 /**
  * One line-item in the task inbox. Three kinds share the same
@@ -103,6 +116,22 @@ export type TaskItem =
       state: TaskState;
       detail: string | null;
       displayBucket: DisplayBucket;
+    }
+  | {
+      /**
+       * A worktree on the configured SSH remote (or the transient
+       * "creating…" placeholder while a remote `wt new` runs). Grouped
+       * at the bottom of the inbox under a "Remote" divider — remote
+       * rows carry no local signals (no jsonl, no session state), so
+       * they don't compete in the bucket sort. Enter/F10-12 open the
+       * remote session through a local SSH wrapper session (see
+       * `core/tmux/remote-wrapper.ts`); `d` removes the remote
+       * worktree over SSH, exactly like classic mode.
+       */
+      kind: "remote";
+      key: string /* remote:<host>:<slug|input> */;
+      entry: RemoteListEntry;
+      displayBucket: "remote";
     }
   | {
       /**
@@ -420,6 +449,11 @@ function taskItemEq(a: TaskItem, b: TaskItem): boolean {
       a.displayBucket === b.displayBucket
     );
   }
+  if (a.kind === "remote" && b.kind === "remote") {
+    // `entry` by identity: the remote query returns fresh arrays but
+    // TanStack's structural sharing preserves unchanged entry objects.
+    return a.entry === b.entry;
+  }
   if (a.kind === "slot" && b.kind === "slot") {
     return (
       a.slot === b.slot &&
@@ -467,6 +501,10 @@ export function useTaskRows(opts: {
   expandedStacks: ReadonlySet<string>;
   /** Whether the bottom Sessions group shows all three slots (Tab). */
   slotsExpanded: boolean;
+  /** Remote worktree inventory (empty when `[remote]` isn't configured). */
+  remoteWorktrees: readonly RemoteWorktreeSummary[];
+  /** Transient placeholder while a remote `wt new` is in flight. */
+  remoteCreation: RemoteCreation | null;
   isLoading: boolean;
   /**
    * True once the github query has completed a live fetch this
@@ -486,6 +524,8 @@ export function useTaskRows(opts: {
     stackSectionLabels,
     expandedStacks,
     slotsExpanded,
+    remoteWorktrees,
+    remoteCreation,
     isLoading,
     githubFresh,
   } = opts;
@@ -508,8 +548,8 @@ export function useTaskRows(opts: {
   const prevTasksRef = useRef<readonly TaskItem[]>([]);
 
   const tasks = useMemo(() => {
-    // Hub shows the live inbox only — archived worktrees stay out of
-    // it entirely (classic mode's list still shows them).
+    // Archived worktrees stay out of the bucket-sorted inbox — they
+    // reappear in the bottom-pinned Archived group built further down.
     const live = rows.filter((r) => !r.archived);
 
     const rowTasks = new Map<string, RowTaskData>();
@@ -672,10 +712,56 @@ export function useTaskRows(opts: {
 
     units.sort((a, b) => compareTasks(a.sortKey, b.sortKey));
 
-    // The Sessions group sits below everything, outside the bucket
-    // sort — it's infrastructure, not work. Main clone leads (the one
-    // you reach for most); Tab expands to the wt-source + dotfiles
-    // slots.
+    // Below the bucket-sorted inbox, three pinned groups in fixed
+    // order: Remote (SSH worktrees — real work, but with no local
+    // signals to sort on), Archived (cold storage kept reachable so
+    // `a` stays a two-way door in hub mode), and Sessions
+    // (infrastructure, always last so its position is muscle memory).
+
+    // Remote inventory + the transient creating-placeholder, mirroring
+    // `useVisualItems`' classic-list injection (including its "hide the
+    // placeholder once the real row lands" rule).
+    const remoteEntries: RemoteListEntry[] = [...remoteWorktrees];
+    if (
+      remoteCreation &&
+      !remoteWorktrees.some((row) => row.slug === remoteCreation.input)
+    ) {
+      remoteEntries.push(remoteCreation);
+    }
+    const remoteItems: TaskItem[] = remoteEntries.map((entry) =>
+      reuseTaskItem(itemCache.current, {
+        kind: "remote",
+        key: `remote:${remoteEntryKey(entry)}`,
+        entry,
+        displayBucket: "remote",
+      }),
+    );
+
+    const archivedItems: TaskItem[] = rows
+      .filter((r) => r.archived)
+      .map((row) => {
+        const rt = computeRowTask(
+          row,
+          activeSessionBySlug,
+          activeActions,
+          wtState,
+          focusSnapshot,
+          githubFresh,
+        );
+        return reuseTaskItem(itemCache.current, {
+          kind: "wt",
+          key: row.wt.slug,
+          row,
+          state: rt.state,
+          manual: rt.manual,
+          detail: rt.detail,
+          displayBucket: "archived",
+          inExpandedStack: false,
+        });
+      });
+
+    // Main clone leads the Sessions group (the one you reach for
+    // most); Tab expands to the wt-source + dotfiles slots.
     const visibleSlots = slotsExpanded
       ? [MAIN_CLONE_SLOT, WT_SOURCE_SLOT, DOTFILES_SLOT]
       : [MAIN_CLONE_SLOT];
@@ -689,7 +775,12 @@ export function useTaskRows(opts: {
       }),
     );
 
-    const flat = [...units.flatMap((u) => u.build()), ...slotItems];
+    const flat = [
+      ...units.flatMap((u) => u.build()),
+      ...remoteItems,
+      ...archivedItems,
+      ...slotItems,
+    ];
 
     // Prune cache entries for keys no longer present, same rationale
     // as `useWorktreeRows`' `rowCache` prune: without this the map
@@ -728,6 +819,8 @@ export function useTaskRows(opts: {
     stackSectionLabels,
     expandedStacks,
     slotsExpanded,
+    remoteWorktrees,
+    remoteCreation,
     focusSnapshot,
     githubFresh,
   ]);

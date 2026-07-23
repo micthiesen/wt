@@ -415,6 +415,14 @@ export type Config = {
      * force a mode regardless of this setting.
      */
     mode: TuiMode;
+    /**
+     * Background color for hub mode's task pane and the outer tmux
+     * server's pane-border paint (see `applyHubPalette` in
+     * `tui/theme.ts` and `buildHubConfig` in `core/hub/config.ts`).
+     * `#RRGGBB` hex only. Defaults to the built-in Catppuccin Mocha
+     * base the hub palette otherwise hardcodes.
+     */
+    hubBackground: string;
   };
 };
 
@@ -483,6 +491,9 @@ const GENERIC_DEFAULTS = {
     // `panels/details/rebase-block.tsx`). Old configs listing it are
     // harmless — unknown ids drop silently at resolve time.
     rows: ["branch", "base", "linear", "stage", "pr", "claude", "git"] as const,
+    // Catppuccin Mocha base — matches the owner's Alacritty theme
+    // (`~/.dotfiles/alacritty`) and `applyHubPalette`'s prior hardcode.
+    hubBackground: "#1E1E2E",
   },
   actions: [
     {
@@ -748,6 +759,13 @@ function build(raw: Raw, errs: Errors): Config {
     ["classic", "hub"] as const satisfies readonly TuiMode[],
     "classic",
   );
+  const hubBackgroundRaw = errs.optStr(ui, "hub_background", GENERIC_DEFAULTS.ui.hubBackground);
+  let hubBackground = GENERIC_DEFAULTS.ui.hubBackground;
+  if (/^#[0-9a-fA-F]{6}$/.test(hubBackgroundRaw)) {
+    hubBackground = hubBackgroundRaw;
+  } else {
+    errs.add("ui.hub_background must be a #RRGGBB hex color");
+  }
 
   const githubRaw = obj(raw.github);
   const githubEventsRaw = githubRaw ? obj(githubRaw.events) : null;
@@ -808,7 +826,7 @@ function build(raw: Raw, errs: Errors): Config {
     github,
     actions,
     automations,
-    ui: { rows, mode: uiMode },
+    ui: { rows, mode: uiMode, hubBackground },
   };
 }
 

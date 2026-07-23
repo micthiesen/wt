@@ -23,8 +23,11 @@
  * clobber a faster later switch, and a stale debounced follow can
  * never yank the pane away from an explicit F11/F12 target.
  */
+import { config } from "../../core/config.ts";
 import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
+import { canEnterSessionDuringLock } from "../../core/session-readiness.ts";
+import { StatusKind } from "../../core/types.ts";
 import {
   focusLeft,
   focusRight,
@@ -36,9 +39,12 @@ import { createLogger } from "../../core/logger.ts";
 import { taskFocusStore } from "../../core/task-focus.ts";
 import {
   closeHarnessSessionGracefully,
+  ensureRemoteWrapperSession,
   ensureSessionDetached,
   killHarnessSession,
+  killRemoteWrapperSessions,
   sessionName,
+  type RemoteSessionTarget,
 } from "../../core/tmux.ts";
 import {
   resolveDiffBase,
@@ -47,6 +53,7 @@ import {
 import type { useHarnessSessions } from "../hooks/useHarnessSessions.ts";
 import { isSyntheticLiveSessionId } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import { isRemoteSummary, type RemoteListEntry } from "../remote-creation.ts";
 import { withNamedClaudePersistence } from "./sessions.ts";
 import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
@@ -59,13 +66,18 @@ const hubLog = createLogger("[hub]");
  * watch in `useHubController` reconciles the cases it can't see, like
  * a kill or a pane respawn snapping back to home). `task` = a
  * worktree-backed session — the steady state; `slot` = one of the
- * Sessions-group entries (main clone / wt source / dotfiles); `home` =
- * the dashboard. `name` is the inner-server tmux session actually on
- * screen — the liveness watch keys on it.
+ * Sessions-group entries (main clone / wt source / dotfiles);
+ * `remote` = a remote worktree's session viewed through its local SSH
+ * wrapper session (`core/tmux/remote-wrapper.ts`); `home` = the
+ * dashboard. `name` is the inner-server tmux session actually on
+ * screen — the liveness watch keys on it (for `remote` that's the
+ * WRAPPER's name, so a dropped SSH reads as session-death and resets
+ * to home like everything else).
  */
 export type HubShown =
   | { kind: "task"; slug: string; target: "harness" | "diff" | "shell"; name: string }
   | { kind: "slot"; label: string; name: string }
+  | { kind: "remote"; slug: string; target: RemoteSessionTarget; name: string }
   | { kind: "home" };
 
 export type HubFlowsCtx = {
@@ -77,6 +89,8 @@ export type HubFlowsCtx = {
   reportActionError: (label: string, err: unknown) => void;
   refreshTmuxSessions: () => Promise<void>;
   refreshClaudeSummaries: (slug: string) => Promise<void>;
+  /** True when the configured `[remote]` host is known-unreachable. */
+  remoteUnavailable: boolean;
   /** Records what the right pane now shows (drives the liveness watch). */
   setShown: (shown: HubShown) => void;
   /**
@@ -117,6 +131,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     reportActionError,
     refreshTmuxSessions,
     refreshClaudeSummaries,
+    remoteUnavailable,
     setShown,
     setPaneFocused,
     getShown,
@@ -338,6 +353,136 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   }
 
   /**
+   * Show a REMOTE worktree's session in the right pane. Where classic
+   * mode suspends the renderer and hands the raw terminal to `ssh -t`
+   * (`doEnterRemoteSession`), this ensures a local WRAPPER session on
+   * the inner server running that same SSH command and retargets the
+   * right pane at it — the hub-safe drop-in, same guard ladder as the
+   * classic flow (creating / unreachable / busy-lock). The remote
+   * host's own tmux keeps the real session; the wrapper is just this
+   * machine's view of it.
+   */
+  function showRemoteSession(
+    entry: RemoteListEntry,
+    target: RemoteSessionTarget,
+  ): void {
+    if (!isRemoteSummary(entry)) {
+      toast("remote worktree is still being created", theme.warn, 1800);
+      return;
+    }
+    const remote = config.remote;
+    if (!remote) {
+      toast("[remote] is not configured", theme.warn, 2000);
+      return;
+    }
+    if (remoteUnavailable) {
+      toast(`${entry.hostLabel} is unavailable`, theme.warn, 2200);
+      return;
+    }
+    if (
+      entry.status === StatusKind.Busy &&
+      !canEnterSessionDuringLock({ op: entry.statusOp ?? "" }, entry.exists)
+    ) {
+      toast(`${entry.slug} is ${entry.statusLabel}`, theme.warn, 2200);
+      return;
+    }
+    const slug = entry.slug;
+    const targetKey = `remote:${slug}:${target}`;
+    const shown = getShown();
+    const alreadyShown =
+      shown.kind === "remote" && shown.slug === slug && shown.target === target;
+    if (alreadyShown || pendingTargetRef.current === targetKey) {
+      if (isPaneFocused()) focusSessionPane();
+      else focusTaskPane();
+      return;
+    }
+    const seq = ++seqRef.current;
+    pendingTargetRef.current = targetKey;
+    void (async () => {
+      try {
+        const res = await ensureRemoteWrapperSession({
+          remote,
+          slug,
+          target,
+          harnessId: primaryHarness,
+        });
+        if (!res.ok) {
+          toast(`remote ${target} failed: ${res.reason}`, theme.err, 3000);
+          return;
+        }
+        if (res.created) {
+          hubLog.event.info(`opened ${slug} ${target} on ${entry.hostLabel}`);
+          void refreshTmuxSessions();
+        }
+        if (
+          await switchTo(res.name, null, {
+            kind: "remote",
+            slug,
+            target,
+            name: res.name,
+          }, seq)
+        ) {
+          focusSessionPane();
+        }
+      } catch (err) {
+        reportActionError("remote session", err);
+      } finally {
+        if (pendingTargetRef.current === targetKey) {
+          pendingTargetRef.current = null;
+        }
+      }
+    })();
+  }
+
+  /**
+   * Live-follow for a selected remote task: show its live wrapper
+   * session (never spawning one — a follow must not open SSH
+   * connections), else the home dashboard. The remote counterpart of
+   * `followSlot`, with the same yield-to-explicit-actions contract.
+   */
+  function followRemote(
+    entry: RemoteListEntry,
+    liveWrapper: { target: RemoteSessionTarget; name: string } | null,
+  ): void {
+    if (pendingTargetRef.current !== null) return;
+    const seq = seqRef.current;
+    if (liveWrapper && isRemoteSummary(entry)) {
+      void switchTo(liveWrapper.name, null, {
+        kind: "remote",
+        slug: entry.slug,
+        target: liveWrapper.target,
+        name: liveWrapper.name,
+      }, seq);
+    } else {
+      void showHome()
+        .then((ok) => {
+          if (ok && seqRef.current === seq) setShown({ kind: "home" });
+        })
+        .catch(() => {});
+    }
+  }
+
+  /**
+   * Close every local wrapper session for a remote task (Ctrl+D /
+   * cmd+W). Detaches this machine's VIEW only — the remote host's tmux
+   * sessions keep running; the liveness watch flips the right pane
+   * back to home once tmux reaps the wrappers.
+   */
+  function closeRemoteSession(entry: RemoteListEntry): void {
+    if (!isRemoteSummary(entry)) return;
+    // Same sequence bump as closeSlotSession: a Ctrl+D during the
+    // spawn window must win over the spawn's pending switchTo.
+    seqRef.current++;
+    hubLog.event.info(
+      `closed ${entry.slug} view (remote session keeps running on ${entry.hostLabel})`,
+    );
+    void killRemoteWrapperSessions(entry.slug).then(
+      () => refreshTmuxSessions(),
+      (err) => reportActionError("close remote view", err),
+    );
+  }
+
+  /**
    * Hub-safe drop-in for `makeSessionFlows.doEnterHarnessSession` —
    * same signature, so the sessions picker (`;`) and harness-select
    * (`Shift+F12`) modals work unchanged in hub mode. Where classic
@@ -498,6 +643,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
    * back to home once tmux reaps the session.
    */
   function closeSlotSession(slot: SessionSlot): void {
+    // Explicit action: bump the sequence so an in-flight show's
+    // switchTo aborts instead of resurrecting the pane onto a session
+    // the user just asked to close.
+    seqRef.current++;
     hubLog.event.info(`closing ${slot.label} session (ctrl+d ×2)`);
     void closeHarnessSessionGracefully(slot.slug, primaryHarness, null).then(
       () => setTimeout(() => void refreshTmuxSessions(), 800),
@@ -555,8 +704,11 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   return {
     showTaskSession,
     showSlotSession,
+    showRemoteSession,
     closeSlotSession,
+    closeRemoteSession,
     followSlot,
+    followRemote,
     enterHarnessSession,
     spawnNamedClaudeSession,
     showHomePane,

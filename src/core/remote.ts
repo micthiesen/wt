@@ -9,6 +9,34 @@ export type RemoteRunOptions = {
   onLine?: (line: string) => void;
 };
 
+/**
+ * Argv for an interactive (PTY-allocating) remote wt invocation. Shared
+ * by the classic full-screen handoff (`runRemoteWt` interactive) and the
+ * hub's local tmux wrapper sessions, so both ride the same timeouts and
+ * transport encoding. Bound the TCP connect + detect a mid-session drop:
+ * without these, an unreachable host hangs on the OS connect timeout
+ * (often 60s+) — for classic that's AFTER the renderer is already
+ * suspended and the terminal handed off, a frozen blank screen. BatchMode
+ * is deliberately omitted so interactive password/2FA auth still works.
+ */
+export function interactiveRemoteSshArgv(
+  remote: RemoteConfig,
+  argv: readonly string[],
+): string[] {
+  return [
+    "ssh",
+    "-t",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
+    remote.host,
+    remoteWtCommand(remote, argv.length > 0 ? argv : null),
+  ];
+}
+
 /** Run this target's wt over ordinary SSH, relying on ~/.ssh/config. */
 export async function runRemoteWt(
   remote: RemoteConfig,
@@ -16,27 +44,11 @@ export async function runRemoteWt(
   opts: RemoteRunOptions = {},
 ): Promise<number> {
   if (opts.interactive) {
-    const proc = Bun.spawn(
-      [
-        "ssh",
-        "-t",
-        // Bound the TCP connect + detect a mid-session drop. Without
-        // these, an unreachable host hangs on the OS connect timeout
-        // (often 60s+) AFTER the renderer is already suspended and the
-        // terminal handed off — a frozen blank screen. BatchMode is
-        // deliberately omitted here so interactive password/2FA auth
-        // still works; only the timeouts are added.
-        "-o",
-        "ConnectTimeout=10",
-        "-o",
-        "ServerAliveInterval=5",
-        "-o",
-        "ServerAliveCountMax=3",
-        remote.host,
-        remoteWtCommand(remote, argv.length > 0 ? argv : null),
-      ],
-      { stdin: "inherit", stdout: "inherit", stderr: "inherit" },
-    );
+    const proc = Bun.spawn(interactiveRemoteSshArgv(remote, argv), {
+      stdin: "inherit",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
     return proc.exited;
   }
 

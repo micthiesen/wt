@@ -40,6 +40,7 @@
  */
 import { join } from "node:path";
 
+import { config } from "../config.ts";
 import { configDir, TERMINAL_PREAMBLE, writeIfChanged } from "../tmux/config.ts";
 import { HUB_FORWARD_KEYS, HUB_LEFT_PANE, HUB_RIGHT_PANE } from "./naming.ts";
 
@@ -65,25 +66,27 @@ export function tmuxQuote(token: string): string {
 }
 
 /**
- * ## The command layer (cmd+<key> via Alacritty)
+ * ## The command layer (cmd+<key>, terminal-translated)
  *
- * Alacritty translates cmd chords into ESC-prefixed sequences (see
- * ~/.dotfiles/alacritty), which this server receives as `M-<key>` —
- * the same root-table space the Option forwards use. Most cmd keys
- * ride the plain forward list; five get REBINDS below because their
- * literal letter would hit the wrong classic action: `M-u` → F7
- * (focus task pane — cmd+h/cmd+m can't be bound at all: macOS's menu
- * bar consumes Hide/Minimize before Alacritty sees them, so merge
- * rides cmd+shift+m → `M-M` → literal m), `M-d` → F11
- * (diff; literal d is destroy — destroy moved to `M-BSpace`), `M-s`
- * → F10 (shell; literal s is stage URL), `M-f` → zoom (mirrors F8),
- * `M-w` → C-d (graceful session close; literal w is review-checkout).
- * `M-t` → n (new worktree; cmd+n must stay Alacritty's new-window, so
- * "new task" rides t and the rare AI-regen literal `t` moved behind
- * cmd+h). `M-.` and `M-/` alias the action picker (!) and help (?)
- * since cmd+shift punctuation is awkward.
+ * The terminal translates cmd chords into ESC-prefixed sequences —
+ * `wt hub keys <alacritty|wezterm>` prints the config block (see
+ * `hub/command-layer.ts`, the chord table both renderers share) —
+ * which this server receives as `M-<key>`, the same root-table space
+ * the Option forwards use. Most cmd keys ride the plain forward list;
+ * a handful get REBINDS below because their literal letter would hit
+ * the wrong classic action: `M-u` → F7 (focus task pane — cmd+h/cmd+m
+ * can't be bound at all: macOS's menu bar consumes Hide/Minimize
+ * before any terminal sees them, so merge rides cmd+shift+m → `M-M` →
+ * literal m), `M-d` → F11 (diff; literal d is destroy — destroy moved
+ * to `M-BSpace`), `M-s` → F10 (shell; literal s is stage URL), `M-f`
+ * → zoom (mirrors F8), `M-w` → C-d (graceful session close; literal w
+ * is review-checkout). `M-t` → n (new worktree; cmd+n must stay the
+ * terminal's own new-window, so "new task" rides t and the rare
+ * AI-regen literal `t` sits behind cmd+u + typing). `M-.` and `M-/`
+ * alias the action picker (!) and help (?) since cmd+shift
+ * punctuation is awkward.
  */
-export function buildHubConfig(): string {
+export function buildHubConfig(background: string = config.ui.hubBackground): string {
   const forwardLines = HUB_FORWARD_KEYS.map((key) => {
     const bindKey = tmuxQuote(`M-${key}`);
     const arg = tmuxQuote(key);
@@ -94,12 +97,12 @@ export function buildHubConfig(): string {
 set -g remain-on-exit on
 set-hook -g pane-died respawn-pane
 # tmux cannot remove the divider column between panes, only recolor it.
-# Painting the border glyphs in the terminal's background (Alacritty
-# Catppuccin Mocha base, which applyHubPalette also uses as the task
-# pane's bg — keep the three in sync) makes the bar visually disappear;
-# focus is signaled inside the task pane, so active/inactive match.
-set -g pane-border-style "fg=#1E1E2E"
-set -g pane-active-border-style "fg=#1E1E2E"
+# Painting the border glyphs in the terminal's background (config's
+# ui.hub_background, which applyHubPalette also uses as the task pane's
+# bg — keep the two in sync) makes the bar visually disappear; focus is
+# signaled inside the task pane, so active/inactive match.
+set -g pane-border-style "fg=${background}"
+set -g pane-active-border-style "fg=${background}"
 ${forwardLines}
 bind -n M-Enter { send-keys -t ${HUB_LEFT_PANE} Enter }
 bind -n M-Tab { send-keys -t ${HUB_LEFT_PANE} Tab }

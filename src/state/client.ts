@@ -29,7 +29,10 @@ export const CACHE_DB = config.paths.cacheDb;
 // would lack it and break consumers that index `slugsByHarness[id]`.
 // v8: worktree discovery now ignores non-main worktrees outside the
 // configured worktree_root; old external-tool rows should not restore.
-const CACHE_BUSTER = "v8";
+// v9: TmuxSessionsData gained the required `remote` field (hub mode's
+// SSH wrapper sessions); a restored v8 entry would lack it and lie to
+// consumers about the declared non-optional type.
+const CACHE_BUSTER = "v9";
 const STORAGE_PREFIX = "wt";
 const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
