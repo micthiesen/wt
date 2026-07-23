@@ -11,6 +11,7 @@ import { HARNESSES } from "../../core/harness/index.ts";
 import { claudeSummariesQuery } from "../../state/index.ts";
 import type { Modal } from "../modal-state.ts";
 import type { PickerRow } from "../panels/sessions-picker.tsx";
+import { SESSION_SLOTS } from "../sessions/slots.ts";
 import type { useHarnessSessions } from "./useHarnessSessions.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
@@ -22,11 +23,18 @@ export function useSessionsPickerData(opts: {
   const { modal, rows, currentHarnessSessions } = opts;
 
   // LLM-authored summary snippets for the picker's currently-open
-  // worktree. Only fetched when the picker is open (gated by
-  // `enabled`); the queryFn does light tail-bounded disk reads
-  // cached by (mtime, size) so repeat opens are essentially free.
+  // worktree OR Sessions slot (the hub opens the picker on slot tasks
+  // too — the query only needs a slug + path). Only fetched when the
+  // picker is open (gated by `enabled`); the queryFn does light
+  // tail-bounded disk reads cached by (mtime, size) so repeat opens
+  // are essentially free.
+  const pickerSlot =
+    modal?.kind === "claudeSessionsPicker"
+      ? SESSION_SLOTS.find((s) => s.slug === modal.slug)
+      : undefined;
   const pickerWt = (modal?.kind === "claudeSessionsPicker"
-    ? rows.find((r) => r.wt.slug === modal.slug)?.wt
+    ? rows.find((r) => r.wt.slug === modal.slug)?.wt ??
+      (pickerSlot ? { slug: pickerSlot.slug, path: pickerSlot.path } : undefined)
     : undefined);
   const pickerWtForQuery = pickerWt ?? { slug: "__none__", path: "" };
   const summariesQuery = useQuery({

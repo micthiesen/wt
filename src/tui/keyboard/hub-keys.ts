@@ -20,6 +20,7 @@ import { setTaskPinned, setTaskSnooze } from "../../core/wtstate.ts";
 import { isPlainLetter, isShiftedLetter } from "../app-helpers.ts";
 import type { makeHubFlows } from "../flows/hub.ts";
 import type { TaskItem } from "../hooks/useTaskRows.ts";
+import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
 const hubLog = createLogger("[hub]");
@@ -42,6 +43,8 @@ export type HubKeysCtx = {
   focusedOutputId: string | null;
   /** Focus the events output (so a CI-log tail is visible the moment it starts). */
   focusEventsOutput: () => void;
+  /** Open the sessions picker scoped to a Sessions-slot entry. */
+  openSlotSessionsPicker: (slot: SessionSlot) => void;
   toggleDetails: () => void;
   refreshWtState: () => Promise<void>;
   toast: (message: string, color?: string, ms?: number) => void;
@@ -73,6 +76,7 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     rememberPrTargetChord,
     focusedOutputId,
     focusEventsOutput,
+    openSlotSessionsPicker,
     toggleDetails,
     refreshWtState,
     toast,
@@ -89,10 +93,21 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
 
-  // F7 — focus the task pane (cmd+h's relay; the outer server rebinds
-  // M-h here because the literal `h` was the removed-history toggle).
+  // F7 — focus the task pane (cmd+u's relay; the literal `u` is left
+  // free and `h` is the removed-history toggle).
   if (k.name === "f7" && !k.shift && !k.ctrl && !k.option && !k.meta) {
     hubFlows.focusTaskPane();
+    return;
+  }
+
+  // F8 (also cmd+F's relay) — toggle the session pane's full-window
+  // zoom. Performed by wt rather than a raw outer-server binding so
+  // the focus indicator gets stamped in the same stroke: tmux moves
+  // the keyboard to the zoomed pane (and leaves it there on un-zoom),
+  // which a raw binding did silently — the indicator kept showing the
+  // task pane as focused while typing landed in the session.
+  if (k.name === "f8" && !k.shift && !k.ctrl && !k.option && !k.meta) {
+    hubFlows.toggleSessionZoom();
     return;
   }
 
@@ -227,6 +242,17 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     if (task?.kind === "remote") hubFlows.showRemoteSession(task.entry, "shell");
     else if (task && task.kind !== "pr" && task.kind !== "slot") hubFlows.showTaskSession(task.row, "shell");
     else toast("no worktree for this task", theme.fgDim, 1500);
+    return;
+  }
+
+  // ; on a Sessions-slot entry — open the sessions picker scoped to
+  // the slot (the classic opener requires a worktree row). The picker
+  // and its commits are slug-based, so "; d" graceful-close, x kill,
+  // resume, and named spawns all work on slot sessions exactly like a
+  // worktree's; `enterHarnessSession`/`spawnNamedClaudeSession`
+  // resolve slot slugs to the slot's path.
+  if (k.sequence === ";" && task?.kind === "slot") {
+    openSlotSessionsPicker(task.slot);
     return;
   }
 

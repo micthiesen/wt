@@ -42,7 +42,7 @@ import { join } from "node:path";
 
 import { config } from "../config.ts";
 import { configDir, TERMINAL_PREAMBLE, writeIfChanged } from "../tmux/config.ts";
-import { HUB_FORWARD_KEYS, HUB_LEFT_PANE, HUB_RIGHT_PANE } from "./naming.ts";
+import { HUB_FORWARD_KEYS, HUB_LEFT_PANE } from "./naming.ts";
 
 /**
  * Quote a single tmux config-file token when it contains a character
@@ -109,12 +109,12 @@ bind -n M-Tab { send-keys -t ${HUB_LEFT_PANE} Tab }
 bind -n F10 { send-keys -t ${HUB_LEFT_PANE} F10 }
 bind -n F11 { send-keys -t ${HUB_LEFT_PANE} F11 }
 bind -n F12 { send-keys -t ${HUB_LEFT_PANE} F12 }
-bind -n F8 { resize-pane -Z -t ${HUB_RIGHT_PANE} }
+bind -n F8 { send-keys -t ${HUB_LEFT_PANE} F8 }
 bind -n F9 { send-keys -t ${HUB_LEFT_PANE} F9 }
 bind -n M-u { send-keys -t ${HUB_LEFT_PANE} F7 }
 bind -n M-d { send-keys -t ${HUB_LEFT_PANE} F11 }
 bind -n M-s { send-keys -t ${HUB_LEFT_PANE} F10 }
-bind -n M-f { resize-pane -Z -t ${HUB_RIGHT_PANE} }
+bind -n M-f { send-keys -t ${HUB_LEFT_PANE} F8 }
 bind -n M-w { send-keys -t ${HUB_LEFT_PANE} C-d }
 bind -n M-. { send-keys -t ${HUB_LEFT_PANE} ! }
 bind -n M-/ { send-keys -t ${HUB_LEFT_PANE} ? }

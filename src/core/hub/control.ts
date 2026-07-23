@@ -192,29 +192,48 @@ export async function showHome(): Promise<boolean> {
 }
 
 /**
- * Zoom the LEFT (`wt _taskpane`) pane to the full window — the hub's
- * modal-overlay mechanism: while a modal or footer prompt is open, wt
- * temporarily takes the whole terminal so the modal renders across the
- * area of both panes instead of cramming into the ~35-col strip; the
- * session pane keeps running underneath and comes back on `unzoom()`.
+ * Toggle the RIGHT (session) pane's full-window zoom — the F8/⌘F
+ * action, performed by wt itself (the outer server forwards F8/M-f
+ * into the task pane) rather than a raw outer-server binding, so the
+ * focus indicator is stamped by the same code that moves the zoom.
+ * Zooming a pane makes it the active pane and un-zooming keeps it
+ * active (verified against tmux behavior), so after every toggle the
+ * keyboard lands in the session pane — callers stamp `paneFocused =
+ * false` unconditionally.
  *
  * tmux's `-Z` is a WINDOW-level toggle (zooming targets the named
- * pane, un-zooming ignores it), so this reads the current state first:
- * already zoomed on the left → no-op; zoomed on the right (the user's
- * ⌘F) → toggle off, then zoom left.
+ * pane, un-zooming ignores it), so read the current state first; a
+ * stray left-pane zoom (shouldn't happen, but a crashed process could
+ * leave one) is folded into "un-zoom, then zoom right".
  */
-export async function zoomLeft(): Promise<void> {
+export async function toggleRightZoom(): Promise<void> {
   const state = await zoomState();
-  if (state === "left") return;
-  if (state === "right") await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_LEFT_PANE]);
-  await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_LEFT_PANE]);
+  if (state !== "none") {
+    await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_RIGHT_PANE]);
+  }
+  if (state !== "right") {
+    await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_RIGHT_PANE]);
+  }
 }
 
-/** Restore the split layout if the window is zoomed (either pane). */
-export async function unzoom(): Promise<void> {
-  const state = await zoomState();
-  if (state === "none") return;
-  await spawnTmux(HUB_SOCKET, ["resize-pane", "-Z", "-t", HUB_LEFT_PANE]);
+/**
+ * Whether the LEFT (`wt _taskpane`) pane is the outer window's active
+ * pane right now — the ground truth behind the task pane's focus
+ * indicator. `null` when the query fails (caller keeps its current
+ * belief rather than flapping).
+ */
+export async function isLeftPaneActive(): Promise<boolean | null> {
+  const r = await spawnTmux(HUB_SOCKET, [
+    "display-message",
+    "-p",
+    "-t",
+    HUB_LEFT_PANE,
+    "#{?pane_active,1,0}",
+  ]);
+  if (r.code !== 0) return null;
+  const out = r.stdout.trim();
+  if (out !== "0" && out !== "1") return null;
+  return out === "1";
 }
 
 /**

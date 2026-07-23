@@ -78,11 +78,17 @@ shell view, `⌘F` → zoom, `⌘W` → graceful session close.
 
 Pane focus is not something you manage: `⌘L`/`⌘D`/`⌘S` land focus in the
 session; `⌘U` brings it to the inbox; **Esc** in the task pane (no picker
-open) bounces it back to the session; pickers and prompts pull focus
+open) bounces it back to the session; `⌘F`/F8 zoom lands it in the
+session pane (tmux makes the zoomed pane active, and it stays active
+after un-zooming — wt performs the zoom itself so the indicator is
+stamped in the same stroke); pickers and prompts pull focus
 automatically and restore whichever pane held it before they opened. The
 tasks panel border tints accent while typing lands there and dims when it
 goes to the session. Refocusing the task pane while the right pane shows
 something other than the selection re-asserts the selection follow.
+Underneath the deterministic stamps, a slow reconciler polls the outer
+server's `#{pane_active}` every few seconds and corrects any drift tmux's
+focus events missed, so the indicator can never stay wrong for long.
 
 Rare classic actions (yank `y`, reviewers `v`, base `b`, restack `R`,
 archive `a`, clean `c`, AI regen `t`, ready/ship `e`/`E`, CI logs `f`,
@@ -277,16 +283,16 @@ the details card for the output viewer; `Esc` clears the focus and the
 details card returns (a second `Esc` bounces focus to the session
 pane, as usual).
 
-## Modals take the whole window
+## Modals fill the task pane
 
-Pickers, confirms, and footer prompts zoom the task pane to the full
-terminal for their duration (`zoomLeft`/`unzoom` in `core/hub/control.ts`,
-driven by the modal focus dance in `useHubController`): the modal renders
-over the area of both panes instead of cramming into the ~35-col strip,
-and the split snaps back the moment it closes. The session pane keeps
-running underneath — a picker commit's session switch still lands after
-the restore. A ⌘F/F8 zoom of the session pane yields to a modal and is
-not restored afterward (the window returns to the split).
+The shared modal frame sizes itself by viewport-relative insets (20%
+each side), which is right for classic mode's full terminal and wrong
+for the hub's ~35-col strip — so below 60 columns the frame switches
+to full pane width with a small vertical margin (`NARROW_WIDTH` in
+`src/tui/modal.tsx`). Panes are never resized for a modal: an earlier
+iteration zoomed the task pane to the full window for the modal's
+duration, but the layout reflow on every open/close read as jank and
+was retired in favor of the stable-layout, full-width-in-pane frame.
 
 ## Limitations
 
@@ -310,8 +316,11 @@ Instead the inbox ends with a **Sessions** group: a bottom-pinned entry for
 the main clone's harness session, Tab-expandable to the wt-source and
 dotfiles slots. Slot entries behave like any task — selecting one
 live-follows its session, ⏎/F12 starts + shows it (and toggles pane focus
-on a repeat press) — so the right pane always corresponds to the selected
-entry and there is no special "viewing a slot" state to track. The hub
+on a repeat press), and `;` opens the full sessions picker scoped to the
+slot (so `; d` graceful-close, `x` kill, resuming a past conversation,
+and named `+ new` spawns all work exactly as they do on a worktree) — so
+the right pane always corresponds to the selected entry and there is no
+special "viewing a slot" state to track. The hub
 also drops the classic bottom bar entirely (its robots moved into the
 Sessions entries); the footer only appears transiently for prompts and
 toasts.

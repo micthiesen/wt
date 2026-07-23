@@ -54,7 +54,14 @@ describe("hub outer tmux config", () => {
     expect(config).toContain(`bind -n M-M { send-keys -t ${HUB_LEFT_PANE} m }`);
     expect(config).toContain(`bind -n M-d { send-keys -t ${HUB_LEFT_PANE} F11 }`);
     expect(config).toContain(`bind -n M-s { send-keys -t ${HUB_LEFT_PANE} F10 }`);
-    expect(config).toContain("bind -n M-f { resize-pane -Z");
+    // M-f (and F8) forward INTO wt rather than zooming directly — wt
+    // performs the zoom itself so the focus indicator gets stamped by
+    // the same code that moves it (a raw resize-pane binding silently
+    // moved the keyboard to the zoomed pane while the indicator kept
+    // showing the task pane as focused).
+    expect(config).toContain(`bind -n M-f { send-keys -t ${HUB_LEFT_PANE} F8 }`);
+    expect(config).toContain(`bind -n F8 { send-keys -t ${HUB_LEFT_PANE} F8 }`);
+    expect(config).not.toContain("resize-pane -Z");
     expect(config).toContain(`bind -n M-w { send-keys -t ${HUB_LEFT_PANE} C-d }`);
     expect(config).toContain(`bind -n M-BSpace { send-keys -t ${HUB_LEFT_PANE} d }`);
     expect(config).toContain(`bind -n M-t { send-keys -t ${HUB_LEFT_PANE} n }`);

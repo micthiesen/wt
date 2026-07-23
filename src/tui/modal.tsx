@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useTerminalDimensions } from "@opentui/react";
 
 import { KeyHint, type KeyHintPair } from "./key-hint.tsx";
 import { theme } from "./theme.ts";
@@ -17,6 +18,22 @@ const DEFAULT_INSET: Required<Inset> = {
   right: "20%",
   bottom: "20%",
   left: "20%",
+};
+
+/**
+ * Below this terminal width the viewport-relative insets stop making
+ * sense — 20% of the hub's ~35-col task pane leaves a ~21-col modal.
+ * Narrow viewports get a full-width, near-full-height frame instead
+ * (caller insets included: whatever margin looked right at 130 cols
+ * is wrong at 35).
+ */
+const NARROW_WIDTH = 60;
+
+const NARROW_INSET: Required<Inset> = {
+  top: "5%",
+  right: "0%",
+  bottom: "5%",
+  left: "0%",
 };
 
 type Props = {
@@ -57,7 +74,9 @@ export function Modal({
   hints,
   children,
 }: Props) {
-  const i = { ...DEFAULT_INSET, ...inset };
+  const { width } = useTerminalDimensions();
+  const i =
+    width < NARROW_WIDTH ? NARROW_INSET : { ...DEFAULT_INSET, ...inset };
   return (
     <box
       position="absolute"

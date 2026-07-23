@@ -39,10 +39,10 @@ export {
   focusLeft,
   focusRight,
   isHubPane,
+  isLeftPaneActive,
   killHub,
   resolveRightTty,
   showHome,
   switchRight,
-  unzoom,
-  zoomLeft,
+  toggleRightZoom,
 } from "./hub/control.ts";

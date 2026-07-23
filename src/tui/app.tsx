@@ -388,12 +388,27 @@ export function App({ onExit, hubPane = false }: Props) {
     activeActions,
     activeSessionBySlug,
   });
+  // Sessions-picker session discovery for a SLOT-scoped picker (hub's
+  // `;` on a Sessions entry): the current-row hook is keyed to the
+  // selected worktree, which a slot task never is, so a second hook
+  // instance follows the modal's slug when it names a slot. `enabled`
+  // gating makes the idle case free (empty path).
+  const pickerSlot =
+    modal?.kind === "claudeSessionsPicker" &&
+    !rows.some((r) => r.wt.slug === modal.slug)
+      ? SESSION_SLOTS.find((s) => s.slug === modal.slug)
+      : undefined;
+  const slotHarnessSessions = useHarnessSessions(
+    pickerSlot?.slug ?? "",
+    pickerSlot?.path ?? "",
+    primaryHarness,
+  );
   // Sessions-picker derived data (row list + summaries) — extracted to
   // `hooks/useSessionsPickerData.ts`.
   const { pickerRows, pickerSummaries } = useSessionsPickerData({
     modal,
     rows,
-    currentHarnessSessions,
+    currentHarnessSessions: pickerSlot ? slotHarnessSessions : currentHarnessSessions,
   });
 
   // Parallel set for diff sessions — used by the Shift+F11 hint so
@@ -861,6 +876,8 @@ export function App({ onExit, hubPane = false }: Props) {
         focusedOutputId,
         focusEventsOutput: () =>
           setFocus(currentSlug ?? null, { focused: eventsOutputId() }),
+        openSlotSessionsPicker: (slot) =>
+          setModal({ kind: "claudeSessionsPicker", slug: slot.slug, index: 0 }),
         toggleDetails: () => setShowHubDetails((v) => !v),
         refreshWtState: async () => {
           await queryClient.invalidateQueries({ queryKey: qk.wtState() });

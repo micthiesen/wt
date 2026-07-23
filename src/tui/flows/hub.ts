@@ -34,6 +34,7 @@ import {
   killHub,
   showHome,
   switchRight,
+  toggleRightZoom,
 } from "../../core/hub.ts";
 import { createLogger } from "../../core/logger.ts";
 import { taskFocusStore } from "../../core/task-focus.ts";
@@ -55,7 +56,7 @@ import { isSyntheticLiveSessionId } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { isRemoteSummary, type RemoteListEntry } from "../remote-creation.ts";
 import { withNamedClaudePersistence } from "./sessions.ts";
-import type { SessionSlot } from "../sessions/slots.ts";
+import { SESSION_SLOTS, type SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
 const hubLog = createLogger("[hub]");
@@ -161,6 +162,20 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
       await focusLeft();
     });
     setPaneFocused(true);
+  }
+
+  /**
+   * F8/⌘F — toggle the session pane's full-window zoom. Routed through
+   * wt (the outer server forwards F8/M-f here) so the indicator is
+   * stamped by the code that moves the zoom: tmux makes the zoomed
+   * pane active and leaves it active on un-zoom, so after every press
+   * the keyboard lands in the session pane.
+   */
+  function toggleSessionZoom(): void {
+    queueFocusOp(async () => {
+      await toggleRightZoom();
+    });
+    setPaneFocused(false);
   }
 
   /**
@@ -483,12 +498,30 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   }
 
   /**
+   * Resolve a picker/flow slug to either a worktree row or a Sessions
+   * slot — the sessions picker (`;`) is open for both in hub mode, and
+   * everything downstream only needs a cwd (plus the slot's label for
+   * claude's display name and the shown-record). Null when the slug is
+   * neither (a row destroyed mid-flight).
+   */
+  function resolveSessionHost(
+    slug: string,
+  ): { row: WorktreeRow; slot?: undefined } | { row?: undefined; slot: SessionSlot } | null {
+    const row = rows.find((r) => r.wt.slug === slug);
+    if (row) return { row };
+    const slot = SESSION_SLOTS.find((s) => s.slug === slug);
+    return slot ? { slot } : null;
+  }
+
+  /**
    * Hub-safe drop-in for `makeSessionFlows.doEnterHarnessSession` —
    * same signature, so the sessions picker (`;`) and harness-select
    * (`Shift+F12`) modals work unchanged in hub mode. Where classic
    * suspends the renderer and attaches full-screen, this ensures the
    * session detached and retargets the right pane; attaching inside
    * the ~35-col task pane is exactly the failure this replaces.
+   * Accepts Sessions-slot slugs too: the hub's `;` picker opens on
+   * slot tasks, and its resume/fresh-slot commits land here.
    */
   function enterHarnessSession(
     slug: string,
@@ -499,12 +532,12 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
       freshSlot?: boolean;
     } = {},
   ): void {
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row) {
+    const host = resolveSessionHost(slug);
+    if (!host) {
       toast(`no row for ${slug}`, theme.warn, 1500);
       return;
     }
-    const blocked = sessionLaunchBlockedReason(row);
+    const blocked = host.row ? sessionLaunchBlockedReason(host.row) : null;
     if (blocked) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
@@ -524,10 +557,11 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         }
         const res = await ensureSessionDetached({
           slug,
-          cwd: row.wt.path,
+          cwd: host.row ? host.row.wt.path : host.slot.path,
           kind: harnessId,
           managedName,
           resumeSessionId: opts.resumeSessionId ?? null,
+          claudeDisplayName: host.slot?.label,
         });
         if (!res.ok) {
           toast(`${getHarness(harnessId).label} failed: ${res.reason}`, theme.err, 3000);
@@ -535,14 +569,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         }
         if (res.created) void refreshTmuxSessions();
         const name = sessionName(slug, harnessId, managedName);
-        if (
-          await switchTo(name, slug, {
-            kind: "task",
-            slug,
-            target: "harness",
-            name,
-          }, seq)
-        ) {
+        const shown: HubShown = host.row
+          ? { kind: "task", slug, target: "harness", name }
+          : { kind: "slot", label: host.slot.label, name };
+        if (await switchTo(name, host.row ? slug : null, shown, seq)) {
           focusSessionPane();
         }
       } catch (err) {
@@ -562,12 +592,12 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
    * instead of attached.
    */
   function spawnNamedClaudeSession(slug: string, name: string): void {
-    const row = rows.find((r) => r.wt.slug === slug);
-    if (!row) {
+    const host = resolveSessionHost(slug);
+    if (!host) {
       toast(`no row for ${slug}`, theme.warn, 1500);
       return;
     }
-    const blocked = sessionLaunchBlockedReason(row);
+    const blocked = host.row ? sessionLaunchBlockedReason(host.row) : null;
     if (blocked) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
@@ -584,9 +614,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           async () =>
             await ensureSessionDetached({
               slug,
-              cwd: row.wt.path,
+              cwd: host.row ? host.row.wt.path : host.slot.path,
               kind: "claude",
               managedName: name,
+              claudeDisplayName: host.slot?.label,
             }),
         );
         if (!out.ok) {
@@ -595,14 +626,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         }
         void refreshTmuxSessions();
         const tmuxName = sessionName(slug, "claude", name);
-        if (
-          await switchTo(tmuxName, slug, {
-            kind: "task",
-            slug,
-            target: "harness",
-            name: tmuxName,
-          }, seq)
-        ) {
+        const shown: HubShown = host.row
+          ? { kind: "task", slug, target: "harness", name: tmuxName }
+          : { kind: "slot", label: host.slot.label, name: tmuxName };
+        if (await switchTo(tmuxName, host.row ? slug : null, shown, seq)) {
           focusSessionPane();
         }
       } catch (err) {
@@ -715,6 +742,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     followSelection,
     focusSessionPane,
     focusTaskPane,
+    toggleSessionZoom,
     hubQuit,
   };
 }
