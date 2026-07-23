@@ -194,7 +194,7 @@ const TaskRowView = memo(function TaskRowView({
 
   const pinned = isRowKind && item.manual.pinned;
   const rawTitle = taskTitle(item);
-  const titleText = pinned ? `^ ${rawTitle}` : rawTitle;
+  const titleText = pinned ? `${NF.pin} ${rawTitle}` : rawTitle;
   const budget1 = Math.max(0, panelWidth - FIXED_OVERHEAD - badgeCells);
   const budget2 = Math.max(0, panelWidth - FIXED_OVERHEAD);
 
@@ -296,7 +296,9 @@ export function TaskList({
     <box
       flexDirection="column"
       width={width}
-      flexShrink={0}
+      flexGrow={1}
+      flexShrink={1}
+      minHeight={0}
       border
       borderStyle="single"
       borderColor={paneFocused ? theme.accent : theme.borderDim}

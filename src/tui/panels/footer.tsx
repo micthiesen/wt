@@ -106,14 +106,16 @@ export function Footer({ mode, hint, compact = false }: Props) {
           <text fg={theme.fgDim}>{hint}</text>
         </box>
       ) : null}
-      <box flexShrink={0} marginLeft={1} flexDirection="row">
-        <box width={2} flexShrink={0}>
-          <text fg={slotGlyphFg(primary, wtState)}>{primaryGlyph}</text>
+      {compact ? null : (
+        <box flexShrink={0} marginLeft={1} flexDirection="row">
+          <box width={2} flexShrink={0}>
+            <text fg={slotGlyphFg(primary, wtState)}>{primaryGlyph}</text>
+          </box>
+          <box width={2} flexShrink={0}>
+            <text fg={slotGlyphFg(primary, dotfilesState)}>{primaryGlyph}</text>
+          </box>
         </box>
-        <box width={2} flexShrink={0}>
-          <text fg={slotGlyphFg(primary, dotfilesState)}>{primaryGlyph}</text>
-        </box>
-      </box>
+      )}
     </box>
   );
 }

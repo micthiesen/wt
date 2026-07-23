@@ -20,6 +20,7 @@ import {
   useHarnessSessions,
 } from "./hooks/useHarnessSessions.ts";
 import { SESSION_SLOTS } from "./sessions/slots.ts";
+import { taskFocusStore } from "../core/task-focus.ts";
 import type { Modal } from "./modal-state.ts";
 import { PostFooterModals, PreFooterModals } from "./modal-host.tsx";
 import { handleSimpleModalKey } from "./modal-keys/index.ts";
@@ -661,6 +662,36 @@ export function App({ onExit, hubPane = false }: Props) {
   // tmux focus onto this pane while one is open and hand it back to the
   // harness pane on close. Everything else is Alt-driven and works
   // regardless of pane focus.
+  // On-screen = reviewed: while a task's HARNESS session is displayed
+  // in the right pane, keep its focus stamp fresh whenever new output
+  // lands — a turn that finishes in front of you must not file itself
+  // under "Review output". Keyed on the shown slug's latest tail entry
+  // so the effect re-stamps exactly when output arrives, not per render.
+  const shownHarnessSlug =
+    hubPane && hubShown.kind === "task" && hubShown.target === "harness"
+      ? hubShown.slug
+      : null;
+  const shownTailMs = useMemo(() => {
+    if (!shownHarnessSlug) return null;
+    const row = rows.find((r) => r.wt.slug === shownHarnessSlug);
+    let latest: number | null = null;
+    for (const t of row?.fields.claude.data?.sessions ?? []) {
+      if (t.lastEntryMs !== null && (latest === null || t.lastEntryMs > latest)) {
+        latest = t.lastEntryMs;
+      }
+    }
+    return latest;
+  }, [shownHarnessSlug, rows]);
+  useEffect(() => {
+    if (!shownHarnessSlug || shownTailMs === null) return;
+    // Only stamp when the tail is actually ahead of the stamp — while a
+    // busy session streams output this effect re-fires per jsonl line,
+    // and an unconditional record() would write the focus file each time.
+    const stamped = taskFocusStore.getSnapshot().get(shownHarnessSlug) ?? 0;
+    if (stamped >= shownTailMs) return;
+    taskFocusStore.record(shownHarnessSlug);
+  }, [shownHarnessSlug, shownTailMs]);
+
   const inputActive = modal !== null || footer.kind === "input";
   // Transition-only: acting on the mount value would immediately focus
   // the session pane (`inputActive` starts false) and undo the
@@ -1041,7 +1072,7 @@ export function App({ onExit, hubPane = false }: Props) {
               : `auto ${automations.pendingCount} queued  `}
           </text>
         ) : null}
-        <UsageBadge primary={primaryHarness} />
+        <UsageBadge primary={primaryHarness} compact={hubPane} />
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>
       {hubPane ? (

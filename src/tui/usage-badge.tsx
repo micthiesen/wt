@@ -49,7 +49,15 @@ export function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
  * Each source is gated to its primary so we don't scan rollouts / hit
  * the opencode DB when that harness isn't selected.
  */
-export function UsageBadge({ primary }: { primary: HarnessId }) {
+export function UsageBadge({
+  primary,
+  compact = false,
+}: {
+  primary: HarnessId;
+  /** Hub pane (~35 cols): percentages only — `21% · 5%` — no window
+   *  labels or reset countdowns, or the badge alone fills the bar. */
+  compact?: boolean;
+}) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 30_000);
@@ -68,6 +76,18 @@ export function UsageBadge({ primary }: { primary: HarnessId }) {
   if (primary === "opencode") {
     const cost = opencode.data;
     if (!cost) return null;
+    if (compact) {
+      return (
+        <box flexShrink={0} flexDirection="row">
+          <text>
+            <span fg={theme.fg}>{formatCost(cost.fiveHour)}</span>
+            <span fg={theme.fgDim}>{" · "}</span>
+            <span fg={theme.fg}>{formatCost(cost.sevenDay)}</span>
+            <span fg={theme.fgDim}>{" "}</span>
+          </text>
+        </box>
+      );
+    }
     return (
       <box flexShrink={0} flexDirection="row">
         <text>
@@ -86,6 +106,18 @@ export function UsageBadge({ primary }: { primary: HarnessId }) {
   );
   if (!formatted) return null;
   const { fiveHour: five, sevenDay: seven } = formatted;
+  if (compact) {
+    return (
+      <box flexShrink={0} flexDirection="row">
+        <text>
+          <span fg={pctColor(five.pct)}>{`${five.pct}%`}</span>
+          <span fg={theme.fgDim}>{" · "}</span>
+          <span fg={pctColor(seven.pct)}>{`${seven.pct}%`}</span>
+          <span fg={theme.fgDim}>{" "}</span>
+        </text>
+      </box>
+    );
+  }
   return (
     <box flexShrink={0} flexDirection="row">
       <text>

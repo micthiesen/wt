@@ -170,6 +170,11 @@ a `review-output` task is the agent's last written line
 it's the pending question (`SessionTail.pendingAsk`) — both come from
 `core/harness/claude/jsonl.ts`'s tail parser.
 
+A displayed session also counts as seen: while a task's harness session
+is showing in the right pane, wt re-stamps its focus clock whenever new
+output lands, so a turn that finishes in front of you never files itself
+under Review output.
+
 ## Keymap (hub-only)
 
 Every classic-mode key still works (as `Alt+<key>`, see above); these are
