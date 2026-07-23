@@ -1,24 +1,30 @@
 /**
  * Track whether THIS process's tmux pane has keyboard focus — hub mode
- * only. The outer hub server runs `focus-events on`, so tmux forwards
- * XTerm focus-in/out to the pane whenever the active pane changes (F9,
- * `select-pane`, a mouse click), and opentui re-emits them as renderer
- * FOCUS / BLUR events. Classic mode gets window-level focus through the
- * same events (see `useTerminalFocus`); in a hub pane they mean pane
- * focus, which is exactly the "where does typing go" signal the task
- * pane surfaces.
+ * only. Two signal sources, deterministic one first:
  *
- * Starts `false`: `ensureHubLayout` selects the right (session) pane at
- * creation, and terminals don't replay focus state — the first
- * transition corrects it either way.
+ *  1. wt's own focus mutations. F9 is forwarded into the task pane
+ *     (like F10-F12) and wt runs the `select-pane` itself; the modal
+ *     focus dance likewise calls focusLeft/focusRight. Every one of
+ *     those call sites stamps the state via `setFocused`, so the
+ *     indicator can never drift from an action wt performed.
+ *  2. Terminal focus events as the fallback for changes wt did NOT
+ *     make (a mouse click on a pane): the outer hub server runs
+ *     `focus-events on`, tmux forwards XTerm focus-in/out to the pane,
+ *     and opentui re-emits them as renderer FOCUS / BLUR.
+ *
+ * Starts `true`: `ensureHubLayout` selects the task pane at creation,
+ * so the hub opens with the inbox focused.
  */
 import { useEffect, useState } from "react";
 import { CliRenderEvents } from "@opentui/core";
 import { useRenderer } from "@opentui/react";
 
-export function useHubPaneFocus(enabled: boolean): boolean {
+export function useHubPaneFocus(enabled: boolean): {
+  focused: boolean;
+  setFocused: (focused: boolean) => void;
+} {
   const renderer = useRenderer();
-  const [focused, setFocused] = useState(false);
+  const [focused, setFocused] = useState(true);
   useEffect(() => {
     if (!enabled || !renderer) return;
     const onFocus = (): void => setFocused(true);
@@ -30,5 +36,5 @@ export function useHubPaneFocus(enabled: boolean): boolean {
       renderer.off(CliRenderEvents.BLUR, onBlur);
     };
   }, [enabled, renderer]);
-  return focused;
+  return { focused, setFocused };
 }

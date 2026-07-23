@@ -34,6 +34,12 @@ type Props = {
   mode: FooterMode;
   hint?: string;
   height?: number;
+  /**
+   * Hub mode: legend renders as bare harness status glyphs (main slot
+   * included) with no last-message preview — the ~35-col task pane has
+   * no room for tail text. Toast / input modes are unaffected.
+   */
+  compact?: boolean;
 };
 
 /** Status color for a slot's robot glyph; dim when no live session. */
@@ -41,7 +47,7 @@ function slotGlyphFg(harnessId: HarnessId, state: DerivedState | null): string {
   return state ? stateColor(harnessId, state) : theme.fgDim;
 }
 
-export function Footer({ mode, hint }: Props) {
+export function Footer({ mode, hint, compact = false }: Props) {
   // The two tail-less session slots (`,` wt-source and `/` dotfiles) get
   // permanent status robots bundled at the far right — wt-source first,
   // dotfiles to its right. No labels: position is the discriminator (the
@@ -68,9 +74,15 @@ export function Footer({ mode, hint }: Props) {
     >
       <box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
         {mode.kind === "legend" ? (
-          <MainSlotTail
-            state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
-          />
+          compact ? (
+            <MainSlotGlyph
+              state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
+            />
+          ) : (
+            <MainSlotTail
+              state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
+            />
+          )
         ) : null}
         {mode.kind === "toast" ? (
           <text fg={mode.color ?? theme.ok}>{mode.message}</text>
@@ -122,6 +134,14 @@ export function Footer({ mode, hint }: Props) {
  * lights nothing here — the slot keybind opens the primary, so the bar
  * tracks the primary, same as the slot glyphs above.
  */
+/** Compact-legend variant: the main slot's status robot, nothing else. */
+function MainSlotGlyph({ state }: { state: DerivedState | null }) {
+  const primary = usePrimaryHarness();
+  return (
+    <text fg={slotGlyphFg(primary, state)}>{getHarness(primary).glyph}</text>
+  );
+}
+
 function MainSlotTail({ state }: { state: DerivedState | null }) {
   const primary = usePrimaryHarness();
   const claudeRun = useSessionRun(MAIN_CLONE_SLOT.slug, null);

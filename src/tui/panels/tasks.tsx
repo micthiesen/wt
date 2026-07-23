@@ -270,8 +270,8 @@ export function TaskList({
       flexShrink={0}
       border
       borderStyle="single"
-      borderColor={paneFocused ? theme.accent : theme.border}
-      title=" tasks "
+      borderColor={paneFocused ? theme.accent : theme.borderDim}
+      title={paneFocused ? " ⌨ tasks " : " tasks "}
       titleAlignment="left"
       paddingTop={0}
     >

@@ -36,6 +36,8 @@ export type HubKeysCtx = {
   setSel: (key: string | null) => void;
   toggleStackExpanded: (stackKey: string) => void;
   hubFlows: ReturnType<typeof makeHubFlows>;
+  /** F9 — flip pane focus (wt runs select-pane itself; see useHubPaneFocus). */
+  toggleFocus: () => void;
   /** Open the selected PR task in the browser (reuses the chord-aware opener). */
   openPrUrl: (url: string, number: number) => void;
   toggleDetails: () => void;
@@ -63,6 +65,7 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     setSel,
     toggleStackExpanded,
     hubFlows,
+    toggleFocus,
     openPrUrl,
     toggleDetails,
     refreshWtState,
@@ -71,6 +74,14 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     fallthrough,
   } = ctx;
   const task = tasks[taskIndex];
+
+  // F9 — pane-focus toggle, forwarded from the outer server so wt both
+  // performs the select-pane AND stamps its indicator (no event-path
+  // guesswork).
+  if (k.name === "f9" && !k.shift && !k.ctrl && !k.option && !k.meta) {
+    toggleFocus();
+    return;
+  }
 
   // --- Task-cursor navigation --------------------------------------
   const move = (delta: number): void => {
@@ -97,9 +108,15 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
 
   // Tab — expand/collapse the selected stack (classic mode folds
   // sections here; the hub's only foldable group is a stack task).
+  // The cursor is re-keyed across the toggle: an expanding stack's key
+  // vanishes from the task list (members take over, keyed by slug) and
+  // a collapsing member's slug vanishes likewise — without the re-key
+  // the resolver misses and the cursor snaps to the top.
   if (k.name === "tab" && !k.shift && !k.ctrl && !k.option && !k.meta) {
     const stackKey = stackKeyOf(task);
-    if (stackKey) toggleStackExpanded(stackKey);
+    if (!stackKey || !task) return;
+    toggleStackExpanded(stackKey);
+    setSel(task.kind === "stack" ? task.row.wt.slug : stackKey);
     return;
   }
 

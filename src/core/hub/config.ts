@@ -15,7 +15,9 @@
  *
  * Two bindings are handled by tmux itself rather than forwarded:
  *   - `F8` zooms the right pane (a full-screen harness view).
- *   - `F9` cycles pane focus (left <-> right).
+ *   - `F9` is forwarded to the task pane like F10-F12: wt toggles the
+ *     focus itself (select-pane) so its focus indicator can never drift
+ *     from reality — terminal focus events stay a mouse-click fallback.
  *
  * Pane resilience: `remain-on-exit` + a `pane-died` hook means a
  * crashed left `wt _taskpane` or a crashed right tmux client
@@ -90,7 +92,7 @@ bind -n F10 send-keys -t ${HUB_LEFT_PANE} F10
 bind -n F11 send-keys -t ${HUB_LEFT_PANE} F11
 bind -n F12 send-keys -t ${HUB_LEFT_PANE} F12
 bind -n F8 resize-pane -Z -t ${HUB_RIGHT_PANE}
-bind -n F9 select-pane -t :.+
+bind -n F9 send-keys -t ${HUB_LEFT_PANE} F9
 `;
 }
 

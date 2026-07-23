@@ -64,7 +64,9 @@ classic mode if you need one of those.
 Two bindings are exceptions with no Alt prefix, handled by tmux itself
 instead of relayed to wt:
 
-- **`F9`** cycles pane focus (left ↔ right) — `select-pane -t :.+`.
+- **`F9`** cycles pane focus (left ↔ right). Forwarded to wt like
+  F10-F12: wt runs the `select-pane` itself and stamps its focus
+  indicator in the same stroke, so the signal can't drift.
 - **`F8`** zooms the right pane to full-screen — `resize-pane -Z`.
 
 Which pane holds focus is signaled **inside the task pane** (the session
@@ -186,7 +188,7 @@ additional or hub-specific:
 | `D` | toggle the stacked details card below the task list |
 | `,` / `.` / `/` | show the wt-repo / main-clone / dotfiles slot session in the right pane |
 | `q` / `Ctrl+C` | leave the hub — kills the outer layout session only; every inner-server session keeps running |
-| `F9` (tmux-level, no Alt) | cycle pane focus left ↔ right |
+| `F9` (no Alt) | cycle pane focus left ↔ right |
 | `F8` (tmux-level) | zoom the right pane full-screen |
 
 Moving the task cursor auto-follows: after a 150ms debounce, the right pane

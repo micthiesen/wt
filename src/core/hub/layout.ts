@@ -147,9 +147,11 @@ export async function ensureHubLayout(): Promise<void> {
   }
 
   await spawnTmux(HUB_SOCKET, ["resize-pane", "-t", `${HUB_SESSION}:0.0`, "-x", "35"]);
-  // Focus starts on the harness (right) pane — that's where the user's
-  // attention belongs the moment hub mode comes up.
-  await spawnTmux(HUB_SOCKET, ["select-pane", "-t", `${HUB_SESSION}:0.1`]);
+  // Focus starts on the TASK pane: the hub opens as an inbox to triage,
+  // and `useHubPaneFocus` initializes to focused to match. Enter/F12 on
+  // a task hands focus to the session pane the moment there's something
+  // to type into.
+  await spawnTmux(HUB_SOCKET, ["select-pane", "-t", `${HUB_SESSION}:0.0`]);
 }
 
 /**

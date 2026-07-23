@@ -289,8 +289,12 @@ export function App({ onExit, hubPane = false }: Props) {
   const [hubShown, setHubShown] = useState<HubShown>({ kind: "home" });
   // Whether THIS pane holds keyboard focus (hub only; F9 / select-pane
   // flips it). Signaled in the task pane; the harness pane is left
-  // untouched.
-  const hubPaneFocused = useHubPaneFocus(hubPane);
+  // untouched. Every wt-driven focus change stamps the state directly
+  // (see useHubPaneFocus); terminal events cover mouse clicks.
+  const { focused: hubPaneFocused, setFocused: setHubPaneFocused } =
+    useHubPaneFocus(hubPane);
+  const hubPaneFocusedRef = useRef(hubPaneFocused);
+  hubPaneFocusedRef.current = hubPaneFocused;
   const { tasks } = useTaskRows({
     rows,
     reviewRequests: reviewRequestRows,
@@ -306,11 +310,13 @@ export function App({ onExit, hubPane = false }: Props) {
     if (sel !== null) {
       const direct = tasks.findIndex((t) => t.key === sel);
       if (direct >= 0) return direct;
-      // A slug key can point inside a collapsed stack — select the
-      // stack task that contains it.
+      // A slug key can point inside a collapsed stack (select the stack
+      // task that contains it), and a stack key can point at an
+      // expanded stack (select its first member — `row.section` IS the
+      // stack key on members).
       const bySlug = tasks.findIndex((t) =>
         t.kind === "wt"
-          ? t.row.wt.slug === sel
+          ? t.row.wt.slug === sel || t.row.section === sel
           : t.kind === "stack"
             ? t.members.some((m) => m.wt.slug === sel)
             : false,
@@ -609,10 +615,37 @@ export function App({ onExit, hubPane = false }: Props) {
   // harness pane on close. Everything else is Alt-driven and works
   // regardless of pane focus.
   const inputActive = modal !== null || footer.kind === "input";
+  // Transition-only: acting on the mount value would immediately focus
+  // the session pane (`inputActive` starts false) and undo the
+  // task-pane-focused startup `ensureHubLayout` set up. A modal pull
+  // remembers where focus was and puts it BACK on close, so answering
+  // a picker doesn't dump you into the session pane you weren't in.
+  const prevInputActiveRef = useRef<boolean | null>(null);
+  const preModalFocusRef = useRef(true);
   useEffect(() => {
     if (!hubPane) return;
-    void (inputActive ? focusLeft() : focusRight());
-  }, [hubPane, inputActive]);
+    const prev = prevInputActiveRef.current;
+    prevInputActiveRef.current = inputActive;
+    if (prev === null || prev === inputActive) return;
+    if (inputActive) {
+      preModalFocusRef.current = hubPaneFocusedRef.current;
+      void focusLeft();
+      setHubPaneFocused(true);
+    } else {
+      const restore = preModalFocusRef.current;
+      void (restore ? focusLeft() : focusRight());
+      setHubPaneFocused(restore);
+    }
+  }, [hubPane, inputActive, setHubPaneFocused]);
+
+  // F9 — flip pane focus. Routed through wt (the outer server forwards
+  // it like F10-F12) so the focus indicator is stamped by the very code
+  // that moves the focus, never inferred.
+  function toggleHubFocus(): void {
+    const next = !hubPaneFocusedRef.current;
+    void (next ? focusLeft() : focusRight());
+    setHubPaneFocused(next);
+  }
 
   // Refocusing the task pane by hand (F9, mouse) while the right pane
   // shows something other than the selection (a slot session, home) is
@@ -872,6 +905,7 @@ export function App({ onExit, hubPane = false }: Props) {
             return next;
           }),
         hubFlows,
+        toggleFocus: toggleHubFocus,
         openPrUrl: (url, number) => openPrUrl(url, number, null, "pr"),
         toggleDetails: () => setShowHubDetails((v) => !v),
         refreshWtState: async () => {
@@ -906,10 +940,13 @@ export function App({ onExit, hubPane = false }: Props) {
   // so it doesn't re-render on every count tick. `loading...` still wins
   // during cold start — the wave is suppressed below while isLoading.
   const titleBar = useMemo(() => {
+    // Hub pane is ~35 cols; every word counts. `wt · 3` carries the
+    // same information as the classic long form.
+    if (hubPane) return ` wt · ${activeCount}${isLoading ? " …" : ""} `;
     const loadingNote = isLoading ? " · loading..." : "";
     const archivedNote = archivedCount > 0 ? ` · ${archivedCount} archived` : "";
     return ` wt · ${activeCount} worktree${activeCount === 1 ? "" : "s"}${archivedNote}${loadingNote} `;
-  }, [activeCount, archivedCount, isLoading]);
+  }, [hubPane, activeCount, archivedCount, isLoading]);
 
   const footerHint = useMemo(() => {
     const parts: string[] = [];
@@ -931,15 +968,24 @@ export function App({ onExit, hubPane = false }: Props) {
           <text fg={theme.fgBright} attributes={1}>
             {titleBar}
           </text>
-          <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
+          {/* Hub: one animated cell regardless of in-flight count — the
+              classic per-query wave eats the narrow pane's title room. */}
+          <RefreshWave
+            count={isLoading ? 0 : hubPane ? Math.min(fetchingCount, 1) : fetchingCount}
+            fg={theme.fgDim}
+          />
           {remoteUnavailable ? (
             <text fg={theme.warn}>{` ⚠ ${config.remote?.label ?? "remote"} offline`}</text>
           ) : null}
         </box>
         {automations.configured && automations.paused ? (
-          <text fg={theme.warn}>{"auto ⏸  "}</text>
+          <text fg={theme.warn}>{hubPane ? "⏸  " : "auto ⏸  "}</text>
         ) : automations.pendingCount > 0 ? (
-          <text fg={theme.fgDim}>{`auto ${automations.pendingCount} queued  `}</text>
+          <text fg={theme.fgDim}>
+            {hubPane
+              ? `q${automations.pendingCount}  `
+              : `auto ${automations.pendingCount} queued  `}
+          </text>
         ) : null}
         {hubPane && hubShown.kind === "slot" ? (
           // The right pane is showing a special (slot) session, not the
@@ -947,12 +993,18 @@ export function App({ onExit, hubPane = false }: Props) {
           <text fg={theme.warn} attributes={1}>{`◂ ${hubShown.label}  `}</text>
         ) : null}
         {hubPane ? (
+          // Compact focus chip: solid accent block when typing lands in
+          // the task pane, dim glyph when it goes to the session. The
+          // tasks panel border/title carries the louder version.
           hubPaneFocused ? (
-            <text fg={theme.accent} attributes={1}>{"⌨ tasks  "}</text>
+            <box backgroundColor={theme.accent} paddingLeft={1} paddingRight={1}>
+              <text fg={theme.bg} attributes={1}>{"⌨"}</text>
+            </box>
           ) : (
-            <text fg={theme.fgDim}>{"⌨ session  "}</text>
+            <text fg={theme.fgDim}>{"⌨ "}</text>
           )
         ) : null}
+        {hubPane ? <text>{" "}</text> : null}
         <UsageBadge primary={primaryHarness} />
         <PrimaryHarnessBadge primary={primaryHarness} />
       </box>
@@ -1055,7 +1107,7 @@ export function App({ onExit, hubPane = false }: Props) {
         pickerRows={pickerRows}
         pickerSummaries={pickerSummaries}
       />
-      <Footer mode={footer} hint={footerHint} />
+      <Footer mode={footer} hint={footerHint} compact={hubPane} />
       <PostFooterModals
         modal={modal}
         current={current}
