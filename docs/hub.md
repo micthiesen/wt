@@ -185,10 +185,11 @@ additional or hub-specific:
 | `Tab` | expand/collapse the selected stack task |
 | `z` | snooze the task until its bucket changes |
 | `P` | pin the task to the top |
-| `D` | toggle the stacked details card below the task list |
+| `I` | toggle the stacked details card below the task list |
 | `,` / `.` / `/` | show the wt-repo / main-clone / dotfiles slot session in the right pane |
 | `q` / `Ctrl+C` | leave the hub — kills the outer layout session only; every inner-server session keeps running |
 | `F9` (no Alt) | cycle pane focus left ↔ right |
+| `F10`/`F11`/`F12` again | toggle pane focus once the session is already shown |
 | `F8` (tmux-level) | zoom the right pane full-screen |
 
 Moving the task cursor auto-follows: after a 150ms debounce, the right pane

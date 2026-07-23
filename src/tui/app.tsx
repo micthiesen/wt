@@ -287,6 +287,10 @@ export function App({ onExit, hubPane = false }: Props) {
   // indicator so a slot session (`,`) can't be mistaken for the
   // selected task's session.
   const [hubShown, setHubShown] = useState<HubShown>({ kind: "home" });
+  // Keypresses before this timestamp are dropped in hub mode — the
+  // startup window where terminal-query replies can masquerade as keys
+  // (see the mute note in the keyboard router).
+  const hubMuteUntilRef = useRef(Date.now() + 800);
   // Whether THIS pane holds keyboard focus (hub only; F9 / select-pane
   // flips it). Signaled in the task pane; the harness pane is left
   // untouched. Every wt-driven focus change stamps the state directly
@@ -572,6 +576,8 @@ export function App({ onExit, hubPane = false }: Props) {
     refreshClaudeSummaries,
     setShown: setHubShown,
     setPaneFocused: setHubPaneFocused,
+    getShown: () => hubShownRef.current,
+    isPaneFocused: () => hubPaneFocusedRef.current,
     onExit: quit,
   });
   // Hub mode swaps the renderer-suspending session entries for
@@ -750,6 +756,12 @@ export function App({ onExit, hubPane = false }: Props) {
   // mode. The per-layer key maps live in `keyboard/` and
   // `modal-keys/`; this callback only routes.
   useKeyboard((k) => {
+    // Hub startup mute: opentui's terminal-capability queries are
+    // answered while the pane sits inside tmux, and a reply split
+    // across reads can leak fragments ("?", digits) into the key
+    // parser — which opened the help overlay on launch. Nothing a
+    // human types in the first beats of a fresh pane is worth keeping.
+    if (hubPane && Date.now() - hubMuteUntilRef.current < 0) return;
     // Exactly one modal is active at a time; dispatch to its handler
     // and swallow the keypress — no modal mode falls through to the
     // input/normal-mode handling below.
@@ -997,6 +1009,22 @@ export function App({ onExit, hubPane = false }: Props) {
         // stacked below (`D` toggles). The live session lives in the
         // hub's right pane, so no OutputViewer here.
         <box flexDirection="column" flexGrow={1}>
+          {hubShown.kind === "slot" ? (
+            // The right pane is a special session, not any task's — say
+            // so in words, full-width, and deselect the task list below
+            // (a highlighted row would imply the session belongs to it).
+            <box
+              height={1}
+              flexShrink={0}
+              backgroundColor={theme.warn}
+              paddingLeft={1}
+              paddingRight={1}
+            >
+              <text fg={theme.bg} attributes={1} wrapMode="none" truncate>
+                {`${hubShown.label} session — j/k or F9 to return`}
+              </text>
+            </box>
+          ) : null}
           {removedView ? (
             <RemovedList
               entries={removedEntries}
@@ -1006,7 +1034,7 @@ export function App({ onExit, hubPane = false }: Props) {
           ) : (
             <TaskList
               tasks={tasks}
-              selectedIndex={taskIndex}
+              selectedIndex={hubShown.kind === "slot" ? -1 : taskIndex}
               width={width}
               isLoading={isLoading}
               activeSessionBySlug={activeSessionBySlug}

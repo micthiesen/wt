@@ -17,6 +17,7 @@ import {
 } from "../../core/harness/claude/names.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import {
+  focusLeft,
   focusRight,
   killHub,
   showHome,
@@ -51,7 +52,7 @@ const hubLog = createLogger("[hub]");
  * dashboard.
  */
 export type HubShown =
-  | { kind: "task"; slug: string }
+  | { kind: "task"; slug: string; target: "harness" | "diff" | "shell" }
   | { kind: "slot"; label: string }
   | { kind: "home" };
 
@@ -74,6 +75,10 @@ export type HubFlowsCtx = {
    * while typing actually goes to the session (the F10/F11/`,` bug).
    */
   setPaneFocused: (focused: boolean) => void;
+  /** Live reads for the F-key toggle (refs on the app side, so the
+   *  per-render flow identity doesn't matter). */
+  getShown: () => HubShown;
+  isPaneFocused: () => boolean;
   onExit: () => void;
 };
 
@@ -88,6 +93,8 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     refreshClaudeSummaries,
     setShown,
     setPaneFocused,
+    getShown,
+    isPaneFocused,
     onExit,
   } = ctx;
 
@@ -95,6 +102,12 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   async function focusSessionPane(): Promise<void> {
     await focusRight();
     setPaneFocused(false);
+  }
+
+  /** And back: focus the task pane, stamping likewise. */
+  async function focusTaskPane(): Promise<void> {
+    await focusLeft();
+    setPaneFocused(true);
   }
 
   /**
@@ -128,6 +141,15 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     target: "harness" | "diff" | "shell",
   ): void {
     const slug = row.wt.slug;
+    // Repeat press = focus toggle: the right pane already shows exactly
+    // this session, so F12/F11/F10 flip which pane the keyboard lands
+    // in instead of re-switching — enter with one press, hop back with
+    // the same key.
+    const shown = getShown();
+    if (shown.kind === "task" && shown.slug === slug && shown.target === target) {
+      void (isPaneFocused() ? focusSessionPane() : focusTaskPane());
+      return;
+    }
     const blocked = sessionLaunchBlockedReason(row);
     if (blocked) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
@@ -138,7 +160,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         if (target === "harness") {
           const f12 = currentHarnessSessions.f12Target;
           if (f12?.isLive) {
-            await switchTo(f12.tmuxSessionName, slug, { kind: "task", slug });
+            await switchTo(f12.tmuxSessionName, slug, { kind: "task", slug, target });
             await focusSessionPane();
             return;
           }
@@ -170,6 +192,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           await switchTo(sessionName(slug, harnessId, managedName), slug, {
             kind: "task",
             slug,
+            target,
           });
           await focusSessionPane();
           return;
@@ -192,7 +215,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, target), null, { kind: "task", slug });
+        await switchTo(sessionName(slug, target), null, { kind: "task", slug, target });
         await focusSessionPane();
       } catch (err) {
         reportActionError(`${target} session`, err);
@@ -283,6 +306,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
         await switchTo(sessionName(slug, harnessId, managedName), slug, {
           kind: "task",
           slug,
+          target: "harness",
         });
         await focusSessionPane();
       } catch (err) {
@@ -325,7 +349,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, "claude", name), slug, { kind: "task", slug });
+        await switchTo(sessionName(slug, "claude", name), slug, { kind: "task", slug, target: "harness" });
         await focusSessionPane();
       } catch (err) {
         if (!wasPersisted) removeClaudeName(slug, name);
@@ -354,6 +378,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
       void switchTo(f12.tmuxSessionName, row.wt.slug, {
         kind: "task",
         slug: row.wt.slug,
+        target: "harness",
       });
     } else {
       void showHome()

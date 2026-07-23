@@ -17,7 +17,7 @@ import type { KeyEvent } from "@opentui/core";
 import { createLogger } from "../../core/logger.ts";
 import type { TaskBucket } from "../../core/task-state.ts";
 import { setTaskPinned, setTaskSnooze } from "../../core/wtstate.ts";
-import { isPlainLetter } from "../app-helpers.ts";
+import { isPlainLetter, isShiftedLetter } from "../app-helpers.ts";
 import type { makeHubFlows } from "../flows/hub.ts";
 import type { TaskItem } from "../hooks/useTaskRows.ts";
 import {
@@ -97,11 +97,15 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     move(-1);
     return;
   }
-  if (k.sequence === "g") {
+  // name+shift checks, not `k.sequence` — inside the hub's tmux,
+  // extended-keys (csi-u) encodes Shift+letter as an escape sequence,
+  // so sequence-equality against "G"/"P"/… silently never matches for
+  // direct typing (the Alt layer's send-keys still delivers literals).
+  if (isPlainLetter(k, "g")) {
     if (tasks.length > 0) setSel(tasks[0]!.key);
     return;
   }
-  if (k.sequence === "G") {
+  if (isShiftedLetter(k, "g")) {
     if (tasks.length > 0) setSel(tasks[tasks.length - 1]!.key);
     return;
   }
@@ -197,7 +201,7 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
   // P — pin toggle.
-  if (k.sequence === "P") {
+  if (isShiftedLetter(k, "p")) {
     if (!task || task.kind === "pr") return;
     const slug = task.row.wt.slug;
     try {
@@ -211,8 +215,10 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
 
-  // D — toggle the stacked details card.
-  if (k.sequence === "D") {
+  // I — toggle the stacked details card (info). Deliberately far from
+  // `d` (destroy): the old Shift+D binding was one slip away from a
+  // destructive confirm.
+  if (isShiftedLetter(k, "i")) {
     toggleDetails();
     return;
   }
