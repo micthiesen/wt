@@ -56,12 +56,16 @@ into the task pane — from either pane, no matter where focus sits. Cmd was
 chosen deliberately: skhd/yabai globally own the Alt, Shift+Alt, Ctrl+Alt,
 and Hyper spaces (so bare Option chords for `j`/`k`/`n`/`1-5` never even
 reach the terminal), while the Cmd domain is free apart from a few
-overridden defaults. The overrides are GLOBAL to every Alacritty window
-(Alacritty can't scope per-process) — accepted deliberately, in full:
-Hide on `⌘H`, Minimize on `⌘M` (both fight yabai tiling anyway), search
-on `⌘F` (stays on `Ctrl+Shift+F`), close-window on `⌘W`, and
-clear-scrollback on `⌘K` (`Ctrl+L` covers it). `⌘N` is deliberately
-untouched — it stays Alacritty's new-window; new-worktree rides `⌘T`
+overridden defaults. The overrides are scoped to Alacritty's `Alt`
+(alternate-screen) binding mode: full-screen apps — the hub's tmux
+client, classic wt, vim — receive the chords, while at a bare shell
+prompt none of them bind, so the defaults all survive there (`⌘W`
+closes the window, `⌘K` clears scrollback, `⌘F` searches, `⌘H` hides,
+`⌘M` minimizes) and no Meta bytes leak into the shell's line editor.
+Inside the hub the overridden set is: Hide (`⌘H`), Minimize (`⌘M`),
+search (`⌘F` — stays on `Ctrl+Shift+F`), close-window (`⌘W`), and
+clear-scrollback (`⌘K` — `Ctrl+L` covers it). `⌘N` is never touched in
+any mode — it stays Alacritty's new-window; new-worktree rides `⌘T`
 ("new task"), whose literal `t` (AI-regen, rare) moved behind `⌘H`.
 
 Most cmd chords forward the bare classic key; five have dedicated rebinds
