@@ -38,6 +38,12 @@ import {
   type PullRequest,
 } from "../../core/types.ts";
 import type { WtState } from "../../core/wtstate.ts";
+import {
+  DOTFILES_SLOT,
+  MAIN_CLONE_SLOT,
+  WT_SOURCE_SLOT,
+  type SessionSlot,
+} from "../sessions/slots.ts";
 import type { ActiveSessionGlyph } from "./useHarnessSessions.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
@@ -84,6 +90,22 @@ export type TaskItem =
       state: TaskState;
       detail: string | null;
       displayBucket: string;
+    }
+  | {
+      /**
+       * A special (non-worktree) harness session slot — the main
+       * clone, the wt source repo, the dotfiles. Pinned as a group at
+       * the BOTTOM of the inbox under its own "Sessions" divider:
+       * collapsed to just the main-clone entry, Tab-expanded to all
+       * three. Selecting one live-follows its session like any task;
+       * there are no dedicated keybindings.
+       */
+      kind: "slot";
+      key: string /* slot:<slug> */;
+      slot: SessionSlot;
+      displayBucket: "sessions";
+      /** True when the group is collapsed (the visible main entry hints at Tab). */
+      collapsedGroup: boolean;
     };
 
 export type TaskRowsResult = { tasks: readonly TaskItem[]; isLoading: boolean };
@@ -296,6 +318,8 @@ export function useTaskRows(opts: {
   stackSectionLabels: ReadonlyMap<string, string>;
   /** Stack section keys the user expanded (Tab). */
   expandedStacks: ReadonlySet<string>;
+  /** Whether the bottom Sessions group shows all three slots (Tab). */
+  slotsExpanded: boolean;
   isLoading: boolean;
 }): TaskRowsResult {
   const {
@@ -306,6 +330,7 @@ export function useTaskRows(opts: {
     wtState,
     stackSectionLabels,
     expandedStacks,
+    slotsExpanded,
     isLoading,
   } = opts;
 
@@ -468,7 +493,23 @@ export function useTaskRows(opts: {
     }
 
     units.sort((a, b) => compareTasks(a.sortKey, b.sortKey));
-    return units.flatMap((u) => u.build());
+
+    // The Sessions group sits below everything, outside the bucket
+    // sort — it's infrastructure, not work. Main clone leads (the one
+    // you reach for most); Tab expands to the wt-source + dotfiles
+    // slots.
+    const visibleSlots = slotsExpanded
+      ? [MAIN_CLONE_SLOT, WT_SOURCE_SLOT, DOTFILES_SLOT]
+      : [MAIN_CLONE_SLOT];
+    const slotItems: TaskItem[] = visibleSlots.map((slot) => ({
+      kind: "slot",
+      key: `slot:${slot.slug}`,
+      slot,
+      displayBucket: "sessions",
+      collapsedGroup: !slotsExpanded,
+    }));
+
+    return [...units.flatMap((u) => u.build()), ...slotItems];
   }, [
     rows,
     reviewRequests,
@@ -477,6 +518,7 @@ export function useTaskRows(opts: {
     wtState,
     stackSectionLabels,
     expandedStacks,
+    slotsExpanded,
     focusSnapshot,
   ]);
 

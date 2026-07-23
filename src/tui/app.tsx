@@ -19,6 +19,7 @@ import {
   useActiveSessionsBySlug,
   useHarnessSessions,
 } from "./hooks/useHarnessSessions.ts";
+import { SESSION_SLOTS } from "./sessions/slots.ts";
 import type { Modal } from "./modal-state.ts";
 import { PostFooterModals, PreFooterModals } from "./modal-host.tsx";
 import { handleSimpleModalKey } from "./modal-keys/index.ts";
@@ -281,6 +282,7 @@ export function App({ onExit, hubPane = false }: Props) {
   const [expandedStacks, setExpandedStacks] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [slotsExpanded, setSlotsExpanded] = useState(false);
   const [showHubDetails, setShowHubDetails] = useState(true);
   // What the hub's right pane currently shows (task session / slot /
   // home) — set by every hub-flow switch; drives the title-bar
@@ -299,6 +301,19 @@ export function App({ onExit, hubPane = false }: Props) {
     useHubPaneFocus(hubPane);
   const hubPaneFocusedRef = useRef(hubPaneFocused);
   hubPaneFocusedRef.current = hubPaneFocused;
+  // Sessions-slot glyphs (main clone / wt source / dotfiles) — the
+  // same discovery the footer's robots used, keyed to the primary
+  // harness. Merged with the per-worktree map for the task pane so a
+  // slot entry tints exactly like the old bottom-bar robot did.
+  const slotGlyphs = useActiveSessionsBySlug(
+    SESSION_SLOTS,
+    primaryHarness,
+    primaryHarness,
+  );
+  const hubSessionGlyphs = useMemo(
+    () => new Map([...activeSessionBySlug, ...slotGlyphs]),
+    [activeSessionBySlug, slotGlyphs],
+  );
   const { tasks } = useTaskRows({
     rows,
     reviewRequests: reviewRequestRows,
@@ -307,6 +322,7 @@ export function App({ onExit, hubPane = false }: Props) {
     wtState: wtStateForStacks.data,
     stackSectionLabels,
     expandedStacks,
+    slotsExpanded,
     isLoading,
   });
   const taskIndex = useMemo(() => {
@@ -330,7 +346,10 @@ export function App({ onExit, hubPane = false }: Props) {
     return 0;
   }, [hubPane, tasks, sel]);
   const hubTask = hubPane ? tasks[taskIndex] : undefined;
-  const hubRow = hubTask && hubTask.kind !== "pr" ? hubTask.row : undefined;
+  const hubRow =
+    hubTask && (hubTask.kind === "wt" || hubTask.kind === "stack")
+      ? hubTask.row
+      : undefined;
   const hubPr = hubTask?.kind === "pr" ? hubTask.pr : undefined;
 
   // Effective selection — hub mode derives it from the task cursor,
@@ -598,7 +617,26 @@ export function App({ onExit, hubPane = false }: Props) {
   hubFlowsRef.current = hubFlows;
   const hubRowRef = useRef(hubRow);
   hubRowRef.current = hubRow;
+  const hubTaskRef = useRef(hubTask);
+  hubTaskRef.current = hubTask;
+  const slotGlyphsRef = useRef(slotGlyphs);
+  slotGlyphsRef.current = slotGlyphs;
   const queryClient = useQueryClient();
+
+  /** Re-assert the right pane against the current selection (task OR slot). */
+  function followNow(): void {
+    const t = hubTaskRef.current;
+    if (t?.kind === "slot") {
+      hubFlowsRef.current.followSlot(
+        t.slot,
+        slotGlyphsRef.current.has(t.slot.slug),
+      );
+      return;
+    }
+    hubFlowsRef.current.followSelection(hubRowRef.current);
+  }
+  const followNowRef = useRef(followNow);
+  followNowRef.current = followNow;
 
   // Live-follow: the right pane tracks the task cursor — a task with a
   // live session shows it (stamping the focus clock: it's on screen),
@@ -607,12 +645,14 @@ export function App({ onExit, hubPane = false }: Props) {
   // session going live/dead re-follows without a cursor move.
   const f12 = currentHarnessSessions.f12Target;
   const followKey = hubPane
-    ? `${hubTask?.key ?? ""}:${f12?.isLive ? f12.tmuxSessionName : ""}`
+    ? hubTask?.kind === "slot"
+      ? `${hubTask.key}:${slotGlyphs.has(hubTask.slot.slug) ? "live" : ""}`
+      : `${hubTask?.key ?? ""}:${f12?.isLive ? f12.tmuxSessionName : ""}`
     : "";
   useEffect(() => {
     if (!hubPane) return;
     const t = setTimeout(() => {
-      hubFlowsRef.current.followSelection(hubRowRef.current);
+      followNowRef.current();
     }, 150);
     return () => clearTimeout(t);
   }, [hubPane, followKey]);
@@ -669,7 +709,7 @@ export function App({ onExit, hubPane = false }: Props) {
     if (!hubPane || !hubPaneFocused) return;
     if (inputActiveRef.current) return;
     if (hubShownRef.current.kind === "task") return;
-    hubFlowsRef.current.followSelection(hubRowRef.current);
+    followNowRef.current();
   }, [hubPane, hubPaneFocused]);
 
 
@@ -917,6 +957,7 @@ export function App({ onExit, hubPane = false }: Props) {
             else next.add(stackKey);
             return next;
           }),
+        toggleSlotsExpanded: () => setSlotsExpanded((v) => !v),
         hubFlows,
         toggleFocus: toggleHubFocus,
         openPrUrl: (url, number) => openPrUrl(url, number, null, "pr"),
@@ -1009,22 +1050,6 @@ export function App({ onExit, hubPane = false }: Props) {
         // stacked below (`D` toggles). The live session lives in the
         // hub's right pane, so no OutputViewer here.
         <box flexDirection="column" flexGrow={1}>
-          {hubShown.kind === "slot" ? (
-            // The right pane is a special session, not any task's — say
-            // so in words, full-width, and deselect the task list below
-            // (a highlighted row would imply the session belongs to it).
-            <box
-              height={1}
-              flexShrink={0}
-              backgroundColor={theme.warn}
-              paddingLeft={1}
-              paddingRight={1}
-            >
-              <text fg={theme.bg} attributes={1} wrapMode="none" truncate>
-                {`${hubShown.label} session — j/k or F9 to return`}
-              </text>
-            </box>
-          ) : null}
           {removedView ? (
             <RemovedList
               entries={removedEntries}
@@ -1034,12 +1059,13 @@ export function App({ onExit, hubPane = false }: Props) {
           ) : (
             <TaskList
               tasks={tasks}
-              selectedIndex={hubShown.kind === "slot" ? -1 : taskIndex}
+              selectedIndex={taskIndex}
               width={width}
               isLoading={isLoading}
-              activeSessionBySlug={activeSessionBySlug}
+              activeSessionBySlug={hubSessionGlyphs}
               activeActions={activeActions}
               paneFocused={hubPaneFocused}
+              primaryHarness={primaryHarness}
             />
           )}
           {showHubDetails ? (
@@ -1118,7 +1144,9 @@ export function App({ onExit, hubPane = false }: Props) {
         pickerRows={pickerRows}
         pickerSummaries={pickerSummaries}
       />
-      <Footer mode={footer} hint={footerHint} compact={hubPane} />
+      {hubPane && footer.kind === "legend" ? null : (
+        <Footer mode={footer} hint={footerHint} compact={hubPane} />
+      )}
       <PostFooterModals
         modal={modal}
         current={current}

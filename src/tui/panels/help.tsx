@@ -170,7 +170,7 @@ const KEY_BLOCKS: Block[] = [
   {
     kind: "keys",
     title: "hub mode (wt hub)",
-    note: "Tmux-hosted task inbox: left = tasks, right = live session. Typing goes to the session; every wt key above works as alt+<key>. These are hub-only:",
+    note: "Tmux-hosted task inbox: left = tasks, right = live session. Typing goes to the session; wt keys work as alt+<key>. The , . / slot keys are retired here — use the bottom Sessions group (TAB expands it). Hub-only:",
     items: [
       { key: "⏎ / F12", label: "show the task's agent session · same key again toggles pane focus (PR task: open PR)" },
       { key: "F11 / F10", label: "show diff / shell session · again toggles pane focus" },

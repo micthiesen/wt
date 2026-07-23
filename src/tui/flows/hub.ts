@@ -229,6 +229,12 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
    * renderer handoff.
    */
   function showSlotSession(slot: SessionSlot): void {
+    // Repeat press = focus toggle, mirroring showTaskSession.
+    const shown = getShown();
+    if (shown.kind === "slot" && shown.label === slot.label) {
+      void (isPaneFocused() ? focusSessionPane() : focusTaskPane());
+      return;
+    }
     void (async () => {
       try {
         const res = await ensureSessionDetached({
@@ -358,6 +364,26 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     })();
   }
 
+  /**
+   * Live-follow for a selected Sessions-slot task: show its live
+   * session (never stealing focus), else the home dashboard. The slot
+   * counterpart of `followSelection`.
+   */
+  function followSlot(slot: SessionSlot, isLive: boolean): void {
+    if (isLive) {
+      void switchTo(sessionName(slot.slug, primaryHarness, null), null, {
+        kind: "slot",
+        label: slot.label,
+      });
+    } else {
+      void showHome()
+        .then((ok) => {
+          if (ok) setShown({ kind: "home" });
+        })
+        .catch(() => {});
+    }
+  }
+
   /** Point the right pane back at the home dashboard. */
   function showHomePane(): void {
     void showHome()
@@ -404,6 +430,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   return {
     showTaskSession,
     showSlotSession,
+    followSlot,
     enterHarnessSession,
     spawnNamedClaudeSession,
     showHomePane,

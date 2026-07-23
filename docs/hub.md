@@ -73,10 +73,8 @@ Which pane holds focus is signaled **inside the task pane** (the session
 pane is left unmarked): the title bar shows `⌨ tasks` (accent) when typing
 lands in the task pane and `⌨ session` (dim) otherwise, and the tasks
 panel border tints accent while focused. When the right pane is showing a
-special slot session (`,` / `.` / `/`) instead of the selected task, the
-title bar flags it with a warn-colored `◂ <label>` badge — and manually
-refocusing the task pane (F9, mouse) snaps the right pane back to the
-selected task's session.
+special session that isn't the selected task's, manually refocusing the
+task pane (F9, mouse) snaps the right pane back to the selection.
 
 `F10`/`F11`/`F12` are also forwarded un-prefixed (not `Alt+F10` etc.) since
 they're already dedicated function keys distinct from ordinary letters.
@@ -186,7 +184,7 @@ additional or hub-specific:
 | `z` | snooze the task until its bucket changes |
 | `P` | pin the task to the top |
 | `I` | toggle the stacked details card below the task list |
-| `,` / `.` / `/` | show the wt-repo / main-clone / dotfiles slot session in the right pane |
+| ⏎ / F12 on a Sessions entry | show that special session (main clone / wt repo / dotfiles) |
 | `q` / `Ctrl+C` | leave the hub — kills the outer layout session only; every inner-server session keeps running |
 | `F9` (no Alt) | cycle pane focus left ↔ right |
 | `F10`/`F11`/`F12` again | toggle pane focus once the session is already shown |
@@ -212,3 +210,17 @@ clock) or falls back to the home dashboard if it has none.
 - Classic and hub mode are two views over identical state — nothing needs
   reconciling when you switch, so treat `wt hub` / `wt classic` as a
   free toggle rather than a mode commitment.
+
+## The Sessions group
+
+The classic `,` / `.` / `/` slot keybindings do not exist in hub mode.
+Instead the inbox ends with a **Sessions** group: a bottom-pinned entry for
+the main clone's harness session, Tab-expandable to the wt-source and
+dotfiles slots. Slot entries behave like any task — selecting one
+live-follows its session, ⏎/F12 starts + shows it (and toggles pane focus
+on a repeat press) — so the right pane always corresponds to the selected
+entry and there is no special "viewing a slot" state to track. The hub
+also drops the classic bottom bar entirely (its robots moved into the
+Sessions entries); the footer only appears transiently for prompts and
+toasts.
+

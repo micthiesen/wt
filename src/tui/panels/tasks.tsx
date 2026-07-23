@@ -22,7 +22,7 @@ import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { NF } from "../icons.ts";
-import { getHarness } from "../../core/harness/index.ts";
+import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import { stateColor } from "../claude-state.ts";
 import { TASK_BUCKET_LABEL, type TaskBucket } from "../../core/task-state.ts";
 import { capitalizeFirst } from "../../core/stage.ts";
@@ -48,6 +48,8 @@ type Props = {
    * signal; the harness pane is deliberately left unmarked.
    */
   paneFocused?: boolean;
+  /** TAB-cycled primary harness — the glyph a dead Sessions slot shows. */
+  primaryHarness: HarnessId;
   scrollHandle?: RefObject<TaskListHandle | null>;
 };
 
@@ -77,11 +79,24 @@ type Glyph = { glyph: string; fg: string };
 function taskGlyph(
   item: TaskItem,
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>,
+  primaryHarness: HarnessId,
 ): Glyph {
   if (item.kind === "pr") {
     return item.pr.isDraft
       ? { glyph: NF.prDraft, fg: theme.fgDim }
       : { glyph: NF.prOpen, fg: theme.accentAlt };
+  }
+  if (item.kind === "slot") {
+    // Same robot the footer's slot glyphs used: live sessions tint by
+    // state, a dead slot shows the primary harness's glyph dimmed.
+    const active = activeSessionBySlug.get(item.slot.slug);
+    if (active) {
+      const fg = active.state
+        ? stateColor(active.harnessId, active.state)
+        : getHarness(active.harnessId).color;
+      return { glyph: getHarness(active.harnessId).glyph, fg };
+    }
+    return { glyph: getHarness(primaryHarness).glyph, fg: theme.fgDim };
   }
   return bucketGlyph(item.state.bucket, item.row, activeSessionBySlug);
 }
@@ -125,6 +140,7 @@ function bucketGlyph(
  * stack's resolved label when collapsed, or the PR title.
  */
 function taskTitle(item: TaskItem): string {
+  if (item.kind === "slot") return item.slot.label;
   if (item.kind === "pr") return capitalizeFirst(item.pr.title);
   if (item.kind === "stack") return item.label;
   const label = rowLabel(item.row);
@@ -135,7 +151,15 @@ function taskTitle(item: TaskItem): string {
 }
 
 /** Line-2 text: `state.reason` + optional detail + optional "(snoozed)" suffix. */
-function taskDetailLine(item: TaskItem): string {
+function taskDetailLine(
+  item: TaskItem,
+  activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>,
+): string {
+  if (item.kind === "slot") {
+    const state = activeSessionBySlug.get(item.slot.slug)?.state;
+    const status = state ?? "no session";
+    return item.collapsedGroup ? `${status} · tab: more` : status;
+  }
   const base = item.detail ? `${item.state.reason} — ${item.detail}` : item.state.reason;
   return item.state.snoozed ? `${base} (snoozed)` : base;
 }
@@ -145,27 +169,30 @@ const TaskRowView = memo(function TaskRowView({
   selected,
   activeSessionBySlug,
   activeActions,
+  primaryHarness,
   panelWidth,
 }: {
   item: TaskItem;
   selected: boolean;
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   activeActions: ReadonlySet<string>;
+  primaryHarness: HarnessId;
   panelWidth: number;
 }) {
   const bg = selected ? theme.rowSelectedBg : undefined;
   const titleFg = selected ? theme.fgBright : theme.fg;
   const attrs = selected ? TextAttributes.BOLD : 0;
-  const glyph = taskGlyph(item, activeSessionBySlug);
+  const glyph = taskGlyph(item, activeSessionBySlug, primaryHarness);
 
-  const hasBadges = item.kind !== "pr";
-  const row = item.kind !== "pr" ? item.row : undefined;
+  const isRowKind = item.kind === "wt" || item.kind === "stack";
+  const row = isRowKind ? item.row : undefined;
+  const hasBadges = isRowKind;
   const actionRunning = row ? activeActions.has(row.wt.slug) : false;
   const activeHarnessId = row ? activeSessionBySlug.get(row.wt.slug)?.harnessId : undefined;
   const sessionState = row ? (activeSessionBySlug.get(row.wt.slug)?.state ?? undefined) : undefined;
   const badgeCells = row ? badgeClusterCells(row, actionRunning, activeHarnessId) : 0;
 
-  const pinned = item.kind !== "pr" && item.manual.pinned;
+  const pinned = isRowKind && item.manual.pinned;
   const rawTitle = taskTitle(item);
   const titleText = pinned ? `^ ${rawTitle}` : rawTitle;
   const budget1 = Math.max(0, panelWidth - FIXED_OVERHEAD - badgeCells);
@@ -198,7 +225,7 @@ const TaskRowView = memo(function TaskRowView({
         <box width={DETAIL_INDENT} flexShrink={0} />
         <box flexGrow={1} flexShrink={1} overflow="hidden">
           <text fg={theme.fgDim} wrapMode="none">
-            {truncateEnd(taskDetailLine(item), budget2)}
+            {truncateEnd(taskDetailLine(item, activeSessionBySlug), budget2)}
           </text>
         </box>
       </box>
@@ -231,6 +258,7 @@ function Divider({ label, width }: { label: string; width: number }) {
 function dividerLabel(displayBucket: string): string {
   if (displayBucket === "pinned") return "Pinned";
   if (displayBucket === "snoozed") return "Snoozed";
+  if (displayBucket === "sessions") return "Sessions";
   return TASK_BUCKET_LABEL[displayBucket as TaskBucket] ?? displayBucket;
 }
 
@@ -242,6 +270,7 @@ export function TaskList({
   activeSessionBySlug,
   activeActions,
   paneFocused = false,
+  primaryHarness,
   scrollHandle,
 }: Props) {
   const hasTasks = tasks.length > 0;
@@ -307,6 +336,7 @@ export function TaskList({
                   selected={i === selectedIndex}
                   activeSessionBySlug={activeSessionBySlug}
                   activeActions={activeActions}
+                  primaryHarness={primaryHarness}
                   panelWidth={width}
                 />
               </Fragment>

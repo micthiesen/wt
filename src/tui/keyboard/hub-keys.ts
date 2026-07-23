@@ -20,11 +20,6 @@ import { setTaskPinned, setTaskSnooze } from "../../core/wtstate.ts";
 import { isPlainLetter, isShiftedLetter } from "../app-helpers.ts";
 import type { makeHubFlows } from "../flows/hub.ts";
 import type { TaskItem } from "../hooks/useTaskRows.ts";
-import {
-  DOTFILES_SLOT,
-  MAIN_CLONE_SLOT,
-  WT_SOURCE_SLOT,
-} from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
 const hubLog = createLogger("[hub]");
@@ -35,6 +30,7 @@ export type HubKeysCtx = {
   /** Select by task key (the same `sel` state flows already target by slug). */
   setSel: (key: string | null) => void;
   toggleStackExpanded: (stackKey: string) => void;
+  toggleSlotsExpanded: () => void;
   hubFlows: ReturnType<typeof makeHubFlows>;
   /** F9 — flip pane focus (wt runs select-pane itself; see useHubPaneFocus). */
   toggleFocus: () => void;
@@ -64,6 +60,7 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     taskIndex,
     setSel,
     toggleStackExpanded,
+    toggleSlotsExpanded,
     hubFlows,
     toggleFocus,
     openPrUrl,
@@ -117,6 +114,15 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
   // a collapsing member's slug vanishes likewise — without the re-key
   // the resolver misses and the cursor snaps to the top.
   if (k.name === "tab" && !k.shift && !k.ctrl && !k.option && !k.meta) {
+    if (task?.kind === "slot") {
+      // The Sessions group folds like a stack. Keep the cursor on the
+      // group across the toggle (collapsing from a sub-entry re-keys
+      // onto the surviving main entry).
+      toggleSlotsExpanded();
+      if (task.collapsedGroup) setSel(task.key);
+      else setSel("slot:main");
+      return;
+    }
     const stackKey = stackKeyOf(task);
     if (!stackKey || !task) return;
     toggleStackExpanded(stackKey);
@@ -131,6 +137,10 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
       openPrUrl(task.pr.url, task.pr.number);
       return;
     }
+    if (task.kind === "slot") {
+      hubFlows.showSlotSession(task.slot);
+      return;
+    }
     hubFlows.showTaskSession(task.row, "harness");
     return;
   }
@@ -142,17 +152,18 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
   const plainFn = (name: string): boolean =>
     k.name === name && !k.shift && !k.ctrl && !k.option && !k.meta;
   if (plainFn("f12")) {
-    if (task && task.kind !== "pr") hubFlows.showTaskSession(task.row, "harness");
+    if (task?.kind === "slot") hubFlows.showSlotSession(task.slot);
+    else if (task && task.kind !== "pr") hubFlows.showTaskSession(task.row, "harness");
     else toast("no session for this task", theme.fgDim, 1500);
     return;
   }
   if (plainFn("f11")) {
-    if (task && task.kind !== "pr") hubFlows.showTaskSession(task.row, "diff");
+    if (task && task.kind !== "pr" && task.kind !== "slot") hubFlows.showTaskSession(task.row, "diff");
     else toast("no worktree for this task", theme.fgDim, 1500);
     return;
   }
   if (plainFn("f10")) {
-    if (task && task.kind !== "pr") hubFlows.showTaskSession(task.row, "shell");
+    if (task && task.kind !== "pr" && task.kind !== "slot") hubFlows.showTaskSession(task.row, "shell");
     else toast("no worktree for this task", theme.fgDim, 1500);
     return;
   }
@@ -165,17 +176,11 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
 
-  // Slot sessions retarget the right pane instead of attaching.
-  if (k.sequence === ",") {
-    hubFlows.showSlotSession(WT_SOURCE_SLOT);
-    return;
-  }
-  if (k.sequence === ".") {
-    hubFlows.showSlotSession(MAIN_CLONE_SLOT);
-    return;
-  }
-  if (k.sequence === "/") {
-    hubFlows.showSlotSession(DOTFILES_SLOT);
+  // The classic `,` / `.` / `/` slot keybindings are retired in hub
+  // mode — the Sessions group at the bottom of the inbox IS the slot
+  // surface. Swallow them so they can't fall through to the global
+  // handler's full-screen attach.
+  if (k.sequence === "," || k.sequence === "." || k.sequence === "/") {
     return;
   }
 
@@ -184,7 +189,7 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
   // by itself when the derived bucket moves on (level semantics, no
   // timers). Worktree-backed tasks only.
   if (isPlainLetter(k, "z")) {
-    if (!task || task.kind === "pr") return;
+    if (!task || (task.kind !== "wt" && task.kind !== "stack")) return;
     const slug = task.row.wt.slug;
     try {
       if (task.state.snoozed) {
@@ -202,7 +207,7 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
   }
   // P — pin toggle.
   if (isShiftedLetter(k, "p")) {
-    if (!task || task.kind === "pr") return;
+    if (!task || (task.kind !== "wt" && task.kind !== "stack")) return;
     const slug = task.row.wt.slug;
     try {
       const next = !task.manual.pinned;

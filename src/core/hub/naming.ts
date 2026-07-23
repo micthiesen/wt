@@ -83,7 +83,7 @@ export const HUB_FORWARD_KEYS = [
   "A",
   "P",
   "z",
-  "D",
+  "I",
   "h",
   "q",
   "o",
@@ -93,9 +93,6 @@ export const HUB_FORWARD_KEYS = [
   "'",
   "[",
   "]",
-  ",",
-  ".",
-  "/",
   ">",
   "?",
 ] as const;
