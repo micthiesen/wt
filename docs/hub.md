@@ -56,9 +56,12 @@ into the task pane — from either pane, no matter where focus sits. Cmd was
 chosen deliberately: skhd/yabai globally own the Alt, Shift+Alt, Ctrl+Alt,
 and Hyper spaces (so bare Option chords for `j`/`k`/`n`/`1-5` never even
 reach the terminal), while the Cmd domain is free apart from a few
-overridden defaults (Hide on `⌘H`, Minimize on `⌘M`, search on `⌘F` —
-Alacritty search stays on `Ctrl+Shift+F` — new-window on `⌘N`,
-close-window on `⌘W`).
+overridden defaults. The overrides are GLOBAL to every Alacritty window
+(Alacritty can't scope per-process) — accepted deliberately, in full:
+Hide on `⌘H`, Minimize on `⌘M` (both fight yabai tiling anyway), search
+on `⌘F` (stays on `Ctrl+Shift+F`), new-window on `⌘N` (skhd's
+`cmd+return` spawns windows), close-window on `⌘W`, and clear-scrollback
+on `⌘K` (`Ctrl+L` covers it).
 
 Most cmd chords forward the bare classic key; five have dedicated rebinds
 because the literal letter means something else in classic mode: `⌘H` →
