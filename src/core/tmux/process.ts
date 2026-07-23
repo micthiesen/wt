@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
 import { TMUX_SOCKET } from "./naming.ts";
@@ -55,11 +57,22 @@ export function paneTarget(name: string): string {
   return `=${name}:`;
 }
 
-/** Run a tmux command on our private server; collect exit code + stderr. */
+/**
+ * Run a tmux command on our private server; collect exit code + stderr.
+ * `cwd` is pinned to `homedir()` rather than `run()`'s default
+ * (`config.paths.mainClone`) for the same reason `hub/proc.ts`'s
+ * `spawnTmux` pins it: the first client to touch a socket forks its
+ * tmux server, and that server inherits the client's cwd for its whole
+ * life (see `tmuxClientCwd` in `core/tmux/attach.ts`). A worktree-
+ * rooted cwd is dangerous there — if it's later deleted, the server is
+ * left sitting in a nonexistent directory — so every client spawned
+ * against this socket, including this one, uses the immortal home
+ * directory instead.
+ */
 export async function runTmux(
   args: readonly string[],
 ): Promise<{ code: number; stderr: string }> {
-  const r = await run(["tmux", "-L", TMUX_SOCKET, ...args]);
+  const r = await run(["tmux", "-L", TMUX_SOCKET, ...args], { cwd: homedir() });
   return { code: r.exitCode, stderr: r.stderr };
 }
 

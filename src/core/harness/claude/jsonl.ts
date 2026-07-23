@@ -2,6 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { sanitizeLine } from "../../proc.ts";
 import { readFileSlice } from "../../tail-util.ts";
 import { asArr, asObj, briefToolInput } from "./events.ts";
 import { listClaudeNames } from "./names.ts";
@@ -296,13 +297,22 @@ function firstNonEmptyLine(text: string): string | null {
  *
  * Exported (rather than folded into the tail parser) so both are
  * unit-testable without constructing a jsonl fixture.
+ *
+ * Every return path is agent-influenced text (the plan, the question,
+ * or a tool's own input via `briefToolInput`) heading straight into
+ * the TUI's activity/task panes with no terminal in between to
+ * interpret it — an unscrubbed ANSI/control-char payload here is a
+ * terminal-escape injection vector. `sanitizeLine` (the same scrub
+ * `core/proc.ts` uses for subprocess output, and `briefToolResultBody`
+ * in `events.ts` already applies) strips that before the string ever
+ * gets composed into `pendingAsk`.
  */
 export function describePendingToolUse(name: string, input: unknown): string {
   if (name === "ExitPlanMode") {
     const obj = asObj(input);
     const plan = obj && typeof obj.plan === "string" ? obj.plan : "";
     const line = firstNonEmptyLine(plan);
-    const stripped = line ? line.replace(/^#{1,6}\s*/, "").trim() : "";
+    const stripped = line ? sanitizeLine(line.replace(/^#{1,6}\s*/, "").trim()) : "";
     return stripped ? `approve plan: ${stripped}` : "approve plan";
   }
   if (name === "AskUserQuestion") {
@@ -318,12 +328,12 @@ export function describePendingToolUse(name: string, input: unknown): string {
       }
     }
     const line = question
-      ? question.replaceAll("\n", " ").replace(/\s+/g, " ").trim()
+      ? sanitizeLine(question.replaceAll("\n", " ").replace(/\s+/g, " ").trim())
       : "";
     return line ? `question: ${line}` : "question";
   }
   const brief = briefToolInput(input);
-  return brief ? `allow ${name}: ${brief}` : `allow ${name}`;
+  return brief ? `allow ${name}: ${sanitizeLine(brief)}` : `allow ${name}`;
 }
 
 /** Accumulated `pendingAsk` / `lastAssistantText` inputs — see `extractPendingContext`. */
@@ -366,7 +376,10 @@ export function extractPendingContext(
         lastToolUse = { name: b.name, input: b.input };
       } else if (b.type === "text" && typeof b.text === "string") {
         const line = firstNonEmptyLine(b.text);
-        if (line) lastAssistantText = line;
+        // Scrubbed for the same reason as `describePendingToolUse`
+        // above: this is raw assistant text heading into the TUI with
+        // no terminal in between to interpret ANSI/control bytes.
+        if (line) lastAssistantText = sanitizeLine(line);
       }
     }
   }

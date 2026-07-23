@@ -38,18 +38,20 @@ export const theme = {
 };
 
 /**
- * Re-skin the palette to the user's terminal theme (Catppuccin Mocha,
- * mirroring ~/.config/alacritty/alacritty.toml) — hub mode only. The
- * hub's task pane lives INSIDE the terminal next to a harness that
- * renders on the terminal's own background, so wt's Nord surface reads
- * as a mismatched slab there; with `bg`/`bgAlt` set to the terminal's
- * exact background the pane blends in like Claude Code does. Mutates
- * the shared object in place BEFORE the first render (theme values are
- * read at render time) and only in the `wt _taskpane` process — the
- * classic TUI keeps Nord. Brand colors (claude/codex/opencode) are
- * identities, not theme, and stay put.
+ * Re-skin the palette to the hub pane's static Catppuccin Mocha
+ * palette (mirroring ~/.config/alacritty/alacritty.toml) — hub mode
+ * only. This is NOT terminal-theme detection — the values below are
+ * hardcoded to match the owner's Alacritty config, not read from the
+ * terminal in any way. The hub's task pane lives INSIDE the terminal
+ * next to a harness that renders on the terminal's own background, so
+ * wt's Nord surface reads as a mismatched slab there; with `bg`/`bgAlt`
+ * set to the same hardcoded background the pane blends in like Claude
+ * Code does. Mutates the shared object in place BEFORE the first
+ * render (theme values are read at render time) and only in the
+ * `wt _taskpane` process — the classic TUI keeps Nord. Brand colors
+ * (claude/codex/opencode) are identities, not theme, and stay put.
  */
-export function applyTerminalTheme(): void {
+export function applyHubPalette(): void {
   Object.assign(theme, {
     bg: "#1E1E2E", // base — identical to the terminal background
     bgAlt: "#1E1E2E", // bars blend into the terminal bg too

@@ -19,6 +19,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 
 import { BadgeCluster, badgeClusterCells } from "../badge-cluster.tsx";
 import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
+import { useScrollToEdge } from "../hooks/useScrollToEdge.ts";
 import { truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import { NF } from "../icons.ts";
@@ -28,9 +29,10 @@ import { TASK_BUCKET_LABEL, type TaskBucket } from "../../core/task-state.ts";
 import { capitalizeFirst } from "../../core/stage.ts";
 import { stackOrdinalLabel } from "../../core/stack-layout.ts";
 import type { ActiveSessionGlyph } from "../hooks/useHarnessSessions.ts";
-import type { TaskItem } from "../hooks/useTaskRows.ts";
+import type { DisplayBucket, TaskItem } from "../hooks/useTaskRows.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { rowLabel } from "./list.tsx";
+import { Divider } from "./section-divider.tsx";
 
 /** Imperative scroll-to-edge control, same contract as `ListScrollHandle` in `panels/list.tsx`. */
 export type TaskListHandle = { toEdge: (dir: "top" | "bottom") => void };
@@ -233,33 +235,14 @@ const TaskRowView = memo(function TaskRowView({
   );
 });
 
-/** Section divider — visually identical to `panels/list.tsx`'s `Divider` (blank line above, `── label ───`). */
-function Divider({ label, width }: { label: string; width: number }) {
-  const inner = Math.max(0, width - 4);
-  const labelStr = ` ${label} `;
-  const padding = Math.max(0, inner - labelStr.length - 2);
-  const trail = "─".repeat(padding);
-  return (
-    <box flexDirection="row" height={1} paddingLeft={1} paddingRight={1}>
-      <box flexShrink={0}>
-        <text fg={theme.borderDim} wrapMode="none">──</text>
-      </box>
-      <box flexShrink={1} overflow="hidden">
-        <text fg={theme.fgDim} wrapMode="none" truncate>{labelStr}</text>
-      </box>
-      <box flexShrink={1} overflow="hidden">
-        <text fg={theme.borderDim} wrapMode="none">{trail}</text>
-      </box>
-    </box>
-  );
-}
-
-/** Divider label for a `displayBucket` value — the two synthetic buckets get their own copy, everything else reads from `TASK_BUCKET_LABEL`. */
-function dividerLabel(displayBucket: string): string {
+/** Divider label for a `displayBucket` value — the two synthetic buckets get their own copy, everything else is a real `TaskBucket` read from `TASK_BUCKET_LABEL`. */
+function dividerLabel(displayBucket: DisplayBucket): string {
   if (displayBucket === "pinned") return "Pinned";
   if (displayBucket === "snoozed") return "Snoozed";
   if (displayBucket === "sessions") return "Sessions";
-  return TASK_BUCKET_LABEL[displayBucket as TaskBucket] ?? displayBucket;
+  // Excluding the three literals above narrows `displayBucket` from
+  // `DisplayBucket` straight to `TaskBucket` — no `as` cast needed.
+  return TASK_BUCKET_LABEL[displayBucket];
 }
 
 export function TaskList({
@@ -273,19 +256,10 @@ export function TaskList({
   primaryHarness,
   scrollHandle,
 }: Props) {
-  const hasTasks = tasks.length > 0;
+  const hasWork = tasks.some((t) => t.kind !== "slot");
   const listRef = useRef<ScrollBoxRenderable>(null);
   const listScrollRef = useScrollbarNoFlash(listRef);
-
-  useEffect(() => {
-    if (!scrollHandle) return;
-    scrollHandle.current = {
-      toEdge: (dir) => listRef.current?.scrollBy(dir === "bottom" ? 9999 : -9999, "viewport"),
-    };
-    return () => {
-      if (scrollHandle) scrollHandle.current = null;
-    };
-  }, [scrollHandle]);
+  useScrollToEdge(listRef, scrollHandle);
 
   const selectedId = tasks[selectedIndex]?.key;
   useEffect(() => {
@@ -306,7 +280,13 @@ export function TaskList({
       titleAlignment="left"
       paddingTop={0}
     >
-      {!hasTasks ? (
+      {!hasWork ? (
+        // The Sessions slot group is always present (see `useTaskRows`),
+        // so `tasks` itself is never empty — `hasWork` (any non-`slot`
+        // item) is the real "is there anything worth showing" signal.
+        // The hint renders ABOVE the still-rendered Sessions group below
+        // rather than replacing the whole pane, so the loading/empty
+        // state and the Sessions group are never mutually exclusive.
         <box padding={1} flexDirection="row">
           {isLoading ? (
             <text fg={theme.fgDim}>Loading tasks...</text>
@@ -320,32 +300,31 @@ export function TaskList({
             </>
           )}
         </box>
-      ) : (
-        <scrollbox ref={listScrollRef} scrollY flexGrow={1} minHeight={0}>
-          {tasks.map((item, i) => {
-            const prev = i > 0 ? tasks[i - 1] : undefined;
-            const showDivider = prev === undefined || prev.displayBucket !== item.displayBucket;
-            return (
-              <Fragment key={item.key}>
-                {showDivider ? (
-                  <>
-                    <box height={1} flexShrink={0} />
-                    <Divider label={dividerLabel(item.displayBucket)} width={width} />
-                  </>
-                ) : null}
-                <TaskRowView
-                  item={item}
-                  selected={i === selectedIndex}
-                  activeSessionBySlug={activeSessionBySlug}
-                  activeActions={activeActions}
-                  primaryHarness={primaryHarness}
-                  panelWidth={width}
-                />
-              </Fragment>
-            );
-          })}
-        </scrollbox>
-      )}
+      ) : null}
+      <scrollbox ref={listScrollRef} scrollY flexGrow={1} minHeight={0}>
+        {tasks.map((item, i) => {
+          const prev = i > 0 ? tasks[i - 1] : undefined;
+          const showDivider = prev === undefined || prev.displayBucket !== item.displayBucket;
+          return (
+            <Fragment key={item.key}>
+              {showDivider ? (
+                <>
+                  <box height={1} flexShrink={0} />
+                  <Divider label={dividerLabel(item.displayBucket)} width={width} />
+                </>
+              ) : null}
+              <TaskRowView
+                item={item}
+                selected={i === selectedIndex}
+                activeSessionBySlug={activeSessionBySlug}
+                activeActions={activeActions}
+                primaryHarness={primaryHarness}
+                panelWidth={width}
+              />
+            </Fragment>
+          );
+        })}
+      </scrollbox>
     </box>
   );
 }

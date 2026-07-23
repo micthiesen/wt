@@ -27,7 +27,7 @@ import {
 import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { config } from "../../core/config.ts";
 
-import { enterHarnessSession } from "../sessions/harness.ts";
+import { enterHarnessSession, type EnterResult } from "../sessions/harness.ts";
 import { enterRemoteWorktreeSession } from "../sessions/remote.ts";
 import { resolveDiffBase, sessionLaunchBlockedReason } from "../app-helpers.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
@@ -58,6 +58,50 @@ export function slotSessionResumeTarget(
     resumeSessionId: latest?.sessionId ?? null,
     freshSlot: latest !== null,
   };
+}
+
+/**
+ * Persist-before-spawn / conditional-rollback contract for a named
+ * claude session, shared by `doSpawnNamedClaudeSession` below and its
+ * hub-mode drop-in (`flows/hub.ts`'s `spawnNamedClaudeSession`, which
+ * detaches + retargets instead of attaching but needs byte-for-byte
+ * the same persistence semantics).
+ *
+ * Persist-before-spawn is intentional: a wt crash mid-spawn must
+ * leave the name reachable on next start. The trade-off is a
+ * spawn-failure window where we'd persist a name for a session that
+ * never started; this rolls that back — but only when THIS call
+ * created the entry (`!wasPersisted`). A resume (name already on
+ * disk from an earlier session) is left alone on failure, since a
+ * real prior session still owns that entry and removing it would
+ * orphan it from the picker.
+ *
+ * `spawn`'s return type is generic (bounded only by `{ ok: boolean }`)
+ * rather than pinned to the full result shape either caller's
+ * underlying spawn call returns (`enterHarnessSession`'s `AttachResult`
+ * for the classic flow, `ensureSessionDetached`'s `{ ok, created }` /
+ * `{ ok, reason }` for the hub flow) — those two shapes disagree, and
+ * this helper only needs the `ok` discriminant to decide whether to
+ * roll back. Callers that need the extra detail (e.g. classic's
+ * detached-vs-exited messaging) get it back verbatim through the
+ * (generic, discriminated) return value / their own closure — see the
+ * two call sites.
+ */
+export async function withNamedClaudePersistence<T extends { ok: boolean }>(
+  slug: string,
+  name: string,
+  refreshClaudeSummaries: (slug: string) => Promise<void>,
+  spawn: () => Promise<T>,
+): Promise<T> {
+  const wasPersisted = nameInUse(slug, name);
+  addClaudeName(slug, name);
+  void refreshClaudeSummaries(slug);
+  const result = await spawn();
+  // Roll back the optimistic add IFF we created the entry — if `name`
+  // was already in the file (resume case), leave it so the user can
+  // retry from the picker.
+  if (!result.ok && !wasPersisted) removeClaudeName(slug, name);
+  return result;
 }
 
 export type SessionFlowsCtx = {
@@ -243,11 +287,12 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
    * If `name` already exists in state, this is a resume (no
    * duplicate state mutation).
    *
-   * Persist-before-spawn is intentional: a wt crash mid-spawn must
-   * leave the name reachable on next start. The trade-off is a
-   * spawn-failure window where we'd persist a name for a session
-   * that never started; we roll that back below by only persisting
-   * fresh names (not pre-existing ones) and removing on spawn-fail.
+   * The persist-before-spawn / rollback contract lives in
+   * `withNamedClaudePersistence` above (shared with the hub-mode
+   * drop-in); this function's `spawn` closure captures the full
+   * `enterHarnessSession` result in `attachResult` so the
+   * detached-vs-exited-vs-failed messaging below — which the shared
+   * helper doesn't know about — still has it to work with.
    */
   function doSpawnNamedClaudeSession(slug: string, name: string): void {
     const row = rows.find((r) => r.wt.slug === slug);
@@ -260,9 +305,6 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
     }
-    const wasPersisted = nameInUse(slug, name);
-    addClaudeName(slug, name);
-    void refreshClaudeSummaries(slug);
     const sessionLog = createLogger(slug);
     void (async () => {
       const diffBase = await effectiveBaseOrTrunk(
@@ -270,20 +312,31 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
         resolveDiffBase(row),
       );
       sessionLog.event.info(`entering claude session "${name}" (F12 to detach)`);
-      const result = await enterHarnessSession({
-        renderer,
-        slug,
-        cwd: row.wt.path,
-        harnessId: "claude",
-        managedName: name,
-        diffBase,
+      // Captured via a ref object rather than a plain `let` — TS
+      // doesn't carry control-flow narrowing for a variable back out
+      // of the closure that assigns it, so a bare `let` would still
+      // type as its pre-closure (`null`) state below. A property on an
+      // object read straight back out doesn't hit that limitation.
+      const captured: { result: EnterResult | null } = { result: null };
+      await withNamedClaudePersistence(slug, name, refreshClaudeSummaries, async () => {
+        captured.result = await enterHarnessSession({
+          renderer,
+          slug,
+          cwd: row.wt.path,
+          harnessId: "claude",
+          managedName: name,
+          diffBase,
+        });
+        return captured.result.kind === "spawn-failed"
+          ? { ok: false, reason: captured.result.reason }
+          : { ok: true };
       });
       void refreshTmuxSessions();
+      // Non-null: `withNamedClaudePersistence` always awaits `spawn()`
+      // to completion before returning, and the closure above sets
+      // `captured.result` as its very first statement.
+      const result = captured.result!;
       if (result.kind === "spawn-failed") {
-        // Roll back the optimistic add IFF we created the entry —
-        // if `name` was already in the file (resume case), leave it
-        // so the user can retry from the picker.
-        if (!wasPersisted) removeClaudeName(slug, name);
         sessionLog.event.err(`claude failed to start: ${result.reason}`);
         toast(`claude failed: ${result.reason}`, theme.err, 3000);
       } else if (result.kind === "detached") {

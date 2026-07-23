@@ -13,8 +13,10 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 
 import { type Badge, checkBadge, statusBadge } from "../badges.ts";
 import { BadgeCluster, badgeClusterCells } from "../badge-cluster.tsx";
-import { NF } from "../icons.ts";
 import { useScrollbarNoFlash } from "../hooks/useScrollbarNoFlash.ts";
+import { useScrollToEdge } from "../hooks/useScrollToEdge.ts";
+import { NF } from "../icons.ts";
+import { Divider } from "./section-divider.tsx";
 import { truncateEnd } from "../text.ts";
 import { laneColor, theme } from "../theme.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
@@ -321,47 +323,6 @@ const ReviewRequestRowView = memo(function ReviewRequestRowView({
 });
 
 /**
- * Section divider. One style for every section — manual sections and
- * auto-managed stack sections render identically (muted rule + label);
- * the stack's tree spine on its rows is what marks it as a stack, not
- * the header.
- */
-function Divider({
-  label,
-  width,
-}: {
-  label: string;
-  width: number;
-}) {
-  // Leave room for padding (border+paddingLeft+paddingRight roughly 4
-  // cells) so the rule doesn't bleed past the panel edge.
-  const inner = Math.max(0, width - 4);
-  const labelStr = ` ${label} `;
-  const padding = Math.max(0, inner - labelStr.length - 2);
-  const trail = "─".repeat(padding);
-  // The trail is sized for the full width, but when the list overflows the
-  // vertical scrollbar steals a column, making the row one cell too wide.
-  // Flex layout absorbs that: the `──` prefix is pinned (`flexShrink={0}`),
-  // while the label and trail sit in `overflow="hidden"` boxes that shrink —
-  // so the stolen column clips a `─` off the (much wider) trail, and the
-  // label's `truncate` only ever ellipsises its TAIL, never eating the
-  // leading space after `──`. height={1} + wrapMode="none" keep it one line.
-  return (
-    <box flexDirection="row" height={1} paddingLeft={1} paddingRight={1}>
-      <box flexShrink={0}>
-        <text fg={theme.borderDim} wrapMode="none">──</text>
-      </box>
-      <box flexShrink={1} overflow="hidden">
-        <text fg={theme.fgDim} wrapMode="none" truncate>{labelStr}</text>
-      </box>
-      <box flexShrink={1} overflow="hidden">
-        <text fg={theme.borderDim} wrapMode="none">{trail}</text>
-      </box>
-    </box>
-  );
-}
-
-/**
  * A folded section, collapsed to one selectable header line: a `[×NN]` chip
  * with the hidden-worktree count, then the section label which truncates to a
  * native ellipsis. Highlights like a row when selected; the right detail pane
@@ -464,18 +425,10 @@ export function WorktreeList({ items, archivedRows, reviewRequests, selectedInde
   // header, or the PR url for review-request rows.
   const listRef = useRef<ScrollBoxRenderable>(null);
   const listScrollRef = useScrollbarNoFlash(listRef);
-  // Expose scroll-to-edge to the parent's j/k handler. A large `scrollBy`
-  // clamps at the content edge, so this reveals trailing blank space / the
-  // review + archived headers that sit below the last selectable item.
-  useEffect(() => {
-    if (!scrollHandle) return;
-    scrollHandle.current = {
-      toEdge: (dir) => listRef.current?.scrollBy(dir === "bottom" ? 9999 : -9999, "viewport"),
-    };
-    return () => {
-      if (scrollHandle) scrollHandle.current = null;
-    };
-  }, [scrollHandle]);
+  // Expose scroll-to-edge to the parent's j/k handler — reveals trailing
+  // blank space / the review + archived headers that sit below the last
+  // selectable item. Shared with `panels/tasks.tsx` via `useScrollToEdge`.
+  useScrollToEdge(listRef, scrollHandle);
   const selItem = selectedIndex < reviewOffset ? items[selectedIndex] : undefined;
   const selectedChildId =
     selItem !== undefined

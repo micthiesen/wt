@@ -58,8 +58,9 @@ works in hub mode as Alt+that-key** (`Alt+j`/`Alt+k` to move, `Alt+n` for a
 new worktree, `Alt+d` to remove, `Alt+r` to refresh, `Alt+;` for the sessions
 picker, and so on), plus `Alt+Enter` and `Alt+Tab`. Modifier-combos that
 aren't plain single keys (`Ctrl+J`/`Ctrl+K` scroll, `Ctrl+N`/`Ctrl+R`/`Ctrl+A`,
-`Shift+Tab`, `Shift+F10`/`F11`/`F12`) have no hub-level forwarding — reach for
-classic mode if you need one of those.
+`Shift+Tab`, `Shift+F10`/`F11`/`F12`) have no Alt-level forwarding, but they
+still work whenever the task pane holds direct focus (`F9` over, press the
+combo, `F9` back).
 
 Two bindings are exceptions with no Alt prefix, handled by tmux itself
 instead of relayed to wt:
@@ -70,11 +71,11 @@ instead of relayed to wt:
 - **`F8`** zooms the right pane to full-screen — `resize-pane -Z`.
 
 Which pane holds focus is signaled **inside the task pane** (the session
-pane is left unmarked): the title bar shows `⌨ tasks` (accent) when typing
-lands in the task pane and `⌨ session` (dim) otherwise, and the tasks
-panel border tints accent while focused. When the right pane is showing a
-special session that isn't the selected task's, manually refocusing the
-task pane (F9, mouse) snaps the right pane back to the selection.
+pane is left unmarked): the tasks panel border tints accent while typing
+lands there and drops to a dim border when it goes to the session. When
+the right pane is showing a special session that isn't the selected
+task's, manually refocusing the task pane (F9, mouse) snaps the right
+pane back to the selection.
 
 `F10`/`F11`/`F12` are also forwarded un-prefixed (not `Alt+F10` etc.) since
 they're already dedicated function keys distinct from ordinary letters.
@@ -87,10 +88,11 @@ hub's outer tmux config also turns on `extended-keys always` / `csi-u` so a
 CSI-u-capable terminal gets unambiguous key events instead of the older
 Esc-prefix heuristic.
 
-When a modal picker or footer text prompt is open, wt temporarily pulls tmux
-focus onto the left pane (so you can type into it directly) and hands focus
-back to the right pane the moment it closes — you never have to reach for
-`F9` just to answer a picker.
+When a modal picker or footer text prompt is open, wt temporarily pulls
+tmux focus onto the left pane (so you can type into it directly) and, on
+close, restores focus to whichever pane held it BEFORE the modal opened —
+answering a picker never dumps you into a session pane you weren't in.
+You never need `F9` just to answer a picker.
 
 ## The task model
 
@@ -153,6 +155,14 @@ override where a task sorts without touching its underlying bucket:
 
 Both are worktree-backed only — review-request `pr` tasks can't be pinned or
 snoozed.
+
+For a **collapsed stack** the group's placement uses an effective overlay
+rather than just its focus slice: the stack sorts as pinned when ANY live
+member is pinned, and as snoozed only when EVERY member is live-snoozed at
+its own bucket — so snoozing one urgent slice can't bury the whole stack,
+and pinning any member is enough to surface the group. `z`/`P` on the
+collapsed entry still act on the focus slice; Tab-expand to manage members
+individually.
 
 ## The unread-output bit
 

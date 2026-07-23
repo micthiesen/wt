@@ -21,18 +21,24 @@ test("record stamps a slug and getSnapshot reflects it", () => {
   expect(store.getSnapshot().get("my-slug")).toBe(now);
 });
 
-test("a stamp persists across a second store instance on the same file", () => {
+test("a stamp persists across a second store instance on the same file, once loaded", () => {
   const filePath = tempPath();
   const now = Date.now();
   const first = createTaskFocusStore(filePath);
   first.record("slug-a", now);
 
+  // getSnapshot() never loads on its own (see the type doc) — a fresh
+  // store instance has to call load() explicitly to pick up what's on
+  // disk, the same way the hub pane does at startup.
   const second = createTaskFocusStore(filePath);
+  expect(second.getSnapshot().has("slug-a")).toBe(false);
+  second.load();
   expect(second.getSnapshot().get("slug-a")).toBe(now);
 });
 
-test("a missing file starts empty rather than throwing", () => {
+test("a missing file loads as empty rather than throwing", () => {
   const store = createTaskFocusStore(join(tmpdir(), "wt-task-focus-does-not-exist", "nope.json"));
+  store.load();
   expect(store.getSnapshot().size).toBe(0);
 });
 
@@ -41,6 +47,7 @@ test("a corrupt file is tolerated and treated as empty", () => {
   writeFileSync(filePath, "{ not valid json");
 
   const store = createTaskFocusStore(filePath);
+  store.load();
 
   expect(store.getSnapshot().size).toBe(0);
   // And it's still writable afterward.
@@ -53,8 +60,27 @@ test("a non-object JSON value is tolerated and treated as empty", () => {
   writeFileSync(filePath, "[1,2,3]");
 
   const store = createTaskFocusStore(filePath);
+  store.load();
 
   expect(store.getSnapshot().size).toBe(0);
+});
+
+test("mixed-validity entries: only finite-number values survive load", () => {
+  const filePath = tempPath();
+  // "a"'s value must be a recent-enough epoch-ms or the 30-day prune
+  // (a separate, unrelated guard) would drop it too and defeat the
+  // point of this test.
+  const a = Date.now() - 1_000;
+  writeFileSync(filePath, JSON.stringify({ a, b: "x", c: null }));
+
+  const store = createTaskFocusStore(filePath);
+  store.load();
+  const snapshot = store.getSnapshot();
+
+  expect(snapshot.get("a")).toBe(a);
+  expect(snapshot.has("b")).toBe(false);
+  expect(snapshot.has("c")).toBe(false);
+  expect(snapshot.size).toBe(1);
 });
 
 test("entries older than 30 days are pruned on load", () => {
@@ -70,6 +96,7 @@ test("entries older than 30 days are pruned on load", () => {
   );
 
   const store = createTaskFocusStore(filePath);
+  store.load();
   const snapshot = store.getSnapshot();
 
   expect(snapshot.has("stale")).toBe(false);
@@ -104,4 +131,31 @@ test("subscribe fires listeners on record and unsubscribe stops delivery", () =>
   unsubscribe();
   store.record("slug-e", 2);
   expect(calls).toBe(1);
+});
+
+test("rapid re-stamps within 1500ms of the existing stamp are gated to a single write", () => {
+  const filePath = tempPath();
+  const store = createTaskFocusStore(filePath);
+  // A recent-enough epoch-ms so the unrelated 30-day prune-on-load
+  // doesn't drop it out from under this test.
+  const t0 = Date.now() - 10_000;
+
+  store.record("slug-f", t0);
+  store.record("slug-f", t0 + 500); // within the 1500ms gate — no-op
+  store.record("slug-f", t0 + 1000); // still within the gate — no-op
+
+  // In-memory value stays at the first stamp; the gated calls never
+  // touched the map or bumped the snapshot.
+  expect(store.getSnapshot().get("slug-f")).toBe(t0);
+
+  // A second store instance reading the file confirms only the first
+  // record() actually wrote — the gated calls never hit disk either.
+  const second = createTaskFocusStore(filePath);
+  second.load();
+  expect(second.getSnapshot().get("slug-f")).toBe(t0);
+
+  // Once nowMs clears the gate window (>= 1500ms after the existing
+  // stamp), the next record() persists normally.
+  store.record("slug-f", t0 + 1500);
+  expect(store.getSnapshot().get("slug-f")).toBe(t0 + 1500);
 });

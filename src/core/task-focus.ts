@@ -17,10 +17,14 @@
  * that lock exists to serialize read-modify-write across MULTIPLE
  * writer processes (CLI mutations racing the TUI), and pulls in
  * `core/config.ts` (which fails fast without a real `config.toml`) to
- * find the lock directory. `record()` is called only from the hub's own
- * process on its own local ui action, so a plain load-once /
- * write-through is enough, and staying config-independent keeps this
- * module trivially unit-testable against a temp path.
+ * find the lock directory. Single-writer is now actually true (not just
+ * assumed): only a process that calls `load()`/`record()` — the hub
+ * pane, via `wt _taskpane`'s startup — ever touches the file. The
+ * classic TUI's `useTaskRows` also subscribes to this store (to read
+ * unread state for the task list), but reads never load or write —
+ * see `getSnapshot`'s doc below. That split keeps a plain load-once /
+ * write-through model correct, and staying config-independent keeps
+ * this module trivially unit-testable against a temp path.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -36,8 +40,28 @@ const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export type TaskFocusStore = {
   /** Register a listener fired after every `record()`. Returns an unsubscribe function. Shaped for `useSyncExternalStore`. */
   subscribe(cb: () => void): () => void;
-  /** Stable-identity snapshot; changes identity only on record(). */
+  /**
+   * Stable-identity snapshot; changes identity only on `record()`.
+   * Never triggers a load — before the first `load()`/`record()` call
+   * in this process, this returns the initial empty map. Reading must
+   * stay a pure, side-effect-free operation: `useSyncExternalStore`
+   * (via `useTaskRows`, which the classic TUI's non-hub mode also
+   * subscribes through) can call this from any process, and a lazy
+   * load-that-also-writes here would let a read from a random process
+   * prune-and-persist the file — defeating the single-writer property
+   * the module header promises. Only the hub pane calls `load()`.
+   */
   getSnapshot(): ReadonlyMap<string, number>;
+  /**
+   * Read the on-disk file into memory, pruning stale entries (and
+   * persisting the pruned result, if anything was dropped). Bumps the
+   * snapshot identity so subscribers pick up the loaded state. Safe to
+   * call more than once — subsequent calls are a no-op read-through,
+   * not a re-load, since `record()` already calls this lazily and a
+   * second explicit call (e.g. hub startup racing a keystroke) must
+   * not stomp on any writes made since the first load.
+   */
+  load(): void;
   /** Stamp now for slug and persist. */
   record(slug: string, nowMs?: number): void;
 };
@@ -91,6 +115,9 @@ function pruneStale(map: Map<string, number>, nowMs: number): boolean {
   return changed;
 }
 
+/** Minimum gap between persisted stamps for the same slug — see `record()`'s write gate. */
+const REWRITE_GATE_MS = 1500;
+
 /**
  * Build an independent store bound to `filePath`. Exported (rather than
  * only the singleton below) so tests can point at a temp file instead
@@ -102,7 +129,7 @@ export function createTaskFocusStore(filePath: string): TaskFocusStore {
   let snapshot: ReadonlyMap<string, number> = map;
   const listeners = new Set<() => void>();
 
-  function ensureLoaded(): void {
+  function load(): void {
     if (loaded) return;
     loaded = true;
     map = readFile(filePath);
@@ -118,11 +145,25 @@ export function createTaskFocusStore(filePath: string): TaskFocusStore {
       };
     },
     getSnapshot() {
-      ensureLoaded();
+      // No lazy load here — see the type's doc comment. A process
+      // that never calls `load()`/`record()` just sees an empty map
+      // forever, which is correct: it's not the writer, so it has no
+      // business pulling the file (or a prune-write) into existence.
       return snapshot;
     },
+    load,
     record(slug, nowMs = Date.now()) {
-      ensureLoaded();
+      load();
+      const existing = map.get(slug);
+      // Gate rapid re-stamps of the same slug (e.g. focus flapping
+      // between panes within a keystroke or two of itself) so a burst
+      // of re-focuses doesn't turn into a burst of disk writes and
+      // listener notifications for a timestamp nobody will observe
+      // the intermediate values of. The in-memory map still only ever
+      // needs the latest stamp, so skip the write (and the snapshot
+      // bump that would trigger it) entirely rather than coalescing —
+      // there's nothing to coalesce, the last write always wins.
+      if (existing !== undefined && nowMs - existing < REWRITE_GATE_MS) return;
       map.set(slug, nowMs);
       // New identity so `useSyncExternalStore` (and any naive
       // `===`-comparing caller) sees the change; reads between

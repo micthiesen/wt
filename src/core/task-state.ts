@@ -110,6 +110,19 @@ function computeBucket(sig: TaskSignals): { bucket: TaskBucket; reason: string }
   if (sig.sessionState === "asking") {
     return { bucket: "needs-you", reason: "agent is asking" };
   }
+
+  // busyLock jumps the queue here, checked BEFORE midRebase/conflict
+  // (and everything else in this rung) even though its own bucket is
+  // "working" (rung 3) — a wt-driven op (restack) holds the per-slug
+  // lock while the worktree is legitimately mid-rebase/conflicted, and
+  // that must read "working", not "needs-you: conflict mid-rebase". A
+  // rebase or conflict sitting there WITHOUT a lock is a hand rebase,
+  // so it still falls through to needs-you below. Mirrors
+  // `tui/badges.ts`'s `rebaseBadge`, which checks `lock.op ===
+  // "restack"` first for exactly this reason.
+  if (sig.busyLock) {
+    return { bucket: "working", reason: "worktree busy" };
+  }
   if (sig.midRebase) {
     return { bucket: "needs-you", reason: "conflict mid-rebase" };
   }
@@ -124,9 +137,8 @@ function computeBucket(sig: TaskSignals): { bucket: TaskBucket; reason: string }
   }
 
   // 3. working — something is actively running on the user's behalf.
-  if (sig.busyLock) {
-    return { bucket: "working", reason: "worktree busy" };
-  }
+  // (busyLock itself is handled above, ahead of the needs-you rungs it
+  // would otherwise be shadowed by.)
   if (sig.actionRunning) {
     return { bucket: "working", reason: "action running" };
   }

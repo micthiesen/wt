@@ -14,9 +14,10 @@
  * `taskFocusStore` — everything else arrives via `rows` / `reviewRequests`
  * / `wtState`, already fetched by the caller's existing hooks.
  */
-import { useMemo, useSyncExternalStore } from "react";
+import { useMemo, useRef, useSyncExternalStore } from "react";
 
 import type { SessionTail } from "../../core/harness/claude/jsonl.ts";
+import type { DerivedState } from "../../core/harness/status.ts";
 import { isCleanCandidate } from "../app-helpers.ts";
 import type { ReviewRequestPr } from "../../core/github.ts";
 import {
@@ -48,6 +49,18 @@ import type { ActiveSessionGlyph } from "./useHarnessSessions.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 /**
+ * Section-grouping key for a `TaskItem` — the two synthetic overlay
+ * buckets ("pinned"/"snoozed", which outrank the derived bucket for
+ * display per `displayBucketFor`) and the Sessions-group sentinel,
+ * union'd with the real `TaskBucket`s. Typed as its own union (rather
+ * than `string`) so consumers can switch on it without an `as
+ * TaskBucket` cast — narrowing the three literals out of a `string`
+ * left the residual as an untyped string, whereas narrowing them out
+ * of this union leaves exactly `TaskBucket`.
+ */
+export type DisplayBucket = "pinned" | "snoozed" | "sessions" | TaskBucket;
+
+/**
  * One line-item in the task inbox. Three kinds share the same
  * bucket/manual/detail/displayBucket shape so the panel can render and
  * sort them uniformly:
@@ -69,7 +82,7 @@ export type TaskItem =
       state: TaskState;
       manual: TaskManual;
       detail: string | null;
-      displayBucket: string;
+      displayBucket: DisplayBucket;
       inExpandedStack: boolean;
     }
   | {
@@ -79,7 +92,7 @@ export type TaskItem =
       state: TaskState;
       manual: TaskManual;
       detail: string | null;
-      displayBucket: string;
+      displayBucket: DisplayBucket;
       label: string;
       members: readonly WorktreeRow[];
     }
@@ -89,7 +102,7 @@ export type TaskItem =
       pr: ReviewRequestPr;
       state: TaskState;
       detail: string | null;
-      displayBucket: string;
+      displayBucket: DisplayBucket;
     }
   | {
       /**
@@ -117,7 +130,7 @@ export type TaskRowsResult = { tasks: readonly TaskItem[]; isLoading: boolean };
  * `detail` (pendingAsk / lastAssistantText) all read off it rather than
  * re-scanning the session list per signal.
  */
-function freshestTail(sessions: readonly SessionTail[] | undefined): SessionTail | null {
+export function freshestTail(sessions: readonly SessionTail[] | undefined): SessionTail | null {
   let best: SessionTail | null = null;
   let bestMs = -Infinity;
   for (const s of sessions ?? []) {
@@ -131,7 +144,7 @@ function freshestTail(sessions: readonly SessionTail[] | undefined): SessionTail
 }
 
 /** `PrChecks` (lowercase, worktree-row PR shape) → `TaskPrSignals["checks"]`. */
-function prChecksToTaskChecks(c: PrChecks): TaskPrSignals["checks"] {
+export function prChecksToTaskChecks(c: PrChecks): TaskPrSignals["checks"] {
   switch (c) {
     case "pass":
       return "passing";
@@ -151,7 +164,7 @@ function prChecksToTaskChecks(c: PrChecks): TaskPrSignals["checks"] {
  * closest GitHub concept — and `unrequested`/`none` both collapse to
  * `null` (no decision to report).
  */
-function mapReviewDecision(r: PrReview): TaskPrSignals["reviewDecision"] {
+export function mapReviewDecision(r: PrReview): TaskPrSignals["reviewDecision"] {
   switch (r) {
     case "approved":
       return "APPROVED";
@@ -166,12 +179,22 @@ function mapReviewDecision(r: PrReview): TaskPrSignals["reviewDecision"] {
   }
 }
 
-/** Null when the row has no PR at all — `deriveTaskState`'s `isOpenPr` guard handles the rest. */
-function buildPrSignals(
+/**
+ * Null when the row has no PR at all — `deriveTaskState`'s `isOpenPr`
+ * guard handles the rest — OR when `githubFresh` is false. Persisted
+ * PR data restored from the query cache at boot must never drive a
+ * bucket decision before the github query has live-fetched this
+ * session; `automation-rules.ts`'s freshness guard (see its module doc
+ * comment) enforces the exact same hard rule for automation triggers,
+ * for the exact same reason: a stale red badge shouldn't be able to
+ * fire "needs-you: checks failing" off yesterday's cache.
+ */
+export function buildPrSignals(
   pr: PullRequest | undefined,
   mq: MergeQueueEntry | undefined,
+  githubFresh: boolean,
 ): TaskPrSignals | null {
-  if (!pr) return null;
+  if (!pr || !githubFresh) return null;
   return {
     state: pr.state,
     isDraft: pr.isDraft,
@@ -182,7 +205,7 @@ function buildPrSignals(
   };
 }
 
-function isTaskBucket(x: string): x is TaskBucket {
+export function isTaskBucket(x: string): x is TaskBucket {
   return (TASK_BUCKET_ORDER as readonly string[]).includes(x);
 }
 
@@ -220,7 +243,7 @@ function detailFor(state: TaskState, tail: SessionTail | null): string | null {
 }
 
 /** `"pinned"` / `"snoozed"` outrank the derived bucket for section grouping — same task, different shelf. */
-function displayBucketFor(state: TaskState, manual: TaskManual): string {
+function displayBucketFor(state: TaskState, manual: TaskManual): DisplayBucket {
   if (manual.pinned) return "pinned";
   if (state.snoozed) return "snoozed";
   return state.bucket;
@@ -232,6 +255,31 @@ type RowTaskData = {
   detail: string | null;
   lastActivityMs: number;
 };
+
+/**
+ * `turnEndedAt` gate: only non-null when the freshest tail's own
+ * terminal-ness agrees with the live session state — a session that's
+ * since resumed working past an old tail shouldn't still read as "turn
+ * ended" just because the jsonl hasn't caught up.
+ *
+ * Only `"end_turn"` counts as a genuinely COMPLETED turn. `"paused"` is
+ * mid-turn — a tool-permission stop, not a finished response — per
+ * `core/harness/status.ts`'s own `midTurn` set (which lists
+ * `"paused"` alongside `"tool_use"`/`"tool_result"`). A session
+ * abandoned mid-pause must fall through to idle/"abandoned" in
+ * `deriveTaskState`, not read as unreviewed review-output.
+ */
+export function computeTurnEndedAt(
+  tail: SessionTail | null,
+  sessionState: DerivedState | null,
+): number | null {
+  if (tail === null || tail.lastEntryMs === null) return null;
+  if (tail.lastEntryKind !== "end_turn") return null;
+  if (sessionState === "working" || sessionState === "polling" || sessionState === "asking") {
+    return null;
+  }
+  return tail.lastEntryMs;
+}
 
 /**
  * The full `TaskSignals` → `TaskState` pipeline for one worktree row.
@@ -246,23 +294,12 @@ function computeRowTask(
   activeActions: ReadonlySet<string>,
   wtState: WtState | undefined,
   focusSnapshot: ReadonlyMap<string, number>,
+  githubFresh: boolean,
 ): RowTaskData {
   const slug = row.wt.slug;
   const tail = freshestTail(row.fields.claude.data?.sessions);
   const sessionState = activeSessionBySlug.get(slug)?.state ?? null;
-  // Only meaningful when the freshest tail's own terminal-ness agrees
-  // with the live session state — a session that's since resumed
-  // working past an old end_turn/paused tail shouldn't still read as
-  // "turn ended" just because the jsonl hasn't caught up.
-  const turnEndedAt =
-    tail !== null &&
-    tail.lastEntryMs !== null &&
-    (tail.lastEntryKind === "end_turn" || tail.lastEntryKind === "paused") &&
-    sessionState !== "working" &&
-    sessionState !== "polling" &&
-    sessionState !== "asking"
-      ? tail.lastEntryMs
-      : null;
+  const turnEndedAt = computeTurnEndedAt(tail, sessionState);
   const probe = row.fields.conflict.data;
   const sig: TaskSignals = {
     sessionState,
@@ -274,7 +311,7 @@ function computeRowTask(
     midRebase: probe?.status === "rebasing",
     dirty: row.status.kind === StatusKind.Dirty,
     mergedOrGone: isCleanCandidate(row),
-    pr: buildPrSignals(row.pr, row.mq),
+    pr: buildPrSignals(row.pr, row.mq, githubFresh),
     lastActivityMs: tail?.lastEntryMs ?? 0,
   };
   const manual = manualFor(wtState, slug);
@@ -296,6 +333,116 @@ type SortUnit = {
   sortKey: { state: TaskState; manual: TaskManual; lastActivityMs: number };
   build: () => TaskItem[];
 };
+
+/**
+ * Pick a stack's "focus slice" — the member whose bucket ranks highest
+ * (lowest `TASK_BUCKET_ORDER` index = most urgent); ties broken by
+ * spine ordinal so the pick is deterministic. Uses the RAW bucket
+ * rank, not the snooze-adjusted sort rank — a snoozed member "winning"
+ * the focus slice would hide a genuinely urgent stack behind its own
+ * snooze. Generic over the member shape (rather than `WorktreeRow`
+ * directly) so it's testable with plain data.
+ */
+export function pickFocusMember<T>(
+  members: readonly T[],
+  bucketOf: (m: T) => TaskBucket,
+  ordinalOf: (m: T) => number,
+): T {
+  let focus = members[0]!;
+  let focusRank = TASK_BUCKET_ORDER.indexOf(bucketOf(focus));
+  for (let i = 1; i < members.length; i++) {
+    const m = members[i]!;
+    const rank = TASK_BUCKET_ORDER.indexOf(bucketOf(m));
+    if (rank < focusRank || (rank === focusRank && ordinalOf(m) < ordinalOf(focus))) {
+      focus = m;
+      focusRank = rank;
+    }
+  }
+  return focus;
+}
+
+/** Value-equality for the tiny `TaskState` record — used by `taskItemEq` so a fresh `deriveTaskState()` result with identical fields doesn't defeat item reuse. */
+function taskStateEq(a: TaskState, b: TaskState): boolean {
+  return a.bucket === b.bucket && a.reason === b.reason && a.snoozed === b.snoozed;
+}
+
+/** Value-equality for `TaskManual`, same rationale as `taskStateEq`. */
+function taskManualEq(a: TaskManual, b: TaskManual): boolean {
+  return a.pinned === b.pinned && a.snoozedBucket === b.snoozedBucket;
+}
+
+/** Element-wise identity equality — `stack` items carry their member list by reference per-slot, not the array's own identity (which is rebuilt every pass). */
+function membersEq(a: readonly WorktreeRow[], b: readonly WorktreeRow[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Field-level equality for one `TaskItem`, keyed to each variant's
+ * OBSERVABLE fields: `state`/`manual` by value (fresh objects every
+ * pass but the same content shouldn't count as a change), `row`/`pr`/
+ * `slot` by identity (already reused upstream by `useWorktreeRows` /
+ * the github query, so identity IS the change signal), everything else
+ * by value. Backs the per-key cache in `useTaskRows` that keeps
+ * `TaskItem` identity stable across recomputes so `memo(TaskRowView)`
+ * can actually skip re-rendering unchanged rows.
+ */
+function taskItemEq(a: TaskItem, b: TaskItem): boolean {
+  if (a.kind === "wt" && b.kind === "wt") {
+    return (
+      a.row === b.row &&
+      taskStateEq(a.state, b.state) &&
+      taskManualEq(a.manual, b.manual) &&
+      a.detail === b.detail &&
+      a.displayBucket === b.displayBucket &&
+      a.inExpandedStack === b.inExpandedStack
+    );
+  }
+  if (a.kind === "stack" && b.kind === "stack") {
+    return (
+      a.row === b.row &&
+      taskStateEq(a.state, b.state) &&
+      taskManualEq(a.manual, b.manual) &&
+      a.detail === b.detail &&
+      a.displayBucket === b.displayBucket &&
+      a.label === b.label &&
+      membersEq(a.members, b.members)
+    );
+  }
+  if (a.kind === "pr" && b.kind === "pr") {
+    return (
+      a.pr === b.pr &&
+      taskStateEq(a.state, b.state) &&
+      a.detail === b.detail &&
+      a.displayBucket === b.displayBucket
+    );
+  }
+  if (a.kind === "slot" && b.kind === "slot") {
+    return (
+      a.slot === b.slot &&
+      a.displayBucket === b.displayBucket &&
+      a.collapsedGroup === b.collapsedGroup
+    );
+  }
+  return false;
+}
+
+/**
+ * Return `next` unless an item cached under the same key is field-equal
+ * (`taskItemEq`) to it, in which case the CACHED reference is returned
+ * instead — the reuse that lets `memo(TaskRowView)` skip a re-render.
+ * Always (re-)stores whichever object wins under `next.key`, so the
+ * cache tracks the latest live item per key.
+ */
+function reuseTaskItem(cache: Map<string, TaskItem>, next: TaskItem): TaskItem {
+  const prev = cache.get(next.key);
+  const out = prev && taskItemEq(prev, next) ? prev : next;
+  cache.set(next.key, out);
+  return out;
+}
 
 /**
  * Build the task-inbox list: every live (non-archived) worktree folded
@@ -321,6 +468,14 @@ export function useTaskRows(opts: {
   /** Whether the bottom Sessions group shows all three slots (Tab). */
   slotsExpanded: boolean;
   isLoading: boolean;
+  /**
+   * True once the github query has completed a live fetch this
+   * session — same meaning (and same source: `useAutomations`'
+   * query-cache subscription) as `AutomationEvalCtx.githubFresh` in
+   * `tui/automation-rules.ts`. Gates every PR-derived signal so a
+   * task never buckets off yesterday's persisted PR cache.
+   */
+  githubFresh: boolean;
 }): TaskRowsResult {
   const {
     rows,
@@ -332,6 +487,7 @@ export function useTaskRows(opts: {
     expandedStacks,
     slotsExpanded,
     isLoading,
+    githubFresh,
   } = opts;
 
   // `useSyncExternalStore` is the store's contract for React consumers
@@ -342,6 +498,15 @@ export function useTaskRows(opts: {
     taskFocusStore.getSnapshot,
   );
 
+  // Per-key `TaskItem` cache + the previous flattened array, mirroring
+  // `useWorktreeRows`' `rowCache`/`rowsRef` pattern (see
+  // `useWorktreeRows.ts` around its `rows` memo): lets unchanged items
+  // — and the whole array, when nothing changed — keep their identity
+  // across recomputes so `memo(TaskRowView)` can skip re-rendering rows
+  // whose observable fields didn't move.
+  const itemCache = useRef<Map<string, TaskItem>>(new Map());
+  const prevTasksRef = useRef<readonly TaskItem[]>([]);
+
   const tasks = useMemo(() => {
     // Hub shows the live inbox only — archived worktrees stay out of
     // it entirely (classic mode's list still shows them).
@@ -351,7 +516,7 @@ export function useTaskRows(opts: {
     for (const row of live) {
       rowTasks.set(
         row.wt.slug,
-        computeRowTask(row, activeSessionBySlug, activeActions, wtState, focusSnapshot),
+        computeRowTask(row, activeSessionBySlug, activeActions, wtState, focusSnapshot, githubFresh),
       );
     }
 
@@ -384,7 +549,7 @@ export function useTaskRows(opts: {
       units.push({
         sortKey: { state: rt.state, manual: rt.manual, lastActivityMs: rt.lastActivityMs },
         build: () => [
-          {
+          reuseTaskItem(itemCache.current, {
             kind: "wt",
             key: row.wt.slug,
             row,
@@ -393,34 +558,43 @@ export function useTaskRows(opts: {
             detail: rt.detail,
             displayBucket,
             inExpandedStack: false,
-          },
+          }),
         ],
       });
     }
 
     for (const [key, members] of stackGroups) {
-      // Focus slice: the member whose bucket ranks highest (lowest
-      // TASK_BUCKET_ORDER index = most urgent); ties broken by spine
-      // ordinal so the pick is deterministic. Uses the raw bucket rank,
-      // not the snooze-adjusted sort rank — a snoozed member "winning"
-      // the focus slice would hide a genuinely urgent stack behind its
-      // own snooze.
-      let focus = members[0]!;
-      let focusRank = TASK_BUCKET_ORDER.indexOf(rowTasks.get(focus.wt.slug)!.state.bucket);
-      for (let i = 1; i < members.length; i++) {
-        const m = members[i]!;
-        const rank = TASK_BUCKET_ORDER.indexOf(rowTasks.get(m.wt.slug)!.state.bucket);
-        if (rank < focusRank || (rank === focusRank && m.stack!.ordinal < focus.stack!.ordinal)) {
-          focus = m;
-          focusRank = rank;
-        }
-      }
+      const focus = pickFocusMember(
+        members,
+        (m) => rowTasks.get(m.wt.slug)!.state.bucket,
+        (m) => m.stack!.ordinal,
+      );
       const focusTask = rowTasks.get(focus.wt.slug)!;
       const label = stackSectionLabels.get(key) ?? key;
-      const displayBucket = displayBucketFor(focusTask.state, focusTask.manual);
+
+      // Effective manual overlay for the STACK'S sort position and
+      // section grouping only — NOT the focus member's own `manual`/
+      // `state` fields carried on the built `TaskItem` below, which
+      // still drive the `z`/Shift+P toggles and the row's own badges
+      // (`hub-keys.ts` reads `task.manual`/`task.state` and always
+      // targets the focus slug). Two rules, folded over every live
+      // member:
+      //  - pinned: ANY member pinned promotes the whole stack — using
+      //    only the focus slice's own pin here would mean pinning a
+      //    non-focus member does nothing.
+      //  - snoozed: only when EVERY member is live-snoozed at its OWN
+      //    bucket. An individually-snoozed urgent focus member must
+      //    NOT demote the whole stack below an unsnoozed lesser
+      //    sibling — "any member snoozed" would do exactly that
+      //    whenever the loudest member happened to be the snoozed one.
+      const effectivePinned = members.some((m) => rowTasks.get(m.wt.slug)!.manual.pinned);
+      const effectiveSnoozed = members.every((m) => rowTasks.get(m.wt.slug)!.state.snoozed);
+      const sortState: TaskState = { ...focusTask.state, snoozed: effectiveSnoozed };
+      const sortManual: TaskManual = { ...focusTask.manual, pinned: effectivePinned };
+      const displayBucket = displayBucketFor(sortState, sortManual);
       const sortKey = {
-        state: focusTask.state,
-        manual: focusTask.manual,
+        state: sortState,
+        manual: sortManual,
         lastActivityMs: focusTask.lastActivityMs,
       };
 
@@ -434,7 +608,7 @@ export function useTaskRows(opts: {
           build: () =>
             members.map((m) => {
               const rt = rowTasks.get(m.wt.slug)!;
-              return {
+              return reuseTaskItem(itemCache.current, {
                 kind: "wt",
                 key: m.wt.slug,
                 row: m,
@@ -443,14 +617,14 @@ export function useTaskRows(opts: {
                 detail: rt.detail,
                 displayBucket,
                 inExpandedStack: true,
-              };
+              });
             }),
         });
       } else {
         units.push({
           sortKey,
           build: () => [
-            {
+            reuseTaskItem(itemCache.current, {
               kind: "stack",
               key,
               row: focus,
@@ -460,7 +634,7 @@ export function useTaskRows(opts: {
               displayBucket,
               label,
               members,
-            },
+            }),
           ],
         });
       }
@@ -480,14 +654,14 @@ export function useTaskRows(opts: {
       units.push({
         sortKey: { state, manual, lastActivityMs },
         build: () => [
-          {
+          reuseTaskItem(itemCache.current, {
             kind: "pr",
             key: pr.url,
             pr,
             state,
             detail,
             displayBucket,
-          },
+          }),
         ],
       });
     }
@@ -501,15 +675,46 @@ export function useTaskRows(opts: {
     const visibleSlots = slotsExpanded
       ? [MAIN_CLONE_SLOT, WT_SOURCE_SLOT, DOTFILES_SLOT]
       : [MAIN_CLONE_SLOT];
-    const slotItems: TaskItem[] = visibleSlots.map((slot) => ({
-      kind: "slot",
-      key: `slot:${slot.slug}`,
-      slot,
-      displayBucket: "sessions",
-      collapsedGroup: !slotsExpanded,
-    }));
+    const slotItems: TaskItem[] = visibleSlots.map((slot) =>
+      reuseTaskItem(itemCache.current, {
+        kind: "slot",
+        key: `slot:${slot.slug}`,
+        slot,
+        displayBucket: "sessions",
+        collapsedGroup: !slotsExpanded,
+      }),
+    );
 
-    return [...units.flatMap((u) => u.build()), ...slotItems];
+    const flat = [...units.flatMap((u) => u.build()), ...slotItems];
+
+    // Prune cache entries for keys no longer present, same rationale
+    // as `useWorktreeRows`' `rowCache` prune: without this the map
+    // grows unboundedly across the session as worktrees/PRs/stacks
+    // come and go.
+    if (itemCache.current.size > flat.length) {
+      const liveKeys = new Set(flat.map((t) => t.key));
+      for (const k of itemCache.current.keys()) {
+        if (!liveKeys.has(k)) itemCache.current.delete(k);
+      }
+    }
+
+    // Keep the final array's own identity stable when every element
+    // was reused — lets a consumer that depends on `tasks` (e.g. the
+    // scroll-follow effect in `panels/tasks.tsx`) skip work on a pass
+    // where nothing observable changed at all.
+    const prevTasks = prevTasksRef.current;
+    let tasksUnchanged = prevTasks.length === flat.length;
+    if (tasksUnchanged) {
+      for (let i = 0; i < flat.length; i++) {
+        if (prevTasks[i] !== flat[i]) {
+          tasksUnchanged = false;
+          break;
+        }
+      }
+    }
+    const result = tasksUnchanged ? prevTasks : flat;
+    prevTasksRef.current = result;
+    return result;
   }, [
     rows,
     reviewRequests,
@@ -520,7 +725,41 @@ export function useTaskRows(opts: {
     expandedStacks,
     slotsExpanded,
     focusSnapshot,
+    githubFresh,
   ]);
 
   return { tasks, isLoading };
+}
+
+/**
+ * Resolve a persisted selection key (`sel`, from `taskFocusStore` or
+ * wherever the caller tracks "last selected task") to an index into
+ * the current `tasks` array. Exact rules, in order:
+ *
+ *  1. Direct `key` match (the common case — the exact same item is
+ *     still present).
+ *  2. Otherwise `sel` may be a worktree SLUG that has since moved
+ *     inside a collapsed stack (`row.section === sel` on an expanded
+ *     member) or that names a collapsed stack's key directly
+ *     (`row.section === sel`) — or `sel` may itself be a stack section
+ *     key whose collapsed item's members still include it.
+ *  3. Falls back to `0` (the top of the inbox) when nothing matches,
+ *     or when `sel` is `null`.
+ *
+ * Pure and side-effect-free so it's usable both from the app's
+ * selection-derivation memo and from unit tests, without constructing
+ * a `TaskRowsResult` at all.
+ */
+export function resolveTaskIndex(tasks: readonly TaskItem[], sel: string | null): number {
+  if (sel === null) return 0;
+  const direct = tasks.findIndex((t) => t.key === sel);
+  if (direct >= 0) return direct;
+  const bySlug = tasks.findIndex((t) =>
+    t.kind === "wt"
+      ? t.row.wt.slug === sel || t.row.section === sel
+      : t.kind === "stack"
+        ? t.members.some((m) => m.wt.slug === sel)
+        : false,
+  );
+  return bySlug >= 0 ? bySlug : 0;
 }

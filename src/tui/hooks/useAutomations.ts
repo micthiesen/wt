@@ -77,6 +77,7 @@ import {
   type AutomationFire,
 } from "../automation-rules.ts";
 import { isCleanCandidate } from "../app-helpers.ts";
+import { useGithubFresh } from "./useGithubFresh.ts";
 import type { ActiveSessionGlyph } from "./useHarnessSessions.ts";
 import type { LaunchActionOpts, LaunchOutcome } from "./useActionDispatch.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
@@ -188,26 +189,9 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
   // engine must not fire before it knows the pause flags.
   const wtStateReady = wtState.data !== undefined;
   const paused = !wtStateReady || wtState.data.automationsPaused === true;
-  // "Fresh" = a FETCH-driven success on the github query this session.
-  // Deliberately not `dataUpdatedAt > appStart`: optimistic patches
-  // (`setQueriesData` in the mark-ready / auto-merge / reviewer flows)
-  // bump `dataUpdatedAt` on the whole cached blob without any network
-  // round-trip, which would forge freshness for every OTHER PR still
-  // sitting on restored persisted data. The cache subscription filters
-  // to non-manual successes — the same manual-flag discrimination the
-  // clobber guard in `runOptimisticMutation` uses.
-  const [githubFresh, setGithubFresh] = useState(false);
-  useEffect(() => {
-    if (!configured || githubFresh) return;
-    const unsubscribe = qc.getQueryCache().subscribe((event) => {
-      if (event.type !== "updated") return;
-      if (event.action.type !== "success") return;
-      if ((event.action as { manual?: boolean }).manual) return;
-      if (event.query.queryKey[0] !== "github") return;
-      setGithubFresh(true);
-    });
-    return unsubscribe;
-  }, [configured, githubFresh, qc]);
+  // Freshness subscription extracted to `useGithubFresh` (shared with
+  // the hub task-inbox derivation — same persisted-cache hard rule).
+  const githubFresh = useGithubFresh(configured);
 
   // Everything the pass reads lives in a ref so the effects subscribe
   // once and never tear down mid-flight (same pattern as

@@ -7,14 +7,23 @@
  * takes over the terminal wt lives in.
  *
  * Same per-render factory pattern as the other flows: closures see
- * fresh rows / primary harness on every render.
+ * fresh rows / primary harness on every render. All cross-render
+ * coordination state (switch sequencing, in-flight target, the focus
+ * subprocess queue) lives in refs the caller owns (`useHubController`),
+ * because the factory itself is rebuilt every render.
+ *
+ * ## Switch sequencing
+ *
+ * Every explicit, user-initiated flow (Enter/F-keys, picker commits)
+ * bumps `seqRef` synchronously at dispatch; every awaited step in its
+ * async chain re-checks the sequence and aborts when a newer action
+ * superseded it. The live-follow flows do NOT bump — they capture the
+ * current sequence and abort if anything explicit fires afterward.
+ * Net effect: last explicit action wins, a slow spawn can never
+ * clobber a faster later switch, and a stale debounced follow can
+ * never yank the pane away from an explicit F11/F12 target.
  */
 import { effectiveBaseOrTrunk } from "../../core/git.ts";
-import {
-  addClaudeName,
-  nameInUse,
-  removeClaudeName,
-} from "../../core/harness/claude/names.ts";
 import { getHarness, type HarnessId } from "../../core/harness/index.ts";
 import {
   focusLeft,
@@ -37,6 +46,7 @@ import {
 import type { useHarnessSessions } from "../hooks/useHarnessSessions.ts";
 import { isSyntheticLiveSessionId } from "../hooks/useHarnessSessions.ts";
 import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import { withNamedClaudePersistence } from "./sessions.ts";
 import type { SessionSlot } from "../sessions/slots.ts";
 import { theme } from "../theme.ts";
 
@@ -44,16 +54,17 @@ const hubLog = createLogger("[hub]");
 
 /**
  * What the hub's right pane is currently showing, as far as this
- * process knows (it performs every switch, so this only drifts if
- * someone drives the inner tmux server by hand). `task` = the selected
- * task's own session — the steady state; `slot` = a special session
- * (`,` / `.` / `/`), which the task pane surfaces prominently so the
- * user isn't confused about what they're typing into; `home` = the
- * dashboard.
+ * process knows (it performs every switch; the shown-session liveness
+ * watch in `useHubController` reconciles the cases it can't see, like
+ * a kill or a pane respawn snapping back to home). `task` = a
+ * worktree-backed session — the steady state; `slot` = one of the
+ * Sessions-group entries (main clone / wt source / dotfiles); `home` =
+ * the dashboard. `name` is the inner-server tmux session actually on
+ * screen — the liveness watch keys on it.
  */
 export type HubShown =
-  | { kind: "task"; slug: string; target: "harness" | "diff" | "shell" }
-  | { kind: "slot"; label: string }
+  | { kind: "task"; slug: string; target: "harness" | "diff" | "shell"; name: string }
+  | { kind: "slot"; label: string; name: string }
   | { kind: "home" };
 
 export type HubFlowsCtx = {
@@ -65,20 +76,34 @@ export type HubFlowsCtx = {
   reportActionError: (label: string, err: unknown) => void;
   refreshTmuxSessions: () => Promise<void>;
   refreshClaudeSummaries: (slug: string) => Promise<void>;
-  /** Records what the right pane now shows (drives the task-pane indicator). */
+  /** Records what the right pane now shows (drives the liveness watch). */
   setShown: (shown: HubShown) => void;
   /**
    * Stamp the task pane's focus indicator. Every flow that moves tmux
-   * focus to the session pane must record it here in the same stroke —
-   * terminal focus events are an unreliable fallback (mouse only), so
-   * an unstamped `focusRight()` leaves the tasks pane styled focused
-   * while typing actually goes to the session (the F10/F11/`,` bug).
+   * focus must record it in the same stroke — terminal focus events
+   * are an unreliable fallback (mouse only), so an unstamped
+   * `focusRight()` leaves the tasks pane styled focused while typing
+   * actually goes to the session.
    */
   setPaneFocused: (focused: boolean) => void;
-  /** Live reads for the F-key toggle (refs on the app side, so the
-   *  per-render flow identity doesn't matter). */
+  /** Live reads (refs on the caller side, immune to render identity). */
   getShown: () => HubShown;
   isPaneFocused: () => boolean;
+  /** Monotone sequence for last-explicit-action-wins (see header). */
+  seqRef: { current: number };
+  /**
+   * Key of the explicit switch currently in flight (`task:<slug>:<target>`
+   * or `slot:<label>`), null when idle. Lets a repeat press during the
+   * spawn window read as "toggle focus", and lets the follow flows
+   * yield to explicit actions.
+   */
+  pendingTargetRef: { current: string | null };
+  /**
+   * Serialization queue for focus subprocesses: two rapid F9s must
+   * apply their `select-pane`s in dispatch order or the indicator and
+   * reality can end up inverted.
+   */
+  focusOpRef: { current: Promise<void> };
   onExit: () => void;
 };
 
@@ -95,18 +120,30 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     setPaneFocused,
     getShown,
     isPaneFocused,
+    seqRef,
+    pendingTargetRef,
+    focusOpRef,
     onExit,
   } = ctx;
 
+  /** Enqueue a focus subprocess so rapid toggles apply in order. */
+  function queueFocusOp(op: () => Promise<void>): void {
+    focusOpRef.current = focusOpRef.current.then(op).catch(() => {});
+  }
+
   /** Hand keyboard focus to the session pane AND stamp the indicator. */
-  async function focusSessionPane(): Promise<void> {
-    await focusRight();
+  function focusSessionPane(): void {
+    queueFocusOp(async () => {
+      await focusRight();
+    });
     setPaneFocused(false);
   }
 
   /** And back: focus the task pane, stamping likewise. */
-  async function focusTaskPane(): Promise<void> {
-    await focusLeft();
+  function focusTaskPane(): void {
+    queueFocusOp(async () => {
+      await focusLeft();
+    });
     setPaneFocused(true);
   }
 
@@ -114,40 +151,50 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
    * Point the right pane at `name`, record what it shows now, and
    * optionally stamp the task-focus clock (harness views count as
    * "looked at the output"; diff/shell views don't clear the unread
-   * bit).
+   * bit). Returns false when the switch failed or was superseded by a
+   * newer explicit action — callers must not move focus on false, or
+   * the indicator lies about where typing lands.
    */
   async function switchTo(
     name: string,
     focusSlug: string | null,
     shown: HubShown,
-  ): Promise<void> {
+    seq: number,
+  ): Promise<boolean> {
+    if (seqRef.current !== seq) return false;
     const ok = await switchRight(name);
+    if (seqRef.current !== seq) return false;
     if (!ok) {
       toast(`could not show ${name}`, theme.warn, 2000);
-      return;
+      return false;
     }
     setShown(shown);
     if (focusSlug) taskFocusStore.record(focusSlug);
+    return true;
   }
 
   /**
    * Show a worktree's session in the right pane, spawning it detached
    * first when nothing is live. `harness` resolves the same F12 target
    * the classic mode would attach to (live session of any harness, else
-   * resume/spawn the primary).
+   * resume/spawn the primary — named claude slots included).
    */
   function showTaskSession(
     row: WorktreeRow,
     target: "harness" | "diff" | "shell",
   ): void {
     const slug = row.wt.slug;
-    // Repeat press = focus toggle: the right pane already shows exactly
-    // this session, so F12/F11/F10 flip which pane the keyboard lands
-    // in instead of re-switching — enter with one press, hop back with
-    // the same key.
+    const targetKey = `task:${slug}:${target}`;
+    // Repeat press = focus toggle: the right pane already shows (or an
+    // in-flight switch is already bringing up) exactly this session, so
+    // F12/F11/F10 flip which pane the keyboard lands in instead of
+    // re-switching — enter with one press, hop back with the same key.
     const shown = getShown();
-    if (shown.kind === "task" && shown.slug === slug && shown.target === target) {
-      void (isPaneFocused() ? focusSessionPane() : focusTaskPane());
+    const alreadyShown =
+      shown.kind === "task" && shown.slug === slug && shown.target === target;
+    if (alreadyShown || pendingTargetRef.current === targetKey) {
+      if (isPaneFocused()) focusSessionPane();
+      else focusTaskPane();
       return;
     }
     const blocked = sessionLaunchBlockedReason(row);
@@ -155,13 +202,22 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
     }
+    const seq = ++seqRef.current;
+    pendingTargetRef.current = targetKey;
     void (async () => {
       try {
         if (target === "harness") {
           const f12 = currentHarnessSessions.f12Target;
           if (f12?.isLive) {
-            await switchTo(f12.tmuxSessionName, slug, { kind: "task", slug, target });
-            await focusSessionPane();
+            const shownNext: HubShown = {
+              kind: "task",
+              slug,
+              target,
+              name: f12.tmuxSessionName,
+            };
+            if (await switchTo(f12.tmuxSessionName, slug, shownNext, seq)) {
+              focusSessionPane();
+            }
             return;
           }
           // Match classic F12 exactly: resume the target's OWN slot —
@@ -189,12 +245,12 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
             hubLog.event.info(`started ${getHarness(harnessId).label} session for ${slug}`);
             void refreshTmuxSessions();
           }
-          await switchTo(sessionName(slug, harnessId, managedName), slug, {
-            kind: "task",
-            slug,
-            target,
-          });
-          await focusSessionPane();
+          const name = sessionName(slug, harnessId, managedName);
+          if (
+            await switchTo(name, slug, { kind: "task", slug, target, name }, seq)
+          ) {
+            focusSessionPane();
+          }
           return;
         }
         // diff / shell: ensure the kind's single per-slug session, then
@@ -215,26 +271,41 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, target), null, { kind: "task", slug, target });
-        await focusSessionPane();
+        const name = sessionName(slug, target);
+        if (
+          await switchTo(name, null, { kind: "task", slug, target, name }, seq)
+        ) {
+          focusSessionPane();
+        }
       } catch (err) {
         reportActionError(`${target} session`, err);
+      } finally {
+        if (pendingTargetRef.current === targetKey) {
+          pendingTargetRef.current = null;
+        }
       }
     })();
   }
 
   /**
-   * Show a slot session (`,` / `.` / `/`) in the right pane. The hub
-   * analogue of `doEnterSlotSession` — same primary-harness spawn, no
-   * renderer handoff.
+   * Show a Sessions-group slot entry (main clone / wt source /
+   * dotfiles) in the right pane — reached by selecting the entry and
+   * pressing Enter/F12, never by a dedicated keybinding (the classic
+   * `,` / `.` / `/` chords are retired in hub mode).
    */
   function showSlotSession(slot: SessionSlot): void {
-    // Repeat press = focus toggle, mirroring showTaskSession.
+    const targetKey = `slot:${slot.label}`;
     const shown = getShown();
-    if (shown.kind === "slot" && shown.label === slot.label) {
-      void (isPaneFocused() ? focusSessionPane() : focusTaskPane());
+    if (
+      (shown.kind === "slot" && shown.label === slot.label) ||
+      pendingTargetRef.current === targetKey
+    ) {
+      if (isPaneFocused()) focusSessionPane();
+      else focusTaskPane();
       return;
     }
+    const seq = ++seqRef.current;
+    pendingTargetRef.current = targetKey;
     void (async () => {
       try {
         const res = await ensureSessionDetached({
@@ -249,13 +320,18 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slot.slug, primaryHarness, null), null, {
-          kind: "slot",
-          label: slot.label,
-        });
-        await focusSessionPane();
+        const name = sessionName(slot.slug, primaryHarness, null);
+        if (
+          await switchTo(name, null, { kind: "slot", label: slot.label, name }, seq)
+        ) {
+          focusSessionPane();
+        }
       } catch (err) {
         reportActionError("slot session", err);
+      } finally {
+        if (pendingTargetRef.current === targetKey) {
+          pendingTargetRef.current = null;
+        }
       }
     })();
   }
@@ -266,7 +342,7 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
    * (`Shift+F12`) modals work unchanged in hub mode. Where classic
    * suspends the renderer and attaches full-screen, this ensures the
    * session detached and retargets the right pane; attaching inside
-   * the ~44-col task pane is exactly the failure this replaces.
+   * the ~35-col task pane is exactly the failure this replaces.
    */
   function enterHarnessSession(
     slug: string,
@@ -288,6 +364,9 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
       return;
     }
     const managedName = opts.managedName ?? null;
+    const seq = ++seqRef.current;
+    const targetKey = `task:${slug}:harness`;
+    pendingTargetRef.current = targetKey;
     void (async () => {
       try {
         // Codex / OpenCode share one tmux slot per slug; a "fresh"
@@ -309,23 +388,32 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
           return;
         }
         if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, harnessId, managedName), slug, {
-          kind: "task",
-          slug,
-          target: "harness",
-        });
-        await focusSessionPane();
+        const name = sessionName(slug, harnessId, managedName);
+        if (
+          await switchTo(name, slug, {
+            kind: "task",
+            slug,
+            target: "harness",
+            name,
+          }, seq)
+        ) {
+          focusSessionPane();
+        }
       } catch (err) {
         reportActionError("harness session", err);
+      } finally {
+        if (pendingTargetRef.current === targetKey) {
+          pendingTargetRef.current = null;
+        }
       }
     })();
   }
 
   /**
-   * Hub-safe drop-in for `doSpawnNamedClaudeSession` (`; c`). Mirrors
-   * the classic flow's persist-before-spawn contract (name reachable
-   * after a crash mid-spawn; rolled back only when WE created it and
-   * the spawn failed) — just detached + retargeted instead of attached.
+   * Hub-safe drop-in for `doSpawnNamedClaudeSession` (`; c`). The
+   * persist-before-spawn/rollback contract is shared with the classic
+   * flow via `withNamedClaudePersistence` — just detached + retargeted
+   * instead of attached.
    */
   function spawnNamedClaudeSession(slug: string, name: string): void {
     const row = rows.find((r) => r.wt.slug === slug);
@@ -338,28 +426,45 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
       toast(`${slug} is ${blocked}`, theme.warn, 2000);
       return;
     }
-    const wasPersisted = nameInUse(slug, name);
-    addClaudeName(slug, name);
-    void refreshClaudeSummaries(slug);
+    const seq = ++seqRef.current;
+    const targetKey = `task:${slug}:harness`;
+    pendingTargetRef.current = targetKey;
     void (async () => {
       try {
-        const res = await ensureSessionDetached({
+        const out = await withNamedClaudePersistence(
           slug,
-          cwd: row.wt.path,
-          kind: "claude",
-          managedName: name,
-        });
-        if (!res.ok) {
-          if (!wasPersisted) removeClaudeName(slug, name);
-          toast(`claude failed: ${res.reason}`, theme.err, 3000);
+          name,
+          refreshClaudeSummaries,
+          async () =>
+            await ensureSessionDetached({
+              slug,
+              cwd: row.wt.path,
+              kind: "claude",
+              managedName: name,
+            }),
+        );
+        if (!out.ok) {
+          toast(`claude failed: ${out.reason ?? "spawn failed"}`, theme.err, 3000);
           return;
         }
-        if (res.created) void refreshTmuxSessions();
-        await switchTo(sessionName(slug, "claude", name), slug, { kind: "task", slug, target: "harness" });
-        await focusSessionPane();
+        void refreshTmuxSessions();
+        const tmuxName = sessionName(slug, "claude", name);
+        if (
+          await switchTo(tmuxName, slug, {
+            kind: "task",
+            slug,
+            target: "harness",
+            name: tmuxName,
+          }, seq)
+        ) {
+          focusSessionPane();
+        }
       } catch (err) {
-        if (!wasPersisted) removeClaudeName(slug, name);
         reportActionError("named claude session", err);
+      } finally {
+        if (pendingTargetRef.current === targetKey) {
+          pendingTargetRef.current = null;
+        }
       }
     })();
   }
@@ -367,18 +472,19 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   /**
    * Live-follow for a selected Sessions-slot task: show its live
    * session (never stealing focus), else the home dashboard. The slot
-   * counterpart of `followSelection`.
+   * counterpart of `followSelection`. Yields to any in-flight or later
+   * explicit action (captures the sequence without bumping it).
    */
   function followSlot(slot: SessionSlot, isLive: boolean): void {
+    if (pendingTargetRef.current !== null) return;
+    const seq = seqRef.current;
     if (isLive) {
-      void switchTo(sessionName(slot.slug, primaryHarness, null), null, {
-        kind: "slot",
-        label: slot.label,
-      });
+      const name = sessionName(slot.slug, primaryHarness, null);
+      void switchTo(name, null, { kind: "slot", label: slot.label, name }, seq);
     } else {
       void showHome()
         .then((ok) => {
-          if (ok) setShown({ kind: "home" });
+          if (ok && seqRef.current === seq) setShown({ kind: "home" });
         })
         .catch(() => {});
     }
@@ -386,9 +492,10 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
 
   /** Point the right pane back at the home dashboard. */
   function showHomePane(): void {
+    const seq = seqRef.current;
     void showHome()
       .then((ok) => {
-        if (ok) setShown({ kind: "home" });
+        if (ok && seqRef.current === seq) setShown({ kind: "home" });
       })
       .catch((err) => reportActionError("hub home", err));
   }
@@ -396,20 +503,23 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
   /**
    * Follow the task cursor: live session → show it (and stamp focus,
    * since it's now on screen); anything else → home. Fire-and-forget;
-   * the caller debounces.
+   * the caller debounces. Yields to explicit actions (see header).
    */
   function followSelection(row: WorktreeRow | undefined): void {
+    if (pendingTargetRef.current !== null) return;
+    const seq = seqRef.current;
     const f12 = currentHarnessSessions.f12Target;
     if (row && f12?.isLive) {
       void switchTo(f12.tmuxSessionName, row.wt.slug, {
         kind: "task",
         slug: row.wt.slug,
         target: "harness",
-      });
+        name: f12.tmuxSessionName,
+      }, seq);
     } else {
       void showHome()
         .then((ok) => {
-          if (ok) setShown({ kind: "home" });
+          if (ok && seqRef.current === seq) setShown({ kind: "home" });
         })
         .catch(() => {});
     }
@@ -435,6 +545,8 @@ export function makeHubFlows(ctx: HubFlowsCtx) {
     spawnNamedClaudeSession,
     showHomePane,
     followSelection,
+    focusSessionPane,
+    focusTaskPane,
     hubQuit,
   };
 }

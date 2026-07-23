@@ -168,10 +168,19 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
 
-  // Bottom-pane focus keys have no destination in hub mode (the
-  // outputs pane isn't rendered; the real session lives in the right
-  // tmux pane). Swallow with feedback instead of silently no-op'ing.
-  if (k.sequence === "'" || k.sequence === "[" || k.sequence === "]" || isPlainLetter(k, "f")) {
+  // Bottom-pane FOCUS keys (' pick output, [ ] cycle, " jump to
+  // events) have no destination in hub mode — the outputs pane isn't
+  // rendered; the real session lives in the right tmux pane. Swallow
+  // the whole sibling family with feedback instead of silently
+  // mutating output-focus state nothing displays. `f` (tail failing CI
+  // logs) is deliberately NOT swallowed: it's an action, not a focus
+  // key — it falls through and its lines land in the daily app log.
+  if (
+    k.sequence === "'" ||
+    k.sequence === "[" ||
+    k.sequence === "]" ||
+    k.sequence === '"'
+  ) {
     toast("no output pane in hub — the session pane is live", theme.fgDim, 1800);
     return;
   }

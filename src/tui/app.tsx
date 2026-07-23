@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import type { KeyEvent, ScrollBoxRenderable } from "@opentui/core";
@@ -20,7 +20,6 @@ import {
   useHarnessSessions,
 } from "./hooks/useHarnessSessions.ts";
 import { SESSION_SLOTS } from "./sessions/slots.ts";
-import { taskFocusStore } from "../core/task-focus.ts";
 import type { Modal } from "./modal-state.ts";
 import { PostFooterModals, PreFooterModals } from "./modal-host.tsx";
 import { handleSimpleModalKey } from "./modal-keys/index.ts";
@@ -54,10 +53,9 @@ import { handleGlobalKey } from "./keyboard/global-keys.ts";
 import { handleHubKey } from "./keyboard/hub-keys.ts";
 import { handleNormalKey, type NormalKeysCtx } from "./keyboard/normal-keys.ts";
 import { handleRemovedViewKey } from "./keyboard/removed-view-keys.ts";
-import { focusLeft, focusRight } from "../core/hub.ts";
-import { makeHubFlows, type HubShown } from "./flows/hub.ts";
-import { useHubPaneFocus } from "./hooks/useHubPaneFocus.ts";
-import { useTaskRows } from "./hooks/useTaskRows.ts";
+import { useGithubFresh } from "./hooks/useGithubFresh.ts";
+import { useHubController } from "./hooks/useHubController.ts";
+import { resolveTaskIndex, useTaskRows } from "./hooks/useTaskRows.ts";
 import { TaskList } from "./panels/tasks.tsx";
 import { makeActionPickerFlows } from "./flows/action-picker.ts";
 import { makeBaseFlows } from "./flows/base.ts";
@@ -285,23 +283,9 @@ export function App({ onExit, hubPane = false }: Props) {
   );
   const [slotsExpanded, setSlotsExpanded] = useState(false);
   const [showHubDetails, setShowHubDetails] = useState(true);
-  // What the hub's right pane currently shows (task session / slot /
-  // home) — set by every hub-flow switch; drives the title-bar
-  // indicator so a slot session (`,`) can't be mistaken for the
-  // selected task's session.
-  const [hubShown, setHubShown] = useState<HubShown>({ kind: "home" });
-  // Keypresses before this timestamp are dropped in hub mode — the
-  // startup window where terminal-query replies can masquerade as keys
-  // (see the mute note in the keyboard router).
-  const hubMuteUntilRef = useRef(Date.now() + 800);
-  // Whether THIS pane holds keyboard focus (hub only; F9 / select-pane
-  // flips it). Signaled in the task pane; the harness pane is left
-  // untouched. Every wt-driven focus change stamps the state directly
-  // (see useHubPaneFocus); terminal events cover mouse clicks.
-  const { focused: hubPaneFocused, setFocused: setHubPaneFocused } =
-    useHubPaneFocus(hubPane);
-  const hubPaneFocusedRef = useRef(hubPaneFocused);
-  hubPaneFocusedRef.current = hubPaneFocused;
+  // Hub orchestration (focus, follow, shown-state, mute) lives in
+  // useHubController — called further down once its inputs (tasks,
+  // session discovery) exist.
   // Sessions-slot glyphs (main clone / wt source / dotfiles) — the
   // same discovery the footer's robots used, keyed to the primary
   // harness. Merged with the per-worktree map for the task pane so a
@@ -315,6 +299,9 @@ export function App({ onExit, hubPane = false }: Props) {
     () => new Map([...activeSessionBySlug, ...slotGlyphs]),
     [activeSessionBySlug, slotGlyphs],
   );
+  // PR-driven buckets honor the same persisted-cache freshness hard
+  // rule the automations engine enforces (see useGithubFresh).
+  const githubFresh = useGithubFresh();
   const { tasks } = useTaskRows({
     rows,
     reviewRequests: reviewRequestRows,
@@ -324,28 +311,14 @@ export function App({ onExit, hubPane = false }: Props) {
     stackSectionLabels,
     expandedStacks,
     slotsExpanded,
+    githubFresh,
     isLoading,
   });
-  const taskIndex = useMemo(() => {
-    if (!hubPane || tasks.length === 0) return 0;
-    if (sel !== null) {
-      const direct = tasks.findIndex((t) => t.key === sel);
-      if (direct >= 0) return direct;
-      // A slug key can point inside a collapsed stack (select the stack
-      // task that contains it), and a stack key can point at an
-      // expanded stack (select its first member — `row.section` IS the
-      // stack key on members).
-      const bySlug = tasks.findIndex((t) =>
-        t.kind === "wt"
-          ? t.row.wt.slug === sel || t.row.section === sel
-          : t.kind === "stack"
-            ? t.members.some((m) => m.wt.slug === sel)
-            : false,
-      );
-      if (bySlug >= 0) return bySlug;
-    }
-    return 0;
-  }, [hubPane, tasks, sel]);
+  // Selection-key → index resolution lives with the task model.
+  const taskIndex = useMemo(
+    () => (hubPane ? resolveTaskIndex(tasks, sel) : 0),
+    [hubPane, tasks, sel],
+  );
   const hubTask = hubPane ? tasks[taskIndex] : undefined;
   const hubRow =
     hubTask && (hubTask.kind === "wt" || hubTask.kind === "stack")
@@ -583,28 +556,34 @@ export function App({ onExit, hubPane = false }: Props) {
     reportActionError,
   });
 
-  // Hub-mode flows: retarget the right pane instead of attaching. Kept
-  // in a ref so the follow effect below can fire on selection changes
-  // without depending on the per-render flow identity.
-  const hubFlows = makeHubFlows({
+  // Hub orchestration: shown-state, focus indicator + F9 toggle, the
+  // live-follow, the modal focus dance, the shown-session liveness
+  // watch, on-screen focus stamping, and the startup key mute.
+  const inputActive = modal !== null || footer.kind === "input";
+  const hub = useHubController({
+    enabled: hubPane,
+    tasks,
+    taskIndex,
     rows,
-    primaryHarness,
     currentHarnessSessions,
+    primaryHarness,
+    slotGlyphs,
+    inputActive,
     toast,
     reportActionError,
     refreshTmuxSessions,
     refreshClaudeSummaries,
-    setShown: setHubShown,
-    setPaneFocused: setHubPaneFocused,
-    getShown: () => hubShownRef.current,
-    isPaneFocused: () => hubPaneFocusedRef.current,
     onExit: quit,
   });
+  const hubFlows = hub.hubFlows;
   // Hub mode swaps the renderer-suspending session entries for
-  // right-pane retargets EVERYWHERE they're reachable — the sessions
-  // picker (`;`), harness-select (`Shift+F12`), and the slot keys —
-  // not just the intercepted F-keys. A full-screen attach inside the
-  // ~44-col task pane is never correct.
+  // right-pane retargets EVERYWHERE they're reachable. In hub mode the
+  // only LIVE paths through these substitutions are the modal ones —
+  // the sessions picker (`;`) and harness-select (`Shift+F12`) commit
+  // handlers, plus the removed-view global keys — because handleHubKey
+  // intercepts the direct F12 and slot keybindings before fallthrough.
+  // They're still substituted wholesale so no future caller can reach
+  // a full-screen attach from the ~35-col task pane.
   const effDoEnterHarnessSession = hubPane
     ? hubFlows.enterHarnessSession
     : doEnterHarnessSession;
@@ -614,135 +593,7 @@ export function App({ onExit, hubPane = false }: Props) {
   const effDoEnterSlotSession = hubPane
     ? hubFlows.showSlotSession
     : doEnterSlotSession;
-  const hubFlowsRef = useRef(hubFlows);
-  hubFlowsRef.current = hubFlows;
-  const hubRowRef = useRef(hubRow);
-  hubRowRef.current = hubRow;
-  const hubTaskRef = useRef(hubTask);
-  hubTaskRef.current = hubTask;
-  const slotGlyphsRef = useRef(slotGlyphs);
-  slotGlyphsRef.current = slotGlyphs;
   const queryClient = useQueryClient();
-
-  /** Re-assert the right pane against the current selection (task OR slot). */
-  function followNow(): void {
-    const t = hubTaskRef.current;
-    if (t?.kind === "slot") {
-      hubFlowsRef.current.followSlot(
-        t.slot,
-        slotGlyphsRef.current.has(t.slot.slug),
-      );
-      return;
-    }
-    hubFlowsRef.current.followSelection(hubRowRef.current);
-  }
-  const followNowRef = useRef(followNow);
-  followNowRef.current = followNow;
-
-  // Live-follow: the right pane tracks the task cursor — a task with a
-  // live session shows it (stamping the focus clock: it's on screen),
-  // anything else shows the home dashboard. Debounced so holding j/k
-  // doesn't spray switch-clients; keyed on the resolved target so a
-  // session going live/dead re-follows without a cursor move.
-  const f12 = currentHarnessSessions.f12Target;
-  const followKey = hubPane
-    ? hubTask?.kind === "slot"
-      ? `${hubTask.key}:${slotGlyphs.has(hubTask.slot.slug) ? "live" : ""}`
-      : `${hubTask?.key ?? ""}:${f12?.isLive ? f12.tmuxSessionName : ""}`
-    : "";
-  useEffect(() => {
-    if (!hubPane) return;
-    const t = setTimeout(() => {
-      followNowRef.current();
-    }, 150);
-    return () => clearTimeout(t);
-  }, [hubPane, followKey]);
-
-  // Focus dance: pickers and footer prompts need direct typing, so pull
-  // tmux focus onto this pane while one is open and hand it back to the
-  // harness pane on close. Everything else is Alt-driven and works
-  // regardless of pane focus.
-  // On-screen = reviewed: while a task's HARNESS session is displayed
-  // in the right pane, keep its focus stamp fresh whenever new output
-  // lands — a turn that finishes in front of you must not file itself
-  // under "Review output". Keyed on the shown slug's latest tail entry
-  // so the effect re-stamps exactly when output arrives, not per render.
-  const shownHarnessSlug =
-    hubPane && hubShown.kind === "task" && hubShown.target === "harness"
-      ? hubShown.slug
-      : null;
-  const shownTailMs = useMemo(() => {
-    if (!shownHarnessSlug) return null;
-    const row = rows.find((r) => r.wt.slug === shownHarnessSlug);
-    let latest: number | null = null;
-    for (const t of row?.fields.claude.data?.sessions ?? []) {
-      if (t.lastEntryMs !== null && (latest === null || t.lastEntryMs > latest)) {
-        latest = t.lastEntryMs;
-      }
-    }
-    return latest;
-  }, [shownHarnessSlug, rows]);
-  useEffect(() => {
-    if (!shownHarnessSlug || shownTailMs === null) return;
-    // Only stamp when the tail is actually ahead of the stamp — while a
-    // busy session streams output this effect re-fires per jsonl line,
-    // and an unconditional record() would write the focus file each time.
-    const stamped = taskFocusStore.getSnapshot().get(shownHarnessSlug) ?? 0;
-    if (stamped >= shownTailMs) return;
-    taskFocusStore.record(shownHarnessSlug);
-  }, [shownHarnessSlug, shownTailMs]);
-
-  const inputActive = modal !== null || footer.kind === "input";
-  // Transition-only: acting on the mount value would immediately focus
-  // the session pane (`inputActive` starts false) and undo the
-  // task-pane-focused startup `ensureHubLayout` set up. A modal pull
-  // remembers where focus was and puts it BACK on close, so answering
-  // a picker doesn't dump you into the session pane you weren't in.
-  const prevInputActiveRef = useRef<boolean | null>(null);
-  const preModalFocusRef = useRef(true);
-  useEffect(() => {
-    if (!hubPane) return;
-    const prev = prevInputActiveRef.current;
-    prevInputActiveRef.current = inputActive;
-    if (prev === null || prev === inputActive) return;
-    if (inputActive) {
-      preModalFocusRef.current = hubPaneFocusedRef.current;
-      void focusLeft();
-      setHubPaneFocused(true);
-    } else {
-      const restore = preModalFocusRef.current;
-      void (restore ? focusLeft() : focusRight());
-      setHubPaneFocused(restore);
-    }
-  }, [hubPane, inputActive, setHubPaneFocused]);
-
-  // F9 — flip pane focus. Routed through wt (the outer server forwards
-  // it like F10-F12) so the focus indicator is stamped by the very code
-  // that moves the focus, never inferred.
-  function toggleHubFocus(): void {
-    const next = !hubPaneFocusedRef.current;
-    void (next ? focusLeft() : focusRight());
-    setHubPaneFocused(next);
-  }
-
-  // Refocusing the task pane by hand (F9, mouse) while the right pane
-  // shows something other than the selection (a slot session, home) is
-  // "I'm back to the inbox" — re-assert the selection follow so the
-  // right pane matches what's highlighted. Gated on `inputActive` so
-  // the modal focus dance (which also lands focus here) doesn't yank
-  // the right pane mid-picker, and on `hubShown` so the common case
-  // (already following) stays a no-op.
-  const inputActiveRef = useRef(inputActive);
-  inputActiveRef.current = inputActive;
-  const hubShownRef = useRef(hubShown);
-  hubShownRef.current = hubShown;
-  useEffect(() => {
-    if (!hubPane || !hubPaneFocused) return;
-    if (inputActiveRef.current) return;
-    if (hubShownRef.current.kind === "task") return;
-    followNowRef.current();
-  }, [hubPane, hubPaneFocused]);
-
 
   /**
    * Copy `value` to the clipboard, log + toast appropriately. Used by
@@ -832,7 +683,7 @@ export function App({ onExit, hubPane = false }: Props) {
     // across reads can leak fragments ("?", digits) into the key
     // parser — which opened the help overlay on launch. Nothing a
     // human types in the first beats of a fresh pane is worth keeping.
-    if (hubPane && Date.now() - hubMuteUntilRef.current < 0) return;
+    if (hub.isMuted(k)) return;
     // Exactly one modal is active at a time; dispatch to its handler
     // and swallow the keypress — no modal mode falls through to the
     // input/normal-mode handling below.
@@ -990,7 +841,7 @@ export function App({ onExit, hubPane = false }: Props) {
           }),
         toggleSlotsExpanded: () => setSlotsExpanded((v) => !v),
         hubFlows,
-        toggleFocus: toggleHubFocus,
+        toggleFocus: hub.toggleFocus,
         openPrUrl: (url, number) => openPrUrl(url, number, null, "pr"),
         toggleDetails: () => setShowHubDetails((v) => !v),
         refreshWtState: async () => {
@@ -1078,7 +929,7 @@ export function App({ onExit, hubPane = false }: Props) {
       {hubPane ? (
         // Hub layout: this process IS the narrow left pane of the tmux
         // hub — one column of tasks with an optional details card
-        // stacked below (`D` toggles). The live session lives in the
+        // stacked below (`I` toggles). The live session lives in the
         // hub's right pane, so no OutputViewer here.
         <box flexDirection="column" flexGrow={1}>
           {removedView ? (
@@ -1095,7 +946,7 @@ export function App({ onExit, hubPane = false }: Props) {
               isLoading={isLoading}
               activeSessionBySlug={hubSessionGlyphs}
               activeActions={activeActions}
-              paneFocused={hubPaneFocused}
+              paneFocused={hub.paneFocused}
               primaryHarness={primaryHarness}
             />
           )}

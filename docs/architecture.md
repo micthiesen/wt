@@ -46,7 +46,7 @@ Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. E
 | 3-minute `fetch origin` interval | backstop for remote drift |
 | claude-registry fs.watch, session-tail triggers (`gh pr …` / `git push` inside a session) | sessions / github |
 | action `affects` tags on completion | the declared domains |
-| hub's `switchRight` (right-pane retarget on session entry) | `~/.cache/wt/task-focus.json` — the slug's last-focused stamp, which is what flips a task out of the `review-output` bucket; push-based, no polling |
+| hub session entry (`switchRight` retargets) + the on-screen re-stamp while a shown session streams output (`useHubController`) | `~/.cache/wt/task-focus.json` — the slug's last-focused stamp, which is what flips a task out of the `review-output` bucket; push-based, no polling |
 
 When adding a new state source or mutation path, wire one of these (or an explicit invalidation at the call site) rather than shortening a staleTime — staleTimes only bound how wrong things can be when a trigger is missed. Watchers live in `src/core/repo-watch.ts` and are wired in `src/tui/runtime.tsx` through a 50ms-coalescing invalidation scheduler.
 

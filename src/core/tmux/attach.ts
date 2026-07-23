@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { config } from "../config.ts";
-import { getHarness, type Harness } from "../harness/index.ts";
+import { getHarness, type Harness, type HarnessId } from "../harness/index.ts";
 import { createLogger } from "../logger.ts";
 import { shellLogPath } from "../shell-tail.ts";
 import { killServer, resolveDiffCommand } from "./admin.ts";
@@ -84,6 +84,39 @@ function scrubStderr(raw: string): string | null {
     out = `…${out.slice(-STDERR_TAIL_LIMIT)}`;
   }
   return out;
+}
+
+/**
+ * Resolve a (slug, kind, managedName)'s tmux identity: which harness
+ * impl (if any) owns `kind`, the normalized managed name (harness
+ * kinds only — `diff`/`shell` never carry one, so it collapses to
+ * `null` even if a caller passed one), the resulting tmux session
+ * name, and which physical F-key shortcut owns it (used for the
+ * `@wt-shortcut` tag tmux's config reads to decide detach-vs-switch).
+ *
+ * Shared by `attachOrCreate` and `ensureSessionDetached` — same
+ * reasoning as `buildInnerArgs`/`wrapInnerArgs` below: one source of
+ * truth so the two creation paths can't resolve a session's identity
+ * differently and end up fighting over two different tmux sessions
+ * for what the caller thinks is one (slug, kind, managedName).
+ */
+export function resolveSessionIdentity(
+  slug: string,
+  kind: Exclude<SessionKind, "action">,
+  managedName: string | null | undefined,
+): {
+  harnessId: HarnessId | null;
+  harness: Harness | null;
+  managedNameNorm: string | null;
+  name: string;
+  shortcut: SessionShortcut;
+} {
+  const harnessId = harnessIdForKind(kind);
+  const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
+  const managedNameNorm = harness ? (managedName ?? null) : null;
+  const name = sessionName(slug, kind, managedNameNorm);
+  const shortcut: SessionShortcut = harness ? "harness" : kind === "diff" ? "diff" : "shell";
+  return { harnessId, harness, managedNameNorm, name, shortcut };
 }
 
 /**
@@ -208,15 +241,11 @@ export async function attachOrCreate(opts: {
     claudeDisplayName,
     base,
   } = opts;
-  const harnessId = harnessIdForKind(kind);
-  const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
-  const managedNameNorm = harness ? (managedName ?? null) : null;
-  const name = sessionName(slug, kind, managedNameNorm);
-  const shortcut: SessionShortcut = harness
-    ? "harness"
-    : kind === "diff"
-      ? "diff"
-      : "shell";
+  const { harness, managedNameNorm, name, shortcut } = resolveSessionIdentity(
+    slug,
+    kind,
+    managedName,
+  );
   const { path: configPath, changed } = writeConfig();
   if (changed) {
     // tmux only reads its config at server start, so a changed render
@@ -254,6 +283,14 @@ export async function attachOrCreate(opts: {
           stderr: sourceErr.trim() || null,
         });
       }
+      // USER-VISIBLE (activity pane), not just the file log: server-
+      // start-only settings (default-terminal, extended-keys, the
+      // terminal-features preamble) silently stay on their old values
+      // until every session closes — without this line there is no way
+      // to discover that an edited config isn't fully live yet.
+      log.event.warn(
+        "tmux config changed; applied what's hot-reloadable — full effect after all sessions close",
+      );
       log.info(
         "config changed with live sessions present; applied via source-file, full config takes effect at next server restart",
         { slug, kind, liveSessions: liveSessions.size },
@@ -512,11 +549,11 @@ export async function ensureSessionDetached(opts: {
   base?: string;
 }): Promise<{ ok: true; created: boolean } | { ok: false; reason: string }> {
   const { slug, cwd, kind, managedName, resumeSessionId, claudeDisplayName, base } = opts;
-  const harnessId = harnessIdForKind(kind);
-  const harness: Harness | null = harnessId ? getHarness(harnessId) : null;
-  const managedNameNorm = harness ? (managedName ?? null) : null;
-  const name = sessionName(slug, kind, managedNameNorm);
-  const shortcut: SessionShortcut = harness ? "harness" : kind === "diff" ? "diff" : "shell";
+  const { harness, managedNameNorm, name, shortcut } = resolveSessionIdentity(
+    slug,
+    kind,
+    managedName,
+  );
   const configPath = ensureConfig();
 
   const exists = (await listAllSessionsRaw().catch(() => new Set<string>())).has(name);
@@ -611,6 +648,32 @@ export async function ensureSessionDetached(opts: {
   const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
   if (code !== 0) {
     const reason = stderr.trim() || `tmux new-session exited ${code}`;
+    // A non-zero exit here is ambiguous, not necessarily a failed
+    // create — two distinct scenarios collapse to the same exit code:
+    //
+    //  1. Duplicate-session race: another caller's `ensureSessionDetached`
+    //     (or an `attachOrCreate`) won the create between our exists-check
+    //     above and this spawn — the `exists` snapshot is TOCTOU by
+    //     construction, there's no lock across the gap. tmux's
+    //     `new-session` then fails with "duplicate session" even though
+    //     the session the caller wanted now exists.
+    //  2. Partial chain failure: `new-session` itself succeeded (the
+    //     session IS running) but a later command chained onto it with
+    //     `;` (`pipe-pane` / `set-option`) failed, which still exits the
+    //     whole `tmux` invocation non-zero.
+    //
+    // Both leave a live session behind despite the non-zero exit, so
+    // re-check reality rather than trusting the exit code: if the
+    // session now exists, treat this as a (degraded) success instead
+    // of reporting a create failure for a session that's actually up.
+    const nowExists = (await listAllSessionsRaw().catch(() => new Set<string>())).has(name);
+    if (nowExists) {
+      log.warn(
+        "ensureSessionDetached: create exited non-zero but session exists (race or partial chain failure)",
+        { slug, kind, code, reason },
+      );
+      return { ok: true, created: false };
+    }
     log.warn("ensureSessionDetached: create failed", { slug, kind, code, reason });
     return { ok: false, reason };
   }

@@ -35,9 +35,12 @@ type Props = {
   hint?: string;
   height?: number;
   /**
-   * Hub mode: legend renders as bare harness status glyphs (main slot
-   * included) with no last-message preview — the ~35-col task pane has
-   * no room for tail text. Toast / input modes are unaffected.
+   * Hub mode: suppresses the trailing wt-source/dotfiles slot robots
+   * (the two `box` glyphs on the far right) on toast/input footers.
+   * The hub never renders a `legend`-mode footer at all — `app.tsx`
+   * returns `null` there instead — so `compact` only ever affects the
+   * toast/input branches; it doesn't do anything to a legend footer
+   * because the hub never reaches one.
    */
   compact?: boolean;
 };
@@ -74,15 +77,9 @@ export function Footer({ mode, hint, compact = false }: Props) {
     >
       <box flexDirection="row" flexGrow={1} flexShrink={1} overflow="hidden">
         {mode.kind === "legend" ? (
-          compact ? (
-            <MainSlotGlyph
-              state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
-            />
-          ) : (
-            <MainSlotTail
-              state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
-            />
-          )
+          <MainSlotTail
+            state={slotSessions.get(MAIN_CLONE_SLOT.slug)?.state ?? null}
+          />
         ) : null}
         {mode.kind === "toast" ? (
           <text fg={mode.color ?? theme.ok}>{mode.message}</text>
@@ -136,14 +133,6 @@ export function Footer({ mode, hint, compact = false }: Props) {
  * lights nothing here — the slot keybind opens the primary, so the bar
  * tracks the primary, same as the slot glyphs above.
  */
-/** Compact-legend variant: the main slot's status robot, nothing else. */
-function MainSlotGlyph({ state }: { state: DerivedState | null }) {
-  const primary = usePrimaryHarness();
-  return (
-    <text fg={slotGlyphFg(primary, state)}>{getHarness(primary).glyph}</text>
-  );
-}
-
 function MainSlotTail({ state }: { state: DerivedState | null }) {
   const primary = usePrimaryHarness();
   const claudeRun = useSessionRun(MAIN_CLONE_SLOT.slug, null);

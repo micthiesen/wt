@@ -34,8 +34,13 @@ export function isHubPane(): boolean {
  */
 let rightTtyCache: string | null = null;
 
-/** Drop the cached right-pane tty so the next `resolveRightTty` re-queries. */
-export function invalidateRightTty(): void {
+/**
+ * Drop the cached right-pane tty so the next `resolveRightTty`
+ * re-queries. Not exported beyond this module — the only caller is
+ * `switchRight`'s own retry path below, when a switch-client fails and
+ * the pane may have been respawned since the cache was filled.
+ */
+function invalidateRightTty(): void {
   rightTtyCache = null;
 }
 
@@ -59,16 +64,52 @@ export async function resolveRightTty(): Promise<string | null> {
   return tty;
 }
 
+/** How many `switch-client` attempts `switchRight` makes against a single tty before giving up on it. */
+const SWITCH_COLD_START_ATTEMPTS = 3;
+
+/** Delay between cold-start retry attempts (see `switchRight`). */
+const SWITCH_COLD_START_DELAY_MS = 300;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * tmux's `-t` target syntax parses `:` and `.` inside the name as the
+ * window/pane separators, so a bare session name containing either
+ * (real for branch-derived slugs like a worktree on `release/v1.2`,
+ * which the inner server's sessions are named after) gets silently
+ * mis-parsed into a different target than intended. Prefixing with
+ * `=` switches tmux into exact-match mode, where the rest of the
+ * string is taken as a literal session name. Session-target `-t` args
+ * need this; `-s` (session name, not a target expression) does not.
+ */
+function exactSessionTarget(sessionName: string): string {
+  return `=${sessionName}`;
+}
+
 /**
  * Retarget the right pane's tty at a different session on the INNER
  * `-L wt` server — this is how wt "opens" a worktree's harness/diff/
- * shell session into the pane the user is actually looking at. On
- * failure the cached tty is invalidated and re-resolved once (the pane
- * may have been respawned since the cache was filled) before retrying;
- * a second failure is logged and reported to the caller. Debouncing
- * rapid retargets (e.g. fast row navigation) is the caller's
- * responsibility — this function does exactly one switch attempt (plus
- * its single retry) per call.
+ * shell session into the pane the user is actually looking at.
+ *
+ * Two independent failure modes get their own handling:
+ *  - Cold start: right after `ensureHubLayout` splits the right pane,
+ *    the nested tmux client `rightPaneCommand` spawns into it hasn't
+ *    necessarily finished attaching to the inner server by the time
+ *    the first `switchRight` call lands, so `switch-client -c <tty>`
+ *    can fail with "client not found" for a brief window. The first
+ *    attempt is retried up to `SWITCH_COLD_START_ATTEMPTS` times with
+ *    a `SWITCH_COLD_START_DELAY_MS` delay between attempts to ride out
+ *    that window.
+ *  - Stale tty: the cached tty itself may be wrong (the pane was
+ *    respawned since the cache was filled) — invalidated and
+ *    re-resolved once, then given a single further attempt (not the
+ *    cold-start retry budget again, to keep the worst case bounded).
+ * Worst case is `SWITCH_COLD_START_ATTEMPTS * SWITCH_COLD_START_DELAY_MS`
+ * (~900ms with current constants) plus one extra attempt, i.e. roughly
+ * the ~1s the constants were picked to stay under. Debouncing rapid
+ * retargets (e.g. fast row navigation) is the caller's responsibility.
  */
 export async function switchRight(sessionName: string): Promise<boolean> {
   const tty = await resolveRightTty();
@@ -76,7 +117,8 @@ export async function switchRight(sessionName: string): Promise<boolean> {
     log.warn("switchRight: no right pane tty available", { sessionName });
     return false;
   }
-  let r = await spawnTmux(TMUX_SOCKET, ["switch-client", "-c", tty, "-t", sessionName]);
+  const target = exactSessionTarget(sessionName);
+  let r = await switchClientWithColdStartRetries(tty, target);
   if (r.code === 0) return true;
 
   invalidateRightTty();
@@ -88,7 +130,7 @@ export async function switchRight(sessionName: string): Promise<boolean> {
     });
     return false;
   }
-  r = await spawnTmux(TMUX_SOCKET, ["switch-client", "-c", retryTty, "-t", sessionName]);
+  r = await spawnTmux(TMUX_SOCKET, ["switch-client", "-c", retryTty, "-t", target]);
   if (r.code !== 0) {
     log.warn("switchRight: switch-client failed after retry", {
       sessionName,
@@ -99,6 +141,19 @@ export async function switchRight(sessionName: string): Promise<boolean> {
   return true;
 }
 
+/** `switch-client -c tty -t target`, retried through the cold-start window (see `switchRight`). */
+async function switchClientWithColdStartRetries(
+  tty: string,
+  target: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  let r = await spawnTmux(TMUX_SOCKET, ["switch-client", "-c", tty, "-t", target]);
+  for (let attempt = 1; r.code !== 0 && attempt < SWITCH_COLD_START_ATTEMPTS; attempt++) {
+    await sleep(SWITCH_COLD_START_DELAY_MS);
+    r = await spawnTmux(TMUX_SOCKET, ["switch-client", "-c", tty, "-t", target]);
+  }
+  return r;
+}
+
 /**
  * Ensure the reserved `wt-hub-home` session exists on the inner
  * server (detached — nothing attaches to it directly; `showHome`
@@ -106,7 +161,11 @@ export async function switchRight(sessionName: string): Promise<boolean> {
  * already there.
  */
 export async function ensureHomeSession(): Promise<void> {
-  const has = await spawnTmux(TMUX_SOCKET, ["has-session", "-t", HUB_HOME_SESSION]);
+  const has = await spawnTmux(TMUX_SOCKET, [
+    "has-session",
+    "-t",
+    exactSessionTarget(HUB_HOME_SESSION),
+  ]);
   if (has.code === 0) return;
   const configPath = ensureConfig();
   const r = await spawnTmux(TMUX_SOCKET, [

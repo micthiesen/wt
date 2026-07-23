@@ -67,7 +67,7 @@ describe("deriveTaskState — one case per precedence rung", () => {
     expect(s.reason).toBe("agent is asking");
   });
 
-  test("2b. needs-you: midRebase", () => {
+  test("2b. needs-you: midRebase (no lock — a hand rebase)", () => {
     const s = deriveTaskState(signals({ midRebase: true }), manual());
     expect(s.bucket).toBe("needs-you");
     expect(s.reason).toBe("conflict mid-rebase");
@@ -292,6 +292,18 @@ describe("deriveTaskState — precedence collisions", () => {
   test("conflict + midRebase → needs-you/'conflict mid-rebase' (2b beats 2c)", () => {
     const s = deriveTaskState(signals({ midRebase: true, conflict: true }), manual());
     expect(s.reason).toBe("conflict mid-rebase");
+  });
+
+  test("busyLock + midRebase → working (a wt-driven restack, not a hand rebase)", () => {
+    const s = deriveTaskState(signals({ busyLock: true, midRebase: true }), manual());
+    expect(s.bucket).toBe("working");
+    expect(s.reason).toBe("worktree busy");
+  });
+
+  test("busyLock + conflict → working (lock wins over the conflict probe too)", () => {
+    const s = deriveTaskState(signals({ busyLock: true, conflict: true }), manual());
+    expect(s.bucket).toBe("working");
+    expect(s.reason).toBe("worktree busy");
   });
 });
 

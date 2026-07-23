@@ -4,15 +4,25 @@ import { join } from "node:path";
 
 import { SESSION_SWITCH_EXIT_CODE } from "./naming.ts";
 
-/** Path to the generated tmux.conf. */
-function configDir(): string {
+/**
+ * Path to the directory holding every generated tmux config (this
+ * server's `tmux.conf` and hub mode's `hub-tmux.conf`) — shared so
+ * `core/hub/config.ts` doesn't duplicate the `~/.cache/wt` join +
+ * mkdir dance.
+ */
+export function configDir(): string {
   const dir = join(homedir(), ".cache", "wt");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 /**
- * Render the wt-private tmux config. Notable choices:
+ * Terminal-capability preamble shared verbatim by this server's config
+ * and hub mode's outer-server config (`core/hub/config.ts`'s
+ * `buildHubConfig`) — the hub's left pane runs `wt _taskpane` and its
+ * right pane's client passes through into THIS server, so both need
+ * identical truecolor / extended-keys / no-flash settings for the
+ * passthrough to be transparent. Notable choices:
  *  - `status off` + `set-titles off`: no tmux chrome anywhere.
  *  - `alternate-screen off`: tmux fakes alt-screen for inner programs
  *    instead of switching the outer terminal's buffer, which removes
@@ -30,13 +40,9 @@ function configDir(): string {
  *    `allow-passthrough on` lets desktop notifications + the progress bar
  *    reach the outer terminal instead of being swallowed by tmux. These
  *    mirror the user's global tmux config for modified-key forwarding.
- *  - `unbind C-b` + F10/F11/F12 are context-aware. The key that owns
- *    the current session detaches back to wt; either other key exits
- *    the tmux client with a private status that asks the renderer-side
- *    navigator to attach the corresponding session immediately.
+ *  - `unbind C-b`: freed up for each config's own bindings below.
  */
-export function buildConfig(): string {
-  return `set -g status off
+export const TERMINAL_PREAMBLE = `set -g status off
 set -g alternate-screen off
 set -g set-titles off
 set -sg escape-time 0
@@ -50,11 +56,42 @@ set -g allow-passthrough on
 set -s extended-keys always
 set -s extended-keys-format csi-u
 set -as terminal-features ",xterm*:extkeys,tmux-256color:extkeys"
-unbind C-b
+unbind C-b`;
+
+/**
+ * Render the wt-private tmux config: the shared `TERMINAL_PREAMBLE`
+ * plus this server's own bindings. `unbind C-b` + F10/F11/F12 are
+ * context-aware. The key that owns the current session detaches back
+ * to wt; either other key exits the tmux client with a private status
+ * that asks the renderer-side navigator to attach the corresponding
+ * session immediately.
+ */
+export function buildConfig(): string {
+  return `${TERMINAL_PREAMBLE}
 bind-key -n F10 if-shell -F '#{==:#{@wt-shortcut},shell}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.shell}"'
 bind-key -n F11 if-shell -F '#{==:#{@wt-shortcut},diff}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.diff}"'
 bind-key -n F12 if-shell -F '#{==:#{@wt-shortcut},harness}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.harness}"'
 `;
+}
+
+/**
+ * Write `content` to `path` only if it differs from what's already
+ * there. Shared by this module's `writeConfig` and hub mode's
+ * `writeHubConfig` — both need the same read-prev/compare/write-if-
+ * changed shape, since callers on both sides use `changed` to decide
+ * whether to kill+restart the affected tmux server (tmux only loads
+ * its config at server start).
+ */
+export function writeIfChanged(path: string, content: string): { path: string; changed: boolean } {
+  let prev = "";
+  try {
+    prev = readFileSync(path, "utf8");
+  } catch {
+    // first run
+  }
+  const changed = prev !== content;
+  if (changed) writeFileSync(path, content, "utf8");
+  return { path, changed };
 }
 
 /**
@@ -64,16 +101,7 @@ bind-key -n F12 if-shell -F '#{==:#{@wt-shortcut},harness}' 'detach-client' 'det
  */
 export function writeConfig(): { path: string; changed: boolean } {
   const path = join(configDir(), "tmux.conf");
-  const next = buildConfig();
-  let prev = "";
-  try {
-    prev = readFileSync(path, "utf8");
-  } catch {
-    // first run
-  }
-  const changed = prev !== next;
-  if (changed) writeFileSync(path, next, "utf8");
-  return { path, changed };
+  return writeIfChanged(path, buildConfig());
 }
 
 /**

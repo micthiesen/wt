@@ -77,6 +77,29 @@ describe("describePendingToolUse", () => {
     expect(describePendingToolUse("SomeTool", {})).toBe("allow SomeTool");
     expect(describePendingToolUse("SomeTool", null)).toBe("allow SomeTool");
   });
+
+  test("ANSI escapes and raw control bytes are scrubbed from the output", () => {
+    // \x1b[31m is a CSI color escape, \x07 is a bare BEL control byte —
+    // both are terminal-escape-injection vectors if agent-influenced
+    // text like a plan or question reaches the TUI unscrubbed.
+    const plan = describePendingToolUse("ExitPlanMode", {
+      plan: "\x1b[31mDo the thing\x07",
+    });
+    expect(plan).toBe("approve plan: Do the thing");
+    expect(plan).not.toMatch(/[\x1b\x07]/);
+
+    const question = describePendingToolUse("AskUserQuestion", {
+      question: "\x1b[31mDeploy?\x07",
+    });
+    expect(question).toBe("question: Deploy?");
+    expect(question).not.toMatch(/[\x1b\x07]/);
+
+    const generic = describePendingToolUse("Bash", {
+      command: "\x1b[31mnpm test\x07",
+    });
+    expect(generic).toBe("allow Bash: npm test");
+    expect(generic).not.toMatch(/[\x1b\x07]/);
+  });
 });
 
 describe("extractPendingContext", () => {

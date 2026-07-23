@@ -24,19 +24,24 @@
  * auto-respawns instead of leaving a dead pane — harness sessions on
  * the INNER server are untouched either way, since this server never
  * hosts them.
+ *
+ * Every forwarded binding (including `M-;`) is wrapped in tmux's
+ * `{ ... }` command-group syntax rather than a bare `send-keys ...`
+ * command line. Bare `bind -n 'M-;' send-keys -t hub:0.0 ';'` parses
+ * fine but tmux drops the trailing `;` argument at config-parse time
+ * regardless of quoting — `;` is tmux's own command separator, and
+ * outside a `{ }` group it terminates the `send-keys` command instead
+ * of being passed through as its final argument. Wrapping every
+ * generated bind in `{ }` (not just the `;` one) keeps the bindings
+ * uniform rather than special-casing the one key that needs it.
+ * Live-verified on a throwaway `-L fixprobe` socket: `list-keys -T
+ * root` showed `send-keys -t hub:0.0` with the `;` argument silently
+ * missing under the bare form, and present under the `{ }` form.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { configDir, TERMINAL_PREAMBLE, writeIfChanged } from "../tmux/config.ts";
 import { HUB_FORWARD_KEYS, HUB_LEFT_PANE, HUB_RIGHT_PANE } from "./naming.ts";
-
-/** Path to the generated hub tmux.conf. */
-function configDir(): string {
-  const dir = join(homedir(), ".cache", "wt");
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
 
 /**
  * Quote a single tmux config-file token when it contains a character
@@ -48,72 +53,52 @@ function configDir(): string {
  * file by hand would write, so tests (and any future diffing against a
  * hand-written config) stay readable. Single-quote by default; switch
  * to double-quotes when the token itself contains a single quote (`'`)
- * so the token doesn't have to escape its own delimiter.
+ * — UNLESS it also contains a double quote, in which case neither bare
+ * delimiter is safe and the token's internal `"` characters are
+ * backslash-escaped so it can still be wrapped in `"..."`.
  */
-function tmuxQuote(token: string): string {
+export function tmuxQuote(token: string): string {
   if (!/[;"'#\s]/.test(token)) return token;
-  return token.includes("'") ? `"${token}"` : `'${token}'`;
+  if (!token.includes("'")) return `'${token}'`;
+  if (!token.includes('"')) return `"${token}"`;
+  return `"${token.replace(/"/g, '\\"')}"`;
 }
 
 export function buildHubConfig(): string {
   const forwardLines = HUB_FORWARD_KEYS.map((key) => {
     const bindKey = tmuxQuote(`M-${key}`);
     const arg = tmuxQuote(key);
-    return `bind -n ${bindKey} send-keys -t ${HUB_LEFT_PANE} ${arg}`;
+    return `bind -n ${bindKey} { send-keys -t ${HUB_LEFT_PANE} ${arg} }`;
   }).join("\n");
 
-  return `set -g status off
-set -g alternate-screen off
-set -g set-titles off
-set -sg escape-time 0
-set -g mouse on
-set -g focus-events on
-set -g default-terminal "tmux-256color"
-set -as terminal-features ",xterm*:RGB,tmux-256color:RGB"
-set -ag terminal-overrides ",xterm-256color:Tc,tmux-256color:Tc"
-set -ag update-environment "COLORTERM"
-set -g allow-passthrough on
-set -s extended-keys always
-set -s extended-keys-format csi-u
-set -as terminal-features ",xterm*:extkeys,tmux-256color:extkeys"
-unbind C-b
+  return `${TERMINAL_PREAMBLE}
 set -g remain-on-exit on
 set-hook -g pane-died respawn-pane
 # tmux cannot remove the divider column between panes, only recolor it.
 # Painting the border glyphs in the terminal's background (Alacritty
-# Catppuccin Mocha base, which applyTerminalTheme also uses as the task
+# Catppuccin Mocha base, which applyHubPalette also uses as the task
 # pane's bg — keep the three in sync) makes the bar visually disappear;
 # focus is signaled inside the task pane, so active/inactive match.
 set -g pane-border-style "fg=#1E1E2E"
 set -g pane-active-border-style "fg=#1E1E2E"
 ${forwardLines}
-bind -n M-Enter send-keys -t ${HUB_LEFT_PANE} Enter
-bind -n M-Tab send-keys -t ${HUB_LEFT_PANE} Tab
-bind -n F10 send-keys -t ${HUB_LEFT_PANE} F10
-bind -n F11 send-keys -t ${HUB_LEFT_PANE} F11
-bind -n F12 send-keys -t ${HUB_LEFT_PANE} F12
-bind -n F8 resize-pane -Z -t ${HUB_RIGHT_PANE}
-bind -n F9 send-keys -t ${HUB_LEFT_PANE} F9
+bind -n M-Enter { send-keys -t ${HUB_LEFT_PANE} Enter }
+bind -n M-Tab { send-keys -t ${HUB_LEFT_PANE} Tab }
+bind -n F10 { send-keys -t ${HUB_LEFT_PANE} F10 }
+bind -n F11 { send-keys -t ${HUB_LEFT_PANE} F11 }
+bind -n F12 { send-keys -t ${HUB_LEFT_PANE} F12 }
+bind -n F8 { resize-pane -Z -t ${HUB_RIGHT_PANE} }
+bind -n F9 { send-keys -t ${HUB_LEFT_PANE} F9 }
 `;
 }
 
 /**
  * Write the hub config to disk if it differs from what's already
- * there. Same write-if-changed shape as `core/tmux/config.ts`'s
- * `writeConfig` — callers use `changed` to decide whether to kill+
- * restart the hub server, since tmux only loads its config at server
- * start.
+ * there. Delegates to `core/tmux/config.ts`'s shared `writeIfChanged`
+ * — callers use `changed` to decide whether to kill+restart the hub
+ * server, since tmux only loads its config at server start.
  */
 export function writeHubConfig(): { path: string; changed: boolean } {
   const path = join(configDir(), "hub-tmux.conf");
-  const next = buildHubConfig();
-  let prev = "";
-  try {
-    prev = readFileSync(path, "utf8");
-  } catch {
-    // first run
-  }
-  const changed = prev !== next;
-  if (changed) writeFileSync(path, next, "utf8");
-  return { path, changed };
+  return writeIfChanged(path, buildHubConfig());
 }

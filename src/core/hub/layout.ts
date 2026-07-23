@@ -45,13 +45,23 @@ export function wtArgv(): string[] {
 
 /**
  * Shell command string for the right pane's split-window: a nested
- * tmux client (env-stripped of `TMUX`/`TMUX_PANE` so it isn't confused
- * for a pane of its own parent) attaching-or-creating the reserved
- * `wt-hub-home` session on the INNER `-L wt` server. `new-session -A`
- * means the inner server boots lazily on first hub launch rather than
- * requiring it to already be running. Every token is `shQuote`d (not
- * just the paths) since this whole thing travels as ONE argv element
- * that tmux itself re-parses through the shell.
+ * tmux client (env-stripped of `TMUX`/`TMUX_PANE`/`WT_HUB` so it isn't
+ * confused for a pane of its own parent) attaching-or-creating the
+ * reserved `wt-hub-home` session on the INNER `-L wt` server.
+ * `WT_HUB` matters here for a subtler reason than `TMUX`/`TMUX_PANE`:
+ * the hub session sets `-e WT_HUB=1` session-scoped on itself (see
+ * `ensureHubLayout` below), but that's inherited by every process this
+ * pane forks — including, on whichever hub launch happens to be first
+ * to touch the inner `-L wt` socket, the tmux client that FORKS the
+ * inner server itself. A forked server inherits its birth client's
+ * environment as its own global env for the rest of its life, so
+ * without the strip every session ever created on that inner server
+ * would see `WT_HUB=1` and `isHubPane()` would report true everywhere,
+ * permanently. `-u WT_HUB` closes that hole at the source. `new-session
+ * -A` means the inner server boots lazily on first hub launch rather
+ * than requiring it to already be running. Every token is `shQuote`d
+ * (not just the paths) since this whole thing travels as ONE argv
+ * element that tmux itself re-parses through the shell.
  */
 function rightPaneCommand(): string {
   const configPath = ensureConfig();
@@ -61,6 +71,8 @@ function rightPaneCommand(): string {
     "TMUX",
     "-u",
     "TMUX_PANE",
+    "-u",
+    WT_HUB_ENV,
     "tmux",
     "-L",
     TMUX_SOCKET,
@@ -85,6 +97,12 @@ function rightPaneCommand(): string {
  * fiddling, a previous crash mid-setup) is torn down and rebuilt rather
  * than patched in place — recreating from scratch is simpler than
  * reasoning about partial layouts.
+ *
+ * Throws if `split-window` fails after a fresh `new-session` — the
+ * just-created (broken, one-pane) session is killed first so a failed
+ * call never leaves partial state behind for a later caller to trip
+ * over. Callers that need a non-throwing degrade (rather than
+ * `launchHub`'s "print and exit non-zero") should catch explicitly.
  */
 export async function ensureHubLayout(): Promise<void> {
   const has = await spawnTmux(HUB_SOCKET, ["has-session", "-t", HUB_SESSION]);
@@ -143,7 +161,15 @@ export async function ensureHubLayout(): Promise<void> {
     rightPaneCommand(),
   ]);
   if (split.code !== 0) {
-    log.warn("hub split-window failed", { stderr: split.stderr.trim() || null });
+    // Proceeding to resize/select below would leave (and then attach)
+    // a one-pane session masquerading as the two-pane hub layout —
+    // silently broken rather than loudly failed. Kill the
+    // just-created session and throw instead; `launchHub` surfaces
+    // this to the user and exits non-zero rather than attaching it.
+    const stderr = split.stderr.trim() || null;
+    log.warn("hub split-window failed; tearing down partial session", { stderr });
+    await spawnTmux(HUB_SOCKET, ["kill-session", "-t", HUB_SESSION]);
+    throw new Error(`hub split-window failed: ${stderr ?? `exit ${split.code}`}`);
   }
 
   await spawnTmux(HUB_SOCKET, ["resize-pane", "-t", `${HUB_SESSION}:0.0`, "-x", "35"]);
@@ -163,14 +189,22 @@ export async function ensureHubLayout(): Promise<void> {
  * interactively, with `TMUX`/`TMUX_PANE` stripped from the spawn env so
  * `wt hub` works even when run from inside the user's own personal
  * tmux. Resolves to the attach client's exit code once the user
- * detaches or the session ends.
+ * detaches or the session ends — or to a non-zero code without
+ * attaching at all if `ensureHubLayout` couldn't build a working
+ * two-pane session (see its split-window failure handling); attaching
+ * to a broken layout would be worse than a loud CLI failure.
  */
 export async function launchHub(): Promise<number> {
   const { changed } = writeHubConfig();
   if (changed) {
     await spawnTmux(HUB_SOCKET, ["kill-server"]);
   }
-  await ensureHubLayout();
+  try {
+    await ensureHubLayout();
+  } catch (err) {
+    console.error(`wt hub: failed to build the hub layout: ${(err as Error).message}`);
+    return 1;
+  }
 
   const { path: hubConfPath } = writeHubConfig();
   const env = { ...process.env };

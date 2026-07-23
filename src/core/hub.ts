@@ -29,7 +29,6 @@ export {
   ensureHomeSession,
   focusLeft,
   focusRight,
-  invalidateRightTty,
   isHubPane,
   killHub,
   resolveRightTty,
