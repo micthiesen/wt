@@ -64,6 +64,21 @@ export function tmuxQuote(token: string): string {
   return `"${token.replace(/"/g, '\\"')}"`;
 }
 
+/**
+ * ## The command layer (cmd+<key> via Alacritty)
+ *
+ * Alacritty translates cmd chords into ESC-prefixed sequences (see
+ * ~/.dotfiles/alacritty), which this server receives as `M-<key>` —
+ * the same root-table space the Option forwards use. Most cmd keys
+ * ride the plain forward list; five get REBINDS below because their
+ * literal letter would hit the wrong classic action: `M-h` → F7
+ * (focus task pane; literal h was removed-history), `M-d` → F11
+ * (diff; literal d is destroy — destroy moved to `M-BSpace`), `M-s`
+ * → F10 (shell; literal s is stage URL), `M-f` → zoom (mirrors F8),
+ * `M-w` → C-d (graceful session close; literal w is review-checkout).
+ * `M-.` and `M-/` alias the action picker (!) and help (?) since
+ * cmd+shift punctuation is awkward.
+ */
 export function buildHubConfig(): string {
   const forwardLines = HUB_FORWARD_KEYS.map((key) => {
     const bindKey = tmuxQuote(`M-${key}`);
@@ -89,6 +104,14 @@ bind -n F11 { send-keys -t ${HUB_LEFT_PANE} F11 }
 bind -n F12 { send-keys -t ${HUB_LEFT_PANE} F12 }
 bind -n F8 { resize-pane -Z -t ${HUB_RIGHT_PANE} }
 bind -n F9 { send-keys -t ${HUB_LEFT_PANE} F9 }
+bind -n M-h { send-keys -t ${HUB_LEFT_PANE} F7 }
+bind -n M-d { send-keys -t ${HUB_LEFT_PANE} F11 }
+bind -n M-s { send-keys -t ${HUB_LEFT_PANE} F10 }
+bind -n M-f { resize-pane -Z -t ${HUB_RIGHT_PANE} }
+bind -n M-w { send-keys -t ${HUB_LEFT_PANE} C-d }
+bind -n M-. { send-keys -t ${HUB_LEFT_PANE} ! }
+bind -n M-/ { send-keys -t ${HUB_LEFT_PANE} ? }
+bind -n M-BSpace { send-keys -t ${HUB_LEFT_PANE} d }
 `;
 }
 

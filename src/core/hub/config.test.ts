@@ -46,6 +46,26 @@ describe("hub outer tmux config", () => {
     expect(config).toContain(`{ send-keys -t ${HUB_LEFT_PANE} ';' }`);
   });
 
+  test("cmd-layer rebinds: M-h/d/s/f/w and the digit forwards", () => {
+    const config = buildHubConfig();
+    // Five keys whose literal letter would hit the wrong classic
+    // action get dedicated rebinds instead of plain forwards.
+    expect(config).toContain(`bind -n M-h { send-keys -t ${HUB_LEFT_PANE} F7 }`);
+    expect(config).toContain(`bind -n M-d { send-keys -t ${HUB_LEFT_PANE} F11 }`);
+    expect(config).toContain(`bind -n M-s { send-keys -t ${HUB_LEFT_PANE} F10 }`);
+    expect(config).toContain("bind -n M-f { resize-pane -Z");
+    expect(config).toContain(`bind -n M-w { send-keys -t ${HUB_LEFT_PANE} C-d }`);
+    expect(config).toContain(`bind -n M-BSpace { send-keys -t ${HUB_LEFT_PANE} d }`);
+    // No plain forwards may remain for the rebound letters (a literal
+    // `h` would open removed-history, `d` would destroy, …).
+    expect(config).not.toContain(`bind -n M-h { send-keys -t ${HUB_LEFT_PANE} h }`);
+    expect(config).not.toContain(`bind -n M-d { send-keys -t ${HUB_LEFT_PANE} d }`);
+    expect(config).not.toContain(`bind -n M-w { send-keys -t ${HUB_LEFT_PANE} w }`);
+    // Task quick-jump digits forward bare.
+    expect(config).toContain(`bind -n M-1 { send-keys -t ${HUB_LEFT_PANE} 1 }`);
+    expect(config).toContain(`bind -n M-9 { send-keys -t ${HUB_LEFT_PANE} 9 }`);
+  });
+
   test("F10/F11/F12 are forwarded bare (the left wt process retargets on them)", () => {
     const config = buildHubConfig();
     expect(config).toContain(`bind -n F10 { send-keys -t ${HUB_LEFT_PANE} F10 }`);

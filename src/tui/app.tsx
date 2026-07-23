@@ -770,7 +770,9 @@ export function App({ onExit, hubPane = false }: Props) {
       return;
     }
     // `h` — flip the left pane to the removed-worktrees history.
-    if (isPlainLetter(k, "h")) {
+    // Classic only: hub retired the view (cmd+h is focus-left there;
+    // use `wt classic` for removal history).
+    if (!hubPane && isPlainLetter(k, "h")) {
       setRemovedView(true);
       return;
     }

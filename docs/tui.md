@@ -102,4 +102,4 @@ Every list picker follows the same shape: the key that opened it confirms the hi
 
 ## Hub mode
 
-An opt-in alternate UI: a prioritized task inbox instead of the three-pane list, next to a pane that's always a live coding-agent session. Every key above still works (as `Alt+<key>`), plus a handful of hub-only bindings. `[ui] mode = "hub"` (see [configuration.md](configuration.md#ui)) makes it the default for a bare `wt`; `wt hub` / `wt classic` switch explicitly, and both views share all on-disk state. Full writeup: [docs/hub.md](hub.md).
+An opt-in alternate UI: a prioritized task inbox instead of the three-pane list, next to a pane that's always a live coding-agent session. Driven by a ⌘ layer (Alacritty-translated, works from either pane): ⌘J/⌘K nav, ⌘L open session, ⌘D/⌘S diff/shell, ⌘H/Esc focus hops, ⌘1-9 task jump; rare classic actions stay plain letters with the task pane focused. `[ui] mode = "hub"` (see [configuration.md](configuration.md#ui)) makes it the default for a bare `wt`; `wt hub` / `wt classic` switch explicitly, and both views share all on-disk state. Full writeup: [docs/hub.md](hub.md).

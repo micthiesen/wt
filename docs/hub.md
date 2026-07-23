@@ -45,54 +45,45 @@ When the task cursor points at nothing with a live session, the right pane
 parks on a reserved `wt-hub-home` session (`wt _home`) — a static dashboard
 printing the core key legend.
 
-## Terminal focus and the Alt key layer
+## The command layer
 
-Your terminal's keyboard focus normally sits on the right (session) pane —
-that's where you're typing to Claude/Codex/etc. wt still needs a way to
-receive keystrokes without you switching panes for every action, so the
-outer server's root key table forwards `Alt+<key>` chords straight into the
-left pane as the bare key (`core/hub/naming.ts`'s `HUB_FORWARD_KEYS`,
-rendered as `bind -n M-<key> send-keys -t hub:0.0 <key>` in
-`core/hub/config.ts`). Concretely: **every classic-mode single-key binding
-works in hub mode as Alt+that-key** (`Alt+j`/`Alt+k` to move, `Alt+n` for a
-new worktree, `Alt+d` to remove, `Alt+r` to refresh, `Alt+;` for the sessions
-picker, and so on), plus `Alt+Enter` and `Alt+Tab`. Modifier-combos that
-aren't plain single keys (`Ctrl+J`/`Ctrl+K` scroll, `Ctrl+N`/`Ctrl+R`/`Ctrl+A`,
-`Shift+Tab`, `Shift+F10`/`F11`/`F12`) have no Alt-level forwarding, but they
-still work whenever the task pane holds direct focus (`F9` over, press the
-combo, `F9` back).
+Typing always goes to the session pane. wt itself is driven by a **⌘
+layer**: Alacritty translates each `cmd+<key>` chord into an ESC-prefixed
+sequence (see the `wt hub command layer` block in
+`~/.dotfiles/alacritty/.config/alacritty/alacritty.toml`), which the hub's
+outer tmux server intercepts as an `M-<key>` root-table binding and relays
+into the task pane — from either pane, no matter where focus sits. Cmd was
+chosen deliberately: skhd/yabai globally own the Alt, Shift+Alt, Ctrl+Alt,
+and Hyper spaces (so bare Option chords for `j`/`k`/`n`/`1-5` never even
+reach the terminal), while the Cmd domain is free apart from a few
+overridden defaults (Hide on `⌘H`, Minimize on `⌘M`, search on `⌘F` —
+Alacritty search stays on `Ctrl+Shift+F` — new-window on `⌘N`,
+close-window on `⌘W`).
 
-Two bindings are exceptions with no Alt prefix, handled by tmux itself
-instead of relayed to wt:
+Most cmd chords forward the bare classic key; five have dedicated rebinds
+because the literal letter means something else in classic mode: `⌘H` →
+focus the task pane (literal `h` was removed-history, retired in hub),
+`⌘D` → diff view (literal `d` is destroy — destroy moved to `⌘⌫`), `⌘S` →
+shell view, `⌘F` → zoom, `⌘W` → graceful session close.
 
-- **`F9`** cycles pane focus (left ↔ right). Forwarded to wt like
-  F10-F12: wt runs the `select-pane` itself and stamps its focus
-  indicator in the same stroke, so the signal can't drift.
-- **`F8`** zooms the right pane to full-screen — `resize-pane -Z`.
+Pane focus is not something you manage: `⌘L`/`⌘D`/`⌘S` land focus in the
+session; `⌘H` brings it to the inbox; **Esc** in the task pane (no picker
+open) bounces it back to the session; pickers and prompts pull focus
+automatically and restore whichever pane held it before they opened. The
+tasks panel border tints accent while typing lands there and dims when it
+goes to the session. Refocusing the task pane while the right pane shows
+something other than the selection re-asserts the selection follow.
 
-Which pane holds focus is signaled **inside the task pane** (the session
-pane is left unmarked): the tasks panel border tints accent while typing
-lands there and drops to a dim border when it goes to the session. When
-the right pane is showing a special session that isn't the selected
-task's, manually refocusing the task pane (F9, mouse) snaps the right
-pane back to the selection.
+Rare classic actions (yank `y`, reviewers `v`, base `b`, restack `R`,
+archive `a`, clean `c`, AI regen `t`, ready/ship `e`/`E`, CI logs `f`,
+review-checkout `w`, zed opens, `Shift+Tab` harness cycle, `Ctrl+A`
+automations, `Shift+F10/F11/F12`) have no cmd chord: `⌘H`, type the
+letter, `Esc` back.
 
-`F10`/`F11`/`F12` are also forwarded un-prefixed (not `Alt+F10` etc.) since
-they're already dedicated function keys distinct from ordinary letters.
-
-**Prerequisite:** your terminal has to actually send `Alt+<key>` (or
-`Option+<key>` on macOS) as a distinguishable Meta/CSI-u sequence for tmux's
-`M-` bindings to fire at all — most modern terminals (iTerm2 with "Left/Right
-Option Key" set to Esc+, WezTerm, Kitty, Ghostty) do this out of the box. The
-hub's outer tmux config also turns on `extended-keys always` / `csi-u` so a
-CSI-u-capable terminal gets unambiguous key events instead of the older
-Esc-prefix heuristic.
-
-When a modal picker or footer text prompt is open, wt temporarily pulls
-tmux focus onto the left pane (so you can type into it directly) and, on
-close, restores focus to whichever pane held it BEFORE the modal opened —
-answering a picker never dumps you into a session pane you weren't in.
-You never need `F9` just to answer a picker.
+Outside the hub the cmd chords degrade to ordinary Meta keystrokes (`⌘D`
+in a plain zsh is `kill-word`, in a full-screen classic claude attach
+they're inert Option chords) — the same class of leak the Option layer
+always had, no new failure modes.
 
 ## The task model
 
@@ -192,23 +183,25 @@ under Review output.
 
 ## Keymap (hub-only)
 
-Every classic-mode key still works (as `Alt+<key>`, see above); these are
-additional or hub-specific:
-
 | key | action |
 |---|---|
-| `Enter` / `F12` | start (or resume) and show the selected task's agent session in the right pane; on a PR task, opens the PR instead |
-| `F11` / `F10` | show the task's diff / shell session in the right pane |
-| `j`/`k`, `g`/`G` | move the task cursor |
-| `Tab` | expand/collapse the selected stack task |
-| `z` | snooze the task until its bucket changes |
-| `P` | pin the task to the top |
-| `I` | toggle the stacked details card below the task list |
-| ⏎ / F12 on a Sessions entry | show that special session (main clone / wt repo / dotfiles) |
-| `q` / `Ctrl+C` | leave the hub — kills the outer layout session only; every inner-server session keeps running |
-| `F9` (no Alt) | cycle pane focus left ↔ right |
-| `F10`/`F11`/`F12` again | toggle pane focus once the session is already shown |
-| `F8` (tmux-level) | zoom the right pane full-screen |
+| `⌘J` / `⌘K` | move the task cursor (the right pane live-follows) |
+| `⌘1`-`⌘9` | jump straight to task N (dim ordinals on the first nine rows) |
+| `⌘L` | start (or resume) and show the task's agent session; on a PR task, `Enter` opens the PR; repeat = toggle pane focus |
+| `⌘D` / `⌘S` | show the diff / shell session; repeat = toggle pane focus |
+| `⌘H` / `Esc` | focus the task pane / bounce back to the session |
+| `⌘E` | expand/collapse the selected stack or the Sessions group |
+| `⌘Z` / `⌘P` | snooze until the bucket changes / pin to top |
+| `⌘I` | toggle the stacked details card |
+| `⌘O` / `⌘M` | open the PR / toggle auto-merge |
+| `⌘N` | new-worktree prompt |
+| `⌘.` / `⌘;` | action picker / sessions picker |
+| `⌘W` | close the task's session gracefully (`⌘W` ×2 to confirm) |
+| `⌘⌫` | remove the worktree (confirm) |
+| `⌘F` | zoom the session pane full-width |
+| `⌘R` / `⌘/` | refresh / help |
+| `q` (task pane focused) / `Ctrl+C` | leave the hub — kills the outer layout only; inner sessions keep running |
+| `Enter`/`Tab`/`j`/`k`/`g`/`G`/`z`/`P`/`I`, `F7`-`F12` | direct equivalents when the task pane holds focus (F7 focus-tasks, F8 zoom, F9 focus-toggle, F10-F12 shell/diff/agent) |
 
 Moving the task cursor auto-follows: after a 150ms debounce, the right pane
 switches to the newly-selected task's live session (stamping its focus
@@ -227,6 +220,9 @@ clock) or falls back to the home dashboard if it has none.
   layout, they just don't move anything in the inbox).
 - **Archived worktrees are hidden**, unlike classic mode's list, which can
   still show them via the archived section.
+- **The removed-worktrees history view is hub-less** (`h` is classic-only;
+  `⌘H` means focus-the-task-pane in hub) — use `wt classic` to browse or
+  restore removed worktrees.
 - Classic and hub mode are two views over identical state — nothing needs
   reconciling when you switch, so treat `wt hub` / `wt classic` as a
   free toggle rather than a mode commitment.

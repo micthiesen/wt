@@ -172,6 +172,7 @@ const TaskRowView = memo(function TaskRowView({
   activeSessionBySlug,
   activeActions,
   primaryHarness,
+  ordinal,
   panelWidth,
 }: {
   item: TaskItem;
@@ -179,6 +180,8 @@ const TaskRowView = memo(function TaskRowView({
   activeSessionBySlug: ReadonlyMap<string, ActiveSessionGlyph>;
   activeActions: ReadonlySet<string>;
   primaryHarness: HarnessId;
+  /** 1-9 quick-jump ordinal (cmd+N), shown dim in the detail indent. */
+  ordinal?: number;
   panelWidth: number;
 }) {
   const bg = selected ? theme.rowSelectedBg : undefined;
@@ -224,7 +227,11 @@ const TaskRowView = memo(function TaskRowView({
         ) : null}
       </box>
       <box flexDirection="row">
-        <box width={DETAIL_INDENT} flexShrink={0} />
+        <box width={DETAIL_INDENT} flexShrink={0}>
+          {ordinal !== undefined ? (
+            <text fg={theme.borderDim}>{String(ordinal)}</text>
+          ) : null}
+        </box>
         <box flexGrow={1} flexShrink={1} overflow="hidden">
           <text fg={theme.fgDim} wrapMode="none">
             {truncateEnd(taskDetailLine(item, activeSessionBySlug), budget2)}
@@ -319,6 +326,7 @@ export function TaskList({
                 activeSessionBySlug={activeSessionBySlug}
                 activeActions={activeActions}
                 primaryHarness={primaryHarness}
+                ordinal={i < 9 ? i + 1 : undefined}
                 panelWidth={width}
               />
             </Fragment>

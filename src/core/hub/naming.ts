@@ -51,19 +51,34 @@ export const WT_HUB_ENV_VALUE = "1";
  * entry (`G`, `N`, `J`, …) is a *separate* forward for Alt+Shift+<key>,
  * since tmux's key table distinguishes `M-g` from `M-G` the same way it
  * distinguishes `g` from `G`.
+ *
+ * The primary driver of this table is the CMD LAYER: Alacritty maps
+ * cmd+<key> to the same ESC-prefixed sequences (skhd/yabai own most of
+ * the Alt space globally, so bare Option chords for j/k/n/1-5 never
+ * reach the terminal). `h`/`d`/`s`/`f`/`w` are deliberately absent
+ * here — they have dedicated rebinds in `buildHubConfig` (F7 focus /
+ * F11 diff / F10 shell / zoom / C-d close) instead of forwarding the
+ * literal letter. Digits 1-9 forward for the task quick-jump.
  */
 export const HUB_FORWARD_KEYS = [
   "j",
   "k",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
   "g",
   "G",
   "n",
   "N",
-  "d",
   "c",
   "a",
   "i",
-  "s",
   "t",
   "y",
   "r",
@@ -71,9 +86,7 @@ export const HUB_FORWARD_KEYS = [
   "e",
   "E",
   "m",
-  "f",
   "v",
-  "w",
   "l",
   "L",
   "J",
@@ -84,7 +97,6 @@ export const HUB_FORWARD_KEYS = [
   "P",
   "z",
   "I",
-  "h",
   "q",
   "o",
   "O",

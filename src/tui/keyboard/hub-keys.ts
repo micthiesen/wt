@@ -80,6 +80,33 @@ export function handleHubKey(k: KeyEvent, ctx: HubKeysCtx): void {
     return;
   }
 
+  // F7 — focus the task pane (cmd+h's relay; the outer server rebinds
+  // M-h here because the literal `h` was the removed-history toggle).
+  if (k.name === "f7" && !k.shift && !k.ctrl && !k.option && !k.meta) {
+    hubFlows.focusTaskPane();
+    return;
+  }
+
+  // Esc with no modal open (modals consume Esc upstream) — bounce
+  // focus back to the session pane: the inverse of cmd+h, so hopping
+  // into the inbox for one action and back needs no chord at all.
+  if (k.name === "escape" && !k.shift && !k.ctrl && !k.option && !k.meta) {
+    hubFlows.focusSessionPane();
+    return;
+  }
+
+  // 1-9 — jump straight to the Nth task (cmd+1..9; the pane renders
+  // dim ordinals on the first nine rows). A digit reaching this layer
+  // means no picker is open (their quick-pick runs upstream).
+  if (
+    /^[1-9]$/.test(k.sequence ?? "") &&
+    !k.shift && !k.ctrl && !k.option && !k.meta
+  ) {
+    const n = Number(k.sequence) - 1;
+    if (n < tasks.length) setSel(tasks[n]!.key);
+    return;
+  }
+
   // --- Task-cursor navigation --------------------------------------
   const move = (delta: number): void => {
     if (tasks.length === 0) return;
