@@ -10,7 +10,8 @@ enabled — that id is public by design; it powers the README badge).
 - **#updates** — AI-written commit digests, posted by the workflow below.
   Nothing else posts here.
 - **#github** — raw repo events via a native Discord GitHub webhook (see
-  below). Deliberately excludes pushes so it never overlaps #updates.
+  below), plus unsuccessful `ci` completions on `main`. Deliberately excludes
+  pushes so it never overlaps #updates.
 - **#help** — support. Carries a pinned message telling reporters to include
   `wt doctor` output and the tail of `~/.cache/wt/logs/app/wt-<date>.log`.
 
@@ -57,15 +58,21 @@ Full mechanics are documented in those files' header comments; the shape:
   resumes normally once ci runs are getting picked up again.
 
 **Actions secrets** (repo Settings → Secrets → Actions): `OPENAI_API_KEY`,
-`DISCORD_UPDATES_WEBHOOK` (the #updates channel webhook URL). These are the
-only Discord-related Actions secrets.
+`DISCORD_UPDATES_WEBHOOK` (the #updates channel webhook URL).
 
-## #github: the raw event feed
+## #github: repo events and CI failures
 
 A GitHub **repo webhook** (repo Settings → Webhooks — not an Actions secret)
 posting to the #github channel's Discord webhook URL with `/github` appended.
 Registered events: `issues`, `issue_comment`, `pull_request`,
 `pull_request_review`, `fork`, `star` — no `push`. Hook id `662175381`.
+
+`.github/workflows/discord-ci-alert.yml` separately posts every non-successful
+completion of the `ci` workflow on `main`, including failures, cancellations,
+and timeouts. The alert includes the conclusion, commit, actor, and a direct
+link to the Actions run. It uses the Actions secret `DISCORD_GITHUB_WEBHOOK`,
+which is the same channel webhook URL without the native integration's
+`/github` suffix.
 
 To re-register (e.g. after rotating the Discord webhook):
 
@@ -77,8 +84,8 @@ gh api repos/micthiesen/wt/hooks -X POST -F active=true -f name=web \
 ```
 
 Discord webhook URLs grant post access to the channel — they live only in
-Discord (channel → Integrations → Webhooks), repo webhook settings, and the
-Actions secret; never commit one.
+Discord (channel → Integrations → Webhooks), repo webhook settings, and Actions
+secrets; never commit one.
 
 ## Repo surfaces pointing at the server
 

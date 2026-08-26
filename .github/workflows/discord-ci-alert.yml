@@ -1,0 +1,65 @@
+# Post unsuccessful main-branch CI completions to Discord #github.
+# Secret: DISCORD_GITHUB_WEBHOOK (the channel webhook URL, without /github).
+name: discord-ci-alert
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  notify:
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post CI result to Discord
+        env:
+          ACTOR: ${{ github.event.workflow_run.actor.login }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_GITHUB_WEBHOOK }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          TIMESTAMP: ${{ github.event.workflow_run.updated_at }}
+        run: |
+          payload="$RUNNER_TEMP/discord-ci-alert.json"
+          jq -n \
+            --arg actor "$ACTOR" \
+            --arg conclusion "$CONCLUSION" \
+            --arg repository "$REPOSITORY" \
+            --arg run_title "$RUN_TITLE" \
+            --arg run_url "$RUN_URL" \
+            --arg sha "$HEAD_SHA" \
+            --arg timestamp "$TIMESTAMP" \
+            '{
+              username: "GitHub Actions",
+              embeds: [{
+                title: ("CI " + $conclusion + " on main"),
+                url: $run_url,
+                description: $run_title,
+                color: 15158332,
+                fields: [
+                  {
+                    name: "Commit",
+                    value: ("[" + $sha[0:7] + "](https://github.com/" + $repository + "/commit/" + $sha + ")"),
+                    inline: true
+                  },
+                  {
+                    name: "Triggered by",
+                    value: ("@" + $actor),
+                    inline: true
+                  }
+                ],
+                timestamp: $timestamp
+              }]
+            }' > "$payload"
+
+          curl --fail-with-body --silent --show-error \
+            --user-agent "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+            --header "Content-Type: application/json" \
+            --data-binary "@$payload" \
+            "$DISCORD_WEBHOOK"
