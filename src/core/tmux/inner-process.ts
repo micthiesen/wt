@@ -175,7 +175,7 @@ export function wrapInnerArgs(opts: {
   // "no stamp" branches silently inherited the CALLER's identity — a
   // human's F10 shell sending mail signed as whichever agent opened it,
   // and its browser tabs closing with that agent's worktree.
-  const unset: string[] = ["TMUX", "TMUX_PANE", "WT_AGENT", "BROWSER_CONTROL_SESSION"];
+  const unset: string[] = ["TMUX", "TMUX_PANE", "WT_WORKSPACE_SOCKET", "WT_WORKSPACE", "WT_AGENT", "BROWSER_CONTROL_SESSION"];
   const harnessId = harnessIdForKind(kind);
   if (harnessId !== null) {
     // wt is commonly launched from a shell that disables color for command

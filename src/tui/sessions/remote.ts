@@ -7,6 +7,7 @@ import type { WorktreeTarget } from "../../core/worktree-target.ts";
 import { runWorktreeWt } from "../../core/worktree-executor.ts";
 import { setWezTermTabTitle } from "../../core/wezterm.ts";
 import { NF } from "../icons.ts";
+import { workspaceSocket, showWorkspaceTarget } from "../../core/workspace.ts";
 import { handoffTerminal } from "./renderer-handoff.ts";
 
 export class RemoteSessionTargetError extends Data.TaggedError("RemoteSessionTargetError")<{
@@ -31,6 +32,11 @@ export const enterRemoteWorktreeSession = Effect.fn("enterRemoteWorktreeSession"
       });
     }
     const remote = worktree.location.endpoint;
+    if (workspaceSocket) {
+      yield* showWorkspaceTarget({ slug: worktree.slug, cwd: worktree.path, initial: target,
+        harness: { harnessId }, diffBase: config.branch.base, remote });
+      return 0;
+    }
     return yield* setWezTermTabTitle(
       `${NF.remote} ${worktree.slug} · ${remote.label}`,
       config.paths.weztermCli,

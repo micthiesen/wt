@@ -54,6 +54,7 @@ case "$cmd" in
     T new-session -d -s "$name" -x "$w" -y "$h" \
       -e WT_AUTOMATIONS="${WT_AUTOMATIONS:-off}" -e WT_GITHUB="${WT_GITHUB:-off}" \
       -e WT_UPDATE="${WT_UPDATE:-off}" -e WT_SKILLS="${WT_SKILLS:-off}" \
+      -e WT_WORKSPACE="${WT_WORKSPACE:-off}" \
       ${WT_CONFIG:+-e WT_CONFIG="$WT_CONFIG"} \
       ${WT_TMUX_SOCKET:+-e WT_TMUX_SOCKET="$WT_TMUX_SOCKET"} \
       ${WT_DEBUG_THROW:+-e WT_DEBUG_THROW="$WT_DEBUG_THROW"} \

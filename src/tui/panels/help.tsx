@@ -153,6 +153,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "⇧F10", label: "kill shell session (ends background procs)" },
       { key: "F11", label: "enter diff TUI · F11 again to detach" },
       { key: "⇧F11", label: "kill diff session (resets its view state)" },
+      { key: "F9", label: "workspace prototype: toggle full dashboard" },
       { key: "F12", label: "enter F12-target session · F12 again to detach" },
     ],
   },

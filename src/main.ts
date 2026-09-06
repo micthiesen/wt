@@ -150,6 +150,15 @@ const main = Effect.fn("wt")(function* () {
     yield* setWezTermTabTitle("wt", config.paths.weztermCli).pipe(
       Effect.catch(() => Effect.void),
     );
+    if (process.env.WT_WORKSPACE === "on" && !process.env.WT_WORKSPACE_SOCKET && process.stdout.columns >= 100) {
+      const { launchWorkspace } = yield* io.promise("load workspace prototype", () => import("./core/workspace.ts"));
+      const workspaceCode = yield* launchWorkspace();
+      if (process.env.WT_UPDATE !== "off") {
+        const { completeBootSentinel } = yield* io.promise("load boot completion", () => import("./core/update.ts"));
+        yield* Effect.sync(completeBootSentinel);
+      }
+      return workspaceCode;
+    }
     const { runTui } = yield* io.promise("load TUI", () => import("./tui/runtime.tsx"));
     yield* runTui.pipe(
       Effect.mapError(io.wrap("run TUI")),

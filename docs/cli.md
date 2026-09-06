@@ -397,3 +397,10 @@ and its fallback.
 ---
 
 There is also an internal `wt _destroy` entrypoint that `rm --background` / `clean` spawn for background removals — not for direct use.
+
+### Workspace prototype
+
+The `side-nav-workspace` branch offers `WT_WORKSPACE=on wt` for the
+[experimental sticky explorer](tui.md#experimental-sticky-explorer-issue-18).
+No user-managed outer tmux session is required. `_workspace-host` is an
+internal presentation process, not a worktree lifecycle command.

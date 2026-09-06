@@ -218,3 +218,11 @@ describe("tmux inner-process stderr routing", () => {
     );
   });
 });
+
+test("persistent sessions do not inherit presentation workspace identity", async () => {
+  const proc = Bun.spawn(wrapInnerArgs({
+    kind: "shell", stderrPath: "/dev/null", innerArgs: ["printenv", "WT_WORKSPACE_SOCKET", "WT_WORKSPACE"],
+  }), { stdout: "pipe", stderr: "ignore", env: { ...process.env, WT_WORKSPACE_SOCKET: "old-view", WT_WORKSPACE: "on" } });
+  const [, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+  expect(stdout.trim()).toBe("");
+});

@@ -450,13 +450,14 @@ export function App({ onExit }: Props) {
       selectedWorktree,
     });
 
-  const listWidth = Math.max(32, Math.min(52, Math.floor(width * 0.44)));
+  const compactExplorer = !!process.env.WT_WORKSPACE_SOCKET && width < 90;
+  const listWidth = compactExplorer ? width : Math.max(32, Math.min(52, Math.floor(width * 0.44)));
   // Two layouts, differing only in where the activity pane sits
   // (`[ui] activity_pane`). `column` (default): the list owns the full
   // usable height and the right column splits between details and
   // activity. `full_width`: activity spans the bottom under both panes,
   // so the list is capped to the same height as details.
-  const activityInColumn = config.ui.activityPane === "column";
+  const activityInColumn = compactExplorer || config.ui.activityPane === "column";
   const detailsMax = 20;
   // Title and footer take 1 row each, so `height - 2` is the budget the
   // details cap and the activity pane divide between them. Identical in
@@ -1087,7 +1088,7 @@ export function App({ onExit }: Props) {
             scrollHandle={listScrollHandleRef}
           />
         )}
-        <box
+        {!compactExplorer && <box
           flexDirection="column"
           width={detailsWidth}
           flexShrink={0}
@@ -1118,7 +1119,7 @@ export function App({ onExit }: Props) {
           {activityInColumn && (
             <OutputViewer output={displayedOutput} height={activityHeight} />
           )}
-        </box>
+        </box>}
       </box>
       {!activityInColumn && (
         <OutputViewer output={displayedOutput} height={activityHeight} />

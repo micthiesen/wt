@@ -174,3 +174,8 @@ been exercised.
 offers) for one run — the probe harness arms it. Everything the
 automation does is also just git: `git -C ~/.wt log|reset|pull` remain
 the ultimate manual override.
+
+The opt-in workspace prototype runs startup prompts in the launching terminal
+before creating its presentation workspace. The child explorer receives
+`WT_WORKSPACE=off` to prevent recursive workspace creation. The prototype is
+not the default startup path; see [tui.md](tui.md#experimental-sticky-explorer-issue-18).

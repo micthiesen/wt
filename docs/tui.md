@@ -225,3 +225,27 @@ Confirm modals follow the same muscle-memory rule in reverse: the key that opene
 Every text input (the `n`/`N`/`Ctrl+N` new-worktree prompt, `L` section rename, `u m` / `u a` status text, `! c` custom prompts and action args, `; c` session names, help search) shares one line editor: `←`/`→` move the cursor, `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to the ends, `Opt/Alt+←`/`→` (or `Esc B`/`Esc F`, or `Ctrl+←`/`→`) jump by word, `Backspace`/`Delete` edit at the cursor, `Opt/Alt+Backspace` deletes the word left, and `Ctrl+U`/`Ctrl+K` kill to the start/end of the line (`Ctrl+U` is how you empty a pre-filled prompt, since backspacing past empty backs out instead). Word boundaries are slug- and sentence-aware: `-`, `_`, and spaces all separate words. Backspace on an already-empty input still backs out of the prompt.
 
 The title bar's `auto ⏸` chip (inverse, warn-colored) means all automations are paused — a fleet-tier fact deliberately louder than the CPU/usage telemetry next to it.
+
+## Experimental sticky explorer (issue #18)
+
+On the `side-nav-workspace` prototype branch, launch `WT_WORKSPACE=on wt`
+from a normal terminal at least 100 columns wide. wt creates an outer tmux
+workspace: the left explorer stays visible while F10/F11/F12 open persistent
+shell/diff/agent sessions on the right. Browsing rows does not change the
+right-side session. Its pane title identifies the displayed worktree and target.
+Press the active target's F-key to focus the explorer without detaching it.
+F9 zooms the explorer into the full dashboard; press it again to restore the
+split. Ordinary tmux resizing is supported; a sidebar under 90 columns uses
+the compact explorer. Closing the right pane lets the next open recreate it.
+
+The workspace copies plain `prefix` and directional `select-pane` bindings
+from `~/.tmux.conf` and `~/.config/tmux/tmux.conf`; it does not source either
+file or change the user's tmux server. Other custom bindings/plugins are not
+imported. Quitting closes owned presentation panes; persistent wt sessions
+continue running. `WT_WORKSPACE=off` (or omitting the opt-in) retains fullscreen
+entry, as do terminals narrower than 100 columns at launch.
+
+This is the plan's prototype stage, not the completed feature. Remote targets
+use the existing SSH entrypoint, but remote cross-target titles/focus routing,
+disconnect/reconnect recovery, multiple-viewer resizing, and end-to-end
+clipboard/modified-input behavior still need the issue's acceptance pass.

@@ -327,3 +327,20 @@ These define contracts; touching them ripples. Read them first:
 - `src/core/diff/` — graceful-degradation diff compactor for the AI pipeline (`parts.ts` parses, `render.ts` transforms per mode, `fit.ts` runs the priority-aware greedy reducer). Cache keys are SHA-256 prefixes of the *unfiltered* diff so filter tweaks don't invalidate prior summaries.
 - `src/core/ai.ts` — harness-backed naming pipeline returning `{title, brief, description}` from a line-prefixed response, with a lenient parser; `core/harness/completion.ts` owns the safe one-shot CLI contract.
 - `src/core/logger.ts` — see above.
+
+## Workspace prototype
+
+`core/workspace.ts` owns an opt-in outer tmux server per invocation. Its
+presentation panes are distinct from the existing persistent-session server.
+`main.ts` launches it only with `WT_WORKSPACE=on` in a wide TTY; the child
+explorer carries `WT_WORKSPACE_SOCKET` to prevent recursion. Compact rendering
+is selected by the explorer's pane width; F9 uses native zoom for the dashboard.
+
+Session flows route workspace targets to a thin `_workspace-host` command.
+The fullscreen entry and local content host share `navigateWorktreeSession`;
+remote content uses the existing `_session` SSH transport. Target activation
+is serialized and stale requests cannot take focus. Pane IDs survive index
+changes; process ownership is checked before replacement. Host HUP/TERM
+interrupts its scoped attach client, not the underlying session. Workspace
+identity is removed from persistent-session environments. The prototype's
+remaining acceptance work is documented in [tui.md](tui.md#experimental-sticky-explorer-issue-18).

@@ -16,6 +16,7 @@ import {
   attachOrCreate,
 } from "../../core/tmux/attach.ts";
 import { killHarnessSession } from "../../core/tmux/admin.ts";
+import { workspaceSocket, showWorkspaceTarget, setWorkspaceTargetLabel } from "../../core/workspace.ts";
 import { handoffTerminal } from "./renderer-handoff.ts";
 
 export type HarnessRoute = {
@@ -47,8 +48,17 @@ export type EnterWorktreeSessionOptions = {
 };
 
 export function enterWorktreeSession(opts: EnterWorktreeSessionOptions) {
-  const { renderer, slug, cwd, diffBase, harness, switchable = true } = opts;
-  return handoffTerminal(renderer, cwd, Effect.gen(function* () {
+  const { renderer, ...target } = opts;
+  if (workspaceSocket) {
+    return showWorkspaceTarget(target).pipe(Effect.as({ kind: "detached" } as const));
+  }
+  return handoffTerminal(renderer, opts.cwd, navigateWorktreeSession(target));
+}
+
+/** Shared by fullscreen entry and the workspace's thin content host. */
+export function navigateWorktreeSession(opts: Omit<EnterWorktreeSessionOptions, "renderer">) {
+  const { slug, cwd, diffBase, harness, switchable = true } = opts;
+  return Effect.gen(function* () {
     let target = opts.initial;
     let harnessPrepared = false;
 
@@ -80,10 +90,11 @@ export function enterWorktreeSession(opts: EnterWorktreeSessionOptions) {
     });
 
     for (;;) {
+      yield* setWorkspaceTargetLabel(opts, target);
       const result = yield* attachTarget();
       if (result.kind !== "switch") return result;
       if (!switchable) return { kind: "detached" } as const;
       target = result.target;
     }
-  }));
+  });
 }
