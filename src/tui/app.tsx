@@ -50,6 +50,7 @@ import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWtStateEvents } from "./hooks/useWtStateEvents.ts";
 import { useManagerReports } from "./hooks/useManagerSignals.ts";
 import { useWorktreeRows } from "./hooks/useWorktreeRows.ts";
+import { useWorkspaceHelp } from "./hooks/useWorkspaceHelp.ts";
 import { useStackSections } from "./hooks/useStackSections.ts";
 import type { CreatedWorktreePlacement } from "./created-worktree.ts";
 import { useVisualItems, visualKey } from "./hooks/useVisualItems.ts";
@@ -208,6 +209,7 @@ export function App({ onExit }: Props) {
   // items, slug context) lives on its variant. The keyboard handler
   // and JSX both `switch` on `modal.kind`.
   const [modal, setModalState] = useState<Modal | null>(null);
+  useWorkspaceHelp(modal?.kind === "help");
   // Same ref-authoritative discipline as `footer` above.
   const modalRef = useRef<Modal | null>(modal);
   const setModal = useCallback((m: Modal | null | ((prev: Modal | null) => Modal | null)) => {

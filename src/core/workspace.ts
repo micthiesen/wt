@@ -181,3 +181,24 @@ export const idleWorkspaceHost = Effect.fn("idleWorkspaceHost")(function* (messa
   yield* Effect.sync(() => console.log(`\n  ${message}\n\n  F9: full dashboard`));
   return yield* Effect.never;
 });
+
+/** Help temporarily owns explorer zoom; preserve a dashboard already zoomed by F9. */
+export const workspaceHelpZoom = Effect.acquireUseRelease(
+  Effect.gen(function* () {
+    const socket = workspaceSocket;
+    const pane = process.env.TMUX_PANE;
+    if (!socket || !pane) return null;
+    const state = yield* tmux(socket, ["display-message", "-p", "-t", pane, "#{pane_pid} #{window_zoomed_flag}"]);
+    if (state !== `${process.pid} 0`) return null;
+    yield* tmux(socket, ["resize-pane", "-Z", "-t", pane]);
+    return { socket, pane };
+  }),
+  () => Effect.never,
+  (owned) => Effect.gen(function* () {
+    if (!owned) return;
+    const state = yield* tmux(owned.socket, ["display-message", "-p", "-t", owned.pane, "#{pane_pid} #{window_zoomed_flag}"]);
+    if (state === `${process.pid} 1`) {
+      yield* tmux(owned.socket, ["resize-pane", "-Z", "-t", owned.pane]);
+    }
+  }).pipe(Effect.ignore),
+).pipe(gate.withPermit);

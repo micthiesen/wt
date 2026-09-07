@@ -335,6 +335,8 @@ presentation panes are distinct from the existing persistent-session server.
 `main.ts` launches it only with `WT_WORKSPACE=on` in a wide TTY; the child
 explorer carries `WT_WORKSPACE_SOCKET` to prevent recursion. Compact rendering
 is selected by the explorer's pane width; F9 uses native zoom for the dashboard.
+`useWorkspaceHelp` leases that zoom for the help overlay and restores it on
+dismissal only when help acquired it; search renders do not renew the lease.
 
 Session flows route workspace targets to a thin `_workspace-host` command.
 The fullscreen entry and local content host share `navigateWorktreeSession`;
