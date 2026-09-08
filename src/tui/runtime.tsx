@@ -1,3 +1,4 @@
+import { theme } from "./theme.ts";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { QueryClientProvider } from "@tanstack/react-query";
@@ -776,6 +777,7 @@ export const runTui = Effect.gen(function* () {
     Effect.tryPromise({
       try: () =>
         createCliRenderer({
+          backgroundColor: theme.bg,
           exitOnCtrlC: false,
           // No targetFps override: it only applies in the renderer's "live"
           // (continuous) mode, which wt never enters now that no Timeline /

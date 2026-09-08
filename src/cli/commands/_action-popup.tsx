@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { createConnection } from "node:net";
+import { theme } from "../../tui/theme.ts";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot, useKeyboard } from "@opentui/react";
 import { Effect } from "effect";
@@ -20,7 +21,7 @@ function Popup({ store, send }: { store: SnapshotStore; send: (event: unknown) =
 export const run = Effect.fn("actionPopup")(function* (argv: string[]) {
   if (argv.length !== 1) return 2;
   return yield* Effect.acquireUseRelease(
-    io.promise("create renderer", () => createCliRenderer({ exitOnCtrlC: false, autoFocus: false, openConsoleOnError: false })),
+    io.promise("create renderer", () => createCliRenderer({ backgroundColor: theme.bg, exitOnCtrlC: false, autoFocus: false, openConsoleOnError: false })),
     (renderer) => Effect.acquireUseRelease(
       io.sync("create root", () => createRoot(renderer)),
       (root) => Effect.callback<number>((resume) => {

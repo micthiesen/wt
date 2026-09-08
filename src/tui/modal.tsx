@@ -103,7 +103,12 @@ export function Modal({
   children,
 }: Props) {
   const { width, height } = useTerminalDimensions();
-  if (process.env.WT_POPUP === "1") fill = true;
+  if (process.env.WT_POPUP === "1") {
+    // tmux already bounds the popup; a second width cap leaves bare terminal
+    // columns beside the painted modal.
+    fill = true;
+    maxWidth = null;
+  }
   const i =
     process.env.WT_POPUP === "1"
       ? { top: "0%", right: "0%", bottom: "0%", left: "0%" } as const

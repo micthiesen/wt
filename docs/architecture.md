@@ -345,6 +345,9 @@ and relays key/paste events back to the explorer's existing handlers. The
 explorer owns the captured target, availability checks, and action execution;
 the popup has no fleet queries or action runtime. Closing either side disposes
 the connection and popup; input received after the action modal closes is ignored.
+Popup modals fill their terminal width without the normal modal width cap; both
+popup renderers paint the theme background so no bare terminal gutters show.
+The main TUI renderer uses the same background for any space outside its layout.
 
 Session flows route workspace targets to a thin `_workspace-host` command.
 The fullscreen entry and local content host share `navigateWorktreeSession`;

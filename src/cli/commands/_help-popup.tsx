@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { theme } from "../../tui/theme.ts";
 import { createCliRenderer } from "@opentui/core";
 import { createRoot, useKeyboard } from "@opentui/react";
 import { Effect } from "effect";
@@ -27,7 +28,7 @@ function HelpPopup({ close }: { close: () => void }) {
 /** Only the shared help UI: no fleet queries, startup prompts, or session runtime. */
 export const run = Effect.fn("helpPopup")(function* (_argv: string[]) {
   return yield* Effect.acquireUseRelease(
-    io.promise("create renderer", () => createCliRenderer({ exitOnCtrlC: false, autoFocus: false, openConsoleOnError: false })),
+    io.promise("create renderer", () => createCliRenderer({ backgroundColor: theme.bg, exitOnCtrlC: false, autoFocus: false, openConsoleOnError: false })),
     (renderer) => Effect.acquireUseRelease(
       io.sync("create root", () => createRoot(renderer)),
       (root) => Effect.callback<number>((resume) => {
