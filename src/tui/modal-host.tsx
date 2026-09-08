@@ -153,7 +153,7 @@ export function PostFooterModals({
 }) {
   return (
     <>
-      {modal?.kind === "help" ? (
+      {modal?.kind === "help" && !process.env.WT_WORKSPACE_SOCKET ? (
         <HelpOverlay query={modal.query} searching={modal.searching} />
       ) : null}
       {modal?.kind === "perf" ? (

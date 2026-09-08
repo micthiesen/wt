@@ -234,8 +234,9 @@ workspace: the left explorer stays visible while F10/F11/F12 open persistent
 shell/diff/agent sessions on the right. Browsing rows does not change the
 right-side session. Its pane title identifies the displayed worktree and target.
 Press the active target's F-key to focus the explorer without detaching it.
-`?` temporarily expands help across the whole workspace and restores the prior
-split when dismissed. If the dashboard was already expanded, it stays expanded.
+`?` opens help in a centered tmux popup over both panes. Scrolling and search
+use the same help controls; opening and closing it never resizes either pane
+or changes the current dashboard zoom.
 F9 zooms the explorer into the full dashboard; press it again to restore the
 split. Ordinary tmux resizing is supported; a sidebar under 90 columns uses
 the compact explorer. Closing the right pane lets the next open recreate it.

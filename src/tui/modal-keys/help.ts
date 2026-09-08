@@ -9,7 +9,7 @@ import type { SimpleModalContext } from "./ctx.ts";
 export function handleHelpKey(
   k: KeyEvent,
   modal: Extract<Modal, { kind: "help" }>,
-  { setModal }: SimpleModalContext,
+  { setModal }: Pick<SimpleModalContext, "setModal">,
 ): boolean {
   if (modal.searching) {
     if (k.ctrl && k.name === "c") {

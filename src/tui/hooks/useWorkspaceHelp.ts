@@ -1,15 +1,19 @@
+import type { Dispatch, SetStateAction } from "react";
 import { Effect } from "effect";
 import { createLogger } from "../../core/logger.ts";
-import { workspaceHelpZoom, workspaceSocket } from "../../core/workspace.ts";
+import { workspaceHelpPopup, workspaceSocket } from "../../core/workspace.ts";
+import type { Modal } from "../modal-state.ts";
 import { useEffectFiber } from "./useEffectFiber.ts";
 
 const log = createLogger("[workspace]");
 
-/** One zoom lease for the help overlay, independent of search/filter renders. */
-export function useWorkspaceHelp(open: boolean): void {
+export function useWorkspaceHelp(open: boolean, setModal: Dispatch<SetStateAction<Modal | null>>): void {
   useEffectFiber(() => open && workspaceSocket
-    ? workspaceHelpZoom.pipe(Effect.catch((error) => Effect.sync(() => {
-      log.event.warn(`could not expand help: ${error.message}`);
-    })))
-    : null, [open]);
+    ? workspaceHelpPopup.pipe(
+      Effect.catch((error) => Effect.sync(() => {
+        log.event.warn(`could not open help: ${error.message}`);
+      })),
+      Effect.ensuring(Effect.sync(() => setModal((current) => current?.kind === "help" ? null : current))),
+    )
+    : null, [open, setModal]);
 }

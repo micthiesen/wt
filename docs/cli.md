@@ -403,4 +403,5 @@ There is also an internal `wt _destroy` entrypoint that `rm --background` / `cle
 The `side-nav-workspace` branch offers `WT_WORKSPACE=on wt` for the
 [experimental sticky explorer](tui.md#experimental-sticky-explorer-issue-18).
 No user-managed outer tmux session is required. `_workspace-host` is an
-internal presentation process, not a worktree lifecycle command.
+internal presentation process, not a worktree lifecycle command. `_help-popup`
+is the lightweight renderer used by workspace help.

@@ -209,13 +209,13 @@ export function App({ onExit }: Props) {
   // items, slug context) lives on its variant. The keyboard handler
   // and JSX both `switch` on `modal.kind`.
   const [modal, setModalState] = useState<Modal | null>(null);
-  useWorkspaceHelp(modal?.kind === "help");
   // Same ref-authoritative discipline as `footer` above.
   const modalRef = useRef<Modal | null>(modal);
   const setModal = useCallback((m: Modal | null | ((prev: Modal | null) => Modal | null)) => {
     modalRef.current = typeof m === "function" ? m(modalRef.current) : m;
     setModalState(modalRef.current);
   }, []);
+  useWorkspaceHelp(modal?.kind === "help", setModal);
   // Perf sampling runs ONLY while the `P` overlay is up — three
   // shell-outs every 2s is cheap against the load it measures, but
   // pointless (and self-defeating) with nothing watching.

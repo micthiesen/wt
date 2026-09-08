@@ -182,23 +182,18 @@ export const idleWorkspaceHost = Effect.fn("idleWorkspaceHost")(function* (messa
   return yield* Effect.never;
 });
 
-/** Help temporarily owns explorer zoom; preserve a dashboard already zoomed by F9. */
-export const workspaceHelpZoom = Effect.acquireUseRelease(
-  Effect.gen(function* () {
-    const socket = workspaceSocket;
-    const pane = process.env.TMUX_PANE;
-    if (!socket || !pane) return null;
-    const state = yield* tmux(socket, ["display-message", "-p", "-t", pane, "#{pane_pid} #{window_zoomed_flag}"]);
-    if (state !== `${process.pid} 0`) return null;
-    yield* tmux(socket, ["resize-pane", "-Z", "-t", pane]);
-    return { socket, pane };
-  }),
-  () => Effect.never,
-  (owned) => Effect.gen(function* () {
-    if (!owned) return;
-    const state = yield* tmux(owned.socket, ["display-message", "-p", "-t", owned.pane, "#{pane_pid} #{window_zoomed_flag}"]);
-    if (state === `${process.pid} 1`) {
-      yield* tmux(owned.socket, ["resize-pane", "-Z", "-t", owned.pane]);
-    }
-  }).pipe(Effect.ignore),
-).pipe(gate.withPermit);
+/** A separate popup terminal overlays both panes without changing their sizes. */
+export const workspaceHelpPopup = Effect.gen(function* () {
+  const socket = workspaceSocket;
+  const pane = process.env.TMUX_PANE;
+  if (!socket || !pane) return;
+  const state = yield* tmux(socket, ["display-message", "-p", "-t", pane,
+    "#{pane_pid} #{client_width} #{client_height}"]);
+  const [owner, width, height] = state.split(" ");
+  if (owner !== String(process.pid)) return;
+  yield* tmux(socket, ["display-popup", "-E", "-B", "-t", pane, "-x", "C", "-y", "C",
+    "-w", String(Math.max(20, Math.min(104, Number(width) - 4))),
+    "-h", String(Math.max(8, Math.floor(Number(height) * 0.9))),
+    command(["env", "-u", "BUN_INSPECT", "bun", entry, "_help-popup"]),
+  ]);
+}).pipe(gate.withPermit);

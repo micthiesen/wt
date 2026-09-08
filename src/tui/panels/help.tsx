@@ -574,9 +574,11 @@ function BlockView({ block }: { block: Block }) {
 export function HelpOverlay({
   query,
   searching,
+  popup = false,
 }: {
   query: TextEdit;
   searching: boolean;
+  popup?: boolean;
 }) {
   // j/k etc. scroll via `handleOverlayScrollKey` in modal-keys/help.ts
   // (the shared overlay keymap), not the focused-scrollbox built-in —
@@ -610,7 +612,8 @@ export function HelpOverlay({
   return (
     <Modal
       title={`help · wt ${wtVersion()}`}
-      inset={{ top: "6%", right: "6%", bottom: "6%", left: "6%" }}
+      inset={popup ? { top: "0%", right: "0%", bottom: "0%", left: "0%" } : { top: "6%", right: "6%", bottom: "6%", left: "6%" }}
+      maxWidth={popup ? null : undefined}
       hints={hints}
       fill
     >
