@@ -96,6 +96,7 @@ const RUNNERS: Record<string, Loader> = {
   _remote: () => import("./commands/_remote.ts"),
   _hello: () => import("./commands/_hello.ts"),
   _snapshot: () => import("./commands/_snapshot.ts"),
+  "_action-popup": () => import("./commands/_action-popup.tsx"),
   "_help-popup": () => import("./commands/_help-popup.tsx"),
   "_workspace-host": () => import("./commands/_workspace-host.ts"),
   _session: () => import("./commands/_session.ts"),

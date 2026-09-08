@@ -103,8 +103,11 @@ export function Modal({
   children,
 }: Props) {
   const { width, height } = useTerminalDimensions();
+  if (process.env.WT_POPUP === "1") fill = true;
   const i =
-    width < NARROW_WIDTH ? NARROW_INSET : { ...DEFAULT_INSET, ...inset };
+    process.env.WT_POPUP === "1"
+      ? { top: "0%", right: "0%", bottom: "0%", left: "0%" } as const
+      : width < NARROW_WIDTH ? NARROW_INSET : { ...DEFAULT_INSET, ...inset };
   const { left, right } =
     maxWidth === null
       ? { left: i.left, right: i.right }

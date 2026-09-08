@@ -339,6 +339,12 @@ is selected by the explorer's pane width; F9 uses native zoom for the dashboard.
 untouched. Its `_help-popup` process renders only the shared `HelpOverlay` and
 uses the shared help keyboard handler; it starts no fleet queries or session
 runtime. The explorer suppresses its own help overlay while the popup is open.
+`useWorkspaceActions` does the same for the row `!` menu and its edit/argument
+screens. A private temporary Unix socket sends view snapshots to `_action-popup`
+and relays key/paste events back to the explorer's existing handlers. The
+explorer owns the captured target, availability checks, and action execution;
+the popup has no fleet queries or action runtime. Closing either side disposes
+the connection and popup; input received after the action modal closes is ignored.
 
 Session flows route workspace targets to a thin `_workspace-host` command.
 The fullscreen entry and local content host share `navigateWorktreeSession`;

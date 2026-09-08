@@ -50,6 +50,10 @@ import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWtStateEvents } from "./hooks/useWtStateEvents.ts";
 import { useManagerReports } from "./hooks/useManagerSignals.ts";
 import { useWorktreeRows } from "./hooks/useWorktreeRows.ts";
+import { useWorkspaceActions } from "./hooks/useWorkspaceActions.ts";
+import { isActionPopupModal, type ActionPopupSnapshot } from "./action-popup.tsx";
+import { actionSubjectVars } from "./action-subject.ts";
+import { actionSkillPrefix } from "./app-helpers.ts";
 import { useWorkspaceHelp } from "./hooks/useWorkspaceHelp.ts";
 import { useStackSections } from "./hooks/useStackSections.ts";
 import type { CreatedWorktreePlacement } from "./created-worktree.ts";
@@ -261,7 +265,7 @@ export function App({ onExit }: Props) {
   // Bracketed paste → append into whichever text mode is active. No-op
   // in legend/confirm modes since paste only makes sense when the
   // user is typing.
-  usePaste((text) => {
+  const handlePaste = (text: string) => {
     // Read the refs, not the render closures — see the footer/modal
     // state comment above.
     const modal = modalRef.current;
@@ -289,7 +293,8 @@ export function App({ onExit }: Props) {
     if (footer.kind === "input") {
       setFooter({ ...footer, edit: insertText(footer.edit, clean) });
     }
-  });
+  };
+  usePaste(handlePaste);
 
   const { wtStateForStacks, foldedSections } = useStackSections();
   const remoteRows = useMemo(
@@ -849,7 +854,7 @@ export function App({ onExit }: Props) {
   // everything → footer input → removed view → `h` toggle → normal
   // mode. The per-layer key maps live in `keyboard/` and
   // `modal-keys/`; this callback only routes.
-  useKeyboard((k) => {
+  const handleKey = (k: KeyEvent) => {
     // WT_PERF input-latency probe: stamp the keypress before any
     // dispatch work (no-op when unarmed).
     markKeypress();
@@ -1029,7 +1034,24 @@ export function App({ onExit }: Props) {
     };
 
     handleNormalKey(k, normalCtx);
-  });
+  };
+  useKeyboard(handleKey);
+  let actionPopup: ActionPopupSnapshot | null = null;
+  if (isActionPopupModal(modal)) {
+    const state = modal.kind === "actionPicker" ? modal.state : null;
+    const subject = state?.target ? actionSubjectFor(state.target) : undefined;
+    actionPopup = {
+      modal,
+      items: state?.mode === "list" ? buildActionPickerItems(state.target!) : [],
+      vars: state?.mode === "edit" && subject
+        ? actionSubjectVars(subject, actionSkillPrefix(state.def, primaryHarness)) : {},
+    };
+  }
+  useWorkspaceActions(actionPopup,
+    (key) => { if (isActionPopupModal(modalRef.current)) handleKey(key); },
+    (text) => { if (isActionPopupModal(modalRef.current)) handlePaste(text); },
+    setModal);
+
 
   const remoteArchivedCount = remoteRows.filter((row) =>
     archivedKeys.has(remoteWorktreeLedgerKey(row.hostKey, row.slug)),

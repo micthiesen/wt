@@ -1,3 +1,4 @@
+import { isActionPopupModal } from "./action-popup.tsx";
 /**
  * Modal overlay rendering, extracted from `app.tsx`. Two components
  * because render order is paint order in OpenTUI: the bottom-pane
@@ -95,7 +96,7 @@ export function PreFooterModals({
           error={modal.error}
         />
       ) : null}
-      {modal?.kind === "argPicker" ? (
+      {modal?.kind === "argPicker" && !(process.env.WT_WORKSPACE_SOCKET && isActionPopupModal(modal)) ? (
         <ArgPickerModal
           title={modal.def.name}
           prompt={modal.def.argPrompt?.label ?? ""}
@@ -228,7 +229,7 @@ export function PostFooterModals({
           newName={modal.newName}
         />
       ) : null}
-      {modal?.kind === "actionPicker" && modal.state.mode === "list" ? (
+      {modal?.kind === "actionPicker" && modal.state.mode === "list" && !(process.env.WT_WORKSPACE_SOCKET && isActionPopupModal(modal)) ? (
         <ActionPickerModal
           slug={modal.state.slug}
           surface={modal.state.surface}
@@ -242,7 +243,7 @@ export function PostFooterModals({
           selectedIndex={modal.state.index}
         />
       ) : null}
-      {modal?.kind === "actionPicker" && modal.state.mode === "edit" ? (
+      {modal?.kind === "actionPicker" && modal.state.mode === "edit" && !(process.env.WT_WORKSPACE_SOCKET && isActionPopupModal(modal)) ? (
         <ActionEditModal
           slug={modal.state.slug}
           surface={modal.state.surface}

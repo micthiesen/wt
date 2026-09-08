@@ -237,6 +237,8 @@ Press the active target's F-key to focus the explorer without detaching it.
 `?` opens help in a centered tmux popup over both panes. Scrolling and search
 use the same help controls; opening and closing it never resizes either pane
 or changes the current dashboard zoom.
+`!` uses the same popup for actions, custom prompts, and argument entry,
+keeping the worktree selected when the menu opened as its action target.
 F9 zooms the explorer into the full dashboard; press it again to restore the
 split. Ordinary tmux resizing is supported; a sidebar under 90 columns uses
 the compact explorer. Closing the right pane lets the next open recreate it.

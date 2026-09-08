@@ -183,7 +183,7 @@ export const idleWorkspaceHost = Effect.fn("idleWorkspaceHost")(function* (messa
 });
 
 /** A separate popup terminal overlays both panes without changing their sizes. */
-export const workspaceHelpPopup = Effect.gen(function* () {
+export const showWorkspacePopup = Effect.fn("showWorkspacePopup")(function* (argv: string[], heightRatio = 0.9) {
   const socket = workspaceSocket;
   const pane = process.env.TMUX_PANE;
   if (!socket || !pane) return;
@@ -193,7 +193,9 @@ export const workspaceHelpPopup = Effect.gen(function* () {
   if (owner !== String(process.pid)) return;
   yield* tmux(socket, ["display-popup", "-E", "-B", "-t", pane, "-x", "C", "-y", "C",
     "-w", String(Math.max(20, Math.min(104, Number(width) - 4))),
-    "-h", String(Math.max(8, Math.floor(Number(height) * 0.9))),
-    command(["env", "-u", "BUN_INSPECT", "bun", entry, "_help-popup"]),
+    "-h", String(Math.max(8, Math.floor(Number(height) * heightRatio))),
+    command(["env", "-u", "BUN_INSPECT", "WT_POPUP=1", "bun", entry, ...argv]),
   ]);
-}).pipe(gate.withPermit);
+}, gate.withPermit);
+
+export const workspaceHelpPopup = showWorkspacePopup(["_help-popup"]);
