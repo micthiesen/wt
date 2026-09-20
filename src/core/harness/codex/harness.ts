@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { isRiftWorktree } from "../../backend.ts";
+import { config } from "../../config.ts";
 import { createLogger } from "../../logger.ts";
 import { readFileSlice } from "../../tail-util.ts";
 import type { DerivedState } from "../status.ts";
@@ -43,16 +44,13 @@ const log = createLogger("[codex]");
 const CODEX_GLYPH = "\u{F4AC}"; // nf-oct-cloud
 const CODEX_COLOR = "#4d56d6";
 const CODEX_TMUX_INFIX = "-codex";
-// Keep Codex in a real full-screen buffer under tmux. Codex's Astra animations
-// in the TUI input box currently interact poorly with tmux, causing cursor
-// flicker and background artifacts. Keep animations disabled until that
-// rendering interaction is fixed.
-const CODEX_TMUX_TUI_ARGS = [
-  "-c",
-  'tui.alternate_screen="always"',
-  "-c",
-  "tui.animations=false",
-] as const;
+// Apply wt's terminal preferences equally to fresh and resumed sessions.
+function codexTmuxTuiArgs(): string[] {
+  return [
+    "-c", `tui.alternate_screen=${JSON.stringify(config.codex.alternateScreen)}`,
+    "-c", `tui.animations=${config.codex.animations}`,
+  ];
+}
 
 const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 /** Initial backwards window for state derivation. Expanded when a large
@@ -116,11 +114,11 @@ export const codexHarness: Harness = {
 
   buildArgs(args: HarnessSpawnArgs) {
     if (args.resumeSessionId !== null) {
-      return ["codex", ...CODEX_TMUX_TUI_ARGS, "resume", args.resumeSessionId];
+      return ["codex", ...codexTmuxTuiArgs(), "resume", args.resumeSessionId];
     }
-    if (args.slug === "manager") return ["codex", ...CODEX_TMUX_TUI_ARGS, CODEX_MANAGER_PROMPT];
-    if (args.slug === "main") return ["codex", ...CODEX_TMUX_TUI_ARGS, CODEX_MAIN_PROMPT];
-    return ["codex", ...CODEX_TMUX_TUI_ARGS];
+    if (args.slug === "manager") return ["codex", ...codexTmuxTuiArgs(), CODEX_MANAGER_PROMPT];
+    if (args.slug === "main") return ["codex", ...codexTmuxTuiArgs(), CODEX_MAIN_PROMPT];
+    return ["codex", ...codexTmuxTuiArgs()];
   },
 
   ensureTrusted(wtPath) {

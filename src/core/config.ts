@@ -727,7 +727,11 @@ export type Config = {
    * child processes); this makes the second-instance recipe expressible
    * in config instead of requiring a shell wrapper.
    */
-  tmux: { socket: string };
+  tmux: { socket: string; terminalConfig: string | null };
+  codex: {
+    animations: boolean;
+    alternateScreen: "always" | "auto" | "never";
+  };
   branch: {
     prefix: string;
     base: string;
@@ -1492,6 +1496,21 @@ function build(
   // resolving the same server no matter what the config says.
   const tmuxSocket = process.env.WT_TMUX_SOCKET?.trim() ||
     errs.optStr(obj(raw.tmux), "socket", ownRepositoryConfig ? `wt-${repoId}` : "wt");
+  const terminalConfig = obj(raw.tmux)?.terminal_config;
+  if (terminalConfig !== undefined && typeof terminalConfig !== "string") {
+    errs.add("tmux.terminal_config must be a string");
+  }
+  const codexRaw = obj(raw.codex);
+  const animations = codexRaw?.animations;
+  if (animations !== undefined && typeof animations !== "boolean") {
+    errs.add("codex.animations must be a boolean");
+  }
+  const codex = {
+    animations: typeof animations === "boolean" ? animations : false,
+    alternateScreen: errs.optEnum(
+      codexRaw, "codex", "alternate_screen", ["always", "auto", "never"] as const, "always",
+    ),
+  };
 
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
   const hiddenBadges = new Set<BadgeSlot>();
@@ -1612,7 +1631,11 @@ function build(
       weztermCli,
       dotfiles,
     },
-    tmux: { socket: tmuxSocket },
+    tmux: {
+      socket: tmuxSocket,
+      terminalConfig: typeof terminalConfig === "string" ? terminalConfig : null,
+    },
+    codex,
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen, keepFresh },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
     lifecycle: { envFilesToCopy: envFiles, copyGlobs, installCommand, destroyCommand },

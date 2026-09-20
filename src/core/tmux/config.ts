@@ -82,8 +82,8 @@ unbind C-b`;
  * that asks the renderer-side navigator to attach the corresponding
  * session immediately.
  */
-export function buildConfig(paletteConfig = ""): string {
-  return `${TERMINAL_PREAMBLE}
+export function buildConfig(paletteConfig = "", terminalConfig = config.tmux.terminalConfig): string {
+  return `${terminalConfig ?? TERMINAL_PREAMBLE}
 ${paletteConfig}
 bind-key -n F10 if-shell -F '#{==:#{@wt-shortcut},shell}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.shell}"'
 bind-key -n F11 if-shell -F '#{==:#{@wt-shortcut},diff}' 'detach-client' 'detach-client -E "exit ${SESSION_SWITCH_EXIT_CODE.diff}"'

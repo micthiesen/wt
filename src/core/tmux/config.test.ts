@@ -3,11 +3,21 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildConfig } from "./config.ts";
+import { buildConfig, TERMINAL_PREAMBLE } from "./config.ts";
 import { codexPaneOptionArgs } from "./attach.ts";
 import { sessionSwitchTarget } from "./naming.ts";
 
 describe("worktree session shortcut routing", () => {
+  test("a pinned preamble reproduces defaults and a replacement retains palette and navigation", () => {
+    expect(buildConfig("", TERMINAL_PREAMBLE)).toBe(buildConfig("", null));
+    const custom = buildConfig("set -g window-style bg=#123456", "set -g mouse off");
+    expect(custom).toStartWith("set -g mouse off\n");
+    expect(custom).not.toContain("set -g mouse on");
+    expect(custom).toContain("set -g window-style bg=#123456");
+    expect(custom).toContain("bind-key -n F12");
+    expect(buildConfig("", "")).not.toContain("set -g alternate-screen");
+  });
+
   test("allows full-screen harness TUIs to use the alternate screen", () => {
     const config = buildConfig();
     expect(config).toContain("set -g alternate-screen on");

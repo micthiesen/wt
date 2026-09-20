@@ -125,12 +125,18 @@ standard select-and-forward behavior for every non-link click.
 It also leaves tmux's `alternate-screen` support enabled: full-screen harness
 TUIs such as Codex depend on `smcup`/`rmcup` for a stable full-height viewport
 and cursor redraws.
-wt-launched Codex sessions additionally force `tui.alternate_screen="always"`
+wt-launched Codex sessions default to `tui.alternate_screen="always"`
 and `tui.animations=false` to avoid composer flicker and background artifacts
 through tmux. These overrides apply to fresh and resumed sessions, including
 main and manager slots; direct Codex launches retain the user's settings.
 Already-running Codex processes must exit and resume through wt to pick up
 the animation override; reattaching alone does not change launch arguments.
+`[codex] animations` and `alternate_screen` configure those launch overrides.
+`[tmux] terminal_config` replaces the built-in terminal preamble as a whole,
+allowing users to pin every terminal setting while following wt's session
+navigation and observed-palette behavior. An omitted value follows defaults;
+an empty string removes the preamble. Both startup and interactive config
+reload use the same renderer.
 The private server declares `sync`
 for xterm-family, Alacritty, and nested tmux clients so physical redraws are
 buffered by supporting terminals. tmux accepting synchronized application
