@@ -323,6 +323,10 @@ export function notYetEnqueueable(error: string | undefined): boolean {
   );
 }
 
+// Dequeue uses `id`; enqueue's input instead calls this `pullRequestId`.
+export const DEQUEUE_PULL_REQUEST_MUTATION =
+  "mutation($prId: ID!) { dequeuePullRequest(input: {id: $prId}) { mergeQueueEntry { position } } }";
+
 /**
  * Cancel a previously-armed "merge when ready".
  *
@@ -346,7 +350,7 @@ export const disableAutoMerge = Effect.fn("disableAutoMerge")(function* (
       [
         "gh", "api", "graphql",
         "-f",
-        "query=mutation($prId: ID!) { dequeuePullRequest(input: {pullRequestId: $prId}) { mergeQueueEntry { position } } }",
+        `query=${DEQUEUE_PULL_REQUEST_MUTATION}`,
         "-f", `prId=${opts.prId}`,
       ],
       "dequeue failed",

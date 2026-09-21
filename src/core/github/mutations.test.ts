@@ -8,7 +8,12 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { checksStillPending, missingWorkflowScope, notYetEnqueueable } from "./mutations.ts";
+import { checksStillPending, DEQUEUE_PULL_REQUEST_MUTATION, missingWorkflowScope, notYetEnqueueable } from "./mutations.ts";
+
+test("dequeue uses DequeuePullRequestInput.id, not enqueue's pullRequestId", () => {
+  expect(DEQUEUE_PULL_REQUEST_MUTATION).toContain("dequeuePullRequest(input: {id: $prId})");
+  expect(DEQUEUE_PULL_REQUEST_MUTATION).not.toContain("pullRequestId:");
+});
 
 describe("notYetEnqueueable", () => {
   // Observed verbatim on a live queue base while a required check had
