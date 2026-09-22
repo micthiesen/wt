@@ -66,7 +66,14 @@ export type SstConfig = {
  * deep link. `[issue_tracker.linear]` is a preset that derives the
  * template from a Linear workspace slug.
  */
+export const ISSUE_STATUS_ICONS = ["circle", "backlog", "progress", "review", "completed", "cancelled", "blocked"] as const;
+export type IssueStatusStyle = { icon: typeof ISSUE_STATUS_ICONS[number]; color: string };
+
 export type IssueTrackerConfig = {
+  /** Exact status labels mapped to provider-owned presentation. */
+  statusStyles: Readonly<Record<string, IssueStatusStyle>>;
+  /** Batched status reader; one standalone {ids} expands to distinct task IDs. */
+  statusCommand: readonly string[] | null;
   /** Argument vector for a full task reader; {id} is replaced without a shell. */
   readCommand: readonly string[] | null;
   /**
@@ -438,7 +445,7 @@ export type NamingConfig = {
  * Both arrays are deduped at parse time. See the architecture block
  * in `state/hooks.ts` for the rules these tags participate in.
  */
-export type EffectTag = "git" | "github" | "dev";
+export type EffectTag = "git" | "github" | "dev" | "issue";
 export type RequireTag = "pr" | "pr.ready" | "deployed" | "issue.tracker";
 
 /**
@@ -547,6 +554,8 @@ export type ActionDef =
       id: string;
       name: string;
       shell: string;
+      /** Exact expected tracker status while this tracked shell action runs. */
+      issueStatus?: string;
       affects: readonly EffectTag[];
       requires: readonly RequireTag[];
       argPrompt: ActionArgPrompt | null;
@@ -586,6 +595,7 @@ export type AutomationTrigger =
   | "review.changes_requested"
   | "pr.conflict"
   | "wt.merged"
+  | "wt.created"
   | "stack.parent_merged"
   // Work-status assertions (`wt status`; see core/work-status.ts). Level
   // conditions like everything else; the fire key carries the assertion
@@ -1027,7 +1037,7 @@ const GENERIC_DEFAULTS = {
 export const DEFAULT_CLAUDE_AFFECTS: readonly EffectTag[] = ["git", "github"];
 export const DEFAULT_SHELL_AFFECTS: readonly EffectTag[] = [];
 export const DEFAULT_REQUIRES: readonly RequireTag[] = [];
-const VALID_EFFECT_TAGS = new Set<EffectTag>(["git", "github", "dev"]);
+const VALID_EFFECT_TAGS = new Set<EffectTag>(["git", "github", "dev", "issue"]);
 const VALID_REQUIRE_TAGS = new Set<RequireTag>(["pr", "pr.ready", "deployed", "issue.tracker"]);
 
 function configPath(): { path: string; present: boolean } {
@@ -1374,7 +1384,33 @@ function build(
         readCommand = [expandHome(rawReader[0]), ...rawReader.slice(1)];
       }
     }
-    issueTracker = { urlTemplate, prefix: prefix || null, readCommand };
+    const rawStatus = tracker.status_command;
+    let statusCommand: string[] | null = null;
+    if (rawStatus !== undefined) {
+      if (!Array.isArray(rawStatus) || rawStatus.some((arg) => typeof arg !== "string" || !arg.trim() || arg.includes("\0"))) {
+        errs.add("issue_tracker.status_command must be an array of nonempty strings (argv, not a shell command)");
+      } else if (rawStatus.length > 0) {
+        if (rawStatus[0].includes("{ids}") || rawStatus.filter((arg) => arg === "{ids}").length !== 1 || rawStatus.some((arg) => arg.includes("{ids}") && arg !== "{ids}")) {
+          errs.add("issue_tracker.status_command must contain exactly one standalone {ids} argument, not the executable");
+        }
+        statusCommand = [expandHome(rawStatus[0]), ...rawStatus.slice(1)];
+      }
+    }
+    const statusStyles: Record<string, IssueStatusStyle> = {};
+    if (tracker.status_styles !== undefined) {
+      const styles = obj(tracker.status_styles);
+      if (!styles) errs.add("issue_tracker.status_styles must be a table of status labels to { icon, color }");
+      else for (const [label, rawStyle] of Object.entries(styles)) {
+        const style = obj(rawStyle);
+        const icon = ISSUE_STATUS_ICONS.find((candidate) => candidate === style?.icon);
+        if (!label.trim() || /[\x00-\x1f\x7f]/.test(label) || !style ||
+          !icon || typeof style.color !== "string" ||
+          !/^#[0-9a-fA-F]{6}$/.test(style.color) || Object.keys(style).some((key) => key !== "icon" && key !== "color")) {
+          errs.add(`issue_tracker.status_styles.${label} needs icon (${ISSUE_STATUS_ICONS.join("|")}) and color (#RRGGBB)`);
+        } else statusStyles[label] = { icon, color: style.color };
+      }
+    }
+    issueTracker = { urlTemplate, prefix: prefix || null, readCommand, statusCommand, statusStyles };
   }
 
   // [review_bot] — absent means the CodeRabbit preset, preserving the
@@ -1682,6 +1718,7 @@ const VALID_TRIGGERS = new Set<AutomationTrigger>([
   "review.changes_requested",
   "pr.conflict",
   "wt.merged",
+  "wt.created",
   "stack.parent_merged",
   "status.needs_human",
   "status.needs_testing",
@@ -1722,7 +1759,7 @@ const STATUS_TRIGGERS: ReadonlySet<AutomationTrigger> = new Set([
   "status.verification_overdue",
 ]);
 function defaultSettleSeconds(on: AutomationTrigger): number {
-  if (STATUS_TRIGGERS.has(on)) return 0;
+  if (on === "wt.created" || STATUS_TRIGGERS.has(on)) return 0;
   return MERGE_TRIGGERS.has(on) ? MERGED_SETTLE_SECONDS : DEFAULT_SETTLE_SECONDS;
 }
 
@@ -1940,16 +1977,27 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
     if (affects === "invalid") continue;
     const requires = parseRequires(entry.requires, tag, errs);
     if (requires === "invalid") continue;
+    const issueStatus = entry.issue_status;
+    if (issueStatus !== undefined) {
+      if (!hasShell || typeof issueStatus !== "string" || !issueStatus.trim() || /[\x00-\x1f\x7f]/.test(issueStatus)) {
+        errs.add(`${tag}.issue_status must be a nonempty single-line string on a shell action`);
+        continue;
+      }
+      if (!affects?.includes("issue")) {
+        errs.add(`${tag}.issue_status requires affects = ["issue"]`);
+        continue;
+      }
+    }
     // Optional picker affordances. `key` must be a single character;
     // `group` a non-empty label. Both default to undefined (auto-derived
     // key / ungrouped) when absent.
-    // Only /^[a-z]$/ is a valid picker binding — core/actions/builtins.ts
+    // Lowercase letters and digits are valid explicit picker bindings; builtins
     // reserves uppercase and punctuation for built-ins, and an
     // out-of-range key silently dies (never rendered, never dispatchable)
     // instead of erroring, so catch it here.
     const keyRaw = entry.key;
-    if (keyRaw !== undefined && !(typeof keyRaw === "string" && /^[a-z]$/.test(keyRaw))) {
-      errs.add(`${tag}.key must be a single lowercase letter (a-z)`);
+    if (keyRaw !== undefined && !(typeof keyRaw === "string" && /^[a-z0-9]$/.test(keyRaw))) {
+      errs.add(`${tag}.key must be a single lowercase letter or digit (a-z, 0-9)`);
       continue;
     }
     const groupRaw = entry.group;
@@ -2025,6 +2073,7 @@ function parseActions(raw: unknown, errs: Errors): readonly ActionDef[] {
         id,
         name,
         shell: shellVal as string,
+        ...(typeof issueStatus === "string" ? { issueStatus } : {}),
         affects: affects ?? DEFAULT_SHELL_AFFECTS,
         requires: requires ?? DEFAULT_REQUIRES,
         argPrompt,

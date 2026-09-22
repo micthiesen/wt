@@ -1,5 +1,5 @@
 import type { RequireTag } from "../config.ts";
-import { resolveIssueId } from "../issue-tracker.ts";
+import { isTrackerIssueId, resolveIssueId } from "../issue-tracker.ts";
 import type { ActionAvailability, ActionRowState } from "./types.ts";
 
 /**
@@ -44,7 +44,7 @@ export function evaluateActionRequirements(
       // rather than just the lack, since a permanently-grayed picker
       // entry with no way out is the same as a missing feature.
       case "issue.tracker":
-        if (!resolveIssueId(row.slug, row.issueId)) {
+        if (!isTrackerIssueId(resolveIssueId(row.slug, row.issueId))) {
           return { ok: false, reason: "no tracker id (set one with `#`)" };
         }
         break;

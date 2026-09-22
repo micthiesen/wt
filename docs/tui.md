@@ -1,5 +1,20 @@
 # TUI guide
 
+When `[issue_tracker].status_command` is configured, the selected worktree's
+issue row includes the external tracker's current status, separate from its
+agent-asserted work-status banner. A shell action's configured `issue_status`
+appears immediately with `(updating)` until its tracked result is confirmed;
+failures return to server truth. Normal source spinners and errors apply.
+The compact issue line shows a configurable colored icon with `#ENG-123 · In Review`.
+An attached GitHub notes issue appears as `#ENG-123 ← #456 · In Review`, without
+its own status. Opening/copying still uses the full URLs. Configure exact
+status colors and icons under `[issue_tracker.status_styles]`.
+Confirmed tracker changes appear in attention as `#ENG-123: In Progress → In Review`;
+initial loads and optimistic updates are not narrated as completed changes.
+Automation queue entries include their remaining settle delay, followed by running
+and outcome entries. External task-action success/failure stays in attention.
+Explicit `[[actions]].key` bindings may use lowercase letters or digits in `!`.
+
 `wt` with no arguments launches the TUI. Press `?` inside for the built-in keymap + glyph legend (with `/` to filter it) — that overlay is always the most current reference; this page is the tour. The overlay's title also shows the running version (the source clone's git short hash — see [`wt version`](cli.md#wt-version)).
 
 ## Layout
@@ -220,7 +235,7 @@ error ~1.5s after startup — that's how the capture path is probed.
 
 ## Picker conventions
 
-Every list picker follows the same shape: the key that opened it confirms the highlight when pressed again (`l l`, `; ;`, `' '`, `! !`, `M M`, `< <` / `> >` / `\ \` in the slot palettes, `b b`, `v v`, `u u`, `y y`, and `Shift+F12` again in the harness picker), `Enter` always confirms, `Esc`/`q`/`Ctrl+C` always cancel, `j`/`k` move, and digits `1`–`9` quick-pick when the list is short — except the action picker and the manager/slot palettes (assigned letters instead) and the reviewer picker (`Space` toggles; digits would be ambiguous in a multi-select). Rows with a natural name carry a direct letter chord, shown dim in the row (`u t` → todo, `u y` → ready, `; c` new claude session); special rows get their own letter too (`l n` new section, `! c` custom prompt).
+Every list picker follows the same shape: the key that opened it confirms the highlight when pressed again (`l l`, `; ;`, `' '`, `! !`, `M M`, `< <` / `> >` / `\ \` in the slot palettes, `b b`, `v v`, `u u`, `y y`, and `Shift+F12` again in the harness picker), `Enter` always confirms, `Esc`/`q`/`Ctrl+C` always cancel, `j`/`k` move, and digits `1`–`9` quick-pick when the list is short — except the action picker and the manager/slot palettes (assigned keys instead) and the reviewer picker (`Space` toggles; digits would be ambiguous in a multi-select). Rows with a natural name carry a direct letter chord, shown dim in the row (`u t` → todo, `u y` → ready, `; c` new claude session); special rows get their own letter too (`l n` new section, `! c` custom prompt).
 
 Confirm modals follow the same muscle-memory rule in reverse: the key that opened one also **cancels** it (`d`, `c`, `e`, `E`, `w`, `!`'s kill confirm), alongside the universal `n`/`Esc`/`q`/`Ctrl+C`.
 

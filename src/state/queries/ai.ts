@@ -13,7 +13,7 @@ import type { DiffContext } from "../../core/diff/index.ts";
 import { buildDiffContextViaPool } from "../../core/diff/pool.ts";
 import type { Worktree } from "../../core/types.ts";
 import { createLogger } from "../../core/logger.ts";
-import { pluralize } from "../../core/text.ts";
+import { formatDuration, pluralize } from "../../core/text.ts";
 import { stackIdFromSectionKey } from "../../core/wtstate.ts";
 
 import { qk } from "../keys.ts";
@@ -138,9 +138,6 @@ export const aiSummaryQuery = (
     gcTime: Number.POSITIVE_INFINITY,
   });
 
-function formatDuration(ms: number): string {
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
-}
 
 export type StackMember = { branch: string; brief: string };
 

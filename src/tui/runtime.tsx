@@ -80,6 +80,25 @@ class RuntimeCleanupError extends Data.TaggedError("RuntimeCleanupError")<{
 }> {}
 
 /**
+ * Query namespaces whose answers depend on refs in the main clone. Keep this
+ * beside the refs watcher so a newly-added ref-backed source cannot silently
+ * miss the push invalidation that makes branch.advanced observable.
+ */
+export function invalidateRefQueries(
+  invalidate: (key: readonly unknown[]) => void,
+): void {
+  for (const key of [
+    ["github"] as const,
+    qk.reviewRequests(),
+    ["wt"] as const,
+    qk.wtState(),
+    ["watchedBranchTips"] as const,
+  ]) {
+    invalidate(key);
+  }
+}
+
+/**
  * Attach a resource to the current Effect scope. Cleanup failures are defects
  * of the cleanup itself, not a reason to abandon the rest of the scope: every
  * independently registered finalizer must still get its turn during shutdown.
@@ -404,10 +423,7 @@ export const runTui = Effect.gen(function* () {
   yield* acquireSyncResource(
     () =>
       watchRefs(config.paths.mainClone, () => {
-        invalidations.key(["github"]);
-        invalidations.key(qk.reviewRequests());
-        invalidations.key(["wt"]);
-        invalidations.key(qk.wtState());
+        invalidateRefQueries((key) => invalidations.key(key));
       }),
     (stop) => stop(),
   );

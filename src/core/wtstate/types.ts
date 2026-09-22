@@ -49,6 +49,8 @@ export type WorktreeLayout = {
 };
 
 export type WtSlugState = WorktreeLayout & {
+  /** Successful wt creation, written once for this checkout; absent on legacy rows. */
+  createdAt?: string;
   /** Section name. `null` = unsectioned (rendered at top, no header). */
   section: string | null;
   /** Manual ordering scalar within (section, archived) bucket. Lower = earlier. */

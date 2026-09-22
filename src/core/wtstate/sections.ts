@@ -187,6 +187,16 @@ export function setSlugExamined(
   });
 }
 
+/** Called only after creation succeeds; restacks and ordinary status writes retain it. */
+export function recordSlugCreated(slug: string, at = new Date().toISOString()): void {
+  withWtStateLock(() => {
+    const state = readWtState();
+    const prev = state.slugs[slug];
+    if (prev?.createdAt) return;
+    writeWtState({ ...state, slugs: { ...state.slugs, [slug]: { section: null, order: 0, ...prev, createdAt: at } } });
+  });
+}
+
 export function setSlugBase(
   slug: string,
   base: { branch: string; sha?: string } | null,

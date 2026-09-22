@@ -18,7 +18,7 @@ export type ActionRowState = {
   slug: string;
   /** Stored tracker-id override (`wt issue <slug> --id`), when set. */
   issueId?: string | null;
-  pr: PullRequest | undefined;
+  pr: Pick<PullRequest, "state" | "isDraft"> | undefined;
   /**
    * `isOurStageDeployed` result for the row. Strict gate (matches
    * the safe-stage rules); used by `requires: ["deployed"]` actions

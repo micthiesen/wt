@@ -33,7 +33,8 @@ import {
   type WtState,
 } from "../../core/wtstate.ts";
 import { type DevServerStatus } from "../../core/dev-server.ts";
-import { useGithub } from "../../state/hooks.ts";
+import { useGithub, useIssueStatuses } from "../../state/hooks.ts";
+import { resolveIssueId } from "../../core/issue-tracker.ts";
 import type { GithubData } from "../../state/queries/github.ts";
 import { qk } from "../../state/keys.ts";
 import {
@@ -154,6 +155,10 @@ export type WorktreeRow = {
   githubIssue: number | null;
   /** Stored tracker-id override; null = fall back to parsing the slug. */
   issueId: string | null;
+  /** External tracker truth, separate from the agent's asserted work status. */
+  issueStatus?: FieldState<string> & { optimistic: boolean };
+  /** Successful wt new creation event, absent on pre-existing checkouts. */
+  createdAt?: string;
   /**
    * Agent-asserted work status (`wt status` / the `u` picker), straight
    * from wtstate. `null` = never asserted. The list dot renders the
@@ -641,6 +646,7 @@ function useLockReleasedInvalidator(lockedSig: string): void {
 export function useWorktreeRows(): WorktreeRowsResult {
   const wtList = useQuery(worktreesQuery());
   const github = useGithub();
+  const issues = useIssueStatuses();
   const archive = useQuery(archiveQuery());
   const wtState = useQuery(wtStateQuery());
   // Batched tmux session set — read here (rather than letting
@@ -842,6 +848,15 @@ export function useWorktreeRows(): WorktreeRowsResult {
       effectiveOrders.set(wt.slug, stateSlugs[wt.slug]?.order ?? -Infinity);
       const githubIssue = stateSlugs[wt.slug]?.githubIssue ?? null;
       const issueId = stateSlugs[wt.slug]?.issueId ?? null;
+      const resolvedId = resolveIssueId(wt.slug, issueId);
+      const optimistic = !!resolvedId && issues.expected.has(resolvedId);
+      const nextIssueStatus = config.issueTracker?.statusCommand && resolvedId
+        ? { ...toFieldState(issues), data: issues.data?.[resolvedId], optimistic }
+        : undefined;
+      const issueStatus = nextIssueStatus && prev?.issueStatus?.optimistic === optimistic
+        ? reuseField(prev.issueStatus, nextIssueStatus) as typeof nextIssueStatus
+        : nextIssueStatus;
+      const createdAt = stateSlugs[wt.slug]?.createdAt;
       const work = stateSlugs[wt.slug]?.work ?? null;
       const llmTitle = aiResults[i]?.title ?? null;
       const llmBrief = aiResults[i]?.brief ?? null;
@@ -875,6 +890,8 @@ export function useWorktreeRows(): WorktreeRowsResult {
         prev.mq === mq &&
         prev.githubIssue === githubIssue &&
         prev.issueId === issueId &&
+        prev.issueStatus === issueStatus &&
+        prev.createdAt === createdAt &&
         prev.work === work &&
         prev.archived === archived &&
         prev.title === title &&
@@ -902,6 +919,8 @@ export function useWorktreeRows(): WorktreeRowsResult {
         stack: stackOut,
         githubIssue,
         issueId,
+        issueStatus,
+        createdAt,
         work,
         archived,
         title,
@@ -957,6 +976,12 @@ export function useWorktreeRows(): WorktreeRowsResult {
   }, [
     worktrees,
     results,
+    issues.data,
+    issues.expected,
+    issues.error,
+    issues.isFetching,
+    issues.isLoading,
+    issues.isStale,
     github.data?.mergeQueue,
     rowLayout,
     archivedSet,

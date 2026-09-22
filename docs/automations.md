@@ -14,6 +14,7 @@ Fire keys embed the PR's head SHA where relevant: a new push produces a new key 
 
 | trigger | holds when |
 |---|---|
+| `wt.created` | a successfully completed worktree creation has a recorded creation timestamp. The rule is opt-in and does not backfill older worktrees without that timestamp. External bookkeeping shell actions may run while the harness is busy; removed worktrees and per-worktree pauses still suppress the fire |
 | `pr.checks.failed` | the open PR's checks rollup is failing |
 | `review_bot.unresolved` | the configured [`[review_bot]`](configuration.md#review_bot--the-bot-review-track) has unresolved findings — unresolved threads (CodeRabbit) or unticked checklist boxes, per `unresolved_via`. `rabbit.unresolved` is accepted as a legacy alias |
 | `review.changes_requested` | a human review requested changes |
@@ -93,6 +94,11 @@ When a condition holds and its fire key is unseen, the rule creates an **intent*
 - **Quiescence**: if the worktree has a live session that's working or asking, or an action already running, the `busy` policy decides. `queue` (default) holds the intent until things settle, while `skip` marks the fire handled and drops it. There is deliberately no "force" so automations do not collide with an active or blocked turn, regardless of harness transport.
 - **Cooldown** (`cooldown_minutes`): minimum spacing between dispatches per (rule, worktree).
 
+The queue event includes any remaining settle delay. A queued review or CI
+remediation normally waits two minutes before delivery; it may wait longer for
+an idle session or another dispatch to finish. Pausing and resuming starts a
+fresh settle window for conditions that still hold.
+
 Dispatch goes through the exact same paths keystrokes use (`launchAction`, the clean flow, the restack flow) — automations have no special powers.
 
 ## Failure handling and the breaker
@@ -110,6 +116,22 @@ This does not pause rules, change cooldowns or breakers, stop running actions,
 or recall prompts already handed to a harness's native queue. Unlike clearing,
 pausing drops pending intents without consuming their keys, so they can return
 when resumed.
+
+Clearing also works while globally paused, without resuming or dispatching
+anything. It reconstructs currently eligible, unseen trigger instances from
+the same evaluator and cancels those exact keys. Live GitHub freshness,
+per-worktree pauses and row-eligibility guards still apply; this does not
+recover historical instances whose rows or conditions have disappeared.
+Cancellation is persisted before any in-memory intents are removed, so a
+failed write leaves them available to retry.
+
+The ledger notices atomic replacements made by another process, and all
+writers share a lock beside it. Cancelling an instance cannot be overwritten
+by a later writer using an older in-memory snapshot; dispatch rechecks the
+keys under that lock before launching. A TUI already running code from before
+this support was installed must be restarted before resuming automations.
+Dispatch also refuses to launch when its ledger write fails, keeps the intent
+pending, and reports the persistence error in attention.
 
 - `A` toggles a global pause of all automations.
 - `Ctrl+A` pauses the selected worktree — or its whole stack when it's a stack member. A stack pause is stored both under the stack's id (the root branch — covers members stacked on later) and as per-member flags (covers the survivors when the root lands and the stack re-roots under a new id).

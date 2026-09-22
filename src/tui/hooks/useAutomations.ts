@@ -92,6 +92,7 @@ import { useGithubFresh } from "./useGithubFresh.ts";
 import type { ActiveSessionGlyph } from "./useHarnessSessions.ts";
 import type { LaunchActionOpts, LaunchOutcome } from "./useActionDispatch.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
+import { cancellableAutomationFires } from "../automation-queue.ts";
 
 const log = createLogger("[auto]");
 
@@ -112,6 +113,7 @@ type Intent = {
   fire: AutomationFire;
   createdAt: number;
   announced: boolean;
+  persistenceError?: string;
 };
 
 type Executing = {
@@ -340,6 +342,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     githubFresh,
     pausedSlugs: new Set<string>(),
     paused,
+    stateReady: wtStateReady,
   });
   // Effective per-worktree pause set: individually-paused slugs plus
   // every member of a paused STACK (Ctrl+A on any stack row pauses by
@@ -375,6 +378,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     githubFresh,
     pausedSlugs,
     paused,
+    stateReady: wtStateReady,
   };
 
   const intents = useRef<Map<string, Intent>>(new Map());
@@ -716,6 +720,22 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     return "headless";
   }
 
+  function evaluationContext() {
+    const ctx = latest.current;
+    return {
+      githubFresh: ctx.githubFresh,
+      isPausedSlug: (slug: string) => ctx.pausedSlugs.has(slug),
+      audienceOf,
+      externalOf: isExternalShellRule,
+      varsFor: (rule: AutomationDef, row: WorktreeRow) => {
+        const def = resolveActionDef(rule.run);
+        return buildActionVars(row, actionSkillPrefix(def, ctx.primaryHarness));
+      },
+      branchTips: branchTips.current,
+      nowMs: Date.now(),
+    };
+  }
+
   function runPass(): void {
     if (!configured) return;
     const now = Date.now();
@@ -737,18 +757,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       return;
     }
 
-    const evalCtx = {
-      githubFresh: ctx.githubFresh,
-      isPausedSlug: (slug: string) => ctx.pausedSlugs.has(slug),
-      audienceOf,
-      externalOf: isExternalShellRule,
-      varsFor: (rule: AutomationDef, row: WorktreeRow) => {
-        const def = resolveActionDef(rule.run);
-        return buildActionVars(row, actionSkillPrefix(def, ctx.primaryHarness));
-      },
-      branchTips: branchTips.current,
-      nowMs: Date.now(),
-    };
+    const evalCtx = evaluationContext();
     const fires = evaluateAutomations(rules, ctx.rows, evalCtx);
     const byId = new Map(fires.map((f) => [fireIdentity(f), f] as const));
 
@@ -911,7 +920,11 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       if (isManagerRun && managerInFlight) continue;
       if (!intent.announced) {
         intent.announced = true;
-        wtLog.event.info(`auto ${rule.id}: ${fire.detail} — queued`);
+        const settleLeft = Math.ceil(
+          Math.max(0, rule.settleSeconds * 1000 - (now - intent.createdAt)) / 1000,
+        );
+        const settleNote = settleLeft > 0 ? ` (${settleLeft}s settle remaining)` : "";
+        wtLog.attention.info(`auto ${rule.id}: ${fire.detail} · queued${settleNote}`, { toast: false });
       }
       const target = pairTarget(fire);
       const breaker = breakerState(rule.id, target);
@@ -965,7 +978,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
             ? {
                 slug: fire.slug,
                 issueId: fire.frozenVars.issue_id ?? null,
-                pr: row?.pr,
+                pr: fire.frozenPr,
                 deployed: false,
               }
             : {
@@ -1008,7 +1021,19 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       // DECLINES (contention with a manual launch in the sub-second
       // window after the gates above) never ran, so it must count
       // toward neither the ledger nor the breaker.
-      markFiresDispatched(fire.fireKeys, rule.id, target);
+      try {
+        if (!markFiresDispatched(fire.fireKeys, rule.id, target)) {
+          intents.current.delete(intent.id);
+          continue;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (intent.persistenceError !== message) {
+          wtLog.attention.err(`auto ${rule.id}: not started; cannot persist dispatch: ${message}`);
+          intent.persistenceError = message;
+        }
+        continue;
+      }
       intents.current.delete(intent.id);
       const entry: Executing = {
         slug: fire.slug,
@@ -1023,7 +1048,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       for (const s of fire.quiesceSlugs) occupiedSlugs.add(s);
       if (isRestack && fire.stackId) restackStacksInFlight.add(fire.stackId);
       if (isManagerRun) managerInFlight = true;
-      wtLog.event.info(`auto ${rule.id}: ${fire.detail} — running ${rule.run}`, {
+      wtLog.attention.info(`auto ${rule.id}: ${fire.detail} · running ${rule.run}`, {
         toast: true,
       });
       let dispatchFiber: Fiber.Fiber<void, never>;
@@ -1145,9 +1170,18 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     },
     pendingCount,
     clearQueued: Effect.fn("clearQueuedAutomations")(function* () {
-      const pending = [...intents.current.values()];
-      yield* cancelAutomationFires(pending.flatMap((intent) => intent.fire.fireKeys));
-      for (const intent of pending) intents.current.delete(intent.id);
+      const pending = cancellableAutomationFires({
+        paused: latest.current.paused,
+        stateReady: latest.current.stateReady,
+        rules,
+        rows: latest.current.rows,
+        evalCtx: evaluationContext(),
+        pending: [...intents.current.values()].map((intent) => intent.fire),
+        executing: new Set(executing.current.keys()),
+        handled: hasHandledFire,
+      });
+      yield* cancelAutomationFires(pending.flatMap((fire) => fire.fireKeys));
+      for (const fire of pending) intents.current.delete(fireIdentity(fire));
       setPendingCount(intents.current.size);
       log.info("cancelled queued automations", { count: pending.length });
       return pending.length;

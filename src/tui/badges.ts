@@ -45,7 +45,7 @@
  *    font renders them 2-cell. The extra space prevents the icon's
  *    right half from overlapping the next char.
  */
-import { config } from "../core/config.ts";
+import { config, type IssueStatusStyle } from "../core/config.ts";
 import type { MergeConflictProbe } from "../core/git.ts";
 import type { DerivedState } from "../core/harness/status.ts";
 import {
@@ -70,6 +70,16 @@ import { NF } from "./icons.ts";
 import { theme } from "./theme.ts";
 
 export type Badge = { glyph: string; fg: string };
+
+/** Tracker vocabulary and colors belong to config, never a provider in wt. */
+export function issueStatusBadge(status: string | undefined, styles: Readonly<Record<string, IssueStatusStyle>> = config.issueTracker?.statusStyles ?? {}): Badge {
+  const style = status && Object.hasOwn(styles, status) ? styles[status] : undefined;
+  const icons: Record<IssueStatusStyle["icon"], string> = {
+    circle: NF.dotOutline, backlog: NF.checkPend, progress: NF.dotCircle,
+    review: NF.halfCircle, completed: NF.taskComplete, cancelled: NF.taskCancelled, blocked: NF.slash,
+  };
+  return style ? { glyph: icons[style.icon], fg: style.color } : { glyph: NF.dotOutline, fg: theme.fgDim };
+}
 
 /** Glyph + color for a worktree's status — used by row marker AND git-line verb. */
 export function statusBadge(s: Status): Badge {

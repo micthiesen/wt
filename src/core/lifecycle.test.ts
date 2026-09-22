@@ -42,6 +42,7 @@ test("createWorktree copies configured glob matches from the main clone", () => 
   git(main, ["add", ".gitignore", "README.md"]);
   git(main, ["commit", "-q", "-m", "fixture"]);
   git(main, ["push", "-q", "-u", "origin", "main"]);
+  git(main, ["branch", "test/existing-branch"]);
 
   const skill = join(main, ".agents", "skills", "example", "SKILL.md");
   mkdirSync(join(main, ".agents", "skills", "example"), { recursive: true });
@@ -99,11 +100,13 @@ exec sleep 3
   const script = `
     const { Effect } = await import(${JSON.stringify(effectModule)});
     const { createWorktree } = await import(${JSON.stringify(lifecycleModule)});
+    const { readWtState } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dir, "wtstate.ts")).href)});
     const createOrFail = (branch, opts) => Effect.runPromise(createWorktree(branch, opts).pipe(
       Effect.catchTag("LifecycleError", (e) => Effect.succeed({ ok: false, reason: e.message })),
     ));
     const { lockStatus } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dir, "locks.ts")).href)});
     const result = await createOrFail("test/copy-agents", { runInstall: false });
+    const attached = await createOrFail("test/existing-branch", { runInstall: false });
     const failed = await createOrFail("test/bad-base", {
       runInstall: false,
       base: "missing-ref-that-does-not-exist",
@@ -138,6 +141,7 @@ exec sleep 3
       { signal: installController.signal },
     );
     const removeController = new AbortController();
+    const creationState = readWtState().slugs;
     const removeInterrupted = await Effect.runPromiseExit(
       (await import(${JSON.stringify(lifecycleModule)})).removeWorktree(
         { ...result, isMain: false },
@@ -162,6 +166,9 @@ exec sleep 3
     );
     console.log(JSON.stringify({
       result,
+      created: typeof creationState["copy-agents"]?.createdAt === "string",
+      attachedCreated: attached.ok && typeof creationState["existing-branch"]?.createdAt === "string",
+      failedCreated: Boolean(creationState["bad-base"]?.createdAt || creationState["install-interrupted"]?.createdAt || creationState["backend-interrupted"]?.createdAt),
       failed,
       interrupted: interrupted._tag,
       backendInterrupted: backendInterrupted._tag,
@@ -202,6 +209,9 @@ exec sleep 3
   expect(result.exitCode, result.stderr.toString()).toBe(0);
   expect(JSON.parse(result.stdout.toString())).toMatchObject({
     result: { ok: true },
+    created: true,
+    attachedCreated: true,
+    failedCreated: false,
     failed: { ok: false },
     interrupted: "Failure",
     backendInterrupted: "Failure",

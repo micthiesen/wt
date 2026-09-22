@@ -192,7 +192,7 @@ export function handleActionPickerKey(
       });
       return true;
     }
-    if (k.sequence && /^[a-z]$/.test(k.sequence)) {
+    if (k.sequence && /^[a-z0-9]$/.test(k.sequence) && !k.ctrl && !k.meta && !k.shift) {
       const i = items.findIndex(
         (it) => it.kind !== "custom" && it.key === k.sequence,
       );

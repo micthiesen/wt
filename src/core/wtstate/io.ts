@@ -121,6 +121,9 @@ export function parseWtState(raw: unknown): WtState {
         : null;
       const order = typeof rec.order === "number" && Number.isFinite(rec.order) ? rec.order : 0;
       slugs[k] = { section, order };
+      if (typeof rec.createdAt === "string" && Number.isFinite(Date.parse(rec.createdAt))) {
+        slugs[k]!.createdAt = rec.createdAt;
+      }
       if (typeof rec.baseBranch === "string" && rec.baseBranch.trim() !== "") {
         slugs[k]!.baseBranch = rec.baseBranch;
         if (typeof rec.baseSha === "string" && rec.baseSha.trim() !== "") {

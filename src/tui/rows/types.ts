@@ -9,7 +9,7 @@
  * never live inside a row: ordering, the trailing staleness glyph,
  * and inline error display once retries are exhausted.
  *
- * Pure-derived rows (branch, path, issue) declare no sources. They
+ * Pure-derived rows (branch, path) declare no sources. They
  * never show staleness or errors because there's no fetch behind
  * them — the data comes straight off the worktree record.
  */

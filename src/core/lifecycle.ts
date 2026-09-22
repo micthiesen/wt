@@ -20,6 +20,7 @@ import {
   recordRemovedWorktrees,
   reparentBaseReferences,
   setSlugBase,
+  recordSlugCreated,
 } from "./wtstate.ts";
 import { getBackend, getBackendForPath } from "./backend.ts";
 import { closeWorktreeBrowserSessions } from "./browser.ts";
@@ -537,6 +538,7 @@ const createWorktreeProgram = Effect.fnUntraced(function* (
         }
       }
     }
+    yield* Effect.uninterruptible(Effect.sync(() => recordSlugCreated(slug)));
   return { ok: true, path, branch, stage, slug } as const;
 });
 

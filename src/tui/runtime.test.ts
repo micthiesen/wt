@@ -1,9 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { Effect, Exit } from "effect";
 
-import { acquireRuntimeResource } from "./runtime.tsx";
+import { acquireRuntimeResource, invalidateRefQueries } from "./runtime.tsx";
 
 describe("TUI runtime resources", () => {
+  test("refs invalidate branch tips used by branch.advanced", () => {
+    const keys: unknown[][] = [];
+
+    invalidateRefQueries((key) => keys.push([...key]));
+
+    expect(keys).toContainEqual(["watchedBranchTips"]);
+  });
+
   test("releases every acquired resource when later startup fails", async () => {
     const releases: string[] = [];
     const program = Effect.scoped(

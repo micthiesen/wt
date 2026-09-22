@@ -12,6 +12,31 @@ The TUI is split into three layers; respect the boundaries:
 
 The list panel (`src/tui/panels/list.tsx`) is deliberately **not** row-driven — different layout (one line of glyphs, no labels). Don't try to unify them.
 
+`core/issue-status.ts` validates the optional generic `status_command` protocol.
+`useIssueStatuses` joins override-aware local identities and remote inventory
+identities into one sorted batch, keyed by IDs, argv, and main-clone cwd. Its
+query uses `runQuery` cancellation and never reads once per row. Invalid or
+partial results fail the whole batch, retaining cached server truth. Local and
+remote details display external status separately from the work-status banner.
+`useIssueStatusEvents` compares confirmed batch snapshots once at the app root,
+not optimistic projections. First sightings seed silently; subsequent changes
+join the attention feed. Config maps status labels to compact detail icons/colors.
+
+`state/issue-status.ts` owns transient, per-QueryClient issue expectations for
+tracked shell actions with `issue_status`, never persisted or written into the
+server cache. Per-ID launch tokens prevent an older failure erasing a newer
+expectation or another issue's status. The guard tracks the exact run, removes
+failed/killed expectations, and after success waits for a live read to agree,
+bounded at 12 seconds. Rows mark the projection `(updating)` until confirmed.
+Config owns every external label and command.
+Log durations share `core/text.ts` formatting: whole milliseconds below a second,
+tenths of seconds, and whole minute/second pairs for longer runs. Structured
+duration fields are rounded at the logger boundary without changing stored timings.
+
+Successful `wt new` records a write-once `createdAt` timestamp for the opt-in
+`wt.created` trigger. Existing checkouts gain no inferred timestamp; normal
+automation pause and dispatch guards still apply.
+
 ## Effect boundary
 
 `core/issue-reader.ts` runs the optional tracker reader as an argv subprocess in
@@ -221,7 +246,8 @@ Freshness is **push-based**; the `r` keybind is a backstop, not the mechanism. E
 
 | trigger | invalidates |
 |---|---|
-| `.git/refs/` watcher (commits, fetches, pushes) | github + per-worktree fields + wtState + reviewRequests (deliberately keyed outside the `["github"]` prefix) |
+| issue action completion (`affects = ["issue"]`), manual refresh, identity-set changes; 3-minute poll backstop | the single batched external issue-status source; no provider webhook is assumed |
+| `.git/refs/` watcher (commits, fetches, pushes) | github + per-worktree fields + wtState + reviewRequests + watched branch tips (deliberately keyed outside the `["github"]` prefix) |
 | `.git/worktrees/` watcher (worktree add/remove) | worktree list |
 | worktree-root watcher (subdir add/remove) | worktree list — catches `rift` checkouts, which are independent clones that never touch `.git/worktrees/`; harmlessly redundant for git worktrees |
 | `.git/worktrees/<slug>/rebase-{merge,apply}` watcher (hand/`/restack` rebase starts or ends) | that slug's conflict probe (the mid-rebase glyph) |

@@ -99,6 +99,12 @@ The current contract. These are deliberate, not accidental — expanding one (sa
 
 **The human** keeps: the merge decision (delegable per branch via `/babysit`, never assumed), auth that can only be interactive, final QA whenever they want it, risk acceptance on medium/high `ready`s, external-tracker status, and any expansion of the levels above. One deliberate carve-out from "external-tracker status": the post-merge close of a worktree's **attached GitHub issue** is deterministic bookkeeping (the merge already happened — the human's decision is spent), so it belongs to wt via the opt-in `builtin:close-issue` automation, not to the human. The primary tracker's status stays human; agents still never close issues themselves.
 
+The user can explicitly configure deterministic external tracker transitions
+through `wt.created`, `wt.merged`, and `branch.advanced` automations. That
+delegates only the configured transitions to wt's normal action pipeline, not
+general tracker authority to worker agents. Providers and status labels remain
+outside wt; branch advancement alone is not proof of a successful deployment.
+
 ## Known deliberate omissions
 
 - `auto-address-codex` (dispatch a fix session whenever the review bot has findings) exists as a commented-out automation — off until the status system has earned trust.

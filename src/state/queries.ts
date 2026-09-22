@@ -11,6 +11,7 @@ export { worktreesQuery, fetchOriginNow, fetchOriginQuery, wtDirtyQuery, wtLockQ
 export { remoteWorkerInfoQuery, remoteWorktreesQuery } from "./queries/remote.ts";
 
 export { archiveQuery, wtStateQuery } from "./queries/wtstate.ts";
+export { issueStatusesQuery } from "./queries/issue-status.ts";
 
 export type { GithubData, ReviewRequestPr } from "./queries/github.ts";
 export { githubQuery, reviewRequestsQuery, contributorsQuery } from "./queries/github.ts";

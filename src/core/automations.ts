@@ -35,12 +35,13 @@
  * and stays tripped until the condition is seen false (i.e. someone
  * actually fixed it). All state here so it survives restarts.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Effect } from "effect";
 import { operationErrors } from "./errors.ts";
 
 import { createLogger } from "./logger.ts";
+import { withFileLockAt } from "./locks.ts";
 import { WT_STATE_DIR } from "./wtstate.ts";
 
 let ledgerFile = join(WT_STATE_DIR, "automations.json");
@@ -92,14 +93,28 @@ function emptyLedger(): Ledger {
 }
 
 let ledger: Ledger | null = null;
+let ledgerSignature: string | null = null;
 
 function pairKey(ruleId: string, slug: string): string {
   return `${ruleId}|${slug}`;
 }
 
+function fileSignature(): string | null {
+  try {
+    const stat = statSync(ledgerFile);
+    return `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw error;
+  }
+}
+
 function loadLedger(): Ledger {
-  if (ledger) return ledger;
-  if (!existsSync(ledgerFile)) {
+  const signature = fileSignature();
+  if (ledger && ledgerSignature === signature) return ledger;
+  ledgerSignature = signature;
+  if (signature === null) {
     ledger = emptyLedger();
     return ledger;
   }
@@ -156,7 +171,8 @@ function loadLedger(): Ledger {
 /**
  * Atomic write (tmp + rename), same pattern as wtstate. Mutations are
  * rare (one per fire / breaker transition), so sync writes are fine.
- * Single-writer by assumption — only one TUI runs the engine.
+ * Every read-modify-write holds the lock beside this shared ledger, including
+ * callers outside the TUI. Repository-specific runtime locks cannot protect it.
  */
 function saveLedger(strict = false): void {
   const l = loadLedger();
@@ -165,6 +181,7 @@ function saveLedger(strict = false): void {
     const tmp = `${ledgerFile}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(l, null, 2)}\n`);
     renameSync(tmp, ledgerFile);
+    ledgerSignature = fileSignature();
   } catch (err) {
     if (strict) throw err;
     log.warn("ledger write failed", {
@@ -174,6 +191,15 @@ function saveLedger(strict = false): void {
   }
 }
 
+function withLedgerLock<T>(mutate: () => T): T {
+  return withFileLockAt(`${ledgerFile}.lock`, () => {
+    // A reader may have observed the old file before waiting on this lock.
+    // Reload inside the critical section before mutating any of its fields.
+    ledger = null;
+    return mutate();
+  });
+}
+
 /** True when the key was already dispatched, delivered, or cancelled. */
 export function hasHandledFire(key: string): boolean {
   return key in loadLedger().fired;
@@ -181,7 +207,7 @@ export function hasHandledFire(key: string): boolean {
 
 /** Consume only pending fire instances, without claiming delivery or a run. */
 export const cancelAutomationFires = Effect.fn("cancelAutomationFires")(
-  (keys: readonly string[]) => io.sync("cancel queued automations", () => {
+  (keys: readonly string[]) => io.sync("cancel queued automations", () => withLedgerLock(() => {
     const l = loadLedger();
     const added = keys.filter((key) => !(key in l.fired));
     if (added.length === 0) return;
@@ -193,7 +219,7 @@ export const cancelAutomationFires = Effect.fn("cancelAutomationFires")(
       for (const key of added) delete l.fired[key];
       throw error;
     }
-  }),
+  })),
 );
 
 /**
@@ -201,17 +227,30 @@ export const cancelAutomationFires = Effect.fn("cancelAutomationFires")(
  * path) so a concurrent evaluation pass can't double-fire, and stamp
  * the cooldown clock. Breaker accounting is separate (`bumpBreaker`) —
  * the caller decides trip-vs-launch before committing the dispatch.
+ * Returns false if another writer already handled every key.
  */
 export function markFiresDispatched(
   keys: readonly string[],
   ruleId: string,
   slug: string,
-): void {
-  const l = loadLedger();
-  const at = Date.now();
-  for (const k of keys) l.fired[k] = { state: "dispatched", at, ruleId, slug };
-  l.lastDispatch[pairKey(ruleId, slug)] = at;
-  saveLedger();
+): boolean {
+  return withLedgerLock(() => {
+    const l = loadLedger();
+    const unseen = keys.filter((key) => !(key in l.fired));
+    // Cancellation may win after the caller's evaluation but before dispatch.
+    if (unseen.length === 0) return false;
+    const at = Date.now();
+    for (const k of unseen) l.fired[k] = { state: "dispatched", at, ruleId, slug };
+    l.lastDispatch[pairKey(ruleId, slug)] = at;
+    try {
+      saveLedger(true);
+    } catch (error) {
+      // Never expose an in-memory claim as durable after a failed write.
+      ledger = null;
+      throw error;
+    }
+    return true;
+  });
 }
 
 /**
@@ -224,29 +263,33 @@ export function markFiresDispatched(
  * (no auto-retry).
  */
 export function dropFires(keys: readonly string[]): void {
-  const l = loadLedger();
-  let changed = false;
-  for (const k of keys) {
-    if (k in l.fired) {
-      delete l.fired[k];
-      changed = true;
+  withLedgerLock(() => {
+    const l = loadLedger();
+    let changed = false;
+    for (const k of keys) {
+      if (l.fired[k]?.state === "dispatched") {
+        delete l.fired[k];
+        changed = true;
+      }
     }
-  }
-  if (changed) saveLedger();
+    if (changed) saveLedger();
+  });
 }
 
 /** Flip keys to delivered once the launch handed off successfully. */
 export function markFiresDelivered(keys: readonly string[]): void {
-  const l = loadLedger();
-  let changed = false;
-  for (const k of keys) {
-    const e = l.fired[k];
-    if (e && e.state !== "delivered") {
-      l.fired[k] = { ...e, state: "delivered" };
-      changed = true;
+  withLedgerLock(() => {
+    const l = loadLedger();
+    let changed = false;
+    for (const k of keys) {
+      const e = l.fired[k];
+      if (e?.state === "dispatched") {
+        l.fired[k] = { ...e, state: "delivered" };
+        changed = true;
+      }
     }
-  }
-  if (changed) saveLedger();
+    if (changed) saveLedger();
+  });
 }
 
 /**
@@ -260,21 +303,23 @@ export function markFiresDelivered(keys: readonly string[]): void {
 export function reconcileDispatchedFires(
   hasRunForKey: (key: string) => boolean,
 ): number {
-  const l = loadLedger();
-  let dropped = 0;
-  let changed = false;
-  for (const [k, e] of Object.entries(l.fired)) {
-    if (e.state !== "dispatched") continue;
-    if (hasRunForKey(k)) {
-      l.fired[k] = { ...e, state: "delivered" };
-    } else {
-      delete l.fired[k];
-      dropped++;
+  return withLedgerLock(() => {
+    const l = loadLedger();
+    let dropped = 0;
+    let changed = false;
+    for (const [k, e] of Object.entries(l.fired)) {
+      if (e.state !== "dispatched") continue;
+      if (hasRunForKey(k)) {
+        l.fired[k] = { ...e, state: "delivered" };
+      } else {
+        delete l.fired[k];
+        dropped++;
+      }
+      changed = true;
     }
-    changed = true;
-  }
-  if (changed) saveLedger();
-  return dropped;
+    if (changed) saveLedger();
+    return dropped;
+  });
 }
 
 export function breakerState(ruleId: string, slug: string): BreakerEntry {
@@ -285,22 +330,26 @@ export function breakerState(ruleId: string, slug: string): BreakerEntry {
 
 /** Increment the consecutive-dispatch count; returns the new count. */
 export function bumpBreaker(ruleId: string, slug: string): number {
-  const l = loadLedger();
-  const key = pairKey(ruleId, slug);
-  const prev = l.breaker[key] ?? { count: 0, trippedAt: null, updatedAt: 0 };
-  const next = { ...prev, count: prev.count + 1, updatedAt: Date.now() };
-  l.breaker[key] = next;
-  saveLedger();
-  return next.count;
+  return withLedgerLock(() => {
+    const l = loadLedger();
+    const key = pairKey(ruleId, slug);
+    const prev = l.breaker[key] ?? { count: 0, trippedAt: null, updatedAt: 0 };
+    const next = { ...prev, count: prev.count + 1, updatedAt: Date.now() };
+    l.breaker[key] = next;
+    saveLedger();
+    return next.count;
+  });
 }
 
 /** Open the breaker: no more dispatches for this (rule, slug) until reset. */
 export function tripBreaker(ruleId: string, slug: string): void {
-  const l = loadLedger();
-  const key = pairKey(ruleId, slug);
-  const prev = l.breaker[key] ?? { count: 0, trippedAt: null, updatedAt: 0 };
-  l.breaker[key] = { ...prev, trippedAt: Date.now(), updatedAt: Date.now() };
-  saveLedger();
+  withLedgerLock(() => {
+    const l = loadLedger();
+    const key = pairKey(ruleId, slug);
+    const prev = l.breaker[key] ?? { count: 0, trippedAt: null, updatedAt: 0 };
+    l.breaker[key] = { ...prev, trippedAt: Date.now(), updatedAt: Date.now() };
+    saveLedger();
+  });
 }
 
 /**
@@ -309,11 +358,15 @@ export function tripBreaker(ruleId: string, slug: string): void {
  * (no write) when there's nothing to reset.
  */
 export function resetBreaker(ruleId: string, slug: string): void {
-  const l = loadLedger();
   const key = pairKey(ruleId, slug);
-  if (!(key in l.breaker)) return;
-  delete l.breaker[key];
-  saveLedger();
+  // The common evaluator path must not take a lock per rule per row.
+  if (!(key in loadLedger().breaker)) return;
+  withLedgerLock(() => {
+    const l = loadLedger();
+    if (!(key in l.breaker)) return;
+    delete l.breaker[key];
+    saveLedger();
+  });
 }
 
 /** Last dispatch timestamp for cooldown checks; null when never fired. */
@@ -329,6 +382,7 @@ export function lastDispatchAt(ruleId: string, slug: string): number | null {
 export function __setLedgerPathForTests(path: string): void {
   ledgerFile = path;
   ledger = null;
+  ledgerSignature = null;
 }
 
 // ---------- worktree activity timestamps ----------

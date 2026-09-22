@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Effect } from "effect";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,17 @@ afterEach(() => {
 });
 
 describe("fire ledger", () => {
+  test("failed dispatch persistence refuses launch and forgets its memory claim", () => {
+    // Block only the write, after the lock and a valid ledger read succeed.
+    mkdirSync(join(dir, `automations.json.${process.pid}.tmp`));
+    let launched = false;
+    expect(() => {
+      if (markFiresDispatched(["pending"], "fix", "a")) launched = true;
+    }).toThrow();
+    expect(launched).toBe(false);
+    expect(hasHandledFire("pending")).toBe(false);
+    expect(lastDispatchAt("fix", "a")).toBeNull();
+  });
   test("cancelled pending fires survive reload without changing running fires or cooldowns", async () => {
     markFiresDispatched(["running"], "fix", "a");
     const before = lastDispatchAt("fix", "a");
@@ -54,6 +65,66 @@ describe("fire ledger", () => {
     const result = await Effect.runPromise(Effect.result(cancelAutomationFires(["pending"])));
     expect(result._tag).toBe("Failure");
     expect(hasHandledFire("pending")).toBe(false);
+  });
+
+  test("a warmed reader observes an atomic external cancellation without a reset", () => {
+    markFiresDispatched(["ours"], "fix", "a");
+    expect(hasHandledFire("external")).toBe(false);
+    const file = join(dir, "automations.json");
+    const stored = JSON.parse(readFileSync(file, "utf8"));
+    stored.fired.external = { state: "cancelled", at: Date.now(), ruleId: "", slug: "" };
+    const replacement = join(dir, "replacement.json");
+    writeFileSync(replacement, JSON.stringify(stored));
+    renameSync(replacement, file);
+    expect(hasHandledFire("external")).toBe(true);
+    bumpBreaker("fix", "a");
+    expect(JSON.parse(readFileSync(file, "utf8")).fired.external.state).toBe("cancelled");
+  });
+
+  test("cancellation wins a stale dispatch attempt and cannot be delivered or dropped", async () => {
+    expect(hasHandledFire("cancelled")).toBe(false);
+    await Effect.runPromise(cancelAutomationFires(["cancelled"]));
+    expect(markFiresDispatched(["cancelled"], "fix", "a")).toBe(false);
+    expect(lastDispatchAt("fix", "a")).toBeNull();
+    markFiresDelivered(["cancelled"]);
+    dropFires(["cancelled"]);
+    expect(JSON.parse(readFileSync(join(dir, "automations.json"), "utf8")).fired.cancelled.state).toBe("cancelled");
+    expect(markFiresDispatched(["cancelled", "fresh"], "fix", "a")).toBe(true);
+    const stored = JSON.parse(readFileSync(join(dir, "automations.json"), "utf8"));
+    expect(stored.fired.cancelled.state).toBe("cancelled");
+    expect(stored.fired.fresh.state).toBe("dispatched");
+  });
+
+  test("independent warmed writers preserve cancellations and concurrent breaker increments", async () => {
+    const file = join(dir, "automations.json");
+    markFiresDispatched(["existing"], "fix", "a");
+    const moduleUrl = new URL("./automations.ts", import.meta.url).href;
+    const start = async (key: string) => {
+      const child = Bun.spawn(["bun", "-e", `
+        import { Effect } from "effect";
+        import { __setLedgerPathForTests, hasHandledFire, cancelAutomationFires, bumpBreaker } from ${JSON.stringify(moduleUrl)};
+        __setLedgerPathForTests(${JSON.stringify(file)});
+        hasHandledFire("warm-cache");
+        console.log("ready");
+        await Bun.stdin.text();
+        await Effect.runPromise(cancelAutomationFires([${JSON.stringify(key)}]));
+        for (let i = 0; i < 30; i++) bumpBreaker("concurrent", "a");
+      `], { cwd: join(import.meta.dir, "../.."), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      const reader = child.stdout.getReader();
+      const first = await reader.read();
+      reader.releaseLock();
+      expect(new TextDecoder().decode(first.value)).toContain("ready");
+      return child;
+    };
+    const children = await Promise.all([start("external-a"), start("external-b")]);
+    for (const child of children) child.stdin.end();
+    for (const child of children) {
+      expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+    }
+    expect(hasHandledFire("external-a")).toBe(true);
+    expect(hasHandledFire("external-b")).toBe(true);
+    expect(hasHandledFire("existing")).toBe(true);
+    expect(breakerState("concurrent", "a").count).toBe(60);
   });
 
   test("dispatched keys count as handled and persist across a reload", () => {

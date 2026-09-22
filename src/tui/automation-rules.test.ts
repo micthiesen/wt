@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { config } from "../core/config.ts";
+import { evaluateActionRequirements } from "../core/actions/requirements.ts";
 import type { AutomationDef } from "../core/config.ts";
 import { StatusKind, type PullRequest } from "../core/types.ts";
 
@@ -110,6 +111,27 @@ const FRESH: AutomationEvalCtx = {
       branchTips: new Map(),
   nowMs: Date.parse("2026-08-20T12:00:00Z"),
 };
+
+describe("wt.created", () => {
+  const r = rule({ id: "started", on: "wt.created" });
+  const createdAt = "2026-09-22T12:00:00.000Z";
+  test("only explicit successful creations fire, once per checkout identity", () => {
+    expect(evaluateAutomations([r], [makeRow("legacy")], FRESH)).toEqual([]);
+    const fires = evaluateAutomations([r], [makeRow("fresh", { createdAt })], FRESH);
+    expect(fires[0]?.fireKeys).toEqual([`started:created:fresh:${createdAt}`]);
+    expect(fires[0]?.quiesceSlugs).toEqual(["fresh"]);
+    const later = evaluateAutomations([r], [makeRow("fresh", { createdAt: "2026-09-23T00:00:00.000Z" })], FRESH);
+    expect(later[0]?.fireKeys).not.toEqual(fires[0]?.fireKeys);
+  });
+  test("external creation bookkeeping bypasses busy harness but honors pause and landing", () => {
+    const row = makeRow("fresh", { createdAt });
+    expect(evaluateAutomations([r], [row], { ...FRESH, externalOf: () => true })[0]?.quiesceSlugs).toEqual([]);
+    expect(evaluateAutomations([r], [row], { ...FRESH, isPausedSlug: () => true })).toEqual([]);
+    expect(evaluateAutomations([r], [makeRow("fresh", { createdAt, pr: makePr({ state: "MERGED" }) })], FRESH)).toEqual([]);
+    row.fields.merged = field(true);
+    expect(evaluateAutomations([r], [row], FRESH)).toEqual([]);
+  });
+});
 
 describe("pr.checks.failed", () => {
   const r = rule({ id: "fix-ci", on: "pr.checks.failed" });
@@ -283,6 +305,10 @@ describe("wt.merged → an external shell action", () => {
     // outlives its row", so an empty map here would silently restore
     // the old behaviour.
     expect(fires[0]!.frozenVars).toEqual({ slug: "a", issue_id: "COZ-2185" });
+    // Dispatch no longer needs the row (which may have been deleted).
+    const evidence = { slug: "a", issueId: "COZ-2185", pr: fires[0]!.frozenPr, deployed: false };
+    expect(evaluateActionRequirements(["pr", "issue.tracker"], evidence)).toEqual({ ok: true });
+    expect(evaluateActionRequirements(["pr.ready"], evidence)).toEqual({ ok: false, reason: "PR not open" });
   });
 
   test("fires for stack members, unlike a worktree-touching merge rule", () => {

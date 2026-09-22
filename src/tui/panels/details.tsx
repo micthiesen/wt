@@ -30,7 +30,7 @@ import type { ReviewRequestPr } from "../../core/github.ts";
 import type { DerivedState } from "../../core/harness/status.ts";
 import { StatusKind, type PrComment, type Worktree } from "../../core/types.ts";
 import type { WorkStatusRecord } from "../../core/work-status.ts";
-import { useGithub } from "../../state/hooks.ts";
+import { useGithub, useIssueStatuses } from "../../state/hooks.ts";
 import { useHarnessSessions } from "../hooks/useHarnessSessions.ts";
 import { useNowTick } from "../hooks/useNowTick.ts";
 import { usePrimaryHarness } from "../hooks/usePrimaryHarness.ts";
@@ -58,6 +58,7 @@ import { NF } from "../icons.ts";
 import { statusBadge } from "../badges.ts";
 import { remoteRowLabel } from "./list.tsx";
 import { PrLine } from "../rows/pr.tsx";
+import { IssueLine } from "../rows/issue.tsx";
 import { DevStatusText } from "../rows/dev.tsx";
 import { DEV_SERVER_STOPPED } from "../../core/dev-server.ts";
 import { Row } from "./details/row-cell.tsx";
@@ -570,6 +571,7 @@ function RemoteDetails({
   scrollRef?: RefObject<ScrollBoxRenderable | null>;
 }) {
   const github = useGithub();
+  const issues = useIssueStatuses();
   const summary = isRemoteSummary(entry) ? entry : null;
   const pr = model?.pr ?? (summary ? github.data?.prs[summary.branch] : undefined);
   const mq = model?.mq ?? (summary ? github.data?.mergeQueue?.[summary.branch] : undefined);
@@ -610,12 +612,16 @@ function RemoteDetails({
     }
     if (module.id === "issue") {
       if (!config.issueTracker) return null;
-      const issue = summary?.issueUrl ?? summary?.issueId ?? null;
+      const id = summary?.issueId ?? null;
+      const sources = config.issueTracker.statusCommand && id ? [issues] : [];
+      const glyph = combinedGlyph(sources);
+      const fetchError = firstError(sources);
+      const status = id ? issues.data?.[id] : undefined;
       return (
-        <Row key={module.id} label={module.label} labelWidth={LABEL_WIDTH}>
-          <text fg={issue ? theme.accentAlt : theme.fgDim} wrapMode="none" truncate>
-            {issue ?? "—"}
-          </text>
+        <Row key={module.id} label={module.label} labelWidth={LABEL_WIDTH} trailing={glyph ? <Glyph kind={glyph} /> : undefined}>
+          {fetchError ? <text fg={theme.err} wrapMode="none" truncate>{fetchError.message}</text> : (
+          <IssueLine id={id} githubIssue={summary?.githubIssue} status={status} optimistic={!!id && issues.expected.has(id)} />
+          )}
         </Row>
       );
     }

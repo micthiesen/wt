@@ -35,6 +35,7 @@ export {
   renameSection,
   reparentBaseReferences,
   setSlugBase,
+  recordSlugCreated,
   setSlugDevPort,
   setSlugDevStartedSha,
   setSlugExamined,

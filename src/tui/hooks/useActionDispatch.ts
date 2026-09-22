@@ -13,6 +13,7 @@
  * `state/hooks.ts` for the `affects` contract.
  */
 import { useEffect, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Effect } from "effect";
 
 import {
@@ -25,6 +26,7 @@ import {
 } from "../../core/actions.ts";
 import { recordRun as recordHistoryRun } from "../../core/actions.ts";
 import { config } from "../../core/config.ts";
+import { trackIssueStatusAction } from "../../state/issue-status.ts";
 import { operationErrors } from "../../core/errors.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
 import { sendAgentMessage } from "../../core/harness/agent-routing.ts";
@@ -106,6 +108,7 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
     extras: string,
   ) => Promise<LaunchOutcome>;
 } {
+  const queryClient = useQueryClient();
   // Custom action effect dispatch — each action carries an `affects`
   // tag set captured at start time; on every transition from
   // `running` → terminal status, fan that out to the matching
@@ -194,6 +197,9 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
               break;
             case "github":
               forkRefresh("refresh github", rg);
+              break;
+            case "issue":
+              forkRefresh("refresh issue statuses", () => queryClient.invalidateQueries({ queryKey: ["issueStatuses"] }));
               break;
             case "dev":
               // Dev-server start/stop — refresh the slug's per-worktree
@@ -457,6 +463,10 @@ export function useActionDispatch(opts: ActionDispatchOpts): {
     if (!result.ok) {
       ack(`action: ${result.reason}`, theme.err, 3000);
       return { launched: false, reason: result.reason };
+    }
+    if (def?.kind === "shell" && def.issueStatus && vars.issue_id && config.issueTracker?.statusCommand) {
+      forkReported(trackIssueStatusAction(queryClient, result.run, vars.issue_id, def.issueStatus),
+        () => dispatchLog.warn("issue status update failed"));
     }
     // Clear this worktree's focus so the auto-rules surface the
     // just-launched action.

@@ -138,7 +138,7 @@ const KEY_BLOCKS: Block[] = [
     title: "sessions",
     items: [
       { key: "!", label: "run action (picker) · kill if one's running" },
-      { key: "! <key>", label: "run action by its quick-pick letter" },
+      { key: "! <key>", label: "run action by its assigned letter or digit" },
       { key: "! c", label: "open action picker, jump to custom prompt" },
       { key: "! u", label: "agent updates the work status (re-assesses, runs `wt status`)" },
       { key: "! g", label: "agent continues the work per current status (build / test / address review)" },
@@ -279,7 +279,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "key key", label: "confirm highlighted (trigger re-press)" },
       { key: "⏎", label: "confirm highlighted" },
       { key: "esc / q", label: "cancel" },
-      { key: "1-9", label: "quick pick by row digit (action picker uses letters, reviewer picker uses space)" },
+      { key: "1-9", label: "quick pick by row digit (actions use assigned keys, reviewers use space)" },
     ],
   },
 ];

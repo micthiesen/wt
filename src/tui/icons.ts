@@ -26,6 +26,10 @@ export const NF = {
 	clean: "\u{F06C}", // nf-fa-leaf             — clean working tree, at rest
 	dot: "\u{F111}", // nf-fa-circle            — work-status dot (asserted states)
 	dotOutline: "\u{F10C}", // nf-fa-circle_o    — work-status dot, todo (hollow)
+	dotCircle: "\u{F192}", // nf-fa-dot_circle_o — tracker work in progress
+	halfCircle: "\u{F042}", // nf-fa-adjust       — tracker review
+	taskComplete: "\u{F058}", // nf-fa-check_circle — completed tracker task
+	taskCancelled: "\u{F057}", // nf-fa-times_circle — cancelled tracker task
 
 	// PR badges
 	prOpen: "\u{F407}", // nf-oct-git_pull_request

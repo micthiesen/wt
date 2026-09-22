@@ -121,6 +121,8 @@ export type AutomationFire = {
    * to the main clone.
    */
   frozenVars: ActionVars | null;
+  /** PR requirement evidence captured with a post-merge external fire. */
+  frozenPr?: Pick<NonNullable<WorktreeRow["pr"]>, "state" | "isDraft">;
   /** Human-readable trigger summary for the activity-pane event line. */
   detail: string;
 };
@@ -286,6 +288,17 @@ function evaluateRowTrigger(
 ): AutomationFire | null {
   const slug = row.wt.slug;
   switch (trigger) {
+    case "wt.created": {
+      // No retrofit from directory mtimes or first observation. An old checkout
+      // must not suddenly become "started" merely because a rule was enabled.
+      if (!row.createdAt || row.fields.merged.isLoading || row.fields.gone.isLoading) return null;
+      if (row.fields.merged.data || row.fields.gone.data || row.pr?.state === "MERGED") return null;
+      const fire = singleRowFire(rule, row, `${rule.id}:created:${slug}:${row.createdAt}`, "worktree created");
+      // External bookkeeping needs no idle harness, but unlike merged fires it
+      // does not survive removal: creating then deleting must not start a task.
+      if (ctx.externalOf(rule)) fire.quiesceSlugs = [];
+      return fire;
+    }
     case "pr.checks.failed": {
       const pr = freshOpenPr(row, ctx);
       if (!pr || pr.checks !== "fail") return null;
@@ -458,6 +471,7 @@ function evaluateRowTrigger(
           // here. `{{issue_id}}` above all: it is the whole point of
           // the run and is unrecoverable once the worktree is gone.
           frozenVars: ctx.varsFor(rule, row),
+          frozenPr: row.pr ? { state: row.pr.state, isDraft: row.pr.isDraft } : undefined,
           detail: landed,
         };
       }

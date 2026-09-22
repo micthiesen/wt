@@ -79,7 +79,7 @@
  *
  * ────────────────────────────────────────────────────────────────────
  */
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { Duration, Effect, Fiber } from "effect";
 import {
   MutationObserver,
@@ -97,6 +97,8 @@ import {
   toggleArchived as toggleArchivedOnDisk,
 } from "../core/archive.ts";
 import { config } from "../core/config.ts";
+import { issueStatusIds, type IssueStatuses } from "../core/issue-status.ts";
+import { issueStatusExpectations } from "./issue-status.ts";
 import type { DiffContext } from "../core/diff/index.ts";
 import { causeMessage } from "../core/errors.ts";
 import { gitRun, invalidateMainFirstParents } from "../core/git.ts";
@@ -130,9 +132,11 @@ import {
   contributorsQuery,
   fetchOriginQuery,
   githubQuery,
+  issueStatusesQuery,
   remoteWorktreesQuery,
   tmuxSessionsQuery,
   worktreesQuery,
+  wtStateQuery,
   type GithubData,
   type TmuxSessionsData,
 } from "./queries.ts";
@@ -247,6 +251,36 @@ export function useGithub(): UseQueryResult<GithubData, Error> {
     return [...new Set([...local, ...remote])].sort();
   }, [wtList.data, remoteList.data]);
   return useQuery(githubQuery(branches));
+}
+
+/** Local overrides and remote inventory IDs share one provider-neutral batch. */
+export function useIssueStatuses() {
+  const qc = useQueryClient();
+  const local = useQuery(worktreesQuery());
+  const remote = useQuery(remoteWorktreesQuery());
+  const state = useQuery(wtStateQuery());
+  const ids = useMemo(() => issueStatusIds([
+    ...(local.data ?? []).filter((wt) => !wt.isMain).map((wt) => ({
+      slug: wt.slug, issueId: state.data?.slugs[wt.slug]?.issueId,
+    })),
+    // Worker snapshots already resolved the override. Null is asserted none,
+    // not permission to resurrect the ID embedded in the remote slug.
+    ...(remote.data ?? []).map((wt) => ({ slug: wt.slug, issueId: wt.issueId ?? "" })),
+  ], config.issueTracker?.prefix), [local.data, remote.data, state.data?.slugs]);
+  const query = useQuery({
+    ...issueStatusesQuery(ids),
+    // Wait for overrides: slug-only identity is not an adequate interim key.
+    enabled: !!config.issueTracker?.statusCommand && ids.length > 0 && state.data !== undefined,
+  });
+  const store = issueStatusExpectations(qc);
+  const expected = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const data = useMemo<IssueStatuses | undefined>(() => {
+    if (!expected.size) return query.data;
+    const merged = { ...query.data };
+    for (const [id, value] of expected) if (ids.includes(id)) merged[id] = value.status;
+    return merged;
+  }, [query.data, expected, ids]);
+  return { ...query, data, expected, confirmedData: query.data, ids };
 }
 
 /**
@@ -526,6 +560,7 @@ export function useWtActions() {
             invalidate({ queryKey: qk.remoteWorkerInfo() }),
             invalidate({ queryKey: qk.remoteWorktrees() }),
             invalidate({ queryKey: ["github"] }),
+            invalidate({ queryKey: ["issueStatuses"] }),
             invalidate({ queryKey: qk.reviewRequests() }),
             invalidate({ queryKey: qk.wtState() }),
           ],

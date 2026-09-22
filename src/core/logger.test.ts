@@ -14,6 +14,14 @@ import { createLogger, flushLogger } from "./logger.ts";
  * pid change with a clean gap in the log.
  */
 describe("flushLogger", () => {
+  test("structured duration fields are rounded without changing other numeric metadata", async () => {
+    const marker = `logger-durations-${process.pid}-${Date.now()}`;
+    createLogger("[logger-test]").debug(marker, { elapsedMs: 799.797119140625, duration_ms: 23.999, durationSeconds: 1.234, ratio: 0.123456 });
+    await Effect.runPromise(flushLogger);
+    const day = new Date().toISOString().slice(0, 10);
+    const body = readFileSync(join(config.paths.appLogDir, `wt-${day}.log`), "utf8");
+    expect(body).toContain(`${marker} {"elapsedMs":800,"duration_ms":24,"durationSeconds":1.2,"ratio":0.123456}`);
+  });
   test("a line logged immediately before it is on disk after it", async () => {
     const marker = `flushLog-probe-${process.pid}-${performance.now()}`;
     createLogger("[logger-test]").debug(marker);

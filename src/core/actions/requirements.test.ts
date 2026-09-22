@@ -11,6 +11,10 @@ const rowState = (over: Partial<ActionRowState> = {}): ActionRowState => ({
 });
 
 describe("issue.tracker", () => {
+  test("GitHub notes alone cannot run tracker mutations", () => {
+    expect(evaluateActionRequirements(["issue.tracker"], rowState({ slug: "gh-123-notes" })).ok).toBe(false);
+    expect(evaluateActionRequirements(["issue.tracker"], rowState({ issueId: "GH-123" })).ok).toBe(false);
+  });
   test("a slug carrying a tracker id satisfies it", () => {
     expect(evaluateActionRequirements(["issue.tracker"], rowState())).toEqual({ ok: true });
   });

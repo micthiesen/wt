@@ -453,6 +453,41 @@ stdout/stderr and nonzero exit status (except reserved exit 3, mapped to 1);
 a 300-second timeout exits 124 and reports
 incomplete context. Ordinary issue-link lookup never starts the reader.
 
+`status_command = ["tracker", "task", "statuses", "{ids}", "--json"]` adds
+external tracker status to the issue row. Exactly one standalone `{ids}` argument
+expands into unique, sorted task IDs from local and remote inventory, resolving
+stored overrides before slug IDs and omitting explicitly detached issues. The
+batch excludes `GH-*` notes issues and, when `prefix` is configured, IDs outside
+that tracker prefix. The command runs once in the main clone, without a shell,
+with a 30-second timeout.
+Stdout must be only JSON of this shape:
+
+```json
+{"issues":[{"id":"ENG-1","status":"In Review"},{"id":"ENG-2","status":"Open"}]}
+```
+
+Return every requested ID exactly once, without extra fields or unrequested IDs.
+Statuses are arbitrary nonempty single-line strings; wt assigns no tracker
+vocabulary. Missing, duplicate, invalid, or failed responses
+reject the entire batch, retaining the last good cache and showing the source
+error. No reader or no IDs means no subprocess. Omission inherits the reader;
+`[]` disables it. `affects = ["issue"]` action completion and `r` refresh it
+immediately; a three-minute poll picks up changes made outside wt.
+
+Optional presentation maps exact status labels to icons and six-digit RGB colors:
+
+```toml
+[issue_tracker.status_styles]
+"In Review" = { icon = "review", color = "#2563EB" }
+"Completed" = { icon = "completed", color = "#047857" }
+```
+
+Icons are `circle`, `backlog`, `progress`, `review`, `completed`, `cancelled`,
+or `blocked`. Unknown/unconfigured labels use a neutral hollow circle; the
+original status text is always retained. Details show `#ENG-123 · In Review`,
+or `#ENG-123 ← #456 · In Review` with an attached GitHub notes issue. The
+status applies only to the tracker task. Full URLs remain the open/copy targets.
+
 Omit the section entirely to hide the `issue` row. The section's mere presence surfaces the issue id parsed from the branch slug (`yourname/eng-1883-fix` → `ENG-1883`) as an unlinked value — useful when your tracker has no per-task URLs. Add `url_template` (or the Linear preset) to turn the id into a deep link, which also powers the `i` open-issue key and the `y i` yank.
 
 ```toml
@@ -720,9 +755,10 @@ Fields:
 | `name` | both | — (required) | Picker label. |
 | `prompt` / `shell` | — | — | Exactly one must be set; picks the kind. |
 | `target` | prompt only | `"headless"` | `"headless"`, `"session"`, or `"manager"` (see above). |
-| `affects` | both | prompt: `["git", "github"]`, shell: `[]` | State domains the action mutates; the matching caches are refreshed when the run exits. Tags: `git`, `github`, `dev` (the worktree's `[dev_server]` state). Explicit `[]` opts out. |
-| `requires` | both | `[]` | Preconditions; unmet entries gray out in the picker with the reason. Tags: `pr` (any PR exists), `pr.ready` (open non-draft PR), `deployed` (this worktree's SST stage is live), `issue.tracker` (the worktree resolves to a tracker id, i.e. `{{issue_id}}` renders non-empty — settable with `#` / `wt issue --id` when the slug carries none). |
-| `key` | both | auto-derived | Single-char quick-pick letter in the `!` menu. Lowercase only — keys are case-folded and the picker matches `a-z`, so an uppercase key silently degrades to auto-derivation. With `[dev_server]` configured, `d` and `s` are claimed by the pinned built-ins. |
+| `affects` | both | prompt: `["git", "github"]`, shell: `[]` | State domains refreshed when the run exits: `git`, `github`, `dev` (the worktree's `[dev_server]` state), `issue` (batched external tracker statuses). Explicit `[]` opts out. |
+| `issue_status` | shell only | *(unset)* | Expected external status, shown immediately with `(updating)` after a tracked run launches. Requires `affects` to include `issue`. Failure/cancellation drops the expectation; success holds it until a live read agrees or 12 seconds elapse. Server cache stays authoritative and is never overwritten by the expectation. |
+| `requires` | both | `[]` | Preconditions; unmet entries gray out in the picker with the reason. Tags: `pr` (any PR exists), `pr.ready` (open non-draft PR), `deployed` (this worktree's SST stage is live), `issue.tracker` (a non-GitHub tracker ID matching the configured `prefix`, if any; settable with `#` / `wt issue --id` when the slug carries none). |
+| `key` | both | auto-derived | One lowercase letter or digit (`a-z`, `0-9`) in the `!` menu. Automatic assignment uses letters only; digits are explicit bindings. Uppercase and punctuation are rejected. With `[dev_server]` configured, `d` and `s` are claimed by pinned built-ins. |
 | `group` | both | ungrouped | Section label; same-group actions cluster under one header. |
 | `arg_prompt` | both | *(unset)* | Label for a per-launch value prompt. Picking the action first shows recent values (from `~/.cache/wt/action-history.json`) plus a "new…" input; the value substitutes `{{arg}}`. |
 | `label_extract` | both | *(unset)* | Regex (source string, no flags) scanned against the run's output; the last per-line match (capture group 1, or the full match) becomes the history label for the `{{arg}}` value. |
@@ -761,3 +797,9 @@ settle_seconds   = 300
 | `settle_seconds` | no | `120` (merge triggers: `10`; status triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. |
 
 At runtime, `A` pauses all automations and `Ctrl+A` pauses the selected worktree (or its whole stack); both persist across restarts.
+
+`wt.created` is an opt-in single-worktree trigger with a zero-second default
+settle window. It keys on the write-once timestamp of a successful `wt new`,
+never retrofits existing checkouts, and respects the normal pause and dispatch
+guards. This can launch a configured tracker action without making a tracker's
+workflow part of wt.

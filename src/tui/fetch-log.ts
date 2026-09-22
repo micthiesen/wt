@@ -1,6 +1,7 @@
 import type { QueryCacheNotifyEvent, QueryClient } from "@tanstack/react-query";
 
 import { createLogger } from "../core/logger.ts";
+import { formatDuration } from "../core/text.ts";
 
 /**
  * Surface external (network-hitting) query fetches in the event log so
@@ -21,12 +22,6 @@ const originLog = createLogger("[origin]");
 function loggerFor(source: string) {
   return source === "[gh]" ? ghLog : originLog;
 }
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
 export function attachFetchLogs(client: QueryClient): () => void {
   const starts = new Map<string, number>();
   // Sources currently in a failing streak (keyed by label). The FIRST

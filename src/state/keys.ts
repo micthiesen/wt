@@ -7,6 +7,8 @@
 export const qk = {
   /** All worktrees (from `git worktree list`). */
   worktrees: () => ["worktrees"] as const,
+  issueStatuses: (ids: readonly string[], command: readonly string[] | null, cwd: string) =>
+    ["issueStatuses", command, cwd, [...ids].sort()] as const,
   /** Worktrees owned by one SSH host; no arg is the all-hosts prefix. */
   remoteWorktrees: (host?: string) =>
     host ? (["remoteWorktrees", host] as const) : (["remoteWorktrees"] as const),

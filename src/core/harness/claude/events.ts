@@ -12,6 +12,7 @@
  * logic stays in the caller.
  */
 import { sanitizeLine } from "../../proc.ts";
+import { formatDuration } from "../../text.ts";
 
 export type ActionLineKind =
   | "info" // synthesized — start, kill, error, truncation hints
@@ -151,13 +152,7 @@ export function asArr(v: unknown): unknown[] | null {
   return Array.isArray(v) ? v : null;
 }
 
-export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.floor((ms % 60_000) / 1000);
-  return `${m}m${s.toString().padStart(2, "0")}s`;
-}
+export { formatDuration } from "../../text.ts";
 
 export function formatTokens(n: number): string {
   if (n < 1000) return `${n}`;

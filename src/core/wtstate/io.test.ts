@@ -9,6 +9,12 @@ import { parseWtState } from "./io.ts";
  * survives) via plain JSON round-trips, no fs involved.
  */
 describe("parseWtState", () => {
+  test("retains creation identity without inventing one for legacy or invalid records", () => {
+    const state = parseWtState({ slugs: { fresh: { createdAt: "2026-09-22T12:00:00.000Z" }, old: {}, invalid: { createdAt: "oops" } } });
+    expect(state.slugs.fresh?.createdAt).toBe("2026-09-22T12:00:00.000Z");
+    expect(state.slugs.old?.createdAt).toBeUndefined();
+    expect(state.slugs.invalid?.createdAt).toBeUndefined();
+  });
   test("round-trips a full slug record including the work status", () => {
     const state = parseWtState({
       slugs: {

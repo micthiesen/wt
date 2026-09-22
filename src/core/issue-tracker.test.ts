@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { issueIdForSlug, repoWebUrl, resolveIssueId } from "./issue-tracker.ts";
+import { isTrackerIssueId, issueIdForSlug, repoWebUrl, resolveIssueId } from "./issue-tracker.ts";
+
+test("tracker eligibility excludes notes and scopes configured prefixes", () => {
+  expect(isTrackerIssueId("GH-12", null)).toBe(false);
+  expect(isTrackerIssueId("ENG-12", "eng")).toBe(true);
+  expect(isTrackerIssueId("LEGACY-12", "eng")).toBe(false);
+  expect(isTrackerIssueId("LEGACY-12", null)).toBe(true);
+  expect(isTrackerIssueId(null, null)).toBe(false);
+});
 
 describe("issueIdForSlug", () => {
   test("extracts and uppercases an id at the head of a slug", () => {

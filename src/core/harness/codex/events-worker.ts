@@ -4,6 +4,7 @@
  * sessions cannot stall the TUI render/input thread.
  */
 import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { formatDuration } from "../../text.ts";
 
 import {
   findCodexRolloutForSession,
@@ -195,7 +196,7 @@ function emitEvent(
       }
       case "task_complete": {
         const ms = p.duration_ms;
-        const dur = typeof ms === "number" ? `${ms}ms` : "?ms";
+        const dur = typeof ms === "number" ? formatDuration(ms) : "?ms";
         push(events, "ok", `turn done in ${dur} · ${slug}`);
         break;
       }

@@ -45,6 +45,7 @@ import { useAutoCopy } from "./hooks/useAutoCopy.ts";
 import { useLogTails } from "./hooks/useLogTails.ts";
 import { usePaste } from "./hooks/usePaste.ts";
 import { usePrCommentEvents } from "./hooks/usePrCommentEvents.ts";
+import { useIssueStatusEvents } from "./hooks/useIssueStatusEvents.ts";
 import { useDevServerEvents } from "./hooks/useDevServerEvents.ts";
 import { useTerminalFocus } from "./hooks/useTerminalFocus.ts";
 import { useWtStateEvents } from "./hooks/useWtStateEvents.ts";
@@ -309,6 +310,8 @@ export function App({ onExit }: Props) {
   useWtStateEvents(wtStateForStacks.data, remoteRows);
   // New PR comments from other people → attention feed.
   usePrCommentEvents(rows, githubData);
+  // Confirmed external task-status transitions, never optimistic labels.
+  useIssueStatusEvents();
   // `wt manager report` spool → attention feed (cross-process watcher).
   useManagerReports();
 

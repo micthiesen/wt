@@ -84,7 +84,7 @@ export function assignActionKeys(
   const taken = new Set<string>([...RESERVED_KEYS, ...extraReserved]);
   for (const def of defs) {
     const k = def.key?.toLowerCase();
-    if (k && /^[a-z]$/.test(k) && !taken.has(k)) {
+    if (k && /^[a-z0-9]$/.test(k) && !taken.has(k)) {
       out.set(def.id, k);
       taken.add(k);
     }
@@ -218,7 +218,7 @@ export function ActionPickerModal({ slug, surface, items, selectedIndex }: Props
       inset={{ top: "12%", right: "18%", bottom: "12%", left: "18%" }}
       hints={[
         ["j/k", "move"],
-        ["a-z", "quick pick"],
+        ["key", "quick pick"],
         ["c", palette ? "custom message" : "custom prompt"],
         [confirmKey ? `${confirmKey} / ⏎` : "⏎", "select"],
         ["esc / q", "cancel"],

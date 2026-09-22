@@ -11,6 +11,12 @@ export const ISSUE_ID_RE = /^[A-Z]+-\d+$/i;
 /** Issue id embedded in a worktree slug (`coz-1883-some-fix` → `coz-1883`). */
 export const ISSUE_SLUG_ID_RE = /([a-z]+-\d+)(?:-|$)/i;
 
+/** GitHub notes are never tracker tasks; an optional prefix scopes the provider. */
+export function isTrackerIssueId(id: string | null, prefix: string | null = config.issueTracker?.prefix ?? null): boolean {
+  return !!id && ISSUE_ID_RE.test(id) && !/^GH-\d+$/i.test(id) &&
+    (!prefix || id.toUpperCase().startsWith(`${prefix.toUpperCase()}-`));
+}
+
 /**
  * Uppercased issue id parsed from a slug, or null when the slug carries
  * none. Independent of `[issue_tracker]` — parsing is free; config only

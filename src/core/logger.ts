@@ -259,7 +259,12 @@ function writeError(source: string, msg: string | Error, ctx?: object): void {
 
 function safeJson(ctx: object): string {
   try {
-    return JSON.stringify(ctx);
+    return JSON.stringify(ctx, (key, value) => {
+      if (typeof value !== "number" || !Number.isFinite(value)) return value;
+      if (/(?:Ms|_ms|milliseconds)$/.test(key)) return Math.round(value);
+      if (/(?:Seconds|_seconds)$/.test(key)) return Math.round(value * 10) / 10;
+      return value;
+    });
   } catch {
     return '"<unserializable ctx>"';
   }
