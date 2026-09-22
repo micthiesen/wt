@@ -99,6 +99,7 @@ describe("fire ledger", () => {
     const file = join(dir, "automations.json");
     markFiresDispatched(["existing"], "fix", "a");
     const moduleUrl = new URL("./automations.ts", import.meta.url).href;
+    const children: Bun.Subprocess<"pipe", "pipe", "pipe">[] = [];
     const start = async (key: string) => {
       const child = Bun.spawn(["bun", "-e", `
         import { Effect } from "effect";
@@ -109,17 +110,35 @@ describe("fire ledger", () => {
         await Bun.stdin.text();
         await Effect.runPromise(cancelAutomationFires([${JSON.stringify(key)}]));
         for (let i = 0; i < 30; i++) bumpBreaker("concurrent", "a");
-      `], { cwd: join(import.meta.dir, "../.."), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      `], {
+        cwd: join(import.meta.dir, "../.."),
+        // Bun 1.4.1 children can miss env set by the test preload. Pin the
+        // fixture explicitly, never fall through to the machine's config.
+        env: { ...process.env, WT_CONFIG: join(import.meta.dir, "../../test/config.toml"), WT_REPO_CONFIG: "", BUN_INSPECT: "" },
+        stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      });
+      children.push(child);
       const reader = child.stdout.getReader();
-      const first = await reader.read();
-      reader.releaseLock();
-      expect(new TextDecoder().decode(first.value)).toContain("ready");
+      let output = "";
+      try {
+        while (!output.includes("\n")) {
+          const chunk = await reader.read();
+          if (chunk.done) throw new Error(`ledger child exited ${await child.exited}: ${await new Response(child.stderr).text()}`);
+          output += new TextDecoder().decode(chunk.value);
+        }
+      } finally { reader.releaseLock(); }
+      expect(output).toContain("ready");
       return child;
     };
-    const children = await Promise.all([start("external-a"), start("external-b")]);
-    for (const child of children) child.stdin.end();
-    for (const child of children) {
-      expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+    try {
+      await Promise.all([start("external-a"), start("external-b")]);
+      for (const child of children) child.stdin.end();
+      for (const child of children) {
+        expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+      }
+    } finally {
+      for (const child of children) child.kill();
+      await Promise.all(children.map((child) => child.exited));
     }
     expect(hasHandledFire("external-a")).toBe(true);
     expect(hasHandledFire("external-b")).toBe(true);
