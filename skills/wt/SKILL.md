@@ -83,9 +83,13 @@ in each one.
   once; `-` means the inbox. Moves you make show on the human's attention
   feed.
 - `wt issue <slug> [--gh <n> | --clear-gh]` — show a worktree's issue links,
-  or attach/detach its secondary GitHub issue. The primary id stays parsed
-  from the slug; the attached GH issue becomes the `i`-key / `y i` target
+  or attach/detach its secondary GitHub issue. The primary id uses its explicit
+  override when set, otherwise the slug; the attached GH issue becomes the `i`-key / `y i` target
   (most specific wins), while `I` / `y I` always hit the primary.
+- `wt issue [<slug>] --read` — read the complete attached tracker task through
+  `[issue_tracker] read_command`; omitted slug resolves the current worktree.
+  Explicit attachment overrides apply. Exit 3 means no reader is configured;
+  other failures may include partial context and must not be treated as success.
 - `wt agent send <target> <text…>` / `wt agent ls [--json]` — message or list
   every addressable worktree and the `wt`, `main`, `dotfiles`, and `manager`
   special sessions. wt selects the target's active harness, or the configured

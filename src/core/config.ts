@@ -67,6 +67,8 @@ export type SstConfig = {
  * template from a Linear workspace slug.
  */
 export type IssueTrackerConfig = {
+  /** Argument vector for a full task reader; {id} is replaced without a shell. */
+  readCommand: readonly string[] | null;
   /**
    * URL template containing an `{id}` placeholder, substituted with the
    * uppercased issue id (`ENG-1883`). Null when no template is
@@ -1360,7 +1362,19 @@ function build(
     if (prefix && !/^[a-z]+$/.test(prefix)) {
       errs.add("issue_tracker.prefix must be lowercase letters (e.g. \"coz\")");
     }
-    issueTracker = { urlTemplate, prefix: prefix || null };
+    const rawReader = tracker.read_command;
+    let readCommand: string[] | null = null;
+    if (rawReader !== undefined) {
+      if (!Array.isArray(rawReader) || rawReader.some((arg) => typeof arg !== "string" || !arg.trim() || arg.includes("\0"))) {
+        errs.add("issue_tracker.read_command must be an array of nonempty strings (argv, not a shell command)");
+      } else if (rawReader.length > 0) {
+        if (rawReader[0].includes("{id}") || !rawReader.slice(1).some((arg: string) => arg.includes("{id}"))) {
+          errs.add("issue_tracker.read_command must contain {id} in an argument, not the executable");
+        }
+        readCommand = [expandHome(rawReader[0]), ...rawReader.slice(1)];
+      }
+    }
+    issueTracker = { urlTemplate, prefix: prefix || null, readCommand };
   }
 
   // [review_bot] — absent means the CodeRabbit preset, preserving the

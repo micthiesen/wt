@@ -57,6 +57,16 @@ describe("repositoryConfigPath", () => {
 });
 
 describe("mergeConfig", () => {
+  test("task readers inherit when omitted and clear only with an explicit empty array", () => {
+    const base = { issue_tracker: { read_command: ["tracker", "read", "{id}"] } };
+    expect(mergeConfig(base, { issue_tracker: { prefix: "eng" } })).toEqual({
+      issue_tracker: { prefix: "eng", read_command: ["tracker", "read", "{id}"] },
+    });
+    expect(mergeConfig(base, { issue_tracker: { read_command: [] } })).toEqual({
+      issue_tracker: { read_command: [] },
+    });
+  });
+
   test("merges tables while replacing scalar values and arrays", () => {
     expect(mergeConfig(
       {

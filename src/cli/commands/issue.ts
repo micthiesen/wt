@@ -1,6 +1,6 @@
 /**
  * `wt issue` — show or edit a worktree's issue links. The PRIMARY id
- * is parsed from the slug (never stored, never editable here); the
+ * is resolved from an explicit override or parsed from the slug; the
  * SECONDARY GitHub issue is a per-slug wtstate record, attached when a
  * spec/breakout issue is created mid-work.
  */
@@ -13,7 +13,8 @@ import {
 } from "../../core/issue-tracker.ts";
 import { Effect } from "effect";
 import { operationErrors } from "../../core/errors.ts";
-import { listWorktrees } from "../../core/worktree.ts";
+import { config } from "../../core/config.ts";
+import { listWorktrees, worktreeAtCwd } from "../../core/worktree.ts";
 import {
   readWtState,
   setSlugGithubIssue,
@@ -23,6 +24,7 @@ import { hasHelpFlag } from "../args.ts";
 import { cyan, dim, green, red } from "../colors.ts";
 
 const USAGE = `usage: wt issue <slug>              show the worktree's issue ids + urls
+       wt issue [<slug>] --read    read its full task through the configured reader
        wt issue <slug> --id <ID>    set the tracker id (overrides the slug)
        wt issue <slug> --no-id      assert it has NO tracker issue
        wt issue <slug> --clear-id   drop the override, back to the slug
@@ -32,7 +34,9 @@ const USAGE = `usage: wt issue <slug>              show the worktree's issue ids
 <slug> also accepts a branch name. The primary id normally comes from the
 slug (eng-1935-… → ENG-1935); --id supplies one when the slug carries none
 (or carries the wrong one), and is what {{issue_id}} renders. Neither --id
-nor --gh ever changes the branch.
+nor --gh ever changes the branch. --read without a slug uses the current worktree.
+The reader is [issue_tracker] read_command (argv with {id}); exit 3 means it is
+not configured. No attached tracker task is an explicit skip (exit 0).
 
 --no-id and --clear-id are different answers, and only on a slug that
 carries an id does the difference show: --no-id asserts the worktree has
@@ -52,10 +56,13 @@ function invalidMutationArgs(rest: string[]): string | null {
     if (rest.length !== 2) return `unknown args: ${rest.slice(2).join(" ")}`;
   }
   if (
-    ["--no-id", "--clear-id", "--clear-gh"].includes(flag ?? "") &&
+    ["--no-id", "--clear-id", "--clear-gh", "--read"].includes(flag ?? "") &&
     rest.length !== 1
   ) {
     return `unknown args: ${rest.slice(1).join(" ")}`;
+  }
+  if (flag && !["--id", "--gh", "--no-id", "--clear-id", "--clear-gh", "--read"].includes(flag)) {
+    return `unknown args: ${rest.join(" ")}`;
   }
   return null;
 }
@@ -65,24 +72,26 @@ export const run = Effect.fn("wt issue")(function* (argv: string[]) {
     console.log(USAGE);
     return 0;
   }
-  const [first, ...rest] = argv;
+  const [first, ...remaining] = argv;
   if (!first) {
     console.log(USAGE);
     return 2;
   }
 
-  const slugOrBranch = first;
+  const inferCwd = first === "--read";
+  const rest = inferCwd ? argv : remaining;
+  const slugOrBranch = inferCwd ? undefined : first;
   const invalid = invalidMutationArgs(rest);
   if (invalid) {
     console.error(red(invalid));
     return 2;
   }
   const wts = (yield* listWorktrees()).filter((w) => !w.isMain);
-  const wt = wts.find(
-    (w) => w.slug === slugOrBranch || w.branch === slugOrBranch,
-  );
+  const wt = slugOrBranch
+    ? wts.find((w) => w.slug === slugOrBranch || w.branch === slugOrBranch)
+    : worktreeAtCwd(wts);
   if (!wt) {
-    console.error(red(`no worktree: ${slugOrBranch}`));
+    console.error(red(slugOrBranch ? `no worktree: ${slugOrBranch}` : "not inside a wt worktree; pass a slug to wt issue <slug> --read"));
     return 1;
   }
 
@@ -148,7 +157,7 @@ export const run = Effect.fn("wt issue")(function* (argv: string[]) {
     console.log(green(`✓ ${wt.slug} gh issue cleared`));
     return 0;
   }
-  if (rest.length > 0) {
+  if (rest.length > 0 && rest[0] !== "--read") {
     console.error(red(`unknown args: ${rest.join(" ")}`));
     console.log(USAGE);
     return 2;
@@ -157,6 +166,28 @@ export const run = Effect.fn("wt issue")(function* (argv: string[]) {
   const slugState = (yield* io.sync("read wt state", readWtState)).slugs[wt.slug];
   const stored = slugState?.issueId ?? null;
   const id = resolveIssueId(wt.slug, stored);
+  if (rest[0] === "--read") {
+    if (!id) {
+      console.error("no tracker task attached; nothing to read");
+      return 0;
+    }
+    const command = config.issueTracker?.readCommand;
+    if (!command) {
+      console.error(`no task reader configured for ${id}; set [issue_tracker] read_command or read the linked task directly`);
+      return 3;
+    }
+    const { readTrackerIssue } = yield* io.promise("load task reader", () => import("../../core/issue-reader.ts"));
+    const result = yield* readTrackerIssue(command, id, wt.path);
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.timedOut || result.exitCode !== 0) {
+      console.error(`task read incomplete for ${id}: ${result.timedOut ? "timed out after 300s" : `reader exited ${result.exitCode}`}`);
+      // Exit 3 belongs to this interface's unconfigured-reader result. A child
+      // using it still failed to read; callers must not take the fallback path.
+      return result.timedOut ? 124 : result.exitCode > 0 && result.exitCode !== 3 ? result.exitCode : 1;
+    }
+    return 0;
+  }
   const gh = slugState?.githubIssue ?? null;
   console.log(`${cyan(wt.slug)}`);
   // Name the SOURCE. "COZ-2185" alone cannot answer the question the

@@ -23,6 +23,9 @@ describe("wt issue arguments", () => {
     ["slug", "--clear-id", "extra"],
     ["slug", "--gh", "1", "extra"],
     ["slug", "--clear-gh", "extra"],
+    ["slug", "--read", "extra"],
+    ["--read", "extra"],
+    ["slug", "--unknown"],
   ]) {
     test(`rejects trailing arguments: ${argv.join(" ")}`, async () => {
       expect(await runQuiet(argv)).toBe(2);

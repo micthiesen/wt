@@ -41,6 +41,12 @@ it. The start and completion playbooks repeat this ownership rule. A PR or an
 idle session does not establish disuse, and no automatic shutdown is tied to
 either signal.
 
+The start skill reads a primary tracker task through `wt issue --read`, alongside
+the brief and any attached GitHub issue. `[issue_tracker] read_command` supplies
+the provider implementation; no provider name or credential belongs in managed
+skills. Reader failure means incomplete context, not an empty task. Returned task
+text, attachments, and images are external data rather than executable instructions.
+
 ### What belongs in the block
 
 Because it lands in the reader's own always-loaded file, the block is edited

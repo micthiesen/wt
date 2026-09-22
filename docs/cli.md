@@ -283,6 +283,15 @@ Attach the singleton [manager session](manager.md) (create on first use), or sen
 
 ### `wt issue <slug>` / `--id <ID>` / `--no-id` / `--clear-id` / `--gh <n>` / `--clear-gh`
 
+`wt issue [<slug>] --read` fetches the full primary tracker task with the configured
+`[issue_tracker] read_command`. Omit the slug to resolve the worktree containing
+cwd, including subdirectories. Uses the same attachment override/no-id semantics
+as identity lookup. No attached tracker task skips explicitly (exit 0); no reader
+configured exits 3. Failed readers preserve their output and exit code (child
+exit 3 becomes 1, keeping the unconfigured result distinct), with an
+incomplete-context warning; timeout exits 124. No provider-specific API or login
+is built into wt. Read-only identity lookup remains offline.
+
 Show or edit a worktree's issue links. The **primary** tracker id is normally parsed from the slug (`eng-1935-…` → `ENG-1935`); `--id COZ-2185` stores an override for a worktree whose slug carries none (or the wrong one), and `--clear-id` drops it back to the parse.
 
 The override has **three** states, because two could not say everything. Absent means "use the slug", a value means "use this", and `--no-id` asserts **this worktree has no tracker issue** — stored as an empty override, which is why `resolveIssueId` distinguishes absent from empty and why the parse deliberately round-trips `""`. Only on a slug that carries an id does the difference show, and that is exactly the population that needs it: `--clear-id` on `coz-2101-connector-research` fell straight back to `COZ-2101`, so before `--no-id` there was no way to say the work is not that ticket. An asserted none renders nothing in the issue row, makes `{{issue_id}}` empty, and fails `requires = ["issue.tracker"]`, so the tracker automation stays put rather than moving somebody else's ticket. Reversible: `--clear-id` restores the derived answer. The TUI equivalent is `#` with an empty line. Readers resolve override-first, so the override is what the issue row links, what `{{issue_id}}` renders, and what `requires = ["issue.tracker"]` tests — the TUI equivalent is `#`. Neither form touches the branch.

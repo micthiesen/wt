@@ -14,6 +14,12 @@ The list panel (`src/tui/panels/list.tsx`) is deliberately **not** row-driven â€
 
 ## Effect boundary
 
+`core/issue-reader.ts` runs the optional tracker reader as an argv subprocess in
+the resolved worktree cwd. `wt issue --read` resolves identity through the existing
+override-aware task resolver; ordinary identity lookup does not invoke external
+tools. The reader owns credentials and downloaded artifacts, while wt preserves
+its output and failure status. The start skill invokes this provider-neutral path.
+
 Effect 4 (`effect@4.0.0-rc`) is the model for production work that performs
 I/O, starts or waits for subprocesses, coordinates concurrency, retries, waits
 on time, or owns a resource. These functions return `Effect<Success,

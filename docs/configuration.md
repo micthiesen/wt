@@ -442,6 +442,17 @@ Refusal is exit `75` (sysexits `EX_TEMPFAIL`), distinct from `1` so a looping ag
 
 ## `[issue_tracker]` — optional integration
 
+`read_command = ["tracker", "task", "read", "{id}"]` configures a headless
+full-task reader for `wt issue --read` and the start skill. It is an argv array,
+not a shell string: `{id}` is substituted literally in arguments, the executable
+is fixed, and the command runs in the destination worktree. Omitting it preserves
+an inherited reader, or leaves reading disabled when none is inherited. Set `[]`
+to disable reading explicitly, including an inherited reader. The reader owns authentication,
+Markdown rendering, attachment downloads, and any local artifacts. wt preserves
+stdout/stderr and nonzero exit status (except reserved exit 3, mapped to 1);
+a 300-second timeout exits 124 and reports
+incomplete context. Ordinary issue-link lookup never starts the reader.
+
 Omit the section entirely to hide the `issue` row. The section's mere presence surfaces the issue id parsed from the branch slug (`yourname/eng-1883-fix` → `ENG-1883`) as an unlinked value — useful when your tracker has no per-task URLs. Add `url_template` (or the Linear preset) to turn the id into a deep link, which also powers the `i` open-issue key and the `y i` yank.
 
 ```toml
