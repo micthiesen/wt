@@ -1,7 +1,7 @@
 import {
   issueUrlForId,
   resolveIssueId,
-  specificIssueUrl,
+  preferredIssueUrl,
 } from "../../core/issue-tracker.ts";
 import { stageUrl } from "../../core/stage.ts";
 import { Modal } from "../modal.tsx";
@@ -39,14 +39,14 @@ export function yankItemsFor(row: WorktreeRow): Item[] {
     { key: "d", label: "dev url", value: dev?.running ? dev.url : null },
     { key: "p", label: "path", value: row.wt.path },
     { key: "n", label: "slug", value: row.wt.slug },
-    // `i` mirrors the open key: most specific first (attached GitHub
-    // issue, else tracker URL, else the bare parsed id). `I` is always
+    // `i` mirrors the open key: tracker URL first, then an attached
+    // GitHub issue, then the bare resolved id. `I` is always
     // the primary tracker issue.
     {
       key: "i",
       label: "issue",
       value:
-        specificIssueUrl(row.wt.slug, row.githubIssue, row.issueId) ??
+        preferredIssueUrl(row.wt.slug, row.githubIssue, row.issueId) ??
         resolveIssueId(row.wt.slug, row.issueId),
     },
     {

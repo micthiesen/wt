@@ -116,7 +116,7 @@ export type WtSlugState = WorktreeLayout & {
    * <slug> --gh <n>`, typically after a spec/breakout issue is created
    * mid-work (which is why it's state, not part of the branch name:
    * renaming a pushed branch to encode it would be disruptive). The
-   * TUI's `i`/`y i` treat it as the most-specific link target.
+   * TUI's `i`/`y i` use it when the primary issue has no URL.
    */
   githubIssue?: number;
   /**

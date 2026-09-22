@@ -515,7 +515,7 @@ Id parsing itself is driven by the slug shape (`[a-z]+-\d+`), independent of `[b
 
 **Built-in `GH-` convention:** an id with the `gh` prefix (`yourname/gh-970-fix-typo` → `GH-970`) is taken to mean a GitHub issue on this repo and links to `<origin repo>/issues/970`, bypassing `url_template`. The repo URL is derived from the main clone's `origin` remote (ssh, scp, or https forms; bare ssh-config aliases can't be resolved, so those ids render unlinked). No configuration — this works even with a bare `[issue_tracker]` section. (With `prefix` set, GH-led ids can't *create* worktrees — the supported shape there is the secondary id below.)
 
-**Secondary GitHub issue:** independent of the slug id, a worktree can carry an attached GitHub issue number (`wt new … --gh 970`, `wt issue <slug> --gh 970` — see [cli.md](cli.md)). The issue row shows it after the primary (`ENG-1935 · #970`), and it becomes the most-specific target for `i` / `y i`; `I` / `y I` keep targeting the primary.
+**Secondary GitHub issue:** independent of the slug id, a worktree can carry an attached GitHub issue number (`wt new … --gh 970`, `wt issue <slug> --gh 970` — see [cli.md](cli.md)). The issue row shows it after the primary (`#ENG-1935 ← #970`). `i` / `y i` prefer the primary tracker URL and fall back to this GitHub issue when no primary URL is available; `I` / `y I` target only the primary.
 
 ## `[harness]` — coding-agent default
 

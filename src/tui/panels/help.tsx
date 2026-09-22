@@ -92,7 +92,7 @@ const KEY_BLOCKS: Block[] = [
       { key: "p", label: `open PR in ${PR_TARGET_LABEL}` },
       { key: "g p", label: "open PR in GitHub" },
       { key: "l p", label: "open PR in Linear" },
-      { key: "i", label: "open issue (gh issue when attached, else tracker)" },
+      { key: "i", label: "open issue (tracker first, else attached gh issue)" },
       { key: "I", label: "open primary tracker issue" },
       {
         key: "#",

@@ -76,7 +76,7 @@ function mainRepoWebUrl(): string | null {
  * automation moves to In Review.
  *
  * Pure: the caller supplies the stored value (from wtstate), the same
- * way `specificIssueUrl` takes `githubIssue`. That keeps this callable
+ * way `preferredIssueUrl` takes `githubIssue`. That keeps this callable
  * from the automations evaluator and the action-requirement check,
  * neither of which may do I/O.
  */
@@ -146,18 +146,15 @@ export function githubIssueNumberFromSlug(slug: string): number | null {
 }
 
 /**
- * The row's default link target: the MOST SPECIFIC issue. A worktree's
- * secondary GitHub issue (when attached) is narrower than its tracker
- * task, so `i` / `y i` prefer it; the tracker id stays the primary
- * identity (display prefix, branch name) and keeps its own explicit
- * key (`I` / `y I`).
+ * The row's default link target: the primary tracker issue when linkable,
+ * otherwise the attached GitHub issue. Shared by `i` and `y i`;
+ * `I` / `y I` remain primary-only, without the secondary fallback.
  */
-export function specificIssueUrl(
+export function preferredIssueUrl(
   slug: string,
   githubIssue: number | null | undefined,
   storedIssueId?: string | null,
 ): string | null {
   const tracker = issueUrlForId(resolveIssueId(slug, storedIssueId));
-  if (githubIssue) return githubIssueUrl(githubIssue) ?? tracker;
-  return tracker;
+  return tracker ?? (githubIssue ? githubIssueUrl(githubIssue) : null);
 }

@@ -22,7 +22,7 @@ import { config, type PullRequestTarget } from "../../core/config.ts";
 import { getHarness, VISIBLE_HARNESSES, type HarnessId } from "../../core/harness/index.ts";
 import {
   issueUrlForId,
-  specificIssueUrl,
+  preferredIssueUrl,
 } from "../../core/issue-tracker.ts";
 import { lockLabel, lockStatus } from "../../core/locks.ts";
 import { createLogger } from "../../core/logger.ts";
@@ -860,7 +860,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         return;
       }
       if (isPlainLetter(k, "i")) {
-        const url = specificIssueUrl(
+        const url = preferredIssueUrl(
           selectedWorktree.slug,
           selectedWorktree.githubIssue,
           selectedWorktree.issueId,
@@ -874,11 +874,7 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
         forkReported(openUrlHidingTerminal(url), (error) =>
           modelLog.debug(`open issue url failed: ${error.message}`),
         );
-        modelLog.event.info(
-          selectedWorktree.githubIssue
-            ? `opened gh issue #${selectedWorktree.githubIssue}`
-            : "opened issue",
-        );
+        modelLog.event.info("opened issue");
         return;
       }
       if (k.sequence === "I") {

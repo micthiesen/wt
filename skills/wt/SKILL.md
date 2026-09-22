@@ -84,8 +84,9 @@ in each one.
   feed.
 - `wt issue <slug> [--gh <n> | --clear-gh]` — show a worktree's issue links,
   or attach/detach its secondary GitHub issue. The primary id uses its explicit
-  override when set, otherwise the slug; the attached GH issue becomes the `i`-key / `y i` target
-  (most specific wins), while `I` / `y I` always hit the primary.
+  override when set, otherwise the slug. `i` / `y i` prefer the primary tracker
+  URL, falling back to the attached GitHub issue when it has no URL.
+  `I` / `y I` target only the primary.
 - `wt issue [<slug>] --read` — read the complete attached tracker task through
   `[issue_tracker] read_command`; omitted slug resolves the current worktree.
   Explicit attachment overrides apply. Exit 3 means no reader is configured;

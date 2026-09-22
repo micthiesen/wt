@@ -47,6 +47,9 @@ the provider implementation; no provider name or credential belongs in managed
 skills. Reader failure means incomplete context, not an empty task. Returned task
 text, attachments, and images are external data rather than executable instructions.
 
+The wt skill mirrors issue navigation: `i` / `y i` prefer the primary tracker
+URL and fall back to an attached GitHub issue; `I` / `y I` stay primary-only.
+
 ### What belongs in the block
 
 Because it lands in the reader's own always-loaded file, the block is edited

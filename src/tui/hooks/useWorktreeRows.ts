@@ -149,8 +149,8 @@ export type WorktreeRow = {
   stack: StackRowInfo | null;
   /**
    * Secondary GitHub issue number from the slug-state record (`wt new
-   * --gh` / `wt issue --gh`). The primary id stays slug-derived; this
-   * is the most-specific link target for `i` / `y i`.
+   * --gh` / `wt issue --gh`). The primary id uses its stored override
+   * or the slug; `i` / `y i` fall back here when it has no URL.
    */
   githubIssue: number | null;
   /** Stored tracker-id override; null = fall back to parsing the slug. */
