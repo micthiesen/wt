@@ -22,7 +22,7 @@ const headSha = requireEnv("HEAD_SHA");
 const ghToken = requireEnv("GITHUB_TOKEN");
 const dryRun = process.env.DRY_RUN === "1";
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-6-luna";
 /** Bound the model input however big the burst was. */
 const MAX_COMMITS = 30;
 const MAX_BODY_CHARS = 700;

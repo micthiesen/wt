@@ -36,7 +36,7 @@ Full mechanics are documented in those files' header comments; the shape:
   check instead.
 - "Since when" state is the head SHA of the digest workflow's own last
   successful run — no tags, no state files.
-- The model (`gpt-5.6-luna`) sees commit titles + bodies only, never diffs.
+- The model (`gpt-6-luna`) sees commit titles + bodies only, never diffs.
   OpenAI failure degrades to posting raw commit titles.
 - Attribution is built in: the embed footer lists commit authors' GitHub
   logins.
