@@ -39,7 +39,8 @@ substitute: it only ever does the second, and fails on a queue repo
 with an error naming a repo setting that is not the reason.
 
 Never merges on the spot: if the PR is not ready, GitHub holds it.
---cancel dequeues on a queue base and disarms auto-merge elsewhere.
+--cancel checks the PR's actual state: dequeues an entry or disarms
+classic auto-merge, even when that PR's base has a merge queue.
 
 <slug> defaults to $WT_AGENT, then to the worktree containing the
 current directory. Exits 75 when the refusal is temporary (a required

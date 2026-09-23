@@ -327,26 +327,53 @@ export function notYetEnqueueable(error: string | undefined): boolean {
 export const DEQUEUE_PULL_REQUEST_MUTATION =
   "mutation($prId: ID!) { dequeuePullRequest(input: {id: $prId}) { mergeQueueEntry { position } } }";
 
+export const PR_MERGE_ARM_QUERY =
+  "query($prId: ID!) { node(id: $prId) { ... on PullRequest { mergeQueueEntry { id } autoMergeRequest { enabledAt } } } }";
+
+export function mergeArmKind(node: {
+  mergeQueueEntry?: { id?: string } | null;
+  autoMergeRequest?: { enabledAt?: string } | null;
+} | null | undefined): "queue" | "classic" | "both" | "none" {
+  if (node?.mergeQueueEntry?.id && node?.autoMergeRequest?.enabledAt) return "both";
+  if (node?.mergeQueueEntry?.id) return "queue";
+  if (node?.autoMergeRequest?.enabledAt) return "classic";
+  return "none";
+}
+
 /**
  * Cancel a previously-armed "merge when ready".
  *
- * Mirrors `enableAutoMerge`'s split, and has to: `--disable-auto` does
- * not remove a PR from a merge queue, so on a queue branch the cancel
- * would report success while the PR stayed queued and merged anyway.
- * Queued PRs go through `dequeuePullRequest`; everything else through
- * `gh pr merge --disable-auto`, which no-ops with an error we surface
- * verbatim when the PR wasn't armed.
+ * Inspect the PR itself, not its base's queue configuration. A queue
+ * base can have classic auto-merge armed while checks are pending;
+ * trying to dequeue that PR fails because it has no queue entry.
+ * Conversely, `--disable-auto` cannot remove a real queue entry.
+ * Inspection failure is not evidence that either feature is absent.
  */
 export const disableAutoMerge = Effect.fn("disableAutoMerge")(function* (
   prNumber: number,
   opts: { prId?: string; baseRefName?: string } = {},
 ): Effect.fn.Return<GhActionResult> {
-  const queueId =
-    opts.prId && opts.baseRefName
-      ? yield* mergeQueueIdForBranch(opts.baseRefName)
-      : null;
-  if (queueId && opts.prId) {
-    return yield* runGhMutation(
+  if (!opts.prId) return { ok: false, error: `cannot inspect #${prNumber}: missing PR node id` };
+  if (!(yield* hasGh())) return { ok: false, error: "gh CLI not found" };
+  const inspected = yield* run(
+    ["gh", "api", "graphql", "-f", `query=${PR_MERGE_ARM_QUERY}`, "-f", `prId=${opts.prId}`],
+    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+  ).pipe(Effect.catch((error) => Effect.succeed({ stdout: "", stderr: error.message, exitCode: -1 })));
+  if (inspected.exitCode !== 0) {
+    return { ok: false, error: `cannot inspect #${prNumber}'s merge state: ${(inspected.stderr || inspected.stdout).trim()}` };
+  }
+  const parsed = yield* parseJsonOrNull<{
+    data?: { node?: { mergeQueueEntry?: { id?: string } | null; autoMergeRequest?: { enabledAt?: string } | null } | null };
+    errors?: unknown[];
+  }>(inspected.stdout);
+  if (!parsed?.data || parsed.errors || !parsed.data.node ||
+      !("mergeQueueEntry" in parsed.data.node) || !("autoMergeRequest" in parsed.data.node)) {
+    return { ok: false, error: `cannot inspect #${prNumber}'s merge state: incomplete GitHub response` };
+  }
+  const kind = mergeArmKind(parsed.data.node);
+  if (kind === "none") return { ok: false, error: `#${prNumber} has neither a merge-queue entry nor classic auto-merge armed` };
+  if (kind === "queue" || kind === "both") {
+    const dequeued = yield* runGhMutation(
       [
         "gh", "api", "graphql",
         "-f",
@@ -356,6 +383,7 @@ export const disableAutoMerge = Effect.fn("disableAutoMerge")(function* (
       "dequeue failed",
       { prNumber, base: opts.baseRefName },
     );
+    if (!dequeued.ok || kind === "queue") return dequeued;
   }
   return yield* runGhMutation(
     ["gh", "pr", "merge", String(prNumber), "--disable-auto"],

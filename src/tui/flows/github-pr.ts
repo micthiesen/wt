@@ -128,9 +128,9 @@ export function makeGithubPrFlows(ctx: GithubPrFlowsCtx) {
 
   /**
    * Toggle GitHub "merge when ready" on the PR. Which of the two
-   * features that means is decided in `enableAutoMerge`/
-   * `disableAutoMerge` from the PR's base branch — a queued base is
-   * enqueued/dequeued, anything else arms classic auto-merge.
+   * features that means is decided from the base branch when enabling,
+   * and the PR's actual queue/auto-merge state when disabling. A PR on
+   * a queue base may have classic auto-merge armed but not be queued.
    *
    * The optimistic patch flips `pr.autoMerge` either way, so on a queue
    * branch it paints the "armed" badge for the round trip even though

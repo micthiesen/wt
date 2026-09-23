@@ -8,11 +8,23 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { checksStillPending, DEQUEUE_PULL_REQUEST_MUTATION, missingWorkflowScope, notYetEnqueueable } from "./mutations.ts";
+import { checksStillPending, DEQUEUE_PULL_REQUEST_MUTATION, mergeArmKind, missingWorkflowScope, notYetEnqueueable, PR_MERGE_ARM_QUERY } from "./mutations.ts";
 
 test("dequeue uses DequeuePullRequestInput.id, not enqueue's pullRequestId", () => {
   expect(DEQUEUE_PULL_REQUEST_MUTATION).toContain("dequeuePullRequest(input: {id: $prId})");
   expect(DEQUEUE_PULL_REQUEST_MUTATION).not.toContain("pullRequestId:");
+});
+
+test("cancel probes the PR's actual queue entry and classic arm", () => {
+  expect(PR_MERGE_ARM_QUERY).toContain("mergeQueueEntry { id }");
+  expect(PR_MERGE_ARM_QUERY).toContain("autoMergeRequest { enabledAt }");
+  // #2146: staging has a queue, but classic auto-merge was armed while
+  // the PR was not queued. Branch configuration cannot decide cancellation.
+  expect(mergeArmKind({ mergeQueueEntry: null, autoMergeRequest: { enabledAt: "2026-09-23T19:52:58Z" } })).toBe("classic");
+  expect(mergeArmKind({ mergeQueueEntry: { id: "MQE_1" }, autoMergeRequest: null })).toBe("queue");
+  expect(mergeArmKind({ mergeQueueEntry: { id: "MQE_1" }, autoMergeRequest: { enabledAt: "now" } })).toBe("both");
+  expect(mergeArmKind({ mergeQueueEntry: null, autoMergeRequest: null })).toBe("none");
+  expect(mergeArmKind(null)).toBe("none");
 });
 
 describe("notYetEnqueueable", () => {
