@@ -54,7 +54,7 @@ export const BREAKER_LIMIT = 2;
 /** Fired entries older than this are pruned at load. */
 const FIRED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-export type FireState = "dispatched" | "delivered" | "cancelled";
+export type FireState = "dispatched" | "delivered" | "cancelled" | "skipped";
 
 type FiredEntry = {
   state: FireState;
@@ -126,7 +126,7 @@ function loadLedger(): Ledger {
       for (const [k, v] of Object.entries(raw.fired)) {
         if (!v || typeof v !== "object") continue;
         const e = v as Partial<FiredEntry>;
-        if (e.state !== "dispatched" && e.state !== "delivered" && e.state !== "cancelled") continue;
+        if (e.state !== "dispatched" && e.state !== "delivered" && e.state !== "cancelled" && e.state !== "skipped") continue;
         if (typeof e.at !== "number" || e.at < cutoff) continue;
         next.fired[k] = {
           state: e.state,
@@ -203,6 +203,24 @@ function withLedgerLock<T>(mutate: () => T): T {
 /** True when the key was already dispatched, delivered, or cancelled. */
 export function hasHandledFire(key: string): boolean {
   return key in loadLedger().fired;
+}
+
+/** Consume a fire that a pre-dispatch guard intentionally declined for good. */
+export function markFiresSkipped(keys: readonly string[], ruleId: string, slug: string): boolean {
+  return withLedgerLock(() => {
+    const l = loadLedger();
+    const unseen = keys.filter((key) => !(key in l.fired));
+    if (unseen.length === 0) return false;
+    const at = Date.now();
+    for (const key of unseen) l.fired[key] = { state: "skipped", at, ruleId, slug };
+    try {
+      saveLedger(true);
+    } catch (error) {
+      ledger = null;
+      throw error;
+    }
+    return true;
+  });
 }
 
 /** Consume only pending fire instances, without claiming delivery or a run. */

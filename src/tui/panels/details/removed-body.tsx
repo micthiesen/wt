@@ -6,6 +6,7 @@ import { ageMsToText, truncateEnd } from "../../text.ts";
 import { NF } from "../../icons.ts";
 import { theme } from "../../theme.ts";
 import { RRRow } from "./row-cell.tsx";
+import { WorkStatusRecordBlock } from "./work-status-block.tsx";
 
 /** Glyph + label for a removed entry's snapshotted PR state. */
 export function removedPrBadge(state: string | undefined): {
@@ -58,6 +59,17 @@ export function RemovedBody({ entry, width }: { entry: RemovedWorktree; width: n
           </span>
         </text>
       </box>
+      {entry.work ? (
+        <WorkStatusRecordBlock
+          record={entry.work}
+          contentWidth={Math.max(1, width - 4)}
+          verifyExpanded={null}
+          landed={entry.prState === "MERGED"}
+          lastCommitMs={null}
+        />
+      ) : (
+        <text fg={theme.fgDim}>status unknown</text>
+      )}
       <RRRow label="branch">
         <text fg={theme.fg} wrapMode="none" truncate>
           {entry.branch}

@@ -14,6 +14,7 @@ import {
   lastDispatchAt,
   markFiresDelivered,
   markFiresDispatched,
+  markFiresSkipped,
   reconcileDispatchedFires,
   resetBreaker,
   tripBreaker,
@@ -31,6 +32,24 @@ afterEach(() => {
 });
 
 describe("fire ledger", () => {
+  test("pre-dispatch skips consume an unseen fire durably without a launch", () => {
+    expect(markFiresSkipped(["blocked:sha1"], "fix", "a")).toBe(true);
+    expect(hasHandledFire("blocked:sha1")).toBe(true);
+    expect(lastDispatchAt("fix", "a")).toBeNull();
+    expect(breakerState("fix", "a").count).toBe(0);
+    __setLedgerPathForTests(join(dir, "automations.json"));
+    expect(hasHandledFire("blocked:sha1")).toBe(true);
+    expect(markFiresDispatched(["blocked:sha1"], "fix", "a")).toBe(false);
+    expect(markFiresSkipped(["blocked:sha1"], "fix", "a")).toBe(false);
+    expect(JSON.parse(readFileSync(join(dir, "automations.json"), "utf8")).fired["blocked:sha1"].state).toBe("skipped");
+  });
+
+  test("failed skip persistence leaves the fire eligible to retry", () => {
+    mkdirSync(join(dir, `automations.json.${process.pid}.tmp`));
+    expect(() => markFiresSkipped(["blocked:sha1"], "fix", "a")).toThrow();
+    expect(hasHandledFire("blocked:sha1")).toBe(false);
+  });
+
   test("failed dispatch persistence refuses launch and forgets its memory claim", () => {
     // Block only the write, after the lock and a valid ledger read succeed.
     mkdirSync(join(dir, `automations.json.${process.pid}.tmp`));

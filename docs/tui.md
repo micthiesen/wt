@@ -42,7 +42,7 @@ Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the 
 | `Ctrl+D` / `Ctrl+U` | jump to the first visible item in the next / previous section. For an expanded section that is its first row; for a folded section it is the selectable title, ready for `Tab` to unfold |
 | `Ctrl+J` / `Ctrl+K` | scroll the details pane, 3 rows a press |
 | `Ctrl+Shift+J` / `Ctrl+Shift+K` | scroll the bottom event feed — same 3-row step (also `Ctrl+E`/`Ctrl+Y`, mouse wheel); re-follows at the bottom. Kitty-protocol terminals only: legacy encodings can't express the chord and it degrades to the details scroll, leaving `Ctrl+E`/`Ctrl+Y` for the feed. There is no `Alt+J`/`Alt+K` alias, deliberately: outside the kitty protocol `Alt+<letter>` and `Esc`-then-letter are the same bytes, so such a binding hijacks bare `j`/`k` whenever you navigate right after dismissing a modal (or when a terminal binding emits an Esc-prefixed letter) |
-| `h` | flip to the removed-worktrees history view (grouped under day headers; a day starts at 04:00 local, so a late-night session stays in one group) |
+| `h` | flip to removed-worktree history (grouped under day headers; a day starts at 04:00 local). Rows show the saved work-status glyph on the left and PR/removal glyph on the right; older entries without a saved status show `?`. Selecting a row shows its saved status and note. No remote status lookup runs for history. |
 
 **Where the cursor goes when the row under it leaves.** The cursor is
 anchored to a row, not to a position, so it follows a row that merely

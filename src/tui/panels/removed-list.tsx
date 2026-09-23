@@ -2,7 +2,7 @@
  * Removed-worktrees view for the left pane (`h` toggles it in and out).
  * Renders the persisted removed history (`WtState.removed`) instead of
  * live worktrees: no per-slug sources exist anymore, so rows are a
- * stripped-down glyph + label + age, mirroring the review-request rows.
+ * snapshotted work-status glyph + label + PR glyph + age.
  * Entries whose slug is live again are filtered out by the parent.
  */
 import { memo, useEffect, useMemo, useRef } from "react";
@@ -12,14 +12,21 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
+import { workStatusBadge } from "../badges.ts";
 import { dayBucket, dayLabel } from "../day-headers.ts";
 import { NF } from "../icons.ts";
 import { scrollCursorIntoView, WtScrollbox } from "../scrollbox.tsx";
 import { ageMsToText, truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 
+/** The last asserted work status, or unknown for entries without a snapshot. */
+export function removedStatusGlyph(entry: RemovedWorktree): { glyph: string; fg: string } {
+  if (!entry.work) return { glyph: "?", fg: theme.fgDim };
+  return workStatusBadge(entry.work, undefined, false, entry.prState === "MERGED");
+}
+
 /** PR-state glyph for a removed row; a dim trash glyph when no PR was recorded. */
-export function removedGlyph(entry: RemovedWorktree): { glyph: string; fg: string } {
+export function removedPrGlyph(entry: RemovedWorktree): { glyph: string; fg: string } {
   switch (entry.prState) {
     case "MERGED":
       return { glyph: NF.prMerged, fg: theme.ok };
@@ -58,14 +65,15 @@ const RemovedRowView = memo(function RemovedRowView({
   selected: boolean;
   panelWidth: number;
 }) {
-  const marker = removedGlyph(entry);
+  const status = removedStatusGlyph(entry);
+  const pr = removedPrGlyph(entry);
   const age = removedAge(entry);
   const fg = selected ? theme.fgBright : theme.fgDim;
   const attrs = selected ? TextAttributes.BOLD : 0;
   // Width budget mirrors the live rows: borders(2) + padding(2) +
-  // scrollbar gutter(1) + leading glyph slot(3) + trailing age cell
-  // when present.
-  const trailingCells = age.length > 0 ? age.length + 2 : 0;
+  // scrollbar gutter(1) + leading status slot(3) + trailing PR
+  // slot(3) and age cell when present.
+  const trailingCells = 3 + (age.length > 0 ? age.length + 2 : 0);
   const budget = Math.max(0, panelWidth - 8 - trailingCells);
   return (
     <box
@@ -77,7 +85,7 @@ const RemovedRowView = memo(function RemovedRowView({
     >
       <box flexShrink={0} flexDirection="row">
         <box width={2} flexShrink={0}>
-          <text fg={marker.fg}>{marker.glyph}</text>
+          <text fg={status.fg}>{status.glyph}</text>
         </box>
         <box width={1} flexShrink={0}>
           <text> </text>
@@ -87,6 +95,12 @@ const RemovedRowView = memo(function RemovedRowView({
         <text fg={fg} attributes={attrs} wrapMode="none">
           {truncateEnd(removedRowLabel(entry), budget)}
         </text>
+      </box>
+      <box width={2} flexShrink={0}>
+        <text fg={pr.fg}>{pr.glyph}</text>
+      </box>
+      <box width={1} flexShrink={0}>
+        <text> </text>
       </box>
       {age.length > 0 ? (
         <box flexShrink={0} flexDirection="row">

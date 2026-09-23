@@ -63,6 +63,7 @@ import {
   lastWorktreeEditAt,
   markFiresDelivered,
   markFiresDispatched,
+  markFiresSkipped,
   reconcileDispatchedFires,
   resetBreaker,
   tripBreaker,
@@ -219,6 +220,17 @@ function pairTarget(fire: AutomationFire): string {
  */
 function isPostMergeExternalFire(fire: AutomationFire): boolean {
   return isPostMergeExternalRun(fire.rule.run) || fire.frozenVars !== null;
+}
+
+/** Fleet branch moves are independent instances, never a persistent
+ * worktree condition for the breaker to clear. */
+export function isBreakerExemptFire(fire: AutomationFire, isManagerRun: boolean): boolean {
+  return (
+    fire.rule.on === "branch.advanced" ||
+    fire.rule.run === "builtin:notify" ||
+    isPostMergeExternalFire(fire) ||
+    isManagerRun
+  );
 }
 
 function isPostMergeExternalRun(run: string): boolean {
@@ -761,6 +773,24 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
     const fires = evaluateAutomations(rules, ctx.rows, evalCtx);
     const byId = new Map(fires.map((f) => [fireIdentity(f), f] as const));
 
+    function recordSkipped(intent: Intent): boolean {
+      let skipped: boolean;
+      try {
+        skipped = markFiresSkipped(intent.fire.fireKeys, intent.fire.rule.id, pairTarget(intent.fire));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (intent.persistenceError !== message) {
+          createLogger(intent.fire.slug).attention.err(
+            `auto ${intent.fire.rule.id}: cannot persist skipped fire: ${message}`,
+          );
+          intent.persistenceError = message;
+        }
+        return false;
+      }
+      intents.current.delete(intent.id);
+      return skipped;
+    }
+
     // Breaker resets: a (rule, target) with breaker state whose
     // condition is now observed FALSE means the failure actually
     // cleared — the consecutive count starts over. Github-driven
@@ -902,10 +932,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       // needs-human ping exactly when it matters, or trip a post-merge
       // run after a couple of reused-slug landings. Cooldowns still apply
       // for spacing.
-      const breakerExempt =
-        rule.run === "builtin:notify" ||
-        isPostMergeExternalFire(fire) ||
-        isManagerRun;
+      const breakerExempt = isBreakerExemptFire(fire, isManagerRun);
       if (fire.quiesceSlugs.some((s) => occupiedSlugs.has(s))) continue;
       if (
         isRestack &&
@@ -918,6 +945,14 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       // One manager send at a time. The session is a shared singleton;
       // this gate keeps the queue orderly across every harness transport.
       if (isManagerRun && managerInFlight) continue;
+      const target = pairTarget(fire);
+      const breaker = breakerState(rule.id, target);
+      if (!breakerExempt && breaker.trippedAt !== null) {
+        // A pre-dispatch skip must create a ledger record; marking it
+        // delivered only updates a previously dispatched fire.
+        if (recordSkipped(intent)) wtLog.event.dim(`auto ${rule.id}: breaker open — skipping`);
+        continue;
+      }
       if (!intent.announced) {
         intent.announced = true;
         const settleLeft = Math.ceil(
@@ -925,17 +960,6 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
         );
         const settleNote = settleLeft > 0 ? ` (${settleLeft}s settle remaining)` : "";
         wtLog.attention.info(`auto ${rule.id}: ${fire.detail} · queued${settleNote}`, { toast: false });
-      }
-      const target = pairTarget(fire);
-      const breaker = breakerState(rule.id, target);
-      if (!breakerExempt && breaker.trippedAt !== null) {
-        // Breaker is open: swallow the fire (mark handled) so it
-        // doesn't re-announce every pass. Resets when the condition
-        // is observed clear.
-        markFiresDelivered(fire.fireKeys);
-        wtLog.event.dim(`auto ${rule.id}: breaker open — skipping`);
-        intents.current.delete(intent.id);
-        continue;
       }
       if (rule.cooldownMinutes !== null) {
         const last = lastDispatchAt(rule.id, target);
@@ -957,9 +981,7 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
       const blocked = bypassQuiesce ? null : quiesceBlockReason(fire, now);
       if (blocked) {
         if (rule.busy === "skip") {
-          markFiresDelivered(fire.fireKeys);
-          wtLog.event.dim(`auto ${rule.id}: skipped (${blocked})`);
-          intents.current.delete(intent.id);
+          if (recordSkipped(intent)) wtLog.event.dim(`auto ${rule.id}: skipped (${blocked})`);
         }
         continue;
       }
@@ -997,21 +1019,19 @@ export function useAutomations(opts: AutomationsOpts): AutomationsState {
           // now protects it from the row's death is exactly what stops
           // anything else clearing it. Drop it, and say why once.
           if (fire.frozenVars) {
-            markFiresDelivered(fire.fireKeys);
-            intents.current.delete(intent.id);
-            wtLog.event.dim(`auto ${rule.id}: ${avail.reason} — skipped`);
+            if (recordSkipped(intent)) wtLog.event.dim(`auto ${rule.id}: ${avail.reason} — skipped`);
           }
           continue;
         }
       }
       if (!breakerExempt && breaker.count >= BREAKER_LIMIT) {
         tripBreaker(rule.id, target);
-        markFiresDelivered(fire.fireKeys);
-        wtLog.event.err(
-          `auto ${rule.id} tripped breaker on ${target} — ${BREAKER_LIMIT} runs, condition never cleared; fix by hand to re-arm`,
-          { toast: true },
-        );
-        intents.current.delete(intent.id);
+        if (recordSkipped(intent)) {
+          wtLog.event.err(
+            `auto ${rule.id} tripped breaker on ${target} — ${BREAKER_LIMIT} runs, condition never cleared; fix by hand to re-arm`,
+            { toast: true },
+          );
+        }
         continue;
       }
 
