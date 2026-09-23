@@ -9,6 +9,18 @@ import { parseWtState } from "./io.ts";
  * survives) via plain JSON round-trips, no fs involved.
  */
 describe("parseWtState", () => {
+  test("keeps removed outcome and tracker override, including an explicit unlink", () => {
+    const state = parseWtState({ removed: [
+      { slug: "a", branch: "m/a", removedAt: "2026-09-23T00:00:00Z", issueId: "COZ-1445", gitState: "merged" },
+      { slug: "b", branch: "m/b", removedAt: "2026-09-23T00:00:00Z", issueId: "", gitState: "gone" },
+      { slug: "c", branch: "m/c", removedAt: "2026-09-23T00:00:00Z", gitState: "impossible" },
+    ] });
+    expect(state.removed.map(({ issueId, gitState }) => ({ issueId, gitState }))).toEqual([
+      { issueId: "COZ-1445", gitState: "merged" },
+      { issueId: "", gitState: "gone" },
+      { issueId: undefined, gitState: undefined },
+    ]);
+  });
   test("retains creation identity without inventing one for legacy or invalid records", () => {
     const state = parseWtState({ slugs: { fresh: { createdAt: "2026-09-22T12:00:00.000Z" }, old: {}, invalid: { createdAt: "oops" } } });
     expect(state.slugs.fresh?.createdAt).toBe("2026-09-22T12:00:00.000Z");

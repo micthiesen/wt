@@ -213,6 +213,10 @@ export type RemovedWorktree = {
   removedAt: string;
   /** Display title at removal (AI/PR/commit-derived; absent when it was just the slug). */
   title?: string;
+  /** Primary tracker override at removal; empty means deliberately unlinked. */
+  issueId?: string;
+  /** Git-derived terminal state observed while the checkout still existed. */
+  gitState?: "merged" | "gone";
   /** PR snapshot at removal, when the branch had one. */
   prNumber?: number;
   prUrl?: string;

@@ -1,6 +1,6 @@
 import { TextAttributes } from "@opentui/core";
 
-import type { RemovedWorktree } from "../../../core/wtstate.ts";
+import { isMergedRemoval, type RemovedWorktree } from "../../../core/wtstate.ts";
 import { slugLabel } from "../../../core/stage.ts";
 import { ageMsToText, truncateEnd } from "../../text.ts";
 import { NF } from "../../icons.ts";
@@ -64,7 +64,7 @@ export function RemovedBody({ entry, width }: { entry: RemovedWorktree; width: n
           record={entry.work}
           contentWidth={Math.max(1, width - 4)}
           verifyExpanded={null}
-          landed={entry.prState === "MERGED"}
+          landed={isMergedRemoval(entry)}
           lastCommitMs={null}
         />
       ) : (

@@ -15,9 +15,9 @@ const REMOVED_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
  */
 export const RECENT_REMOVED_WINDOW_MS = 48 * 60 * 60 * 1000;
 
-/** True when the removed entry's PR snapshot says the branch landed. */
+/** True when either the PR or the checkout's git state proved it landed. */
 export function isMergedRemoval(e: RemovedWorktree): boolean {
-  return e.prState === "MERGED";
+  return e.prState === "MERGED" || e.gitState === "merged";
 }
 
 /**
@@ -98,6 +98,8 @@ export function recordRemovedWorktrees(
         branch: e.branch,
         removedAt: e.removedAt,
         ...(e.title !== undefined ? { title: e.title } : {}),
+        ...(e.issueId !== undefined ? { issueId: e.issueId } : {}),
+        ...(e.gitState !== undefined ? { gitState: e.gitState } : {}),
         ...(e.prNumber !== undefined ? { prNumber: e.prNumber } : {}),
         ...(e.prUrl !== undefined ? { prUrl: e.prUrl } : {}),
         ...(e.prState !== undefined ? { prState: e.prState } : {}),

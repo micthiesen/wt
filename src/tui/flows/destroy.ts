@@ -24,7 +24,7 @@ import {
   remoteWorktreeActionKey,
   type WorktreeTarget,
 } from "../../core/worktree-target.ts";
-import type { PullRequest } from "../../core/types.ts";
+import { StatusKind, type PullRequest } from "../../core/types.ts";
 import { getHarness } from "../../core/harness/index.ts";
 import {
   resolveAgentRoute,
@@ -88,6 +88,9 @@ function removedSnapshot(row: WorktreeRow): RemovedWorktree {
     branch: row.wt.branch,
     removedAt: new Date().toISOString(),
     ...(row.titleSource !== "slug" ? { title: row.title } : {}),
+    ...(row.issueId !== null ? { issueId: row.issueId } : {}),
+    ...(row.status.kind === StatusKind.Merged ? { gitState: "merged" as const } : {}),
+    ...(row.status.kind === StatusKind.Gone ? { gitState: "gone" as const } : {}),
     ...(row.pr
       ? { prNumber: row.pr.number, prUrl: row.pr.url, prState: row.pr.state }
       : {}),
