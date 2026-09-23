@@ -34,6 +34,7 @@ const MIGRATIONS: readonly SqlMigration[] = [
 ];
 
 let handle: Database | null = null;
+let readHandle: Database | null = null;
 
 function canonicalRepoPath(): string {
   const path = resolve(config.repoPath);
@@ -86,14 +87,42 @@ function database(): Database {
   return db;
 }
 
+/** Existing state can be read from restricted agent sandboxes without
+ * attempting WAL setup, schema DDL, or the repository timestamp upsert. */
+function readDatabase(): Database | null {
+  if (handle) return handle;
+  if (readHandle) return readHandle;
+  if (!existsSync(config.paths.stateDb)) return null;
+  const db = new Database(config.paths.stateDb, { readonly: true });
+  try {
+    const existing = db.query<{ repo_path: string }, [string]>(
+      "SELECT repo_path FROM repositories WHERE repo_id = ?",
+    ).get(config.repoId);
+    const repoPath = canonicalRepoPath();
+    if (existing && existing.repo_path !== repoPath) {
+      throw new Error(
+        `repository namespace collision: ${config.repoId} belongs to ${existing.repo_path}, not ${repoPath}`,
+      );
+    }
+  } catch (err) {
+    db.close();
+    // A database from an older build still needs its forward-only SQL
+    // migration. Ordinary current-schema reads never take this write path.
+    if (err instanceof Error && err.message.includes("no such table")) return database();
+    throw err;
+  }
+  readHandle = db;
+  return db;
+}
+
 export function hasRepositoryState(): boolean {
-  return database().query<{ found: number }, [string]>(
+  return (readDatabase()?.query<{ found: number }, [string]>(
     "SELECT 1 AS found FROM repository_state WHERE repo_id = ? LIMIT 1",
-  ).get(config.repoId) !== null;
+  ).get(config.repoId) ?? null) !== null;
 }
 
 export function readRepositoryStateJson(): string | null {
-  return database().query<{ data: string }, [string]>(
+  return readDatabase()?.query<{ data: string }, [string]>(
     "SELECT data FROM repository_state WHERE repo_id = ? LIMIT 1",
   ).get(config.repoId)?.data ?? null;
 }
@@ -107,9 +136,9 @@ export function writeRepositoryStateJson(data: string): void {
 }
 
 export function readArchivedKeys(): Set<string> {
-  const rows = database().query<{ worktree_key: string }, [string]>(
+  const rows = readDatabase()?.query<{ worktree_key: string }, [string]>(
     "SELECT worktree_key FROM archived_worktrees WHERE repo_id = ? ORDER BY worktree_key",
-  ).all(config.repoId);
+  ).all(config.repoId) ?? [];
   return new Set(rows.map((row) => row.worktree_key));
 }
 

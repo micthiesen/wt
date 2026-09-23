@@ -137,8 +137,11 @@ Three stores, three policies:
   `core/state-db.ts`. The repository-state payload retains its existing
   forward-only `WT_STATE_VERSION` transformations, so the proven migration
   helpers remain the compatibility boundary while storage evolves. The
-  `repo_id` that scopes every row is derived from the REPOSITORY, never from
-  the working directory a command ran in — see
+  current-schema read path opens the existing database read-only and does not
+  refresh repository timestamps; only writes and a pending schema migration
+  need write access. This keeps `wt status` and `wt fleet` usable from a
+  restricted agent sandbox. The `repo_id` that scopes every row is derived
+  from the REPOSITORY, never from the working directory a command ran in — see
   [configuration.md](configuration.md#repository-identity-is-a-property-of-the-repository-not-of-your-shell).
   A build that got that wrong does not corrupt anything, it PARTITIONS: each
   namespace stays internally consistent and simply cannot see the others, which

@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,6 +10,7 @@ afterAll(() => {
 });
 
 const WTSTATE = JSON.stringify(pathToFileURL(join(import.meta.dir, "wtstate.ts")).href);
+const STATE_DB = JSON.stringify(pathToFileURL(join(import.meta.dir, "state-db.ts")).href);
 
 function run(cwd: string, userConfig: string, script: string) {
   const env: Record<string, string | undefined> = { ...process.env, WT_CONFIG: userConfig };
@@ -66,6 +67,67 @@ test("one database isolates repository state by path-derived id", () => {
   expect(firstRead.stdout.toString().trim()).toBe("one-section");
 });
 
+test("reads existing state without write access or repository timestamp updates", () => {
+  const root = mkdtempSync(join(tmpdir(), "wt-state-readonly-"));
+  roots.push(root);
+  const db = join(root, "state", "wt.sqlite");
+  const user = join(root, "config.toml");
+  const repo = join(root, "repo");
+  writeFileSync(user, "[branch]\nprefix = \"test\"\n");
+  writeRepoConfig(repo, repo, db);
+
+  const seeded = run(repo, user, `
+    const state = await import(${WTSTATE});
+    state.readWtState();
+    state.setSlugSection("existing", "Test Section");
+  `);
+  expect(seeded.exitCode, seeded.stderr.toString()).toBe(0);
+  const before = run(repo, user, `
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(${JSON.stringify(db)}, { readonly: true });
+    console.log(db.query("SELECT updated_at FROM repositories LIMIT 1").get().updated_at);
+  `);
+  expect(before.exitCode, before.stderr.toString()).toBe(0);
+
+  chmodSync(db, 0o444);
+  chmodSync(join(root, "state"), 0o555);
+  try {
+    const read = run(repo, user, `
+      const state = await import(${WTSTATE});
+      const database = await import(${STATE_DB});
+      console.log(state.readWtState().slugs.existing.section);
+      console.log(String(database.readArchivedKeys().size));
+    `);
+    expect(read.exitCode, read.stderr.toString()).toBe(0);
+    expect(read.stdout.toString().trim()).toBe("Test Section\n0");
+    const after = run(repo, user, `
+      const { Database } = await import("bun:sqlite");
+      const db = new Database(${JSON.stringify(db)}, { readonly: true });
+      console.log(db.query("SELECT updated_at FROM repositories LIMIT 1").get().updated_at);
+    `);
+    expect(after.stdout.toString()).toBe(before.stdout.toString());
+  } finally {
+    chmodSync(join(root, "state"), 0o755);
+    chmodSync(db, 0o644);
+  }
+});
+
+test("reading a repository with no state database does not create one", () => {
+  const root = mkdtempSync(join(tmpdir(), "wt-state-absent-"));
+  roots.push(root);
+  const db = join(root, "state", "wt.sqlite");
+  const user = join(root, "config.toml");
+  const repo = join(root, "repo");
+  writeFileSync(user, "[branch]\nprefix = \"test\"\n");
+  writeRepoConfig(repo, repo, db);
+  const read = run(repo, user, `
+    const state = await import(${WTSTATE});
+    console.log(state.readWtState().version);
+  `);
+  expect(read.exitCode, read.stderr.toString()).toBe(0);
+  expect(existsSync(db)).toBe(false);
+});
+
 test("controller keeps host-qualified remote layout separate from local slug state", () => {
   const root = mkdtempSync(join(tmpdir(), "wt-remote-layout-"));
   roots.push(root);
@@ -110,7 +172,7 @@ test("a namespace collision refuses the second canonical repository path", () =>
 
   const first = run(flat, user, `
     const state = await import(${WTSTATE});
-    state.readWtState();
+    state.setSlugSection("owned", "flat");
   `);
   expect(first.exitCode, first.stderr.toString()).toBe(0);
   const second = run(nested, user, `
