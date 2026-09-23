@@ -550,7 +550,7 @@ harness          = "primary"
 reasoning_effort = "low"
 
 [naming.models]
-codex = "gpt-5.6-luna"
+codex = "gpt-6-luna"
 ```
 
 | key | required | default | meaning |
