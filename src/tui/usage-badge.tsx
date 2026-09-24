@@ -47,7 +47,8 @@ export function PrimaryHarnessBadge({ primary }: { primary: HarnessId }) {
 
 /**
  * Top-right usage slot, following the Shift+TAB-selected primary harness:
- *   - claude / codex → rate-limit windows as `5h X% / 7d Y%`
+ *   - claude         → used rate-limit windows as `5h X% / 7d Y%`
+ *   - codex          → remaining allowance as `5h X% left / weekly Y% left`
  *   - opencode       → spend over the same windows as `5h $X / 7d $Y`
  *     (it has no rate-limit window — it bills per token)
  * Each source is gated to its primary so we don't scan rollouts / hit
@@ -89,6 +90,7 @@ export function UsageBadge({ primary }: { primary: HarnessId }) {
   const clusters = formatPctUsage(
     primary === "claude" ? claude.data : codex.data,
     nowMs,
+    primary === "codex" ? "codex" : "claude",
   );
   if (clusters.length === 0) return null;
 
@@ -105,8 +107,11 @@ export function UsageBadge({ primary }: { primary: HarnessId }) {
       );
     }
     nodes.push(
-      <span key={`${c.key}-pct`} fg={pctColor(c.pct)}>
-        {`${c.key} ${c.pct}%`}
+      <span
+        key={`${c.key}-pct`}
+        fg={pctColor(primary === "codex" ? 100 - c.pct : c.pct)}
+      >
+        {`${c.key} ${c.pct}%${primary === "codex" ? " left" : ""}`}
       </span>,
     );
     if (c.remaining) {
@@ -184,15 +189,20 @@ function pctCluster(
 export function formatPctUsage(
   usage: ClaudeUsage | CodexUsage | null | undefined,
   nowMs: number,
+  harness: "claude" | "codex" = "claude",
 ): PctCluster[] {
   if (!usage) return [];
   const scoped = "sevenDayScoped" in usage ? usage.sevenDayScoped : [];
   const clusters = [
     pctCluster(usage.fiveHour, "5h", nowMs),
     ...scoped.map((p) => pctCluster(p, windowKey(p, true), nowMs)),
-    pctCluster(usage.sevenDay, "7d", nowMs),
+    pctCluster(usage.sevenDay, harness === "codex" ? "weekly" : "7d", nowMs),
   ].filter((c) => c !== null);
-  return dedupeCountdowns(clusters);
+  const displayed =
+    harness === "codex"
+      ? clusters.map((c) => ({ ...c, pct: 100 - c.pct }))
+      : clusters;
+  return dedupeCountdowns(displayed);
 }
 
 /**

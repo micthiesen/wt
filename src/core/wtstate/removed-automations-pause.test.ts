@@ -119,6 +119,21 @@ test("a later minimal confirm does not blank a pause toggled on the archived row
   expect(JSON.parse(out.trim())).toEqual({ paused: true });
 });
 
+test("a later minimal confirm preserves the archived release evidence", () => {
+  const out = inSandbox(`
+    const m = await import(${WTSTATE_MOD});
+    const removedAt = Date.now();
+    m.recordRemovedWorktrees([{ slug: "s", branch: "t/s",
+      removedAt: new Date(removedAt).toISOString(),
+      prState: "MERGED", landedOnAtRemoval: "base", prMergeCommitOid: "merge-sha" }]);
+    m.recordRemovedWorktrees([{ slug: "s", branch: "t/s",
+      removedAt: new Date(removedAt + 5_000).toISOString() }]);
+    const entry = m.readWtState().removed.find((e) => e.slug === "s");
+    console.log(JSON.stringify({ landing: entry.landedOnAtRemoval, sha: entry.prMergeCommitOid }));
+  `);
+  expect(JSON.parse(out.trim())).toEqual({ landing: "base", sha: "merge-sha" });
+});
+
 test("toggling a slug that is not in the history reports null", () => {
   const out = inSandbox(`
     const m = await import(${WTSTATE_MOD});

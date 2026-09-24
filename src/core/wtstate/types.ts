@@ -223,6 +223,10 @@ export type RemovedWorktree = {
   prNumber?: number;
   prUrl?: string;
   prState?: string;
+  /** Release position proved by the live row at removal; absent on older snapshots. */
+  landedOnAtRemoval?: "base" | "production";
+  /** Exact PR merge commit, used to recheck promotion after removal. */
+  prMergeCommitOid?: string;
   /**
    * The work status the row held when its checkout went away, copied
    * from `slugs[slug].work` by `recordRemovedWorktrees`.

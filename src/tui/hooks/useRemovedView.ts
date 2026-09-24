@@ -11,6 +11,7 @@ import { config } from "../../core/config.ts";
 import { issueStatusIds } from "../../core/issue-status.ts";
 import type { RemovedWorktree, WtState } from "../../core/wtstate.ts";
 import { issueStatusesQuery } from "../../state/queries/issue-status.ts";
+import { productionCommitsQuery, watchedBranchTipsQuery } from "../../state/queries/worktree.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 export function useRemovedView(opts: {
@@ -38,6 +39,25 @@ export function useRemovedView(opts: {
     ...issueStatusesQuery(issueIds),
     enabled: removedView && issueIds.length > 0 && config.issueTracker?.statusCommand != null,
   });
+  const production = config.branch.production;
+  const promotionCommits = useMemo(() => [
+    ...new Set(removedEntries
+      .filter((e) => e.landedOnAtRemoval === "base" && e.prMergeCommitOid)
+      .map((e) => e.prMergeCommitOid!)),
+  ], [removedEntries]);
+  const productionTip = useQuery({
+    ...watchedBranchTipsQuery(production ? [production] : []),
+    enabled: removedView && !!production && production !== config.branch.base && promotionCommits.length > 0,
+  });
+  const productionCommits = useQuery({
+    ...productionCommitsQuery(
+      production,
+      production ? productionTip.data?.[production] : undefined,
+      promotionCommits,
+    ),
+    enabled: removedView && !!production && production !== config.branch.base &&
+      !!productionTip.data?.[production] && promotionCommits.length > 0,
+  });
   const removedCursor = Math.min(
     removedIndex,
     Math.max(0, removedEntries.length - 1),
@@ -54,5 +74,6 @@ export function useRemovedView(opts: {
     removedCursor,
     currentRemoved,
     removedIssueStatuses: issueStatuses.data,
+    removedProductionCommits: productionCommits.data,
   };
 }

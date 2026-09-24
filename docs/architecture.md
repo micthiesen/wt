@@ -19,6 +19,12 @@ current production tip. The ref watcher refreshes that tip, which rekeys the
 membership query when production advances. Unknown merge SHA or failed ancestry
 check never implies production.
 
+Removed-history rows retain the live row's proved release position and merged
+PR SHA at removal. While `h` is open, one batched ancestry query can advance
+archived staging markers to production as that branch moves; entries without
+proof keep their older outcome glyph. The release marker keeps the saved work
+status color, including overdue verification.
+
 `core/issue-status.ts` validates the optional generic `status_command` protocol.
 `useIssueStatuses` joins override-aware local identities and remote inventory
 identities into one sorted batch, keyed by IDs, argv, and main-clone cwd. Its

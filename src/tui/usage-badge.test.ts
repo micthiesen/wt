@@ -3,9 +3,15 @@ import { describe, expect, test } from "bun:test";
 import { formatPctUsage } from "./usage-badge.tsx";
 
 /** Render clusters the way the badge does, so assertions read as the bar does. */
-function render(clusters: ReturnType<typeof formatPctUsage>): string {
+function render(
+  clusters: ReturnType<typeof formatPctUsage>,
+  harness: "claude" | "codex" = "claude",
+): string {
   return clusters
-    .map((c) => `${c.key} ${c.pct}%${c.remaining ? ` (${c.remaining})` : ""}`)
+    .map(
+      (c) =>
+        `${c.key} ${c.pct}%${harness === "codex" ? " left" : ""}${c.remaining ? ` (${c.remaining})` : ""}`,
+    )
     .join(" · ");
 }
 
@@ -104,17 +110,20 @@ describe("formatPctUsage", () => {
     expect(render(out)).toBe("5h 0%");
   });
 
-  test("codex usage (no scoped windows) still formats", () => {
+  test("codex shows remaining allowance, with the weekly label", () => {
     const out = formatPctUsage(
       {
         fiveHour: { utilization: 20, resetsAt: IN_5M },
-        sevenDay: { utilization: 40, resetsAt: IN_1D13H_A },
+        sevenDay: { utilization: 62, resetsAt: "2026-08-13T00:00:00Z" },
         planType: "max",
         cachedAtMs: NOW,
       },
       NOW,
+      "codex",
     );
-    expect(render(out)).toBe("5h 20% (5m) · 7d 40% (1d13h)");
+    expect(render(out, "codex")).toBe(
+      "5h 80% left (5m) · weekly 38% left (4d12h)",
+    );
   });
 
   test("codex can render only the weekly window", () => {
@@ -126,8 +135,23 @@ describe("formatPctUsage", () => {
         cachedAtMs: NOW,
       },
       NOW,
+      "codex",
     );
-    expect(render(out)).toBe("7d 97% (1d13h)");
+    expect(render(out, "codex")).toBe("weekly 3% left (1d13h)");
+  });
+
+  test("expired codex window reports a fresh 100% left", () => {
+    const out = formatPctUsage(
+      {
+        fiveHour: null,
+        sevenDay: { utilization: 97, resetsAt: "2026-08-08T11:00:00Z" },
+        planType: "pro",
+        cachedAtMs: NOW,
+      },
+      NOW,
+      "codex",
+    );
+    expect(render(out, "codex")).toBe("weekly 100% left");
   });
 
   test("nothing to show", () => {

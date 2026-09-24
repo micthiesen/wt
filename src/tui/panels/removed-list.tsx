@@ -2,7 +2,7 @@
  * Removed-worktrees view for the left pane (`h` toggles it in and out).
  * Renders the persisted removed history (`WtState.removed`) instead of
  * live worktrees: no per-slug sources exist anymore, so rows are a
- * snapshotted outcome glyph + label + tracker/PR glyphs + age.
+ * release/outcome glyph + label + tracker/PR glyphs + age.
  * Entries whose slug is live again are filtered out by the parent.
  */
 import { memo, useEffect, useMemo, useRef } from "react";
@@ -14,16 +14,29 @@ import { config } from "../../core/config.ts";
 import { isTrackerIssueId, resolveIssueId } from "../../core/issue-tracker.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
-import { issueStatusBadge } from "../badges.ts";
+import { issueStatusBadge, workStatusBadge } from "../badges.ts";
 import { dayBucket, dayLabel } from "../day-headers.ts";
 import { NF } from "../icons.ts";
+import { releaseMarkerBadge } from "../row-gutter.tsx";
 import { scrollCursorIntoView, WtScrollbox } from "../scrollbox.tsx";
 import { ageMsToText, truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
 import type { IssueStatuses } from "../../core/issue-status.ts";
 
-/** Outcome at removal, not the agent's internal todo/ready assertion. */
-export function removedStatusGlyph(entry: RemovedWorktree): { glyph: string; fg: string } {
+/** Release shape + work hue when proved; legacy snapshots retain their outcome glyph. */
+export function removedStatusGlyph(
+  entry: RemovedWorktree,
+  productionCommits?: readonly string[],
+): { glyph: string; fg: string } {
+  if (entry.landedOnAtRemoval) {
+    const promoted = entry.landedOnAtRemoval === "production" ||
+      (config.branch.production === config.branch.base) ||
+      (!!entry.prMergeCommitOid && productionCommits?.includes(entry.prMergeCommitOid));
+    return releaseMarkerBadge(
+      promoted ? "production" : "base",
+      workStatusBadge(entry.work, undefined, false, true),
+    );
+  }
   if (entry.prState === "MERGED" || entry.gitState === "merged") return { glyph: NF.merge, fg: theme.ok };
   if (entry.prState === "CLOSED") return { glyph: NF.prClosed, fg: theme.err };
   if (entry.work?.state === "dropped") return { glyph: NF.slash, fg: theme.fgDim };
@@ -68,13 +81,15 @@ const RemovedRowView = memo(function RemovedRowView({
   selected,
   panelWidth,
   issueStatus,
+  productionCommits,
 }: {
   entry: RemovedWorktree;
   selected: boolean;
   panelWidth: number;
   issueStatus?: string;
+  productionCommits?: readonly string[];
 }) {
-  const status = removedStatusGlyph(entry);
+  const status = removedStatusGlyph(entry, productionCommits);
   const pr = removedPrGlyph(entry);
   const issueId = resolveIssueId(entry.slug, entry.issueId);
   const issue = config.issueTracker && issueId && isTrackerIssueId(issueId, config.issueTracker.prefix)
@@ -154,11 +169,13 @@ export function RemovedList({
   selectedIndex,
   width,
   issueStatuses,
+  productionCommits,
 }: {
   entries: readonly RemovedWorktree[];
   selectedIndex: number;
   width: number;
   issueStatuses?: IssueStatuses;
+  productionCommits?: readonly string[];
 }) {
   const listRef = useRef<ScrollBoxRenderable>(null);
   // Interleave a header wherever the day-bucket changes. `entries` is
@@ -197,11 +214,12 @@ export function RemovedList({
           selected={i === selectedIndex}
           panelWidth={width}
           issueStatus={issueStatuses?.[resolveIssueId(entry.slug, entry.issueId) ?? ""]}
+          productionCommits={productionCommits}
         />,
       );
     });
     return out;
-  }, [entries, selectedIndex, width, issueStatuses]);
+  }, [entries, selectedIndex, width, issueStatuses, productionCommits]);
   const selectedChildId = entries[selectedIndex]
     ? `removed:${entries[selectedIndex]!.slug}`
     : undefined;

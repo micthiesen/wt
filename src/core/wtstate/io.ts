@@ -282,6 +282,12 @@ export function parseWtState(raw: unknown): WtState {
         ...(typeof rec.prNumber === "number" && Number.isFinite(rec.prNumber) ? { prNumber: rec.prNumber } : {}),
         ...(typeof rec.prUrl === "string" && rec.prUrl.trim() !== "" ? { prUrl: rec.prUrl } : {}),
         ...(typeof rec.prState === "string" && rec.prState.trim() !== "" ? { prState: rec.prState } : {}),
+        ...(rec.landedOnAtRemoval === "base" || rec.landedOnAtRemoval === "production"
+          ? { landedOnAtRemoval: rec.landedOnAtRemoval }
+          : {}),
+        ...(typeof rec.prMergeCommitOid === "string" && rec.prMergeCommitOid.trim() !== ""
+          ? { prMergeCommitOid: rec.prMergeCommitOid }
+          : {}),
         ...(work ? { work } : {}),
         ...(rec.automationsPaused === true ? { automationsPaused: true } : {}),
       });

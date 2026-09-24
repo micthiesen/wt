@@ -346,6 +346,7 @@ export function App({ onExit }: Props) {
     removedCursor,
     currentRemoved,
     removedIssueStatuses,
+    removedProductionCommits,
   } = useRemovedView({ rows, wtState: wtStateForStacks.data });
 
   const activeCreatedPlacements = useMemo(() => createdPlacements.filter((placement) => {
@@ -1079,6 +1080,7 @@ export function App({ onExit }: Props) {
             selectedIndex={removedCursor}
             width={listWidth}
             issueStatuses={removedIssueStatuses}
+            productionCommits={removedProductionCommits}
           />
         ) : (
           <WorktreeList

@@ -104,6 +104,8 @@ export function recordRemovedWorktrees(
         ...(e.prNumber !== undefined ? { prNumber: e.prNumber } : {}),
         ...(e.prUrl !== undefined ? { prUrl: e.prUrl } : {}),
         ...(e.prState !== undefined ? { prState: e.prState } : {}),
+        ...(e.landedOnAtRemoval !== undefined ? { landedOnAtRemoval: e.landedOnAtRemoval } : {}),
+        ...(e.prMergeCommitOid !== undefined ? { prMergeCommitOid: e.prMergeCommitOid } : {}),
         ...(work !== undefined ? { work } : {}),
         ...(automationsPaused === true ? { automationsPaused: true } : {}),
       });

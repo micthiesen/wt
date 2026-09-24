@@ -95,6 +95,10 @@ function removedSnapshot(row: WorktreeRow): RemovedWorktree {
     ...(row.pr
       ? { prNumber: row.pr.number, prUrl: row.pr.url, prState: row.pr.state }
       : {}),
+    ...(row.landedOn ? { landedOnAtRemoval: row.landedOn } : {}),
+    ...(row.pr?.state === "MERGED" && row.pr.mergeCommitOid
+      ? { prMergeCommitOid: row.pr.mergeCommitOid }
+      : {}),
   };
 }
 

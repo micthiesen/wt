@@ -21,6 +21,17 @@ describe("parseWtState", () => {
       { issueId: undefined, githubIssue: undefined, gitState: undefined },
     ]);
   });
+  test("accepts only proved release snapshot fields", () => {
+    const state = parseWtState({ removed: [
+      { slug: "a", branch: "m/a", removedAt: "2026-09-23T00:00:00Z", landedOnAtRemoval: "base", prMergeCommitOid: "abc" },
+      { slug: "b", branch: "m/b", removedAt: "2026-09-23T00:00:00Z", landedOnAtRemoval: "maybe", prMergeCommitOid: "" },
+    ] });
+    expect(state.removed.map(({ landedOnAtRemoval, prMergeCommitOid }) =>
+      ({ landedOnAtRemoval, prMergeCommitOid }))).toEqual([
+      { landedOnAtRemoval: "base", prMergeCommitOid: "abc" },
+      { landedOnAtRemoval: undefined, prMergeCommitOid: undefined },
+    ]);
+  });
   test("retains creation identity without inventing one for legacy or invalid records", () => {
     const state = parseWtState({ slugs: { fresh: { createdAt: "2026-09-22T12:00:00.000Z" }, old: {}, invalid: { createdAt: "oops" } } });
     expect(state.slugs.fresh?.createdAt).toBe("2026-09-22T12:00:00.000Z");
