@@ -5,7 +5,7 @@ import { createLogger } from "../logger.ts";
 import { run, type RunResult } from "../proc.ts";
 import type { MergeQueueEntry, PullRequest } from "../types.ts";
 import { listWorktrees, type WorktreeError } from "../worktree.ts";
-import { hasGh, repoSlug } from "./gh-cli.ts";
+import { GH_TIMEOUT_MS, ghFailureMessage, hasGh, repoSlug } from "./gh-cli.ts";
 import { nodeToPr } from "./parse.ts";
 import type { GithubData, GqlResponse } from "./types.ts";
 
@@ -95,8 +95,8 @@ const COMMENT_FETCH_LIMIT =
  */
 export const CHUNK_SIZE = 8;
 
-/** Subprocess budget for ONE attempt. ~5x the measured chunk latency. */
-const ATTEMPT_TIMEOUT_MS = 15_000;
+/** Includes cross-process gate wait as well as the GitHub round trip. */
+const ATTEMPT_TIMEOUT_MS = GH_TIMEOUT_MS;
 
 /** Attempts per chunk: one try plus two retries. */
 const MAX_ATTEMPTS = 3;
@@ -110,7 +110,7 @@ const RETRY_BASE_MS = 400;
  * poll interval, so a wedged fetch can't still be running when the next
  * one starts.
  */
-const RETRY_DEADLINE_MS = 40_000;
+const RETRY_DEADLINE_MS = 100_000;
 
 /**
  * Failures a retry can actually fix. A 502/504, GitHub's own "couldn't
@@ -149,10 +149,10 @@ const PERMANENT_PATTERNS = [
 export function isTransientFailure(r: RunResult): boolean {
   const body = `${r.stderr}\n${r.stdout}`;
   if (PERMANENT_PATTERNS.some((re) => re.test(body))) return false;
-  // `run` surfaces its own SIGKILL timeout as a negative exit code with
-  // nothing captured. That attempt outlived ATTEMPT_TIMEOUT_MS, which is
-  // the same story the 504s tell, just told by our side of the wire.
-  if (r.exitCode < 0) return true;
+  // Bun reports a SIGKILL as 137 on macOS, not necessarily a negative exit
+  // code. The explicit timeout flag distinguishes our deadline from an
+  // unrelated external kill.
+  if (r.timedOut) return true;
   return TRANSIENT_PATTERNS.some((re) => re.test(body));
 }
 
@@ -335,10 +335,7 @@ const executeGithub: GithubExecutor = (args) =>
   );
 
 const classifyFailure = (result: RunResult): GithubFetchError => {
-  const message =
-    firstLine(result.stderr) ||
-    firstLine(result.stdout) ||
-    `gh exited ${result.exitCode}`;
+  const message = ghFailureMessage(result, true);
   const body = `${result.stderr}\n${result.stdout}`;
   if (PERMANENT_PATTERNS.some((pattern) => pattern.test(body))) {
     if (/rate limit|RATE_LIMITED|abuse detection/i.test(body)) {

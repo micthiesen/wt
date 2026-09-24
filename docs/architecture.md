@@ -145,6 +145,14 @@ old snapshot. A foreign snapshot is therefore always refused, but it only
 produces an attention warning when the live daemon state is foreign too; the
 ordinary post-restart handoff silently uses a live fetch.
 
+GitHub subprocess deadlines in `core/github/gh-cli.ts` include any wait in a
+machine-wide `gh` PATH gate. The 45-second per-call budget covers ordinary gate
+contention as well as the request; background GraphQL chunks have a bounded
+100-second retry budget. `proc.run` marks its own SIGKILL with `timedOut`, which
+must be tested directly: Bun can report that kill as exit 137 on macOS. A
+write killed at the deadline has an unknown remote outcome and is not retried
+automatically.
+
 Codex and OpenCode session UUIDs are harness-owned resume handles, while wt owns a persistent per-worktree `primary` / `2` / `3` name mapping. That mapping is identity, not presentation: the picker shows it, F12 resumes the mapped `primary` when no session is live, and detached cold starts used by `wt agent send/start` resolve the same UUID before spawning. A resumed single-slot session stamps its exact UUID onto the live tmux session as `@wt-harness-session-id`; the stamp self-expires with tmux and lets the picker identify a deliberately selected secondary without guessing from rollout mtime. Old and brand-new unstamped Codex slots fall back to the stable primary mapping. When several harnesses are live on one worktree, the Shift+Tab-selected primary harness wins the F12 target and list glyph. Explicit `+ new` picker rows are the only path that intentionally starts a fresh single-slot conversation.
 
 Codex's `main` and `manager` slots share a cwd, so `core/harness/codex/slot.ts` stamps new conversations with a fixed opening user message and derives ownership from the opening turn. Unmarked legacy conversations belong to main after their first assistant message; incomplete or unrecognized prefixes belong to neither shared-cwd slot. Worker-side discovery and both output readers apply the same ownership filter before naming/selecting rollouts. Root sessions accept both Codex's native `codex-tui` originator and the `wt` originator preserved by newer Codex versions; `thread_source: user` excludes guardian and subagent rollouts under either form. The reader scans at most 2 MiB of the opening prefix, caches completed classifications, and retries incomplete writes. Ordinary worktree discovery remains cwd-based. A live tmux UUID stamp is also passed into discovery for an exact all-partitions lookup: resumed Codex threads keep writing their creation-day rollout, so an old special session outside the bounded picker scan still receives current status. Keep the opening messages stable: their exact text is the persisted identity contract, not a display label.

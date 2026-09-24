@@ -13,7 +13,7 @@ import {
 } from "./fetch.ts";
 
 const res = (
-  over: Partial<{ stdout: string; stderr: string; exitCode: number }> = {},
+  over: Partial<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean }> = {},
 ) => ({
   stdout: "",
   stderr: "",
@@ -48,9 +48,12 @@ describe("isTransientFailure", () => {
   });
 
   test("treats our own SIGKILL timeout as retryable", () => {
-    // `run` surfaces a timeout as a negative exit code with nothing
-    // captured, so there is no message to pattern-match on.
-    expect(isTransientFailure(res({ exitCode: -1 }))).toBe(true);
+    // Bun reports the same SIGKILL as 137 on macOS. The timeout flag,
+    // rather than that platform-specific exit code, proves retryability.
+    expect(isTransientFailure(res({ exitCode: -1, timedOut: true }))).toBe(true);
+    expect(isTransientFailure(res({ exitCode: -1 }))).toBe(false);
+    expect(isTransientFailure(res({ exitCode: 137, timedOut: true }))).toBe(true);
+    expect(isTransientFailure(res({ exitCode: 137 }))).toBe(false);
   });
 
   test("never retries a rate limit", () => {
@@ -232,7 +235,7 @@ describe("Effect chunk execution", () => {
         fetchChunk("owner", "repo", ["branch"], false, () => {
           calls += 1;
           return Effect.succeed(
-            calls < 2 ? res({ stderr: "gh: HTTP 502" }) : emptyGraphql(1),
+            calls < 2 ? res({ exitCode: 137, timedOut: true }) : emptyGraphql(1),
           );
         }),
       );

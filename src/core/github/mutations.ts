@@ -4,7 +4,7 @@ import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { run, runStreaming } from "../proc.ts";
 import type { AutoMergeMethod } from "../types.ts";
-import { hasGh, repoSlug } from "./gh-cli.ts";
+import { GH_TIMEOUT_MS, ghFailureMessage, hasGh, repoSlug } from "./gh-cli.ts";
 import type { GhActionResult, LivePrInfo } from "./types.ts";
 
 const log = createLogger("[gh]");
@@ -65,14 +65,14 @@ const runGhMutation = Effect.fnUntraced(function* (
   if (!(yield* hasGh())) return { ok: false, error: "gh CLI not found" };
   const r = yield* run(argv, {
     cwd: config.paths.mainClone,
-    timeoutMs: 15_000,
+    timeoutMs: GH_TIMEOUT_MS,
   }).pipe(Effect.catch((error) => Effect.succeed({
     stdout: "",
     stderr: error.message,
     exitCode: -1,
   })));
   if (r.exitCode !== 0) {
-    const raw = (r.stderr || r.stdout).trim() || `gh exited ${r.exitCode}`;
+    const raw = ghFailureMessage(r);
     const msg = missingWorkflowScope(raw) ? `${raw} ${WORKFLOW_SCOPE_REMEDY}` : raw;
     log.error(logLabel, { ...logCtx, msg });
     return { ok: false, error: msg };
@@ -109,11 +109,11 @@ const mergeQueueIdForBranch = Effect.fnUntraced(function* (
       "-f", `name=${name}`,
       "-f", `branch=${branch}`,
     ],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+    { cwd: config.paths.mainClone, timeoutMs: GH_TIMEOUT_MS },
   ).pipe(Effect.catch(() => Effect.succeed(null)));
   if (r === null) return null;
   if (r.exitCode !== 0) {
-    log.warn("merge-queue probe failed", { branch, msg: (r.stderr || r.stdout).slice(0, 200) });
+    log.warn("merge-queue probe failed", { branch, msg: ghFailureMessage(r).slice(0, 200) });
     return null;
   }
   const parsed = yield* parseJsonOrNull<{
@@ -357,10 +357,10 @@ export const disableAutoMerge = Effect.fn("disableAutoMerge")(function* (
   if (!(yield* hasGh())) return { ok: false, error: "gh CLI not found" };
   const inspected = yield* run(
     ["gh", "api", "graphql", "-f", `query=${PR_MERGE_ARM_QUERY}`, "-f", `prId=${opts.prId}`],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+    { cwd: config.paths.mainClone, timeoutMs: GH_TIMEOUT_MS },
   ).pipe(Effect.catch((error) => Effect.succeed({ stdout: "", stderr: error.message, exitCode: -1 })));
   if (inspected.exitCode !== 0) {
-    return { ok: false, error: `cannot inspect #${prNumber}'s merge state: ${(inspected.stderr || inspected.stdout).trim()}` };
+    return { ok: false, error: `cannot inspect #${prNumber}'s merge state: ${ghFailureMessage(inspected)}` };
   }
   const parsed = yield* parseJsonOrNull<{
     data?: { node?: { mergeQueueEntry?: { id?: string } | null; autoMergeRequest?: { enabledAt?: string } | null } | null };
@@ -516,14 +516,14 @@ export const streamFailedRunLog = Effect.fn("streamFailedRunLog")(function* (
       "--limit", "1",
       "--json", "databaseId",
     ],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+    { cwd: config.paths.mainClone, timeoutMs: GH_TIMEOUT_MS },
   ).pipe(Effect.catch((error) => Effect.succeed({
     stdout: "",
     stderr: error.message,
     exitCode: -1,
   })));
   if (listed.exitCode !== 0) {
-    return { ok: false, reason: (listed.stderr || listed.stdout).trim() || "gh run list failed" };
+    return { ok: false, reason: ghFailureMessage(listed) };
   }
   const runs = yield* parseJsonOrNull<Array<{ databaseId?: number }>>(
     listed.stdout,
@@ -555,7 +555,7 @@ export const viewPrInfo = Effect.fn("viewPrInfo")(function* (
       "gh", "pr", "view", branch,
       "--json", "number,baseRefName,state,isDraft,title,id,headRefOid",
     ],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000 },
+    { cwd: config.paths.mainClone, timeoutMs: GH_TIMEOUT_MS },
   ).pipe(Effect.catch(() => Effect.succeed(null)));
   if (r === null) return null;
   if (r.exitCode !== 0) return null;

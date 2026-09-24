@@ -3,8 +3,22 @@ import { Effect } from "effect";
 import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
+import type { RunResult } from "../proc.ts";
 
 const log = createLogger("[gh]");
+
+// Includes time spent waiting for the machine-wide gh gate before the actual
+// request starts. The old 15s budget could kill a healthy queued request.
+export const GH_TIMEOUT_MS = 45_000;
+
+export function ghFailureMessage(result: RunResult, firstLine = false): string {
+  if (result.timedOut) {
+    return `gh timed out after ${GH_TIMEOUT_MS / 1000}s (including any local concurrency-gate wait); request outcome unknown`;
+  }
+  const body = result.stderr.trim() || result.stdout.trim();
+  if (!body) return `gh exited ${result.exitCode}`;
+  return firstLine ? body.split("\n").find((line) => line.trim())?.trim() || body : body;
+}
 
 // `which gh` is memoized so per-slice loops (stack status/rebase) don't
 // re-spawn it each call — but only the POSITIVE result. A cached negative
@@ -31,10 +45,13 @@ export function repoSlug(): Effect.Effect<string | null> {
   if (_repoSlug != null) return Effect.succeed(_repoSlug);
   return run(["gh", "repo", "view", "--json", "nameWithOwner"], {
     cwd: config.paths.mainClone,
-    timeoutMs: 5_000,
+    timeoutMs: GH_TIMEOUT_MS,
   }).pipe(
     Effect.map((r) => {
-      if (r.exitCode !== 0) return null;
+      if (r.exitCode !== 0) {
+        log.warn("repo slug fetch failed", { error: ghFailureMessage(r, true) });
+        return null;
+      }
       try {
         const data = JSON.parse(r.stdout) as { nameWithOwner?: string };
         _repoSlug = data.nameWithOwner ?? null;
@@ -66,11 +83,11 @@ export const fetchAuthenticatedLogin = Effect.fn(
   if (!(yield* hasGh())) return null;
   const r = yield* run(["gh", "api", "user", "--jq", ".login"], {
     cwd: config.paths.mainClone,
-    timeoutMs: 5_000,
+    timeoutMs: GH_TIMEOUT_MS,
   }).pipe(Effect.catch(() => Effect.succeed(null)));
   if (r === null || r.exitCode !== 0) {
     if (r) {
-      log.error("auth user fetch failed", { stderr: r.stderr.slice(0, 200) });
+      log.error("auth user fetch failed", { error: ghFailureMessage(r, true).slice(0, 200) });
     }
     return null;
   }

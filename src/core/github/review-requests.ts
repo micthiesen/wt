@@ -4,7 +4,7 @@ import { config } from "../config.ts";
 import { causeMessage } from "../errors.ts";
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
-import { hasGh } from "./gh-cli.ts";
+import { GH_TIMEOUT_MS, ghFailureMessage, hasGh } from "./gh-cli.ts";
 import { openPrChecks, rollupChecks } from "./parse.ts";
 import type { RawCheck } from "./types.ts";
 import type { ReviewRequestPr } from "./types.ts";
@@ -121,7 +121,7 @@ export const fetchReviewRequests = Effect.fn("fetchReviewRequests")(function* (
   if (!(yield* hasGh())) return [];
   const r = yield* run(
     ["gh", "api", "graphql", "-f", `query=${REVIEW_REQUESTS_QUERY}`],
-    { cwd: config.paths.mainClone, timeoutMs: 15_000, signal },
+    { cwd: config.paths.mainClone, timeoutMs: GH_TIMEOUT_MS, signal },
   ).pipe(
     Effect.catch((cause) =>
       signal?.aborted
@@ -142,6 +142,7 @@ export const fetchReviewRequests = Effect.fn("fetchReviewRequests")(function* (
     // actually diagnosable instead of `{"stderr":""}`.
     log.error("review-requests fetch failed", {
       exitCode: r.exitCode,
+      timedOut: r.timedOut ?? false,
       stderr: r.stderr.slice(0, 200) || null,
       stdout: r.stdout.slice(0, 200) || null,
     });
@@ -150,7 +151,7 @@ export const fetchReviewRequests = Effect.fn("fetchReviewRequests")(function* (
     // the last good list and marks the query errored.
     return yield* new ReviewRequestsError({
       cause: new Error(
-        `review-requests fetch failed: ${r.stderr.split("\n")[0]?.trim() || r.stdout.split("\n")[0]?.trim() || `gh exited ${r.exitCode}`}`,
+        `review-requests fetch failed: ${ghFailureMessage(r, true)}`,
       ),
     });
   }

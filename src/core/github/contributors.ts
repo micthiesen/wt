@@ -4,7 +4,7 @@ import { config } from "../config.ts";
 import { createLogger } from "../logger.ts";
 import { run } from "../proc.ts";
 import type { Contributor } from "../types.ts";
-import { hasGh, repoSlug } from "./gh-cli.ts";
+import { GH_TIMEOUT_MS, ghFailureMessage, hasGh, repoSlug } from "./gh-cli.ts";
 
 const log = createLogger("[gh]");
 
@@ -33,12 +33,12 @@ const fetchActiveCommitAuthors = Effect.fnUntraced(function* (
         "api",
         `repos/${slug}/commits?since=${since}&per_page=100&page=${page}`,
       ],
-      { cwd: config.paths.mainClone, timeoutMs: 15_000, signal },
+      { cwd: config.paths.mainClone, timeoutMs: GH_TIMEOUT_MS, signal },
     ).pipe(Effect.catch(() => Effect.succeed(null)));
     if (r === null) return empty;
     if (r.exitCode !== 0) {
       log.error("active authors fetch failed", {
-        stderr: r.stderr.slice(0, 200),
+        error: ghFailureMessage(r).slice(0, 200),
         page,
       });
       return empty;
@@ -86,7 +86,7 @@ export const fetchRepoContributors = Effect.fn("fetchRepoContributors")(
     const [contribRes, activeAuthors] = yield* Effect.all([
       run(["gh", "api", `repos/${slug}/contributors?per_page=100`], {
         cwd: config.paths.mainClone,
-        timeoutMs: 15_000,
+        timeoutMs: GH_TIMEOUT_MS,
         signal,
       }).pipe(Effect.catch(() => Effect.succeed(null))),
       fetchActiveCommitAuthors(slug, now, signal),
@@ -94,7 +94,7 @@ export const fetchRepoContributors = Effect.fn("fetchRepoContributors")(
     if (contribRes === null) return [];
     if (contribRes.exitCode !== 0) {
       log.error("contributors fetch failed", {
-        stderr: contribRes.stderr.slice(0, 200),
+        error: ghFailureMessage(contribRes).slice(0, 200),
         exitCode: contribRes.exitCode,
       });
       return [];
