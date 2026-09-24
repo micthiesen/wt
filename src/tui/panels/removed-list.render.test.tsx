@@ -57,3 +57,28 @@ test("removed rows stay one TUI line with aligned trailing slots", async () => {
     }
   }
 });
+
+test("legacy rows render distinct staging and main glyphs in the left slot", async () => {
+  const setup = await testRender(
+    <RemovedList
+      entries={entries}
+      selectedIndex={0}
+      width={45}
+      legacyMerges={{ 2150: "a", 2146: "b" }}
+      productionCommits={["a"]}
+    />,
+    { width: 45, height: 12 },
+  );
+  try {
+    await setup.flush();
+    const lines = setup.captureCharFrame().split("\n");
+    const main = lines.find((line) => line.includes("1445:"))!;
+    const staging = lines.find((line) => line.includes("2517:"))!;
+    expect(main.indexOf(NF.production)).toBeGreaterThanOrEqual(0);
+    expect(main.indexOf(NF.production)).toBeLessThan(main.indexOf("1445:"));
+    expect(staging.indexOf(NF.staging)).toBeGreaterThanOrEqual(0);
+    expect(staging.indexOf(NF.staging)).toBeLessThan(staging.indexOf("2517:"));
+  } finally {
+    act(() => setup.renderer.destroy());
+  }
+});

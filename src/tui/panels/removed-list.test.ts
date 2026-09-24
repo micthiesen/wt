@@ -68,3 +68,12 @@ test("archived overdue verification stays red under the release glyph", () => {
     work: { state: "ready", at: "2020-01-01T00:00:00.000Z", verifyAfterMerge: "check staging" },
   }, [])).toEqual({ glyph: NF.staging, fg: theme.err });
 });
+
+test("legacy removed rows recover release position from exact local PR merges", () => {
+  const legacy = { ...entry, prNumber: 2162, work: { state: "ready" as const, at: "2026-09-24T00:00:00.000Z" } };
+  const merges = { 2162: "a".repeat(40) };
+  const fg = workStatusBadge(legacy.work, undefined, false, true).fg;
+  expect(removedStatusGlyph(legacy, [], merges)).toEqual({ glyph: NF.staging, fg });
+  expect(removedStatusGlyph(legacy, [merges[2162]!], merges)).toEqual({ glyph: NF.production, fg });
+  expect(removedStatusGlyph(legacy, [merges[2162]!], {})).toEqual({ glyph: NF.merge, fg: theme.ok });
+});

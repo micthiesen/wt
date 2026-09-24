@@ -315,6 +315,46 @@ export const productionCommitsQuery = (
     staleTime: Infinity,
   });
 
+/** Exact first-parent PR merges already present in the local base branch. */
+export function parseRemovedPrMerges(
+  log: string,
+  numbers: readonly number[],
+): Record<number, string> {
+  const wanted = new Set(numbers);
+  const found: Record<number, string> = {};
+  for (const line of log.split("\n")) {
+    const separator = line.indexOf("\0");
+    if (separator < 0) continue;
+    const sha = line.slice(0, separator);
+    const subject = line.slice(separator + 1);
+    const match = /^Merge pull request #(\d+)(?:\s|$)/.exec(subject);
+    if (!/^[a-f\d]{40,64}$/i.test(sha) || !match) continue;
+    const number = Number(match[1]);
+    // The log is newest-first, so a duplicate never replaces the newest proof.
+    if (wanted.has(number) && !found[number]) found[number] = sha;
+  }
+  return found;
+}
+
+/** One local Git walk for legacy removed rows, only observed while `h` is open. */
+export const removedPrMergesQuery = (
+  branch: string,
+  tip: string | undefined,
+  numbers: readonly number[],
+) =>
+  queryOptions({
+    queryKey: qk.removedPrMerges(branch, tip ?? "", numbers),
+    queryFn: ({ signal }): Promise<Record<number, string>> =>
+      runQuery(
+        git(["log", "--first-parent", "--format=%H%x00%s", tip!]).pipe(
+          Effect.map((log) => parseRemovedPrMerges(log, numbers)),
+        ),
+        signal,
+      ),
+    enabled: !!tip && numbers.length > 0,
+    staleTime: Infinity,
+  });
+
 /**
  * Subject of the oldest commit on the branch — fallback title when
  * there's no PR yet. Cheap (one `git log`); short staleTime.

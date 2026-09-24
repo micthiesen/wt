@@ -20,8 +20,10 @@ membership query when production advances. Unknown merge SHA or failed ancestry
 check never implies production.
 
 Removed-history rows retain the live row's proved release position and merged
-PR SHA at removal. While `h` is open, one batched ancestry query can advance
-archived staging markers to production as that branch moves; entries without
+PR SHA at removal. Older snapshots lack both, so while `h` is open one local
+first-parent walk of the base branch recovers exact `Merge pull request #N`
+commits for their recorded PR numbers. A batched ancestry query then advances
+those staging markers to production as that branch moves. Entries without Git
 proof keep their older outcome glyph. The release marker keeps the saved work
 status color, including overdue verification.
 

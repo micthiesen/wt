@@ -11,7 +11,7 @@ import { config } from "../../core/config.ts";
 import { issueStatusIds } from "../../core/issue-status.ts";
 import type { RemovedWorktree, WtState } from "../../core/wtstate.ts";
 import { issueStatusesQuery } from "../../state/queries/issue-status.ts";
-import { productionCommitsQuery, watchedBranchTipsQuery } from "../../state/queries/worktree.ts";
+import { productionCommitsQuery, removedPrMergesQuery, watchedBranchTipsQuery } from "../../state/queries/worktree.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 export function useRemovedView(opts: {
@@ -40,11 +40,25 @@ export function useRemovedView(opts: {
     enabled: removedView && issueIds.length > 0 && config.issueTracker?.statusCommand != null,
   });
   const production = config.branch.production;
-  const promotionCommits = useMemo(() => [
+  const legacyPrNumbers = useMemo(() => [
     ...new Set(removedEntries
-      .filter((e) => e.landedOnAtRemoval === "base" && e.prMergeCommitOid)
-      .map((e) => e.prMergeCommitOid!)),
+      .filter((e) => !e.landedOnAtRemoval && e.prNumber != null)
+      .map((e) => e.prNumber!)),
   ], [removedEntries]);
+  const baseTip = useQuery({
+    ...watchedBranchTipsQuery([config.branch.base]),
+    enabled: removedView && !!production && legacyPrNumbers.length > 0,
+  });
+  const legacyMerges = useQuery({
+    ...removedPrMergesQuery(config.branch.base, baseTip.data?.[config.branch.base], legacyPrNumbers),
+    enabled: removedView && !!production && !!baseTip.data?.[config.branch.base] && legacyPrNumbers.length > 0,
+  });
+  const promotionCommits = useMemo(() => [
+    ...new Set(removedEntries.flatMap((e) => {
+      const sha = e.prMergeCommitOid ?? (e.prNumber != null ? legacyMerges.data?.[e.prNumber] : undefined);
+      return sha ? [sha] : [];
+    })),
+  ], [removedEntries, legacyMerges.data]);
   const productionTip = useQuery({
     ...watchedBranchTipsQuery(production ? [production] : []),
     enabled: removedView && !!production && production !== config.branch.base && promotionCommits.length > 0,
@@ -75,5 +89,6 @@ export function useRemovedView(opts: {
     currentRemoved,
     removedIssueStatuses: issueStatuses.data,
     removedProductionCommits: productionCommits.data,
+    removedLegacyMerges: legacyMerges.data,
   };
 }

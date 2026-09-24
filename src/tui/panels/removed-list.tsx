@@ -27,11 +27,14 @@ import type { IssueStatuses } from "../../core/issue-status.ts";
 export function removedStatusGlyph(
   entry: RemovedWorktree,
   productionCommits?: readonly string[],
+  legacyMerges?: Readonly<Record<number, string>>,
 ): { glyph: string; fg: string } {
-  if (entry.landedOnAtRemoval) {
+  const legacySha = entry.prNumber != null ? legacyMerges?.[entry.prNumber] : undefined;
+  if (entry.landedOnAtRemoval || legacySha) {
+    const mergeSha = entry.prMergeCommitOid ?? legacySha;
     const promoted = entry.landedOnAtRemoval === "production" ||
       (config.branch.production === config.branch.base) ||
-      (!!entry.prMergeCommitOid && productionCommits?.includes(entry.prMergeCommitOid));
+      (!!mergeSha && productionCommits?.includes(mergeSha));
     return releaseMarkerBadge(
       promoted ? "production" : "base",
       workStatusBadge(entry.work, undefined, false, true),
@@ -82,14 +85,16 @@ const RemovedRowView = memo(function RemovedRowView({
   panelWidth,
   issueStatus,
   productionCommits,
+  legacyMerges,
 }: {
   entry: RemovedWorktree;
   selected: boolean;
   panelWidth: number;
   issueStatus?: string;
   productionCommits?: readonly string[];
+  legacyMerges?: Readonly<Record<number, string>>;
 }) {
-  const status = removedStatusGlyph(entry, productionCommits);
+  const status = removedStatusGlyph(entry, productionCommits, legacyMerges);
   const pr = removedPrGlyph(entry);
   const issueId = resolveIssueId(entry.slug, entry.issueId);
   const issue = config.issueTracker && issueId && isTrackerIssueId(issueId, config.issueTracker.prefix)
@@ -170,12 +175,14 @@ export function RemovedList({
   width,
   issueStatuses,
   productionCommits,
+  legacyMerges,
 }: {
   entries: readonly RemovedWorktree[];
   selectedIndex: number;
   width: number;
   issueStatuses?: IssueStatuses;
   productionCommits?: readonly string[];
+  legacyMerges?: Readonly<Record<number, string>>;
 }) {
   const listRef = useRef<ScrollBoxRenderable>(null);
   // Interleave a header wherever the day-bucket changes. `entries` is
@@ -215,11 +222,12 @@ export function RemovedList({
           panelWidth={width}
           issueStatus={issueStatuses?.[resolveIssueId(entry.slug, entry.issueId) ?? ""]}
           productionCommits={productionCommits}
+          legacyMerges={legacyMerges}
         />,
       );
     });
     return out;
-  }, [entries, selectedIndex, width, issueStatuses, productionCommits]);
+  }, [entries, selectedIndex, width, issueStatuses, productionCommits, legacyMerges]);
   const selectedChildId = entries[selectedIndex]
     ? `removed:${entries[selectedIndex]!.slug}`
     : undefined;
