@@ -35,6 +35,7 @@ import {
 import { type DevServerStatus } from "../../core/dev-server.ts";
 import { useGithub, useIssueStatuses } from "../../state/hooks.ts";
 import { resolveIssueId } from "../../core/issue-tracker.ts";
+import { resolveLanding, type Landing } from "../landing.ts";
 import type { GithubData } from "../../state/queries/github.ts";
 import { qk } from "../../state/keys.ts";
 import {
@@ -55,6 +56,8 @@ import {
   wtMergedQuery,
   wtStateQuery,
   wtSyncQuery,
+  watchedBranchTipsQuery,
+  productionCommitsQuery,
 } from "../../state/queries.ts";
 
 /**
@@ -125,6 +128,8 @@ export type WorktreeRow = {
   wt: Worktree;
   fields: WorktreeFields;
   status: Status;
+  /** Furthest confirmed configured branch containing this work. */
+  landedOn: Landing;
   pr?: PullRequest;
   /**
    * GitHub merge-queue entry for this worktree's branch, when the PR is
@@ -711,6 +716,20 @@ export function useWorktreeRows(): WorktreeRowsResult {
     };
   }, [worktrees, github.data?.prs, stateSlugs]);
 
+  const production = config.branch.production;
+  const productionTip = useQuery(watchedBranchTipsQuery(production ? [production] : []));
+  const mergeCommits = useMemo(() => [
+    ...new Set(rowLayout.prsByIndex
+      .filter((pr) => pr?.state === "MERGED" && pr.baseRefName === config.branch.base)
+      .map((pr) => pr?.mergeCommitOid)
+      .filter((sha): sha is string => !!sha)),
+  ], [rowLayout]);
+  const productionCommits = useQuery(productionCommitsQuery(
+    production,
+    production ? productionTip.data?.[production] : undefined,
+    mergeCommits,
+  ));
+
   const queries = worktrees.flatMap((wt, i) => [
     wtDirtyQuery(wt),
     wtLockQuery(wt),
@@ -821,6 +840,13 @@ export function useWorktreeRows(): WorktreeRowsResult {
       const nextStatus = deriveStatus(wt, fields);
       const status = prev && statusEq(prev.status, nextStatus) ? prev.status : nextStatus;
       const pr = rowLayout.prsByIndex[i];
+      const landedOn = resolveLanding(
+        fields.merged.data,
+        pr,
+        config.branch.base,
+        production,
+        productionCommits.data,
+      );
       const mq = wt.branch ? github.data?.mergeQueue?.[wt.branch] : undefined;
       const stackedOn = rowLayout.stackedOnByIndex[i] ?? null;
       const archived = archivedSet.has(wt.slug);
@@ -886,6 +912,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
         prev.fields.gitActivity === fields.gitActivity &&
         prev.fields.conflict === fields.conflict &&
         prev.status === status &&
+        prev.landedOn === landedOn &&
         prev.pr === pr &&
         prev.mq === mq &&
         prev.githubIssue === githubIssue &&
@@ -913,6 +940,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
         wt,
         fields,
         status,
+        landedOn,
         pr,
         mq,
         stackedOn: stackedOnOut,
@@ -984,6 +1012,7 @@ export function useWorktreeRows(): WorktreeRowsResult {
     issues.isStale,
     github.data?.mergeQueue,
     rowLayout,
+    productionCommits.data,
     archivedSet,
     stateSlugs,
     aiResults,

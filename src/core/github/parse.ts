@@ -690,6 +690,7 @@ export function nodeToPr(pr: GqlPrNode): PullRequest {
     headRefName: pr.headRefName,
     headRefOid: pr.headRefOid ?? undefined,
     baseRefName: pr.baseRefName,
+    mergeCommitOid: pr.mergeCommit?.oid ?? null,
     isDraft: pr.isDraft,
     state: pr.state,
     mergeable: pr.mergeable ?? null,

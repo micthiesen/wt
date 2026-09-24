@@ -144,6 +144,7 @@ describe("buildQuery", () => {
       const q = buildQuery(2, withMq);
       expect(q).toContain("fragment PrFields on PullRequest");
       expect(q).toContain("...PrFields");
+      expect(q).toContain("mergeCommit { oid }");
     }
   });
 });

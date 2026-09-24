@@ -7,7 +7,7 @@
  * for the actual implementations, grouped by source.
  */
 
-export { worktreesQuery, fetchOriginNow, fetchOriginQuery, wtDirtyQuery, wtLockQuery, wtDeployQuery, wtDevQuery, wtMergedQuery, wtGoneQuery, wtSyncQuery, wtClaudeQuery, wtGitActivityQuery, wtConflictQuery, wtFirstCommitQuery, watchedBranchTipsQuery } from "./queries/worktree.ts";
+export { worktreesQuery, fetchOriginNow, fetchOriginQuery, wtDirtyQuery, wtLockQuery, wtDeployQuery, wtDevQuery, wtMergedQuery, wtGoneQuery, wtSyncQuery, wtClaudeQuery, wtGitActivityQuery, wtConflictQuery, wtFirstCommitQuery, watchedBranchTipsQuery, productionCommitsQuery } from "./queries/worktree.ts";
 export { remoteWorkerInfoQuery, remoteWorktreesQuery } from "./queries/remote.ts";
 
 export { archiveQuery, wtStateQuery } from "./queries/wtstate.ts";

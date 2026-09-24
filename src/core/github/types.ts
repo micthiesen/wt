@@ -49,6 +49,7 @@ export type GqlPrNode = {
   headRefName: string;
   headRefOid: string | null;
   baseRefName: string;
+  mergeCommit?: { oid: string } | null;
   isDraft: boolean;
   state: PullRequest["state"];
   mergeable: MergeableState | null;

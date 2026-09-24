@@ -292,7 +292,11 @@ const STATUS_GLYPHS: GlyphItem[] = [
   { glyph: NF.restack, color: theme.accent, label: "busy (restacking)" },
   { glyph: NF.unlink, color: theme.err, label: "missing (path vanished)" },
   { glyph: NF.slash, color: theme.warn, label: "gone (branch deleted upstream)" },
-  { glyph: NF.merge, color: theme.ok, label: `merged into ${TRUNK}` },
+  { glyph: NF.merge, color: theme.ok, label: `git: merged into ${TRUNK}` },
+  ...(config.branch.production ? [
+    { glyph: NF.staging, color: theme.fgDim, label: `in ${TRUNK} (colour = work status)` },
+    { glyph: NF.production, color: theme.fgDim, label: `in ${config.branch.production} (colour = work status)` },
+  ] : []),
   { glyph: "  ", color: theme.fgDim, label: "no status asserted", search: "idle clean no status" },
 ];
 

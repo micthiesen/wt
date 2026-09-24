@@ -170,6 +170,8 @@ export type PullRequest = {
    * `stackedOn` when commit-walk detection (the stronger signal) finds nothing.
    */
   baseRefName: string;
+  /** GitHub's merged result commit; optional for older cached PR entries. */
+  mergeCommitOid?: string | null;
   /** Human-authored PR title; preferred title source for the details pane. */
   title: string;
   isDraft: boolean;

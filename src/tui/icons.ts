@@ -21,7 +21,9 @@ export const NF = {
 	trash: "\u{F48E}", // nf-oct-trash           — busy, destructive (rm)
 	unlink: "\u{F529}", // nf-oct-unlink         — worktree path vanished
 	slash: "\u{F468}", // nf-oct-circle_slash    — branch gone from remote
-	merge: "\u{F419}", // nf-oct-git_merge       — branch merged into main
+	merge: "\u{F419}", // nf-oct-git_merge       — branch merged into configured base
+	staging: "\u{F0C3}", // nf-fa-flask          — work landed on configured base
+	production: "\u{F0AC}", // nf-fa-globe       — work landed on production branch
 	pencil: "\u{F448}", // nf-oct-pencil         — uncommitted changes
 	clean: "\u{F06C}", // nf-fa-leaf             — clean working tree, at rest
 	dot: "\u{F111}", // nf-fa-circle            — work-status dot (asserted states)

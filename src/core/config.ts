@@ -763,6 +763,8 @@ export type Config = {
      * local history here.
      */
     keepFresh: readonly string[];
+    /** Optional branch whose history represents production promotion. */
+    production: string | null;
   };
   stage: {
     prefix: string;
@@ -1246,6 +1248,10 @@ function build(
   // in a list is a git call that fails on every fetch, and the value of
   // failing the whole load over one is nil.
   const keepFresh = strArr(branch?.keep_fresh, []).filter((b) => b.trim() !== "");
+  const production = errs.optStr(branch, "production", "").trim() || null;
+  if (production && production !== branchBase && !keepFresh.includes(production)) {
+    errs.add(`branch.production "${production}" must be [branch] base or in [branch] keep_fresh`);
+  }
 
   const mainClone = expandHome(errs.reqStr(paths, "paths", "main_clone"));
   const worktreeRoot = expandHome(errs.reqStr(paths, "paths", "worktree_root"));
@@ -1686,7 +1692,7 @@ function build(
       terminalConfig: typeof terminalConfig === "string" ? terminalConfig : null,
     },
     codex,
-    branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen, keepFresh },
+    branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen, keepFresh, production },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
     lifecycle: { envFilesToCopy: envFiles, copyGlobs, installCommand, destroyCommand },
     backend: { kind: backendKind },

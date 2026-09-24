@@ -259,6 +259,24 @@ copy_globs = ["/tmp/**", "../secrets/**"]
     }
   });
 
+  test("production branch must be one that wt keeps fresh", () => {
+    const root = mkdtempSync(join(tmpdir(), "wt-config-production-"));
+    try {
+      const userConfig = join(root, "config.toml");
+      writeFileSync(userConfig, `[paths]\nmain_clone = "/repo"\nworktree_root = "/worktrees"\n[branch]\nprefix = "alex"\nbase = "staging"\nproduction = "main"\n`);
+      const env: Record<string, string | undefined> = { ...process.env, WT_CONFIG: userConfig };
+      delete env[REPOSITORY_CONFIG_ENV];
+      const moduleUrl = pathToFileURL(join(import.meta.dir, "config.ts")).href;
+      const result = Bun.spawnSync([process.execPath, "-e", `await import(${JSON.stringify(moduleUrl)})`], {
+        cwd: root, env, stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toContain('branch.production "main" must be [branch] base or in [branch] keep_fresh');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects invalid hidden harness configuration", () => {
     const root = mkdtempSync(join(tmpdir(), "wt-config-hidden-harnesses-"));
     try {

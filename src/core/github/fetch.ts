@@ -173,6 +173,7 @@ fragment PrFields on PullRequest {
   headRefName
   headRefOid
   baseRefName
+  mergeCommit { oid }
   isDraft
   state
   mergeable

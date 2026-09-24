@@ -12,6 +12,13 @@ The TUI is split into three layers; respect the boundaries:
 
 The list panel (`src/tui/panels/list.tsx`) is deliberately **not** row-driven — different layout (one line of glyphs, no labels). Don't try to unify them.
 
+When `[branch] production` is configured, the list's left marker combines
+agent work-status color with release-position shape. PR fetch supplies the
+merged result SHA, a single git walk checks all visible merge SHAs against the
+current production tip. The ref watcher refreshes that tip, which rekeys the
+membership query when production advances. Unknown merge SHA or failed ancestry
+check never implies production.
+
 `core/issue-status.ts` validates the optional generic `status_command` protocol.
 `useIssueStatuses` joins override-aware local identities and remote inventory
 identities into one sorted batch, keyed by IDs, argv, and main-clone cwd. Its

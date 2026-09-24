@@ -16,6 +16,7 @@ import {
   effectiveBaseOrTrunk,
   firstCommitSubject,
   freshBaseRev,
+  git,
   invalidateMainFirstParents,
   mergeConflictProbe,
   revParse,
@@ -290,6 +291,28 @@ export const watchedBranchTipsQuery = (branches: readonly string[]) =>
       ),
     enabled: branches.length > 0,
     staleTime: STALE.mid,
+  });
+
+/** One git walk for every visible PR, never a subprocess per row. */
+export const productionCommitsQuery = (
+  branch: string | null,
+  tip: string | undefined,
+  mergeCommits: readonly string[],
+) =>
+  queryOptions({
+    queryKey: qk.productionCommits(branch ?? "", tip ?? "", mergeCommits),
+    queryFn: ({ signal }): Promise<readonly string[]> =>
+      runQuery(
+        git(["rev-list", tip!]).pipe(
+          Effect.map((out) => {
+            const wanted = new Set(mergeCommits);
+            return out.split("\n").filter((sha) => wanted.has(sha));
+          }),
+        ),
+        signal,
+      ),
+    enabled: !!branch && !!tip && mergeCommits.length > 0,
+    staleTime: Infinity,
   });
 
 /**

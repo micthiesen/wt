@@ -19,7 +19,10 @@ import {
 } from "../core/stack-layout.ts";
 import { StatusKind } from "../core/types.ts";
 import type { DerivedState } from "../core/harness/status.ts";
-import { statusBadge, workStatusBadge } from "./badges.ts";
+import { config } from "../core/config.ts";
+import { statusBadge, workStatusBadge, type Badge } from "./badges.ts";
+import { NF } from "./icons.ts";
+import type { Landing } from "./landing.ts";
 import type { WorktreeRow } from "./hooks/useWorktreeRows.ts";
 import { laneColor, theme } from "./theme.ts";
 
@@ -35,6 +38,13 @@ export const STATUS_MARKER_CELLS = 3;
  */
 function statusKeepsMarker(kind: StatusKind): boolean {
   return kind !== StatusKind.Dirty && kind !== StatusKind.Clean;
+}
+
+/** Release position changes the shape only; `u` keeps ownership of the hue. */
+export function releaseMarkerBadge(landing: Landing, workBadge: Badge): Badge {
+  if (landing === "production") return { ...workBadge, glyph: NF.production };
+  if (landing === "base") return { ...workBadge, glyph: NF.staging };
+  return workBadge;
 }
 
 /** Stale signal for the row's work-status dot (see `isWorkStatusStale`). */
@@ -57,17 +67,17 @@ export function StatusMarker({
   row: WorktreeRow;
   sessionState: DerivedState | undefined;
 }) {
-  // A landed row normally wears the git merge/gone glyph, which is the
-  // most important thing about it — unless something is still owed, in
-  // which case it is precisely NOT: "merged" reads as finished, and a
-  // finished-looking row is how a post-merge check stops happening. So
-  // an outstanding verification takes the slot back for the work dot.
+  // With a promotion branch configured, release position owns the shape
+  // and work status owns the color. Without it, preserve the legacy loud
+  // git marker unless post-merge verification is owed.
   const landed = rowHasLanded(row);
   const owes = owesPostMergeVerification(row.work, landed);
-  const base =
-    !owes && statusKeepsMarker(row.status.kind)
+  const workBadge = workStatusBadge(row.work, sessionState, rowWorkStale(row), landed);
+  const base = row.landedOn && config.branch.production
+    ? releaseMarkerBadge(row.landedOn, workBadge)
+    : !owes && statusKeepsMarker(row.status.kind)
       ? statusBadge(row.status)
-      : workStatusBadge(row.work, sessionState, rowWorkStale(row), landed);
+      : workBadge;
   const fg = row.archived ? theme.fgDim : base.fg;
   return (
     <box flexShrink={0} flexDirection="row">

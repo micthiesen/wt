@@ -156,6 +156,7 @@ alternate_screen = "always"
 | `id_pattern` | no | `"^[a-z]+-(\\d+)(?:-|$)"` | Regex (no flags) matching an issue ID at the start of a slug. The default matches Linear/Jira/Shortcut-style ids (`eng-1234`, `inf-99`). |
 | `slug_max_len` | no | `50` | Slugs generated from issue titles are truncated to this length. |
 | `keep_fresh` | no | `[]` | Extra local branches the **main clone** keeps current, alongside `base`. See below. |
+| `production` | no | *(none)* | Optional promotion branch for the list's release-position glyph. Must equal `base` or appear in `keep_fresh`. A merged PR's exact merge commit must be reachable from this branch before wt marks it “in production”; this means branch promotion, not verified deployment. |
 
 ### `keep_fresh` — reference branches nobody forks from
 
@@ -163,6 +164,7 @@ alternate_screen = "always"
 [branch]
 base       = "staging"
 keep_fresh = ["main"]
+production = "main"
 ```
 
 When you fork from `staging`, `main` is still the branch you check

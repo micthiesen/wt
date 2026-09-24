@@ -55,6 +55,8 @@ export const qk = {
    */
   watchedBranchTips: (branches: readonly string[]) =>
     ["watchedBranchTips", [...branches].sort()] as const,
+  productionCommits: (branch: string, tip: string, commits: readonly string[]) =>
+    ["productionCommits", branch, tip, [...commits].sort()] as const,
   /**
    * Pull requests where the authenticated user has been requested as
    * reviewer. Single global key — the GraphQL `search` doesn't take a
