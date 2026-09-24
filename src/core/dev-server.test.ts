@@ -12,12 +12,19 @@ import { join } from "node:path";
 import {
   decideDevSlot,
   DEV_SERVER_STOPPED,
+  DevResetStopFailedError,
   devServerCrashSummary,
   probePort,
   readDevWaiters,
   supervisorScript,
   type DevSlotHolder,
 } from "./dev-server.ts";
+
+test("failed reset stop reports unknown external state, not an untouched live stack", () => {
+  const message = new DevResetStopFailedError("broken-stack").message;
+  expect(message).toContain("external resources are unconfirmed");
+  expect(message).toContain("reset_command was not run");
+});
 
 /** Hold the event loop hostage the way a heavy sync render does. */
 function blockLoop(ms: number): void {

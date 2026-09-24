@@ -47,14 +47,14 @@ const EXIT_NO_SLOT = 75;
 const SETTLING_GRACE_MS = 5 * 60_000;
 
 const USAGE =
-  "usage: wt dev <start|stop|status|logs> [slug] [flags]\n" +
+  "usage: wt dev <start|reset|stop|status|queue|logs> [slug] [flags]\n" +
   "  start    start (or restart) the worktree's dev server\n" +
   "             --wait            queue for a slot AND block until it is usable\n" +
   "             --timeout <secs>  give up waiting after this long (default 1800)\n" +
   "             --rebuild         drop the environment's state first (see reset)\n" +
   "  reset    stop, run [dev_server] reset_command, start again — the recovery\n" +
   "             when the environment no longer matches the tree (after a rebase)\n" +
-  "  stop     stop it (the port stays reserved for the slug)\n" +
+  "  stop     stop it (the port stays reserved for the slug); failed teardown exits 1\n" +
   "  status   print state, port, and URL\n" +
   "             --all             every dev server, the slot count and the queue\n" +
   "             --json            machine-readable form of either view\n" +
@@ -227,15 +227,13 @@ const runStart = Effect.fnUntraced(function* (wt: Worktree, argv: readonly strin
   });
   return yield* operation.pipe(Effect.catch((err) => {
     if (err instanceof DevResetStopFailedError) {
-      // The environment is still up and its state is intact — nothing
-      // was discarded, which is the whole point of stopping here. wt
-      // cannot name the remedy because it does not know what the
-      // environment IS; the project's own teardown does.
+      // The stop hook may have partially torn down external resources.
+      // Only the reset hook is known not to have run.
       return Effect.sync(() => {
-        console.error(red(`stop_command failed — refusing to reset ${wt.slug}`));
-        console.error(dim("  the environment is still up and its state is untouched; resetting"));
-        console.error(dim("  on top of a live environment is what leaves it unstartable"));
-        console.error(dim(`  clear it with the project's own teardown, then ${bold(`wt dev reset ${wt.slug}`)}`));
+        console.error(red(`stop_command failed — reset_command was not run for ${wt.slug}`));
+        console.error(dim("  the dev supervisor stopped, but external resources may remain"));
+        console.error(dim("  inspect the stop_command errors above and repair the project's teardown"));
+        console.error(dim(`  then retry ${bold(`wt dev reset ${wt.slug}`)}`));
         return 1;
       });
     }
@@ -558,7 +556,12 @@ export const run = Effect.fn("wt dev")(function* (argv: string[]) {
       // reaches for, and they will not find it under `start`.
       return yield* runStart(wt, [...argv, "--rebuild"]);
     case "stop": {
-      yield* stopDevServer(wt);
+      const stopped = yield* stopDevServer(wt, (line) => console.error(dim(`  ${line}`)));
+      if (!stopped) {
+        console.error(red(`dev supervisor stopped for ${wt.slug}, but stop_command failed`));
+        console.error(dim("  external resources may remain; inspect the stop_command errors above"));
+        return 1;
+      }
       console.log(green(`✓ dev server stopped for ${cyan(wt.slug)}`));
       return 0;
     }

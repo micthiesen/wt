@@ -148,6 +148,8 @@ Manage the worktree's `[dev_server]` (see [configuration.md](configuration.md#de
 
 `stop` also closes the browser tabs that were on the server, matched by the dev port (not by session name, so the login-script sessions actually holding the app open are covered) — both the `browser-control` sessions sitting on that port and, over AppleScript, the browser's own tabs on it. Stopping the server strands those tabs on a refused port, so they go with it. The worktree's other browser sessions are deliberately untouched: an agent's reference tabs are not the dev server's. And it runs `[dev_server] stop_command` if the project set one, which is the only thing that releases what the dev command created *outside* its own process tree (docker containers above all).
 
+If `stop_command` fails, `stop` exits 1 instead of claiming the entire environment stopped. `reset` also exits 1 without running the destructive `reset_command`. Both show the stop-hook errors: the wt supervisor has stopped, but external resources may be partly removed or still running. An exited database alone does not prove the rest of a container stack is gone; inspect the reported teardown failure before retrying reset.
+
 Flags:
 
 - `start --wait [--timeout <secs>]` — when `[dev_server] max_concurrent` is set and the fleet is full, queue until a slot opens instead of refusing. Default timeout 1800s; on expiry it exits `75` like a plain refusal. While queued the slug shows in `wt dev status --all` and on its own board row, so a waiting agent doesn't read as a stalled one.

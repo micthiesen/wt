@@ -654,8 +654,9 @@ export const devSlotReport = Effect.fn("devSlotReport")(function* (): Effect.fn.
  * container-name or port-block filter needs.
  */
 /**
- * Returns whether the environment is believed DOWN: the hook succeeded,
- * or there is no hook to run. The distinction only matters to
+ * Returns whether the teardown was confirmed: the hook succeeded,
+ * or there is no hook to run. A failed hook leaves external resources
+ * in an unknown state. The distinction only matters to
  * `resetDevServer` — a plain stop reports the failure and moves on,
  * exactly as a destroy does.
  */
@@ -715,13 +716,13 @@ export const reclaimDevSlots = Effect.fn("reclaimDevSlots")(function* (): Effect
 
 /**
  * Thrown by `resetDevServer` when `stop_command` failed, so the
- * environment is still believed to be UP and its state must not be
- * discarded underneath it. Carries the slug for the message; the
+ * environment's state is unknown and must not be discarded. Carries
+ * the slug for the message; the
  * remedy is always the project's own teardown, which wt cannot name.
  */
 export class DevResetStopFailedError extends Error {
   constructor(readonly slug: string) {
-    super(`stop_command failed for ${slug} — refusing to discard the environment`);
+    super(`stop_command failed for ${slug} — external resources are unconfirmed; reset_command was not run`);
     this.name = "DevResetStopFailedError";
   }
 }
@@ -1310,6 +1311,7 @@ export function reapDevServerFiles(liveSlugs: ReadonlySet<string>): void {
  */
 export const stopDevServer = Effect.fn("stopDevServer")(function* (
   wt: { slug: string; path: string },
+  onLog?: (line: string) => void,
 ) {
   const slug = wt.slug;
   yield* killByName(sessionName(slug, "dev"));
@@ -1323,8 +1325,9 @@ export const stopDevServer = Effect.fn("stopDevServer")(function* (
   }).pipe(Effect.ignore);
   // After the kill, so the teardown isn't racing a supervisor that is
   // about to restart the command it just tore down.
-  const stopped = yield* runDevStopCommandEffect(slug, wt.path);
-  log.event.info(`dev server stopped (${slug})`);
+  const stopped = yield* runDevStopCommandEffect(slug, wt.path, onLog);
+  if (stopped) log.event.info(`dev server stopped (${slug})`);
+  else log.attention.warn(`dev supervisor stopped, but stop_command failed; external resources unconfirmed (${slug})`);
   // The tabs pointed at this server are stranded on a refused port the
   // moment it goes down, so they go with it — same reflex as destroy,
   // narrowed to the port (an agent's other tabs aren't the server's).
@@ -1523,20 +1526,21 @@ export const resetDevServer = Effect.fn("resetDevServer")(function* (
   wt: { slug: string; path: string },
   onLog?: (line: string) => void,
 ) {
-  const stopped = yield* stopDevServer(wt);
+  const stopped = yield* stopDevServer(wt, onLog);
   // `reset_command` DISCARDS the environment's state (volumes, caches,
   // a migrated database). Doing that on top of an environment that is
   // still up is worse than not resetting at all: whatever survived the
   // failed stop keeps running against state that just vanished, and the
   // rebuild then fails in a way that reads as a broken tree rather than
   // a failed teardown. wt supervises a PROCESS — the thing holding that
-  // state is usually not its child — so a failed `stop_command` is the
-  // only signal it has that the environment is still there.
+  // state is usually not its child — so a failed `stop_command` leaves
+  // its external resources unconfirmed, even when the supervisor is gone.
   //
   // The asymmetry with a destroy is deliberate: refusing to delete a
   // worktree because its teardown broke is a bigger leak than the one
   // it prevents, but refusing to DISCARD STATE is the safe direction —
-  // nothing is lost, and the environment is still whatever it was.
+  // the reset command has not run, even if the stop hook partially tore
+  // down external resources before failing.
   if (!stopped) {
     return yield* Effect.fail(new DevResetStopFailedError(wt.slug));
   }

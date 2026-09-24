@@ -45,8 +45,7 @@ test("resolveTeardownCommand still runs a port-independent command with no port"
 // `runTeardownCommand` reports whether the teardown TOOK. A destroy
 // ignores it on purpose (refusing to delete a worktree because its
 // teardown broke is a bigger leak than the one it prevents); a dev
-// RESET must not, because discarding an environment's state on top of
-// an environment that is still up is what leaves it unstartable.
+// RESET must not, because failure leaves external resources unconfirmed.
 test("runTeardownCommand reports success and failure", async () => {
   expect(
     await Effect.runPromise(runTeardownCommand({
@@ -66,4 +65,18 @@ test("runTeardownCommand reports success and failure", async () => {
       onLog: () => {},
     })),
   ).toBe(false);
+});
+
+test("runTeardownCommand forwards a failing stop hook's diagnostic output", async () => {
+  const lines: string[] = [];
+  const stopped = await Effect.runPromise(runTeardownCommand({
+    label: "stop_command",
+    command: "printf 'container is a zombie\\n' >&2; exit 7",
+    cwd: "/",
+    slug: "broken-stack",
+    onLog: (line) => lines.push(line),
+  }));
+  expect(stopped).toBe(false);
+  expect(lines.join("\n")).toContain("container is a zombie");
+  expect(lines.join("\n")).toContain("stop_command failed");
 });
