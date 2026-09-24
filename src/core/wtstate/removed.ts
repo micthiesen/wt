@@ -99,6 +99,7 @@ export function recordRemovedWorktrees(
         removedAt: e.removedAt,
         ...(e.title !== undefined ? { title: e.title } : {}),
         ...(e.issueId !== undefined ? { issueId: e.issueId } : {}),
+        ...(e.githubIssue !== undefined ? { githubIssue: e.githubIssue } : {}),
         ...(e.gitState !== undefined ? { gitState: e.gitState } : {}),
         ...(e.prNumber !== undefined ? { prNumber: e.prNumber } : {}),
         ...(e.prUrl !== undefined ? { prUrl: e.prUrl } : {}),

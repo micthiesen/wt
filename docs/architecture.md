@@ -21,6 +21,11 @@ remote details display external status separately from the work-status banner.
 `useIssueStatusEvents` compares confirmed batch snapshots once at the app root,
 not optimistic projections. First sightings seed silently; subsequent changes
 join the attention feed. Config maps status labels to compact detail icons/colors.
+The removed-history view shares its single batched status observer between
+the list's glyphs and selected detail's `IssueLine`; no per-archived-row read
+or separate detail fetch is needed. Removal snapshots retain the tracker
+override and attached GitHub issue so the detail identity and `i` action
+agree with live rows, while older snapshots simply omit unknown fields.
 
 `state/issue-status.ts` owns transient, per-QueryClient issue expectations for
 tracked shell actions with `issue_status`, never persisted or written into the

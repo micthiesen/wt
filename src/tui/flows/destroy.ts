@@ -89,6 +89,7 @@ function removedSnapshot(row: WorktreeRow): RemovedWorktree {
     removedAt: new Date().toISOString(),
     ...(row.titleSource !== "slug" ? { title: row.title } : {}),
     ...(row.issueId !== null ? { issueId: row.issueId } : {}),
+    ...(row.githubIssue != null ? { githubIssue: row.githubIssue } : {}),
     ...(row.status.kind === StatusKind.Merged ? { gitState: "merged" as const } : {}),
     ...(row.status.kind === StatusKind.Gone ? { gitState: "gone" as const } : {}),
     ...(row.pr

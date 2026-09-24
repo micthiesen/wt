@@ -42,12 +42,14 @@ import {
 import { resolveRows, type RowModule } from "../rows/index.ts";
 import type { FetchLike, RowContext } from "../rows/types.ts";
 import { WtScrollbox } from "../scrollbox.tsx";
-import { ageMsToText, ELLIPSIS, truncateEnd } from "../text.ts";
+import { ageMsToText, ELLIPSIS } from "../text.ts";
 import { Spinner, useBouncingBall } from "../spinner.tsx";
 import { theme } from "../theme.ts";
-import type { TitleSource, WorktreeRow } from "../hooks/useWorktreeRows.ts";
+import type { WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import type { WorktreeModel } from "../worktree-model.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
+import type { IssueStatuses } from "../../core/issue-status.ts";
+import { resolveIssueId } from "../../core/issue-tracker.ts";
 import {
   isRemoteSummary,
   remoteEntryKey,
@@ -68,6 +70,7 @@ import {
   WorkStatusRecordBlock,
 } from "./details/work-status-block.tsx";
 import { RemovedBody } from "./details/removed-body.tsx";
+import { detailPaneTitle, DetailTitleLine } from "./details/title.tsx";
 import { ReviewRequestBody } from "./details/review-request-body.tsx";
 import {
   SectionSummaryBody,
@@ -84,6 +87,8 @@ type Props = {
   section?: SectionDetail;
   /** Set in the removed-worktrees view (`h`) — shows the history snapshot. */
   removed?: RemovedWorktree;
+  /** Shares the history list's one batched tracker read. */
+  removedIssueStatuses?: IssueStatuses;
   /** SSH-hosted worktree selected in a normal fleet section. */
   remote?: RemoteListEntry;
   remoteUnavailable?: boolean;
@@ -217,49 +222,6 @@ function RenderedRow({ module: m, ctx }: { module: RowModule; ctx: RowContext })
         m.render(ctx)
       )}
     </Row>
-  );
-}
-
-/**
- * Border title for the details pane: the worktree's SLUG.
- *
- * The slug is the fleet's identifier — what `wt status`, a manager
- * message and a log line all name a worktree by — and it used to
- * appear in this pane only inside the `path` row, four lines down,
- * spelled as the tail of a directory. The title lived here instead,
- * but the title is also on the highlighted list row a few cells to the
- * left, so the border was spending wt's most identity-shaped chrome on
- * the one string already on screen. Lowercase, like every other pane's
- * border (` worktrees `, ` section `, ` attention `).
- *
- * End-truncated by hand, with margin: opentui's native drawBox DROPS a
- * title that doesn't fit between the corner chrome rather than
- * clipping it, so an over-budget title blanks the whole bar — observed
- * at 110 cols, where titles within 3 cells of the pane width vanished
- * under the old `width - PANE_CHROME_WIDTH` budget while shorter ones
- * rendered.
- */
-function paneTitle(slug: string, width: number): string {
-  return ` ${truncateEnd(slug, Math.max(0, width - 8))} `;
-}
-
-/**
- * The worktree's title, back in the body where it can use the pane's
- * full width. The muted `(source)` tag stays so a stale PR title vs. a
- * fresh LLM one is spottable at a glance.
- *
- * No bottom margin: the status banner below owns its own, and when
- * there's no status the definition rows read fine directly under it —
- * one row, and the pane is vertically tight.
- */
-function TitleLine({ title, source }: { title: string; source: TitleSource }) {
-  return (
-    <box flexShrink={0} overflow="hidden">
-      <text fg={theme.fgBright} wrapMode="none" truncate>
-        {title}
-        <span fg={theme.fgDim}>{` (${source})`}</span>
-      </text>
-    </box>
   );
 }
 
@@ -515,13 +477,13 @@ const DetailsBody = memo(function DetailsBody({
       border
       borderStyle="single"
       borderColor={theme.border}
-      title={paneTitle(row.wt.slug, width)}
+      title={detailPaneTitle(row.wt.slug, width)}
       titleAlignment="left"
       padding={1}
       flexDirection="column"
     >
       <WtScrollbox scrollRef={scrollRef}>
-        <TitleLine title={row.title} source={row.titleSource} />
+        <DetailTitleLine title={row.title} source={row.titleSource} />
         {/* Asserted work status, full width — the note is the payload
             (merge impacts, needs-human asks) and must never truncate. */}
         <WorkStatusBlock
@@ -701,13 +663,13 @@ function RemoteDetails({
       border
       borderStyle="single"
       borderColor={theme.border}
-      title={paneTitle(remoteEntryLabel(entry), width)}
+      title={detailPaneTitle(remoteEntryLabel(entry), width)}
       titleAlignment="left"
       padding={1}
       flexDirection="column"
     >
       <WtScrollbox scrollRef={scrollRef}>
-        <TitleLine title={title} source={pr ? "pr" : "slug"} />
+        <DetailTitleLine title={title} source={pr ? "pr" : "slug"} />
         <WorkStatusRecordBlock
           record={work}
           contentWidth={Math.max(0, width - PANE_CHROME_WIDTH)}
@@ -748,6 +710,7 @@ export const Details = memo(function Details({
   reviewRequest,
   section,
   removed,
+  removedIssueStatuses,
   remote,
   remoteUnavailable = false,
   remoteError = null,
@@ -762,7 +725,8 @@ export const Details = memo(function Details({
   useNowTick();
   if (removed) {
     // Key by slug so cursor moves across history entries remount cleanly.
-    return <RemovedBody key={`removed:${removed.slug}`} entry={removed} width={width} />;
+    const issueId = resolveIssueId(removed.slug, removed.issueId);
+    return <RemovedBody key={`removed:${removed.slug}`} entry={removed} width={width} issueStatus={issueId ? removedIssueStatuses?.[issueId] : undefined} />;
   }
   if (section) {
     return (

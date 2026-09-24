@@ -275,6 +275,9 @@ export function parseWtState(raw: unknown): WtState {
         removedAt: typeof rec.removedAt === "string" ? rec.removedAt : "",
         ...(typeof rec.title === "string" && rec.title.trim() !== "" ? { title: rec.title } : {}),
         ...(typeof rec.issueId === "string" ? { issueId: rec.issueId } : {}),
+        ...(typeof rec.githubIssue === "number" && Number.isInteger(rec.githubIssue) && rec.githubIssue > 0
+          ? { githubIssue: rec.githubIssue }
+          : {}),
         ...(rec.gitState === "merged" || rec.gitState === "gone" ? { gitState: rec.gitState } : {}),
         ...(typeof rec.prNumber === "number" && Number.isFinite(rec.prNumber) ? { prNumber: rec.prNumber } : {}),
         ...(typeof rec.prUrl === "string" && rec.prUrl.trim() !== "" ? { prUrl: rec.prUrl } : {}),

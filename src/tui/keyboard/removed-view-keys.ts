@@ -9,7 +9,7 @@ import type { KeyEvent } from "@opentui/core";
 
 import { config } from "../../core/config.ts";
 import { createLogger } from "../../core/logger.ts";
-import { issueUrlForSlug } from "../../core/issue-tracker.ts";
+import { githubIssueUrl, issueUrlForId, resolveIssueId } from "../../core/issue-tracker.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { isPlainLetter } from "../app-helpers.ts";
 import { openUrlHidingTerminal } from "../../core/macos.ts";
@@ -125,10 +125,11 @@ export function handleRemovedViewKey(
     return;
   }
   if (isPlainLetter(k, "i")) {
-    const url = issueUrlForSlug(entry.slug);
+    const url = issueUrlForId(resolveIssueId(entry.slug, entry.issueId)) ??
+      (entry.githubIssue ? githubIssueUrl(entry.githubIssue) : null);
     if (!url) {
       removedLog.event.warn(
-        "no issue URL (needs an id in the slug + [issue_tracker] url_template)",
+        "no issue URL (needs a tracker URL or recorded GitHub issue)",
       );
       return;
     }

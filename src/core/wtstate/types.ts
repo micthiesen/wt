@@ -215,6 +215,8 @@ export type RemovedWorktree = {
   title?: string;
   /** Primary tracker override at removal; empty means deliberately unlinked. */
   issueId?: string;
+  /** Secondary GitHub issue attached when the checkout was removed. */
+  githubIssue?: number;
   /** Git-derived terminal state observed while the checkout still existed. */
   gitState?: "merged" | "gone";
   /** PR snapshot at removal, when the branch had one. */

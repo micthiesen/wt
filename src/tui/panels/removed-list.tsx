@@ -9,10 +9,8 @@ import { memo, useEffect, useMemo, useRef } from "react";
 import type React from "react";
 import { TextAttributes } from "@opentui/core";
 import type { ScrollBoxRenderable } from "@opentui/core";
-import { useQuery } from "@tanstack/react-query";
 
 import { config } from "../../core/config.ts";
-import { issueStatusIds } from "../../core/issue-status.ts";
 import { isTrackerIssueId, resolveIssueId } from "../../core/issue-tracker.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
 import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
@@ -22,7 +20,7 @@ import { NF } from "../icons.ts";
 import { scrollCursorIntoView, WtScrollbox } from "../scrollbox.tsx";
 import { ageMsToText, truncateEnd } from "../text.ts";
 import { theme } from "../theme.ts";
-import { issueStatusesQuery } from "../../state/queries/issue-status.ts";
+import type { IssueStatuses } from "../../core/issue-status.ts";
 
 /** Outcome at removal, not the agent's internal todo/ready assertion. */
 export function removedStatusGlyph(entry: RemovedWorktree): { glyph: string; fg: string } {
@@ -93,6 +91,9 @@ const RemovedRowView = memo(function RemovedRowView({
     <box
       id={`removed:${entry.slug}`}
       flexDirection="row"
+      height={1}
+      flexShrink={0}
+      overflow="hidden"
       backgroundColor={selected ? theme.rowSelectedBg : undefined}
       paddingLeft={1}
       paddingRight={1}
@@ -105,20 +106,22 @@ const RemovedRowView = memo(function RemovedRowView({
           <text> </text>
         </box>
       </box>
-      <box flexGrow={1} flexShrink={1} overflow="hidden">
-        <text fg={fg} attributes={attrs} wrapMode="none">
+      <box flexGrow={1} flexShrink={1} minWidth={0} height={1} overflow="hidden">
+        <text fg={fg} attributes={attrs} wrapMode="none" truncate>
           {truncateEnd(removedRowLabel(entry), budget)}
         </text>
       </box>
-      <text>  </text>
-      <box width={2} flexShrink={0}>
-        {issue ? <text fg={issue.fg}>{issue.glyph}</text> : null}
-      </box>
-      <box width={2} flexShrink={0}>
-        <text fg={pr.fg}>{pr.glyph}</text>
-      </box>
-      <box width={4} flexShrink={0} justifyContent="flex-end">
-        <text fg={theme.fgDim}>{age}</text>
+      <box flexDirection="row" flexShrink={0} height={1}>
+        <box width={2} flexShrink={0} />
+        <box width={2} flexShrink={0}>
+          {issue ? <text fg={issue.fg} wrapMode="none">{issue.glyph}</text> : null}
+        </box>
+        <box width={2} flexShrink={0}>
+          <text fg={pr.fg} wrapMode="none">{pr.glyph}</text>
+        </box>
+        <box width={4} flexShrink={0} justifyContent="flex-end">
+          <text fg={theme.fgDim} wrapMode="none">{age}</text>
+        </box>
       </box>
     </box>
   );
@@ -150,16 +153,14 @@ export function RemovedList({
   entries,
   selectedIndex,
   width,
+  issueStatuses,
 }: {
   entries: readonly RemovedWorktree[];
   selectedIndex: number;
   width: number;
+  issueStatuses?: IssueStatuses;
 }) {
   const listRef = useRef<ScrollBoxRenderable>(null);
-  // Mounted only while h is open. One provider read for all archived IDs,
-  // never a per-row request or ongoing poll while the ordinary list is shown.
-  const issueIds = useMemo(() => issueStatusIds(entries, config.issueTracker?.prefix), [entries]);
-  const issueStatuses = useQuery(issueStatusesQuery(issueIds));
   // Interleave a header wherever the day-bucket changes. `entries` is
   // stored newest-first (`recordRemovedWorktrees` sorts on write), so
   // comparing against the previous entry is enough — no regrouping, and
@@ -195,12 +196,12 @@ export function RemovedList({
           entry={entry}
           selected={i === selectedIndex}
           panelWidth={width}
-          issueStatus={issueStatuses.data?.[resolveIssueId(entry.slug, entry.issueId) ?? ""]}
+          issueStatus={issueStatuses?.[resolveIssueId(entry.slug, entry.issueId) ?? ""]}
         />,
       );
     });
     return out;
-  }, [entries, selectedIndex, width, issueStatuses.data]);
+  }, [entries, selectedIndex, width, issueStatuses]);
   const selectedChildId = entries[selectedIndex]
     ? `removed:${entries[selectedIndex]!.slug}`
     : undefined;

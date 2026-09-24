@@ -1,11 +1,11 @@
-import { TextAttributes } from "@opentui/core";
-
 import { isMergedRemoval, type RemovedWorktree } from "../../../core/wtstate.ts";
-import { slugLabel } from "../../../core/stage.ts";
+import { resolveIssueId } from "../../../core/issue-tracker.ts";
 import { ageMsToText, truncateEnd } from "../../text.ts";
 import { NF } from "../../icons.ts";
 import { theme } from "../../theme.ts";
+import { IssueLine } from "../../rows/issue.tsx";
 import { RRRow } from "./row-cell.tsx";
+import { detailPaneTitle, DetailTitleLine } from "./title.tsx";
 import { WorkStatusRecordBlock } from "./work-status-block.tsx";
 
 /** Glyph + label for a removed entry's snapshotted PR state. */
@@ -27,17 +27,21 @@ export function removedPrBadge(state: string | undefined): {
 }
 
 /**
- * Details body for a removed-worktree history entry. Everything here is
- * a snapshot taken at destroy time — no live worktree, no per-slug
- * sources, no AI pipeline — so it renders straight from the persisted
- * record. `⏎` restores, `p`/`i` open the PR/issue from the parent.
+ * Details body for a removed-worktree history entry. Identity, work,
+ * PR, and outcome are removal snapshots; the optional tracker status
+ * comes from the history view's existing batch, never a per-slug read.
+ * `⏎` restores, `p`/`i` open the PR/issue from the parent.
  */
-export function RemovedBody({ entry, width }: { entry: RemovedWorktree; width: number }) {
+export function RemovedBody({ entry, width, issueStatus }: {
+  entry: RemovedWorktree;
+  width: number;
+  issueStatus?: string;
+}) {
   const removedMs = Date.parse(entry.removedAt);
   const removedText = Number.isFinite(removedMs)
     ? `${ageMsToText(Date.now() - removedMs)} ago · ${new Date(removedMs).toLocaleString()}`
     : null;
-  const issueId = slugLabel(entry.slug).id;
+  const issueId = resolveIssueId(entry.slug, entry.issueId);
   const pr = removedPrBadge(entry.prState);
   return (
     <box
@@ -47,18 +51,12 @@ export function RemovedBody({ entry, width }: { entry: RemovedWorktree; width: n
       border
       borderStyle="single"
       borderColor={theme.border}
-      title={` ${entry.slug} · removed `}
+      title={detailPaneTitle(entry.slug, width, " · removed")}
       titleAlignment="left"
       padding={1}
       flexDirection="column"
     >
-      <box marginBottom={1}>
-        <text wrapMode="word">
-          <span fg={theme.fg} attributes={TextAttributes.BOLD}>
-            {entry.title ?? entry.slug}
-          </span>
-        </text>
-      </box>
+      <DetailTitleLine title={entry.title ?? entry.slug} />
       {entry.work ? (
         <WorkStatusRecordBlock
           record={entry.work}
@@ -75,11 +73,9 @@ export function RemovedBody({ entry, width }: { entry: RemovedWorktree; width: n
           {entry.branch}
         </text>
       </RRRow>
-      {issueId ? (
+      {issueId || entry.githubIssue ? (
         <RRRow label="issue">
-          <text fg={theme.fg} wrapMode="none" truncate>
-            {issueId}
-          </text>
+          <IssueLine id={issueId} githubIssue={entry.githubIssue} status={issueStatus} />
         </RRRow>
       ) : null}
       {entry.prNumber !== undefined ? (

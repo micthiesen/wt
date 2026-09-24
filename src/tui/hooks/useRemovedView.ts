@@ -5,8 +5,12 @@
  * model of the live list would be overkill here.
  */
 import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
+import { config } from "../../core/config.ts";
+import { issueStatusIds } from "../../core/issue-status.ts";
 import type { RemovedWorktree, WtState } from "../../core/wtstate.ts";
+import { issueStatusesQuery } from "../../state/queries/issue-status.ts";
 import type { WorktreeRow } from "./useWorktreeRows.ts";
 
 export function useRemovedView(opts: {
@@ -24,6 +28,16 @@ export function useRemovedView(opts: {
     const live = new Set(rows.map((r) => r.wt.slug));
     return (wtState?.removed ?? []).filter((e) => !live.has(e.slug));
   }, [rows, wtState?.removed]);
+  // The history list and selected details share this one batch observer.
+  // Do not poll archived issues while the ordinary fleet view is showing.
+  const issueIds = useMemo(
+    () => issueStatusIds(removedEntries, config.issueTracker?.prefix),
+    [removedEntries],
+  );
+  const issueStatuses = useQuery({
+    ...issueStatusesQuery(issueIds),
+    enabled: removedView && issueIds.length > 0 && config.issueTracker?.statusCommand != null,
+  });
   const removedCursor = Math.min(
     removedIndex,
     Math.max(0, removedEntries.length - 1),
@@ -39,5 +53,6 @@ export function useRemovedView(opts: {
     removedEntries,
     removedCursor,
     currentRemoved,
+    removedIssueStatuses: issueStatuses.data,
   };
 }

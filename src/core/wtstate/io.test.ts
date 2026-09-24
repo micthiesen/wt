@@ -11,14 +11,14 @@ import { parseWtState } from "./io.ts";
 describe("parseWtState", () => {
   test("keeps removed outcome and tracker override, including an explicit unlink", () => {
     const state = parseWtState({ removed: [
-      { slug: "a", branch: "m/a", removedAt: "2026-09-23T00:00:00Z", issueId: "COZ-1445", gitState: "merged" },
-      { slug: "b", branch: "m/b", removedAt: "2026-09-23T00:00:00Z", issueId: "", gitState: "gone" },
+      { slug: "a", branch: "m/a", removedAt: "2026-09-23T00:00:00Z", issueId: "COZ-1445", githubIssue: 2116, gitState: "merged" },
+      { slug: "b", branch: "m/b", removedAt: "2026-09-23T00:00:00Z", issueId: "", githubIssue: -1, gitState: "gone" },
       { slug: "c", branch: "m/c", removedAt: "2026-09-23T00:00:00Z", gitState: "impossible" },
     ] });
-    expect(state.removed.map(({ issueId, gitState }) => ({ issueId, gitState }))).toEqual([
-      { issueId: "COZ-1445", gitState: "merged" },
-      { issueId: "", gitState: "gone" },
-      { issueId: undefined, gitState: undefined },
+    expect(state.removed.map(({ issueId, githubIssue, gitState }) => ({ issueId, githubIssue, gitState }))).toEqual([
+      { issueId: "COZ-1445", githubIssue: 2116, gitState: "merged" },
+      { issueId: "", githubIssue: undefined, gitState: "gone" },
+      { issueId: undefined, githubIssue: undefined, gitState: undefined },
     ]);
   });
   test("retains creation identity without inventing one for legacy or invalid records", () => {
