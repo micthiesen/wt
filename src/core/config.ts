@@ -740,10 +740,6 @@ export type Config = {
    * in config instead of requiring a shell wrapper.
    */
   tmux: { socket: string; terminalConfig: string | null };
-  codex: {
-    animations: boolean;
-    alternateScreen: "always" | "auto" | "never";
-  };
   branch: {
     prefix: string;
     base: string;
@@ -1556,18 +1552,6 @@ function build(
   if (terminalConfig !== undefined && typeof terminalConfig !== "string") {
     errs.add("tmux.terminal_config must be a string");
   }
-  const codexRaw = obj(raw.codex);
-  const animations = codexRaw?.animations;
-  if (animations !== undefined && typeof animations !== "boolean") {
-    errs.add("codex.animations must be a boolean");
-  }
-  const codex = {
-    animations: typeof animations === "boolean" ? animations : false,
-    alternateScreen: errs.optEnum(
-      codexRaw, "codex", "alternate_screen", ["always", "auto", "never"] as const, "always",
-    ),
-  };
-
   const rows = strArr(ui?.rows, GENERIC_DEFAULTS.ui.rows);
   const hiddenBadges = new Set<BadgeSlot>();
   for (const id of strArr(ui?.hidden_badges, [])) {
@@ -1691,7 +1675,6 @@ function build(
       socket: tmuxSocket,
       terminalConfig: typeof terminalConfig === "string" ? terminalConfig : null,
     },
-    codex,
     branch: { prefix: branchPrefix, base: branchBase, idPattern, slugMaxLen, keepFresh, production },
     stage: { prefix: stagePrefix, defaultPersonal: stageDefault, domain: stageDomain },
     lifecycle: { envFilesToCopy: envFiles, copyGlobs, installCommand, destroyCommand },

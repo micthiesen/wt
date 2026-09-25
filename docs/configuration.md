@@ -129,23 +129,13 @@ Pick it with `WT_CONFIG=/path/to/config.toml` (or let a repo `.wt.toml` supply t
 | `socket` | no | repository with a `.wt.toml`: `"wt-<repo-id>"`; otherwise `"wt"` | Socket name (`tmux -L <socket>`) for the wt-private tmux server that hosts every agent, shell, diff, dev-server and action session. `WT_TMUX_SOCKET` wins when set. |
 | `terminal_config` | no | built-in terminal preamble | Literal tmux configuration replacing the entire terminal preamble, including mouse, clipboard, hyperlinks, terminal features, extended keys, alternate-screen, status and title settings. Omit to follow wt defaults; set to a TOML multiline literal string to pin or customize every terminal setting. An empty string deliberately removes the preamble. wt still appends the observed terminal palette and F10/F11/F12 navigation bindings. Applies when the server starts or an interactive attach reloads its config; terminal capability changes can require detaching and reattaching. |
 
-## `[codex]`
+## Codex terminal settings
 
-These settings apply only to interactive Codex sessions launched through wt,
-including fresh and resumed worktree, main, and manager sessions. Other Codex
-options continue to come from Codex's own configuration. Running sessions keep
-their launch settings until they exit and resume; reattaching does not change them.
-
-| key | required | default | meaning |
-|---|---|---|---|
-| `animations` | no | `false` | Enable Codex TUI animations. The default avoids animated-composer artifacts with affected tmux versions. Set `true` when animations work with your terminal setup. |
-| `alternate_screen` | no | `"always"` | Codex TUI alternate-screen policy: `"always"`, `"auto"`, or `"never"`. The default keeps the full-height viewport stable under tmux. |
-
-```toml
-[codex]
-animations = true
-alternate_screen = "always"
-```
+wt does not pass Codex CLI configuration or feature overrides when launching
+or resuming a session. Set TUI preferences in Codex's own `~/.codex/config.toml`,
+for example `[tui] alternate_screen = "auto"` and `animations = true`.
+Legacy `[codex] animations` and `alternate_screen` entries in wt config are
+ignored and can be removed.
 
 ## `[branch]`
 

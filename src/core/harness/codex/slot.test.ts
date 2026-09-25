@@ -67,31 +67,20 @@ describe("Codex main/manager ownership", () => {
 
   test("fresh shared-cwd slots get a stamp; resumes use the exact id", () => {
     const args = { wtPath: "/repo", managedName: null, resumeSessionId: null };
-    const tuiArgs = [
-      "-c",
-      'tui.alternate_screen="always"',
-      "-c",
-      "tui.animations=false",
-    ];
     expect(codexHarness.buildArgs({ ...args, slug: "manager" })).toEqual([
       "codex",
-      ...tuiArgs,
       CODEX_MANAGER_PROMPT,
     ]);
     expect(codexHarness.buildArgs({ ...args, slug: "main" })).toEqual([
       "codex",
-      ...tuiArgs,
       CODEX_MAIN_PROMPT,
     ]);
-    expect(codexHarness.buildArgs({ ...args, slug: "worktree" })).toEqual([
-      "codex",
-      ...tuiArgs,
-    ]);
+    expect(codexHarness.buildArgs({ ...args, slug: "worktree" })).toEqual(["codex"]);
     expect(codexHarness.buildArgs({
       ...args,
       slug: "manager",
       resumeSessionId: "manager-id",
-    })).toEqual(["codex", ...tuiArgs, "resume", "manager-id"]);
+    })).toEqual(["codex", "resume", "manager-id"]);
   });
 });
 
