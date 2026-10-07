@@ -314,6 +314,15 @@ let _version: string | null = null;
  */
 export function wtVersion(): string {
   if (_version !== null) return _version;
+  // Remote packages have no Git metadata. The installer records the build.
+  try {
+    const runtime = JSON.parse(readFileSync(join(WT_REPO_ROOT, ".wt-runtime.json"), "utf8"));
+    if (typeof runtime.build === "string" && /^[a-f0-9]{64}$/.test(runtime.hash)) {
+      return (_version = runtime.build);
+    }
+  } catch {
+    // Source checkouts use Git below.
+  }
   const head = gitSync(["log", "-1", "--format=%h %cs"]);
   if (!head) return (_version = "unknown");
   const [sha, date] = head.split(" ");

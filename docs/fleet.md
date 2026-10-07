@@ -4,6 +4,11 @@ wt's intent doc. The mechanics live in [cli.md](cli.md#wt-status-slug-state--m-n
 
 ## The principle
 
+Remote wt runtime setup belongs to the controller. Before it uses a worker,
+it prepares and validates a matching package. The human supplies SSH access,
+Bun, and worker configuration once. Routine wt code updates need no manual
+server update. Setup does not replace code used by existing sessions.
+
 **The human does only the work only a human can do.** Everything else — anything agents are good at, anything deterministic code can express — belongs to agents or to wt itself. Concretely:
 
 - Merges, genuinely interactive auth (a 2FA challenge, an OAuth consent screen), judgment calls, and risk acceptance stay human. Almost nothing else should.

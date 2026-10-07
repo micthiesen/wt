@@ -4,6 +4,15 @@ Internals map for contributors and coding agents. Bun + React + [OpenTUI](https:
 
 ## The three layers
 
+`core/remote-runtime.ts` prepares content-addressed source packages on SSH
+workers. `remote-protocol.ts` holds the process-local selection for each
+endpoint. Inventory handshakes and command execution prepare the package
+before selecting it. `scripts/remote-runtime-install.sh` checks the archive,
+installs dependencies in a separate stage, checks the worker handshake, and
+publishes the directory under a file lock. A failed stage leaves existing
+packages and the configured wt install unchanged. Remote packages record their
+build in `.wt-runtime.json`; they do not contain Git metadata.
+
 The title bar reserves 12 columns for the refresh wave, including when it is
 idle. Remote warnings follow this fixed column, so animation changes do not
 move the warning text.

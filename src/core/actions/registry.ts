@@ -48,6 +48,7 @@ import { join } from "node:path";
 import { Clock, Deferred, Effect, Fiber, Semaphore } from "effect";
 
 import { causeMessage } from "../errors.ts";
+import { ensureRemoteRuntime } from "../remote-runtime.ts";
 
 import {
   type ActionLine,
@@ -237,44 +238,52 @@ class ActionRegistry {
     harnessId: HarnessId = "claude",
     opts: { autoFireKeys?: readonly string[] } = {},
   ): Effect.Effect<ActionStartResult> {
-    const remoteAction = prepareRemoteAction(
-      def,
-      remote,
-      remoteCwd,
-      worktreeRef.slug,
-      extras,
-      vars,
-      harnessId,
-    );
-    const execution: PreparedExecution = {
-      argv: remoteAction.argv,
-      cwd: supervisorCwd,
-      kind: remoteAction.kind,
-      prompt: remoteAction.prompt,
-    };
+    const prepare = def.id === "dev-server-start" || def.id === "dev-server-stop"
+      ? ensureRemoteRuntime(remote)
+      : Effect.void;
+    return prepare.pipe(
+      Effect.flatMap(() => {
+        const remoteAction = prepareRemoteAction(
+          def,
+          remote,
+          remoteCwd,
+          worktreeRef.slug,
+          extras,
+          vars,
+          harnessId,
+        );
+        const execution: PreparedExecution = {
+          argv: remoteAction.argv,
+          cwd: supervisorCwd,
+          kind: remoteAction.kind,
+          prompt: remoteAction.prompt,
+        };
 
-    return Effect.acquireUseRelease(
-      Effect.sync(() => {
-        const existing = this.runs.get(actionKey);
-        if (existing?.status === "running" || this.starting.has(actionKey)) return false;
-        this.starting.add(actionKey);
-        return true;
+        return Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const existing = this.runs.get(actionKey);
+            if (existing?.status === "running" || this.starting.has(actionKey)) return false;
+            this.starting.add(actionKey);
+            return true;
+          }),
+          (reserved) => reserved ? this.startInner(
+            def,
+            actionKey,
+            supervisorCwd,
+            extras,
+            vars,
+            harnessId,
+            { execution, worktreeRef, autoFireKeys: opts.autoFireKeys },
+          ) : Effect.succeed({
+            ok: false as const,
+            reason: "an action is already running for this worktree",
+          }),
+          (reserved) => Effect.sync(() => {
+            if (reserved) this.starting.delete(actionKey);
+          }),
+        );
       }),
-      (reserved) => reserved ? this.startInner(
-        def,
-        actionKey,
-        supervisorCwd,
-        extras,
-        vars,
-        harnessId,
-        { execution, worktreeRef, autoFireKeys: opts.autoFireKeys },
-      ) : Effect.succeed({
-        ok: false as const,
-        reason: "an action is already running for this worktree",
-      }),
-      (reserved) => Effect.sync(() => {
-        if (reserved) this.starting.delete(actionKey);
-      }),
+      Effect.catch((cause) => Effect.succeed({ ok: false as const, reason: causeMessage(cause) })),
     );
   }
 

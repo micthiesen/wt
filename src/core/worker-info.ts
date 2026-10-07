@@ -3,10 +3,11 @@ import { Data, Effect, Fiber, SynchronizedRef } from "effect";
 import type { RemoteConfig } from "./config.ts";
 import { run } from "./proc.ts";
 import { remoteWtCommand } from "./remote-protocol.ts";
+import { ensureRemoteRuntime } from "./remote-runtime.ts";
 import { wtVersion } from "./update.ts";
 
-/** Incompatible controller/worker wire changes increment this value. */
-export const WORKER_PROTOCOL_VERSION = 2;
+import { WORKER_PROTOCOL_VERSION } from "./worker-protocol.ts";
+export { WORKER_PROTOCOL_VERSION } from "./worker-protocol.ts";
 
 export type WorkerInfo = {
   role: "controller" | "worker";
@@ -188,6 +189,9 @@ export function createWorkerInfoFetcher(load: WorkerInfoLoader) {
 const loadRemoteWorkerInfo = Effect.fnUntraced(function* (
   remote: RemoteConfig,
 ): Effect.fn.Return<WorkerInfo, WorkerInfoError> {
+  yield* ensureRemoteRuntime(remote).pipe(Effect.mapError((cause) =>
+    new WorkerInfoTransportError({ message: `remote runtime setup failed: ${cause.message}`, cause }),
+  ));
   const result = yield* run(
     [
       "ssh",

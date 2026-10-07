@@ -1,5 +1,12 @@
 # Updates, rollback & compatibility
 
+SSH worker commands use separate source packages prepared by the controller
+(see [configuration.md](configuration.md#remote--optional-ssh-worktree-host)).
+These packages have no Git metadata. Their `.wt-runtime.json` records the
+controller build for `wt version` and the worker handshake. Source-clone
+updates and rollback still use Git. Automatic runtime setup does not replace
+the worker's source clone or remove packages used by existing sessions.
+
 wt has no release process: `main` is the release channel, and installs
 are git clones that fast-forward (see [cli.md](cli.md#wt-update-log---check---head)
 for command surface). What makes that safe is not a version scheme but

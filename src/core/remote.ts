@@ -4,6 +4,7 @@ import type { RemoteConfig } from "./config.ts";
 import { causeMessage } from "./errors.ts";
 import { runStreaming, terminateSubprocess } from "./proc.ts";
 import { remoteWtCommand } from "./remote-protocol.ts";
+import { ensureRemoteRuntime } from "./remote-runtime.ts";
 
 export type RemoteRunOptions = {
   /** Allocate a PTY and inherit stdio for the remote wt TUI. */
@@ -109,6 +110,17 @@ export function runRemoteWt(
   remote: RemoteConfig,
   argv: readonly string[],
   opts: RemoteRunOptions = {},
+): Effect.Effect<number, RemoteRunError> {
+  return ensureRemoteRuntime(remote, opts.onLine).pipe(
+    Effect.mapError((cause) => new RemoteRunError({ operation: "spawn", cause })),
+    Effect.flatMap(() => runPreparedRemoteWt(remote, argv, opts)),
+  );
+}
+
+function runPreparedRemoteWt(
+  remote: RemoteConfig,
+  argv: readonly string[],
+  opts: RemoteRunOptions,
 ): Effect.Effect<number, RemoteRunError> {
   if (opts.interactive) {
     return Effect.acquireUseRelease(

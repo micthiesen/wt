@@ -16,6 +16,7 @@ import {
   remoteWtSshArgv,
 } from "./remote.ts";
 import type { WorktreeTarget } from "./worktree-target.ts";
+import { ensureRemoteRuntime } from "./remote-runtime.ts";
 
 const WT_BIN = join(import.meta.dir, "..", "..", "bin", "wt");
 
@@ -54,6 +55,20 @@ export function runWorktreeWt(
   args: readonly string[],
   opts: WorktreeRunOptions = {},
 ): Effect.Effect<number, WorktreeExecutorError> {
+  if (target.location.kind === "remote") {
+    return ensureRemoteRuntime(target.location.endpoint, opts.onLine).pipe(
+      Effect.mapError((cause) => new WorktreeExecutorError({ operation: "spawn", cause })),
+      Effect.flatMap(() => runPreparedWorktreeWt(target, args, opts)),
+    );
+  }
+  return runPreparedWorktreeWt(target, args, opts);
+}
+
+function runPreparedWorktreeWt(
+  target: WorktreeTarget,
+  args: readonly string[],
+  opts: WorktreeRunOptions,
+): Effect.Effect<number, WorktreeExecutorError> {
   if (opts.interactive) {
     return Effect.acquireUseRelease(
       Effect.try({
@@ -85,12 +100,17 @@ export function captureWorktreeWt(
   args: readonly string[],
   opts: Omit<RunOptions, "cwd"> = {},
 ): Effect.Effect<RunResult, WorktreeExecutorError> {
-  return run(worktreeWtArgv(target, args), {
+  const prepare = target.location.kind === "remote"
+    ? ensureRemoteRuntime(target.location.endpoint).pipe(
+        Effect.mapError((cause) => new WorktreeExecutorError({ operation: "spawn", cause })),
+      )
+    : Effect.void;
+  return prepare.pipe(Effect.flatMap(() => run(worktreeWtArgv(target, args), {
     ...opts,
     cwd: target.location.kind === "local" ? target.path : process.cwd(),
   }).pipe(
     Effect.mapError((cause) => new WorktreeExecutorError({ operation: "wait", cause })),
-  );
+  )));
 }
 
 /** Read supervised dev output from the machine that owns the checkout. */

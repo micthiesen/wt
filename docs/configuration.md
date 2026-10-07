@@ -199,8 +199,8 @@ is an independent clone with its own refs — see
 
 ## `[remote]` — optional SSH worktree host
 
-Configure a second machine whose own `wt` installation, clone, config, and
-worktree root remain authoritative for execution. Set `[instance] role =
+Configure a second machine whose clone, config, and worktree root remain
+authoritative for execution. Set `[instance] role =
 "worker"` on that machine. The controller TUI polls the worker's worktree
 summaries and renders them in the same sections as local worktrees, with a
 small remote indicator on each row. `Ctrl+N` forwards the normal `wt new`
@@ -210,6 +210,22 @@ for local and remote rows: requirements/templates use one normalized row model,
 while tracked commands, custom prompts, dev controls/logs, and cancellation run
 against the selected checkout through SSH. Ordinary `n` / `N`
 continue to create locally.
+
+The controller prepares its own wt runtime on the worker before reading
+inventory or running wt commands. It hashes the local source files and build,
+uploads a missing package over SSH, installs frozen dependencies, and checks
+the worker handshake. Each package lives at
+`~/.cache/wt/runtimes/<hash>` on the worker. An existing package is reused.
+The configured `wt_path` and installed wt directory are not replaced.
+Running sessions can continue to use their original package. The controller
+selects the validated package for later commands in that process.
+
+Automatic setup requires a Linux worker with Bash, tar, sha256sum, flock,
+and Bun on PATH or at `~/.bun/bin/bun`. Local setup requires Git, tar, SSH,
+and SCP. The package includes tracked and untracked non-ignored source files,
+including local edits. It excludes Git metadata and ignored dependencies.
+A failed upload, dependency install, or handshake stops the operation.
+Old packages are retained so setup does not remove code used by a session.
 
 The last successful remote inventory is persisted with the rest of wt's query
 cache. If the host sleeps or becomes unreachable, those rows remain visible as
@@ -246,7 +262,7 @@ wt_path = "~/.wt/bin/wt"       # optional
 |---|---|---|---|
 | `host` | **yes** | — | SSH destination or alias used by `ssh`. |
 | `label` | no | `host` | Short name in the prompt, event log, and remote WezTerm tab title. |
-| `wt_path` | no | `~/.wt/bin/wt` | Remote executable. The `~/` prefix expands in the remote account. |
+| `wt_path` | no | `~/.wt/bin/wt` | Configured remote executable. The `~/` prefix expands in the remote account. Controller commands use the separately prepared runtime package. |
 
 The remote machine needs its own `~/.config/wt/config.toml`, including
 `[instance] role = "worker"`; do not point the local process at a mounted
@@ -255,8 +271,8 @@ remote `wt skills sync --yes`, provisioning missing/current bundled skills and
 the managed instructions block before any harness command is typed. Personal
 or modified copies keep the normal skills-sync protection and are not
 overwritten. The worker then fails closed if the selected harness still cannot
-resolve `start`. Every spawned harness also receives the configured remote
-`wt_path` launcher's directory at the front of `PATH`, so the skill can call
+resolve `start`. Every spawned harness also receives the selected runtime
+launcher's directory at the front of `PATH`, so the skill can call
 `wt status` even when that directory is absent from the SSH login PATH.
 
 `wt remote [args…]` remains a

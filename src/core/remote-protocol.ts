@@ -1,5 +1,13 @@
 import type { RemoteConfig } from "./config.ts";
 
+const runtimePaths = new Map<string, string>();
+const endpointKey = (remote: RemoteConfig) => `${remote.host}\0${remote.wtPath}`;
+
+/** Select a validated package for this controller process and endpoint. */
+export function setRemoteRuntimePath(remote: RemoteConfig, path: string): void {
+  runtimePaths.set(endpointKey(remote), path);
+}
+
 /**
  * Encode argv into one shell-safe token. OpenSSH sends its remote command
  * through the account's login shell (Fish on CachyOS), so forwarding raw argv
@@ -39,7 +47,7 @@ export function remoteWtCommand(
   remote: RemoteConfig,
   argv: readonly string[] | null,
 ): string {
-  const executable = remoteExecutable(remote.wtPath);
+  const executable = remoteExecutable(runtimePaths.get(endpointKey(remote)) ?? remote.wtPath);
   return argv === null
     ? `exec ${executable}`
     : `exec ${executable} _remote ${encodeRemoteArgs(argv)}`;

@@ -36,6 +36,11 @@ deleted.
 
 ### `wt remote [<command> ...]`
 
+Before execution, wt prepares a matching source package on the worker.
+It reuses a package with the same content hash. Missing packages are uploaded,
+installed, and checked automatically. See [worker setup](configuration.md#remote--optional-ssh-worktree-host)
+for prerequisites. Existing worker installs and running sessions are retained.
+
 With no arguments, allocate an SSH terminal and enter the `[remote]` host's
 interactive `wt`. With arguments, forward the exact argv through a shell-safe
 encoded transport to that installation—for example `wt remote ls --json` or
