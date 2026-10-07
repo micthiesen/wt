@@ -98,6 +98,11 @@ Both read "unpushed" as commits missing from `origin/<branch>` — the `(↑n �
 When the SSH host is sleeping or offline, its last-known worktrees remain in
 the Inbox with `host unavailable`. The title bar also shows an offline warning;
 F10/F11/F12 resume once a refresh reaches the host again.
+
+On a remote creating row, F12 requests the selected agent session. wt opens
+it automatically after creation succeeds and the new checkout is found.
+Repeated F12 presses keep one request. A failed creation does not start a
+session.
 Remote deletion also stays disabled while the worktree holds a live operation
 lock. It deletes the remote branch but never destroys an SST stage implicitly.
 

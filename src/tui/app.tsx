@@ -729,6 +729,7 @@ export function App({ onExit }: Props) {
     doSpawnNamedClaudeSession,
     doKillClaudeSession,
     doEnterWorktreeSession,
+    doEnterCreatedRemoteHarness,
   } = makeSessionFlows({
     rows,
     renderer,
@@ -837,6 +838,7 @@ export function App({ onExit }: Props) {
     },
     remoteWorktrees: remoteRows,
     refreshAfterCreation,
+    enterCreatedRemoteHarness: doEnterCreatedRemoteHarness,
     refreshRemoteWorktrees: async () => {
       const result = await remoteWorktreeList.refetch();
       return result.data ?? [];

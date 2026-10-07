@@ -21,11 +21,13 @@ import { operationErrors, type OperationError } from "../../core/errors.ts";
 import { createLogger } from "../../core/logger.ts";
 import { runRemoteWt } from "../../core/remote.ts";
 import type { RemoteWorktreeSummary } from "../../core/remote-worktrees.ts";
+import type { HarnessId } from "../../core/harness/index.ts";
 import { readWtState, GROUP_INBOX, setSlugGithubIssue, type RemovedWorktree } from "../../core/wtstate.ts";
 import { parseNewInput } from "../app-helpers.ts";
 import type { Modal } from "../modal-state.ts";
 import {
   discoveredRemoteCreation,
+  consumeRemoteCreationSession,
   remoteEntryKey,
   type RemoteCreation,
 } from "../remote-creation.ts";
@@ -50,6 +52,7 @@ type WorktreeCreateFlowsCtx = {
   remoteWorktrees: readonly RemoteWorktreeSummary[];
   refreshAfterCreation: (slug: string) => Promise<void>;
   refreshRemoteWorktrees: () => Promise<readonly RemoteWorktreeSummary[]>;
+  enterCreatedRemoteHarness: (row: RemoteWorktreeSummary, harnessId: HarnessId) => void;
   toast: (message: string, color?: string, ms?: number) => void;
 };
 
@@ -230,6 +233,7 @@ export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
         return false;
       }
       remoteLog.event.ok(`ready on ${remote.label}`);
+      creation.status = "ready";
       const refreshed = yield* io.promise("refresh remote worktrees", refreshRemoteWorktrees);
       const created = discoveredRemoteCreation(creation, refreshed);
       if (created) {
@@ -245,9 +249,20 @@ export function makeWorktreeCreateFlows(ctx: WorktreeCreateFlowsCtx) {
           readWtState().remoteLayouts[ledgerKey]!.order,
         );
         revealCreated({ key: `remote:${remoteEntryKey(created)}`, ledgerKey, section, workAt: created.work?.at, order });
+        const requestedHarness = consumeRemoteCreationSession(creation, created);
+        if (requestedHarness) {
+          yield* io.sync("enter requested remote session", () =>
+            ctx.enterCreatedRemoteHarness(created, requestedHarness),
+          );
+        }
       }
       setRemoteCreation(null);
-      toast(`ready on ${remote.label}`, theme.ok, 1800);
+      if (!created && creation.requestedHarness) {
+        remoteLog.event.warn("created checkout was not found; agent session was not opened");
+        toast("created checkout was not found; select it after refresh and press F12", theme.warn, 3500);
+      } else {
+        toast(`ready on ${remote.label}`, theme.ok, 1800);
+      }
       return true;
     }).pipe(Effect.ensuring(Effect.sync(() => setRemoteCreation(null))));
   });

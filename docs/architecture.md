@@ -4,6 +4,11 @@ Internals map for contributors and coding agents. Bun + React + [OpenTUI](https:
 
 ## The three layers
 
+A remote creation placeholder can carry one F12 session request. The creation
+flow consumes it only after successful creation and inventory refresh. Session
+entry stays in `tui/flows/sessions.ts`; a placeholder never supplies a checkout
+path for launch.
+
 `core/remote-runtime.ts` prepares content-addressed source packages on SSH
 workers. `remote-protocol.ts` holds the process-local selection for each
 endpoint. Inventory handshakes and command execution prepare the package

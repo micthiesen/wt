@@ -312,3 +312,33 @@ test("! opens the same action picker for a remote worktree", () => {
 
   expect(opened).toEqual([target]);
 });
+
+test("F12 queues one agent session on a remote creation row", () => {
+  const messages: string[] = [];
+  const creation = {
+    remote: { host: "worker", label: "Worker", wtPath: "~/bin/wt" },
+    hostKey: "worker",
+    hostLabel: "Worker",
+    input: "new-task",
+    previousKeys: [],
+    status: "creating" as const,
+  };
+  const ctx = {
+    focusedOutputId: null,
+    consumePrTargetChord: () => false,
+    handleGlobalKey: () => false,
+    current: undefined,
+    selectedWorktree: undefined,
+    selectedRemote: creation,
+    primaryHarness: "codex",
+    toast: (message: string) => messages.push(message),
+    doEnterWorktreeSession: () => { throw new Error("checkout is not ready"); },
+  } as unknown as NormalKeysCtx;
+  handleNormalKey(plainKey("f12"), ctx);
+  handleNormalKey(plainKey("f12"), ctx);
+  expect((creation as { requestedHarness?: string }).requestedHarness).toBe("codex");
+  expect(messages).toEqual([
+    "agent session will open when creation finishes",
+    "agent session will open when creation finishes",
+  ]);
+});

@@ -756,6 +756,11 @@ export function handleNormalKey(k: KeyEvent, ctx: NormalKeysCtx): void {
     // Init locks are allowed once the checkout exists; destructive operations
     // remain blocked so we don't race a destroy.
     if (isBareKey(k, "f12")) {
+      if (selectedRemote && !isRemoteSummary(selectedRemote)) {
+        selectedRemote.requestedHarness = primaryHarness;
+        toast("agent session will open when creation finishes", theme.info, 2200);
+        return;
+      }
       if (selectedWorktree?.source.kind === "remote") {
         doEnterWorktreeSession(selectedWorktree, "harness");
         return;

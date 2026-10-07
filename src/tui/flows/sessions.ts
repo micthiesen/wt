@@ -29,6 +29,8 @@ import {
 } from "../../core/tmux.ts";
 import { effectiveBaseOrTrunk } from "../../core/git.ts";
 import { config } from "../../core/config.ts";
+import { remoteWorktreeTarget } from "../../core/worktree-target.ts";
+import type { RemoteWorktreeSummary } from "../../core/remote-worktrees.ts";
 
 import { enterHarnessSession } from "../sessions/harness.ts";
 import { enterRemoteWorktreeSession } from "../sessions/remote.ts";
@@ -412,6 +414,21 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     );
   }
 
+  function doEnterCreatedRemoteHarness(row: RemoteWorktreeSummary, harnessId: HarnessId): void {
+    // Successful creation and the refreshed inventory prove the checkout exists.
+    forkReported(
+      enterRemoteWorktreeSession({
+        renderer,
+        worktree: remoteWorktreeTarget(row),
+        target: "harness",
+        harnessId,
+      }).pipe(Effect.tap((code) => Effect.sync(() => {
+        if (code !== 0) toast(`remote session exited ${code}`, theme.warn, 2500);
+      }))),
+      (error) => reportActionError("remote session", error),
+    );
+  }
+
   /**
    * Enter a shell / diff / harness session on the SELECTED remote
    * worktree over SSH. Mirrors `doEnterHarnessSession`'s guard-then-run
@@ -526,5 +543,6 @@ export function makeSessionFlows(ctx: SessionFlowsCtx) {
     doSpawnNamedClaudeSession,
     doKillClaudeSession,
     doEnterWorktreeSession,
+    doEnterCreatedRemoteHarness,
   };
 }

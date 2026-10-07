@@ -1,5 +1,6 @@
 import type { RemoteConfig } from "../core/config.ts";
 import type { RemoteWorktreeSummary } from "../core/remote-worktrees.ts";
+import type { HarnessId } from "../core/harness/index.ts";
 
 /** In-flight placeholder: hold new inventory rows back until the command completes. */
 export type RemoteCreation = {
@@ -10,6 +11,8 @@ export type RemoteCreation = {
   /** Fleet identities present before this create started. */
   previousKeys: readonly string[];
   status: "creating" | "ready";
+  /** One-shot session request, consumed only after successful creation. */
+  requestedHarness?: HarnessId;
 };
 
 export type RemoteListEntry = RemoteCreation | RemoteWorktreeSummary;
@@ -28,6 +31,18 @@ export function remoteEntryKey(entry: RemoteListEntry): string {
 
 export function remoteEntryLabel(entry: RemoteListEntry): string {
   return isRemoteSummary(entry) ? entry.slug : entry.input;
+}
+
+/** Consume one request only for a completed checkout from this creation. */
+export function consumeRemoteCreationSession(
+  creation: RemoteCreation,
+  row: RemoteWorktreeSummary | undefined,
+): HarnessId | undefined {
+  if (creation.status !== "ready" || !row || row.hostKey !== creation.hostKey ||
+      creation.previousKeys.includes(remoteEntryKey(row))) return undefined;
+  const harness = creation.requestedHarness;
+  delete creation.requestedHarness;
+  return harness;
 }
 
 /**
