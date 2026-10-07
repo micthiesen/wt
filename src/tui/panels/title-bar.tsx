@@ -16,7 +16,7 @@ import { useFetchingCount } from "../hooks/useFetchingCount.ts";
 
 import { config } from "../../core/config.ts";
 import type { HarnessId } from "../../core/harness/index.ts";
-import { RefreshWave } from "../spinner.tsx";
+import { MAX_WAVE_WIDTH, RefreshWave } from "../spinner.tsx";
 import { theme } from "../theme.ts";
 import { PrimaryHarnessBadge, UsageBadge } from "../usage-badge.tsx";
 
@@ -67,7 +67,9 @@ export const TitleBar = memo(function TitleBar({
         </text>
         {/* The animated wave (width = in-flight count) is the live
             "refreshing" signal; `loading...` wins during cold start. */}
-        <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
+        <box width={MAX_WAVE_WIDTH} flexShrink={0} overflow="hidden">
+          <RefreshWave count={isLoading ? 0 : fetchingCount} fg={theme.fgDim} />
+        </box>
         {remoteUnavailable ? (
           <text fg={theme.warn}>{` ⚠ ${config.remote?.label ?? "remote"} offline`}</text>
         ) : remoteVersionMismatch ? (

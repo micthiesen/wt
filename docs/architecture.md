@@ -4,6 +4,10 @@ Internals map for contributors and coding agents. Bun + React + [OpenTUI](https:
 
 ## The three layers
 
+The title bar reserves 12 columns for the refresh wave, including when it is
+idle. Remote warnings follow this fixed column, so animation changes do not
+move the warning text.
+
 The TUI is split into three layers; respect the boundaries:
 
 - **Sources** — `src/state/queries/` (per-source files behind the `src/state/queries.ts` barrel), `src/state/hooks.ts`, `src/tui/hooks/useWorktreeRows.ts`. They own fetching, batching, and caching via TanStack Query. Small fixed set (github, git, sst, dev-server, claude, issue-tracker-derived, ai); not user-pluggable.

@@ -105,7 +105,7 @@ const BALL_FRAMES = [
  */
 const WAVE_FRAMES = "▁▂▃▄▅▆▇█▇▆▅▄▃▂";
 /** Cap so a big refresh fan-out can't overrun the header line. */
-const MAX_WAVE_WIDTH = 12;
+export const MAX_WAVE_WIDTH = 12;
 // Per-tick smoothing fractions for the wave width (see `ease`). The
 // raw in-flight count bounces around as queries fire/resolve in bursts;
 // low-passing it makes the ribbon glide instead of flashing. Grows a
