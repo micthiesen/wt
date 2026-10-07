@@ -485,7 +485,7 @@ const DetailsBody = memo(function DetailsBody({
       flexDirection="column"
     >
       <WtScrollbox scrollRef={scrollRef}>
-        <DetailTitleLine title={row.title} source={row.titleSource} />
+        <DetailTitleLine title={row.title} source={row.titleSource} contentWidth={Math.max(1, width - PANE_CHROME_WIDTH)} />
         {/* Asserted work status, full width — the note is the payload
             (merge impacts, needs-human asks) and must never truncate. */}
         <WorkStatusBlock
@@ -671,7 +671,7 @@ function RemoteDetails({
       flexDirection="column"
     >
       <WtScrollbox scrollRef={scrollRef}>
-        <DetailTitleLine title={title} source={pr ? "pr" : "slug"} />
+        <DetailTitleLine title={title} source={pr ? "pr" : "slug"} contentWidth={Math.max(1, width - PANE_CHROME_WIDTH)} />
         <WorkStatusRecordBlock
           record={work}
           contentWidth={Math.max(0, width - PANE_CHROME_WIDTH)}

@@ -61,7 +61,7 @@ export function RemovedBody({ entry, width, issueStatus, scrollRef }: {
       flexDirection="column"
     >
       <WtScrollbox scrollRef={scrollRef}>
-        <DetailTitleLine title={entry.title ?? entry.slug} />
+        <DetailTitleLine title={entry.title ?? entry.slug} contentWidth={Math.max(1, width - 5)} />
         {entry.work ? (
           <WorkStatusRecordBlock
             record={entry.work}

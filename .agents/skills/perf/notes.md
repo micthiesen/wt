@@ -27,6 +27,15 @@ despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Codex updater ownership and drain exits (2026-10-07).** move-files-to-r2
+  exited at 09:56:51 local after `turn/steer failed: Server is draining;
+  retry after reconnecting`. Native logs confirm repeated shutdown-signal
+  restarts, but not the signal sender. Six same-user update loops coexist;
+  three independently logged scheduled updates. Dotfiles c32b1d8 only fixed
+  daemon argv recognition. A singleton repair preserving the current daemon
+  and native TUI reconnect handling remain owed; no updaters were stopped.
+  Evidence: `/tmp/wt-daemon-followup-20261007/assessment.md`. Feature-list
+  responsiveness does not prove that a draining server admits new turns.
 - **Native Supabase cron startup remains broken.** CLI 2.119.0's native
   Postgres for set-your-status exposed only a Unix socket, while cron
   connected to localhost:5432. It accumulated 18,115 failed attempts and
@@ -52,6 +61,14 @@ despite roughly 900 MB RSS.
 
 Failure signatures (check these first):
 
+- **Same-version daemon feature mismatch can be a desktop runtime default.**
+  On 0.161.0, the shared daemon reported `api_key_model_discovery=false`
+  although the CLI default was true. The desktop rollout gate can set that
+  runtime value without a config-file change. Dotfiles adc455c explicitly
+  enables it in shared config, which takes precedence over host defaults.
+  Readback matched all four native compatibility features without restarting
+  PID 41633. A fresh TUI reached `/status: Local background server` in 1.877s;
+  this fixes the mismatch, not the separate drain exits or historical timeouts.
 - **Obsolete test caps silently allow all-core parallelism (dotfiles 9cb5756).** Vitest 5
   honors `VITEST_MAX_WORKERS`, not the old fork/thread env limits. Here
   it defaulted to 11 workers. set-your-status's 394.5s native typecheck

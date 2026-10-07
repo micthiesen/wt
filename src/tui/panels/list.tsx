@@ -144,17 +144,12 @@ type Props = {
 };
 
 /**
- * Row label text. Prefers the LLM-authored `brief` (caveman-talk noun
- * phrase) over the longer `title`, since the list column is tight —
- * after the badge cluster on a busy row the slug area can drop to ~20
- * chars. The issue-tracker prefix is stripped (`ENG-4926` → `4926`)
- * because it's constant for a given `id_pattern` and pure noise here;
- * the full ID is preserved in the details pane via the panel title.
- * First char is capitalized to match PR-title convention even when the
- * LLM emits lowercase.
+ * The same resolved title as details, with its original casing. Layout
+ * truncates it to the available cells. Issue IDs keep their numeric prefix
+ * in the list; the full ID remains available in details.
  */
 export function rowLabel(row: WorktreeRow): string {
-  const text = capitalizeFirst(row.brief ?? row.title);
+  const text = row.title;
   // Stacked rows used to drop the `<id>: ` prefix because a stack
   // section header carried the ID. Stacks render inside the human's
   // sections now and there is no such header, so dropping it just cost

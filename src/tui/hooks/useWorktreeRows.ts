@@ -175,20 +175,13 @@ export type WorktreeRow = {
   archived: boolean;
   /**
    * Resolved title with `manual > llm > pr > commit > slug` fallback. Both the
-   * list row label and the details-pane title bar read this so they
+   * list row label and the details-pane body read this so they
    * stay in sync. Always non-empty — `slugLabel` produces a prettified
    * fallback for any worktree, so consumers never need to check for
    * null.
    */
   title: string;
   titleSource: TitleSource;
-  /**
-   * Ultra-short LLM-authored label for the worktree list, where space
-   * after the issue ID and badge cluster is tight. Null when the AI
-   * source hasn't produced a summary yet; the list panel falls back to
-   * `title` in that case.
-   */
-  brief: string | null;
   /**
    * Effective section. A stack member's section is the synthetic stack
    * key (`STACK_SECTION_PREFIX + stackId`), which overrides any manual
@@ -891,7 +884,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
       const createdAt = stateSlugs[wt.slug]?.createdAt;
       const work = stateSlugs[wt.slug]?.work ?? null;
       const llmTitle = aiResults[i]?.title ?? null;
-      const llmBrief = stateSlugs[wt.slug]?.manualTitle ? null : aiResults[i]?.brief ?? null;
       const prTitle = pr?.title ?? null;
       const commitTitle = firstCommitResults[i] ?? null;
       const { title, source: titleSource } = resolveTitle(
@@ -930,7 +922,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
         prev.archived === archived &&
         prev.title === title &&
         prev.titleSource === titleSource &&
-        prev.brief === llmBrief &&
         prev.section === section &&
         stackInfoEq(prev.stack, stack) &&
         stackedOnEq(prev.stackedOn, stackedOn)
@@ -960,7 +951,6 @@ export function useWorktreeRows(): WorktreeRowsResult {
         archived,
         title,
         titleSource,
-        brief: llmBrief,
         section,
       };
       rowCache.current.set(wt.slug, next);

@@ -152,10 +152,13 @@ Stores have explicit compatibility policies:
   adopts stranded namespaces back, and is the pattern any future change to the
   id must ship with — a source fix cannot heal state an earlier build already
   filed elsewhere.
-- **`cache.sqlite`** (persisted queries — fully rebuildable): no
-  migrations, ever. `CACHE_BUSTER` in `src/state/client.ts` busts the
-  whole persisted cache on any shape change; busting is the *correct*
-  policy for this store, formalized.
+- **`cache.sqlite`** (persisted queries): `CACHE_BUSTER` in
+  `src/state/client.ts` advances on shape or meaning changes. Incompatible
+  entries are discarded. The v32-to-v33 title consolidation carries forward
+  valid AI summaries on read, dropping only the obsolete `brief` field:
+  manually requested names must survive without another model call. Both
+  hash-keyed and per-slug summaries keep their original title, description,
+  and expiry; unrelated entries still bust. There is no disk rewrite.
 - **`communication-holds.json` beside the state database** stores the latest
   resource event. Version 1 is parsed strictly; malformed or newer formats fail
   without rewriting. Release watermarks are not a disposable cache. Hold

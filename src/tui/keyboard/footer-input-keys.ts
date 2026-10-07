@@ -199,9 +199,9 @@ export function handleFooterInputKey(
     return;
   }
   // `k.sequence` is the literal bytes the terminal delivered — a
-  // single key for typing, or a paste blob. Filter to printable
-  // ASCII so control chars in the middle of a paste don't corrupt.
-  const text = printableText(k.sequence);
+  // single key for typing, or a paste blob. Human titles allow Unicode;
+  // other inputs retain their charset. Control characters never insert.
+  const text = printableText(k.sequence, footer.purpose === "worktree-title");
   if (text) setFooter({ ...footer, edit: insertText(footer.edit, text) });
   return;
 }

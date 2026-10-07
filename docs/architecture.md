@@ -8,7 +8,7 @@ The TUI is split into three layers; respect the boundaries:
 
 - **Sources** — `src/state/queries/` (per-source files behind the `src/state/queries.ts` barrel), `src/state/hooks.ts`, `src/tui/hooks/useWorktreeRows.ts`. They own fetching, batching, and caching via TanStack Query. Small fixed set (github, git, sst, dev-server, claude, issue-tracker-derived, ai); not user-pluggable.
 - **Rows** — `src/tui/rows/*.tsx`. Pure-presentational modules declaring `{id, label, sources, render, visible?}`. Multiple rows can read from the same source; the source still fetches once. `src/tui/rows/index.ts` is the registry; `[ui].rows` in the user config selects + orders them, and a row hides itself when its integration isn't configured.
-- **Driver** — `src/tui/panels/details.tsx`. Iterates the configured row list, computes the trailing staleness glyph, and renders inline errors verbatim once retries are exhausted. Also owns the pane-level chrome that isn't a row: the resolved title in the border bar (`paneTitle`, hand-truncated — opentui's native drawBox drops an over-wide border title instead of clipping it) and the AI description band below the row stack.
+- **Driver** — `src/tui/panels/details.tsx`. Iterates the configured row list, computes the trailing staleness glyph, and renders inline errors verbatim once retries are exhausted. Also owns the pane-level chrome that isn't a row: the stable slug in the border bar (`detailPaneTitle`, hand-truncated — opentui's native drawBox drops an over-wide border title instead of clipping it) and the AI description band below the row stack.
 
 The list panel (`src/tui/panels/list.tsx`) is deliberately **not** row-driven — different layout (one line of glyphs, no labels). Don't try to unify them.
 
@@ -22,7 +22,9 @@ restore. Wtstate itself is read from its canonical local database, never restore
 from the disposable query cache; naming waits for that first read. Generation
 replaces a pinned title only if its revision has not advanced, preserving later
 edits made during inventory, diff, or model work.
-Pinned titles suppress the AI brief used by the list so both panes agree.
+Both panes use that one resolved title with its original casing. The list
+truncates it to fit; details wraps the full title above the status banner.
+AI naming generates only a title and description, with no separate short label.
 Sorting breaks status/manual-order ties by stable slug (stack root for groups),
 never by title or filesystem enumeration.
 
@@ -628,5 +630,5 @@ when the caller is inside a nested repository.
   and saves the result under `["wt", slug, "manualSummary"]`. This persisted
   key keeps the name fixed across commits. The `! t` action and direct
   `T` key use the same refresh function in `state/hooks.ts`.
-- `src/core/ai.ts` — harness-backed naming pipeline returning `{title, brief, description}` from a line-prefixed response, with a lenient parser; `core/harness/completion.ts` owns the safe one-shot CLI contract.
+- `src/core/ai.ts` — harness-backed naming pipeline returning `{title, description}` from a line-prefixed response, with a lenient parser; `core/harness/completion.ts` owns the safe one-shot CLI contract.
 - `src/core/logger.ts` — see above.

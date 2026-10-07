@@ -89,10 +89,9 @@ describe("NAMING_RETRY_SCHEDULE", () => {
 describe("parseTitleDescription", () => {
   test("extracts the naming contract from harness output", () => {
     expect(parseTitleDescription(
-      "TITLE: Fix the thing\nBRIEF: Thing fix\nDESCRIPTION: Done.",
+      "TITLE: Fix the thing\nDESCRIPTION: Done.",
     )).toEqual({
       title: "Fix the thing",
-      brief: "Thing fix",
       description: "Done.",
     });
   });
@@ -101,5 +100,20 @@ describe("parseTitleDescription", () => {
     expect(parseTitleDescription(
       "startup notice\nTITLE: Fix the thing\nBRIEF: Thing fix\nDESCRIPTION: Done.",
     ).title).toBe("Fix the thing");
+  });
+
+  test("ignores legacy BRIEF output instead of giving the list a second title", () => {
+    expect(parseTitleDescription(
+      'TITLE: "Move files to R2."\nBRIEF: R2 files\nMoves uploads into object storage.',
+    )).toEqual({ title: "Move files to R2", description: "Moves uploads into object storage." });
+  });
+
+  test("missing title stays unknown rather than promoting the old brief", () => {
+    expect(parseTitleDescription("BRIEF: R2 files\nDESCRIPTION: Move uploads.")).toEqual({
+      title: null, description: "Move uploads.",
+    });
+    expect(parseTitleDescription("Unstructured description.")).toEqual({
+      title: null, description: "Unstructured description.",
+    });
   });
 });

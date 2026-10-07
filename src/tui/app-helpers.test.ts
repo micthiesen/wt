@@ -80,7 +80,6 @@ function makeRow(overrides: {
     archived,
     title: "s",
     titleSource: "slug",
-    brief: null,
     section: null,
     sectionIsStack: false,
     work: work ?? null,

@@ -26,7 +26,7 @@ function row(slug: string, overrides: Partial<WorktreeRow> = {}): WorktreeRow {
     },
     status: { kind: StatusKind.Clean, label: "clean" },
     landedOn: null, stackedOn: null, stack: null, githubIssue: null, issueId: null,
-    work: null, archived: false, title: slug, titleSource: "llm", brief: null, section: null,
+    work: null, archived: false, title: slug, titleSource: "llm", section: null,
     ...overrides,
   };
 }

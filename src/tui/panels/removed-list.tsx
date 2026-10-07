@@ -13,7 +13,7 @@ import type { ScrollBoxRenderable } from "@opentui/core";
 import { config } from "../../core/config.ts";
 import { isTrackerIssueId, resolveIssueId } from "../../core/issue-tracker.ts";
 import type { RemovedWorktree } from "../../core/wtstate.ts";
-import { capitalizeFirst, slugLabel } from "../../core/stage.ts";
+import { slugLabel } from "../../core/stage.ts";
 import { issueStatusBadge, workStatusBadge } from "../badges.ts";
 import { dayBucket, dayLabel } from "../day-headers.ts";
 import { NF } from "../icons.ts";
@@ -68,7 +68,7 @@ export function removedPrGlyph(entry: RemovedWorktree): { glyph: string; fg: str
  */
 export function removedRowLabel(entry: RemovedWorktree): string {
   const { id, rest } = slugLabel(entry.slug);
-  const text = capitalizeFirst(entry.title ?? (rest || entry.slug));
+  const text = entry.title ?? (rest || entry.slug);
   const numId = id ? id.replace(/^[A-Z]+-/, "") : null;
   return numId ? `${numId}: ${text}` : text;
 }

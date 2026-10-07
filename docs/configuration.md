@@ -541,7 +541,7 @@ hidden = ["opencode"]
 
 ## `[naming]` — optional generated worktree names
 
-Omit to disable generated title/brief/description text. Naming invokes the
+Omit to disable generated title and description text. Naming invokes the
 configured coding-agent harness's non-interactive CLI using its existing
 authentication; wt does not require or call a separate model API. Runs are
 serialized, short-lived, and read-only. Codex runs ephemerally without project
@@ -574,8 +574,8 @@ worktree with AI** (`t`). The direct `T` key does the same operation.
 The `t` key opens the manual title editor. A saved manual title disables
 automatic naming for that worktree. Explicit AI generation can replace it.
 The requested name stays fixed until you request another name, including
-after new commits and TUI restarts. Naming changes the displayed title,
-brief, and description. It does not change the Git branch or directory name.
+after new commits and TUI restarts. Naming changes the displayed title and description. The list and details
+use the same title, truncated in the list and wrapped in details. It does not change the Git branch or directory name.
 A worktree needs committed changes for AI naming.
 
 ## `[browser]` — legacy settings

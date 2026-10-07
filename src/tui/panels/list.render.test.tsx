@@ -6,7 +6,7 @@ import { testRender } from "@opentui/react/test-utils";
 import { StatusKind } from "../../core/types.ts";
 import type { FieldState, WorktreeRow } from "../hooks/useWorktreeRows.ts";
 import { localWorktreeModel } from "../worktree-model.ts";
-import { WorktreeList, type ListActiveItem } from "./list.tsx";
+import { rowLabel, WorktreeList, type ListActiveItem } from "./list.tsx";
 
 function ListFixture({ items = [] }: { items?: ListActiveItem[] }) {
   const { width } = useTerminalDimensions();
@@ -40,11 +40,29 @@ function row(slug: string, section: string): WorktreeRow {
     },
     status: { kind: StatusKind.Clean, label: "clean" },
     landedOn: null, work: null, githubIssue: null, issueId: null,
-    archived: false, titleSource: "slug", brief: null, section,
+    archived: false, titleSource: "slug", section,
     title: "Long implementation name for a task with 日本語 and emoji 👩🏽‍💻 continued to overflow",
     stackedOn: null, stack: null,
   };
 }
+
+test("list uses the full canonical title with exact casing, ignoring any old brief", async () => {
+  const item = { ...row("move-files-to-r2", ""), title: "iOS uploads move to R2 with previews intact", brief: "Old short label" };
+  expect(rowLabel(item)).toBe(item.title);
+  const model = localWorktreeModel(item);
+  const items: ListActiveItem[] = [{ kind: "wt", row: item, model, target: model.target }];
+  const setup = await testRender(<ListFixture items={items} />, { width: 80, height: 10 });
+  try {
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain(item.title);
+    act(() => setup.resize(30, 10));
+    await setup.flush();
+    const narrow = setup.captureCharFrame();
+    expect(narrow).toContain("iOS uploads");
+    expect(narrow).toContain("...");
+    expect(narrow).not.toContain("Old short label");
+  } finally { act(() => setup.renderer.destroy()); }
+});
 
 test("empty worktree hint wraps in reading order at narrow widths", async () => {
   const setup = await testRender(<ListFixture />, { width: 45, height: 16 });

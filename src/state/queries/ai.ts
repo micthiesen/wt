@@ -147,16 +147,16 @@ export const aiSummaryQuery = (
   });
 
 
-export type StackMember = { branch: string; brief: string };
+export type StackMember = { branch: string; title: string };
 
 /**
  * Stable signature for a stack: a hash over the sorted *branch names*
- * only. Briefs are passed to the LLM as flavor but deliberately don't
+ * only. Titles are passed to the LLM as context but deliberately don't
  * participate in the cache key, so:
  *
- *   - Cold start (briefs not loaded yet) → signature stable; restored
+ *   - Cold start (titles not loaded yet) → signature stable; restored
  *     persisted title appears immediately without a wasted refetch.
- *   - A member's commits change (brief regenerates) → signature
+ *   - A member's commits change (title regenerates) → signature
  *     unchanged; title sticks. Stack themes rarely pivot per-commit,
  *     so this is the right default. A manual regen knob lives below
  *     for the "title is wrong, redo it" case.
@@ -184,7 +184,7 @@ export function buildStackSignature(
 
 /**
  * AI-named stack section title. Hash-keyed on the member-branch
- * signature (see `buildStackSignature` for why briefs are excluded
+ * signature (see `buildStackSignature` for why titles are excluded
  * from the key) so two stacks with the same membership share one
  * cache entry. Member additions / removals cut a fresh entry; commit
  * churn within members does not.

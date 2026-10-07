@@ -58,7 +58,11 @@ test("long removed notes scroll without overprinting and retain restore hints", 
       const first = setup.captureCharFrame();
       const lines = first.split("\n");
       expect(lines[2]).toContain("Internat");
-      expect(lines[3]).toContain("● unver");
+      const statusLine = lines.findIndex((line) => line.includes("● unver"));
+      expect(statusLine).toBeGreaterThan(2);
+      // Exclude pane padding and the scroll gutter as well as both borders.
+      const title = lines.slice(2, statusLine).map((line) => line.slice(2, -3).trim()).join(" ");
+      expect(title).toContain(removed.title!);
       expect(lines.some((line) => line.includes("│ Saved note"))).toBe(true);
       expect(lines[12]).toContain("⏎ restore");
       expect(lines[14]).toStartWith("└");

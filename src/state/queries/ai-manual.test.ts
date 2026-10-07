@@ -24,7 +24,7 @@ auto_rename = ${automatic}
       import { aiSummaryQuery } from ${JSON.stringify(source)};
       const client = new QueryClient();
       let calls = 0;
-      const summary = { title: "Fixed name", brief: "Fixed name", description: "Fixed description." };
+      const summary = { title: "Fixed name", description: "Fixed description." };
       const first = aiSummaryQuery("selected", { hash: "first", prompt: "first diff" });
       const observer = new QueryObserver(client, { ...first, queryFn: async () => { calls++; return summary; } });
       const unsubscribe = observer.subscribe(() => {});

@@ -72,7 +72,6 @@ function makeRow(
     archived: false,
     title: slug,
     titleSource: "slug",
-    brief: null,
     section: null,
     sectionIsStack: false,
     ...overrides,

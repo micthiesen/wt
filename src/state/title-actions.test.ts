@@ -9,7 +9,7 @@ const context: DiffContext = {
   hash: "title-test", prompt: "a diff", filesTotal: 1,
   counts: { full: 1, tight: 0, hunks: 0, dropped: 0 },
 };
-const summary: AiSummary = { title: "Generated title", brief: "brief", description: "description" };
+const summary: AiSummary = { title: "Generated title", description: "description" };
 
 describe("explicit title generation", () => {
   test("reads fresh context and waits for generation before saving", async () => {

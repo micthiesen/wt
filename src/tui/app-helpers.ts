@@ -281,11 +281,11 @@ export function isBareShiftedKey(
 }
 
 /**
- * Filter a key sequence down to printable ASCII so single keypresses
+ * Filter a key sequence down to printable text so single keypresses
  * and pasted blobs both append cleanly, while control chars (escape,
  * backspace, embedded newlines from multi-line pastes) drop out.
  */
-export function printableText(sequence: string | undefined): string {
+export function printableText(sequence: string | undefined, unicode = false): string {
   if (!sequence) return "";
   // Escape-sequence keypresses (function/arrow/nav keys — F10 arrives as
   // "\x1b[21~", arrows as "\x1b[A") lead with ESC. Stripping control chars
@@ -293,6 +293,10 @@ export function printableText(sequence: string | undefined): string {
   // bail on a leading ESC outright — real typed text and pastes never
   // start with one.
   if (sequence.charCodeAt(0) === 0x1b) return "";
+  // Human titles accept Unicode; identifier inputs retain their ASCII policy.
+  // Keep joiners/variation selectors used by emoji, but never terminal control
+  // characters, directional formatting, unpaired surrogates, or line breaks.
+  if (unicode) return sequence.replace(/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}\p{Bidi_Control}]/gu, "");
   let out = "";
   for (let i = 0; i < sequence.length; i++) {
     const ch = sequence[i]!;

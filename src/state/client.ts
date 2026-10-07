@@ -1,5 +1,5 @@
 import { hashKey, notifyManager, QueryClient } from "@tanstack/react-query";
-import { experimental_createQueryPersister } from "@tanstack/query-persist-client-core";
+import { experimental_createQueryPersister, type PersistedQuery } from "@tanstack/query-persist-client-core";
 
 import { config } from "../core/config.ts";
 
@@ -123,9 +123,42 @@ export const CACHE_DB = config.paths.cacheDb;
 // v32: `TmuxSessionsData` gained `harnessSessionIds`, the exact resumed UUID
 // stamped on a live single-slot tmux session. Restoring v31 would briefly
 // revive the file-recency guess this field replaces.
-const CACHE_BUSTER = "v32";
+// v33: AiSummary uses one title and no separate brief. Preserve valid v32
+// summaries at deserialization: manual-only naming cannot regenerate them
+// automatically. Other query families follow ordinary cache busting.
+const CACHE_BUSTER = "v33";
 const STORAGE_PREFIX = "wt";
 const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+function deserializeQuery(serialized: string): PersistedQuery {
+  const persisted: PersistedQuery = JSON.parse(serialized);
+  if (!persisted || !persisted.state || !Array.isArray(persisted.queryKey)) {
+    throw new Error("Invalid persisted query");
+  }
+  if (persisted.buster !== "v32") return persisted;
+
+  const key = persisted.queryKey;
+  const summaryKey = typeof key[1] === "string" && key[1].length > 0 && (
+    (key.length === 2 && key[0] === "aiSummary") ||
+    (key.length === 3 && key[0] === "wt" && key[2] === "manualSummary")
+  );
+  const data = persisted.state.data;
+  if (!summaryKey || persisted.queryHash !== hashKey(key) ||
+      !Number.isFinite(persisted.state.dataUpdatedAt) || persisted.state.dataUpdatedAt <= 0 ||
+      !data || typeof data !== "object" ||
+      !("title" in data) || !(data.title === null || typeof data.title === "string") ||
+      !("description" in data) || typeof data.description !== "string" ||
+      !("brief" in data) || typeof data.brief !== "string") {
+    return persisted;
+  }
+  // Preserve identity and all timestamps. The persister still applies maxAge;
+  // migration must not extend a cached name's lifetime or invoke its model.
+  return {
+    ...persisted,
+    buster: "v33",
+    state: { ...persisted.state, data: { title: data.title, description: data.description } },
+  };
+}
 
 /**
  * Build a QueryClient with TUI-friendly defaults and wire up the
@@ -152,6 +185,7 @@ export type WtQueryClient = {
 export function createWtQueryClient(storage: AsyncStorageDb = createSqliteAsyncStorage(CACHE_DB)): WtQueryClient {
   const persister = experimental_createQueryPersister<string>({
     storage,
+    deserialize: deserializeQuery,
     buster: CACHE_BUSTER,
     maxAge: MAX_CACHE_AGE_MS,
     prefix: STORAGE_PREFIX,
