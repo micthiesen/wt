@@ -64,7 +64,12 @@ worktree_root = "~/Code/your-repo-wt"
 prefix = "yourname"
 ```
 
-The source of truth for the schema is [`src/core/config.ts`](../src/core/config.ts).
+The Rust configuration API lives in [`crates/wt-config`](../crates/wt-config/).
+`Config::load` resolves the user config and repository `.wt.toml` using the
+discovery, merging and defaults described here. Valid configuration is covered
+by compatibility fixtures. Malformed optional values now produce validation
+errors instead of silently falling back to a default. The TypeScript loader
+remains the behavior reference during the rewrite.
 
 ## `[instance]`
 
@@ -96,6 +101,7 @@ version warning so development snapshots can be synchronized deliberately.
 | `cache_db` | no | repository with a `.wt.toml`: `~/.cache/wt/<repo-id>/cache.sqlite`; otherwise `~/.cache/wt/cache.sqlite` | Disposable TanStack Query cache. Its directory (the **cache root**) also anchors rebuildable/runtime files: session registries, automation delivery files, manager reports, logs, locks, generated `tmux.conf`, message sockets, and shims. Durable section/status/archive state is not stored here. |
 | `state_db` | no | repository with a `.wt.toml`: `~/.local/state/wt/wt.sqlite`; user-config-only compatibility mode: `<cache root>/wt.sqlite` | Authoritative SQLite state shared by local repositories and partitioned by `repo_id`. Normally leave this unset. The canonical repository path stored with each id is a collision guard. |
 | `wezterm_cli` | no | macOS: `/Applications/WezTerm.app/Contents/MacOS/wezterm`; elsewhere: `wezterm` from `PATH` | WezTerm CLI executable used to set the tab title to `wt` when `WEZTERM_PANE` is present. Supports `~` expansion. |
+| `wt_source` | no | absent | Optional wt source checkout for the `,` developer session and `<` palette. Supports `~`; the slot is hidden when unset or missing. Native installs do not require a checkout. |
 | `dotfiles` | no | `~/.dotfiles` | Repo behind the general-purpose config session (`/` and its `\` palette). **The slot hides itself entirely when the directory doesn't exist** — no footer button, and `/` / `\` fall through — so a machine without a dotfiles repo isn't offered a key that can only cold-start a harness in a missing directory. |
 
 ### Repository identity is a property of the repository, not of your shell

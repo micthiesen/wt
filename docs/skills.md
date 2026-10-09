@@ -8,6 +8,10 @@ symlink or rulesync topology your dotfiles use. The point is that you never
 hand-maintain wt-related agent config: updates ship with `git pull` in the
 wt checkout and offer themselves on the next launch.
 
+The native Rust binary embeds these files at compile time and does not need a
+source checkout at runtime. `wt skills` tracks installed hashes and saved
+template answers in `~/.cache/wt/skills.json`.
+
 ## What gets distributed
 
 | unit | what it is |
@@ -170,8 +174,10 @@ wt skills sync [<name>...]   # interactive install/update (what startup runs)
 wt skills sync --yes         # accept all missing/outdated; never touches modified
 wt skills sync <n> --force   # non-interactive: also overwrite a modified copy
                              # (interactive runs always ask per modified copy)
-wt skills diff <name>        # what a sync would change
+wt skills diff <name>        # old and bundled content for each target
 wt skills reset              # forget remembered answers + declines
+wt skills reset --answers    # forget only template answers
+wt skills reset --declines   # offer declined versions again
 ```
 
 Naming a unit explicitly (`wt skills sync start`) overrides a remembered

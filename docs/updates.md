@@ -1,5 +1,13 @@
 # Updates, rollback & compatibility
 
+Native installs use GitHub Releases and immutable per-build directories; they
+do not fetch or modify a source checkout. The stable launcher path remains
+`~/.local/share/wt/bin/wt` unless the installer supplies `WT_INSTALL_ROOT`.
+Release packaging and the CI manifest contract are described in
+[the distribution design](rust-distribution-design.md). The earlier source
+updater remains only as a behavior reference during the Rust rewrite; see
+[the rewrite record](rust-rewrite.md).
+
 SSH worker commands use separate source packages prepared by the controller
 (see [configuration.md](configuration.md#remote--optional-ssh-worktree-host)).
 These packages have no Git metadata. Their `.wt-runtime.json` records the
@@ -7,131 +15,71 @@ controller build for `wt version` and the worker handshake. Source-clone
 updates and rollback still use Git. Automatic runtime setup does not replace
 the worker's source clone or remove packages used by existing sessions.
 
-wt has no release process: `main` is the release channel, and installs
-are git clones that fast-forward (see [cli.md](cli.md#wt-update-log---check---head)
-for command surface). What makes that safe is not a version scheme but
-four layers around the pull — prevent, detect, recover, evolve. This
-page is the semantics reference for those layers; the enforcement rules
-for people (and agents) changing wt live in `AGENTS.md`.
+Stable follows the latest non-prerelease GitHub release; preview follows the
+latest `preview-<fullsha>` prerelease. `wt update --channel stable|preview`
+persists an explicit channel choice, while the default uses the saved channel.
+`wt update --check` reads metadata without downloading. For explicit release
+artifact testing, `wt update --release <tag>` selects that exact GitHub release,
+including a `rust-test-*` tag; this does not change automatic channel discovery.
+The legacy `--head` option is rejected because native updates only accept
+CI-published manifests.
+`wt update log` and `wt rollback [release-or-sha]` use the same install state.
 
 ## The moving parts
 
-- **Version** = the source clone's git short hash (`wt version`, the
-  help overlay title). `-dirty` marks local modifications.
-- **Memory** = `~/.cache/wt/update.json`, machine-global (one source
-  clone per machine, shared by every instance including sealed ones):
-  the daily-check stamp, the per-version decline, the update/rollback
-  **journal**, the **boot sentinel**, and the **last good boot** sha.
-- Everything under `src/core/update/` (and the `wt rollback` command
-  path) is deliberately **config-free** — no imports of `core/config.ts`,
-  `proc`, `locks`, or `logger` at module load (its logging goes to a
-  fixed `~/.cache/wt/logs/update.log` instead). The crash-rollback
-  offer must work when the config loader is exactly what the broken
-  update can't run — and so must the commands: main.ts dispatches
-  `update` / `rollback` / `version` AROUND `cli/index.ts`, whose static
-  command imports would otherwise pull the fail-fast loader in first.
-- Update/rollback git mutations on the shared clone are serialized by a
-  config-free mkdir lock (`~/.cache/wt/update-git.lock`, stale-holder
-  detection by pid); a second concurrent update/rollback gets "another
-  update is in progress" instead of interleaved resets.
+- **Version identity** keeps release tag, full build SHA and target separate.
+  Each identity has an immutable directory under `versions/`; state records
+  current, last-good and pending boot identities.
+- **Memory** is `<install-root>/state.json`: saved channel, daily check time,
+  declined build, boot transition and bounded operation history. Unknown fields
+  survive read/write so newer launchers retain policy state.
+- Update and rollback commands run before repository config and database load.
+  They remain usable when repository configuration is broken and never need a
+  source checkout.
+- OS file locks serialize state transitions across launcher, app, update and
+  rollback processes. Downloads and extraction happen outside the short state
+  lock; activation uses one atomic state-file replacement.
 
-## Prevent: the CI gate and the boot probe
+## Prevent: release manifests and the boot probe
 
-**Green-main gate.** The updater doesn't target origin's raw tip: it
-walks the incoming commits newest-first and targets the newest one
-whose CI check run (names `ci` / `typecheck`, see
-`.github/workflows/ci.yml` and `GATE_CHECK_NAMES` in
-`core/update/green.ts`) concluded green. Red and still-running commits
-are held back; commits with *no* matching check runs (pre-CI history),
-API failures, rate limits, and non-GitHub origins all **fail open** —
-the gate exists to skip known-bad pushes, never to strand anyone.
-Unrelated workflows (e.g. the Discord digest) can't veto an update
-because matching is by check-run name. When the pick rests on an
-"unknown" verdict the CLI says so ("CI status couldn't be verified —
-the gate fails open") rather than letting a network problem impersonate
-a green check. `wt update --head` bypasses the gate explicitly.
+Each stable or preview release must include `wt-release.json`. The client
+matches the manifest's full build SHA, archive name, size and digest against
+the GitHub release, then checks the archive's `wt-build-info.json` before using
+its two executables. Metadata and downloads have strict size limits; extraction
+rejects links, traversal, extra files and unexpected entry types. Preview only
+offers `preview-<fullsha>` tags. The separate `rust-test-*` workflow tags are
+never candidates for automatic preview updates. They can only be selected by
+an intentional `wt update --release rust-test-…` invocation.
 
-The CI job runs Effect language-service diagnostics, TypeScript
-typechecking, the Bun production build, and the full test suite before its
-single `ci` check can turn green.
+The stable launcher runs `--_boot-probe` without user arguments and verifies
+the candidate's compiled build and target before dispatching the real command.
+A failed pending probe selects the fallback before the command has started.
+After application initialization succeeds, wt confirms the exact release and
+attempt token. Explicit early startup failure restores its fallback. Once a real
+command starts, its exit status never triggers rollback or argument replay.
 
-**Boot probe.** After the fast-forward (and a `bun install` when the
-dependency manifest changed), the updater boot-probes the checkout in a
-child process: `wt version` (the CLI chain) and an import of the full
-TUI module tree — which loads `core/config.ts` and therefore also
-catches "new code rejects the user's existing config", the likeliest
-hot-update break. A probe failure reverts code *and* deps, declines
-that version (so the daily check skips it until origin moves), and
-leaves the user on what they had. A broken push therefore usually
-costs its author a red X, not a user a broken install.
+The startup check runs at most once per day. `[update] startup_check = false`
+and `WT_UPDATE=off` disable it. A declined build stays suppressed until a newer
+build appears; explicit `wt update` is the deliberate reapply path.
 
-Every interactive startup reconciles an installed events daemon against the
-freshly loaded wt build. The daemon records its build in `state.json`; a live
-daemon with the same build is untouched, while a stopped, older, or unstamped
-daemon is restarted through the newly checked-out `bin/wt events restart`.
-This happens after the update process re-execs, rather than only in the process
-that applied the update: that old process may itself predate the restart hook,
-and the source clone may also have moved outside the startup updater. Failure
-is visible but does not strand the user before the TUI; `wt events restart` is
-the manual retry. Restart readiness is established by the new process state;
-its warm-up GitHub fetch can finish a moment later, so the TUI refuses the
-leftover old snapshot without reporting the already-current daemon as stale.
+## Detect: the boot attempt
 
-**What the gate does not do is tell anyone it is holding.** A red `main`
-stops shipping silently: users stay on their last green version, which is
-the correct behaviour and produces no message anywhere. `main` was red from
-2026-08-24 to 08-26 and the only visible symptom was the Discord #updates
-channel going quiet, because that digest is gated on the same green run
-(see [discord.md](discord.md)). When updates seem to have stopped, check
-whether `main` is green before looking at `core/update/`.
-
-**Lazy command dispatch.** For the pushes that do get through, the CLI
-limits how far one broken module reaches: `cli/index.ts` imports each
-subcommand's module graph on demand, so `wt status` doesn't load the
-message transport and survives a break in it. It matters most for the
-commands agents depend on to report trouble — a fleet that can't run
-`wt status` or `wt manager report` can't tell anyone the update went
-bad. `scripts/broken-module-check.sh` asserts the containment; see
-[architecture.md](architecture.md#module-layout-conventions).
-
-## Detect: the boot sentinel
-
-Starting the TUI writes `booting: {sha, at}` to the memory; the sha is
-promoted to `lastGoodSha` (and the sentinel cleared) after 15 s alive
-or a clean quit, whichever comes first. The promotion is an Effect fiber
-scoped to the TUI lifetime, so failure interrupts it before the crash
-handler can wait at the rollback prompt. An update additionally writes
-an `applying: {fromSha, toSha}` marker before its merge moves HEAD —
-if the process dies mid-update (the deps/probe window runs seconds to
-minutes), the offers treat the marker like a journal entry, so even an
-interrupted update leaves a rollback target. Two detectors hang off
-the sentinel:
-
-- **Crash offer** — the top-level catch in `main.ts`: if the process
-  dies while HEAD is a journaled update that never booted good, offer
-  a rollback (default **yes** — the crash is proven).
-- **Stale-sentinel offer** — pre-TUI at the next launch: a leftover
-  sentinel for the current HEAD means the previous start never
-  finished (native crash, kill). Weaker evidence, so the offer
-  defaults to **no**, and a subsequent healthy boot clears the
-  suspicion.
-
-Both offers (and sentinel writes) are disabled by `WT_UPDATE=off`, so
-probe-harness instances can't leave false crash evidence.
+The launcher records a pending build and fallback before dispatch. Confirmation
+clears that marker and promotes the candidate to last-good. If a process dies
+before confirming, the next launcher probe can reject the candidate without
+loading repository config or replaying user arguments. Confirmation, explicit
+startup failure and launcher rejection all compare release identity and the
+unique attempt token under the durable state lock.
 
 ## Recover: rollback
 
-`wt rollback [<ref>]` resets the clone to the last version that booted
-healthy (or an explicit ref), syncs deps across the jump, journals the
-move, and — the piece that makes it stick — records the abandoned sha
-as **declined**, so the startup check won't re-offer the known-bad
-version. The moment origin moves past it (presumably the fix), offers
-resume. `wt update` explicitly can always re-apply anything. Rollback
-refuses dirty/ahead clones for the same reason update does: local
-divergence means a human is driving.
-
-`wt update log` prints the journal (updates and rollbacks, newest
-first) plus current / last-good / skipped shas.
+`wt rollback [<release-or-sha>]` selects the pending fallback, last-good or
+previous confirmed identity from local history. It probes the chosen installed
+binary before activation, then records a pending rollback and declines the
+build being left behind in one state write. A bad candidate leaves the active
+version unchanged. The stable launcher still probes again on the next start.
+`wt update log` prints local update and rollback history and current, last-good
+and declined build identities.
 
 ## Evolve: data compatibility across hot updates
 

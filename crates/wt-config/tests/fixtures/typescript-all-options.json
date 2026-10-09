@@ -1,0 +1,241 @@
+{
+  "instance": {
+    "role": "worker"
+  },
+  "harness": {
+    "primary": "codex",
+    "hidden": [
+      "claude"
+    ]
+  },
+  "repoId": "tmp-wt-config-fixture-main",
+  "repoPath": "/tmp/wt-config-fixture/main",
+  "paths": {
+    "mainClone": "/tmp/wt-config-fixture/main",
+    "worktreeRoot": "/tmp/wt-config-fixture/worktrees",
+    "logDir": "/tmp/wt-config-fixture/logs",
+    "appLogDir": "/tmp/wt-config-fixture/logs/app",
+    "lockDir": "/tmp/wt-config-fixture/locks",
+    "cacheDb": "/tmp/wt-config-fixture/cache/cache.sqlite",
+    "stateDb": "/tmp/wt-config-fixture/state.sqlite",
+    "cacheRoot": "/tmp/wt-config-fixture/cache",
+    "weztermCli": "/tmp/bin/wezterm",
+    "dotfiles": "/tmp/wt-config-fixture/dotfiles"
+  },
+  "tmux": {
+    "socket": "fixture-socket",
+    "terminalConfig": "/tmp/tmux.conf"
+  },
+  "branch": {
+    "prefix": "eng",
+    "base": "trunk",
+    "idPattern": "^eng-(\\d+)$",
+    "slugMaxLen": 64,
+    "keepFresh": [
+      "release",
+      "staging"
+    ],
+    "production": "release"
+  },
+  "stage": {
+    "prefix": "eng-stage-",
+    "defaultPersonal": "eng",
+    "domain": "example.test"
+  },
+  "lifecycle": {
+    "envFilesToCopy": [
+      ".env",
+      ".env.local"
+    ],
+    "copyGlobs": [
+      "config/*.json"
+    ],
+    "installCommand": "pnpm install",
+    "destroyCommand": "./scripts/teardown"
+  },
+  "backend": {
+    "kind": "rift"
+  },
+  "sst": {
+    "stateBucket": "fixture-state",
+    "statePrefix": "apps/",
+    "awsProfile": "fixture",
+    "autoRegenPaths": [
+      "sst-env.d.ts",
+      "types.d.ts"
+    ]
+  },
+  "issueTracker": {
+    "urlTemplate": "https://linear.app/acme/issue/{id}",
+    "prefix": "acme",
+    "readCommand": [
+      "/tmp/wt-config-fixture/home/bin/read-issue",
+      "{id}"
+    ],
+    "statusCommand": [
+      "/tmp/wt-config-fixture/home/bin/read-status",
+      "{ids}"
+    ],
+    "statusStyles": {
+      "Doing": {
+        "icon": "progress",
+        "color": "#123abc"
+      }
+    }
+  },
+  "reviewBot": {
+    "name": "Review Bot",
+    "login": "reviewer",
+    "checkContexts": [
+      "Review/*",
+      "AI Review"
+    ],
+    "unresolvedVia": "checklist",
+    "summaryMarkers": [
+      "## Full review",
+      "## Delta findings"
+    ],
+    "pendingMarker": "## Review started",
+    "rerunCommand": "/review-again"
+  },
+  "devServer": {
+    "command": "pnpm dev -- --port {{port}}",
+    "portBase": 8200,
+    "portRange": 20,
+    "urlTemplate": "http://localhost:{{port}}/app",
+    "maxConcurrent": 3,
+    "stopCommand": "docker compose down",
+    "resetCommand": "docker compose down -v",
+    "healthCommand": "./scripts/health"
+  },
+  "remote": {
+    "host": "builder",
+    "label": "Remote builder",
+    "wtPath": "/opt/wt/bin/wt"
+  },
+  "naming": {
+    "autoRename": false,
+    "harness": "opencode",
+    "models": {
+      "claude": "model-a",
+      "codex": "model-b",
+      "opencode": "model-c"
+    },
+    "reasoningEffort": "high",
+    "maxInputTokens": 12000,
+    "timeoutMs": 60000
+  },
+  "diff": {
+    "command": "diff-tool {{base}}"
+  },
+  "editor": {
+    "command": "code {{path}}"
+  },
+  "browser": {
+    "chromeProfile": "fixture-profile"
+  },
+  "github": {
+    "reviewers": false,
+    "ignoredReviewRepositories": [
+      "acme/legacy"
+    ],
+    "ignoredChecks": [
+      "advisory"
+    ],
+    "defaultReviewer": "acme/reviewer",
+    "prTarget": "linear",
+    "events": {
+      "port": 9123,
+      "host": "0.0.0.0",
+      "secret": "fixture-secret",
+      "secretFile": "/tmp/github-secret",
+      "backstopPollMs": 30000
+    }
+  },
+  "actions": [
+    {
+      "kind": "claude",
+      "id": "review",
+      "name": "Review branch",
+      "prompt": "Review {{branch}}",
+      "target": "session",
+      "affects": [
+        "git",
+        "github"
+      ],
+      "requires": [
+        "pr.ready"
+      ],
+      "argPrompt": {
+        "label": "Focus area"
+      },
+      "labelExtract": "^([A-Z]+-\\d+)",
+      "key": "r",
+      "group": "Review",
+      "external": true
+    },
+    {
+      "kind": "shell",
+      "id": "set-status",
+      "name": "Set status",
+      "shell": "wt issue status {{issue}}",
+      "issueStatus": "Doing",
+      "affects": [
+        "issue"
+      ],
+      "requires": [],
+      "argPrompt": null,
+      "labelExtract": null
+    }
+  ],
+  "automations": [
+    {
+      "id": "review-failed",
+      "on": "pr.checks.failed",
+      "run": "review",
+      "busy": "skip",
+      "cooldownMinutes": 15,
+      "afterDays": 2,
+      "settleSeconds": 30,
+      "branch": null
+    },
+    {
+      "id": "advanced",
+      "on": "branch.advanced",
+      "run": "builtin:notify",
+      "busy": "queue",
+      "cooldownMinutes": null,
+      "afterDays": 2,
+      "settleSeconds": 10,
+      "branch": "release"
+    }
+  ],
+  "ui": {
+    "rows": [
+      "issue",
+      "branch",
+      "git"
+    ],
+    "hiddenBadges": [
+      "dirty",
+      "session"
+    ],
+    "sort": "manual",
+    "activityPane": "full_width",
+    "hideTerminalApps": [
+      "Terminal"
+    ],
+    "actionGroupsLast": [
+      "Housekeeping"
+    ]
+  },
+  "skills": {
+    "startupCheck": false
+  },
+  "manager": {
+    "wtFeedback": true
+  },
+  "update": {
+    "startupCheck": false
+  }
+}

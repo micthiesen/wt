@@ -1,0 +1,22 @@
+{
+  "input": {
+    "state": "ready",
+    "note": "safe",
+    "risk": "medium",
+    "at": "2026-08-08T12:00:00.000Z",
+    "sha": "abc123",
+    "by": "agent-a",
+    "blockedOn": "release window",
+    "verifyAfterMerge": "deploy to staging"
+  },
+  "expected": {
+    "state": "ready",
+    "at": "2026-08-08T12:00:00.000Z",
+    "note": "safe",
+    "risk": "medium",
+    "blockedOn": "release window",
+    "verifyAfterMerge": "deploy to staging",
+    "sha": "abc123",
+    "by": "agent-a"
+  }
+}

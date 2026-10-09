@@ -1,0 +1,24 @@
+[package]
+name = "wt-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+uuid.workspace = true
+wt-core.workspace = true
+wt-platform.workspace = true
+wt-tmux.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

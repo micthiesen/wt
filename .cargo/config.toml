@@ -1,0 +1,7 @@
+[build]
+# Keep compile bursts bounded on the developer machine; override with
+# `CARGO_BUILD_JOBS` when a larger build budget is intentional.
+jobs = 4
+
+[alias]
+xtask = "run --package xtask --"

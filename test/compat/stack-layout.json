@@ -1,0 +1,38 @@
+{
+  "input": [
+    { "slug": "root", "branch": "A" },
+    { "slug": "first", "branch": "B1", "baseBranch": "A" },
+    { "slug": "second", "branch": "B2", "baseBranch": "A" }
+  ],
+  "expected": [
+    {
+      "stackId": "A",
+      "nodes": [
+        {
+          "slug": "root",
+          "branch": "A",
+          "depth": 0,
+          "lane": 0,
+          "parentBranch": null,
+          "index": 0
+        },
+        {
+          "slug": "first",
+          "branch": "B1",
+          "depth": 1,
+          "lane": 0,
+          "parentBranch": "A",
+          "index": 1
+        },
+        {
+          "slug": "second",
+          "branch": "B2",
+          "depth": 1,
+          "lane": 1,
+          "parentBranch": "A",
+          "index": 2
+        }
+      ]
+    }
+  ]
+}

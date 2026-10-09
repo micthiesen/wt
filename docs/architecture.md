@@ -1,5 +1,12 @@
 # Architecture
 
+The `rusty` branch is replacing the implementation with the native workspace
+under `crates/`. Its acceptance criteria and current verification evidence live
+in [the rewrite record](rust-rewrite.md), with feature coverage in
+[the migration inventory](rust-rewrite-inventory.md). The sections below still
+describe the TypeScript behavior reference until each Rust domain is verified;
+they are not evidence that the new implementation has reached parity.
+
 Internals map for contributors and coding agents. Bun + React + [OpenTUI](https://github.com/sst/opentui) on top of TanStack Query. The companion rules file for agents is [`AGENTS.md`](../AGENTS.md); this page is the *map*, that one is the *rules*.
 
 ## The three layers

@@ -1,0 +1,163 @@
+[instance]
+role = "worker"
+
+[paths]
+main_clone = "/tmp/wt-config-fixture/main"
+worktree_root = "/tmp/wt-config-fixture/worktrees"
+log_dir = "/tmp/wt-config-fixture/logs"
+lock_dir = "/tmp/wt-config-fixture/locks"
+cache_db = "/tmp/wt-config-fixture/cache/cache.sqlite"
+state_db = "/tmp/wt-config-fixture/state.sqlite"
+wezterm_cli = "/tmp/bin/wezterm"
+dotfiles = "/tmp/wt-config-fixture/dotfiles"
+
+[tmux]
+socket = "fixture-socket"
+terminal_config = "/tmp/tmux.conf"
+
+[branch]
+prefix = "eng"
+base = "trunk"
+id_pattern = "^eng-(\\d+)$"
+slug_max_len = 64
+keep_fresh = ["release", "staging"]
+production = "release"
+
+[stage]
+prefix = "eng-stage-"
+default_personal = "eng"
+domain = "example.test"
+
+[lifecycle]
+env_files_to_copy = [".env", ".env.local"]
+copy_globs = ["config/*.json"]
+install_command = "pnpm install"
+destroy_command = "./scripts/teardown"
+
+[backend]
+kind = "rift"
+
+[deploy.sst]
+state_bucket = "fixture-state"
+state_prefix = "apps/"
+aws_profile = "fixture"
+auto_regen_paths = ["sst-env.d.ts", "types.d.ts"]
+
+[issue_tracker]
+url_template = "https://linear.app/acme/issue/{id}"
+prefix = "acme"
+read_command = ["~/bin/read-issue", "{id}"]
+status_command = ["~/bin/read-status", "{ids}"]
+[issue_tracker.status_styles]
+Doing = { icon = "progress", color = "#123abc" }
+[issue_tracker.linear]
+workspace = "acme"
+
+[review_bot]
+name = "Review Bot"
+login = "reviewer[bot]"
+check_contexts = ["Review/*", "AI Review"]
+unresolved_via = "checklist"
+summary_marker = ["## Full review", "## Delta findings"]
+pending_marker = "## Review started"
+rerun_command = "/review-again"
+
+[dev_server]
+command = "pnpm dev -- --port {{port}}"
+port_base = 8200
+port_range = 20
+url = "http://localhost:{{port}}/app"
+max_concurrent = 3
+stop_command = "docker compose down"
+reset_command = "docker compose down -v"
+health_command = "./scripts/health"
+
+[remote]
+host = "builder"
+label = "Remote builder"
+wt_path = "/opt/wt/bin/wt"
+
+[harness]
+primary = "codex"
+hidden = ["claude"]
+
+[naming]
+auto_rename = false
+harness = "opencode"
+models = { claude = "model-a", codex = "model-b", opencode = "model-c" }
+reasoning_effort = "high"
+max_input_tokens = 12000
+timeout_ms = 60000
+
+[diff]
+command = "diff-tool {{base}}"
+
+[editor]
+command = "code {{path}}"
+
+[browser]
+chrome_profile = "fixture-profile"
+
+[github]
+reviewers = false
+ignored_review_repositories = ["acme/legacy"]
+ignored_checks = ["advisory"]
+default_reviewer = "acme/reviewer"
+pr_target = "linear"
+[github.events]
+port = 9123
+host = "0.0.0.0"
+secret = "fixture-secret"
+secret_file = "/tmp/github-secret"
+backstop_poll_ms = 30000
+
+[[actions]]
+id = "review"
+name = "Review branch"
+prompt = "Review {{branch}}"
+target = "session"
+affects = ["git", "github"]
+requires = ["pr.ready"]
+key = "r"
+group = "Review"
+external = true
+arg_prompt = "Focus area"
+label_extract = "^([A-Z]+-\\d+)"
+
+[[actions]]
+id = "set-status"
+name = "Set status"
+shell = "wt issue status {{issue}}"
+affects = ["issue"]
+issue_status = "Doing"
+
+[[automations]]
+id = "review-failed"
+on = "pr.checks.failed"
+run = "review"
+busy = "skip"
+cooldown_minutes = 15
+settle_seconds = 30
+
+[[automations]]
+id = "advanced"
+on = "branch.advanced"
+run = "builtin:notify"
+branch = "release"
+
+[ui]
+hide_terminal_apps = ["Terminal"]
+action_groups_last = ["Housekeeping"]
+rows = ["issue", "branch", "git"]
+hidden_badges = ["dirty", "session"]
+sort = "manual"
+activity_pane = "full_width"
+
+[skills]
+startup_check = false
+
+[manager]
+wt_feedback = true
+
+[update]
+startup_check = false

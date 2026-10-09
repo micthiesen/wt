@@ -1,0 +1,18 @@
+{
+  "input": {
+    "slug": "brand-membership-rls",
+    "names": [
+      "brand-membership-rls-codex",
+      "brand-membership-rls-dev",
+      "brand-membership-rls-diff",
+      "brand-membership-rls-shell"
+    ],
+    "knownSlugs": ["brand-membership-rls"],
+    "primary": "claude"
+  },
+  "expected": {
+    "harnessId": "codex",
+    "source": "live",
+    "liveHarnesses": ["codex"]
+  }
+}

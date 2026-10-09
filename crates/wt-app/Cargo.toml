@@ -1,0 +1,45 @@
+[package]
+name = "wt-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+notify.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+wt-config.workspace = true
+wt-core.workspace = true
+wt-github.workspace = true
+wt-harness.workspace = true
+wt-lifecycle.workspace = true
+wt-launcher.workspace = true
+wt-platform.workspace = true
+wt-runtime.workspace = true
+wt-store.workspace = true
+wt-skills.workspace = true
+wt-tui.workspace = true
+wt-tmux.workspace = true
+wt-update.workspace = true
+wt-vcs.workspace = true
+
+[lints]
+workspace = true

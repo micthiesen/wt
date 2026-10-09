@@ -1,0 +1,98 @@
+name: Rust CI
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [rusty]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# Lint metadata, test executables and optimized builds have distinct caches.
+# All work can start together; release publication must depend on their success.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: lint
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo xtask deps-check
+      - name: Verify native release packaging
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/wt-python-cache
+        run: python3 scripts/test-package-native.py
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-${{ matrix.os }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.145
+      - name: Install terminal integration dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux
+      - name: Install terminal integration dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew list tmux || brew install tmux
+      - run: cargo nextest run --workspace --locked --profile ci
+      - run: cargo test --workspace --locked --doc
+      - run: cargo build -p wt-app --locked
+      - name: Verify terminal liveness and filesystem refresh
+        run: python3 scripts/native-ui-check.py --binary target/debug/wt --output "${{ runner.temp }}/wt-native-ui"
+      - name: Verify shutdown with Git children in flight
+        run: python3 scripts/native-ui-check.py --binary target/debug/wt --exit-signal TERM --output "${{ runner.temp }}/wt-native-signal"
+      - name: Verify detached lifecycle and cancellable CLI prompts
+        env:
+          WT_NATIVE_BIN: target/debug/wt
+        run: python3 scripts/native-lifecycle-check.py
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-${{ matrix.os }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo build --workspace --release --locked
