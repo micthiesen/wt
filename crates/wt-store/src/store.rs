@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{
@@ -60,8 +60,8 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let mut db = Connection::open(&path)?;
-        db.busy_timeout(std::time::Duration::from_millis(3_000))?;
-        db.pragma_update(None, "journal_mode", "WAL")?;
+        enable_wal(&db, Duration::from_secs(3))?;
+        db.busy_timeout(Duration::from_secs(3))?;
         db.pragma_update(None, "foreign_keys", "ON")?;
         initialize_schema(&mut db)?;
         register_repository(&mut db, &identity)?;
@@ -420,6 +420,33 @@ fn validate_identity(identity: &RepositoryIdentity) -> Result<(), StoreError> {
     }
     Ok(())
 }
+
+fn enable_wal(db: &Connection, timeout: Duration) -> Result<(), rusqlite::Error> {
+    // Changing journal mode can return BUSY without invoking SQLite's busy
+    // handler when two first opens would deadlock while upgrading their locks.
+    // Retry this idempotent, autocommit operation after its statement has been
+    // dropped. Never retry an arbitrary transaction or hide a different error.
+    let deadline = Instant::now() + timeout;
+    loop {
+        db.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        match db.pragma_update(None, "journal_mode", "WAL") {
+            Err(error)
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "wal_tests.rs"]
+mod wal_tests;
 
 fn initialize_schema(db: &mut Connection) -> Result<(), StoreError> {
     // Serialize schema discovery and creation. Without this transaction two
