@@ -58,6 +58,15 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Local Rift creation can remain hidden until WT restarts (2026-10-09).**
+  `tasks-take-2` and `secrets-check` TUI logs stop at `rift create --copy-all`
+  at 20:50:13Z and 21:05:08Z. Their lock metadata records `init` at the same
+  phase. Rift inventory hides rows under a live init lock. After the reported
+  restart, neither creator PID (20158, 4199) nor a Rift process remained,
+  and agents used both directories. This does not prove the filesystem
+  watcher failed: no successful creation was logged before the restart.
+  Capture the live creator, Rift child, pipe state, and lock liveness during
+  the next occurrence. No processes or checkout files were changed.
 - **Codex updater ownership and drain exits (2026-10-07).**
   `move-files-to-r2` exited at 09:56:51 local after `turn/steer failed: Server
   is draining; retry after reconnecting`. Native logs confirm repeated
