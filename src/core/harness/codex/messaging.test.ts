@@ -53,9 +53,6 @@ function fakes(options: {
             ? [["task-codex", options.stampedId ?? "primary-id"]]
             : [],
         ),
-        sessionCreatedAtMs: new Map(
-          options.live === false ? [] : [["task-codex", 10_000]],
-        ),
       });
     },
     stampSession: (_tmuxName: string, sessionId: string) => {

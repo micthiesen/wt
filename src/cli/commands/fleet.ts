@@ -106,21 +106,24 @@ type SessionInfo = {
 };
 
 /**
- * Per-worktree primary-session liveness, from the same two signals
- * Harness session discovery joins tmux liveness with each harness's process
- * registry (busy / last_activity, matched by cwd + name; see
- * commands/claude.ts for the name-leg rationale). Worktree primaries
- * register under the slug; "primary" and null are the pre-slug-naming
- * forms, still matched so a session started before that change (or by
- * hand, without `--name`) keeps reporting liveness.
+ * Per-worktree primary-session liveness. The live set covers every harness;
+ * richer busy / last_activity detail is currently available only from
+ * Claude's process registry. Worktree Claude primaries register under the
+ * slug; "primary" and null are the pre-slug-naming forms, still matched so a
+ * session started before that change (or by hand, without `--name`) keeps
+ * reporting liveness.
  */
-function sessionInfoFor(
+export function sessionInfoFor(
   wt: Worktree,
+  liveHarnessSlugs: ReadonlySet<string>,
   liveClaudeSlugs: ReadonlySet<string>,
   registry: ReturnType<typeof readRegistry>,
 ): SessionInfo {
-  const alive = liveClaudeSlugs.has(wt.slug);
+  const alive = liveHarnessSlugs.has(wt.slug);
   if (!alive) return { alive: false, busy: null, last_activity: null };
+  if (!liveClaudeSlugs.has(wt.slug)) {
+    return { alive: true, busy: null, last_activity: null };
+  }
   const match = registry
     .filter(
       (r) =>
@@ -344,6 +347,11 @@ export const run = Effect.fn("wt fleet")(function* (argv: string[]) {
   const liveClaudeSlugs = new Set(
     sessions.claude.filter((e) => e.name === null).map((e) => e.slug),
   );
+  const liveHarnessSlugs = new Set([
+    ...liveClaudeSlugs,
+    ...sessions.codex,
+    ...sessions.opencode,
+  ]);
 
   // Staleness for edges reuses the HEADs already resolved above (one
   // per live worktree). An endpoint that is not a live worktree maps
@@ -377,7 +385,7 @@ export const run = Effect.fn("wt fleet")(function* (argv: string[]) {
       landed:
         (landedFlags[i] ?? false) ||
         pickPrForWorktree(w, prs)?.state === "MERGED",
-      session: sessionInfoFor(w, liveClaudeSlugs, registry),
+      session: sessionInfoFor(w, liveHarnessSlugs, liveClaudeSlugs, registry),
       pr: pickPrForWorktree(w, prs),
     };
   });
