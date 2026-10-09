@@ -5,6 +5,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 pub fn initialize(directory: &Path) -> Result<WorkerGuard> {
+    std::fs::create_dir_all(directory).context("create application log directory")?;
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("wt-native")

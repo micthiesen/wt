@@ -75,6 +75,8 @@ jobs:
         run: python3 scripts/native-ui-check.py --binary target/debug/wt --output "${{ runner.temp }}/wt-native-ui"
       - name: Verify shutdown with Git children in flight
         run: python3 scripts/native-ui-check.py --binary target/debug/wt --exit-signal TERM --output "${{ runner.temp }}/wt-native-signal"
+      - name: Verify terminal handoff to a private tmux shell and back
+        run: python3 scripts/native-session-check.py --binary target/debug/wt --output "${{ runner.temp }}/wt-native-session"
       - name: Verify detached lifecycle and cancellable CLI prompts
         env:
           WT_NATIVE_BIN: target/debug/wt

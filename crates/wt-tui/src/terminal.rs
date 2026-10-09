@@ -171,12 +171,15 @@ pub async fn run(
                         drop(events);
                         match suspend_for_handoff(ticket, &mut guard, &cancel).await? {
                             HandoffResult::Resumed(Ok(())) => {
-                                terminal.clear()?;
+                                // Fullscreen resize clears both render buffers
+                                // without querying the terminal cursor. `clear`
+                                // would synchronously read input after handoff.
+                                terminal.resize(terminal.size()?.into())?;
                                 events = EventStream::new();
                                 dirty = true;
                             }
                             HandoffResult::Resumed(Err(message)) => {
-                                terminal.clear()?;
+                                terminal.resize(terminal.size()?.into())?;
                                 events = EventStream::new();
                                 model.toast = Some((message, true));
                                 dirty = true;

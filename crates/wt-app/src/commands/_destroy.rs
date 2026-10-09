@@ -373,12 +373,11 @@ async fn reap_abandoned(
 async fn process_start_identity(pid: u32, runner: &wt_platform::process::ProcessRunner) -> String {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            if let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) {
-                if let Some(start) = rest.split_whitespace().nth(19) {
-                    return format!("linux:{start}");
-                }
-            }
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest)
+            && let Some(start) = rest.split_whitespace().nth(19)
+        {
+            return format!("linux:{start}");
         }
     }
     let mut spec = CommandSpec::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]);

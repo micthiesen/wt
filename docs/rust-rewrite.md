@@ -142,6 +142,18 @@ established. The TypeScript tree remains unchanged as the behavior reference.
 
 Additional integration evidence:
 
+- First remote CI run at `dcf2b8c`: Linux and macOS tests and release builds
+  passed. Linux strict lint found a nested-if warning in its `/proc` process
+  identity reader; the follow-up collapses it. CI URL:
+  https://github.com/micthiesen/wt/actions/runs/38002199332
+- Real shell handoff exposed a blocking cursor-position read in Ratatui's
+  `clear()` after tmux detach. Resuming now invalidates fullscreen buffers with
+  `resize()` instead. `scripts/native-session-check.py` passes shell input,
+  detach, resumed navigation/title save, clean quit and shell survival, using a
+  private tmux server. Evidence: `/tmp/wt-rust-native-session-5/result.json`.
+  The test drains terminal output through exit and closes its PTY before forced
+  reap so fixture teardown cannot hang on macOS.
+
 - Real Rift create/remove and stale registry recovery pass with isolated HOME
   and XDG state. The detached native removal probe checks startup acknowledgment,
   completed durable removal, worker exit, traversal-ID refusal and stale-head
