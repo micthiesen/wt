@@ -1352,7 +1352,7 @@ impl LifecycleService {
         let spec = plan.spec;
         let output = self
             .runner
-            .run(spec, cancellation)
+            .run_streaming(spec, cancellation, |_, _| {})
             .await
             .map_err(|source| process_error("run package install", path, source))?;
         output

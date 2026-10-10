@@ -401,7 +401,10 @@ impl GitRepository {
         }
         let result = self
             .origin_runner()
-            .run(plan.spec, cancellation)
+            // Package managers can be verbose. Keep a bounded diagnostic
+            // capture while draining the rest, never terminate an install just
+            // because it printed more than the capture budget.
+            .run_streaming(plan.spec, cancellation, |_, _| {})
             .await
             .and_then(|output| output.checked("package manager").map(|_| ()));
         match result {
@@ -772,6 +775,14 @@ mod tests {
         spec.args = args.iter().map(OsString::from).collect();
         spec.cwd = Some(cwd.to_path_buf());
         spec.timeout = Duration::from_secs(15);
+        for (key, value) in [
+            ("GIT_AUTHOR_NAME", "wt test"),
+            ("GIT_AUTHOR_EMAIL", "wt-test@example.invalid"),
+            ("GIT_COMMITTER_NAME", "wt test"),
+            ("GIT_COMMITTER_EMAIL", "wt-test@example.invalid"),
+        ] {
+            spec.env.push((key.into(), Some(value.into())));
+        }
         let output = runner
             .run(spec, &CancellationToken::new())
             .await
@@ -793,7 +804,7 @@ mod tests {
         git(
             &runner,
             root.path(),
-            &["init", "--bare", bare.to_str().unwrap()],
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
         )
         .await;
         git(&runner, &seed, &["init", "-b", "main"]).await;
@@ -818,6 +829,13 @@ mod tests {
             &runner,
             root.path(),
             &["clone", bare.to_str().unwrap(), main.to_str().unwrap()],
+        )
+        .await;
+        git(&runner, &main, &["config", "user.name", "wt test"]).await;
+        git(
+            &runner,
+            &main,
+            &["config", "user.email", "wt-test@example.invalid"],
         )
         .await;
         (root, runner, seed, main, worktrees)
@@ -882,7 +900,9 @@ mod tests {
         let options = FetchOriginOptions {
             auto_regen_paths: vec!["generated.ts".into()],
             sync_install: Some(InstallPolicy {
-                command: Some("cat pnpm-lock.yaml >> .git/installed-locks".into()),
+                command: Some(
+                    "printf '%3145728s' ''; cat pnpm-lock.yaml >> .git/installed-locks".into(),
+                ),
                 shell: "sh".into(),
             }),
             ..Default::default()

@@ -579,6 +579,8 @@ async fn launchd_owned_pids(ctx: &AppContext) -> Option<HashSet<u32>> {
 }
 
 async fn load_average(ctx: &AppContext) -> Option<[f64; 3]> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = ctx;
     #[cfg(target_os = "macos")]
     {
         if let Ok(out) = ctx
@@ -611,6 +613,8 @@ async fn load_average(ctx: &AppContext) -> Option<[f64; 3]> {
 }
 
 async fn memory(ctx: &AppContext) -> Option<MemorySnapshot> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = ctx;
     #[cfg(target_os = "macos")]
     {
         let total = ctx

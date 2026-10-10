@@ -96,6 +96,12 @@ impl VerifiedRelease {
     pub fn archive_sha256(&self) -> &str {
         &self.archive_sha256
     }
+
+    /// Verified application bytes, for provisioning a worker of another target.
+    /// The caller must preserve the release version and probe on that worker.
+    pub fn app_binary(&self) -> &[u8] {
+        &self.app_binary
+    }
 }
 
 #[derive(Clone)]
