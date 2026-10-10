@@ -166,7 +166,7 @@ impl ReleaseSource {
                 self.repository.name()
             ),
             Channel::Preview => format!(
-                "{base}/repos/{}/{}/releases?per_page=30",
+                "{base}/repos/{}/{}/releases?per_page=100",
                 self.repository.owner(),
                 self.repository.name()
             ),
@@ -184,10 +184,7 @@ impl ReleaseSource {
             Channel::Preview => {
                 let releases: Vec<ApiRelease> = serde_json::from_slice(&bytes)
                     .map_err(|error| ArtifactError::InvalidMetadata(error.to_string()))?;
-                releases
-                    .into_iter()
-                    .find(|release| !release.draft && is_preview_tag(&release.tag_name))
-                    .ok_or(ArtifactError::NoRelease(channel))?
+                newest_preview(releases).ok_or(ArtifactError::NoRelease(channel))?
             }
         };
         self.load_manifest(release, channel).await
@@ -643,6 +640,16 @@ fn is_preview_tag(tag: &str) -> bool {
     tag.strip_prefix("preview-").is_some_and(is_full_build_id)
 }
 
+/// The most recently published preview. GitHub's release list is not in
+/// publication order (it listed the first preview ahead of later ones), so
+/// taking the first match pinned preview installs to an old build.
+fn newest_preview(releases: Vec<ApiRelease>) -> Option<ApiRelease> {
+    releases
+        .into_iter()
+        .filter(|release| !release.draft && is_preview_tag(&release.tag_name))
+        .max_by(|a, b| a.published_at.cmp(&b.published_at))
+}
+
 #[derive(Deserialize)]
 struct ApiRelease {
     tag_name: String,
@@ -941,6 +948,29 @@ mod tests {
         assert_eq!(
             seen.await.unwrap(),
             vec![UPDATER_USER_AGENT, UPDATER_USER_AGENT, UPDATER_USER_AGENT]
+        );
+    }
+
+    #[test]
+    fn preview_discovery_takes_the_newest_publication_not_the_first_listed() {
+        let release = |tag: &str, published: &str, draft: bool| ApiRelease {
+            tag_name: tag.into(),
+            name: None,
+            draft,
+            prerelease: true,
+            published_at: Some(published.into()),
+            assets: Vec::new(),
+        };
+        let sha = |c: char| c.to_string().repeat(40);
+        let releases = vec![
+            release(&format!("preview-{}", sha('a')), "2026-10-10T15:36:54Z", false),
+            release(&format!("preview-{}", sha('b')), "2026-10-10T17:49:34Z", false),
+            release(&format!("preview-{}", sha('c')), "2026-10-10T18:00:00Z", true),
+            release("rust-test-0123456789ab-1", "2026-10-11T00:00:00Z", false),
+        ];
+        assert_eq!(
+            newest_preview(releases).unwrap().tag_name,
+            format!("preview-{}", sha('b'))
         );
     }
 
