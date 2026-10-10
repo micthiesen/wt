@@ -1355,7 +1355,7 @@ fn human_comments(pr: &Value, bot_login: &str) -> Vec<PrComment> {
 }
 
 fn review_requests_query() -> &'static str {
-    r#"query { search(query:"is:pr is:open review-requested:@me",type:ISSUE,first:50) { nodes { ... on PullRequest { number url title isDraft createdAt updatedAt author { login } repository { nameWithOwner } headRefName headRefOid additions deletions changedFiles reviewDecision comments { totalCount } commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } } } } }"#
+    r#"query { search(query:"is:pr is:open review-requested:@me",type:ISSUE,first:50) { nodes { ... on PullRequest { number url title isDraft createdAt updatedAt author { login } repository { nameWithOwner } headRefName headRefOid additions deletions changedFiles reviewDecision comments { totalCount } commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } } } } } }"#
 }
 fn parse_review_request(v: &Value, options: &GithubOptions) -> Option<ReviewRequestPr> {
     let repo = str_at(v, "/repository/nameWithOwner").unwrap_or_default();
@@ -1790,6 +1790,13 @@ else:
             without_queue.matches('}').count()
         );
         assert!(!without_queue.contains("mergeQueue("));
+    }
+
+    #[test]
+    fn review_request_query_is_complete() {
+        let query = review_requests_query();
+        assert!(query.starts_with("query "));
+        assert_eq!(query.matches('{').count(), query.matches('}').count());
     }
 
     #[tokio::test]

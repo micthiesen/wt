@@ -13,10 +13,11 @@ follow-ups.
 
 ## Current state
 
-The first live cutover found an unbalanced selection in the GitHub PR query.
-The missing closing brace is corrected, generated-query regression assertions
-cover queue and non-queue requests, and the corrected query succeeded against
-the live repository. The bundled wt skill now documents the native PATH entry.
+The first live cutover found unbalanced selections in the GitHub PR and
+review-request queries. The missing closing braces are corrected, generated-query
+regression assertions cover both documents and queue/non-queue requests, and
+the corrected queries succeeded against the live repository. The bundled wt
+skill now documents the native PATH entry.
 These follow-ups are included before the first stable publication.
 
 Application build `4ef9878` passed all 577 workspace tests, doctests,
