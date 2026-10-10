@@ -247,7 +247,7 @@ pub async fn reorder(
             state[collection][key]["order"]
                 .as_f64()
                 .filter(|value| value.is_finite())
-                .unwrap_or(0.0)
+                .unwrap_or(f64::NEG_INFINITY)
         };
         units.sort_by(|a, b| {
             manual_order(a)

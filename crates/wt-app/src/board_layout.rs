@@ -110,14 +110,19 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         } else {
             0
         };
+        // An unordered row sorts before ordered ones, as in the TS sorter;
+        // the first reorder writes explicit orders for the whole bucket.
         let order = state["slugs"][slug]["order"]
             .as_f64()
             .filter(|n| n.is_finite())
-            .unwrap_or(0.0);
+            .unwrap_or(f64::NEG_INFINITY);
+        // Ties break on one stable identity per stack (its root branch),
+        // as in the TS sorter, so tied units stay contiguous.
+        let identity = node_of(anchor).map_or(slug, |entry| entry.node.stack_id.as_str());
         (
             status,
             order,
-            slug,
+            identity,
             node_of(index).map_or(0, |entry| entry.node.index),
         )
     };
