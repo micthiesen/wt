@@ -147,7 +147,22 @@ def main() -> None:
         )
 
         def wt(*argv: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
-            return run([str(binary), *argv], cwd=main_clone, env=env, expected=expected)
+            try:
+                return run([str(binary), *argv], cwd=main_clone, env=env, expected=expected)
+            except (AssertionError, subprocess.TimeoutExpired):
+                # Capture evidence while the isolated server still exists.
+                # The finally block deliberately tears it down on failure.
+                for diagnostic in (
+                    [str(binary), "dev", "status", "--all", "--json"],
+                    [str(binary), "dev", "logs", "dev-one"],
+                    ["tmux", "-L", socket, "capture-pane", "-p", "-t", "=dev-one-dev"],
+                ):
+                    try:
+                        result = subprocess.run(diagnostic, cwd=main_clone, env=env, text=True, capture_output=True, timeout=10)
+                        print(f"fixture diagnostic {diagnostic!r}:\n{result.stdout}\n{result.stderr}", flush=True)
+                    except subprocess.TimeoutExpired:
+                        print(f"fixture diagnostic timed out: {diagnostic!r}", flush=True)
+                raise
 
         waiter: subprocess.Popen[str] | None = None
         try:
