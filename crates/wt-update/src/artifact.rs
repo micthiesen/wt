@@ -963,9 +963,21 @@ mod tests {
         };
         let sha = |c: char| c.to_string().repeat(40);
         let releases = vec![
-            release(&format!("preview-{}", sha('a')), "2026-10-10T15:36:54Z", false),
-            release(&format!("preview-{}", sha('b')), "2026-10-10T17:49:34Z", false),
-            release(&format!("preview-{}", sha('c')), "2026-10-10T18:00:00Z", true),
+            release(
+                &format!("preview-{}", sha('a')),
+                "2026-10-10T15:36:54Z",
+                false,
+            ),
+            release(
+                &format!("preview-{}", sha('b')),
+                "2026-10-10T17:49:34Z",
+                false,
+            ),
+            release(
+                &format!("preview-{}", sha('c')),
+                "2026-10-10T18:00:00Z",
+                true,
+            ),
             release("rust-test-0123456789ab-1", "2026-10-11T00:00:00Z", false),
         ];
         assert_eq!(
