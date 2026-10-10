@@ -73,7 +73,10 @@ jobs:
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
-        run: brew list tmux || brew install tmux
+        run: |
+          if ! brew list --versions tmux >/dev/null 2>&1; then
+            brew install tmux
+          fi
       - run: cargo nextest run --workspace --locked --profile ci
       - run: cargo test --workspace --locked --doc
       - run: cargo build --workspace --bins --examples --locked

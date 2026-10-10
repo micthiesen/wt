@@ -80,6 +80,38 @@ binary will merge writes made after the rollback. Older binaries may not know
 about newer fields or migrations. Keep migration backups and restart long-lived
 wt processes when changing versions that alter storage contracts.
 
+## Moving an existing source installation to native wt
+
+Close the old wt boards and stop their events service before importing state;
+leave tmux agents and worktrees running. Keep the old source checkout in place
+until the native installation is verified. Install the chosen published release
+with `scripts/install.sh --release <tag> --path`. This switches a recognized
+`~/.local/bin/wt` source link only after archiving the old checkout and recording
+the prior link under `<install-root>/migrations/`. Without `--path`, installation
+does not inspect or change that link. Unrelated PATH entries are refused.
+
+For each repository configuration, run the installed binary with that selector:
+
+```sh
+WT_CONFIG=/absolute/project.toml wt state migrate --keep-legacy
+WT_CONFIG=/absolute/project.toml wt ls --json
+WT_CONFIG=/absolute/project.toml wt status --all --json
+```
+
+The default legacy source is `~/.cache/wt`; use `--from /absolute/legacy-cache`
+when that configuration stored its JSON elsewhere. Check imported status,
+sections, issue identities, fork bases, and retained sessions before continuing.
+One process still selects one configuration. Remote worker state is migrated on
+its host with its worker configuration, using the matching provisioned runtime
+or an installed native launcher. Native and TypeScript processes do not share
+live writes between the old JSON and new SQLite stores.
+
+Reinstall an enabled events service with `wt events install` under its owning
+configuration so it pins the stable native launcher and absolute config paths.
+Keep the migration backups. Native `wt rollback` selects a previously installed
+native release; returning to TypeScript instead requires the preserved checkout
+and legacy data. It does not automatically export later SQLite edits to JSON.
+
 ## Remote workers
 
 The controller and worker speak a versioned native protocol. A controller

@@ -10,38 +10,27 @@ behavior.
 
 ## Current evidence and cutover state
 
-Checkpoint `7ab434d` passed the full 547-test workspace gate, doctests,
-formatting, strict Clippy, and dependency checks. The log is
-`/tmp/wt-rust-gate-review-fixes.log`. Rust CI run
-[38020225318](https://github.com/micthiesen/wt/actions/runs/38020225318) and
-four-target release run
-[38020250780](https://github.com/micthiesen/wt/actions/runs/38020250780) are
-green. The release workflow published the isolated
-`rust-test-7ab434d-20261010` release.
+Application build `4ef9878` passed all 577 workspace tests, doctests,
+formatting, strict Clippy, and dependency checks. The final local log is
+`/tmp/wt-rust-final-retired-gate.log`. Linux/macOS
+[Rust CI 38023495258](https://github.com/micthiesen/wt/actions/runs/38023495258)
+passed. The four-target release, published install/update/rollback, and real
+macOS-to-Boris provisioning checks passed too, including two-config isolation
+and fixture/runtime cleanup. Exact evidence is in [the execution record](rust-rewrite.md).
 
-Release installation passed under an isolated install root
-(`/tmp/wt-native-release-7ab434d-install.log`). A real Boris SSH fixture
-verified exact native build provisioning from macOS to Linux, selected config
-and PATH in managed sessions, literal quoting and `$HOME`, two configs sharing
-a worktree slug, and an unrelated sentinel surviving cleanup:
-`/tmp/wt-native-boris-7ab434d-3/result.json` and `cleanup.json`. The nine
-representative CLI comparisons pass at
-`/tmp/wt-cli-compat-final-fixed/result.json`.
+The final PTY passes cover normal and SIGTERM shutdown, delayed Git navigation,
+filesystem refresh, metadata-only writes, accepted-write draining, sections,
+history, and feeds: `/tmp/wt-native-ui-retired-final` and
+`/tmp/wt-native-signal-retired-final`. The command fixture and nine representative
+old/new JSON comparisons passed (`/tmp/wt-cli-compat-retired-final/result.json`).
+Independent review findings were repaired and re-reviewed.
 
-Those hosted proofs do not cover later Rust changes. The retired-source
-checkout passed an expanded 577-test gate, including the installer and UI
-regressions (`/tmp/wt-rust-final-presentation-gate.log`). A final refinement
-invalidates ref/index/rebase facts before replacement probes start; its full
-577-test gate and PTY pass also succeeded (`/tmp/wt-rust-final-retired-gate.log`,
-`/tmp/wt-native-ui-retired-final`, `/tmp/wt-native-signal-retired-final`). The
-retired-source command fixture and nine JSON comparisons passed again
-(`/tmp/wt-cli-compat-retired-final/result.json`).
-The five-scenario TypeScript runtime fixture used checkout `bbf1696` plus a
-minimal two-token tmux delimiter fix. Tmux 3.9 and official 3.7c both emit `_`
-for a tab delimiter, so the probe parser uses `|`; the original shared goldens
-remain tied to `d9cd2f4`. Results are in
-`/tmp/wt-perf-ts-final-24-20261010/results.json`. The matching optimized Rust
-comparison is owed. Full rewrite acceptance is not yet complete.
+The optimized five-scenario comparison is complete: CPU fell 56–88%, peak RSS
+fell from 288–386 MiB to 23–25 MiB, and navigation p90 fell from 12 ms to
+1.24 ms. See [the measurements and workload limits](rust-rewrite.md#performance-evidence)
+and [machine-readable results](rust-rewrite-performance.json). The oracle is
+`bbf1696` plus the minimal tmux delimiter repair; original shared goldens remain
+tied to `d9cd2f4`.
 
 ## Command surface
 
@@ -62,7 +51,7 @@ replaced by explicit config-free dispatch for `version`, `init`, `install`,
 | `manager`, `manager send [--hold <id>] <text...>`, `manager report [--info|--ok|--warn|--err] <text...>`; `hold [set|release|check]`; `issue [--id|--no-id|--clear-id|--gh|--clear-gh|--read]`. | Hold/report/state tests and issue CLI fixture cover durable semantics, output routing, reader stderr/exit propagation, and identity. |
 | `skills [status|sync|diff|reset]`; `sync [names...] [--yes|-y] [--force]`, `reset [--answers|--declines]`, legacy `install`; `update [log] [--check] [--head]`; `rollback [ref]`. | Current parser accepts multiple sync units and `-y`; skill sync protects modified copies. Native release fixtures cover update/install/rollback and recovery. `--head` is intentionally rejected because source-clone updates were retired. |
 | `events install|start|stop|restart|status|secret|uninstall|serve`; `remote [argv…]`; `agent send <target> [text...] [--hold <id>]`, `start <slug>`, `ls [--json]`; `claude send` alias, `ls [--json]`, `selftest [slug]`, `stop|kill <slug>`; `codex selftest`; OpenCode through `agent`. | Isolated loopback SSH, host, session, action, event and cleanup fixtures cover their named protocol/lifecycle behavior. Boris adds real native remote provisioning. Claude Code's external Bun inspector remains an integration requirement. Native fixtures do not assert successful live delivery through every user's installed agent CLI. |
-| `dev start|reset [--wait] [--timeout] [--rebuild]`, `stop`, `status [--all] [--json]`, `logs`, `queue [slug] [--first|--normal] [--json]`, `--lines`; help and unknown-command exit 2. | `native-dev-check.py` covers real local process health, queue, cancellation, logs and cleanup. Hosted macOS dev fixture passed at the 7ab434d workflow. Static linking intentionally replaces TypeScript import-failure isolation. |
+| `dev start|reset [--wait] [--timeout] [--rebuild]`, `stop`, `status [--all] [--json]`, `logs`, `queue [slug] [--first|--normal] [--json]`, `--lines`; help and unknown-command exit 2. | `native-dev-check.py` covers real local process health, queue, cancellation, logs and cleanup. Hosted macOS dev fixture passed at the 4ef9878 workflow. Static linking intentionally replaces TypeScript import-failure isolation. |
 | Internal `_remote`, `_hello`, `_snapshot`, `_session`, `_host`, `_destroy`, `_dev-giveup`, `_claude-hook`, `_action-worker`, `_restack-worker`, `_dev-supervise`. | Protocol/lifecycle tests cover framing, exact argv/build, errors, cancellation, and worker recovery. `_claude-hook` is a native no-op compatibility endpoint. |
 
 Representative old/new CLI comparisons are useful evidence, not a mandate to
@@ -77,7 +66,7 @@ covers list/details/activity; section and stack layout; remote rows; identity-
 anchored selection; folded summaries; navigation, sort, history and refresh;
 create/remove/archive/restore/clean; editor, issue/title, tracker and yank;
 PR actions; tmux/harness sessions; section/base/status/restack; automation
-controls; performance/error/crash views; clipboard and help; picker/modal
+controls; performance/error views; clipboard and help; picker/modal
 semantics; Unicode width, clipping, wrapping, scroll/follow, resize, mouse and
 links. The current source refinements are covered by independent review and
 the focused regressions; the integrated verification is tracked above.
@@ -97,6 +86,8 @@ probe. Known deliberate or informational differences:
 - Completed-session transcript summaries are shown for selected Claude output,
   not as a generic banner for all harnesses.
 - Rows do not display an explicit title-source badge.
+- A fatal TUI failure restores the terminal and reports the error. Recovery is
+  a fresh launch rather than the former in-app crash/retry overlay.
 
 These are documented behavior differences, not automatically blockers to a
 non-exact conversion. Decide product importance from observed use rather than
@@ -141,11 +132,9 @@ Cross-cutting safety contracts remain load-bearing:
 - Install immutable checksummed builds; probe before activation and provision
   the exact remote build. Logs are bounded and safe for terminal output.
 
-## Remaining acceptance work
+## Acceptance
 
-Finish the optimized Rust comparison against the
-five-scenario 24-row, 65-second TypeScript runtime fixture at `bbf1696` with the
-tmux delimiter fix; report process-tree CPU/RSS, idle TUI CPU, and
-injected-key-to-painted-frame latency separately. Run current-head CI after
-shared edits settle. These are outstanding evidence gates; there is no blanket
-requirement for exhaustive per-flag golden comparisons.
+The application and pre-promotion evidence gates are complete. Post-promotion
+release checks and recovery operations are recorded in
+[the execution record](rust-rewrite.md#promotion-and-recovery); they are not
+claims that main or stable publication has happened.

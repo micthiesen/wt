@@ -1,0 +1,263 @@
+{
+  "date_utc": "2026-10-10",
+  "machine": {
+    "cpu": "Apple M2 Pro",
+    "logical_cpus": 12,
+    "memory_bytes": 34359738368,
+    "os": "macOS 26.6.2 (25G83)"
+  },
+  "builds": {
+    "typescript": "bbf1696 plus two-token tmux TAB-to-pipe delimiter repair",
+    "rust": "4ef9878cdb64481694547c59067d2eb4b2c5fac2",
+    "bun": "1.4.2",
+    "rustc": "1.98.1",
+    "tmux": "3.7c"
+  },
+  "fixture": {
+    "script": "scripts/perf-baseline.py",
+    "rows": 24,
+    "seconds_per_scenario": 65,
+    "warmup_seconds_before_key_stream": 5,
+    "terminal_columns": 180,
+    "terminal_rows": 50,
+    "codex_records_per_second": 5,
+    "codex_record_payload_bytes_approx": 1024,
+    "disabled": [
+      "GitHub",
+      "automations",
+      "AI naming",
+      "updates",
+      "skills"
+    ],
+    "no_cargo_or_test_suites_during_measurements": true
+  },
+  "notes": [
+    "One run per scenario and implementation on the same machine; these are workload samples, not confidence intervals or a whole-machine freeze diagnosis.",
+    "CPU uses waited process-tree rusage, including startup and Git children. Driver, synthetic output writer, and concurrent lifecycle CLI CPU are separate.",
+    "Peak RSS is OS-reported rusage, not macOS physical footprint or a summed process-tree memory measurement.",
+    "First output is terminal bytes, not a verified complete frame. Input-latency instruments receipt through draw completion and excludes physical display timing.",
+    "Post-warmup output visibility is one marker sample, not a tail-latency distribution.",
+    "The lifecycle fixture creates and removes a worktree; no package install, external agent turn, cloud deletion or deployment is included."
+  ],
+  "runs": {
+    "typescript": {
+      "scenarios": [
+        {
+          "scenario": "idle",
+          "elapsed_seconds": 65.08157224999741,
+          "first_output_seconds": 0.21640566596761346,
+          "terminal_bytes": 41334,
+          "input_keys": 0,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 5.28036,
+          "process_tree_cpu_percent": 8.113448734330799,
+          "peak_rss_bytes": 301776896,
+          "driver_cpu_seconds": 0.22606,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0
+        },
+        {
+          "scenario": "navigation",
+          "elapsed_seconds": 65.10173325007781,
+          "first_output_seconds": 0.18107949988916516,
+          "terminal_bytes": 969856,
+          "input_keys": 690,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 20.236925,
+          "process_tree_cpu_percent": 31.085078675652326,
+          "peak_rss_bytes": 360333312,
+          "driver_cpu_seconds": 0.28171899999999994,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0
+        },
+        {
+          "scenario": "refresh",
+          "elapsed_seconds": 65.10112116718665,
+          "first_output_seconds": 0.18177025020122528,
+          "terminal_bytes": 63335,
+          "input_keys": 12,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 46.601912999999996,
+          "process_tree_cpu_percent": 71.5838869814873,
+          "peak_rss_bytes": 404209664,
+          "driver_cpu_seconds": 0.23043400000000003,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0
+        },
+        {
+          "scenario": "lifecycle",
+          "elapsed_seconds": 65.11841620784253,
+          "first_output_seconds": 0.18290812522172928,
+          "terminal_bytes": 47014,
+          "input_keys": 2,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 9.614716999999999,
+          "process_tree_cpu_percent": 14.764973658622322,
+          "peak_rss_bytes": 364625920,
+          "driver_cpu_seconds": 0.24882899999999997,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.714483,
+          "lifecycle_cli_elapsed_seconds": 0.555776750203222,
+          "injected_key_to_output_ms": 19.457167014479637
+        },
+        {
+          "scenario": "codex_output",
+          "elapsed_seconds": 65.07519391691312,
+          "first_output_seconds": 0.18248216668143868,
+          "terminal_bytes": 113631,
+          "input_keys": 2,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 7.263334,
+          "process_tree_cpu_percent": 11.161448107667107,
+          "peak_rss_bytes": 324255744,
+          "driver_cpu_seconds": 0.2620119999999999,
+          "fixture_writer_cpu_seconds": 0.182572,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0,
+          "injected_key_to_output_ms": 20.888499915599823,
+          "fixture_writer_report": {
+            "cpu_seconds": 0.14345599999999997,
+            "records": 264
+          },
+          "post_warmup_output_visible_seconds": 0.5899465000256896,
+          "tmux_version": "tmux 3.7c",
+          "tmux_session_id_separator": "underscore"
+        }
+      ],
+      "evidence_directory": "/tmp/wt-perf-ts-final-24-20261010"
+    },
+    "rust": {
+      "scenarios": [
+        {
+          "scenario": "idle",
+          "elapsed_seconds": 65.02255033282563,
+          "first_output_seconds": 0.033957290928810835,
+          "terminal_bytes": 6577,
+          "input_keys": 0,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 2.024483,
+          "process_tree_cpu_percent": 3.113509066681396,
+          "peak_rss_bytes": 23756800,
+          "driver_cpu_seconds": 0.21096099999999998,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0
+        },
+        {
+          "scenario": "navigation",
+          "elapsed_seconds": 65.02708524977788,
+          "first_output_seconds": 0.006666457746177912,
+          "terminal_bytes": 167605,
+          "input_keys": 692,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 2.661372,
+          "process_tree_cpu_percent": 4.092713043768313,
+          "peak_rss_bytes": 24281088,
+          "driver_cpu_seconds": 0.276641,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0
+        },
+        {
+          "scenario": "refresh",
+          "elapsed_seconds": 65.04600404109806,
+          "first_output_seconds": 0.010168083012104034,
+          "terminal_bytes": 14293,
+          "input_keys": 12,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 5.630888,
+          "process_tree_cpu_percent": 8.656777742168808,
+          "peak_rss_bytes": 24199168,
+          "driver_cpu_seconds": 0.21810799999999997,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0
+        },
+        {
+          "scenario": "lifecycle",
+          "elapsed_seconds": 65.04256391571835,
+          "first_output_seconds": 0.011868583038449287,
+          "terminal_bytes": 8897,
+          "input_keys": 2,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 2.965417,
+          "process_tree_cpu_percent": 4.559194505066812,
+          "peak_rss_bytes": 24739840,
+          "driver_cpu_seconds": 0.22077200000000008,
+          "fixture_writer_cpu_seconds": 0.0,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.4829939999999999,
+          "lifecycle_cli_elapsed_seconds": 0.531212373636663,
+          "injected_key_to_output_ms": 1.3848328962922096
+        },
+        {
+          "scenario": "codex_output",
+          "elapsed_seconds": 65.03577004093677,
+          "first_output_seconds": 0.006635833065956831,
+          "terminal_bytes": 29044,
+          "input_keys": 4,
+          "exit_code": 0,
+          "process_tree_cpu_seconds": 3.212216,
+          "process_tree_cpu_percent": 4.9391527123889984,
+          "peak_rss_bytes": 26591232,
+          "driver_cpu_seconds": 0.24663600000000008,
+          "fixture_writer_cpu_seconds": 0.17811,
+          "lifecycle_cli_process_tree_cpu_seconds": 0.0,
+          "lifecycle_cli_elapsed_seconds": 0.0,
+          "injected_key_to_output_ms": 0.04045804962515831,
+          "fixture_writer_report": {
+            "cpu_seconds": 0.146041,
+            "records": 264
+          },
+          "post_warmup_output_visible_seconds": 0.0388817498460412,
+          "tmux_version": "tmux 3.7c",
+          "tmux_session_id_separator": "underscore"
+        }
+      ],
+      "evidence_directory": "/tmp/wt-perf-rust-final-24-20261010"
+    }
+  },
+  "navigation_input_latency_ms": {
+    "typescript_windows": [
+      {
+        "n": 638,
+        "p50": 10,
+        "p90": 12,
+        "max": 110
+      }
+    ],
+    "rust_windows": [
+      {
+        "n": 637,
+        "p50": 1.204167,
+        "p90": 1.242375,
+        "max": 1.576583
+      },
+      {
+        "n": 55,
+        "p50": 1.202917,
+        "p90": 1.233541,
+        "max": 1.272542
+      }
+    ],
+    "note": "Keep percentile windows separate; do not average percentiles into a fabricated aggregate."
+  },
+  "idle_ui_process_cpu": [
+    {
+      "runtime": "typescript",
+      "interval_seconds": 50.00966929085553,
+      "self_cpu_seconds": 0.77,
+      "self_cpu_percent": 1.5397022434235486,
+      "note": "ps cumulative TIME delta after five seconds warmup; UI process only, excluding children; 0.01-second CPU resolution."
+    },
+    {
+      "runtime": "rust",
+      "interval_seconds": 50.01350233331323,
+      "self_cpu_seconds": 0.06,
+      "self_cpu_percent": 0.11996760314870994,
+      "note": "ps cumulative TIME delta after five seconds warmup; UI process only, excluding children; 0.01-second CPU resolution."
+    }
+  ]
+}
