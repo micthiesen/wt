@@ -8,7 +8,7 @@ Each row shows live status, PR state, preview deployment, issue link, and coding
 
 The design principle behind all of it: **the human does only the work only a human can do** (merges, logins, judgment calls). Agents assert a per-worktree work status (`wt status` — blocked-on-you / needs-testing / ready-to-merge, with a merge-risk level), the list auto-sorts by what needs you, automations ping only when human action is genuinely required, and a singleton manager session coordinates the fleet. The full rationale and agency model: **[docs/fleet.md](docs/fleet.md)**.
 
-![Native wt showing work status and sections in a demo repository](docs/screenshot.png)
+![wt showing work statuses, sections, a stacked branch, and the attention feed in a demo repository](docs/screenshot.png)
 
 ## Requirements
 
