@@ -6,11 +6,19 @@ use anyhow::Result;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
-use wt_tui::Board;
+use wt_tui::{Board, PerfView};
 
 use crate::context::AppContext;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One published sample: the plain report `i` hands to an agent and remote
+/// hosts forward, plus the typed overlay model.
+#[derive(Clone, Debug, Default)]
+pub struct PerfSample {
+    pub report: Vec<String>,
+    pub view: Option<PerfView>,
+}
 
 pub struct PerfSources {
     pub board: SourceHandle<Board>,
@@ -71,7 +79,10 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
         context.cancellation = cancellation;
         async move {
             let snapshot = crate::commands::perf::snapshot(&context, true).await?;
-            Ok(format_snapshot(&snapshot))
+            Ok(PerfSample {
+                report: crate::commands::perf::report(&snapshot),
+                view: Some(crate::commands::perf::view(&snapshot)),
+            })
         }
     })
 }
@@ -83,14 +94,14 @@ fn start_with_sampler<F, Fut>(
 ) -> PerfSources
 where
     F: Fn(CancellationToken) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = Result<Vec<String>>> + Send + 'static,
+    Fut: Future<Output = Result<PerfSample>> + Send + 'static,
 {
-    let (perf, perf_publisher) = source_channel::<Vec<String>>();
+    let (perf, perf_publisher) = source_channel::<PerfSample>();
     let (control_tx, mut control_rx) = watch::channel(Controls::default());
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut controls = *control_rx.borrow_and_update();
-        let mut latest: Option<Arc<Vec<String>>> = None;
+        let mut latest: Option<Arc<PerfSample>> = None;
         let mut should_sample = controls.active;
         loop {
             if cancellation.is_cancelled() {
@@ -163,19 +174,22 @@ where
 
             let now = tokio::time::Instant::now();
             let (data, state) = match sampled {
-                Ok(lines) => {
-                    let data = Arc::new(lines);
+                Ok(sample) => {
+                    let data = Arc::new(sample);
                     latest = Some(data.clone());
                     (Some(data), SourceState::Ready)
                 }
                 Err(error) => {
                     let error_line = format!("Performance snapshot failed: {error:#}");
-                    let mut lines = latest
-                        .as_deref()
-                        .map_or_else(Vec::new, |data| data.to_vec());
-                    lines.retain(|line| !line.starts_with("Performance snapshot failed:"));
-                    lines.push(error_line.clone());
-                    let data = Arc::new(lines);
+                    let mut sample = latest.as_deref().cloned().unwrap_or_default();
+                    sample
+                        .report
+                        .retain(|line| !line.starts_with("Performance snapshot failed:"));
+                    sample.report.push(error_line.clone());
+                    if let Some(view) = &mut sample.view {
+                        view.error = Some(format!("{error:#}"));
+                    }
+                    let data = Arc::new(sample);
                     (Some(data), SourceState::Failed(Arc::from(error_line)))
                 }
             };
@@ -219,7 +233,7 @@ where
 fn overlay(
     scope: &TaskScope,
     board: SourceHandle<Board>,
-    perf: SourceHandle<Vec<String>>,
+    perf: SourceHandle<PerfSample>,
 ) -> SourceHandle<Board> {
     let (output, mut publisher) = source_channel();
     let cancellation = scope.token();
@@ -250,10 +264,9 @@ fn overlay(
             let base = board_updates.borrow().clone();
             let perf_snapshot = perf_updates.borrow().clone();
             let mut projected = base.data.as_deref().cloned().unwrap_or_default();
-            projected.perf = perf_snapshot
-                .data
-                .as_deref()
-                .map_or_else(Vec::new, Clone::clone);
+            let sample = perf_snapshot.data.as_deref();
+            projected.perf = sample.map_or_else(Vec::new, |sample| sample.report.clone());
+            projected.perf_view = sample.and_then(|sample| sample.view.clone()).map(Box::new);
             let state = base.state.clone();
             let key = (projected.clone(), state.clone());
             if previous.as_ref() == Some(&key) {
@@ -269,102 +282,6 @@ fn overlay(
         }
     });
     output
-}
-
-fn format_snapshot(snapshot: &crate::commands::perf::Snapshot) -> Vec<String> {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "Sampled at {} UTC",
-        time::OffsetDateTime::from_unix_timestamp_nanos(
-            i128::try_from(snapshot.sampled_at_ms).unwrap_or(i128::MAX) * 1_000_000
-        )
-        .map(|time| time
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default())
-        .unwrap_or_else(|_| "unknown time".into())
-    ));
-    if let Some(load) = snapshot.load_average {
-        lines.push(format!(
-            "Load {:.2} / {:.2} / {:.2}    system CPU {:.0}%",
-            load[0], load[1], load[2], snapshot.system_cpu
-        ));
-    } else {
-        lines.push(format!("System CPU {:.0}%", snapshot.system_cpu));
-    }
-    if let Some(memory) = &snapshot.memory {
-        lines.push(format!(
-            "Memory {:.1} / {:.1} GiB",
-            memory.used_bytes as f64 / 1_073_741_824.0,
-            memory.total_bytes as f64 / 1_073_741_824.0
-        ));
-    }
-    lines.push(format!(
-        "wt tree {:.0}% CPU, {:.1} GiB RSS, {} processes; other processes {}",
-        snapshot.wt_cpu,
-        snapshot.wt_rss_kb as f64 / 1024.0 / 1024.0,
-        snapshot.downstream_count,
-        snapshot.other_count
-    ));
-    for (category, (cpu, rss)) in &snapshot.category_totals {
-        let count = snapshot
-            .categories
-            .get(category)
-            .copied()
-            .unwrap_or_default();
-        lines.push(format!(
-            "  {category}: {count} process(es), {cpu:.1}% CPU, {:.1} MiB RSS",
-            *rss as f64 / 1024.0
-        ));
-    }
-    for session in &snapshot.sessions {
-        lines.push(format!(
-            "Session {}: {:.1}% CPU, {:.1} MiB RSS, {} process(es): {}",
-            session.name,
-            session.cpu,
-            session.rss_kb as f64 / 1024.0,
-            session.count,
-            session.summary
-        ));
-    }
-    lines.push("Top wt processes:".into());
-    lines.extend(snapshot.top_downstream.iter().map(format_process));
-    lines.push("Top other processes:".into());
-    lines.extend(snapshot.top_other.iter().map(format_process));
-    if snapshot.orphan_probe_available {
-        if snapshot.orphans.is_empty() {
-            lines.push("No orphaned headless wt processes found.".into());
-        } else {
-            lines.push(format!(
-                "Orphaned headless wt processes: {} (verify identity before acting)",
-                snapshot.orphans.len()
-            ));
-            lines.extend(snapshot.orphans.iter().map(format_process));
-        }
-    } else {
-        lines.push("Orphan detection unavailable on this platform.".into());
-    }
-    if !snapshot.tmux_probe_available {
-        lines.push("tmux session attribution unavailable.".into());
-    }
-    lines
-}
-
-fn format_process(process: &crate::commands::perf::ProcessRow) -> String {
-    let session = process
-        .session
-        .as_deref()
-        .map(|name| format!(" [{name}]"))
-        .unwrap_or_default();
-    format!(
-        "  pid {} {} {:.1}% CPU {:.1} MiB RSS up {}: {}{}",
-        process.pid,
-        process.category,
-        process.cpu,
-        process.rss_kb as f64 / 1024.0,
-        process.elapsed,
-        process.command,
-        session
-    )
 }
 
 #[cfg(test)]
@@ -392,7 +309,10 @@ mod tests {
             let calls = sampler_calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec!["sample".into()])
+                Ok(PerfSample {
+                    report: vec!["sample".into()],
+                    view: None,
+                })
             }
         });
 
@@ -440,7 +360,7 @@ mod tests {
                         cancelled.fetch_add(1, Ordering::SeqCst);
                         anyhow::bail!("cancelled")
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => Ok(vec!["late".into()]),
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => Ok(PerfSample::default()),
                 }
             }
         });

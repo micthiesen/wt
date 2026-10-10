@@ -198,9 +198,9 @@ Tail a destroy log (`tail -F`). No slug ⇒ the most recently modified log.
 
 ### `wt perf [--json]`
 
-One-shot perf snapshot framed as **wt-downstream vs the rest of the machine** — the headless form of the TUI's [`P` overlay](tui.md#perf-overlay-p): verdict numbers, per-category and per-worktree-session breakdowns, the heaviest processes on both sides, and any leaked headless wt instances. The default output is the same plain-text report the overlay's `i` key sends, written for handing to an agent ("is this load reasonable, and if not, whose is it?"); `--json` emits the raw `PerfSnapshot` instead. On macOS, `ps` `%CPU` is a decaying average over up to one minute, not an instantaneous profile.
+One-shot perf snapshot framed as **wt-downstream vs the rest of the machine** — the headless form of the TUI's [`P` overlay](tui.md#perf-overlay-p): verdict numbers, per-category and per-worktree-session breakdowns, the heaviest processes on both sides, and any leaked headless wt instances. The default output is the same plain-text report the overlay's `i` key sends, written for handing to an agent ("is this load reasonable, and if not, whose is it?"); `--json` emits the raw `PerfSnapshot` instead, including `cores` (the CPU ceiling is `cores × 100%`) and the one-line `verdict`. On macOS, `ps` `%CPU` is a decaying average over up to one minute, not an instantaneous profile.
 
-Unlike the overlay (where the TUI process itself anchors the tree), the CLI also roots at any live wt instance it finds in the process table, so the running TUI counts as "us" rather than showing up as an outsider.
+Both the CLI and the TUI's `P` overlay root the tree at every live wt instance in the process table, so a running TUI counts as "us" rather than showing up as an outsider.
 
 Downstream means process ancestry, not task ownership. An agent's tools can be
 launched by an external daemon and appear outside wt. Only the six outsiders
