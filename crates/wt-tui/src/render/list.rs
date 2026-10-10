@@ -380,7 +380,8 @@ fn folded_header(
         Modifier::empty()
     };
     let chip = format!("[×{count:02}] ");
-    let mut right: Vec<Span<'static>> = Vec::new();
+    let mut states: Vec<Span<'static>> = Vec::new();
+    let mut alarms: Vec<Span<'static>> = Vec::new();
     if let Some(rollup) = rollup {
         for entry in super::details::ranked_states(&rollup.states).filter(|entry| {
             entry
@@ -388,30 +389,41 @@ fn folded_header(
                 .is_some_and(|state| state != wt_core::WorkState::Todo)
         }) {
             let state = entry.state.expect("filtered to asserted states");
-            right.push(Span::styled(
+            states.push(Span::styled(
                 format!("{} {} ", badges::work_state_glyph(state), entry.count),
                 style(badges::work_state_color(state)),
             ));
         }
         if rollup.verification_overdue > 0 {
-            right.push(Span::styled(
+            alarms.push(Span::styled(
                 format!("{} {} ", glyphs::DOT, rollup.verification_overdue),
                 style(theme::ERR),
             ));
         }
         if rollup.conflicted > 0 {
-            right.push(Span::styled(
+            alarms.push(Span::styled(
                 format!("{} {} ", glyphs::CONFLICT, rollup.conflicted),
                 style(theme::ERR),
             ));
         }
         if rollup.failing_checks > 0 {
-            right.push(Span::styled(
+            alarms.push(Span::styled(
                 format!("{} {} ", glyphs::CHECK_FAIL, rollup.failing_checks),
                 style(theme::ERR),
             ));
         }
     }
+    // The name wins over the counts: the least urgent state counts go first
+    // when the name would otherwise be cut; alarms always stay.
+    let cells =
+        |spans: &[Span<'static>]| spans.iter().map(|span| span.content.width()).sum::<usize>();
+    while !states.is_empty()
+        && width.saturating_sub(2 + chip.width() + cells(&states) + cells(&alarms)) < label.width()
+    {
+        states.pop();
+    }
+    let mut right = states;
+    right.extend(alarms);
     let right_width: usize = right.iter().map(|span| span.content.width()).sum();
     let room = width.saturating_sub(2 + chip.width() + right_width);
     let label = truncate_end(label, room);
@@ -590,6 +602,38 @@ mod tests {
             .map(|span| span.content.width())
             .sum();
         assert_eq!(cells, 38);
+    }
+
+    #[test]
+    fn a_narrow_folded_header_drops_counts_before_its_name() {
+        let rollup = SectionRollup {
+            states: [
+                wt_core::WorkState::Ready,
+                wt_core::WorkState::NeedsHuman,
+                wt_core::WorkState::Working,
+                wt_core::WorkState::Review,
+            ]
+            .into_iter()
+            .map(|state| crate::WorkStateCount {
+                state: Some(state),
+                count: 1,
+            })
+            .collect(),
+            failing_checks: 1,
+            ..Default::default()
+        };
+        let line = folded_header("Statuses", 8, Some(&rollup), false, 30, None);
+        let text: String = line
+            .line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("Statuses"), "{text:?}");
+        assert!(
+            text.contains(&format!("{} 1", glyphs::CHECK_FAIL)),
+            "{text:?}"
+        );
     }
 
     #[test]

@@ -75,6 +75,10 @@ async fn palette(
         }));
     }
     let keys = assign_keys(&definitions, reserved_keys(&surface));
+    let primary = board.map_or_else(
+        || ctx.config.harness.primary.as_str().to_owned(),
+        |board| board.display.primary_harness.clone(),
+    );
     let mut groups: Vec<(String, Vec<PickerOption>)> = Vec::new();
     for def in definitions.iter().filter(|def| def.id != CUSTOM_ID) {
         let reason = match (&blocked, &context) {
@@ -94,7 +98,10 @@ async fn palette(
             chord: keys.get(&def.id).copied(),
             note: None,
             verify_after_merge: None,
-            detail: Some(reason.map_or_else(|| action_detail(def), |reason| format!("({reason})"))),
+            detail: Some(reason.map_or_else(
+                || action_detail(def, &primary),
+                |reason| format!("({reason})"),
+            )),
         };
         if let Some((_, values)) = groups.iter_mut().find(|(name, _)| *name == group) {
             values.push(option);
@@ -456,17 +463,18 @@ async fn dev_logs(
     }))
 }
 
-/// The `! t` row label, with the reason when it cannot run.
 /// The palette's trailing hint, as in TS: `$ id` for shell commands, the
 /// agent glyph and id for prompts, with `↪` when it goes to the live session.
-fn action_detail(def: &wt_config::ActionDef) -> String {
+fn action_detail(def: &wt_config::ActionDef, primary: &str) -> String {
+    let agent = wt_tui::harness_glyph(primary);
     match (def.kind, def.target) {
         (wt_config::ActionKind::Shell, _) => format!("$ {}", def.id),
-        (_, wt_config::ActionTarget::Session) => format!("↪ {}", def.id),
-        _ => def.id.clone(),
+        (_, wt_config::ActionTarget::Session) => format!("{agent}  ↪ {}", def.id),
+        _ => format!("{agent}  {}", def.id),
     }
 }
 
+/// The `! t` row detail, with the reason when it cannot run.
 fn rename_detail(ctx: &AppContext, board: Option<&Board>, surface: &ActionSurface) -> String {
     let busy = match surface {
         ActionSurface::Row { key } => board

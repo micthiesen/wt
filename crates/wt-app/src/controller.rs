@@ -204,6 +204,7 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
         Err(error) if error.downcast_ref::<Notice>().is_some() => (
             UiReply {
                 message: error.to_string(),
+                notice: true,
                 ..Default::default()
             },
             false,
@@ -379,6 +380,7 @@ mod tests {
     fn a_notice_is_a_plain_toast_not_a_failure() {
         let reply = action_reply(Err(notice("already at top")), None);
         assert!(!reply.failed);
+        assert!(reply.notice);
         assert_eq!(reply.message, "already at top");
     }
 

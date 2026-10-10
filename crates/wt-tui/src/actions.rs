@@ -477,6 +477,9 @@ pub struct UiReply {
     pub ui_generation: Option<u64>,
     pub message: String,
     pub failed: bool,
+    /// The key had nothing to act on; the toast reads as a notice.
+    #[serde(default)]
+    pub notice: bool,
     /// Creation can finish before the source publishes the new row. The model
     /// consumes this selection only once the actual row is visible.
     pub select_when_visible: Option<String>,

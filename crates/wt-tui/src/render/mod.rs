@@ -290,10 +290,10 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
         .toast
         .as_ref()
         .filter(|(message, _)| !message.trim().is_empty());
-    let left = if let Some((message, failed)) = toast {
+    let left = if let Some((message, tone)) = toast {
         // Leave the slot buttons their cells; a long toast truncates.
         let room = (area.width as usize).saturating_sub(slot_buttons_width(model) + 4);
-        if *failed {
+        if *tone == crate::model::ToastTone::Failed {
             vec![
                 Span::raw(" "),
                 Span::styled(format!("{} ", glyphs::CHECK_FAIL), base.fg(theme::ERR)),
@@ -305,7 +305,14 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
         } else {
             vec![
                 Span::raw(" "),
-                Span::styled(truncate_end(message, room), base.fg(theme::FG)),
+                Span::styled(
+                    truncate_end(message, room),
+                    base.fg(if *tone == crate::model::ToastTone::Notice {
+                        theme::WARN
+                    } else {
+                        theme::FG
+                    }),
+                ),
             ]
         }
     } else if let SourceState::Failed(error) = &model.source_state {
@@ -701,7 +708,7 @@ mod tests {
     #[test]
     fn an_empty_toast_keeps_the_help_legend_under_a_modal() {
         let mut model = Model {
-            toast: Some((String::new(), false)),
+            toast: Some((String::new(), crate::model::ToastTone::Info)),
             interaction: Interaction::Picker(crate::model::PickerPrompt {
                 action: PickerAction::Status { key: "one".into() },
                 title: "status".into(),

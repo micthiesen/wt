@@ -65,7 +65,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
             scroll,
         } => log(frame, area, title, lines, scroll),
         Interaction::Confirm(confirm) => confirmation(frame, area, confirm),
-        Interaction::Picker(picker) => self::picker(frame, area, picker, &primary),
+        Interaction::Picker(picker) => {
+            let summary = session_summary(&model.board, picker);
+            self::picker(frame, area, picker, &primary, summary.as_deref())
+        }
         Interaction::Text(_) | Interaction::None => {}
     }
 }
@@ -123,8 +126,11 @@ impl Modal {
     /// The frame for `body_rows` of content that would like
     /// `content_width` cells. `fill` takes the full available height.
     fn place(&self, area: Rect, content_width: usize, body_rows: usize, fill: bool) -> Rect {
-        let max_width = if area.width < NARROW_WIDTH {
-            area.width
+        // Narrow terminals give the modal the width inside the pane borders,
+        // so no sliver of list text shows beside it.
+        let narrow = area.width < NARROW_WIDTH;
+        let max_width = if narrow {
+            area.width.saturating_sub(4)
         } else {
             area.width.saturating_sub(4).min(MAX_FRAME_WIDTH)
         };
@@ -141,12 +147,16 @@ impl Modal {
             .saturating_add(4)
             .min(usize::from(u16::MAX)) as u16)
             .clamp(min_width, max_width);
+        let width = if narrow { max_width } else { width };
         let hint_rows = hint_lines(&self.visible_hints(area), width.saturating_sub(4)).len();
         let chrome = 2 + Self::top_padding(area) as usize + hint_rows + usize::from(hint_rows > 0);
+        // Keep the header, the pane borders, and the footer visible: the
+        // modal sits inside the panes like the TS dialogs, with a spare row
+        // above and below when the terminal has room.
         let max_height = if area.height >= 24 {
-            area.height - 2
+            area.height - 6
         } else {
-            area.height
+            area.height.saturating_sub(4).max(3.min(area.height))
         };
         let height = if fill {
             max_height
@@ -160,9 +170,14 @@ impl Modal {
     fn draw(&self, frame: &mut Frame<'_>, area: Rect, outer: Rect) -> Rect {
         // A one-cell gutter of board background on each side, so text
         // behind the modal never sits flush against its border.
+        // The gutter never covers the pane borders at the screen edges.
+        let left = outer.x.saturating_sub(1).max(area.x + 1).min(outer.x);
+        let right = (outer.x + outer.width + 1)
+            .min(area.x + area.width.saturating_sub(1))
+            .max(outer.x + outer.width);
         let gutter = Rect {
-            x: outer.x.saturating_sub(1).max(area.x),
-            width: (outer.width + 2).min(area.width),
+            x: left,
+            width: right - left,
             ..outer
         };
         frame.render_widget(Clear, gutter);
@@ -335,13 +350,49 @@ enum PickRow {
     Group(String),
     Spacer,
     Option(usize),
+    /// Read-only text below the entries, such as a session summary.
+    Note(String, bool),
 }
 
-fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &str) {
+/// The highlighted resumable session's summary, from the prepared board.
+/// `Some("")` means a resumable session with no summary yet.
+fn session_summary(board: &crate::Board, picker: &PickerPrompt) -> Option<String> {
+    let PickerAction::Sessions { choices } = &picker.action else {
+        return None;
+    };
+    let choice = picker
+        .options
+        .get(picker.selected)?
+        .value
+        .as_deref()?
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| choices.get(index))?;
+    if choice.mode != SessionMode::Resume {
+        return None;
+    }
+    let id = choice.session_id.as_deref();
+    let summary = board
+        .rows
+        .iter()
+        .flat_map(|row| row.sessions.iter())
+        .chain(board.slot_sessions.values().flatten())
+        .find(|session| id.is_some_and(|id| session.id == id))
+        .and_then(|session| session.summary.clone());
+    Some(summary.unwrap_or_default())
+}
+
+fn picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &PickerPrompt,
+    primary: &str,
+    summary: Option<&str>,
+) {
     let actions = matches!(picker.action, PickerAction::Actions { .. });
     let chords = picker.options.iter().any(|option| option.chord.is_some());
     let digit_rows = crate::model::digit_rows(picker);
-    let digits = !chords && !digit_rows.is_empty() && picker.options.len() <= 9;
+    let digits = !digit_rows.is_empty() && picker.options.len() <= 9;
     let glyphs = matches!(
         picker.action,
         PickerAction::Status { .. } | PickerAction::Sessions { .. } | PickerAction::Harness { .. }
@@ -370,6 +421,23 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
         }
         rows.push(PickRow::Option(index));
         labels.push(label);
+    }
+    // TS shows the highlighted session's last summary under the entries.
+    if let Some(summary) = summary {
+        rows.push(PickRow::Spacer);
+        rows.push(PickRow::Note("── summary ──".into(), true));
+        rows.push(PickRow::Spacer);
+        let text = if summary.is_empty() {
+            "(no summary yet)"
+        } else {
+            summary
+        };
+        rows.extend(
+            wrap(text, 72)
+                .into_iter()
+                .take(6)
+                .map(|line| PickRow::Note(line, false)),
+        );
     }
 
     let mut title = picker.title.as_str();
@@ -414,10 +482,11 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
         _ => None,
     };
     let mut hints = vec![hint("j/k", "move")];
-    if chords {
-        hints.push(hint("letter", "quick pick"));
-    } else if digits {
-        hints.push(hint("1-9", "quick pick"));
+    match (chords, digits) {
+        (true, true) => hints.push(hint("letter / 1-9", "quick pick")),
+        (true, false) => hints.push(hint("letter", "quick pick")),
+        (false, true) => hints.push(hint("1-9", "quick pick")),
+        (false, false) => {}
     }
     hints.push(hint(
         opener.map_or("⏎".to_owned(), |key| format!("{key} / ⏎")),
@@ -480,30 +549,38 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
                 ),
             ]),
             PickRow::Spacer => Line::default(),
+            PickRow::Note(text, header) => Line::from(vec![
+                Span::raw(if *header { "" } else { " " }),
+                Span::styled(
+                    truncate_end(text, width.saturating_sub(1)),
+                    if *header {
+                        theme::dim().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::dim()
+                    },
+                ),
+            ]),
             PickRow::Option(index) => {
                 let option = &picker.options[*index];
                 let selected = *index == picker.selected;
                 let mut spans = Vec::new();
-                let key_color = if selected {
+                // Palette letters stay in the accent on every row, as in TS:
+                // they are the palette's primary way to pick.
+                let key_color = if selected || actions {
                     theme::ACCENT
                 } else {
                     theme::FG_DIM
                 };
-                if chords {
-                    spans.push(Span::styled(
-                        option
-                            .chord
-                            .map_or("  ".to_owned(), |chord| format!("{chord} ")),
-                        theme::fg(key_color),
-                    ));
-                } else if digits {
-                    spans.push(Span::styled(
-                        digit_rows
-                            .iter()
-                            .position(|&row| row == *index)
-                            .map_or("  ".to_owned(), |digit| format!("{} ", digit + 1)),
-                        theme::fg(key_color),
-                    ));
+                if chords || digits {
+                    let digit = digits
+                        .then(|| digit_rows.iter().position(|&row| row == *index))
+                        .flatten();
+                    let key = match (option.chord, digit) {
+                        (Some(chord), _) => format!("{chord} "),
+                        (None, Some(digit)) => format!("{} ", digit + 1),
+                        (None, None) => "  ".to_owned(),
+                    };
+                    spans.push(Span::styled(key, theme::fg(key_color)));
                 }
                 if glyphs {
                     let (glyph, color) = picker_glyph(&picker.action, option, primary);
@@ -610,7 +687,8 @@ fn picker_glyph(
                     badges::work_state_glyph(state),
                     badges::work_state_color(state),
                 ),
-                None => (glyphs::DOT_OUTLINE, theme::FG_DIM),
+                // Clearing has no state to draw, as in TS.
+                None => (" ", theme::FG_DIM),
             }
         }
         PickerAction::Sessions { choices } => {
@@ -894,11 +972,21 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
     let widest = confirm
         .lines
         .iter()
-        .map(|line| line.width() + 3)
+        // A glyph line takes a three-cell lead and keeps one spare cell
+        // (see `confirm_rows`), so size for both or it wraps one word.
+        .map(|line| {
+            line.width()
+                + 4
+                + if confirm_line_kind(line).0.is_some() {
+                    3
+                } else {
+                    0
+                }
+        })
         .max()
         .unwrap_or(0)
         .max(confirm.title.width() + 4)
-        .clamp(44, 76);
+        .clamp(44, 80);
     // Measure at the width the frame will actually get.
     let probe = Modal::new(confirm.title.clone(), hints.clone());
     let probe_width = probe.place(area, widest, 1, false).width.saturating_sub(4) as usize;
@@ -2306,6 +2394,91 @@ mod tests {
             theme::FG_BRIGHT,
             "subject line is bright"
         );
+    }
+
+    #[test]
+    fn sessions_picker_shows_the_highlighted_session_summary() {
+        use crate::{SessionMode, SessionSelection, SessionTarget};
+        let choice = |mode, id: Option<&str>| SessionSelection {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+            harness: wt_core::HarnessId::Claude,
+            session_id: id.map(str::to_owned),
+            managed_name: None,
+            mode,
+            live: false,
+        };
+        let board = crate::Board {
+            rows: vec![crate::BoardRow {
+                key: "one".into(),
+                sessions: vec![crate::SessionView {
+                    id: "s1".into(),
+                    summary: Some("Finished the review".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut picker = PickerPrompt {
+            action: PickerAction::Sessions {
+                choices: vec![
+                    choice(SessionMode::Resume, Some("s1")),
+                    choice(SessionMode::Resume, Some("s2")),
+                    choice(SessionMode::New, None),
+                ],
+            },
+            title: "sessions · one".into(),
+            options: (0..3)
+                .map(|index| PickerOption {
+                    value: Some(index.to_string()),
+                    label: format!("row {index}"),
+                    chord: None,
+                    note: None,
+                    verify_after_merge: None,
+                    detail: None,
+                })
+                .collect(),
+            selected: 0,
+        };
+        assert_eq!(
+            session_summary(&board, &picker).as_deref(),
+            Some("Finished the review")
+        );
+        picker.selected = 1;
+        assert_eq!(session_summary(&board, &picker).as_deref(), Some(""));
+        picker.selected = 2;
+        assert_eq!(session_summary(&board, &picker), None);
+    }
+
+    #[test]
+    fn section_picker_numbers_sections_and_keeps_the_new_row_letter() {
+        let option = |label: &str, chord| PickerOption {
+            value: Some(label.into()),
+            label: label.into(),
+            chord,
+            note: None,
+            verify_after_merge: None,
+            detail: None,
+        };
+        let mut model = Model {
+            interaction: Interaction::Picker(PickerPrompt {
+                action: PickerAction::Section { key: "one".into() },
+                title: "section".into(),
+                options: vec![
+                    option("Inbox", None),
+                    option("Landed", None),
+                    option("+ new section", Some('n')),
+                ],
+                selected: 0,
+            }),
+            ..Model::default()
+        };
+        let text = rows(&draw(&mut model, 100, 30)).join("\n");
+        assert!(text.contains("1 Inbox"), "{text}");
+        assert!(text.contains("2 Landed"), "{text}");
+        assert!(text.contains("n + new section"), "{text}");
+        assert!(text.contains("letter / 1-9 quick pick"), "{text}");
     }
 
     #[test]

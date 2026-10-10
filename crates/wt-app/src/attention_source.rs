@@ -294,9 +294,15 @@ struct TransitionTracker {
 
 impl TransitionTracker {
     fn push(&mut self, line: String) {
+        self.push_from("wt", line);
+    }
+
+    /// An event about one worktree or feed: the feed shows `source` in its
+    /// right-aligned column and `line` beside it, as TS did.
+    fn push_from(&mut self, source: &str, line: String) {
         let text = wt_core::sanitize_terminal_text(&line);
         let at_ms = crate::activity_source::epoch_ms();
-        let source = "wt".to_owned();
+        let source = wt_core::sanitize_terminal_text(source);
         tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
         self.events.push_back(wt_tui::AttentionLine {
             at_ms,
@@ -323,11 +329,10 @@ impl TransitionTracker {
                 else {
                     continue;
                 };
-                self.push(format!(
-                    "{}: {}",
-                    wt_core::worktree_ledger_label(slug),
-                    describe_status(record)
-                ));
+                self.push_from(
+                    &wt_core::worktree_ledger_label(slug),
+                    describe_status(record),
+                );
             }
         }
         if let Some(previous) = self.sections.clone() {
@@ -338,16 +343,14 @@ impl TransitionTracker {
                 let destination = section
                     .as_ref()
                     .map_or_else(|| "the inbox".to_owned(), Clone::clone);
-                let text = format!(
-                    "{} moved to {destination}",
-                    wt_core::worktree_ledger_label(key)
-                );
+                let label = wt_core::worktree_ledger_label(key);
+                let text = format!("moved to {destination}");
                 // The user's own move already showed a toast; only a move
                 // made elsewhere interrupts.
                 if self.own_section_writes.consume(key, section.as_deref()) {
-                    tracing::info!(target: "wt::sections", event_text = %text, "section move");
+                    tracing::info!(target: "wt::sections", event_source = %label, event_text = %text, "section move");
                 } else {
-                    self.push(text);
+                    self.push_from(&label, text);
                 }
             }
         }
@@ -360,7 +363,7 @@ impl TransitionTracker {
         if let Some(previous) = self.issues.clone() {
             for (id, status) in &next {
                 if let Some(old) = previous.get(id).filter(|old| *old != status) {
-                    self.push(format!("issues: #{id}: {old} → {status}"));
+                    self.push_from("issues", format!("#{id}: {old} → {status}"));
                 }
             }
         }
@@ -378,10 +381,10 @@ impl TransitionTracker {
                 continue;
             };
             if status.crashed && next.get(&row.slug) == Some(&false) {
-                self.push(format!(
-                    "{}: dev server crashed, see `wt dev logs`",
-                    wt_core::worktree_ledger_label(&row.slug)
-                ));
+                self.push_from(
+                    &wt_core::worktree_ledger_label(&row.slug),
+                    "dev server crashed, see `wt dev logs`".into(),
+                );
             }
             next.insert(row.slug.clone(), status.crashed);
         }
@@ -437,7 +440,7 @@ impl TransitionTracker {
                 .map(|row| wt_core::worktree_ledger_label(&row.key))
                 .unwrap_or_else(|| branch.clone());
             for line in comment_lines(&fresh) {
-                self.push(format!("{label}: {line}"));
+                self.push_from(&label, line);
             }
         }
         while self.comments.len() > 256 {

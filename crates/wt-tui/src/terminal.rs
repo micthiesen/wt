@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+
+use crate::model::ToastTone;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
@@ -254,7 +256,10 @@ async fn run_inner<'a>(
                     })
                     .is_err()
                 {
-                    model.toast = Some(("Actions are busy; selection not copied".into(), true));
+                    model.toast = Some((
+                        "Actions are busy; selection not copied".into(),
+                        ToastTone::Failed,
+                    ));
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                     terminal.draw(|frame| render(frame, &mut model))?;
                 }
@@ -296,7 +301,7 @@ async fn run_inner<'a>(
                             InputResult::Quit => break,
                             InputResult::Refresh => {
                                 source.refresh();
-                                model.toast = Some(("Refreshing…".into(), false));
+                                model.toast = Some(("Refreshing…".into(), ToastTone::Info));
                                 toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
                                 dirty = true;
                                 input_at = Some(received);
@@ -305,9 +310,9 @@ async fn run_inner<'a>(
                             InputResult::Unchanged => {}
                             InputResult::Action(action) => {
                                 match actions.requests.try_send(crate::UiRequest { generation: model.ui_generation, action }) {
-                                    Ok(()) => model.toast = Some(("Working…".into(), false)),
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), true)),
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), true)),
+                                    Ok(()) => model.toast = Some(("Working…".into(), ToastTone::Info)),
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)),
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)),
                                 }
                                 dirty = true;
                                 toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
@@ -362,7 +367,7 @@ async fn run_inner<'a>(
                             HandoffResult::Resumed(Err(message)) => {
                                 terminal.resize(terminal.size()?.into())?;
                                 events = EventStream::new();
-                                model.toast = Some((message, true));
+                                model.toast = Some((message, ToastTone::Failed));
                                 dirty = true;
                             }
                             HandoffResult::Cancelled => {

@@ -114,7 +114,12 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             Ok(UiReply {
                 modal: Some(UiModal::Picker {
                     action: PickerAction::Sessions { choices },
-                    title: "Sessions".into(),
+                    title: match (&key, target) {
+                        (Some(key), wt_tui::SessionTarget::Harness) => {
+                            format!("sessions · {}", wt_core::worktree_ledger_label(key))
+                        }
+                        _ => "sessions".into(),
+                    },
                     options,
                     selected: 0,
                 }),

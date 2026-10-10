@@ -56,7 +56,10 @@ impl GithubPickers {
         };
         let branch = row.branch.clone();
         let Some(pr) = github.prs.get(&branch) else {
-            return Ok(reply("no PR for this row"));
+            return Ok(UiReply {
+                notice: true,
+                ..reply("no PR for this row")
+            });
         };
         if pr.state != "OPEN" {
             return Ok(reply(format!("PR #{} is not open", pr.number)));

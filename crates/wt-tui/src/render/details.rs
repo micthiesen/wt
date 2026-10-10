@@ -53,17 +53,38 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     // One cell of padding each side; the right one doubles as the
     // scrollbar's gutter so a thumb never sits on text. A blank row above
     // the content (outside the scroll region) matches the TS pane's top
-    // padding, so the title never sits against the border.
+    // padding, so the title never sits against the border; a pane too short
+    // for everything gives that row to content instead.
     let mut content = inner.inner(Margin {
         vertical: 0,
         horizontal: 1,
     });
-    if content.height > 3 {
+    let width = usize::from(content.width).max(1);
+    let mut lines = build(model, width);
+    // A section's key hint is its last line; when the summary overflows,
+    // pin the hint to the bottom row so it never scrolls out of sight.
+    let section_view = model.selected_row().is_none()
+        && model.selected_review().is_none()
+        && model.selected_section().is_some();
+    if section_view && lines.len() > usize::from(content.height) && content.height > 2 {
+        let hint = lines.pop().unwrap_or_default();
+        if lines.last().is_some_and(|line| line.width() == 0) {
+            lines.pop();
+        }
+        content.height -= 1;
+        frame.render_widget(
+            Paragraph::new(hint),
+            Rect {
+                y: content.y + content.height,
+                height: 1,
+                ..content
+            },
+        );
+    }
+    if content.height > 3 && lines.len() < usize::from(content.height) {
         content.y += 1;
         content.height -= 1;
     }
-    let width = usize::from(content.width).max(1);
-    let lines = build(model, width);
     let height = usize::from(content.height);
     let max_scroll = lines.len().saturating_sub(height);
     let scroll = usize::from(model.details_scroll).min(max_scroll);
@@ -676,10 +697,8 @@ fn git_value(row: &BoardRow, width: usize, now: u64) -> Spans {
         let age = age(at, now);
         segments.push(Segment::new(
             4,
-            vec![
-                vec![Span::styled(format!("created {age}"), theme::dim())],
-                vec![Span::styled(format!("+{age}"), theme::dim())],
-            ],
+            // No compact form: a bare `+2h` beside `+2 −0` reads as a diff.
+            vec![vec![Span::styled(format!("created {age}"), theme::dim())]],
         ));
     }
     if inspectable {

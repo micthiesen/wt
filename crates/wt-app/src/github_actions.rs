@@ -104,6 +104,7 @@ impl GithubActions {
         let Some(pr) = github.prs.get(&branch) else {
             return Ok(UiReply {
                 message: "no PR for this row".into(),
+                notice: true,
                 ..UiReply::default()
             });
         };

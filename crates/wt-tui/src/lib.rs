@@ -21,6 +21,7 @@ pub use actions::{
     ReviewerOption, SessionMode, SessionSelection, SessionTarget, TerminalHandoff, TextAction,
     UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
 };
+pub use badges::harness_glyph;
 pub use editor::LineEditor;
 pub use model::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,

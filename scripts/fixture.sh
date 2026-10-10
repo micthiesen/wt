@@ -181,7 +181,10 @@ url_template = "https://tracker.invalid/issue/{id}"
 # section; "dev" is there because the section below configures a real
 # [dev_server]. Without either, the row is hidden and the fixture
 # silently stops covering the surface its own comment claims to exercise.
-rows = ["branch", "base", "path", "status", "issue", "dev", "git"]
+# "pr" and "claude" show PR and session details when a probe supplies them
+# (a fake gh on PATH, a fixture session); the branch group carries the base
+# and path lines.
+rows = ["branch", "issue", "dev", "pr", "claude", "git"]
 
 # A real, supervised, per-worktree dev server — enough to exercise
 # \`wt dev start/stop\`, the row's URL, port allocation, and the browser-tab

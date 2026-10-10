@@ -196,7 +196,7 @@ pub(crate) fn active_session<'a>(
         })
 }
 
-pub(crate) fn harness_glyph(harness: &str) -> &'static str {
+pub fn harness_glyph(harness: &str) -> &'static str {
     match harness.to_ascii_lowercase().as_str() {
         "codex" => glyphs::CODEX,
         "opencode" => glyphs::OPENCODE,

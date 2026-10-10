@@ -621,6 +621,14 @@ pub struct BoardRow {
     pub logs: Vec<LogView>,
 }
 
+/// How a footer toast reads: plain feedback, a notice that the key had
+/// nothing to act on (yellow, as in TS), or a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToastTone {
+    Info,
+    Notice,
+    Failed,
+}
 pub struct Model {
     pub board: Arc<Board>,
     pub source_state: SourceState,
@@ -652,7 +660,7 @@ pub struct Model {
     pub interaction: Interaction,
     pub(crate) interaction_host: Option<String>,
     pub yank: Option<usize>,
-    pub toast: Option<(String, bool)>,
+    pub toast: Option<(String, ToastTone)>,
     pub pending_selection: Option<String>,
     pub(crate) last_section_target: Option<Option<String>>,
     pub(crate) items: Vec<VisualItem>,
@@ -930,7 +938,14 @@ impl Model {
             self.show_perf = false;
             self.help = false;
         }
-        self.toast = Some((reply.message, reply.failed));
+        let tone = if reply.failed {
+            ToastTone::Failed
+        } else if reply.notice {
+            ToastTone::Notice
+        } else {
+            ToastTone::Info
+        };
+        self.toast = Some((reply.message, tone));
         self.interaction = match reply.modal.filter(|_| current) {
             Some(UiModal::Reviewers {
                 key,
@@ -1279,7 +1294,7 @@ impl Model {
 
     /// Feedback for a key that has nothing to act on.
     pub(crate) fn notify(&mut self, text: impl Into<String>) -> InputResult {
-        self.toast = Some((text.into(), false));
+        self.toast = Some((text.into(), ToastTone::Info));
         InputResult::Draw
     }
 
@@ -3462,7 +3477,8 @@ pub(crate) fn digit_rows(picker: &PickerPrompt) -> Vec<usize> {
                 .and_then(|value| value.parse::<usize>().ok())
                 .and_then(|choice| choices.get(choice))
                 .is_some_and(|choice| choice.mode == crate::SessionMode::Resume),
-            _ => true,
+            // A row with its own letter keeps the letter, as in TS.
+            _ => picker.options[index].chord.is_none(),
         })
         .take(9)
         .collect()

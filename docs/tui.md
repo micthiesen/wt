@@ -252,3 +252,37 @@ The wheel scrolls the pane under the pointer. Over the list it scrolls the
 viewport without moving the cursor; the next cursor move scrolls back to it.
 Dragging selects text within one pane and copies it to the clipboard on
 release.
+
+## Differences from the TypeScript UI
+
+The native TUI keeps the TypeScript board's keys, chords, prompts, glyphs,
+and spacing. It departs from that UI only where the change is deliberate:
+
+- The dirty badge stays on landed rows. Cleanup would discard those files,
+  so the hazard stays visible until the row is removed.
+- Folded section headers show a count per work state beside the row count,
+  so a folded group still says what needs attention.
+- Landed rows take their title from the landing commit when no title was
+  set, rather than repeating the branch name.
+- Modals use rounded borders and pane titles are dim, so the focused modal
+  stands apart from the panes behind it.
+- The perf overlay leads with a verdict on whether wt is the load, then
+  meters, a per-category breakdown, and the heaviest processes inside and
+  outside wt's process tree.
+- Help adds selection, sync notation, and create-prompt flag sections, and
+  its search finds keys by their aliases (`/rebase` finds `R` and `b`).
+- The create prompt reads `New worktree name:` rather than `new:`, so an
+  empty field says what it expects.
+- A key with nothing to act on, such as `e` without a PR, shows a yellow
+  toast and is not recorded as a failed action on the attention feed.
+- Remove confirmation revalidates hazards before removal, and `f` keeps its
+  log overlay.
+- `Space` jumps through a broader attention set (status, checks, review,
+  failed action) and toasts when nothing needs you.
+- `Esc` output focus is global rather than per worktree, and there is no
+  separate warning toast level. Errors appear on the attention feed rather
+  than in a dedicated error overlay, and `F12` on a remote row does not
+  queue an attach.
+
+Session `; d` and `; x` act immediately, as they did in TypeScript; the
+review-requests fold is not persisted, also as before.

@@ -275,7 +275,10 @@ pub async fn execute(
                 plan.row.target.branch
             )];
             if force {
-                lines.extend(removal_hazard_lines(&plan.hazards));
+                lines.extend(removal_hazard_lines(
+                    &plan.hazards,
+                    dirty_file_count(board, &key),
+                ));
             }
             if plan.destroy_stage {
                 lines.push(format!("Destroy deployed stage {}", plan.row.target.stage));
@@ -319,7 +322,10 @@ pub async fn execute(
                     "Checkout or hazards changed since the previous confirmation.".into(),
                 ];
                 if next_force {
-                    lines.extend(removal_hazard_lines(&plan.hazards));
+                    lines.extend(removal_hazard_lines(
+                        &plan.hazards,
+                        dirty_file_count(board, &key),
+                    ));
                 }
                 if plan.destroy_stage {
                     lines.push(format!("Destroy deployed stage {}", plan.row.target.stage));
@@ -476,6 +482,25 @@ pub async fn execute(
                     archived: archived.contains(&wt_core::worktree_target_key(&other.target)),
                 })
                 .collect::<Vec<_>>();
+            // Offer bases in the order the board shows them, as TS did.
+            let shown = board
+                .map(|board| {
+                    board
+                        .sections
+                        .iter()
+                        .flat_map(|section| section.rows.iter())
+                        .filter_map(|index| board.rows.get(*index))
+                        .map(|row| row.key.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut worktrees = worktrees;
+            worktrees.sort_by_key(|candidate| {
+                shown
+                    .iter()
+                    .position(|key| *key == candidate.slug)
+                    .unwrap_or(usize::MAX)
+            });
             let (options, selected) = base_picker_options(
                 trunk,
                 &slug,
@@ -657,6 +682,7 @@ const STATUS_CHORDS: [(&str, char); 8] = [
 async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
     let row = resolve_key(ctx, &key).await?;
     let slug = row.target.slug().to_owned();
+    let title = format!("status for {slug}");
     let previous = ctx
         .database
         .call(move |store| Ok(store.read_slug_state(&slug)?))
@@ -678,7 +704,8 @@ async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
             .iter()
             .find(|(name, _)| *name == state)
             .map(|(_, chord)| *chord),
-        None => Some('x'),
+        // No claim yet starts on todo, the usual first claim, as in TS.
+        None => Some('t'),
     };
     let mut options = Vec::new();
     for (state, chord) in STATUS_CHORDS {
@@ -718,7 +745,7 @@ async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
     }
     Ok(modal(UiModal::Picker {
         action: PickerAction::Status { key },
-        title: "Work status".into(),
+        title,
         options,
         selected,
     }))
@@ -810,10 +837,31 @@ fn ui_revision(revision: &wt_lifecycle::RemovalRevision) -> UiRemovalRevision {
 
 /// Force-remove confirm lines in the TS style: work that disappears reads
 /// "<what> will be lost."; any other hazard is its own sentence.
-fn removal_hazard_lines(hazards: &[String]) -> Vec<String> {
-    let (lost, other): (Vec<_>, Vec<_>) = hazards
+/// Changed and untracked files on the row, from the prepared board, so the
+/// confirm can count what would be lost as TS did.
+fn dirty_file_count(board: Option<&Board>, key: &str) -> Option<u32> {
+    let row = board?.rows.iter().find(|row| row.key == key)?;
+    let count = row.git.tracked_changes? + row.git.untracked_files.unwrap_or(0);
+    (count > 0).then_some(count)
+}
+
+fn removal_hazard_lines(hazards: &[String], dirty_files: Option<u32>) -> Vec<String> {
+    // The lifecycle hazard does not count files; the board's facts do.
+    let hazards = hazards
         .iter()
-        .partition(|hazard| wt_lifecycle::is_lost_work_hazard(hazard));
+        .map(|hazard| match dirty_files {
+            Some(count) if hazard == wt_lifecycle::UNCOMMITTED_HAZARD => {
+                format!(
+                    "{count} uncommitted change{}",
+                    if count == 1 { "" } else { "s" }
+                )
+            }
+            _ => hazard.clone(),
+        })
+        .collect::<Vec<_>>();
+    let (lost, other): (Vec<_>, Vec<_>) = hazards.iter().partition(|hazard| {
+        wt_lifecycle::is_lost_work_hazard(hazard) || hazard.contains(" uncommitted change")
+    });
     let sentence = |text: &str| {
         let mut chars = text.chars();
         chars.next().map_or_else(String::new, |first| {
@@ -922,19 +970,26 @@ mod tests {
     #[test]
     fn removal_hazards_read_as_sentences() {
         assert_eq!(
-            removal_hazard_lines(&[
-                "uncommitted changes".into(),
-                "1 unpushed commit".into(),
-                "post-merge verification still owed".into(),
-            ]),
+            removal_hazard_lines(
+                &[
+                    "uncommitted changes".into(),
+                    "1 unpushed commit".into(),
+                    "post-merge verification still owed".into(),
+                ],
+                None,
+            ),
             [
                 "Uncommitted changes, 1 unpushed commit will be lost.",
                 "Post-merge verification still owed.",
             ]
         );
         assert_eq!(
-            removal_hazard_lines(&["3 unpushed commits".into()]),
+            removal_hazard_lines(&["3 unpushed commits".into()], None),
             ["3 unpushed commits will be lost."]
+        );
+        assert_eq!(
+            removal_hazard_lines(&["uncommitted changes".into()], Some(1)),
+            ["1 uncommitted change will be lost."]
         );
     }
 
