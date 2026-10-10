@@ -75,16 +75,15 @@ fn compose(
             .and_then(|data| {
                 let pr = pick_pr(row, data)?;
                 let mut presentation = pr_presentation(pr);
-                presentation.merge_queue = data
-                    .merge_queue
-                    .get(&row.branch)
-                    .map(|queue| format!("#{} · {:?}", queue.position, queue.state));
+                presentation.merge_queue =
+                    data.merge_queue
+                        .get(&row.branch)
+                        .map(|queue| wt_tui::MergeQueueView {
+                            position: queue.position,
+                            state: merge_queue_state(&queue.state).into(),
+                        });
                 presentation.auto_merge_armed = pr.auto_merge.is_some();
-                presentation.comments = pr
-                    .comments
-                    .iter()
-                    .map(|comment| format!("{}: {}", clean(&comment.author), clean(&comment.body)))
-                    .collect();
+                presentation.comments = comments(pr, now_ms);
                 Some(presentation)
             })
             .or_else(|| match &github.state {
@@ -154,49 +153,65 @@ fn pick_pr<'a>(row: &BoardRow, data: &'a GithubData) -> Option<&'a PullRequest> 
 }
 
 fn pr_presentation(pr: &PullRequest) -> wt_tui::PrPresentation {
-    let checks = match pr.checks {
-        PrChecks::Pass => "passing",
-        PrChecks::Fail => "failing",
-        PrChecks::Pending => "pending",
-        PrChecks::None => "none",
-    };
-    let review = match pr.review {
-        PrReview::Approved => "approved",
-        PrReview::ChangesRequested => "changes requested",
-        PrReview::Pending => "pending",
-        PrReview::Unrequested => "not requested",
-        PrReview::None => "none",
-    };
     wt_tui::PrPresentation {
         head_sha: pr.head_ref_oid.clone(),
         number: Some(pr.number),
         url: Some(clean(&pr.url)),
         title: Some(clean(&pr.title)),
-        state: Some(clean(&pr.state)),
+        state: Some(clean(&pr.state).to_ascii_uppercase()),
         draft: pr.is_draft,
         base_branch: Some(clean(&pr.base_ref_name)),
-        checks: Some(checks.into()),
+        checks: match pr.checks {
+            PrChecks::Pass => wt_tui::CheckState::Pass,
+            PrChecks::Fail => wt_tui::CheckState::Fail,
+            PrChecks::Pending => wt_tui::CheckState::Pending,
+            PrChecks::None => wt_tui::CheckState::None,
+        },
         failed_checks: pr.failed_checks.iter().map(|line| clean(line)).collect(),
-        review: Some(review.into()),
+        review: match pr.review {
+            PrReview::Approved => wt_tui::ReviewState::Approved,
+            PrReview::ChangesRequested => wt_tui::ReviewState::ChangesRequested,
+            PrReview::Pending => wt_tui::ReviewState::Pending,
+            PrReview::Unrequested => wt_tui::ReviewState::Unrequested,
+            PrReview::None => wt_tui::ReviewState::None,
+        },
         reviewers: pr
             .requested_reviewers
             .iter()
             .map(|login| clean(login))
             .collect(),
-        review_bot: pr
-            .review_bot
-            .as_ref()
-            .map(|bot| format!("{} · {} unresolved", clean(&bot.state), bot.unresolved)),
+        review_bot: pr.review_bot.as_ref().map(|bot| wt_tui::ReviewBotView {
+            state: clean(&bot.state).to_ascii_lowercase(),
+            unresolved: bot.unresolved,
+            stale: bot.stale.unwrap_or(false),
+        }),
         unresolved_threads: pr.unresolved_threads_total,
         merge_queue: None,
         auto_merge_armed: pr.auto_merge.is_some(),
-        comments: pr
-            .comments
-            .iter()
-            .map(|comment| format!("{}: {}", clean(&comment.author), clean(&comment.body)))
-            .collect(),
+        comments: Vec::new(),
         error: None,
     }
+}
+
+fn merge_queue_state(state: &wt_github::MergeQueueState) -> &'static str {
+    match state {
+        wt_github::MergeQueueState::AwaitingChecks => "AWAITING_CHECKS",
+        wt_github::MergeQueueState::Locked => "LOCKED",
+        wt_github::MergeQueueState::Mergeable => "MERGEABLE",
+        wt_github::MergeQueueState::Queued => "QUEUED",
+        wt_github::MergeQueueState::Unmergeable => "UNMERGEABLE",
+    }
+}
+
+fn comments(pr: &PullRequest, now_ms: i64) -> Vec<wt_tui::PrCommentView> {
+    pr.comments
+        .iter()
+        .map(|comment| wt_tui::PrCommentView {
+            author: clean(&comment.author),
+            body: clean(&comment.body),
+            age: wt_core::work_age(&comment.created_at, now_ms),
+        })
+        .collect()
 }
 
 fn detail_groups(row: &BoardRow, config: &Config) -> Vec<PreparedDetailGroup> {
@@ -272,15 +287,13 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                 pr.base_branch
                     .as_deref()
                     .map(|base| format!("base: {}", clean(base))),
-                pr.checks
-                    .as_deref()
-                    .map(|checks| format!("checks: {checks}")),
-                pr.review
-                    .as_deref()
-                    .map(|review| format!("review: {review}")),
-                pr.review_bot
-                    .as_deref()
-                    .map(|bot| format!("review bot: {}", clean(bot))),
+                (pr.checks != wt_tui::CheckState::None)
+                    .then(|| format!("checks: {:?}", pr.checks).to_lowercase()),
+                (pr.review != wt_tui::ReviewState::None)
+                    .then(|| format!("review: {:?}", pr.review).to_lowercase()),
+                pr.review_bot.as_ref().map(|bot| {
+                    format!("review bot: {} · {} unresolved", bot.state, bot.unresolved)
+                }),
             ]);
             lines.extend(pr.failed_checks.iter().map(|check| clean(check)));
             if !pr.reviewers.is_empty() {
@@ -290,11 +303,18 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                 lines.push(format!("unresolved threads: {}", pr.unresolved_threads));
             }
             if let Some(queue) = &pr.merge_queue {
-                lines.push(format!("merge queue: {}", clean(queue)));
+                lines.push(format!(
+                    "merge queue: #{} · {}",
+                    queue.position, queue.state
+                ));
             } else if pr.auto_merge_armed {
                 lines.push("merge when ready: armed".into());
             }
-            lines.extend(pr.comments.iter().map(|comment| clean(comment)));
+            lines.extend(
+                pr.comments
+                    .iter()
+                    .map(|comment| format!("{}: {}", comment.author, comment.body)),
+            );
             ("pr", "Pull request", lines, pr.error.as_deref().map(clean))
         }
         "claude" => {
@@ -635,8 +655,11 @@ mod tests {
                     pr: Some(wt_tui::PrPresentation {
                         state: Some("OPEN".into()),
                         draft: true,
-                        checks: Some("failing".into()),
-                        merge_queue: Some("#4 · checking".into()),
+                        checks: wt_tui::CheckState::Fail,
+                        merge_queue: Some(wt_tui::MergeQueueView {
+                            position: 4,
+                            state: "AWAITING_CHECKS".into(),
+                        }),
                         ..Default::default()
                     }),
                     automations_paused: true,

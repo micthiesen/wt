@@ -774,7 +774,7 @@ fn publish_board(
         }
         let manual = state.and_then(|state| manual_title(state, &row.slug));
         let summary = visible.get(&row.key).map(|(_, summary)| summary);
-        row.title = title_fallback(
+        (row.title, row.title_source) = title_fallback(
             &row.slug,
             manual.as_deref(),
             summary.and_then(|value| value.title.as_deref()),
@@ -819,22 +819,37 @@ fn title_fallback(
     generated: Option<&str>,
     pr: Option<&str>,
     first_commit: Option<&str>,
-) -> String {
-    [manual, generated, pr, first_commit, Some(slug)]
-        .into_iter()
-        .flatten()
-        .find(|title| !title.trim().is_empty())
-        .map(|title| wt_core::sanitize_terminal_text(title.trim()))
-        .unwrap_or_else(|| wt_core::sanitize_terminal_text(slug))
+) -> (String, wt_tui::TitleSource) {
+    use wt_tui::TitleSource;
+    [
+        (manual, TitleSource::Manual),
+        (generated, TitleSource::Llm),
+        (pr, TitleSource::Pr),
+        (first_commit, TitleSource::Commit),
+    ]
+    .into_iter()
+    .find_map(|(title, source)| {
+        title
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|title| (wt_core::sanitize_terminal_text(title), source))
+    })
+    .unwrap_or_else(|| {
+        (
+            wt_core::sanitize_terminal_text(&crate::issue_identity::slug_title(slug)),
+            TitleSource::Slug,
+        )
+    })
 }
 
 fn board_fingerprint(board: &Board, upstream: &SourceSnapshot<Board>) -> String {
     let mut text = format!("{}:{}", upstream.revision, board.name);
     for row in &board.rows {
         text.push_str(&format!(
-            "\0{}\0{}\0{}\0{}",
+            "\0{}\0{}\0{}\0{}\0{}",
             row.key,
             row.title,
+            row.title_source.as_str(),
             row.badge,
             row.details.join("\n")
         ));
@@ -892,7 +907,7 @@ mod title_tests {
                 Some("PR"),
                 Some("Commit")
             ),
-            "Manual"
+            ("Manual".into(), wt_tui::TitleSource::Manual)
         );
         assert_eq!(
             title_fallback(
@@ -902,7 +917,7 @@ mod title_tests {
                 Some("PR"),
                 Some("Commit")
             ),
-            "Generated"
+            ("Generated".into(), wt_tui::TitleSource::Llm)
         );
     }
 
@@ -916,15 +931,15 @@ mod title_tests {
                 Some("PR title"),
                 Some("Commit title")
             ),
-            "PR title"
+            ("PR title".into(), wt_tui::TitleSource::Pr)
         );
         assert_eq!(
             title_fallback("feat-42-fix", None, None, None, Some("Commit title")),
-            "Commit title"
+            ("Commit title".into(), wt_tui::TitleSource::Commit)
         );
         assert_eq!(
             title_fallback("feat-42-fix", None, None, None, None),
-            "feat-42-fix"
+            ("Fix".into(), wt_tui::TitleSource::Slug)
         );
     }
 }

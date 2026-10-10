@@ -173,21 +173,36 @@ fn compose(
             }
         }
         if let Some(usage) = &activity.usage {
-            for (name, five, week) in [
+            for (harness, five, week) in [
                 ("Claude", &usage.claude_five_hour, &usage.claude_seven_day),
                 ("Codex", &usage.codex_five_hour, &usage.codex_seven_day),
             ] {
-                let periods = [("5h", five), ("7d", week)]
-                    .into_iter()
-                    .filter_map(|(period, value)| usage_text(period, value.as_ref()))
-                    .collect::<Vec<_>>();
-                if !periods.is_empty() {
-                    board.usage.push(format!("{name} {}", periods.join(" / ")));
+                for (period, value) in [("5h", five), ("7d", week)] {
+                    if let Some(item) = usage_item(harness, period, value.as_ref()) {
+                        board.usage.push(item);
+                    }
                 }
             }
-            if let Some(cost) = usage.opencode_five_hour.filter(|cost| cost.is_finite()) {
-                board.usage.push(format!("OpenCode 5h ${cost:.2}"));
+            for (period, cost) in [
+                ("5h", usage.opencode_five_hour),
+                ("7d", usage.opencode_seven_day),
+            ] {
+                if let Some(cost) = cost.filter(|cost| cost.is_finite()) {
+                    board.usage.push(wt_tui::UsageItem {
+                        harness: "OpenCode".into(),
+                        period: period.into(),
+                        cost: Some(if cost >= 100.0 {
+                            format!("${cost:.0}")
+                        } else {
+                            format!("${cost:.2}")
+                        }),
+                        ..Default::default()
+                    });
+                }
             }
+        }
+        if let Some(primary) = &activity.primary {
+            board.display.primary_harness = primary.clone();
         }
     }
     crate::activity_source::bound_feeds(&mut board);
@@ -195,9 +210,23 @@ fn compose(
     source
 }
 
-fn usage_text(label: &str, period: Option<&UsagePeriodDto>) -> Option<String> {
-    let period = period.filter(|period| period.utilization.is_finite())?;
-    Some(format!("{label} {:.0}%", period.utilization))
+fn usage_item(
+    harness: &str,
+    period: &str,
+    value: Option<&UsagePeriodDto>,
+) -> Option<wt_tui::UsageItem> {
+    let value = value.filter(|value| value.utilization.is_finite())?;
+    Some(wt_tui::UsageItem {
+        harness: harness.into(),
+        period: period.into(),
+        percent: Some(value.utilization.round().clamp(0.0, 100.0) as u8),
+        resets_at_ms: value
+            .resets_at
+            .as_deref()
+            .and_then(wt_core::parse_iso_millis)
+            .and_then(|ms| u64::try_from(ms).ok()),
+        cost: None,
+    })
 }
 
 fn clean(value: &str) -> String {

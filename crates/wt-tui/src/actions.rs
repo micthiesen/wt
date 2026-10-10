@@ -443,6 +443,10 @@ pub struct UiReply {
     /// input handoff; the controller owns the child process and its lifecycle.
     #[serde(skip)]
     pub handoff: Option<TerminalHandoff>,
+    /// A primary harness the controller just persisted. The model shows it
+    /// until the board's own value catches up.
+    #[serde(default)]
+    pub primary_harness: Option<String>,
 }
 
 #[derive(Debug)]

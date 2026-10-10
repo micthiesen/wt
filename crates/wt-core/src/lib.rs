@@ -5,6 +5,7 @@ mod merge_edges;
 mod stack_layout;
 mod stage;
 mod time;
+pub use time::parse_iso_millis;
 mod work_status;
 mod worktree_ref;
 mod worktree_target;

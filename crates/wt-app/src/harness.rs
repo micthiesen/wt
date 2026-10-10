@@ -761,6 +761,19 @@ fn live_harnesses(
     live
 }
 
+/// The persisted primary harness, read without blocking a runtime worker.
+/// A missing or unreadable selection falls back to configuration.
+pub async fn read_primary(path: &Path, fallback: HarnessId) -> HarnessId {
+    let Ok(text) = tokio::fs::read_to_string(path).await else {
+        return fallback;
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| value.get("primary")?.as_str().map(str::to_owned))
+        .and_then(|value| serde_json::from_value(Value::String(value)).ok())
+        .unwrap_or(fallback)
+}
+
 pub fn persist_primary(cache_root: &Path, id: HarnessId) -> Result<()> {
     let path = cache_root.join("harness.json");
     let mut root = match fs::read(&path) {

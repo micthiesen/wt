@@ -87,7 +87,7 @@ mod tests {
             state: SourceState::Ready,
             ..Default::default()
         });
-        model.selected = Some(1);
+        model.selected = Some(0);
         assert!(model.selected_row().is_none());
         assert!(
             matches!(model.input(KeyEvent::from(KeyCode::Char('w')), 20),
@@ -98,7 +98,7 @@ mod tests {
             state: SourceState::Ready,
             ..Default::default()
         });
-        assert_eq!(model.selected, Some(1));
+        assert_eq!(model.selected, Some(0));
         assert_eq!(
             model.input(KeyEvent::from(KeyCode::Char('t')), 20),
             InputResult::Unchanged

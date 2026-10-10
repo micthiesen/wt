@@ -20,11 +20,14 @@ pub fn board(
         let target = &snapshot.worktree.target;
         let stored = &state["slugs"][target.slug()];
         let work = parse_work_status(&stored["work"]);
-        let title = stored["manualTitle"]
+        let manual = stored["manualTitle"]
             .as_str()
             .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .unwrap_or(target.slug());
+            .filter(|title| !title.is_empty());
+        let title = manual.map_or_else(
+            || crate::issue_identity::slug_title(target.slug()),
+            str::to_owned,
+        );
         let mut details = Vec::new();
         let mut badge = String::new();
         if stored["automationsPaused"].as_bool() == Some(true) {
@@ -37,7 +40,12 @@ pub fn board(
                 .as_str()
                 .map(str::to_owned),
             slug: clean_text(target.slug()),
-            title: clean_text(title),
+            title: clean_text(&title),
+            title_source: if manual.is_some() {
+                wt_tui::TitleSource::Manual
+            } else {
+                wt_tui::TitleSource::Slug
+            },
             branch: clean_text(&target.branch),
             path: clean_text(&target.path),
             badge,
@@ -122,11 +130,26 @@ pub fn board(
         name: clean_text(&config.repo_id),
         automations_paused: state["automationsPaused"].as_bool().unwrap_or(false),
         full_width_activity: config.ui.activity_pane == wt_config::ActivityPane::FullWidth,
+        display: display_policy(config),
         rows,
         ..Board::default()
     };
     crate::board_layout::prepare(&mut board, state, &config.branch.base, config.ui.sort);
     board
+}
+
+/// Configuration the renderer needs, resolved once per board.
+pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
+    wt_tui::DisplayPolicy {
+        hidden_badges: config.ui.hidden_badges.iter().cloned().collect(),
+        review_bot_carrot: config.review_bot.login == "coderabbitai",
+        review_bot_checklist: config.review_bot.unresolved_via
+            == wt_config::ReviewBotMode::Checklist,
+        reviewers: config.github.reviewers,
+        production: config.branch.production.is_some(),
+        automations: !config.automations.is_empty(),
+        primary_harness: config.harness.primary.as_str().to_owned(),
+    }
 }
 
 /// Strip terminal controls while preserving text and line structure. Log and

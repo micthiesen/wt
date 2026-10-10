@@ -87,9 +87,14 @@ pub struct Board {
     pub sections: Vec<BoardSection>,
     pub hosts: Vec<HostChoice>,
     #[serde(default)]
-    pub usage: Vec<String>,
+    pub usage: Vec<UsageItem>,
     #[serde(default)]
     pub slot_sessions: std::collections::BTreeMap<String, Vec<SessionView>>,
+    #[serde(default)]
+    pub display: DisplayPolicy,
+    /// Queued automation fires waiting to dispatch.
+    #[serde(default)]
+    pub automations_pending: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -174,6 +179,10 @@ pub struct ReviewRequestRow {
     pub author: String,
     pub details: Vec<String>,
     pub issue_url: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub checks: CheckState,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -242,9 +251,30 @@ pub struct GitPresentation {
     pub behind: Option<u32>,
     pub landed_on: Option<LandingKind>,
     pub rebasing: bool,
+    /// Unmerged paths in the working tree (a rebase or merge stopped on them).
     pub conflict_files: Vec<String>,
+    /// Pre-flight: files that would conflict if HEAD were rebased onto its
+    /// base now. Empty when the probe ran clean or has not run.
+    pub base_conflicts: Vec<String>,
     pub pr_title: Option<String>,
     pub first_commit_title: Option<String>,
+    /// Work since the fork point, committed and uncommitted together.
+    pub diff: Option<DiffStat>,
+    /// UTC epoch milliseconds of the newest commit on HEAD.
+    pub last_commit_ms: Option<u64>,
+    /// UTC epoch milliseconds when the checkout was created.
+    pub created_ms: Option<u64>,
+    /// Commits ahead of and behind the row's base branch.
+    pub base_ahead: Option<u32>,
+    pub base_behind: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DiffStat {
+    pub files: u32,
+    pub added: u32,
+    pub removed: u32,
 }
 
 /// Persisted status plus display-time derivations. This never authorizes actions.
@@ -268,19 +298,145 @@ pub struct PrPresentation {
     pub number: Option<u64>,
     pub url: Option<String>,
     pub title: Option<String>,
+    /// GitHub's PR state, upper case: `OPEN`, `MERGED`, or `CLOSED`.
     pub state: Option<String>,
     pub draft: bool,
     pub base_branch: Option<String>,
-    pub checks: Option<String>,
+    pub checks: CheckState,
     pub failed_checks: Vec<String>,
-    pub review: Option<String>,
+    pub review: ReviewState,
     pub reviewers: Vec<String>,
-    pub review_bot: Option<String>,
+    pub review_bot: Option<ReviewBotView>,
     pub unresolved_threads: u32,
-    pub merge_queue: Option<String>,
+    pub merge_queue: Option<MergeQueueView>,
     pub auto_merge_armed: bool,
-    pub comments: Vec<String>,
+    pub comments: Vec<PrCommentView>,
     pub error: Option<String>,
+}
+
+impl PrPresentation {
+    pub fn is_open(&self) -> bool {
+        self.state.as_deref() == Some("OPEN")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    #[default]
+    None,
+    Pass,
+    Fail,
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    #[default]
+    None,
+    Approved,
+    ChangesRequested,
+    Pending,
+    Unrequested,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReviewBotView {
+    /// `clean`, `pending`, `unresolved`, or `none`.
+    pub state: String,
+    pub unresolved: u32,
+    /// The review describes an older head commit.
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MergeQueueView {
+    pub position: u32,
+    /// `MERGEABLE`, `AWAITING_CHECKS`, `QUEUED`, `UNMERGEABLE`, or `LOCKED`.
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PrCommentView {
+    pub author: String,
+    pub body: String,
+    /// Prepared relative age, such as `3h`.
+    pub age: Option<String>,
+}
+
+/// Where the row's title came from. Shown dimly beside the details title.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    Manual,
+    Llm,
+    Pr,
+    Commit,
+    #[default]
+    Slug,
+}
+
+impl TitleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Llm => "llm",
+            Self::Pr => "pr",
+            Self::Commit => "commit",
+            Self::Slug => "slug",
+        }
+    }
+}
+
+/// An operation holding the worktree's lock, as reported by the lock owner.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BusyView {
+    /// Lock operation, such as `remove`, `restack`, or `init`.
+    pub op: String,
+    /// Human label, such as `removing`.
+    pub label: String,
+    pub age: Option<String>,
+}
+
+/// One harness rate-limit window or spend figure for the title bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct UsageItem {
+    /// `Claude`, `Codex`, or `OpenCode`.
+    pub harness: String,
+    /// Window label, such as `5h` or `7d`.
+    pub period: String,
+    /// Utilization percent of the window.
+    pub percent: Option<u8>,
+    /// UTC epoch milliseconds when the window resets.
+    pub resets_at_ms: Option<u64>,
+    /// Spend, already formatted (`$1.20`), for harnesses that report cost.
+    pub cost: Option<String>,
+}
+
+/// Render-time display policy prepared from configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DisplayPolicy {
+    /// `[ui].hidden_badges` slot names.
+    pub hidden_badges: Vec<String>,
+    /// The configured review bot is CodeRabbit (carrot glyph).
+    pub review_bot_carrot: bool,
+    /// The review bot reports through a checklist and also reviews drafts.
+    pub review_bot_checklist: bool,
+    /// Human reviewer requests are configured.
+    pub reviewers: bool,
+    /// A production branch is configured, so release position owns the marker.
+    pub production: bool,
+    /// Automations are configured at all.
+    pub automations: bool,
+    /// Primary harness name: `Claude`, `Codex`, or `OpenCode`.
+    pub primary_harness: String,
 }
 
 /// One explicitly identified detail pane group. `id` is matched against
@@ -294,7 +450,10 @@ pub struct PreparedDetailGroup {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Board key of the archived block, prepared by the host.
+pub(crate) const ARCHIVED_SECTION: &str = "\0archived";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum VisualItem {
     Section(usize),
     Row(usize),
@@ -326,7 +485,35 @@ pub struct BoardRow {
     pub stage_url: Option<String>,
     pub dev_url: Option<String>,
     pub archived: bool,
+    /// Stack rail, one character per column (`┌`, `├`, `│└`), empty for
+    /// rows that draw no rail.
     pub stack_prefix: String,
+    /// Parallel-lane index of the row's stack position; tints the rail.
+    #[serde(default)]
+    pub stack_lane: u8,
+    /// The section holding this stacked row's parent when it differs from
+    /// the row's own, so a split stack can still be followed.
+    #[serde(default)]
+    pub split_parent_section: Option<String>,
+    #[serde(default)]
+    pub title_source: TitleSource,
+    #[serde(default)]
+    pub busy: Option<BusyView>,
+    /// The checkout directory no longer exists.
+    #[serde(default)]
+    pub path_missing: bool,
+    /// The branch was deleted from the remote.
+    #[serde(default)]
+    pub branch_gone: bool,
+    /// A tracked headless action is running for this row.
+    #[serde(default)]
+    pub action_running: bool,
+    /// A stage is deployed or a dev server is running for this row.
+    #[serde(default)]
+    pub environment_live: bool,
+    /// Dev server summary for the details pane, such as `running :8701`.
+    #[serde(default)]
+    pub dev_status: Option<String>,
     #[serde(default)]
     pub work: Option<WorkPresentation>,
     #[serde(default)]
@@ -372,6 +559,9 @@ pub struct Model {
     pub pending_selection: Option<String>,
     pub(crate) last_section_target: Option<Option<String>>,
     pub(crate) items: Vec<VisualItem>,
+    /// Optimistic primary harness from a just-accepted cycle, held until the
+    /// board reports the same value.
+    pub(crate) primary_override: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -414,6 +604,7 @@ impl Default for Model {
             pending_selection: None,
             last_section_target: None,
             items: Vec::new(),
+            primary_override: None,
         }
     }
 }
@@ -430,6 +621,13 @@ impl Model {
                         section.folded = false;
                     }
                 }
+            }
+            if self
+                .primary_override
+                .as_deref()
+                .is_some_and(|primary| primary.eq_ignore_ascii_case(&board.display.primary_harness))
+            {
+                self.primary_override = None;
             }
             let first_rows = self.board.rows.is_empty() && !board.rows.is_empty();
             let requested_selection = self.pending_selection.is_some();
@@ -561,7 +759,23 @@ impl Model {
         }
     }
 
+    /// The primary harness to display: a just-cycled value wins until the
+    /// board catches up; an unset board means the default, Claude.
+    pub(crate) fn primary_harness(&self) -> &str {
+        match (
+            &self.primary_override,
+            self.board.display.primary_harness.as_str(),
+        ) {
+            (Some(primary), _) => primary,
+            (None, "") => "Claude",
+            (None, primary) => primary,
+        }
+    }
+
     pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
+        if let Some(primary) = &reply.primary_harness {
+            self.primary_override = Some(primary.clone());
+        }
         let current = reply
             .ui_generation
             .is_none_or(|generation| generation == self.ui_generation);
@@ -769,32 +983,69 @@ impl Model {
         self.selected.and_then(|index| self.item(index))
     }
 
+    /// Cursor stops in render order. An expanded section is a divider, not a
+    /// stop; a folded section collapses to one selectable header. Sections
+    /// with no rows are kept for pickers but never drawn. Requested reviews
+    /// sit between the active board and the archived block.
     pub(crate) fn rebuild_items(&mut self) {
         self.items.clear();
-        if !self.board.review_requests.is_empty() {
-            self.items.push(VisualItem::ReviewHeader);
-            if !self.reviews_folded {
-                self.items
-                    .extend((0..self.board.review_requests.len()).map(VisualItem::ReviewRequest));
-            }
-        }
         if self.board.sections.is_empty() {
             self.items
                 .extend((0..self.board.rows.len()).map(VisualItem::Row));
         }
-        for (index, section) in self.board.sections.iter().enumerate() {
-            self.items.push(VisualItem::Section(index));
-            if !section.folded {
-                self.items.extend(
-                    section
-                        .rows
-                        .iter()
-                        .copied()
-                        .filter(|&row| row < self.board.rows.len())
-                        .map(VisualItem::Row),
-                );
+        let (archived, active): (Vec<_>, Vec<_>) = self
+            .board
+            .sections
+            .iter()
+            .enumerate()
+            .partition(|(_, section)| section.key == ARCHIVED_SECTION);
+        let push_section = |items: &mut Vec<VisualItem>,
+                            (index, section): (usize, &BoardSection)| {
+            let rows: Vec<_> = section
+                .rows
+                .iter()
+                .copied()
+                .filter(|&row| row < self.board.rows.len())
+                .collect();
+            if rows.is_empty() {
+                return;
+            }
+            if section.folded {
+                items.push(VisualItem::Section(index));
+            } else {
+                items.extend(rows.into_iter().map(VisualItem::Row));
+            }
+        };
+        let mut items = Vec::new();
+        for entry in active {
+            push_section(&mut items, entry);
+        }
+        if !self.board.review_requests.is_empty() {
+            if self.reviews_folded {
+                items.push(VisualItem::ReviewHeader);
+            } else {
+                items.extend((0..self.board.review_requests.len()).map(VisualItem::ReviewRequest));
             }
         }
+        for entry in archived {
+            push_section(&mut items, entry);
+        }
+        self.items.extend(items);
+    }
+
+    /// First cursor stop belonging to a section: its folded header or its
+    /// first row.
+    fn section_first_position(&self, key: &str) -> Option<usize> {
+        let section = self
+            .board
+            .sections
+            .iter()
+            .position(|section| section.key == key)?;
+        (0..self.item_count()).find(|&position| match self.item(position) {
+            Some(VisualItem::Section(index)) => index == section,
+            Some(VisualItem::Row(row)) => self.board.sections[section].rows.contains(&row),
+            _ => false,
+        })
     }
 
     fn row_position(&self, key: &str) -> Option<usize> {
@@ -805,10 +1056,7 @@ impl Model {
     }
 
     fn section_position(&self, key: &str) -> Option<usize> {
-        (0..self.item_count()).find(|&position| match self.item(position) {
-            Some(VisualItem::Section(index)) => self.board.sections[index].key == key,
-            _ => false,
-        })
+        self.section_first_position(key)
     }
 
     pub fn keep_selection_visible(&mut self, height: usize) {
@@ -849,18 +1097,17 @@ impl Model {
         }) else {
             return InputResult::Unchanged;
         };
-        let next = if forward {
-            current.checked_add(1)
+        let mut candidates: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(current + 1..self.board.sections.len())
         } else {
-            current.checked_sub(1)
+            Box::new((0..current).rev())
         };
-        let Some(section) = next.and_then(|index| self.board.sections.get(index)) else {
+        let Some(position) = candidates
+            .find_map(|index| self.section_first_position(&self.board.sections[index].key))
+        else {
             return InputResult::Unchanged;
         };
-        let Some(position) = self.section_position(&section.key) else {
-            return InputResult::Unchanged;
-        };
-        self.select(position + usize::from(!section.folded && !section.rows.is_empty()))
+        self.select(position)
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
@@ -2119,9 +2366,11 @@ mod tests {
             InputResult::Unchanged
         );
         assert_eq!(model.yank_choices()[0].2, "Batch");
+        // Unfolding expands in place: the first row takes the header's stop.
         model.apply(grouped(&["one", "two"], false));
-        model.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 10);
         assert_eq!(model.selected_row().unwrap().key, "one");
+        model.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 10);
+        assert_eq!(model.selected_row().unwrap().key, "two");
     }
 
     #[test]

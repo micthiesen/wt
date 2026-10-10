@@ -412,6 +412,13 @@ fn review_rows(board: &Board, snapshot: &ReviewRequestSnapshot) -> Vec<ReviewReq
                 author: wt_core::sanitize_terminal_text(pr.author.as_deref().unwrap_or("unknown")),
                 details,
                 issue_url: issue_url.map(|url| wt_core::sanitize_terminal_text(&url)),
+                draft: pr.is_draft,
+                checks: match pr.checks {
+                    PrChecks::Pass => wt_tui::CheckState::Pass,
+                    PrChecks::Fail => wt_tui::CheckState::Fail,
+                    PrChecks::Pending => wt_tui::CheckState::Pending,
+                    PrChecks::None => wt_tui::CheckState::None,
+                },
             })
         })
         .collect()

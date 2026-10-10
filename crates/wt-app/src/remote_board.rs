@@ -260,12 +260,7 @@ fn compose(
                         line.text = wt_core::sanitize_terminal_text(&line.text);
                         line
                     }));
-                board.usage.extend(
-                    remote
-                        .usage
-                        .iter()
-                        .map(|line| format!("{label}: {}", wt_core::sanitize_terminal_text(line))),
-                );
+                // Usage describes the account, which the local header already shows.
                 for (slot, logs) in &remote.slot_logs {
                     let mut logs = logs.clone();
                     for log in &mut logs {

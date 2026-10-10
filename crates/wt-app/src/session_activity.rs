@@ -205,6 +205,9 @@ pub struct SessionActivitySnapshot {
     pub tails: Vec<SessionTailSnapshot>,
     pub events: VecDeque<SessionEvent>,
     pub usage: Option<UsageSnapshot>,
+    /// The persisted primary harness name, read with each activity pass.
+    #[serde(default)]
+    pub primary: Option<String>,
 }
 
 pub struct SessionActivitySources {
@@ -243,6 +246,8 @@ pub fn start(
         context.processes.clone(),
         tmux,
     );
+    let primary_path = context.config.paths.cache_root.join("harness.json");
+    let primary_fallback = context.config.harness.primary;
     let cancellation = scope.token();
     let scope_cancel = scope.token();
     let inventory = sessions.inventory.clone();
@@ -348,6 +353,8 @@ pub fn start(
                     commands.discover(entry.key.slug.clone(), entry.key.harness);
                 }
             }
+            snapshot.primary =
+                Some(crate::harness::read_primary(&primary_path, primary_fallback).await.as_str().to_owned());
             let errors = usage_error
                 .iter()
                 .cloned()

@@ -15,6 +15,14 @@ use crate::{
     lifecycle_ops::{self, resolve_key},
 };
 
+fn harness_name(harness: wt_core::HarnessId) -> &'static str {
+    match harness {
+        wt_core::HarnessId::Claude => "Claude",
+        wt_core::HarnessId::Codex => "Codex",
+        wt_core::HarnessId::Opencode => "OpenCode",
+    }
+}
+
 fn message(text: impl Into<String>) -> UiReply {
     UiReply {
         message: text.into(),
@@ -192,7 +200,10 @@ pub async fn execute(
                 Ok::<_, anyhow::Error>(next)
             })
             .await??;
-            Ok(message(format!("Primary harness: {}", next.as_str())))
+            Ok(UiReply {
+                primary_harness: Some(harness_name(next).into()),
+                ..message(format!("Primary harness: {}", harness_name(next)))
+            })
         }
         UiAction::SetTitle { key, title } => {
             let row = resolve_key(ctx, &key).await?;

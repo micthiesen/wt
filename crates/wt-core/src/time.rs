@@ -2,7 +2,7 @@
 /// legacy timestamps into Unix milliseconds. Zone-less forms are treated as
 /// UTC for deterministic cross-host behavior; locale-dependent local times
 /// are rejected. Fractional seconds are truncated to milliseconds.
-pub(crate) fn parse_iso_millis(input: &str) -> Option<i64> {
+pub fn parse_iso_millis(input: &str) -> Option<i64> {
     parse_iso_form(input).or_else(|| parse_explicit_zone_legacy(input))
 }
 

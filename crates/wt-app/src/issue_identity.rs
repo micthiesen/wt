@@ -14,6 +14,24 @@ pub fn resolve(slug: &str, explicit: Option<&str>) -> Option<String> {
         .map(|id| id.as_str().to_ascii_uppercase())
 }
 
+/// A readable title from a slug: a leading issue id is dropped (the list
+/// shows the id separately), dashes become spaces, and the first letter is
+/// capitalized. A slug that is only an id falls back to the id.
+pub fn slug_title(slug: &str) -> String {
+    let rest = SLUG_ID
+        .captures(slug)
+        .and_then(|captures| captures.get(0))
+        .filter(|matched| matched.start() == 0)
+        .map_or(slug, |matched| &slug[matched.end()..]);
+    let words = rest.replace('-', " ");
+    let words = words.trim();
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => resolve(slug, None).unwrap_or_else(|| slug.to_owned()),
+    }
+}
+
 pub fn is_tracker(id: &str, prefix: Option<&str>) -> bool {
     let Some((team, number)) = id.split_once('-') else {
         return false;
@@ -41,5 +59,13 @@ mod tests {
         assert!(!is_tracker("GH-12", None));
         assert!(!is_tracker("ENG-12", Some("OTHER")));
         assert!(is_tracker("ENG-12", Some("eng")));
+    }
+
+    #[test]
+    fn slug_titles_drop_the_leading_id_and_read_as_text() {
+        assert_eq!(slug_title("fresh-task"), "Fresh task");
+        assert_eq!(slug_title("eng-123-fix-login"), "Fix login");
+        assert_eq!(slug_title("eng-123"), "ENG-123");
+        assert_eq!(slug_title("fix-eng-123"), "Fix eng 123");
     }
 }

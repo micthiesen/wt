@@ -199,6 +199,7 @@ fn compose(
             .and_then(|rows| rows.iter().find(|status| status.slug == row.slug));
         if let Some(status) = status.and_then(|row| row.status.as_ref()) {
             row.details.push(label(status));
+            row.environment_live |= status.running || status.starting;
             row.dev_url = status.url.as_deref().map(wt_core::sanitize_terminal_text);
         }
         if let Some(error) = error.or_else(|| status.and_then(|row| row.error.as_deref())) {
