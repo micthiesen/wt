@@ -938,17 +938,21 @@ mod tests {
         config.inventory_ttl_ms = 0;
         let daemon = start(config, source.clone(), cancel.clone()).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let initial = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if source.fetches.load(Ordering::SeqCst) >= 1 {
-                    break;
+                if let Some(snapshot) = read_snapshot(dir.path()).await.unwrap()
+                    && snapshot
+                        .branches
+                        .iter()
+                        .any(|branch| branch == "remote-only")
+                {
+                    break snapshot;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .unwrap();
-        let initial = read_snapshot(dir.path()).await.unwrap().unwrap();
         assert!(
             initial
                 .branches
@@ -969,11 +973,18 @@ mod tests {
         .await;
         assert_eq!(response, StatusCode::OK.as_u16());
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let refreshed = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let state = read_state(dir.path()).await.unwrap().unwrap();
-                if state.event_count == 1 && source.fetches.load(Ordering::SeqCst) >= 2 {
-                    break;
+                let snapshot = read_snapshot(dir.path()).await.unwrap();
+                if state.event_count == 1
+                    && source.fetches.load(Ordering::SeqCst) >= 2
+                    && source.remote_calls.load(Ordering::SeqCst) >= 2
+                    && snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.updated_at != initial.updated_at)
+                {
+                    break snapshot.unwrap();
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -981,7 +992,6 @@ mod tests {
         .await
         .unwrap();
 
-        let refreshed = read_snapshot(dir.path()).await.unwrap().unwrap();
         assert!(
             refreshed
                 .branches

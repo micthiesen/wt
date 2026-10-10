@@ -12,6 +12,10 @@ The native Rust binary embeds these files at compile time and does not need a
 source checkout at runtime. `wt skills` tracks installed hashes and saved
 template answers in `~/.cache/wt/skills.json`.
 
+The bundled orientation uses the native `~/.local/bin/wt` PATH entry and
+`~/.local/share/wt/bin/wt` launcher. It does not require an alias to a source
+checkout; agents invoke `wt` by name so session shims remain effective.
+
 ## What gets distributed
 
 | unit | what it is |

@@ -21,9 +21,9 @@ id/link, review-bot state, work status, and coding-agent session activity.
 Config lives at `~/.config/wt/config.toml`, with the nearest `.wt.toml` (from
 cwd upward) recursively merged over it for repo-specific settings like the
 trunk branch (`wt` refuses to start without the required fields; the loader
-reports every missing field at once). The standard install aliases
-`wt='~/.wt/bin/wt'`; if `wt` isn't found in a non-interactive shell, invoke
-`~/.wt/bin/wt` directly.
+reports every missing field at once). The standard native install puts `wt` at
+`~/.local/bin/wt`, backed by the stable launcher in `~/.local/share/wt/bin/wt`.
+Keep `~/.local/bin` on PATH and invoke `wt` by name so session shims apply.
 
 ## Under `[backend] kind = "rift"`, worktrees are clones
 

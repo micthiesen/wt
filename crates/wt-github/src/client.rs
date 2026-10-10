@@ -1101,7 +1101,7 @@ id number url title headRefName headRefOid baseRefName mergeCommit { oid } isDra
 reviewRequests(first:20) { totalCount nodes { requestedReviewer { __typename ... on User { login } ... on Team { combinedSlug } } } }
 suggestedReviewers { reviewer { login } isAuthor isCommenter }
 autoMergeRequest { enabledAt mergeMethod }
-commits(last:1) { nodes { commit { committedDate statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } }
+commits(last:1) { nodes { commit { committedDate statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } }
 reviewThreads(first:50) { nodes { isResolved comments(first:1) { nodes { author { login __typename } } } } }
 comments(last:COMMENT_FETCH_LIMIT) { nodes { author { login __typename } body createdAt updatedAt } }
 reviews(last:10) { nodes { author { login __typename } body state createdAt } }
@@ -1774,6 +1774,10 @@ else:
             "release",
             30,
         );
+        assert_eq!(
+            with_queue.matches('{').count(),
+            with_queue.matches('}').count()
+        );
         assert!(with_queue.contains("mergeQueue(branch:$mergeQueueBranch)"));
         assert!(!with_queue.contains(&branch));
         assert!(
@@ -1781,6 +1785,10 @@ else:
                 .any(|(key, value)| key == "b0" && value == &branch)
         );
         let (without_queue, _) = build_query(&[branch], false, "owner", "repo", "release", 10);
+        assert_eq!(
+            without_queue.matches('{').count(),
+            without_queue.matches('}').count()
+        );
         assert!(!without_queue.contains("mergeQueue("));
     }
 

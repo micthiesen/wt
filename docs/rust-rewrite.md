@@ -2,8 +2,9 @@
 
 The production TypeScript application has been retired from this branch. Its
 behavior baseline is commit `d9cd2f4`; that checkout is a historical oracle,
-not a runtime, build, or test dependency of the native application. Promotion
-from `rusty` to `main` is not authorized.
+not a runtime, build, or test dependency of the native application. The original
+pre-promotion checkpoint was `e122c3d`; its final Linux/macOS CI passed. The
+subsequently authorized cutover promoted that commit to main.
 
 The scope and evidence are summarized in
 [rust-rewrite-inventory.md](rust-rewrite-inventory.md). This record distinguishes
@@ -11,6 +12,12 @@ the verified application build from the final test, documentation, and CI setup
 follow-ups.
 
 ## Current state
+
+The first live cutover found an unbalanced selection in the GitHub PR query.
+The missing closing brace is corrected, generated-query regression assertions
+cover queue and non-queue requests, and the corrected query succeeded against
+the live repository. The bundled wt skill now documents the native PATH entry.
+These follow-ups are included before the first stable publication.
 
 Application build `4ef9878` passed all 577 workspace tests, doctests,
 formatting, strict Clippy, and dependency checks
@@ -155,12 +162,12 @@ Builds use bounded local concurrency, small development symbols, disabled CI
 incremental compilation, separate lint/test/release caches, and main-only
 release-cache writes. After validation, clearing accumulated debug artifacts
 reclaimed 34.4 GiB, leaving 1.3 GiB of optimized outputs. Test logs and workload
-evidence were retained. Promotion and its publication checks below remain
-explicitly outside this branch's authorization.
+evidence were retained. Publication checks below are tracked separately from
+the pre-promotion evidence.
 
 ## Promotion and recovery
 
-These are cutover operations, not permission to promote this branch.
+The cutover follows this order and retains the recovery copies.
 
 1. Before updating an existing TypeScript source installation to native main,
    close its boards and stop its owned events daemon. Leave agent tmux sessions
