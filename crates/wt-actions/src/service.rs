@@ -1616,14 +1616,16 @@ mod tests {
             .unwrap();
         assert_eq!(tail, b"ut");
         assert_eq!(offset, 3);
-        fs::OpenOptions::new()
+        // Tokio file writes finish on a blocking thread; flush before the
+        // read or it can race the append and see nothing.
+        let mut log = fs::OpenOptions::new()
             .append(true)
             .open(run_dir.join("stream.log"))
             .await
-            .unwrap()
-            .write_all(b"more")
-            .await
             .unwrap();
+        log.write_all(b"more").await.unwrap();
+        log.flush().await.unwrap();
+        drop(log);
         let (offset, delta) = service
             .read_log_chunk(&run_id, ProcessStream::Stdout, Some(offset), 2)
             .await
