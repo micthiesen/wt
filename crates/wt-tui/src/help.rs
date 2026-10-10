@@ -135,7 +135,7 @@ pub(crate) const LINES: &[&str] = &[
     "  (↑N ↓M)            Ahead / behind vs the upstream (remote) branch",
     "  [↑N ↓M]            Ahead / behind vs the base branch",
     "",
-    "New: prompt flags",
+    "New worktree name: flags",
     "  --base <ref>       Branch off <ref> instead of the configured base",
     "  --attach           Attach to an existing branch for the id",
     "  --any              With --attach, match any author's branch",

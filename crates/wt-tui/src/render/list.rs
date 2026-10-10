@@ -506,6 +506,60 @@ mod tests {
     }
 
     #[test]
+    fn archive_uses_bottom_space_without_changing_selection() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::sync::Arc;
+        let mut model = Model::default();
+        model.apply(wt_runtime::SourceSnapshot {
+            data: Some(Arc::new(crate::Board {
+                rows: vec![
+                    BoardRow {
+                        key: "one".into(),
+                        title: "Active task".into(),
+                        ..Default::default()
+                    },
+                    BoardRow {
+                        key: "old".into(),
+                        title: "Old task".into(),
+                        archived: true,
+                        ..Default::default()
+                    },
+                ],
+                sections: vec![
+                    crate::BoardSection {
+                        key: "\0inbox".into(),
+                        title: "Inbox".into(),
+                        rows: vec![0],
+                        ..Default::default()
+                    },
+                    crate::BoardSection {
+                        key: ARCHIVED_SECTION.into(),
+                        title: "Archived".into(),
+                        rows: vec![1],
+                        folded: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            state: wt_runtime::SourceState::Ready,
+            updated_at: None,
+            revision: 1,
+        });
+        let selected = model.selected;
+        for height in [14u16, 7] {
+            let mut terminal = Terminal::new(TestBackend::new(50, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut model, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let bottom: String = (0..50).map(|x| buffer[(x, height - 2)].symbol()).collect();
+            assert!(bottom.contains("Archived"), "{height}: {bottom:?}");
+            assert_eq!(model.selected, selected);
+        }
+    }
+
+    #[test]
     fn labels_carry_the_issue_number() {
         let row = BoardRow {
             title: "Fix the thing".into(),
