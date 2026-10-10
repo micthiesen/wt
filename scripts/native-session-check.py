@@ -17,6 +17,9 @@ import subprocess
 import termios
 import time
 
+# The list marks the cursor row with the selection background, not a glyph.
+SELECTED_ROW = b"48;2;59;66;82m"
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -82,7 +85,7 @@ def main():
         # Ratatui may advance over unchanged blank cells with cursor commands.
         wait_for(lambda data: b"Returnedfromsession" in printed(data))
         os.write(terminal, b"j")
-        wait_for(lambda data: "›".encode() in data)
+        wait_for(lambda data: SELECTED_ROW in data)
         os.write(terminal, b"t\x15After session\r")
         wait_for(lambda data: b"Titlesaved" in printed(data))
         os.write(terminal, b"q")

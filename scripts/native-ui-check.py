@@ -24,6 +24,9 @@ import struct
 import termios
 import time
 
+# The list marks the cursor row with the selection background, not a glyph.
+SELECTED_ROW = b"48;2;59;66;82m"
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -160,7 +163,7 @@ def main():
         drain_for(0.06)
         injected = time.monotonic()
         os.write(master, b"j")
-        wait_for(lambda data: "›".encode() in data, timeout=0.5)
+        wait_for(lambda data: SELECTED_ROW in data, timeout=0.5)
         latency_ms = (time.monotonic() - injected) * 1000
         # The source still has blocked Git processes, so this frame proves the
         # input owner was not waiting for their completion.
@@ -208,13 +211,13 @@ def main():
             assert any(record.get("slugs", {}).get("bench-001", {}).get("section") == "Today"
                        for record in records), "renaming did not preserve section membership"
             os.write(master, b"h")
-            wait_for(lambda data: b"Removed" in data)
+            wait_for(lambda data: b"removed (" in data)
             os.write(master, b"P")
-            wait_for(lambda data: b"Performance" in data)
+            wait_for(lambda data: b"performance" in data)
             os.write(master, b"P")
-            # The overlay leaves the history header visible, so closing it
-            # repaints the body rather than emitting the header again.
-            wait_for(lambda data: b"No recently removed worktrees" in data)
+            # Closing the overlay repaints only the cells it covered; the
+            # history pane under it is unchanged, so any frame is the signal.
+            wait_for(lambda data: bool(data))
             os.write(master, b"h")
             wait_for(lambda data: b"bench-001" in data or b"Native UI title" in data)
             os.write(master, b"\x12")

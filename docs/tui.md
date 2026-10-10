@@ -6,83 +6,127 @@ application and is the most current reference.
 
 ## Layout
 
-At 80 columns or wider, the list uses about 42% of the width and the right
-column contains details above the activity feed. Narrower terminals stack the
-list above the right column. With `[ui].activity_pane = "full_width"`, list and
-details share a top region capped at 22 rows and the activity feed spans the
-bottom. Terminals smaller than 20 columns or 5 rows show a resize prompt.
+The list takes 44% of the width, clamped to 32..52 columns, and the right
+column holds details above the activity feed. Details get at most 20 rows; the
+feed gets the rest and at least 7. Below 60 columns the panes stack vertically.
+With `[ui].activity_pane = "full_width"`, list and details share the top region
+and the activity feed spans the bottom. Terminals smaller than 20 columns or 5
+rows show a resize prompt. The UI uses a Nord-derived palette and Nerd Font
+glyphs; a terminal font without Nerd Font symbols shows placeholder boxes.
 
-The list shows a stack tree prefix, a work-status marker, the worktree title,
-issue status when available, and PR/session/automation badges. Work-status
-markers use color for state: red for needs-human, yellow for needs-testing or
-working, green for ready or verified, cyan for review, dim hollow for todo or
-unset, and dim slash for dropped. A hollow marker in a state's color means the saved
-status SHA differs from the current observed HEAD. A gated ready/todo status
-uses a yellow slash, and overdue post-merge verification is red. The list does
-not change the marker into a Git merge or commit glyph when a branch lands;
-landing, rebase, and conflict facts appear in the Git details group.
+Each section starts with a dim rule naming it, separated from the previous
+section by a blank line. A row shows, left to right: the stack rail (tinted per
+stack lane), the work-status marker, the title (prefixed with the issue number
+when the issue is tracked), a dim `→ Section` when a stack member sits apart
+from its parent's section, and a right-aligned glyph cluster. The cluster's
+fixed order is action running, dirty, rebase or conflict, deploy, AI session
+state, review bot, review decision, PR state or merge-queue position, and CI
+checks. `[ui].hidden_badges` removes slots by name (`action`, `dirty`,
+`rebase`, `deploy`, `session`, `review_bot`, `review`, `pr`, `checks`).
+Archived rows render dimmed. Review requests and the archive sit at the bottom
+of the list. The cursor keeps three rows of context while scrolling and the
+list border carries a scrollbar when rows overflow.
 
-Sections can be folded with `Tab`. A folded header summarizes work states,
-risk, stale or overdue status, Git dirtiness and upstream movement, rebases or
-conflicts, PRs and checks, paused automations, attention, and up to two blocker
-notes. Select the section to see the full rollup and blocker notes above its
-member rows. The summary is prepared from the same typed facts used by the
-detail pane. `[ui].sort = "status"` orders rows by work status; manual section
-placement remains separate.
+Work-status markers use color for state: red for needs-human, yellow for
+needs-testing or blocked, cyan for working, purple for review, green for ready
+or verified, and a dim hollow dot for todo or unset. A slash marks a gated or
+dropped status. A hollow marker in a state's color means the saved status SHA
+differs from the current observed HEAD, and overdue post-merge verification is
+red. A landed branch without a newer status shows the green merge glyph.
 
-The details pane begins with the title, branch, and path, followed by the work
-status, risk, status age, note, gate, and verification obligation when present.
-`[ui].rows` controls the order and visibility of typed detail groups: `branch`,
-`issue` (also `linear`), `stage`, `dev`, `pr`, `claude` (the cross-harness AI
-session group), and `git`. The optional `path` group can be added explicitly.
-Unknown group names are skipped. A GitHub or host error remains visible as an
-error, and unavailable facts remain unknown rather than being shown as clean.
+Sections fold with `Tab`. Only folded sections are cursor stops; an expanded
+section is just its rows. A folded header reads `[×NN] Name` with a
+right-aligned count per work state plus overdue verifications, conflicts, and
+failing checks. Selecting it shows the full rollup and blocker notes in the
+details pane. `[ui].sort = "status"` orders rows by work status; manual section
+placement remains separate. Within a section, rows without a manual order sort
+first, and a stack sorts as one unit under its root's identity.
 
-Title precedence is saved manual title, generated title, PR title, first commit
-title, then slug. The pane does not show a title-source tag. The AI session
-group lists live or discovered Claude, Codex, and OpenCode sessions. When none
-is listed, it shows the configured primary harness and the F12 start hint.
-Selected session output starts with its available transcript summary.
+The details pane's border names the slug. It starts with the wrapped title
+and a dim source tag: `manual`, `llm`, `pr`, `commit`, or `slug`, following the
+title precedence of saved manual title, generated title, PR title, first commit
+title, then slug. The work-status block follows when a status is saved: state,
+risk, age, and commits since the status, then the gate and the note behind a
+rail in the state's color. `OPS`, `REVERT`, `IF WRONG`, and `UNTESTED` note
+fields align under a hanging indent. A verify-after-merge obligation shows its
+step count with a two-line preview; `V` expands or collapses the steps, and
+they start expanded when the check is due.
 
-The activity pane shows attention and activity feeds, session output, and
-tracked action output. Attention is the curated feed; activity contains the
-broader event stream. Entries show local time, wrap to the pane width, and
-scroll by visual rows. The attention watermark is saved and `x` marks the
-current feed as seen. `Ctrl+J`/`Ctrl+K` scroll details; `Ctrl+E`/`Ctrl+Y`,
-`Ctrl+Shift+J`/`Ctrl+Shift+K` where supported, and the mouse wheel scroll the
-output pane. Selecting an output with `'` pins it until it ends; `[`/`]` cycle
-outputs, `"` toggles attention/all activity, and `Esc` returns to the default.
-The feed is restored from the app log on startup.
+Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
+order and visibility: `branch` (with its landing base), `issue` (also
+`linear`), `stage`, `dev`, `pr` (number, merge queue or auto-merge, checks with
+failing names, review, review bot), `claude` (every Claude, Codex, and OpenCode
+session, the F12 target first), and `git` (dirty or clean, diff against the
+merge-base, last commit and creation ages, upstream counts in parentheses, base
+counts in brackets). The optional `path` group can be added explicitly and
+keeps the checkout name visible when truncated. Unknown group names are
+skipped. On narrow panes the `pr` and `git` rows drop their least important
+parts first. A GitHub or host error remains visible as an error, and an
+unavailable fact shows `—` rather than reading as clean.
 
-The footer shows the active prompt, a toast, a source error, or a static key
-hint. When the normal key hint is shown and facts are available, it prefixes
-live manager/main/wt/dotfiles session states; the manager Claude session also
-shows context occupancy after a transcript turn provides usage. These are
-status labels, not clickable session buttons.
-Remote session entry is available after its worktree is present; F12 does not
-queue an automatic attach for a worktree that is still being created.
+Below the rows come a rebase block when the branch would not rebase cleanly
+onto its base (listing up to eight conflicting files from a `git merge-tree`
+pre-flight), paused automations, the session summary, PR comments, and the
+unresolved thread count. A folded section's details show its rollup, member
+rows, and blocker notes. A review request's details show its state, branch,
+author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
+shows a scrollbar when it overflows.
 
-When `h` opens removed-worktree history, rows are grouped by local day starting
-at 04:00. `↑` marks proved production landing, `✓` marks proved base landing,
-and age appears beside the row. Older records can be checked against a bounded
-local GitHub-merge and production-history scan while history is open. Select a
-row to see its removal time, host, saved status, issue/PR facts, and restore
-details. `Enter` restores, `p` opens the PR, `i` opens the issue when known, and
-`y` copies the branch.
+The bottom pane shows the attention feed, all activity, session output, or
+tracked action output; its title names which, such as `attention · 2 new` or
+`slug · claude / name · live · 1/3`. Rows show a dim local time, the source,
+and the message. Attention entries wrap with a hanging indent; the full feed is
+one line per event, colored by level. Entries already marked seen are dimmed
+below a `seen HH:MM:SS` rule, and an empty attention feed reads "nothing needs
+you". The attention watermark is saved and `x` marks the current feed as seen.
+`Ctrl+E`/`Ctrl+Y`, `Ctrl+Shift+J`/`Ctrl+Shift+K` where supported, and the
+mouse wheel scroll the output pane. Selecting an output with `'` pins it until
+it ends; `[`/`]` cycle outputs, `"` toggles attention/all activity, and `Esc`
+returns to the default. The feed is restored from the app log on startup.
+
+The header shows worktree and archive counts, refresh state, paused or queued
+automations, the primary harness's rate-limit windows (colored as they near
+the limit, with time to reset), and the primary harness glyph. The footer shows
+the active prompt, a toast (failures in red with a glyph), a source error, or a
+static key hint, and on the right the manager, main, wt, and dotfiles slot
+sessions as `[m] [.] [,] [/]` colored by session state. The manager Claude
+session also shows context occupancy after a transcript turn provides usage.
+These are status labels, not clickable buttons. Remote session entry is
+available after its worktree is present; F12 does not queue an automatic attach
+for a worktree that is still being created.
+
+Modals share one frame: a rounded border (yellow for destructive confirms), a
+title, and their keys listed along the bottom edge. Pickers show chords or
+digits in a key column and a `›` cursor. Confirm hazards are red. Help (`?`)
+groups the keymap by area and ends with a glyph legend built from the same
+rules the list uses; `/` filters with a match count and highlights hits.
+
+When `h` opens removed-worktree history, the list pane reads `removed (N)`
+and groups rows under day rules, each day starting at 04:00 local time. A row
+shows a marker (the work-status color when a landing is proved, otherwise
+merged, closed, dropped, gone, open, or a dim trash glyph), the title, pause,
+issue and PR glyphs, and a right-aligned age. Older records can be checked
+against a bounded local GitHub-merge and production-history scan while history
+is open. The `removal record` pane shows removal time, host, saved status,
+verification, landing, and notes. `Enter` restores, `p` opens the PR, `i` opens
+the issue when known, and `y` copies the branch. `p` and `i` toast when nothing is recorded, and `O`
+opens the main clone as it does on the board.
 
 ## Keymap
 
 | Key | Action |
 |---|---|
-| `j` / `k`, arrows | Move the selection |
-| `g` / `G` | First / last visible item |
-| `Space` | Move to the next row needing attention |
-| `Tab` | Fold / expand the section |
+| `j` / `k`, arrows | Move the selection; at the first or last item, scroll the list to that edge |
+| `g` / `G`, `Home` / `End` | First / last visible item |
+| `PgUp` / `PgDn` | Move half a page |
+| `Space` | Next row needing you: saved work states plus failing checks, changes requested, unresolved threads, and failed actions; toasts when nothing needs you |
+| `Tab` | Fold / unfold the section; unfolding lands on its first row. Requested reviews fold too |
 | `Ctrl+D` / `Ctrl+U` | Next / previous section |
 | `Ctrl+J` / `Ctrl+K` | Scroll details |
 | `Ctrl+E` / `Ctrl+Y` | Scroll output |
 | `r` / `Ctrl+R` | Refresh / clear derived caches and refresh |
 | `?` | Open searchable help |
+| `Esc` | Return the bottom pane to its default feed |
 | `q` / `Ctrl+C` | Quit |
 
 ### Worktrees and organization
@@ -103,21 +147,21 @@ WT still checks the published base. Missing evidence does not mean merged.
 
 | Key | Action |
 |---|---|
-| `n` / `N` | Create a worktree / create from the selected branch |
-| `Ctrl+N` | Start the create flow; configured remotes add a host chooser |
+| `n` / `N` | Create a worktree on this machine / create from the selected branch |
+| `Ctrl+N` | Create on a chosen host; toasts when `[remote]` is not configured |
 | `o` | Open the selected worktree in the configured editor |
 | `d` | Remove the selected worktree after confirmation |
 | `c` | Review and clean eligible merged or gone worktrees |
-| `a` | Archive / restore the selected row |
+| `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
 | `t` / `T` | Edit title / regenerate its AI title |
 | `#` | Set or clear the worktree's issue identity |
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
-| `V` | Show or hide post-merge verification steps |
+| `V` | Show or hide this row's post-merge verification steps (open by default when the check is due) |
 | `u` | Set or clear the work-status claim, note, risk, or verification obligation |
-| `y` | Copy a selected worktree field |
+| `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed |
 | `l` / `L` | Move to a section / rename the section |
-| `J` / `K` | Reorder the selected row or group |
+| `J` / `K` | Reorder the selected row, stack, or folded group; the cursor follows the row across sections |
 | `b` | Record a fork base without rebasing |
 | `R` | Restack or rebase the selected branch |
 | `h` | Open removed-worktree history |
@@ -131,10 +175,10 @@ removal.
 
 | Key | Action |
 |---|---|
-| `p` | Open the selected pull request |
+| `p` | Open the selected pull request at the configured target (also `Enter` on a review request) |
 | `g p` / `l p` | Open the PR in GitHub / Linear Reviews |
-| `e` | Mark a draft PR ready after confirmation |
-| `E` | Run the configured ship flow after confirmation |
+| `e` | Mark a draft PR ready after confirmation; toasts when it is already ready |
+| `E` | Ship after confirmation, listing only the steps still needed; toasts when already shipped |
 | `! m` | Toggle merge-when-ready |
 | `f` | View failing check logs |
 | `v` | Select requested reviewers |
@@ -151,13 +195,13 @@ cancels an idle retry; an uncertain external result is not retried blindly.
 |---|---|
 | `F10` / `F11` / `F12` | Enter shell / diff / agent session |
 | `Shift+F10` / `Shift+F11` | Stop shell / diff session after confirmation |
-| `Shift+F12` | Choose a harness for a new agent session |
-| `;` | Pick or manage named sessions |
+| `Shift+F12` | Start a new agent session: `c` Claude, `x` Codex, `o` OpenCode, or `F12` for the highlighted one |
+| `;` | Pick a session. Inside: `d` closes the highlighted live session gracefully and `x` kills it (a dead Claude row is forgotten), both without confirmation; `c`/`x`/`o` on a New row jump between harnesses; an empty Claude name picks one automatically |
 | `Shift+Tab` | Cycle the primary harness |
-| `!` | Open worktree actions and configured actions |
+| `!` | Open worktree actions: `m` merge when ready, `u`/`g` agent builtins, `d`/`s` dev server, `l` dev logs, `t` rename with AI, `c` custom prompt, and configured actions |
 | `m` / `M` | Enter the manager session / open manager commands |
 | `,` / `.` / `/` | Enter the wt repo / main clone / dotfiles session when configured |
-| `<` / `>` / `\` | Open the corresponding special-session command palette |
+| `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
 
 While attached, the configured terminal handoff returns to the TUI. `/compact`
@@ -180,8 +224,9 @@ special-session state and manager context usage when those facts are available.
 ### Performance and errors
 
 Press `P` for the process and system performance view. `r` takes a sample,
-`i` enables repeated sampling, `j`/`k` and page keys scroll, and `Esc` or `q`
-closes it. The same snapshot is available with [`wt perf`](cli.md#wt-perf---json).
+`c` toggles repeated sampling, `i` sends the snapshot to the wt repo session
+and enters it, `j`/`k`, page keys, and `Ctrl+D`/`U`/`E`/`Y` scroll, and `Esc` or
+`q` closes it. The same snapshot is available with [`wt perf`](cli.md#wt-perf---json).
 Command and source failures remain visible in the footer, source state, or
 activity/attention feed. The native TUI does not provide a full-screen
 uncaught-error recovery overlay.
@@ -189,7 +234,18 @@ uncaught-error recovery overlay.
 ## Picker and text input
 
 Use `j`/`k`, arrows, page keys, and `g`/`G` to move through lists. `Enter`
-confirms; `Esc`, `q`, and `Ctrl+C` cancel. Repeating the opening key confirms
-the current selection in pickers that show that chord. Reviewer selection uses
-`Space` to toggle entries. Text fields support cursor movement, word movement,
-Unicode-safe deletion, and `Ctrl+U`/`Ctrl+K` to clear to the start/end.
+confirms; `Esc`, `q`, and `Ctrl+C` cancel, and confirmations also cancel with
+`n` or their opening key. `Space` never confirms. Repeating the opening key
+confirms the current selection. Digits `1`-`9` pick real entries (sessions,
+saved values) but not palette rows, which use their letters. Reviewer selection
+uses `Space` to toggle entries. `Esc` or `Backspace` on an empty sub-prompt,
+such as a new section or session name, returns to its picker. Text fields support cursor movement, word movement,
+Unicode-safe deletion, and `Ctrl+U`/`Ctrl+K` to clear to the start/end. A
+custom `! c` prompt keeps pasted line breaks.
+
+## Mouse
+
+The wheel scrolls the pane under the pointer. Over the list it scrolls the
+viewport without moving the cursor; the next cursor move scrolls back to it.
+Dragging selects text within one pane and copies it to the clipboard on
+release.
