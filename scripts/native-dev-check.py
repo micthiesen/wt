@@ -92,7 +92,7 @@ def main() -> None:
         pid_file = scratch / "dev-child.pid"
         server_file = scratch / "server.py"
         server_file.write_text(
-            "import http.server, os, pathlib, sys\n"
+            "import http.server, os, pathlib, socketserver, sys\n"
             "port = int(sys.argv[1])\n"
             f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
             "class Handler(http.server.BaseHTTPRequestHandler):\n"
@@ -101,7 +101,16 @@ def main() -> None:
             "        self.end_headers()\n"
             "        self.wfile.write(b'ok\\n')\n"
             "    def log_message(self, *args): pass\n"
-            "http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()\n",
+            # HTTPServer.server_bind calls socket.getfqdn between bind/listen.
+            # On macOS hosted runners that reverse lookup can stall for 35s:
+            # https://github.com/actions/runner-images/issues/14409
+            # This private loopback fixture does not use a canonical hostname.
+            "class Server(http.server.HTTPServer):\n"
+            "    def server_bind(self):\n"
+            "        socketserver.TCPServer.server_bind(self)\n"
+            "        self.server_name = 'localhost'\n"
+            "        self.server_port = self.server_address[1]\n"
+            "Server(('127.0.0.1', port), Handler).serve_forever()\n",
             encoding="utf-8",
         )
         settings = {
