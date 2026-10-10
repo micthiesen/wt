@@ -83,7 +83,12 @@ def main() -> None:
         lock_dir = scratch / "locks"
         socket = f"wt-dev-check-{os.getpid()}"
         python = shlex.quote(sys.executable)
-        healthy = f'{python} -c "import urllib.request; urllib.request.urlopen(\'http://127.0.0.1:{{{{port}}}}/\', timeout=2).read()"'
+        probe = (
+            "import urllib.request; "
+            "opener=urllib.request.build_opener(urllib.request.ProxyHandler({})); "
+            "opener.open('http://127.0.0.1:{{port}}/', timeout=2).read()"
+        )
+        healthy = f"{python} -c {shlex.quote(probe)}"
         pid_file = scratch / "dev-child.pid"
         server_file = scratch / "server.py"
         server_file.write_text(
