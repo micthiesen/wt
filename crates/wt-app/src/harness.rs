@@ -25,7 +25,9 @@ use crate::context::AppContext;
 
 #[path = "session_commands.rs"]
 mod session_commands;
-pub use session_commands::{list_session_options, prepare_session, stop_managed_session};
+pub use session_commands::{
+    SessionEnd, forget_claude_session, list_session_options, prepare_session, stop_managed_session,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {

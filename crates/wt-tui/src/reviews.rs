@@ -23,9 +23,18 @@ impl Model {
                 Some(VisualItem::ReviewHeader | VisualItem::ReviewRequest(_))
             )
         {
+            // Folding keeps the cursor on the review header; unfolding lands
+            // on the first requested review.
             self.reviews_folded = !self.reviews_folded;
             self.rebuild_items();
-            self.selected = Some(0);
+            self.selected = (0..self.item_count())
+                .find(|&position| {
+                    matches!(
+                        self.item(position),
+                        Some(VisualItem::ReviewHeader | VisualItem::ReviewRequest(_))
+                    )
+                })
+                .or(self.selected);
             return Some(InputResult::Draw);
         }
         let row = self.selected_review()?;
@@ -39,12 +48,15 @@ impl Model {
                 url: row.url.clone(),
                 updated_at: row.updated_at.clone(),
             },
-            KeyCode::Char('p') => {
-                return Some(InputResult::Action(UiAction::OpenLink {
+            // TS opens a review PR at the configured `pr_target`.
+            KeyCode::Char('p') | KeyCode::Enter => {
+                return Some(InputResult::Action(UiAction::OpenPrDefault {
                     url: row.url.clone(),
                 }));
             }
-            KeyCode::Char('l' | 'i') => {
+            // `l` only arms the `l p` chord (armed in `Model::input`).
+            KeyCode::Char('l') => return Some(InputResult::Unchanged),
+            KeyCode::Char('i') => {
                 return Some(
                     row.issue_url
                         .as_ref()

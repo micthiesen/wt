@@ -66,7 +66,7 @@ async fn palette(
             cancel_key:Some('!'),
         }));
     }
-    let keys = assign_keys(&definitions);
+    let keys = assign_keys(&definitions, reserved_keys(&surface));
     let mut groups: Vec<(String, Vec<PickerOption>)> = Vec::new();
     for def in definitions.iter().filter(|def| def.id != CUSTOM_ID) {
         let reason = availability(def, &surface, &context.row);
@@ -78,15 +78,57 @@ async fn palette(
         };
         let option = PickerOption {
             value: Some(def.id.clone()),
-            label: reason.map_or(label.clone(), |reason| format!("{label} ({reason})")),
+            label: label.clone(),
             chord: keys.get(&def.id).copied(),
             note: None,
             verify_after_merge: None,
+            detail: Some(reason.map_or_else(|| action_detail(def), |reason| format!("({reason})"))),
         };
         if let Some((_, values)) = groups.iter_mut().find(|(name, _)| *name == group) {
             values.push(option);
         } else {
             groups.push((group, vec![option]));
+        }
+    }
+    if matches!(surface, ActionSurface::Row { .. }) {
+        let mut pinned = vec![(
+            "worktree",
+            PickerOption {
+                value: Some(crate::action_builtins::RENAME_ID.into()),
+                label: "worktree: Rename worktree with AI".into(),
+                chord: Some('t'),
+                note: None,
+                verify_after_merge: None,
+                detail: Some(rename_detail(ctx, board, &surface)),
+            },
+        )];
+        if ctx.config.dev_server.is_some() {
+            let running = crate::dev::service(ctx)?
+                .logs(&context.slug, 1, &ctx.cancellation)
+                .await?
+                .is_some();
+            pinned.push((
+                "dev server",
+                PickerOption {
+                    value: Some(crate::action_builtins::DEV_LOGS_ID.into()),
+                    label: "dev server: Open dev server logs".into(),
+                    chord: Some('l'),
+                    note: None,
+                    verify_after_merge: None,
+                    detail: Some(if running {
+                        "live · scrollable".into()
+                    } else {
+                        "(dev server is not running)".into()
+                    }),
+                },
+            ));
+        }
+        for (group, option) in pinned {
+            if let Some((_, values)) = groups.iter_mut().find(|(name, _)| name == group) {
+                values.push(option);
+            } else {
+                groups.push((group.to_owned(), vec![option]));
+            }
         }
     }
     // Stable grouping preserves first appearance, except user-configured tail groups.
@@ -100,22 +142,39 @@ async fn palette(
             .unwrap_or(0)
     });
     let mut options: Vec<_> = groups.into_iter().flat_map(|(_, values)| values).collect();
-    if matches!(surface, ActionSurface::Row { .. }) {
+    if let ActionSurface::Row { key } = &surface {
         for option in &mut options {
             if option.chord == Some('m') {
                 option.chord = None;
             }
         }
-        options.insert(
-            0,
-            PickerOption {
-                value: Some(AUTO_MERGE_ID.into()),
-                label: "Toggle merge when ready".into(),
-                chord: Some('m'),
-                note: None,
-                verify_after_merge: None,
-            },
-        );
+        // As in TS, merge-when-ready sits in a github group after the
+        // configured actions.
+        let has_pr = board
+            .and_then(|board| board.rows.iter().find(|row| &row.key == key))
+            .is_some_and(|row| row.pr.as_ref().is_some_and(|pr| pr.number.is_some()));
+        options.push(PickerOption {
+            value: Some(AUTO_MERGE_ID.into()),
+            label: "github: Toggle merge when ready".into(),
+            chord: Some('m'),
+            note: None,
+            verify_after_merge: None,
+            detail: Some(if has_pr {
+                "gh · merge queue aware".into()
+            } else {
+                "(no PR)".into()
+            }),
+        });
+    }
+    if matches!(surface, ActionSurface::Slot { .. }) {
+        options.push(PickerOption {
+            value: Some(crate::action_builtins::OPEN_EDITOR_ID.into()),
+            label: "Open in editor".into(),
+            chord: Some('z'),
+            note: None,
+            verify_after_merge: None,
+            detail: Some("local".into()),
+        });
     }
     options.push(PickerOption {
         value: Some(CUSTOM_ID.into()),
@@ -123,6 +182,7 @@ async fn palette(
         chord: Some('c'),
         note: None,
         verify_after_merge: None,
+        detail: Some("freeform".into()),
     });
     let title = match &surface {
         ActionSurface::Row { .. } => format!("{} actions", context.slug),
@@ -159,6 +219,19 @@ async fn prepare(
     board: Option<&Board>,
     github: &GithubData,
 ) -> Result<UiReply> {
+    if let ActionSurface::Slot { target } = &surface
+        && id == crate::action_builtins::OPEN_EDITOR_ID
+    {
+        let path = crate::controller_actions::slot_path(ctx, *target)?;
+        crate::editor::open(ctx, &path).await?;
+        return Ok(UiReply {
+            message: format!("Opened {}", path.display()),
+            ..Default::default()
+        });
+    }
+    if matches!(surface, ActionSurface::Row { .. }) && id == crate::action_builtins::DEV_LOGS_ID {
+        return dev_logs(ctx, surface, board, github).await;
+    }
     let def = definition(ctx, &surface, &id)?;
     let context = action_dispatch::prepare(ctx, &surface, github, board, arg.clone()).await?;
     if let Some(reason) = availability(&def, &surface, &context.row) {
@@ -186,6 +259,7 @@ async fn prepare(
             chord: Some('n'),
             note: None,
             verify_after_merge: None,
+            detail: None,
         }];
         options.extend(history.into_iter().map(|entry| {
             PickerOption {
@@ -197,6 +271,7 @@ async fn prepare(
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                detail: None,
             }
         }));
         return Ok(modal(UiModal::Picker {
@@ -279,8 +354,74 @@ fn modal(modal: UiModal) -> UiReply {
     }
 }
 
-fn assign_keys(definitions: &[ActionDef]) -> BTreeMap<String, char> {
-    let mut taken: BTreeSet<_> = ['c', 'j', 'k', 'q'].into_iter().collect();
+/// Most dev-server output kept in the `! l` overlay.
+const DEV_LOG_LINES: u32 = 500;
+
+async fn dev_logs(
+    ctx: &AppContext,
+    surface: ActionSurface,
+    board: Option<&Board>,
+    github: &GithubData,
+) -> Result<UiReply> {
+    let context = action_dispatch::prepare(ctx, &surface, github, board, None).await?;
+    let text = crate::dev::service(ctx)?
+        .logs(&context.slug, DEV_LOG_LINES, &ctx.cancellation)
+        .await?
+        .context("dev server is not running")?;
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let skip = lines.len().saturating_sub(DEV_LOG_LINES as usize);
+    Ok(modal(UiModal::Log {
+        title: format!("{} dev logs", context.slug),
+        lines: lines.into_iter().skip(skip).collect(),
+        close_key: Some('l'),
+        refresh: Some(Box::new(UiAction::PrepareAction {
+            surface,
+            id: crate::action_builtins::DEV_LOGS_ID.into(),
+            arg: None,
+        })),
+    }))
+}
+
+/// The `! t` row label, with the reason when it cannot run.
+/// The palette's trailing hint, as in TS: `$ id` for shell commands, the
+/// agent glyph and id for prompts, with `↪` when it goes to the live session.
+fn action_detail(def: &wt_config::ActionDef) -> String {
+    match (def.kind, def.target) {
+        (wt_config::ActionKind::Shell, _) => format!("$ {}", def.id),
+        (_, wt_config::ActionTarget::Session) => format!("↪ {}", def.id),
+        _ => def.id.clone(),
+    }
+}
+
+fn rename_detail(ctx: &AppContext, board: Option<&Board>, surface: &ActionSurface) -> String {
+    let busy = match surface {
+        ActionSurface::Row { key } => board
+            .and_then(|board| board.rows.iter().find(|row| &row.key == key))
+            .is_some_and(|row| row.busy.is_some()),
+        _ => false,
+    };
+    if ctx.config.naming.is_none() {
+        "(worktree naming not configured)".into()
+    } else if busy {
+        "(worktree is busy)".into()
+    } else {
+        "AI".into()
+    }
+}
+
+/// Letters a surface keeps for its fixed rows, so user actions never take
+/// them: custom prompt and movement everywhere, then merge, dev logs, and
+/// rename on rows and open-in-editor on slots.
+fn reserved_keys(surface: &ActionSurface) -> &'static [char] {
+    match surface {
+        ActionSurface::Row { .. } => &['c', 'j', 'k', 'q', 'm', 'l', 't'],
+        ActionSurface::Manager { .. } => &['c', 'j', 'k', 'q'],
+        ActionSurface::Slot { .. } => &['c', 'j', 'k', 'q', 'z'],
+    }
+}
+
+fn assign_keys(definitions: &[ActionDef], reserved: &[char]) -> BTreeMap<String, char> {
+    let mut taken: BTreeSet<_> = reserved.iter().copied().collect();
     let mut keys = BTreeMap::new();
     for def in definitions.iter().filter(|def| def.id != CUSTOM_ID) {
         if let Some(key) = def
@@ -338,9 +479,35 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let keys = assign_keys(&defs);
+        let keys = assign_keys(&defs, reserved_keys(&ActionSurface::Manager { key: None }));
         assert_eq!(keys["explicit"], 'a');
         assert_ne!(keys["derived"], 'a');
         assert!(!keys.values().any(|key| ['c', 'j', 'k', 'q'].contains(key)));
+    }
+
+    #[test]
+    fn row_palette_reserves_merge_logs_and_rename_letters() {
+        let defs = vec![
+            ActionDef {
+                id: "lint".into(),
+                name: "Lint".into(),
+                key: Some("l".into()),
+                ..Default::default()
+            },
+            ActionDef {
+                id: "test".into(),
+                name: "Test".into(),
+                ..Default::default()
+            },
+        ];
+        let keys = assign_keys(
+            &defs,
+            reserved_keys(&ActionSurface::Row { key: "a".into() }),
+        );
+        assert!(!keys.values().any(|key| ['m', 'l', 't'].contains(key)));
+        let slot = reserved_keys(&ActionSurface::Slot {
+            target: wt_tui::SessionTarget::Main,
+        });
+        assert!(slot.contains(&'z'));
     }
 }

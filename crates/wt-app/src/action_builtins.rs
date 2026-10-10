@@ -4,6 +4,12 @@ use wt_config::{ActionDef, ActionKind, ActionTarget, Config, EffectTag, RequireT
 use wt_tui::ActionSurface;
 
 pub const CUSTOM_ID: &str = "__custom__";
+/// Slot palette `z`: open the slot's checkout in the editor.
+pub const OPEN_EDITOR_ID: &str = "__open_editor__";
+/// Row palette `t`: regenerate the worktree's AI title.
+pub const RENAME_ID: &str = "__rename__";
+/// Row palette `l`: show the dev server's output.
+pub const DEV_LOGS_ID: &str = "__dev_logs__";
 
 pub fn definitions(config: &Config, surface: &ActionSurface) -> Vec<ActionDef> {
     let mut out = match surface {

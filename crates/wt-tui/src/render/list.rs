@@ -46,7 +46,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let selected_line = model
         .selected
         .and_then(|selected| lines.iter().position(|line| line.item == Some(selected)));
-    model.offset = scroll_offset(model.offset, selected_line, lines.len(), height);
+    // A wheel-scrolled viewport stays put until the cursor moves.
+    let follow = if model.list_free_scroll {
+        None
+    } else {
+        selected_line
+    };
+    model.offset = scroll_offset(model.offset, follow, lines.len(), height);
     let total = lines.len();
     let visible: Vec<_> = lines
         .into_iter()
@@ -80,9 +86,9 @@ fn scroll_offset(offset: usize, selected: Option<usize>, total: usize, height: u
     let mut offset = offset;
     if let Some(selected) = selected {
         let margin = 3.min(height.saturating_sub(1) / 2);
-        if selected < offset + margin {
+        if selected < offset.saturating_add(margin) {
             offset = selected.saturating_sub(margin);
-        } else if selected + margin >= offset + height {
+        } else if selected + margin >= offset.saturating_add(height) {
             offset = (selected + margin + 1).saturating_sub(height);
         }
     }

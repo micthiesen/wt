@@ -12,6 +12,7 @@ pub async fn execute(
     replies: &tokio::sync::mpsc::Sender<UiReply>,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
+    let command = rename_as_title(command);
     // Cleanup is a fleet-wide confirmation: prepare the candidate set from
     // every configured host, then route the captured revisions back to their
     // owners. Explicitly host-scoped legacy requests still use the normal path.
@@ -64,23 +65,42 @@ pub async fn execute(
             ..Default::default()
         });
     }
-    if !explicit
-        && !fleet.remotes.is_empty()
-        && matches!(
-            action,
-            UiAction::PrepareCreate { .. }
-                | UiAction::PrepareHardRefresh
-                | UiAction::PrepareCleanup
-                | UiAction::ToggleAutomations { key: None }
-                | UiAction::CancelAutomations
-        )
-    {
+    if let UiAction::PerfInvestigate { report } = action {
+        if report.iter().all(|line| line.trim().is_empty()) {
+            return Ok(UiReply {
+                message: "No perf sample yet".into(),
+                ..Default::default()
+            });
+        }
+        let sent = fleet
+            .local
+            .execute(UiAction::RunAction {
+                surface: wt_tui::ActionSurface::Slot {
+                    target: SessionTarget::WtSource,
+                },
+                id: crate::action_palette::CUSTOM_ID.into(),
+                arg: None,
+                extras: perf_investigation_prompt(&report),
+            })
+            .await
+            .context("send the perf snapshot to the wt session")?;
+        if sent.failed {
+            return Ok(sent);
+        }
+        let prepared = crate::harness::ui_session(context, None, SessionTarget::WtSource).await?;
+        return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
+    }
+    // Only Ctrl+N (PrepareCreate without a captured host) asks for a host.
+    // Like the TS TUI, `n`, hard refresh, and the global automation keys act
+    // on this machine; cleanup is fleet-wide above.
+    if !explicit && !fleet.remotes.is_empty() && matches!(action, UiAction::PrepareCreate { .. }) {
         let mut options = vec![PickerOption {
             value: None,
             label: "This machine".into(),
             chord: None,
             note: None,
             verify_after_merge: None,
+            detail: None,
         }];
         options.extend(fleet.remotes.iter().map(|remote| PickerOption {
             value: Some(remote.endpoint.key()),
@@ -88,6 +108,7 @@ pub async fn execute(
             chord: None,
             note: None,
             verify_after_merge: None,
+            detail: None,
         }));
         return Ok(UiReply {
             modal: Some(UiModal::Picker {
@@ -118,6 +139,38 @@ pub async fn execute(
                 let client = remote.session_client().await?;
                 let prepared =
                     client.interactive_selected_session(&serde_json::to_string(&selection)?);
+                crate::harness::PreparedSession {
+                    program: prepared.program,
+                    args: prepared.args,
+                    cwd: context.config.paths.main_clone.clone(),
+                }
+            }
+        };
+        return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
+    }
+    if let UiAction::EnterHarness { key, harness } = action {
+        let prepared = match (remote, harness) {
+            (None, wt_core::HarnessId::Claude) => {
+                crate::harness::prepare_session(context, &new_claude_selection(key)).await?
+            }
+            (None, harness) => {
+                crate::harness::ui_session_with_harness(
+                    context,
+                    Some(key),
+                    SessionTarget::Harness,
+                    Some(harness),
+                )
+                .await?
+            }
+            (Some(remote), harness) => {
+                let client = remote.session_client().await?;
+                let prepared = if harness == wt_core::HarnessId::Claude {
+                    client.interactive_selected_session(&serde_json::to_string(
+                        &new_claude_selection(key),
+                    )?)
+                } else {
+                    client.interactive_session(&key, "harness", Some(harness.as_str()))
+                };
                 crate::harness::PreparedSession {
                     program: prepared.program,
                     args: prepared.args,
@@ -251,6 +304,62 @@ pub async fn execute(
     Ok(reply)
 }
 
+/// The row palette's `t` entry is the same request as `T`, so it shares the
+/// title path, including remote pin migration.
+fn rename_as_title(action: UiAction) -> UiAction {
+    match action {
+        UiAction::OnHost { host, action } => UiAction::OnHost {
+            host,
+            action: Box::new(rename_as_title(*action)),
+        },
+        UiAction::PrepareAction {
+            surface: wt_tui::ActionSurface::Row { key },
+            id,
+            ..
+        } if id == crate::action_builtins::RENAME_ID => UiAction::GenerateTitle { key },
+        action => action,
+    }
+}
+
+/// A fresh Claude session; the host picks the next automatic name.
+fn new_claude_selection(key: String) -> wt_tui::SessionSelection {
+    wt_tui::SessionSelection {
+        key: Some(key),
+        target: SessionTarget::Harness,
+        harness: wt_core::HarnessId::Claude,
+        session_id: None,
+        managed_name: None,
+        mode: wt_tui::SessionMode::New,
+        live: false,
+    }
+}
+
+/// The TS perf overlay's investigation prompt followed by the shown report.
+fn perf_investigation_prompt(report: &[String]) -> String {
+    [
+        "My machine feels slow and I captured a perf snapshot from wt's `P`",
+        "overlay. Work out whether the load is reasonable for what's actually",
+        "running, and if it isn't, what to do about it.",
+        "",
+        "Compare wt-downstream load with the machine total. Downstream describes",
+        "process ancestry, not task ownership: tools launched by an external agent",
+        "daemon may appear outside wt. Recheck current PIDs, working directories,",
+        "elapsed and CPU time before attributing overlapping checks. Low RSS or",
+        "cumulative swap counters alone do not establish memory pressure or its",
+        "cause; use interval measurements. CPU percentages are averages.",
+        "",
+        "Do not kill any processes without asking me first.",
+        "",
+        "---",
+        "",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(report.iter().cloned())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 async fn clear_migrated_pin(context: &AppContext, key: &str, revision: u64) -> Result<()> {
     let key = key.to_owned();
     let cleared = context
@@ -263,4 +372,16 @@ async fn clear_migrated_pin(context: &AppContext, key: &str, revision: u64) -> R
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_prompt_carries_the_guardrail_and_the_report() {
+        let prompt = perf_investigation_prompt(&["cpu 90%".into(), "rss 1G".into()]);
+        assert!(prompt.contains("Do not kill any processes without asking me first."));
+        assert!(prompt.ends_with("---\n\ncpu 90%\nrss 1G"));
+    }
 }

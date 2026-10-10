@@ -135,7 +135,10 @@ fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
     Ok(
         if matches!(
             action,
-            wt_tui::UiAction::Session { .. } | wt_tui::UiAction::SelectSession { .. }
+            wt_tui::UiAction::Session { .. }
+                | wt_tui::UiAction::SelectSession { .. }
+                | wt_tui::UiAction::EnterHarness { .. }
+                | wt_tui::UiAction::PerfInvestigate { .. }
         ) {
             Lane::Terminal
         } else if crate::host_routing::controller_owned(&action) {
@@ -225,7 +228,7 @@ fn sanitize_reply(mut reply: UiReply) -> UiReply {
                 }
             }
             wt_tui::UiModal::Confirm { title, lines, .. }
-            | wt_tui::UiModal::Log { title, lines } => {
+            | wt_tui::UiModal::Log { title, lines, .. } => {
                 *title = clean(title);
                 for line in lines {
                     *line = clean(line);

@@ -31,6 +31,7 @@ pub async fn prepare(
             chord: None,
             note: None,
             verify_after_merge: None,
+            detail: None,
         })
         .collect();
     if current.is_some() {
@@ -40,6 +41,7 @@ pub async fn prepare(
             chord: None,
             note: None,
             verify_after_merge: None,
+            detail: None,
         });
     }
     Ok(UiReply {

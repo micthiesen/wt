@@ -26,7 +26,7 @@ pub async fn prepare_restore(ctx: &AppContext, key: &str) -> Result<UiReply> {
                 ),
                 "The current local/origin branch is used when it still exists; otherwise it is recreated from the configured base.".into(),
             ],
-            cancel_key: Some('e'),
+            cancel_key: None,
         }),
         ..UiReply::default()
     })

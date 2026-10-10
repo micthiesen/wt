@@ -10,6 +10,10 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::SetAttentionSeen { .. }
         | UiAction::OpenLink { .. }
         | UiAction::OpenPrLink { .. }
+        | UiAction::OpenPrDefault { .. }
+        | UiAction::OpenSlotEditor { .. }
+        | UiAction::PerfInvestigate { .. }
+        | UiAction::EnterHarness { .. }
         | UiAction::Copy { .. }
         | UiAction::OpenEditor { .. }
         | UiAction::OpenUrl { .. }
@@ -60,8 +64,9 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::PrepareSessions { .. }
         | UiAction::PrepareStopTerminal { .. }
         | UiAction::StopTerminal { .. }
-        | UiAction::PrepareStopSession { .. }
         | UiAction::StopSession { .. }
+        | UiAction::KillSession { .. }
+        | UiAction::PrepareHarnesses { .. }
         | UiAction::SetIssueOverride { .. } => false,
     }
 }
@@ -127,7 +132,9 @@ fn visit_keys(
         | UiAction::SetIssueOverride { key, .. }
         | UiAction::OpenUrl { key, .. }
         | UiAction::PrepareSection { key }
-        | UiAction::MoveSection { key, .. } => visit(key)?,
+        | UiAction::MoveSection { key, .. }
+        | UiAction::PrepareHarnesses { key }
+        | UiAction::EnterHarness { key, .. } => visit(key)?,
         UiAction::KillAction { action_key, .. } => visit(action_key)?,
         UiAction::Remove { key, revision, .. } => {
             visit(key)?;
@@ -144,7 +151,7 @@ fn visit_keys(
             }
         }
         UiAction::SelectSession { selection }
-        | UiAction::PrepareStopSession { selection }
+        | UiAction::KillSession { selection }
         | UiAction::StopSession { selection } => {
             if let Some(key) = &mut selection.key {
                 visit(key)?;
@@ -187,6 +194,9 @@ fn visit_keys(
         | UiAction::SetAttentionSeen { .. }
         | UiAction::OpenLink { .. }
         | UiAction::OpenPrLink { .. }
+        | UiAction::OpenPrDefault { .. }
+        | UiAction::OpenSlotEditor { .. }
+        | UiAction::PerfInvestigate { .. }
         | UiAction::FoldSection { .. }
         | UiAction::RenameSection { .. }
         | UiAction::Copy { .. }
@@ -256,6 +266,7 @@ mod tests {
                 session_id: Some("exact-uuid".into()),
                 managed_name: None,
                 mode: wt_tui::SessionMode::Resume,
+                live: false,
             },
         };
         let (owner, action, _) = resolve(action).unwrap();

@@ -83,6 +83,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                     chord: None,
                     note: None,
                     verify_after_merge: None,
+                    detail: None,
                 });
                 choices.push(session.selection);
             }
@@ -96,6 +97,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                     chord: None,
                     note: None,
                     verify_after_merge: None,
+                    detail: None,
                 });
                 choices.push(SessionSelection {
                     key: key.clone(),
@@ -104,39 +106,70 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                     session_id: None,
                     managed_name: None,
                     mode: SessionMode::New,
+                    live: false,
                 });
             }
             Ok(UiReply {
                 modal: Some(UiModal::Picker {
                     action: PickerAction::Sessions { choices },
-                    title: "Sessions · d stops selected session".into(),
+                    title: "Sessions".into(),
                     options,
                     selected: 0,
                 }),
                 ..Default::default()
             })
         }
-        UiAction::PrepareStopSession { selection } => Ok(UiReply {
-            modal: Some(UiModal::Confirm {
-                title: "Stop this agent session?".into(),
-                lines: vec![
-                    format!(
-                        "{} · {}",
-                        selection.harness.as_str(),
-                        selection.session_id.as_deref().unwrap_or("unknown session")
-                    ),
-                    "Ongoing work in this session will stop. The conversation remains resumable."
-                        .into(),
-                ],
-                action: wt_tui::ConfirmAction::StopSession { selection },
-                cancel_key: Some('d'),
-            }),
-            ..Default::default()
-        }),
         UiAction::StopSession { selection } => {
-            crate::harness::stop_managed_session(context, &selection).await?;
+            let label = harness_label(selection.harness);
+            let closed = crate::harness::stop_managed_session(
+                context,
+                &selection,
+                crate::harness::SessionEnd::Graceful,
+            )
+            .await?;
             Ok(UiReply {
-                message: "Stopped selected session".into(),
+                message: if closed {
+                    format!("Closed {label} session")
+                } else {
+                    "Session isn't live, nothing to close".into()
+                },
+                ..Default::default()
+            })
+        }
+        UiAction::KillSession { selection } => {
+            let label = harness_label(selection.harness);
+            if selection.live {
+                let killed = crate::harness::stop_managed_session(
+                    context,
+                    &selection,
+                    crate::harness::SessionEnd::Kill,
+                )
+                .await?;
+                return Ok(UiReply {
+                    message: if killed {
+                        format!("Killed {label} session")
+                    } else {
+                        "Session isn't live, nothing to kill".into()
+                    },
+                    ..Default::default()
+                });
+            }
+            if selection.harness != wt_core::HarnessId::Claude {
+                anyhow::bail!(
+                    "{label} session is dead; remove via {} CLI",
+                    selection.harness.as_str()
+                );
+            }
+            let name = crate::harness::forget_claude_session(context, &selection).await?;
+            Ok(UiReply {
+                message: format!("Forgot ghost session \"{name}\""),
+                ..Default::default()
+            })
+        }
+        UiAction::PrepareHarnesses { key } => {
+            let primary = crate::harness::AppHarness::new(context).primary();
+            Ok(UiReply {
+                modal: Some(harness_picker(key, &context.config.harness.hidden, primary)),
                 ..Default::default()
             })
         }
@@ -168,4 +201,83 @@ async fn terminal_target(
         name,
         label,
     ))
+}
+
+/// Display name for a harness, as used in replies.
+pub fn harness_label(harness: wt_core::HarnessId) -> &'static str {
+    match harness {
+        wt_core::HarnessId::Claude => "Claude",
+        wt_core::HarnessId::Codex => "Codex",
+        wt_core::HarnessId::Opencode => "OpenCode",
+    }
+}
+
+/// Quick-pick letter for each harness in the TS pickers.
+pub fn harness_letter(harness: wt_core::HarnessId) -> char {
+    match harness {
+        wt_core::HarnessId::Claude => 'c',
+        wt_core::HarnessId::Codex => 'x',
+        wt_core::HarnessId::Opencode => 'o',
+    }
+}
+
+/// Shift+F12 chooser over the visible harnesses, cursor on the primary.
+fn harness_picker(
+    key: String,
+    hidden: &std::collections::BTreeSet<wt_core::HarnessId>,
+    primary: wt_core::HarnessId,
+) -> UiModal {
+    let visible: Vec<_> = wt_core::HarnessId::ALL
+        .into_iter()
+        .filter(|id| !hidden.contains(id))
+        .collect();
+    UiModal::Picker {
+        action: PickerAction::Harness { key },
+        title: "Start agent".into(),
+        selected: visible.iter().position(|id| *id == primary).unwrap_or(0),
+        options: visible
+            .into_iter()
+            .map(|id| PickerOption {
+                value: Some(id.as_str().into()),
+                label: harness_label(id).into(),
+                chord: Some(harness_letter(id)),
+                note: None,
+                verify_after_merge: None,
+                detail: None,
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wt_core::HarnessId;
+
+    #[test]
+    fn harness_picker_skips_hidden_and_starts_on_primary() {
+        let UiModal::Picker {
+            action,
+            options,
+            selected,
+            ..
+        } = harness_picker(
+            "one".into(),
+            &[HarnessId::Codex].into_iter().collect(),
+            HarnessId::Opencode,
+        )
+        else {
+            panic!("expected a picker");
+        };
+        assert_eq!(action, PickerAction::Harness { key: "one".into() });
+        let values: Vec<_> = options
+            .iter()
+            .map(|option| (option.value.clone().unwrap(), option.chord))
+            .collect();
+        assert_eq!(
+            values,
+            vec![("claude".into(), Some('c')), ("opencode".into(), Some('o'))]
+        );
+        assert_eq!(selected, 1);
+    }
 }

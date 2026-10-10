@@ -37,6 +37,19 @@ impl LineEditor {
         self.cursor += count;
     }
 
+    /// Paste that keeps line breaks, for free-text prompts such as `! c`
+    /// (TS `printableMultiline`). Other control characters are dropped.
+    pub fn paste_multiline(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let chars: Vec<_> = text
+            .chars()
+            .filter(|ch| *ch == '\n' || !ch.is_control())
+            .collect();
+        let count = chars.len();
+        self.chars.splice(self.cursor..self.cursor, chars);
+        self.cursor += count;
+    }
+
     fn word_left(&self) -> usize {
         let mut cursor = self.cursor;
         while cursor > 0 && separator(self.chars[cursor - 1]) {
@@ -118,7 +131,7 @@ impl LineEditor {
         let mut start = self.cursor;
         let mut column = 0;
         while start > 0 {
-            let cells = self.chars[start - 1].width().unwrap_or(0);
+            let cells = shown(self.chars[start - 1]).width().unwrap_or(0);
             if column + cells >= width {
                 break;
             }
@@ -128,6 +141,7 @@ impl LineEditor {
         let mut cells = 0;
         let text = self.chars[start..]
             .iter()
+            .map(|ch| shown(*ch))
             .take_while(|ch| {
                 cells += ch.width().unwrap_or(0);
                 cells <= width
@@ -135,6 +149,11 @@ impl LineEditor {
             .collect();
         (text, column as u16)
     }
+}
+
+/// A pasted line break shows as one visible cell in the one-line footer.
+fn shown(ch: char) -> char {
+    if ch == '\n' { '↵' } else { ch }
 }
 
 fn separator(ch: char) -> bool {
@@ -175,5 +194,13 @@ mod tests {
         editor.input(key(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(editor.viewport(4), ("a界".into(), 0));
         assert_eq!(editor.viewport(0), (String::new(), 0));
+    }
+
+    #[test]
+    fn multiline_paste_keeps_line_breaks_and_shows_them_as_one_cell() {
+        let mut editor = LineEditor::default();
+        editor.paste_multiline("one\r\ntwo\u{1b}\rthree");
+        assert_eq!(editor.text(), "one\ntwo\nthree");
+        assert_eq!(editor.viewport(40).0, "one↵two↵three");
     }
 }

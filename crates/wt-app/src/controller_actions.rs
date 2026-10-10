@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, FromArgMatches};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_lifecycle::CreateOptions;
+use wt_platform::lock::FileLock;
 use wt_tui::{
     Board, ConfirmAction, PickerAction, PickerOption, RemovalRevision as UiRemovalRevision,
     UiAction, UiModal, UiReply, UrlKind,
@@ -73,12 +74,30 @@ pub async fn execute(
             crate::editor::open_url(ctx, &wt_github::pull_request_open_url(&url, target)).await?;
             Ok(message("Opened pull request"))
         }
+        UiAction::OpenPrDefault { url } => {
+            crate::editor::open_url(
+                ctx,
+                &wt_github::pull_request_open_url(&url, ctx.config.github.pr_target),
+            )
+            .await?;
+            Ok(message("Opened pull request"))
+        }
+        UiAction::OpenSlotEditor { target } => {
+            let path = slot_path(ctx, target)?;
+            crate::editor::open(ctx, &path).await?;
+            Ok(message(format!("Opened {}", path.display())))
+        }
         action @ (UiAction::PrepareSessions { .. }
         | UiAction::PrepareStopTerminal { .. }
         | UiAction::StopTerminal { .. }
-        | UiAction::PrepareStopSession { .. }
-        | UiAction::StopSession { .. }) => crate::session_ui::execute(ctx, action).await,
-        UiAction::SelectSession { .. } => bail!("session attachment is owned by the controller"),
+        | UiAction::StopSession { .. }
+        | UiAction::KillSession { .. }
+        | UiAction::PrepareHarnesses { .. }) => crate::session_ui::execute(ctx, action).await,
+        UiAction::SelectSession { .. }
+        | UiAction::EnterHarness { .. }
+        | UiAction::PerfInvestigate { .. } => {
+            bail!("session attachment is owned by the controller")
+        }
         UiAction::CancelAutomations => {
             bail!("queued automations must be cancelled through the host service")
         }
@@ -399,7 +418,18 @@ pub async fn execute(
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
                     .context("remote worktree metadata is still loading")?;
             } else {
-                resolve_key(ctx, &key).await?;
+                let row = resolve_key(ctx, &key).await?;
+                let slug = row.target.slug().to_owned();
+                if FileLock::try_acquire(&ctx.config.paths.lock_dir, &slug, "archive probe")
+                    .await?
+                    .is_none()
+                {
+                    let op = board
+                        .and_then(|board| board.rows.iter().find(|row| row.key == key))
+                        .and_then(|row| row.busy.as_ref())
+                        .map_or("busy".to_owned(), |busy| busy.label.clone());
+                    bail!("{slug} is {op}; can't change archive state");
+                }
             }
             let slug = key;
             let archived = ctx
@@ -409,6 +439,9 @@ pub async fn execute(
                     store.set_archived(&slug, archived)?;
                     if archived {
                         store.set_section_folded(crate::board_layout::ARCHIVED, true)?;
+                    } else {
+                        // Restored rows return to the Inbox, as in TS.
+                        store.move_worktrees_to_section(std::slice::from_ref(&slug), None)?;
                     }
                     Ok(archived)
                 })
@@ -467,6 +500,7 @@ pub async fn execute(
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                detail: None,
             }];
             options.extend(branches.into_iter().map(|branch| PickerOption {
                 label: if current.as_deref() == Some(branch.as_str()) {
@@ -478,6 +512,7 @@ pub async fn execute(
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                detail: None,
             }));
             let selected = current
                 .as_ref()
@@ -537,6 +572,30 @@ pub async fn execute(
             Ok(message("Opened URL"))
         }
         UiAction::Session { .. } => unreachable!("session handoff is owned by the controller"),
+    }
+}
+
+/// The checkout a special slot works in.
+pub(crate) fn slot_path(
+    ctx: &AppContext,
+    target: wt_tui::SessionTarget,
+) -> Result<std::path::PathBuf> {
+    use wt_tui::SessionTarget;
+    match target {
+        SessionTarget::Main | SessionTarget::Manager => Ok(ctx.config.paths.main_clone.clone()),
+        SessionTarget::WtSource => ctx
+            .config
+            .paths
+            .wt_source
+            .clone()
+            .filter(|path| path.is_dir())
+            .context("wt source checkout is unavailable"),
+        SessionTarget::Dotfiles => Some(ctx.config.paths.dotfiles.clone())
+            .filter(|path| path.is_dir())
+            .context("dotfiles checkout is unavailable"),
+        SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
+            bail!("worktree targets are not slots")
+        }
     }
 }
 
@@ -623,6 +682,17 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
     })
 }
 
+const STATUS_CHORDS: [(&str, char); 8] = [
+    ("todo", 't'),
+    ("working", 'w'),
+    ("review", 'r'),
+    ("needs-testing", 'n'),
+    ("needs-human", 'h'),
+    ("ready", 'y'),
+    ("verified", 'v'),
+    ("dropped", 'd'),
+];
+
 async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
     let row = resolve_key(ctx, &key).await?;
     let slug = row.target.slug().to_owned();
@@ -637,43 +707,54 @@ async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
     let verify = work
         .and_then(|work| work["verifyAfterMerge"].as_str())
         .map(str::to_owned);
-    let mut options = [
-        ("todo", 't'),
-        ("working", 'w'),
-        ("review", 'r'),
-        ("needs-testing", 'n'),
-        ("needs-human", 'h'),
-        ("ready", 'y'),
-        ("verified", 'v'),
-        ("dropped", 'd'),
-    ]
-    .into_iter()
-    .map(|(state, chord)| PickerOption {
-        value: Some(state.into()),
-        label: state.into(),
-        chord: Some(chord),
-        note: note.clone(),
-        verify_after_merge: None,
-    })
-    .collect::<Vec<_>>();
-    let selected = options
-        .iter()
-        .position(|option| option.value.as_deref() == work.and_then(|work| work["state"].as_str()))
-        .unwrap_or(0);
-    options.push(PickerOption {
-        value: Some("ready".into()),
-        label: "ready + verify after merge".into(),
-        chord: Some('a'),
-        note: None,
-        verify_after_merge: Some(verify.unwrap_or_default()),
-    });
+    // TS order: the plain states, `a` beside `y`, then clear. The current
+    // claim is marked and starts highlighted; a ready claim with an owed
+    // check is the `a` row.
+    let current_state = work.and_then(|work| work["state"].as_str());
+    let current = match current_state {
+        Some("ready") if verify.is_some() => Some('a'),
+        Some(state) => STATUS_CHORDS
+            .iter()
+            .find(|(name, _)| *name == state)
+            .map(|(_, chord)| *chord),
+        None => Some('x'),
+    };
+    let mut options = Vec::new();
+    for (state, chord) in STATUS_CHORDS {
+        options.push(PickerOption {
+            value: Some(state.into()),
+            label: state.into(),
+            chord: Some(chord),
+            note: note.clone(),
+            verify_after_merge: None,
+            detail: None,
+        });
+        if chord == 'y' {
+            options.push(PickerOption {
+                value: Some("ready".into()),
+                label: "ready + verify after merge".into(),
+                chord: Some('a'),
+                note: None,
+                verify_after_merge: Some(verify.clone().unwrap_or_default()),
+                detail: None,
+            });
+        }
+    }
     options.push(PickerOption {
         value: None,
-        label: "Clear status".into(),
+        label: "clear status".into(),
         chord: Some('x'),
         note: None,
         verify_after_merge: None,
+        detail: None,
     });
+    let selected = options
+        .iter()
+        .position(|option| option.chord == current)
+        .unwrap_or(0);
+    if current_state.is_some() {
+        options[selected].label.push_str(" (current)");
+    }
     Ok(modal(UiModal::Picker {
         action: PickerAction::Status { key },
         title: "Work status".into(),

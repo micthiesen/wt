@@ -49,6 +49,21 @@ pub enum UiAction {
         url: String,
         linear: bool,
     },
+    /// Open a pull request URL at the configured `[github].pr_target`.
+    /// Used where the UI has only the URL, such as a requested review.
+    OpenPrDefault {
+        url: String,
+    },
+    /// Open a special slot's checkout (`O` = main clone, slot palette `z`)
+    /// in the editor. Always on this machine.
+    OpenSlotEditor {
+        target: SessionTarget,
+    },
+    /// Perf overlay `i`: send the shown snapshot to the wt-source session
+    /// as an investigation prompt, then enter that session.
+    PerfInvestigate {
+        report: Vec<String>,
+    },
     Restack {
         key: String,
     },
@@ -199,8 +214,20 @@ pub enum UiAction {
     SelectSession {
         selection: SessionSelection,
     },
-    PrepareStopSession {
+    /// `; x`: kill a live session directly, or forget a dead Claude
+    /// session's stored name. No confirmation, as in the TS picker.
+    KillSession {
         selection: SessionSelection,
+    },
+    /// Shift+F12: list the visible harnesses for a worktree.
+    PrepareHarnesses {
+        key: String,
+    },
+    /// Harness picker commit: Claude spawns a new auto-named session; other
+    /// harnesses attach their live slot or start it.
+    EnterHarness {
+        key: String,
+        harness: wt_core::HarnessId,
     },
     PrepareStopTerminal {
         key: String,
@@ -212,6 +239,8 @@ pub enum UiAction {
         session_id: String,
         created_at: i64,
     },
+    /// `; d`: close a live session gracefully (Claude: kill the tmux
+    /// session; others: Ctrl+D twice). The reply says when nothing was live.
     StopSession {
         selection: SessionSelection,
     },
@@ -279,9 +308,6 @@ pub enum ConfirmAction {
         key: String,
         ship: bool,
     },
-    StopSession {
-        selection: SessionSelection,
-    },
     KillAction {
         action_key: String,
         run_id: String,
@@ -308,8 +334,13 @@ pub struct SessionSelection {
     pub target: SessionTarget,
     pub harness: wt_core::HarnessId,
     pub session_id: Option<String>,
+    /// A Claude `New` selection with no name gets the next automatic name.
     pub managed_name: Option<String>,
     pub mode: SessionMode,
+    /// The session was live when the picker was prepared. Execution still
+    /// revalidates the exact identity.
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +368,10 @@ pub enum PickerAction {
         key: String,
     },
     Section {
+        key: String,
+    },
+    /// Shift+F12 harness picker. Option values are `HarnessId::as_str`.
+    Harness {
         key: String,
     },
 }
@@ -384,6 +419,10 @@ pub struct PickerOption {
     /// selection starts a fresh status assertion and does not carry this note.
     pub note: Option<String>,
     pub verify_after_merge: Option<String>,
+    /// Dim right-aligned text: an action's kind and id, or why it is
+    /// unavailable.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +443,13 @@ pub enum UiModal {
     Log {
         title: String,
         lines: Vec<String>,
+        /// An extra key that closes the overlay, such as `l` for `! l`.
+        #[serde(default)]
+        close_key: Option<char>,
+        /// Re-sent about once a second while the overlay stays open; the
+        /// reply's Log replaces the lines and keeps the scroll position.
+        #[serde(default)]
+        refresh: Option<Box<UiAction>>,
     },
     Confirm {
         action: ConfirmAction,

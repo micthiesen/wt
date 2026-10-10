@@ -125,6 +125,19 @@ pub async fn prepare_session(
     if agent.remote {
         bail!("session preparation must run on the worktree host");
     }
+    // A fresh Claude session from the picker or harness chooser without a
+    // typed name takes the next automatic name, as the TS picker did.
+    if selection.harness == HarnessId::Claude
+        && selection.mode == SessionMode::New
+        && selection.target == SessionTarget::Harness
+        && selection.managed_name.is_none()
+        && agent.managed_name.is_none()
+    {
+        agent.managed_name = Some(wt_harness::next_auto_name(
+            &context.config.paths.cache_root,
+            &agent.slug,
+        )?);
+    }
     if selection.harness == HarnessId::Claude
         && let Some(name) = selection.managed_name.as_deref()
         && name != "manager"
@@ -260,12 +273,24 @@ pub async fn prepare_session(
     Ok(app.attach_command(&tmux_name, &agent.cwd))
 }
 
+/// How a live session is ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionEnd {
+    /// `; d`: Claude's tmux session is killed (its pane is never an input
+    /// transport); other harnesses get Ctrl+D twice.
+    Graceful,
+    /// `; x`: every harness's tmux session is killed.
+    Kill,
+}
+
 /// Stop only the currently live conversation named by a picker selection.
 /// Single-slot harnesses are checked against tmux's persisted session UUID.
+/// Returns whether a live session was actually ended.
 pub async fn stop_managed_session(
     context: &AppContext,
     selection: &SessionSelection,
-) -> Result<()> {
+    end: SessionEnd,
+) -> Result<bool> {
     if selection.mode != SessionMode::Resume {
         bail!("only an exact resumed session can be stopped");
     }
@@ -306,8 +331,7 @@ pub async fn stop_managed_session(
                 &context.cancellation,
             )
             .await
-            .context("stop selected Claude session")?;
-        Ok(())
+            .context("stop selected Claude session")
     } else {
         let lock_dir = context.config.paths.cache_root.join("locks");
         let _guard = FileLock::acquire(
@@ -319,12 +343,18 @@ pub async fn stop_managed_session(
         .await?;
         let sessions = app.session_inventory(context).await?;
         let Some(live) = sessions.iter().find(|session| session.name == name) else {
-            return Ok(());
+            return Ok(false);
         };
         if live.harness_session_id.as_deref() != Some(expected.as_str()) {
             bail!(
                 "live {name} slot no longer matches the selected conversation; refusing to stop it"
             );
+        }
+        if end == SessionEnd::Kill {
+            return Ok(app
+                .tmux
+                .kill_session_id(&live.id, &context.cancellation)
+                .await?);
         }
         let pane = PaneTarget::active_session_pane(&name);
         app.tmux
@@ -334,8 +364,37 @@ pub async fn stop_managed_session(
         app.tmux
             .send_keys(&pane, &["C-d"], &context.cancellation)
             .await?;
-        Ok(())
+        Ok(true)
     }
+}
+
+/// Forget a dead Claude session's stored name so it leaves the picker.
+/// Refuses while the named session is live.
+pub async fn forget_claude_session(
+    context: &AppContext,
+    selection: &SessionSelection,
+) -> Result<String> {
+    if selection.harness != HarnessId::Claude {
+        bail!("only Claude session names can be forgotten");
+    }
+    let name = selection
+        .managed_name
+        .clone()
+        .context("this Claude session has no stored name to forget")?;
+    let mut agent = resolve_target(context, selection.key.as_deref(), selection.target).await?;
+    agent.managed_name = Some(name.clone());
+    let tmux_name = wt_harness::claude_tmux_name(&agent.slug, Some(&name));
+    let app = AppHarness::new(context);
+    if app
+        .session_inventory(context)
+        .await?
+        .iter()
+        .any(|session| session.name == tmux_name)
+    {
+        bail!("{tmux_name} is live; it was not forgotten");
+    }
+    wt_harness::remove_claude_name(&context.config.paths.cache_root, &agent.slug, &name)?;
+    Ok(name)
 }
 
 fn option_for(
@@ -353,6 +412,7 @@ fn option_for(
             session_id: Some(session.session_id),
             managed_name: session.extras.managed_name,
             mode: SessionMode::Resume,
+            live: is_live,
         },
         display_name: session.display_name,
         tmux_session_name: session.tmux_session_name,
@@ -432,10 +492,9 @@ async fn resolve_target(
 
 fn session_name(agent: &AgentTarget, harness: HarnessId) -> String {
     match harness {
-        HarnessId::Claude if agent.managed_name.as_deref() == Some("manager") => {
-            format!("{}~manager", agent.slug)
+        HarnessId::Claude => {
+            wt_harness::claude_tmux_name(&agent.slug, agent.managed_name.as_deref())
         }
-        HarnessId::Claude => agent.slug.clone(),
         HarnessId::Codex => format!("{}-codex", agent.slug),
         HarnessId::Opencode => format!("{}-opencode", agent.slug),
     }

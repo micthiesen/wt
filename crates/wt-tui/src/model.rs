@@ -254,8 +254,9 @@ pub struct GitPresentation {
     /// Unmerged paths in the working tree (a rebase or merge stopped on them).
     pub conflict_files: Vec<String>,
     /// Pre-flight: files that would conflict if HEAD were rebased onto its
-    /// base now. Empty when the probe ran clean or has not run.
-    pub base_conflicts: Vec<String>,
+    /// base now. `Some(empty)` when the probe ran clean; `None` when it has
+    /// not run or its result is unknown (never render that as clean).
+    pub base_conflicts: Option<Vec<String>>,
     pub pr_title: Option<String>,
     pub first_commit_title: Option<String>,
     /// Work since the fork point, committed and uncommitted together.
@@ -483,6 +484,9 @@ pub struct BoardRow {
     pub github_issue_url: Option<String>,
     pub pr_url: Option<String>,
     pub stage_url: Option<String>,
+    /// Configured stage name for this row, offered by the yank picker.
+    #[serde(default)]
+    pub stage_name: Option<String>,
     pub dev_url: Option<String>,
     pub archived: bool,
     /// Stack rail, one character per column (`┌`, `├`, `│└`), empty for
@@ -541,6 +545,9 @@ pub struct Model {
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
     pub(crate) help_scroll: usize,
+    /// Furthest useful help scroll for the last drawn frame, published by
+    /// the renderer because wrapping and the glyph legend set the length.
+    pub(crate) help_max_scroll: usize,
     pub(crate) help_query: crate::LineEditor,
     pub(crate) help_searching: bool,
     pub(crate) show_verification: bool,
@@ -562,6 +569,14 @@ pub struct Model {
     /// Optimistic primary harness from a just-accepted cycle, held until the
     /// board reports the same value.
     pub(crate) primary_override: Option<String>,
+    /// Extra close key and periodic refresh request of the open Log overlay.
+    pub(crate) log_close_key: Option<char>,
+    pub(crate) log_refresh: Option<UiAction>,
+    /// The list viewport was scrolled independently of the cursor (mouse
+    /// wheel, or `j`/`k` pressed at an edge). Any cursor move clears it.
+    pub list_free_scroll: bool,
+    /// Mouse drag selection, in screen cells, while a button is held.
+    pub(crate) mouse_selection: Option<crate::mouse::Selection>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -586,6 +601,7 @@ impl Default for Model {
             pr_chord: None,
             help: false,
             help_scroll: 0,
+            help_max_scroll: 0,
             help_query: crate::LineEditor::default(),
             help_searching: false,
             show_verification: false,
@@ -605,6 +621,10 @@ impl Default for Model {
             last_section_target: None,
             items: Vec::new(),
             primary_override: None,
+            log_close_key: None,
+            log_refresh: None,
+            list_free_scroll: false,
+            mouse_selection: None,
         }
     }
 }
@@ -635,6 +655,10 @@ impl Model {
             let previous_review = self
                 .selected_review()
                 .map(|row| (row.host.clone(), row.url.clone()));
+            let previous_review_index = match self.selected_item() {
+                Some(VisualItem::ReviewRequest(index)) => Some(index),
+                _ => None,
+            };
             let on_reviews_header = matches!(self.selected_item(), Some(VisualItem::ReviewHeader));
             let previous_section = self.selected_section().map(|section| section.key.clone());
             let previous_neighbors: Vec<_> = self
@@ -743,17 +767,41 @@ impl Model {
             }
             if self.selected_row().map(|row| row.key.as_str()) != previous_key.as_deref() {
                 self.details_scroll = 0;
+                self.reset_verification();
             }
             if !requested_selection {
                 if let Some((host, url)) = previous_review {
-                    if let Some(position) = (0..self.item_count()).find(|&position| {
-                        matches!(self.item(position), Some(VisualItem::ReviewRequest(index))
-                            if self.board.review_requests[index].host == host && self.board.review_requests[index].url == url)
-                    }) {
-                        self.selected = Some(position);
-                    }
+                    let review_position = |model: &Self, wanted: &dyn Fn(usize) -> bool| {
+                        (0..model.item_count()).find(|&position| {
+                            matches!(model.item(position), Some(VisualItem::ReviewRequest(index)) if wanted(index))
+                        })
+                    };
+                    let same = review_position(self, &|index| {
+                        self.board.review_requests[index].host == host
+                            && self.board.review_requests[index].url == url
+                    });
+                    // A dismissed or checked-out review hands the cursor to
+                    // the next surviving review, else the previous one, else
+                    // whatever now occupies its slot.
+                    let survivor = || {
+                        let last = self.board.review_requests.len().checked_sub(1)?;
+                        let wanted = previous_review_index.unwrap_or(0).min(last);
+                        review_position(self, &|index| index == wanted)
+                    };
+                    self.selected = same
+                        .or_else(survivor)
+                        .or_else(|| {
+                            (self.item_count() > 0)
+                                .then(|| previous_index.min(self.item_count() - 1))
+                        })
+                        .or(self.selected);
                 } else if on_reviews_header && !self.board.review_requests.is_empty() {
-                    self.selected = Some(0);
+                    self.selected = (0..self.item_count()).find(|&position| {
+                        matches!(
+                            self.item(position),
+                            Some(VisualItem::ReviewHeader | VisualItem::ReviewRequest(_))
+                        )
+                    });
                 }
             }
         }
@@ -785,6 +833,12 @@ impl Model {
         if reply.modal.is_some() && current {
             self.interaction_host = reply.modal_host;
         }
+        if reply.handoff.is_some() {
+            // Entering a session (perf `i` included) closes the overlays so
+            // they do not paint back over the board on return.
+            self.show_perf = false;
+            self.help = false;
+        }
         self.toast = Some((reply.message, reply.failed));
         self.interaction = match reply.modal.filter(|_| current) {
             Some(UiModal::Reviewers {
@@ -799,11 +853,31 @@ impl Model {
                 candidates,
                 selected: 0,
             }),
-            Some(UiModal::Log { title, lines }) => Interaction::Log {
+            Some(UiModal::Log {
                 title,
                 lines,
-                scroll: 0,
-            },
+                close_key,
+                refresh,
+            }) => {
+                // A refreshed overlay keeps its scroll position.
+                let scroll = match &self.interaction {
+                    Interaction::Log {
+                        title: open,
+                        scroll,
+                        ..
+                    } if refresh.is_some() && *open == title => {
+                        (*scroll).min(lines.len().saturating_sub(1))
+                    }
+                    _ => 0,
+                };
+                self.log_close_key = close_key;
+                self.log_refresh = refresh.map(|action| *action);
+                Interaction::Log {
+                    title,
+                    lines,
+                    scroll,
+                }
+            }
             Some(UiModal::Confirm {
                 action,
                 title,
@@ -865,7 +939,13 @@ impl Model {
 
     pub(crate) fn paste(&mut self, text: &str) -> bool {
         if let Interaction::Text(prompt) = &mut self.interaction {
-            prompt.editor.paste(text);
+            // Action prompts keep pasted line breaks (TS `! c`); footer
+            // prompts stay one line.
+            if matches!(prompt.action, TextAction::ActionExtras { .. }) {
+                prompt.editor.paste_multiline(text);
+            } else {
+                prompt.editor.paste(text);
+            }
             return true;
         }
         if let Some(prompt) = &mut self.title_prompt {
@@ -919,14 +999,19 @@ impl Model {
         }
         self.selected_row()
             .map(|row| {
-                let mut choices = vec![
-                    ('b', "branch", row.branch.clone()),
-                    ('p', "path", row.path.clone()),
-                    ('n', "slug", row.slug.clone()),
-                ];
+                // Unavailable entries stay listed with an empty value so
+                // digit positions are stable; picking one says so.
+                let mut choices = vec![('b', "branch", row.branch.clone())];
                 for (key, label, value) in [
+                    ('s', "stage name", row.stage_name.as_ref()),
                     ('S', "stage URL", row.stage_url.as_ref()),
                     ('d', "dev URL", row.dev_url.as_ref()),
+                ] {
+                    choices.push((key, label, value.cloned().unwrap_or_default()));
+                }
+                choices.push(('p', "path", row.path.clone()));
+                choices.push(('n', "slug", row.slug.clone()));
+                for (key, label, value) in [
                     (
                         'i',
                         "issue",
@@ -935,9 +1020,7 @@ impl Model {
                     ('I', "primary issue", row.issue_url.as_ref()),
                     ('r', "PR URL", row.pr_url.as_ref()),
                 ] {
-                    if let Some(value) = value {
-                        choices.push((key, label, value.clone()));
-                    }
+                    choices.push((key, label, value.cloned().unwrap_or_default()));
                 }
                 choices
             })
@@ -1080,12 +1163,52 @@ impl Model {
     fn select(&mut self, index: usize) -> InputResult {
         self.pending_selection = None;
         let selected = (self.item_count() > 0).then(|| index.min(self.item_count() - 1));
+        let freed = std::mem::take(&mut self.list_free_scroll);
         if self.selected == selected {
-            return InputResult::Unchanged;
+            return if freed {
+                InputResult::Draw
+            } else {
+                InputResult::Unchanged
+            };
         }
         self.selected = selected;
         self.details_scroll = 0;
+        self.reset_verification();
         InputResult::Draw
+    }
+
+    /// `V` is per row: it starts open once the post-merge check is due and
+    /// resets whenever the cursor lands on another row.
+    fn reset_verification(&mut self) {
+        self.show_verification = self
+            .selected_row()
+            .and_then(|row| row.work.as_ref())
+            .is_some_and(|work| work.verification_owed);
+    }
+
+    /// Feedback for a key that has nothing to act on.
+    pub(crate) fn notify(&mut self, text: impl Into<String>) -> InputResult {
+        self.toast = Some((text.into(), false));
+        InputResult::Draw
+    }
+
+    /// Move the cursor one stop; at an edge, scroll the list to that edge
+    /// instead (TS `normal-keys.ts:545-570`).
+    fn step(&mut self, forward: bool) -> InputResult {
+        let current = self.selected.unwrap_or(0);
+        let count = self.item_count();
+        let at_edge = if forward {
+            count == 0 || current + 1 >= count
+        } else {
+            current == 0
+        };
+        if at_edge {
+            self.pending_selection = None;
+            self.list_free_scroll = true;
+            self.offset = if forward { usize::MAX } else { 0 };
+            return InputResult::Draw;
+        }
+        self.select(if forward { current + 1 } else { current - 1 })
     }
 
     fn jump_section(&mut self, forward: bool) -> InputResult {
@@ -1138,21 +1261,24 @@ impl Model {
             && key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Char('g' | 'l'))
         {
-            self.pr_chord = self
+            // Requested reviews arm the chord too. A row without a PR keeps
+            // an earlier chord alive, as in TS `usePrTargetChord.ts:54-57`.
+            if let Some(url) = self
                 .selected_row()
                 .and_then(|row| row.pr_url.clone())
-                .map(|url| {
-                    (
-                        std::time::Instant::now(),
-                        url,
-                        key.code == KeyCode::Char('l'),
-                    )
-                });
+                .or_else(|| self.selected_review().map(|review| review.url.clone()))
+            {
+                self.pr_chord = Some((
+                    std::time::Instant::now(),
+                    url,
+                    key.code == KeyCode::Char('l'),
+                ));
+            }
         }
         if !matches!(self.interaction, Interaction::None) {
             let interaction = std::mem::take(&mut self.interaction);
             let host = self.interaction_host.clone();
-            let result = self.interaction_input(key, interaction);
+            let result = self.interaction_input(key, interaction, height);
             if matches!(self.interaction, Interaction::None) {
                 self.interaction_host = None;
             }
@@ -1224,6 +1350,11 @@ impl Model {
                 KeyCode::Char(digit @ '1'..='9') => Some(digit as usize - '1' as usize),
                 _ => direct,
             };
+            if let Some((_, _, value)) = pick.and_then(|index| choices.get(index))
+                && value.is_empty()
+            {
+                return self.notify("nothing to yank");
+            }
             if let Some((_, label, value)) = pick.and_then(|index| choices.get(index)) {
                 let action = UiAction::Copy {
                     value: value.clone(),
@@ -1271,25 +1402,13 @@ impl Model {
             }
             let maximum = crate::help::filtered_lines(&self.help_query.text())
                 .len()
-                .saturating_sub(1);
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.help_scroll = self.help_scroll.saturating_add(1).min(maximum);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
-                }
-                KeyCode::PageDown => {
-                    self.help_scroll = self.help_scroll.saturating_add(height / 2).min(maximum);
-                }
-                KeyCode::PageUp => {
-                    self.help_scroll = self.help_scroll.saturating_sub(height / 2);
-                }
-                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
-                KeyCode::End | KeyCode::Char('G') => self.help_scroll = maximum,
-                _ => return InputResult::Unchanged,
-            }
-            return InputResult::Draw;
+                .saturating_sub(1)
+                .max(self.help_max_scroll);
+            return if overlay_scroll(key, &mut self.help_scroll, maximum, height) {
+                InputResult::Draw
+            } else {
+                InputResult::Unchanged
+            };
         }
         if self.show_perf {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'P'))
@@ -1302,33 +1421,35 @@ impl Model {
                     refresh: false,
                 });
             }
-            if key.code == KeyCode::Char('i') {
-                self.perf_continuous = !self.perf_continuous;
-            }
-            if matches!(key.code, KeyCode::Char('i' | 'r')) {
-                return InputResult::Action(UiAction::SetPerf {
-                    active: true,
-                    continuous: self.perf_continuous,
-                    refresh: key.code == KeyCode::Char('r'),
-                });
+            let maximum = self.board.perf.len().saturating_sub(1);
+            if overlay_scroll(key, &mut self.perf_scroll, maximum, height) {
+                return InputResult::Draw;
             }
             match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.perf_scroll = self
-                        .perf_scroll
-                        .saturating_add(3)
-                        .min(self.board.perf.len().saturating_sub(1))
+                // TS `perf.ts:23-55`: investigate the shown snapshot in the
+                // wt-source session.
+                KeyCode::Char('i') if !control => {
+                    if self.board.perf.is_empty() {
+                        return self.notify("no perf sample yet");
+                    }
+                    // The overlay closes when the session handoff arrives,
+                    // so a failed send leaves it up with the reason.
+                    return InputResult::Action(UiAction::PerfInvestigate {
+                        report: self.board.perf.clone(),
+                    });
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.perf_scroll = self.perf_scroll.saturating_sub(3)
+                // Continuous sampling moved from `i` to `c`.
+                KeyCode::Char('c') if !control => {
+                    self.perf_continuous = !self.perf_continuous;
                 }
-                KeyCode::Home | KeyCode::Char('g') => self.perf_scroll = 0,
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.perf_scroll = self.board.perf.len().saturating_sub(1)
-                }
+                KeyCode::Char('r') if !control => {}
                 _ => return InputResult::Unchanged,
             }
-            return InputResult::Draw;
+            return InputResult::Action(UiAction::SetPerf {
+                active: true,
+                continuous: self.perf_continuous,
+                refresh: key.code == KeyCode::Char('r'),
+            });
         }
         if self.history.active && !crate::history::is_global_key(key) {
             return self.history_input(key, height);
@@ -1365,6 +1486,9 @@ impl Model {
                 self.row_action(|key| UiAction::ToggleAutomations { key: Some(key) })
             }
             KeyCode::Char('A') if !control => {
+                if !self.board.display.automations {
+                    return self.notify("no [[automations]] configured");
+                }
                 InputResult::Action(UiAction::ToggleAutomations { key: None })
             }
             KeyCode::Char('\'') if !control => {
@@ -1378,7 +1502,13 @@ impl Model {
             KeyCode::Char('x')
                 if !control
                     && matches!(self.output.target, crate::output::OutputTarget::Attention)
-                    && !self.board.attention.is_empty() =>
+                    && self.board.attention.is_empty() =>
+            {
+                self.notify("attention feed is empty")
+            }
+            KeyCode::Char('x')
+                if !control
+                    && matches!(self.output.target, crate::output::OutputTarget::Attention) =>
             {
                 let at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1412,6 +1542,18 @@ impl Model {
                 self.row_action(|key| UiAction::GenerateTitle { key })
             }
             KeyCode::Char('V') if !control => {
+                let Some(row) = self.selected_row() else {
+                    return self.notify("select a worktree first");
+                };
+                let has_steps = row.verify_steps.is_some()
+                    || row
+                        .work
+                        .as_ref()
+                        .and_then(|work| work.record.as_ref())
+                        .is_some_and(|record| record.verify_after_merge.is_some());
+                if !has_steps {
+                    return self.notify("no verify-after-merge steps on this row");
+                }
                 self.show_verification = !self.show_verification;
                 InputResult::Draw
             }
@@ -1435,26 +1577,38 @@ impl Model {
                 })
             }
             KeyCode::Char('d') if control => self.jump_section(true),
-            KeyCode::Char('J' | 'K') if !control => self
-                .selected_section()
-                .map(|section| {
-                    InputResult::Action(UiAction::Reorder {
-                        key: self.selected_row().map(|row| row.key.clone()),
-                        section: section.key.clone(),
-                        down: key.code == KeyCode::Char('J'),
-                    })
+            KeyCode::Char('J' | 'K') if !control => {
+                let Some(section) = self.selected_section().map(|section| section.key.clone())
+                else {
+                    return self.notify("select a worktree first");
+                };
+                let row = self.selected_row().map(|row| row.key.clone());
+                // The cursor follows a moved row, including across a section
+                // boundary (TS docs/tui.md "J / K").
+                self.pending_selection = row.clone();
+                InputResult::Action(UiAction::Reorder {
+                    key: row,
+                    section,
+                    down: key.code == KeyCode::Char('J'),
                 })
-                .unwrap_or(InputResult::Unchanged),
+            }
             KeyCode::Char('u') if control => self.jump_section(false),
-            KeyCode::Tab if !control => self
-                .selected_section()
-                .map(|section| {
-                    InputResult::Action(UiAction::FoldSection {
-                        key: section.key.clone(),
-                        folded: !section.folded,
-                    })
-                })
-                .unwrap_or(InputResult::Unchanged),
+            KeyCode::Tab if !control => {
+                let Some(section) = self.selected_section() else {
+                    return self.notify("no section here to fold");
+                };
+                let (key, folded) = (section.key.clone(), !section.folded);
+                // Unfolding from the header lands on the section's first row.
+                if !folded
+                    && let Some(row) = section
+                        .rows
+                        .first()
+                        .and_then(|&index| self.board.rows.get(index))
+                {
+                    self.pending_selection = Some(row.key.clone());
+                }
+                InputResult::Action(UiAction::FoldSection { key, folded })
+            }
             KeyCode::Char('q') | KeyCode::Char('c')
                 if key.code == KeyCode::Char('q') || control =>
             {
@@ -1506,11 +1660,7 @@ impl Model {
                 }
             }
             KeyCode::Char('n') if !control && !shift => {
-                if self.board.hosts.len() > 1 {
-                    return InputResult::Action(UiAction::PrepareCreate {
-                        initial: String::new(),
-                    });
-                }
+                // Always local, as in TS; Ctrl+N chooses a host.
                 self.interaction = Interaction::Text(TextPrompt {
                     action: TextAction::Create,
                     prompt: "New worktree name: ".into(),
@@ -1519,9 +1669,23 @@ impl Model {
                 });
                 InputResult::Draw
             }
-            KeyCode::Char('n') if control => InputResult::Action(UiAction::PrepareCreate {
-                initial: String::new(),
+            KeyCode::Char('n') if control => {
+                if self.board.hosts.len() <= 1 {
+                    return self.notify("[remote] is not configured");
+                }
+                InputResult::Action(UiAction::PrepareCreate {
+                    initial: String::new(),
+                })
+            }
+            KeyCode::Char('O') if !control => InputResult::Action(UiAction::OpenSlotEditor {
+                target: SessionTarget::Main,
             }),
+            KeyCode::Esc => {
+                // Clear the explicit output focus; the bottom pane returns to
+                // its default feed.
+                self.output.choose(crate::output::OutputTarget::default());
+                InputResult::Draw
+            }
             KeyCode::Char('N') | KeyCode::Char('n') if !control && shift => {
                 let initial = self
                     .selected_row()
@@ -1548,6 +1712,20 @@ impl Model {
             }
             KeyCode::Char('c') if !control => InputResult::Action(UiAction::PrepareCleanup),
             KeyCode::Char('a') if !control => {
+                if let Some(row) = self.selected_row()
+                    && row.host.is_none()
+                    && let Some(busy) = &row.busy
+                {
+                    let label = if busy.label.is_empty() {
+                        &busy.op
+                    } else {
+                        &busy.label
+                    };
+                    return self.notify(format!(
+                        "{} is {label}; can't change archive state",
+                        row.slug
+                    ));
+                }
                 self.row_action(|key| UiAction::ToggleArchive { key })
             }
             KeyCode::Char('u') if !control => {
@@ -1583,10 +1761,7 @@ impl Model {
             }),
             KeyCode::F(10) => self.session_action(SessionTarget::Shell),
             KeyCode::F(11) => self.session_action(SessionTarget::Diff),
-            KeyCode::F(12) if shift => self.row_action(|key| UiAction::PrepareSessions {
-                key: Some(key),
-                target: SessionTarget::Harness,
-            }),
+            KeyCode::F(12) if shift => self.row_action(|key| UiAction::PrepareHarnesses { key }),
             KeyCode::Char(';') if !control => self.row_action(|key| UiAction::PrepareSessions {
                 key: Some(key),
                 target: SessionTarget::Harness,
@@ -1625,12 +1800,8 @@ impl Model {
                 self.details_scroll = self.details_scroll.saturating_sub(3);
                 InputResult::Draw
             }
-            KeyCode::Down | KeyCode::Char('j') if !control => {
-                self.select(self.selected.unwrap_or(0).saturating_add(1))
-            }
-            KeyCode::Up | KeyCode::Char('k') if !control => {
-                self.select(self.selected.unwrap_or(0).saturating_sub(1))
-            }
+            KeyCode::Down | KeyCode::Char('j') if !control => self.step(true),
+            KeyCode::Up | KeyCode::Char('k') if !control => self.step(false),
             KeyCode::Home | KeyCode::Char('g') => self.select(0),
             KeyCode::End | KeyCode::Char('G') => self.select(self.item_count().saturating_sub(1)),
             KeyCode::PageDown => self.select(self.selected.unwrap_or(0).saturating_add(height / 2)),
@@ -1653,47 +1824,59 @@ impl Model {
                         Some(VisualItem::ReviewHeader) => self.reviews_folded,
                         None => false,
                     });
-                next.map_or(InputResult::Unchanged, |index| self.select(index))
+                match next {
+                    Some(index) => self.select(index),
+                    None => self.notify("nothing needs you"),
+                }
             }
             _ => InputResult::Unchanged,
         }
     }
 
-    fn row_action(&self, build: impl FnOnce(String) -> UiAction) -> InputResult {
-        self.selected_row()
-            .map(|row| InputResult::Action(build(row.key.clone())))
-            .unwrap_or(InputResult::Unchanged)
+    fn row_action(&mut self, build: impl FnOnce(String) -> UiAction) -> InputResult {
+        match self.selected_row() {
+            Some(row) => InputResult::Action(build(row.key.clone())),
+            None => self.notify("select a worktree first"),
+        }
     }
 
-    fn session_action(&self, target: SessionTarget) -> InputResult {
-        self.selected_row()
-            .map(|row| {
-                InputResult::Action(UiAction::Session {
-                    key: Some(row.key.clone()),
-                    target,
-                })
-            })
-            .unwrap_or(InputResult::Unchanged)
+    fn session_action(&mut self, target: SessionTarget) -> InputResult {
+        self.row_action(|key| UiAction::Session {
+            key: Some(key),
+            target,
+        })
     }
 
-    fn url_action(&self, kind: UrlKind) -> InputResult {
-        self.selected_row()
-            .filter(|row| match kind {
-                UrlKind::PullRequest => row.pr_url.is_some(),
-                UrlKind::Issue => row.issue_url.is_some() || row.github_issue_url.is_some(),
-                UrlKind::PrimaryIssue => row.issue_url.is_some(),
-                UrlKind::StageOrDev => row.stage_url.is_some() || row.dev_url.is_some(),
-            })
-            .map(|row| {
-                InputResult::Action(UiAction::OpenUrl {
-                    key: row.key.clone(),
-                    kind,
-                })
-            })
-            .unwrap_or(InputResult::Unchanged)
+    fn url_action(&mut self, kind: UrlKind) -> InputResult {
+        let Some(row) = self.selected_row() else {
+            return self.notify("select a worktree first");
+        };
+        let missing = match kind {
+            UrlKind::PullRequest => row.pr_url.is_none().then_some("no PR for this branch"),
+            UrlKind::Issue => (row.issue_url.is_none() && row.github_issue_url.is_none())
+                .then_some("no issue URL (set a tracker id with #, or attach a --gh issue)"),
+            UrlKind::PrimaryIssue => row
+                .issue_url
+                .is_none()
+                .then_some("no primary issue URL (set a tracker id with #)"),
+            UrlKind::StageOrDev => (row.stage_url.is_none() && row.dev_url.is_none())
+                .then_some("no stage deployed or dev server running"),
+        };
+        if let Some(missing) = missing {
+            return self.notify(missing);
+        }
+        InputResult::Action(UiAction::OpenUrl {
+            key: row.key.clone(),
+            kind,
+        })
     }
 
-    fn interaction_input(&mut self, key: KeyEvent, mut interaction: Interaction) -> InputResult {
+    fn interaction_input(
+        &mut self,
+        key: KeyEvent,
+        mut interaction: Interaction,
+        height: usize,
+    ) -> InputResult {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let code = key.code;
         match &mut interaction {
@@ -1728,31 +1911,54 @@ impl Model {
                 InputResult::Draw
             }
             Interaction::Log { lines, scroll, .. } => {
+                let close_key = self
+                    .log_close_key
+                    .is_some_and(|close| !control && code == KeyCode::Char(close));
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                    || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c'))
+                    || (control && key.code == KeyCode::Char('c'))
+                    || close_key
                 {
+                    self.log_close_key = None;
+                    self.log_refresh = None;
                     return InputResult::Draw;
                 }
-                match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *scroll = scroll.saturating_add(3).min(lines.len().saturating_sub(1))
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(3),
-                    KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
-                    KeyCode::End | KeyCode::Char('G') => *scroll = lines.len().saturating_sub(1),
-                    KeyCode::PageDown => {
-                        *scroll = scroll.saturating_add(12).min(lines.len().saturating_sub(1))
-                    }
-                    KeyCode::PageUp => *scroll = scroll.saturating_sub(12),
-                    _ => {}
-                }
+                let maximum = lines.len().saturating_sub(1);
+                let moved = overlay_scroll(key, scroll, maximum, height);
                 self.interaction = interaction;
-                InputResult::Draw
+                if moved {
+                    InputResult::Draw
+                } else {
+                    InputResult::Unchanged
+                }
             }
             Interaction::Text(prompt) => {
+                // Session names are restricted to the Claude name charset.
+                if matches!(prompt.action, TextAction::SessionName { .. })
+                    && let KeyCode::Char(ch) = code
+                    && !control
+                    && !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                {
+                    self.interaction = interaction;
+                    return InputResult::Unchanged;
+                }
                 let result = prompt.editor.input(key);
                 match result {
+                    // Esc or Backspace on empty input inside a picker's
+                    // sub-prompt returns to that picker; Ctrl+C closes all.
+                    EditResult::Cancel if !(control && code == KeyCode::Char('c')) => {
+                        match &prompt.action {
+                            TextAction::NewSection { key } => {
+                                InputResult::Action(UiAction::PrepareSection { key: key.clone() })
+                            }
+                            TextAction::SessionName { selection } => {
+                                InputResult::Action(UiAction::PrepareSessions {
+                                    key: selection.key.clone(),
+                                    target: selection.target,
+                                })
+                            }
+                            _ => InputResult::Draw,
+                        }
+                    }
                     EditResult::Cancel => InputResult::Draw,
                     EditResult::Changed => {
                         self.interaction = interaction;
@@ -1771,7 +1977,11 @@ impl Model {
                         let action = match &prompt.action {
                             TextAction::SessionName { selection } => {
                                 let mut selection = selection.clone();
-                                selection.managed_name = Some(text.trim().to_owned());
+                                // Empty input asks the host for the next
+                                // automatic name.
+                                let name = text.trim();
+                                selection.managed_name =
+                                    (!name.is_empty()).then(|| name.to_owned());
                                 UiAction::SelectSession { selection }
                             }
                             TextAction::ActionArg { surface, id } => UiAction::PrepareAction {
@@ -1823,7 +2033,7 @@ impl Model {
                     self.interaction = interaction;
                     return InputResult::Draw;
                 }
-                let cancel = matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+                let cancel = matches!(code, KeyCode::Esc | KeyCode::Char('q' | 'n'))
                     || (control && code == KeyCode::Char('c'))
                     || confirm
                         .cancel_key
@@ -1870,9 +2080,6 @@ impl Model {
                                 UiAction::GithubMarkReady { key: key.clone() }
                             }
                         }
-                        ConfirmAction::StopSession { selection } => UiAction::StopSession {
-                            selection: selection.clone(),
-                        },
                         ConfirmAction::KillAction { action_key, run_id } => UiAction::KillAction {
                             action_key: action_key.clone(),
                             run_id: run_id.clone(),
@@ -1895,20 +2102,24 @@ impl Model {
                 InputResult::Unchanged
             }
             Interaction::Picker(picker) => {
-                if code == KeyCode::Char('d')
+                if let PickerAction::Sessions { choices } = &picker.action
                     && !control
-                    && let PickerAction::Sessions { choices } = &picker.action
-                    && let Some(selection) = choices.get(picker.selected)
-                    && selection.mode == crate::SessionMode::Resume
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
                 {
-                    return InputResult::Action(UiAction::PrepareStopSession {
-                        selection: selection.clone(),
-                    });
+                    let choices = choices.clone();
+                    if let Some((result, keep_open)) =
+                        self.sessions_picker_key(code, picker, &choices)
+                    {
+                        if keep_open {
+                            self.interaction = interaction;
+                        }
+                        return result;
+                    }
                 }
                 let quick_pick = match code {
-                    KeyCode::Char(digit @ '1'..='9') => {
-                        let index = digit as usize - '1' as usize;
-                        (index < picker.options.len()).then_some(index)
+                    KeyCode::Char(digit @ '1'..='9') if !control => {
+                        let wanted = digit as usize - '1' as usize;
+                        digit_rows(picker).get(wanted).copied()
                     }
                     _ => None,
                 };
@@ -1951,6 +2162,8 @@ impl Model {
                         self.interaction = interaction;
                         return InputResult::Unchanged;
                     };
+                    // The note starts empty, as in TS: a new assertion
+                    // carries a fresh note.
                     let (action, prompt, initial) = if let Some(steps) = option.verify_after_merge {
                         (
                             TextAction::VerifyAfterMerge {
@@ -1967,7 +2180,7 @@ impl Model {
                                 state,
                             },
                             "status note: ".into(),
-                            option.note.clone().unwrap_or_default(),
+                            String::new(),
                         )
                     };
                     self.interaction = Interaction::Text(TextPrompt {
@@ -1990,9 +2203,22 @@ impl Model {
                     });
                     return InputResult::Draw;
                 }
-                let opener = match picker.action {
+                let opener = match &picker.action {
                     PickerAction::Host { .. } => KeyCode::Enter,
-                    PickerAction::Actions { .. } => KeyCode::Char('!'),
+                    PickerAction::Actions {
+                        surface: crate::ActionSurface::Row { .. },
+                    } => KeyCode::Char('!'),
+                    PickerAction::Actions {
+                        surface: crate::ActionSurface::Manager { .. },
+                    } => KeyCode::Char('M'),
+                    PickerAction::Actions {
+                        surface: crate::ActionSurface::Slot { target },
+                    } => KeyCode::Char(match target {
+                        SessionTarget::WtSource => '<',
+                        SessionTarget::Main => '>',
+                        _ => '\\',
+                    }),
+                    PickerAction::Harness { .. } => KeyCode::F(12),
                     PickerAction::ActionArg { .. } => KeyCode::Enter,
                     PickerAction::Status { .. } => KeyCode::Char('u'),
                     PickerAction::Base { .. } => KeyCode::Char('b'),
@@ -2005,9 +2231,9 @@ impl Model {
                 } else {
                     quick_pick.or(direct)
                 };
+                // Enter or the opener re-press confirms; Space never does.
                 let chosen = pick.or_else(|| {
-                    (code == KeyCode::Enter || code == KeyCode::Char(' ') || code == opener)
-                        .then_some(picker.selected)
+                    (code == KeyCode::Enter || code == opener).then_some(picker.selected)
                 });
                 let Some(option) = chosen.and_then(|index| picker.options.get(index)).cloned()
                 else {
@@ -2029,9 +2255,9 @@ impl Model {
                         {
                             self.interaction = Interaction::Text(TextPrompt {
                                 action: TextAction::SessionName { selection },
-                                prompt: "Session name: ".into(),
+                                prompt: "Session name (empty for automatic): ".into(),
                                 editor: LineEditor::new(""),
-                                allow_empty: false,
+                                allow_empty: true,
                             });
                             InputResult::Draw
                         } else {
@@ -2048,6 +2274,15 @@ impl Model {
                             self.output.choose(target);
                         }
                         InputResult::Draw
+                    }
+                    PickerAction::Harness { key } => {
+                        match option.value.as_deref().and_then(parse_harness) {
+                            Some(harness) => InputResult::Action(UiAction::EnterHarness {
+                                key: key.clone(),
+                                harness,
+                            }),
+                            None => InputResult::Draw,
+                        }
                     }
                     PickerAction::Host { action } => InputResult::Action(UiAction::OnHost {
                         host: option.value,
@@ -2123,6 +2358,104 @@ impl Model {
     }
 }
 
+impl Model {
+    /// Sessions picker letters (TS `modal-keys/sessions.ts:105-203`). `x`
+    /// on a session row kills it directly; elsewhere `c`/`x`/`o` jump to
+    /// the matching `New` row without committing. `d` closes a live session
+    /// gracefully. Returns the result and whether the picker stays open.
+    fn sessions_picker_key(
+        &mut self,
+        code: KeyCode,
+        picker: &mut PickerPrompt,
+        choices: &[crate::SessionSelection],
+    ) -> Option<(InputResult, bool)> {
+        let KeyCode::Char(letter) = code else {
+            return None;
+        };
+        let current = picker
+            .options
+            .get(picker.selected)
+            .and_then(|option| option.value.as_deref())
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(|index| choices.get(index))
+            .filter(|choice| choice.mode == crate::SessionMode::Resume)
+            .cloned();
+        match (letter, current) {
+            ('x', Some(selection)) => {
+                let (label, _) = harness_label(selection.harness);
+                if selection.live {
+                    Some((
+                        InputResult::Action(UiAction::KillSession { selection }),
+                        false,
+                    ))
+                } else if selection.harness == wt_core::HarnessId::Claude {
+                    // Forget a dead session's stored name; nothing to forget
+                    // for the unnamed primary conversation.
+                    if selection.managed_name.is_some() {
+                        Some((
+                            InputResult::Action(UiAction::KillSession { selection }),
+                            false,
+                        ))
+                    } else {
+                        Some((InputResult::Draw, false))
+                    }
+                } else {
+                    let result = self.notify(format!(
+                        "{label} session is dead; remove via {} CLI",
+                        selection.harness.as_str()
+                    ));
+                    Some((result, true))
+                }
+            }
+            ('d', Some(selection)) => {
+                if selection.live {
+                    Some((
+                        InputResult::Action(UiAction::StopSession { selection }),
+                        false,
+                    ))
+                } else {
+                    Some((self.notify("session isn't live, nothing to close"), true))
+                }
+            }
+            ('d', None) => Some((InputResult::Unchanged, true)),
+            _ => {
+                let harness = wt_core::HarnessId::ALL
+                    .into_iter()
+                    .find(|harness| harness_label(*harness).1 == letter)?;
+                let target = picker.options.iter().position(|option| {
+                    option
+                        .value
+                        .as_deref()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .and_then(|index| choices.get(index))
+                        .is_some_and(|choice| {
+                            choice.mode == crate::SessionMode::New && choice.harness == harness
+                        })
+                });
+                if let Some(target) = target {
+                    picker.selected = target;
+                }
+                Some((InputResult::Draw, true))
+            }
+        }
+    }
+}
+
+fn parse_harness(value: &str) -> Option<wt_core::HarnessId> {
+    wt_core::HarnessId::ALL
+        .into_iter()
+        .find(|harness| harness.as_str() == value)
+}
+
+/// Display label and picker letter for each harness (TS `VISIBLE_HARNESSES`).
+pub(crate) fn harness_label(harness: wt_core::HarnessId) -> (&'static str, char) {
+    match harness {
+        wt_core::HarnessId::Claude => ("Claude", 'c'),
+        wt_core::HarnessId::Codex => ("Codex", 'x'),
+        wt_core::HarnessId::Opencode => ("OpenCode", 'o'),
+    }
+}
+
 fn clear_verification_for(state: &str) -> Option<String> {
     matches!(state, "verified" | "dropped").then(String::new)
 }
@@ -2145,6 +2478,36 @@ fn confirm_scroll(code: KeyCode, selected: &mut usize, count: usize) -> bool {
     } else {
         false
     }
+}
+
+/// Shared overlay scroll keymap (TS `scrollbox.tsx:173-210`): j/k, arrows,
+/// Ctrl+J/K/E/Y step three lines; PgUp/PgDn and Ctrl+U/D move half a page;
+/// g/G and Home/End jump to the edges.
+pub(crate) fn overlay_scroll(
+    key: KeyEvent,
+    scroll: &mut usize,
+    maximum: usize,
+    height: usize,
+) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let half = (height / 2).max(1);
+    let next = match key.code {
+        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(3),
+        KeyCode::Char('e') if control => scroll.saturating_add(3),
+        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(3),
+        KeyCode::Char('y') if control => scroll.saturating_sub(3),
+        KeyCode::PageDown => scroll.saturating_add(half),
+        KeyCode::Char('d') if control => scroll.saturating_add(half),
+        KeyCode::PageUp => scroll.saturating_sub(half),
+        KeyCode::Char('u') if control => scroll.saturating_sub(half),
+        KeyCode::Home => 0,
+        KeyCode::Char('g') if !control => 0,
+        KeyCode::End => maximum,
+        KeyCode::Char('G') if !control => maximum,
+        _ => return false,
+    };
+    *scroll = next.min(maximum);
+    true
 }
 
 fn picker_move(code: KeyCode, selected: &mut usize, count: usize) -> bool {
@@ -2236,6 +2599,8 @@ mod tests {
             modal: Some(UiModal::Log {
                 title: "Old result".into(),
                 lines: vec![],
+                close_key: None,
+                refresh: None,
             }),
             ..Default::default()
         });
@@ -2284,6 +2649,7 @@ mod tests {
                     chord: Some('g'),
                     note: None,
                     verify_after_merge: None,
+                    detail: None,
                 }],
             }),
             ..Default::default()
@@ -2363,7 +2729,11 @@ mod tests {
         assert!(model.selected_row().is_none());
         assert_eq!(
             model.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 10),
-            InputResult::Unchanged
+            InputResult::Draw
+        );
+        assert_eq!(
+            model.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("select a worktree first")
         );
         assert_eq!(model.yank_choices()[0].2, "Batch");
         // Unfolding expands in place: the first row takes the header's stop.
@@ -2407,6 +2777,7 @@ mod tests {
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                detail: None,
             })
             .to_vec();
         model.reply(UiReply {
@@ -2616,7 +2987,7 @@ mod tests {
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         model.input(key('?'), 10);
         assert_eq!(model.input(key('j'), 10), InputResult::Draw);
-        assert_eq!(model.help_scroll, 1);
+        assert_eq!(model.help_scroll, 3);
         assert_eq!(model.selected, Some(0));
         assert_eq!(model.input(key('q'), 10), InputResult::Draw);
         assert!(!model.help);
@@ -2818,6 +3189,7 @@ mod tests {
                         chord: Some('y'),
                         note: Some("old note".into()),
                         verify_after_merge: None,
+                        detail: None,
                     },
                     PickerOption {
                         value: Some("ready".into()),
@@ -2825,6 +3197,7 @@ mod tests {
                         chord: Some('a'),
                         note: None,
                         verify_after_merge: Some("probe".into()),
+                        detail: None,
                     },
                     PickerOption {
                         value: None,
@@ -2832,6 +3205,7 @@ mod tests {
                         chord: Some('x'),
                         note: None,
                         verify_after_merge: None,
+                        detail: None,
                     },
                 ],
                 selected: 0,
@@ -2866,6 +3240,7 @@ mod tests {
                     chord: Some('y'),
                     note: Some("old note".into()),
                     verify_after_merge: None,
+                    detail: None,
                 }],
                 selected: 0,
             }),
@@ -2891,6 +3266,7 @@ mod tests {
                     chord: Some('a'),
                     note: None,
                     verify_after_merge: Some("probe".into()),
+                    detail: None,
                 }],
                 selected: 0,
             }),
@@ -2917,7 +3293,11 @@ mod tests {
         model.apply(snapshot(&["row"]));
         assert_eq!(
             model.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), 20),
-            InputResult::Unchanged
+            InputResult::Draw
+        );
+        assert_eq!(
+            model.toast.as_ref().map(|(text, _)| text.as_str()),
+            Some("no PR for this branch")
         );
         model.board = Arc::new(Board {
             rows: vec![BoardRow {
@@ -2949,4 +3329,28 @@ mod tests {
             })
         );
     }
+}
+
+#[cfg(test)]
+#[path = "interaction_tests.rs"]
+mod interaction_tests;
+
+/// Picker rows that digits select, in order. Digits count real entries only
+/// (TS list-picker): session rows and saved argument values; palettes are
+/// picked by their letters.
+pub(crate) fn digit_rows(picker: &PickerPrompt) -> Vec<usize> {
+    (0..picker.options.len())
+        .filter(|&index| match &picker.action {
+            PickerAction::Actions { .. } => false,
+            PickerAction::ActionArg { .. } => picker.options[index].value.is_some(),
+            PickerAction::Sessions { choices } => picker.options[index]
+                .value
+                .as_deref()
+                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|choice| choices.get(choice))
+                .is_some_and(|choice| choice.mode == crate::SessionMode::Resume),
+            _ => true,
+        })
+        .take(9)
+        .collect()
 }

@@ -84,12 +84,14 @@ impl HostService {
             || matches!(
                 command,
                 UiAction::PrepareSessions { .. }
-                    | UiAction::PrepareStopSession { .. }
+                    | UiAction::PrepareHarnesses { .. }
                     | UiAction::PrepareStopTerminal { .. }
             );
         let session_changed = matches!(
             command,
-            UiAction::StopSession { .. } | UiAction::StopTerminal { .. }
+            UiAction::StopSession { .. }
+                | UiAction::KillSession { .. }
+                | UiAction::StopTerminal { .. }
         );
         let created = matches!(command, UiAction::Create { .. });
         let snapshot = self.sources.board.snapshot();
@@ -283,28 +285,29 @@ impl HostService {
                     .data
                     .as_ref()
                     .and_then(|data| data.prs.get(&row.branch))
-                    .filter(|pr| pr.state == "OPEN")
-                    .ok_or_else(|| anyhow::anyhow!("{} has no open pull request", row.slug))?;
-                UiReply {
-                    modal: Some(wt_tui::UiModal::Confirm {
-                        action: wt_tui::ConfirmAction::Github { key, ship },
-                        title: if ship {
-                            format!("Ship PR #{}?", pr.number)
-                        } else {
-                            format!("Mark PR #{} ready?", pr.number)
-                        },
-                        lines: if ship {
-                            vec![format!("{}: {}", row.branch, pr.title),
-                        "Mark ready, request the configured reviewer, and arm merge when ready.".into()]
-                        } else {
-                            vec![
-                                format!("{}: {}", row.branch, pr.title),
-                                "Remove draft status from this pull request.".into(),
-                            ]
-                        },
-                        cancel_key: Some(if ship { 'E' } else { 'e' }),
-                    }),
-                    ..Default::default()
+                    .ok_or_else(|| anyhow::anyhow!("No PR for this row"))?;
+                if pr.state != "OPEN" {
+                    anyhow::bail!("PR #{} is not open", pr.number);
+                }
+                let config = &self.context.config.github;
+                let reviewer = config
+                    .reviewers
+                    .then_some(config.default_reviewer.as_deref())
+                    .flatten();
+                match github_prompt(pr, ship, reviewer) {
+                    GithubPrompt::Done(text) => UiReply {
+                        message: text,
+                        ..Default::default()
+                    },
+                    GithubPrompt::Confirm(title) => UiReply {
+                        modal: Some(wt_tui::UiModal::Confirm {
+                            action: wt_tui::ConfirmAction::Github { key, ship },
+                            title,
+                            lines: vec![format!("{}: {}", row.branch, pr.title)],
+                            cancel_key: Some(if ship { 'E' } else { 'e' }),
+                        }),
+                        ..Default::default()
+                    },
                 }
             }
             UiAction::CancelAutomations => {
@@ -362,5 +365,86 @@ impl HostService {
             self.sources.local.refresh();
         }
         Ok(reply)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GithubPrompt {
+    /// Nothing left to do; show this message instead of a confirmation.
+    Done(String),
+    /// Confirmation title listing only the remaining steps.
+    Confirm(String),
+}
+
+/// `e` / `E` pre-checks from the TS keymap: mark-ready refuses a PR that is
+/// already ready, and ship lists only the steps still needed.
+fn github_prompt(pr: &wt_github::PullRequest, ship: bool, reviewer: Option<&str>) -> GithubPrompt {
+    if !ship {
+        return if pr.is_draft {
+            GithubPrompt::Confirm(format!("Mark #{} ready for review?", pr.number))
+        } else {
+            GithubPrompt::Done(format!("PR #{} is already ready", pr.number))
+        };
+    }
+    let mut steps = Vec::new();
+    if pr.is_draft {
+        steps.push("mark ready".to_owned());
+    }
+    if let Some(reviewer) = reviewer
+        && !pr.requested_reviewers.iter().any(|login| login == reviewer)
+    {
+        steps.push(format!("request {reviewer}"));
+    }
+    if pr.auto_merge.is_none() {
+        steps.push("arm auto-merge".to_owned());
+    }
+    if steps.is_empty() {
+        GithubPrompt::Done(format!("#{} already shipped", pr.number))
+    } else {
+        GithubPrompt::Confirm(format!("Ship #{}? ({})", pr.number, steps.join(", ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr(draft: bool, reviewers: &[&str], armed: bool) -> wt_github::PullRequest {
+        let auto_merge =
+            armed.then(|| serde_json::json!({"enabledAt": "x", "mergeMethod": "SQUASH"}));
+        serde_json::from_value(serde_json::json!({
+            "number": 7, "url": "u", "headRefName": "b", "baseRefName": "main",
+            "mergeCommitOid": null, "title": "t", "isDraft": draft, "state": "OPEN",
+            "mergeable": null, "mergeStateStatus": null, "checks": "none",
+            "failedChecks": [], "review": "none", "reviewRequests": 0,
+            "requestedReviewers": reviewers, "suggestedReviewers": [], "autoMerge": auto_merge,
+            "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0,
+            "mergedAt": null, "closedAt": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mark_ready_refuses_a_ready_pr_and_ship_lists_remaining_steps() {
+        assert_eq!(
+            github_prompt(&pr(false, &[], false), false, None),
+            GithubPrompt::Done("PR #7 is already ready".into())
+        );
+        assert_eq!(
+            github_prompt(&pr(true, &[], false), false, None),
+            GithubPrompt::Confirm("Mark #7 ready for review?".into())
+        );
+        assert_eq!(
+            github_prompt(&pr(true, &[], false), true, Some("ana")),
+            GithubPrompt::Confirm("Ship #7? (mark ready, request ana, arm auto-merge)".into())
+        );
+        assert_eq!(
+            github_prompt(&pr(false, &["ana"], false), true, Some("ana")),
+            GithubPrompt::Confirm("Ship #7? (arm auto-merge)".into())
+        );
+        assert_eq!(
+            github_prompt(&pr(false, &["ana"], true), true, Some("ana")),
+            GithubPrompt::Done("#7 already shipped".into())
+        );
     }
 }

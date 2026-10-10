@@ -436,6 +436,8 @@ impl GithubActions {
             modal: Some(UiModal::Log {
                 title: format!("Failed checks: {} #{run_id}", pr.head_ref_name),
                 lines,
+                close_key: Some('f'),
+                refresh: None,
             }),
             ..UiReply::default()
         })

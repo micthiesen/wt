@@ -207,11 +207,58 @@ async fn run_inner<'a>(
     let mut metric_at = Instant::now();
     let mut controller_open = true;
     let mut toast_until = None;
+    let mut log_refresh_at: Option<tokio::time::Instant> = None;
     source.refresh();
     loop {
+        // A Log overlay replaced by another interaction leaves nothing to
+        // refresh; stop waking for it and forget its close key.
+        if !matches!(model.interaction, crate::Interaction::Log { .. }) {
+            model.log_refresh = None;
+            model.log_close_key = None;
+        }
+        if model.log_refresh.is_none() {
+            log_refresh_at = None;
+        } else if log_refresh_at.is_none() {
+            log_refresh_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        }
         if dirty {
             let start = Instant::now();
-            terminal.draw(|frame| render(frame, &mut model))?;
+            let mut copied = None;
+            terminal.draw(|frame| {
+                render(frame, &mut model);
+                // Drag selection: highlight while the button is held; on
+                // release, copy the rendered text and clear the highlight.
+                if let Some(selection) = model.mouse_selection {
+                    if selection.finished {
+                        copied = Some(crate::mouse::extract(frame.buffer_mut(), &selection));
+                        model.mouse_selection = None;
+                    } else {
+                        crate::mouse::highlight(frame.buffer_mut(), &selection);
+                    }
+                }
+            })?;
+            if let Some(text) = copied.filter(|text| !text.trim().is_empty()) {
+                let chars = text.chars().count();
+                let lines = text.lines().count();
+                let label = if lines > 1 {
+                    format!("{chars} chars ({lines} lines)")
+                } else {
+                    format!("{chars} chars")
+                };
+                let action = crate::UiAction::Copy { value: text, label };
+                if actions
+                    .requests
+                    .try_send(crate::UiRequest {
+                        generation: model.ui_generation,
+                        action,
+                    })
+                    .is_err()
+                {
+                    model.toast = Some(("Actions are busy; selection not copied".into(), true));
+                    toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+                    terminal.draw(|frame| render(frame, &mut model))?;
+                }
+            }
             model.last_frame_micros = start.elapsed().as_micros();
             model.frame_count += 1;
             if let Some(at) = input_at.take() {
@@ -238,7 +285,14 @@ async fn run_inner<'a>(
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let received = Instant::now();
-                        match model.input(key, terminal.size()?.height.saturating_sub(4) as usize) {
+                        let toast_before = model.toast.clone();
+                        let result = model.input(key, terminal.size()?.height.saturating_sub(4) as usize);
+                        if model.toast.is_some() && model.toast != toast_before {
+                            // Input-side feedback ("nothing needs you") expires
+                            // like any other toast.
+                            toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+                        }
+                        match result {
                             InputResult::Quit => break,
                             InputResult::Refresh => {
                                 source.refresh();
@@ -263,7 +317,9 @@ async fn run_inner<'a>(
                     }
                     Event::Resize(_, _) => dirty = true,
                     Event::Mouse(mouse) => {
-                        dirty |= crate::mouse::scroll(&mut model, mouse, terminal.size()?.into());
+                        let area = terminal.size()?.into();
+                        dirty |= crate::mouse::select(&mut model, mouse, area);
+                        dirty |= crate::mouse::scroll(&mut model, mouse, area);
                     }
                     Event::Paste(text) => dirty |= model.paste(&text),
                     _ => {}
@@ -272,11 +328,22 @@ async fn run_inner<'a>(
             reply = actions.replies.recv(), if controller_open => {
                 if let Some(reply) = reply {
                     let history_was_open = model.history.active;
+                    let perf_was_open = model.show_perf;
                     let handoff = model.reply(reply);
                     if history_was_open && !model.history.active {
                         let _ = actions.requests.try_send(crate::UiRequest {
                             generation: model.ui_generation,
                             action: crate::UiAction::SetHistoryActive { active: false },
+                        });
+                    }
+                    if perf_was_open && !model.show_perf {
+                        let _ = actions.requests.try_send(crate::UiRequest {
+                            generation: model.ui_generation,
+                            action: crate::UiAction::SetPerf {
+                                active: false,
+                                continuous: model.perf_continuous,
+                                refresh: false,
+                            },
                         });
                     }
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
@@ -314,6 +381,25 @@ async fn run_inner<'a>(
                 model.toast = None;
                 toast_until = None;
                 dirty = true;
+            }
+            // A live Log overlay (`! l` dev logs) re-requests its lines about
+            // once a second while it stays open. Its generation is the
+            // current one, so any key pressed meanwhile drops the reply.
+            _ = async {
+                match log_refresh_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if model.log_refresh.is_some() => {
+                log_refresh_at = None;
+                if let Some(action) = model.log_refresh.clone()
+                    && matches!(model.interaction, crate::Interaction::Log { .. })
+                {
+                    let _ = actions.requests.try_send(crate::UiRequest {
+                        generation: model.ui_generation,
+                        action,
+                    });
+                }
             }
             changed = snapshots.changed() => {
                 if changed.is_err() { break; }
