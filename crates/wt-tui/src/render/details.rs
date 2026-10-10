@@ -1532,7 +1532,7 @@ fn wrap_spans(spans: Spans, width: usize) -> Vec<Line<'static>> {
         if used + cells > width && used > 0 {
             lines.push(Line::from(std::mem::take(&mut current)));
             used = 0;
-        } else if spaced {
+        } else if spaced && used > 0 {
             current.push(Span::raw(" "));
             used += 1;
         }

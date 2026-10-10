@@ -299,16 +299,12 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
         .and_then(Value::as_u64)
         .or_else(|| parse_timestamp_ms(timestamp))?;
     // An explicit event names its text, or marks itself with a channel and
-    // carries the text as its message.
-    let event_text = fields
-        .get("event_text")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            fields
-                .get("event_channel")
-                .and(fields.get("message"))
-                .and_then(Value::as_str)
-        });
+    // carries the text as its message (plus any error field).
+    let event_text = match fields.get("event_text").and_then(Value::as_str) {
+        Some(text) => Some(text.to_owned()),
+        None if fields.get("event_channel").is_some() => plain_error_text(fields),
+        None => None,
+    };
     let (source, text, channel) = match event_text {
         Some(text) => (
             fields
@@ -317,7 +313,7 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
                 .filter(|source| !source.trim().is_empty())
                 .unwrap_or("wt")
                 .to_owned(),
-            text.to_owned(),
+            text,
             fields
                 .get("event_channel")
                 .and_then(Value::as_str)
@@ -326,15 +322,9 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
         ),
         None => {
             let target = value.get("target").and_then(Value::as_str).unwrap_or("");
-            // wt's own warnings and errors reach the feeds (a background
-            // retry giving up is a warning); errors also reach attention.
-            let diagnostic = DIAGNOSTIC_TARGETS
-                .iter()
-                .any(|prefix| target.starts_with(prefix));
-            if !matches!(level.as_str(), "ERROR" | "WARN")
-                || !is_user_facing_error_target(target)
-                || (level == "WARN" && diagnostic)
-            {
+            // Warnings reach the feeds only when marked as events, since
+            // most describe plumbing; wt's own errors always do.
+            if level != "ERROR" || !is_user_facing_error_target(target) {
                 return None;
             }
             (
@@ -359,20 +349,6 @@ fn is_user_facing_error_target(target: &str) -> bool {
     let crate_name = target.split("::").next().unwrap_or("");
     (crate_name == "wt" || crate_name.starts_with("wt_")) && !target.starts_with("wt_tui::terminal")
 }
-
-/// Modules whose warnings (not errors) describe wt's own plumbing (watcher fallbacks,
-/// terminal driving, shutdown) rather than anything the user acts on.
-const DIAGNOSTIC_TARGETS: &[&str] = &[
-    "wt_tui::terminal",
-    "wt::freshness",
-    "wt::activity_source",
-    "wt::session_activity",
-    "wt::naming",
-    "wt::controller",
-    "wt::remote_cache",
-    "wt::display_time",
-    "wt::terminal_palette",
-];
 
 /// A logged failure names its cause in the `error` field; the feed shows
 /// it, since "action failed" alone tells the reader nothing. The
@@ -454,6 +430,7 @@ mod tests {
             r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"activity feeds use refresh backstop"},"target":"wt::activity_source"}"#,
             r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"connection reset"},"target":"hyper::proto"}"#,
             r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"filesystem watcher unavailable; using refresh backstop"},"target":"wt::freshness"}"#,
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"removed-worktree history refresh failed"},"target":"wt::history_source"}"#,
         ] {
             assert_eq!(parse_app_log_line(line), None, "{line}");
         }
@@ -461,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_background_failure_warning_reaches_the_activity_feed() {
-        let line = r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"background merge-when-ready retry failed","error":"HTTP 502"},"target":"wt::github_actions"}"#;
+        let line = r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"background merge-when-ready retry failed","error":"HTTP 502","event_channel":"activity"},"target":"wt::github_actions"}"#;
         let event = parse_app_log_line(line).unwrap();
         assert_eq!(
             event.text,

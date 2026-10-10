@@ -185,7 +185,8 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
     let (mut reply, ambiguous) = match result {
         Ok(reply) => (reply, false),
         Err(error) => {
-            tracing::error!(%error, "TUI action failed");
+            // The full chain, so the feed names the cause, not just the step.
+            tracing::error!(error = %format_args!("{error:#}"), "TUI action failed");
             let ambiguous = error
                 .downcast_ref::<crate::remote_host::RemoteHostError>()
                 .is_some_and(|error| {

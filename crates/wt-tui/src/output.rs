@@ -133,8 +133,8 @@ impl Model {
         // One cell of padding each side, as in the list.
         let width = width.saturating_sub(2).max(1);
         let target = self.output.target.clone();
-        // Line indexes where each attention entry begins.
-        let mut entry_starts = Vec::new();
+        // Line ranges of attention entries.
+        let mut entries: Vec<(usize, usize)> = Vec::new();
         let (title, lines, identity, count) = match &target {
             OutputTarget::Attention => {
                 let seen_ms = self.board.attention_seen_ms;
@@ -154,7 +154,7 @@ impl Model {
                         marked = true;
                     }
                     fresh += usize::from(!seen);
-                    entry_starts.push(lines.len());
+                    let start = lines.len();
                     let text = if seen {
                         theme::dim()
                     } else {
@@ -168,6 +168,7 @@ impl Model {
                         seen,
                         true,
                     ));
+                    entries.push((start, lines.len()));
                 }
                 if seen_ms > 0 && !marked && !events.is_empty() {
                     lines.extend(self.seen_rule(seen_ms, width, true));
@@ -322,11 +323,24 @@ impl Model {
         let mut top = self.output.viewport(lines.len(), height);
         // Following the newest entries, start at an entry rather than the
         // wrapped tail of one, so the top row always carries its time.
+        // When no entry starts in view (a seen rule trails the last one),
+        // show the cut entry from its start if it fits; a taller entry
+        // keeps the plain bottom so its end stays reachable.
+        let snapped = entries
+            .iter()
+            .map(|(start, _)| *start)
+            .find(|start| *start >= top)
+            .or_else(|| {
+                entries
+                    .last()
+                    .filter(|(start, end)| end - start <= height)
+                    .map(|(start, _)| *start)
+            });
         if self.output.top.is_none()
-            && let Some(start) = entry_starts.into_iter().find(|start| *start >= top)
+            && let Some(start) = snapped
         {
+            // Render only: scrolling still steps from the clamped top.
             top = start;
-            self.output.last_top = start;
         }
         let hint = if self.output.top.is_some() {
             " · scrolled"

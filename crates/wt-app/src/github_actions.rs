@@ -776,8 +776,8 @@ fn spawn_retry_owner(
                         }
                         match finished.result {
                             RetryOutcome::Armed => tracing::info!(pr = finished.number, "armed merge when ready after checks appeared"),
-                            RetryOutcome::Failed(error) => tracing::warn!(pr = finished.number, %error, "background merge-when-ready retry failed"),
-                            RetryOutcome::GaveUp => tracing::warn!(pr = finished.number, "gave up waiting for required checks to appear"),
+                            RetryOutcome::Failed(error) => tracing::warn!(pr = finished.number, %error, event_channel = "attention", event_text = %format_args!("#{}: merge when ready failed: {error}", finished.number), "background merge-when-ready retry failed"),
+                            RetryOutcome::GaveUp => tracing::warn!(pr = finished.number, event_channel = "attention", event_text = %format_args!("#{}: merge when ready gave up waiting for required checks", finished.number), "gave up waiting for required checks to appear"),
                             RetryOutcome::Cancelled => tracing::info!(pr = finished.number, "cancelled pending merge-when-ready retry"),
                         }
                     }

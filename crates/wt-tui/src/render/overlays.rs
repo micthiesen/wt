@@ -233,9 +233,6 @@ fn hint_lines(hints: &[&Hint], width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// A thumb on the modal's right border while content overflows.
-/// A thumb on the frame's right border when `total` rows overflow the
-/// `visible` rows of the content area (which excludes the hint rows).
 /// Help headings read in lowercase like the pane titles, but a key named
 /// in parentheses keeps its case: `Performance (P)` is `performance (P)`.
 fn help_heading(line: &str) -> String {
@@ -245,6 +242,8 @@ fn help_heading(line: &str) -> String {
     }
 }
 
+/// A thumb on the frame's right border when `total` rows overflow the
+/// `visible` rows of the content area (which excludes the hint rows).
 fn scrollbar(
     frame: &mut Frame<'_>,
     outer: Rect,
@@ -1464,7 +1463,11 @@ fn perf_load_color(fraction: f64) -> Color {
 /// A CPU meter's fill. A share that its label rounds to `0%` draws empty,
 /// so the bar never claims load the number denies.
 fn perf_cpu_fraction(cpu: f64, ceiling: f64) -> f64 {
-    if cpu < 0.5 { 0.0 } else { cpu / ceiling }
+    if perf_percent(cpu) == "0%" {
+        0.0
+    } else {
+        cpu / ceiling
+    }
 }
 
 fn perf_percent(value: f64) -> String {

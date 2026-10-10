@@ -2763,7 +2763,7 @@ fn prioritized_rift_gc(rift_binary: &OsString) -> CommandSpec {
 pub const UNCOMMITTED_HAZARD: &str = "uncommitted changes";
 
 /// Removal hazard for commits that exist only locally.
-pub fn unpushed_hazard(count: impl std::fmt::Display + PartialEq<u32>) -> String {
+pub fn unpushed_hazard(count: u32) -> String {
     let plural = if count == 1 { "" } else { "s" };
     format!("{count} unpushed commit{plural}")
 }
@@ -2783,11 +2783,11 @@ mod tests {
     #[test]
     fn lost_work_hazards_are_recognized_by_their_own_wording() {
         use super::{UNCOMMITTED_HAZARD, is_lost_work_hazard, unpushed_hazard};
-        assert_eq!(unpushed_hazard(1u32), "1 unpushed commit");
-        assert_eq!(unpushed_hazard(3u32), "3 unpushed commits");
+        assert_eq!(unpushed_hazard(1), "1 unpushed commit");
+        assert_eq!(unpushed_hazard(3), "3 unpushed commits");
         assert!(is_lost_work_hazard(UNCOMMITTED_HAZARD));
-        assert!(is_lost_work_hazard(&unpushed_hazard(1u32)));
-        assert!(is_lost_work_hazard(&unpushed_hazard(12u32)));
+        assert!(is_lost_work_hazard(&unpushed_hazard(1)));
+        assert!(is_lost_work_hazard(&unpushed_hazard(12)));
         assert!(!is_lost_work_hazard("post-merge verification still owed"));
         assert!(!is_lost_work_hazard("could not verify pushed state"));
     }

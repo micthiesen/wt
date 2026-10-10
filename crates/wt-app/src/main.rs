@@ -398,7 +398,7 @@ async fn run_application(
     let events_context = context.clone();
     scope.spawn(async move {
         if let Err(error) = events::reconcile_at_startup(&events_context).await {
-            tracing::warn!(%error, "GitHub events service reconciliation failed");
+            tracing::warn!(%error, event_channel = "attention", "GitHub events service reconciliation failed");
         }
     });
     let commands = tokio_util::sync::CancellationToken::new();
