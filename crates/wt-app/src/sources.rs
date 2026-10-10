@@ -118,6 +118,13 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     let dev = crate::dev_source::overlay(scope, context, local.clone(), board);
     let origin = crate::origin::overlay(scope, context, dev.board, local.clone());
     let issues = crate::issue_source::start(scope, context, origin.board);
+    let attention_sources = crate::attention_source::AttentionSources {
+        metadata: local_sources.metadata.clone(),
+        github: github.clone(),
+        issue_statuses: issues.statuses.clone(),
+        dev_status: dev.status.clone(),
+        manager_sessions: sessions.discoveries.clone(),
+    };
     let board = crate::action_source::overlay(
         scope,
         context,
@@ -143,6 +150,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     let (review_requests, review_snapshot) =
         crate::review_requests::ReviewRequests::start(scope, context);
     let board = crate::review_requests::overlay(scope, board, review_snapshot);
+    let board = crate::attention_source::overlay(scope, context, board, attention_sources);
     let automations = crate::automation_source::start(
         scope,
         context,

@@ -4,6 +4,7 @@ mod action_palette;
 mod action_source;
 mod actions;
 mod activity_source;
+mod attention_source;
 mod automation_builtins;
 mod automation_engine;
 mod automation_facts;
@@ -61,6 +62,7 @@ mod session_ui;
 mod skills;
 mod sources;
 mod updates;
+mod worktree_facts;
 
 use std::sync::Arc;
 use std::time::Duration;

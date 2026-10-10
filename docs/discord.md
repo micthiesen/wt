@@ -17,7 +17,8 @@ enabled — that id is public by design; it powers the README badge).
 
 ## #updates: the commit digest
 
-`.github/workflows/discord-digest.yml` + `.github/scripts/discord-digest.ts`.
+`.github/workflows/discord-digest.yml` + `.github/scripts/discord-digest.py`.
+The helper uses Python's standard library and needs no JavaScript runtime.
 Full mechanics are documented in those files' header comments; the shape:
 
 - Triggers via `workflow_run` when the `ci` workflow goes green on `main` (a

@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -41,6 +42,14 @@ def main() -> None:
         bin_dir.mkdir()
         shutil.copy2(binary, bin_dir / "wt")
         shutil.copy2(args.launcher, bin_dir / "wt-launcher")
+        # Debug ELF binaries can exceed the installer's release-size guard.
+        # Strip only fixture copies, matching the release profile's debuginfo
+        # policy without weakening production archive limits or losing local
+        # debugging symbols. The four-platform release job also exercises its
+        # actual optimized binaries through this same fixture.
+        strip_flag = "-S" if platform.system() == "Darwin" else "--strip-debug"
+        for executable in (bin_dir / "wt", bin_dir / "wt-launcher"):
+            subprocess.run(["strip", strip_flag, str(executable)], check=True)
         responses: dict[str, bytes] = {}
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -105,7 +114,7 @@ def main() -> None:
             def state() -> dict:
                 return json.loads(state_path.read_text())
 
-            run(binary, "install", "--release", "v0.0.1", "--path")
+            run(bin_dir / "wt", "install", "--release", "v0.0.1", "--path")
             stable = home / ".local/bin/wt"
             assert stable.resolve() == (root / "bin/wt").resolve()
             assert build in run(stable, "version")

@@ -10,6 +10,37 @@ surfaces so a large rewrite cannot silently drop an obscure command or flow.
 Status: `pending` = no Rust parity evidence recorded; `verified` = Rust behavior
 and its required compatibility evidence are reviewed. No item is verified yet.
 
+## Integrated checkpoint evidence
+
+At `cd7b2db`, the full local workspace gate passed 499 tests, doctests,
+formatting, Clippy with warnings denied, and dependency-direction checks.
+This establishes integrated Rust correctness for those assertions, not complete
+old/new feature parity. The detailed rows below remain open until their full
+contract is accounted for.
+
+- The isolated PTY fixture passed stalled-Git navigation, filesystem-triggered
+  refresh, title persistence without Git scans, section movement and renaming,
+  history/performance controls, hard refresh preserving saved state, and accepted
+  writes draining on quit. The one key-to-output sample was 1.14 ms with Git
+  delayed for two seconds; it is not a general latency percentile.
+- The shared-host fixture passed fragmented frames, same-slug isolation across
+  two configurations, title/status writes, non-destructive removal preflight,
+  reconnect, endpoint loss, protocol rejection, and active action survival
+  through two immutable remote-runtime publications.
+- The original work-status, stack-layout, and harness-target identity golden
+  fixtures now have native consumers. These cover pure rules, not live harness
+  control or every command JSON field.
+- Follow-up parity work includes attention narration and `wt ls` fact/output
+  contracts. Live cleanup ownership tests, four-target release CI, real `boris`
+  provisioning, optimized performance workloads and independent review remain
+  acceptance gates. Earlier debug CPU samples predate a watcher lifetime fix
+  and are not final performance evidence.
+
+Local evidence: `/tmp/wt-rust-workspace-gate-current.log`,
+`/tmp/wt-rust-native-ui-integrated-10/result.json`,
+`/tmp/wt-rust-native-host-current2.log`. Release verification runs from the
+isolated `rust-test-cd7b2db-20261009` tag; promotion is not authorized here.
+
 ## Command surface
 
 The dispatcher is `src/cli/index.ts`. Preserve lazy per-command loading and

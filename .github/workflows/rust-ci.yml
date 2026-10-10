@@ -42,7 +42,9 @@ jobs:
       - name: Verify native release packaging
         env:
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/wt-python-cache
-        run: python3 scripts/test-package-native.py
+        run: |
+          python3 scripts/test-package-native.py
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
   test:
     strategy:
@@ -94,6 +96,8 @@ jobs:
         run: python3 scripts/native-lifecycle-check.py
       - name: Verify cleanup retains dirty, empty and unlanded work and owed verification
         run: python3 scripts/native-cleanup-check.py
+      - name: Verify removal owns only its worktree sessions and listeners
+        run: python3 scripts/native-resource-cleanup-check.py
       - name: Verify dev-server health, queueing, cancellation and teardown
         run: python3 scripts/native-dev-check.py --binary target/debug/wt
       - name: Verify durable action workers, streamed logs and descendant cleanup

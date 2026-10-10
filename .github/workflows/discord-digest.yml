@@ -4,7 +4,7 @@
 # sleeps 30 minutes; the concurrency group cancels a sleeping run when a newer
 # push goes green, so the countdown resets and one digest covers the whole
 # burst. "Since when" state is the head SHA of this workflow's own last
-# successful run — no tags, no files (see .github/scripts/discord-digest.ts).
+# successful run — no tags, no files (see .github/scripts/discord-digest.py).
 #
 # Gated on ci success (workflow_run) rather than raw pushes so the
 # digest only ever describes a green tree; commits pushed while red roll into
@@ -38,12 +38,11 @@ jobs:
     steps:
       - name: Debounce (a newer green push cancels this and restarts the countdown)
         run: sleep 1800
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Summarize commits and post to Discord
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
-        run: bun .github/scripts/discord-digest.ts
+        run: python3 .github/scripts/discord-digest.py

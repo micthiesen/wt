@@ -20,6 +20,10 @@ def main() -> None:
         home = scratch / "home"
         repo = scratch / "main"
         worktrees = scratch / "worktrees"
+        fake_bin = scratch / "bin"
+        fake_bin.mkdir()
+        tmux_tmp = Path(tempfile.mkdtemp(prefix="wtc-", dir="/tmp"))
+        socket_name = f"wt-cleanup-retention-{os.getpid()}"
         for path in [home / ".config/wt", repo, worktrees]:
             path.mkdir(parents=True)
         (home / ".config/wt/config.toml").write_text("")
@@ -27,6 +31,7 @@ def main() -> None:
         env.update({
             "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_DATA_HOME": str(home / ".local/share"), "XDG_CACHE_HOME": str(home / ".cache"),
+            "XDG_STATE_HOME": str(home / ".local/state"),
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(scratch / "gitconfig"),
             "WT_GITHUB": "off", "WT_AUTO_UPDATE": "off",
         })
@@ -56,8 +61,38 @@ def main() -> None:
             f'[paths]\nmain_clone = "{repo}"\nworktree_root = "{worktrees}"\n'
             f'lock_dir = "{scratch / "locks"}"\nstate_db = "{scratch / "state.sqlite"}"\n'
             '[branch]\nbase = "main"\nprefix = "fixture"\n'
+            f'[tmux]\nsocket = "{socket_name}"\n'
         )
         env["WT_REPO_CONFIG"] = str(config)
+        env["TMUX_TMPDIR"] = str(tmux_tmp)
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        for key in ["TMUX", "TMUX_PANE", "BUN_INSPECT", "BUN_OPTIONS", "NODE_OPTIONS"]:
+            env.pop(key, None)
+        env["WT_UPDATE"] = "off"
+        env["WT_SKILLS"] = "off"
+        interpreter = os.path.realpath(shutil.which("python3") or "/usr/bin/python3")
+        browser = fake_bin / "browser-control"
+        browser.write_text(
+            "#!" + interpreter + "\n"
+            "import json, sys\n"
+            "if sys.argv[1:] == ['status', '--json']:\n"
+            "    print(json.dumps({'relay': {'running': False}, 'extension': {'sessions': []}}))\n"
+            "else:\n"
+            "    raise SystemExit('unexpected browser cleanup in retention fixture: ' + repr(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        browser.chmod(0o700)
+        fake_ps = fake_bin / "ps"
+        fake_ps.write_text(
+            "#!" + interpreter + "\n"
+            "import sys\n"
+            "if sys.argv[1:] == ['-Aco', 'command']:\n"
+            "    print('COMMAND')\n"
+            "else:\n"
+            "    raise SystemExit('unexpected ps invocation in retention fixture: ' + repr(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        fake_ps.chmod(0o700)
         for slug in ["landed", "dirty", "verification", "empty", "unlanded"]:
             path = worktrees / slug
             git("worktree", "add", "-b", f"fixture/{slug}", str(path), "main")
@@ -80,7 +115,7 @@ def main() -> None:
             assert (worktrees / slug).is_dir(), (slug, output)
         assert (worktrees / "dirty/untracked.txt").read_text() == "keep this file\n"
         rows = json.loads(run(str(binary), "ls", "--json"))
-        assert any(row["slug"] == "landed" and row["kind"] == "removed" for row in rows), rows
+        assert any(row["slug"] == "landed" and row["kind"] == "merged" for row in rows), rows
         assert "Confirm fixture environment" in run(str(binary), "status", "verification")
         output = run(str(binary), "clean", "--yes", "--foreground", "--no-destroy-stage")
         assert "Nothing to clean" in output, output
@@ -90,6 +125,7 @@ def main() -> None:
                           "repeat_idempotent": True}))
     finally:
         shutil.rmtree(scratch)
+        shutil.rmtree(tmux_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

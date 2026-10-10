@@ -21,20 +21,18 @@ pub struct Controller {
 
 impl Controller {
     pub async fn shutdown(mut self) -> Result<()> {
-        match tokio::time::timeout(Duration::from_secs(30), &mut self.task).await {
-            Ok(result) => result.context("action controller exited"),
+        let result = match tokio::time::timeout(Duration::from_secs(30), &mut self.task).await {
+            Ok(result) => result,
             Err(_) => {
-                self.cancel.cancel();
-                if tokio::time::timeout(Duration::from_secs(5), &mut self.task)
-                    .await
-                    .is_err()
-                {
-                    self.task.abort();
-                    let _ = self.task.await;
-                }
-                bail!("action shutdown timed out; unfinished commands were cancelled (see wt log)")
+                tracing::warn!("waiting for accepted commands to finish before exiting");
+                eprintln!("wt: waiting for accepted commands to finish before exiting");
+                // Service operations own their timeouts and commit boundaries.
+                // A UI shutdown deadline cannot safely cancel an accepted write.
+                self.task.await
             }
-        }
+        };
+        self.cancel.cancel();
+        result.context("action controller exited")
     }
 }
 
@@ -70,21 +68,7 @@ pub fn start(
                 let task = running.spawn(async move {
                     let retry = create_retry(&command);
                     let result = crate::host_dispatch::execute(&context, &fleet, command, &replies, &shutdown).await;
-                    let mut reply = match result {
-                        Ok(reply) => reply,
-                        Err(error) => {
-                            tracing::error!(%error, "TUI action failed");
-                            let mut reply = UiReply { message: format!("{error:#}"), failed: true, ..Default::default() };
-                            let ambiguous = error.downcast_ref::<crate::remote_host::RemoteHostError>()
-                                .is_some_and(|error| matches!(error, crate::remote_host::RemoteHostError::Ambiguous { .. }));
-                            if !ambiguous && let Some((host, input)) = retry {
-                                reply.modal_host = host;
-                                reply.modal = Some(wt_tui::UiModal::Text { action: wt_tui::TextAction::Create,
-                                    prompt: "New worktree: ".into(), initial: input, allow_empty: false });
-                            }
-                            reply
-                        }
-                    };
+                    let mut reply = action_reply(result, retry);
                     reply.ui_generation = Some(generation);
                     (lane, reply)
                 });
@@ -169,6 +153,42 @@ fn create_retry(action: &wt_tui::UiAction) -> Option<(Option<String>, String)> {
         wt_tui::UiAction::Create { input } => Some((host, input)),
         _ => None,
     }
+}
+
+fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>) -> UiReply {
+    let (mut reply, ambiguous) = match result {
+        Ok(reply) => (reply, false),
+        Err(error) => {
+            tracing::error!(%error, "TUI action failed");
+            let ambiguous = error
+                .downcast_ref::<crate::remote_host::RemoteHostError>()
+                .is_some_and(|error| {
+                    matches!(error, crate::remote_host::RemoteHostError::Ambiguous { .. })
+                });
+            (
+                UiReply {
+                    message: format!("{error:#}"),
+                    failed: true,
+                    ..Default::default()
+                },
+                ambiguous,
+            )
+        }
+    };
+    if reply.failed
+        && !ambiguous
+        && reply.modal.is_none()
+        && let Some((host, input)) = retry
+    {
+        reply.modal_host = host;
+        reply.modal = Some(wt_tui::UiModal::Text {
+            action: wt_tui::TextAction::Create,
+            prompt: "New worktree: ".into(),
+            initial: input,
+            allow_empty: false,
+        });
+    }
+    reply
 }
 
 fn sanitize_reply(mut reply: UiReply) -> UiReply {
@@ -260,6 +280,49 @@ pub(crate) async fn handoff_prepared(
 mod tests {
     use super::*;
     use wt_tui::UiAction;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_keeps_accepted_work_alive_past_the_notice_deadline() {
+        let cancel = CancellationToken::new();
+        let (finish, work) = tokio::sync::oneshot::channel();
+        let controller = Controller {
+            task: tokio::spawn(async move {
+                work.await.unwrap();
+            }),
+            cancel: cancel.clone(),
+        };
+        let shutdown = tokio::spawn(controller.shutdown());
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(36)).await;
+        tokio::task::yield_now().await;
+        assert!(!cancel.is_cancelled());
+        assert!(!shutdown.is_finished());
+        finish.send(()).unwrap();
+        shutdown.await.unwrap().unwrap();
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn remote_create_failure_restores_input_but_ambiguous_outcome_does_not() {
+        let retry = Some((Some("builder".into()), "keep my title".into()));
+        let failed = UiReply {
+            failed: true,
+            message: "branch already exists".into(),
+            ..Default::default()
+        };
+        let reply = action_reply(Ok(failed), retry.clone());
+        assert_eq!(reply.modal_host.as_deref(), Some("builder"));
+        assert!(
+            matches!(reply.modal, Some(wt_tui::UiModal::Text { initial, .. }) if initial == "keep my title")
+        );
+        let ambiguous = crate::remote_host::RemoteHostError::Ambiguous {
+            host: "builder".into(),
+            detail: "SSH stream closed".into(),
+        };
+        let reply = action_reply(Err(ambiguous.into()), retry);
+        assert!(reply.failed);
+        assert!(reply.modal.is_none());
+    }
 
     #[test]
     fn busy_host_preserves_its_order_without_blocking_other_hosts() {

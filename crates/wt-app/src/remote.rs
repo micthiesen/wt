@@ -17,7 +17,7 @@ use wt_remote::{
 };
 use wt_update::{InstallState, VersionId};
 
-use crate::{commands::resolve::run_git, context::AppContext};
+use crate::{commands::resolve::run_git, context::AppContext, worktree_facts::push_facts};
 
 pub fn worker_info(role: InstanceRole) -> WorkerInfo {
     WorkerInfo {
@@ -338,34 +338,7 @@ async fn build_snapshot_row(
         .and_then(|entry| entry.get("work"))
         .and_then(parse_work_status);
     let git_status = snapshot.status.as_ref();
-    let expected_upstream = format!("origin/{}", target.branch);
-    let ahead_of_base = ahead_of_base(&context, &target.path, &base).await;
-    let origin_branch = run_git(
-        &context,
-        &target.path,
-        [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            expected_upstream.as_str(),
-        ],
-    )
-    .await
-    .ok()
-    .map(|output| output.status.success());
-    let (unpushed, pushed) = match origin_branch {
-        Some(true) => (
-            commit_count(
-                &context,
-                Path::new(&target.path),
-                &format!("{expected_upstream}..HEAD"),
-            )
-            .await,
-            Some(true),
-        ),
-        Some(false) => (ahead_of_base, Some(false)),
-        None => (None, None),
-    };
+    let push = push_facts(&context, Path::new(&target.path), &target.branch, &base).await;
     let path = std::path::PathBuf::from(&target.path);
     let stage_prefix = context.config.stage.prefix.clone();
     let (exists, deployed) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
@@ -412,9 +385,9 @@ async fn build_snapshot_row(
             .map(remote_dev_status),
         dev_error: dev_row.and_then(|row| row.error),
         dirty,
-        unpushed,
-        pushed,
-        ahead_of_base,
+        unpushed: push.unpushed.map(|count| count as f64),
+        pushed: push.pushed,
+        ahead_of_base: push.ahead_of_base.map(|count| count as f64),
         issue_id,
         issue_url,
         github_issue: issue_number,
@@ -743,75 +716,6 @@ fn resolve_issue_id(slug: &str, stored: Option<&str>) -> Option<String> {
         .captures(slug)?
         .get(1)
         .map(|found| found.as_str().to_ascii_uppercase())
-}
-
-async fn ahead_of_base(context: &AppContext, path: &str, base: &str) -> Option<f64> {
-    let trunk = &context.config.branch.base;
-    let requested = if base.is_empty() {
-        trunk.as_str()
-    } else {
-        base
-    };
-    let base_ref = if requested == trunk || requested == format!("origin/{trunk}") {
-        let origin_trunk = format!("origin/{trunk}");
-        let fresh = run_git(
-            context,
-            &context.config.paths.main_clone,
-            ["rev-parse", origin_trunk.as_str()],
-        )
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        if let Some(sha) = fresh {
-            let commit = format!("{sha}^{{commit}}");
-            let check = run_git(context, path, ["cat-file", "-e", commit.as_str()])
-                .await
-                .ok()
-                .is_some_and(|output| output.status.success());
-            if check {
-                sha
-            } else {
-                format!("origin/{trunk}")
-            }
-        } else {
-            format!("origin/{trunk}")
-        }
-    } else {
-        let local = run_git(context, path, ["rev-parse", requested])
-            .await
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        if local.is_some() {
-            requested.to_owned()
-        } else {
-            let origin = format!("origin/{requested}");
-            let remote = run_git(context, path, ["rev-parse", &origin])
-                .await
-                .ok()
-                .is_some_and(|output| output.status.success());
-            if remote {
-                origin
-            } else {
-                format!("origin/{trunk}")
-            }
-        }
-    };
-    commit_count(context, Path::new(path), &format!("{base_ref}..HEAD")).await
-}
-
-async fn commit_count(context: &AppContext, path: &Path, range: &str) -> Option<f64> {
-    let output = run_git(context, path, ["rev-list", "--count", range])
-        .await
-        .ok()?
-        .checked("git")
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|count| count as f64)
 }
 
 fn repo_web_url(remote: &str) -> Option<String> {

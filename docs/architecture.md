@@ -48,6 +48,15 @@ publish only meaningful changes; timers are backstops for inputs without a
 reliable local event. Optional source failures are shown beside the last good
 data instead of erasing it.
 
+`attention_source` observes the existing prepared GitHub, metadata, issue,
+dev-server, and manager-session snapshots and narrates confirmed transitions.
+It does not refetch those inputs or perform per-row requests. It seeds each
+transition tracker quietly, retains its last good baseline across failures,
+and bounds the in-memory event tail. Manager report lines remain owned by the
+separate activity source. The GitHub comment observer fetches the authenticated
+viewer once on demand and never treats comments as foreign while that identity
+is unknown.
+
 `wt-tui::model` owns cursor, pane, modal, and key dispatch state. The terminal
 driver polls input and prepared snapshots and renders them with Ratatui. Actions
 cross a typed `UiAction` boundary into the application controller. This keeps
@@ -81,6 +90,11 @@ tracks running commands through shutdown. `HostService` performs the host-local
 operation and returns a typed reply. Accepted mutations belong to the command
 drain, not the lifetime of a particular SSH view; read sources are cancelled
 when their host scope ends.
+Quitting closes command admission and waits for accepted local writes to finish;
+after 30 seconds it reports that it is still waiting. Each operation owns its
+timeout and safe stopping points, so a UI deadline cannot interrupt a write.
+Known create failures retain the input and selected host for correction. A lost
+remote reply remains ambiguous and never opens an automatic retry path.
 
 The SSH protocol is framed and versioned. The controller probes the worker,
 checks its role and protocol, and provisions the exact native build before

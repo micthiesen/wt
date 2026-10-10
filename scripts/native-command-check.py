@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Exercise native CLI commands in an isolated temporary Git/HOME fixture."""
 
+import fcntl
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -87,7 +89,19 @@ def main() -> int:
         (main_repo / "README.md").write_text("fixture\n", encoding="utf-8")
         git(main_repo, "add", "README.md", env=env)
         git(main_repo, "commit", "-m", "fixture base", env=env)
+        origin = root / "origin.git"
+        git(root, "init", "--bare", "--initial-branch=main", str(origin), env=env)
+        git(main_repo, "remote", "add", "origin", str(origin), env=env)
+        git(main_repo, "push", "origin", "main", env=env)
         git(main_repo, "worktree", "add", "-b", "feature/one", str(worktree), "main", env=env)
+        git(worktree, "push", "origin", "feature/one", env=env)
+        git(worktree, "branch", "--set-upstream-to=origin/main", env=env)
+        (worktree / "feature.txt").write_text("unpushed work\n", encoding="utf-8")
+        git(worktree, "add", "feature.txt", env=env)
+        git(worktree, "commit", "-m", "one unpushed commit", env=env)
+        (worktree / ".sst").mkdir()
+        (worktree / ".sst/stage").write_text("fixture-one\n", encoding="utf-8")
+        (worktree / ".sst/outputs.json").write_text('{"stage":"fixture-one"}\n', encoding="utf-8")
 
         config = "\n".join([
             "[paths]",
@@ -102,6 +116,7 @@ def main() -> int:
             f"dotfiles = {json.dumps(str(home / 'dotfiles'))}",
             "[branch]", 'prefix = "feature/"', 'base = "main"',
             "[stage]", 'prefix = "fixture-"',
+            "[deploy.sst]", 'state_bucket = "native-fixture"', 'state_prefix = "wt/"', 'aws_profile = "fixture"',
             "[issue_tracker]", 'url_template = "https://tracker.invalid/{id}"',
             "read_command = [" + ", ".join(map(json.dumps, [sys.executable, "-c", "import sys; print('reader:'+sys.argv[1]); print('partial-error', file=sys.stderr); sys.exit(7)", "{id}"])) + "]",
             "",
@@ -151,6 +166,53 @@ def main() -> int:
         require((cache_root / "automations.json").exists(), "migration did not carry the automation ledger")
         check_command(binary, worktree, env, "state", "migrate", "--from", str(legacy))
 
+        # `wt ls` retains its stage/PR columns and JSON fact contract. The
+        # fake gh executable makes PR unavailability explicit without using
+        # the caller's authentication.
+        listed = check_command(binary, worktree, env, "ls")
+        require("STAGE" in listed.stdout and "PR" in listed.stdout, "wt ls omitted the configured stage or PR column")
+        require("fixture-one" in listed.stdout and "unavailable" in listed.stdout, "wt ls omitted the pinned deployment or explicit unavailable PR state")
+        listed_json = json.loads(check_command(binary, worktree, env, "ls", "--json").stdout)
+        live_row = next((row for row in listed_json if row.get("slug") == "one"), None)
+        require(live_row is not None, "wt ls --json omitted the fixture worktree")
+        require(live_row.get("deployed") is True and live_row.get("stage") == "fixture-one", "wt ls --json omitted safe local deployment facts")
+        require({"status_age", "status_op", "dev", "ahead_of_base", "pushed", "unpushed"}.issubset(live_row), "wt ls --json omitted status/dev/push facts")
+        require(live_row.get("issue_id") == "LIVE-5", "wt ls --json omitted the explicit issue identity")
+        require(live_row.get("pushed") is True and live_row.get("unpushed") == 1, "wt ls --json used configured upstream instead of origin/<branch> for push facts")
+        require(live_row.get("ahead_of_base") == 1, "wt ls --json omitted commits ahead of the effective base")
+
+        # Hold a fixture operation lock while the command runs to verify the
+        # JSON status fields carry observed age/op facts instead of nulls.
+        lock_dir = home / "locks"
+        lock_dir.mkdir(exist_ok=True)
+        lock_path = lock_dir / "one.lock"
+        lock_time = datetime.now(timezone.utc).isoformat()
+        with lock_path.open("w+", encoding="utf-8") as lock_file:
+            lock_file.write(json.dumps({"op": "restack", "phase": "fetch", "startedAt": lock_time, "phaseStarted": lock_time}))
+            lock_file.flush()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            busy_json = json.loads(check_command(binary, worktree, env, "ls", "--json").stdout)
+            busy_row = next((row for row in busy_json if row.get("slug") == "one"), None)
+            require(busy_row is not None and busy_row.get("status") == "busy", "wt ls --json missed an active operation lock")
+            require(busy_row.get("status_op") == "restack" and busy_row.get("status_age"), "wt ls --json omitted active operation age/op facts")
+
+        # A worker can observe a stored section, but layout belongs to the
+        # controller and the public worker snapshot must report null.
+        state_db = sqlite3.connect(home / "state.sqlite")
+        state_text = state_db.execute("SELECT data FROM repository_state LIMIT 1").fetchone()[0]
+        worker_state = json.loads(state_text)
+        worker_state.setdefault("slugs", {}).setdefault("one", {})["section"] = "Controller only"
+        state_db.execute("UPDATE repository_state SET data = ?", (json.dumps(worker_state),))
+        state_db.commit()
+        state_db.close()
+        worker_config = root / "worker.wt.toml"
+        worker_config.write_text(config + '\n[instance]\nrole = "worker"\n', encoding="utf-8")
+        worker_env = env.copy()
+        worker_env["WT_REPO_CONFIG"] = str(worker_config)
+        worker_json = json.loads(check_command(binary, worktree, worker_env, "ls", "--json").stdout)
+        worker_row = next((row for row in worker_json if row.get("slug") == "one"), None)
+        require(worker_row is not None and worker_row.get("section") is None, "worker wt ls --json leaked controller section state")
+
         # Machine-readable diagnostics use only the fixture HOME/repo and fake
         # gh/tmux executables, so they cannot inspect the caller's services.
         # Doctor's dependency probe applies to managed JavaScript projects,
@@ -178,7 +240,7 @@ def main() -> int:
                 required = {"sampled_at_ms", "cpu_note", "system_cpu", "wt_cpu", "category_totals", "sessions", "orphans", "orphan_probe_available", "tmux_probe_available"}
                 require(required.issubset(parsed), f"perf snapshot omitted measurement/attribution fields: {required - set(parsed)}")
                 require(parsed["sampled_at_ms"] > 0 and parsed["cpu_note"], "perf snapshot omitted measurement window caveat")
-        print("native issue/state/doctor/fleet/perf command checks passed in isolated HOME and Git fixtures")
+        print("native issue/state/list/doctor/fleet/perf command checks passed in isolated HOME and Git fixtures")
     return 0
 
 
