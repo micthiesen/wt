@@ -864,7 +864,7 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     model.keep_selection_visible(inner.height as usize);
-    let lines: Vec<_> = (0..model.item_count())
+    let mut lines: Vec<_> = (0..model.item_count())
         .skip(model.offset)
         .take(inner.height as usize)
         .map(|index| {
@@ -938,6 +938,18 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
             }
         })
         .collect();
+    // Keep the archive at the bottom when the complete list fits. Padding is
+    // presentation only, so keyboard selection still follows the real items.
+    if model.offset == 0 && model.item_count() < inner.height as usize {
+        let archive = (0..model.item_count()).find(|&index| {
+            matches!(model.item(index), Some(crate::model::VisualItem::Section(section))
+                if model.board.sections[section].key == "\0archived")
+        });
+        if let Some(index) = archive {
+            let padding = inner.height as usize - lines.len();
+            lines.splice(index..index, std::iter::repeat_n(Line::default(), padding));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -948,6 +960,49 @@ mod tests {
     use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn archive_uses_bottom_space_without_changing_selection() {
+        let mut model = Model::default();
+        model.apply(wt_runtime::SourceSnapshot {
+            data: Some(Arc::new(Board {
+                rows: vec![BoardRow {
+                    key: "one".into(),
+                    title: "Active task".into(),
+                    ..Default::default()
+                }],
+                sections: vec![
+                    crate::BoardSection {
+                        key: "\0inbox".into(),
+                        title: "Inbox".into(),
+                        rows: vec![0],
+                        ..Default::default()
+                    },
+                    crate::BoardSection {
+                        key: "\0archived".into(),
+                        title: "Archived".into(),
+                        folded: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            state: SourceState::Ready,
+            updated_at: None,
+            revision: 1,
+        });
+        let selected = model.selected;
+        for height in [12, 5] {
+            let mut terminal = Terminal::new(TestBackend::new(50, height)).unwrap();
+            terminal
+                .draw(|frame| render_list(frame, &mut model, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let bottom: String = (0..50).map(|x| buffer[(x, height - 2)].symbol()).collect();
+            assert!(bottom.contains("Archived"));
+            assert_eq!(model.selected, selected);
+        }
+    }
 
     #[test]
     fn footer_slot_status_uses_only_live_special_sessions() {

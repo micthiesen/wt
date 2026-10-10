@@ -111,6 +111,20 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
     plan_with_facts(ctx, rows, &state, &github, warning).await
 }
 
+/// Read local hazards with the host's existing GitHub evidence. A merged PR
+/// must still match the current HEAD; Git ancestry keeps its published-base check.
+pub async fn plan_cached(
+    ctx: &AppContext,
+    rows: Vec<WorktreeRecord>,
+    github: &GithubData,
+) -> Result<RemovalPlans> {
+    let state = ctx
+        .database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await?;
+    plan_with_facts(ctx, rows, &state, github, None).await
+}
+
 /// Build removal evidence from caller-prepared wtstate and GitHub snapshots.
 /// This keeps automation evaluation on the same authoritative safety path as
 /// explicit cleanup without launching another GitHub fetch.
@@ -320,6 +334,22 @@ pub async fn cleanup_confirmed(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
 ) -> Result<String> {
+    cleanup_with_evidence(ctx, confirmed, None).await
+}
+
+pub async fn cleanup_cached(
+    ctx: &AppContext,
+    confirmed: &[wt_tui::RemovalRevision],
+    github: &GithubData,
+) -> Result<String> {
+    cleanup_with_evidence(ctx, confirmed, Some(github)).await
+}
+
+async fn cleanup_with_evidence(
+    ctx: &AppContext,
+    confirmed: &[wt_tui::RemovalRevision],
+    github: Option<&GithubData>,
+) -> Result<String> {
     let live = ctx.repository.inventory(&ctx.cancellation).await?;
     let selected = live
         .into_iter()
@@ -332,7 +362,11 @@ pub async fn cleanup_confirmed(
             })
         })
         .collect();
-    let plans = plan(ctx, selected).await?;
+    let plans = if let Some(github) = github {
+        plan_cached(ctx, selected, github).await?
+    } else {
+        plan(ctx, selected).await?
+    };
     let mut by_key: BTreeMap<_, _> = plans
         .rows
         .into_iter()
@@ -563,15 +597,39 @@ mod tests {
             }))
             .unwrap(),
         );
-        let reused = plan_with_facts(ctx, vec![row.clone()], &state, &github, None)
-            .await
-            .unwrap();
+        let reused = plan_cached(ctx, vec![row.clone()], &github).await.unwrap();
         assert!(!reused.rows[0].landed);
         let history = &reused.rows[0].removed_snapshot;
         assert_eq!(history.extra["landedOnAtRemoval"], "unlanded");
         assert_eq!(history.extra["prState"], "MERGED");
         assert!(!history.extra.contains_key("prMergeCommitOid"));
         assert!(!wt_store::is_merged_removal(history));
+
+        // Cached merge evidence for this exact HEAD is enough. An unavailable
+        // origin must not trigger another network read for the merged PR.
+        github.prs.get_mut(&row.target.branch).unwrap().head_ref_oid = Some(head.clone());
+        git(
+            ctx,
+            path,
+            &["remote", "set-url", "origin", "/missing-wt-origin"],
+        )
+        .await;
+        let cached = plan_cached(ctx, vec![row.clone()], &github).await.unwrap();
+        assert!(cached.rows[0].landed);
+        assert!(!cached.rows[0].local_merged);
+        assert!(cached.warning.is_none());
+        assert!(cached.rows[0].hazards.is_empty());
+        std::fs::write(path.join("work.txt"), "new uncommitted work\n").unwrap();
+        let dirty = plan_cached(ctx, vec![row.clone()], &github).await.unwrap();
+        assert!(dirty.rows[0].landed);
+        assert!(!dirty.rows[0].hazards.is_empty());
+        std::fs::write(path.join("work.txt"), "unpublished branch work\n").unwrap();
+        git(
+            ctx,
+            path,
+            &["remote", "set-url", "origin", origin.to_str().unwrap()],
+        )
+        .await;
 
         // Neither a deleted remote base nor a matching local main is a proof.
         git(ctx, &origin, &["update-ref", "-d", "refs/heads/main"]).await;

@@ -67,9 +67,11 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   configured hosts. GitHub's fetch budget is 100 seconds. TypeScript's initial
   removal guards use prepared board rows. No live deletion was run and no
   measured action timing establishes which request caused this report.
-  Proposed fix: prepare confirmation from existing board evidence, retain
-  authoritative locked checks before deletion, bound parallel planning, and
-  show the host and phase while fresh proof is needed.
+  Source fix now passes each host's existing GitHub snapshot into TUI planning
+  and confirmation rechecks. Cached merged PRs require an exact HEAD match;
+  local hazards and Git-only published-base checks remain. Installation and
+  live key-to-confirmation timing are still owed. Serial planning and waiting
+  for unavailable hosts can still add delay.
 - **Local Rift creation can remain hidden until WT restarts (2026-10-09).**
   `tasks-take-2` and `secrets-check` TUI logs stop at `rift create --copy-all`
   at 20:50:13Z and 21:05:08Z. Their lock metadata records `init` at the same

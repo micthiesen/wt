@@ -31,6 +31,12 @@ worker protocol. `sources.rs` composes the host-local source graph. A remote
 host runs the same source and action pipeline as a local host; the controller
 combines the resulting snapshots for display.
 
+TUI cleanup and removal pass the host's current GitHub snapshot to the
+lifecycle planner, including the confirmation recheck. They do not start a
+second PR fetch. Cached merged-PR evidence applies only to its exact HEAD;
+local hazards and removal revisions remain authoritative. Git-only landing
+evidence retains the published-base check.
+
 ## Source and presentation boundaries
 
 The TUI input loop consumes prepared `Board` snapshots. It does not run Git,

@@ -87,6 +87,15 @@ details. `Enter` restores, `p` opens the PR, `i` opens the issue when known, and
 
 ### Worktrees and organization
 
+The Archived group sits at the bottom of the worktree pane when all visible
+items fit. When the list is taller than the pane, it scrolls with the list.
+
+Clean and delete use the host's existing GitHub data. They do not refetch PRs
+when you press the key or confirm. A merged PR must match the current worktree
+commit. Local file changes, unpushed work, and checkout identity are checked
+again before removal. When landing evidence comes only from Git ancestry,
+WT still checks the published base. Missing evidence does not mean merged.
+
 | Key | Action |
 |---|---|
 | `n` / `N` | Create a worktree / create from the selected branch |

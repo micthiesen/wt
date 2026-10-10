@@ -174,7 +174,13 @@ pub async fn execute(
                 ..Default::default()
             }
         } else {
-            crate::controller_actions::execute(context, action, snapshot.data.as_deref()).await?
+            crate::controller_actions::execute(
+                context,
+                action,
+                snapshot.data.as_deref(),
+                &wt_github::GithubData::default(),
+            )
+            .await?
         };
         fleet.local.sources.metadata.refresh();
         return Ok(reply);

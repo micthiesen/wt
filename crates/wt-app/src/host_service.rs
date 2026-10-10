@@ -339,10 +339,13 @@ impl HostService {
                 .await?
             }
             command => {
+                let github = self.sources.github.snapshot();
+                let empty = wt_github::GithubData::default();
                 Box::pin(crate::controller_actions::execute(
                     &self.context,
                     command,
                     snapshot.data.as_deref(),
+                    github.data.as_deref().unwrap_or(&empty),
                 ))
                 .await?
             }

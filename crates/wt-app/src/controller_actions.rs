@@ -29,7 +29,12 @@ fn modal(modal: UiModal) -> UiReply {
     }
 }
 
-pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) -> Result<UiReply> {
+pub async fn execute(
+    ctx: &AppContext,
+    action: UiAction,
+    board: Option<&Board>,
+    github: &wt_github::GithubData,
+) -> Result<UiReply> {
     match action {
         UiAction::PrepareHardRefresh
         | UiAction::HardRefresh
@@ -227,7 +232,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
         }
         UiAction::PrepareRemove { key } => {
             let row = resolve_key(ctx, &key).await?;
-            let plans = lifecycle_ops::plan(ctx, vec![row]).await?;
+            let plans = lifecycle_ops::plan_cached(ctx, vec![row], github).await?;
             let plan = plans
                 .rows
                 .into_iter()
@@ -273,7 +278,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
             revision,
         } => {
             let row = resolve_key(ctx, &key).await?;
-            let plans = lifecycle_ops::plan(ctx, vec![row]).await?;
+            let plans = lifecycle_ops::plan_cached(ctx, vec![row], github).await?;
             let mut plan = plans
                 .rows
                 .into_iter()
@@ -340,7 +345,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
         }
         UiAction::PrepareCleanup => {
             let rows = ctx.repository.inventory(&ctx.cancellation).await?;
-            let plans = lifecycle_ops::plan(ctx, rows).await?;
+            let plans = lifecycle_ops::plan_cached(ctx, rows, github).await?;
             let mut revisions = Vec::new();
             let mut lines = Vec::new();
             for plan in plans.rows {
@@ -375,7 +380,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
             }))
         }
         UiAction::Cleanup { revisions } => Ok(message(
-            lifecycle_ops::cleanup_confirmed(ctx, &revisions).await?,
+            lifecycle_ops::cleanup_cached(ctx, &revisions, github).await?,
         )),
         UiAction::ToggleArchive { key } => {
             if wt_core::is_remote_worktree_ledger_key(&key) {
@@ -879,6 +884,7 @@ mod tests {
                 issue_id: None,
             },
             None,
+            &wt_github::GithubData::default(),
         )
         .await
         .unwrap();
@@ -896,7 +902,8 @@ mod tests {
                     key: "missing".into(),
                     title: "new".into()
                 },
-                None
+                None,
+                &wt_github::GithubData::default()
             )
             .await
             .is_err()
