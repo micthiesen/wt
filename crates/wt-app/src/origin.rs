@@ -119,10 +119,21 @@ pub fn overlay(
             let origin = origin_updates.borrow().clone();
             if let SourceState::Failed(error) = origin.state {
                 if let Some(board) = snapshot.data.as_mut() {
-                    Arc::make_mut(board).activity.push(wt_core::sanitize_terminal_text(&format!("Fetch origin: {error}")));
+                    crate::activity_source::append_attention(
+                        Arc::make_mut(board),
+                        "Fetch origin",
+                        &error,
+                    );
                 }
             } else if let (Some(board), Some(report)) = (snapshot.data.as_mut(), origin.data) {
-                Arc::make_mut(board).activity.extend(report.warnings.iter().map(|warning| wt_core::sanitize_terminal_text(warning)));
+                for warning in &report.warnings {
+                    crate::activity_source::append_activity(
+                        Arc::make_mut(board),
+                        "WARN",
+                        "Fetch origin",
+                        warning,
+                    );
+                }
             }
             publisher.publish(snapshot);
         }

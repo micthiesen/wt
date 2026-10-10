@@ -16,6 +16,9 @@ pub enum UiAction {
     },
     PrepareHardRefresh,
     HardRefresh,
+    SetAttentionSeen {
+        at_ms: u64,
+    },
     ToggleAutomations {
         key: Option<String>,
     },

@@ -373,22 +373,27 @@ fn overlay(
                 continue;
             };
             board.activity.retain(|line| {
-                !line.starts_with("Automations:") && !line.starts_with("Automation error:")
+                !line.text.starts_with("Automations:")
+                    && !line.text.starts_with("Automation error:")
             });
             board.attention.retain(|line| {
-                !line.starts_with("Automations:") && !line.starts_with("Automation error:")
+                !line.text.starts_with("Automations:")
+                    && !line.text.starts_with("Automation error:")
             });
             if pending > 0 {
-                board
-                    .activity
-                    .push(format!("Automations: {pending} pending"));
-                board
-                    .attention
-                    .push(format!("Automations: {pending} pending"));
+                crate::activity_source::append_activity(
+                    &mut board,
+                    "INFO",
+                    "Automations",
+                    &format!("Automations: {pending} pending"),
+                );
             }
             if let Some(error) = error {
-                board.activity.push(format!("Automation error: {error}"));
-                board.attention.push(format!("Automation error: {error}"));
+                crate::activity_source::append_attention(
+                    &mut board,
+                    "Automations",
+                    &format!("Automation error: {error}"),
+                );
             }
             if previous.as_ref() != Some(&(board.clone(), snapshot.state.clone())) {
                 let state = snapshot.state.clone();

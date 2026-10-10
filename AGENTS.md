@@ -25,9 +25,10 @@ presentation model and terminal driver live in `wt-tui`.
 - Changes to update/recovery, skills distribution, backends, or Discord
   integration also update `docs/updates.md`, `docs/skills.md`,
   `docs/backends.md`, or `docs/discord.md`, respectively. Bundled skills are
-  brand-neutral because wt is OSS. Edit bundled or installed skill content only
-  through `wt skills sync`; replace the managed `instructions.md` block instead
-  of appending, and keep its enforced line budget.
+  brand-neutral because wt is OSS. Edit bundled sources in this repository and
+  distribute them with `wt skills sync`; do not edit installed copies. Replace
+  the managed `instructions.md` block instead of appending, and keep its
+  enforced line budget.
 - Use the existing Cargo workspace boundaries. `wt-config` owns selected
   configuration, `wt-store` durable state, `wt-platform` subprocesses and OS
   resources, `wt-runtime` scheduled source lifetimes, `wt-vcs` Git operations,

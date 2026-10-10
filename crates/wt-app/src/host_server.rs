@@ -261,7 +261,9 @@ mod tests {
         // of waiting forever for a second command.
         drop(input);
         drop(output);
-        tokio::time::timeout(Duration::from_secs(3), task)
+        // The server allows five seconds for owned source cleanup. The test
+        // must not impose a shorter deadline while watchers/children drain.
+        tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .unwrap()
             .unwrap()

@@ -175,10 +175,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
     }
     let available = activity.height.saturating_sub(2) as usize;
     let (title, activity_lines) = model.output_view(available);
-    let activity_lines = activity_lines
-        .into_iter()
-        .map(Line::from)
-        .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(activity_lines).block(panel(&title)),
         activity,
@@ -281,15 +277,45 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
     if model.help {
         let overlay = centered(area, 74, area.height.saturating_sub(2));
         frame.render_widget(Clear, overlay);
-        let lines = crate::help::LINES
+        let query = model.help_query.text();
+        let filtered = crate::help::filtered_lines(&query);
+        let visible_lines = overlay.height.saturating_sub(3) as usize;
+        model.help_scroll = model
+            .help_scroll
+            .min(filtered.len().saturating_sub(visible_lines));
+        let mut lines = filtered
             .iter()
             .skip(model.help_scroll)
+            .take(visible_lines)
             .map(|line| Line::from(*line))
             .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(lines).block(panel("wt keymap · j/k scroll · Esc closes")),
-            overlay,
-        );
+        if filtered.is_empty() {
+            lines.push(Line::from("No matching help entries"));
+        }
+        let title = if model.help_searching {
+            "wt keymap · / filter · Enter done · Esc clear"
+        } else if query.is_empty() {
+            "wt keymap · / search · j/k scroll · Esc closes"
+        } else {
+            "wt keymap · / search · Esc clear · q closes"
+        };
+        frame.render_widget(Paragraph::new(lines).block(panel(title)), overlay);
+        if model.help_searching && overlay.width > 4 {
+            let label = "/";
+            let (text, cursor) = model
+                .help_query
+                .viewport(overlay.width.saturating_sub(4) as usize);
+            frame.set_cursor_position((overlay.x + 2 + cursor, overlay.y + overlay.height - 2));
+            frame.render_widget(
+                Paragraph::new(format!("{label}{text}")),
+                Rect::new(
+                    overlay.x + 1,
+                    overlay.y + overlay.height - 2,
+                    overlay.width - 2,
+                    1,
+                ),
+            );
+        }
     }
     match &model.interaction {
         Interaction::Reviewers(picker) => {
@@ -427,6 +453,53 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
             );
         }
         Interaction::Text(_) | Interaction::None => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MousePane {
+    List,
+    Details,
+    Output,
+    Other,
+}
+
+pub(crate) fn mouse_pane(area: Rect, full_width_activity: bool, x: u16, y: u16) -> MousePane {
+    let [_, body, _] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    let (list, details, output) = if full_width_activity && area.width >= 80 {
+        let [top, output] = Layout::vertical([Constraint::Max(22), Constraint::Min(4)]).areas(body);
+        let [list, details] =
+            Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(top);
+        (list, details, output)
+    } else {
+        let [list, right] = if area.width >= 80 {
+            Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body)
+        } else {
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body)
+        };
+        let [details, output] =
+            Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(right);
+        (list, details, output)
+    };
+    let contains = |rect: Rect| {
+        x >= rect.x
+            && x < rect.x.saturating_add(rect.width)
+            && y >= rect.y
+            && y < rect.y.saturating_add(rect.height)
+    };
+    if contains(list) {
+        MousePane::List
+    } else if contains(details) {
+        MousePane::Details
+    } else if contains(output) {
+        MousePane::Output
+    } else {
+        MousePane::Other
     }
 }
 

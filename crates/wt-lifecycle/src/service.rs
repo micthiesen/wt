@@ -209,6 +209,7 @@ pub struct LifecycleService {
     id_pattern: Option<Regex>,
     dev: Option<wt_dev::DevServerService>,
     before_remove: Option<BeforeRemoveHook>,
+    sst_program: OsString,
 }
 
 type BeforeRemoveHook = Arc<
@@ -239,6 +240,7 @@ impl LifecycleService {
             id_pattern,
             dev: None,
             before_remove: None,
+            sst_program: "pnpm".into(),
         }
     }
 
@@ -850,6 +852,7 @@ impl LifecycleService {
         }
         let mut force = options.force;
         let mut destroyed_stage = false;
+        let mut verified_revision = expected_revision.cloned();
         if options.destroy_stage {
             if !self.config.has_sst {
                 warnings.push("skipping sst remove: [deploy.sst] is not configured".into());
@@ -862,8 +865,41 @@ impl LifecycleService {
                 .await
                 {
                     Ok(stage) => {
-                        let mut spec =
-                            CommandSpec::new("pnpm").args(["sst", "remove", "--stage", &stage]);
+                        // Revalidate immediately before the external destructive
+                        // operation. Hooks above may have changed the checkout
+                        // since the user's confirmation was captured.
+                        if let Some(expected) = verified_revision.as_ref() {
+                            self.verify_removal_revision(
+                                &row,
+                                options.landed || cleanup,
+                                expected,
+                                cancellation,
+                            )
+                            .await?;
+                        }
+                        let before_sst = if verified_revision.is_some() {
+                            let snapshot =
+                                self.capture_revision_for_row(&row, cancellation).await?;
+                            if let Some(expected) = verified_revision.as_ref()
+                                && !same_checkout_revision(&snapshot, expected)
+                            {
+                                return Err(LifecycleError::Refused(
+                                    "checkout changed before SST removal; review the new state before removing".into(),
+                                ));
+                            }
+                            let outside = self
+                                .capture_revision_for_row_excluding(
+                                    &row,
+                                    &self.config.auto_regen_paths,
+                                    cancellation,
+                                )
+                                .await?;
+                            Some((snapshot, outside))
+                        } else {
+                            None
+                        };
+                        let mut spec = CommandSpec::new(self.sst_program.clone())
+                            .args(["sst", "remove", "--stage", &stage]);
                         spec.cwd = Some(path.clone());
                         spec.timeout = Duration::from_secs(20 * 60);
                         spec.output_limit = PROCESS_OUTPUT_LIMIT;
@@ -871,6 +907,21 @@ impl LifecycleService {
                             Ok(output) if output.status.success() => {
                                 destroyed_stage = true;
                                 force = true;
+                                if let (Some(expected), Some((before_sst, before_outside))) =
+                                    (verified_revision.as_ref(), before_sst.as_ref())
+                                {
+                                    verified_revision = Some(
+                                        self.rebase_revision_after_sst(
+                                            &row,
+                                            options.landed || cleanup,
+                                            expected,
+                                            before_sst,
+                                            before_outside,
+                                            cancellation,
+                                        )
+                                        .await?,
+                                    );
+                                }
                             }
                             Ok(output) => warnings.push(format!(
                                 "sst remove failed (exit {:?})",
@@ -889,7 +940,7 @@ impl LifecycleService {
             }
             warnings.push(error.to_string());
         }
-        if let Some(expected) = expected_revision {
+        if let Some(expected) = verified_revision.as_ref() {
             self.verify_removal_revision(&row, options.landed || cleanup, expected, cancellation)
                 .await?;
         }
@@ -1906,7 +1957,18 @@ impl LifecycleService {
         row: &WorktreeRecord,
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
+        self.capture_revision_for_row_excluding(row, &[], cancellation)
+            .await
+    }
+
+    async fn capture_revision_for_row_excluding(
+        &self,
+        row: &WorktreeRecord,
+        excluded_paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<RemovalRevision, LifecycleError> {
         let path = Path::new(&row.target.path);
+        let exclusions = exclusion_pathspecs(excluded_paths)?;
         let head = self
             .git_snapshot_output(path, ["rev-parse", "--verify", "HEAD"], cancellation)
             .await?
@@ -1918,43 +1980,45 @@ impl LifecycleService {
                 "checkout HEAD could not be captured".into(),
             ));
         }
+        let mut status_args = args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ]);
+        status_args.push(".".into());
+        status_args.extend(exclusions.iter().cloned());
         let status = self
-            .git_snapshot_output(
-                path,
-                ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
-                cancellation,
-            )
+            .git_snapshot_output_vec(path, status_args, cancellation)
             .await?
             .stdout;
+        let mut worktree_args = args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "--"]);
+        worktree_args.push(".".into());
+        worktree_args.extend(exclusions.iter().cloned());
         let worktree_diff = self
-            .git_snapshot_output(
-                path,
-                ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--"],
-                cancellation,
-            )
+            .git_snapshot_output_vec(path, worktree_args, cancellation)
             .await?
             .stdout;
+        let mut index_args = args([
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ]);
+        index_args.push(".".into());
+        index_args.extend(exclusions.iter().cloned());
         let index_diff = self
-            .git_snapshot_output(
-                path,
-                [
-                    "diff",
-                    "--cached",
-                    "--binary",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--",
-                ],
-                cancellation,
-            )
+            .git_snapshot_output_vec(path, index_args, cancellation)
             .await?
             .stdout;
+        let mut untracked_args = args(["ls-files", "--others", "--exclude-standard", "-z", "--"]);
+        untracked_args.push(".".into());
+        untracked_args.extend(exclusions);
         let untracked = self
-            .git_snapshot_output(
-                path,
-                ["ls-files", "--others", "--exclude-standard", "-z"],
-                cancellation,
-            )
+            .git_snapshot_output_vec(path, untracked_args, cancellation)
             .await?
             .stdout;
         let checkout = PathBuf::from(&row.target.path);
@@ -1978,6 +2042,60 @@ impl LifecycleService {
             digest: format!("{:x}", digest.finalize()),
             hazards: Vec::new(),
         })
+    }
+
+    async fn rebase_revision_after_sst(
+        &self,
+        row: &WorktreeRecord,
+        landed: bool,
+        expected: &RemovalRevision,
+        before_sst: &RemovalRevision,
+        before_outside: &RemovalRevision,
+        cancellation: &CancellationToken,
+    ) -> Result<RemovalRevision, LifecycleError> {
+        let allowed = &self.config.auto_regen_paths;
+        if before_sst.key != before_outside.key
+            || before_sst.path != before_outside.path
+            || before_sst.branch != before_outside.branch
+            || before_sst.head != before_outside.head
+        {
+            return Err(LifecycleError::Refused(
+                "checkout identity changed immediately before SST removal; review the new state before removing".into(),
+            ));
+        }
+
+        let after_outside = self
+            .capture_revision_for_row_excluding(row, allowed, cancellation)
+            .await?;
+        if !same_checkout_revision(&after_outside, before_outside) {
+            return Err(LifecycleError::Refused(
+                "SST removal changed files outside the configured generated paths; review the checkout before removing".into(),
+            ));
+        }
+        let hazards = self
+            .collect_removal_hazards(row, landed, cancellation)
+            .await?;
+        if removal_hazards_without_checkout_dirty(&hazards)
+            != removal_hazards_without_checkout_dirty(&expected.hazards)
+        {
+            return Err(LifecycleError::Refused(
+                "removal hazards changed during SST removal; review the new state before removing"
+                    .into(),
+            ));
+        }
+
+        let full = self.capture_revision_for_row(row, cancellation).await?;
+        let after_full_outside = self
+            .capture_revision_for_row_excluding(row, allowed, cancellation)
+            .await?;
+        if !same_checkout_revision(&after_full_outside, &after_outside) {
+            return Err(LifecycleError::Refused(
+                "checkout changed while verifying SST removal; review the new state before removing".into(),
+            ));
+        }
+        let mut rebased = full;
+        rebased.hazards = hazards;
+        Ok(rebased)
     }
 
     async fn verify_removal_revision(
@@ -2012,7 +2130,22 @@ impl LifecycleService {
         args: [&str; N],
         cancellation: &CancellationToken,
     ) -> Result<wt_platform::process::ProcessOutput, LifecycleError> {
-        let mut command = CommandSpec::new("git").args(args);
+        self.git_snapshot_output_vec(
+            path,
+            args.into_iter().map(Into::into).collect(),
+            cancellation,
+        )
+        .await
+    }
+
+    async fn git_snapshot_output_vec(
+        &self,
+        path: &Path,
+        args: Vec<OsString>,
+        cancellation: &CancellationToken,
+    ) -> Result<wt_platform::process::ProcessOutput, LifecycleError> {
+        let mut command = CommandSpec::new("git");
+        command.args = args;
         command.cwd = Some(path.to_path_buf());
         command.timeout = Duration::from_secs(30);
         command.output_limit = PROCESS_OUTPUT_LIMIT;
@@ -2310,6 +2443,38 @@ fn same_checkout_revision(current: &RemovalRevision, expected: &RemovalRevision)
         && current.branch == expected.branch
         && current.head == expected.head
         && current.digest == expected.digest
+}
+
+fn args<const N: usize>(values: [&str; N]) -> Vec<OsString> {
+    values.into_iter().map(Into::into).collect()
+}
+
+fn exclusion_pathspecs(paths: &[String]) -> Result<Vec<OsString>, LifecycleError> {
+    let mut result = Vec::with_capacity(paths.len());
+    for path in paths {
+        let relative = Path::new(path);
+        if path.is_empty()
+            || path == "."
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(LifecycleError::Refused(format!(
+                "configured SST generated path is not safely relative: {path:?}"
+            )));
+        }
+        result.push(OsString::from(format!(":(exclude,literal){path}")));
+    }
+    Ok(result)
+}
+
+fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
+    hazards
+        .iter()
+        .map(String::as_str)
+        .filter(|hazard| *hazard != "uncommitted changes")
+        .collect()
 }
 
 fn untracked_metadata(checkout: &Path, paths: &[u8]) -> Result<Vec<u8>, String> {
@@ -3280,6 +3445,146 @@ mod tests {
         assert!(matches!(result, Err(LifecycleError::Refused(_))));
         assert!(!cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_sst_removal_allows_only_configured_generated_file_changes() {
+        let (_scratch, mut service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        fs::write(main.join("generated.txt"), "generated baseline\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["add", "generated.txt"]).await;
+        run(&runner, &main, &["commit", "-m", "add generated file"]).await;
+        service.config.has_sst = true;
+        service.config.auto_regen_paths = vec!["generated.txt".into()];
+
+        let created = service
+            .create(
+                "michael/ENG-101-sst-remove",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = Path::new(&created.target.path);
+        fs::create_dir_all(path.join(".sst")).await.unwrap();
+        fs::write(path.join(".sst/stage"), "stage-eng-101-sst\n")
+            .await
+            .unwrap();
+        let script = _scratch.path().join("fake-pnpm-generated-only");
+        write_executable(
+            &script,
+            "#!/bin/sh\nprintf 'regenerated by SST\\n' > generated.txt\n",
+        )
+        .await;
+        service.sst_program = script.into_os_string();
+        let revision = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+
+        let removed = service
+            .remove_with_revision(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: true,
+                    landed: false,
+                    destroy_stage: true,
+                    removed_snapshot: None,
+                },
+                &revision,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(removed.destroyed_stage, "{:?}", removed.warnings);
+        assert!(removed.removed);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_sst_removal_still_refuses_unrelated_checkout_changes() {
+        let (_scratch, mut service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        for (name, contents) in [
+            ("generated.txt", "generated baseline\n"),
+            ("unrelated.txt", "unrelated baseline\n"),
+        ] {
+            fs::write(main.join(name), contents).await.unwrap();
+            run(&runner, &main, &["add", name]).await;
+        }
+        run(&runner, &main, &["commit", "-m", "add generated files"]).await;
+        service.config.has_sst = true;
+        service.config.auto_regen_paths = vec!["generated.txt".into()];
+
+        let created = service
+            .create(
+                "michael/ENG-102-sst-unrelated",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = Path::new(&created.target.path);
+        fs::create_dir_all(path.join(".sst")).await.unwrap();
+        fs::write(path.join(".sst/stage"), "stage-eng-102-sst\n")
+            .await
+            .unwrap();
+        let script = _scratch.path().join("fake-pnpm-with-unrelated-change");
+        write_executable(
+            &script,
+            "#!/bin/sh\nprintf 'regenerated by SST\\n' > generated.txt\nprintf 'unexpected edit\\n' > unrelated.txt\n",
+        )
+        .await;
+        service.sst_program = script.into_os_string();
+        let revision = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+
+        let result = service
+            .remove_with_revision(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: true,
+                    landed: false,
+                    destroy_stage: true,
+                    removed_snapshot: None,
+                },
+                &revision,
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(LifecycleError::Refused(ref message)) if message.contains("outside the configured generated paths")),
+            "{result:?}"
+        );
+        assert!(path.exists());
+        assert_eq!(
+            fs::read_to_string(path.join("unrelated.txt"))
+                .await
+                .unwrap(),
+            "unexpected edit\n"
+        );
+    }
+
+    async fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, contents).await.unwrap();
+        let mut permissions = fs::metadata(path).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).await.unwrap();
     }
 
     #[tokio::test]

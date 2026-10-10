@@ -69,10 +69,16 @@ def main() -> int:
         # under test must report these optional sources as unavailable.
         fake_gh = bin_dir / "gh"
         fake_tmux = bin_dir / "tmux"
+        fake_tail = bin_dir / "tail"
+        fake_editor = bin_dir / "fixture-editor"
         fake_gh.write_text("#!/bin/sh\nprintf 'isolated gh fixture\n' >&2\nexit 1\n", encoding="utf-8")
         fake_tmux.write_text("#!/bin/sh\nprintf 'no server running on isolated fixture\n' >&2\nexit 1\n", encoding="utf-8")
+        fake_tail.write_text("#!/bin/sh\nshift 3\ncat \"$1\"\n", encoding="utf-8")
+        fake_editor.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$WT_FIXTURE_EDITOR\"\n", encoding="utf-8")
         fake_gh.chmod(0o755)
         fake_tmux.chmod(0o755)
+        fake_tail.chmod(0o755)
+        fake_editor.chmod(0o755)
         git_config = root / "gitconfig"
         git_config.write_text("", encoding="utf-8")
         env = os.environ.copy()
@@ -82,7 +88,15 @@ def main() -> int:
             "WT_REPO_CONFIG": str(main_repo / ".wt.toml"), "GIT_CONFIG_GLOBAL": str(git_config),
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+            "WT_FIXTURE_EDITOR": str(root / "editor-targets"),
         })
+        # Every version spelling reports the same build without loading even
+        # malformed repository configuration. Recovery must work outside a repo.
+        broken_config = root / "broken.toml"
+        broken_config.write_text("not valid TOML [", encoding="utf-8")
+        broken_env = dict(env, WT_CONFIG=str(broken_config), WT_REPO_CONFIG=str(broken_config))
+        versions = [check_command(binary, root, broken_env, flag).stdout for flag in ("version", "--version", "-v")]
+        require(len(set(versions)) == 1 and "(" in versions[0], "version aliases disagree or omit build identity")
         git(main_repo, "init", "-b", "main", env=env)
         git(main_repo, "config", "user.name", "Native Fixture", env=env)
         git(main_repo, "config", "user.email", "native@example.invalid", env=env)
@@ -119,12 +133,18 @@ def main() -> int:
             "[deploy.sst]", 'state_bucket = "native-fixture"', 'state_prefix = "wt/"', 'aws_profile = "fixture"',
             "[issue_tracker]", 'url_template = "https://tracker.invalid/{id}"',
             "read_command = [" + ", ".join(map(json.dumps, [sys.executable, "-c", "import sys; print('reader:'+sys.argv[1]); print('partial-error', file=sys.stderr); sys.exit(7)", "{id}"])) + "]",
+            "[editor]", f"command = {json.dumps(str(fake_editor) + ' {{path}}')}",
             "",
         ])
         (main_repo / ".wt.toml").write_text(config, encoding="utf-8")
 
         # Exercise issue mutations, explicit no-issue, clearing overrides, and
         # read-command substitution/output from a failing configured reader.
+        # With the isolated HOME, this also validates that multi-unit `sync`
+        # and the `-y` spelling reach the command even when no harness targets
+        # are installed for the fixture user.
+        check_command(binary, worktree, env, "skills", "sync", "wt", "start", "-y")
+        check_command(binary, worktree, env, "skills", "install", "wt", "start", "--yes")
         check_command(binary, worktree, env, "issue", "one", "--id", "coz-51")
         check_command(binary, worktree, env, "issue", "one", "--no-id")
         check_command(binary, worktree, env, "issue", "one", "--clear-id")
@@ -135,6 +155,26 @@ def main() -> int:
         require(read.returncode == 7 and "reader:LIVE-5" in read.stdout and "partial-error" in read.stderr, "issue --read did not preserve substituted arguments and partial output on reader failure")
         bad_number = run(binary, worktree, env, "issue", "one", "--gh", "0")
         require(bad_number.returncode == 2, "issue --gh accepted zero")
+
+        # Exercise user-facing log tailing, manager report delivery into the
+        # local spool, and editor target resolution without invoking services.
+        log_dir = home / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        retained_log = log_dir / "one-2026-10-09T19-30-00.log"
+        retained_log.write_text("fixture destroy output\n", encoding="utf-8")
+        logs = check_command(binary, worktree, env, "logs", "one")
+        require("fixture destroy output" in logs.stdout and str(retained_log) in logs.stderr,
+                "wt logs did not select and stream the exact retained slug log")
+        opened = check_command(binary, worktree, env, "open", "one")
+        editor_targets = Path(env["WT_FIXTURE_EDITOR"]).read_text(encoding="utf-8").splitlines()
+        require(opened.returncode == 0 and [Path(path).resolve() for path in editor_targets] == [worktree.resolve()],
+                f"wt open did not pass the exact worktree path to the configured editor: {editor_targets!r}")
+        check_command(binary, worktree, env, "manager", "report", "--warn", "isolated fixture report")
+        report_spool = cache_root / "manager/reports.jsonl"
+        reports = [json.loads(line) for line in report_spool.read_text(encoding="utf-8").splitlines()]
+        require(len(reports) == 1 and reports[0].get("level") == "warn"
+                and reports[0].get("text") == "isolated fixture report" and reports[0].get("at"),
+                f"wt manager report wrote an invalid structured report: {reports!r}")
 
         # Legacy JSON, a stranded per-worktree namespace, and harness runtime
         # files all migrate from temp-only sources. Unknown fields and current
@@ -236,6 +276,16 @@ def main() -> int:
                 report = next((row for row in parsed if row.get("slug") == "one"), None)
                 require(report is not None, "fleet omitted the live worktree")
                 require("session" in report and "operation" in report and "dev" in report, "fleet omitted session, lock, or dev-server availability facts")
+                require(report.get("kind") == "live" and isinstance(report.get("session"), dict)
+                        and isinstance(report.get("dev"), dict), "fleet JSON omitted discriminator or nested nullable source objects")
+                require(report.get("pr") is None and isinstance(report.get("pr_note"), str)
+                        and report.get("session_note") is None and report["session"]["alive"] is False,
+                        "fleet JSON did not distinguish unavailable GitHub from a known absent tmux server")
+                fake_tmux.write_text("#!/bin/sh\nprintf 'isolated tmux probe failed\\n' >&2\nexit 1\n", encoding="utf-8")
+                unknown = json.loads(check_command(binary, worktree, env, "fleet", "--json").stdout)
+                unknown_row = next(row for row in unknown if row.get("slug") == "one")
+                require(unknown_row["session"]["alive"] is None and unknown_row.get("session_note"),
+                        "fleet treated a failed tmux probe as a stopped session")
             else:
                 required = {"sampled_at_ms", "cpu_note", "system_cpu", "wt_cpu", "category_totals", "sessions", "orphans", "orphan_probe_available", "tmux_probe_available"}
                 require(required.issubset(parsed), f"perf snapshot omitted measurement/attribution fields: {required - set(parsed)}")

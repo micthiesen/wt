@@ -16,6 +16,8 @@ pub struct CleanupArgs {
     pub no_destroy_stage: bool,
     #[arg(long)]
     pub foreground: bool,
+    #[arg(long, conflicts_with = "foreground")]
+    pub background: bool,
 }
 
 pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
@@ -85,7 +87,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
         }
     }
     let mut failed = false;
-    if !args.foreground {
+    if args.background || !args.foreground {
         let requests: Vec<_> = candidates
             .into_iter()
             .map(|plan| {
@@ -183,5 +185,31 @@ mod tests {
                 .try_get_matches_from(["clean", "--yes", "--foreground"])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn clean_accepts_background_alias_and_rejects_conflicting_mode() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        #[command(name = "wt")]
+        struct Cli {
+            #[command(subcommand)]
+            command: TestCommand,
+        }
+        #[derive(clap::Subcommand)]
+        enum TestCommand {
+            #[command(name = "clean")]
+            Cleanup(CleanupArgs),
+        }
+
+        let parsed = Cli::try_parse_from(["wt", "clean", "--background"]).unwrap();
+        let TestCommand::Cleanup(args) = parsed.command;
+        assert!(args.background);
+        assert!(!args.foreground);
+        assert!(Cli::try_parse_from(["wt", "clean", "--background", "--foreground"]).is_err());
+        let parsed = Cli::try_parse_from(["wt", "clean"]).unwrap();
+        let TestCommand::Cleanup(args) = parsed.command;
+        assert!(!args.background && !args.foreground);
     }
 }

@@ -67,9 +67,11 @@ pub struct Board {
     #[serde(default)]
     pub full_width_activity: bool,
     pub rows: Vec<BoardRow>,
-    pub activity: Vec<String>,
+    pub activity: Vec<ActivityLine>,
     #[serde(default)]
-    pub attention: Vec<String>,
+    pub attention: Vec<AttentionLine>,
+    #[serde(default)]
+    pub attention_seen_ms: u64,
     #[serde(default)]
     pub slot_logs: std::collections::BTreeMap<String, Vec<LogView>>,
     #[serde(default)]
@@ -84,6 +86,22 @@ pub struct Board {
     pub usage: Vec<String>,
     #[serde(default)]
     pub slot_sessions: std::collections::BTreeMap<String, Vec<SessionView>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActivityLine {
+    pub at_ms: u64,
+    pub level: String,
+    pub channel: String,
+    pub source: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttentionLine {
+    pub at_ms: u64,
+    pub source: String,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -203,6 +221,8 @@ pub struct Model {
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
     pub(crate) help_scroll: usize,
+    pub(crate) help_query: crate::LineEditor,
+    pub(crate) help_searching: bool,
     pub(crate) show_verification: bool,
     pub show_perf: bool,
     pub(crate) perf_continuous: bool,
@@ -243,6 +263,8 @@ impl Default for Model {
             pr_chord: None,
             help: false,
             help_scroll: 0,
+            help_query: crate::LineEditor::default(),
+            help_searching: false,
             show_verification: false,
             show_perf: false,
             perf_continuous: false,
@@ -824,13 +846,43 @@ impl Model {
             return InputResult::Unchanged;
         }
         if self.help {
+            if self.help_searching {
+                match self.help_query.input(key) {
+                    EditResult::Cancel => {
+                        if control && key.code == KeyCode::Char('c') {
+                            self.help = false;
+                            self.help_searching = false;
+                        } else {
+                            self.help_searching = false;
+                            self.help_query = crate::LineEditor::default();
+                        }
+                    }
+                    EditResult::Submit => self.help_searching = false,
+                    EditResult::Changed => self.help_scroll = 0,
+                    EditResult::Unchanged => {}
+                }
+                return InputResult::Draw;
+            }
+            if (key.code == KeyCode::Esc || (control && key.code == KeyCode::Char('c')))
+                && !self.help_query.text().is_empty()
+            {
+                self.help_query = crate::LineEditor::default();
+                self.help_scroll = 0;
+                return InputResult::Draw;
+            }
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?'))
                 || (control && key.code == KeyCode::Char('c'))
             {
                 self.help = false;
                 return InputResult::Draw;
             }
-            let maximum = crate::help::LINES.len().saturating_sub(1);
+            if key.code == KeyCode::Char('/') {
+                self.help_searching = true;
+                return InputResult::Draw;
+            }
+            let maximum = crate::help::filtered_lines(&self.help_query.text())
+                .len()
+                .saturating_sub(1);
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.help_scroll = self.help_scroll.saturating_add(1).min(maximum);
@@ -929,6 +981,23 @@ impl Model {
             KeyCode::Char('\'') if !control => {
                 self.open_output_picker();
                 InputResult::Draw
+            }
+            KeyCode::Char('"') if !control => {
+                self.output.toggle_feed();
+                InputResult::Draw
+            }
+            KeyCode::Char('x')
+                if !control
+                    && matches!(self.output.target, crate::output::OutputTarget::Attention)
+                    && !self.board.attention.is_empty() =>
+            {
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                self.output.mark_seen();
+                InputResult::Action(UiAction::SetAttentionSeen { at_ms })
             }
             KeyCode::Char('[' | ']') if !control => {
                 self.output.cycle(key.code == KeyCode::Char(']'));
@@ -2171,6 +2240,60 @@ mod tests {
             model.input(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT), 10),
             InputResult::Unchanged
         );
+    }
+
+    #[test]
+    fn help_search_filters_rows_and_esc_clears_before_closing() {
+        let mut model = Model {
+            help: true,
+            ..Default::default()
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(model.input(key(KeyCode::Char('/')), 20), InputResult::Draw);
+        assert!(model.help_searching);
+        model.input(key(KeyCode::Char('r')), 20);
+        model.input(key(KeyCode::Char('e')), 20);
+        assert!(
+            crate::help::filtered_lines(&model.help_query.text())
+                .iter()
+                .any(|line| line.contains("Refresh"))
+        );
+        assert_eq!(model.input(key(KeyCode::Esc), 20), InputResult::Draw);
+        assert!(!model.help_searching);
+        assert!(model.help_query.text().is_empty());
+        assert!(model.help);
+        assert_eq!(model.input(key(KeyCode::Esc), 20), InputResult::Draw);
+        assert!(!model.help);
+    }
+
+    #[test]
+    fn attention_toggle_and_seen_mark_preserve_the_feed_contract() {
+        let mut model = Model {
+            board: Arc::new(Board {
+                attention: (0..20)
+                    .map(|at_ms| crate::AttentionLine {
+                        at_ms,
+                        source: "test".into(),
+                        text: at_ms.to_string(),
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let key = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+        model.output_view(4);
+        model.output.scroll(true);
+        assert!(model.output.is_scrolled());
+        assert!(matches!(
+            model.input(key('x'), 20),
+            InputResult::Action(UiAction::SetAttentionSeen { at_ms }) if at_ms > 0
+        ));
+        assert!(!model.output.is_scrolled());
+        assert_eq!(model.input(key('"'), 20), InputResult::Draw);
+        assert_eq!(model.output.target, crate::output::OutputTarget::Activity);
+        assert_eq!(model.input(key('"'), 20), InputResult::Draw);
+        assert_eq!(model.output.target, crate::output::OutputTarget::Attention);
     }
 
     #[test]

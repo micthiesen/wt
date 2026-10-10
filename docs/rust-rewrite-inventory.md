@@ -7,12 +7,13 @@ version is covered. The TypeScript tree remains the behavior reference; docs
 are the user contract. This inventory deliberately names behavior and test
 surfaces so a large rewrite cannot silently drop an obscure command or flow.
 
-Status: `pending` = no Rust parity evidence recorded; `verified` = Rust behavior
-and its required compatibility evidence are reviewed. No item is verified yet.
+Status: `pending` = full parity evidence has not been reviewed; `verified` = the
+named contract and its compatibility evidence have been reviewed. Verification
+of one row does not establish release readiness or cover unrelated workflows.
 
 ## Integrated checkpoint evidence
 
-At `cd7b2db`, the full local workspace gate passed 499 tests, doctests,
+At `8ba6375`, the full local workspace gate passed 507 tests, doctests,
 formatting, Clippy with warnings denied, and dependency-direction checks.
 This establishes integrated Rust correctness for those assertions, not complete
 old/new feature parity. The detailed rows below remain open until their full
@@ -30,16 +31,34 @@ contract is accounted for.
 - The original work-status, stack-layout, and harness-target identity golden
   fixtures now have native consumers. These cover pure rules, not live harness
   control or every command JSON field.
-- Follow-up parity work includes attention narration and `wt ls` fact/output
-  contracts. Live cleanup ownership tests, four-target release CI, real `boris`
-  provisioning, optimized performance workloads and independent review remain
-  acceptance gates. Earlier debug CPU samples predate a watcher lifetime fix
-  and are not final performance evidence.
+- `wt ls` now retains stage/PR columns and nullable Git/session/dev facts. The
+  command fixture covers migrated unknown fields and session registries, linked
+  worktree selectors, issue-reader errors, and diagnostic JSON contracts.
+- Local cleanup fixtures prove dirty/stale-ref refusals preserve resources,
+  foreground/background removal touches only the exact checkout's resources,
+  and similarly named neighboring sessions survive. Linux and macOS CI passed
+  at `2e9d9a9`, including cleanup; the macOS fixture now avoids the standard
+  Python HTTP server's reverse-DNS lookup before listening.
+- Four-target release packaging has exercised actual optimized install/update/
+  rollback flows, but the complete release workflow has not passed its checks
+  or published an accepted test release. Real `boris` provisioning, optimized
+  performance comparisons, final feed/terminal integration, and independent
+  review remain acceptance gates. Earlier debug CPU samples predate a watcher
+  lifetime fix and are not final performance evidence.
 
-Local evidence: `/tmp/wt-rust-workspace-gate-current.log`,
+The next local checkpoint passed 530 tests and the full workspace gate.
+The PTY feed fixture covers retained attention/activity, file-triggered appends,
+persisted seen state, help search and the earlier lifecycle/navigation checks.
+Native Codex compact and terminal-palette probes passed against the installed
+Codex TUI. Independent review is still open for fleet cleanup, wrapped/local-time
+feed presentation, startup key replay, and durable landing proof at removal.
+Evidence: `/tmp/wt-rust-gate-checkpoint.log`,
+`/tmp/wt-native-ui-feeds-4/result.json`.
+
+Local evidence: `/tmp/wt-rust-workspace-gate-next.log`,
 `/tmp/wt-rust-native-ui-integrated-10/result.json`,
-`/tmp/wt-rust-native-host-current2.log`. Release verification runs from the
-isolated `rust-test-cd7b2db-20261009` tag; promotion is not authorized here.
+`/tmp/wt-rust-native-host-cached-snapshot.log`. Release verification uses isolated
+`rust-test-*` tags; promotion is not authorized here.
 
 ## Command surface
 
@@ -118,10 +137,10 @@ selection rule.
 
 | Check | Contract | Source/evidence | Rust |
 |---|---|---|---|
-| [ ] | Parse TOML, required paths, fail-fast validation, aliases/deprecations, defaults and repository identity independent of cwd | `src/core/config.ts`; `docs/configuration.md` | pending |
-| [ ] | Config blocks: `[instance]`, `[paths]`, `[tmux]`, `[branch]`, `[remote]`, `[stage]`, `[lifecycle]`, `[backend]`, `[deploy.sst]`, `[dev_server]` | `docs/configuration.md`; `src/core/config.ts` | pending |
-| [ ] | Config blocks: `[issue_tracker]`, `[harness]`, `[naming]`, legacy `[browser]`, `[github]`, `[review_bot]`, `[github.events]`, `[diff]`, `[editor]`, `[ui]` | same | pending |
-| [ ] | Config blocks: `[skills]`, `[manager]`, `[update]`, repeated `[[actions]]`, `[[automations]]`; templates, validation, action/automation requirements | same; `src/core/config.ts` | pending |
+| [x] | Parse TOML, required paths, fail-fast validation, aliases/deprecations, defaults and repository identity independent of cwd | `crates/wt-config/tests/config.rs`: defaults, table merge/array replacement, explicit selectors and real linked-worktree discovery; full gate at `8ba6375` | verified |
+| [x] | Config blocks: `[instance]`, `[paths]`, `[tmux]`, `[branch]`, `[remote]`, `[stage]`, `[lifecycle]`, `[backend]`, `[deploy.sst]`, `[dev_server]` | `wt-config` all-options golden snapshot matches the TS loader; `tests/remotes.rs` covers selected configs and plural hosts; full gate at `8ba6375` | verified schema; integration behavior is tracked separately below |
+| [x] | Config blocks: `[issue_tracker]`, `[harness]`, `[naming]`, legacy `[browser]`, `[github]`, `[review_bot]`, `[github.events]`, `[diff]`, `[editor]`, `[ui]` | Same all-options golden snapshot plus optional-section/default and supported-harness tests | verified schema |
+| [x] | Config blocks: `[skills]`, `[manager]`, `[update]`, repeated `[[actions]]`, `[[automations]]`; templates, validation, action/automation requirements | Same golden snapshot; invalid automation/action pairs fail closed, aliases normalize, slot target stays compatible | verified schema |
 | [ ] | `git-worktree` and `rift` backends; base/ref freshness, self-healing registry, remote orthogonality and known limits | `docs/backends.md`; `src/core/backend/` | pending |
 | [ ] | SST stage pin/cleanup; configured issue tracker commands; GitHub REST/GraphQL and queue; webhook daemon; editor/diff command; remote SSH worker; dev server supervisor | configuration and feature docs; `src/core/integrations/`, `src/core/github/`, `src/core/dev-server.ts` | pending |
 | [ ] | Harnesses Claude, Codex and OpenCode; primary selection vs live-target routing; session names, usage, summaries, events, output tails and message transports | `src/core/harness/types.ts`, `src/core/harness/`; harness tests | pending |

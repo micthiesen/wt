@@ -3270,6 +3270,8 @@ dependencies = [
 name = "wt-tmux"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3283,6 +3285,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "futures-util",
+ "libc",
  "ratatui",
  "serde",
  "tokio",

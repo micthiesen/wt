@@ -111,6 +111,7 @@ Remove every worktree that is merged or whose remote branch is gone. "Gone" is o
 - `--yes` / `-y` — skip confirmation (required non-interactively).
 - `--destroy-stage` / `--no-destroy-stage` — apply to all candidates (default: per-worktree, destroy iff its stage is live).
 - `--foreground` — run removals synchronously (background dispatch is the default here, unlike `rm`).
+- `--background` — spell out the default background dispatch; conflicts with `--foreground`.
 
 ### `wt merge [<slug>]` / `wt merge --cancel [<slug>]`
 
@@ -154,7 +155,7 @@ List SST stages in the configured state bucket and flag orphans (no matching liv
 - `--yes` / `-y` — skip the destroy confirmation.
 - `--json` — machine-readable `{live, orphaned}`.
 
-### `wt dev <start|stop|status|logs> [<slug>]`
+### `wt dev <start|reset|stop|status|queue|logs> [<slug>]`
 
 Manage the worktree's `[dev_server]` (see [configuration.md](configuration.md#dev_server--optional-per-worktree-dev-server)). `start` is also restart; `stop` keeps the slug's port reserved; `logs` prints the supervisor pane's recent output. The slug defaults to the worktree containing the current directory.
 

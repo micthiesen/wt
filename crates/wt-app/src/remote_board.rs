@@ -104,6 +104,7 @@ fn compose(
     if !state["slugs"].is_object() {
         state["slugs"] = serde_json::json!({});
     }
+    board.attention_seen_ms = state["attentionSeenTs"].as_u64().unwrap_or_default();
     let archived = metadata.data.as_ref().map(|m| &m.1);
     for (endpoint, source) in hosts {
         let host = endpoint.key();
@@ -243,18 +244,22 @@ fn compose(
                     }
                     board.removed_history.rows.push(row);
                 }
-                board.activity.extend(
-                    remote
-                        .activity
-                        .iter()
-                        .map(|line| format!("{label}: {}", wt_core::sanitize_terminal_text(line))),
-                );
-                board.attention.extend(
-                    remote
-                        .attention
-                        .iter()
-                        .map(|line| format!("{label}: {}", wt_core::sanitize_terminal_text(line))),
-                );
+                board
+                    .activity
+                    .extend(remote.activity.iter().cloned().map(|mut line| {
+                        line.source =
+                            format!("{label}: {}", wt_core::sanitize_terminal_text(&line.source));
+                        line.text = wt_core::sanitize_terminal_text(&line.text);
+                        line
+                    }));
+                board
+                    .attention
+                    .extend(remote.attention.iter().cloned().map(|mut line| {
+                        line.source =
+                            format!("{label}: {}", wt_core::sanitize_terminal_text(&line.source));
+                        line.text = wt_core::sanitize_terminal_text(&line.text);
+                        line
+                    }));
                 board.usage.extend(
                     remote
                         .usage
@@ -295,14 +300,20 @@ fn compose(
             }
         }
         if let Some(error) = error {
-            board.activity.push(format!(
-                "{label}: {}",
-                wt_core::sanitize_terminal_text(&error)
-            ));
-            board.attention.push(format!(
-                "{label}: {}",
-                wt_core::sanitize_terminal_text(&error)
-            ));
+            let at_ms = crate::activity_source::epoch_ms();
+            let text = wt_core::sanitize_terminal_text(&error);
+            board.activity.push(wt_tui::ActivityLine {
+                at_ms,
+                level: "ERROR".into(),
+                channel: "attention".into(),
+                source: label.clone(),
+                text: text.clone(),
+            });
+            board.attention.push(wt_tui::AttentionLine {
+                at_ms,
+                source: label.clone(),
+                text,
+            });
         }
     }
     board.removed_history.rows.sort_by(|a, b| {
@@ -311,6 +322,7 @@ fn compose(
             .then_with(|| a.key.cmp(&b.key))
     });
     crate::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
+    crate::activity_source::bound_feeds(&mut board);
     snapshot.data = Some(Arc::new(board));
     snapshot
 }

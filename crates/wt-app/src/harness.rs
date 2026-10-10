@@ -18,7 +18,7 @@ use wt_harness::{
     CodexPaths, DiscoveryRequest, HarnessId, HarnessMessageOutcome, HarnessService,
     HarnessSpawnRequest, HarnessTarget, OpenCodePaths,
 };
-use wt_tmux::{CreateSession, SessionInfo, TmuxClient, TmuxServer};
+use wt_tmux::{CreateSession, SessionInfo, TmuxClient, TmuxServer, write_terminal_palette_config};
 use wt_tui::SessionTarget;
 
 use crate::context::AppContext;
@@ -86,11 +86,13 @@ pub struct AppHarness {
 
 impl AppHarness {
     pub fn new(context: &AppContext) -> Self {
-        let tmux = TmuxClient::new(
-            context.processes.clone(),
-            TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone()),
-        );
         let cache_root = context.config.paths.cache_root.clone();
+        let mut server =
+            TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone());
+        if let Ok(config_path) = write_terminal_palette_config(&cache_root, &context.home) {
+            server = server.with_config_file(config_path);
+        }
+        let tmux = TmuxClient::new(context.processes.clone(), server);
         let claude_paths = ClaudePaths::new(&context.home, &cache_root);
         let claude_sessions =
             ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone());

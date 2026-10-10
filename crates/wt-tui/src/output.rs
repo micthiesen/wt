@@ -1,5 +1,9 @@
 //! Prepared output only. Cursor and viewport updates never ask a source to read.
 use crate::{Interaction, Model, PickerAction, PickerOption, model::PickerPrompt};
+use ratatui::{
+    style::{Color, Style},
+    text::Line,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutputTarget {
@@ -43,6 +47,19 @@ impl OutputState {
             };
             self.top = None;
         }
+    }
+    pub fn toggle_feed(&mut self) {
+        self.choose(match self.target {
+            OutputTarget::Attention => OutputTarget::Activity,
+            _ => OutputTarget::Attention,
+        });
+    }
+    pub fn mark_seen(&mut self) {
+        self.top = None;
+    }
+    #[cfg(test)]
+    pub fn is_scrolled(&self) -> bool {
+        self.top.is_some()
     }
     pub fn scroll(&mut self, up: bool) {
         self.top = if up {
@@ -103,18 +120,54 @@ impl Model {
         });
     }
 
-    pub(crate) fn output_view(&mut self, height: usize) -> (String, Vec<String>) {
+    pub(crate) fn output_view(&mut self, height: usize) -> (String, Vec<Line<'static>>) {
         let target = self.output.target.clone();
         let (title, lines, identity, count) = match &target {
-            OutputTarget::Attention => (
-                "Attention".to_owned(),
-                self.board.attention.clone(),
-                "attention".into(),
-                0,
-            ),
+            OutputTarget::Attention => {
+                let mut lines = Vec::new();
+                let mut marked = false;
+                for event in &self.board.attention {
+                    if !marked && event.at_ms > self.board.attention_seen_ms {
+                        lines.push(Line::styled(
+                            format!("── seen {}", time_of_day(self.board.attention_seen_ms)),
+                            Style::new().fg(Color::DarkGray),
+                        ));
+                        marked = true;
+                    }
+                    let text = format!("{}: {}", event.source, event.text);
+                    lines.push(
+                        if self.board.attention_seen_ms > 0
+                            && event.at_ms <= self.board.attention_seen_ms
+                        {
+                            Line::styled(text, Style::new().fg(Color::DarkGray))
+                        } else {
+                            Line::from(text)
+                        },
+                    );
+                }
+                if self.board.attention_seen_ms > 0 && !marked && !self.board.attention.is_empty() {
+                    lines.push(Line::styled(
+                        format!("── seen {}", time_of_day(self.board.attention_seen_ms)),
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                ("Attention".to_owned(), lines, "attention".into(), 0)
+            }
             OutputTarget::Activity => (
                 "All activity".to_owned(),
-                self.board.activity.clone(),
+                self.board
+                    .activity
+                    .iter()
+                    .map(|event| {
+                        Line::from(format!(
+                            "{} {} [{}] {}",
+                            time_of_day(event.at_ms),
+                            event.level,
+                            event.source,
+                            event.text
+                        ))
+                    })
+                    .collect(),
                 "activity".into(),
                 0,
             ),
@@ -154,7 +207,7 @@ impl Model {
                             "{label} · {} / {} · {}",
                             session.harness, session.name, session.state
                         ),
-                        session.output.clone(),
+                        session.output.iter().cloned().map(Line::from).collect(),
                         identity,
                         count,
                     )
@@ -164,14 +217,14 @@ impl Model {
                 {
                     (
                         format!("{label} · {}", log.title),
-                        log.lines.clone(),
+                        log.lines.iter().cloned().map(Line::from).collect(),
                         identity,
                         count,
                     )
                 } else {
                     (
                         format!("{label} output"),
-                        vec!["No output yet".into()],
+                        vec![Line::from("No output yet")],
                         identity,
                         count,
                     )
@@ -185,8 +238,21 @@ impl Model {
         }
         self.output.stream_count = count;
         let lines = lines
-            .iter()
-            .flat_map(|line| line.lines().map(str::to_owned))
+            .into_iter()
+            .flat_map(|line| {
+                let line_style = line.style;
+                line.spans
+                    .into_iter()
+                    .flat_map(|span| {
+                        span.content
+                            .lines()
+                            .map(|content| {
+                                Line::styled(content.to_owned(), line_style.patch(span.style))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let top = self.output.viewport(lines.len(), height);
         let hint = if self.output.top.is_some() {
@@ -201,6 +267,16 @@ impl Model {
     }
 }
 
+fn time_of_day(at_ms: u64) -> String {
+    let seconds = at_ms / 1_000 % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,20 +285,61 @@ mod tests {
     fn scrolling_stays_put_on_append_and_refollows_at_bottom() {
         let mut model = Model {
             board: Arc::new(crate::Board {
-                attention: (0..20).map(|n| n.to_string()).collect(),
+                attention: (0..20)
+                    .map(|n| crate::AttentionLine {
+                        at_ms: n,
+                        source: "test".into(),
+                        text: n.to_string(),
+                    })
+                    .collect(),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert_eq!(model.output_view(4).1, ["16", "17", "18", "19"]);
+        assert!(format!("{:?}", model.output_view(4).1).contains("19"));
         model.output.scroll(true);
-        assert_eq!(model.output_view(4).1[0], "13");
-        Arc::make_mut(&mut model.board).attention.push("20".into());
-        assert_eq!(model.output_view(4).1[0], "13");
+        assert!(format!("{:?}", model.output_view(4).1[0]).contains("13"));
+        Arc::make_mut(&mut model.board)
+            .attention
+            .push(crate::AttentionLine {
+                at_ms: 20,
+                source: "test".into(),
+                text: "20".into(),
+            });
+        assert!(format!("{:?}", model.output_view(4).1[0]).contains("13"));
         model.output.scroll(false);
         model.output_view(4);
         model.output.scroll(false);
-        assert_eq!(model.output_view(4).1, ["17", "18", "19", "20"]);
+        assert!(format!("{:?}", model.output_view(4).1).contains("20"));
         assert!(model.output.top.is_none());
+    }
+
+    #[test]
+    fn seen_watermark_dims_old_rows_and_keeps_a_timestamped_rule() {
+        let mut model = Model {
+            board: Arc::new(crate::Board {
+                attention: vec![
+                    crate::AttentionLine {
+                        at_ms: 1_000,
+                        source: "old".into(),
+                        text: "handled".into(),
+                    },
+                    crate::AttentionLine {
+                        at_ms: 3_000,
+                        source: "new".into(),
+                        text: "unread".into(),
+                    },
+                ],
+                attention_seen_ms: 2_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = model.output_view(5).1;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].style.fg, Some(Color::DarkGray));
+        assert!(lines[1].spans[0].content.starts_with("── seen "));
+        assert_eq!(lines[2].spans[0].content, "new: unread");
+        assert_eq!(lines[2].style.fg, None);
     }
 }

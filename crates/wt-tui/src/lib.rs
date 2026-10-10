@@ -6,10 +6,12 @@ mod editor;
 mod help;
 mod history;
 mod model;
+mod mouse;
 mod output;
 mod render;
 mod reviews;
 mod terminal;
+mod terminal_probe;
 
 pub use actions::{
     ActionController, ActionSurface, ConfirmAction, PickerAction, PickerOption, RemovalRevision,
@@ -18,7 +20,9 @@ pub use actions::{
 };
 pub use editor::LineEditor;
 pub use model::{
-    Board, BoardRow, BoardSection, HostChoice, Interaction, LogView, Model, RemovedHistoryRow,
-    RemovedHistorySnapshot, ReviewRequestRow, SessionView,
+    ActivityLine, AttentionLine, Board, BoardRow, BoardSection, HostChoice, Interaction, LogView,
+    Model, RemovedHistoryRow, RemovedHistorySnapshot, ReviewRequestRow, SessionView,
 };
-pub use terminal::run;
+pub use terminal::{run, run_with_palette_probe};
+#[doc(hidden)]
+pub use terminal_probe::{decode_terminal_probe_bytes, decode_terminal_probe_chunks};

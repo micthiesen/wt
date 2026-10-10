@@ -61,6 +61,7 @@ mod session_source;
 mod session_ui;
 mod skills;
 mod sources;
+mod terminal_palette;
 mod updates;
 mod worktree_facts;
 
@@ -75,7 +76,7 @@ use wt_runtime::TaskScope;
 use wt_vcs::{GitRepository, RepositoryConfig, StageConfig};
 
 #[derive(Parser)]
-#[command(name = "wt", version, about = "Git worktree manager")]
+#[command(name = "wt", version = NATIVE_VERSION, about = "Git worktree manager")]
 struct Cli {
     #[arg(long = "_boot-probe", hide = true)]
     boot_probe: bool,
@@ -84,6 +85,15 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
+
+const NATIVE_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("WT_BUILD_ID"),
+    ", ",
+    env!("WT_TARGET"),
+    ")"
+);
 
 #[cfg(test)]
 mod cli_tests {
@@ -107,6 +117,9 @@ mod cli_tests {
                 error.kind(),
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ));
+            if error.kind() == clap::error::ErrorKind::DisplayVersion {
+                assert_eq!(error.to_string().trim(), format!("wt {NATIVE_VERSION}"));
+            }
         }
         assert_eq!(
             Cli::try_parse_from(["wt", "invalid-command"])
@@ -228,12 +241,7 @@ fn main() {
     }
     // Recovery and informational commands never load repository configuration.
     if matches!(cli.command, Some(Command::Version)) {
-        println!(
-            "wt {} ({}, {})",
-            env!("CARGO_PKG_VERSION"),
-            env!("WT_BUILD_ID"),
-            env!("WT_TARGET")
-        );
+        println!("wt {NATIVE_VERSION}");
         return;
     }
     match run(cli) {
@@ -397,10 +405,10 @@ async fn run_application(
     ));
     let fleet = remote_board::start(scope, &context, host);
     let board = fleet.board.clone();
-    let controller = controller::start(scope, context, fleet, controller_port);
+    let controller = controller::start(scope, context.clone(), fleet, controller_port);
     // A child cancellation token does not cancel its parent. The terminal
     // token handles Ctrl+C and explicit application shutdown owns the scope.
-    let result = wt_tui::run(board, actions, token).await;
+    let result = terminal_palette::run(scope, board, actions, token, &context).await;
     scope.cancel();
     let actions_finished = controller.shutdown().await;
     let shutdown = scope.shutdown(Duration::from_secs(5)).await;
@@ -454,12 +462,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::WorkerDispatch { args } => Box::pin(commands::_remote::run(context, args)).await,
         Command::Host => host_server::run(context).await,
         Command::Version => {
-            println!(
-                "wt {} ({}, {})",
-                env!("CARGO_PKG_VERSION"),
-                env!("WT_BUILD_ID"),
-                env!("WT_TARGET")
-            );
+            println!("wt {NATIVE_VERSION}");
             Ok(0)
         }
         Command::Inventory => {

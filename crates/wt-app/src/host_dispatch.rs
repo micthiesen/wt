@@ -36,6 +36,22 @@ pub async fn execute(
         }
         return Ok(UiReply::default());
     }
+    if let UiAction::SetAttentionSeen { at_ms } = action {
+        fleet
+            .local
+            .context
+            .database
+            .call(move |store| {
+                store.set_attention_seen(at_ms)?;
+                Ok(())
+            })
+            .await?;
+        fleet.local.sources.metadata.refresh();
+        return Ok(UiReply {
+            message: "Attention marked seen".into(),
+            ..Default::default()
+        });
+    }
     if !explicit
         && !fleet.remotes.is_empty()
         && matches!(

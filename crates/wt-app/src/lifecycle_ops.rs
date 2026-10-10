@@ -1,6 +1,9 @@
 //! Shared lifecycle planning for CLI, TUI and automation callers. A plan is
 //! presentation data, not permission to skip the service's locked rechecks.
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use wt_github::{GithubClient, GithubData, GithubOptions};
@@ -116,10 +119,11 @@ pub async fn plan_with_facts(
     rows: Vec<WorktreeRecord>,
     state: &serde_json::Value,
     github: &GithubData,
-    warning: Option<String>,
+    mut warning: Option<String>,
 ) -> Result<RemovalPlans> {
     let lifecycle = service(ctx)?;
     let mut plans = Vec::with_capacity(rows.len());
+    let mut published_bases = BTreeMap::new();
     for row in rows {
         if row.is_main {
             continue;
@@ -149,33 +153,10 @@ pub async fn plan_with_facts(
             && github.prs.get(&row.target.branch).is_some_and(|pr| {
                 pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
             });
-        let mut local_merged = false;
-        if own_work && !pr_landed {
-            for reference in [
-                format!("refs/remotes/origin/{}", ctx.config.branch.base),
-                format!("refs/heads/{}", ctx.config.branch.base),
-            ] {
-                let exists =
-                    run_git(ctx, path, ["rev-parse", "--verify", "--quiet", &reference]).await?;
-                if !exists.status.success() {
-                    continue;
-                }
-                let ancestry = run_git(
-                    ctx,
-                    path,
-                    ["merge-base", "--is-ancestor", &head, &reference],
-                )
+        let local_merged = own_work
+            && !pr_landed
+            && published_base_contains(ctx, path, &head, &mut published_bases, &mut warning)
                 .await?;
-                match ancestry.status.code() {
-                    Some(0) => local_merged = true,
-                    Some(1) => {}
-                    _ => {
-                        ancestry.checked("git")?;
-                    }
-                }
-                break;
-            }
-        }
         let landed = pr_landed || local_merged;
         let mut extra = serde_json::Map::new();
         let pr = github.prs.get(&row.target.branch);
@@ -248,6 +229,70 @@ pub async fn plan_with_facts(
         rows: plans,
         warning,
     })
+}
+
+/// A cached ancestry match only nominates a candidate. Confirm that the origin
+/// still advertises a containing base tip before it can waive the unpushed-work
+/// guard. Query once per object store in a batch, without changing any checkout,
+/// fetching every branch, or running keep-fresh/install hooks.
+async fn published_base_contains(
+    ctx: &AppContext,
+    path: &Path,
+    head: &str,
+    published: &mut BTreeMap<PathBuf, Option<String>>,
+    warning: &mut Option<String>,
+) -> Result<bool> {
+    let reference = format!("refs/remotes/origin/{}", ctx.config.branch.base);
+    let cached = run_git(ctx, path, ["merge-base", "--is-ancestor", head, &reference]).await?;
+    if !cached.status.success() {
+        return Ok(false);
+    }
+    let repository = match ctx.config.backend.kind {
+        wt_config::BackendKind::GitWorktree => ctx.config.paths.main_clone.as_path(),
+        wt_config::BackendKind::Rift => path,
+    };
+    if !published.contains_key(repository) {
+        let remote_ref = format!("refs/heads/{}", ctx.config.branch.base);
+        let result = run_git(
+            ctx,
+            repository,
+            ["ls-remote", "--exit-code", "--refs", "origin", &remote_ref],
+        )
+        .await?;
+        let tip = if result.status.success() {
+            result.stdout_text().lines().find_map(|line| {
+                let (oid, name) = line.split_once('\t')?;
+                (name == remote_ref
+                    && matches!(oid.len(), 40 | 64)
+                    && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| oid.to_owned())
+            })
+        } else {
+            None
+        };
+        if tip.is_none() {
+            let detail = format!(
+                "Current origin/{} landing proof unavailable; cached refs are not sufficient",
+                ctx.config.branch.base
+            );
+            *warning = Some(match warning.take() {
+                Some(previous) => format!("{previous}; {detail}"),
+                None => detail,
+            });
+        }
+        published.insert(repository.to_path_buf(), tip);
+    }
+    let Some(tip) = published.get(repository).and_then(Option::as_deref) else {
+        return Ok(false);
+    };
+    // A newly advertised object may not have been fetched yet. Missing objects
+    // are unknown, not a reason to trust the older local base.
+    Ok(
+        run_git(ctx, path, ["merge-base", "--is-ancestor", head, tip])
+            .await?
+            .status
+            .success(),
+    )
 }
 
 /// Re-plan the exact confirmed set. Never expand a user's confirmation because
@@ -337,4 +382,98 @@ fn same_revision(plan: &wt_lifecycle::RemovalRevision, expected: &wt_tui::Remova
         && plan.head == expected.head
         && plan.digest == expected.digest
         && plan.hazards == expected.hazards
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::test_support::CommandFixture;
+
+    async fn git(ctx: &AppContext, path: &Path, args: &[&str]) -> String {
+        run_git(ctx, path, args.iter().copied())
+            .await
+            .unwrap()
+            .checked("fixture git")
+            .unwrap()
+            .stdout_text()
+            .trim()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn removal_landing_requires_the_current_published_base() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, path, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(
+            ctx,
+            path,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        let base = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        let anchor = base.clone();
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(path.join("work.txt"), "unpublished branch work\n").unwrap();
+        git(ctx, path, &["add", "work.txt"]).await;
+        git(ctx, path, &["commit", "-m", "feature work"]).await;
+        let head = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let row = ctx
+            .repository
+            .inventory(&ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "one")
+            .unwrap();
+        let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+            .await
+            .unwrap();
+        assert!(plan.rows[0].local_merged);
+        assert!(plan.rows[0].hazards.is_empty());
+
+        // Simulate a remote force-push without updating this checkout's cached
+        // origin/main. The old cache still contains HEAD, but origin does not.
+        git(ctx, &origin, &["update-ref", "refs/heads/main", &base]).await;
+        assert_eq!(git(ctx, path, &["rev-parse", "origin/main"]).await, head);
+        let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+            .await
+            .unwrap();
+        assert!(!plan.rows[0].landed);
+        assert!(
+            plan.rows[0]
+                .hazards
+                .iter()
+                .any(|hazard| hazard.contains("unpushed"))
+        );
+
+        // Neither a deleted remote base nor a matching local main is a proof.
+        git(ctx, &origin, &["update-ref", "-d", "refs/heads/main"]).await;
+        let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+            .await
+            .unwrap();
+        assert!(!plan.rows[0].landed);
+        assert!(plan.warning.is_some());
+        git(ctx, path, &["update-ref", "-d", "refs/remotes/origin/main"]).await;
+        git(ctx, path, &["update-ref", "refs/heads/main", &head]).await;
+        let plan = plan_with_facts(ctx, vec![row], &state, &GithubData::default(), None)
+            .await
+            .unwrap();
+        assert!(!plan.rows[0].landed);
+        fixture.close().await.unwrap();
+    }
 }

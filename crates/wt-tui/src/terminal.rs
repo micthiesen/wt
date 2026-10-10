@@ -1,9 +1,14 @@
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
+use std::{future::Future, pin::Pin};
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -25,6 +30,7 @@ impl TerminalGuard {
             io::stdout(),
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableMouseCapture,
             Hide
         ) {
             let _ = disable_raw_mode();
@@ -41,6 +47,7 @@ impl TerminalGuard {
         if let Err(error) = execute!(
             io::stdout(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             Show,
             LeaveAlternateScreen
         ) {
@@ -49,6 +56,7 @@ impl TerminalGuard {
                 io::stdout(),
                 EnterAlternateScreen,
                 EnableBracketedPaste,
+                EnableMouseCapture,
                 Hide
             );
             return Err(error);
@@ -66,6 +74,7 @@ impl TerminalGuard {
             io::stdout(),
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableMouseCapture,
             Hide
         ) {
             let _ = disable_raw_mode();
@@ -85,6 +94,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             Show,
             LeaveAlternateScreen
         );
@@ -95,8 +105,37 @@ impl Drop for TerminalGuard {
 /// workers. No timer drives rendering and no source is fetched from this loop.
 pub async fn run(
     source: SourceHandle<Board>,
+    actions: UiActions,
+    cancel: CancellationToken,
+) -> io::Result<()> {
+    run_inner(source, actions, cancel, None).await
+}
+
+/// Run the TUI and query OSC 10/11 colors while wt owns the raw terminal.
+/// Any ordinary key events received during the bounded query are replayed
+/// before the event stream begins consuming new input.
+pub async fn run_with_palette_probe<'a, F, Fut>(
+    source: SourceHandle<Board>,
+    actions: UiActions,
+    cancel: CancellationToken,
+    on_palette: F,
+) -> io::Result<()>
+where
+    F: FnOnce(Option<(String, String)>) -> Fut + 'a,
+    Fut: Future<Output = ()> + 'a,
+{
+    let callback: PaletteCallback<'a> = Box::new(move |colors| Box::pin(on_palette(colors)));
+    run_inner(source, actions, cancel, Some(callback)).await
+}
+
+type PaletteCallback<'a> =
+    Box<dyn FnOnce(Option<(String, String)>) -> Pin<Box<dyn Future<Output = ()> + 'a>> + 'a>;
+
+async fn run_inner<'a>(
+    source: SourceHandle<Board>,
     mut actions: UiActions,
     cancel: CancellationToken,
+    on_palette: Option<PaletteCallback<'a>>,
 ) -> io::Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         return Err(io::Error::other(
@@ -105,6 +144,19 @@ pub async fn run(
     }
     let mut guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut pending_events = VecDeque::new();
+    if let Some(on_palette) = on_palette {
+        match crate::terminal_probe::query().await {
+            Ok(probe) => {
+                on_palette(probe.palette).await;
+                pending_events.extend(probe.events);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "terminal color probe failed");
+                on_palette(None).await;
+            }
+        }
+    }
     let mut events = EventStream::new();
     let mut snapshots = source.subscribe();
     let mut model = Model::default();
@@ -135,7 +187,13 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            event = events.next() => {
+            event = async {
+                if let Some(event) = pending_events.pop_front() {
+                    Some(Ok(event))
+                } else {
+                    events.next().await
+                }
+            } => {
                 let Some(event) = event else { break; };
                 match event? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -164,6 +222,9 @@ pub async fn run(
                         }
                     }
                     Event::Resize(_, _) => dirty = true,
+                    Event::Mouse(mouse) => {
+                        dirty |= crate::mouse::scroll(&mut model, mouse, terminal.size()?.into());
+                    }
                     Event::Paste(text) => dirty |= model.paste(&text),
                     _ => {}
                 }

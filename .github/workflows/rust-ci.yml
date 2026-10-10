@@ -84,7 +84,7 @@ jobs:
       - name: Verify real native installation, update, rollback and failed release recovery
         run: python3 scripts/native-release-check.py
       - name: Verify terminal liveness and filesystem refresh
-        run: python3 scripts/native-ui-check.py --binary target/debug/wt --sections --output "${{ runner.temp }}/wt-native-ui"
+        run: python3 scripts/native-ui-check.py --binary target/debug/wt --sections --feeds --output "${{ runner.temp }}/wt-native-ui"
       - name: Verify shutdown with Git children in flight
         run: python3 scripts/native-ui-check.py --binary target/debug/wt --exit-signal TERM --output "${{ runner.temp }}/wt-native-signal"
       - name: Verify terminal handoff to a private tmux shell and back

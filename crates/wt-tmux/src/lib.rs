@@ -7,11 +7,15 @@
 
 use std::{
     ffi::OsString,
+    fs::{self, OpenOptions},
+    io,
+    io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use wt_platform::process::{CommandSpec, ProcessError, ProcessOutput, ProcessRunner};
@@ -21,6 +25,7 @@ use wt_platform::process::{CommandSpec, ProcessError, ProcessOutput, ProcessRunn
 // last and parse with splitn so their contents remain intact.
 const FORMAT_SEPARATOR: char = ':';
 static BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PALETTE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TmuxSocket {
@@ -37,6 +42,164 @@ pub struct TmuxServer {
     /// Optional config file passed at server launch; tests and embedded
     /// callers can avoid reading a user's tmux configuration.
     pub config_file: Option<PathBuf>,
+}
+
+/// Terminal colors observed by the owning TUI. Invalid or partial observations
+/// are ignored rather than replaced with a guessed palette.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPalette {
+    pub default_foreground: String,
+    pub default_background: String,
+}
+
+/// Validate and canonicalize the colors used in the generated tmux config.
+pub fn terminal_palette(value: &serde_json::Value) -> Option<TerminalPalette> {
+    let palette: TerminalPalette = serde_json::from_value(value.clone()).ok()?;
+    let valid = |color: &str| {
+        color.len() == 7
+            && color.starts_with('#')
+            && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if !valid(&palette.default_foreground) || !valid(&palette.default_background) {
+        return None;
+    }
+    Some(TerminalPalette {
+        default_foreground: palette.default_foreground.to_ascii_lowercase(),
+        default_background: palette.default_background.to_ascii_lowercase(),
+    })
+}
+
+/// Render tmux's global window styles from a previously observed palette.
+pub fn terminal_palette_config(value: &serde_json::Value) -> String {
+    let Some(palette) = terminal_palette(value) else {
+        return String::new();
+    };
+    let style = format!(
+        "fg={},bg={}",
+        palette.default_foreground, palette.default_background
+    );
+    format!("set -g window-style '{style}'\nset -g window-active-style '{style}'\n")
+}
+
+/// Persist a real OSC palette observation. Invalid values leave the previous
+/// observation untouched so an unsupported terminal does not erase known
+/// colors.
+pub fn save_terminal_palette(
+    cache_root: &Path,
+    default_foreground: &str,
+    default_background: &str,
+) -> io::Result<bool> {
+    let value = serde_json::json!({
+        "defaultForeground": color_to_hex(default_foreground),
+        "defaultBackground": color_to_hex(default_background),
+    });
+    if value["defaultForeground"].is_null() || value["defaultBackground"].is_null() {
+        return Ok(false);
+    }
+    let Some(palette) = terminal_palette(&value) else {
+        return Ok(false);
+    };
+    fs::create_dir_all(cache_root)?;
+    let target = cache_root.join("terminal-palette.json");
+    let sequence = PALETTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = cache_root.join(format!(
+        "terminal-palette.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let bytes = serde_json::to_vec(&palette).map_err(io::Error::other)?;
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(true)
+}
+
+fn color_to_hex(value: &str) -> Option<String> {
+    if value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Some(value.to_ascii_lowercase());
+    }
+    let components = value.strip_prefix("rgb:")?.split('/').collect::<Vec<_>>();
+    if components.len() != 3 {
+        return None;
+    }
+    let mut output = String::from("#");
+    for component in components {
+        if !(1..=4).contains(&component.len())
+            || !component.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let value = u32::from_str_radix(component, 16).ok()?;
+        let max = (1_u32 << (4 * component.len())) - 1;
+        let scaled = ((value * 255 + max / 2) / max) as u8;
+        use std::fmt::Write as _;
+        write!(&mut output, "{scaled:02x}").ok()?;
+    }
+    Some(output)
+}
+
+/// Write an optional palette config for a private tmux server. `None` means
+/// there was no trustworthy observation. When active, source the user's
+/// ordinary tmux config first so adding palette styles does not hide it.
+pub fn write_terminal_palette_config(cache_root: &Path, home: &Path) -> io::Result<PathBuf> {
+    let palette_path = cache_root.join("terminal-palette.json");
+    fs::create_dir_all(cache_root)?;
+    let styles = fs::metadata(&palette_path)
+        .ok()
+        .filter(|metadata| metadata.is_file() && metadata.len() <= 64 * 1024)
+        .and_then(|_| fs::read(&palette_path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|value| terminal_palette_config(&value))
+        .unwrap_or_default();
+    let target = cache_root.join("tmux-palette.conf");
+    let sequence = PALETTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = cache_root.join(format!(
+        "tmux-palette.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let user_config = home.join(".tmux.conf");
+    let content = format!(
+        "source-file -q {}\n{styles}",
+        tmux_config_quote(&user_config.to_string_lossy())
+    );
+    let result = fs::write(&temporary, content).and_then(|()| fs::rename(&temporary, &target));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(target)
+}
+
+fn tmux_config_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 impl TmuxServer {
@@ -616,6 +779,50 @@ impl TmuxClient {
             .run_os("set-option", args, None, None, cancellation)
             .await?;
         checked("set-option", result).map(|_| ())
+    }
+
+    /// Apply terminal defaults to an already-running private server. The
+    /// persisted config handles cold starts; this avoids stale colors for
+    /// sessions in a server that was started before the observation.
+    pub async fn apply_terminal_palette(
+        &self,
+        default_foreground: &str,
+        default_background: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, TmuxError> {
+        let (Some(foreground), Some(background)) = (
+            color_to_hex(default_foreground),
+            color_to_hex(default_background),
+        ) else {
+            return Ok(false);
+        };
+        let style = format!("fg={foreground},bg={background}");
+        let result = self
+            .run_os(
+                "apply terminal palette",
+                [
+                    "set-option".into(),
+                    "-g".into(),
+                    "window-style".into(),
+                    style.clone().into(),
+                    ";".into(),
+                    "set-option".into(),
+                    "-g".into(),
+                    "window-active-style".into(),
+                    style.into(),
+                ],
+                None,
+                None,
+                cancellation,
+            )
+            .await?;
+        if result.status.success() {
+            return Ok(true);
+        }
+        if tmux_server_definitely_absent(&result.stderr_text()) {
+            return Ok(false);
+        }
+        Err(command_error("apply terminal palette", result))
     }
 
     pub async fn rename_session(

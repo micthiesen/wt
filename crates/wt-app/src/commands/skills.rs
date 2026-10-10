@@ -18,8 +18,9 @@ pub enum SkillsCommand {
     /// Install or update bundled skills.
     #[command(alias = "install")]
     Sync {
-        unit: Option<String>,
-        #[arg(long)]
+        #[arg(value_name = "NAME", num_args = 0..)]
+        units: Vec<String>,
+        #[arg(short = 'y', long)]
         yes: bool,
         #[arg(long)]
         force: bool,
@@ -73,7 +74,7 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
             }
             Ok(0)
         }
-        SkillsCommand::Sync { unit, yes, force } => {
+        SkillsCommand::Sync { units, yes, force } => {
             let options = super::super::skills::target_options_for(context);
             let targets = detect_targets(&options);
             if targets.harnesses.is_empty() {
@@ -83,12 +84,43 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
             let interactive = std::io::stdin().is_terminal() && !yes;
             let mut mem = memory.load()?;
             let initial = build_reports(&targets, &mem);
+            let known = initial
+                .iter()
+                .map(|report| wt_skills::unit_key(report.unit).to_owned())
+                .chain(wt_skills::units().iter().map(|unit| unit.name.to_owned()))
+                .collect::<std::collections::BTreeSet<_>>();
+            let unknown = units
+                .iter()
+                .filter(|name| !known.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unknown.is_empty() {
+                let available = wt_skills::units()
+                    .iter()
+                    .map(|unit| unit.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "unknown unit(s): {} (have: {available})",
+                    unknown.join(", ")
+                );
+            }
             if interactive {
                 let pending = initial
                     .iter()
-                    .filter(|r| {
-                        unit.as_ref().is_some_and(|name| name == r.unit.name)
-                            || wt_skills::report_is_actionable(r)
+                    .filter(|report| {
+                        let explicitly_named = units.iter().any(|name| {
+                            name == report.unit.name || *name == wt_skills::unit_key(report.unit)
+                        });
+                        if units.is_empty() {
+                            wt_skills::report_is_actionable(report)
+                        } else {
+                            explicitly_named
+                                && matches!(
+                                    report.state,
+                                    UnitState::Missing | UnitState::Outdated | UnitState::Modified
+                                )
+                        }
                     })
                     .map(|r| r.unit.name)
                     .collect::<std::collections::BTreeSet<_>>();
@@ -117,19 +149,12 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
             let selected = before
                 .into_iter()
                 .filter(|r| {
-                    unit.as_ref().is_none_or(|name| {
-                        name == r.unit.name || *name == wt_skills::unit_key(r.unit)
-                    })
+                    units.is_empty()
+                        || units
+                            .iter()
+                            .any(|name| name == r.unit.name || *name == wt_skills::unit_key(r.unit))
                 })
                 .collect::<Vec<_>>();
-            if let Some(name) = &unit
-                && wt_skills::find_unit(name).is_none()
-                && !selected
-                    .iter()
-                    .any(|r| wt_skills::unit_key(r.unit) == *name)
-            {
-                bail!("unknown skill unit `{name}`")
-            }
             if !interactive && !yes && !force {
                 let pending = selected
                     .iter()
@@ -164,7 +189,7 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
                 ) {
                     continue;
                 }
-                if report.declined && unit.is_none() {
+                if report.declined && units.is_empty() {
                     continue;
                 }
                 let apply = if report.state == UnitState::Modified {
@@ -346,5 +371,58 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
             println!("cleared saved skills answers and declines");
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SkillsArgs, SkillsCommand};
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: AppCommand,
+    }
+
+    #[derive(Debug, clap::Subcommand)]
+    enum AppCommand {
+        Skills(SkillsArgs),
+    }
+
+    #[test]
+    fn sync_accepts_multiple_units_yes_alias_and_install_alias() {
+        for invocation in [
+            vec!["wt", "skills", "sync", "wt", "start", "-y"],
+            vec!["wt", "skills", "install", "wt", "start", "--yes"],
+        ] {
+            let Cli {
+                command:
+                    AppCommand::Skills(SkillsArgs {
+                        command: Some(SkillsCommand::Sync { units, yes, force }),
+                    }),
+            } = Cli::try_parse_from(invocation).unwrap()
+            else {
+                panic!("expected skills sync")
+            };
+            assert_eq!(units, vec!["wt".to_owned(), "start".to_owned()]);
+            assert!(yes);
+            assert!(!force);
+        }
+    }
+
+    #[test]
+    fn sync_keeps_force_distinct_and_rejects_unknown_flags() {
+        let parsed = Cli::try_parse_from(["wt", "skills", "sync", "wt", "--force"]).unwrap();
+        let AppCommand::Skills(SkillsArgs {
+            command: Some(SkillsCommand::Sync { units, yes, force }),
+        }) = parsed.command
+        else {
+            panic!("expected skills sync")
+        };
+        assert_eq!(units, vec!["wt".to_owned()]);
+        assert!(!yes);
+        assert!(force);
+        assert!(Cli::try_parse_from(["wt", "skills", "sync", "--typo"]).is_err());
     }
 }

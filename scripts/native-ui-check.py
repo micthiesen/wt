@@ -7,6 +7,7 @@ processes are blocked, external file invalidation, and clean terminal shutdown.
 """
 
 import argparse
+from datetime import datetime, timezone
 import errno
 import fcntl
 import importlib.util
@@ -14,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shutil
 import signal
@@ -29,6 +31,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--exit-signal", choices=["quit", "TERM", "HUP", "INT"], default="quit")
     parser.add_argument("--sections", action="store_true", help="also exercise filing and renaming through the terminal")
+    parser.add_argument("--feeds", action="store_true", help="also verify log backfill, seen state and searchable help")
     args = parser.parse_args()
     binary = args.binary.resolve()
     root = args.output.resolve()
@@ -36,6 +39,23 @@ def main():
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
     main_clone, home, config = fixture.fixture(root, 3)
+    app_logs = root / "logs/app"
+    app_logs.mkdir(parents=True)
+    config.write_text(config.read_text().replace(
+        "[paths]\n", "[paths]\n" + f"log_dir = {json.dumps(str(app_logs.parent))}\n"
+    ))
+    feed_log = app_logs / "wt-native.fixture.log"
+
+    def append_feed(text, channel="activity"):
+        record = dict(timestamp=datetime.now(timezone.utc).isoformat(), level="INFO",
+                      target="fixture", fields=dict(message=text, event_channel=channel))
+        with feed_log.open("a") as stream:
+            stream.write(json.dumps(record) + "\n")
+
+    if args.feeds:
+        # Use contiguous glyphs: Ratatui may skip blank cells with cursor moves.
+        append_feed("Retained-attention-fixture", "attention")
+        append_feed("Retained-activity-fixture")
     tools = root / "tools"
     tools.mkdir()
     delay = root / "delay-git"
@@ -107,6 +127,29 @@ def main():
         before = len(capture)
         drain_for(0.5)
         assert len(capture) == before, "idle terminal kept emitting frames"
+        if args.feeds:
+            wait_for(lambda _: b"Retained-attention-fixture" in capture)
+            os.write(master, b'"')
+            wait_for(lambda data: b"Retained-activity-fixture" in data)
+            append_feed("Live-log-fixture")
+            wait_for(lambda data: b"Live-log-fixture" in data)
+            os.write(master, b'"x')
+
+            def seen_persisted():
+                with sqlite3.connect(f"file:{root / 'state/wt.sqlite'}?mode=ro", uri=True) as state:
+                    return any(json.loads(row[0]).get("attentionSeenTs", 0) > 0
+                               for row in state.execute("SELECT data FROM repository_state"))
+
+            wait_for(lambda _: seen_persisted())
+            os.write(master, b"?/merge")
+            wait_for(lambda data: b"Togglemergewhenready" in re.sub(
+                rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data
+            ))
+            # First Esc clears the search, second closes help.
+            os.write(master, b"\x1b")
+            drain_for(0.1)
+            os.write(master, b"\x1b")
+            drain_for(0.2)
         delay.touch()
         os.write(master, b"r")
         wait_for(lambda _: started.exists())
@@ -208,6 +251,8 @@ def main():
                       title_edit_git_scans=0,
                       section_controls=args.sections,
                       history_perf_and_hard_refresh=args.sections,
+                      feed_backfill_append_and_seen=args.feeds,
+                      searchable_help=args.feeds,
                       accepted_write_survived_quit=args.exit_signal == "quit",
                       clean_shutdown=True, exit_signal=args.exit_signal)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")

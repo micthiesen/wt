@@ -40,6 +40,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
         | UiAction::SubmitReviewers { .. }
         | UiAction::SetPerf { .. }
         | UiAction::SetHistoryActive { .. }
+        | UiAction::SetAttentionSeen { .. }
         | UiAction::Restack { .. }
         | UiAction::PrepareRestoreRemoved { .. }
         | UiAction::RestoreRemoved { .. }

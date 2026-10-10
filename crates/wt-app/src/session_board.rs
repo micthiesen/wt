@@ -69,15 +69,17 @@ fn compose(
         return source;
     };
     let mut board = prepared.as_ref().clone();
-    board.attention.extend(board.activity.iter().cloned());
     for (label, state) in [
         ("Session inventory", &inventory.state),
         ("Session discovery", &discoveries.state),
         ("Agent activity", &activity.state),
     ] {
         if let SourceState::Failed(error) = state {
-            board.activity.push(format!("{label}: {}", clean(error)));
-            board.attention.push(format!("{label}: {}", clean(error)));
+            crate::activity_source::append_attention(
+                &mut board,
+                label,
+                &format!("{}: {}", label, clean(error)),
+            );
         }
     }
     let inventory_ok = matches!(inventory.state, SourceState::Ready);
@@ -140,31 +142,29 @@ fn compose(
         }
     }
     if let Some(activity) = activity.data.as_ref() {
-        board.activity.extend(
-            activity
-                .events
-                .iter()
-                .rev()
-                .take(100)
-                .rev()
-                .map(|event| clean(&event.text)),
-        );
-        board.attention.extend(
-            activity
-                .events
-                .iter()
-                .rev()
-                .take(100)
-                .rev()
-                .filter(|event| {
-                    matches!(
-                        event.level,
-                        crate::session_activity::ActivityKindDto::Warn
-                            | crate::session_activity::ActivityKindDto::ToolError
-                    )
-                })
-                .map(|event| clean(&event.text)),
-        );
+        for event in activity.events.iter().rev().take(100).rev() {
+            let at_ms = u64::try_from(event.timestamp_ms).unwrap_or_default();
+            let text = clean(&event.text);
+            let (level, attention) = match event.level {
+                crate::session_activity::ActivityKindDto::Warn => ("WARN", true),
+                crate::session_activity::ActivityKindDto::ToolError => ("ERROR", true),
+                _ => ("INFO", false),
+            };
+            board.activity.push(wt_tui::ActivityLine {
+                at_ms,
+                level: level.into(),
+                channel: if attention { "attention" } else { "activity" }.into(),
+                source: "agent session".into(),
+                text: text.clone(),
+            });
+            if attention {
+                board.attention.push(wt_tui::AttentionLine {
+                    at_ms,
+                    source: "agent session".into(),
+                    text,
+                });
+            }
+        }
         if let Some(usage) = &activity.usage {
             for (name, five, week) in [
                 ("Claude", &usage.claude_five_hour, &usage.claude_seven_day),
@@ -183,6 +183,7 @@ fn compose(
             }
         }
     }
+    crate::activity_source::bound_feeds(&mut board);
     source.data = Some(Arc::new(board));
     source
 }
@@ -266,7 +267,7 @@ mod tests {
             board
                 .activity
                 .iter()
-                .any(|line| line.contains("tmux unavailable"))
+                .any(|line| line.text.contains("tmux unavailable"))
         );
     }
 }

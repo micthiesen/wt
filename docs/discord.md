@@ -10,7 +10,7 @@ enabled — that id is public by design; it powers the README badge).
 - **#updates** — AI-written commit digests, posted by the workflow below.
   Nothing else posts here.
 - **#github** — raw repo events via a native Discord GitHub webhook (see
-  below), plus unsuccessful `ci` completions on `main`. Deliberately excludes
+  below), plus unsuccessful `Native release` completions on `main`. Deliberately excludes
   pushes so it never overlaps #updates.
 - **#help** — support. Carries a pinned message telling reporters to include
   `wt doctor` output and the tail of `~/.cache/wt/logs/app/wt-<date>.log`.
@@ -21,10 +21,11 @@ enabled — that id is public by design; it powers the README badge).
 The helper uses Python's standard library and needs no JavaScript runtime.
 Full mechanics are documented in those files' header comments; the shape:
 
-- Triggers via `workflow_run` when the `ci` workflow goes green on `main` (a
+- Triggers via `workflow_run` when `Native release` goes green on `main` (a
   red tree is never digested; its commits roll into the next green digest).
-  The trigger names the workflow by its `name:` — if `ci` is ever renamed,
-  update `workflows: [ci]` here in the same commit, or digests silently stop
+  That workflow includes Rust CI, all four native packages, and publication.
+  The trigger names the workflow by its `name:`. If it is renamed,
+  update `workflows: [Native release]` in both Discord workflows in the same commit, or digests silently stop
   (this bit us once when `typecheck` became `ci`).
 - Debounce: the run sleeps 30 minutes inside a `concurrency` group with
   `cancel-in-progress: true`, so every newer green push cancels the sleeping
@@ -42,14 +43,14 @@ Full mechanics are documented in those files' header comments; the shape:
 - Attribution is built in: the embed footer lists commit authors' GitHub
   logins.
 - **Silence is ambiguous, and #updates is the only place it shows.** Because
-  the trigger is green-`ci`-on-`main`, "no digest for two days" has two
+  the trigger is a green release on `main`, "no digest for two days" has two
   readings that look identical from the channel: nobody pushed, or `main` has
   been red and every commit is queued for the next green digest. It was the
   second on 2026-08-24 to 08-26 (eight pushes, four config-leaking
   `rollupChecklist` tests, fixed in `test/preload.ts` + `test/config.toml`),
   and nothing anywhere announced it — the same green gate also holds back
   hot updates, so users had been getting nothing either. Before treating a
-  quiet #updates as a digest bug, check `gh run list --workflow=ci.yml
+  quiet #updates as a digest bug, check `gh run list --workflow=release.yml
   --branch=main`; a run of `skipped` digest runs is the tell, since the
   green-only `if:` skips rather than fails.
 - A GitHub Actions outage can wedge a `push`-triggered ci run in
@@ -70,7 +71,7 @@ events. `issue_comment` is deliberately excluded because GitHub also uses it
 for pull-request comments. Hook id `662175381`.
 
 `.github/workflows/discord-ci-alert.yml` separately posts every non-successful
-completion of the `ci` workflow on `main`, including failures, cancellations,
+completion of `Native release` on `main`, including failures, cancellations,
 and timeouts. The alert includes the conclusion, commit, actor, and a direct
 link to the Actions run. It uses the Actions secret `DISCORD_GITHUB_WEBHOOK`,
 which is the same channel webhook URL without the native integration's
@@ -105,8 +106,7 @@ secrets; never commit one.
 
 ## Deliberately not set up (revisit when the server grows)
 
-- Release flow / release announcements — too heavy for now; the digest covers
-  it.
+- Separate release announcements; the digest covers published changes.
 - Forum-style #help (needs Community mode) and an opt-in @updates ping role —
   wait for strangers.
 - Stats/moderation bots, server banner, vanity URL.

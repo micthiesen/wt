@@ -4,9 +4,8 @@ The user authorized a complete rewrite on this branch. Keep work on this branch;
 do not merge or promote it. The TypeScript tree is a temporary behavior reference,
 not a permitted runtime dependency of the finished application.
 
-Use the parent instructions for behavioral contracts. Their TypeScript-specific
-Effect, React, OpenTUI, and TanStack rules apply to the reference implementation;
-Rust uses explicit ownership, typed errors, Tokio tasks, and scoped resources.
+Use the parent instructions for behavioral contracts. Rust uses explicit
+ownership, typed errors, Tokio tasks, and scoped resources.
 
 - Keep domain transforms pure. Pass configuration, clocks, repository identity,
   and external adapters explicitly; never read global configuration at import or

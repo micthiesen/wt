@@ -48,6 +48,8 @@ pub(crate) const LINES: &[&str] = &[
     "",
     "Output",
     "'                Select activity / session / action log",
+    "\"                Toggle attention / all activity",
+    "x                Mark attention feed seen",
     "[ / ]            Previous / next stream",
     "Ctrl+Y / Ctrl+E  Scroll output up / down",
     "",
@@ -60,3 +62,16 @@ pub(crate) const LINES: &[&str] = &[
     "",
     "Esc / q / ? closes help",
 ];
+
+pub(crate) fn filtered_lines(query: &str) -> Vec<&'static str> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        LINES.to_vec()
+    } else {
+        LINES
+            .iter()
+            .copied()
+            .filter(|line| line.to_lowercase().contains(&query))
+            .collect()
+    }
+}

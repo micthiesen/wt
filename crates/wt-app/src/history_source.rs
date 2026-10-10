@@ -245,8 +245,8 @@ pub fn overlay(
                 }
                 if let SourceState::Failed(error) = &history_snapshot.state {
                     let detail = clean(&format!("History: {error}"));
-                    if !board.attention.contains(&detail) {
-                        board.attention.push(detail);
+                    if !board.attention.iter().any(|line| line.text == detail) {
+                        crate::activity_source::append_attention(board, "History", &detail);
                     }
                 }
             }

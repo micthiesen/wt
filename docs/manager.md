@@ -60,12 +60,18 @@ thread ownership and an empty idle composer, protecting drafts and approval
 prompts. A command is never automatically retried after submission.
 Command submission does not prove native compaction completed.
 
-`bun scripts/codex-compact-recognition.ts` runs installed Codex in an isolated
-tmux session with a local fake Responses provider. It requires one native
-Compact dispatch, a persisted compaction event, and no additional user turn,
-using the production ownership and readiness checks. It tests the transport
-and native compaction lifecycle, not summary quality. No live sessions or
-credentials are used.
+`python3 scripts/native-codex-compact-smoke.py` runs installed Codex in an
+isolated tmux session with a loopback fake Responses provider. A Rust bridge
+calls the production `CodexMessenger` fallback, including its exact-UUID and
+idle-composer readiness checks. The smoke requires one persisted compaction
+event and no additional user turn; it tests transport and lifecycle, not
+summary quality. No live sessions or credentials are used.
+
+`python3 scripts/native-codex-palette-smoke.py --binary target/debug/wt` runs
+the native TUI in an isolated PTY, answers its bounded OSC color query with
+fragmented replies and an interleaved navigation key, then verifies the saved
+colors reach a private tmux session and the actual Codex composer. It uses
+isolated homes and repositories, with no credentials or model requests.
 
 Fleet-scoped commands (`d`/`t`/`o`/`n`/`a`/`s` and custom text) send with no row context and no `[re:]` prefix. The row-scoped entries (`r`, plus any of your `[[actions]]` with `target = "manager"`, which also appear in the palette) launch against the row selected when the palette opened — grayed out when there isn't one.
 

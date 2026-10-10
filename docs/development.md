@@ -35,3 +35,21 @@ The workspace's development profile keeps line tables for project code and
 disables dependency debug symbols to reduce disk use while retaining useful
 backtraces. Do not replace the soft size report with an automatic `cargo clean`
 or a broad artifact sweep.
+
+## CI and release checks
+
+`rust-ci.yml` runs formatting, Clippy, dependency policy, packaging helper tests,
+and native unit/integration tests on Linux and macOS. Lint, test, and optimized
+builds have separate Cargo caches; CI disables incremental compilation. Pull
+requests run this workflow directly. On `main`, `release.yml` calls the same
+checks while building the four release targets in parallel, then publishes only
+after every check and package succeeds. This avoids a duplicate main-branch test
+run and removes the former Bun workflow. Discord digests and failure alerts
+follow completion of the encompassing native release workflow.
+
+`scripts/fixture.sh build` creates a native 24-worktree board with sections,
+stacks, statuses and cleanup hazards. Build `wt-app` first, or set `WT_NATIVE_BIN`
+to the binary to exercise. `scripts/fixture.sh probe` opens it in a private tmux
+session; `scripts/fixture.sh rm` removes that fixture. `scripts/tui-test.sh`
+also supports explicit native binary probes; without the fixture's isolated
+configuration, treat a probe as read-only.

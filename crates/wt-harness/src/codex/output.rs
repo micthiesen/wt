@@ -103,6 +103,17 @@ impl CodexHarness {
     }
 }
 
+impl CodexOutputTracker {
+    /// Exact rollout files whose cursors are currently retained. Callers may
+    /// watch these paths for append notifications while keeping a bounded
+    /// polling fallback for missed filesystem events.
+    pub fn watched_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.by_session
+            .values()
+            .filter_map(|cursor| cursor.path.as_deref())
+    }
+}
+
 fn read_target(
     sessions_dir: &std::path::Path,
     cursor: &mut Cursor,
@@ -405,6 +416,16 @@ mod tests {
             .unwrap();
         assert!(initial.reset);
         assert_eq!(initial.session_id, id);
+        let tracker = CodexOutputTracker {
+            by_session: HashMap::from([(
+                (target.slug.clone(), target.session_id.clone()),
+                cursor.clone(),
+            )]),
+        };
+        assert_eq!(
+            tracker.watched_paths().collect::<Vec<_>>(),
+            [path.as_path()]
+        );
         assert!(
             initial
                 .append

@@ -7,7 +7,8 @@ use wt_platform::process::ProcessRunner;
 use crate::{
     CreateSession, CreateWindow, OptionScope, PaneTarget, TmuxClient, TmuxServer, WindowTarget,
     exact_pane_target, exact_session_target, exact_window_target, parse_panes, parse_sessions,
-    parse_windows, shell_quote,
+    parse_windows, save_terminal_palette, shell_quote, terminal_palette, terminal_palette_config,
+    write_terminal_palette_config,
 };
 
 #[test]
@@ -42,6 +43,93 @@ fn exact_targets_and_shell_quoting_are_structural() {
     assert_eq!(exact_window_target("@4"), "@4");
     assert_eq!(PaneTarget::active_session_pane("demo").as_str(), "=demo:");
     assert_eq!(shell_quote("a'b $(touch nope)"), "'a'\\''b $(touch nope)'");
+}
+
+#[test]
+fn production_palette_config_uses_only_valid_observations() {
+    let colors = serde_json::json!({
+        "defaultForeground": "#CDd6F4",
+        "defaultBackground": "#1E1E2E",
+        "futureField": {"keptByCaller": true}
+    });
+    assert_eq!(
+        terminal_palette(&colors).unwrap().default_foreground,
+        "#cdd6f4"
+    );
+    assert_eq!(
+        terminal_palette_config(&colors),
+        "set -g window-style 'fg=#cdd6f4,bg=#1e1e2e'\nset -g window-active-style 'fg=#cdd6f4,bg=#1e1e2e'\n"
+    );
+    assert!(
+        terminal_palette_config(&serde_json::json!({"defaultBackground":"#000000"})).is_empty()
+    );
+    assert!(
+        terminal_palette_config(&serde_json::json!({
+            "defaultForeground":"#zzzzzz",
+            "defaultBackground":"#000000"
+        }))
+        .is_empty()
+    );
+
+    let temp = tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let home = temp.path().join("home with spaces");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        cache.join("terminal-palette.json"),
+        serde_json::to_vec(&colors).unwrap(),
+    )
+    .unwrap();
+    let config = write_terminal_palette_config(&cache, &home).unwrap();
+    let rendered = std::fs::read_to_string(&config).unwrap();
+    assert!(rendered.starts_with("source-file -q '"));
+    assert!(rendered.contains(&home.to_string_lossy().to_string()));
+    assert!(rendered.contains("window-active-style 'fg=#cdd6f4,bg=#1e1e2e'"));
+
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::named("isolated").with_config_file(&config),
+    );
+    assert!(
+        client
+            .create_session_args(&CreateSession {
+                name: "palette".into(),
+                cwd: home,
+                command: vec!["cat".into()],
+                width: None,
+                height: None,
+            })
+            .iter()
+            .any(|arg| arg == config.as_os_str())
+    );
+}
+
+#[test]
+fn palette_observations_are_atomic_validated_and_preserve_last_known_value() {
+    let temp = tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    assert!(save_terminal_palette(&cache, "#CDD6F4", "#1E1E2E").unwrap());
+    let path = cache.join("terminal-palette.json");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r##"{"defaultForeground":"#cdd6f4","defaultBackground":"#1e1e2e"}"##
+    );
+    assert!(save_terminal_palette(&cache, "rgb:cdcd/d6d6/f4f4", "rgb:1e1e/1e1e/2e2e").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r##"{"defaultForeground":"#cdd6f4","defaultBackground":"#1e1e2e"}"##
+    );
+    assert!(!save_terminal_palette(&cache, "default", "#000000").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r##"{"defaultForeground":"#cdd6f4","defaultBackground":"#1e1e2e"}"##
+    );
+    assert_eq!(
+        std::fs::read_dir(&cache).unwrap().count(),
+        1,
+        "atomic temporary files should be cleaned"
+    );
 }
 
 #[test]

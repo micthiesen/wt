@@ -435,7 +435,7 @@ struct Tracker {
     seen: BTreeSet<String>,
     expected: BTreeMap<String, Expected>,
     settled: BTreeSet<String>,
-    attention: VecDeque<String>,
+    attention: VecDeque<wt_tui::AttentionLine>,
 }
 
 impl Tracker {
@@ -488,8 +488,15 @@ impl Tracker {
                         format!(": {detail}")
                     }
                 );
-                self.attention
-                    .push_back(wt_core::sanitize_terminal_text(&line));
+                let text = wt_core::sanitize_terminal_text(&line);
+                let at_ms = epoch_ms();
+                let source = wt_core::sanitize_terminal_text(&meta.slug);
+                tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
+                self.attention.push_back(wt_tui::AttentionLine {
+                    at_ms,
+                    source,
+                    text,
+                });
                 while self.attention.len() > 10 {
                     self.attention.pop_front();
                 }
@@ -572,10 +579,11 @@ fn compose(
     };
     let mut data = data.as_ref().clone();
     if let SourceState::Failed(error) = &runs.state {
-        data.activity.push(format!(
-            "Action history: {}",
-            wt_core::sanitize_terminal_text(error)
-        ));
+        crate::activity_source::append_attention(
+            &mut data,
+            "Action history",
+            &wt_core::sanitize_terminal_text(error),
+        );
     }
     data.slot_logs.clear();
     for row in &mut data.rows {
@@ -662,12 +670,26 @@ fn compose(
         }
     }
     data.attention.retain(|line| {
-        !line.starts_with("Action succeeded:")
-            && !line.starts_with("Action failed:")
-            && !line.starts_with("Action killed:")
-            && !line.starts_with("Action uncertain:")
+        !line.text.starts_with("Action succeeded:")
+            && !line.text.starts_with("Action failed:")
+            && !line.text.starts_with("Action killed:")
+            && !line.text.starts_with("Action uncertain:")
     });
+    for event in &tracker.attention {
+        if !data.activity.iter().any(|line| {
+            line.at_ms == event.at_ms && line.source == event.source && line.text == event.text
+        }) {
+            data.activity.push(wt_tui::ActivityLine {
+                at_ms: event.at_ms,
+                level: "INFO".into(),
+                channel: "attention".into(),
+                source: event.source.clone(),
+                text: event.text.clone(),
+            });
+        }
+    }
     data.attention.extend(tracker.attention.iter().cloned());
+    crate::activity_source::bound_feeds(&mut data);
     board.data = Some(Arc::new(data));
     board
 }

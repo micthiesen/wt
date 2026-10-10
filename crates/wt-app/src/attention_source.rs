@@ -24,6 +24,7 @@ use crate::{
 };
 
 const MAX_ATTENTION_LINES: usize = 50;
+const MAX_ATTENTION_FEED: usize = 200;
 const COMMENT_BODY_CHARS: usize = 100;
 const MAX_COMMENT_LINES: usize = 3;
 
@@ -182,7 +183,13 @@ pub fn overlay(
                 );
             }
 
-            let projection = compose(board_snapshot, &transitions.events);
+            let seen_ms = metadata_snapshot
+                .data
+                .as_deref()
+                .and_then(|(state, _)| state.get("attentionSeenTs"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let projection = compose(board_snapshot, &transitions.events, seen_ms);
             let key = (projection.data.clone(), projection.state.clone());
             if last_projection.as_ref() != Some(&key) {
                 last_projection = Some(key);
@@ -193,12 +200,27 @@ pub fn overlay(
     source
 }
 
-fn compose(mut board: SourceSnapshot<Board>, events: &VecDeque<String>) -> SourceSnapshot<Board> {
+fn compose(
+    mut board: SourceSnapshot<Board>,
+    events: &VecDeque<wt_tui::AttentionLine>,
+    seen_ms: u64,
+) -> SourceSnapshot<Board> {
     let Some(existing) = board.data.as_ref() else {
         return board;
     };
     let mut prepared = existing.as_ref().clone();
     prepared.attention.extend(events.iter().cloned());
+    prepared.attention.sort_by_key(|event| event.at_ms);
+    prepared.attention.dedup_by(|left, right| {
+        left.at_ms == right.at_ms && left.source == right.source && left.text == right.text
+    });
+    if prepared.attention.len() > MAX_ATTENTION_FEED {
+        prepared
+            .attention
+            .drain(..prepared.attention.len() - MAX_ATTENTION_FEED);
+    }
+    prepared.attention_seen_ms = seen_ms;
+    crate::activity_source::bound_feeds(&mut prepared);
     board.data = Some(Arc::new(prepared));
     board
 }
@@ -261,13 +283,20 @@ struct TransitionTracker {
     dev: Option<BTreeMap<String, bool>>,
     manager: Option<(String, Option<DerivedState>)>,
     comments: BTreeMap<String, String>,
-    events: VecDeque<String>,
+    events: VecDeque<wt_tui::AttentionLine>,
 }
 
 impl TransitionTracker {
     fn push(&mut self, line: String) {
-        self.events
-            .push_back(wt_core::sanitize_terminal_text(&line));
+        let text = wt_core::sanitize_terminal_text(&line);
+        let at_ms = crate::activity_source::epoch_ms();
+        let source = "wt".to_owned();
+        tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
+        self.events.push_back(wt_tui::AttentionLine {
+            at_ms,
+            source,
+            text,
+        });
         while self.events.len() > MAX_ATTENTION_LINES {
             self.events.pop_front();
         }
@@ -627,13 +656,13 @@ mod tests {
             tracker
                 .events
                 .iter()
-                .any(|line| line.contains("ready to merge (risk: low)"))
+                .any(|line| line.text.contains("ready to merge (risk: low)"))
         );
         assert!(
             tracker
                 .events
                 .iter()
-                .any(|line| line.contains("moved to Review"))
+                .any(|line| line.text.contains("moved to Review"))
         );
     }
 
@@ -670,7 +699,7 @@ mod tests {
         };
         tracker.comments(&second, "me", None);
         assert_eq!(tracker.events.len(), 1);
-        assert!(tracker.events[0].contains("4 new PR comments"));
+        assert!(tracker.events[0].text.contains("4 new PR comments"));
     }
 
     #[test]
@@ -692,13 +721,13 @@ mod tests {
             tracker
                 .events
                 .iter()
-                .any(|line| line.contains("#ENG-1: Open → Review"))
+                .any(|line| line.text.contains("#ENG-1: Open → Review"))
         );
         assert!(
             tracker
                 .events
                 .iter()
-                .any(|line| line.contains("dev server crashed"))
+                .any(|line| line.text.contains("dev server crashed"))
         );
     }
 
@@ -709,7 +738,10 @@ mod tests {
             tracker.push(format!("line {index}"));
         }
         assert_eq!(tracker.events.len(), MAX_ATTENTION_LINES);
-        assert_eq!(tracker.events.front().map(String::as_str), Some("line 5"));
+        assert_eq!(
+            tracker.events.front().map(|line| line.text.as_str()),
+            Some("line 5")
+        );
     }
 
     #[test]
@@ -752,7 +784,7 @@ mod tests {
             tracker
                 .events
                 .iter()
-                .any(|line| line.contains("Open → Review"))
+                .any(|line| line.text.contains("Open → Review"))
         );
     }
 

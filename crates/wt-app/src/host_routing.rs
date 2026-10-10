@@ -7,6 +7,7 @@ pub fn controller_owned(action: &UiAction) -> bool {
     match action {
         UiAction::SetPerf { .. }
         | UiAction::SetHistoryActive { .. }
+        | UiAction::SetAttentionSeen { .. }
         | UiAction::OpenLink { .. }
         | UiAction::OpenPrLink { .. }
         | UiAction::Copy { .. }
@@ -183,6 +184,7 @@ fn visit_keys(
         | UiAction::DismissReviewRequest { .. }
         | UiAction::SetPerf { .. }
         | UiAction::SetHistoryActive { .. }
+        | UiAction::SetAttentionSeen { .. }
         | UiAction::OpenLink { .. }
         | UiAction::OpenPrLink { .. }
         | UiAction::FoldSection { .. }

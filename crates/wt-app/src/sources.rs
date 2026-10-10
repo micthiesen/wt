@@ -106,7 +106,11 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         context,
         github.clone(),
     ));
-    let activity = crate::activity_source::start(scope, context.config.paths.cache_root.clone());
+    let activity = crate::activity_source::start(
+        scope,
+        context.config.paths.cache_root.clone(),
+        context.config.paths.app_log_dir.clone(),
+    );
     let board = project(
         scope,
         fleet,
@@ -274,7 +278,7 @@ fn project(
     scope: &TaskScope,
     local: SourceHandle<Board>,
     github: SourceHandle<GithubData>,
-    activity: SourceHandle<Vec<String>>,
+    activity: SourceHandle<crate::activity_source::ActivitySnapshot>,
     enabled: bool,
     backstop: Duration,
 ) -> SourceHandle<Board> {
@@ -348,20 +352,31 @@ fn project(
 fn compose(
     mut local: SourceSnapshot<Board>,
     github: SourceSnapshot<GithubData>,
-    activity: SourceSnapshot<Vec<String>>,
+    activity: SourceSnapshot<crate::activity_source::ActivitySnapshot>,
 ) -> SourceSnapshot<Board> {
     let Some(board) = local.data.as_ref() else {
         return local;
     };
     let mut board = board.as_ref().clone();
-    if let Some(lines) = activity.data {
-        board.activity.extend(lines.iter().cloned());
+    if let Some(feed) = activity.data {
+        board.activity.extend(feed.activity.iter().cloned());
+        board.attention.extend(feed.attention.iter().cloned());
     }
     if let SourceState::Failed(error) = activity.state {
-        board.activity.push(format!(
-            "Manager reports: {}",
-            wt_core::sanitize_terminal_text(&error)
-        ));
+        let at_ms = crate::activity_source::epoch_ms();
+        let text = wt_core::sanitize_terminal_text(&error);
+        board.activity.push(wt_tui::ActivityLine {
+            at_ms,
+            level: "ERROR".into(),
+            channel: "activity".into(),
+            source: "activity feed".into(),
+            text: text.clone(),
+        });
+        board.attention.push(wt_tui::AttentionLine {
+            at_ms,
+            source: "activity feed".into(),
+            text,
+        });
     }
     if let Some(data) = &github.data {
         for row in &mut board.rows {
@@ -445,6 +460,7 @@ fn compose(
             }
         }
     }
+    crate::activity_source::bound_feeds(&mut board);
     local.data = Some(Arc::new(board));
     if let SourceState::Failed(error) = github.state {
         // A remote failure stays visible while local updates and last-good
@@ -611,7 +627,20 @@ mod tests {
         assert!(row.needs_attention);
         assert!(row.details.iter().any(|line| line == "Checks: failing"));
         activity_publisher.publish(SourceSnapshot {
-            data: Some(Arc::new(vec!["manager report".into()])),
+            data: Some(Arc::new(crate::activity_source::ActivitySnapshot {
+                activity: vec![wt_tui::ActivityLine {
+                    at_ms: 1,
+                    level: "INFO".into(),
+                    channel: "attention".into(),
+                    source: "manager".into(),
+                    text: "manager report".into(),
+                }],
+                attention: vec![wt_tui::AttentionLine {
+                    at_ms: 1,
+                    source: "manager".into(),
+                    text: "manager report".into(),
+                }],
+            })),
             state: SourceState::Ready,
             updated_at: None,
             revision: 0,
@@ -619,7 +648,7 @@ mod tests {
         wait_for(&source, |s| {
             s.data
                 .as_ref()
-                .is_some_and(|b| b.activity == ["manager report"])
+                .is_some_and(|b| b.activity.iter().any(|line| line.text == "manager report"))
         })
         .await;
         assert!(

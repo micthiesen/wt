@@ -4,7 +4,7 @@ name: discord-ci-alert
 
 on:
   workflow_run:
-    workflows: [ci]
+    workflows: [Native release]
     types: [completed]
     branches: [main]
 

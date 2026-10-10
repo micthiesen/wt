@@ -1,19 +1,19 @@
 # AI-written digest of recent commits, posted to the Discord #updates channel.
 #
-# Debounce: every green ci run on main starts a run whose first step
+# Debounce: every green native release on main starts a run whose first step
 # sleeps 30 minutes; the concurrency group cancels a sleeping run when a newer
 # push goes green, so the countdown resets and one digest covers the whole
 # burst. "Since when" state is the head SHA of this workflow's own last
 # successful run — no tags, no files (see .github/scripts/discord-digest.py).
 #
-# Gated on ci success (workflow_run) rather than raw pushes so the
+# Gated on release success (workflow_run) rather than raw pushes so the
 # digest only ever describes a green tree; commits pushed while red roll into
 # the next green digest. Secrets: OPENAI_API_KEY, DISCORD_UPDATES_WEBHOOK.
 name: discord-digest
 
 on:
   workflow_run:
-    workflows: [ci]
+    workflows: [Native release]
     types: [completed]
     branches: [main]
 

@@ -4,15 +4,17 @@
 //! usage value changes; an empty poll is intentionally invisible to the TUI.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wt_core::HarnessId;
 use wt_harness::{
@@ -38,6 +40,93 @@ const MAX_SEED_BYTES: u64 = 64 * 1024;
 const MAX_DELTA_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LINES_PER_SESSION: usize = 1_000;
 const MAX_EVENT_LINES: usize = 500;
+
+/// Coalesced notifications for the exact active Codex rollout files. Watching
+/// their parent directories avoids recursive session-tree watches; the event
+/// handler filters back to retained UUID paths. The 2.5s source timer remains
+/// a recovery path for dropped or unsupported notifications.
+struct CodexOutputWatch {
+    watcher: Option<RecommendedWatcher>,
+    watched_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
+    directories: BTreeSet<PathBuf>,
+    updates: mpsc::Receiver<()>,
+}
+
+impl CodexOutputWatch {
+    fn new() -> Self {
+        let (sender, updates) = mpsc::channel(1);
+        let watched_paths = Arc::new(RwLock::new(BTreeSet::new()));
+        let callback_paths = Arc::clone(&watched_paths);
+        let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            let should_wake = match result {
+                Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => false,
+                Ok(event) => {
+                    let Ok(paths) = callback_paths.read() else {
+                        let _ = sender.try_send(());
+                        return;
+                    };
+                    event.paths.iter().any(|changed| {
+                        paths.contains(changed)
+                            || std::fs::canonicalize(changed)
+                                .ok()
+                                .is_some_and(|changed| paths.contains(&changed))
+                    })
+                }
+                Err(_) => true,
+            };
+            if should_wake {
+                // A full channel means one wake is already pending. The tailer
+                // reads the latest bounded delta, so intermediate writes need
+                // no individual queue entry.
+                let _ = sender.try_send(());
+            }
+        });
+        let watcher = match watcher {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                tracing::warn!(%error, "could not create Codex rollout watcher; polling fallback remains active");
+                None
+            }
+        };
+        Self {
+            watcher,
+            watched_paths,
+            directories: BTreeSet::new(),
+            updates,
+        }
+    }
+
+    fn sync(&mut self, paths: impl Iterator<Item = PathBuf>) {
+        let paths = paths
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+            .collect::<BTreeSet<_>>();
+        let next_directories = paths
+            .iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect::<BTreeSet<_>>();
+        if let Some(watcher) = self.watcher.as_mut() {
+            for directory in self.directories.difference(&next_directories) {
+                let _ = watcher.unwatch(directory);
+            }
+            for directory in next_directories.difference(&self.directories) {
+                if let Err(error) = watcher.watch(directory, RecursiveMode::NonRecursive) {
+                    tracing::warn!(path = %directory.display(), %error, "could not watch Codex rollout directory; polling fallback remains active");
+                }
+            }
+        }
+        self.directories = next_directories;
+        if let Ok(mut watched) = self.watched_paths.write() {
+            *watched = paths;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityWake {
+    Source,
+    Backstop,
+    CodexOutput,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -164,6 +253,7 @@ pub fn start(
         };
         let mut next_activity = tokio::time::interval(ACTIVITY_INTERVAL);
         next_activity.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut codex_watch = CodexOutputWatch::new();
         let mut next_usage = tokio::time::Instant::now();
         let mut last_published = snapshot.clone();
         let mut usage_error = None;
@@ -176,14 +266,15 @@ pub fn start(
                 inventory_updates.borrow().clone(),
                 discovery_updates.borrow().clone(),
             );
-            tokio::select! {
+            let wake = tokio::select! {
                 biased;
                 _ = scope_cancel.cancelled() => break,
                 _ = cancellation.cancelled() => break,
-                changed = inventory_updates.changed() => if changed.is_err() { break; },
-                changed = discovery_updates.changed() => if changed.is_err() { break; },
-                changed = git_updates.changed() => if changed.is_err() { break; },
-                _ = next_activity.tick(), if !active.is_empty() => {},
+                changed = inventory_updates.changed() => if changed.is_err() { break; } else { ActivityWake::Source },
+                changed = discovery_updates.changed() => if changed.is_err() { break; } else { ActivityWake::Source },
+                changed = git_updates.changed() => if changed.is_err() { break; } else { ActivityWake::Source },
+                _ = next_activity.tick(), if !active.is_empty() => ActivityWake::Backstop,
+                Some(()) = codex_watch.updates.recv(), if !active.is_empty() => ActivityWake::CodexOutput,
                 _ = tokio::time::sleep_until(next_usage) => {
                     next_usage = tokio::time::Instant::now() + USAGE_INTERVAL;
                     let updated = fetch_usage(&paths, &codex, &opencode, &cancellation).await;
@@ -199,8 +290,9 @@ pub fn start(
                         },
                         Err(error) => usage_error = Some(format!("session usage: {error}")),
                     }
+                    ActivityWake::Source
                 }
-            }
+            };
             if scope_cancel.is_cancelled() || cancellation.is_cancelled() {
                 break;
             }
@@ -210,17 +302,41 @@ pub fn start(
                 inventory_updates.borrow().clone(),
                 discovery_updates.borrow().clone(),
             );
-            let (changed, poll_errors) = poll_active(
-                &paths,
-                &codex,
-                &opencode,
-                &mut cursors,
-                &mut snapshot,
-                &active,
-                &cancellation,
-            )
-            .await;
-            if changed {
+            let (_changed, discovery_changed, poll_errors) = if wake == ActivityWake::CodexOutput {
+                let (changed, errors) = poll_codex_output(
+                    &codex,
+                    &mut cursors,
+                    &mut snapshot,
+                    &active,
+                    &cancellation,
+                )
+                .await;
+                (changed, false, errors)
+            } else {
+                let (mut changed, discovery_changed, mut errors) = poll_active(
+                    &paths,
+                    &codex,
+                    &opencode,
+                    &mut cursors,
+                    &mut snapshot,
+                    &active,
+                    &cancellation,
+                )
+                .await;
+                let (output_changed, output_errors) = poll_codex_output(
+                    &codex,
+                    &mut cursors,
+                    &mut snapshot,
+                    &active,
+                    &cancellation,
+                )
+                .await;
+                changed |= output_changed;
+                errors.extend(output_errors);
+                (changed, discovery_changed, errors)
+            };
+            codex_watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf));
+            if discovery_changed {
                 for entry in &active {
                     commands.discover(entry.key.slug.clone(), entry.key.harness);
                 }
@@ -323,16 +439,17 @@ async fn poll_active(
     snapshot: &mut SessionActivitySnapshot,
     active: &[ActiveSession],
     cancel: &CancellationToken,
-) -> (bool, Vec<String>) {
+) -> (bool, bool, Vec<String>) {
     let ActivityCursors {
         claude: claude_cursors,
         codex: codex_tracker,
         opencode: opencode_tracker,
-        codex_output: codex_output_tracker,
         opencode_output: opencode_output_tracker,
         next_event_id,
+        ..
     } = cursors;
     let mut changed = false;
+    let mut discovery_changed = false;
     let mut errors = Vec::new();
     let codex_active = active
         .iter()
@@ -363,23 +480,12 @@ async fn poll_active(
                         event.text,
                     );
                 }
-                changed |= !batch.changed_slugs.is_empty();
+                let activity_changed = !batch.changed_slugs.is_empty();
+                changed |= activity_changed;
+                discovery_changed |= activity_changed;
             }
             Err(error) => errors.push(format!("Codex activity: {error}")),
         }
-    }
-    let codex_output_targets = output_targets(active, HarnessId::Codex);
-    let (tracker, result) = codex
-        .poll_output_async(codex_output_tracker.clone(), codex_output_targets, cancel)
-        .await;
-    *codex_output_tracker = tracker;
-    match result {
-        Ok(updates) => {
-            for update in updates {
-                changed |= apply_output_update(snapshot, HarnessId::Codex, update);
-            }
-        }
-        Err(error) => errors.push(format!("Codex output: {error}")),
     }
     let opencode_active = active
         .iter()
@@ -404,6 +510,7 @@ async fn poll_active(
                     );
                 }
                 changed |= batch.changed;
+                discovery_changed |= batch.changed;
             }
             Err(error) => errors.push(format!("OpenCode activity: {error}")),
         }
@@ -420,7 +527,9 @@ async fn poll_active(
     match result {
         Ok(updates) => {
             for update in updates {
-                changed |= apply_output_update(snapshot, HarnessId::Opencode, update);
+                let output_changed = apply_output_update(snapshot, HarnessId::Opencode, update);
+                changed |= output_changed;
+                discovery_changed |= output_changed;
             }
         }
         Err(error) => errors.push(format!("OpenCode output: {error}")),
@@ -451,6 +560,7 @@ async fn poll_active(
             *claude_cursors = cursors;
             snapshot.tails = tails;
             changed |= updated;
+            discovery_changed |= updated;
             errors.extend(read_errors);
         }
         Err(error) => {
@@ -469,7 +579,34 @@ async fn poll_active(
     snapshot
         .tails
         .retain(|tail| active_keys.contains(&tail.key));
-    (changed, errors)
+    (changed, discovery_changed, errors)
+}
+
+async fn poll_codex_output(
+    codex: &CodexHarness,
+    cursors: &mut ActivityCursors,
+    snapshot: &mut SessionActivitySnapshot,
+    active: &[ActiveSession],
+    cancel: &CancellationToken,
+) -> (bool, Vec<String>) {
+    let (tracker, result) = codex
+        .poll_output_async(
+            cursors.codex_output.clone(),
+            output_targets(active, HarnessId::Codex),
+            cancel,
+        )
+        .await;
+    cursors.codex_output = tracker;
+    match result {
+        Ok(updates) => {
+            let mut changed = false;
+            for update in updates {
+                changed |= apply_output_update(snapshot, HarnessId::Codex, update);
+            }
+            (changed, Vec::new())
+        }
+        Err(error) => (false, vec![format!("Codex output: {error}")]),
+    }
 }
 
 fn output_targets(active: &[ActiveSession], harness: HarnessId) -> Vec<HarnessOutputTarget> {
@@ -837,6 +974,127 @@ struct ClaudeTailRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+    use wt_platform::process::ProcessRunner;
+    use wt_tmux::{TmuxClient, TmuxServer};
+
+    #[tokio::test]
+    async fn codex_output_watch_coalesces_exact_rollout_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let watched = temp.path().join("rollout-session.jsonl");
+        let neighbor = temp.path().join("rollout-other-session.jsonl");
+        std::fs::write(&watched, b"seed\n").unwrap();
+        std::fs::write(&neighbor, b"seed\n").unwrap();
+        let mut watch = CodexOutputWatch::new();
+        watch.sync([watched.clone()].into_iter());
+
+        std::fs::write(&neighbor, b"unrelated\n").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), watch.updates.recv())
+                .await
+                .is_err()
+        );
+
+        std::fs::write(&watched, b"seed\nnew output\n").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.updates.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_rollout_append_wakes_tailer_and_updates_exact_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let home = temp.path().join("home");
+        let path = home
+            .join(".codex/sessions/2026/10/09")
+            .join("rollout-2026-10-09T00-00-00-thread-uuid.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let id = "thread-uuid";
+        let header = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "id": id, "cwd": cwd, "originator": "codex-tui", "thread_source": "user" }
+        });
+        let seed = serde_json::json!({
+            "type": "event_msg", "timestamp": "2026-10-09T00:00:01Z",
+            "payload": { "type": "agent_message", "message": "seed_output_ready" }
+        });
+        std::fs::write(&path, format!("{header}\n{seed}\n")).unwrap();
+
+        let runner = ProcessRunner::new(NonZeroUsize::new(1).unwrap());
+        let codex = CodexHarness::new(
+            CodexPaths::new(&home, temp.path().join("cache")),
+            runner.clone(),
+            TmuxClient::new(runner, TmuxServer::named("test-output-tail")),
+        );
+        let active = [ActiveSession {
+            key: SessionKey {
+                slug: "fixture".into(),
+                harness: HarnessId::Codex,
+                session_id: id.into(),
+            },
+            target: AgentTarget {
+                slug: "fixture".into(),
+                kind: crate::harness::AgentTargetKind::Worktree,
+                branch: Some("feature/fixture".into()),
+                cwd,
+                managed_name: None,
+                remote: false,
+            },
+        }];
+        let mut cursors = ActivityCursors::default();
+        let mut snapshot = SessionActivitySnapshot::default();
+        let cancel = CancellationToken::new();
+
+        let (changed, errors) =
+            poll_codex_output(&codex, &mut cursors, &mut snapshot, &active, &cancel).await;
+        assert!(changed);
+        assert!(errors.is_empty());
+        assert_eq!(snapshot.tails[0].key.session_id, id);
+        assert!(
+            snapshot.tails[0]
+                .lines
+                .iter()
+                .any(|line| line.text == "seed_output_ready")
+        );
+
+        let mut watch = CodexOutputWatch::new();
+        watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf));
+        let appended = serde_json::json!({
+            "type": "event_msg", "timestamp": "2026-10-09T00:00:02Z",
+            "payload": { "type": "agent_message", "message": "notify_append_visible" }
+        });
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{appended}"
+        )
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.updates.recv())
+                .await
+                .unwrap(),
+            Some(())
+        );
+
+        let (changed, errors) =
+            poll_codex_output(&codex, &mut cursors, &mut snapshot, &active, &cancel).await;
+        assert!(changed);
+        assert!(errors.is_empty());
+        assert!(
+            snapshot.tails[0]
+                .lines
+                .iter()
+                .any(|line| line.text == "notify_append_visible")
+        );
+    }
 
     #[test]
     fn claude_tail_truncation_clears_stale_visible_lines() {

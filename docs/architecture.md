@@ -57,11 +57,20 @@ separate activity source. The GitHub comment observer fetches the authenticated
 viewer once on demand and never treats comments as foreign while that identity
 is unknown.
 
+The activity source backfills a bounded tail from the seven rolling native
+JSON logs and manager reports. Attention transitions are written to that same
+log with their event timestamp, so both feeds can recover them after restart
+without a second durable event database. The attention watermark is stored in
+the repository-scoped state and projected into every board snapshot.
+
 `wt-tui::model` owns cursor, pane, modal, and key dispatch state. The terminal
 driver polls input and prepared snapshots and renders them with Ratatui. Actions
 cross a typed `UiAction` boundary into the application controller. This keeps
 terminal rendering separate from I/O and lets the same host service handle
 local and SSH-routed requests.
+The output pane switches between attention, all app activity, and prepared
+session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
+the terminal restores normal mouse handling when the UI suspends or exits.
 
 Creation records the intended target and selects it only after the refreshed
 inventory contains the actual row. A successful refresh alone is not proof the
