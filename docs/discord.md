@@ -45,9 +45,10 @@ Full mechanics are documented in those files' header comments; the shape:
 - **Silence is ambiguous, and #updates is the only place it shows.** Because
   the trigger is a green release on `main`, "no digest for two days" has two
   readings that look identical from the channel: nobody pushed, or `main` has
-  been red and every commit is queued for the next green digest. It was the
-  second on 2026-08-24 to 08-26 (eight pushes, four config-leaking
-  `rollupChecklist` tests, fixed in `test/preload.ts` + `test/config.toml`),
+  been red and every commit is queued for the next green digest. This happened
+  on 2026-08-24 to 08-26 at the TypeScript baseline (eight pushes, four
+  config-leaking `rollupChecklist` tests, fixed by the then-current
+  `test/preload.ts` and `test/config.toml` at commit `d9cd2f4`),
   and nothing anywhere announced it — the same green gate also holds back
   hot updates, so users had been getting nothing either. Before treating a
   quiet #updates as a digest bug, check `gh run list --workflow=release.yml

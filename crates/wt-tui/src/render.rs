@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 use wt_runtime::SourceState;
 
-use crate::{Interaction, Model};
+use crate::{BoardRow, Interaction, Model};
 
 const MUTED: Color = Color::DarkGray;
 
@@ -85,33 +85,25 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
                     Line::styled(&row.path, Style::new().fg(MUTED)),
                     Line::default(),
                 ];
-                if let Some(status) = &row.issue_status {
-                    lines.push(Line::from(format!("Tracker: {status}")));
+                lines.extend(work_status_lines(row, model.show_verification));
+                if row.work.is_some() {
+                    lines.push(Line::default());
+                }
+                for group in &row.detail_groups {
+                    for line in &group.lines {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{}: ", group.label), Style::new().fg(MUTED)),
+                            Span::raw(line.clone()),
+                        ]));
+                    }
+                    if let Some(error) = &group.error {
+                        lines.push(Line::styled(
+                            format!("{}: {}", group.label, error),
+                            Style::new().fg(Color::Red),
+                        ));
+                    }
                 }
                 lines.extend(row.details.iter().map(|line| Line::from(line.as_str())));
-                if model.show_verification
-                    && let Some(steps) = &row.verify_steps
-                {
-                    lines.push(Line::default());
-                    lines.extend(steps.lines().map(Line::from));
-                }
-                for session in &row.sessions {
-                    lines.push(Line::default());
-                    lines.push(Line::styled(
-                        format!(
-                            "{} / {}: {}{}",
-                            session.harness,
-                            session.name,
-                            session.state,
-                            if session.queued > 0 {
-                                format!(" · {} queued", session.queued)
-                            } else {
-                                String::new()
-                            }
-                        ),
-                        Style::new().fg(Color::Cyan),
-                    ));
-                }
                 lines
             })
             .unwrap_or_else(|| {
@@ -143,6 +135,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
                                 )),
                                 Line::default(),
                             ];
+                            lines.extend(section_rollup_lines(section));
+                            lines.push(Line::default());
                             lines.extend(
                                 section
                                     .rows
@@ -201,6 +195,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
                 ),
             }
         };
+        let footer_text =
+            if model.toast.is_none() && !matches!(&model.source_state, SourceState::Failed(_)) {
+                let status = slot_status_summary(&model.board);
+                if status.is_empty() {
+                    footer_text.to_owned()
+                } else {
+                    format!("{status}  {footer_text}")
+                }
+            } else {
+                footer_text.to_owned()
+            };
         frame.render_widget(
             Paragraph::new(footer_text).style(Style::new().fg(if failed {
                 Color::Red
@@ -457,6 +462,33 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
     }
 }
 
+fn slot_status_summary(board: &crate::Board) -> String {
+    ["manager", "main", "wt", "dotfiles"]
+        .into_iter()
+        .filter_map(|key| {
+            let sessions = board.slot_sessions.get(key)?;
+            let session = sessions.iter().find(|session| session.live)?;
+            let label = match key {
+                "manager" => "M",
+                "main" => "main",
+                "wt" => "wt",
+                "dotfiles" => "dotfiles",
+                _ => return None,
+            };
+            let context = if key == "manager" && session.harness.eq_ignore_ascii_case("claude") {
+                session
+                    .context_percent
+                    .map(|percent| format!(" {percent}%"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Some(format!("{label}:{}{context}", session.state))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MousePane {
     List,
@@ -529,6 +561,304 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+fn work_marker(row: &BoardRow) -> Span<'static> {
+    let Some(work) = row.work.as_ref() else {
+        return Span::styled("○ ", Style::new().fg(MUTED));
+    };
+    let Some(state) = work.effective_state else {
+        return Span::styled("○ ", Style::new().fg(MUTED));
+    };
+    let (glyph, color) = if work.verification_overdue {
+        ("●", Color::Red)
+    } else if work.blocked {
+        ("⊘", Color::Yellow)
+    } else {
+        let color = work_state_color(state);
+        let glyph = match state {
+            wt_core::WorkState::Todo => "○",
+            wt_core::WorkState::Verified => "✓",
+            wt_core::WorkState::Dropped => "⊘",
+            _ => "●",
+        };
+        if work.stale == Some(true) && !work.derived {
+            ("○", color)
+        } else {
+            (glyph, color)
+        }
+    };
+    Span::styled(format!("{glyph} "), Style::new().fg(color))
+}
+
+fn work_state_color(state: wt_core::WorkState) -> Color {
+    match state {
+        wt_core::WorkState::Ready | wt_core::WorkState::Verified => Color::Green,
+        wt_core::WorkState::NeedsHuman => Color::Red,
+        wt_core::WorkState::NeedsTesting | wt_core::WorkState::Working => Color::Yellow,
+        wt_core::WorkState::Review => Color::Cyan,
+        wt_core::WorkState::Todo | wt_core::WorkState::Dropped => MUTED,
+    }
+}
+
+fn work_status_lines(row: &BoardRow, show_verification: bool) -> Vec<Line<'static>> {
+    let Some(work) = row.work.as_ref() else {
+        return Vec::new();
+    };
+    let Some(state) = work.effective_state else {
+        return Vec::new();
+    };
+    let state_text = if work.verification_overdue {
+        format!("unverified · {} · overdue", state.as_str())
+    } else if work.verification_owed {
+        format!("unverified · {}", state.as_str())
+    } else if work.blocked {
+        format!("blocked · {}", state.as_str())
+    } else if work.derived {
+        format!("{} · live", state.as_str())
+    } else {
+        state.as_str().to_owned()
+    };
+    let status_color = if work.verification_overdue {
+        Color::Red
+    } else if work.blocked {
+        Color::Yellow
+    } else {
+        work_state_color(state)
+    };
+    let mut spans = vec![Span::styled(
+        state_text,
+        Style::new().fg(status_color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(risk) = work.record.as_ref().and_then(|record| record.risk) {
+        spans.push(Span::styled(" · risk ", Style::new().fg(MUTED)));
+        spans.push(Span::styled(
+            risk.as_str(),
+            Style::new().fg(match risk {
+                wt_core::WorkRisk::Low => Color::Green,
+                wt_core::WorkRisk::Medium => Color::Yellow,
+                wt_core::WorkRisk::High => Color::Red,
+            }),
+        ));
+    }
+    if let Some(age) = work.age.as_ref().filter(|_| !work.derived) {
+        spans.push(Span::styled(
+            format!(" · {age} ago"),
+            Style::new().fg(MUTED),
+        ));
+    }
+    if work.stale == Some(true) && !work.derived {
+        spans.push(Span::styled(
+            " · commits since",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    let mut lines = vec![Line::from(spans)];
+    if let Some(blocked_on) = work
+        .record
+        .as_ref()
+        .and_then(|record| record.blocked_on.as_deref())
+    {
+        lines.push(Line::styled(
+            format!("blocked on: {blocked_on}"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if let Some(note) = work
+        .record
+        .as_ref()
+        .and_then(|record| record.note.as_deref())
+    {
+        lines.extend(note.lines().map(|line| {
+            Line::from(vec![
+                Span::styled("  ", Style::new()),
+                Span::raw(line.to_owned()),
+            ])
+        }));
+    }
+    if let Some(steps) = work
+        .record
+        .as_ref()
+        .and_then(|record| record.verify_after_merge.as_deref())
+    {
+        if work.verification_owed {
+            lines.push(Line::styled(
+                "Post-merge verification is owed · V shows steps",
+                Style::new().fg(if work.verification_overdue {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }),
+            ));
+        }
+        if show_verification {
+            lines.extend(steps.lines().map(|line| Line::from(line.to_owned())));
+        }
+    }
+    lines
+}
+
+fn folded_summary(rollup: &crate::SectionRollup) -> String {
+    let mut parts = Vec::new();
+    for entry in &rollup.states {
+        let name = entry.state.map_or("unset", wt_core::WorkState::as_str);
+        parts.push(format!("{} {name}", entry.count));
+    }
+    for entry in &rollup.risks {
+        parts.push(format!("{} {} risk", entry.count, entry.risk.as_str()));
+    }
+    if rollup.stale_statuses > 0 {
+        parts.push(format!("{} stale status", rollup.stale_statuses));
+    }
+    if rollup.verification_owed > 0 {
+        parts.push(format!("{} verify owed", rollup.verification_owed));
+    }
+    if rollup.verification_overdue > 0 {
+        parts.push(format!("{} overdue verify", rollup.verification_overdue));
+    }
+    if rollup.dirty_worktrees.is_some_and(|count| count > 0) {
+        parts.push(format!(
+            "{} dirty",
+            rollup.dirty_worktrees.unwrap_or_default()
+        ));
+    }
+    if rollup.unknown_git > 0 {
+        parts.push(format!("{} Git unknown", rollup.unknown_git));
+    }
+    if rollup.upstream_ahead > 0 {
+        parts.push(format!("{} ahead upstream", rollup.upstream_ahead));
+    }
+    if rollup.upstream_behind > 0 {
+        parts.push(format!("{} behind upstream", rollup.upstream_behind));
+    }
+    if rollup.rebasing > 0 {
+        parts.push(format!("{} rebasing", rollup.rebasing));
+    }
+    if rollup.conflicted > 0 {
+        parts.push(format!("{} conflicts", rollup.conflicted));
+    }
+    if rollup.open_prs > 0 {
+        parts.push(format!("{} open PR", rollup.open_prs));
+    }
+    if rollup.draft_prs > 0 {
+        parts.push(format!("{} draft", rollup.draft_prs));
+    }
+    if rollup.queued_prs > 0 {
+        parts.push(format!("{} queued", rollup.queued_prs));
+    }
+    if rollup.failing_checks > 0 {
+        parts.push(format!("{} red CI", rollup.failing_checks));
+    }
+    if rollup.paused_automations > 0 {
+        parts.push(format!("{} paused", rollup.paused_automations));
+    }
+    if rollup.needs_attention > 0 {
+        parts.push(format!("{} attention", rollup.needs_attention));
+    }
+    for note in rollup.blocked_notes.iter().take(2) {
+        parts.push(format!("blocked {}", truncate(note, 48)));
+    }
+    if rollup.blocked_notes.len() > 2 {
+        parts.push(format!("+{} blockers", rollup.blocked_notes.len() - 2));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn section_rollup_lines(section: &crate::BoardSection) -> Vec<Line<'static>> {
+    let rollup = &section.rollup;
+    let states = rollup
+        .states
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} {}",
+                entry.count,
+                entry.state.map_or("unset", wt_core::WorkState::as_str)
+            )
+        })
+        .collect::<Vec<_>>();
+    let risks = rollup
+        .risks
+        .iter()
+        .map(|entry| format!("{} {}", entry.count, entry.risk.as_str()))
+        .collect::<Vec<_>>();
+    let mut lines = vec![Line::from(format!("Work: {}", states.join(" · ")))];
+    if !risks.is_empty() {
+        lines.push(Line::from(format!("Risk: {}", risks.join(" · "))));
+    }
+    let mut mechanics = Vec::new();
+    if rollup.stale_statuses > 0 {
+        mechanics.push(format!("{} stale status", rollup.stale_statuses));
+    }
+    if rollup.verification_owed > 0 {
+        mechanics.push(format!("{} verify owed", rollup.verification_owed));
+    }
+    if rollup.verification_overdue > 0 {
+        mechanics.push(format!("{} overdue verify", rollup.verification_overdue));
+    }
+    if let Some(dirty) = rollup.dirty_worktrees.filter(|count| *count > 0) {
+        mechanics.push(format!("{dirty} dirty"));
+    }
+    if rollup.unknown_git > 0 {
+        mechanics.push(format!("{} Git unknown", rollup.unknown_git));
+    }
+    if rollup.upstream_ahead > 0 {
+        mechanics.push(format!("{} ahead upstream", rollup.upstream_ahead));
+    }
+    if rollup.upstream_behind > 0 {
+        mechanics.push(format!("{} behind upstream", rollup.upstream_behind));
+    }
+    if rollup.rebasing > 0 {
+        mechanics.push(format!("{} rebasing", rollup.rebasing));
+    }
+    if rollup.conflicted > 0 {
+        mechanics.push(format!("{} conflicts", rollup.conflicted));
+    }
+    if rollup.open_prs > 0 {
+        mechanics.push(format!("{} open PR", rollup.open_prs));
+    }
+    if rollup.draft_prs > 0 {
+        mechanics.push(format!("{} draft", rollup.draft_prs));
+    }
+    if rollup.queued_prs > 0 {
+        mechanics.push(format!("{} queued", rollup.queued_prs));
+    }
+    if rollup.failing_checks > 0 {
+        mechanics.push(format!("{} failing CI", rollup.failing_checks));
+    }
+    if rollup.paused_automations > 0 {
+        mechanics.push(format!("{} automation-paused", rollup.paused_automations));
+    }
+    if !mechanics.is_empty() {
+        lines.push(Line::from(format!("Mechanics: {}", mechanics.join(" · "))));
+    }
+    if rollup.needs_attention > 0 {
+        lines.push(Line::styled(
+            format!("{} need attention", rollup.needs_attention),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    lines.extend(rollup.blocked_notes.iter().map(|note| {
+        Line::styled(
+            format!("Blocked on: {note}"),
+            Style::new().fg(Color::Yellow),
+        )
+    }));
+    lines
+}
+
 fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let block = panel("Worktrees");
     let inner = block.inner(area);
@@ -550,6 +880,7 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
                     Line::from(vec![
                         Span::raw(if selected { "› " } else { "  " }),
                         Span::styled(&row.stack_prefix, Style::new().fg(MUTED)),
+                        work_marker(row),
                         Span::raw(&row.title),
                         Span::styled(
                             row.issue_status
@@ -558,19 +889,21 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
                                 .unwrap_or_default(),
                             Style::new().fg(Color::Blue),
                         ),
-                        Span::styled(format!("  {}", row.badge), Style::new().fg(Color::Cyan)),
+                        Span::styled(
+                            if row.badge.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  {}", row.badge)
+                            },
+                            Style::new().fg(Color::Cyan),
+                        ),
                     ])
                     .style(style)
                 }
                 Some(crate::model::VisualItem::Section(index)) => {
                     let section = &model.board.sections[index];
-                    let attention = section
-                        .rows
-                        .iter()
-                        .filter(|&&index| model.board.rows[index].needs_attention)
-                        .count();
-                    let summary = if section.folded && attention > 0 {
-                        format!(" · {attention} need attention")
+                    let summary = if section.folded {
+                        folded_summary(&section.rollup)
                     } else {
                         String::new()
                     };
@@ -615,6 +948,36 @@ mod tests {
     use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn footer_slot_status_uses_only_live_special_sessions() {
+        let board = Board {
+            slot_sessions: [
+                (
+                    "manager".into(),
+                    vec![crate::SessionView {
+                        live: true,
+                        harness: "Claude".into(),
+                        state: "asking".into(),
+                        context_percent: Some(87),
+                        ..Default::default()
+                    }],
+                ),
+                (
+                    "main".into(),
+                    vec![crate::SessionView {
+                        live: false,
+                        state: "working".into(),
+                        ..Default::default()
+                    }],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(slot_status_summary(&board), "M:asking 87%");
+    }
 
     #[test]
     fn picker_keeps_late_selection_visible_after_terminal_shrinks() {
@@ -687,6 +1050,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn narrow_worktree_titles_keep_state_and_stale_marker_visible() {
+        let mut model = Model {
+            board: Arc::new(Board {
+                rows: vec![BoardRow {
+                    key: "one".into(),
+                    title: "A deliberately narrow title".into(),
+                    work: Some(crate::WorkPresentation {
+                        effective_state: Some(wt_core::WorkState::Ready),
+                        stale: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            selected: Some(0),
+            ..Model::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut model)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("○ A deliberately narrow title"));
+        let details = work_status_lines(&model.board.rows[0], false)
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.to_string())
+            .collect::<String>();
+        assert!(details.contains("ready"));
+        assert!(details.contains("commits since"));
+    }
+
+    #[test]
+    fn folded_section_summary_exposes_states_risk_and_blocker_notes() {
+        let rollup = crate::SectionRollup {
+            states: vec![crate::WorkStateCount {
+                state: Some(wt_core::WorkState::NeedsHuman),
+                count: 2,
+            }],
+            risks: vec![crate::WorkRiskCount {
+                risk: wt_core::WorkRisk::High,
+                count: 1,
+            }],
+            blocked_notes: vec!["api: waiting for review".into()],
+            ..Default::default()
+        };
+        let summary = folded_summary(&rollup);
+        assert!(summary.contains("2 needs-human"));
+        assert!(summary.contains("1 high risk"));
+        assert!(summary.contains("blocked api: waiting for review"));
+        let section = crate::BoardSection {
+            rollup,
+            ..Default::default()
+        };
+        let details = section_rollup_lines(&section)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(details.contains("api: waiting for review"));
     }
 
     #[test]

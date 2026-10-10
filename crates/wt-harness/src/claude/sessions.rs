@@ -181,6 +181,10 @@ impl ClaudeHarness {
         Ok(entries
             .into_iter()
             .map(|entry| {
+                let context_percent = tails
+                    .get(&entry.name)
+                    .and_then(|tail| tail.context_usage.as_ref())
+                    .map(|usage| usage.percent());
                 let session_id = entry.session_id.clone();
                 let waiting_for = registry.get(&session_id).and_then(|r| {
                     (entry.state == crate::DerivedState::Asking)
@@ -205,6 +209,7 @@ impl ClaudeHarness {
                         status_since,
                         tail_ended_at: None,
                         session_summary: entry.session_summary,
+                        context_percent,
                     },
                 }
             })

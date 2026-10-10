@@ -24,7 +24,9 @@ Use `wt update --check` to inspect the selected channel and `wt rollback` to cho
 
 ## Migrating an older install
 
-When `~/.local/bin/wt` points to the recognized legacy `~/.wt/bin/wt` Bun shim and `~/.wt` has the expected source-checkout markers, installation makes a compressed backup under `<install-root>/migrations/`, records the prior shim's checksum and link target, then atomically points the PATH entry at the native stable launcher. The old checkout remains in place. A PATH file or unrelated symlink is never overwritten; `wt install --path` reports that conflict so it can be resolved deliberately.
+The historical `~/.wt/bin/wt` entry point remains usable after the source checkout is promoted: its marked native compatibility wrapper forwards arguments to the stable launcher under `WT_INSTALL_ROOT` or `~/.local/share/wt`. It does not require Bun or the checkout's TypeScript sources. If the native launcher is missing, the wrapper prints the install command and exits; it never downloads or builds wt during an ordinary invocation. It also refuses to exec itself if `WT_INSTALL_ROOT` points back to the compatibility wrapper.
+
+Without `--path`, installation does not inspect or change `~/.local/bin/wt` and does not archive the checkout. When `~/.local/bin/wt` points to either the recognized legacy Bun shim or the marked native compatibility wrapper at `~/.wt/bin/wt`, `wt install --path` makes a compressed backup under `<install-root>/migrations/`, records the prior shim's checksum and link target, then atomically points the PATH entry at the native stable launcher. The native wrapper is recognized by its exact `wt-native-compat-v1` marker and checkout metadata; lookalike or unrelated symlinks are refused. The old checkout remains in place. A PATH file or unrelated symlink is never overwritten; `wt install --path` reports that conflict so it can be resolved deliberately.
 
 The installer does not modify the legacy checkout or remove it. Keep it until the native install has been exercised and any user-owned files have been recovered. The migration archive and JSON record are the recovery copy if the checkout is later moved or removed.
 

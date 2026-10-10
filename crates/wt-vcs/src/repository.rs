@@ -5,9 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -132,7 +131,10 @@ struct PorcelainWorktree {
 
 impl GitRepository {
     pub fn new(config: RepositoryConfig, runner: ProcessRunner) -> Self {
-        let stage_issue_pattern = Regex::new(&config.stage.issue_id_pattern).ok();
+        let stage_issue_pattern = RegexBuilder::new(&config.stage.issue_id_pattern)
+            .case_insensitive(true)
+            .build()
+            .ok();
         Self {
             config,
             runner,
@@ -189,7 +191,7 @@ impl GitRepository {
             }
             record.target.stage = read_stage(&canonical)
                 .await
-                .unwrap_or_else(|| self.derive_stage(record.target.slug(), &record.target.branch));
+                .unwrap_or_else(|| self.derive_stage(record.target.slug()));
             let slug = if record.is_main {
                 "main".to_owned()
             } else {
@@ -450,7 +452,7 @@ impl GitRepository {
         let branch = branch.unwrap_or_default();
         let stage = read_stage(&path)
             .await
-            .unwrap_or_else(|| self.derive_stage(&slug, &branch));
+            .unwrap_or_else(|| self.derive_stage(&slug));
         let target = local_worktree_target(slug, branch, path.to_string_lossy(), stage);
         let (git_dir, common_dir) = git_metadata_paths(&path).await;
         Ok(WorktreeRecord {
@@ -466,18 +468,12 @@ impl GitRepository {
         })
     }
 
-    fn derive_stage(&self, slug: &str, branch: &str) -> String {
-        let Some(pattern) = &self.stage_issue_pattern else {
-            return format!("{}-{}", self.config.stage.prefix, digest(slug, 10));
-        };
-        let issue = pattern
-            .captures(branch)
-            .and_then(|captures| captures.get(1).or_else(|| captures.get(0)))
-            .map(|m| m.as_str());
-        match issue {
-            Some(issue) => format!("{}-{issue}-{}", self.config.stage.prefix, digest(slug, 6)),
-            None => format!("{}-{}", self.config.stage.prefix, digest(slug, 10)),
-        }
+    fn derive_stage(&self, slug: &str) -> String {
+        wt_core::stage_name(
+            slug,
+            &self.config.stage.prefix,
+            self.stage_issue_pattern.as_ref(),
+        )
     }
 
     async fn run_git<const N: usize>(
@@ -711,14 +707,6 @@ async fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path)
         .await
         .unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn digest(value: &str, bytes: usize) -> String {
-    let hash = Sha256::digest(value.as_bytes());
-    hash.iter()
-        .take(bytes)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[cfg(test)]

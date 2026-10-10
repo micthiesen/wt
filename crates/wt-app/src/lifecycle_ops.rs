@@ -180,15 +180,19 @@ pub async fn plan_with_facts(
         }
         if landed {
             extra.insert("gitState".into(), serde_json::json!("merged"));
-            extra.insert("landedOnAtRemoval".into(), serde_json::json!("base"));
         }
+        // A branch may have advanced after an older PR merged. Persist the
+        // current revision's verdict so historical PR metadata cannot turn
+        // those unlanded commits into a claim that all work landed.
+        extra.insert(
+            "landedOnAtRemoval".into(),
+            serde_json::json!(if landed { "base" } else { "unlanded" }),
+        );
         if let Some(pr) = pr {
             extra.insert("prNumber".into(), serde_json::json!(pr.number));
             extra.insert("prUrl".into(), serde_json::json!(pr.url));
             extra.insert("prState".into(), serde_json::json!(pr.state));
-            if pr.state == "MERGED"
-                && let Some(merge_oid) = &pr.merge_commit_oid
-            {
+            if pr_landed && let Some(merge_oid) = &pr.merge_commit_oid {
                 extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
             }
         }
@@ -461,6 +465,7 @@ mod tests {
             .unwrap();
         assert!(plan.rows[0].local_merged);
         assert!(plan.rows[0].hazards.is_empty());
+        assert!(wt_store::is_merged_removal(&plan.rows[0].removed_snapshot));
         // Detached workers deserialize this revision after the planning process
         // exits. Do not reduce the published-base witness to a `landed` bool.
         let delayed: wt_lifecycle::RemovalRevision =
@@ -544,6 +549,29 @@ mod tests {
                 .iter()
                 .any(|hazard| hazard.contains("unpushed"))
         );
+        let mut github = GithubData::default();
+        github.prs.insert(
+            row.target.branch.clone(),
+            serde_json::from_value(serde_json::json!({
+                "number": 42, "url": "https://example.invalid/pull/42",
+                "headRefName": row.target.branch, "headRefOid": base,
+                "baseRefName": "main", "mergeCommitOid": base,
+                "title": "Previous work", "isDraft": false, "state": "MERGED",
+                "checks": "pass", "failedChecks": [], "review": "none",
+                "reviewRequests": 0, "requestedReviewers": [], "suggestedReviewers": [],
+                "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0
+            }))
+            .unwrap(),
+        );
+        let reused = plan_with_facts(ctx, vec![row.clone()], &state, &github, None)
+            .await
+            .unwrap();
+        assert!(!reused.rows[0].landed);
+        let history = &reused.rows[0].removed_snapshot;
+        assert_eq!(history.extra["landedOnAtRemoval"], "unlanded");
+        assert_eq!(history.extra["prState"], "MERGED");
+        assert!(!history.extra.contains_key("prMergeCommitOid"));
+        assert!(!wt_store::is_merged_removal(history));
 
         // Neither a deleted remote base nor a matching local main is a proof.
         git(ctx, &origin, &["update-ref", "-d", "refs/heads/main"]).await;

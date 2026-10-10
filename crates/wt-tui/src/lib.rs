@@ -20,8 +20,10 @@ pub use actions::{
 };
 pub use editor::LineEditor;
 pub use model::{
-    ActivityLine, AttentionLine, Board, BoardRow, BoardSection, HostChoice, Interaction, LogView,
-    Model, RemovedHistoryRow, RemovedHistorySnapshot, ReviewRequestRow, SessionView,
+    ActivityLine, AttentionLine, Board, BoardRow, BoardSection, GitPresentation, HostChoice,
+    Interaction, LandingKind, LogView, Model, PrPresentation, PreparedDetailGroup,
+    RemovedHistoryRow, RemovedHistorySnapshot, ReviewRequestRow, SectionRollup, SessionView,
+    WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use terminal::{run, run_with_palette_probe};
 #[doc(hidden)]

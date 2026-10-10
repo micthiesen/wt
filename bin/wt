@@ -1,37 +1,29 @@
 #!/bin/sh
+# wt-native-compat-v1
 
-# Resolve symlinks so installs such as ~/bin/wt -> ~/.wt/bin/wt still find the
-# source tree relative to the real launcher rather than the symlink location.
-launcher=$0
-while [ -L "$launcher" ]; do
-  launcher_dir=$(CDPATH= cd -P -- "$(dirname -- "$launcher")" && pwd)
-  launcher_target=$(readlink "$launcher")
-  case $launcher_target in
-    /*) launcher=$launcher_target ;;
-    *) launcher=$launcher_dir/$launcher_target ;;
-  esac
-done
-
-launcher_dir=$(CDPATH= cd -P -- "$(dirname -- "$launcher")" && pwd)
-# `env -u BUN_INSPECT`: wt is most often run from INSIDE a Claude session,
-# whose environment binds that session's inspector socket (the transport
-# messages arrive through). bun honors BUN_INSPECT in every child, so an
-# unscrubbed launch would have wt try to bind a socket its parent already
-# owns — a 20-line EADDRINUSE stack on stderr for every `wt` an agent runs.
-# See src/core/harness/claude/inject/shims.ts, which does the same for the
-# other bun binaries an agent invokes.
-#
-# Non-interactive SSH commonly supplies only /usr/local/bin:/usr/bin:/bin,
-# even when Bun was installed in its default ~/.bun/bin location. Remote wt
-# commands and agent sessions must not depend on a login-shell PATH, so use
-# that deterministic fallback when `bun` is otherwise unavailable.
-bun_exe=$(command -v bun 2>/dev/null || true)
-if [ -z "$bun_exe" ] && [ -x "$HOME/.bun/bin/bun" ]; then
-  bun_exe="$HOME/.bun/bin/bun"
-fi
-if [ -z "$bun_exe" ]; then
-  echo "wt: bun not found (checked PATH and $HOME/.bun/bin/bun)" >&2
+# Keep the historical ~/.wt/bin/wt entry point working after this checkout's
+# TypeScript runtime is retired. This wrapper only forwards to an installed
+# native launcher; it never downloads or builds wt itself.
+if [ -z "${HOME:-}" ]; then
+  echo "wt: HOME is unset; install or configure the native launcher first" >&2
   exit 127
 fi
-exec env -u BUN_INSPECT WT_LAUNCHER_DIR="$launcher_dir" \
-  "$bun_exe" "$launcher_dir/../src/main.ts" "$@"
+
+install_root=${WT_INSTALL_ROOT:-"$HOME/.local/share/wt"}
+stable_launcher=$install_root/bin/wt
+
+if [ ! -x "$stable_launcher" ]; then
+  echo "wt: native launcher not found at $stable_launcher" >&2
+  echo "Install it with:" >&2
+  echo "  curl -fsSL https://github.com/micthiesen/wt/releases/latest/download/install.sh | sh -s -- --path" >&2
+  exit 127
+fi
+
+# A bad WT_INSTALL_ROOT can point back at this compatibility wrapper. Refuse
+# that configuration rather than recursively execing ourselves.
+if [ "$stable_launcher" -ef "$0" ]; then
+  echo "wt: WT_INSTALL_ROOT resolves to this compatibility wrapper; set it to the native install root or reinstall wt" >&2
+  exit 126
+fi
+
+exec "$stable_launcher" "$@"

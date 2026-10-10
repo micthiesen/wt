@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use wt_harness::{ClaudeMessageOutcome, HarnessMessageOutcome};
+use wt_harness::{ClaudeInjectFailureKind, ClaudeMessageOutcome, HarnessMessageOutcome};
 
 use crate::{
     context::AppContext,
@@ -156,7 +156,7 @@ async fn send_route(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let outcome = app.send(route, body, sender.as_deref(), context).await?;
-    print_delivery(route, outcome)
+    print_delivery(context, route, outcome)
 }
 
 fn list(routes: &[AgentRoute], json: bool) -> Result<i32> {
@@ -375,7 +375,11 @@ impl Drop for NonblockingInput {
     }
 }
 
-fn print_delivery(route: &AgentRoute, outcome: HarnessMessageOutcome) -> Result<i32> {
+fn print_delivery(
+    context: &AppContext,
+    route: &AgentRoute,
+    outcome: HarnessMessageOutcome,
+) -> Result<i32> {
     match outcome {
         HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
             transport,
@@ -385,9 +389,16 @@ fn print_delivery(route: &AgentRoute, outcome: HarnessMessageOutcome) -> Result<
             fallback,
         }) => {
             println!(
-                "sent to {} via Claude {:?} (cold_started={cold_started}, delivered={delivered:?}, resent={resent}, fallback={fallback:?})",
+                "sent to {} via Claude {:?} (cold_started={cold_started}, delivered={delivered:?}, resent={resent})",
                 route.target.slug, transport
             );
+            if let Some((level, advice)) = claude_fallback_advice(
+                &context.config.paths.cache_root,
+                fallback,
+                std::env::var("WT_INSPECT").is_ok_and(|value| value.eq_ignore_ascii_case("off")),
+            ) {
+                println!("{level}: {advice}");
+            }
             Ok(0)
         }
         HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
@@ -451,6 +462,60 @@ fn print_delivery(route: &AgentRoute, outcome: HarnessMessageOutcome) -> Result<
     }
 }
 
+fn claude_fallback_advice(
+    cache_root: &std::path::Path,
+    fallback: Option<ClaudeInjectFailureKind>,
+    inspector_disabled: bool,
+) -> Option<(&'static str, String)> {
+    let kind = fallback?;
+    if inspector_disabled {
+        return Some((
+            "info",
+            "Claude prompt injection was intentionally disabled by WT_INSPECT=off; terminal delivery was expected".into(),
+        ));
+    }
+    if kind == ClaudeInjectFailureKind::Absent {
+        let stale = wt_harness::stale_harness_shims(cache_root);
+        if !stale.is_empty() {
+            return Some((
+                "warning",
+                format!(
+                    "stale {} harness shim(s) in {}; these can interfere with managed harness launches and may explain the missing Claude inspector socket. Remove them, start a new wt-managed session, then run `wt claude selftest`",
+                    stale.join(", "),
+                    cache_root.join("shims").display()
+                ),
+            ));
+        }
+    }
+    let (level, advice) = match kind {
+        ClaudeInjectFailureKind::Absent => (
+            "info",
+            "this Claude session has no inspector socket; start it from wt and run `wt claude selftest` if the problem persists".into(),
+        ),
+        ClaudeInjectFailureKind::Stale => (
+            "info",
+            "this session's inspector socket is stale; restart the session from wt, then run `wt claude selftest`".into(),
+        ),
+        ClaudeInjectFailureKind::NotReady => (
+            "warning",
+            "Claude's prompt was not reachable; run `wt claude selftest` to check whether its injector anchors changed".into(),
+        ),
+        ClaudeInjectFailureKind::Blocked => (
+            "info",
+            "Claude is waiting on a human; terminal fallback does not indicate an inspector failure".into(),
+        ),
+        ClaudeInjectFailureKind::SubmittedUnknown => (
+            "warning",
+            "the inspector submit may have been accepted; check the target transcript before retrying".into(),
+        ),
+        ClaudeInjectFailureKind::Failed => (
+            "warning",
+            "inspector delivery failed; run `wt claude selftest` if this repeats".into(),
+        ),
+    };
+    Some((level, advice))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +549,32 @@ mod tests {
             },
         };
         assert_eq!(route.target.kind, AgentTargetKind::Special);
+    }
+
+    #[test]
+    fn fallback_advice_distinguishes_intentional_disable_and_stale_shims() {
+        let cache = tempfile::tempdir().unwrap();
+        let disabled =
+            claude_fallback_advice(cache.path(), Some(ClaudeInjectFailureKind::Failed), true)
+                .unwrap();
+        assert_eq!(disabled.0, "info");
+        assert!(disabled.1.contains("WT_INSPECT=off"));
+
+        let shim_dir = cache.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::write(shim_dir.join("claude"), "stale").unwrap();
+        let advice =
+            claude_fallback_advice(cache.path(), Some(ClaudeInjectFailureKind::Absent), false)
+                .unwrap();
+        assert_eq!(advice.0, "warning");
+        assert!(advice.1.contains(&shim_dir.display().to_string()));
+        assert!(advice.1.contains("wt claude selftest"));
+
+        let intentional =
+            claude_fallback_advice(cache.path(), Some(ClaudeInjectFailureKind::Absent), true)
+                .unwrap();
+        assert_eq!(intentional.0, "info");
+        assert!(intentional.1.contains("intentionally disabled"));
     }
 
     #[cfg(unix)]

@@ -9,6 +9,7 @@ name = "wt"
 path = "src/main.rs"
 
 [dependencies]
+futures-util.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 getrandom.workspace = true

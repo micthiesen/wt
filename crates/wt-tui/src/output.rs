@@ -221,12 +221,20 @@ impl Model {
                     self.output.stream.min(count.saturating_sub(1))
                 };
                 if let Some(session) = sessions.get(stream) {
+                    let mut output = Vec::with_capacity(session.output.len() + 1);
+                    if let Some(summary) = session.summary.as_deref() {
+                        output.push(Line::styled(
+                            format!("Summary: {summary}"),
+                            Style::new().fg(Color::Cyan),
+                        ));
+                    }
+                    output.extend(session.output.iter().cloned().map(Line::from));
                     (
                         format!(
                             "{label} · {} / {} · {}",
                             session.harness, session.name, session.state
                         ),
-                        session.output.iter().cloned().map(Line::from).collect(),
+                        output,
                         identity,
                         count,
                     )
@@ -385,6 +393,33 @@ mod tests {
         model.output.scroll(false);
         assert!(format!("{:?}", model.output_view(4, 40).1).contains("20"));
         assert!(model.output.top.is_none());
+    }
+
+    #[test]
+    fn selected_session_output_starts_with_its_completed_summary() {
+        let mut model = Model {
+            board: Arc::new(crate::Board {
+                rows: vec![crate::BoardRow {
+                    slug: "one".into(),
+                    sessions: vec![crate::SessionView {
+                        harness: "Claude".into(),
+                        name: "primary".into(),
+                        summary: Some("Finished the review".into()),
+                        output: vec!["last output line".into()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        model.selected = Some(0);
+        model.output.choose(OutputTarget::Selected);
+        let (title, lines) = model.output_view(5, 80);
+        assert!(title.contains("Claude"));
+        assert_eq!(lines[0].spans[0].content, "Summary: Finished the review");
+        assert_eq!(lines[1].spans[0].content, "last output line");
     }
 
     #[test]

@@ -26,39 +26,10 @@ pub fn board(
             .filter(|title| !title.is_empty())
             .unwrap_or(target.slug());
         let mut details = Vec::new();
-        let mut badge = if let Some(work) = &work {
-            details.push(format!("Work: {}", work.state.as_str()));
-            if let Some(note) = &work.note {
-                details.push(clean_text(note));
-            }
-            if let Some(gate) = &work.blocked_on {
-                details.push(format!("Blocked on: {}", clean_text(gate)));
-            }
-            if work.verify_after_merge.is_some() {
-                details.push("Verify after merge: required · V shows steps".into());
-            }
-            work.state.as_str().to_owned()
-        } else {
-            String::new()
-        };
+        let mut badge = String::new();
         if stored["automationsPaused"].as_bool() == Some(true) {
             badge.push_str("  auto paused");
             details.push("Automations paused for this worktree".into());
-        }
-        if let Some(status) = &snapshot.status {
-            details.push(format!(
-                "Changes: {} tracked, {} untracked",
-                status.tracked_changes, status.untracked_files
-            ));
-            if let Some(upstream) = &status.upstream {
-                details.push(format!("Upstream: {}", clean_text(upstream)));
-                if let (Some(ahead), Some(behind)) = (status.ahead, status.behind) {
-                    details.push(format!("{ahead} ahead, {behind} behind upstream"));
-                }
-            }
-        }
-        if let Some(error) = &snapshot.error {
-            details.push(format!("Git: {}", clean_text(error)));
         }
         rows.push(BoardRow {
             key: wt_core::worktree_target_key(target),
@@ -71,6 +42,54 @@ pub fn board(
             path: clean_text(&target.path),
             badge,
             work_rank: wt_core::work_record_rank(work.as_ref()),
+            work: work.as_ref().map(|record| {
+                let mut record = record.clone();
+                record.note = record.note.as_deref().map(clean_text);
+                record.blocked_on = record.blocked_on.as_deref().map(clean_text);
+                record.verify_after_merge = record.verify_after_merge.as_deref().map(clean_text);
+                wt_tui::WorkPresentation {
+                    record: Some(record.clone()),
+                    effective_state: Some(record.state),
+                    blocked: wt_core::is_gated(Some(&record)),
+                    stale: record
+                        .sha
+                        .as_deref()
+                        .zip(
+                            snapshot
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.head_sha.as_deref())
+                                .or(snapshot.worktree.head_sha.as_deref()),
+                        )
+                        .map(|(recorded, current)| recorded != current),
+                    ..wt_tui::WorkPresentation::default()
+                }
+            }),
+            git: wt_tui::GitPresentation {
+                head_sha: snapshot
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.head_sha.clone())
+                    .or_else(|| snapshot.worktree.head_sha.clone()),
+                error: snapshot.error.as_deref().map(clean_text),
+                tracked_changes: snapshot
+                    .status
+                    .as_ref()
+                    .map(|status| status.tracked_changes),
+                untracked_files: snapshot
+                    .status
+                    .as_ref()
+                    .map(|status| status.untracked_files),
+                upstream: snapshot
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.upstream.as_deref())
+                    .map(clean_text),
+                ahead: snapshot.status.as_ref().and_then(|status| status.ahead),
+                behind: snapshot.status.as_ref().and_then(|status| status.behind),
+                ..wt_tui::GitPresentation::default()
+            },
+            automations_paused: stored["automationsPaused"].as_bool() == Some(true),
             verify_steps: work
                 .as_ref()
                 .and_then(|work| work.verify_after_merge.as_deref())

@@ -24,6 +24,7 @@ mod events;
 mod fleet_cleanup;
 mod fork_base;
 mod freshness;
+mod git_presentation;
 mod github_actions;
 mod github_events_source;
 mod github_pickers;
@@ -65,6 +66,7 @@ mod skills;
 mod sources;
 mod terminal_palette;
 mod updates;
+mod work_presentation;
 mod worktree_facts;
 
 use std::sync::Arc;

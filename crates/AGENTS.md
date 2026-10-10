@@ -1,8 +1,8 @@
 # Rust implementation
 
 The user authorized a complete rewrite on this branch. Keep work on this branch;
-do not merge or promote it. The TypeScript tree is a temporary behavior reference,
-not a permitted runtime dependency of the finished application.
+do not merge or promote it. The TypeScript behavior baseline is commit `d9cd2f4`
+and is not included in this tree. Do not add it as a runtime dependency.
 
 Use the parent instructions for behavioral contracts. Rust uses explicit
 ownership, typed errors, Tokio tasks, and scoped resources.
@@ -32,5 +32,5 @@ ownership, typed errors, Tokio tasks, and scoped resources.
   integration checks, dependency policy, commits, and release operations.
 
 The migration inventory lives in `docs/rust-rewrite-inventory.md`; the execution
-record is `docs/rust-rewrite.md`. Neither a passing subset of tests nor this new
-workspace proves completion of the full rewrite.
+record is `docs/rust-rewrite.md`. Use their current evidence and open cutover
+gates when assessing completion; a package-scoped test is not a workspace gate.

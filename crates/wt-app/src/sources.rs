@@ -141,6 +141,22 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
             issues: issues.statuses,
         },
     );
+    let git_facts = crate::git_presentation::start(
+        scope,
+        context,
+        local_sources.git.clone(),
+        local_sources.metadata.clone(),
+        github.clone(),
+    );
+    let board = crate::git_presentation::overlay(
+        scope,
+        board,
+        git_facts,
+        local_sources.git.clone(),
+        local_sources.metadata.clone(),
+        github.clone(),
+        context.config.branch.base.clone(),
+    );
     let naming = crate::naming_source::start(
         scope,
         context,
@@ -155,6 +171,8 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         crate::review_requests::ReviewRequests::start(scope, context);
     let board = crate::review_requests::overlay(scope, board, review_snapshot);
     let board = crate::attention_source::overlay(scope, context, board, attention_sources);
+    let board =
+        crate::work_presentation::overlay(scope, context.config.clone(), board, github.clone());
     let automations = crate::automation_source::start(
         scope,
         context,
@@ -393,70 +411,10 @@ fn compose(
             row.badge = format!("{}  #{} {}", row.badge, pr.number, clean(state))
                 .trim()
                 .to_owned();
-            row.details
-                .push(format!("PR #{}: {}", pr.number, clean(&pr.title)));
-            row.details.push(clean(&pr.url));
-            row.details.push(format!(
-                "GitHub: {} · base {}",
-                clean(state),
-                clean(&pr.base_ref_name)
-            ));
             if pr.state == "OPEN" {
-                let checks = match pr.checks {
-                    PrChecks::Pass => "passing",
-                    PrChecks::Fail => "failing",
-                    PrChecks::Pending => "pending",
-                    PrChecks::None => "none",
-                };
-                row.details.push(format!("Checks: {checks}"));
-                for failed in &pr.failed_checks {
-                    row.details.push(format!("  {}", clean(failed)));
-                }
-                let review = match pr.review {
-                    PrReview::Approved => "approved",
-                    PrReview::ChangesRequested => "changes requested",
-                    PrReview::Pending => "pending",
-                    PrReview::Unrequested => "not requested",
-                    PrReview::None => "none",
-                };
-                row.details.push(format!("Review: {review}"));
-                if !pr.requested_reviewers.is_empty() {
-                    row.details.push(format!(
-                        "Reviewers: {}",
-                        clean(&pr.requested_reviewers.join(", "))
-                    ));
-                }
-                if let Some(bot) = &pr.review_bot {
-                    row.details.push(format!(
-                        "Review bot: {} · {} unresolved",
-                        clean(&bot.state),
-                        bot.unresolved
-                    ));
-                }
-                if pr.unresolved_threads_total > 0 {
-                    row.details.push(format!(
-                        "Unresolved threads: {}",
-                        pr.unresolved_threads_total
-                    ));
-                }
-                if let Some(queue) = data.merge_queue.get(&row.branch) {
-                    row.details.push(format!(
-                        "Merge queue: #{} · {:?}",
-                        queue.position, queue.state
-                    ));
-                } else if pr.auto_merge.is_some() {
-                    row.details.push("Merge when ready: armed".into());
-                }
                 row.needs_attention |= pr.checks == PrChecks::Fail
                     || pr.review == PrReview::ChangesRequested
                     || pr.unresolved_threads > 0;
-            }
-            for comment in &pr.comments {
-                row.details.push(format!(
-                    "{}: {}",
-                    clean(&comment.author),
-                    clean(&comment.body)
-                ));
             }
         }
     }
@@ -625,7 +583,6 @@ mod tests {
         let row = &snapshot.data.as_ref().unwrap().rows[0];
         assert!(row.badge.contains("#42"));
         assert!(row.needs_attention);
-        assert!(row.details.iter().any(|line| line == "Checks: failing"));
         activity_publisher.publish(SourceSnapshot {
             data: Some(Arc::new(crate::activity_source::ActivitySnapshot {
                 activity: vec![wt_tui::ActivityLine {

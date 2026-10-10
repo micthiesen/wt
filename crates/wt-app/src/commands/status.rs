@@ -860,8 +860,7 @@ fn removed_json(entry: wt_store::RemovedWorktree) -> Value {
     let verification_owed = entry.work.as_ref().is_some_and(|work| {
         work.verify_after_merge.is_some() && work.state != "verified" && work.state != "dropped"
     });
-    let merged = entry.extra.get("prState").and_then(Value::as_str) == Some("MERGED")
-        || entry.extra.get("gitState").and_then(Value::as_str) == Some("merged");
+    let merged = wt_store::is_merged_removal(&entry);
     json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_after_merge":entry.work.and_then(|work|work.verify_after_merge),"verification_owed":verification_owed})
 }
 

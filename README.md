@@ -8,7 +8,7 @@ Each row shows live status, PR state, preview deployment, issue link, and coding
 
 The design principle behind all of it: **the human does only the work only a human can do** (merges, logins, judgment calls). Agents assert a per-worktree work status (`wt status` — blocked-on-you / needs-testing / ready-to-merge, with a merge-risk level), the list auto-sorts by what needs you, automations ping only when human action is genuinely required, and a singleton manager session coordinates the fleet. The full rationale and agency model: **[docs/fleet.md](docs/fleet.md)**.
 
-![screenshot](docs/screenshot.png)
+![Native wt showing work status and sections in a demo repository](docs/screenshot.png)
 
 ## Requirements
 
@@ -42,7 +42,8 @@ sh /tmp/wt-install.sh --path
 
 The installer verifies the release checksum and installs under
 `~/.local/share/wt`; `--path` creates `~/.local/bin/wt` when it is available.
-For development builds, use the workspace's Cargo commands instead.
+For development builds and bounded Cargo caches, see
+[development.md](docs/development.md).
 
 `wt update` installs a verified stable or preview release. The launcher probes
 the candidate before it becomes current, and `wt rollback` restores a previously
@@ -116,4 +117,7 @@ Questions, ideas, or a setup to show off — join the [Discord](https://discord.
 
 ## Logs
 
-Every action and error goes to a daily file at `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log` (14-day retention) — a strict superset of what the activity pane shows. Per-worktree destroy logs live at `~/.cache/wt/logs/<slug>-*.log`; `wt logs <slug>` tails the latest.
+Application logs live under the configured log directory in
+`app/wt-native.YYYY-MM-DD.log`, retaining seven daily files. The default log
+directory is `~/.cache/wt/logs`. `wt logs <slug>` reads the worktree's latest
+action or removal log; see [the CLI reference](docs/cli.md).

@@ -122,7 +122,11 @@ def main():
     try:
         # Ratatui patches just the changed digit when an empty board was
         # painted first; raw terminal bytes need not contain "3 worktrees".
-        wait_for(lambda data: all(slug in data for slug in (b"bench-000", b"bench-001", b"bench-002")))
+        # Unnamed rows use their first commit's subject after native Git
+        # presentation resolves; the slug remains in selected details.
+        wait_for(lambda data: all(title in re.sub(
+            rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data
+        ) for title in (b"Fixturework0", b"Fixturework1", b"Fixturework2")))
         drain_for(1)
         before = len(capture)
         drain_for(0.5)

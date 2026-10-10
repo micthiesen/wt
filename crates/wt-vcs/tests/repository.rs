@@ -71,7 +71,7 @@ fn repository(main: PathBuf, root: PathBuf, runner: ProcessRunner) -> GitReposit
             worktree_root: root,
             trunk_branch: "origin/main".into(),
             stage: StageConfig {
-                prefix: "stage".into(),
+                prefix: "stage-".into(),
                 issue_id_pattern: r"([A-Z]+-\d+)".into(),
             },
         },
@@ -159,7 +159,7 @@ async fn inventory_keeps_linked_spaces_detached_and_rift_clones_distinct() {
     assert_eq!(linked.target.path, parent_canonical.to_string_lossy());
     assert_eq!(
         linked.target.stage,
-        "stage-ENG-42-".to_owned() + &digest_prefix("feature parent", 6)
+        wt_core::stage_name("feature parent", "stage-", None)
     );
     assert!(
         linked
@@ -219,13 +219,4 @@ async fn inventory_keeps_linked_spaces_detached_and_rift_clones_distinct() {
             .as_deref()
             .is_some_and(|error| error.contains("Git status"))
     );
-}
-
-fn digest_prefix(value: &str, bytes: usize) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(value.as_bytes())
-        .iter()
-        .take(bytes)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

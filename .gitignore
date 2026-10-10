@@ -1,4 +1,4 @@
-# dependencies (bun install)
+# Dependency directories for managed repositories and external baseline checkouts.
 node_modules
 
 # output
@@ -24,9 +24,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.local
 
 # caches
-.eslintcache
 .cache
-*.tsbuildinfo
 
 # IntelliJ based IDEs
 .idea

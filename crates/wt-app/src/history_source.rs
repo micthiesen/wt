@@ -5,12 +5,13 @@
 //! batch; metadata and inventory changes refresh the same prepared snapshot.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
 
 use anyhow::Result;
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -175,12 +176,14 @@ pub fn start(
                 result = prepare(&context, live_slugs, &request_cancellation) => result,
             };
             match prepared {
-                Ok(snapshot) if !cancellation.is_cancelled() => {
+                Ok((snapshot, fact_error)) if !cancellation.is_cancelled() => {
                     let snapshot = Arc::new(snapshot);
                     last_data = Some(snapshot.clone());
                     publisher.publish(SourceSnapshot {
                         data: Some(snapshot),
-                        state: SourceState::Ready,
+                        state: fact_error
+                            .map(|error| SourceState::Failed(error.into()))
+                            .unwrap_or(SourceState::Ready),
                         updated_at: Some(tokio::time::Instant::now()),
                         revision: 0,
                     });
@@ -265,7 +268,7 @@ async fn prepare(
     context: &AppContext,
     live_slugs: BTreeSet<String>,
     cancellation: &tokio_util::sync::CancellationToken,
-) -> Result<RemovedHistorySnapshot> {
+) -> Result<(RemovedHistorySnapshot, Option<String>)> {
     let records = context
         .database
         .call(|store| Ok(store.read_removed_worktrees()?))
@@ -274,6 +277,8 @@ async fn prepare(
     let records = filter_records(records, &live_slugs, cutoff);
 
     let statuses = read_issue_statuses(context, &records, cancellation).await;
+    let legacy_merges = read_legacy_pr_merges(context, &records, cancellation).await;
+    let landing = read_landing_facts(context, &records, &legacy_merges, cancellation).await;
     let needs_github_url = records.iter().any(|entry| {
         entry
             .extra
@@ -295,6 +300,7 @@ async fn prepare(
     let rows = records
         .into_iter()
         .map(|entry| {
+            let landed = landing.values.get(&entry.slug).copied().flatten();
             present(
                 context
                     .config
@@ -304,10 +310,14 @@ async fn prepare(
                 entry,
                 &statuses,
                 github_repo.as_deref(),
+                landed,
             )
         })
         .collect();
-    Ok(RemovedHistorySnapshot { rows })
+    let error = landing
+        .had_query_error
+        .then(|| "Could not verify production landing for one or more removed worktrees".into());
+    Ok((RemovedHistorySnapshot { rows }, error))
 }
 
 fn present(
@@ -315,6 +325,7 @@ fn present(
     entry: RemovedWorktree,
     statuses: &BTreeMap<String, String>,
     github_repo: Option<&str>,
+    landing_override: Option<bool>,
 ) -> RemovedHistoryRow {
     let issue_override = entry.extra.get("issueId").and_then(Value::as_str);
     let issue_id = issue_identity::resolve(&entry.slug, issue_override);
@@ -352,11 +363,19 @@ fn present(
     if let Some(pr_state) = entry.extra.get("prState").and_then(Value::as_str) {
         details.push(format!("PR: {}", clean(pr_state)));
     }
-    let production_landed = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
+    let saved_landing = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
         Some("production") => Some(true),
         Some("base") => Some(false),
         _ => None,
     };
+    let production_landed = landing_override.or(saved_landing);
+    let landed_on = production_landed.map(|production| {
+        if production {
+            wt_tui::LandingKind::Production
+        } else {
+            wt_tui::LandingKind::Base
+        }
+    });
     if production_landed == Some(true) {
         details.push("Landed on production when removed".into());
     } else if production_landed == Some(false) {
@@ -380,6 +399,8 @@ fn present(
     {
         details.push(format!("Verification is still owed: {}", clean(verify)));
     }
+    let day_label = removal_day_label(&entry.removed_at);
+    let age = wt_core::work_age(&entry.removed_at, now_ms());
     RemovedHistoryRow {
         key: entry.slug.clone(),
         host: None,
@@ -398,8 +419,298 @@ fn present(
         pr_url: entry.extra.get("prUrl").and_then(Value::as_str).map(clean),
         issue_status,
         production_landed,
+        landed_on,
+        day_label,
+        age,
         automations_paused: entry.automations_paused.unwrap_or(false),
     }
+}
+
+fn removal_day_label(timestamp: &str) -> Option<String> {
+    let timestamp_ms = u64::try_from(parse_timestamp_ms(timestamp)?).ok()?;
+    let day = local_removal_day(timestamp_ms)?;
+    let today = local_removal_day(u64::try_from(now_ms()).ok()?)?;
+    if day == today {
+        return Some("today".into());
+    }
+    if today.previous_day() == Some(day) {
+        return Some("yesterday".into());
+    }
+    let weekday = match day.weekday() {
+        time::Weekday::Monday => "Mon",
+        time::Weekday::Tuesday => "Tue",
+        time::Weekday::Wednesday => "Wed",
+        time::Weekday::Thursday => "Thu",
+        time::Weekday::Friday => "Fri",
+        time::Weekday::Saturday => "Sat",
+        time::Weekday::Sunday => "Sun",
+    };
+    let month = match day.month() {
+        time::Month::January => "Jan",
+        time::Month::February => "Feb",
+        time::Month::March => "Mar",
+        time::Month::April => "Apr",
+        time::Month::May => "May",
+        time::Month::June => "Jun",
+        time::Month::July => "Jul",
+        time::Month::August => "Aug",
+        time::Month::September => "Sep",
+        time::Month::October => "Oct",
+        time::Month::November => "Nov",
+        time::Month::December => "Dec",
+    };
+    Some(format!("{weekday} {} {month}", day.day()))
+}
+
+fn local_removal_day(timestamp_ms: u64) -> Option<time::Date> {
+    let (year, month, day, hour, _, _) = crate::display_time::local_time_components(timestamp_ms)?;
+    let month = time::Month::try_from(month).ok()?;
+    let mut date = time::Date::from_calendar_date(year, month, day).ok()?;
+    if hour < 4 {
+        date = date.previous_day()?;
+    }
+    Some(date)
+}
+
+async fn read_legacy_pr_merges(
+    context: &AppContext,
+    records: &[RemovedWorktree],
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> BTreeMap<u64, String> {
+    let wanted = records
+        .iter()
+        .filter(|entry| entry.extra.get("landedOnAtRemoval").is_none())
+        .filter(|entry| entry.extra.get("gitState").and_then(Value::as_str) == Some("merged"))
+        .filter_map(|entry| entry.extra.get("prNumber").and_then(Value::as_u64))
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() || cancellation.is_cancelled() {
+        return BTreeMap::new();
+    }
+    let mut spec = CommandSpec::new("git").args([
+        "log",
+        "--first-parent",
+        "--format=%H%x00%s",
+        &context.config.branch.base,
+    ]);
+    spec.cwd = Some(context.config.paths.main_clone.clone());
+    spec.env = git_read_env();
+    spec.timeout = Duration::from_secs(10);
+    spec.output_limit = 2 * 1024 * 1024;
+    let Ok(output) = context.processes.run(spec, cancellation).await else {
+        return BTreeMap::new();
+    };
+    if !output.status.success() || output.stdout_truncated {
+        return BTreeMap::new();
+    }
+    parse_legacy_pr_merges(&output.stdout, &wanted)
+}
+
+fn parse_legacy_pr_merges(bytes: &[u8], wanted: &HashSet<u64>) -> BTreeMap<u64, String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut found = BTreeMap::new();
+    for line in text.lines() {
+        let Some((sha, subject)) = line.split_once('\0') else {
+            continue;
+        };
+        if !(40..=64).contains(&sha.len()) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Some(tail) = subject.strip_prefix("Merge pull request #") else {
+            continue;
+        };
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0
+            || !tail[digits..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        {
+            continue;
+        }
+        let Ok(number) = tail[..digits].parse::<u64>() else {
+            continue;
+        };
+        if wanted.contains(&number) {
+            found.entry(number).or_insert_with(|| sha.to_owned());
+        }
+    }
+    found
+}
+
+fn classify_landing(
+    saved: Option<bool>,
+    merged_on_base: bool,
+    on_production: Option<bool>,
+) -> Option<bool> {
+    if on_production == Some(true) {
+        Some(true)
+    } else {
+        saved.or_else(|| merged_on_base.then_some(false))
+    }
+}
+
+fn has_durable_landing_proof(landing_marker: Option<&str>, git_state: Option<&str>) -> bool {
+    match landing_marker {
+        Some("base" | "production") => true,
+        Some(_) => false,
+        None => git_state == Some("merged"),
+    }
+}
+
+async fn read_landing_facts(
+    context: &AppContext,
+    records: &[RemovedWorktree],
+    legacy_merges: &BTreeMap<u64, String>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> LandingFacts {
+    let production = context.config.branch.production.as_deref();
+    let base = context.config.branch.base.as_str();
+    let candidates: Vec<(String, Option<bool>, bool, Option<String>)> = records
+        .iter()
+        .map(|entry| {
+            let saved = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
+                Some("production") => Some(true),
+                Some("base") => Some(false),
+                _ => None,
+            };
+            let durable_landing_proof = has_durable_landing_proof(
+                entry.extra.get("landedOnAtRemoval").and_then(Value::as_str),
+                entry.extra.get("gitState").and_then(Value::as_str),
+            );
+            let merged_on_base = durable_landing_proof;
+            let merge_oid = durable_landing_proof
+                .then(|| {
+                    entry
+                        .extra
+                        .get("prMergeCommitOid")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            entry
+                                .extra
+                                .get("prNumber")
+                                .and_then(Value::as_u64)
+                                .and_then(|number| legacy_merges.get(&number).map(String::as_str))
+                        })
+                })
+                .flatten();
+            (
+                entry.slug.clone(),
+                saved,
+                merged_on_base,
+                merge_oid.map(str::to_owned),
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(production) = production else {
+        return LandingFacts {
+            values: candidates
+                .into_iter()
+                .map(|(slug, saved, merged, _)| {
+                    let result = saved.or_else(|| merged.then_some(false));
+                    (slug, result)
+                })
+                .collect(),
+            had_query_error: false,
+        };
+    };
+    if production == base {
+        return LandingFacts {
+            values: candidates
+                .into_iter()
+                .map(|(slug, saved, merged, _)| {
+                    let result = (saved.is_some() || merged).then_some(true);
+                    (slug, result)
+                })
+                .collect(),
+            had_query_error: false,
+        };
+    }
+
+    let mut queries = candidates
+        .iter()
+        .filter(|(_, saved, _, merge_oid)| *saved != Some(true) && merge_oid.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    let main_clone = context.config.paths.main_clone.clone();
+    let processes = context.processes.clone();
+    let production = production.to_owned();
+    let cancellation_child = cancellation.child_token();
+    let checks = stream::iter(queries.drain(..))
+        .map(|(slug, saved, merged, merge_oid)| {
+            let context_path = main_clone.clone();
+            let runner = processes.clone();
+            let production = production.clone();
+            let cancellation = cancellation_child.child_token();
+            async move {
+                let Some(merge_oid) = merge_oid else {
+                    return (slug, saved.or_else(|| merged.then_some(false)), false);
+                };
+                let mut spec = CommandSpec::new("git").args([
+                    "merge-base",
+                    "--is-ancestor",
+                    &merge_oid,
+                    &production,
+                ]);
+                spec.cwd = Some(context_path);
+                spec.env = git_read_env();
+                spec.timeout = Duration::from_secs(8);
+                spec.output_limit = 16 * 1024;
+                let (landing, failed) = match runner.run(spec, &cancellation).await {
+                    Ok(output) => classify_production_exit(saved, merged, output.status.code()),
+                    Err(_) => classify_production_exit(saved, merged, None),
+                };
+                (slug, landing, failed)
+            }
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+    let checks = checks.into_iter().collect::<Vec<_>>();
+    let had_query_error = checks.iter().any(|(_, _, failed)| *failed);
+    let mut result = checks
+        .into_iter()
+        .map(|(slug, value, _)| (slug, value))
+        .collect::<HashMap<_, _>>();
+    for (slug, saved, merged, merge_oid) in candidates {
+        result.entry(slug).or_insert_with(|| {
+            if saved == Some(true) {
+                Some(true)
+            } else if merge_oid.is_none() && merged {
+                Some(false)
+            } else {
+                saved
+            }
+        });
+    }
+    LandingFacts {
+        values: result,
+        had_query_error,
+    }
+}
+
+struct LandingFacts {
+    values: HashMap<String, Option<bool>>,
+    had_query_error: bool,
+}
+
+fn classify_production_exit(
+    saved: Option<bool>,
+    merged_on_base: bool,
+    exit_code: Option<i32>,
+) -> (Option<bool>, bool) {
+    match exit_code {
+        Some(0) => (classify_landing(saved, merged_on_base, Some(true)), false),
+        Some(1) => (classify_landing(saved, merged_on_base, Some(false)), false),
+        _ => (classify_landing(saved, merged_on_base, None), true),
+    }
+}
+
+fn git_read_env() -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+    vec![
+        ("GIT_OPTIONAL_LOCKS".into(), Some("0".into())),
+        ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
+        ("LC_ALL".into(), Some("C".into())),
+    ]
 }
 
 fn filter_records(
@@ -578,6 +889,7 @@ mod tests {
             entry,
             &statuses,
             Some("https://github.com/org/repo"),
+            None,
         );
         assert_eq!(row.key, "eng-12-fix");
         assert_eq!(row.title, "Saved title");
@@ -618,6 +930,7 @@ mod tests {
             entry,
             &BTreeMap::new(),
             Some("https://github.com/org/repo"),
+            None,
         );
         assert_eq!(
             row.issue_url.as_deref(),
@@ -633,6 +946,67 @@ mod tests {
             parse_timestamp_ms("2026-10-09T10:00:00.123Z"),
             Some(1_791_540_000_123)
         );
+    }
+
+    #[test]
+    fn legacy_merge_scan_requires_exact_pr_number_and_keeps_newest_match() {
+        let wanted = HashSet::from([12, 123]);
+        let rows = parse_legacy_pr_merges(
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0Merge pull request #12 from x\n\
+              bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\0Merge pull request #123x bad\n\
+              cccccccccccccccccccccccccccccccccccccccc\0Merge pull request #12 again\n\
+              dddddddddddddddddddddddddddddddddddddddd\0Merge pull request #123 from valid\n",
+            &wanted,
+        );
+        assert_eq!(
+            rows.get(&12).map(String::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            rows.get(&123).map(String::as_str),
+            Some("dddddddddddddddddddddddddddddddddddddddd")
+        );
+    }
+
+    #[test]
+    fn production_query_does_not_invent_base_landing() {
+        assert_eq!(classify_landing(None, false, Some(false)), None);
+        assert_eq!(classify_landing(None, true, Some(false)), Some(false));
+        assert_eq!(classify_landing(Some(false), false, Some(true)), Some(true));
+        assert_eq!(classify_landing(Some(false), false, None), Some(false));
+    }
+
+    #[test]
+    fn production_query_only_exit_one_means_negative_and_other_errors_surface() {
+        assert_eq!(
+            classify_production_exit(None, false, Some(0)),
+            (Some(true), false)
+        );
+        assert_eq!(
+            classify_production_exit(None, false, Some(1)),
+            (None, false)
+        );
+        assert_eq!(
+            classify_production_exit(None, false, Some(128)),
+            (None, true)
+        );
+        assert_eq!(
+            classify_production_exit(Some(false), true, Some(128)),
+            (Some(false), true)
+        );
+        assert_eq!(
+            classify_production_exit(None, true, None),
+            (Some(false), true)
+        );
+    }
+
+    #[test]
+    fn legacy_pr_identity_without_landing_proof_stays_unknown() {
+        assert!(!has_durable_landing_proof(None, Some("open")));
+        assert!(!has_durable_landing_proof(None, None));
+        assert!(has_durable_landing_proof(None, Some("merged")));
+        assert!(!has_durable_landing_proof(Some("unlanded"), Some("merged")));
+        assert!(has_durable_landing_proof(Some("base"), None));
     }
 
     #[test]

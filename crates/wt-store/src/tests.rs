@@ -641,6 +641,25 @@ fn work_status_reassertion_and_amend_preserve_unknown_fields() {
 }
 
 #[test]
+fn removal_revision_proof_overrides_historical_pr_state() {
+    let mut row: RemovedWorktree = serde_json::from_value(json!({
+        "slug": "feature", "branch": "feature/one", "removedAt": "2026-10-09T00:00:00Z",
+        "prState": "MERGED", "gitState": "merged"
+    }))
+    .unwrap();
+    assert!(crate::is_merged_removal(&row));
+    for (proof, expected) in [
+        ("unlanded", false),
+        ("unknown-future-proof", false),
+        ("base", true),
+        ("production", true),
+    ] {
+        row.extra.insert("landedOnAtRemoval".into(), json!(proof));
+        assert_eq!(crate::is_merged_removal(&row), expected, "{proof}");
+    }
+}
+
+#[test]
 fn removed_history_keeps_verification_obligation_and_pause_across_minimal_confirm() {
     let temp = tempdir().unwrap();
     let mut store = Store::open(

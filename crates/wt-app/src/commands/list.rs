@@ -361,6 +361,10 @@ fn live_json(
         (None, None) => ("missing", "missing".into()),
     };
     let deployed = is_deployed(ctx, target.path.as_ref());
+    // No configured service is a known stopped state. A configured service
+    // whose observation failed stays null, with dev_error explaining why.
+    let unconfigured_dev = DevServerStatus::default();
+    let dev = dev.or_else(|| ctx.config.dev_server.is_none().then_some(&unconfigured_dev));
     let base = entry
         .and_then(|entry| entry.get("baseBranch"))
         .and_then(Value::as_str)
@@ -458,16 +462,7 @@ fn removed_json(entry: &RemovedWorktree) -> Value {
 }
 
 fn is_merged(entry: &RemovedWorktree) -> bool {
-    entry
-        .extra
-        .get("prState")
-        .and_then(Value::as_str)
-        .is_some_and(|state| state == "MERGED")
-        || entry
-            .extra
-            .get("gitState")
-            .and_then(Value::as_str)
-            .is_some_and(|state| state == "merged")
+    wt_store::is_merged_removal(entry)
 }
 
 fn now_ms() -> i64 {

@@ -142,41 +142,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
     if model.history.selected < model.history.offset {
         model.history.offset = model.history.selected;
     }
-    if model.history.selected >= model.history.offset + height {
-        model.history.offset = model
-            .history
-            .selected
-            .saturating_add(1)
-            .saturating_sub(height);
+    while model.history.selected >= model.history.offset
+        && visible_row_count(rows, model.history.offset, height)
+            <= model.history.selected.saturating_sub(model.history.offset)
+    {
+        model.history.offset = model.history.offset.saturating_add(1);
     }
-    let lines = rows
-        .iter()
-        .enumerate()
-        .skip(model.history.offset)
-        .take(height)
-        .map(|(index, row)| {
-            Line::from(format!(
-                "{} {}  {}{}",
-                if index == model.history.selected {
-                    "›"
-                } else {
-                    " "
-                },
-                row.slug,
-                row.title,
-                if row.automations_paused {
-                    " [auto paused]"
-                } else {
-                    ""
-                }
-            ))
-            .style(if index == model.history.selected {
-                Style::new().fg(Color::Cyan)
-            } else {
-                Style::new()
-            })
-        })
-        .collect::<Vec<_>>();
+    let (lines, _) = history_lines(rows, model.history.offset, model.history.selected, height);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -191,7 +163,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
             let mut lines = vec![
                 Line::from(row.title.clone()),
                 Line::from(row.branch.clone()),
-                Line::from(format!("Removed: {}", row.removed_at)),
+                Line::from(format!(
+                    "Removed: {}{}",
+                    row.day_label.as_deref().unwrap_or(&row.removed_at),
+                    row.age
+                        .as_deref()
+                        .map(|age| format!(" · {age} ago"))
+                        .unwrap_or_default()
+                )),
             ];
             if let Some(host) = &row.host {
                 lines.push(Line::from(format!("Host: {host}")));
@@ -212,6 +191,73 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
             ),
         details,
     );
+}
+
+fn visible_row_count(rows: &[crate::RemovedHistoryRow], offset: usize, height: usize) -> usize {
+    history_lines(rows, offset, usize::MAX, height).1
+}
+
+fn history_lines(
+    rows: &[crate::RemovedHistoryRow],
+    offset: usize,
+    selected: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let mut lines = Vec::new();
+    let mut row_count = 0;
+    let mut previous_day = offset
+        .checked_sub(1)
+        .and_then(|previous| rows.get(previous))
+        .and_then(|row| row.day_label.as_deref());
+    for (index, row) in rows.iter().enumerate().skip(offset) {
+        if lines.len() >= height {
+            break;
+        }
+        let day = row.day_label.as_deref();
+        if let Some(day) = day
+            && Some(day) != previous_day
+        {
+            if lines.len() + 1 >= height {
+                break;
+            }
+            lines.push(Line::from(format!("  {day}")).style(Style::new().fg(Color::DarkGray)));
+        }
+        let marker = match row.landed_on {
+            Some(crate::LandingKind::Production) => "↑",
+            Some(crate::LandingKind::Base) => "✓",
+            None if row.issue_status.is_some() => "·",
+            None => " ",
+        };
+        let age = row
+            .age
+            .as_deref()
+            .map(|age| format!("  {age}"))
+            .unwrap_or_default();
+        let paused = if row.automations_paused {
+            " [auto paused]"
+        } else {
+            ""
+        };
+        lines.push(
+            Line::from(format!(
+                "{}{} {}  {}{}{}",
+                if index == selected { "›" } else { " " },
+                marker,
+                row.slug,
+                row.title,
+                age,
+                paused
+            ))
+            .style(if index == selected {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new()
+            }),
+        );
+        row_count += 1;
+        previous_day = day;
+    }
+    (lines, row_count)
 }
 
 #[cfg(test)]

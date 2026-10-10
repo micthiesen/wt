@@ -2,8 +2,8 @@
 
 wt is a native Rust workspace. The installed `wt` executable is built from
 `crates/wt-app`; running it does not require Bun, Node, a JavaScript bundle, or
-a source checkout. The `src/` tree is the retained TypeScript implementation
-and compatibility reference, not the runtime implementation.
+a source checkout. The former TypeScript implementation is not included in this
+tree; its behavior baseline is commit `d9cd2f4`.
 
 ## Workspace map
 

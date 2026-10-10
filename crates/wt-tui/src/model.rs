@@ -116,6 +116,10 @@ pub struct SessionView {
     pub state: String,
     pub live: bool,
     pub queued: u32,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub context_percent: Option<u8>,
     pub output: Vec<String>,
 }
 
@@ -139,11 +143,17 @@ pub struct RemovedHistoryRow {
     pub branch: String,
     pub title: String,
     pub removed_at: String,
+    #[serde(default)]
+    pub day_label: Option<String>,
+    #[serde(default)]
+    pub age: Option<String>,
     pub details: Vec<String>,
     pub issue_url: Option<String>,
     pub pr_url: Option<String>,
     pub issue_status: Option<String>,
     pub production_landed: Option<bool>,
+    #[serde(default)]
+    pub landed_on: Option<LandingKind>,
     pub automations_paused: bool,
 }
 
@@ -173,6 +183,115 @@ pub struct BoardSection {
     pub folded: bool,
     /// Indices into the prepared board's rows, already sorted by the source.
     pub rows: Vec<usize>,
+    #[serde(default)]
+    pub rollup: SectionRollup,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SectionRollup {
+    pub states: Vec<WorkStateCount>,
+    pub risks: Vec<WorkRiskCount>,
+    pub blocked_notes: Vec<String>,
+    pub stale_statuses: usize,
+    pub verification_owed: usize,
+    pub verification_overdue: usize,
+    pub dirty_worktrees: Option<usize>,
+    pub unknown_git: usize,
+    pub upstream_ahead: usize,
+    pub upstream_behind: usize,
+    pub rebasing: usize,
+    pub conflicted: usize,
+    pub open_prs: usize,
+    pub draft_prs: usize,
+    pub queued_prs: usize,
+    pub failing_checks: usize,
+    pub paused_automations: usize,
+    pub needs_attention: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkStateCount {
+    pub state: Option<wt_core::WorkState>,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkRiskCount {
+    pub risk: wt_core::WorkRisk,
+    pub count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandingKind {
+    Base,
+    Production,
+}
+
+/// Git facts prepared by the host source. Missing fields mean unknown, not clean.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GitPresentation {
+    pub head_sha: Option<String>,
+    pub error: Option<String>,
+    pub tracked_changes: Option<u32>,
+    pub untracked_files: Option<u32>,
+    pub upstream: Option<String>,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    pub landed_on: Option<LandingKind>,
+    pub rebasing: bool,
+    pub conflict_files: Vec<String>,
+    pub pr_title: Option<String>,
+    pub first_commit_title: Option<String>,
+}
+
+/// Persisted status plus display-time derivations. This never authorizes actions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkPresentation {
+    pub record: Option<wt_core::WorkStatusRecord>,
+    pub effective_state: Option<wt_core::WorkState>,
+    pub derived: bool,
+    pub age: Option<String>,
+    pub stale: Option<bool>,
+    pub verification_owed: bool,
+    pub verification_overdue: bool,
+    pub blocked: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PrPresentation {
+    pub head_sha: Option<String>,
+    pub number: Option<u64>,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub state: Option<String>,
+    pub draft: bool,
+    pub base_branch: Option<String>,
+    pub checks: Option<String>,
+    pub failed_checks: Vec<String>,
+    pub review: Option<String>,
+    pub reviewers: Vec<String>,
+    pub review_bot: Option<String>,
+    pub unresolved_threads: u32,
+    pub merge_queue: Option<String>,
+    pub auto_merge_armed: bool,
+    pub comments: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// One explicitly identified detail pane group. `id` is matched against
+/// `[ui].rows`; rendering never infers group identity from its text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PreparedDetailGroup {
+    pub id: String,
+    pub label: String,
+    pub lines: Vec<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +327,16 @@ pub struct BoardRow {
     pub dev_url: Option<String>,
     pub archived: bool,
     pub stack_prefix: String,
+    #[serde(default)]
+    pub work: Option<WorkPresentation>,
+    #[serde(default)]
+    pub git: GitPresentation,
+    #[serde(default)]
+    pub pr: Option<PrPresentation>,
+    #[serde(default)]
+    pub automations_paused: bool,
+    #[serde(default)]
+    pub detail_groups: Vec<PreparedDetailGroup>,
     #[serde(default)]
     pub sessions: Vec<SessionView>,
     #[serde(default)]
@@ -1870,6 +1999,7 @@ mod tests {
             title: "Batch".into(),
             folded,
             rows: (0..keys.len()).collect(),
+            ..Default::default()
         }];
         state
     }
@@ -2051,6 +2181,7 @@ mod tests {
             title: "Archived".into(),
             rows: vec![0],
             folded: false,
+            ..Default::default()
         });
         model.apply(moved);
         assert_eq!(model.selected_row().unwrap().key, "two");

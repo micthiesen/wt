@@ -18,6 +18,8 @@ pub struct HarnessExtras {
     pub tail_ended_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_percent: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

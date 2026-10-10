@@ -1,260 +1,181 @@
 # TUI guide
 
-When `[issue_tracker].status_command` is configured, the selected worktree's
-issue row includes the external tracker's current status, separate from its
-agent-asserted work-status banner. A shell action's configured `issue_status`
-appears immediately with `(updating)` until its tracked result is confirmed;
-failures return to server truth. Normal source spinners and errors apply.
-The compact issue line shows a configurable colored icon with `#ENG-123 · In Review`.
-An attached GitHub notes issue appears as `#ENG-123 ← #456 · In Review`, without
-its own status. Opening/copying still uses the full URLs. Configure exact
-status colors and icons under `[issue_tracker.status_styles]`.
-Confirmed tracker changes appear in attention as `#ENG-123: In Progress → In Review`;
-initial loads and optimistic updates are not narrated as completed changes.
-Automation queue entries include their remaining settle delay, followed by running
-and outcome entries. External task-action success/failure stays in attention.
-Explicit `[[actions]].key` bindings may use lowercase letters or digits in `!`.
-
-`wt` with no arguments launches the TUI. Press `?` inside for the built-in keymap + glyph legend (with `/` to filter it) — that overlay is always the most current reference; this page is the tour. The overlay's title also shows the running version (the native build identity — see [`wt version`](cli.md#wt-version)).
-
-In help, `/` starts filtering, Enter keeps the filtered view, and Esc clears a
-query before closing the overlay. Mouse-wheel scrolling follows the pane under
-the pointer. Terminals that support it can use Shift-click or Shift-drag to
-keep native link opening and text selection while wt is running.
-
-The top-right usage badge follows the selected primary harness. Codex shows remaining allowance, for example `weekly 38% left (4d12h)`; Claude continues to show percent used.
+Run `wt` with no arguments to open the terminal interface. Press `?` for the
+live keymap; use `/` to filter help. The help text is rendered by the native
+application and is the most current reference.
 
 ## Layout
 
-Long pane and modal titles shorten with an ellipsis. Status banners and source
-errors wrap; the activity feed uses the width of its own pane and shortens its
-source column before squeezing the message. Section and task names are measured
-in terminal cells, including wide Unicode characters.
-The perf overlay keeps numeric readings visible at narrow widths by replacing
-decorative bars with compact text; long commands retain a truncation mark.
+At 80 columns or wider, the list uses about 42% of the width and the right
+column contains details above the activity feed. Narrower terminals stack the
+list above the right column. With `[ui].activity_pane = "full_width"`, list and
+details share a top region capped at 22 rows and the activity feed spans the
+bottom. Terminals smaller than 20 columns or 5 rows show a resize prompt.
 
-- **List pane** (left; full height by default, capped to 20 rows under `[ui] activity_pane = "full_width"`): one line per worktree — a work-status marker, resolved title (truncated to fit), PR/CI badges, session indicators — grouped into sections, with stacks rendered as trees. By default it spans the full usable height beside both right-hand panes, so a large Inbox keeps its vertical scan space instead of ending above activity output; `[ui] activity_pane = "full_width"` takes the other side of that trade. Remote worktrees participate in those same sections and carry a small monitor indicator; selecting one shows its server in the details pane. Stacked rows carry a tree rail in a gutter to the LEFT of the marker, never in place of it, and the marker column stays straight across stacked and unstacked rows so a scan down it never breaks. The rail is the `tree(1)` idiom — column is depth, glyph is position among siblings (`┌` tops the spine, `├` has one following, `└` is last, `│` continues an ancestor's column), color is lane — and it describes the sub-tree actually on screen, so it never points at a row that isn't there ([stacked-prs.md](stacked-prs.md#the-rail)). There are deliberately no `01`/`02` ordinals, because numbering a fork's children asserts a merge order that doesn't exist (if ordinals are ever wanted, merge **edges** are the thing that actually encodes order). The gutter auto-sizes to the deepest rail drawn and costs zero columns when nothing on screen is stacked. The leftmost slot is the colored **work-status dot** (`wt status` / `u`: red needs-human, yellow needs-testing, green ready, magenta review, cyan working, hollow todo; unasserted rows show the same dim hollow dot as todo; a **hollow dot in a state's color** means the assertion is stale — commits landed after it, so re-verify before trusting it). With `[branch] production` configured, confirmed landing on the base branch changes its shape to a Git merge icon, and inclusion of that PR's merge commit on the production branch changes it to a Git commit icon; **the `u` status keeps its color**, including blocked and overdue states. Those shapes indicate branch position, not successful deployment. Without that option, the loud git states (busy op, missing, gone, merged) retain their existing glyphs; uncommitted changes show as a pencil in the right badge cluster. With `[ui] sort = "status"` (default), rows auto-sort inside each section by that urgency; stable slugs break ties, never displayed titles. The cursor follows the worktree, not the position. Fresh **merge edges** (`wt edge`, [cli.md](cli.md#wt-edge-from-kind-to)) then topologically order rows within their section, so rendering order reads as merge order — sections stay the human's batching, edges own order within a batch, and a stale edge (either branch moved) silently stops steering. A pinned "review requests" section surfaces PRs waiting on your review; press `d` to dismiss the selected snapshot until that PR changes.
-- **Folded-section summary**: when the cursor sits on a folded section header, the details pane describes the BATCH rather than a worktree — a work-status rollup (`7 worktrees · 2 ready · 1 needs-human · …`, most urgent first, each dot in its state's color), a line of mechanical facts that decide whether the batch can move (open PRs, merge-queue entries, failing checks, dirty checkouts, paused automations — each omitted when zero), the member rows rendered with the same gutter and badge glyphs the list uses, `low`/`medium`/`high` on the `ready` ones, and finally the verbatim notes of any member blocked on you. Risk and the badge cluster each get a column reserved at the section's widest member, so both read straight down the pane; without that the risk label drifted by the badge-count difference between rows, since the cluster is flush right and renders only the badges a row actually has. Those notes are sized to the pane: they split whatever rows the rest of the summary left over, so one blocked member reads in full where five each get a couple of lines, and a note the budget cut ends in `...` — a note that just stopped mid-sentence read as a rendering fault, and read as the WHOLE note to anyone who didn't know a cap existed. Member rails are laid out over the members shown here, same rule as the list, so a parent outside the section simply isn't part of the spine. A section is whatever batch you dragged into it, so the summary scrolls on the usual `Ctrl+J`/`Ctrl+K` with the key hints pinned below it.
-- **Details pane** (right): the worktree's **slug in the border bar** (lowercase, like every other pane's border — it is the identifier `wt status`, a manager message and a log line all use, and it used to appear here only as the tail of the `path` row), then its resolved **title**, wrapped in full above the rows (best source wins — `manual > llm > pr > commit > slug` — with a muted `(source)` tag), then a full-width **work-status banner** at the top (state, risk, age, and the complete note, word-wrapped in a mid-tone behind a thin `│` blockquote rail in the state's color, centered under the status dot — the same dot shape/colors as the list; the `u` picker shows the same glyphs per state), then the configured rows (`[ui].rows` in [configuration.md](configuration.md#ui)) for the selected worktree — branch (as `<branch> → <base>`, one line for one fact), tracker issue, stage, PR, sessions, git state — then a rebase-state block (restacking / mid-rebase / conflict with the clashing files) when something is moving, plus the harness-generated description band when `[naming]` is configured (the same resolved title labels the list, truncated to fit). When the row's session just wrapped up, the harness's own summary line renders muted above that description (it disappears as soon as the conversation moves on) — for Claude that includes the "※ recap" away-summaries, hint stripped.
-- **Activity pane** (below details by default; `[ui] activity_pane = "full_width"` moves it back across the bottom under both panes, capping list+details at 20 rows in exchange for the full terminal width before the feed word-wraps): live outputs — harness sessions, action runs, and two event feeds: the curated **attention** feed (status transitions, needs-you signals, new PR comments from other people, dev-server startup crashes, errors) and the full firehose. It occupies the lower part of the right column beneath worktree metadata rather than spanning below the Inbox. Dev logs stay out of this layout: on a row with a running, starting, or crashed dev server, `! l` opens its live supervisor output in a dedicated scrollable overlay (`j`/`k`, arrows, page keys, `g`/`G`, mouse wheel); closing the overlay stops its one-second poll. A supervised dev server that exhausts its startup retries contributes its last useful application-error line and points to `wt dev logs`, rather than only turning the row red. The attention feed is the default whatever row is selected — navigating never flips the pane to a session's output; only a destroy in flight or a just-launched action takes over. Attention and activity entries show local time, wrap to the pane width, and scroll by visual rows; continuation lines use a two-cell hanging indent so long notes remain readable. Each FIELD of a status line is clamped to its own documented budget before it gets there — the note to the ~400 the CLI teaches, the gate and verification steps to a headline — because an unbounded field floods the shared feed and evicts other signals. The clamp marks its cut, and the full text remains in the details pane and log file. `'` picks an output explicitly (remembered per worktree until that output dies), `[` / `]` cycle, `"` jumps to attention (again for the firehose), `Esc` forgets the pick and returns to the default. The feeds **survive restarts** — at boot they're restored from the daily app log (yesterday + today, up to the buffer caps), so the attention trail is still there after wt (or the machine) bounced; identical lines written within a few seconds of each other (several wt processes observing the same transition) are collapsed to one on restore. Scroll them with `Ctrl+Shift+J`/`Ctrl+Shift+K` (or `Ctrl+E`/`Ctrl+Y`, or the mouse wheel — plain `Ctrl+J`/`Ctrl+K` scrolls the details pane); the view re-follows the live tail when you return to the bottom. Once you've worked through what the attention feed is asking for, `x` (while the feed is showing) **marks it seen**: everything up to that moment drops to dim below a `── seen HH:MM:SS` rule in local time, and the pane snaps to the live tail (re-engaging follow if you'd scrolled back), so the feed reads "only new stuff" at a glance while the handled history stays scrollable — nothing is deleted, and the firehose is untouched. The watermark persists (wtstate), so the boot restore comes back already dimmed; an all-dim tail ending in the rule means you're caught up.
-- **Footer**: transient content on the left — the active **toast** (keystroke acks like "copied branch", plus background completions: work-status changes, automation fires, action results) or a quiet `? help` hint when idle — and the four special-session buttons grouped at the right: `[m]` the [manager](manager.md) first, then `[.]` the main clone, `[,]` the wt repo, `[/]` dotfiles (absent when there's no dotfiles repo), each key colored by that session's live state (dim when none). When a live manager claude session has produced a turn, its **context %** renders immediately left of `[m]` (dim; warn at ≥70, red at ≥85 — compact via `M m` before Claude auto-compacts it mid-thought). Replaced by a text prompt when one is active (`n` local new-worktree, `Ctrl+N` remote new-worktree, `L` rename section). Background toasts are always also a line in the bottom pane's feeds — the toast is the flash, the feed is the record — while keystroke acks are toast-only (they answer a key you just pressed).
+The list shows a stack tree prefix, a work-status marker, the worktree title,
+issue status when available, and PR/session/automation badges. Work-status
+markers use color for state: red for needs-human, yellow for needs-testing or
+working, green for ready or verified, cyan for review, dim hollow for todo or
+unset, and dim slash for dropped. A hollow marker in a state's color means the saved
+status SHA differs from the current observed HEAD. A gated ready/todo status
+uses a yellow slash, and overdue post-merge verification is red. The list does
+not change the marker into a Git merge or commit glyph when a branch lands;
+landing, rebase, and conflict facts appear in the Git details group.
 
-**New PR comments land on the attention feed.** When someone else comments on a worktree's PR (a top-level comment or a review body), the line shows up as `<login> commented: <first ~100 chars>` under that worktree — nothing in git moves when a coworker types, so without this the comment lives only in the details pane. Bots and your own comments are filtered out, and a comment is narrated once: the first observation after startup is treated as history, so you get the backlog that arrived while wt was down but never a replay of the whole conversation (more than three at once collapse to a single `N new PR comments (…)` line). Inline review-thread replies aren't included — the details pane's unresolved-thread count covers those.
+Sections can be folded with `Tab`. A folded header summarizes work states,
+risk, stale or overdue status, Git dirtiness and upstream movement, rebases or
+conflicts, PRs and checks, paused automations, attention, and up to two blocker
+notes. Select the section to see the full rollup and blocker notes above its
+member rows. The summary is prepared from the same typed facts used by the
+detail pane. `[ui].sort = "status"` orders rows by work status; manual section
+placement remains separate.
 
-Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the state files — plus the optional [GitHub webhook daemon](github-events.md) — invalidate exactly what changed. `r` requests a refresh; `Ctrl+R` (with confirmation) clears derived naming and GitHub picker caches, bypasses the cached webhook snapshot once, and refreshes sources. Durable state, action history, automation delivery records, and session identity remain intact. GitHub-side changes have no local signal at all, so the PR fetch also re-runs every 3 minutes (or on the daemon's own backstop when it's configured) — that interval is the worst case for how late a comment can reach the feed.
+The details pane begins with the title, branch, and path, followed by the work
+status, risk, status age, note, gate, and verification obligation when present.
+`[ui].rows` controls the order and visibility of typed detail groups: `branch`,
+`issue` (also `linear`), `stage`, `dev`, `pr`, `claude` (the cross-harness AI
+session group), and `git`. The optional `path` group can be added explicitly.
+Unknown group names are skipped. A GitHub or host error remains visible as an
+error, and unavailable facts remain unknown rather than being shown as clean.
+
+Title precedence is saved manual title, generated title, PR title, first commit
+title, then slug. The pane does not show a title-source tag. The AI session
+group lists live or discovered Claude, Codex, and OpenCode sessions. When none
+is listed, it shows the configured primary harness and the F12 start hint.
+Selected session output starts with its available transcript summary.
+
+The activity pane shows attention and activity feeds, session output, and
+tracked action output. Attention is the curated feed; activity contains the
+broader event stream. Entries show local time, wrap to the pane width, and
+scroll by visual rows. The attention watermark is saved and `x` marks the
+current feed as seen. `Ctrl+J`/`Ctrl+K` scroll details; `Ctrl+E`/`Ctrl+Y`,
+`Ctrl+Shift+J`/`Ctrl+Shift+K` where supported, and the mouse wheel scroll the
+output pane. Selecting an output with `'` pins it until it ends; `[`/`]` cycle
+outputs, `"` toggles attention/all activity, and `Esc` returns to the default.
+The feed is restored from the app log on startup.
+
+The footer shows the active prompt, a toast, a source error, or a static key
+hint. When the normal key hint is shown and facts are available, it prefixes
+live manager/main/wt/dotfiles session states; the manager Claude session also
+shows context occupancy after a transcript turn provides usage. These are
+status labels, not clickable session buttons.
+Remote session entry is available after its worktree is present; F12 does not
+queue an automatic attach for a worktree that is still being created.
+
+When `h` opens removed-worktree history, rows are grouped by local day starting
+at 04:00. `↑` marks proved production landing, `✓` marks proved base landing,
+and age appears beside the row. Older records can be checked against a bounded
+local GitHub-merge and production-history scan while history is open. Select a
+row to see its removal time, host, saved status, issue/PR facts, and restore
+details. `Enter` restores, `p` opens the PR, `i` opens the issue when known, and
+`y` copies the branch.
 
 ## Keymap
 
-### Navigation
-
-| key | action |
+| Key | Action |
 |---|---|
-| `j`/`k`, arrows | move cursor. Cursor lists keep vim's `scrolloff` of 3 rows: the view starts sliding a few rows before the cursor reaches an edge, instead of parking it on the edge for the rest of the list |
-| `g` / `G` | jump to top / bottom |
-| `Space` | jump to the next row needing attention (`needs-human` / `needs-testing` / `ready`), scanning forward and wrapping — the cross-section scan that per-section status sort can't express |
-| `Tab` | fold/unfold the section under the cursor — a manual section, the Inbox, or the Archived block. The fold persists (`foldedSections` in wtstate), and folding collapses the group's cursor stops as well as its rows, so `j`/`k` never walk through something you can't see. Archived is otherwise not a section: it isn't in `sectionsOrder`, stays pinned to the bottom, and its summary offers no rename or move because it has neither |
-| `Ctrl+D` / `Ctrl+U` | jump to the first visible item in the next / previous section. For an expanded section that is its first row; for a folded section it is the selectable title, ready for `Tab` to unfold |
-| `Ctrl+J` / `Ctrl+K` | scroll the details pane, 3 rows a press |
-| `Ctrl+Shift+J` / `Ctrl+Shift+K` | scroll the bottom event feed — same 3-row step (also `Ctrl+E`/`Ctrl+Y`, mouse wheel); re-follows at the bottom. wt detects the Kitty keyboard protocol, enables its disambiguation mode only when supported, and restores the prior mode when leaving the alternate screen. Other terminals cannot encode the chord and it degrades to details scrolling, leaving `Ctrl+E`/`Ctrl+Y` for the feed. There is no `Alt+J`/`Alt+K` alias, deliberately: outside the Kitty protocol `Alt+<letter>` and `Esc`-then-letter are the same bytes, so such a binding hijacks bare `j`/`k` whenever you navigate right after dismissing a modal (or when a terminal binding emits an Esc-prefixed letter) |
-| `h` | flip to removed-worktree history (grouped under day headers; a day starts at 04:00 local). The left glyph shows Git merge for a proved staging landing or Git commit once that merge commit is in main, using the saved work-status color. Older entries recover merge evidence from one local first-parent Git walk while `h` is open; those without proof retain their PR/git outcome glyph (merged, closed, dropped, open PR, or simply removed). The aligned right slots show the tracker issue's current status, PR/removal glyph, and age; rows stay one line high. Batched queries while this view is open supply issue status and production membership, never one fetch per row. The detail also shows its saved agent status, note, PR, and removal time. New removals preserve an attached GitHub issue; old snapshots may not have one. `i` opens the primary tracker URL or falls back to that GitHub issue. |
+| `j` / `k`, arrows | Move the selection |
+| `g` / `G` | First / last visible item |
+| `Space` | Move to the next row needing attention |
+| `Tab` | Fold / expand the section |
+| `Ctrl+D` / `Ctrl+U` | Next / previous section |
+| `Ctrl+J` / `Ctrl+K` | Scroll details |
+| `Ctrl+E` / `Ctrl+Y` | Scroll output |
+| `r` / `Ctrl+R` | Refresh / clear derived caches and refresh |
+| `?` | Open searchable help |
+| `q` / `Ctrl+C` | Quit |
 
-**Where the cursor goes when the row under it leaves.** The cursor is
-anchored to a row, not to a position, so it follows a row that merely
-re-sorts (a status change, `Shift+J`/`K` dragging it, a restack). But
-four actions take the row OUT of the slot you were reading — `d`, the
-`c` sweep, `a`, and filing it elsewhere with `l` — and there the cursor
-holds the PLACE instead: it lands on the next surviving row in the same
-section, or the previous one when the row was last, and only leaves the
-section when the whole section is going. It never lands on a row the
-same sweep is about to destroy, or on one already mid-teardown. This
-matters most for `d` and `c`: those park the row in the archived block
-at the bottom of the board for the seconds their background remove
-takes, so a cursor that followed it would drag you off your section and
-strand you next to the archive. Restoring from the archive with `a` is
-the one that still follows the row — it's coming back to where you can
-work on it.
+### Worktrees and organization
 
-### Worktree actions
-
-Creation selects the actual row once inventory has rendered it. Initial bottom
-placement overrides the current sort for that row until its work-status claim
-or manual layout changes; later status updates use the normal ordering.
-
-| key | action |
+| Key | Action |
 |---|---|
-| `n` / `N` | new worktree prompt (accepts an issue id + optional title words, a tracker URL, branch, or slug, plus the same options as [`wt new`](cli.md#wt-new-id-titleurlbranchslug)). With remotes configured, `n` first chooses a host/configuration; without remotes it opens the local prompt directly. `N` uses the selected row's host and pre-fills its branch as `--base`. On success the section expands and selection waits for the actual new row; a resolution failure reopens the prompt with its input intact |
-| `Ctrl+N` | alias for `n`, including the host/configuration picker. Remote creation, commands and sessions use the same host service as local work |
-| `o` | open the worktree in your editor (`[editor] command`; default Zed) |
-| `d` | remove locally or on the row's remote host (confirm; escalates to a force-remove warning listing every hazard when dirty/unpushed) |
-| `c` | clean all merged/gone worktrees across the local and configured remote fleets (one combined confirmation). Never forces: a candidate holding uncommitted changes or unpushed commits — or a landed row still owing its [`verifyAfterMerge`](cli.md#wt-status-slug-state--m-note---risk-r) check — is shown as `kept` in the confirm list and survives the sweep; use `d` on it deliberately. Hazards render as a bare phrase, never with the field behind them: every reader of one is a scan line (a modal row, a `d` confirm that comma-joins reasons and appends *will be lost*, a toast), and `verifyAfterMerge` is the one field with no length budget, so inlining it buried the hazards next to it. Press `V` on the row to read the steps. Same for the `builtin:clean` automation, which has no human in the loop at all |
+| `n` / `N` | Create a worktree / create from the selected branch |
+| `Ctrl+N` | Start the create flow; configured remotes add a host chooser |
+| `o` | Open the selected worktree in the configured editor |
+| `d` | Remove the selected worktree after confirmation |
+| `c` | Review and clean eligible merged or gone worktrees |
+| `a` | Archive / restore the selected row |
+| `t` / `T` | Edit title / regenerate its AI title |
+| `#` | Set or clear the worktree's issue identity |
+| `i` / `I` | Open the preferred issue / primary tracker issue |
+| `s` | Open the deployed stage or dev URL when available |
+| `V` | Show or hide post-merge verification steps |
+| `u` | Set or clear the work-status claim, note, risk, or verification obligation |
+| `y` | Copy a selected worktree field |
+| `l` / `L` | Move to a section / rename the section |
+| `J` / `K` | Reorder the selected row or group |
+| `b` | Record a fork base without rebasing |
+| `R` | Restack or rebase the selected branch |
+| `h` | Open removed-worktree history |
 
-Both read "unpushed" as commits missing from `origin/<branch>` — the `(↑n ↓m)` group, not the `[↑n ↓m]` one. A branch that is fully pushed but ahead of its base is not at risk and neither path treats it as such; a landed branch whose remote ref was pruned isn't either, since a squash merge is what left its local commits behind.
-| `a` | archive / restore the row, local or remote. Archiving folds the Archived block so the row disappears immediately; `Tab` on its header expands it for restore. Archive placement belongs to this TUI's local fleet ledger, while a remote checkout remains untouched on its host |
-| `i` | open the primary tracker issue when it has a URL, otherwise the attached GitHub issue (`wt issue --gh`) |
-| `I` | open the primary tracker issue (needs `[issue_tracker]` with a URL template, or a `gh-`prefixed slug id) |
-| `#` | set the worktree's tracker id — a footer prompt seeded with whatever the row resolves to today; `Enter` saves, **an empty line asserts the worktree has no tracker issue**, `Esc` cancels. Emptying a field that was seeded with the current answer is the natural way to say "not this one", and it has to be a stored none rather than a cleared override: on a slug that carries an id — the population most likely to be wrong — dropping the override just re-supplied it from the slug, so the prompt was a no-op on exactly the rows you would want to detach. `wt issue <slug> --clear-id` is the way back to the derived value. Validated (`COZ-2185` shape), stored per-slug, and preferred over the slug everywhere: the issue row, `i`/`I`, `{{issue_id}}`, and `requires = ["issue.tracker"]`. This is how a worktree named for the work rather than the ticket gets one |
-| `s` | open the deployed stage URL, or the running `[dev_server]` URL when no stage is deployed |
-| `t` | edit the local worktree's title, prefilled with its current displayed title. `Enter` saves even an unchanged title and disables automatic AI naming for this worktree; blank input stays open and `Esc` cancels. PR, commit and automatic AI updates cannot overwrite a saved title |
-| `T` | explicitly regenerate the AI title and summary. Requires `[naming]`; a manually saved title is replaced by the result and stays protected from automatic updates |
-| `V` | expand / collapse the row's [`verifyAfterMerge`](cli.md#wt-status-slug-state--m-note---risk-r) steps in the details pane. The field is dormant until the branch lands, so the block starts collapsed to a header plus a two-line preview and opens by itself once the check has come due; this flips whichever applies, and resets when the cursor moves. Collapsing is the point: a 1896-character field wrapped to fourteen lines pushed the note, the gate and every definition row below the fold, and it was rendering that way on the one row that could not act on it yet |
-| `y` | yank picker — copy branch (`b`), stage (`s`), stage URL (`S`), dev-server URL (`d`), path (`p`), slug (`n`), preferred issue (`i`, tracker URL first, then attached GitHub issue), primary tracker issue (`I`), PR URL (`r`); a full picker since the rebuild: `j`/`k` move, `1`–`9` quick-pick, `y`/`Enter` confirm the highlight, direct letters still fire immediately. On a folded section header the same key yanks the BATCH instead: name (`n`), member slugs (`s`), member branches (`b`), and a pasteable list (`l` — the name, then one `- <slug>: <title>` line per member). Slugs and branches are space-joined so they drop straight into a command; the list is the form a message to the manager wants, which is why it exists |
-| `r` / `Ctrl+R` | refresh / hard refresh (clear caches, confirm) |
+Creation selects the row after it appears in the prepared board. Remote
+worktrees use the same host service for commands and sessions. Removal and
+cleanup revalidate current hazards; unknown state does not authorize force
+removal.
 
-When the SSH host is sleeping or offline, its last-known worktrees remain in
-the Inbox with `host unavailable`. The title bar also shows an offline warning;
-F10/F11/F12 resume once a refresh reaches the host again.
+### Pull requests
 
-On a remote creating row, F12 requests the selected agent session. wt opens
-it automatically after creation succeeds and the new checkout is found.
-Repeated F12 presses keep one request. A failed creation does not start a
-session.
-Remote deletion also stays disabled while the worktree holds a live operation
-lock. It deletes the remote branch but never destroys an SST stage implicitly.
-
-### Pull request
-
-| key | action |
+| Key | Action |
 |---|---|
-| `p` | open the PR at the configured `[github].pr_target` |
-| `g p` / `l p` | open the PR explicitly in GitHub / Linear Reviews (1.2s chord) |
-| `e` | mark a draft PR ready (confirm) |
-| `E` | "ship it": mark ready + request `[github].default_reviewer` + arm auto-merge, in one confirm (the reviewer leg is omitted when `[github].reviewers = false`) |
-| `! m` | Arm/disarm "merge when ready" from the `!` picker, directly and without confirmation. Arming checks the PR's base branch: a branch with a merge queue uses the async REST merge API in explicit queue mode and waits for its final result; otherwise it uses classic auto-merge. Cancellation instead checks the PR's actual queue entry and auto-merge request, since a queue-base PR can be classically armed but not queued. Pending required checks are retried in the background against the same head SHA; `! m` again cancels an idle retry; while a merge request is processing, wt waits for its result before allowing cancellation. On repos that permit it, classic auto-merge can arm while the queue waits. An armed-but-not-queued PR uses the list's queue icon without a position; a queued PR shows its position. The details pane retains its separate auto-merge segment. |
-| `f` | tail the failing CI checks' logs into the activity pane |
-| `v` | reviewer picker (`Space` toggles, `v v` submits; disabled when `[github].reviewers = false`) |
-| `w` | (review-requests section) check the PR's branch out as a worktree |
+| `p` | Open the selected pull request |
+| `g p` / `l p` | Open the PR in GitHub / Linear Reviews |
+| `e` | Mark a draft PR ready after confirmation |
+| `E` | Run the configured ship flow after confirmation |
+| `! m` | Toggle merge-when-ready |
+| `f` | View failing check logs |
+| `v` | Select requested reviewers |
+| `w` | Check out a selected review request |
+| `d` on a review request | Dismiss that review request |
 
-### Sessions
+Merge-when-ready uses the PR's base branch to choose merge queue or classic
+auto-merge. Pending-check retries retain the expected head SHA. A second `! m`
+cancels an idle retry; an uncertain external result is not retried blindly.
 
-Sessions live in a dedicated tmux server; "enter" takes over the terminal, and the same key detaches back to the TUI.
+### Sessions and actions
 
-| key | action |
+| Key | Action |
 |---|---|
-| `F12` | enter the row's coding-agent session (the selected primary harness when live, else another live harness, else resume that harness's mapped primary conversation or spawn it when none exists); from another worktree session, switch straight to it; press again to return home; while attached, `Ctrl+D` closes it gracefully |
-| `Shift+F12` | pick a harness (claude / codex / opencode) for a fresh spawn |
-| `Shift+Tab` | cycle the primary harness |
-| `F11` | enter the row's diff session (`[diff].command`, default `revdiff`, against the resolved diff base); from another session, switch straight to it; press again to return home |
-| `F10` | enter the row's plain shell session; from another session, switch straight to it; press again to return home |
-| `Shift+F10` / `Shift+F11` | kill the shell / diff session (confirm) |
-| `;` | sessions picker — attach (`; ;`), new named claude (`; c`), new codex/opencode (`; x` / `; o`), graceful close (`; d`), kill (`; x` on a live session row — fires directly, no confirm; getting there already took two deliberate steps). Codex rows use wt's stable `primary` / `2` / `3` names rather than Codex-generated thread summaries. |
-| `!` | action picker — identical on local and remote rows (remote execution uses SSH): run a configured `[[actions]]` entry, `! c` for a custom prompt; `!` on a running action offers to kill it. Two agent-delegation builtins are pinned at the top: `! u` has the row's agent re-assess and assert `wt status`, `! g` has it continue the work per the current status (both send to the primary harness session, cold-starting it if needed); with `[dev_server]` configured, start/restart (`d`), stop (`s`), and scrollable logs (`l`) are pinned below them. `! m` toggles auto-merge (group "github") |
-| `,` / `.` / `/` | attach the persistent harness session for the wt repo / main clone / dotfiles (`[paths] dotfiles`, default `~/.dotfiles`). The dotfiles slot is dropped entirely when that directory doesn't exist, freeing `/` and `\` |
-| `<` / `>` / `\` | slot command palette for the wt repo / main clone / dotfiles session — the shift analog of the attach key (dotfiles rides `\` because shift+`/` is `?`, help). Entries: continue current work (`g`), `/compact` (`m`, fires directly), open the slot in your editor (`z`), custom free-text message (`c`). Prompt entries send to the slot's session, cold-starting it detached if needed |
-| `m` | attach the [manager session](manager.md) — the singleton fleet coordinator |
-| `M` | [manager command palette](manager.md#the-command-palette-m) — digest (`d`), triage needs-human (`t`), merge order (`o`), nudge stalled (`n`), audit statuses (`a`), start next todo (`s`), ask about the selected row (`r`), `/compact` (`m`), custom message (`c`); user `[[actions]]` with `target = "manager"` appear too. Fleet commands report back via `wt manager report`, which lands on the attention feed |
+| `F10` / `F11` / `F12` | Enter shell / diff / agent session |
+| `Shift+F10` / `Shift+F11` | Stop shell / diff session after confirmation |
+| `Shift+F12` | Choose a harness for a new agent session |
+| `;` | Pick or manage named sessions |
+| `Shift+Tab` | Cycle the primary harness |
+| `!` | Open worktree actions and configured actions |
+| `m` / `M` | Enter the manager session / open manager commands |
+| `,` / `.` / `/` | Enter the wt repo / main clone / dotfiles session when configured |
+| `<` / `>` / `\` | Open the corresponding special-session command palette |
+| `O` | Open the main clone in the editor |
 
-Inside these four special sessions, `F10`/`F11`/`F12` all return to wt — slots aren't worktrees, so there's no shell or diff sibling to switch to.
-| `O` | open the main clone in your editor (the wt repo's editor open lives in its palette: `< z`) |
-| click link | open an OSC 8 hyperlink in a wt-managed tmux session; tmux handles the link itself so mouse-enabled Codex does not swallow the terminal's normal click action |
-| mouse drag | select text in a wt-managed tmux session and copy it automatically to the macOS clipboard on release |
+While attached, the configured terminal handoff returns to the TUI. `/compact`
+is available in harness command palettes that support it. Manager and special
+session controls remain reachable by these keys. The footer shows live
+special-session state and manager context usage when those facts are available.
 
-### Organize
+### Automations and output
 
-| key | action |
+| Key | Action |
 |---|---|
-| `l` | section picker (`l l` confirms, `l n` creates a new section) |
-| `L` | rename the current section |
-| `J` / `K` | move the row (or its whole stack / folded group) down / up — under status sort, within the same status rank only |
-| `b` | base picker — record which branch this worktree forked from (`b b` confirms; record-only, never rebases) |
-| `u` | work-status picker (`u u` confirms; `t`/`w`/`r`/`n`/`h`/`y`/`v`/`d` set the state directly, `x` clears; `m` picks the highlighted state and collects an optional note in the footer — Enter on an empty note is a plain pick, Esc cancels the whole pick). A second `ready` row, `a` — **`ready + verify after merge`** — sets [`verifyAfterMerge`](cli.md#wt-status-slug-state--m-note---risk-r) instead: the footer collects the STEPS (pre-filled with whatever the row already owes, so the same row amends), and the obligation survives the merge, keeps the row rendering as `needs-testing` once the branch lands, and holds it back from the `c` sweep until someone asserts `verified`. Emptying that pre-filled box is how you take the obligation back off a branch without claiming it was verified; the toast says which happened. Same record as [`wt status`](cli.md#wt-status-slug-state--m-note---risk-r), minus the CLI's risk/note rules (you're the human it escalates to) |
-| `R` | rebase/restack the selected row — a stack member restacks the whole stack, a standalone worktree rebases onto its recorded base or trunk; same engine as [`wt restack`](stacked-prs.md) (fetch + reconcile + squash-safe replay). On a conflict bail it hands off automatically: `/restack` is sent to the failing worktree's session (cold-starting it if needed) to resolve and finish. Locks per chain, so different stacks/worktrees restack concurrently; members show the sync glyph while it runs (warn-tinted when mid-rebase). Refuses on an already-landed row — that's `c`'s job |
+| `A` | Pause / resume all automations |
+| `Ctrl+A` | Pause / resume automations for the selected worktree |
+| `Ctrl+Shift+A` | Cancel queued automations |
+| `'` | Pick an activity, session, or action output |
+| `[` / `]` | Previous / next output |
+| `"` | Toggle attention / all activity |
+| `x` | Mark attention as seen |
 
-### Automations
+### Performance and errors
 
-| key | action |
-|---|---|
-| `A` | pause/resume all automations |
-| `Ctrl+Shift+A` | cancel all queued automations, leaving running actions untouched |
-| `Ctrl+A` | pause/resume the selected worktree (or its whole stack); in the `h` history, the selected archived row |
+Press `P` for the process and system performance view. `r` takes a sample,
+`i` enables repeated sampling, `j`/`k` and page keys scroll, and `Esc` or `q`
+closes it. The same snapshot is available with [`wt perf`](cli.md#wt-perf---json).
+Command and source failures remain visible in the footer, source state, or
+activity/attention feed. The native TUI does not provide a full-screen
+uncaught-error recovery overlay.
 
-### Perf overlay (`P`)
+## Picker and text input
 
-Answers one question: *the machine feels slow — is that us?*
-
-A prepared process snapshot scoped to wt descendants and its private tmux server. The headline is a verdict line (wt's share of
-the CPU actually in use, not of installed capacity — the latter reads
-reassuringly small on a 12-core box even when wt owns all of it),
-followed by system meters, a breakdown by category (agents, tests,
-typecheck/lint, dev servers, wt, tmux, shells), a breakdown by worktree
-session, and the heaviest processes both inside and outside wt's tree.
-That last block is the point: when the hog is a browser tab, it says so
-instead of sending you hunting through worktrees.
-
-| key | action |
-|---|---|
-| `P` / `Esc` / `q` | open / close |
-| `j` / `k` | scroll (the shared overlay keymap: `PgUp`/`PgDn` half-page, `g`/`G` top/bottom) |
-| `i` | toggle continuous two-second sampling |
-| `r` | take one fresh sample |
-
-The overlay also hunts for **leaked headless wt instances** — processes
-orphaned after a terminal died without the process exiting
-(the SIGHUP handler makes current builds exit; older builds and wedged
-teardowns can survive). Any found get a verdict-level warning plus a
-LEAKED section listing pids, CPU, and a ready-to-run `kill` line —
-they'd otherwise keep polling GitHub and duplicating attention-feed
-lines invisibly. The `i` investigation prompt includes them.
-
-Sampling starts when the overlay opens. Continuous sampling is opt-in with
-`i` and runs every two seconds; closing the overlay stops sampling. The
-snapshot is prepared off the input thread and is not persisted as durable state.
-
-The same snapshot is available headless as [`wt perf`](cli.md#wt-perf---json)
-(`--json` for the raw structure); its default output is a readable summary.
-
-Two accuracy notes. On macOS, `ps` `%CPU` is a **decaying average over up
-to one minute, not an instantaneous sample**. A process showing 130%
-may be idle right now. Read it as recent pressure; the
-overlay is not a profiler. Memory "used" is computed from `vm_stat` as
-active + wired + compressor pages (Activity Monitor's definition) rather
-than `os.freemem()`, which counts only genuinely free pages and so reads
-~90% used on any machine that's been up a while.
-
-The native build has no event-loop lag probe. Use the prepared `wt perf` snapshot and the TUI performance overlay to inspect process and machine load.
-
-### Errors and diagnostics
-
-Command failures are reported in the activity/attention output with their
-operation context. Source failures remain visible through source status and
-attention messages; the native TUI does not provide a full-screen uncaught-error overlay or
-render-recovery controls. For process and
-machine diagnostics, open the `P` performance overlay or run `wt perf`.
-
-### Removed-worktrees view (`h`)
-
-`j`/`k` navigate, `g`/`G` jump to top/bottom, `p` opens the snapshotted PR, `i` the issue, `y` copies the branch, `Enter` restores the worktree (from the branch if it still exists, else fresh), `h`/`Esc` returns.
-
-`Ctrl+J`/`Ctrl+K` scroll the selected entry's saved details. Restore hints stay
-pinned below long status notes and verification steps.
-
-## Picker conventions
-
-Pickers use the full available width below 80 columns and reduce vertical
-padding on short terminals. The highlighted row stays visible after opening
-or resizing. Session summaries show at most three lines and hide below 24 rows
-so the session list remains usable. Help switches its small grids to one column
-when needed.
-
-Confirmation text and candidate lists scroll with `j`/`k`, arrows, page keys,
-and `g`/`G` or Home/End. Confirmation and cancellation keys keep their existing
-meaning.
-
-Every list picker follows the same shape: the key that opened it confirms the highlight when pressed again (`l l`, `; ;`, `' '`, `! !`, `M M`, `< <` / `> >` / `\ \` in the slot palettes, `b b`, `v v`, `u u`, `y y`, and `Shift+F12` again in the harness picker), `Enter` always confirms, `Esc`/`q`/`Ctrl+C` always cancel, `j`/`k` move, and digits `1`–`9` quick-pick when the list is short — except the action picker and the manager/slot palettes (assigned keys instead) and the reviewer picker (`Space` toggles; digits would be ambiguous in a multi-select). Rows with a natural name carry a direct letter chord, shown dim in the row (`u t` → todo, `u y` → ready, `; c` new claude session); special rows get their own letter too (`l n` new section, `! c` custom prompt).
-
-Confirm modals follow the same muscle-memory rule in reverse: the key that opened one also **cancels** it (`d`, `c`, `e`, `E`, `w`, `!`'s kill confirm), alongside the universal `n`/`Esc`/`q`/`Ctrl+C`.
-
-Every text input (the `n`/`N`/`Ctrl+N` new-worktree prompt, `L` section rename, `u m` / `u a` status text, `! c` custom prompts and action args, `; c` session names, help search) shares one line editor: `←`/`→` move the cursor, `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to the ends, `Opt/Alt+←`/`→` (or `Esc B`/`Esc F`, or `Ctrl+←`/`→`) jump by word, `Backspace`/`Delete` edit at the cursor, `Opt/Alt+Backspace` deletes the word left, and `Ctrl+U`/`Ctrl+K` kill to the start/end of the line (`Ctrl+U` is how you empty a pre-filled prompt, since backspacing past empty backs out instead). Word boundaries are slug- and sentence-aware: `-`, `_`, and spaces all separate words. Backspace on an already-empty input still backs out of the prompt.
-
-The title bar's `auto ⏸` chip (inverse, warn-colored) means all automations are paused — a fleet-tier fact deliberately louder than the CPU/usage telemetry next to it.
-
-Text inputs scroll horizontally to keep the cursor visible, and cursor movement
-and deletion preserve whole Unicode characters. Footer input uses the full row
-while editing; long prompts shorten to leave room for the value. The submit and
-cancel hint hides below 80 columns, with Enter and Esc still active.
-
-The row action palette (`!`) includes **Rename worktree with AI** (`t`).
-It uses the selected local worktree. It also works when `auto_rename = false`
-under `[naming]`. That setting stops automatic AI naming. The direct
-`T` key requests the same name update. The `t` key opens the manual title editor.
-The Git branch and directory stay
-unchanged.
+Use `j`/`k`, arrows, page keys, and `g`/`G` to move through lists. `Enter`
+confirms; `Esc`, `q`, and `Ctrl+C` cancel. Repeating the opening key confirms
+the current selection in pickers that show that chord. Reviewer selection uses
+`Space` to toggle entries. Text fields support cursor movement, word movement,
+Unicode-safe deletion, and `Ctrl+U`/`Ctrl+K` to clear to the start/end.

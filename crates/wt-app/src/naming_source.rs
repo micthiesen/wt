@@ -774,14 +774,13 @@ fn publish_board(
         }
         let manual = state.and_then(|state| manual_title(state, &row.slug));
         let summary = visible.get(&row.key).map(|(_, summary)| summary);
-        if let Some(title) = manual.as_deref() {
-            row.title = wt_core::sanitize_terminal_text(title);
-        } else if let Some(title) = summary
-            .and_then(|s| s.title.as_deref())
-            .filter(|title| !title.trim().is_empty())
-        {
-            row.title = wt_core::sanitize_terminal_text(title.trim());
-        }
+        row.title = title_fallback(
+            &row.slug,
+            manual.as_deref(),
+            summary.and_then(|value| value.title.as_deref()),
+            row.git.pr_title.as_deref(),
+            row.git.first_commit_title.as_deref(),
+        );
         row.details.retain(|detail| {
             !detail.starts_with("AI summary: ") && !detail.starts_with("Naming: ")
         });
@@ -812,6 +811,21 @@ fn publish_board(
         updated_at: upstream.updated_at,
         revision: 0,
     });
+}
+
+fn title_fallback(
+    slug: &str,
+    manual: Option<&str>,
+    generated: Option<&str>,
+    pr: Option<&str>,
+    first_commit: Option<&str>,
+) -> String {
+    [manual, generated, pr, first_commit, Some(slug)]
+        .into_iter()
+        .flatten()
+        .find(|title| !title.trim().is_empty())
+        .map(|title| wt_core::sanitize_terminal_text(title.trim()))
+        .unwrap_or_else(|| wt_core::sanitize_terminal_text(slug))
 }
 
 fn board_fingerprint(board: &Board, upstream: &SourceSnapshot<Board>) -> String {
@@ -862,4 +876,55 @@ fn hex(bytes: &[u8]) -> String {
         .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::title_fallback;
+
+    #[test]
+    fn title_fallback_preserves_manual_and_generated_precedence() {
+        assert_eq!(
+            title_fallback(
+                "feat-42-fix",
+                Some("Manual"),
+                Some("Generated"),
+                Some("PR"),
+                Some("Commit")
+            ),
+            "Manual"
+        );
+        assert_eq!(
+            title_fallback(
+                "feat-42-fix",
+                None,
+                Some("Generated"),
+                Some("PR"),
+                Some("Commit")
+            ),
+            "Generated"
+        );
+    }
+
+    #[test]
+    fn title_fallback_uses_pr_then_first_commit_then_slug() {
+        assert_eq!(
+            title_fallback(
+                "feat-42-fix",
+                None,
+                Some("  "),
+                Some("PR title"),
+                Some("Commit title")
+            ),
+            "PR title"
+        );
+        assert_eq!(
+            title_fallback("feat-42-fix", None, None, None, Some("Commit title")),
+            "Commit title"
+        );
+        assert_eq!(
+            title_fallback("feat-42-fix", None, None, None, None),
+            "feat-42-fix"
+        );
+    }
 }

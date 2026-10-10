@@ -106,7 +106,7 @@ pub struct WaitingStatus {
 
 /// Wire-compatible with the remote JSON and UI board DTO. Health is kept
 /// separate because it is an on-demand command that can take up to a minute.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevServerStatus {
     pub running: bool,

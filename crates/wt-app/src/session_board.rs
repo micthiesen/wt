@@ -125,6 +125,13 @@ fn compose(
             state: state.into(),
             live,
             queued: session.extras.queued,
+            summary: session
+                .extras
+                .session_summary
+                .as_deref()
+                .map(clean)
+                .filter(|summary| !summary.is_empty()),
+            context_percent: session.extras.context_percent,
             output,
         };
         if let Some(row) = board.rows.iter_mut().find(|row| row.slug == entry.key.slug) {
@@ -244,6 +251,7 @@ mod tests {
                     is_live: true,
                     extras: HarnessExtras {
                         derived_state: Some(DerivedState::Working),
+                        session_summary: Some("Finished the review".into()),
                         ..Default::default()
                     },
                 },
@@ -262,6 +270,10 @@ mod tests {
         );
         let board = result.data.unwrap();
         assert_eq!(board.rows[0].sessions[0].state, "unknown");
+        assert_eq!(
+            board.rows[0].sessions[0].summary.as_deref(),
+            Some("Finished the review")
+        );
         assert!(!board.rows[0].sessions[0].live);
         assert!(
             board

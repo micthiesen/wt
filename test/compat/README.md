@@ -5,7 +5,7 @@ captured from the TypeScript reference checkout at commit
 `d9cd2f48af00633851f59812642cc1b815851f4b` (`d9cd2f4`, “Report live Codex
 and OpenCode sessions in fleet”). Outputs were produced by invoking the
 reference functions with Bun and serializing their return values; they are not
-hand-transcribed Rust expectations. The closest existing assertions are
+hand-transcribed Rust expectations. The corresponding historical assertions are
 `src/core/work-status.test.ts`, `src/core/stack-layout.test.ts`, and
 `src/core/harness/live-target.test.ts`.
 

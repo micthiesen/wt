@@ -127,6 +127,9 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             .and_then(|record| record.get("work"))
             .cloned();
         if let Some(work) = work.as_mut().and_then(Value::as_object_mut) {
+            // Attribution is explicitly nullable in the fleet JSON contract,
+            // even when legacy durable records omitted the optional field.
+            work.entry("by").or_insert(Value::Null);
             let stale = work
                 .get("sha")
                 .and_then(Value::as_str)
@@ -239,8 +242,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         reports.push(report);
     }
     for entry in reports_removed {
-        let merged = entry.extra.get("prState").and_then(Value::as_str) == Some("MERGED")
-            || entry.extra.get("gitState").and_then(Value::as_str) == Some("merged");
+        let merged = wt_store::is_merged_removal(&entry);
         let work = entry.work.as_ref().map(serde_json::to_value).transpose()?;
         let verification_owed = entry.work.as_ref().is_some_and(|work| {
             work.verify_after_merge.is_some() && work.state != "verified" && work.state != "dropped"

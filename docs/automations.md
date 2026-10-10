@@ -33,7 +33,7 @@ PR-driven conditions additionally require a **live GitHub fetch this session** �
 
 A `status.*` rule whose run is a prompt action aimed at a live session (`target = "manager"` or `"session"`) does not fire when the work-status record says that same session asserted it. Everything else is unaffected: `builtin:notify` talks to the human, `builtin:clean` and `builtin:restack` talk to git, and a `headless` run is a fresh conversation that wrote nothing, so none of them has an audience to echo back at.
 
-This exists because the manager's *last* triage step is sharpening the `needs-human` note it was briefed about. That re-asserts the state, which mints a new timestamp, which mints a new fire key, which briefs the manager again — quoting its own words back and asking it to triage them. Observed three times for one slug, and the honest answer to the third was "nothing changed".
+This exists because the manager's *last* triage step is sharpening the `needs-human` note it was briefed about. That re-asserts the state, which mints a new timestamp, which mints a new fire key, which briefs the manager again — quoting its own words back and asking it to triage them. Historical observation: it looped three times for one slug, and the honest answer to the third was "nothing changed".
 
 The wasted turn is not the cost. A briefing whose correct answer is usually "nothing changed" stops getting read, and that spends the one channel that exists for "a worktree is blocked on the human". Note that only `status.*` triggers can loop this way — every other condition is derived from git or GitHub, which no session can write by asserting.
 

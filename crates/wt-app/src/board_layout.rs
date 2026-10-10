@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use wt_config::UiSort;
 use wt_core::{
-    ChainMember, SpineMember, build_stack_index, parse_work_status, spine_layout, work_record_rank,
+    ChainMember, SpineMember, WORK_STATES, WorkRisk, build_stack_index, parse_work_status,
+    spine_layout, work_record_rank,
 };
-use wt_tui::{Board, BoardSection};
+use wt_tui::{Board, BoardSection, SectionRollup, WorkRiskCount, WorkStateCount};
 
 pub const INBOX: &str = "\0inbox";
 pub const ARCHIVED: &str = "\0archived";
@@ -128,6 +129,7 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 title: wt_core::sanitize_terminal_text(&title),
                 key,
                 rows,
+                rollup: SectionRollup::default(),
             }
         })
         .collect();
@@ -209,6 +211,147 @@ pub fn section_for(board: &Board, key: &str) -> Option<String> {
         .iter()
         .find(|section| section.rows.contains(&index))
         .map(|section| section.key.clone())
+}
+
+/// Recompute folded-section summaries from the same typed row facts shown in
+/// each member. Called after source overlays have joined session and PR state.
+pub fn refresh_rollups(board: &mut Board) {
+    for section in &mut board.sections {
+        let rows = section
+            .rows
+            .iter()
+            .filter_map(|&index| board.rows.get(index));
+        let rows = rows.collect::<Vec<_>>();
+        let mut states = Vec::new();
+        for state in WORK_STATES {
+            let count = rows
+                .iter()
+                .filter(|row| {
+                    row.work.as_ref().and_then(|work| work.effective_state) == Some(state)
+                })
+                .count();
+            if count > 0 {
+                states.push(WorkStateCount {
+                    state: Some(state),
+                    count,
+                });
+            }
+        }
+        let unset = rows
+            .iter()
+            .filter(|row| {
+                row.work
+                    .as_ref()
+                    .and_then(|work| work.effective_state)
+                    .is_none()
+            })
+            .count();
+        if unset > 0 {
+            states.push(WorkStateCount {
+                state: None,
+                count: unset,
+            });
+        }
+        let risks = [WorkRisk::High, WorkRisk::Medium, WorkRisk::Low]
+            .into_iter()
+            .filter_map(|risk| {
+                let count = rows
+                    .iter()
+                    .filter(|row| {
+                        row.work.as_ref().is_some_and(|work| {
+                            work.record.as_ref().and_then(|record| record.risk) == Some(risk)
+                        })
+                    })
+                    .count();
+                (count > 0).then_some(WorkRiskCount { risk, count })
+            })
+            .collect();
+        let unknown_git = rows
+            .iter()
+            .filter(|row| row.git.tracked_changes.is_none() || row.git.untracked_files.is_none())
+            .count();
+        let dirty_worktrees = rows
+            .iter()
+            .filter(|row| {
+                row.git.tracked_changes.unwrap_or_default() > 0
+                    || row.git.untracked_files.unwrap_or_default() > 0
+            })
+            .count();
+        let blocked_notes = rows
+            .iter()
+            .filter_map(|row| {
+                row.work
+                    .as_ref()
+                    .and_then(|work| work.record.as_ref())
+                    .and_then(|record| record.blocked_on.as_deref())
+                    .map(|note| format!("{}: {}", row.slug, note))
+            })
+            .collect();
+        section.rollup = SectionRollup {
+            states,
+            risks,
+            blocked_notes,
+            stale_statuses: rows
+                .iter()
+                .filter(|row| {
+                    row.work
+                        .as_ref()
+                        .is_some_and(|work| work.stale == Some(true))
+                })
+                .count(),
+            verification_owed: rows
+                .iter()
+                .filter(|row| row.work.as_ref().is_some_and(|work| work.verification_owed))
+                .count(),
+            verification_overdue: rows
+                .iter()
+                .filter(|row| {
+                    row.work
+                        .as_ref()
+                        .is_some_and(|work| work.verification_overdue)
+                })
+                .count(),
+            dirty_worktrees: Some(dirty_worktrees),
+            unknown_git,
+            upstream_ahead: rows
+                .iter()
+                .filter(|row| row.git.ahead.is_some_and(|count| count > 0))
+                .count(),
+            upstream_behind: rows
+                .iter()
+                .filter(|row| row.git.behind.is_some_and(|count| count > 0))
+                .count(),
+            rebasing: rows.iter().filter(|row| row.git.rebasing).count(),
+            conflicted: rows
+                .iter()
+                .filter(|row| !row.git.conflict_files.is_empty())
+                .count(),
+            open_prs: rows
+                .iter()
+                .filter(|row| row.pr.as_ref().and_then(|pr| pr.state.as_deref()) == Some("OPEN"))
+                .count(),
+            draft_prs: rows
+                .iter()
+                .filter(|row| {
+                    row.pr
+                        .as_ref()
+                        .is_some_and(|pr| pr.state.as_deref() == Some("OPEN") && pr.draft)
+                })
+                .count(),
+            queued_prs: rows
+                .iter()
+                .filter(|row| row.pr.as_ref().is_some_and(|pr| pr.merge_queue.is_some()))
+                .count(),
+            failing_checks: rows
+                .iter()
+                .filter(|row| {
+                    row.pr.as_ref().and_then(|pr| pr.checks.as_deref()) == Some("failing")
+                })
+                .count(),
+            paused_automations: rows.iter().filter(|row| row.automations_paused).count(),
+            needs_attention: rows.iter().filter(|row| row.needs_attention).count(),
+        };
+    }
 }
 
 #[cfg(test)]

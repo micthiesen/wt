@@ -201,9 +201,9 @@ Only the main clone is touched. Under the `rift` backend each worktree
 is an independent clone with its own refs — see
 [backends.md](backends.md#stale-remote-tracking-refs).
 
-## `[remote]` — optional SSH worktree host
+## `[remote]` and `[[remotes]]` — optional SSH worktree hosts
 
-Configure a second machine whose clone, config, and worktree root remain
+Configure one or more machines whose clone, config, and worktree root remain
 authoritative for execution. Set `[instance] role =
 "worker"` on that machine. The controller TUI polls the worker's worktree
 summaries and renders them in the same sections as local worktrees, with a
@@ -242,15 +242,21 @@ starts in the controller's Inbox. Moving it records a host-qualified (`host` +
 `slug`) layout entry in the controller's SQLite state and never mutates the
 worker checkout or database. Archiving uses the same location-aware identity.
 Filesystem, Git, tmux, and destructive operations continue to execute remotely.
-The schema currently accepts one `[remote]`, but stored identity and query
-caches are host-qualified; future multiple-remote support will not conflate
-same-named worktrees or depend on display labels being unique.
+Use repeated `[[remotes]]` tables to configure multiple hosts. The legacy
+single `[remote]` table remains supported and is normalized into the same list.
+Each SSH host may be configured once; remote row identity includes the host
+and selected worker config, so same-named worktrees on different hosts remain
+distinct even when their display labels match.
 
 ```toml
-[remote]
+[[remotes]]
 host = "cachy"                 # SSH host or ~/.ssh/config alias
 label = "cachy"                # optional; defaults to host
 wt_path = "~/.wt/bin/wt"       # optional
+
+[[remotes]]
+host = "linux-worker"
+config = "~/.config/wt/project.toml" # optional worker config selector
 ```
 
 | key | required | default | meaning |
@@ -258,6 +264,7 @@ wt_path = "~/.wt/bin/wt"       # optional
 | `host` | **yes** | — | SSH destination or alias used by `ssh`. |
 | `label` | no | `host` | Short name in the prompt, event log, and remote WezTerm tab title. |
 | `wt_path` | no | `~/.wt/bin/wt` | Configured remote executable. The `~/` prefix expands in the remote account. Controller commands use the separately prepared build-matched native runtime. |
+| `config` | no | worker's default config | Worker config selected for this connection. Must be an absolute path or start with `~/`; tilde expansion happens on the worker. |
 
 The remote machine needs its own `~/.config/wt/config.toml`, including
 `[instance] role = "worker"`; do not point the local process at a mounted
@@ -316,12 +323,12 @@ docker volume ls  -q --filter label=com.supabase.cli.project=$P | xargs -r docke
 """
 ```
 
-**Enumerate every resource KIND the tool creates, not just the obvious one.** A teardown that removes containers and stops there leaks networks and volumes silently, and the networks are the ones that bite: docker's predefined address pools are finite, and ~24 orphaned ones exhausted them fleet-wide with `all predefined address pools have been fully subnetted` — an error naming nothing wt- or Supabase-related, so the first guess is always wrong, and nobody can start a stack until it is cleared. Measured on this machine after a containers-only teardown: one stopped project with **0 containers, 1 network and 3 volumes** still present. `docker network prune -f` is the emergency clear; enumerating the kinds is the fix.
+**Enumerate every resource KIND the tool creates, not just the obvious one.** A teardown that removes containers and stops there leaks networks and volumes silently, and the networks are the ones that bite: docker's predefined address pools are finite, and a historical incident saw ~24 orphaned ones exhaust them fleet-wide with `all predefined address pools have been fully subnetted` — an error naming nothing wt- or Supabase-related, so the first guess is always wrong, and nobody can start a stack until it is cleared. Historical measurement from this machine after a containers-only teardown: one stopped project with **0 containers, 1 network and 3 volumes** still present. `docker network prune -f` is the emergency clear; enumerating the kinds is the fix.
 
 **Match on an identity the tool assigns, not on the container name, and test the pattern read-only before you run it destructively.** Two independent ways a name match goes wrong, both silent:
 
-- **Docker's `--filter name=` is an unanchored regex**, so a bare `name={{slug}}` also matches every container whose name merely *contains* the slug — which includes every longer slug that starts with it. Slugs are routinely prefixes of each other, because worktrees derived from the same issue lead with the same id, so destroying `coz-1691` with an unanchored filter tears down the live stack of `coz-1691-domestic-bovid`. Measured: unanchored `coz-1691` matched 12 containers, all of them the *other* worktree's; `_coz-1691$` matched 0.
-- **Anchoring is not enough, because the name is truncated.** The Supabase CLI cuts its project id to 40 characters, so a 41-character slug's containers are named for the first 40 — and `--filter name=_{{slug}}$` then matches **nothing at all**. Measured on `meetings-notifies-before-actually-joining` (41 chars): the anchored name filter matched 0 containers while 12 were running. That is the more dangerous of the two, because a teardown that quietly does nothing looks exactly like a teardown with nothing to do.
+- **Docker's `--filter name=` is an unanchored regex**, so a bare `name={{slug}}` also matches every container whose name merely *contains* the slug — which includes every longer slug that starts with it. Slugs are routinely prefixes of each other, because worktrees derived from the same issue lead with the same id, so destroying `coz-1691` with an unanchored filter tears down the live stack of `coz-1691-domestic-bovid`. Historical measurement: unanchored `coz-1691` matched 12 containers, all of them the *other* worktree's; `_coz-1691$` matched 0.
+- **Anchoring is not enough, because the name is truncated.** The Supabase CLI cuts its project id to 40 characters, so a 41-character slug's containers are named for the first 40 — and `--filter name=_{{slug}}$` then matches **nothing at all**. Historical measurement on `meetings-notifies-before-actually-joining` (41 chars): the anchored name filter matched 0 containers while 12 were running. That is the more dangerous of the two, because a teardown that quietly does nothing looks exactly like a teardown with nothing to do.
 
 A **label** filter avoids both: `--filter label=k=v` is an equality test, not a regex, so there is no anchoring question and no prefix collision. `printf %.40s` reproduces the CLI's own truncation, and two slugs sharing their first 40 characters would collide inside Supabase anyway. `com.supabase.cli.project` is the label to use — `com.supabase.cli.workdir` carries the full untruncated path and looks like the better key, but the **database container does not have it**, so a filter on it leaves the heaviest container (and the port block) running.
 
@@ -396,7 +403,7 @@ Semantics:
 
 ### `stop_command` — because stopping a process releases only a process
 
-`pnpm dev` is not one process any more. cozee's runs `supabase start`, which hands twelve containers to the docker daemon and returns; killing the tmux session takes vite down and leaves the stack up. Measured on this machine: four Supabase stacks running, one live dev session. Three of the four were survivors of dev servers already stopped, two of them nineteen hours old.
+`pnpm dev` is not one process any more. cozee's runs `supabase start`, which hands twelve containers to the docker daemon and returns; killing the tmux session takes vite down and leaves the stack up. Historical machine snapshot: four Supabase stacks running, one live dev session. Three of the four were survivors of dev servers already stopped, two of them nineteen hours old.
 
 That matters beyond tidiness, because it is what `max_concurrent` would otherwise be counting. Capping dev *sessions* while the *stacks* leak governs a number with no relationship to the load — the cap would have seen 2 where the machine was carrying 4.
 
@@ -430,10 +437,10 @@ health_command = "scripts/dev/check-migrations.sh"
 reset_command  = "docker volume ls -q --filter label=com.supabase.cli.project=$(printf %.40s {{slug}}) | xargs -r docker volume rm"
 ```
 
-- **`health_command`** runs in the worktree with `$PORT` exported and the usual `{{...}}` substitution. Exit 0 is healthy; anything else is a problem and the first line of stdout (then stderr) becomes the message. It is **on demand only** — `wt dev status`, and polled by `wt dev start --wait`. Never on a poll: a `docker exec psql` against a live stack measured **9 seconds** on this machine, which is fine once and ruinous every fifteen seconds across four worktrees.
+- **`health_command`** runs in the worktree with `$PORT` exported and the usual `{{...}}` substitution. Exit 0 is healthy; anything else is a problem and the first line of stdout (then stderr) becomes the message. It is **on demand only** — `wt dev status`, and polled by `wt dev start --wait`. Never on a poll: a `docker exec psql` against a live stack took **9 seconds** in a historical measurement on this machine, which is fine once and ruinous every fifteen seconds across four worktrees.
 - **`reset_command`** is the destructive twin of `stop_command`, run by `wt dev reset` between the stop and the start. `stop_command` keeps the environment's state, which is what makes retaking a slot fast and is right nearly always; this drops it. It exists because the recovery was otherwise folklore — a raw `docker volume rm` nobody could discover from wt, with both obvious in-place repairs actively wrong (`supabase migration up` refuses once newly-arrived stamps sort before the last applied one, and `supabase db reset` wipes buckets that are provisioned at start rather than by migrations).
 
-**Write the health check to distinguish "not yet" from "wrong", or let wt do the waiting.** A check that runs once cannot tell them apart: a migration replay in progress reads 29 of 35 applied, which is indistinguishable from a stale volume stuck at 29, and the one observed settled at 35 about a minute later. `wt dev start --wait` handles this by re-running the check until it passes or the budget expires, so the quiescence wait lives in wt once instead of being reinvented per agent (where it was, and where it was written down wrong). `wt dev status` is a snapshot and says so: an unhealthy answer from a server younger than five minutes is reported as possibly-unfinished startup rather than sending anyone to rebuild.
+**Write the health check to distinguish "not yet" from "wrong", or let wt do the waiting.** A check that runs once cannot tell them apart: a migration replay in progress reads 29 of 35 applied, which is indistinguishable from a stale volume stuck at 29, and in one historical run it settled at 35 about a minute later. `wt dev start --wait` handles this by re-running the check until it passes or the budget expires, so the quiescence wait lives in wt once instead of being reinvented per agent (where it was, and where it was written down wrong). `wt dev status` is a snapshot and says so: an unhealthy answer from a server younger than five minutes is reported as possibly-unfinished startup rather than sending anyone to rebuild.
 
 ### The free half: `stale (rebased since start)`
 

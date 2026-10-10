@@ -1,206 +1,151 @@
-# Rust rewrite compatibility inventory
+# Native rewrite feature accounting
 
-This is the acceptance ledger for a full Rust rewrite. Each `pending` item
-needs an implementation and evidence before the matching TypeScript behavior
-can be retired. A source file or passing test is not evidence that the Rust
-version is covered. The TypeScript tree remains the behavior reference; docs
-are the user contract. This inventory deliberately names behavior and test
-surfaces so a large rewrite cannot silently drop an obscure command or flow.
+This is a feature and risk ledger for the Rust replacement. The TypeScript
+behavior baseline is commit `d9cd2f4`; its source tree is retired from this
+branch. Source paths associated with that baseline are historical references.
+Implementation presence, domain tests, CLI comparisons, and real-environment
+fixtures are different evidence. This ledger does not treat missing exhaustive
+tests as missing implementation, or a passing test as proof of unrelated
+behavior.
 
-Status: `pending` = full parity evidence has not been reviewed; `verified` = the
-named contract and its compatibility evidence have been reviewed. Verification
-of one row does not establish release readiness or cover unrelated workflows.
+## Current evidence and cutover state
 
-## Integrated checkpoint evidence
+Checkpoint `7ab434d` passed the full 547-test workspace gate, doctests,
+formatting, strict Clippy, and dependency checks. The log is
+`/tmp/wt-rust-gate-review-fixes.log`. Rust CI run
+[38020225318](https://github.com/micthiesen/wt/actions/runs/38020225318) and
+four-target release run
+[38020250780](https://github.com/micthiesen/wt/actions/runs/38020250780) are
+green. The release workflow published the isolated
+`rust-test-7ab434d-20261010` release.
 
-At `8ba6375`, the full local workspace gate passed 507 tests, doctests,
-formatting, Clippy with warnings denied, and dependency-direction checks.
-This establishes integrated Rust correctness for those assertions, not complete
-old/new feature parity. The detailed rows below remain open until their full
-contract is accounted for.
+Release installation passed under an isolated install root
+(`/tmp/wt-native-release-7ab434d-install.log`). A real Boris SSH fixture
+verified exact native build provisioning from macOS to Linux, selected config
+and PATH in managed sessions, literal quoting and `$HOME`, two configs sharing
+a worktree slug, and an unrelated sentinel surviving cleanup:
+`/tmp/wt-native-boris-7ab434d-3/result.json` and `cleanup.json`. The nine
+representative CLI comparisons pass at
+`/tmp/wt-cli-compat-final-fixed/result.json`.
 
-- The isolated PTY fixture passed stalled-Git navigation, filesystem-triggered
-  refresh, title persistence without Git scans, section movement and renaming,
-  history/performance controls, hard refresh preserving saved state, and accepted
-  writes draining on quit. The one key-to-output sample was 1.14 ms with Git
-  delayed for two seconds; it is not a general latency percentile.
-- The shared-host fixture passed fragmented frames, same-slug isolation across
-  two configurations, title/status writes, non-destructive removal preflight,
-  reconnect, endpoint loss, protocol rejection, and active action survival
-  through two immutable remote-runtime publications.
-- The original work-status, stack-layout, and harness-target identity golden
-  fixtures now have native consumers. These cover pure rules, not live harness
-  control or every command JSON field.
-- `wt ls` now retains stage/PR columns and nullable Git/session/dev facts. The
-  command fixture covers migrated unknown fields and session registries, linked
-  worktree selectors, issue-reader errors, and diagnostic JSON contracts.
-- Local cleanup fixtures prove dirty/stale-ref refusals preserve resources,
-  foreground/background removal touches only the exact checkout's resources,
-  and similarly named neighboring sessions survive. Linux and macOS CI passed
-  at `2e9d9a9`, including cleanup; the macOS fixture now avoids the standard
-  Python HTTP server's reverse-DNS lookup before listening.
-- Four-target release packaging has exercised actual optimized install/update/
-  rollback flows, but the complete release workflow has not passed its checks
-  or published an accepted test release. Real `boris` provisioning, optimized
-  performance comparisons, final feed/terminal integration, and independent
-  review remain acceptance gates. Earlier debug CPU samples predate a watcher
-  lifetime fix and are not final performance evidence.
-
-The next local checkpoint passed 530 tests and the full workspace gate.
-The PTY feed fixture covers retained attention/activity, file-triggered appends,
-persisted seen state, help search and the earlier lifecycle/navigation checks.
-Native Codex compact and terminal-palette probes passed against the installed
-Codex TUI. Independent review is still open for fleet cleanup, wrapped/local-time
-feed presentation, startup key replay, and durable landing proof at removal.
-Evidence: `/tmp/wt-rust-gate-checkpoint.log`,
-`/tmp/wt-native-ui-feeds-4/result.json`.
-
-Local evidence: `/tmp/wt-rust-workspace-gate-next.log`,
-`/tmp/wt-rust-native-ui-integrated-10/result.json`,
-`/tmp/wt-rust-native-host-cached-snapshot.log`. Release verification uses isolated
-`rust-test-*` tags; promotion is not authorized here.
+Those hosted proofs do not cover later Rust changes. The retired-source
+checkout passed an expanded 577-test gate, including the installer and UI
+regressions (`/tmp/wt-rust-final-presentation-gate.log`). A final refinement
+invalidates ref/index/rebase facts before replacement probes start; its full
+577-test gate and PTY pass also succeeded (`/tmp/wt-rust-final-retired-gate.log`,
+`/tmp/wt-native-ui-retired-final`, `/tmp/wt-native-signal-retired-final`). The
+retired-source command fixture and nine JSON comparisons passed again
+(`/tmp/wt-cli-compat-retired-final/result.json`).
+The five-scenario TypeScript runtime fixture used checkout `bbf1696` plus a
+minimal two-token tmux delimiter fix. Tmux 3.9 and official 3.7c both emit `_`
+for a tab delimiter, so the probe parser uses `|`; the original shared goldens
+remain tied to `d9cd2f4`. Results are in
+`/tmp/wt-perf-ts-final-24-20261010/results.json`. The matching optimized Rust
+comparison is owed. Full rewrite acceptance is not yet complete.
 
 ## Command surface
 
-The dispatcher is `src/cli/index.ts`. Preserve lazy per-command loading and
-the recovery commands' independence. `docs/cli.md` is the flag and output
-contract; command files below own argument parsing and behavior. A test path of
-`—` means no focused command test was found during inventory, not that behavior
-is covered elsewhere.
+The native statically linked dispatcher is in `crates/wt-app/src/main.rs` and
+`crates/wt-app/src/commands/`; `docs/cli.md` is the user-facing flag and output
+contract. Rust adds `archive`, `restore`, and `install`, and aliases `list`,
+`remove`, and `cleanup`. The old lazy TypeScript loader is deliberately
+replaced by explicit config-free dispatch for `version`, `init`, `install`,
+`update`, and `rollback`.
 
-| Check | Command / contract | TypeScript reference | Existing evidence | Rust |
-|---|---|---|---|---|
-| [ ] | `init [directory] [--primary]`; repo config bootstrap | `src/cli/commands/init.ts` | `init.test.ts`; cli `wt init` | pending |
-| [ ] | `state migrate [--from] [--keep-legacy]`; idempotent legacy import | `state.ts` | `state.test.ts`; cli `wt state` | pending |
-| [ ] | `ls [--json]`; live plus removed rows, nullable facts and `kind` | `ls.ts` | `ls.test.ts`; cli `wt ls` | pending |
-| [ ] | `fleet [--json]`; asserted status vs session/PR reality | `fleet.ts` | `fleet.test.ts`; cli `wt fleet` | pending |
-| [ ] | `new <id/title/url/branch/slug>`; `--slug`, `--gh`, `--attach`, `--base`, `--any`, `--open`, `--no-open`, `--no-install` | `new.ts`, `agent-args.ts` | `agent-args.test.ts`; cli `wt new` | pending |
-| [ ] | `rm [slug]`; `--yes|-y`, `--force`, `--destroy-stage|--no-destroy-stage`, `--delete-branch|--keep-branch`, `--background|-b`; safety guards and cleanup | `rm.ts` | —; cli `wt rm` | pending |
-| [ ] | `clean`; `--yes|-y`, `--destroy-stage|--no-destroy-stage`, `--foreground`; merged/gone sweep, owed verification and hazard retention | `clean.ts` | `clean.test.ts`; cli `wt clean` | pending |
-| [ ] | `doctor [slug] [--all|-a] [--json]`; config, backend, skills, harness and resource diagnostics | `doctor.ts` | `doctor.test.ts`; cli `wt doctor` | pending |
-| [ ] | `stages [--clean] [--yes|-y] [--json]`; list, cleanup and orphan handling | `stages.ts` | —; cli `wt stages` | pending |
-| [ ] | `logs [slug]`; tail/fallback to saved destroy output | `logs.ts` | `logs.test.ts`; cli `wt logs` | pending |
-| [ ] | `perf [--json]`; bounded process snapshot and downstream classification | `perf.ts` | —; cli `wt perf` | pending |
-| [ ] | `open [slug-or-query]`; editor target resolution | `open.ts` | —; cli `wt open` | pending |
-| [ ] | `base [show|set|clear]`; recorded fork base and squash-safe anchor | `base.ts` | `base.test.ts`; cli `wt base` | pending |
-| [ ] | `merge [slug] [--cancel]`; queue-aware arm and actual-state cancel | `merge.ts` | —; cli `wt merge` | pending |
-| [ ] | `status [slug] [state]`; `-m`, `--risk`, `--blocked-on`, `--verify-after-merge`, `--unblock`, `--clear`, `--all [--json]`, `--note-only` | `status.ts`, `core/work-status.ts` | `status.test.ts`, `core/work-status.test.ts`; cli `wt status` | pending |
-| [ ] | `edge [from kind to]`; expiring before/conflict/enables assertions | `edge.ts` | `edge.test.ts`; cli `wt edge` | pending |
-| [ ] | `section [mv|rename|rm]`; manual batching and remote-qualified state | `section.ts` | `section.test.ts`; cli `wt section` | pending |
-| [ ] | `manager`, `manager send [--hold <id>] <text...>`, `manager report [--info|--ok|--warn|--err] <text...>`; singleton attach, durable message route, live structured report spool | `manager.ts` | —; cli `wt manager`, `docs/manager.md` | pending |
-| [ ] | `hold [set|release|check]`; bounded resource event and release watermark | `hold.ts` | `hold.test.ts`; cli `wt hold` | pending |
-| [ ] | `issue [--id|--no-id|--clear-id|--gh|--clear-gh|--read]`; tracker/GitHub identities | `issue.ts` | `issue.test.ts`, `issue-read.test.ts`; cli `wt issue` | pending |
-| [ ] | `restack [branch] [--onto]`; `prune-backups [--days]`; lock, conflict handoff, squash replay | `restack.ts` | stack/stack-ops tests; cli `wt restack` | pending |
-| [ ] | `skills [status|sync|diff|reset]`; `sync [names...] [--yes|-y] [--force]`, `reset [--answers|--declines]`, legacy `install`; explicit units and template answers | `skills.ts`, `core/skills/` | `core/skills/*test.ts`; cli `wt skills` | pending |
-| [ ] | `update [log] [--check] [--head]`; fetch, gate, journal and startup contract | `update.ts` | update tests; cli `wt update`, `docs/updates.md` | pending |
-| [ ] | `rollback [ref]`; safe rollback and declined SHA | `rollback.ts` | update tests; cli `wt rollback` | pending |
-| [ ] | `version`, `--version`, `-v`; current source SHA | `version.ts`, `cli/index.ts` | —; cli `wt version` | pending |
-| [ ] | `events install|start|stop|restart|status|secret|uninstall|serve`; launchd ownership, config reconciliation and foreground daemon | `events.ts` | `events.test.ts`; cli `wt events`, `docs/github-events.md` | pending |
-| [ ] | `remote [argv…]`; interactive SSH and safe exact-argv forwarding | `remote.ts` | `remote.test.ts`; cli `wt remote` | pending |
-| [ ] | `agent send <target> [text...] [--hold <id>]`, `start <slug>`, `ls [--json]`; stdin, live-target routing, native queue receipts, skill provisioning | `agent.ts`, `agent-args.ts` | `agent-args.test.ts`, `worker-role.test.ts`, harness routing/messaging tests; cli `wt agent` | pending |
-| [ ] | `claude send` compatibility alias, `ls [--json]`, `selftest [slug]`, `stop|kill <slug>` | `claude.ts` | `claude.test.ts`; cli `wt claude` | pending |
-| [ ] | `codex selftest`; native queue and app-server control transport diagnostics | `codex.ts` | Codex messaging/readiness/startup tests; cli `wt codex` | pending |
-| [ ] | `dev start|reset [--wait] [--timeout] [--rebuild]`, `stop`, `status [--all] [--json]`, `logs`, `queue [slug] [--first|--normal] [--json]`; startup health, limits, wait and priority | `dev.ts`, `core/dev-server.ts` | `dev-server*.test.ts`; cli `wt dev` | pending |
-| [ ] | `--help`, `-h`, per-command help; unknown command exit 2; load vs run error distinction | `cli/index.ts` | No direct dispatcher unit test found; `scripts/broken-module-check.sh` probes failure containment | pending |
-| [ ] | Internal `_remote`, `_hello`, `_snapshot`, `_session` worker protocol; versioning, framing, error/exit behavior | `_remote.ts`, `_hello.ts`, `_snapshot.ts`, `_session.ts` | remote tests; protocol docs under `docs/cli.md` | pending |
-| [ ] | Internal `_destroy`, `_dev-giveup`, `_claude-hook`; lock handoff, bounded cleanup, hook contract | `_destroy.ts`, `_dev-giveup.ts`, `_claude-hook.ts` | `_dev-giveup.test.ts`; integration tests | pending |
+| Commands and retained contracts | Evidence and known differences |
+|---|---|
+| `init [directory] [--primary]` plus native `--prefix`; `state migrate [--from] [--keep-legacy]`; `version`, `--version`, `-v`. | Config generation/parser tests, migration fixture preserving unknown values and backups idempotently, and config-free version fixture. Native version identifies build/target rather than the old source SHA. |
+| `ls [--json]`, `fleet [--json]`; live/removed row `kind`, nullable Git/session/dev facts, PR/stage/issue/section, status and history; `status [slug] [state]` with `-m`, `--risk`, `--blocked-on`, `--verify-after-merge`, `--unblock`, `--clear`, `--all [--json]`, `--note-only`, `--append`, `--examined`. | Native command fixture and nine old/new representative comparisons pass. This is not an exhaustive output snapshot for every failure condition. `by: null` compatibility is fixed. |
+| `new <id/title/url/branch/slug>` with `--slug`, `--gh`, `--attach`, `--base`, `--any`, `--open`, `--no-open`, `--no-install`; `rm [slug]` with `--yes|-y`, `--force`, `--destroy-stage|--no-destroy-stage`, `--delete-branch|--keep-branch`, `--background|-b`; `clean` with `--yes|-y`, stage flags, `--foreground|--background`. | Parser, lifecycle, cleanup, and resource fixtures cover argument separation, create/remove safety, exact resource ownership, stale revision refusal, retention, archive/history, and idempotence. CLI output is allowed to differ where `docs/cli.md` states the native contract. |
+| `doctor [slug] [--all|-a] [--json]`; `stages [--clean] [--yes|-y] [--json]`; `logs [slug]`; `perf [--json]`; `open [slug-or-query]`; `base [show|set|clear]`; `merge [slug] [--cancel]`. | Doctor/stage/perf command fixtures and focused domain/service tests exist. Stage safety uses fake AWS/pnpm; GitHub mutation tests fail closed. Editor, log and CLI text edge cases have less direct fixture coverage, but no missing handler is known. |
+| `edge [from kind to]` with `--blocks`, `--prefer`, `-m`, `--json`, `rm`, `prune`; `section [list|mv|rename|rm]` with `--only`, `--json`, `ls|move|remove`; `restack [branch] [--onto]`, `prune-backups [--days]`. | Domain and real-Git tests cover expiring edges, SHA anchors, sections, stack replay, conflicts, leases, backup pruning and cancellation. These additions and domain-focused evidence replace a requirement for exhaustive flag-by-flag output goldens. |
+| `manager`, `manager send [--hold <id>] <text...>`, `manager report [--info|--ok|--warn|--err] <text...>`; `hold [set|release|check]`; `issue [--id|--no-id|--clear-id|--gh|--clear-gh|--read]`. | Hold/report/state tests and issue CLI fixture cover durable semantics, output routing, reader stderr/exit propagation, and identity. |
+| `skills [status|sync|diff|reset]`; `sync [names...] [--yes|-y] [--force]`, `reset [--answers|--declines]`, legacy `install`; `update [log] [--check] [--head]`; `rollback [ref]`. | Current parser accepts multiple sync units and `-y`; skill sync protects modified copies. Native release fixtures cover update/install/rollback and recovery. `--head` is intentionally rejected because source-clone updates were retired. |
+| `events install|start|stop|restart|status|secret|uninstall|serve`; `remote [argv…]`; `agent send <target> [text...] [--hold <id>]`, `start <slug>`, `ls [--json]`; `claude send` alias, `ls [--json]`, `selftest [slug]`, `stop|kill <slug>`; `codex selftest`; OpenCode through `agent`. | Isolated loopback SSH, host, session, action, event and cleanup fixtures cover their named protocol/lifecycle behavior. Boris adds real native remote provisioning. Claude Code's external Bun inspector remains an integration requirement. Native fixtures do not assert successful live delivery through every user's installed agent CLI. |
+| `dev start|reset [--wait] [--timeout] [--rebuild]`, `stop`, `status [--all] [--json]`, `logs`, `queue [slug] [--first|--normal] [--json]`, `--lines`; help and unknown-command exit 2. | `native-dev-check.py` covers real local process health, queue, cancellation, logs and cleanup. Hosted macOS dev fixture passed at the 7ab434d workflow. Static linking intentionally replaces TypeScript import-failure isolation. |
+| Internal `_remote`, `_hello`, `_snapshot`, `_session`, `_host`, `_destroy`, `_dev-giveup`, `_claude-hook`, `_action-worker`, `_restack-worker`, `_dev-supervise`. | Protocol/lifecycle tests cover framing, exact argv/build, errors, cancellation, and worker recovery. `_claude-hook` is a native no-op compatibility endpoint. |
 
-For each row, enumerate the exact accepted flags and aliases from `docs/cli.md`
-and command usage in the Rust parser. Preserve stdout vs stderr, exit codes,
-TTY-only prompts, JSON field names/nullability, and `WT_CONFIG`,
-`XDG_CONFIG_HOME`, `WT_NO_HINTS`, and command-specific environment behavior.
+Representative old/new CLI comparisons are useful evidence, not a mandate to
+match every incidental string, every flag's exact error text, or every JSON
+field byte-for-byte. Keep user-facing changes explicit in `docs/cli.md`; retain
+the actionable safety, state, exit-code, and machine-readable contracts.
 
-## TUI workflows and interaction contract
+## TUI workflows and known differences
 
-| Check | Workflow that must survive | Source/evidence | Rust |
-|---|---|---|---|
-| [ ] | List/details/activity layout, sections, stack rails, remote rows, cursor anchored to identity, folded-section summary | `docs/tui.md#layout`; `docs/stacked-prs.md`; `src/tui/` | pending |
-| [ ] | Navigation, sorting, history `h`, cursor retention/removal fallback, refresh `r`/`Ctrl+R` | `docs/tui.md#keymap`; `src/tui/normal-keys.ts`, `useVisualItems.ts` | pending |
-| [ ] | Create, remove, archive/restore, clean, editor, issue/title, tracker and yank actions | `docs/tui.md#worktree-actions`; `src/tui/flows/` | pending |
-| [ ] | PR open/ready/ship/reviewer/check logs/queue-aware merge | `docs/tui.md#pull-request`; `src/tui/flows/` | pending |
-| [ ] | tmux shell/diff/agent sessions, named sessions, harness pick/cycle, manager and persistent slots | `docs/tui.md#sessions`; `src/core/tmux/`, `src/core/harness/` | pending |
-| [ ] | Section move/base/work status; restack success, conflicts and chained lock behavior | `docs/tui.md#organize`; `docs/stacked-prs.md` | pending |
-| [ ] | Automation pause/resume/cancel and status/history/key triggers | `docs/tui.md#automations`; `docs/automations.md` | pending |
-| [ ] | Perf overlay, event-driven idle rendering, key-to-painted-frame latency, resize/narrow terminal behavior | `docs/tui.md#perf-overlay-p`; `docs/architecture.md#rendering--input-latency`; perf notes | pending |
-| [ ] | Error overlay, crash view, clipboard, captured errors and restart warning | `docs/tui.md#error-overlay`; `src/tui/` | pending |
-| [ ] | Pickers and modal conventions: selection visible after resize/reorder; Esc/confirm semantics; footer-input dispatch; modal-first routing | `docs/tui.md#picker-conventions`; `docs/architecture.md#modal-ux-rules`; `src/tui/modal-keys/` | pending |
-| [ ] | Keyboard/help legend, Unicode display-cell width, clipping, wrapping, scroll/follow behavior, tmux mouse/link and clipboard contract | `docs/tui.md#keymap`; `src/tui/panels/help.tsx`; TUI render tests | pending |
+`docs/tui.md` and `crates/wt-tui` define the native UI. The feature surface
+covers list/details/activity; section and stack layout; remote rows; identity-
+anchored selection; folded summaries; navigation, sort, history and refresh;
+create/remove/archive/restore/clean; editor, issue/title, tracker and yank;
+PR actions; tmux/harness sessions; section/base/status/restack; automation
+controls; performance/error/crash views; clipboard and help; picker/modal
+semantics; Unicode width, clipping, wrapping, scroll/follow, resize, mouse and
+links. The current source refinements are covered by independent review and
+the focused regressions; the integrated verification is tracked above.
 
-Navigation and keymap groupings are documented under `Navigation`, `Worktree
-actions`, `Pull request`, `Sessions`, `Organize`, `Automations`, `P`, error
-overlay and `h`; port key behavior from those entries and the handlers, not
-from the table alone. The current interaction order is modal, footer input,
-removed view, `h`, normal keys. Preserve creation's pending-key-until-visible
-selection rule.
+PTY fixtures prove their named scenarios: delayed Git while navigating,
+filesystem refresh, title writes and quit drain, sections/folding/history,
+tmux handoff/detach/resume, and cleanup. Do not infer all TUI behavior from one
+probe. Known deliberate or informational differences:
 
-## Configuration, integrations, and data
+- Remote worktree creation does not queue F12 attach; after the row appears,
+  select it and press F12.
+- Special-session footer indicators are status text; actions remain available
+  through keybindings and command palettes.
+- Context-window occupancy is shown for a live manager Claude session when
+  transcript data is available. Codex/OpenCode do not supply equivalent
+  per-turn context facts.
+- Completed-session transcript summaries are shown for selected Claude output,
+  not as a generic banner for all harnesses.
+- Rows do not display an explicit title-source badge.
 
-| Check | Contract | Source/evidence | Rust |
-|---|---|---|---|
-| [x] | Parse TOML, required paths, fail-fast validation, aliases/deprecations, defaults and repository identity independent of cwd | `crates/wt-config/tests/config.rs`: defaults, table merge/array replacement, explicit selectors and real linked-worktree discovery; full gate at `8ba6375` | verified |
-| [x] | Config blocks: `[instance]`, `[paths]`, `[tmux]`, `[branch]`, `[remote]`, `[stage]`, `[lifecycle]`, `[backend]`, `[deploy.sst]`, `[dev_server]` | `wt-config` all-options golden snapshot matches the TS loader; `tests/remotes.rs` covers selected configs and plural hosts; full gate at `8ba6375` | verified schema; integration behavior is tracked separately below |
-| [x] | Config blocks: `[issue_tracker]`, `[harness]`, `[naming]`, legacy `[browser]`, `[github]`, `[review_bot]`, `[github.events]`, `[diff]`, `[editor]`, `[ui]` | Same all-options golden snapshot plus optional-section/default and supported-harness tests | verified schema |
-| [x] | Config blocks: `[skills]`, `[manager]`, `[update]`, repeated `[[actions]]`, `[[automations]]`; templates, validation, action/automation requirements | Same golden snapshot; invalid automation/action pairs fail closed, aliases normalize, slot target stays compatible | verified schema |
-| [ ] | `git-worktree` and `rift` backends; base/ref freshness, self-healing registry, remote orthogonality and known limits | `docs/backends.md`; `src/core/backend/` | pending |
-| [ ] | SST stage pin/cleanup; configured issue tracker commands; GitHub REST/GraphQL and queue; webhook daemon; editor/diff command; remote SSH worker; dev server supervisor | configuration and feature docs; `src/core/integrations/`, `src/core/github/`, `src/core/dev-server.ts` | pending |
-| [ ] | Harnesses Claude, Codex and OpenCode; primary selection vs live-target routing; session names, usage, summaries, events, output tails and message transports | `src/core/harness/types.ts`, `src/core/harness/`; harness tests | pending |
-| [ ] | Harness interface: list/discover, spawn/resume args, tmux name identity, single-slot semantics, derived state/extras, trust, injection-landed check, reap | `src/core/harness/types.ts`; `registry.test.ts`, `primary.test.ts`, `session-selection.test.ts`, `live-target.test.ts`, `agent-routing.test.ts`, `completion.test.ts` | pending |
-| [ ] | Claude: JSONL sessions, named-session identity, trust, questions, summaries, usage, tail worker/parse, inspector injection and fallback | `claude/harness.test.ts`, `jsonl.test.ts`, `names`/`sessions`/`question`/`summary`/`usage`/`tail`/`trust`/`inject/*` tests | pending |
-| [ ] | Codex: app-server queue ambiguity/reconciliation, slot UUID stamps, discovery/output workers, rollout cache, readiness, native status and usage | `codex.test.ts`, `app-server.test.ts`, `messaging.test.ts`, `slot.test.ts`, `discovery.test.ts`, `events.test.ts`, `live-identity.test.ts`, `readiness.test.ts`, `rollout-cache.test.ts`, `startup.test.ts`, `native-status.test.ts`, `usage.test.ts` | pending |
-| [ ] | OpenCode: session identity, discovery, events and usage; shared session choice, completion, messaging, state and tail workers | `opencode.test.ts`, `opencode/events.ts`; `session-messaging.test.ts`, `tail-worker.test.ts`, `compact.test.ts`, `status.ts` | pending |
-| [ ] | Durable state: SQLite schema/migrations/repository ID, wtstate payload migrations, archives/removal history, sections, fork base + base SHA, work status/title, automation once-only ledger, harness registries, communication holds | `docs/updates.md#evolve-data-compatibility-across-hot-updates`; `core/state-db.ts`, `core/wtstate/` | pending |
-| [ ] | Query cache shape/versioning, persisted query invalidation, event-driven freshness, last-good data and whole-fetch failure semantics | `docs/architecture.md#freshness-model`; `src/state/` | pending |
-| [ ] | Self-update startup check, CI gate, boot sentinel, rollback, clean/ahead refusal and data compatibility policies | `docs/updates.md`; `src/core/update/`, update/rollback/version commands | pending |
-| [ ] | Skills/instructions discovery, stamps, modified-copy protection, rulesync, templates, target topology and remote provisioning | `docs/skills.md`; `src/core/skills/` | pending |
-| [ ] | Automations: level-triggered dedupe, triggers, dispatch, breaker, pause/cancel, external side effects and action ledger | `docs/automations.md`; `src/core/automations/` | pending |
-| [ ] | Manager singleton lifecycle, command palette, report channel, agent targeting/delivery, durable ambiguity, transient holds | `docs/manager.md`; `src/core/manager/`, harness messaging | pending |
-| [ ] | Stacks inferred only from fork-base records; trunk normalization, `baseSha` anchor, conflict-safe restack and ephemeral merge edges | `docs/stacked-prs.md`; `src/core/stack-layout.ts`, `core/stack-ops/`, `core/merge-edges.ts` | pending |
+These are documented behavior differences, not automatically blockers to a
+non-exact conversion. Decide product importance from observed use rather than
+inflating the test checklist.
 
-## Instructions, docs, scripts, and CI migration audit
+## Configuration, integrations, state, and safety
 
-This is a read-only review of current guidance. Do not carry language/runtime
-instructions into the Rust tree by renaming paths mechanically. Keep user
-contracts and measured behavioral evidence, then replace only their obsolete
-implementation paths and tools. `CLAUDE.md` contains `@AGENTS.md`; preserve that
-compatibility include rather than creating a second instruction source.
+`wt-config` preserves TOML merge/default/validation, aliases, required paths,
+and repository identity independent of caller cwd. Golden fixtures compare all
+supported blocks with the baseline schema. Blocks include `[instance]`,
+`[paths]`, `[tmux]`, `[branch]`, singular/plural `[remote]`, `[stage]`,
+`[lifecycle]`, `[backend]`, `[deploy.sst]`, `[dev_server]`, `[issue_tracker]`,
+`[harness]`, `[naming]`, legacy `[browser]`, `[github]`, `[review_bot]`,
+`[github.events]`, `[diff]`, `[editor]`, `[ui]`, `[skills]`, `[manager]`,
+`[update]`, `[[actions]]`, and `[[automations]]`. Schema evidence does not
+substitute for runtime integration fixtures.
 
-| Check | Current artifact and stale or still-valid guidance | Rust rewrite implication | Status |
-|---|---|---|---|
-| [ ] | `AGENTS.md:10,21-22,34-41`: Bun/React/OpenTUI/TanStack stack; `src/core/config.ts`, `.tsx` help/details paths; Effect, React lifecycle and test-clock conventions; TypeScript lazy imports and checker | Replace stack, source paths, and Effect/React/TanStack/test commands with the chosen Rust architecture. Preserve the three-layer ownership, typed errors, cancellation, modal-first key dispatch, lazy command blast-radius rule, and per-command failure isolation in Rust-specific terms. Keep creation selection delayed until the actual row is in rendered inventory, but remove React/`visualItems` names. | pending |
-| [ ] | `AGENTS.md:127-131,137-145,154`: Bun Inspector inheritance/shims, `Bun.TOML.parse`, bare-promise spin, `useTimeline`, `Bun.spawn`, Bun test harness | Replace runtime-specific diagnostics where wt's own process changes. **Do not delete** the Claude/Codex Inspector protocol or PATH shim requirements solely because wt is Rust: they still govern external Bun-based harnesses and child tools. Preserve the general rules against busy waits, render-thread blocking, unsafe inherited environment, and non-hermetic subprocess tests. | pending |
-| [ ] | `CLAUDE.md` is the one-line `@AGENTS.md` compatibility include; `AGENTS.md` is canonical | Keep both harnesses loading one canonical project instruction file. No copied `CLAUDE.md` contents. | pending |
-| [ ] | `.agents/skills/perf/SKILL.md:23-29,45-47,59-71` uses `WT_PERF=1`, `event-loop blocked`, app-log grep and Bun/render-thread signatures; `notes.md` holds the measured TUI and creation history | Replace active commands/signatures with Rust runtime CPU and end-to-end key-to-painted-frame probes. Preserve dated measurements and resolved TS-era incidents as historical evidence; keep open issues explicitly open (Brave freeze, Codex updater/drain ownership, native cron startup, duplicate destroy fetch). | pending |
-| [ ] | `skills/instructions.md` is the always-loaded lifecycle/testing/ownership contract; bundled `skills/{wt,start,restack,manager,handoff,shepherd,babysit,triage}/SKILL.md` teach wt commands and workflow | Keep command/status semantics and human/agent ownership guidance. Update command examples only when the public CLI contract changes. They do not require TS implementation paths; do not rewrite them as a side effect of the language migration. | pending |
-| [ ] | `docs/architecture.md:3-4,27-41,94-164,173-330,414-629` maps TS modules, React panes, TanStack cache, Effect boundaries, workers, OpenTUI and stable `.ts/.tsx` files | Rewrite as the Rust internals map after the crate/module layout is established. Preserve dataflow, state freshness, failure, renderer, modal, logging, update and stability contracts as concepts. | pending |
-| [ ] | `docs/configuration.md`, `docs/tui.md`, `docs/cli.md`, `docs/automations.md`, `docs/github-events.md`, `docs/stacked-prs.md`, `docs/backends.md`, `docs/manager.md`, `docs/updates.md`, `docs/skills.md`, `docs/fleet.md` | Treat as user-facing behavioral contracts and update links/source details alongside changed behavior. Replace implementation references such as `bun install`, TypeScript paths and Bun boot probes; preserve external integrations and semantics. `docs/manager.md`'s React fiber reference is to Claude Code's external UI and remains relevant to injection, not wt's renderer. | pending |
-| [ ] | `docs/cli.md:132,140,375`; `docs/github-events.md:106`; `docs/manager.md:63,178,185` include Node package checks/update install, Bun fallback path, Bun-run harness smoke, Inspector shims and Effect sleep | Decide which contracts survive. The Bun fallback and install references for wt itself should reflect the Rust artifact. The Bun Inspector/shim behavior and external manager smoke still apply where they target Bun-based harnesses. Replace Effect sleep with a cancellation-aware Rust wait without changing serialized delivery behavior. | pending |
-| [ ] | `README.md:17,39-51` requires Bun and installs via `bun install`; says Rift carries `node_modules` | Replace runtime/toolchain and install instructions with Rust binaries/build or packaging. Retain `git`, tmux, font, OS and optional integration requirements that still apply. Explain what the backend copies after Rust removes its own Node dependency. | pending |
-| [ ] | `scripts/broken-module-check.sh`, `fixture.sh`, `tui-test.sh`, `remote-runtime-install.sh`, `codex-compact-recognition.ts`, `codex-palette-smoke.ts` invoke `bun src/main.ts`, Bun APIs or import `src/**/*.ts` | Replace runtime invocation and source imports with the Rust binary/test seams. Keep fixture isolation, command-module failure containment, real tmux/session smoke, remote content-hash provisioning and exact handshake checks. `BUN_INSPECT` handling in harness-launch tests remains relevant. | pending |
-| [ ] | `.github/workflows/ci.yml` installs Bun and runs lint/typecheck/build/test; `discord-digest.yml` runs a Bun TypeScript utility; `discord-ci-alert.yml` reports CI failures | Replace core CI with Rust toolchain setup/cache, formatting/lint, clippy, unit/compat tests, build and supported-target checks. Port or package the standalone Discord helper separately so community automation does not disappear with Bun. | pending |
-| [ ] | `docs/skills.md` cites `src/core/skills/` and `registry.test.ts` budget; `AGENTS.md` owns the historical incident ledger | Move source/test pointers to Rust locations while preserving the skill registry line budget, replacement-only rule for `skills/instructions.md`, brand-neutral bundled content, and the distinction between incident evidence (`AGENTS.md`) and terse always-on rules. | pending |
+| Domain | Native ownership and proof scope | Intentional change or remaining evidence limit |
+|---|---|---|
+| Git and Rift backends, origin/ref freshness, inventory and stack replay | `wt-vcs`, `wt-lifecycle`, `wt-stack`; isolated real-Git create/remove, registry, replay, lease and cleanup fixtures. | Rift copies project files and does not synchronize package installs. Rift lookup checks process PATH then bounded login-shell PATH. |
+| SST, issue tracker, GitHub/merge queue, editor/diff, events daemon, dev server | `wt-sst`, `wt-app`, `wt-github`, `wt-events`, `wt-dev`; fake cloud tools, parser/error tests, batched/fail-closed API tests, signed loopback webhook, real temporary dev process. | No live AWS deletion was used. Hosted macOS service checks and real external account mutations are distinct from fixtures. |
+| Claude, Codex, OpenCode and common session lifecycle | `wt-harness`; identity/discovery/usage/output, Claude inspector, Codex app-server receipts, OpenCode state, live-target routing and resource fixtures. Session env pins selected `WT_CONFIG` and launcher PATH. | Real Boris proves remote binary/session environment, not real message delivery for every agent. Claude inspector is provided by external Claude Code/Bun. |
+| SQLite, migrations, archives, status/title, sections, fork-base/base SHA, action history, automation ledger, harness registries and holds | `wt-store`, `wt-core`, `wt-actions`, `wt-automations`; lossless unknown-field/future-version tests and isolated migration/recovery fixtures. | SQLite is durable authority; derived source snapshots are rebuildable and cannot erase accepted writes or history. |
+| Freshness, batching, last-good snapshots and whole-fetch failure | `wt-runtime` and source crates; tests preserve good state while exposing failed reads, batch API calls, and fail closed on incomplete GitHub chunks. | Replaces persisted TanStack query cache with source-owned prepared snapshots. |
+| Skills, managed instructions and remote provisioning | `wt-skills`, `wt-app`; tests protect modified files, managed-block boundaries, symlink/rulesync targets, templates and stamps; Boris remote setup. | `wt skills sync` parser compatibility is implemented; additional template-answer CLI tests are optional evidence, not a known code gap. |
+| Automations and manager | `wt-automations`, `wt-actions`, manager/app code; once-only claims, settle/dedupe, breaker, cancellation, durable ambiguity, hold, spool and action fixtures. | Durable guarantees are tested at domain/service boundaries; not every manager CLI rendering path has a bespoke test. |
+| Update, installer and remote runtime | `wt-update`, `wt-app`, `wt-launcher`, `wt-remote`; immutable checksum/build/target, health probe, rollback, recovery and exact remote build tests; real isolated install and Boris run. | Replaces source-clone/Bun update and remote source upload. `--path` is required before PATH changes or legacy migration. |
 
-## Cross-cutting invariants and acceptance gates
+Cross-cutting safety contracts remain load-bearing:
 
-| Check | Required invariant or gate | Evidence/source | Rust |
-|---|---|---|---|
-| [ ] | I/O, subprocesses, waits, retries, resource acquisition and concurrency have explicit cancellation and ownership; no blocking filesystem/process work on the input thread | `docs/architecture.md#effect-boundary`, `#controller-and-worker-execution` | pending |
-| [ ] | TUI rows stay presentation-only; sources batch by domain, never fetch once per row; stale-time changes do not replace missing invalidation | `docs/architecture.md#the-three-layers`, `#freshness-model` | pending |
-| [ ] | CLI command imports remain isolated so a broken leaf does not disable status, update, rollback or other recovery commands | `cli/index.ts`; `scripts/broken-module-check.sh` | pending |
-| [ ] | Long-running worker/daemon ownership, shutdown/drain, restart detection and duplicate prevention are explicit; unknown liveness never means stopped | `docs/architecture.md#controller-and-worker-execution`; `docs/manager.md`; `docs/updates.md` | pending |
-| [ ] | Logs are structured, actionable, bounded and safe for terminal output; no secrets or untrusted control sequences | `docs/architecture.md#logging`; `src/core/logger.ts` | pending |
-| [ ] | Destructive cleanup is guarded, idempotent, scoped, and keeps owed verification/history; no cleanup inferred from a stale cache | CLI lifecycle docs; worktree/backend tests | pending |
-| [ ] | Pure rules use language-neutral golden fixtures; Rust and reference runner consume same JSON and compare normalized output | `test/compat/README.md`, `test/compat/*.json` | pending |
-| [ ] | Existing unit and integration suites have named Rust counterparts; test-only behavior is not treated as product behavior | `src/**/*.test.ts`; repository test scripts | pending |
-| [x] | Local verification and dependency-direction gate; package-scoped runs must not claim workspace green; target cleanup must preserve evidence | `crates/xtask/`, `.cargo/config.toml`, `.config/nextest.toml`, `docs/development.md` | tooling implemented; xtask tests, Clippy and dependency check pass; workspace gate pending |
-| [ ] | `broken-module-check.sh`, lint/typecheck, build, full tests, distribution/install/update smoke and startup/rollback probes pass before cutover | `package.json`, `.github/workflows/ci.yml`, `docs/updates.md` | pending |
-| [ ] | Real terminal probe records idle CPU and end-to-end key-to-painted-frame latency during creation, sweep, refresh and session churn | prior measured acceptance in `.agents/skills/perf/notes.md` | pending |
-| [ ] | Before removing TypeScript, command-by-command old/new stdout, stderr, exit codes, JSON schemas, state migration and representative TUI interactions are compared | this inventory + compat runner | pending |
+- Load one merged config per process. Pin selected config and active launcher
+  PATH into each managed session, not tmux server-global state.
+- Preserve durable data and unknown fields. Keep `baseSha` as the squash-safe
+  anchor; stack membership comes only from fork-base records.
+- Unknown GitHub, inventory, host, or stage state is not proof of safety.
+  Destructive cleanup is scoped, idempotent, confirmed, and revalidated under
+  its lock. Dirty/unpushed work and owed verification remain hazards.
+- Do not retry ambiguous external mutations. Codex lost replies reconcile
+  without a second add; OpenCode without a receipt does not claim completion.
+- Own and cancel each worker/process/daemon. Drain accepted writes before
+  shutdown. Keep I/O and subprocesses off the TUI input path.
+- Install immutable checksummed builds; probe before activation and provision
+  the exact remote build. Logs are bounded and safe for terminal output.
 
-Performance acceptance should include the known regressions and outcomes:
-idle renderer CPU near the corrected ~0–1% baseline (alert if above 5%); no
-continuous live-render duty while idle; measure key-to-painted-frame latency
-(not just event-loop gaps); and exercise 24-row refresh, large copy, subprocess
-bursts, cleanup sweeps and agent output tailing. The historical creation test
-reduced the worst timer gap from 4.62 s to 54 ms while total fixture creation
-changed 8.96 s to 9.40 s: responsiveness and throughput are separate measures.
-See `.agents/skills/perf/notes.md` for measurement limits and unresolved issues.
+## Remaining acceptance work
+
+Finish the optimized Rust comparison against the
+five-scenario 24-row, 65-second TypeScript runtime fixture at `bbf1696` with the
+tmux delimiter fix; report process-tree CPU/RSS, idle TUI CPU, and
+injected-key-to-painted-frame latency separately. Run current-head CI after
+shared edits settle. These are outstanding evidence gates; there is no blanket
+requirement for exhaustive per-flag golden comparisons.

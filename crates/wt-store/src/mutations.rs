@@ -1436,8 +1436,15 @@ impl Store {
 }
 
 pub fn is_merged_removal(entry: &RemovedWorktree) -> bool {
-    entry.extra.get("prState").and_then(Value::as_str) == Some("MERGED")
-        || entry.extra.get("gitState").and_then(Value::as_str) == Some("merged")
+    match entry.extra.get("landedOnAtRemoval") {
+        Some(proof) => matches!(proof.as_str(), Some("base" | "production")),
+        // Older records predate revision-specific proof. Preserve their
+        // historical classification, but never override an explicit verdict.
+        None => {
+            entry.extra.get("prState").and_then(Value::as_str) == Some("MERGED")
+                || entry.extra.get("gitState").and_then(Value::as_str) == Some("merged")
+        }
+    }
 }
 
 /// Whether a removed row still had an outstanding post-merge check. This is

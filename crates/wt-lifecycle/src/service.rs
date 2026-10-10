@@ -237,7 +237,10 @@ struct ReviewHead {
 
 impl LifecycleService {
     pub fn new(config: ServiceConfig, repository: GitRepository, runner: ProcessRunner) -> Self {
-        let id_pattern = Regex::new(&config.branch_id_pattern).ok();
+        let id_pattern = regex::RegexBuilder::new(&config.branch_id_pattern)
+            .case_insensitive(true)
+            .build()
+            .ok();
         Self {
             config,
             repository,
@@ -1276,22 +1279,7 @@ impl LifecycleService {
     }
 
     fn compute_stage(&self, slug: &str) -> String {
-        let normalized = slug.to_lowercase();
-        let digest = Sha256::digest(normalized.as_bytes());
-        let hex = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let issue = self
-            .id_pattern
-            .as_ref()
-            .and_then(|pattern| pattern.captures(&normalized))
-            .and_then(|captures| captures.get(1))
-            .map(|value| value.as_str());
-        match issue {
-            Some(issue) => format!("{}{issue}-{}", self.config.stage_prefix, &hex[..6]),
-            None => format!("{}{}", self.config.stage_prefix, &hex[..10]),
-        }
+        wt_core::stage_name(slug, &self.config.stage_prefix, self.id_pattern.as_ref())
     }
 
     fn ensure_managed_path(&self, path: &Path, root: &Path) -> Result<(), LifecycleError> {

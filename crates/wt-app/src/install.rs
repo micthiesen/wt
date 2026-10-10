@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use wt_config::LoadOptions;
 use wt_update::{Channel, InstallOutcome, InstallPaths, ReleaseSource, StateStore};
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(100);
+const NATIVE_COMPAT_MARKER: &[u8] = b"#!/bin/sh\n# wt-native-compat-v1\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallResult {
@@ -122,11 +123,14 @@ pub async fn install_once(
 pub fn migrate_or_link_path(
     paths: &InstallPaths,
     home: &Path,
-    create_if_missing: bool,
+    manage_path_link: bool,
 ) -> Result<()> {
+    if !manage_path_link {
+        return Ok(());
+    }
     #[cfg(not(unix))]
     {
-        let _ = (paths, home, create_if_missing);
+        let _ = (paths, home);
         bail!("native PATH link management currently supports macOS and Linux")
     }
     #[cfg(unix)]
@@ -136,9 +140,6 @@ pub fn migrate_or_link_path(
         let link = home.join(".local/bin/wt");
         match fs::symlink_metadata(&link) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if !create_if_missing {
-                    return Ok(());
-                }
                 let parent = link.parent().expect("PATH entry has parent");
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
@@ -165,13 +166,10 @@ pub fn migrate_or_link_path(
                     return Ok(());
                 }
                 if !is_recognized_legacy_link(&link, home)? {
-                    if create_if_missing {
-                        bail!(
-                            "refusing to replace unrelated PATH entry {}",
-                            link.display()
-                        )
-                    }
-                    return Ok(());
+                    bail!(
+                        "refusing to replace unrelated PATH entry {}",
+                        link.display()
+                    )
                 }
                 backup_legacy_checkout(paths, home, &link)?;
                 let parent = link.parent().expect("PATH entry has parent");
@@ -188,10 +186,9 @@ pub fn migrate_or_link_path(
                 sync_directory(parent)?;
                 Ok(())
             }
-            Ok(_) if create_if_missing => {
+            Ok(_) => {
                 bail!("refusing to replace unrelated PATH file {}", link.display())
             }
-            Ok(_) => Ok(()),
         }
     }
 }
@@ -200,16 +197,17 @@ pub fn migrate_or_link_path(
 fn is_recognized_legacy_link(link: &Path, home: &Path) -> Result<bool> {
     let checkout = home.join(".wt");
     let shim = checkout.join("bin/wt");
-    if !checkout.join("src/main.ts").is_file()
-        || !checkout.join("package.json").is_file()
-        || !checkout.join(".git").exists()
-        || !shim.is_file()
-    {
+    if !checkout.join(".git").exists() || !shim.is_file() {
         return Ok(false);
     }
     let contents =
         fs::read(&shim).with_context(|| format!("read legacy shim {}", shim.display()))?;
-    if !contents.starts_with(b"#!/bin/sh") || !contents.windows(3).any(|window| window == b"bun") {
+    let native_compat = contents.starts_with(NATIVE_COMPAT_MARKER);
+    let typescript_compat = checkout.join("src/main.ts").is_file()
+        && checkout.join("package.json").is_file()
+        && contents.starts_with(b"#!/bin/sh")
+        && contents.windows(3).any(|window| window == b"bun");
+    if !native_compat && !typescript_compat {
         return Ok(false);
     }
     Ok(canonical_target(link)
@@ -349,6 +347,20 @@ mod tests {
         (checkout, link)
     }
 
+    fn native_compat_tree(home: &Path, marker: &[u8]) -> (PathBuf, PathBuf) {
+        let checkout = home.join(".wt");
+        fs::create_dir_all(checkout.join("bin")).unwrap();
+        fs::create_dir(checkout.join(".git")).unwrap();
+        let shim = checkout.join("bin/wt");
+        let mut contents = marker.to_vec();
+        contents.extend_from_slice(b"exec /native/wt-launcher \"$@\"\n");
+        fs::write(&shim, contents).unwrap();
+        let link = home.join(".local/bin/wt");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&shim, &link).unwrap();
+        (checkout, link)
+    }
+
     #[test]
     fn path_link_migration_archives_legacy_checkout_and_keeps_source_in_place() {
         let temp = tempdir().unwrap();
@@ -358,7 +370,7 @@ mod tests {
         let paths = InstallPaths::new(home.join(".local/share/wt")).unwrap();
         fs::create_dir_all(paths.launcher().parent().unwrap()).unwrap();
         fs::write(paths.launcher(), b"stable launcher").unwrap();
-        migrate_or_link_path(&paths, &home, false).unwrap();
+        migrate_or_link_path(&paths, &home, true).unwrap();
         assert_eq!(
             canonical_target(&link).unwrap(),
             canonical_target(&paths.launcher()).unwrap()
@@ -391,6 +403,70 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
         assert_eq!(value["checkoutLeftInPlace"], true);
+    }
+
+    #[test]
+    fn path_link_migration_recognizes_native_compat_checkout() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (checkout, link) = native_compat_tree(&home, NATIVE_COMPAT_MARKER);
+        let paths = InstallPaths::new(home.join(".local/share/wt")).unwrap();
+        fs::create_dir_all(paths.launcher().parent().unwrap()).unwrap();
+        fs::write(paths.launcher(), b"stable launcher").unwrap();
+
+        migrate_or_link_path(&paths, &home, true).unwrap();
+
+        assert_eq!(
+            canonical_target(&link).unwrap(),
+            canonical_target(&paths.launcher()).unwrap()
+        );
+        assert!(checkout.join("bin/wt").is_file());
+        assert!(
+            fs::read_dir(paths.root().join("migrations"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "gz"))
+        );
+    }
+
+    #[test]
+    fn install_without_path_leaves_recognized_legacy_link_and_checkout_untouched() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (checkout, link) = legacy_tree(&home);
+        let original_target = canonical_target(&link).unwrap();
+        let paths = InstallPaths::new(home.join(".local/share/wt")).unwrap();
+
+        migrate_or_link_path(&paths, &home, false).unwrap();
+
+        assert_eq!(canonical_target(&link).unwrap(), original_target);
+        assert!(checkout.join("src/main.ts").is_file());
+        assert!(!paths.root().exists());
+    }
+
+    #[test]
+    fn native_compat_lookalike_symlink_is_refused() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (_, link) = native_compat_tree(&home, b"#!/bin/sh\n# wt-native-compat-v2\n");
+        let target = canonical_target(&link).unwrap();
+        let paths = InstallPaths::new(home.join(".local/share/wt")).unwrap();
+
+        let error = migrate_or_link_path(&paths, &home, true).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to replace unrelated PATH entry")
+        );
+        assert_eq!(canonical_target(&link).unwrap(), target);
+        assert!(!paths.root().join("migrations").exists());
     }
 
     #[test]

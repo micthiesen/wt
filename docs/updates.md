@@ -86,8 +86,10 @@ The controller and worker speak a versioned native protocol. A controller
 provisions the matching native runtime before sending commands. Same-platform
 workers can receive the verified running binary; cross-platform workers require
 an exact published release for the controller's build ID and the worker's
-target. The worker's `.wt-runtime.json` records that build identity. Remote
-commands do not update, replace, or require a source checkout on the worker.
+target. The controller stores the worker executable under a content-addressed
+path and validates its SHA-256, boot-probe identity, and worker handshake before
+using it. Remote commands do not update, replace, or require a source checkout
+on the worker.
 
 See [configuration.md](configuration.md#remote--optional-ssh-worktree-host)
 for worker setup and [backends.md](backends.md) for worktree storage behavior.

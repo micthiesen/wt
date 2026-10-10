@@ -322,6 +322,7 @@ fn compose(
             .then_with(|| a.key.cmp(&b.key))
     });
     crate::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
+    crate::board_layout::refresh_rollups(&mut board);
     crate::activity_source::bound_feeds(&mut board);
     snapshot.data = Some(Arc::new(board));
     snapshot
@@ -349,15 +350,31 @@ mod tests {
         };
         let key = wt_core::remote_worktree_ledger_key(&endpoint.key(), "one");
         let metadata = ready((
-            serde_json::json!({"slugs": {}, "remoteLayouts": { &key: { "section": "Review", "order": 9 } }, "sectionsOrder": ["Review"]}),
+            serde_json::json!({
+                "slugs": {"local": {"section": "Review", "order": 1}},
+                "remoteLayouts": { &key: { "section": "Review", "order": 9 } },
+                "sectionsOrder": ["Review"]
+            }),
             Default::default(),
         ));
+        let mut local_work =
+            wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "2026-10-09T00:00:00Z");
+        local_work.risk = Some(wt_core::WorkRisk::High);
+        let mut remote_work =
+            wt_core::WorkStatusRecord::new(wt_core::WorkState::NeedsHuman, "2026-10-09T00:00:00Z");
+        remote_work.blocked_on = Some("waiting for review".into());
         let source = ready(HostSnapshot {
             board: Some(Board {
                 rows: vec![wt_tui::BoardRow {
                     key: "one".into(),
+                    slug: "one".into(),
                     title: "Worker title".into(),
                     branch: "branch".into(),
+                    work: Some(wt_tui::WorkPresentation {
+                        record: Some(remote_work),
+                        effective_state: Some(wt_core::WorkState::NeedsHuman),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -365,19 +382,57 @@ mod tests {
             state: HostState::Ready,
             layout: Default::default(),
         });
+        let local_work = wt_tui::BoardRow {
+            key: "local".into(),
+            slug: "local".into(),
+            title: "Local work".into(),
+            work: Some(wt_tui::WorkPresentation {
+                record: Some(local_work),
+                effective_state: Some(wt_core::WorkState::Ready),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let result = compose(
             &fixture.ctx.config,
-            ready(Board::default()),
+            ready(Board {
+                rows: vec![local_work],
+                ..Default::default()
+            }),
             metadata,
             &[(&endpoint, source)],
         );
         let board = result.data.unwrap();
-        assert_eq!(board.rows[0].title, "Worker title");
-        assert!(
+        assert_eq!(
             board
-                .sections
+                .rows
                 .iter()
-                .any(|section| section.key == "Review" && section.rows == vec![0])
+                .find(|row| row.slug == "one")
+                .unwrap()
+                .title,
+            "Worker title"
+        );
+        let review = board
+            .sections
+            .iter()
+            .find(|section| section.key == "Review")
+            .unwrap();
+        assert_eq!(review.rows.len(), 2);
+        assert!(
+            review.rollup.states.iter().any(|state| {
+                state.state == Some(wt_core::WorkState::Ready) && state.count == 1
+            })
+        );
+        assert!(review.rollup.states.iter().any(|state| {
+            state.state == Some(wt_core::WorkState::NeedsHuman) && state.count == 1
+        }));
+        assert_eq!(review.rollup.risks[0].risk, wt_core::WorkRisk::High);
+        assert!(
+            review
+                .rollup
+                .blocked_notes
+                .iter()
+                .any(|note| note == "one: waiting for review")
         );
         fixture.close().await.unwrap();
     }

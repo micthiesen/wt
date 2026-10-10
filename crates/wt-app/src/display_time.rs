@@ -112,26 +112,8 @@ fn local_time_labels(timestamps: Vec<u64>) -> BTreeMap<u64, String> {
     timestamps
         .into_iter()
         .filter_map(|timestamp_ms| {
-            let seconds = i64::try_from(timestamp_ms / 1_000).ok()?;
-            #[cfg(target_pointer_width = "64")]
-            let seconds: libc::time_t = seconds;
-            #[cfg(not(target_pointer_width = "64"))]
-            let seconds: libc::time_t = seconds.try_into().ok()?;
-            let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
-            // `localtime_r` writes the full `tm` value on success and uses
-            // process-local timezone state without shared static storage.
-            let result = unsafe { libc::localtime_r(&seconds, broken_down.as_mut_ptr()) };
-            if result.is_null() {
-                return None;
-            }
-            let broken_down = unsafe { broken_down.assume_init() };
-            Some((
-                timestamp_ms,
-                format!(
-                    "{:02}:{:02}:{:02}",
-                    broken_down.tm_hour, broken_down.tm_min, broken_down.tm_sec
-                ),
-            ))
+            let (_, _, _, hour, minute, second) = local_time_components(timestamp_ms)?;
+            Some((timestamp_ms, format!("{hour:02}:{minute:02}:{second:02}")))
         })
         .collect()
 }
@@ -139,6 +121,39 @@ fn local_time_labels(timestamps: Vec<u64>) -> BTreeMap<u64, String> {
 #[cfg(not(unix))]
 fn local_time_labels(_timestamps: Vec<u64>) -> BTreeMap<u64, String> {
     BTreeMap::new()
+}
+
+/// Return calendar components in the host's local timezone. The caller must
+/// use this only on a background/source task; libc timezone lookup is not an
+/// input- or render-thread operation.
+#[cfg(unix)]
+pub(crate) fn local_time_components(timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    let seconds = i64::try_from(timestamp_ms / 1_000).ok()?;
+    #[cfg(target_pointer_width = "64")]
+    let seconds: libc::time_t = seconds;
+    #[cfg(not(target_pointer_width = "64"))]
+    let seconds: libc::time_t = seconds.try_into().ok()?;
+    let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // `localtime_r` writes the full tm value and uses process-local timezone
+    // state without sharing static storage with other workers.
+    let result = unsafe { libc::localtime_r(&seconds, broken_down.as_mut_ptr()) };
+    if result.is_null() {
+        return None;
+    }
+    let broken_down = unsafe { broken_down.assume_init() };
+    Some((
+        broken_down.tm_year + 1900,
+        u8::try_from(broken_down.tm_mon + 1).ok()?,
+        u8::try_from(broken_down.tm_mday).ok()?,
+        u8::try_from(broken_down.tm_hour).ok()?,
+        u8::try_from(broken_down.tm_min).ok()?,
+        u8::try_from(broken_down.tm_sec).ok()?,
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_time_components(_timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    None
 }
 
 #[cfg(test)]

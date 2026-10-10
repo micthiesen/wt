@@ -166,7 +166,7 @@ and it drives the rest of the design:
 
 A rift clone's `origin/<trunk>` is frozen at clone time. `fetchOrigin`
 runs `git fetch` in the **main clone** only, so nothing inside a
-worktree advances its copy — measured on a live fleet of 28 rows,
+worktree advances its copy — historical measurement on a live fleet of 28 rows,
 `git rev-parse origin/staging` gave 10 distinct answers, one of them 9
 merges behind and none of them the tip. Two rules fall out of that, and
 both have shipped as bugs:
@@ -181,7 +181,7 @@ files/insertions, the merge-conflict probe (which reports clean against
 a trunk several merges old, a false green), the `{{base}}` handed to
 the diff tool — and the agent's own `git log origin/<trunk>..HEAD`
 inside the checkout, which is the reader no wt-side substitution can
-reach. Measured before the fix: a branch with no commits of its own
+reach. Historical measurement before the fix: a branch with no commits of its own
 showed 3 ahead and an 11-file diff of somebody else's work; a real
 branch showed 304 files changed against a true 24; 17 of 18 checkouts
 were stale across three generations.
@@ -206,7 +206,7 @@ fast-forwards `refs/remotes/origin/<trunk>`, not the local head. So an
 ordinary trunk worktree measured itself against clone time, permanently,
 and the fallback that was supposed to catch this could not: `freshBaseRev`
 keys on the trunk string as well, saw a base that was not it, and
-returned it untouched. Measured on a live fleet of 15: every row resolved
+returned it untouched. Historical measurement on a live fleet of 15: every row resolved
 to a local trunk 97 to 383 commits behind, one reporting 383 commits
 ahead against a true 1. Nine rows shared a single colleague's commit
 subject as their title, because that commit was the oldest in all nine

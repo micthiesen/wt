@@ -1,10 +1,11 @@
 # Remote workers
 
 wt combines local worktrees and multiple SSH hosts in one board. Each host runs
-the same Rust sources and command handlers. A persistent SSH connection carries
-prepared snapshots and typed commands; there is no separate remote feature
-implementation. The controller owns terminal input, desktop applications, and
-board layout. Each host owns its worktrees, database, tmux server, and agents.
+the same native application and command handlers. A persistent SSH connection
+carries prepared snapshots and typed commands; there is no separate remote
+feature implementation. The controller owns terminal input, desktop
+applications, and board layout. Each host owns its worktrees, database, tmux
+server, and agents.
 An unavailable host keeps its last known rows with a visible error while the
 other hosts continue updating.
 

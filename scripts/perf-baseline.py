@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure a real wt process in an isolated PTY and synthetic Git fleet.
 
-Example: python3 scripts/perf-baseline.py --output /tmp/wt-baseline -- bun src/main.ts
+Example: python3 scripts/perf-baseline.py --output /tmp/wt-baseline -- target/release/wt
 All mutable paths, HOME, tmux state and repositories belong to this run. The
 command is resolved before changing cwd. No test talks to GitHub or starts agents.
 Results include waited process-tree CPU, terminal bytes, and wt's own latency log.

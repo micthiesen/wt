@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Args;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use wt_github::{GithubClient, GithubOptions};
+use wt_harness::stale_harness_shims;
 use wt_platform::process::CommandSpec;
 
 use crate::{
@@ -330,6 +330,18 @@ async fn print_banners(ctx: &AppContext) -> Result<()> {
             ctx.config.branch.base
         );
     }
+    let messaging = claude_shim_check(
+        &ctx.config.paths.cache_root,
+        std::env::var("WT_INSPECT").is_ok_and(|value| value.eq_ignore_ascii_case("off")),
+    );
+    if !matches!(messaging.status, CheckStatus::Ok) {
+        println!(
+            "{} {}: {}",
+            display_status(messaging.status),
+            messaging.name,
+            messaging.message
+        );
+    }
     if let Some(expected) = expected_wt_path(ctx) {
         match find_path_wt() {
             Some((candidate, resolved))
@@ -353,9 +365,43 @@ async fn print_banners(ctx: &AppContext) -> Result<()> {
     Ok(())
 }
 
+fn claude_shim_check(cache_root: &Path, inspector_disabled: bool) -> Check {
+    let stale = stale_harness_shims(cache_root);
+    if stale.is_empty() {
+        return check(
+            "Claude messaging",
+            CheckStatus::Ok,
+            "no stale harness shims".into(),
+        );
+    }
+    let shim_dir = cache_root.join("shims");
+    if inspector_disabled {
+        return check(
+            "Claude messaging",
+            CheckStatus::Info,
+            format!(
+                "WT_INSPECT=off intentionally disables prompt injection; stale {} shim(s) remain in {} and should be removed before re-enabling it",
+                stale.join(", "),
+                shim_dir.display()
+            ),
+        );
+    }
+    check(
+        "Claude messaging",
+        CheckStatus::Warn,
+        format!(
+            "stale {} harness shim(s) in {}; these can interfere with managed harness launches and may explain missing Claude inspector sockets. Remove them, start a new wt-managed session, then run `wt claude selftest`",
+            stale.join(", "),
+            shim_dir.display()
+        ),
+    )
+}
+
 fn expected_wt_path(ctx: &AppContext) -> Option<std::path::PathBuf> {
-    let source = ctx.config.paths.wt_source.as_ref()?;
-    let candidate = source.join("bin/wt");
+    let root = std::env::var_os(wt_launcher::INSTALL_ROOT_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| ctx.home.join(".local/share/wt"));
+    let candidate = root.join("bin/wt");
     candidate.is_file().then_some(candidate)
 }
 
@@ -394,16 +440,11 @@ fn check_stage(ctx: &AppContext, worktree: &Path, slug: &str) -> Vec<Check> {
             ];
         }
     };
-    let digest = Sha256::digest(slug.to_ascii_lowercase().as_bytes());
-    let hash = format!("{digest:x}");
-    let lowercase_slug = slug.to_ascii_lowercase();
-    let id = regex::Regex::new(&ctx.config.branch.id_pattern)
-        .ok()
-        .and_then(|pattern| pattern.captures(&lowercase_slug))
-        .and_then(|captures| captures.get(1).map(|value| value.as_str().to_owned()));
-    let expected = id
-        .map(|id| format!("{}{id}-{}", ctx.config.stage.prefix, &hash[..6]))
-        .unwrap_or_else(|| format!("{}{}", ctx.config.stage.prefix, &hash[..10]));
+    let pattern = regex::RegexBuilder::new(&ctx.config.branch.id_pattern)
+        .case_insensitive(true)
+        .build()
+        .ok();
+    let expected = wt_core::stage_name(slug, &ctx.config.stage.prefix, pattern.as_ref());
     let stage_check = check(
         "sst stage",
         if actual == expected {
@@ -499,6 +540,7 @@ async fn check_merged(ctx: &AppContext, worktree: &Path, trunk: &str) -> Check {
 mod tests {
     use super::*;
     use crate::commands::test_support::CommandFixture;
+    use sha2::{Digest, Sha256};
 
     #[tokio::test]
     async fn sst_health_reports_owned_pins_and_outputs_as_deployed() {
@@ -523,5 +565,24 @@ mod tests {
             "not deployed"
         );
         fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn claude_shim_check_distinguishes_clean_stale_and_intentionally_disabled() {
+        let cache = tempfile::tempdir().unwrap();
+        let clean = claude_shim_check(cache.path(), false);
+        assert!(matches!(clean.status, CheckStatus::Ok));
+
+        let shim_dir = cache.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::write(shim_dir.join("claude"), "stale harness shim").unwrap();
+        let stale = claude_shim_check(cache.path(), false);
+        assert!(matches!(stale.status, CheckStatus::Warn));
+        assert!(stale.message.contains(&shim_dir.display().to_string()));
+        assert!(stale.message.contains("wt claude selftest"));
+
+        let disabled = claude_shim_check(cache.path(), true);
+        assert!(matches!(disabled.status, CheckStatus::Info));
+        assert!(disabled.message.contains("WT_INSPECT=off"));
     }
 }

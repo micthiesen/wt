@@ -25,6 +25,26 @@ pub struct SessionTail {
     pub pending_ask: Option<String>,
     pub last_assistant_text: Option<String>,
     pub session_summary: Option<String>,
+    pub context_usage: Option<SessionContextUsage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionContextUsage {
+    /// Prompt tokens currently occupying the conversation window.
+    pub tokens: u64,
+    pub model: Option<String>,
+}
+
+impl SessionContextUsage {
+    pub fn percent(&self) -> u8 {
+        let window = self
+            .model
+            .as_deref()
+            .filter(|model| model.to_ascii_lowercase().contains("haiku"))
+            .map_or(1_000_000u128, |_| 200_000u128);
+        let scaled = (u128::from(self.tokens) * 100 + window / 2) / window;
+        scaled.min(100) as u8
+    }
 }
 
 impl SessionTail {
@@ -38,6 +58,7 @@ impl SessionTail {
             pending_ask: None,
             last_assistant_text: None,
             session_summary: None,
+            context_usage: None,
         }
     }
 }
@@ -167,7 +188,52 @@ pub fn read_session_tail(path: &Path, name: Option<String>) -> SessionTail {
     tail.pending_ask = pending_ask(&entries);
     tail.last_assistant_text = last_assistant_text(&entries);
     tail.session_summary = current_summary(&entries);
+    tail.context_usage = context_usage(&entries);
     tail
+}
+
+fn context_usage(entries: &[Value]) -> Option<SessionContextUsage> {
+    let mut latest = None;
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) == Some("system")
+            && entry.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
+            latest = None;
+            continue;
+        }
+        if entry.get("type").and_then(Value::as_str) != Some("assistant")
+            || entry.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(message) = entry.get("message").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(usage) = message.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(input_tokens) = usage.get("input_tokens").and_then(Value::as_u64) else {
+            continue;
+        };
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let cache_create = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        latest = Some(SessionContextUsage {
+            tokens: input_tokens
+                .saturating_add(cache_read)
+                .saturating_add(cache_create),
+            model: message
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    }
+    latest
 }
 
 fn classify(entries: &[Value], timestamp: &mut Option<i64>) -> Option<LastEntryKind> {
@@ -443,6 +509,36 @@ mod tests {
         assert_eq!(tail.queued, 0);
         assert_eq!(tail.session_summary.as_deref(), Some("Done."));
         assert_eq!(tail.last_entry_ms, Some(1786236000172));
+    }
+
+    #[test]
+    fn context_usage_includes_cache_buckets_ignores_sidechains_and_resets_on_compact() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("context.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":400000,\"cache_read_input_tokens\":100000,\"cache_creation_input_tokens\":200000}}}\n",
+                "{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"model\":\"claude-haiku\",\"usage\":{\"input_tokens\":1}}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-haiku\",\"usage\":{\"input_tokens\":100000,\"cache_read_input_tokens\":20000}}}\n"
+            ),
+        )
+        .unwrap();
+        let tail = read_session_tail(&path, None);
+        let usage = tail.context_usage.unwrap();
+        assert_eq!(usage.tokens, 120_000);
+        assert_eq!(usage.model.as_deref(), Some("claude-haiku"));
+        assert_eq!(usage.percent(), 60);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-sonnet\",\"usage\":{\"input_tokens\":400000,\"cache_read_input_tokens\":100000,\"cache_creation_input_tokens\":200000}}}\n",
+                "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read_session_tail(&path, None).context_usage.is_none());
     }
 
     #[test]
