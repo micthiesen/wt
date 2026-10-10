@@ -132,6 +132,18 @@ pub struct RemoteConfig {
     pub host: String,
     pub label: String,
     pub wt_path: String,
+    /// Select exactly one worker configuration through WT_CONFIG. Relative
+    /// paths are not accepted; `~/` is expanded on the worker, not here.
+    pub config: Option<String>,
+}
+
+impl RemoteConfig {
+    pub fn key(&self) -> String {
+        match &self.config {
+            Some(config) => format!("{} [config: {config}]", self.host),
+            None => self.host.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -562,7 +574,8 @@ pub struct Config {
     pub issue_tracker: Option<IssueTrackerConfig>,
     pub review_bot: ReviewBotConfig,
     pub dev_server: Option<DevServerConfig>,
-    pub remote: Option<RemoteConfig>,
+    /// All SSH hosts. The legacy `[remote]` table is normalized into this list.
+    pub remotes: Vec<RemoteConfig>,
     pub harness: HarnessConfig,
     pub naming: Option<NamingConfig>,
     pub diff: DiffConfig,

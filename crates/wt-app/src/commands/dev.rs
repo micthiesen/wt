@@ -109,9 +109,17 @@ pub async fn run(context: &AppContext, args: &DevArgs) -> Result<i32> {
         } => run_start(context, slug.as_deref(), *wait, *timeout, true).await,
         DevCommand::Stop { slug } => {
             let record = resolve_worktree(context, slug.as_deref()).await?;
-            dev::service(context)?
+            let service = dev::service(context)?;
+            let port = crate::host_cleanup::stored_dev_port(context, record.target.slug()).await;
+            let stopped = service
                 .stop(&DevWorktree::from(&record), &context.cancellation)
-                .await?;
+                .await;
+            for warning in
+                crate::host_cleanup::after_dev_stop(context, record.target.slug(), port).await
+            {
+                eprintln!("warning: {warning}");
+            }
+            stopped?;
             println!("stopped dev server for {}", record.target.slug());
             Ok(0)
         }
@@ -156,6 +164,11 @@ async fn run_start(
     let service = dev::service(context)?;
     let timeout = Duration::from_secs(timeout_seconds.unwrap_or(1800).max(1));
     let deadline = tokio::time::Instant::now() + timeout;
+    let stopped_port = if rebuild {
+        crate::host_cleanup::stored_dev_port(context, &worktree.slug).await
+    } else {
+        None
+    };
     let started_sha = if rebuild {
         None
     } else {
@@ -184,6 +197,13 @@ async fn run_start(
                 .start(&worktree, DevStartOptions::default(), &context.cancellation)
                 .await
         };
+        if rebuild && !matches!(&result, Err(wt_dev::DevServerError::SlotFull { .. })) {
+            for warning in
+                crate::host_cleanup::after_dev_stop(context, &worktree.slug, stopped_port).await
+            {
+                eprintln!("warning: {warning}");
+            }
+        }
         match result {
             Ok(outcome) => {
                 if wait {

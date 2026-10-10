@@ -653,6 +653,25 @@ impl TmuxClient {
         checked("rename-window", result).map(|_| ())
     }
 
+    /// Targets the immutable session ID from an inventory observation. A
+    /// replacement session with the same name will not be terminated.
+    pub async fn kill_session_id(
+        &self,
+        id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, TmuxError> {
+        if !id
+            .strip_prefix('$')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return Err(TmuxError::MalformedOutput {
+                operation: "session identity",
+                line: id.to_owned(),
+            });
+        }
+        self.kill_session_target(id, cancellation).await
+    }
+
     /// Returns `false` when the session or server is already absent.
     pub async fn kill_session(
         &self,
@@ -660,10 +679,18 @@ impl TmuxClient {
         cancellation: &CancellationToken,
     ) -> Result<bool, TmuxError> {
         let target = exact_session_target(name);
+        self.kill_session_target(&target, cancellation).await
+    }
+
+    async fn kill_session_target(
+        &self,
+        target: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, TmuxError> {
         let result = self
             .run(
                 "kill-session",
-                ["kill-session", "-t", target.as_str()],
+                ["kill-session", "-t", target],
                 None,
                 cancellation,
             )

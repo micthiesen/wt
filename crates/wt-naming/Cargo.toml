@@ -1,0 +1,17 @@
+[package]
+name = "wt-naming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+wt-config.workspace = true
+wt-core.workspace = true
+wt-platform.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

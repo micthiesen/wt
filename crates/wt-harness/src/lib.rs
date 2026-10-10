@@ -6,6 +6,7 @@
 mod claude;
 mod codex;
 mod opencode;
+mod output;
 mod persist;
 mod service;
 mod status;
@@ -28,15 +29,16 @@ pub use claude::{
 pub use codex::{
     CodexActivityBatch, CodexActivityTracker, CodexAppServerError, CodexAppServerFailureKind,
     CodexAppServerInfo, CodexEvent, CodexEventLevel, CodexHarness, CodexHarnessError,
-    CodexMessageOutcome, CodexMessageTarget, CodexMessenger, CodexPaths, CodexQueueDelivery,
-    CodexQueueSubmission, CodexTail, CodexThreadStatus, CodexUsage, PendingInteraction,
-    read_codex_tail, read_codex_usage,
+    CodexMessageOutcome, CodexMessageTarget, CodexMessenger, CodexOutputTracker, CodexPaths,
+    CodexQueueDelivery, CodexQueueSubmission, CodexTail, CodexThreadStatus, CodexUsage,
+    PendingInteraction, read_codex_tail, read_codex_usage,
 };
 pub use opencode::{
     OpenCodeActivityBatch, OpenCodeActivityTracker, OpenCodeCost, OpenCodeError, OpenCodeEvent,
-    OpenCodeEventLevel, OpenCodeHarness, OpenCodePaths, OpenCodeSendOutcome,
+    OpenCodeEventLevel, OpenCodeHarness, OpenCodeOutputTracker, OpenCodePaths, OpenCodeSendOutcome,
     opencode_display_title,
 };
+pub use output::{HarnessOutputKind, HarnessOutputLine, HarnessOutputTarget, HarnessOutputUpdate};
 pub use service::{HarnessMessageOutcome, HarnessService, HarnessServiceError, HarnessTarget};
 pub use status::{DerivedState, derive_session_state, registry_status_to_state};
 pub use types::{

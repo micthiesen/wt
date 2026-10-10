@@ -5,8 +5,11 @@ mod ledger;
 mod queue;
 mod types;
 
-pub use evaluate::{FLEET_SLUG, eligible, evaluate, fire_identity};
-pub use ledger::{AutomationLedger, BreakerState, LedgerError};
+pub use evaluate::{FLEET_SLUG, eligible, evaluate, evaluate_breaker_resets, fire_identity};
+pub use ledger::{
+    AutomationLedger, BREAKER_LIMIT, BreakerState, DispatchClaim, DispatchClaimResult,
+    DispatchKind, DispatchPolicy, DispatchRequest, LedgerError, LedgerSnapshot,
+};
 pub use queue::{CancellableFiresInput, QueueIntentsInput, cancellable_fires, queue_intents};
 pub use types::{
     ActionAudience, ActionTraits, AutomationConflict, AutomationEvalContext, AutomationFire,

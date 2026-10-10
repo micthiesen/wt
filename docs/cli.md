@@ -2,7 +2,7 @@
 
 `wt` with no arguments launches the TUI (when stdout is a TTY; piped output falls back to `wt ls`). Everything below is the one-shot subcommand surface. `wt <cmd> --help` prints per-command usage.
 
-Environment variables: `WT_CONFIG` points at an explicit config file; `XDG_CONFIG_HOME` relocates the default lookup (see [configuration.md](configuration.md)). Both are forwarded into the `wt events` launchd daemon so it loads the same config.
+Environment variables: `WT_CONFIG` selects the user config and `XDG_CONFIG_HOME` relocates its default location (see [configuration.md](configuration.md)). Configuration is resolved once per process. The macOS `wt events` launch agent receives the config selection needed to load the same repository settings.
 
 ### `wt init [directory] [--primary <claude|codex|opencode>]`
 
@@ -36,10 +36,9 @@ deleted.
 
 ### `wt remote [<command> ...]`
 
-Before execution, wt prepares a matching source package on the worker.
-It reuses a package with the same content hash. Missing packages are uploaded,
-installed, and checked automatically. See [worker setup](configuration.md#remote--optional-ssh-worktree-host)
-for prerequisites. Existing worker installs and running sessions are retained.
+Before execution, wt checks the worker protocol and build identity. The worker
+runs its own native wt binary; source files and dependencies are not uploaded.
+See [worker setup](configuration.md#remote--optional-ssh-worktree-host).
 
 With no arguments, allocate an SSH terminal and enter the `[remote]` host's
 interactive `wt`. With arguments, forward the exact argv through a shell-safe
@@ -129,15 +128,15 @@ Exit codes: `0` armed, `2` usage, `75` **temporary** — a required check has no
 
 ### `wt doctor [<slug>]`
 
-Health report: working tree, sync vs trunk, node_modules, locks, `gh-merge-base` branch config (must match the recorded fork base / trunk, or a bare `gh pr create` targets the repo default branch — see `wt new`), merged status, PR/CI. One worktree (or the one containing cwd), or all. Also banners machine-level issues: a main clone off its trunk branch, pending agent-skill updates (`wt skills`), Claude/Codex message-transport degradation, and **`wt` not being reachable on `PATH`** — a shell alias satisfies interactive use but doesn't exist inside a script file, so anything that scripts wt (an agent looping over worktrees) dies partway with `wt: command not found` and leaves the fleet half-updated. The check resolves `PATH` itself rather than shelling out, since this process's own shell may carry the alias and answer misleadingly; it also warns when a `wt` on `PATH` resolves to a *different* clone, which is worse than none.
+Health report: working tree, sync vs trunk, dependency-directory presence, locks, configured GitHub base, landed status, and PR/CI state. Select one worktree, default to the worktree containing cwd, or use `--all`. It also reports relevant machine-level issues such as the main clone's branch, pending bundled skill updates, and coding-agent message-transport health.
 
 - `--all` / `-a` — force the full summary table.
 - `--json` — machine-readable.
 
-Two checks are conditional rather than universal, because a check that can only ever warn is noise on the first command a new user runs:
+These checks are conditional rather than universal:
 
 - **SST stage pin + deploy state** (and the summary table's `stage` column) appear only when `[deploy.sst]` is configured. Without the integration there is no stage to pin, so the check would warn forever on every row.
-- **node_modules** detects the package manager from the checkout's lockfile — the same detection `[lifecycle] install_command` defaults to — so the advice it prints (`run \`pnpm install\``, `run \`bun install\``, …) is the command wt would actually run. A checkout with no `package.json` reports the check as inapplicable instead of missing. Only pnpm gets two further probes, because it has the one layout where `node_modules` can exist and still be unusable. The first is existence of the store directory (`node_modules/.pnpm`). The second reads the top level: under `nodeLinker: isolated` every package entry is a symlink into that store, so a real directory there is something pnpm did not write and will not remove — installs prune the store against the lockfile and leave the top level alone. `pnpm install` then prints `Already up to date` over a tree whose resolution is frozen at whenever those directories were written. It warns only for the ones that actually resolve to a version the store lacks (naming up to 8, remedy `rm -rf node_modules && pnpm install`, since a plain install cannot clear them), and otherwise reports the count as info: still wrong, but not yet biting. Measured on a live checkout: 124 of 969 such directories, one of them resolving `@supabase/auth-js` at 2.72.0 against a lockfile holding 2.85.0. The failure this exists for is LOCAL-only and therefore unfalsifiable from either side — CI installs into an empty tree and is correct, the checkout is stale, and the disagreement carries nothing that says which is wrong. It is silent in both directions: a typecheck can fail on a member the real version has, or pass on one it doesn't. Any other linker (`hoisted`, and anything added later) makes real directories correct, so the check returns no opinion rather than a clean one, as does an unreadable `.modules.yaml`.
+- **Dependency directory** reports whether `node_modules` exists when the checkout has a `package.json`. It does not inspect package-manager internals or establish that installed dependencies match the lockfile.
 
 ### `wt open [<slug-or-query>]`
 
@@ -145,7 +144,7 @@ Open a worktree in your editor (`[editor] command`; the default is Zed, with foc
 
 ## Inspection & maintenance
 
-A failing command prints the failure's message chain (`operation: cause`) and exits non-zero; `WT_DEBUG=1` appends the stack, which an unexpected (untagged) crash always prints.
+A failing command prints its operation context and cause, then exits non-zero. Unexpected panics are logged by the application.
 
 ### `wt stages`
 
@@ -370,43 +369,49 @@ skills plus instructions without overwriting modified copies; `agent start`
 then refuses to submit the harness-native command if the selected harness still
 cannot resolve `start`.
 
-### `wt update [log] [--check] [--head]`
+### `wt update [log] [--check] [--channel stable|preview] [--release TAG]`
 
-Update wt itself. The install is a git clone (see the README), so updating is a fast-forward: `git fetch`, `git merge --ff-only`, and a `bun install` when the dependency manifest changed across the jump. Two safety layers ride along (semantics: [updates.md](updates.md)): the target is the newest incoming commit whose **CI is green** (red/still-running commits are held back; missing checks and API failures fail open), and the result is **boot-probed** in a child process — a version that fails the probe is reverted and skipped until origin moves again. Prints the incoming commits before applying and names any still-running wt instances afterwards; they keep the old code until restarted. Refuses to touch a clone with local changes or unpushed commits; update those by hand with git.
+Update to a verified native release; this does not modify a source checkout. Stable is the default channel. `--channel` selects stable or preview, while `--release` selects an exact published tag. Candidate binaries are checked before activation and boot-probed; a failed probe returns to the last good version. See [updates.md](updates.md).
 
-- `log` — print the update/rollback journal plus current / last-good / skipped shas.
+- `log` — print the update and rollback journal, current and last-good builds, and any declined build.
 - `--check` — only report whether an update is available; don't apply.
-- `--head` — ignore the CI gate and target origin's tip.
+- `--head` — legacy source-updater option; rejected because native updates require a published release.
 
-The TUI runs the same check at startup, before the terminal is taken over: at most once a day, prompting y/n, with a "no" remembered per offered version — it never re-asks until the offer changes. Skipped silently when the clone is dirty/ahead (a wt being developed updates itself by hand). An accepted update restarts an installed events daemon, then re-execs wt so both long-lived processes run the fresh code. A daemon restart failure is reported but does not prevent the TUI from starting. `[update] startup_check = false` ([configuration.md](configuration.md#update)) disables the startup check; `WT_UPDATE=off` disables the whole update system for a single run (the probe harness arms this). The check's daily stamp, journal, and remembered declines live in `~/.cache/wt/update.json`, shared machine-wide like the skills memory.
+The TUI can offer the same update at startup. `[update] startup_check = false` disables the offer; `WT_UPDATE=off` disables update checks and activation for that run. Update state is kept under the native install root.
 
-### `wt rollback [<ref>]`
+### `wt install [--channel stable|preview] [--release TAG] [--path]`
 
-Reset the wt source clone to a previous version — by default the last one that completed a healthy boot (see [updates.md](updates.md)). Syncs dependencies across the jump, journals the move, and skips the abandoned version in future startup offers until new commits land on origin (`wt update` can always re-apply it explicitly). Refuses dirty/ahead clones. wt also *offers* this automatically: when a freshly-updated version crashes (default yes) or when a previous start of it never finished booting (default no).
+Install a verified native release without requiring an existing wt binary. The
+optional `--path` flag ensures `~/.local/bin/wt` points to the stable launcher.
+For an initial install from a shell, the release also publishes `install.sh`.
+
+### `wt rollback [<release-or-sha>]`
+
+Activate a previously installed native version, defaulting to the last known good build. This changes the launcher pointer and records the transition; it does not rewrite durable application data. See [updates.md](updates.md).
 
 ### `wt version`
 
-Print the running version — the source clone's git short hash and commit date (`98d1250 (2026-08-08)`), with a `-dirty` suffix when the clone has local modifications. Notes when origin is ahead as of the last fetch (touches no network; `wt update --check` does the live comparison). Also available as `wt --version` / `-v`, and shown in the title of the TUI's help overlay (`?`).
+Print the native version and build identity. Also available as `wt --version` / `-v`.
 
 ## Integrations
 
 ### `wt events <sub>`
 
-The launchd agent is shared per user. `start`, `stop`, `restart`, and `uninstall`
-require its installed config and log paths to match the current repository;
-run them from the owning repository. `install` explicitly replaces ownership.
-Config paths are persisted as absolute paths. See [GitHub events](github-events.md).
+The optional daemon can run in the foreground on supported platforms. Automatic
+per-user service installation currently uses macOS launchd. Service management
+is repository-owned: run it from the repository whose config and paths are
+stored in the launch agent. See [GitHub events](github-events.md).
 
 The optional GitHub webhook daemon — see [github-events.md](github-events.md).
 
 | sub | what it does |
 |---|---|
-| `install` | write the launchd agent + generate the HMAC secret; prints the values to paste into GitHub's webhook settings |
-| `start` / `stop` / `restart` | load / unload / unload-and-reload the launchd agent; `start` and `restart` also rewrite the agent when the stored one no longer matches the environment (a `brew upgrade bun` makes the baked interpreter path unexecutable) |
+| `install` | write the macOS launchd agent + generate the HMAC secret; prints webhook setup guidance |
+| `start` / `stop` / `restart` | load / unload / reload the owned launchd agent and reconcile its saved configuration |
 | `status` | liveness, bind address, pid, delivery count, last fetch/error, snapshot age, and a `build` line when the daemon is running older code than the caller; during restart warm-up it reports the current daemon and ignored previous snapshot separately (see [github-events.md](github-events.md#the-daemons-build-and-why-the-tui-checks-it)) |
-| `secret` | generate or show the HMAC secret |
-| `uninstall` | unload + remove the launchd agent |
-| `serve` | run the daemon in the foreground (what launchd invokes) |
+| `secret` | ensure a webhook secret exists and print setup guidance; a newly generated inline secret is printed for configuration |
+| `uninstall` | unload and remove the owned launchd agent |
+| `serve` | run the daemon in the foreground |
 
 ### `wt agent <sub>`
 

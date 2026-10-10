@@ -78,6 +78,8 @@ jobs:
       - run: cargo build -p wt-app -p wt-launcher --release --locked
       - name: Verify binary identity and package immutable assets
         run: python3 scripts/package-native.py package --release "$RELEASE_VERSION" --build-id "$WT_BUILD_ID" --target "$RELEASE_TARGET" --bin-dir target/release --output dist
+      - name: Exercise optimized install, update, rollback, and launcher recovery
+        run: python3 scripts/native-release-check.py --binary target/release/wt --launcher target/release/wt-launcher
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-${{ matrix.target }}

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -41,10 +41,10 @@ struct PendingTool {
     label: String,
     tool_name: String,
     started_at_ms: i64,
-    batch: Option<Rc<RefCell<ToolBatch>>>,
+    batch: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ToolBatch {
     line_id: u64,
     call_label: String,
@@ -55,10 +55,11 @@ struct ToolBatch {
 
 /// Stateful event conversion for an incremental transcript. Tool results patch
 /// their earlier call lines while those ids remain in the consumer's buffer.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ClaudeEventParser {
     next_id: u64,
     tools: HashMap<String, PendingTool>,
+    batches: HashMap<u64, ToolBatch>,
 }
 
 impl ClaudeEventParser {
@@ -66,6 +67,7 @@ impl ClaudeEventParser {
         Self {
             next_id: first_id,
             tools: HashMap::new(),
+            batches: HashMap::new(),
         }
     }
 
@@ -258,23 +260,21 @@ impl ClaudeEventParser {
             bulk_names.push(name.to_owned());
             first_bulk.get_or_insert(index);
         }
-        let batch = (bulk_names.len() >= 2).then(|| {
-            Rc::new(RefCell::new(ToolBatch {
-                line_id: self.next_id,
-                call_label: format_batch_call(&bulk_names),
-                remaining: blocks
-                    .iter()
-                    .filter(|b| {
-                        b.get("type").and_then(Value::as_str) == Some("tool_use")
-                            && b.get("name")
-                                .and_then(Value::as_str)
-                                .is_none_or(|n| !is_detailed_tool(n))
-                            && b.get("id").and_then(Value::as_str).is_some()
-                    })
-                    .count(),
-                total_duration_ms: 0,
-                results: Vec::new(),
-            }))
+        let mut batch = (bulk_names.len() >= 2).then(|| ToolBatch {
+            line_id: 0,
+            call_label: format_batch_call(&bulk_names),
+            remaining: blocks
+                .iter()
+                .filter(|b| {
+                    b.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && b.get("name")
+                            .and_then(Value::as_str)
+                            .is_none_or(|n| !is_detailed_tool(n))
+                        && b.get("id").and_then(Value::as_str).is_some()
+                })
+                .count(),
+            total_duration_ms: 0,
+            results: Vec::new(),
         });
         for (index, block) in blocks.iter().enumerate() {
             match block.get("type").and_then(Value::as_str) {
@@ -310,26 +310,27 @@ impl ClaudeEventParser {
                     let tool_id = block.get("id").and_then(Value::as_str).unwrap_or_default();
                     let arg = tool_label(&tool_name, block.get("input"));
                     let detailed = is_detailed_tool(&tool_name);
-                    if !detailed && let Some(shared) = &batch {
+                    if !detailed && let Some(shared) = &mut batch {
+                        if Some(index) == first_bulk {
+                            let line = self.make_line(
+                                ts,
+                                ActivityKind::Tool,
+                                format!("  ⚒ {}", shared.call_label),
+                            );
+                            shared.line_id = line.id;
+                            delta.append.push(line);
+                        }
                         if !tool_id.is_empty() {
                             self.tools.insert(
                                 tool_id.to_owned(),
                                 PendingTool {
-                                    id: shared.borrow().line_id,
+                                    id: shared.line_id,
                                     label: arg,
                                     tool_name,
                                     started_at_ms: ts,
-                                    batch: Some(shared.clone()),
+                                    batch: Some(shared.line_id),
                                 },
                             );
-                        }
-                        if Some(index) == first_bulk {
-                            let label = shared.borrow().call_label.clone();
-                            delta.append.push(self.make_line(
-                                ts,
-                                ActivityKind::Tool,
-                                format!("  ⚒ {label}"),
-                            ));
                         }
                     } else {
                         let line = self.make_line(ts, ActivityKind::Tool, format!("  ⚒ {arg}"));
@@ -350,6 +351,11 @@ impl ClaudeEventParser {
                 }
                 _ => {}
             }
+        }
+        if let Some(batch) = batch
+            && batch.remaining > 0
+        {
+            self.batches.insert(batch.line_id, batch);
         }
     }
 
@@ -387,8 +393,9 @@ impl ClaudeEventParser {
                 .push(self.make_line(ts, kind, format!("  {arrow} {label}{detail}")));
             return;
         };
-        if let Some(batch) = start.batch {
-            let mut batch = batch.borrow_mut();
+        if let Some(batch_id) = start.batch
+            && let Some(batch) = self.batches.get_mut(&batch_id)
+        {
             batch.remaining = batch.remaining.saturating_sub(1);
             batch.total_duration_ms = batch
                 .total_duration_ms
@@ -412,7 +419,7 @@ impl ClaudeEventParser {
             }
             if batch.remaining == 0 {
                 let any_error = batch.results.iter().any(|(_, _, err)| *err > 0);
-                let text = format_batch_result(&batch, any_error);
+                let text = format_batch_result(batch, any_error);
                 delta.patch.push(ActivityPatch {
                     id: batch.line_id,
                     line: ActivityLine {
@@ -426,6 +433,7 @@ impl ClaudeEventParser {
                         text: format!("  {text}"),
                     },
                 });
+                self.batches.remove(&batch_id);
             }
             return;
         }
@@ -713,6 +721,26 @@ mod tests {
         let notice = parser.parse_line(r#"{"type":"user","message":{"content":"<task-notification><summary>Monitor event: \"CI\"</summary><event>done\nnext</event></task-notification>"}}"#);
         assert_eq!(notice.append[0].text, "◉ Monitor — CI");
         assert_eq!(notice.append[1].text, "  done");
+    }
+
+    #[test]
+    fn bulk_result_patches_its_tool_line_after_preceding_text_and_can_move_between_workers() {
+        fn require_send<T: Send>() {}
+        require_send::<ClaudeEventParser>();
+        let mut parser = ClaudeEventParser::new(5);
+        let start = parser.parse(
+            &serde_json::json!({"type":"assistant", "message":{"content":[
+                {"type":"text","text":"Before tools"},
+                {"type":"tool_use","id":"a","name":"Read","input":{}},
+                {"type":"tool_use","id":"b","name":"Read","input":{}}
+            ]}}),
+        );
+        assert_eq!(start.append.len(), 2);
+        let result = parser.parse(&serde_json::json!({"type":"user", "message":{"content":[
+            {"type":"tool_result","tool_use_id":"a"}, {"type":"tool_result","tool_use_id":"b"}
+        ]}}));
+        assert_eq!(result.patch[0].id, start.append[1].id);
+        assert!(parser.batches.is_empty());
     }
 
     #[test]

@@ -46,26 +46,12 @@ impl EventSource for AppEventSource {
 
     fn remote_branches<'a>(
         &'a self,
-        cancel: &'a CancellationToken,
+        _cancel: &'a CancellationToken,
     ) -> EventFuture<'a, Result<Option<Vec<String>>, String>> {
-        Box::pin(async move {
-            let Some(remote) = self.context.config.remote.clone() else {
-                return Ok(None);
-            };
-            let snapshot = wt_remote::RemoteClient::new(self.context.processes.clone(), remote)
-                .snapshot(cancel)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(Some(
-                snapshot
-                    .worktrees
-                    .into_iter()
-                    .filter(|row| row.exists)
-                    .map(|row| row.branch)
-                    .filter(|branch| !branch.is_empty())
-                    .collect(),
-            ))
-        })
+        // Each host owns the complete source pipeline for its own inventory.
+        // Reaching through SSH here duplicates that work and makes a slow
+        // remote delay webhook updates for otherwise healthy local rows.
+        Box::pin(async { Ok(None) })
     }
 
     fn fetch_origin<'a>(

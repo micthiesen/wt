@@ -17,8 +17,9 @@ Fixtures:
 - `target-identity.json`: select the live Codex session despite Claude being
   the configured primary.
 
-The Rust side should deserialize each fixture, call the matching pure domain
-function and compare `expected` structurally. Do not compare JSON object key
-order. Add edge cases from the source tests as new fixture cases when a Rust
-port reaches that domain. No Rust implementation or fixture runner exists yet;
-these baselines do not claim Rust coverage.
+The Rust tests deserialize these fixtures, call the production domain functions,
+and compare `expected` structurally. The runners live in
+`crates/wt-core/tests/compat.rs` (status and stack) and
+`crates/wt-app/src/harness.rs` (live target selection). Stack comparison omits
+Rust's repeated per-node `stackId`, which the reference expresses on the parent.
+Object key order is immaterial. The original capture remains unchanged.

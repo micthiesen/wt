@@ -40,11 +40,13 @@ async fn main() -> anyhow::Result<()> {
         root.to_string_lossy().into_owned(),
     ];
     let request = ActionRequest {
+        issue_status: None,
         action_key: "fixture-action".into(),
         slug: "fixture-action".into(),
         worktree_ref: None,
         action_id: "service-smoke".into(),
         action_name: "Action service fixture".into(),
+        arg_history: None,
         prompt: "private fixture only".into(),
         kind: ActionRunKind::Shell,
         command,

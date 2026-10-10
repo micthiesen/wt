@@ -666,3 +666,17 @@ async fn stack_wait_cancels_while_a_member_lock_is_owned_elsewhere() -> Result<(
     assert!(matches!(result, Err(wt_stack::StackError::Cancelled)));
     Ok(())
 }
+
+#[tokio::test]
+async fn nonblocking_busy_probe_checks_the_whole_resolved_chain() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    let cancellation = CancellationToken::new();
+    assert!(!fixture.service.is_busy("child", &cancellation).await?);
+
+    let lock_dir = fixture.root.path().join("locks");
+    let _held = FileLock::try_acquire(&lock_dir, "parent", "fixture holder")
+        .await?
+        .unwrap();
+    assert!(fixture.service.is_busy("child", &cancellation).await?);
+    Ok(())
+}

@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 shlex.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
 wt-config.workspace = true
 wt-core.workspace = true

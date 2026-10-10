@@ -34,6 +34,14 @@ pub struct ConfirmPrompt {
     pub cancel_key: Option<char>,
 }
 
+pub struct ReviewerPrompt {
+    pub key: String,
+    pub pr_number: u64,
+    pub original: Vec<String>,
+    pub candidates: Vec<crate::ReviewerOption>,
+    pub selected: usize,
+}
+
 #[derive(Default)]
 pub enum Interaction {
     #[default]
@@ -41,19 +49,102 @@ pub enum Interaction {
     Text(TextPrompt),
     Picker(PickerPrompt),
     Confirm(ConfirmPrompt),
+    Log {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+    },
+    Reviewers(ReviewerPrompt),
 }
 
 /// Prepared, immutable presentation data. Service code sanitizes terminal
 /// controls and computes labels once when the underlying source changes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Board {
     pub name: String,
+    #[serde(default)]
+    pub automations_paused: bool,
+    #[serde(default)]
+    pub full_width_activity: bool,
     pub rows: Vec<BoardRow>,
     pub activity: Vec<String>,
+    #[serde(default)]
+    pub attention: Vec<String>,
+    #[serde(default)]
+    pub slot_logs: std::collections::BTreeMap<String, Vec<LogView>>,
+    #[serde(default)]
+    pub removed_history: RemovedHistorySnapshot,
+    #[serde(default)]
+    pub review_requests: Vec<ReviewRequestRow>,
+    #[serde(default)]
+    pub perf: Vec<String>,
     pub sections: Vec<BoardSection>,
+    pub hosts: Vec<HostChoice>,
+    #[serde(default)]
+    pub usage: Vec<String>,
+    #[serde(default)]
+    pub slot_sessions: std::collections::BTreeMap<String, Vec<SessionView>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionView {
+    pub id: String,
+    pub harness: String,
+    pub name: String,
+    pub state: String,
+    pub live: bool,
+    pub queued: u32,
+    pub output: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogView {
+    pub id: String,
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemovedHistorySnapshot {
+    pub rows: Vec<RemovedHistoryRow>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemovedHistoryRow {
+    pub key: String,
+    pub host: Option<String>,
+    pub slug: String,
+    pub branch: String,
+    pub title: String,
+    pub removed_at: String,
+    pub details: Vec<String>,
+    pub issue_url: Option<String>,
+    pub pr_url: Option<String>,
+    pub issue_status: Option<String>,
+    pub production_landed: Option<bool>,
+    pub automations_paused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostChoice {
+    pub id: Option<String>,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewRequestRow {
+    pub host: Option<String>,
+    pub url: String,
+    pub updated_at: String,
+    pub branch: String,
+    pub title: String,
+    pub number: u64,
+    pub author: String,
+    pub details: Vec<String>,
+    pub issue_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoardSection {
     pub key: String,
     pub title: String,
@@ -66,19 +157,28 @@ pub struct BoardSection {
 pub(crate) enum VisualItem {
     Section(usize),
     Row(usize),
+    ReviewHeader,
+    ReviewRequest(usize),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoardRow {
     pub key: String,
+    pub host: Option<String>,
     pub slug: String,
     pub title: String,
     pub branch: String,
+    pub base_branch: Option<String>,
     pub path: String,
     pub badge: String,
     pub details: Vec<String>,
     pub needs_attention: bool,
+    #[serde(default)]
+    pub work_rank: u8,
+    #[serde(default)]
+    pub verify_steps: Option<String>,
     pub issue_id: Option<String>,
+    pub issue_status: Option<String>,
     pub issue_url: Option<String>,
     pub github_issue_url: Option<String>,
     pub pr_url: Option<String>,
@@ -86,6 +186,10 @@ pub struct BoardRow {
     pub dev_url: Option<String>,
     pub archived: bool,
     pub stack_prefix: String,
+    #[serde(default)]
+    pub sessions: Vec<SessionView>,
+    #[serde(default)]
+    pub logs: Vec<LogView>,
 }
 
 pub struct Model {
@@ -94,12 +198,22 @@ pub struct Model {
     pub selected: Option<usize>,
     pub offset: usize,
     pub details_scroll: u16,
+    pub(crate) output: crate::output::OutputState,
+    pub(crate) ui_generation: u64,
+    pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
+    pub(crate) help_scroll: usize,
+    pub(crate) show_verification: bool,
     pub show_perf: bool,
+    pub(crate) perf_continuous: bool,
+    pub(crate) perf_scroll: usize,
+    pub(crate) history: crate::history::HistoryView,
+    pub(crate) reviews_folded: bool,
     pub frame_count: u64,
     pub last_frame_micros: u128,
     pub title_prompt: Option<TitlePrompt>,
     pub interaction: Interaction,
+    pub(crate) interaction_host: Option<String>,
     pub yank: Option<usize>,
     pub toast: Option<(String, bool)>,
     pub pending_selection: Option<String>,
@@ -124,12 +238,22 @@ impl Default for Model {
             selected: None,
             offset: 0,
             details_scroll: 0,
+            output: Default::default(),
+            ui_generation: 0,
+            pr_chord: None,
             help: false,
+            help_scroll: 0,
+            show_verification: false,
             show_perf: false,
+            perf_continuous: false,
+            perf_scroll: 0,
+            history: Default::default(),
+            reviews_folded: false,
             frame_count: 0,
             last_frame_micros: 0,
             title_prompt: None,
             interaction: Interaction::None,
+            interaction_host: None,
             yank: None,
             toast: None,
             pending_selection: None,
@@ -143,7 +267,13 @@ impl Model {
     pub fn apply(&mut self, snapshot: SourceSnapshot<Board>) {
         self.source_state = snapshot.state;
         if let Some(board) = snapshot.data {
+            let first_rows = self.board.rows.is_empty() && !board.rows.is_empty();
+            let requested_selection = self.pending_selection.is_some();
             let previous_key = self.selected_row().map(|row| row.key.clone());
+            let previous_review = self
+                .selected_review()
+                .map(|row| (row.host.clone(), row.url.clone()));
+            let on_reviews_header = matches!(self.selected_item(), Some(VisualItem::ReviewHeader));
             let previous_section = self.selected_section().map(|section| section.key.clone());
             let previous_neighbors: Vec<_> = self
                 .selected_section()
@@ -238,15 +368,64 @@ impl Model {
                 self.selected = Some(index);
                 self.pending_selection = None;
             }
+            if first_rows
+                && !requested_selection
+                && previous_key.is_none()
+                && previous_section
+                    .as_deref()
+                    .is_none_or(|section| section == "\0inbox")
+                && let Some(index) = (0..self.item_count())
+                    .find(|&index| matches!(self.item(index), Some(VisualItem::Row(_))))
+            {
+                self.selected = Some(index);
+            }
             if self.selected_row().map(|row| row.key.as_str()) != previous_key.as_deref() {
                 self.details_scroll = 0;
+            }
+            if !requested_selection {
+                if let Some((host, url)) = previous_review {
+                    if let Some(position) = (0..self.item_count()).find(|&position| {
+                        matches!(self.item(position), Some(VisualItem::ReviewRequest(index))
+                            if self.board.review_requests[index].host == host && self.board.review_requests[index].url == url)
+                    }) {
+                        self.selected = Some(position);
+                    }
+                } else if on_reviews_header && !self.board.review_requests.is_empty() {
+                    self.selected = Some(0);
+                }
             }
         }
     }
 
     pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
+        let current = reply
+            .ui_generation
+            .is_none_or(|generation| generation == self.ui_generation);
+        if reply.select_when_visible.is_some() && current {
+            self.history.active = false;
+        }
+        if reply.modal.is_some() && current {
+            self.interaction_host = reply.modal_host;
+        }
         self.toast = Some((reply.message, reply.failed));
-        self.interaction = match reply.modal {
+        self.interaction = match reply.modal.filter(|_| current) {
+            Some(UiModal::Reviewers {
+                key,
+                pr_number,
+                original,
+                candidates,
+            }) => Interaction::Reviewers(ReviewerPrompt {
+                key,
+                pr_number,
+                original,
+                candidates,
+                selected: 0,
+            }),
+            Some(UiModal::Log { title, lines }) => Interaction::Log {
+                title,
+                lines,
+                scroll: 0,
+            },
             Some(UiModal::Confirm {
                 action,
                 title,
@@ -294,9 +473,9 @@ impl Model {
                 editor: LineEditor::new(&initial),
                 allow_empty,
             }),
-            None => Interaction::None,
+            None => std::mem::take(&mut self.interaction),
         };
-        if let Some(key) = reply.select_when_visible {
+        if current && let Some(key) = reply.select_when_visible {
             if let Some(index) = self.row_position(&key) {
                 self.select(index);
             } else {
@@ -390,7 +569,7 @@ impl Model {
     pub fn selected_row(&self) -> Option<&BoardRow> {
         match self.selected_item()? {
             VisualItem::Row(index) => self.board.rows.get(index),
-            VisualItem::Section(_) => None,
+            _ => None,
         }
     }
 
@@ -402,11 +581,12 @@ impl Model {
                 .sections
                 .iter()
                 .find(|section| section.rows.contains(&index)),
+            _ => None,
         }
     }
 
     pub(crate) fn item_count(&self) -> usize {
-        if self.board.sections.is_empty() {
+        if self.board.sections.is_empty() && self.board.review_requests.is_empty() {
             self.board.rows.len()
         } else {
             self.items.len()
@@ -414,19 +594,30 @@ impl Model {
     }
 
     pub(crate) fn item(&self, position: usize) -> Option<VisualItem> {
-        if self.board.sections.is_empty() {
+        if self.board.sections.is_empty() && self.board.review_requests.is_empty() {
             (position < self.board.rows.len()).then_some(VisualItem::Row(position))
         } else {
             self.items.get(position).copied()
         }
     }
 
-    fn selected_item(&self) -> Option<VisualItem> {
+    pub(crate) fn selected_item(&self) -> Option<VisualItem> {
         self.selected.and_then(|index| self.item(index))
     }
 
-    fn rebuild_items(&mut self) {
+    pub(crate) fn rebuild_items(&mut self) {
         self.items.clear();
+        if !self.board.review_requests.is_empty() {
+            self.items.push(VisualItem::ReviewHeader);
+            if !self.reviews_folded {
+                self.items
+                    .extend((0..self.board.review_requests.len()).map(VisualItem::ReviewRequest));
+            }
+        }
+        if self.board.sections.is_empty() {
+            self.items
+                .extend((0..self.board.rows.len()).map(VisualItem::Row));
+        }
         for (index, section) in self.board.sections.iter().enumerate() {
             self.items.push(VisualItem::Section(index));
             if !section.folded {
@@ -509,9 +700,60 @@ impl Model {
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
+        self.ui_generation = self.ui_generation.wrapping_add(1);
+        let chord_allowed = matches!(
+            self.interaction,
+            Interaction::None
+                | Interaction::Picker(PickerPrompt {
+                    action: PickerAction::Section { .. },
+                    ..
+                })
+        ) && self.title_prompt.is_none()
+            && !self.history.active
+            && !self.help
+            && !self.show_perf;
+        if chord_allowed
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('p')
+            && let Some((started, url, linear)) = self.pr_chord.take()
+            && started.elapsed() <= std::time::Duration::from_millis(1200)
+        {
+            self.interaction = Interaction::None;
+            self.interaction_host = None;
+            return InputResult::Action(UiAction::OpenPrLink { url, linear });
+        }
+        if chord_allowed
+            && matches!(self.interaction, Interaction::None)
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('g' | 'l'))
+        {
+            self.pr_chord = self
+                .selected_row()
+                .and_then(|row| row.pr_url.clone())
+                .map(|url| {
+                    (
+                        std::time::Instant::now(),
+                        url,
+                        key.code == KeyCode::Char('l'),
+                    )
+                });
+        }
         if !matches!(self.interaction, Interaction::None) {
             let interaction = std::mem::take(&mut self.interaction);
-            return self.interaction_input(key, interaction);
+            let host = self.interaction_host.clone();
+            let result = self.interaction_input(key, interaction);
+            if matches!(self.interaction, Interaction::None) {
+                self.interaction_host = None;
+            }
+            return match (host, result) {
+                (Some(host), InputResult::Action(action)) => {
+                    InputResult::Action(UiAction::OnHost {
+                        host: Some(host),
+                        action: Box::new(action),
+                    })
+                }
+                (_, result) => result,
+            };
         }
         if let Some(prompt) = &mut self.title_prompt {
             return match prompt.editor.input(key) {
@@ -588,19 +830,163 @@ impl Model {
                 self.help = false;
                 return InputResult::Draw;
             }
-            return InputResult::Unchanged;
+            let maximum = crate::help::LINES.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(maximum);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(height / 2).min(maximum);
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(height / 2);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.help_scroll = maximum,
+                _ => return InputResult::Unchanged,
+            }
+            return InputResult::Draw;
         }
         if self.show_perf {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'P'))
                 || (control && key.code == KeyCode::Char('c'))
             {
                 self.show_perf = false;
-                return InputResult::Draw;
+                return InputResult::Action(UiAction::SetPerf {
+                    active: false,
+                    continuous: self.perf_continuous,
+                    refresh: false,
+                });
             }
-            return InputResult::Unchanged;
+            if key.code == KeyCode::Char('i') {
+                self.perf_continuous = !self.perf_continuous;
+            }
+            if matches!(key.code, KeyCode::Char('i' | 'r')) {
+                return InputResult::Action(UiAction::SetPerf {
+                    active: true,
+                    continuous: self.perf_continuous,
+                    refresh: key.code == KeyCode::Char('r'),
+                });
+            }
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.perf_scroll = self
+                        .perf_scroll
+                        .saturating_add(3)
+                        .min(self.board.perf.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.perf_scroll = self.perf_scroll.saturating_sub(3)
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.perf_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.perf_scroll = self.board.perf.len().saturating_sub(1)
+                }
+                _ => return InputResult::Unchanged,
+            }
+            return InputResult::Draw;
+        }
+        if self.history.active && !crate::history::is_global_key(key) {
+            return self.history_input(key, height);
+        }
+        if let Some(result) = self.review_input(key) {
+            return result;
         }
         match key.code {
+            KeyCode::Char('r' | 'R') if control => {
+                InputResult::Action(UiAction::PrepareHardRefresh)
+            }
+            KeyCode::Char('h') if !control => {
+                self.history.active = true;
+                InputResult::Action(UiAction::SetHistoryActive { active: true })
+            }
+            KeyCode::Char('R') if !control => self.row_action(|key| UiAction::Restack { key }),
+            KeyCode::Char('e' | 'E') if !control => {
+                let ship = key.code == KeyCode::Char('E');
+                self.row_action(|key| UiAction::PrepareGithub { key, ship })
+            }
+            KeyCode::Char('f') if !control => {
+                self.row_action(|key| UiAction::GithubFailedChecks { key })
+            }
+            KeyCode::Char('v') if !control => {
+                self.row_action(|key| UiAction::PrepareReviewers { key })
+            }
+            KeyCode::Char('!') if !control => self.row_action(|key| UiAction::PrepareActions {
+                surface: crate::ActionSurface::Row { key },
+            }),
+            KeyCode::Char('a' | 'A') if control && shift => {
+                InputResult::Action(UiAction::CancelAutomations)
+            }
+            KeyCode::Char('a' | 'A') if control => {
+                self.row_action(|key| UiAction::ToggleAutomations { key: Some(key) })
+            }
+            KeyCode::Char('A') if !control => {
+                InputResult::Action(UiAction::ToggleAutomations { key: None })
+            }
+            KeyCode::Char('\'') if !control => {
+                self.open_output_picker();
+                InputResult::Draw
+            }
+            KeyCode::Char('[' | ']') if !control => {
+                self.output.cycle(key.code == KeyCode::Char(']'));
+                InputResult::Draw
+            }
+            KeyCode::Char('e') if control => {
+                self.output.scroll(false);
+                InputResult::Draw
+            }
+            KeyCode::Char('y') if control => {
+                self.output.scroll(true);
+                InputResult::Draw
+            }
+            KeyCode::Char('j' | 'J') if control && shift => {
+                self.output.scroll(false);
+                InputResult::Draw
+            }
+            KeyCode::Char('k' | 'K') if control && shift => {
+                self.output.scroll(true);
+                InputResult::Draw
+            }
+            KeyCode::Char('T') if !control => {
+                self.row_action(|key| UiAction::GenerateTitle { key })
+            }
+            KeyCode::Char('V') if !control => {
+                self.show_verification = !self.show_verification;
+                InputResult::Draw
+            }
+            KeyCode::Char('M') if !control => InputResult::Action(UiAction::PrepareActions {
+                surface: crate::ActionSurface::Manager {
+                    key: (!self.history.active)
+                        .then(|| self.selected_row())
+                        .flatten()
+                        .map(|row| row.key.clone()),
+                },
+            }),
+            KeyCode::Char('<' | '>' | '\\') if !control => {
+                InputResult::Action(UiAction::PrepareActions {
+                    surface: crate::ActionSurface::Slot {
+                        target: match key.code {
+                            KeyCode::Char('<') => SessionTarget::WtSource,
+                            KeyCode::Char('>') => SessionTarget::Main,
+                            _ => SessionTarget::Dotfiles,
+                        },
+                    },
+                })
+            }
             KeyCode::Char('d') if control => self.jump_section(true),
+            KeyCode::Char('J' | 'K') if !control => self
+                .selected_section()
+                .map(|section| {
+                    InputResult::Action(UiAction::Reorder {
+                        key: self.selected_row().map(|row| row.key.clone()),
+                        section: section.key.clone(),
+                        down: key.code == KeyCode::Char('J'),
+                    })
+                })
+                .unwrap_or(InputResult::Unchanged),
             KeyCode::Char('u') if control => self.jump_section(false),
             KeyCode::Tab if !control => self
                 .selected_section()
@@ -622,7 +1008,11 @@ impl Model {
             }
             KeyCode::Char('P') => {
                 self.show_perf = !self.show_perf;
-                InputResult::Draw
+                InputResult::Action(UiAction::SetPerf {
+                    active: true,
+                    continuous: self.perf_continuous,
+                    refresh: false,
+                })
             }
             KeyCode::Char('l') if !control => {
                 self.row_action(|key| UiAction::PrepareSection { key })
@@ -658,6 +1048,11 @@ impl Model {
                 }
             }
             KeyCode::Char('n') if !control && !shift => {
+                if self.board.hosts.len() > 1 {
+                    return InputResult::Action(UiAction::PrepareCreate {
+                        initial: String::new(),
+                    });
+                }
                 self.interaction = Interaction::Text(TextPrompt {
                     action: TextAction::Create,
                     prompt: "new: ".into(),
@@ -666,11 +1061,20 @@ impl Model {
                 });
                 InputResult::Draw
             }
+            KeyCode::Char('n') if control => InputResult::Action(UiAction::PrepareCreate {
+                initial: String::new(),
+            }),
             KeyCode::Char('N') | KeyCode::Char('n') if !control && shift => {
                 let initial = self
                     .selected_row()
                     .map(|row| format!("--base {}", row.branch))
                     .unwrap_or_default();
+                if let Some(host) = self.selected_row().and_then(|row| row.host.as_ref()) {
+                    return InputResult::Action(UiAction::OnHost {
+                        host: Some(host.clone()),
+                        action: Box::new(UiAction::PrepareCreate { initial }),
+                    });
+                }
                 self.interaction = Interaction::Text(TextPrompt {
                     action: TextAction::Create,
                     prompt: "new: ".into(),
@@ -711,8 +1115,24 @@ impl Model {
             KeyCode::Char('i') if !control => self.url_action(UrlKind::Issue),
             KeyCode::Char('I') if !control => self.url_action(UrlKind::PrimaryIssue),
             KeyCode::Char('s') if !control => self.url_action(UrlKind::StageOrDev),
+            KeyCode::F(10) if shift => self.row_action(|key| UiAction::PrepareStopTerminal {
+                key,
+                target: SessionTarget::Shell,
+            }),
+            KeyCode::F(11) if shift => self.row_action(|key| UiAction::PrepareStopTerminal {
+                key,
+                target: SessionTarget::Diff,
+            }),
             KeyCode::F(10) => self.session_action(SessionTarget::Shell),
             KeyCode::F(11) => self.session_action(SessionTarget::Diff),
+            KeyCode::F(12) if shift => self.row_action(|key| UiAction::PrepareSessions {
+                key: Some(key),
+                target: SessionTarget::Harness,
+            }),
+            KeyCode::Char(';') if !control => self.row_action(|key| UiAction::PrepareSessions {
+                key: Some(key),
+                target: SessionTarget::Harness,
+            }),
             KeyCode::F(12) => self.session_action(SessionTarget::Harness),
             KeyCode::Char('m') if !control => InputResult::Action(UiAction::Session {
                 key: None,
@@ -771,6 +1191,8 @@ impl Model {
                                     .iter()
                                     .any(|&row| self.board.rows[row].needs_attention)
                         }
+                        Some(VisualItem::ReviewRequest(_)) => true,
+                        Some(VisualItem::ReviewHeader) => self.reviews_folded,
                         None => false,
                     });
                 next.map_or(InputResult::Unchanged, |index| self.select(index))
@@ -818,6 +1240,58 @@ impl Model {
         let code = key.code;
         match &mut interaction {
             Interaction::None => InputResult::Unchanged,
+            Interaction::Reviewers(picker) => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+                    || (control && code == KeyCode::Char('c'))
+                {
+                    return InputResult::Draw;
+                }
+                if matches!(code, KeyCode::Enter | KeyCode::Char('v')) {
+                    return InputResult::Action(UiAction::SubmitReviewers {
+                        key: picker.key.clone(),
+                        pr_number: picker.pr_number,
+                        original: picker.original.clone(),
+                        selected: picker
+                            .candidates
+                            .iter()
+                            .filter(|option| option.selected)
+                            .map(|option| option.login.clone())
+                            .collect(),
+                    });
+                }
+                if code == KeyCode::Char(' ')
+                    && let Some(option) = picker.candidates.get_mut(picker.selected)
+                {
+                    option.selected = !option.selected;
+                } else {
+                    picker_move(code, &mut picker.selected, picker.candidates.len());
+                }
+                self.interaction = interaction;
+                InputResult::Draw
+            }
+            Interaction::Log { lines, scroll, .. } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c'))
+                {
+                    return InputResult::Draw;
+                }
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *scroll = scroll.saturating_add(3).min(lines.len().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(3),
+                    KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => *scroll = lines.len().saturating_sub(1),
+                    KeyCode::PageDown => {
+                        *scroll = scroll.saturating_add(12).min(lines.len().saturating_sub(1))
+                    }
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(12),
+                    _ => {}
+                }
+                self.interaction = interaction;
+                InputResult::Draw
+            }
             Interaction::Text(prompt) => {
                 let result = prompt.editor.input(key);
                 match result {
@@ -837,6 +1311,22 @@ impl Model {
                             return InputResult::Unchanged;
                         }
                         let action = match &prompt.action {
+                            TextAction::SessionName { selection } => {
+                                let mut selection = selection.clone();
+                                selection.managed_name = Some(text.trim().to_owned());
+                                UiAction::SelectSession { selection }
+                            }
+                            TextAction::ActionArg { surface, id } => UiAction::PrepareAction {
+                                surface: surface.clone(),
+                                id: id.clone(),
+                                arg: Some(text),
+                            },
+                            TextAction::ActionExtras { surface, id, arg } => UiAction::RunAction {
+                                surface: surface.clone(),
+                                id: id.clone(),
+                                arg: arg.clone(),
+                                extras: text,
+                            },
                             TextAction::Create => UiAction::Create { input: text },
                             TextAction::NewSection { key } => {
                                 self.last_section_target = Some(Some(text.clone()));
@@ -885,6 +1375,50 @@ impl Model {
                 }
                 if code == KeyCode::Enter || code == KeyCode::Char('y') {
                     return InputResult::Action(match &confirm.action {
+                        ConfirmAction::HardRefresh => UiAction::HardRefresh,
+                        ConfirmAction::StopTerminal {
+                            key,
+                            target,
+                            session_id,
+                            created_at,
+                        } => UiAction::StopTerminal {
+                            key: key.clone(),
+                            target: *target,
+                            session_id: session_id.clone(),
+                            created_at: *created_at,
+                        },
+                        ConfirmAction::ReviewCheckout {
+                            url,
+                            updated_at,
+                            branch,
+                        } => UiAction::ReviewCheckout {
+                            url: url.clone(),
+                            updated_at: updated_at.clone(),
+                            branch: branch.clone(),
+                        },
+                        ConfirmAction::RestoreRemoved {
+                            key,
+                            removed_at,
+                            branch,
+                        } => UiAction::RestoreRemoved {
+                            key: key.clone(),
+                            removed_at: removed_at.clone(),
+                            branch: branch.clone(),
+                        },
+                        ConfirmAction::Github { key, ship } => {
+                            if *ship {
+                                UiAction::GithubShip { key: key.clone() }
+                            } else {
+                                UiAction::GithubMarkReady { key: key.clone() }
+                            }
+                        }
+                        ConfirmAction::StopSession { selection } => UiAction::StopSession {
+                            selection: selection.clone(),
+                        },
+                        ConfirmAction::KillAction { action_key, run_id } => UiAction::KillAction {
+                            action_key: action_key.clone(),
+                            run_id: run_id.clone(),
+                        },
                         ConfirmAction::Remove {
                             key,
                             force,
@@ -903,6 +1437,16 @@ impl Model {
                 InputResult::Unchanged
             }
             Interaction::Picker(picker) => {
+                if code == KeyCode::Char('d')
+                    && !control
+                    && let PickerAction::Sessions { choices } = &picker.action
+                    && let Some(selection) = choices.get(picker.selected)
+                    && selection.mode == crate::SessionMode::Resume
+                {
+                    return InputResult::Action(UiAction::PrepareStopSession {
+                        selection: selection.clone(),
+                    });
+                }
                 let quick_pick = match code {
                     KeyCode::Char(digit @ '1'..='9') => {
                         let index = digit as usize - '1' as usize;
@@ -910,7 +1454,13 @@ impl Model {
                     }
                     _ => None,
                 };
+                let action_chord = matches!(picker.action, PickerAction::Actions { .. })
+                    && picker
+                        .options
+                        .iter()
+                        .any(|option| option.chord.is_some_and(|ch| code == KeyCode::Char(ch)));
                 if quick_pick.is_none()
+                    && !action_chord
                     && picker_move(code, &mut picker.selected, picker.options.len())
                 {
                     self.interaction = interaction;
@@ -983,11 +1533,21 @@ impl Model {
                     return InputResult::Draw;
                 }
                 let opener = match picker.action {
+                    PickerAction::Host { .. } => KeyCode::Enter,
+                    PickerAction::Actions { .. } => KeyCode::Char('!'),
+                    PickerAction::ActionArg { .. } => KeyCode::Enter,
                     PickerAction::Status { .. } => KeyCode::Char('u'),
                     PickerAction::Base { .. } => KeyCode::Char('b'),
                     PickerAction::Section { .. } => KeyCode::Char('l'),
+                    PickerAction::Output { .. } => KeyCode::Char('\''),
+                    PickerAction::Sessions { .. } => KeyCode::Char(';'),
                 };
-                let chosen = quick_pick.or(direct).or_else(|| {
+                let pick = if matches!(picker.action, PickerAction::Actions { .. }) {
+                    direct.or(quick_pick)
+                } else {
+                    quick_pick.or(direct)
+                };
+                let chosen = pick.or_else(|| {
                     (code == KeyCode::Enter || code == KeyCode::Char(' ') || code == opener)
                         .then_some(picker.selected)
                 });
@@ -997,6 +1557,71 @@ impl Model {
                     return InputResult::Unchanged;
                 };
                 match &picker.action {
+                    PickerAction::Sessions { choices } => {
+                        let Some(selection) = option
+                            .value
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .and_then(|index| choices.get(index))
+                            .cloned()
+                        else {
+                            return InputResult::Unchanged;
+                        };
+                        if selection.mode == crate::SessionMode::New
+                            && selection.harness == wt_core::HarnessId::Claude
+                        {
+                            self.interaction = Interaction::Text(TextPrompt {
+                                action: TextAction::SessionName { selection },
+                                prompt: "Session name: ".into(),
+                                editor: LineEditor::new(""),
+                                allow_empty: false,
+                            });
+                            InputResult::Draw
+                        } else {
+                            InputResult::Action(UiAction::SelectSession { selection })
+                        }
+                    }
+                    PickerAction::Output { choices } => {
+                        if let Some(target) = option
+                            .value
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .and_then(|index| choices.get(index))
+                            .cloned()
+                        {
+                            self.output.choose(target);
+                        }
+                        InputResult::Draw
+                    }
+                    PickerAction::Host { action } => InputResult::Action(UiAction::OnHost {
+                        host: option.value,
+                        action: action.clone(),
+                    }),
+                    PickerAction::ActionArg { surface, id } => {
+                        if let Some(value) = option.value {
+                            InputResult::Action(UiAction::PrepareAction {
+                                surface: surface.clone(),
+                                id: id.clone(),
+                                arg: Some(value),
+                            })
+                        } else {
+                            self.interaction = Interaction::Text(TextPrompt {
+                                action: TextAction::ActionArg {
+                                    surface: surface.clone(),
+                                    id: id.clone(),
+                                },
+                                prompt: picker.title.clone(),
+                                editor: LineEditor::new(""),
+                                allow_empty: false,
+                            });
+                            InputResult::Draw
+                        }
+                    }
+                    PickerAction::Actions { surface } => {
+                        InputResult::Action(UiAction::PrepareAction {
+                            surface: surface.clone(),
+                            id: option.value.unwrap_or_default(),
+                            arg: None,
+                        })
+                    }
                     PickerAction::Section { key } => {
                         self.last_section_target = Some(option.value.clone());
                         InputResult::Action(UiAction::MoveSection {
@@ -1088,6 +1713,82 @@ fn picker_move(code: KeyCode, selected: &mut usize, count: usize) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn first_inventory_selects_a_visible_row_after_empty_inbox() {
+        let mut model = Model::default();
+        let mut empty = snapshot(&[]);
+        Arc::make_mut(empty.data.as_mut().unwrap()).sections = vec![BoardSection {
+            key: "\0inbox".into(),
+            title: "Inbox".into(),
+            ..Default::default()
+        }];
+        model.apply(empty);
+        let mut populated = snapshot(&["one", "two"]);
+        Arc::make_mut(populated.data.as_mut().unwrap()).sections = vec![BoardSection {
+            key: "\0inbox".into(),
+            title: "Inbox".into(),
+            rows: vec![0, 1],
+            ..Default::default()
+        }];
+        model.apply(populated);
+        assert_eq!(model.selected_row().unwrap().key, "one");
+        model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+        assert_eq!(model.selected_row().unwrap().key, "two");
+    }
+
+    #[test]
+    fn github_keys_capture_target_and_require_confirmation() {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('e')), 20),
+            InputResult::Action(UiAction::PrepareGithub {
+                key: "one".into(),
+                ship: false
+            })
+        );
+        model.reply(UiReply {
+            modal: Some(UiModal::Confirm {
+                action: ConfirmAction::Github {
+                    key: "one".into(),
+                    ship: true,
+                },
+                title: "Ship?".into(),
+                lines: vec![],
+                cancel_key: Some('E'),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Enter), 20),
+            InputResult::Action(UiAction::GithubShip { key: "one".into() })
+        );
+    }
+
+    #[test]
+    fn delayed_modal_and_background_completion_preserve_newer_input() {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one"]));
+        model.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 20);
+        let generation = model.ui_generation;
+        model.input(KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE), 20);
+        assert!(matches!(model.interaction, Interaction::Text(_)));
+        model.reply(UiReply {
+            ui_generation: Some(generation),
+            modal: Some(UiModal::Log {
+                title: "Old result".into(),
+                lines: vec![],
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(model.interaction, Interaction::Text(_)));
+        model.reply(UiReply {
+            message: "Background command finished".into(),
+            ..Default::default()
+        });
+        assert!(matches!(model.interaction, Interaction::Text(_)));
+    }
+
     fn grouped(keys: &[&str], folded: bool) -> SourceSnapshot<Board> {
         let mut state = snapshot(keys);
         let board = Arc::make_mut(state.data.as_mut().unwrap());
@@ -1098,6 +1799,91 @@ mod tests {
             rows: (0..keys.len()).collect(),
         }];
         state
+    }
+
+    #[test]
+    fn action_palette_chords_and_arguments_keep_the_original_target() {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        let surface = crate::ActionSurface::Row { key: "one".into() };
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('!')), 20),
+            InputResult::Action(UiAction::PrepareActions {
+                surface: surface.clone()
+            })
+        );
+        model.reply(UiReply {
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Actions {
+                    surface: surface.clone(),
+                },
+                title: "Actions".into(),
+                selected: 0,
+                options: vec![PickerOption {
+                    value: Some("continue".into()),
+                    label: "Continue".into(),
+                    chord: Some('g'),
+                    note: None,
+                    verify_after_merge: None,
+                }],
+            }),
+            ..Default::default()
+        });
+        model.apply(snapshot(&["two", "one"]));
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('g')), 20),
+            InputResult::Action(UiAction::PrepareAction {
+                surface: surface.clone(),
+                id: "continue".into(),
+                arg: None
+            })
+        );
+        model.reply(UiReply {
+            modal: Some(UiModal::Text {
+                action: TextAction::ActionExtras {
+                    surface: surface.clone(),
+                    id: "continue".into(),
+                    arg: Some("saved".into()),
+                },
+                prompt: "Extra instructions".into(),
+                initial: "go".into(),
+                allow_empty: true,
+            }),
+            ..Default::default()
+        });
+        model.input(KeyEvent::from(KeyCode::Char('q')), 20);
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Enter), 20),
+            InputResult::Action(UiAction::RunAction {
+                surface,
+                id: "continue".into(),
+                arg: Some("saved".into()),
+                extras: "goq".into()
+            })
+        );
+    }
+
+    #[test]
+    fn special_palettes_open_without_a_selected_worktree() {
+        let mut model = Model::default();
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('M')), 20),
+            InputResult::Action(UiAction::PrepareActions {
+                surface: crate::ActionSurface::Manager { key: None }
+            })
+        );
+        for (key, target) in [
+            ('<', SessionTarget::WtSource),
+            ('>', SessionTarget::Main),
+            ('\\', SessionTarget::Dotfiles),
+        ] {
+            assert_eq!(
+                model.input(KeyEvent::from(KeyCode::Char(key)), 20),
+                InputResult::Action(UiAction::PrepareActions {
+                    surface: crate::ActionSurface::Slot { target }
+                })
+            );
+        }
     }
 
     #[test]
@@ -1365,12 +2151,20 @@ mod tests {
         model.apply(snapshot(&["a", "b"]));
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         model.input(key('?'), 10);
-        assert_eq!(model.input(key('j'), 10), InputResult::Unchanged);
+        assert_eq!(model.input(key('j'), 10), InputResult::Draw);
+        assert_eq!(model.help_scroll, 1);
         assert_eq!(model.selected, Some(0));
         assert_eq!(model.input(key('q'), 10), InputResult::Draw);
         assert!(!model.help);
         model.input(key('P'), 10);
-        assert_eq!(model.input(key('q'), 10), InputResult::Draw);
+        assert_eq!(
+            model.input(key('q'), 10),
+            InputResult::Action(UiAction::SetPerf {
+                active: false,
+                continuous: false,
+                refresh: false
+            })
+        );
         assert!(!model.show_perf);
         assert_eq!(model.input(key('q'), 10), InputResult::Quit);
         assert_eq!(

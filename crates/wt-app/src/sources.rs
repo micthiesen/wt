@@ -1,7 +1,14 @@
 //! Independent I/O lanes composed into a prepared board. Only explicit refresh
 //! requests cross from presentation back into fetch scheduling.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use wt_github::{GithubClient, GithubData, GithubOptions, PrChecks, PrReview};
 use wt_runtime::{
     RefreshPolicy, SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel,
@@ -17,12 +24,34 @@ pub struct BoardSources {
     pub board: SourceHandle<Board>,
     pub local: SourceHandle<Board>,
     pub metadata: SourceHandle<crate::local_source::Metadata>,
+    pub github: SourceHandle<GithubData>,
+    pub github_actions: crate::github_actions::GithubActions,
+    pub github_pickers: Arc<crate::github_pickers::GithubPickers>,
+    pub naming: crate::naming_source::NamingCommands,
+    pub sessions: crate::session_source::SessionSources,
+    pub automations: crate::automation_source::AutomationCommands,
+    pub history: crate::history_source::HistoryCommands,
+    pub perf: crate::perf_source::PerfCommands,
+    pub hard_refresh: crate::hard_refresh::HardRefreshCommands,
+    pub review_requests: crate::review_requests::ReviewRequests,
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     let local_sources = crate::local_source::start(scope, context);
+    let history = crate::history_source::start(
+        scope,
+        context,
+        local_sources.metadata.clone(),
+        local_sources.git.clone(),
+    );
+    let sessions = crate::session_source::start(scope, context, local_sources.git.clone());
+    let session_activity = crate::session_activity::start(scope, context, &sessions).activity;
     let local = local_sources.board;
+    // This exact pipeline runs on every host. The controller combines its
+    // completed snapshots; transport never reimplements a feature source.
+    let fleet = local.clone();
     let enabled = std::env::var("WT_GITHUB").as_deref() != Ok("off");
+    let bypass_github_cache = Arc::new(AtomicBool::new(false));
     let github = start_source(
         scope,
         RefreshPolicy {
@@ -31,16 +60,22 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         },
         {
             let context = context.clone();
-            let local = local.clone();
+            let local = fleet.clone();
+            let bypass = bypass_github_cache.clone();
             move |cancel| {
                 let context = context.clone();
+                let bypass = bypass.clone();
                 let branches = branches(&local.snapshot());
                 async move {
                     if !enabled || branches.is_empty() {
-                        return Ok::<_, wt_github::GithubError>(GithubData::default());
+                        return Ok::<_, wt_github::GithubError>((
+                            GithubData::default(),
+                            tokio::time::Instant::now(),
+                        ));
                     }
-                    if let Some(cached) =
-                        crate::github_events_source::load(&context, &branches).await
+                    if !bypass.swap(false, Ordering::AcqRel)
+                        && let Some(cached) =
+                            crate::github_events_source::load(&context, &branches).await
                     {
                         return Ok(cached);
                     }
@@ -50,32 +85,139 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
                         context.config.paths.main_clone.clone(),
                         GithubOptions::from_config(&context.config, ci),
                     );
-                    client.fetch_worktrees(&branches, &cancel).await
+                    let observed_at = tokio::time::Instant::now();
+                    client
+                        .fetch_worktrees(&branches, &cancel)
+                        .await
+                        .map(|data| (data, observed_at))
                 }
             }
         },
     );
+    let github = observe_github(scope, github);
     let github = if enabled {
-        crate::github_events_source::overlay(scope, context, local.clone(), github)
+        crate::github_events_source::overlay(scope, context, fleet.clone(), github)
     } else {
         github
     };
+    let (github_actions, github) =
+        crate::github_actions::GithubActions::start(scope, context, github);
+    let github_pickers = Arc::new(crate::github_pickers::GithubPickers::start(
+        context,
+        github.clone(),
+    ));
     let activity = crate::activity_source::start(scope, context.config.paths.cache_root.clone());
     let board = project(
         scope,
-        local.clone(),
-        github,
+        fleet,
+        github.clone(),
         activity,
         enabled,
         crate::origin::backstop(context),
     );
-    let board = crate::dev_source::overlay(scope, context, local.clone(), board);
-    let board = crate::origin::overlay(scope, context, board, local.clone());
-    BoardSources {
+    let dev = crate::dev_source::overlay(scope, context, local.clone(), board);
+    let origin = crate::origin::overlay(scope, context, dev.board, local.clone());
+    let issues = crate::issue_source::start(scope, context, origin.board);
+    let board = crate::action_source::overlay(
+        scope,
+        context,
+        issues.board,
+        crate::action_source::RefreshTargets {
+            git: local_sources.git.clone(),
+            github: github.clone(),
+            dev: dev.status,
+            origin: origin.origin.clone(),
+            issues: issues.statuses,
+        },
+    );
+    let naming = crate::naming_source::start(
+        scope,
+        context,
+        local_sources.git.clone(),
+        local_sources.metadata.clone(),
         board,
+    );
+    let board =
+        crate::session_board::overlay(scope, naming.board, &sessions, session_activity.clone());
+    let board = crate::history_source::overlay(scope, board, history.snapshot);
+    let (review_requests, review_snapshot) =
+        crate::review_requests::ReviewRequests::start(scope, context);
+    let board = crate::review_requests::overlay(scope, board, review_snapshot);
+    let automations = crate::automation_source::start(
+        scope,
+        context,
+        crate::automation_source::AutomationSources {
+            board,
+            git: local_sources.git,
+            metadata: local_sources.metadata.clone(),
+            github: github.clone(),
+            sessions: sessions.discoveries.clone(),
+            inventory: sessions.inventory.clone(),
+            activity: session_activity.clone(),
+            edits: local_sources.edits,
+        },
+    );
+    let perf = crate::perf_source::start(scope, context, automations.board);
+    let hard_refresh = crate::hard_refresh::HardRefreshCommands::new(
+        perf.board.clone(),
+        github.clone(),
+        origin.origin,
+        bypass_github_cache,
+        naming.commands.clone(),
+        github_pickers.clone(),
+    );
+    BoardSources {
+        board: perf.board,
         local,
         metadata: local_sources.metadata,
+        github,
+        github_actions,
+        github_pickers,
+        naming: naming.commands,
+        sessions,
+        automations: automations.commands,
+        history: history.commands,
+        perf: perf.commands,
+        hard_refresh,
+        review_requests,
     }
+}
+
+/// Preserve the age of a daemon observation through the ordinary fetch lane.
+/// Reading the same file again must not make old data fresh for automations.
+fn observe_github(
+    scope: &TaskScope,
+    input: SourceHandle<(GithubData, tokio::time::Instant)>,
+) -> SourceHandle<GithubData> {
+    let (source, mut publisher) = source_channel();
+    let cancel = scope.token();
+    scope.spawn(async move {
+        let mut updates = input.subscribe();
+        updates.mark_changed();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                request = publisher.requested() => {
+                    if request.is_none() { break; }
+                    input.refresh();
+                    continue;
+                },
+                changed = updates.changed() => if changed.is_err() { break; },
+            }
+            let snapshot = updates.borrow_and_update().clone();
+            publisher.publish(SourceSnapshot {
+                data: snapshot
+                    .data
+                    .as_ref()
+                    .map(|value| Arc::new(value.0.clone())),
+                updated_at: snapshot.data.as_ref().map(|value| value.1),
+                state: snapshot.state,
+                revision: 0,
+            });
+        }
+    });
+    source
 }
 
 async fn has_workflows(root: &Path) -> bool {
@@ -205,7 +347,7 @@ fn compose(
     };
     let mut board = board.as_ref().clone();
     if let Some(lines) = activity.data {
-        board.activity = lines.as_ref().clone();
+        board.activity.extend(lines.iter().cloned());
     }
     if let SourceState::Failed(error) = activity.state {
         board.activity.push(format!(
@@ -215,9 +357,11 @@ fn compose(
     }
     if let Some(data) = &github.data {
         for row in &mut board.rows {
-            let Some(pr) =
+            let Some(pr) = (if wt_core::is_remote_worktree_ledger_key(&row.key) {
+                data.prs.get(&row.branch)
+            } else {
                 wt_github::pick_pr_for_worktree(Some(&row.branch), Path::new(&row.path), &data.prs)
-            else {
+            }) else {
                 continue;
             };
             let clean = wt_core::sanitize_terminal_text;

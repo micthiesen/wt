@@ -26,7 +26,7 @@ pub fn board(
             .filter(|title| !title.is_empty())
             .unwrap_or(target.slug());
         let mut details = Vec::new();
-        let badge = if let Some(work) = &work {
+        let mut badge = if let Some(work) = &work {
             details.push(format!("Work: {}", work.state.as_str()));
             if let Some(note) = &work.note {
                 details.push(clean_text(note));
@@ -34,13 +34,17 @@ pub fn board(
             if let Some(gate) = &work.blocked_on {
                 details.push(format!("Blocked on: {}", clean_text(gate)));
             }
-            if let Some(steps) = &work.verify_after_merge {
-                details.push(format!("Verify after merge: {}", clean_text(steps)));
+            if work.verify_after_merge.is_some() {
+                details.push("Verify after merge: required · V shows steps".into());
             }
             work.state.as_str().to_owned()
         } else {
             String::new()
         };
+        if stored["automationsPaused"].as_bool() == Some(true) {
+            badge.push_str("  auto paused");
+            details.push("Automations paused for this worktree".into());
+        }
         if let Some(status) = &snapshot.status {
             details.push(format!(
                 "Changes: {} tracked, {} untracked",
@@ -58,11 +62,19 @@ pub fn board(
         }
         rows.push(BoardRow {
             key: wt_core::worktree_target_key(target),
+            base_branch: state["slugs"][target.slug()]["baseBranch"]
+                .as_str()
+                .map(str::to_owned),
             slug: clean_text(target.slug()),
             title: clean_text(title),
             branch: clean_text(&target.branch),
             path: clean_text(&target.path),
             badge,
+            work_rank: wt_core::work_record_rank(work.as_ref()),
+            verify_steps: work
+                .as_ref()
+                .and_then(|work| work.verify_after_merge.as_deref())
+                .map(clean_text),
             needs_attention: work.is_some_and(|work| {
                 matches!(
                     work.state,
@@ -89,6 +101,8 @@ pub fn board(
     }
     let mut board = Board {
         name: clean_text(&config.repo_id),
+        automations_paused: state["automationsPaused"].as_bool().unwrap_or(false),
+        full_width_activity: config.ui.activity_pane == wt_config::ActivityPane::FullWidth,
         rows,
         ..Board::default()
     };
@@ -103,14 +117,7 @@ fn clean_text(text: &str) -> String {
 }
 
 fn issue_id(stored: &serde_json::Value, slug: &str) -> Option<String> {
-    if let Some(explicit) = stored.as_str() {
-        return (!explicit.trim().is_empty()).then(|| explicit.trim().to_ascii_uppercase());
-    }
-    regex::Regex::new(r"(?i)([a-z]+-\d+)(?:-|$)")
-        .expect("constant issue regex")
-        .captures(slug)?
-        .get(1)
-        .map(|found| found.as_str().to_ascii_uppercase())
+    crate::issue_identity::resolve(slug, stored.as_str())
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ pub mod claude;
 pub mod cleanup;
 pub mod codex;
 pub mod dev;
-mod diagnostics;
+pub(crate) mod diagnostics;
 pub mod doctor;
 pub mod edge;
 pub mod events;
@@ -35,9 +35,12 @@ pub mod status;
 pub mod update;
 
 pub mod _action_worker;
+pub mod _claude_hook;
 pub mod _destroy;
+pub mod _dev_giveup;
 pub mod _hello;
 pub mod _remote;
+pub mod _restack_worker;
 pub mod _session;
 pub mod _snapshot;
 #[cfg(test)]

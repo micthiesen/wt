@@ -14,37 +14,39 @@ user's invocation already asked for a fix.
 baseline, open issues, and the learnings ledger — a symptom you're
 about to investigate may already have a known signature there.
 
-## 1. Pick the right instrument
+## 1. Capture the right workload
 
-Two different questions, two different tools:
+- For machine pressure, run `wt perf --json`. Its `%CPU` is the process's
+  lifetime decaying average, not an instantaneous profile. For current load,
+  compare `top -l 2 -n 12 -o cpu -stats pid,cpu,mem,command` samples.
+- For native TUI latency, inspect `input-latency` records in the selected
+  configuration's log directory (`wt-native.YYYY-MM-DD.log`). These measure
+  input receipt through terminal draw completion; no restart flag is needed.
+  They exclude terminal transport before input receipt and physical display
+  latency. The renderer is `crates/wt-tui/src/terminal.rs`.
+- Use `scripts/native-ui-check.py --binary target/debug/wt --sections
+  --output /tmp/<unique-fixture>` for an isolated PTY check with delayed Git,
+  external edits, metadata-only writes, and shutdown. Its key-to-output sample
+  supplements the internal draw metric; neither is a physical paint probe.
+- Use `scripts/perf-baseline.py --help` for repeatable idle, navigation and
+  refresh measurements. Compare equivalent fixtures and optimized binaries.
+  Include children in CPU accounting; report cold startup separately from
+  steady-state work. Never label a reduced-feature workload representative
+  without naming the disabled sources.
 
-| Symptom | Tool |
-|---|---|
-| "Machine feels slow — is wt/agents eating the box?" | `wt perf` (one-shot CLI; `--json` for raw structure). Same sampler as the TUI `P` overlay. |
-| "The TUI itself is laggy (j/k, slow paint)" | Loop-lag probe: restart the TUI as `WT_PERF=1 wt`, reproduce, then grep the daily app log for `event-loop blocked`. It logs any >50ms block of the render thread (file-only, never the pane). |
+## 2. Diagnose
 
-The loop-lag probe arms only at startup — it can NOT be attached to a
-running instance. If the symptom is TUI lag and the probe isn't armed,
-say so and ask Michael to restart with `WT_PERF=1` (that restart is his
-call; the TUI holds real state).
-
-## 2. Capture
-
-- Run `wt perf`. Its `%CPU` is `ps`'s **lifetime decaying average** —
-  sustained pressure, not an instantaneous profile. A long-lived
-  process showing 130% may be idle right now.
-- When the average vs. now distinction matters, get a second opinion:
-  `top -l 2 -n 12 -o cpu -stats pid,cpu,mem,command | tail -20`
-  (the second sample of `top -l 2` is a true instantaneous delta), or
-  re-run `wt perf` ~60s later and compare direction.
-- Memory "used" in the report is vm_stat active+wired+compressor
-  (Activity Monitor's definition). Never reason from `os.freemem()` —
-  it reads ~90% used on any long-uptime Mac.
-- For wt-internal state behind a symptom (stuck rows, stale queries,
-  session sprawl), use the `wt-state` skill's read-only scripts.
-- Daily app log: `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log`
-  (`grep ' EVENT '` for the activity feed, `grep 'event-loop blocked'`
-  for probe hits).
+- Separate wt's CPU from harnesses, databases, browsers and OS processes.
+  Correlate cwd and session identity for shared daemons outside wt ancestry.
+- RSS is not macOS physical footprint. Memory in use is active, wired and
+  compressed memory, not a subtraction from `os.freemem()`.
+- Native source scheduling lives in `wt-runtime` and `wt-app` source modules.
+  Check invalidation counts, last-good snapshots, bounded queues, watcher
+  registration and cancellation before increasing poll intervals or timeouts.
+- Keep filesystem/process work off the input path. An idle terminal should
+  not continuously redraw. Preserve batching and start-time rate floors.
+- Use isolated fixtures for fault injection. Do not stop live user sessions
+  merely to obtain a cleaner benchmark.
 
 ## 3. Attribute honestly
 
@@ -54,23 +56,7 @@ when the hog is a browser or another app, say so plainly and stop —
 don't hunt for a wt/agent explanation to justify the invocation.
 Compare wt's share against CPU *in use*, not installed capacity.
 
-## 4. Diagnose
-
-Check the known signatures in `notes.md` first (orphaned headless
-instances, Bun bare-promise spin, worker-less parsing on the render
-thread, ...). For new wt-side suspects:
-
-- Walk the tree: `ps -o pid,ppid,pcpu,rss,etime,command -p <pid>` and
-  children; `wt perf --json` has ppid-free but session-attributed data.
-- Correlate with the app log timeline (what was wt doing when load
-  rose?).
-- For render-thread suspects, reason from the armed loop-lag probe's
-  timestamps, not vibes.
-- For code-level work (reviewing a diff for perf, optimizing a module),
-  the repo rules still apply: batched GitHub fetches, push-based
-  freshness, workers for heavy parsing — see the learnings ledger.
-
-## 5. Propose
+## 4. Report
 
 Report: what the load is, whose it is, whether it's reasonable, and if
 not, the specific fix (code change, kill line, config change) — with
@@ -78,7 +64,7 @@ the evidence. Wait for the go-ahead before mutating anything. A
 ready-to-run `kill` line for leaked instances is a proposal, not an
 action.
 
-## 6. Update notes.md — every invocation
+## 5. Update notes.md — every invocation
 
 `notes.md` is a living document; keeping it current is part of the
 skill, not optional:
@@ -94,5 +80,5 @@ skill, not optional:
 - Prune: stale baselines and superseded learnings get rewritten, not
   accumulated.
 
-Commit `notes.md` changes (this repo commits directly to main; ride
-along with the investigation's other changes or commit standalone).
+Commit `notes.md` with the investigation under the current task’s branch and
+shipping authorization.

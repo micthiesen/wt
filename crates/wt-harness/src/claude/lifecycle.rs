@@ -229,6 +229,40 @@ impl ClaudeSessionManager {
         Ok(())
     }
 
+    /// Stop only the selected deterministic Claude conversation. The UUID
+    /// comparison and tmux kill share the normal per-session lock with start,
+    /// so a name reused between picker preflight and confirmation is safe.
+    pub async fn stop_exact(
+        &self,
+        target: &ClaudeSessionTarget,
+        expected_session_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ClaudeSessionManagerError> {
+        let _guard = SessionLock::acquire(
+            &self.paths.lock_dir,
+            &self.lock_key(target),
+            Duration::from_secs(120),
+            cancel,
+        )
+        .await?;
+        let Some(session) = self.find(target)? else {
+            return Ok(false);
+        };
+        if session.session_id != expected_session_id {
+            return Err(operation(
+                "stop",
+                format!(
+                    "Claude session {} no longer matches selected conversation {expected_session_id}",
+                    self.tmux_name(target)
+                ),
+            ));
+        }
+        self.tmux
+            .kill_session(&self.tmux_name(target), cancel)
+            .await?;
+        Ok(true)
+    }
+
     /// Remove only stale Inspector sockets. A failed tmux inventory is an
     /// error, never evidence that sockets or sessions are absent.
     pub async fn reap_inspector_sockets(
@@ -715,7 +749,29 @@ exec /bin/sleep 30
             .session_exists("repo-test~review", &cancel)
             .await
             .unwrap();
-        manager.stop(&target, &cancel).await.unwrap();
+        assert!(
+            manager
+                .stop_exact(&target, "different-session", &cancel)
+                .await
+                .is_err()
+        );
+        assert!(
+            tmux.session_exists("repo-test~review", &cancel)
+                .await
+                .unwrap()
+        );
+        assert!(
+            manager
+                .stop_exact(&target, &started_id, &cancel)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !tmux
+                .session_exists("repo-test~review", &cancel)
+                .await
+                .unwrap()
+        );
         let _ = tmux.kill_server(&cancel).await;
         assert!(cold);
         assert_eq!(

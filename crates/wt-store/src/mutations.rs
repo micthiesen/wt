@@ -266,8 +266,13 @@ impl Store {
                     .fold(None, |max, n| Some(max.map_or(n, |m: f64| m.max(n))))
                     .map_or(0.0, |max| max + 1.0)
             };
+            let collection = if slug.starts_with("@remote/") {
+                "remoteLayouts"
+            } else {
+                "slugs"
+            };
             let mut entry = state
-                .get("slugs")
+                .get(collection)
                 .and_then(|slugs| slugs.get(slug))
                 .and_then(Value::as_object)
                 .cloned()
@@ -277,7 +282,7 @@ impl Store {
                 section.map_or(Value::Null, |s| json!(s)),
             );
             entry.insert("order".to_owned(), number(order));
-            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            object_mut(state, collection).insert(slug.to_owned(), Value::Object(entry));
             prune_sections_order(state);
             Ok(((), true))
         })
@@ -539,13 +544,24 @@ impl Store {
         bucket_display: &[String],
     ) -> Result<bool, StoreError> {
         self.mutate_wt_state(|state| {
+            if slug_a == slug_b
+                || !bucket_display.iter().any(|key| key == slug_a)
+                || !bucket_display.iter().any(|key| key == slug_b)
+            {
+                return Ok((false, false));
+            }
             let baseline = all_layouts(state)
                 .filter(|layout| layout.get("section").and_then(Value::as_str) == section)
                 .filter_map(|layout| layout.get("order").and_then(Value::as_f64))
                 .reduce(f64::min)
                 .unwrap_or(0.0);
-            let slugs = object_mut(state, "slugs");
             for (index, slug) in bucket_display.iter().enumerate() {
+                let collection = if slug.starts_with("@remote/") {
+                    "remoteLayouts"
+                } else {
+                    "slugs"
+                };
+                let slugs = object_mut(state, collection);
                 let mut entry = slugs
                     .get(slug)
                     .and_then(Value::as_object)
@@ -558,24 +574,40 @@ impl Store {
                 entry.insert("order".to_owned(), number(baseline + index as f64));
                 slugs.insert(slug.clone(), Value::Object(entry));
             }
-            let Some(a_order) = slugs
+            let collection_a = if slug_a.starts_with("@remote/") {
+                "remoteLayouts"
+            } else {
+                "slugs"
+            };
+            let collection_b = if slug_b.starts_with("@remote/") {
+                "remoteLayouts"
+            } else {
+                "slugs"
+            };
+            let Some(a_order) = state[collection_a]
                 .get(slug_a)
                 .and_then(|entry| entry.get("order"))
                 .cloned()
             else {
                 return Ok((false, false));
             };
-            let Some(b_order) = slugs
+            let Some(b_order) = state[collection_b]
                 .get(slug_b)
                 .and_then(|entry| entry.get("order"))
                 .cloned()
             else {
                 return Ok((false, false));
             };
-            if let Some(entry) = slugs.get_mut(slug_a).and_then(Value::as_object_mut) {
+            if let Some(entry) = state[collection_a]
+                .get_mut(slug_a)
+                .and_then(Value::as_object_mut)
+            {
                 entry.insert("order".to_owned(), b_order);
             }
-            if let Some(entry) = slugs.get_mut(slug_b).and_then(Value::as_object_mut) {
+            if let Some(entry) = state[collection_b]
+                .get_mut(slug_b)
+                .and_then(Value::as_object_mut)
+            {
                 entry.insert("order".to_owned(), a_order);
             }
             Ok((true, true))
@@ -733,6 +765,42 @@ impl Store {
             next.entry("order").or_insert(json!(0));
             next.insert("manualTitle".to_owned(), json!(title));
             next.insert("manualTitleRevision".to_owned(), json!(revision + 1));
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(next));
+            Ok((true, true))
+        })
+    }
+
+    /// Retire a controller-owned title after its exact revision was migrated
+    /// to the host that owns the worktree. A concurrent edit must survive.
+    pub fn clear_slug_manual_title(
+        &mut self,
+        slug: &str,
+        expected_revision: u64,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let Some(previous) = state
+                .get("slugs")
+                .and_then(|all| all.get(slug))
+                .and_then(Value::as_object)
+            else {
+                return Ok((false, false));
+            };
+            let revision = previous
+                .get("manualTitleRevision")
+                .and_then(Value::as_u64)
+                .filter(|revision| *revision <= MAX_SAFE_INTEGER)
+                .unwrap_or(0);
+            if revision != expected_revision || !previous.contains_key("manualTitle") {
+                return Ok((false, false));
+            }
+            if revision >= MAX_SAFE_INTEGER {
+                return Err(StoreError::ManualTitleRevisionExhausted {
+                    slug: slug.to_owned(),
+                });
+            }
+            let mut next = previous.clone();
+            next.remove("manualTitle");
+            next.insert("manualTitleRevision".into(), json!(revision + 1));
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(next));
             Ok((true, true))
         })
@@ -1259,6 +1327,37 @@ impl Store {
                 for (key, value) in &incoming.extra {
                     next.insert(key.clone(), value.clone());
                 }
+                // These values can change while a removal confirmation or
+                // detached worker is pending. Refresh them from the current
+                // slug state in the same transaction as the history insert,
+                // so a stale presentation snapshot cannot undo a newer edit.
+                if let Some(title) = current_slugs
+                    .get(&incoming.slug)
+                    .and_then(|slug| slug.get("manualTitle"))
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                {
+                    next.insert("title".to_owned(), Value::String(title.to_owned()));
+                }
+                if let Some(current_slug) = current_slugs.get(&incoming.slug) {
+                    match current_slug.get("issueId").and_then(Value::as_str) {
+                        Some(issue_id) => {
+                            next.insert("issueId".to_owned(), Value::String(issue_id.to_owned()));
+                        }
+                        None => {
+                            // The live override was cleared after dispatch.
+                            // Let history resolve an issue from the slug.
+                            next.remove("issueId");
+                        }
+                    }
+                }
+                if let Some(current_slug) = current_slugs.get(&incoming.slug) {
+                    if let Some(github_issue) = current_slug.get("githubIssue") {
+                        next.insert("githubIssue".to_owned(), github_issue.clone());
+                    } else {
+                        next.remove("githubIssue");
+                    }
+                }
                 by_slug.insert(incoming.slug.clone(), Value::Object(next));
             }
             let cutoff = now_ms.saturating_sub(REMOVED_MAX_AGE_MS);
@@ -1290,6 +1389,48 @@ impl Store {
             removed.retain(|entry| entry.get("slug").and_then(Value::as_str) != Some(slug));
             let changed = removed.len() != previous;
             Ok((changed, changed))
+        })
+    }
+
+    /// Restore a removed-history row after a failed restore attempt, without
+    /// replacing a newer removal record written for the same slug.
+    pub fn restore_removed_worktree_if_absent(
+        &mut self,
+        slug: &str,
+        entry: &RemovedWorktree,
+    ) -> Result<bool, StoreError> {
+        if entry.slug != slug {
+            return Ok(false);
+        }
+        let value = serde_json::to_value(entry)?;
+        let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        let cutoff = i64::try_from(now_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(REMOVED_MAX_AGE_MS);
+        self.mutate_wt_state(|state| {
+            let removed = array_mut(state, "removed");
+            if removed
+                .iter()
+                .any(|existing| existing.get("slug").and_then(Value::as_str) == Some(slug))
+            {
+                return Ok((false, false));
+            }
+            removed.push(value);
+            removed.retain(|candidate| {
+                candidate
+                    .get("removedAt")
+                    .and_then(Value::as_str)
+                    .and_then(parse_timestamp_ms)
+                    .is_some_and(|removed_at| removed_at >= cutoff)
+            });
+            removed.sort_by(|left, right| {
+                right
+                    .get("removedAt")
+                    .and_then(Value::as_str)
+                    .cmp(&left.get("removedAt").and_then(Value::as_str))
+            });
+            removed.truncate(REMOVED_MAX_ENTRIES);
+            Ok((true, true))
         })
     }
 }

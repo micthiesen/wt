@@ -18,11 +18,12 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         .iter()
         .map(|row| {
             ChainMember::new(
-                &row.slug,
-                &row.branch,
-                state["slugs"][&row.slug]["baseBranch"]
+                &row.key,
+                branch_key(row, &row.branch),
+                state["slugs"][&row.key]["baseBranch"]
                     .as_str()
-                    .map(str::to_owned),
+                    .filter(|base| *base != trunk)
+                    .map(|base| branch_key(row, base)),
             )
         })
         .collect::<Vec<_>>();
@@ -32,12 +33,12 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
     for (index, row) in board.rows.iter().enumerate() {
         let stack = stacks
             .by_branch
-            .get(&row.branch)
+            .get(&branch_key(row, &row.branch))
             .map(|entry| &stacks.layouts[entry.layout_index]);
         let anchor = stack
             .and_then(|stack| stack.nodes.first())
             .map(|root| root.slug.as_str())
-            .unwrap_or(&row.slug);
+            .unwrap_or(&row.key);
         let section = state["slugs"][anchor]["section"]
             .as_str()
             .filter(|name| !name.is_empty());
@@ -66,12 +67,12 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         |slug: &str| work_record_rank(parse_work_status(&state["slugs"][slug]["work"]).as_ref());
     let unit = |index: usize| {
         let row = &board.rows[index];
-        let entry = stacks.by_branch.get(&row.branch);
+        let entry = stacks.by_branch.get(&branch_key(row, &row.branch));
         let stack = entry.map(|entry| &stacks.layouts[entry.layout_index]);
         let slug = stack
             .and_then(|stack| stack.nodes.first())
             .map(|root| root.slug.as_str())
-            .unwrap_or(&row.slug);
+            .unwrap_or(&row.key);
         let status = if sort == UiSort::Status {
             stack
                 .map(|stack| {
@@ -153,10 +154,10 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 let row = &board.rows[index];
                 SpineMember {
                     key: row.key.clone(),
-                    branch: row.branch.clone(),
+                    branch: branch_key(row, &row.branch),
                     parent_branch: stacks
                         .by_branch
-                        .get(&row.branch)
+                        .get(&branch_key(row, &row.branch))
                         .and_then(|entry| entry.node.parent_branch.clone()),
                 }
             })
@@ -182,6 +183,20 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 })
                 .unwrap_or_default();
         }
+    }
+}
+
+/// Identical branch names on different machines do not form a shared stack.
+pub(crate) fn branch_key(row: &wt_tui::BoardRow, branch: &str) -> String {
+    if wt_core::is_remote_worktree_ledger_key(&row.key) {
+        let namespace = row
+            .key
+            .rsplit_once('/')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(&row.key);
+        format!("{namespace}/{branch}")
+    } else {
+        branch.to_owned()
     }
 }
 

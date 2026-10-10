@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Exercise the native worker handshake, snapshot, and encoded SSH command."""
+"""Exercise worker handshake, snapshot, native provisioning, and runtime reuse."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,6 +22,26 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def native_target() -> str:
+    system = (
+        "Darwin"
+        if sys.platform == "darwin"
+        else "Linux"
+        if sys.platform.startswith("linux")
+        else sys.platform
+    )
+    machine = os.uname().machine
+    if (system, machine) in (("Darwin", "arm64"), ("Darwin", "aarch64")):
+        return "aarch64-apple-darwin"
+    if (system, machine) in (("Darwin", "x86_64"), ("Darwin", "amd64")):
+        return "x86_64-apple-darwin"
+    if (system, machine) in (("Linux", "aarch64"), ("Linux", "arm64")):
+        return "aarch64-unknown-linux-gnu"
+    if (system, machine) in (("Linux", "x86_64"), ("Linux", "amd64")):
+        return "x86_64-unknown-linux-gnu"
+    raise AssertionError(f"unsupported native fixture platform: {system} {machine}")
+
+
 def run(argv: list[str], *, cwd: Path, env: dict[str, str], expected: int = 0) -> str:
     result = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=30)
     if result.returncode != expected:
@@ -36,7 +56,9 @@ def git(argv: list[str], *, cwd: Path, env: dict[str, str]) -> None:
     subprocess.run(argv, cwd=cwd, env=env, check=True, capture_output=True, timeout=20)
 
 
-def start_isolated_sshd(root: Path, worker_config: Path, binary: Path) -> tuple[subprocess.Popen, Path] | tuple[None, Path]:
+def start_isolated_sshd(
+    root: Path, worker_config: Path, worker_home: Path
+) -> tuple[subprocess.Popen, Path] | tuple[None, Path]:
     """Start an unprivileged, key-only SSH server; return None if unavailable."""
     log = root / "sshd.log"
     sshd = shutil.which("sshd")
@@ -61,19 +83,30 @@ def start_isolated_sshd(root: Path, worker_config: Path, binary: Path) -> tuple[
     command_log = root / "ssh-original-commands.jsonl"
     wrapper.write_text(
         "#!" + sys.executable + "\n"
-        "import base64, json, os, shlex, sys\n"
-        f"binary = {str(binary)!r}\n"
+        "import base64, json, os, shlex, subprocess, sys\n"
+        f"home = {str(worker_home)!r}\n"
         f"log_path = {str(command_log)!r}\n"
         "command = os.environ.get('SSH_ORIGINAL_COMMAND', '')\n"
         "argv = shlex.split(command)\n"
-        "with open(log_path, 'a') as log: log.write(json.dumps({'command': command, 'argv': argv}) + '\\n')\n"
-        "if len(argv) != 4 or argv[0] != 'exec' or argv[1] != binary or argv[2] != '_remote':\n"
+        "record = {'command': command, 'argv': argv}\n"
+        "if command.startswith(\"printf 'WT_REMOTE_PLATFORM\\\\n'; uname -s; uname -m\"):\n"
+        "    record['kind'] = 'platform'\n"
+        "elif command.startswith('set -eu; umask 077; dir='):\n"
+        "    record['kind'] = 'upload'\n"
+        "elif command.startswith('set -eu\\n'):\n"
+        "    record['kind'] = 'publish' if 'stage=\"$dir/.wt-stage-' in command else 'cache-probe'\n"
+        "elif ' _remote ' in command:\n"
+        "    payload = argv[-1]\n"
+        "    decoded = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))\n"
+        "    if decoded not in (['_hello'], ['version']): raise SystemExit('unexpected encoded worker argv')\n"
+        "    record.update(kind='remote', decoded=decoded)\n"
+        "else:\n"
         "    raise SystemExit('unexpected remote command')\n"
-        "payload = argv[3]\n"
-        "decoded = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))\n"
-        "if decoded not in (['_hello'], ['version']):\n"
-        "    raise SystemExit('unexpected encoded worker argv')\n"
-        "os.execve(binary, [binary, '_remote', payload], os.environ)\n"
+        "with open(log_path, 'a') as log: log.write(json.dumps(record) + '\\n')\n"
+        "env = dict(os.environ, HOME=home)\n"
+        "if record['kind'] == 'remote': os.execve('/bin/sh', ['/bin/sh', '-c', command], env)\n"
+        "result = subprocess.run(['/bin/sh', '-c', command], env=env)\n"
+        "raise SystemExit(result.returncode)\n"
     )
     wrapper.chmod(0o700)
 
@@ -255,7 +288,7 @@ def main() -> None:
             )
         )
 
-        server, actual_command_log = start_isolated_sshd(root, worker_config, binary)
+        server, actual_command_log = start_isolated_sshd(root, worker_config, worker_home)
         transport = "isolated OpenSSH server"
         fallback_reason = None
         ssh_log = root / "ssh-argv.jsonl"
@@ -265,12 +298,24 @@ def main() -> None:
             transport = "fake ssh (isolated OpenSSH unavailable)"
             fallback_reason = actual_command_log.read_text(errors="replace")
             fake_ssh = fake_bin / "ssh"
+            actual_command_log = root / "fake-worker-command.jsonl"
             fake_ssh.write_text(
                 "#!" + sys.executable + "\n"
-                "import json, os, subprocess, sys\n"
+                "import base64, json, os, shlex, subprocess, sys\n"
                 f"with open({str(ssh_log)!r}, 'a') as log: log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                f"command = sys.argv[-1]; argv = shlex.split(command); log_path = {str(actual_command_log)!r}\n"
+                "record = {'command': command, 'argv': argv}\n"
+                "if 'WT_REMOTE_PLATFORM' in command: record['kind'] = 'platform'\n"
+                "elif command.startswith('set -eu; umask 077;'): record['kind'] = 'upload'\n"
+                "elif command.startswith('set -eu\\n'): record['kind'] = 'publish' if 'stage=\"$dir/.wt-stage-' in command else 'cache-probe'\n"
+                "elif ' _remote ' in command:\n"
+                " payload = argv[-1]; decoded = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))\n"
+                " if decoded not in (['_hello'], ['version']): raise SystemExit('unexpected encoded worker argv')\n"
+                " record.update(kind='remote', decoded=decoded)\n"
+                "else: raise SystemExit('unexpected remote command')\n"
+                "with open(log_path, 'a') as log: log.write(json.dumps(record) + '\\n')\n"
                 f"env = dict(os.environ, HOME={str(worker_home)!r}, WT_CONFIG={str(worker_config)!r})\n"
-                "result = subprocess.run(['/bin/sh', '-c', sys.argv[-1]], env=env)\n"
+                "result = subprocess.run(['/bin/sh', '-c', command], env=env)\n"
                 "raise SystemExit(result.returncode)\n"
             )
             fake_ssh.chmod(0o755)
@@ -346,27 +391,29 @@ def main() -> None:
             assert snapshot["protocol"] == 3, snapshot
             assert [row["slug"] for row in snapshot["worktrees"]] == ["remote-check"], snapshot
 
-            version_output = run([str(binary), "remote", "version"], cwd=main_clone, env=env)
-            assert version_output.strip(), "remote version command returned no output"
+            version_argv = [str(binary), "remote", "version"]
+            first_version = run(version_argv, cwd=main_clone, env=env)
+            assert first_version.strip(), "remote version command returned no output"
+            second_version = run(version_argv, cwd=main_clone, env=env)
+            assert second_version == first_version, (first_version, second_version)
+            target = native_target()
+            runtimes = list((worker_home / ".cache/wt/native-runtimes" / target).glob("*/wt"))
+            assert len(runtimes) == 1, runtimes
+            runtime = runtimes[0]
+            runtime_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+            assert runtime.parent.name == runtime_hash, runtime
+            assert runtime.read_bytes() == binary.read_bytes(), runtime
+            runtime.write_bytes(b"corrupted native runtime fixture")
+            third_version = run(version_argv, cwd=main_clone, env=env)
+            assert third_version == first_version, (first_version, third_version)
+
             calls = [json.loads(line) for line in ssh_log.read_text().splitlines()]
-            assert len(calls) == 2, calls
-            remote_calls = (
-                [json.loads(line) for line in actual_command_log.read_text().splitlines()]
-                if server is not None
-                else None
-            )
-            if remote_calls is not None:
-                assert len(remote_calls) == 2, remote_calls
-            decoded = []
-            expected_argv = (["_hello"], ["version"])
-            for call, expected in zip(calls, expected_argv, strict=True):
-                if server is None:
-                    assert call[-2] == "fixture-host", call
-                    command = call[-1]
-                else:
-                    assert call[-2] == "fixture-host", call
-                    command = remote_calls[len(decoded)]["command"]
-                    assert remote_calls[len(decoded)]["argv"] == shlex.split(command), remote_calls[len(decoded)]
+            remote_calls = [json.loads(line) for line in actual_command_log.read_text().splitlines()]
+            assert len(calls) == len(remote_calls), (calls, remote_calls)
+            for call, record in zip(calls, remote_calls, strict=True):
+                assert call[-2] == "fixture-host", call
+                command = record["command"]
+                assert record["argv"] == shlex.split(command), record
                 assert call[:-2] == [
                     "-o",
                     "BatchMode=yes",
@@ -377,18 +424,29 @@ def main() -> None:
                     "-o",
                     "ServerAliveCountMax=3",
                 ], call
-                assert " _remote " in command, command
-                command_argv = shlex.split(command)
-                assert command_argv[:3] == ["exec", str(binary), "_remote"], command_argv
-                encoded = command_argv[3]
-                decoded.append(json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))))
-                assert decoded[-1] == expected, (decoded[-1], expected, command)
+            kinds = [record["kind"] for record in remote_calls]
+            assert kinds.count("platform") == 6, remote_calls
+            assert kinds.count("cache-probe") == 3, remote_calls
+            assert kinds.count("upload") == 2, remote_calls
+            assert kinds.count("publish") == 2, remote_calls
+            encoded_calls = [record["decoded"] for record in remote_calls if record["kind"] == "remote"]
+            assert encoded_calls == [["_hello"], ["_hello"], ["version"]] * 3, remote_calls
+
+            runtimes = list((worker_home / ".cache/wt/native-runtimes" / target).glob("*/wt"))
+            assert len(runtimes) == 1, runtimes
+            runtime = runtimes[0]
+            assert runtime.stat().st_mode & 0o111, runtime
+            assert runtime.read_bytes() == binary.read_bytes(), runtime
+            assert runtime.parent.name == runtime_hash
+            assert f'wt_path = {json.dumps(str(binary))}' in controller_config.read_text()
             print(
                 json.dumps(
                     {
                         "worker_hello_protocol": hello["protocol"],
                         "snapshot_worktrees": len(snapshot["worktrees"]),
-                        "remote_encoded_argv": decoded,
+                        "remote_encoded_argv": encoded_calls,
+                        "runtime_path": str(runtime),
+                        "runtime_sha256": runtime.parent.name,
                         "ssh_transport": transport,
                         "ssh_fallback_reason": fallback_reason,
                     }

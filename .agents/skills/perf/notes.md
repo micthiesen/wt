@@ -27,6 +27,14 @@ despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Rust rewrite measurements remain provisional (2026-10-09).** The earlier
+  24-row debug sample had an optional-edit-stream watcher lifetime bug, so it
+  cannot establish final idle or refresh efficiency. Current isolated PTY
+  checks prove external-edit refresh, no idle frames, metadata-only title
+  writes without Git scans, and navigation during a two-second Git stall
+  (one injected-key-to-output sample: 1.23 ms). Final optimized CPU comparisons,
+  active-output and lifecycle workloads remain owed. Evidence:
+  `/tmp/wt-rust-native-ui-integrated-8`, `/tmp/wt-rust-native-ui-8.log`.
 - **Codex updater ownership and drain exits (2026-10-07).** move-files-to-r2
   exited at 09:56:51 local after `turn/steer failed: Server is draining;
   retry after reconnecting`. Native logs confirm repeated shutdown-signal
@@ -61,6 +69,18 @@ despite roughly 900 MB RSS.
 
 Failure signatures (check these first):
 
+- **macOS watcher registration must be batched.** notify 8.2 restarts its
+  FSEvents stream on each `watch` or `unwatch`. Per-path setup exceeded the
+  native freshness regression's five-second registration limit under four
+  test processes. `paths_mut` applies the changed inventory in one transaction;
+  the same unchanged-limit regression then passed in 2.33 seconds total and
+  the 191-test app/TUI/runtime run passed. Skip the transaction entirely for
+  unchanged paths; keep blocking watcher setup and teardown off the UI path.
+- **Optional observers must not own shared invalidation.** Dropping the
+  automation edit-timestamp handle closed its request queue and previously
+  ended the host filesystem watcher. Disable only that select branch when it
+  closes. The Git/state watcher remains scoped to the host, and registration
+  requests one follow-up Git scan to cover edits during initial watch setup.
 - **Same-version daemon feature mismatch can be a desktop runtime default.**
   On 0.161.0, the shared daemon reported `api_key_model_discovery=false`
   although the CLI default was true. The desktop rollout gate can set that

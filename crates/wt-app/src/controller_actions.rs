@@ -31,9 +31,127 @@ fn modal(modal: UiModal) -> UiReply {
 
 pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) -> Result<UiReply> {
     match action {
-        UiAction::PrepareSection { key } => crate::section_actions::prepare(ctx, key).await,
+        UiAction::PrepareHardRefresh
+        | UiAction::HardRefresh
+        | UiAction::PrepareReviewCheckout { .. }
+        | UiAction::ReviewCheckout { .. }
+        | UiAction::DismissReviewRequest { .. }
+        | UiAction::PrepareReviewers { .. }
+        | UiAction::SubmitReviewers { .. }
+        | UiAction::SetPerf { .. }
+        | UiAction::SetHistoryActive { .. }
+        | UiAction::Restack { .. }
+        | UiAction::PrepareRestoreRemoved { .. }
+        | UiAction::RestoreRemoved { .. }
+        | UiAction::ToggleRemovedAutomations { .. } => {
+            bail!("request must run through its host service")
+        }
+        UiAction::OpenLink { url } => {
+            crate::editor::open_url(ctx, &url).await?;
+            Ok(message("Opened link"))
+        }
+        UiAction::OpenPrLink { url, linear } => {
+            let target = if linear {
+                wt_config::PullRequestTarget::Linear
+            } else {
+                wt_config::PullRequestTarget::Github
+            };
+            crate::editor::open_url(ctx, &wt_github::pull_request_open_url(&url, target)).await?;
+            Ok(message("Opened pull request"))
+        }
+        action @ (UiAction::PrepareSessions { .. }
+        | UiAction::PrepareStopTerminal { .. }
+        | UiAction::StopTerminal { .. }
+        | UiAction::PrepareStopSession { .. }
+        | UiAction::StopSession { .. }) => crate::session_ui::execute(ctx, action).await,
+        UiAction::SelectSession { .. } => bail!("session attachment is owned by the controller"),
+        UiAction::CancelAutomations => {
+            bail!("queued automations must be cancelled through the host service")
+        }
+        UiAction::ToggleAutomations { key } => {
+            let members = board
+                .map(|board| {
+                    board
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            wt_core::ChainMember::new(
+                                &row.key,
+                                row.branch.clone(),
+                                row.base_branch.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let stacks = wt_core::build_stack_index(&members, &ctx.config.branch.base);
+            let stack = key
+                .as_ref()
+                .and_then(|key| members.iter().find(|member| member.slug == *key))
+                .and_then(|member| stacks.by_branch.get(&member.branch))
+                .map(|entry| &stacks.layouts[entry.layout_index])
+                .map(|stack| {
+                    (
+                        stack.stack_id.clone(),
+                        stack
+                            .nodes
+                            .iter()
+                            .map(|node| node.slug.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                });
+            let paused = ctx
+                .database
+                .call(move |store| {
+                    if let Some((id, members)) = stack {
+                        return Ok(store.toggle_stack_automations_paused(&id, &members)?);
+                    }
+                    match key {
+                        Some(slug) => Ok(store.toggle_slug_automations_paused(&slug)?),
+                        None => Ok(store.toggle_global_automations_paused()?),
+                    }
+                })
+                .await?;
+            Ok(message(if paused {
+                "Automations paused"
+            } else {
+                "Automations resumed"
+            }))
+        }
+        UiAction::OnHost { .. } => bail!("host routing must be resolved before local dispatch"),
+        UiAction::PrepareCreate { initial } => Ok(modal(UiModal::Text {
+            action: wt_tui::TextAction::Create,
+            prompt: "New worktree".into(),
+            initial,
+            allow_empty: false,
+        })),
+        UiAction::KillAction { action_key, run_id } => {
+            let killed = crate::actions::service(ctx)?
+                .kill_run(&action_key, &run_id, &ctx.cancellation)
+                .await?;
+            Ok(message(if killed {
+                "Action stopped"
+            } else {
+                "That action is no longer running"
+            }))
+        }
+        UiAction::PrepareActions { .. }
+        | UiAction::PrepareGithub { .. }
+        | UiAction::GithubMarkReady { .. }
+        | UiAction::GithubSetAutoMerge { .. }
+        | UiAction::GithubShip { .. }
+        | UiAction::GithubFailedChecks { .. }
+        | UiAction::GenerateTitle { .. }
+        | UiAction::PrepareAction { .. }
+        | UiAction::RunAction { .. } => {
+            bail!("action palette requests must be routed through their controller")
+        }
+        UiAction::PrepareSection { key } => crate::section_actions::prepare(ctx, key, board).await,
+        UiAction::Reorder { key, section, down } => {
+            crate::section_actions::reorder(ctx, key, section, down, board).await
+        }
         UiAction::MoveSection { key, section } => {
-            crate::section_actions::move_row(ctx, key, section).await
+            crate::section_actions::move_row(ctx, key, section, board).await
         }
         UiAction::RenameSection { old, new } => crate::section_actions::rename(ctx, old, new).await,
         UiAction::FoldSection { key, folded } => {
@@ -155,7 +273,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
         } => {
             let row = resolve_key(ctx, &key).await?;
             let plans = lifecycle_ops::plan(ctx, vec![row]).await?;
-            let plan = plans
+            let mut plan = plans
                 .rows
                 .into_iter()
                 .next()
@@ -192,6 +310,15 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
                     cancel_key: Some('d'),
                 }));
             }
+            if let Some(visible) =
+                board.and_then(|board| board.rows.iter().find(|row| row.key == key))
+                && visible.title != visible.slug
+                && !visible.title.trim().is_empty()
+            {
+                plan.removed_snapshot
+                    .extra
+                    .insert("title".into(), serde_json::json!(visible.title));
+            }
             crate::commands::_destroy::start_remove(
                 ctx,
                 &plan.row,
@@ -201,6 +328,7 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
                     landed: plan.landed,
                     destroy_stage: plan.destroy_stage,
                     expected_revision: Some(plan.revision.clone()),
+                    removed_snapshot: Some(plan.removed_snapshot.clone()),
                 },
             )
             .await?;
@@ -249,8 +377,14 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
             lifecycle_ops::cleanup_confirmed(ctx, &revisions).await?,
         )),
         UiAction::ToggleArchive { key } => {
-            let row = resolve_key(ctx, &key).await?;
-            let slug = row.target.slug().to_owned();
+            if wt_core::is_remote_worktree_ledger_key(&key) {
+                board
+                    .and_then(|board| board.rows.iter().find(|row| row.key == key))
+                    .context("remote worktree metadata is still loading")?;
+            } else {
+                resolve_key(ctx, &key).await?;
+            }
+            let slug = key;
             let archived = ctx
                 .database
                 .call(move |store| {
@@ -364,7 +498,9 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
             Ok(message("Issue updated"))
         }
         UiAction::OpenUrl { key, kind } => {
-            resolve_key(ctx, &key).await?;
+            if !wt_core::is_remote_worktree_ledger_key(&key) {
+                resolve_key(ctx, &key).await?;
+            }
             let row = board
                 .and_then(|board| board.rows.iter().find(|row| row.key == key))
                 .context("worktree metadata is still loading")?;
@@ -375,20 +511,12 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
                 UrlKind::StageOrDev => row.stage_url.as_deref().or(row.dev_url.as_deref()),
             }
             .context("no URL is available for this worktree")?;
-            if !url.starts_with("https://") && !url.starts_with("http://") {
-                bail!("refusing to open a URL with an unsupported scheme");
-            }
-            #[cfg(target_os = "macos")]
-            let command = wt_platform::process::CommandSpec::new("open");
-            #[cfg(not(target_os = "macos"))]
-            let command = wt_platform::process::CommandSpec::new("xdg-open");
-            let mut command = command.args([url]);
-            command.preserve_children_on_success = true;
-            let name = command.program.clone();
-            ctx.processes
-                .run(command, &ctx.cancellation)
-                .await?
-                .checked(name)?;
+            let url = if kind == UrlKind::PullRequest {
+                wt_github::pull_request_open_url(url, ctx.config.github.pr_target)
+            } else {
+                url.to_owned()
+            };
+            crate::editor::open_url(ctx, &url).await?;
             Ok(message("Opened URL"))
         }
         UiAction::Session { .. } => unreachable!("session handoff is owned by the controller"),

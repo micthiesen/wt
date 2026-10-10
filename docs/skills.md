@@ -5,8 +5,8 @@ skills coding agents need to work well with wt (in `skills/` of the wt
 checkout) plus a small always-on instructions block, and keeps the installed
 copies current on your machine — across every harness, through whatever
 symlink or rulesync topology your dotfiles use. The point is that you never
-hand-maintain wt-related agent config: updates ship with `git pull` in the
-wt checkout and offer themselves on the next launch.
+hand-maintain wt-related agent config: bundled updates ship in the native
+release and are offered on the next launch.
 
 The native Rust binary embeds these files at compile time and does not need a
 source checkout at runtime. `wt skills` tracks installed hashes and saved
@@ -76,7 +76,7 @@ So when a papercut teaches something, the lesson goes into the repo's
 `AGENTS.md` in full and reaches the block only as the shortest imperative that
 changes behaviour — or not at all, which is the common case.
 
-`registry.test.ts` holds a line budget on the block for the same reason. It
+The bundle tests hold a line budget on the block for the same reason. It
 had grown to 2.5x that budget one reasonable-looking addition at a time, and
 no single addition was ever the problem, which is why the check is a number
 rather than a review habit.
@@ -129,7 +129,7 @@ ever rewrites the region between its own markers.
 
 Detection follows the real filesystem, per tool configured on the machine.
 The tools here are the ones wt installs *into* — a superset of the harnesses
-it can start sessions for (`core/harness/`). Pi, for instance, reads the
+it can start sessions for (`crates/wt-harness/`). Pi, for instance, reads the
 shared instructions file and `~/.agents/skills` without wt ever spawning it.
 
 - **Configured means the config dir has CONTENT.** An empty `~/.config/<tool>`

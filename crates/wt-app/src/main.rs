@@ -1,5 +1,13 @@
+mod action_builtins;
+mod action_dispatch;
+mod action_palette;
+mod action_source;
 mod actions;
 mod activity_source;
+mod automation_builtins;
+mod automation_engine;
+mod automation_facts;
+mod automation_source;
 mod board_layout;
 mod bootstrap;
 mod commands;
@@ -13,17 +21,43 @@ mod editor;
 mod events;
 mod fork_base;
 mod freshness;
+mod github_actions;
 mod github_events_source;
+mod github_pickers;
+mod hard_refresh;
 mod harness;
+mod history_actions;
+mod history_source;
+mod host_cleanup;
+mod host_dispatch;
+mod host_protocol;
+mod host_routing;
+mod host_server;
+mod host_service;
+mod host_stdio;
 mod install;
 mod inventory;
+mod issue_identity;
+mod issue_source;
 mod lifecycle_ops;
 mod local_source;
 mod logging;
+mod naming;
+mod naming_source;
 mod origin;
+mod perf_source;
 mod prompt;
 mod remote;
+mod remote_board;
+mod remote_cache;
+mod remote_host;
+mod restack_action;
+mod review_requests;
 mod section_actions;
+mod session_activity;
+mod session_board;
+mod session_source;
+mod session_ui;
 mod skills;
 mod sources;
 mod updates;
@@ -87,6 +121,8 @@ enum Command {
     /// Execute one acknowledged, durable action job.
     #[command(name = "_action-worker", hide = true)]
     ActionWorker(commands::_action_worker::ActionWorkerArgs),
+    #[command(name = "_restack-worker", hide = true)]
+    RestackWorker(commands::_restack_worker::RestackWorkerArgs),
     /// Manage the optional GitHub webhook daemon.
     Events(commands::events::EventsArgs),
     /// Inspect SST stages and safely clean confirmed orphaned stages.
@@ -105,6 +141,10 @@ enum Command {
     Dev(commands::dev::DevArgs),
     #[command(name = "_dev-supervise", hide = true)]
     DevSupervisor(commands::dev::DevSupervisorArgs),
+    #[command(name = "_dev-giveup", hide = true)]
+    DevGiveup(commands::_dev_giveup::DevGiveupArgs),
+    #[command(name = "_claude-hook", hide = true)]
+    ClaudeHook(commands::_claude_hook::ClaudeHookArgs),
     /// Install a verified native release without a source checkout.
     Install(commands::install::InstallArgs),
     /// Forward a command to the configured native SSH worker.
@@ -119,6 +159,8 @@ enum Command {
     Session { args: Vec<String> },
     #[command(name = "_remote", hide = true)]
     WorkerDispatch { args: Vec<String> },
+    #[command(name = "_host", hide = true)]
+    Host,
     /// Install or inspect checked native releases.
     Update(commands::update::UpdateArgs),
     /// Activate a previously installed native version.
@@ -246,6 +288,9 @@ fn run(cli: Cli) -> Result<i32> {
                 boot.confirm().await?;
             }
             match &cli.command {
+                Some(Command::ClaudeHook(args)) => {
+                    return commands::_claude_hook::run(args).await;
+                }
                 Some(Command::Install(args)) => {
                     return commands::install::run(&options, args, &token).await;
                 }
@@ -342,18 +387,18 @@ async fn run_application(
             tracing::warn!(%error, "GitHub events service reconciliation failed");
         }
     });
-    let sources = sources::start(scope, &context);
-    let controller = controller::start(
+    let commands = tokio_util::sync::CancellationToken::new();
+    let host = Arc::new(host_service::HostService::start(
         scope,
-        context,
-        sources.local,
-        sources.metadata,
-        sources.board.clone(),
-        controller_port,
-    );
+        context.clone(),
+        commands,
+    ));
+    let fleet = remote_board::start(scope, &context, host);
+    let board = fleet.board.clone();
+    let controller = controller::start(scope, context, fleet, controller_port);
     // A child cancellation token does not cancel its parent. The terminal
     // token handles Ctrl+C and explicit application shutdown owns the scope.
-    let result = wt_tui::run(sources.board, actions, token).await;
+    let result = wt_tui::run(board, actions, token).await;
     scope.cancel();
     let actions_finished = controller.shutdown().await;
     let shutdown = scope.shutdown(Duration::from_secs(5)).await;
@@ -367,6 +412,7 @@ async fn run_application(
 async fn dispatch_command(context: &context::AppContext, command: &Command) -> Result<i32> {
     match command {
         Command::ActionWorker(args) => commands::_action_worker::run(context, args).await,
+        Command::RestackWorker(args) => commands::_restack_worker::run(context, args).await,
         Command::Events(args) => commands::events::run(context, args).await,
         Command::Stages(args) => commands::stages::run(context, args).await,
         Command::State(args) => commands::state::run(context, args).await,
@@ -376,6 +422,8 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::Perf(args) => commands::perf::run(context, args).await,
         Command::Dev(args) => commands::dev::run(context, args).await,
         Command::DevSupervisor(args) => commands::dev::run_supervisor_command(context, args).await,
+        Command::DevGiveup(args) => commands::_dev_giveup::run(context, args).await,
+        Command::ClaudeHook(args) => commands::_claude_hook::run(args).await,
         Command::Skills(args) => commands::skills::run(context, args).await,
         Command::Agent(args) => commands::agent::run(context, args).await,
         Command::Claude(args) => commands::claude::run(context, args).await,
@@ -402,6 +450,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::Snapshot { args } => commands::_snapshot::run(context, args).await,
         Command::Session { args } => commands::_session::run(context, args).await,
         Command::WorkerDispatch { args } => Box::pin(commands::_remote::run(context, args)).await,
+        Command::Host => host_server::run(context).await,
         Command::Version => {
             println!(
                 "wt {} ({}, {})",

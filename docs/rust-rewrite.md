@@ -36,14 +36,23 @@ Libraries and architecture remain revisable when evidence warrants it.
 
 ## Current work
 
-Foundation and native workflow integration remain in progress. `wt-config` owns
+Current state (2026-10-09): the native application and domain integrations are
+implemented across the workspace, including automation evaluation and dispatch,
+action history/logs, remote hosts, naming, manager tools, and the TUI. The
+details below are checkpoint history, not a current checklist or a claim that
+the acceptance criteria above have been met. `docs/rust-rewrite-inventory.md`
+tracks remaining parity work; release readiness and performance improvement
+must be established separately before promotion.
+
+`wt-config` owns
 configuration discovery/schema; `wt-store` owns durable SQLite state and payload
 migrations; `wt-platform` owns subprocess lifetime and resource bounds;
 `wt-runtime` owns source scheduling and task lifetimes; `wt-core` owns pure
 status, identity, edge and stack rules. `wt-vcs` and `wt-tmux` provide external
 adapters. `wt-lifecycle` owns creation/removal safety and filesystem copying.
 `wt-harness` has Claude, Codex and OpenCode discovery, lifecycle and message
-adapters; application integration and real installed-harness smoke remain owed.
+adapters, integrated through the application layer. Real installed-harness
+smoke coverage remains a separate verification requirement.
 `wt-app` connects services to the event-driven `wt-tui` presentation and exposes
 status, base, section, edge, lifecycle, merge, open and destroy-log commands.
 The terminal has a shared Unicode line editor and an asynchronous command
@@ -62,10 +71,9 @@ removal jobs and rechecked under the lifecycle lock. A CLI bootstrap command
 creates repository config atomically and requires an explicit/inherited branch
 namespace so a first installation does not depend on an existing global config.
 
-The native agent/manager/hold commands and embedded skills are being integrated.
-Skills crate tests (8) and TUI tests (13) passed in their scoped runs. App-level
-testing is deliberately serialized after the current shared-contract edits;
-mid-edit compiler output is not recorded as verification.
+The native agent, manager, hold, and automation command paths are integrated.
+Historical scoped test results below apply only to the checkpoint named beside
+them; consult the current handoff and integration run for present verification.
 
 Native release packaging validates the compiled binary's exact build/target
 identity and creates deterministic archives. Four packaging tests pass,
@@ -162,11 +170,11 @@ Additional integration evidence:
   job removal and recorded PID exit before changing its plist. The expanded
   isolated fixture passes failure, malformed job tables, live-PID drain timeout,
   already-unloaded success, webhook authentication and durable snapshots.
-- The native action fixture passes with a private tmux server: absolute config
-  selectors, live stdout/stderr logs, durable completion preserving unknown
-  metadata, duplicate-run rejection, and child reaping on cancellation. Actions
-  and automation evaluation/ledger are implemented as services; application
-  dispatch, palettes and source integration remain outstanding.
+- The native action fixture passed at this checkpoint with a private tmux
+  server: absolute config selectors, live stdout/stderr logs, durable completion
+  preserving unknown metadata, duplicate-run rejection, and child reaping on
+  cancellation. Application dispatch and source integration were completed in
+  later checkpoints; this entry records only the fixture result at that time.
 - The rebuilt checkpoint binary passes cleanup retention and the section-enabled
   PTY fixture again: 1.16 ms navigation during two-second Git work, zero idle
   frames, zero Git scans for a title edit, section filing/renaming, durable writes

@@ -222,10 +222,13 @@ pub async fn startup_check(
     config: &Config,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    if options
-        .env
-        .get("WT_UPDATE")
-        .is_some_and(|value| value == "off")
+    // The controller installs an exact worker runtime before connecting.
+    // An interactive worker must not independently offer a different build.
+    if config.instance.role == wt_config::InstanceRole::Worker
+        || options
+            .env
+            .get("WT_UPDATE")
+            .is_some_and(|value| value == "off")
         || !config.update.startup_check
     {
         return Ok(());

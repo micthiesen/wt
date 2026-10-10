@@ -9,49 +9,34 @@ disk. It's the local-materialization axis, selected by `[backend] kind`
 | `git-worktree` (default) | `git worktree add/remove` | one shared db with the main clone | `git worktree list --porcelain` |
 | `rift` | copy-on-write clone ([`rift`](https://github.com/anomalyco/rift)) | **independent** `.git` per checkout | scan the worktree root for `.rift` markers |
 
-The seam is deliberately narrow: `create` and `remove` are the only two
-filesystem mutation points (`core/backend/`, behind the `core/backend.ts`
-barrel). Everything else wt does to a worktree — the fork-base record,
-env/configured-glob copy, `.sst/stage` pin, upstream wiring, lock, dirty/merged/gone
-status — is backend-agnostic and lives in `lifecycle.ts` / `worktree.ts`.
+The lifecycle service selects the backend for create and remove operations.
+Fork-base records, configured file copies, `.sst/stage` pinning, upstream
+wiring, locks, and worktree status are handled by the native lifecycle and VCS
+crates. The backend selection is defined in `crates/wt-config` and implemented
+by `crates/wt-lifecycle`.
 
 ## Why rift
 
 `rift create` copy-on-write-clones the whole working tree (APFS
 `clonefile` on macOS, btrfs snapshots / reflinks on Linux). File data is
 shared until modified, although creating file metadata still takes time
-on large trees. With `--copy-all` it brings
-`node_modules` across without a package install, so a rift checkout has packages
-installed the moment it exists, with no install step. wt passes
-`--copy-all` always; the `--no-install` flag (`runInstall`) is a no-op
-for this backend.
+on large trees. With `--copy-all` it brings project files across without a package install,
+so any dependencies already present in the main clone are present immediately.
+wt passes `--copy-all` to `rift create`.
 
-wt looks for the `rift` executable on its own `PATH` first, then falls
-back to asking the user's login shell (`$SHELL -lc`, via `whence -p` /
-`type -P` so a shell function named `rift` can't shadow the binary).
-That keeps the backend working when wt is spawned from a lean
-environment — launchd, an editor task, an agent harness — whose `PATH`
-misses user-level bins like `~/.bun/bin`.
+wt resolves the `rift` executable from the process `PATH`. Ensure it is
+available to the environment that launches wt, including editor or agent
+processes.
 
-The copy is only as fresh as the main clone it's cloned from, so wt keeps
-the main clone's `node_modules` in sync with trunk: whenever a fetch
-fast-forwards the main clone and the pulled commits changed the repo's
-lockfile, wt runs the detected package manager's frozen install there —
-`pnpm install --frozen-lockfile`, `npm ci`, `bun install
---frozen-lockfile`, `yarn install --frozen-lockfile`, or the `[lifecycle]
-install_command` override (see `syncMainDeps` in `core/worktree.ts` and
-`core/install.ts`). It's gated on the lockfile actually
-changing, the frozen variant keeps the main clone clean, and the
-background fetch interval does it ahead of time — so a rift checkout
-copies an up-to-date `node_modules` without any per-create install. (This
-runs for the git-worktree backend too; it's plain main-clone hygiene.) A
-`.rift.toml` postcreate hook still works if you want a per-checkout sync
-on top, but it's usually redundant.
+Rift copies the project tree from the main clone. Dependencies are present
+when they exist in that tree, but wt does not synchronize package installs as
+part of the native worktree lifecycle. A `.rift.toml` postcreate hook can run
+project-specific setup when required.
 
 ## Setup
 
-The `rift` binary must be on `PATH` (`npm i -g rift-snapshot`), and the
-main clone must be rift-registered (`rift init`). wt runs `rift init`
+The `rift` binary must be on `PATH`, and the main clone must be
+rift-registered (`rift init`). wt runs `rift init`
 **lazily** on the first create (idempotent, guarded on the `.rift`
 marker) rather than at startup, so launching wt never pays a rift
 subprocess. If `rift` isn't installed, create/remove fail with a clear
@@ -117,14 +102,13 @@ and it drives the rest of the design:
   worktree's branch and objects live in the shared main-clone database and
   survive the directory, while a rift clone owns its own, so removal takes
   the branch, the objects and the reflog with it — there is nothing to
-  recover from. Every destroy path checks dirtiness itself before calling
-  `remove` (`destroyHazard` for the TUI, the `worktreeIsDirty` filters in
-  `cli/commands/{rm,clean}.ts`); a new one must too.
+  recover from. Every destroy path checks dirtiness itself before calling remove; keep that
+  guard in `crates/wt-lifecycle` and the CLI cleanup planning path.
 - **Restacking.** `R` / `wt restack` replays each slice in its own
   worktree. A rift slice can't see a sibling slice's branch as a LOCAL ref
   (separate object stores), so the engine resolves a parent through the
   `origin/<parent>` remote-tracking ref every clone carries instead of the
-  bare branch name (`anchorParentRef` in `core/stack-ops/replay.ts`) — it
+  bare branch name (`crates/wt-stack/src/replay.rs`) — it
   prefers the local branch when present (git-worktree, unpushed-safe) and
   falls back to `origin/<parent>`, so it works with rift's own ref layout
   rather than around it. For the Pass-2 rebase target — the parent's
@@ -140,7 +124,7 @@ and it drives the rest of the design:
   prune-backups` also sweeps each rift slice's own clone, since backups are
   created per-clone.
 - **Base resolution for reads.** The conflict-probe glyph and the diff /
-  sync counts resolve a stacked slice's base through `effectiveBaseOrTrunk`:
+  sync counts resolve a stacked slice's base through the shared stack-base resolver:
   the local branch if present (git-worktree), else `origin/<parent>` (the
   only ref a rift clone has for a sibling), else trunk. Keeping a rift
   clone's `origin/<parent>` fresh (the restack does this on replay; it's
@@ -156,21 +140,19 @@ and it drives the rest of the design:
   before spawning a session in a rift checkout, wt marks the path trusted
   via the harness's optional `ensureTrusted` hook: Claude in `~/.claude.json`
   (`.projects["<path>"].hasTrustDialogAccepted = true`,
-  `core/harness/claude/trust.ts`), Codex in `$CODEX_HOME/config.toml`
+  `crates/wt-harness/src/claude/`), Codex in `$CODEX_HOME/config.toml`
   (`[projects."<path>"] trust_level = "trusted"`,
-  `core/harness/codex/trust.ts`). Idempotent and best-effort; skipped once
+  `crates/wt-harness/src/codex/`). Idempotent and best-effort; skipped once
   already trusted. The Codex entry lives in a tracked (stowed) config, so
   it's removed on teardown — Claude's `~/.claude.json` is its own churny,
-  untracked file and is left. OpenCode has no such gate. (Both mirror the
-  `unseamless-coop` fleet.)
+  untracked file and is left. OpenCode has no such gate.
 
   **The Claude write is verified, and repairs its siblings.** `~/.claude.json`
   is one shared blob that Claude Code also read-modify-writes, and its window
   between reading at startup and flushing its snapshot back is *seconds*
   against the ~2.3ms wt spends — so a wt write can be complete, atomic, and
-  gone. `ensureTrustInFile` therefore reads back after the rename and re-applies
-  (3 attempts, 60/200ms), and reports on `log.attention.*` when it still could
-  not make it stick, because the next thing the user sees is the dialog. It also
+  gone. The trust writer therefore reads back after the rename and re-applies
+  (3 attempts, 60/200ms), and reports an attention warning when it still could not make it stick, because the next thing the user sees is the dialog. It also
   re-asserts every rift sibling under the same worktree root that Claude already
   has an entry for: a stale flush wipes a whole snapshot rather than one key, so
   a per-path seed heals one worktree per spawn and leaves the rest — six starts
@@ -215,7 +197,7 @@ ref is the same lie pointing the other way.
 
 **The trunk has two spellings and only one of them was normalized.**
 A fork-base record is written for trunk forks too, storing the BARE
-branch name (`baseBranch: "staging"`). `effectiveBaseOrTrunk` recognized
+branch name (a recorded fork-base branch of `staging`). the resolver recognized
 `origin/staging` and fell through on `staging` — into a preference for a
 LOCAL branch of that name, which exists in every rift clone (`clone -b
 staging` leaves one) and which nothing ever moves: the freshen above
@@ -259,7 +241,7 @@ merges behind. It compares ref VALUES now.
 Neither is reproducible in `scripts/fixture.sh`, which writes no
 `[backend]` section and therefore runs `git-worktree`, where the ref
 store is shared and every clone's answer is the same answer. See
-`src/core/fetch-origin.test.ts` for fixtures that model separate clones.
+`crates/wt-vcs/src/origin.rs` for origin and clone behavior.
 
 ## Self-healing registry
 
@@ -275,8 +257,8 @@ so a manual `rm -rf` of a rift worktree doesn't wedge the next create.
 Backend (how a checkout is materialized *locally*) is a separate axis
 from any remote/SSH-host feature (*where* a worktree lives). A remote
 host runs its own wt with its own `[backend]` config; the two compose.
-Keep new backend logic inside `core/backend/` and the two `lifecycle.ts`
-mutation points — don't spread backend branching across the flows.
+Keep backend selection in the lifecycle service and the `wt-vcs` backend
+implementation; do not spread backend branching through UI actions.
 
 ## Known limitations (rift)
 

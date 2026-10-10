@@ -18,6 +18,8 @@ pub type Metadata = (Value, BTreeSet<String>);
 pub struct LocalSources {
     pub board: SourceHandle<Board>,
     pub metadata: SourceHandle<Metadata>,
+    pub git: SourceHandle<Vec<WorktreeSnapshot>>,
+    pub edits: SourceHandle<std::collections::BTreeMap<String, i64>>,
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
@@ -54,15 +56,20 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
         },
     );
     let board = project(scope, context.config.clone(), git.clone(), metadata.clone());
-    freshness::start(
+    let edits = freshness::start(
         scope,
         context.config.clone(),
         context.repository.clone(),
         board.clone(),
-        git,
+        git.clone(),
         metadata.clone(),
     );
-    LocalSources { board, metadata }
+    LocalSources {
+        board,
+        metadata,
+        git,
+        edits,
+    }
 }
 
 fn project(

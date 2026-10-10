@@ -219,10 +219,12 @@ impl CodexMessenger {
             &tmux_name,
             &target.cwd,
             &target.slug,
-            None,
+            session_id.as_deref(),
             &target.text,
             cold_started,
-            if was_live {
+            if is_codex_command(&target.text) {
+                "Codex slash commands execute through the interactive terminal"
+            } else if was_live {
                 "live Codex slot has no recoverable thread UUID"
             } else {
                 "new Codex thread has no UUID until its first prompt"
@@ -350,15 +352,7 @@ impl CodexMessenger {
                     reason: format!("Codex slot {name} exited before terminal fallback"),
                 });
             };
-            let ready = if is_codex_command(text) {
-                live.harness_session_id.as_deref() == session_id
-                    && self
-                        .tmux
-                        .capture_pane(&target, Some(40), cancel)
-                        .await
-                        .map(|pane| codex_pane_is_idle(&pane))
-                        .unwrap_or(false)
-            } else if let Some(id) = session_id {
+            let ready = if let Some(id) = session_id {
                 // Ownership is rechecked under the cross-process injection
                 // lock immediately before typing.
                 if live.harness_session_id.as_deref() != Some(id) {
@@ -367,11 +361,7 @@ impl CodexMessenger {
                 {
                     let thread_ready = read_codex_tail(&file.path, file.mtime_ms, file.size)?
                         .is_some_and(|tail| {
-                            tail.parse_complete
-                                && matches!(
-                                    tail.last_task_event.as_deref(),
-                                    Some("task_complete" | "turn_aborted")
-                                )
+                            closed_turn(tail.parse_complete, tail.last_task_event.as_deref())
                         });
                     thread_ready
                         && self
@@ -514,4 +504,33 @@ fn is_codex_command(text: &str) -> bool {
         && command
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+fn closed_turn(parse_complete: bool, last_event: Option<&str>) -> bool {
+    parse_complete && matches!(last_event, Some("task_complete" | "turn_aborted"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_require_a_closed_turn_and_an_empty_ordinary_composer() {
+        assert!(is_codex_command("/compact focus on current work"));
+        assert!(!is_codex_command("/Users/michael/file"));
+        for event in [None, Some("task_started")] {
+            assert!(!closed_turn(true, event));
+        }
+        assert!(!closed_turn(false, Some("task_complete")));
+        assert!(closed_turn(true, Some("task_complete")));
+        assert!(closed_turn(true, Some("turn_aborted")));
+        assert!(codex_pane_is_idle("output\n› Ask Codex to do anything"));
+        assert!(!codex_pane_is_idle(
+            "Working (esc to interrupt)\n› Ask Codex to do anything"
+        ));
+        assert!(!codex_pane_is_idle(
+            "› Ask Codex to do anything\nAllow command?\n› 1. Yes"
+        ));
+        assert!(!codex_pane_is_idle("› user draft"));
+    }
 }

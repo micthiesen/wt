@@ -38,6 +38,26 @@ pub fn is_remote_worktree_ledger_key(key: &str) -> bool {
     key.starts_with(REMOTE_LEDGER_PREFIX)
 }
 
+/// Decode only canonical keys. Malformed remote-looking keys never fall back
+/// to local slugs, and aliases cannot address another host's persisted state.
+pub fn parse_worktree_ledger_key(key: &str) -> Option<WorktreeRef> {
+    if let Some(rest) = key.strip_prefix(REMOTE_LEDGER_PREFIX) {
+        let (host, slug) = rest.split_once('/')?;
+        let reference = WorktreeRef::Remote {
+            host: decode_uri_component(host)?,
+            slug: decode_uri_component(slug)?,
+        };
+        if host.is_empty() || slug.is_empty() || worktree_ledger_key(&reference) != key {
+            return None;
+        }
+        Some(reference)
+    } else if !key.is_empty() && !key.starts_with('@') && !key.chars().any(char::is_control) {
+        Some(WorktreeRef::Local { slug: key.into() })
+    } else {
+        None
+    }
+}
+
 /// Human-facing identity for logs sourced from a location-aware ledger key.
 pub fn worktree_ledger_label(key: &str) -> String {
     let Some(rest) = key.strip_prefix(REMOTE_LEDGER_PREFIX) else {

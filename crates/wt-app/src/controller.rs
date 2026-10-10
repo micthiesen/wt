@@ -1,14 +1,18 @@
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
+use std::{
+    collections::{BTreeSet, HashMap, VecDeque},
+    sync::Arc,
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use wt_runtime::{SourceHandle, TaskScope};
-use wt_tui::{ActionController, Board, UiAction, UiReply};
+use wt_runtime::TaskScope;
+use wt_tui::{ActionController, UiReply};
 
 use crate::context::AppContext;
 
-/// Accepted commands are serialized and drained on shutdown. Background
-/// refreshes and input run independently, so a slow command cannot stall them.
+/// Commands serialize within each host and drain on shutdown. Independent
+/// hosts progress concurrently, so an unavailable host cannot block local work.
 /// Services own their own cancellation and irreversible commit boundaries.
 pub struct Controller {
     task: JoinHandle<()>,
@@ -37,90 +41,134 @@ impl Controller {
 pub fn start(
     scope: &TaskScope,
     mut context: AppContext,
-    source: SourceHandle<Board>,
-    metadata: SourceHandle<crate::local_source::Metadata>,
-    board: SourceHandle<Board>,
+    fleet: crate::remote_board::Fleet,
     mut port: ActionController,
 ) -> Controller {
     let shutdown = scope.token();
-    // UI/source cancellation closes admission but must not cancel commands
-    // already accepted. Their own deadline and explicit drain own cancellation.
-    let cancel = CancellationToken::new();
+    let cancel = fleet.local.context.cancellation.clone();
     context.cancellation = cancel.clone();
+    let context = Arc::new(context);
+    let fleet = Arc::new(fleet);
     let task = scope.spawn(async move {
+        let mut pending = VecDeque::new();
+        let mut busy = BTreeSet::new();
+        let mut running = tokio::task::JoinSet::new();
+        let mut task_lanes = HashMap::new();
+        let mut failed_lanes = BTreeSet::new();
+        let mut closed = false;
+        let mut draining = false;
         loop {
-            let command = tokio::select! {
+            while running.len() < 4 {
+                let Some((lane, request)) = take_available(&mut pending, &busy) else { break; };
+                let wt_tui::UiRequest { generation, action: command } = request;
+                busy.insert(lane.clone());
+                let context = context.clone();
+                let fleet = fleet.clone();
+                let replies = port.replies.clone();
+                let shutdown = shutdown.clone();
+                let task_lane = lane.clone();
+                let task = running.spawn(async move {
+                    let retry = create_retry(&command);
+                    let result = crate::host_dispatch::execute(&context, &fleet, command, &replies, &shutdown).await;
+                    let mut reply = match result {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            tracing::error!(%error, "TUI action failed");
+                            let mut reply = UiReply { message: format!("{error:#}"), failed: true, ..Default::default() };
+                            let ambiguous = error.downcast_ref::<crate::remote_host::RemoteHostError>()
+                                .is_some_and(|error| matches!(error, crate::remote_host::RemoteHostError::Ambiguous { .. }));
+                            if !ambiguous && let Some((host, input)) = retry {
+                                reply.modal_host = host;
+                                reply.modal = Some(wt_tui::UiModal::Text { action: wt_tui::TextAction::Create,
+                                    prompt: "New worktree: ".into(), initial: input, allow_empty: false });
+                            }
+                            reply
+                        }
+                    };
+                    reply.ui_generation = Some(generation);
+                    (lane, reply)
+                });
+                task_lanes.insert(task.id(), task_lane);
+            }
+            if closed && pending.is_empty() && running.is_empty() { break; }
+            tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => { port.requests.close(); port.requests.recv().await }
-                command = port.requests.recv() => command,
-            };
-            let Some(command) = command else {
-                break;
-            };
-            let retry_create = if let UiAction::Create { input } = &command {
-                Some(input.clone())
-            } else {
-                None
-            };
-            let snapshot = board.snapshot();
-            let state_only = matches!(
-                &command,
-                UiAction::FoldSection { .. }
-                    | UiAction::MoveSection { .. }
-                    | UiAction::RenameSection { .. }
-                    | UiAction::SetTitle { .. }
-                    | UiAction::ToggleArchive { .. }
-                    | UiAction::SetStatus { .. }
-                    | UiAction::SetBase { .. }
-                    | UiAction::SetIssueOverride { .. }
-            );
-            let read_only = matches!(
-                &command,
-                UiAction::Copy { .. }
-                    | UiAction::OpenEditor { .. }
-                    | UiAction::OpenUrl { .. }
-                    | UiAction::PrepareRemove { .. }
-                    | UiAction::PrepareCleanup
-                    | UiAction::PrepareStatus { .. }
-                    | UiAction::PrepareBase { .. }
-                    | UiAction::PrepareSection { .. }
-            );
-            let result = if let UiAction::Session { key, target } = command {
-                handoff(&context, key, target, &port.replies, &shutdown).await
-            } else {
-                crate::controller_actions::execute(&context, command, snapshot.data.as_deref())
-                    .await
-            };
-            let reply = match result {
-                Ok(reply) => {
-                    if state_only {
-                        metadata.refresh();
-                    } else if !read_only {
-                        source.refresh();
-                    }
-                    reply
-                }
-                Err(error) => {
-                    tracing::error!(%error, "TUI action failed");
-                    UiReply {
-                        message: wt_core::sanitize_terminal_text(&format!("{error:#}")),
-                        failed: true,
-                        modal: retry_create.map(|initial| wt_tui::UiModal::Text {
-                            action: wt_tui::TextAction::Create,
-                            prompt: "New worktree".into(),
-                            initial,
-                            allow_empty: false,
-                        }),
-                        ..Default::default()
-                    }
-                }
-            };
-            // If the terminal closed, accepted commands still finish. A closed
-            // response channel never cancels a durable write.
-            let _ = port.replies.send(sanitize_reply(reply)).await;
+                _ = shutdown.cancelled(), if !draining => {
+                    draining = true;
+                    port.requests.close();
+                },
+                finished = running.join_next_with_id(), if !running.is_empty() => match finished {
+                    Some(Ok((id, (lane, reply)))) => {
+                        task_lanes.remove(&id);
+                        busy.remove(&lane);
+                        let _ = port.replies.send(sanitize_reply(reply)).await;
+                    },
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "action worker exited unexpectedly");
+                        let _ = port.replies.send(UiReply { failed: true, message: format!("Action worker failed: {error}"), ..Default::default() }).await;
+                        if let Some(lane) = task_lanes.remove(&error.id()) {
+                            failed_lanes.insert(lane.clone());
+                            busy.remove(&lane);
+                            let skipped = pending.iter().filter(|(queued, _)| *queued == lane).count();
+                            pending.retain(|(queued, _)| *queued != lane);
+                            if skipped > 0 {
+                                let _ = port.replies.send(UiReply { failed: true, message: format!("{skipped} queued commands on the failed host were not started. Restart wt before retrying."), ..Default::default() }).await;
+                            }
+                        }
+                    },
+                    None => {},
+                },
+                command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
+                    Some(command) => match lane_for(&command.action) {
+                        Ok(lane) if !failed_lanes.contains(&lane) => pending.push_back((lane, command)),
+                        Ok(_) => { let _ = port.replies.send(UiReply { failed: true, message: "Host command worker failed; this command was not started. Restart wt before retrying.".into(), ..Default::default() }).await; },
+                        Err(error) => { let _ = port.replies.send(UiReply { failed: true, message: format!("{error:#}"), ..Default::default() }).await; },
+                    },
+                    None => closed = true,
+                },
+            }
         }
     });
     Controller { task, cancel }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Lane {
+    Host(Option<String>),
+    Presentation,
+    Terminal,
+}
+
+fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
+    let (host, action, _) = crate::host_routing::resolve(action.clone())?;
+    Ok(
+        if matches!(
+            action,
+            wt_tui::UiAction::Session { .. } | wt_tui::UiAction::SelectSession { .. }
+        ) {
+            Lane::Terminal
+        } else if crate::host_routing::controller_owned(&action) {
+            Lane::Presentation
+        } else {
+            Lane::Host(host)
+        },
+    )
+}
+
+fn take_available<T>(
+    pending: &mut VecDeque<(Lane, T)>,
+    busy: &BTreeSet<Lane>,
+) -> Option<(Lane, T)> {
+    let position = pending.iter().position(|(lane, _)| !busy.contains(lane))?;
+    pending.remove(position)
+}
+
+fn create_retry(action: &wt_tui::UiAction) -> Option<(Option<String>, String)> {
+    let (host, action, _) = crate::host_routing::resolve(action.clone()).ok()?;
+    match action {
+        wt_tui::UiAction::Create { input } => Some((host, input)),
+        _ => None,
+    }
 }
 
 fn sanitize_reply(mut reply: UiReply) -> UiReply {
@@ -128,7 +176,13 @@ fn sanitize_reply(mut reply: UiReply) -> UiReply {
     if let Some(modal) = &mut reply.modal {
         let clean = wt_core::sanitize_terminal_text;
         match modal {
-            wt_tui::UiModal::Confirm { title, lines, .. } => {
+            wt_tui::UiModal::Reviewers { candidates, .. } => {
+                for option in candidates {
+                    option.label = wt_core::sanitize_terminal_text(&option.label);
+                }
+            }
+            wt_tui::UiModal::Confirm { title, lines, .. }
+            | wt_tui::UiModal::Log { title, lines } => {
                 *title = clean(title);
                 for line in lines {
                     *line = clean(line);
@@ -151,14 +205,11 @@ fn sanitize_reply(mut reply: UiReply) -> UiReply {
     reply
 }
 
-async fn handoff(
-    context: &AppContext,
-    key: Option<String>,
-    target: wt_tui::SessionTarget,
+pub(crate) async fn handoff_prepared(
+    prepared: crate::harness::PreparedSession,
     replies: &tokio::sync::mpsc::Sender<UiReply>,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
-    let prepared = crate::harness::ui_session(context, key, target).await?;
     let (ready, suspended) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
     replies
@@ -203,4 +254,61 @@ async fn handoff(
         message: "Returned from session".into(),
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wt_tui::UiAction;
+
+    #[test]
+    fn busy_host_preserves_its_order_without_blocking_other_hosts() {
+        let remote = Lane::Host(Some("builder".into()));
+        let local = Lane::Host(None);
+        let title = |value: &str| UiAction::SetTitle {
+            key: "same".into(),
+            title: value.into(),
+        };
+        let mut pending = VecDeque::from([
+            (remote.clone(), title("first")),
+            (remote.clone(), title("second")),
+            (local.clone(), title("local")),
+        ]);
+        let busy = BTreeSet::from([remote.clone()]);
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((local, title("local")))
+        );
+        assert_eq!(take_available(&mut pending, &busy), None);
+        assert_eq!(
+            take_available(&mut pending, &BTreeSet::new()),
+            Some((remote.clone(), title("first")))
+        );
+        assert_eq!(
+            take_available(&mut pending, &BTreeSet::new()),
+            Some((remote, title("second")))
+        );
+    }
+
+    #[test]
+    fn qualified_rows_and_captured_create_modals_keep_their_host_lane() {
+        let action = UiAction::SetTitle {
+            key: wt_core::remote_worktree_ledger_key("builder", "same"),
+            title: "title".into(),
+        };
+        assert_eq!(
+            lane_for(&action).unwrap(),
+            Lane::Host(Some("builder".into()))
+        );
+        let action = UiAction::OnHost {
+            host: Some("builder".into()),
+            action: Box::new(UiAction::Create {
+                input: "retry title".into(),
+            }),
+        };
+        assert_eq!(
+            create_retry(&action),
+            Some((Some("builder".into()), "retry title".into()))
+        );
+    }
 }

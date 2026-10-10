@@ -157,6 +157,9 @@ pub struct ReviewRequestPr {
     pub title: String,
     pub repo_name_with_owner: String,
     pub head_ref_name: Option<String>,
+    /// Immutable commit identity for safe checkout of a review request.
+    #[serde(default)]
+    pub head_ref_oid: Option<String>,
     pub author: Option<String>,
     pub is_draft: bool,
     pub checks: PrChecks,

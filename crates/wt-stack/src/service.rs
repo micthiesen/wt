@@ -109,12 +109,47 @@ impl StackService {
         }
     }
 
+    /// Check whether a restack could acquire every lifecycle lock for the
+    /// currently resolved chain without waiting. This is advisory: `restack`
+    /// resolves and acquires the chain again before doing any work.
+    pub async fn is_busy(
+        &self,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, StackError> {
+        if cancellation.is_cancelled() {
+            return Err(StackError::Cancelled);
+        }
+        let Some(chain) = self
+            .resolve_chain(branch, &self.config.trunk_branch, cancellation)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut slugs = chain
+            .steps
+            .iter()
+            .map(|step| step.slug.clone())
+            .collect::<Vec<_>>();
+        slugs.sort();
+        slugs.dedup();
+        let mut locks = Vec::with_capacity(slugs.len());
+        for slug in slugs {
+            match FileLock::try_acquire(&self.config.lock_dir, &slug, "restack").await? {
+                Some(lock) => locks.push(lock),
+                None => return Ok(true),
+            }
+        }
+        drop(locks);
+        Ok(false)
+    }
+
     pub async fn restack(
         &self,
         branch: &str,
         options: RestackOptions,
         cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(StackEvent),
+        on_event: &mut (dyn FnMut(StackEvent) + Send),
     ) -> Result<RestackOutcome, StackError> {
         let result = self
             .restack_inner(branch, options, cancellation, on_event)
@@ -131,7 +166,7 @@ impl StackService {
         branch: &str,
         options: RestackOptions,
         cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(StackEvent),
+        on_event: &mut (dyn FnMut(StackEvent) + Send),
     ) -> Result<RestackOutcome, StackError> {
         let stack_trunk = self.config.trunk_branch.clone();
         let trunk = options.onto.unwrap_or_else(|| stack_trunk.clone());
@@ -248,7 +283,7 @@ impl StackService {
         &self,
         older_than_days: u64,
         cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(StackEvent),
+        on_event: &mut (dyn FnMut(StackEvent) + Send),
     ) -> Result<PruneBackupsResult, StackError> {
         prune_backups(
             &self.config,
@@ -368,7 +403,7 @@ impl StackService {
         chain: &RestackChain,
         trunk: &str,
         cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(StackEvent),
+        on_event: &mut (dyn FnMut(StackEvent) + Send),
     ) -> Result<BTreeSet<String>, StackError> {
         let in_chain = chain
             .steps

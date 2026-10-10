@@ -30,14 +30,17 @@ struct Cached {
 
 /// A stale, foreign-build or incomplete cache is disposable. Live fetches are
 /// the fallback, and retain their own last-good data on an actual fetch error.
-pub async fn load(context: &AppContext, branches: &[String]) -> Option<GithubData> {
+pub async fn load(
+    context: &AppContext,
+    branches: &[String],
+) -> Option<(GithubData, tokio::time::Instant)> {
     context.config.github.events.as_ref()?;
     read(
         context.config.paths.cache_root.join("events"),
         branches.to_vec(),
     )
     .await
-    .map(|cached| cached.data.as_ref().clone())
+    .map(|cached| (cached.data.as_ref().clone(), cached.observed_at))
 }
 
 async fn read(directory: PathBuf, branches: Vec<String>) -> Option<Cached> {
@@ -175,14 +178,16 @@ fn project(
                 .and_then(|cached| cached.as_ref().clone());
             let usable = cached.as_ref().filter(|cached| {
                 cached.observed_at.elapsed() <= FRESH
+                    && live_snapshot
+                        .updated_at
+                        .is_none_or(|live_at| cached.observed_at >= live_at)
                     && branches
                         .iter()
                         .all(|branch| cached.covered.contains(branch))
             });
-            // Live requests use this same cache first and fetch over the
-            // network only when it is unavailable. A request that began before
-            // a new daemon snapshot must not overwrite it merely by finishing
-            // later. The fresh, complete daemon snapshot is authoritative.
+            // A direct hard refresh can be newer than the daemon snapshot.
+            // A cache-backed read preserves its original observation time,
+            // so comparing timestamps cannot manufacture freshness.
             let use_cache = usable.is_some();
             if use_cache {
                 let cached = usable.unwrap();
@@ -195,7 +200,12 @@ fn project(
             } else {
                 // Once a previously displayed snapshot expires, ask the live
                 // lane for replacement even if no new webhook arrives.
-                if served_cache && usable.is_none() {
+                let live_is_newer = cached.as_ref().is_some_and(|cached| {
+                    live_snapshot
+                        .updated_at
+                        .is_some_and(|live_at| live_at >= cached.observed_at)
+                });
+                if served_cache && !live_is_newer {
                     live.refresh();
                 }
                 publisher.publish(live_snapshot);
@@ -322,6 +332,7 @@ mod tests {
             revision: 0,
         });
         let cached = validate(snapshot(), &["feature".into()], 100_000, "current").unwrap();
+        let earlier_request = cached.observed_at - Duration::from_secs(1);
         cache_publisher.publish(SourceSnapshot {
             data: Some(Arc::new(Some(cached))),
             state: SourceState::Ready,
@@ -353,7 +364,7 @@ mod tests {
         live_publisher.publish(SourceSnapshot {
             data: Some(Arc::new(stale)),
             state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
+            updated_at: Some(earlier_request),
             revision: 0,
         });
         tokio::time::timeout(Duration::from_secs(2), updates.changed())
@@ -369,6 +380,36 @@ mod tests {
                 .merge_queue
                 .is_empty()
         );
+        // A later explicit network refresh must supersede the daemon's old
+        // snapshot, even while that cached snapshot is still within its TTL.
+        let mut fresh = GithubData::default();
+        fresh.merge_queue.insert(
+            "fresh".into(),
+            wt_github::MergeQueueEntry {
+                head_ref_name: "fresh".into(),
+                position: 1,
+                state: wt_github::MergeQueueState::Queued,
+                enqueued_at: String::new(),
+                estimated_time_to_merge: None,
+            },
+        );
+        live_publisher.publish(SourceSnapshot {
+            data: Some(Arc::new(fresh)),
+            state: SourceState::Ready,
+            updated_at: Some(tokio::time::Instant::now()),
+            revision: 0,
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            updates.wait_for(|s| {
+                s.data
+                    .as_ref()
+                    .is_some_and(|d| d.merge_queue.contains_key("fresh"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(25), live_publisher.requested())
                 .await

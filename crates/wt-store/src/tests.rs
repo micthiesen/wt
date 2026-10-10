@@ -468,6 +468,12 @@ fn manual_title_cas_counts_same_text_edit_and_rejects_delayed_result() {
     assert_eq!(state["slugs"]["task"]["manualTitle"], "Pinned title");
     assert_eq!(state["slugs"]["task"]["manualTitleRevision"], 2);
     assert_eq!(state["futureRoot"], true);
+    assert!(!store.clear_slug_manual_title("task", 1).unwrap());
+    assert!(store.clear_slug_manual_title("task", 2).unwrap());
+    let state = store.read_wt_state().unwrap();
+    assert!(state["slugs"]["task"]["manualTitle"].is_null());
+    assert_eq!(state["slugs"]["task"]["manualTitleRevision"], 3);
+    assert_eq!(state["futureRoot"], true);
 }
 
 #[test]
@@ -686,6 +692,74 @@ fn removed_history_keeps_verification_obligation_and_pause_across_minimal_confir
     assert_eq!(entry["automationsPaused"], true);
     assert_eq!(entry["landedOnAtRemoval"], "base");
     assert_eq!(entry["prMergeCommitOid"], "merge-sha");
+}
+
+#[test]
+fn failed_restore_reinserts_exact_history_only_when_no_newer_removal_exists() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let old = RemovedWorktree {
+        slug: "task".to_owned(),
+        branch: "feature/task".to_owned(),
+        removed_at: "2026-10-09T00:00:00Z".to_owned(),
+        work: None,
+        automations_paused: Some(true),
+        extra: Map::from_iter([("futureField".to_owned(), json!({"preserve": true}))]),
+    };
+    assert!(
+        store
+            .restore_removed_worktree_if_absent("task", &old)
+            .unwrap()
+    );
+    assert_eq!(store.read_removed_worktrees().unwrap(), vec![old.clone()]);
+    assert!(store.clear_removed_worktree("task").unwrap());
+
+    let newer = RemovedWorktree {
+        removed_at: "2026-10-09T00:01:00Z".into(),
+        ..old.clone()
+    };
+    store
+        .record_removed_worktrees(std::slice::from_ref(&newer), 1_791_540_060_000)
+        .unwrap();
+    assert!(
+        !store
+            .restore_removed_worktree_if_absent("task", &old)
+            .unwrap()
+    );
+    assert_eq!(store.read_removed_worktrees().unwrap(), vec![newer]);
+}
+
+#[test]
+fn mixed_host_ordering_stays_in_controller_layout_and_preserves_unknown_fields() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let remote = "@remote/server/one";
+    store.write_repository_state_json(r#"{"slugs":{"local":{"order":1,"manualTitle":"Keep"}},"remoteLayouts":{"@remote/server/one":{"order":2,"future":42}}}"#).unwrap();
+    assert!(
+        store
+            .swap_orders("local", remote, None, &["local".into(), remote.into()])
+            .unwrap()
+    );
+    let state = store.read_wt_state().unwrap();
+    assert!(state["slugs"].get(remote).is_none());
+    assert_eq!(state["slugs"]["local"]["manualTitle"], "Keep");
+    assert_eq!(state["remoteLayouts"][remote]["future"], 42);
+    assert!(
+        state["remoteLayouts"][remote]["order"].as_f64().unwrap()
+            < state["slugs"]["local"]["order"].as_f64().unwrap()
+    );
+    store.place_slug(remote, Some("Next"), true).unwrap();
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["remoteLayouts"][remote]["section"], "Next");
+    assert!(state["slugs"].get(remote).is_none());
 }
 
 #[test]

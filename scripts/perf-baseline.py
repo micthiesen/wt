@@ -168,7 +168,7 @@ def main():
     executable = shutil.which(command[0])
     if executable is None:
         parser.error(f"executable not found: {command[0]}")
-    command[0] = executable
+    command[0] = str(Path(executable).resolve())
     command[1:] = [str(Path(arg).resolve()) if Path(arg).is_file() else arg for arg in command[1:]]
     scenarios = args.scenarios.split(",")
     if any(s not in ("idle", "navigation", "refresh") for s in scenarios):

@@ -55,14 +55,22 @@ pub fn backstop(ctx: &AppContext) -> Duration {
 
 /// Fetches have their own lane. A keyboard refresh may request Git/network
 /// work, but a local title/status write never reaches this owner.
+pub struct OriginSources {
+    pub board: SourceHandle<Board>,
+    pub origin: Option<SourceHandle<FetchOriginReport>>,
+}
+
 pub fn overlay(
     scope: &TaskScope,
     ctx: &AppContext,
     board: SourceHandle<Board>,
     local: SourceHandle<Board>,
-) -> SourceHandle<Board> {
+) -> OriginSources {
     if std::env::var("WT_FETCH_ORIGIN").as_deref() == Ok("off") {
-        return board;
+        return OriginSources {
+            board,
+            origin: None,
+        };
     }
     let origin = start_source(
         scope,
@@ -80,6 +88,7 @@ pub fn overlay(
     );
     let (source, mut publisher) = source_channel();
     let cancellation = scope.token();
+    let refresh = origin.clone();
     let backstop = backstop(ctx);
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
@@ -118,5 +127,8 @@ pub fn overlay(
             publisher.publish(snapshot);
         }
     });
-    source
+    OriginSources {
+        board: source,
+        origin: Some(refresh),
+    }
 }

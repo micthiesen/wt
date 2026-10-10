@@ -155,7 +155,10 @@ impl ProcessRunner {
         spec: CommandSpec,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, ProcessError> {
-        self.run_inner(spec, cancellation, None).await
+        // Pipe capture holds sizeable read buffers across awaits. Keep that
+        // state on the heap once, rather than embedding it through every
+        // service future up to a small-stack runtime worker.
+        Box::pin(self.run_inner(spec, cancellation, None)).await
     }
 
     /// Run with bounded in-memory capture while forwarding every read chunk
@@ -174,8 +177,7 @@ impl ProcessRunner {
     where
         F: Fn(ProcessStream, &[u8]) + Send + Sync + 'static,
     {
-        self.run_inner(spec, cancellation, Some(Arc::new(observer)))
-            .await
+        Box::pin(self.run_inner(spec, cancellation, Some(Arc::new(observer)))).await
     }
 
     async fn run_inner(

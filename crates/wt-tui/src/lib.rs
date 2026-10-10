@@ -3,14 +3,22 @@
 
 mod actions;
 mod editor;
+mod help;
+mod history;
 mod model;
+mod output;
 mod render;
+mod reviews;
 mod terminal;
 
 pub use actions::{
-    ActionController, ConfirmAction, PickerAction, PickerOption, RemovalRevision, SessionTarget,
-    TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UrlKind, action_channel,
+    ActionController, ActionSurface, ConfirmAction, PickerAction, PickerOption, RemovalRevision,
+    ReviewerOption, SessionMode, SessionSelection, SessionTarget, TerminalHandoff, TextAction,
+    UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
 };
 pub use editor::LineEditor;
-pub use model::{Board, BoardRow, BoardSection, Interaction, Model};
+pub use model::{
+    Board, BoardRow, BoardSection, HostChoice, Interaction, LogView, Model, RemovedHistoryRow,
+    RemovedHistorySnapshot, ReviewRequestRow, SessionView,
+};
 pub use terminal::run;

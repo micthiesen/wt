@@ -15,7 +15,7 @@ Automation queue entries include their remaining settle delay, followed by runni
 and outcome entries. External task-action success/failure stays in attention.
 Explicit `[[actions]].key` bindings may use lowercase letters or digits in `!`.
 
-`wt` with no arguments launches the TUI. Press `?` inside for the built-in keymap + glyph legend (with `/` to filter it) — that overlay is always the most current reference; this page is the tour. The overlay's title also shows the running version (the source clone's git short hash — see [`wt version`](cli.md#wt-version)).
+`wt` with no arguments launches the TUI. Press `?` inside for the built-in keymap + glyph legend (with `/` to filter it) — that overlay is always the most current reference; this page is the tour. The overlay's title also shows the running version (the native build identity — see [`wt version`](cli.md#wt-version)).
 
 The top-right usage badge follows the selected primary harness. Codex shows remaining allowance, for example `weekly 38% left (4d12h)`; Claude continues to show percent used.
 
@@ -36,7 +36,7 @@ decorative bars with compact text; long commands retain a truncation mark.
 
 **New PR comments land on the attention feed.** When someone else comments on a worktree's PR (a top-level comment or a review body), the line shows up as `<login> commented: <first ~100 chars>` under that worktree — nothing in git moves when a coworker types, so without this the comment lives only in the details pane. Bots and your own comments are filtered out, and a comment is narrated once: the first observation after startup is treated as history, so you get the backlog that arrived while wt was down but never a replay of the whole conversation (more than three at once collapse to a single `N new PR comments (…)` line). Inline review-thread replies aren't included — the details pane's unresolved-thread count covers those.
 
-Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the state files — plus the optional [GitHub webhook daemon](github-events.md) — invalidate exactly what changed. `r` re-fetches as a backstop; `Ctrl+R` (with confirm) nukes all cached data and refetches from scratch. GitHub-side changes have no local signal at all, so the PR fetch also re-runs every 3 minutes (or on the daemon's own backstop when it's configured) — that interval is the worst case for how late a comment can reach the feed.
+Freshness is push-based: fs watchers on git refs, worktree dirs, locks, and the state files — plus the optional [GitHub webhook daemon](github-events.md) — invalidate exactly what changed. `r` requests a refresh; `Ctrl+R` (with confirmation) clears derived naming and GitHub picker caches, bypasses the cached webhook snapshot once, and refreshes sources. Durable state, action history, automation delivery records, and session identity remain intact. GitHub-side changes have no local signal at all, so the PR fetch also re-runs every 3 minutes (or on the daemon's own backstop when it's configured) — that interval is the worst case for how late a comment can reach the feed.
 
 ## Keymap
 
@@ -166,8 +166,7 @@ Inside these four special sessions, `F10`/`F11`/`F12` all return to wt — slots
 
 Answers one question: *the machine feels slow — is that us?*
 
-A filtered `btop` scoped to everything descending from the wt process or
-its private tmux server. The headline is a verdict line (wt's share of
+A prepared process snapshot scoped to wt descendants and its private tmux server. The headline is a verdict line (wt's share of
 the CPU actually in use, not of installed capacity — the latter reads
 reassuringly small on a 12-core box even when wt owns all of it),
 followed by system meters, a breakdown by category (agents, tests,
@@ -180,25 +179,23 @@ instead of sending you hunting through worktrees.
 |---|---|
 | `P` / `Esc` / `q` | open / close |
 | `j` / `k` | scroll (the shared overlay keymap: `PgUp`/`PgDn` half-page, `g`/`G` top/bottom) |
-| `i` | send the snapshot to the wt-source session (`,`) as an investigation prompt, then enter that session |
-| `r` | resample now |
+| `i` | toggle continuous two-second sampling |
+| `r` | take one fresh sample |
 
 The overlay also hunts for **leaked headless wt instances** — processes
-orphaned to launchd when a terminal died without the process exiting
+orphaned after a terminal died without the process exiting
 (the SIGHUP handler makes current builds exit; older builds and wedged
 teardowns can survive). Any found get a verdict-level warning plus a
 LEAKED section listing pids, CPU, and a ready-to-run `kill` line —
 they'd otherwise keep polling GitHub and duplicating attention-feed
 lines invisibly. The `i` investigation prompt includes them.
 
-Sampling runs only while the overlay is open (every 2s, four shell-outs)
-and stops entirely when it closes — nothing polls in the background, and
-the snapshot is never persisted to the query cache.
+Sampling starts when the overlay opens. Continuous sampling is opt-in with
+`i` and runs every two seconds; closing the overlay stops sampling. The
+snapshot is prepared off the input thread and is not persisted as durable state.
 
 The same snapshot is available headless as [`wt perf`](cli.md#wt-perf---json)
-(`--json` for the raw structure) — the default output is the `i`-key
-report, so an agent outside the TUI can be handed one command instead
-of a screenshot.
+(`--json` for the raw structure); its default output is a readable summary.
 
 Two accuracy notes. On macOS, `ps` `%CPU` is a **decaying average over up
 to one minute, not an instantaneous sample**. A process showing 130%
@@ -208,42 +205,15 @@ active + wired + compressor pages (Activity Monitor's definition) rather
 than `os.freemem()`, which counts only genuinely free pages and so reads
 ~90% used on any machine that's been up a while.
 
-Unrelated but adjacent: `WT_PERF=1 bun src/main.ts` arms an event-loop
-lag probe that logs delayed event-loop scheduling, including synchronous
-work and OS descheduling. That's the tool for "j/k feels laggy"; this
-overlay is the tool for "the whole
-machine feels slow".
+The native build has no event-loop lag probe. Use the prepared `wt perf` snapshot and the TUI performance overlay to inspect process and machine load.
 
-### Error overlay
+### Errors and diagnostics
 
-Unhandled errors in the TUI process (uncaught exceptions, unhandled
-promise rejections, React render errors) are **captured instead of
-printed** — a raw stack trace on stdout/stderr while the renderer owns
-the terminal garbles the panes. Captured errors go to a small in-memory
-ring (last 5) plus the daily log (full stack), a footer toast flashes,
-and this overlay pops automatically. It has no opening key: if another
-modal is open it waits its turn and pops when that modal closes;
-dismissing acknowledges everything shown, so only a *new* error re-pops
-it.
-
-| key | action |
-|---|---|
-| `j` / `k` | scroll the stack (shared overlay keymap: `PgUp`/`PgDn` half-page, `g`/`G` top/bottom) |
-| `i` | send the error to the wt-source session (`,`) as an investigate-and-fix prompt, then enter that session |
-| `y` | copy the error (origin, timestamp, full stack) to the clipboard |
-| `Esc` / `q` | dismiss (acknowledge) |
-
-An **uncaught exception does not kill wt** — the process keeps running
-(the state sources are re-derived queries that self-heal), but the
-overlay shows a "state may be inconsistent; restart when convenient"
-banner for the rest of the run. Identical back-to-back errors collapse
-into one entry with a `×N` counter rather than flooding the ring. A
-crash *while rendering* can't use a modal (the app tree is gone), so it
-gets a minimal full-screen crash view instead: `r` retries the render,
-`y` copies, `q` quits cleanly.
-
-Test hook: `WT_DEBUG_THROW=1` (or `=rejection`) fires a synthetic
-error ~1.5s after startup — that's how the capture path is probed.
+Command failures are reported in the activity/attention output with their
+operation context. Source failures remain visible through source status and
+attention messages; the native TUI does not provide a full-screen uncaught-error overlay or
+render-recovery controls. For process and
+machine diagnostics, open the `P` performance overlay or run `wt perf`.
 
 ### Removed-worktrees view (`h`)
 

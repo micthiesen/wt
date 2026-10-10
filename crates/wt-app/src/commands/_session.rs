@@ -4,24 +4,39 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use tokio::process::Command;
 use wt_config::{HarnessId, InstanceRole};
-use wt_tui::SessionTarget;
+use wt_tui::{SessionSelection, SessionTarget};
 
-use crate::{context::AppContext, harness::ui_session_with_harness};
+use crate::{
+    context::AppContext,
+    harness::{prepare_session, ui_session_with_harness},
+};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum RemoteTarget {
     Shell,
     Diff,
     Harness,
+    Manager,
+    Main,
+    Wt,
+    Dotfiles,
 }
 
 pub async fn run(context: &AppContext, args: &[String]) -> Result<i32> {
-    if !(2..=3).contains(&args.len()) {
-        eprintln!("usage: wt _session <slug> <shell|diff|harness> [harness]");
-        return Ok(2);
-    }
     if context.config.instance.role != InstanceRole::Worker {
         bail!("remote session requires [instance] role = \"worker\" on this host");
+    }
+    if args.len() == 1 {
+        let selection: SessionSelection =
+            serde_json::from_str(&args[0]).context("parse structured session selection")?;
+        let prepared = prepare_session(context, &selection).await?;
+        return attach(context, prepared).await;
+    }
+    if !(2..=3).contains(&args.len()) {
+        eprintln!(
+            "usage: wt _session <SessionSelection JSON> | <slug> <shell|diff|harness|manager|main|wt|dotfiles> [harness]"
+        );
+        return Ok(2);
     }
     let target = RemoteTarget::from_str(&args[1], false)
         .map_err(|_| anyhow::anyhow!("unknown remote session target: {}", args[1]))?;
@@ -38,14 +53,29 @@ pub async fn run(context: &AppContext, args: &[String]) -> Result<i32> {
         RemoteTarget::Shell => SessionTarget::Shell,
         RemoteTarget::Diff => SessionTarget::Diff,
         RemoteTarget::Harness => SessionTarget::Harness,
+        RemoteTarget::Manager => SessionTarget::Manager,
+        RemoteTarget::Main => SessionTarget::Main,
+        RemoteTarget::Wt => SessionTarget::WtSource,
+        RemoteTarget::Dotfiles => SessionTarget::Dotfiles,
     };
-    let inventory = context.repository.inventory(&context.cancellation).await?;
-    let record = inventory
-        .iter()
-        .find(|record| !record.is_main && record.target.slug() == args[0])
-        .with_context(|| format!("remote worktree not found: {}", args[0]))?;
-    let key = wt_core::worktree_target_key(&record.target);
-    let prepared = ui_session_with_harness(context, Some(key), target, harness).await?;
+    let key = if matches!(
+        target,
+        SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff
+    ) {
+        let inventory = context.repository.inventory(&context.cancellation).await?;
+        let record = inventory
+            .iter()
+            .find(|record| !record.is_main && record.target.slug() == args[0])
+            .with_context(|| format!("remote worktree not found: {}", args[0]))?;
+        Some(wt_core::worktree_target_key(&record.target))
+    } else {
+        None
+    };
+    let prepared = ui_session_with_harness(context, key, target, harness).await?;
+    attach(context, prepared).await
+}
+
+async fn attach(context: &AppContext, prepared: crate::harness::PreparedSession) -> Result<i32> {
     let mut child = Command::new(prepared.program)
         .args(prepared.args)
         .current_dir(prepared.cwd)

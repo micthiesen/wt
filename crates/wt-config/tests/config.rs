@@ -61,7 +61,7 @@ fn snapshot(config: &Config) -> serde_json::Value {
         "devServer": config.dev_server.as_ref().map(|server| json!({ "command": server.command, "portBase": server.port_base,
             "portRange": server.port_range, "urlTemplate": server.url, "maxConcurrent": server.max_concurrent,
             "stopCommand": server.stop_command, "resetCommand": server.reset_command, "healthCommand": server.health_command })),
-        "remote": config.remote.as_ref().map(|remote| json!({ "host": remote.host, "label": remote.label, "wtPath": remote.wt_path })),
+        "remote": config.remotes.first().map(|remote| json!({ "host": remote.host, "label": remote.label, "wtPath": remote.wt_path })),
         "naming": config.naming.as_ref().map(|naming| json!({ "autoRename": naming.auto_rename,
             "harness": format!("{:?}", naming.harness).to_lowercase(), "models": naming.models,
             "reasoningEffort": format!("{:?}", naming.reasoning_effort).to_lowercase(),
@@ -436,8 +436,8 @@ fn optional_sections_keep_their_typed_values_and_defaults() {
         config.dev_server.as_ref().unwrap().url,
         "http://localhost:{{port}}/"
     );
-    assert_eq!(config.remote.as_ref().unwrap().label, "worker");
-    assert_eq!(config.remote.as_ref().unwrap().wt_path, "~/.wt/bin/wt");
+    assert_eq!(config.remotes[0].label, "worker");
+    assert_eq!(config.remotes[0].wt_path, "~/.wt/bin/wt");
     assert_eq!(
         config.naming.as_ref().unwrap().harness,
         NamingHarness::Codex

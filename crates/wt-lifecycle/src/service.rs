@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
@@ -130,6 +130,9 @@ pub struct RemoveOptions {
     pub delete_branch: bool,
     pub landed: bool,
     pub destroy_stage: bool,
+    /// Caller snapshot captured while the row was visible. Its display data is
+    /// persisted at the removal commit point after identity is revalidated.
+    pub removed_snapshot: Option<RemovedWorktree>,
 }
 
 /// Bounded snapshot of the exact checkout that was shown in a destructive
@@ -205,13 +208,25 @@ pub struct LifecycleService {
     runner: ProcessRunner,
     id_pattern: Option<Regex>,
     dev: Option<wt_dev::DevServerService>,
+    before_remove: Option<BeforeRemoveHook>,
 }
+
+type BeforeRemoveHook = Arc<
+    dyn Fn(WorktreeTarget, CancellationToken) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Default)]
 struct CreateProgress {
     checkout_created: bool,
     checkout_attempted: bool,
     branch_created: bool,
+}
+
+struct ReviewHead {
+    number: u64,
+    expected: String,
 }
 
 impl LifecycleService {
@@ -223,11 +238,26 @@ impl LifecycleService {
             runner,
             id_pattern,
             dev: None,
+            before_remove: None,
         }
     }
 
     pub fn with_dev_server(mut self, dev: wt_dev::DevServerService) -> Self {
         self.dev = Some(dev);
+        self
+    }
+
+    /// Install app-owned teardown that runs after the slug lock and removal
+    /// revision/hazard checks have passed, before project hooks or deletion.
+    /// Cleanup failures are retained as warnings; cancellation still aborts.
+    pub fn with_before_remove<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(WorktreeTarget, CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Vec<String>> + Send + 'static,
+    {
+        self.before_remove = Some(Arc::new(move |target, cancellation| {
+            Box::pin(hook(target, cancellation))
+        }));
         self
     }
 
@@ -243,7 +273,133 @@ impl LifecycleService {
         }
         let slug = self.dir_slug(branch);
         let _lock = self.acquire_lock(&slug, "create", cancellation).await?;
-        if self.config.reserved_slugs.contains(&slug) {
+        self.create_locked(branch, &slug, options, cancellation)
+            .await
+    }
+
+    /// Create a worktree from a pinned GitHub pull-request head when the
+    /// request's branch is absent from both local and origin branch refs.
+    /// The branch lock covers collision checks, fetch, and checkout. The
+    /// synthetic fetch ref is never persisted as stack metadata.
+    pub async fn create_from_pull_request(
+        &self,
+        branch: &str,
+        pull_number: u64,
+        expected_head: &str,
+        options: CreateOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateResult, LifecycleError> {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return Err(LifecycleError::Invalid("branch must not be empty".into()));
+        }
+        if !valid_object_id(expected_head) {
+            return Err(LifecycleError::Invalid(
+                "pull request head must be a full hexadecimal object id".into(),
+            ));
+        }
+        let slug = self.dir_slug(branch);
+        let _lock = self
+            .acquire_lock(&slug, "create review worktree", cancellation)
+            .await?;
+        self.create_locked_inner(
+            branch,
+            &slug,
+            options,
+            Some(ReviewHead {
+                number: pull_number,
+                expected: expected_head.to_ascii_lowercase(),
+            }),
+            cancellation,
+        )
+        .await
+    }
+
+    /// Restore a removed checkout only if the exact removal shown to the user
+    /// is still current. The check and create run under the same per-slug lock
+    /// used by create/remove, so a newer removal cannot be consumed by a stale
+    /// history selection.
+    pub async fn create_from_removed(
+        &self,
+        slug: &str,
+        expected_branch: &str,
+        expected_removed_at: &str,
+        options: CreateOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateResult, LifecycleError> {
+        let _lock = self.acquire_lock(slug, "restore", cancellation).await?;
+        let expected_slug = slug.to_owned();
+        let expected_branch_owned = expected_branch.to_owned();
+        let expected_removed_at_owned = expected_removed_at.to_owned();
+        let record = self
+            .mutate_store(cancellation, move |store| {
+                Ok(store.read_removed_worktrees()?.into_iter().find(|entry| {
+                    entry.slug == expected_slug
+                        && entry.branch == expected_branch_owned
+                        && entry.removed_at == expected_removed_at_owned
+                }))
+            })
+            .await?
+            .ok_or_else(|| {
+                LifecycleError::Refused(
+                    "removed worktree changed after the history view was rendered".into(),
+                )
+            })?;
+        let branch_slug = self.dir_slug(&record.branch);
+        if branch_slug != slug {
+            return Err(LifecycleError::Refused(format!(
+                "removed branch {:?} no longer maps to the recorded slug {slug:?}",
+                record.branch
+            )));
+        }
+        match self
+            .create_locked(&record.branch, slug, options, cancellation)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let record_to_restore = record.clone();
+                let slug_to_restore = slug.to_owned();
+                if let Err(restore_error) = self
+                    .mutate_store(&CancellationToken::new(), move |store| {
+                        store.restore_removed_worktree_if_absent(
+                            &slug_to_restore,
+                            &record_to_restore,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    return Err(LifecycleError::Rollback {
+                        primary: error.to_string(),
+                        rollback: format!("preserve removed-worktree history: {restore_error}"),
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn create_locked(
+        &self,
+        branch: &str,
+        slug: &str,
+        options: CreateOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateResult, LifecycleError> {
+        self.create_locked_inner(branch, slug, options, None, cancellation)
+            .await
+    }
+
+    async fn create_locked_inner(
+        &self,
+        branch: &str,
+        slug: &str,
+        options: CreateOptions,
+        review_head: Option<ReviewHead>,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateResult, LifecycleError> {
+        if self.config.reserved_slugs.contains(slug) {
             return Err(LifecycleError::Refused(format!(
                 "{slug:?} is a reserved worktree/session slug"
             )));
@@ -258,7 +414,7 @@ impl LifecycleService {
             })?;
         let main = canonicalize(&self.config.main_clone, "resolve main clone").await?;
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
-        let path = root.join(&slug);
+        let path = root.join(slug);
         self.ensure_managed_path(&path, &root)?;
         if fs::try_exists(&path)
             .await
@@ -292,34 +448,95 @@ impl LifecycleService {
                 tracing::warn!(%warning, "Git ref maintenance before creation");
             }
         }
-        let local_exists = self
-            .ref_exists(&main, &format!("refs/heads/{branch}"), cancellation)
-            .await?;
-        let remote_exists = if local_exists {
-            false
-        } else {
-            self.ref_exists(
-                &main,
-                &format!("refs/remotes/origin/{branch}"),
-                cancellation,
-            )
-            .await?
-        };
-        let existing = local_exists || remote_exists;
-        let base_ref = if existing {
-            None
-        } else {
-            let base = options.base.clone().unwrap_or_else(|| {
-                if self.config.base_branch.starts_with("origin/") {
-                    self.config.base_branch.clone()
-                } else {
-                    format!("origin/{}", self.config.base_branch)
+        let local_ref = format!("refs/heads/{branch}");
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        let local_oid = self.resolve_ref(&main, &local_ref, cancellation).await?;
+        let remote_oid = self.resolve_ref(&main, &remote_ref, cancellation).await?;
+        let (existing, base_ref, logical_base) = if let Some(review_head) = &review_head {
+            for (name, oid) in [("local", &local_oid), ("origin", &remote_oid)] {
+                if let Some(oid) = oid
+                    && !oid.eq_ignore_ascii_case(&review_head.expected)
+                {
+                    return Err(LifecycleError::Refused(format!(
+                        "review branch {branch:?} already exists on {name} at {oid}, not the reviewed PR head {}; refusing to check out a collision",
+                        review_head.expected
+                    )));
                 }
-            });
-            Some(base)
+            }
+            if local_oid.is_some() || remote_oid.is_some() {
+                (true, None, None)
+            } else {
+                let pinned_ref = format!("refs/wt/reviews/{}", review_head.number);
+                let refspec = format!("+refs/pull/{}/head:{pinned_ref}", review_head.number);
+                let fetched_output = self
+                    .run_git_raw(
+                        &main,
+                        ["fetch", "--no-tags", "origin", &refspec],
+                        cancellation,
+                        "fetch reviewed pull-request head",
+                    )
+                    .await?;
+                if !fetched_output.status.success() {
+                    return Err(process_error(
+                        "fetch reviewed pull-request head",
+                        &main,
+                        fetched_output
+                            .checked("fetch reviewed pull-request head")
+                            .unwrap_err(),
+                    ));
+                }
+                let fetched = self
+                    .resolve_ref(&main, &pinned_ref, cancellation)
+                    .await?
+                    .ok_or_else(|| {
+                        LifecycleError::Refused(
+                            "GitHub pull-request head fetch produced no pinned commit".into(),
+                        )
+                    })?;
+                if !fetched.eq_ignore_ascii_case(&review_head.expected) {
+                    return Err(LifecycleError::Refused(format!(
+                        "pull request #{} changed during checkout: expected head {}, fetched {fetched}",
+                        review_head.number, review_head.expected
+                    )));
+                }
+                let configured_base = self.config.base_branch.clone();
+                let logical_name = configured_base
+                    .strip_prefix("origin/")
+                    .unwrap_or(&configured_base)
+                    .to_owned();
+                let logical_ref = if configured_base.starts_with("origin/") {
+                    configured_base
+                } else {
+                    format!("origin/{configured_base}")
+                };
+                if !self.ref_exists(&main, &logical_ref, cancellation).await? {
+                    return Err(LifecycleError::Refused(format!(
+                        "configured base {logical_ref:?} is unavailable for the review branch anchor"
+                    )));
+                }
+                (
+                    false,
+                    Some(review_head.expected.clone()),
+                    Some((logical_ref, logical_name)),
+                )
+            }
+        } else {
+            let existing = local_oid.is_some() || remote_oid.is_some();
+            let base = if existing {
+                None
+            } else {
+                Some(options.base.clone().unwrap_or_else(|| {
+                    if self.config.base_branch.starts_with("origin/") {
+                        self.config.base_branch.clone()
+                    } else {
+                        format!("origin/{}", self.config.base_branch)
+                    }
+                }))
+            };
+            (existing, base, None)
         };
-        let base_source = match base_ref.as_deref() {
-            Some(base) if !base.starts_with("origin/") => {
+        let base_source = match (base_ref.as_deref(), review_head.is_some()) {
+            (Some(base), false) if !base.starts_with("origin/") => {
                 let branch_name = base.strip_prefix("refs/heads/").unwrap_or(base);
                 let parent = root.join(self.dir_slug(branch_name));
                 fs::try_exists(&parent)
@@ -343,17 +560,20 @@ impl LifecycleService {
                 )));
             }
         }
-        let stage = self.compute_stage(&slug);
+        let stage = self.compute_stage(slug);
         let mut progress = CreateProgress::default();
         let created = self
             .create_inner(
                 branch,
-                &slug,
+                slug,
                 &path,
                 &main,
                 base_ref.as_deref(),
                 base_source.as_deref(),
                 existing,
+                logical_base
+                    .as_ref()
+                    .map(|(reference, name)| (reference.as_str(), name.as_str())),
                 &stage,
                 &options,
                 &mut progress,
@@ -392,6 +612,7 @@ impl LifecycleService {
         base_ref: Option<&str>,
         base_source: Option<&Path>,
         existing: bool,
+        logical_base: Option<(&str, &str)>,
         stage: &str,
         options: &CreateOptions,
         progress: &mut CreateProgress,
@@ -417,7 +638,24 @@ impl LifecycleService {
                 "record fork point",
             )
             .await?;
-        if let Some(base) = base_ref {
+        if let Some((base_reference, base_branch)) = logical_base {
+            let anchor = self
+                .checked_text(
+                    path,
+                    ["merge-base", base_reference, "HEAD"],
+                    cancellation,
+                    "record review branch fork point",
+                )
+                .await?;
+            let slug = slug.to_owned();
+            let base_branch = base_branch.to_owned();
+            self.mutate_store(cancellation, move |store| {
+                store
+                    .set_slug_base(&slug, Some((&base_branch, Some(anchor.trim()))))
+                    .map(|_| ())
+            })
+            .await?;
+        } else if let Some(base) = base_ref {
             let base_branch = base
                 .strip_prefix("origin/")
                 .unwrap_or(base)
@@ -435,7 +673,8 @@ impl LifecycleService {
             })
             .await?;
         }
-        self.configure_branch(branch, path, base_ref, existing, cancellation)
+        let configured_base = logical_base.map(|(reference, _)| reference).or(base_ref);
+        self.configure_branch(branch, path, configured_base, existing, cancellation)
             .await?;
         self.copy_files(main, path, cancellation).await?;
         if self.config.has_sst {
@@ -542,6 +781,7 @@ impl LifecycleService {
                         delete_branch: true,
                         landed: true,
                         destroy_stage: candidate.destroy_stage,
+                        removed_snapshot: None,
                     },
                     true,
                     None,
@@ -579,6 +819,13 @@ impl LifecycleService {
                 "cannot remove the configured main clone".into(),
             ));
         }
+        if let Some(snapshot) = &options.removed_snapshot
+            && (snapshot.slug != slug || snapshot.branch != row.target.branch)
+        {
+            return Err(LifecycleError::Refused(
+                "removed-history snapshot no longer matches this worktree".into(),
+            ));
+        }
         if let Some(expected) = expected_revision {
             self.verify_removal_revision(&row, options.landed || cleanup, expected, cancellation)
                 .await?;
@@ -587,6 +834,13 @@ impl LifecycleService {
             self.guard_removal(&row, options.landed || cleanup, cancellation)
                 .await?;
         }
+        let mut warnings = Vec::new();
+        if let Some(before_remove) = &self.before_remove {
+            warnings.extend(before_remove(row.target.clone(), cancellation.clone()).await);
+            if cancellation.is_cancelled() {
+                return Err(LifecycleError::Cancelled);
+            }
+        }
         if let Some(dev) = &self.dev {
             // Keep the slug lock through supervision cleanup and checkout
             // removal. A new server cannot start in the gap, and a failed
@@ -594,7 +848,6 @@ impl LifecycleService {
             dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(&row), &lock, cancellation)
                 .await?;
         }
-        let mut warnings = Vec::new();
         let mut force = options.force;
         let mut destroyed_stage = false;
         if options.destroy_stage {
@@ -687,13 +940,17 @@ impl LifecycleService {
         {
             warnings.push(format!("reparent stack references: {error}"));
         }
-        let removed = RemovedWorktree {
+        let removed = options.removed_snapshot.unwrap_or_else(|| RemovedWorktree {
             slug: slug.to_owned(),
-            branch: row.target.branch,
+            branch: row.target.branch.clone(),
             removed_at: now_iso(),
             work: None,
             automations_paused: None,
             extra: Default::default(),
+        });
+        let removed = RemovedWorktree {
+            removed_at: now_iso(),
+            ..removed
         };
         if let Err(error) = self
             .mutate_store(&durable_write, move |store| {
@@ -814,6 +1071,46 @@ impl LifecycleService {
             Some(1) | Some(128) => Ok(false),
             _ => Err(process_error(
                 "check Git ref",
+                cwd,
+                output.checked("git").unwrap_err(),
+            )),
+        }
+    }
+
+    async fn resolve_ref(
+        &self,
+        cwd: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, LifecycleError> {
+        let commit_ref = format!("{reference}^{{commit}}");
+        let output = self
+            .run_git_raw(
+                cwd,
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &commit_ref,
+                ],
+                cancellation,
+                "resolve Git ref",
+            )
+            .await?;
+        match output.status.code() {
+            Some(1) | Some(128) => Ok(None),
+            Some(0) => {
+                let resolved = output.stdout_text().trim().to_owned();
+                if !valid_object_id(&resolved) {
+                    return Err(LifecycleError::Refused(format!(
+                        "Git ref {reference:?} resolved to an invalid object id"
+                    )));
+                }
+                Ok(Some(resolved.to_ascii_lowercase()))
+            }
+            _ => Err(process_error(
+                "resolve Git ref",
                 cwd,
                 output.checked("git").unwrap_err(),
             )),
@@ -1970,6 +2267,10 @@ fn validate_slug(slug: &str) -> Result<(), LifecycleError> {
     Ok(())
 }
 
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn truncate_slug(slug: String, limit: usize) -> String {
     if slug.chars().count() <= limit {
         return slug;
@@ -2380,6 +2681,16 @@ mod tests {
     #[tokio::test]
     async fn create_and_remove_linked_worktree_preserves_fork_anchor() {
         let (_scratch, service, runner, main, root) = setup().await;
+        let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cleanup_ran.clone();
+        let service = service.with_before_remove(move |target, _cancellation| {
+            let observed = observed.clone();
+            async move {
+                assert!(Path::new(&target.path).exists());
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                vec!["host resource cleaned".into()]
+            }
+        });
         let cancellation = CancellationToken::new();
         let created = service
             .create(
@@ -2415,11 +2726,54 @@ mod tests {
                 .is_some()
         );
 
+        service
+            .mutate_store(&cancellation, |store| {
+                store.set_slug_manual_title("ENG-42-feature", "Latest manual title", None)?;
+                store.set_slug_issue_id("ENG-42-feature", Some("COZ-42"))?;
+                store.set_slug_github_issue("ENG-42-feature", Some(42))?;
+                store.set_slug_work_status(
+                    "ENG-42-feature",
+                    Some(&wt_store::WorkStatusRecord {
+                        state: "ready".into(),
+                        at: "2026-10-09T00:00:00Z".into(),
+                        note: Some("latest note".into()),
+                        risk: Some("low".into()),
+                        sha: None,
+                        by: None,
+                        blocked_on: None,
+                        verify_after_merge: Some("verify prod".into()),
+                        extra: serde_json::Map::new(),
+                    }),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let snapshot = RemovedWorktree {
+            slug: "ENG-42-feature".into(),
+            branch: "michael/ENG-42-feature".into(),
+            removed_at: String::new(),
+            work: None,
+            automations_paused: None,
+            extra: serde_json::Map::from_iter([
+                ("title".into(), serde_json::json!("stale title")),
+                ("issueId".into(), serde_json::json!("OLD-1")),
+                ("githubIssue".into(), serde_json::json!(1)),
+                ("prNumber".into(), serde_json::json!(84)),
+                (
+                    "prUrl".into(),
+                    serde_json::json!("https://example.invalid/pr/84"),
+                ),
+            ]),
+        };
+
         let removed = service
             .remove(
                 &created.target,
                 RemoveOptions {
+                    force: true,
                     delete_branch: true,
+                    removed_snapshot: Some(snapshot),
                     ..RemoveOptions::default()
                 },
                 &cancellation,
@@ -2427,6 +2781,13 @@ mod tests {
             .await
             .unwrap();
         assert!(removed.removed && removed.deleted_branch);
+        assert!(cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            removed
+                .warnings
+                .iter()
+                .any(|warning| warning == "host resource cleaned")
+        );
         assert!(!Path::new(&created.target.path).exists());
         assert!(!root.join("ENG-42-feature").exists());
         assert!(
@@ -2438,6 +2799,283 @@ mod tests {
             .await
             .is_empty()
         );
+        let history = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].extra["title"], "Latest manual title");
+        assert_eq!(history[0].extra["issueId"], "COZ-42");
+        assert_eq!(history[0].extra["githubIssue"], 42);
+        assert_eq!(history[0].extra["prNumber"], 84);
+        assert_eq!(
+            history[0].work.as_ref().unwrap().note.as_deref(),
+            Some("latest note")
+        );
+
+        let restored = service
+            .create_from_removed(
+                "ENG-42-feature",
+                "michael/ENG-42-feature",
+                &history[0].removed_at,
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(Path::new(&restored.target.path).exists());
+        assert!(
+            service
+                .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        service
+            .remove(
+                &restored.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: true,
+                    ..RemoveOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_review_worktree_fetches_and_pins_verified_pr_head_anchor() {
+        let (_scratch, service, runner, main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let remote = root.parent().unwrap().join("review-origin.git");
+        fs::create_dir_all(&remote).await.unwrap();
+        run(&runner, &remote, &["init", "--bare"]).await;
+        run(
+            &runner,
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        run(&runner, &main, &["checkout", "-b", "contributor/review-42"]).await;
+        fs::write(main.join("review.txt"), "reviewed head\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["add", "review.txt"]).await;
+        run(&runner, &main, &["commit", "-m", "review head"]).await;
+        run(
+            &runner,
+            &main,
+            &["push", "origin", "HEAD:refs/pull/42/head"],
+        )
+        .await;
+        let expected_head = String::from_utf8(run(&runner, &main, &["rev-parse", "HEAD"]).await)
+            .unwrap()
+            .trim()
+            .to_owned();
+        run(&runner, &main, &["checkout", "main"]).await;
+        run(&runner, &main, &["branch", "-D", "contributor/review-42"]).await;
+
+        let created = service
+            .create_from_pull_request(
+                "contributor/review-42",
+                42,
+                &expected_head,
+                CreateOptions {
+                    fetch_origin: false,
+                    run_install: false,
+                    ..CreateOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let checked_out = String::from_utf8(
+            run(
+                &runner,
+                Path::new(&created.target.path),
+                &["rev-parse", "HEAD"],
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(checked_out.trim(), expected_head);
+
+        let anchor = String::from_utf8(
+            run(
+                &runner,
+                Path::new(&created.target.path),
+                &["merge-base", "origin/main", "HEAD"],
+            )
+            .await,
+        )
+        .unwrap();
+        let main_head =
+            String::from_utf8(run(&runner, &main, &["rev-parse", "main"]).await).unwrap();
+        assert_eq!(anchor.trim(), main_head.trim());
+        let repository_state: serde_json::Value = {
+            let store = Store::open(
+                &service.config.state.path,
+                service.config.state.identity.clone(),
+            )
+            .unwrap();
+            serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap()
+        };
+        assert_eq!(
+            repository_state["slugs"][created.target.slug()]["baseBranch"],
+            "main",
+            "state = {repository_state}"
+        );
+        assert_eq!(
+            repository_state["slugs"][created.target.slug()]["baseSha"],
+            anchor.trim()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_review_worktree_refuses_branch_collision_and_moved_head() {
+        let (_scratch, service, runner, main, root) = setup().await;
+        let remote = root.parent().unwrap().join("review-origin.git");
+        fs::create_dir_all(&remote).await.unwrap();
+        run(&runner, &remote, &["init", "--bare"]).await;
+        run(
+            &runner,
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        run(&runner, &main, &["checkout", "-b", "pr/source"]).await;
+        fs::write(main.join("review.txt"), "actual reviewed head\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["add", "review.txt"]).await;
+        run(&runner, &main, &["commit", "-m", "actual review head"]).await;
+        let actual_head = String::from_utf8(run(&runner, &main, &["rev-parse", "HEAD"]).await)
+            .unwrap()
+            .trim()
+            .to_owned();
+        run(
+            &runner,
+            &main,
+            &["push", "origin", "HEAD:refs/pull/43/head"],
+        )
+        .await;
+        run(&runner, &main, &["checkout", "main"]).await;
+        run(&runner, &main, &["branch", "-D", "pr/source"]).await;
+
+        let stale = String::from_utf8(run(&runner, &main, &["rev-parse", "HEAD"]).await)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let moved = service
+            .create_from_pull_request(
+                "pr/source",
+                43,
+                &stale,
+                CreateOptions {
+                    fetch_origin: false,
+                    run_install: false,
+                    ..CreateOptions::default()
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            moved.to_string().contains("changed during checkout"),
+            "unexpected error: {moved}"
+        );
+        assert!(!root.join("pr-source").exists());
+
+        run(&runner, &main, &["branch", "pr/source", "main"]).await;
+        let collision = service
+            .create_from_pull_request(
+                "pr/source",
+                43,
+                &actual_head,
+                CreateOptions {
+                    fetch_origin: false,
+                    run_install: false,
+                    ..CreateOptions::default()
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(collision.to_string().contains("already exists on local"));
+        assert!(!root.join("pr-source").exists());
+    }
+
+    #[tokio::test]
+    async fn restore_requires_exact_removed_snapshot_and_consumes_it_only_on_success() {
+        let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let slug = "ENG-42-restore";
+        let branch = "michael/ENG-42-restore";
+        let removed_at = now_iso();
+        let saved = RemovedWorktree {
+            slug: slug.into(),
+            branch: branch.into(),
+            removed_at: removed_at.clone(),
+            work: None,
+            automations_paused: Some(true),
+            extra: serde_json::Map::from_iter([("title".into(), serde_json::json!("saved title"))]),
+        };
+        service
+            .mutate_store(&cancellation, {
+                let saved = saved.clone();
+                move |store| store.record_removed_worktrees(&[saved], now_ms())
+            })
+            .await
+            .unwrap();
+
+        let stale = service
+            .create_from_removed(
+                slug,
+                branch,
+                "2026-10-08T00:00:00Z",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await;
+        assert!(matches!(stale, Err(LifecycleError::Refused(_))));
+        let after_stale = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        assert_eq!(after_stale, vec![saved.clone()]);
+
+        let restored = service
+            .create_from_removed(
+                slug,
+                branch,
+                &removed_at,
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.target.slug(), slug);
+        let after_restore = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        assert!(after_restore.is_empty());
     }
 
     #[tokio::test]
@@ -2518,6 +3156,7 @@ mod tests {
                         delete_branch: true,
                         landed: true,
                         destroy_stage: false,
+                        removed_snapshot: None,
                     },
                     &cancellation,
                 )
@@ -2529,6 +3168,15 @@ mod tests {
     #[tokio::test]
     async fn dirty_checkout_refuses_removal_without_explicit_force() {
         let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cleanup_ran.clone();
+        let service = service.with_before_remove(move |_target, _cancellation| {
+            let observed = observed.clone();
+            async move {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            }
+        });
         let cancellation = CancellationToken::new();
         let created = service
             .create(
@@ -2552,12 +3200,22 @@ mod tests {
             service.remove(&created.target, RemoveOptions::default(), &cancellation).await,
             Err(LifecycleError::Refused(message)) if message.contains("uncommitted")
         ));
+        assert!(!cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(Path::new(&created.target.path).exists());
     }
 
     #[tokio::test]
     async fn force_removal_revision_rejects_changed_diff_even_when_hazard_label_is_same() {
         let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cleanup_ran.clone();
+        let service = service.with_before_remove(move |_target, _cancellation| {
+            let observed = observed.clone();
+            async move {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            }
+        });
         let cancellation = CancellationToken::new();
         let created = service
             .create(
@@ -2613,12 +3271,14 @@ mod tests {
                     delete_branch: true,
                     landed: false,
                     destroy_stage: false,
+                    removed_snapshot: None,
                 },
                 &first,
                 &cancellation,
             )
             .await;
         assert!(matches!(result, Err(LifecycleError::Refused(_))));
+        assert!(!cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(path.exists());
     }
 
@@ -2737,6 +3397,7 @@ mod tests {
                     delete_branch: true,
                     landed: false,
                     destroy_stage: false,
+                    removed_snapshot: None,
                 },
                 &cancellation,
             )
@@ -2780,6 +3441,7 @@ mod tests {
                     delete_branch: true,
                     landed: false,
                     destroy_stage: false,
+                    removed_snapshot: None,
                 },
                 &cancellation,
             )
@@ -2836,6 +3498,7 @@ mod tests {
                     delete_branch: true,
                     landed: false,
                     destroy_stage: false,
+                    removed_snapshot: None,
                 },
                 &cancellation,
             )
@@ -2849,6 +3512,7 @@ mod tests {
                     delete_branch: true,
                     landed: false,
                     destroy_stage: false,
+                    removed_snapshot: None,
                 },
                 &cancellation,
             )

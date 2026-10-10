@@ -1,18 +1,21 @@
 //! Native SSH worker boundary. The controller owns presentation and the
 //! configured stable worker binary owns its local worktrees and sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::task::JoinSet;
-use wt_config::{InstanceRole, RemoteConfig};
+use tokio_util::sync::CancellationToken;
+use wt_config::{InstanceRole, LoadOptions, RemoteConfig};
 use wt_core::parse_work_status;
 use wt_remote::{
-    StatusKind, WORKER_PROTOCOL_VERSION, WorkerInfo, WorkerRole, WorkerSnapshot, WorktreeSnapshot,
-    WorktreeStatus,
+    BinaryCandidate, RemoteClient, RemotePlatform, StatusKind, WORKER_PROTOCOL_VERSION, WorkerInfo,
+    WorkerRole, WorkerSnapshot, WorktreeSnapshot, WorktreeStatus,
 };
+use wt_update::{InstallState, VersionId};
 
 use crate::{commands::resolve::run_git, context::AppContext};
 
@@ -25,6 +28,167 @@ pub fn worker_info(role: InstanceRole) -> WorkerInfo {
         protocol: WORKER_PROTOCOL_VERSION,
         build: env!("WT_BUILD_ID").to_owned(),
     }
+}
+
+/// Resolve a build-matched native worker executable, install it in the
+/// worker's immutable runtime cache, and bind the returned client to it.
+pub async fn prepare_remote_client(
+    context: &AppContext,
+    remote: &RemoteConfig,
+) -> Result<(RemoteClient, WorkerInfo)> {
+    let base_client = RemoteClient::new(context.processes.clone(), remote.clone());
+    let platform = base_client.probe_platform(&context.cancellation).await?;
+    let (candidate, scratch) =
+        native_candidate_for_platform(context, &platform, &context.cancellation).await?;
+    let client = base_client
+        .prepare_runtime(&candidate, &context.cancellation)
+        .await?;
+    drop(scratch);
+    let worker = client.require_worker(&context.cancellation).await?;
+    Ok((client, worker))
+}
+
+async fn native_candidate_for_platform(
+    context: &AppContext,
+    platform: &RemotePlatform,
+    cancellation: &CancellationToken,
+) -> Result<(BinaryCandidate, Option<tempfile::TempDir>)> {
+    if platform.target == env!("WT_TARGET") {
+        let path = std::env::current_exe()
+            .context("resolve running native wt executable")?
+            .canonicalize()
+            .context("canonicalize running native wt executable")?;
+        let output = context
+            .processes
+            .run(
+                wt_platform::process::CommandSpec::new(path.as_os_str()).args(["--_boot-probe"]),
+                cancellation,
+            )
+            .await?
+            .checked(&path)?;
+        let expected = format!("wt-build-id:{}:{}", env!("WT_BUILD_ID"), env!("WT_TARGET"));
+        if output.stdout_text().trim() != expected {
+            bail!("running wt binary did not prove its native identity; expected `{expected}`");
+        }
+        let candidate =
+            BinaryCandidate::from_path(path, env!("WT_TARGET"), env!("WT_BUILD_ID")).await?;
+        return Ok((candidate, None));
+    }
+
+    let options = LoadOptions::default();
+    let paths = crate::updates::install_paths(&options)?;
+    let store = wt_update::StateStore::new(paths);
+    let state = tokio::task::spawn_blocking(move || store.load())
+        .await
+        .context("join native release identity read")??;
+    let launcher_release = std::env::var_os(wt_launcher::INSTALL_VERSION_ENV)
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                anyhow::anyhow!(
+                    "launcher-provided {} is not valid UTF-8",
+                    wt_launcher::INSTALL_VERSION_ENV
+                )
+            })
+        })
+        .transpose()?;
+    let version = resolve_controller_release(
+        &state,
+        launcher_release.as_deref(),
+        env!("WT_BUILD_ID"),
+        env!("WT_TARGET"),
+    )
+    .with_context(|| {
+        format!(
+            "cannot provision {} for remote: running build {} has no matching published native release",
+            platform.target,
+            env!("WT_BUILD_ID")
+        )
+    })?;
+    let source = wt_update::ReleaseSource::new(crate::updates::repository(&options)?)?;
+    let release = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => bail!("remote runtime preparation cancelled before release lookup"),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(100),
+            source.by_tag(version.release_version()),
+        ) => result.context("matching native release lookup timed out")??,
+    };
+    if release.build_id() != env!("WT_BUILD_ID") {
+        bail!(
+            "release {} has build {}, but the running controller is {}; refusing a cross-target runtime mismatch",
+            release.tag(),
+            release.build_id(),
+            env!("WT_BUILD_ID")
+        );
+    }
+    let verified = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => bail!("remote runtime preparation cancelled before artifact download"),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(100),
+            source.download_verified(&release, &platform.target),
+        ) => result.context("matching native worker artifact download timed out")??,
+    };
+    if verified.version().build_id() != env!("WT_BUILD_ID")
+        || verified.version().target() != platform.target
+        || verified.version().release_version() != version.release_version()
+    {
+        bail!("verified worker artifact identity does not match the running controller build");
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("wt-remote-runtime-")
+        .tempdir()
+        .context("create native worker candidate directory")?;
+    let local_path = scratch.path().join("wt");
+    tokio::fs::write(&local_path, verified.app_binary())
+        .await
+        .context("write verified native worker candidate")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&local_path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .context("make verified native worker candidate executable")?;
+    }
+    let candidate =
+        BinaryCandidate::from_path(local_path, platform.target.clone(), env!("WT_BUILD_ID"))
+            .await?;
+    Ok((candidate, Some(scratch)))
+}
+
+fn resolve_controller_release(
+    state: &InstallState,
+    launcher_release: Option<&str>,
+    build_id: &str,
+    target: &str,
+) -> Result<VersionId> {
+    if let Some(release) = launcher_release {
+        // The stable launcher supplies this tag from the same VersionId as the
+        // build and target identity it exports. Validate the component before
+        // using it in a release lookup; the release manifest must still prove
+        // that the tag actually contains this build and target.
+        return VersionId::new(release, build_id, target)
+            .context("validate launcher-provided release/build/target identity");
+    }
+
+    state
+        .current
+        .iter()
+        .chain(state.last_good.iter())
+        .chain(
+            state
+                .pending_boot
+                .iter()
+                .flat_map(|pending| std::iter::once(&pending.candidate).chain(pending.fallback.iter())),
+        )
+        .chain(state.history.iter().flat_map(|entry| entry.from.iter().chain(entry.to.iter())))
+        .find(|version| version.build_id() == build_id && version.target() == target)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "running build {build_id} for target {target} is absent from launcher identity and retained install history"
+            )
+        })
 }
 
 pub async fn collect_worker_snapshot(context: &AppContext) -> Result<WorkerSnapshot> {
@@ -69,6 +233,11 @@ pub async fn collect_worker_snapshot(context: &AppContext) -> Result<WorkerSnaps
     } else {
         HashMap::new()
     };
+    let main_first_parents = if has_non_main {
+        main_first_parent_shas(context).await
+    } else {
+        None
+    };
     let mut tasks = JoinSet::new();
     let mut indexed = Vec::new();
     for (index, snapshot) in discovered
@@ -90,6 +259,7 @@ pub async fn collect_worker_snapshot(context: &AppContext) -> Result<WorkerSnaps
             .and_then(|slugs| slugs.get(snapshot.worktree.target.slug()))
             .cloned();
         let remote_url = remote_url.clone();
+        let main_first_parents = main_first_parents.clone();
         let dev_row = dev_rows
             .get(snapshot.worktree.target.slug())
             .cloned()
@@ -105,9 +275,16 @@ pub async fn collect_worker_snapshot(context: &AppContext) -> Result<WorkerSnaps
                     })
             });
         tasks.spawn(async move {
-            build_snapshot_row(row_context, snapshot, entry, remote_url, dev_row)
-                .await
-                .map(|row| (index, row))
+            build_snapshot_row(
+                row_context,
+                snapshot,
+                entry,
+                remote_url,
+                dev_row,
+                main_first_parents,
+            )
+            .await
+            .map(|row| (index, row))
         });
     }
     while let Some(row) = tasks.join_next().await {
@@ -127,6 +304,7 @@ async fn build_snapshot_row(
     entry: Option<Value>,
     remote_url: Option<String>,
     dev_row: Option<wt_dev::DevStatusRow>,
+    main_first_parents: Option<HashSet<String>>,
 ) -> Result<WorktreeSnapshot> {
     let target = &snapshot.worktree.target;
     let slug = target.slug();
@@ -162,7 +340,7 @@ async fn build_snapshot_row(
     let git_status = snapshot.status.as_ref();
     let expected_upstream = format!("origin/{}", target.branch);
     let ahead_of_base = ahead_of_base(&context, &target.path, &base).await;
-    let has_origin_branch = run_git(
+    let origin_branch = run_git(
         &context,
         &target.path,
         [
@@ -174,9 +352,9 @@ async fn build_snapshot_row(
     )
     .await
     .ok()
-    .is_some_and(|output| output.status.success());
-    let (unpushed, pushed) = if has_origin_branch {
-        (
+    .map(|output| output.status.success());
+    let (unpushed, pushed) = match origin_branch {
+        Some(true) => (
             commit_count(
                 &context,
                 Path::new(&target.path),
@@ -184,22 +362,22 @@ async fn build_snapshot_row(
             )
             .await,
             Some(true),
-        )
-    } else {
-        (ahead_of_base, Some(false))
+        ),
+        Some(false) => (ahead_of_base, Some(false)),
+        None => (None, None),
     };
     let path = std::path::PathBuf::from(&target.path);
     let stage_prefix = context.config.stage.prefix.clone();
-    let (exists, deployed) = tokio::task::spawn_blocking(move || {
-        let exists = path.exists();
+    let (exists, deployed) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        let exists = path.try_exists()?;
         let deployed = matches!(
             wt_sst::observe_local_deployment(&path, &stage_prefix),
             wt_sst::DeploymentObservation::Deployed { .. }
         );
-        (exists, deployed)
+        Ok((exists, deployed))
     })
     .await
-    .context("inspect remote snapshot stage")?;
+    .context("inspect remote snapshot stage")??;
     let issue_number = entry
         .as_ref()
         .and_then(|entry| entry.get("githubIssue"))
@@ -207,14 +385,16 @@ async fn build_snapshot_row(
     let github_issue_url = issue_number.and_then(|number| {
         repo_web_url(remote_url.as_deref()?).map(|repo| format!("{repo}/issues/{number}"))
     });
+    let status = remote_worktree_status(
+        &context,
+        &snapshot,
+        exists,
+        git_status.is_some_and(|status| status.dirty),
+        entry.as_ref(),
+        main_first_parents.as_ref(),
+    )
+    .await?;
     let dirty = git_status.is_some_and(|status| status.dirty);
-    let (kind, label) = if snapshot.error.is_some() || git_status.is_none() {
-        (StatusKind::Missing, "missing")
-    } else if dirty {
-        (StatusKind::Dirty, "dirty")
-    } else {
-        (StatusKind::Clean, "clean")
-    };
     Ok(WorktreeSnapshot {
         slug: slug.to_owned(),
         branch: target.branch.clone(),
@@ -223,14 +403,7 @@ async fn build_snapshot_row(
         stage: target.stage.clone(),
         deployed,
         exists,
-        status: WorktreeStatus {
-            kind,
-            label: label.to_owned(),
-            age: None,
-            log: None,
-            pid: None,
-            op: None,
-        },
+        status,
         // A row error stays explicit while a null status preserves unknown.
         // In particular, a failed status read is never rendered as stopped.
         dev: dev_row
@@ -248,6 +421,263 @@ async fn build_snapshot_row(
         github_issue_url,
         work,
     })
+}
+
+async fn remote_worktree_status(
+    context: &AppContext,
+    snapshot: &wt_vcs::WorktreeSnapshot,
+    exists: bool,
+    dirty: bool,
+    entry: Option<&Value>,
+    main_first_parents: Option<&HashSet<String>>,
+) -> Result<WorktreeStatus> {
+    let slug = snapshot.worktree.target.slug();
+    if let Some(lock) = crate::commands::diagnostics::operation_lock(context, slug).await? {
+        let log_dir = context.config.paths.log_dir.clone();
+        let log_slug = slug.to_owned();
+        let log = tokio::task::spawn_blocking(move || latest_destroy_log(&log_dir, &log_slug))
+            .await
+            .ok()
+            .flatten();
+        return Ok(WorktreeStatus {
+            kind: StatusKind::Busy,
+            label: operation_lock_label(&lock),
+            age: operation_lock_age(&lock),
+            log,
+            pid: lock.pid.map(i64::from),
+            op: lock.op,
+        });
+    }
+    if !exists {
+        return Ok(WorktreeStatus {
+            kind: StatusKind::Missing,
+            label: "missing".into(),
+            age: None,
+            log: None,
+            pid: None,
+            op: None,
+        });
+    }
+    if let Some(error) = &snapshot.error {
+        bail!("cannot read Git status for remote worktree {slug}: {error}");
+    }
+    if snapshot.status.is_none() {
+        bail!("cannot read Git status for remote worktree {slug}");
+    }
+
+    let target = &snapshot.worktree.target;
+    let ref_name = format!("refs/heads/{}", target.branch);
+    let upstream = run_git(
+        context,
+        &target.path,
+        [
+            "for-each-ref",
+            "--format=%(upstream:track)",
+            ref_name.as_str(),
+        ],
+    )
+    .await?
+    .checked("git for-each-ref")?;
+    if String::from_utf8_lossy(&upstream.stdout).trim() == "[gone]" {
+        return Ok(WorktreeStatus {
+            kind: StatusKind::Gone,
+            label: "gone (squash-merged or deleted)".into(),
+            age: None,
+            log: None,
+            pid: None,
+            op: None,
+        });
+    }
+
+    if branch_is_merged(context, target, entry, main_first_parents).await? {
+        return Ok(WorktreeStatus {
+            kind: StatusKind::Merged,
+            label: format!("merged into origin/{}", context.config.branch.base),
+            age: None,
+            log: None,
+            pid: None,
+            op: None,
+        });
+    }
+    let (kind, label) = if dirty {
+        (StatusKind::Dirty, "dirty")
+    } else {
+        (StatusKind::Clean, "clean")
+    };
+    Ok(WorktreeStatus {
+        kind,
+        label: label.into(),
+        age: None,
+        log: None,
+        pid: None,
+        op: None,
+    })
+}
+
+async fn main_first_parent_shas(context: &AppContext) -> Option<HashSet<String>> {
+    let trunk_ref = format!("origin/{}", context.config.branch.base);
+    let output = run_git(
+        context,
+        &context.config.paths.main_clone,
+        ["rev-list", "--first-parent", trunk_ref.as_str()],
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .filter(|sha| !sha.is_empty())
+            .collect(),
+    )
+}
+
+async fn branch_is_merged(
+    context: &AppContext,
+    target: &wt_core::WorktreeTarget,
+    entry: Option<&Value>,
+    main_first_parents: Option<&HashSet<String>>,
+) -> Result<bool> {
+    let branch_sha = run_git(
+        context,
+        &target.path,
+        ["rev-parse", "--verify", target.branch.as_str()],
+    )
+    .await?
+    .checked("git rev-parse branch")?;
+    let branch_sha = String::from_utf8_lossy(&branch_sha.stdout)
+        .trim()
+        .to_owned();
+    let trunk_ref = format!("origin/{}", context.config.branch.base);
+    let trunk_sha = run_git(
+        context,
+        &context.config.paths.main_clone,
+        ["rev-parse", "--verify", trunk_ref.as_str()],
+    )
+    .await?
+    .checked("git rev-parse trunk")?;
+    if branch_sha == String::from_utf8_lossy(&trunk_sha.stdout).trim() {
+        return Ok(false);
+    }
+
+    let ancestry = run_git(
+        context,
+        &context.config.paths.main_clone,
+        [
+            "merge-base",
+            "--is-ancestor",
+            branch_sha.as_str(),
+            trunk_ref.as_str(),
+        ],
+    )
+    .await?;
+    if ancestry.status.code() == Some(1) {
+        return Ok(false);
+    }
+    if !ancestry.status.success() {
+        bail!(
+            "cannot check whether remote branch {} is merged: {}",
+            target.branch,
+            ancestry.stderr_text().trim()
+        );
+    }
+    let first_parents = main_first_parents.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine origin/{} first-parent history for remote branch {}",
+            context.config.branch.base,
+            target.branch
+        )
+    })?;
+    if first_parents.contains(&branch_sha) {
+        return Ok(false);
+    }
+
+    let fork_base = entry
+        .and_then(|entry| entry.get("baseSha"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            entry
+                .and_then(|entry| entry.get("baseBranch"))
+                .and_then(Value::as_str)
+        });
+    let Some(fork_base) = fork_base else {
+        // Legacy worktrees without a fork record retain the historical
+        // behavior: ancestry is sufficient evidence of real work.
+        return Ok(true);
+    };
+    let range = format!("{fork_base}..{branch_sha}");
+    let count = run_git(
+        context,
+        &target.path,
+        ["rev-list", "--count", range.as_str()],
+    )
+    .await?
+    .checked("git rev-list branch work")?;
+    let count = String::from_utf8_lossy(&count.stdout)
+        .trim()
+        .parse::<u64>()
+        .context("parse commits since recorded fork base")?;
+    Ok(count > 0)
+}
+
+fn operation_lock_label(lock: &crate::commands::diagnostics::OperationLock) -> String {
+    match (&lock.op, &lock.phase) {
+        (Some(operation), Some(phase)) if operation != phase => {
+            format!("{operation}: {phase}")
+        }
+        (Some(operation), _) => operation.clone(),
+        (_, Some(phase)) => phase.clone(),
+        _ => "busy".into(),
+    }
+}
+
+fn operation_lock_age(lock: &crate::commands::diagnostics::OperationLock) -> Option<String> {
+    let started = lock
+        .phase_started
+        .as_deref()
+        .or(lock.started_at.as_deref())?;
+    let started = OffsetDateTime::parse(started, &Rfc3339).ok()?;
+    let seconds = (OffsetDateTime::now_utc() - started).whole_seconds().max(0) as u64;
+    Some(if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86400)
+    })
+}
+
+fn latest_destroy_log(log_dir: &Path, slug: &str) -> Option<String> {
+    let prefix = format!("{slug}-");
+    let entries = std::fs::read_dir(log_dir).ok()?;
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let stamp = name.strip_prefix(&prefix)?.strip_suffix(".log")?;
+            let bytes = stamp.as_bytes();
+            if bytes.len() < 11
+                || !bytes[..4].iter().all(u8::is_ascii_digit)
+                || bytes[4] != b'-'
+                || !bytes[5..7].iter().all(u8::is_ascii_digit)
+                || bytes[7] != b'-'
+                || !bytes[8..10].iter().all(u8::is_ascii_digit)
+                || bytes[10] != b'T'
+            {
+                return None;
+            }
+            let path = entry.path();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path.to_string_lossy().into_owned())
 }
 
 fn remote_dev_status(status: &wt_dev::DevServerStatus) -> wt_remote::DevServerStatus {
@@ -278,7 +708,21 @@ pub async fn remote_admin_command(
     remote: &RemoteConfig,
     args: &[String],
 ) -> Result<i32> {
-    let client = wt_remote::RemoteClient::new(context.processes.clone(), remote.clone());
+    let (client, worker) = prepare_remote_client(context, remote).await?;
+    remote_admin_with_client(context, &client, &worker, args).await
+}
+
+/// Execute an administrative command on an already prepared native worker.
+/// Callers can reuse the verified runtime for prerequisite and user commands.
+pub async fn remote_admin_with_client(
+    context: &AppContext,
+    client: &RemoteClient,
+    worker: &WorkerInfo,
+    args: &[String],
+) -> Result<i32> {
+    if worker.role != WorkerRole::Worker || worker.protocol != WORKER_PROTOCOL_VERSION {
+        bail!("remote administrative command requires a prepared compatible worker");
+    }
     let output = client.run_worker(args, &context.cancellation).await?;
     if !output.stdout.is_empty() {
         print!("{}", output.stdout);
@@ -389,6 +833,58 @@ fn repo_web_url(remote: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_release_identity_survives_bounded_history_eviction() {
+        use wt_update::{Channel, StateHistoryEntry};
+
+        let mut state = InstallState::new(Channel::Stable);
+        let current = VersionId::new("v2.0.0", "b".repeat(40), "aarch64-apple-darwin").unwrap();
+        state.current = Some(current.clone());
+        state.last_good = Some(current.clone());
+        state.history = (0..64)
+            .map(|index| StateHistoryEntry {
+                at_unix: index,
+                operation: "update".to_owned(),
+                from: None,
+                to: Some(
+                    VersionId::new(
+                        format!("v1.{}.0", index),
+                        format!("{index:040x}"),
+                        "aarch64-apple-darwin",
+                    )
+                    .unwrap(),
+                ),
+                detail: None,
+            })
+            .collect();
+        let old_build = "a".repeat(40);
+
+        assert!(
+            resolve_controller_release(&state, None, &old_build, "aarch64-apple-darwin").is_err()
+        );
+        assert_eq!(
+            resolve_controller_release(
+                &state,
+                Some("preview-old-build"),
+                &old_build,
+                "aarch64-apple-darwin"
+            )
+            .unwrap(),
+            VersionId::new("preview-old-build", old_build, "aarch64-apple-darwin").unwrap()
+        );
+    }
+
+    #[test]
+    fn launcher_release_identity_rejects_unsafe_or_mismatched_target() {
+        let state = InstallState::new(wt_update::Channel::Stable);
+        let build = "a".repeat(40);
+        assert!(
+            resolve_controller_release(&state, Some("../escape"), &build, "aarch64-apple-darwin")
+                .is_err()
+        );
+        assert!(resolve_controller_release(&state, Some("v1.2.3"), &build, "../target").is_err());
+    }
 
     #[test]
     fn issue_resolution_matches_inventory_override_and_slug_rules() {

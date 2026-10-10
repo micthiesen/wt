@@ -2965,6 +2965,7 @@ dependencies = [
  "sha2",
  "shlex",
  "tempfile",
+ "thiserror",
  "time",
  "tokio",
  "tokio-util",
@@ -2982,6 +2983,7 @@ dependencies = [
  "wt-harness",
  "wt-launcher",
  "wt-lifecycle",
+ "wt-naming",
  "wt-platform",
  "wt-remote",
  "wt-runtime",
@@ -2999,6 +3001,7 @@ dependencies = [
 name = "wt-automations"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "tempfile",
@@ -3146,6 +3149,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wt-naming"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "wt-config",
+ "wt-core",
+ "wt-platform",
+]
+
+[[package]]
 name = "wt-platform"
 version = "0.1.0"
 dependencies = [
@@ -3162,8 +3179,10 @@ name = "wt-remote"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
+ "sha2",
  "shlex",
  "tempfile",
  "thiserror",
@@ -3265,10 +3284,12 @@ dependencies = [
  "crossterm",
  "futures-util",
  "ratatui",
+ "serde",
  "tokio",
  "tokio-util",
  "tracing",
  "unicode-width",
+ "wt-core",
  "wt-runtime",
 ]
 

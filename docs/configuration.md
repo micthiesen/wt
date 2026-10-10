@@ -26,7 +26,7 @@ global durable state database and names the default cache directory and tmux
 socket, so existing and future worktrees in different repositories cannot
 reap or rearrange one another.
 
-TOML tables merge by key. Scalar values and arrays replace the user value completely, so a repository's `[[actions]]` or `[[automations]]` list is authoritative when present. `$WT_CONFIG` selects a different user config; it does not disable repository overrides. Internally, `wt` carries the selected repository file into child processes with `$WT_REPO_CONFIG`, which also provides an explicit repository-config path for scripts that cannot preserve the invocation directory.
+TOML tables merge by key. Scalar values and arrays replace the user value completely, so a repository's `[[actions]]` or `[[automations]]` list is authoritative when present. `$WT_CONFIG` selects a different user config; it does not disable repository overrides. Each process resolves this merged configuration once at startup. wt carries the selected repository file into child processes with `$WT_REPO_CONFIG`, which also provides an explicit repository-config path for scripts that cannot preserve the invocation directory.
 
 For example, shared personal defaults can live in `~/.config/wt/config.toml`:
 
@@ -64,12 +64,10 @@ worktree_root = "~/Code/your-repo-wt"
 prefix = "yourname"
 ```
 
-The Rust configuration API lives in [`crates/wt-config`](../crates/wt-config/).
-`Config::load` resolves the user config and repository `.wt.toml` using the
-discovery, merging and defaults described here. Valid configuration is covered
-by compatibility fixtures. Malformed optional values now produce validation
-errors instead of silently falling back to a default. The TypeScript loader
-remains the behavior reference during the rewrite.
+The native configuration API lives in [`crates/wt-config`](../crates/wt-config/).
+It resolves and validates the user config and repository `.wt.toml` once when
+the process starts. Malformed values produce validation errors instead of
+silently falling back to a default.
 
 ## `[instance]`
 
@@ -98,7 +96,7 @@ version warning so development snapshots can be synchronized deliberately.
 | `worktree_root` | **yes** | — | Directory where worktrees are created (`<worktree_root>/<slug>`). |
 | `log_dir` | no | `<cache root>/logs` | Per-worktree destroy logs live here; daily structured app logs go to the derived `<log_dir>/app` subdirectory. |
 | `lock_dir` | no | `<cache root>/locks` | Per-slug operation locks (what drives the "setting up…" busy state). |
-| `cache_db` | no | repository with a `.wt.toml`: `~/.cache/wt/<repo-id>/cache.sqlite`; otherwise `~/.cache/wt/cache.sqlite` | Disposable TanStack Query cache. Its directory (the **cache root**) also anchors rebuildable/runtime files: session registries, automation delivery files, manager reports, logs, locks, generated `tmux.conf`, message sockets, and shims. Durable section/status/archive state is not stored here. |
+| `cache_db` | no | repository with a `.wt.toml`: `~/.cache/wt/<repo-id>/cache.sqlite`; otherwise `~/.cache/wt/cache.sqlite` | Cache-root path setting. The native app uses its parent as the **cache root** for rebuildable/runtime files: session registries, automation delivery files, manager reports, logs, locks, generated `tmux.conf`, message sockets, and shims. Durable section/status/archive state lives in the SQLite state database, not this cache root. |
 | `state_db` | no | repository with a `.wt.toml`: `~/.local/state/wt/wt.sqlite`; user-config-only compatibility mode: `<cache root>/wt.sqlite` | Authoritative SQLite state shared by local repositories and partitioned by `repo_id`. Normally leave this unset. The canonical repository path stored with each id is a collision guard. |
 | `wezterm_cli` | no | macOS: `/Applications/WezTerm.app/Contents/MacOS/wezterm`; elsewhere: `wezterm` from `PATH` | WezTerm CLI executable used to set the tab title to `wt` when `WEZTERM_PANE` is present. Supports `~` expansion. |
 | `wt_source` | no | absent | Optional wt source checkout for the `,` developer session and `<` palette. Supports `~`; the slot is hidden when unset or missing. Native installs do not require a checkout. |
@@ -217,21 +215,12 @@ while tracked commands, custom prompts, dev controls/logs, and cancellation run
 against the selected checkout through SSH. Ordinary `n` / `N`
 continue to create locally.
 
-The controller prepares its own wt runtime on the worker before reading
-inventory or running wt commands. It hashes the local source files and build,
-uploads a missing package over SSH, installs frozen dependencies, and checks
-the worker handshake. Each package lives at
-`~/.cache/wt/runtimes/<hash>` on the worker. An existing package is reused.
-The configured `wt_path` and installed wt directory are not replaced.
-Running sessions can continue to use their original package. The controller
-selects the validated package for later commands in that process.
-
-Automatic setup requires a Linux worker with Bash, tar, sha256sum, flock,
-and Bun on PATH or at `~/.bun/bin/bun`. Local setup requires Git, tar, SSH,
-and SCP. The package includes tracked and untracked non-ignored source files,
-including local edits. It excludes Git metadata and ignored dependencies.
-A failed upload, dependency install, or handshake stops the operation.
-Old packages are retained so setup does not remove code used by a session.
+The controller checks the worker platform, protocol, and build identity before
+forwarding commands. It provisions an immutable, checksum-verified native
+runtime matching the controller build, then binds commands to that executable.
+Same-platform hosts can use the verified running binary; cross-platform hosts
+need the exact published native artifact. Source files and project dependencies
+are not uploaded. Each worker process resolves one configuration of its own.
 
 The last successful remote inventory is persisted with the rest of wt's query
 cache. If the host sleeps or becomes unreachable, those rows remain visible as
@@ -268,7 +257,7 @@ wt_path = "~/.wt/bin/wt"       # optional
 |---|---|---|---|
 | `host` | **yes** | — | SSH destination or alias used by `ssh`. |
 | `label` | no | `host` | Short name in the prompt, event log, and remote WezTerm tab title. |
-| `wt_path` | no | `~/.wt/bin/wt` | Configured remote executable. The `~/` prefix expands in the remote account. Controller commands use the separately prepared runtime package. |
+| `wt_path` | no | `~/.wt/bin/wt` | Configured remote executable. The `~/` prefix expands in the remote account. Controller commands use the separately prepared build-matched native runtime. |
 
 The remote machine needs its own `~/.config/wt/config.toml`, including
 `[instance] role = "worker"`; do not point the local process at a mounted
@@ -301,7 +290,7 @@ Preview-stage naming, used by the SST integration and stage URLs.
 |---|---|---|---|
 | `env_files_to_copy` | no | `[".env"]` | Files copied from the main clone into each new worktree during setup. |
 | `copy_globs` | no | `[]` | Glob patterns resolved relative to the main clone and copied into each new worktree with their paths preserved. Dotfiles are included except root `.git` metadata, existing destinations are not overwritten, and patterns must be relative without `..` segments. Example: `[".agents/**"]`. |
-| `install_command` | no | *(auto-detect)* | Dependency install run in a fresh `git-worktree` checkout, via `$SHELL -lc`. Unset ⇒ detect the package manager from the checkout's lockfile (`bun.lock`/`bun.lockb` → `bun install`, `pnpm-lock.yaml` → `pnpm install`, `yarn.lock` → `yarn install`, `package-lock.json`/`npm-shrinkwrap.json` → `npm install`); no lockfile ⇒ the install is skipped with a note. The `rift` backend never installs — packages ride the CoW clone. |
+| `install_command` | no | *(auto-detect)* | Dependency install run in a fresh `git-worktree` checkout, via `$SHELL -lc`. Unset ⇒ detect the project's package manager from its lockfile; no recognized lockfile skips the install with a note. The `rift` backend never installs — files arrive through the copy-on-write clone. This setting concerns the managed project, not wt's own runtime. |
 | `destroy_command` | no | *(none)* | Teardown run at destroy, inside the checkout, via `$SHELL -lc`, just before the process reaper and the backend remove. `{{path}}`, `{{slug}}` and `{{port}}` substitute. Never blocks the destroy: a non-zero exit or a hang past 120s is logged and the removal proceeds, but it also raises an attention-level warning, because a failed *destroy* teardown never retries — the trigger was the removal that just happened, so whatever it owned is orphaned with no future sweep. |
 
 ### `destroy_command` — what it is for
@@ -348,14 +337,19 @@ Selects how a new worktree is materialized on disk. Omit the whole section for t
 
 | key | required | default | meaning |
 |---|---|---|---|
-| `kind` | no | `"git-worktree"` | `"git-worktree"` uses `git worktree` (one shared object db). `"rift"` uses copy-on-write clones via the [`rift`](https://github.com/anomalyco/rift) binary — near-instant, `node_modules` copied for free, each checkout an independent clone. |
+| `kind` | no | `"git-worktree"` | `"git-worktree"` uses `git worktree` (one shared object db). `"rift"` uses copy-on-write clones via the [`rift`](https://github.com/anomalyco/rift) binary; each checkout is an independent clone. |
 
 ```toml
 [backend]
 kind = "rift"
 ```
 
-The `rift` backend needs the `rift` binary (`npm i -g rift-snapshot`); wt runs `rift init` on the main clone lazily at first create. wt looks for the executable on its own `PATH` first, then asks your login shell (`$SHELL -lc`) — so a wt spawned from a lean environment (launchd, an editor task) still finds a `~/.bun/bin/rift` that only your shell profile adds, and a shell *function* named `rift` can't shadow the real binary. Existing checkouts of the other kind keep working after a flip — the backend that owns a checkout is detected from disk (a `.rift` marker) at removal, never stored. Under `rift`, packages arrive via the CoW clone, so wt skips its own install step and the `--no-install` flag is ignored.
+The `rift` backend needs the `rift` executable on `PATH`; wt initializes the
+main clone lazily on first create. Existing checkouts of the other kind keep
+working after a backend change because ownership is detected from disk (a
+`.rift` marker), not stored in configuration. Under `rift`, files arrive
+through the copy-on-write clone, so wt skips its install step and
+`--no-install` has no effect.
 
 ## `[deploy.sst]` — optional integration
 
@@ -754,7 +748,7 @@ entry remains last.
 
 | key | required | default | meaning |
 |---|---|---|---|
-| `startup_check` | no | `true` | Check the wt source clone for upstream commits when the TUI starts — at most once a day — and prompt y/n to fast-forward ([`wt update`](cli.md#wt-update-log---check---head) semantics: CI-green target selection, post-pull boot probe with auto-revert, skipped silently when the clone is dirty or ahead, a "no" remembered until the offer changes, re-exec on accept — see [updates.md](updates.md)). `false` disables the startup check — `wt update` keeps working on demand; `WT_UPDATE=off` disables the whole update system (check, boot sentinel, rollback offers) for a single run. |
+| `startup_check` | no | `true` | Check for a newer verified native release when the TUI starts and offer to install it. `false` disables the startup offer; `wt update` remains available. `WT_UPDATE=off` disables native update checks and activation for one run. See [updates.md](updates.md). |
 
 ## `[[actions]]` — the `!` menu
 

@@ -40,7 +40,7 @@ struct RolloutCursor {
     mtime_ms: i64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CodexActivityTracker {
     by_slug: HashMap<String, RolloutCursor>,
 }

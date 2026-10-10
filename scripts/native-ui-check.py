@@ -100,7 +100,9 @@ def main():
                      if slug in record.get("slugs", {})), {})
 
     try:
-        wait_for(lambda data: b"3 worktrees" in data)
+        # Ratatui patches just the changed digit when an empty board was
+        # painted first; raw terminal bytes need not contain "3 worktrees".
+        wait_for(lambda data: all(slug in data for slug in (b"bench-000", b"bench-001", b"bench-002")))
         drain_for(1)
         before = len(capture)
         drain_for(0.5)
@@ -118,8 +120,11 @@ def main():
         assert latency_ms < 500
         delay.unlink()
         drain_for(3)
+        scans_before_edit = status_calls.read_text().count("status\n")
         (root / "worktrees/bench-001/example.txt").write_text("external edit\n")
-        wait_for(lambda data: b"refreshing" in data)
+        # A fast refresh can settle before the renderer observes Refreshing;
+        # require the watcher-driven scan and a changed terminal frame instead.
+        wait_for(lambda data: status_calls.read_text().count("status\n") > scans_before_edit and bool(data))
         drain_for(0.5)
         # Editing a title is a real controller command and durable write. Check
         # the resulting store, rather than mistaking input echo for success.
@@ -155,6 +160,23 @@ def main():
                 records = [json.loads(row[0]) for row in state.execute("SELECT data FROM repository_state")]
             assert any(record.get("slugs", {}).get("bench-001", {}).get("section") == "Today"
                        for record in records), "renaming did not preserve section membership"
+            os.write(master, b"h")
+            wait_for(lambda data: b"Removed" in data)
+            os.write(master, b"P")
+            wait_for(lambda data: b"Performance" in data)
+            os.write(master, b"P")
+            # The overlay leaves the history header visible, so closing it
+            # repaints the body rather than emitting the header again.
+            wait_for(lambda data: b"No recently removed worktrees" in data)
+            os.write(master, b"h")
+            wait_for(lambda data: b"bench-001" in data or b"Native UI title" in data)
+            os.write(master, b"\x12")
+            wait_for(lambda data: b"Clear derived caches?" in data)
+            os.write(master, b"\r")
+            wait_for(lambda data: b"Caches cleared" in data)
+            assert stored_slug("bench-001").get("manualTitle") == "Native UI title"
+            assert stored_slug("bench-001").get("section") == "Today"
+            drain_for(0.3)
         if args.exit_signal == "quit":
             # The action has been admitted but its inventory read has not
             # completed. Quitting must drain that action, not drop its write.
@@ -185,19 +207,32 @@ def main():
                       idle_no_frames=True, external_edit_refreshed=True, title_persisted=True,
                       title_edit_git_scans=0,
                       section_controls=args.sections,
+                      history_perf_and_hard_refresh=args.sections,
                       accepted_write_survived_quit=args.exit_signal == "quit",
                       clean_shutdown=True, exit_signal=args.exit_signal)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
     finally:
         (root / "terminal.ansi").write_bytes(capture)
-        if not reaped:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            os.waitpid(pid, 0)
+        # Close the PTY before waiting: Darwin can leave a child exiting while
+        # the still-open master holds undrained terminal output.
         os.close(master)
+        if not reaped:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if not done:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    select.select([], [], [], 0.05)
+                if not done:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
 
 
 if __name__ == "__main__":

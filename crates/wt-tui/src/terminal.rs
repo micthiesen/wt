@@ -142,11 +142,17 @@ pub async fn run(
                         let received = Instant::now();
                         match model.input(key, terminal.size()?.height.saturating_sub(4) as usize) {
                             InputResult::Quit => break,
-                            InputResult::Refresh => { source.refresh(); }
+                            InputResult::Refresh => {
+                                source.refresh();
+                                model.toast = Some(("Refreshing…".into(), false));
+                                toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+                                dirty = true;
+                                input_at = Some(received);
+                            }
                             InputResult::Draw => { dirty = true; input_at = Some(received); }
                             InputResult::Unchanged => {}
                             InputResult::Action(action) => {
-                                match actions.requests.try_send(action) {
+                                match actions.requests.try_send(crate::UiRequest { generation: model.ui_generation, action }) {
                                     Ok(()) => model.toast = Some(("Working…".into(), false)),
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), true)),
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), true)),
@@ -164,7 +170,14 @@ pub async fn run(
             }
             reply = actions.replies.recv(), if controller_open => {
                 if let Some(reply) = reply {
+                    let history_was_open = model.history.active;
                     let handoff = model.reply(reply);
+                    if history_was_open && !model.history.active {
+                        let _ = actions.requests.try_send(crate::UiRequest {
+                            generation: model.ui_generation,
+                            action: crate::UiAction::SetHistoryActive { active: false },
+                        });
+                    }
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                     dirty = true;
                     if let Some(ticket) = handoff {

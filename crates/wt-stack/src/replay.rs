@@ -43,7 +43,7 @@ pub(crate) async fn replay_chain(
     chain: &RestackChain,
     trunk: &str,
     cancellation: &CancellationToken,
-    on_event: &mut dyn FnMut(StackEvent),
+    on_event: &mut (dyn FnMut(StackEvent) + Send),
 ) -> Result<ReplayChainResult, StackError> {
     for step in &chain.steps {
         let status = run_git(
@@ -401,7 +401,7 @@ async fn replay_one(
     anchor: &str,
     new_base: &str,
     cancellation: &CancellationToken,
-    on_event: &mut dyn FnMut(StackEvent),
+    on_event: &mut (dyn FnMut(StackEvent) + Send),
 ) -> Result<Result<ReplayStepResult, ReplayFailure>, StackError> {
     let cwd = Path::new(&step.worktree_path);
     let Some(new_base_sha) = git_sha(runner, cwd, new_base, cancellation).await? else {
@@ -730,7 +730,7 @@ async fn prune_superseded_backups(
     runner: &ProcessRunner,
     cwd: &Path,
     branch: &str,
-    on_event: &mut dyn FnMut(StackEvent),
+    on_event: &mut (dyn FnMut(StackEvent) + Send),
 ) {
     let Ok(refs) = run_git(
         runner,
@@ -775,7 +775,7 @@ async fn retarget_if_needed(
     step: &StackStep,
     expected_base: &str,
     cancellation: &CancellationToken,
-    on_event: &mut dyn FnMut(StackEvent),
+    on_event: &mut (dyn FnMut(StackEvent) + Send),
 ) -> Result<(), StackError> {
     let Some(pr) = github.view_pr(&step.branch, cancellation).await? else {
         return Ok(());

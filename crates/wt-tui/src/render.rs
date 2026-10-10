@@ -38,75 +38,149 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
             ),
             Span::raw(&model.board.name),
             Span::styled(
+                if model.board.automations_paused {
+                    "  auto paused"
+                } else {
+                    ""
+                },
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
                 format!("  {} worktrees  {state}", model.board.rows.len()),
+                Style::new().fg(MUTED),
+            ),
+            Span::styled(
+                format!("  {}", model.board.usage.join(" · ")),
                 Style::new().fg(MUTED),
             ),
         ])),
         header,
     );
-    let [list, right] = if area.width >= 80 {
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body)
+    let (list, details, activity) = if model.board.full_width_activity && area.width >= 80 {
+        let [top, activity] =
+            Layout::vertical([Constraint::Max(22), Constraint::Min(4)]).areas(body);
+        let [list, details] =
+            Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(top);
+        (list, details, activity)
     } else {
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body)
+        let [list, right] = if area.width >= 80 {
+            Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body)
+        } else {
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body)
+        };
+        let [details, activity] =
+            Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(right);
+        (list, details, activity)
     };
-    let [details, activity] =
-        Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(right);
-    render_list(frame, model, list);
-    let lines = model
-        .selected_row()
-        .map(|row| {
-            let mut lines = vec![
-                Line::styled(&row.title, Style::new().add_modifier(Modifier::BOLD)),
-                Line::from(row.branch.as_str()),
-                Line::styled(&row.path, Style::new().fg(MUTED)),
-                Line::default(),
-            ];
-            lines.extend(row.details.iter().map(|line| Line::from(line.as_str())));
-            lines
-        })
-        .unwrap_or_else(|| match model.selected_section() {
-            Some(section) => {
+    if model.history.active {
+        crate::history::render(frame, model, list, details);
+    } else {
+        render_list(frame, model, list);
+        let lines = model
+            .selected_row()
+            .map(|row| {
                 let mut lines = vec![
-                    Line::styled(&section.title, Style::new().add_modifier(Modifier::BOLD)),
-                    Line::from(format!(
-                        "{} worktrees · Tab to {}",
-                        section.rows.len(),
-                        if section.folded { "expand" } else { "fold" }
-                    )),
+                    Line::styled(&row.title, Style::new().add_modifier(Modifier::BOLD)),
+                    Line::from(row.branch.as_str()),
+                    Line::styled(&row.path, Style::new().fg(MUTED)),
                     Line::default(),
                 ];
-                lines.extend(
-                    section
-                        .rows
-                        .iter()
-                        .filter_map(|&index| model.board.rows.get(index))
-                        .map(|row| {
-                            Line::from(format!("{}: {}  {}", row.slug, row.title, row.badge))
-                        }),
-                );
+                if let Some(status) = &row.issue_status {
+                    lines.push(Line::from(format!("Tracker: {status}")));
+                }
+                lines.extend(row.details.iter().map(|line| Line::from(line.as_str())));
+                if model.show_verification
+                    && let Some(steps) = &row.verify_steps
+                {
+                    lines.push(Line::default());
+                    lines.extend(steps.lines().map(Line::from));
+                }
+                for session in &row.sessions {
+                    lines.push(Line::default());
+                    lines.push(Line::styled(
+                        format!(
+                            "{} / {}: {}{}",
+                            session.harness,
+                            session.name,
+                            session.state,
+                            if session.queued > 0 {
+                                format!(" · {} queued", session.queued)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        Style::new().fg(Color::Cyan),
+                    ));
+                }
                 lines
-            }
-            None => vec![Line::from("No worktrees")],
-        });
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel("Details"))
-            .wrap(Wrap { trim: false })
-            .scroll((model.details_scroll, 0)),
-        details,
-    );
+            })
+            .unwrap_or_else(|| {
+                if let Some(review) = model.selected_review() {
+                    let mut lines = vec![
+                        Line::styled(&review.title, Style::new().add_modifier(Modifier::BOLD)),
+                        Line::from(format!(
+                            "#{} · {} · {}",
+                            review.number, review.author, review.branch
+                        )),
+                        Line::from(review.url.as_str()),
+                        Line::default(),
+                    ];
+                    lines.extend(review.details.iter().map(|line| Line::from(line.as_str())));
+                    lines.push(Line::from("w checkout · p open PR · d dismiss"));
+                    lines
+                } else {
+                    match model.selected_section() {
+                        Some(section) => {
+                            let mut lines = vec![
+                                Line::styled(
+                                    &section.title,
+                                    Style::new().add_modifier(Modifier::BOLD),
+                                ),
+                                Line::from(format!(
+                                    "{} worktrees · Tab to {}",
+                                    section.rows.len(),
+                                    if section.folded { "expand" } else { "fold" }
+                                )),
+                                Line::default(),
+                            ];
+                            lines.extend(
+                                section
+                                    .rows
+                                    .iter()
+                                    .filter_map(|&index| model.board.rows.get(index))
+                                    .map(|row| {
+                                        Line::from(format!(
+                                            "{}: {}  {}",
+                                            row.slug, row.title, row.badge
+                                        ))
+                                    }),
+                            );
+                            lines
+                        }
+                        None => vec![Line::from(if model.board.review_requests.is_empty() {
+                            "No worktrees"
+                        } else {
+                            "Requested reviews · Tab to fold or expand"
+                        })],
+                    }
+                }
+            });
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel("Details"))
+                .wrap(Wrap { trim: false })
+                .scroll((model.details_scroll, 0)),
+            details,
+        );
+    }
     let available = activity.height.saturating_sub(2) as usize;
-    let activity_lines: Vec<_> = model
-        .board
-        .activity
-        .iter()
-        .rev()
-        .take(available)
-        .rev()
-        .map(|line| Line::from(line.as_str()))
-        .collect();
+    let (title, activity_lines) = model.output_view(available);
+    let activity_lines = activity_lines
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(activity_lines).block(panel("Activity")),
+        Paragraph::new(activity_lines).block(panel(&title)),
         activity,
     );
     if let Interaction::Text(prompt) = &model.interaction {
@@ -173,21 +247,110 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
         );
     }
     if model.show_perf {
-        let overlay = centered(area, 56, 7);
+        let overlay = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
         frame.render_widget(Clear, overlay);
-        frame.render_widget(Paragraph::new(format!(
-            "Frames: {}\nLast draw: {} µs\nDraws occur only after input or source changes.\nP closes this view.",
-            model.frame_count, model.last_frame_micros
-        )).block(panel("Rendering")), overlay);
+        let mut lines = vec![Line::from(format!(
+            "Frames: {} · last draw: {} µs · continuous: {}",
+            model.frame_count,
+            model.last_frame_micros,
+            if model.perf_continuous { "on" } else { "off" }
+        ))];
+        if model.board.perf.is_empty() {
+            lines.push(Line::from("Sampling…"));
+        }
+        lines.extend(
+            model
+                .board
+                .perf
+                .iter()
+                .skip(model.perf_scroll)
+                .take(overlay.height.saturating_sub(3) as usize)
+                .map(|line| Line::from(line.as_str())),
+        );
+        frame.render_widget(
+            Paragraph::new(lines).block(panel(
+                "Performance · r sample · i continuous · j/k scroll · P closes",
+            )),
+            overlay,
+        );
     }
     if model.help {
-        let overlay = centered(area, 68, 28);
+        let overlay = centered(area, 74, area.height.saturating_sub(2));
         frame.render_widget(Clear, overlay);
-        frame.render_widget(Paragraph::new(
-            "j / k, ↑ / ↓    Move cursor\ng / G            First / last item\nPgUp / PgDn      Half-page navigation\nSpace            Next row needing attention\nTab              Fold / expand section\nCtrl+D / Ctrl+U  Next / previous section\nCtrl+J / Ctrl+K  Scroll details\nn / N            Create / create on selected branch\no                Open editor\nd / c            Remove / clean (confirmation)\na                Archive / restore\nt / #            Edit title / issue identity\nl / L            File into section / rename section\nu / b            Work status / fork base\ni / I / p / s    Open issue / primary / PR / stage\nF10 / F11 / F12  Agent / shell / diff\nm                Manager session\n, / . / /        wt / main / dotfiles session\ny                Copy picker\nr                Refresh sources\nP                Rendering metrics\n?                Help\nq / Ctrl+C       Quit\n\nEsc / q / ? closes help"
-        ).block(panel("wt keymap")).wrap(Wrap { trim: false }), overlay);
+        let lines = crate::help::LINES
+            .iter()
+            .skip(model.help_scroll)
+            .map(|line| Line::from(*line))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).block(panel("wt keymap · j/k scroll · Esc closes")),
+            overlay,
+        );
     }
     match &model.interaction {
+        Interaction::Reviewers(picker) => {
+            let height = (picker.candidates.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let visible = height.saturating_sub(2) as usize;
+            let offset = picker
+                .selected
+                .saturating_sub(visible / 2)
+                .min(picker.candidates.len().saturating_sub(visible));
+            let overlay = centered(area, area.width.saturating_sub(4).min(80), height);
+            frame.render_widget(Clear, overlay);
+            let lines = picker
+                .candidates
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(visible)
+                .map(|(index, option)| {
+                    Line::from(format!(
+                        "{} [{}] {}",
+                        if index == picker.selected { "›" } else { " " },
+                        if option.selected { "x" } else { " " },
+                        option.label
+                    ))
+                    .style(if index == picker.selected {
+                        Style::new().fg(Color::Cyan)
+                    } else {
+                        Style::new()
+                    })
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(lines).block(panel(
+                    "Reviewers · Space toggles · v/Enter submits · Esc cancels",
+                )),
+                overlay,
+            );
+        }
+        Interaction::Log {
+            title,
+            lines,
+            scroll,
+        } => {
+            let overlay = centered(
+                area,
+                area.width.saturating_sub(4),
+                area.height.saturating_sub(4),
+            );
+            frame.render_widget(Clear, overlay);
+            let lines = lines
+                .iter()
+                .skip(*scroll)
+                .take(overlay.height.saturating_sub(2) as usize)
+                .map(|line| Line::from(line.as_str()))
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(panel_owned(format!("{title} · j/k scroll · Esc closes"))),
+                overlay,
+            );
+        }
         Interaction::Confirm(confirm) => {
             let max_lines = area.height.saturating_sub(4) as usize;
             let visible = confirm
@@ -314,6 +477,13 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
                         Span::raw(if selected { "› " } else { "  " }),
                         Span::styled(&row.stack_prefix, Style::new().fg(MUTED)),
                         Span::raw(&row.title),
+                        Span::styled(
+                            row.issue_status
+                                .as_ref()
+                                .map(|status| format!("  {status}"))
+                                .unwrap_or_default(),
+                            Style::new().fg(Color::Blue),
+                        ),
                         Span::styled(format!("  {}", row.badge), Style::new().fg(Color::Cyan)),
                     ])
                     .style(style)
@@ -338,6 +508,24 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
                         section.rows.len()
                     ))
                     .style(style.fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                }
+                Some(crate::model::VisualItem::ReviewHeader) => Line::from(format!(
+                    "{} {} Requested reviews ({})",
+                    if selected { "›" } else { " " },
+                    if model.reviews_folded { "▸" } else { "▾" },
+                    model.board.review_requests.len(),
+                ))
+                .style(style.fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Some(crate::model::VisualItem::ReviewRequest(index)) => {
+                    let row = &model.board.review_requests[index];
+                    Line::from(format!(
+                        "{} #{} {} · {}",
+                        if selected { "›" } else { " " },
+                        row.number,
+                        row.title,
+                        row.author
+                    ))
+                    .style(style)
                 }
                 None => Line::default(),
             }

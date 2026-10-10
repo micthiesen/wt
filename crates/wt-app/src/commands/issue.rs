@@ -241,28 +241,12 @@ fn valid_issue_id(raw: &str) -> bool {
         && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn issue_id_from_slug(ctx: &AppContext, slug: &str) -> Option<String> {
-    let regex = regex::Regex::new(&ctx.config.branch.id_pattern).ok()?;
-    regex
-        .captures(slug)?
-        .get(0)
-        .map(|value| value.as_str().trim_end_matches('-').to_ascii_uppercase())
+fn issue_id_from_slug(_ctx: &AppContext, slug: &str) -> Option<String> {
+    crate::issue_identity::resolve(slug, None)
 }
 
 fn resolve_issue_id(slug: &str, stored: Option<&str>) -> Option<String> {
-    match stored {
-        Some(stored) if stored.trim().is_empty() => None,
-        Some(stored) => Some(stored.trim().to_ascii_uppercase()),
-        None => issue_id_from_slug_value(slug),
-    }
-}
-
-fn issue_id_from_slug_value(slug: &str) -> Option<String> {
-    let regex = regex::Regex::new(r"([a-z]+-\d+)(?:-|$)").ok()?;
-    regex
-        .captures(slug)?
-        .get(1)
-        .map(|value| value.as_str().to_ascii_uppercase())
+    crate::issue_identity::resolve(slug, stored)
 }
 
 async fn issue_url(ctx: &AppContext, id: &str) -> Option<String> {

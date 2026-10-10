@@ -10,11 +10,44 @@ use wt_vcs::WorktreeRecord;
 use crate::{commands::resolve::run_git, context::AppContext};
 
 pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
+    let context = ctx.clone();
     let service = LifecycleService::new(
         ServiceConfig::from_config(&ctx.config),
         (*ctx.repository).clone(),
         ctx.processes.clone(),
-    );
+    )
+    .with_before_remove(move |target, cancellation| {
+        let context = context.clone();
+        async move {
+            match crate::host_cleanup::before_remove(
+                &context,
+                target.slug(),
+                Path::new(&target.path),
+                &cancellation,
+            )
+            .await
+            {
+                Ok(cleanup) => {
+                    let mut messages = cleanup.warnings;
+                    messages.extend(
+                        cleanup
+                            .stopped_sessions
+                            .into_iter()
+                            .map(|session| format!("stopped session {session}")),
+                    );
+                    messages.extend(
+                        cleanup
+                            .reaped_listeners
+                            .into_iter()
+                            .map(|pid| format!("reaped listener pid {pid}")),
+                    );
+                    messages
+                }
+                Err(_) if cancellation.is_cancelled() => Vec::new(),
+                Err(error) => vec![format!("host cleanup failed: {error:#}")],
+            }
+        }
+    });
     Ok(if ctx.config.dev_server.is_some() {
         service.with_dev_server(crate::dev::service(ctx)?)
     } else {
@@ -34,9 +67,11 @@ pub async fn resolve_key(ctx: &AppContext, key: &str) -> Result<WorktreeRecord> 
 pub struct RemovalPlan {
     pub row: WorktreeRecord,
     pub landed: bool,
+    pub local_merged: bool,
     pub hazards: Vec<String>,
     pub destroy_stage: bool,
     pub revision: wt_lifecycle::RemovalRevision,
+    pub removed_snapshot: wt_store::RemovedWorktree,
 }
 
 pub struct RemovalPlans {
@@ -70,6 +105,19 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             Err(error) => return Err(error.into()),
         }
     };
+    plan_with_facts(ctx, rows, &state, &github, warning).await
+}
+
+/// Build removal evidence from caller-prepared wtstate and GitHub snapshots.
+/// This keeps automation evaluation on the same authoritative safety path as
+/// explicit cleanup without launching another GitHub fetch.
+pub async fn plan_with_facts(
+    ctx: &AppContext,
+    rows: Vec<WorktreeRecord>,
+    state: &serde_json::Value,
+    github: &GithubData,
+    warning: Option<String>,
+) -> Result<RemovalPlans> {
     let lifecycle = service(ctx)?;
     let mut plans = Vec::with_capacity(rows.len());
     for row in rows {
@@ -101,8 +149,8 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             && github.prs.get(&row.target.branch).is_some_and(|pr| {
                 pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
             });
-        let mut landed = pr_landed;
-        if own_work && !landed {
+        let mut local_merged = false;
+        if own_work && !pr_landed {
             for reference in [
                 format!("refs/remotes/origin/{}", ctx.config.branch.base),
                 format!("refs/heads/{}", ctx.config.branch.base),
@@ -119,7 +167,7 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
                 )
                 .await?;
                 match ancestry.status.code() {
-                    Some(0) => landed = true,
+                    Some(0) => local_merged = true,
                     Some(1) => {}
                     _ => {
                         ancestry.checked("git")?;
@@ -128,6 +176,49 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
                 break;
             }
         }
+        let landed = pr_landed || local_merged;
+        let mut extra = serde_json::Map::new();
+        let pr = github.prs.get(&row.target.branch);
+        if let Some(title) = stored["manualTitle"]
+            .as_str()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                pr.map(|pr| pr.title.as_str())
+                    .filter(|title| !title.trim().is_empty())
+            })
+        {
+            extra.insert("title".into(), serde_json::json!(title));
+        }
+        if let Some(issue_id) =
+            crate::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
+        {
+            extra.insert("issueId".into(), serde_json::json!(issue_id));
+        }
+        if let Some(github_issue) = stored.get("githubIssue") {
+            extra.insert("githubIssue".into(), github_issue.clone());
+        }
+        if landed {
+            extra.insert("gitState".into(), serde_json::json!("merged"));
+            extra.insert("landedOnAtRemoval".into(), serde_json::json!("base"));
+        }
+        if let Some(pr) = pr {
+            extra.insert("prNumber".into(), serde_json::json!(pr.number));
+            extra.insert("prUrl".into(), serde_json::json!(pr.url));
+            extra.insert("prState".into(), serde_json::json!(pr.state));
+            if pr.state == "MERGED"
+                && let Some(merge_oid) = &pr.merge_commit_oid
+            {
+                extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
+            }
+        }
+        let removed_snapshot = wt_store::RemovedWorktree {
+            slug: row.target.slug().to_owned(),
+            branch: row.target.branch.clone(),
+            removed_at: String::new(),
+            work: None,
+            automations_paused: None,
+            extra,
+        };
         let revision = lifecycle
             .removal_revision(&row.target, landed, &ctx.cancellation)
             .await?;
@@ -146,9 +237,11 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
         plans.push(RemovalPlan {
             row,
             landed,
+            local_merged,
             hazards,
             destroy_stage,
             revision,
+            removed_snapshot,
         });
     }
     Ok(RemovalPlans {
@@ -198,6 +291,7 @@ pub async fn cleanup_confirmed(
                         landed: true,
                         destroy_stage: plan.destroy_stage,
                         expected_revision: Some(plan.revision),
+                        removed_snapshot: Some(plan.removed_snapshot),
                     },
                 ))
             }

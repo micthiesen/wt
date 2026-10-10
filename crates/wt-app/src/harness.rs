@@ -23,6 +23,10 @@ use wt_tui::SessionTarget;
 
 use crate::context::AppContext;
 
+#[path = "session_commands.rs"]
+mod session_commands;
+pub use session_commands::{list_session_options, prepare_session, stop_managed_session};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {
     pub slug: String,
@@ -215,20 +219,7 @@ impl AppHarness {
                     },
                     Some(names) => {
                         let live = live_harnesses(&target.slug, names, &known, &ids);
-                        let selected = if live.contains(&primary) {
-                            primary
-                        } else {
-                            live.first().copied().unwrap_or(primary)
-                        };
-                        HarnessChoice {
-                            selected: Some(selected),
-                            source: if live.is_empty() {
-                                SelectionSource::Primary
-                            } else {
-                                SelectionSource::Live
-                            },
-                            live: Some(live),
-                        }
+                        choose_live_harness(primary, live)
                     }
                 };
                 AgentRoute { target, choice }
@@ -536,7 +527,16 @@ pub async fn ui_session_with_harness(
         | SessionTarget::Main
         | SessionTarget::WtSource
         | SessionTarget::Dotfiles => {
-            let harness_id = selected_harness.unwrap_or_else(|| app.primary());
+            let harness_id = match selected_harness {
+                Some(id) => id,
+                None => app
+                    .routes(context)
+                    .await?
+                    .into_iter()
+                    .find(|route| route.target.slug == slug)
+                    .and_then(|route| route.choice.selected)
+                    .unwrap_or_else(|| app.primary()),
+            };
             let request = HarnessSpawnRequest {
                 worktree_path: cwd.clone(),
                 slug: slug.clone(),
@@ -573,12 +573,7 @@ pub async fn ui_session_with_harness(
                 let resume = if harness_id == HarnessId::Claude {
                     None
                 } else {
-                    let desired = managed_name.as_deref().unwrap_or("primary");
-                    discovered
-                        .iter()
-                        .find(|entry| entry.extras.managed_name.as_deref() == Some(desired))
-                        .or_else(|| discovered.first())
-                        .map(|entry| entry.session_id.clone())
+                    primary_single_slot_session(&discovered).map(|entry| entry.session_id.clone())
                 };
                 app.service
                     .ensure_started(
@@ -597,12 +592,42 @@ pub async fn ui_session_with_harness(
     Ok(app.attach_command(&session, &cwd))
 }
 
+fn primary_single_slot_session(
+    sessions: &[wt_harness::HarnessSession],
+) -> Option<&wt_harness::HarnessSession> {
+    sessions
+        .iter()
+        .find(|session| session.extras.managed_name.as_deref() == Some("primary"))
+        .or_else(|| {
+            sessions
+                .iter()
+                .max_by_key(|session| session.last_active_ms.unwrap_or_default())
+        })
+}
+
 fn resolve_diff_command(template: &str, base: &str) -> String {
     if !template.contains("{{base}}") {
         return template.to_owned();
     }
     let quoted = format!("\"{}\"", base.replace('"', "\\\""));
     template.replace("{{base}}", &quoted)
+}
+
+fn choose_live_harness(primary: HarnessId, live: Vec<HarnessId>) -> HarnessChoice {
+    let selected = if live.contains(&primary) {
+        primary
+    } else {
+        live.first().copied().unwrap_or(primary)
+    };
+    HarnessChoice {
+        selected: Some(selected),
+        source: if live.is_empty() {
+            SelectionSource::Primary
+        } else {
+            SelectionSource::Live
+        },
+        live: Some(live),
+    }
 }
 
 fn live_harnesses(
@@ -618,11 +643,9 @@ fn live_harnesses(
             HarnessId::Codex => format!("{slug}-codex"),
             HarnessId::Opencode => format!("{slug}-opencode"),
         };
-        // A Codex slot named exactly like another target belongs to that
-        // target's Claude primary, not to this slug's Codex process.
-        if (id != HarnessId::Codex || name == slug || !known_slugs.contains(&name))
-            && names.contains(&name)
-        {
+        // An auxiliary harness slot can have the same name as another
+        // worktree's Claude primary. The real slug owns that exact name.
+        if (id == HarnessId::Claude || !known_slugs.contains(&name)) && names.contains(&name) {
             live.push(id);
             continue;
         }
@@ -670,6 +693,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_target_matches_typescript_identity_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../test/compat/target-identity.json"))
+                .unwrap();
+        let input = &fixture["input"];
+        let names = serde_json::from_value(input["names"].clone()).unwrap();
+        let known = serde_json::from_value(input["knownSlugs"].clone()).unwrap();
+        let primary = serde_json::from_value(input["primary"].clone()).unwrap();
+        let choice = choose_live_harness(
+            primary,
+            live_harnesses(input["slug"].as_str().unwrap(), &names, &known, &[]),
+        );
+        assert_eq!(choice.source, SelectionSource::Live);
+        assert_eq!(
+            serde_json::json!({
+                "harnessId": choice.selected, "source": "live", "liveHarnesses": choice.live,
+            }),
+            fixture["expected"]
+        );
+    }
+
+    #[test]
     fn manager_claude_slot_has_distinct_identity() {
         assert_eq!(
             session_name(
@@ -693,5 +738,8 @@ mod tests {
             live_harnesses("branch", &names, &known, &[]),
             [HarnessId::Opencode]
         );
+        let mut known = known;
+        known.insert("branch-opencode".into());
+        assert!(live_harnesses("branch", &names, &known, &[]).is_empty());
     }
 }

@@ -33,6 +33,7 @@ pub struct DestroyOptions {
     pub landed: bool,
     pub destroy_stage: bool,
     pub expected_revision: Option<RemovalRevision>,
+    pub removed_snapshot: Option<wt_store::RemovedWorktree>,
 }
 
 pub async fn start_remove(
@@ -119,6 +120,7 @@ async fn start_remove_inner(
             "deleteBranch": options.delete_branch,
             "landed": options.landed,
             "destroyStage": options.destroy_stage,
+            "removedSnapshot": options.removed_snapshot,
         },
         "createdAt": now_string(),
         "workerPid": null,
@@ -256,6 +258,7 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
         bail!("unsupported destroy job operation");
     }
     let options = &job["options"];
+    let dev_port = crate::host_cleanup::stored_dev_port(ctx, row.target.slug()).await;
     let service = crate::lifecycle_ops::service(ctx)?;
     let removed = service
         .remove_with_revision(
@@ -265,6 +268,12 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
                 delete_branch: options["deleteBranch"].as_bool().unwrap_or(true),
                 landed: options["landed"].as_bool().unwrap_or(false),
                 destroy_stage: options["destroyStage"].as_bool().unwrap_or(false),
+                removed_snapshot: options["removedSnapshot"]
+                    .as_null()
+                    .is_none()
+                    .then(|| serde_json::from_value(options["removedSnapshot"].clone()))
+                    .transpose()
+                    .context("background job has invalid removed-history snapshot")?,
             },
             &revision,
             &ctx.cancellation,
@@ -272,6 +281,11 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
         .await?;
     for warning in removed.warnings {
         eprintln!("warning: {warning}");
+    }
+    if removed.removed {
+        for warning in crate::host_cleanup::after_remove(ctx, row.target.slug(), dev_port).await {
+            eprintln!("warning: {warning}");
+        }
     }
     Ok(())
 }

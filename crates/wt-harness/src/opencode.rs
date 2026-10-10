@@ -11,6 +11,10 @@ use tokio_util::sync::CancellationToken;
 use wt_platform::process::ProcessRunner;
 use wt_tmux::{CreateSession, OptionScope, PaneTarget, TmuxClient, TmuxError};
 
+mod output;
+
+pub use output::OpenCodeOutputTracker;
+
 use crate::{
     DiscoveryRequest, HarnessExtras, HarnessSession, HarnessSpawnRequest, SpawnCommand,
     persist::{FileLock, atomic_write_json, read_object},
@@ -104,7 +108,7 @@ struct OpenCodeSnapshot {
     parts_seen: HashSet<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OpenCodeActivityTracker {
     baseline: bool,
     known_sessions: HashMap<String, HashSet<String>>,

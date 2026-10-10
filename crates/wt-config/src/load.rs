@@ -459,14 +459,54 @@ impl Config {
                 dev
             });
 
-        let remote = optional_section::<RawRemote>(&raw, "remote", "", &mut errors).map(|r| {
-            required(&r.host, "remote.host", &mut errors);
-            RemoteConfig {
-                label: nonempty(r.label).unwrap_or_else(|| r.host.clone()),
-                wt_path: nonempty(r.wt_path).unwrap_or_else(|| "~/.wt/bin/wt".into()),
-                host: r.host,
+        let mut remote_entries = Vec::new();
+        if let Some(remote) = optional_section::<RawRemote>(&raw, "remote", "", &mut errors) {
+            remote_entries.push(("remote".to_owned(), remote));
+        }
+        if let Some(value) = raw.get("remotes") {
+            match value.clone().try_into::<Vec<RawRemote>>() {
+                Ok(entries) => remote_entries.extend(
+                    entries
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, remote)| (format!("remotes[{index}]"), remote)),
+                ),
+                Err(error) => errors.push(format!("remotes: {error}; use [[remotes]] tables")),
             }
-        });
+        }
+        let mut hosts = BTreeSet::new();
+        let remotes = remote_entries
+            .into_iter()
+            .map(|(field, r)| {
+                required(&r.host, &format!("{field}.host"), &mut errors);
+                if r.host.starts_with('-')
+                    || r.host.chars().any(char::is_whitespace)
+                    || r.host.chars().any(char::is_control)
+                {
+                    errors.push(format!(
+                        "{field}.host must be an SSH destination or alias, not options"
+                    ));
+                }
+                if !hosts.insert(r.host.clone()) {
+                    errors.push(format!("{field}.host duplicates SSH host {:?}", r.host));
+                }
+                let config = nonempty(r.config);
+                if let Some(path) = &config
+                    && (!(path.starts_with('/') || path.starts_with("~/"))
+                        || path.chars().any(char::is_control))
+                {
+                    errors.push(format!(
+                        "{field}.config must be an absolute worker path or start with ~/"
+                    ));
+                }
+                RemoteConfig {
+                    label: nonempty(r.label).unwrap_or_else(|| r.host.clone()),
+                    wt_path: nonempty(r.wt_path).unwrap_or_else(|| "~/.wt/bin/wt".into()),
+                    host: r.host,
+                    config,
+                }
+            })
+            .collect();
 
         let naming = optional_section::<NamingConfig>(&raw, "naming", "", &mut errors);
         if raw.get("ai").is_some() {
@@ -560,7 +600,7 @@ impl Config {
             issue_tracker,
             review_bot,
             dev_server,
-            remote,
+            remotes,
             harness: HarnessConfig {
                 primary: harness_raw.primary,
                 hidden,
@@ -1154,6 +1194,7 @@ struct RawRemote {
     host: String,
     label: String,
     wt_path: String,
+    config: String,
 }
 #[derive(Deserialize)]
 #[serde(default)]

@@ -28,6 +28,17 @@ pub struct SourceSnapshot<T> {
     pub revision: u64,
 }
 
+impl<T> Default for SourceSnapshot<T> {
+    fn default() -> Self {
+        Self {
+            data: None,
+            state: SourceState::Empty,
+            updated_at: None,
+            revision: 0,
+        }
+    }
+}
+
 impl<T> Clone for SourceSnapshot<T> {
     fn clone(&self) -> Self {
         Self {

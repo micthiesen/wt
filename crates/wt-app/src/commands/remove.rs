@@ -111,6 +111,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
                 landed: plan.landed,
                 destroy_stage,
                 expected_revision: Some(plan.revision),
+                removed_snapshot: Some(plan.removed_snapshot.clone()),
             },
         )
         .await?;
@@ -118,6 +119,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
         return Ok(0);
     }
     let service = lifecycle_ops::service(ctx)?;
+    let dev_port = crate::host_cleanup::stored_dev_port(ctx, record.target.slug()).await;
     let result = service
         .remove_with_revision(
             &record.target,
@@ -126,6 +128,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
                 delete_branch: !args.keep_branch,
                 landed: plan.landed,
                 destroy_stage,
+                removed_snapshot: Some(plan.removed_snapshot),
             },
             &plan.revision,
             &ctx.cancellation,
@@ -134,6 +137,13 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
     match result {
         Ok(result) => {
             println!("✓ removed {}", record.target.slug());
+            if result.removed {
+                for warning in
+                    crate::host_cleanup::after_remove(ctx, record.target.slug(), dev_port).await
+                {
+                    eprintln!("warning: {warning}");
+                }
+            }
             if result.destroyed_stage {
                 println!("✓ destroyed stage {}", record.target.stage);
             }

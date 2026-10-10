@@ -14,14 +14,22 @@ use crate::context::AppContext;
 
 const BACKSTOP: Duration = Duration::from_secs(15);
 
+pub struct DevSources {
+    pub board: SourceHandle<Board>,
+    pub status: Option<SourceHandle<Vec<DevStatusRow>>>,
+}
+
 pub fn overlay(
     scope: &TaskScope,
     context: &AppContext,
     local: SourceHandle<Board>,
     board: SourceHandle<Board>,
-) -> SourceHandle<Board> {
+) -> DevSources {
     if context.config.dev_server.is_none() {
-        return board;
+        return DevSources {
+            board,
+            status: None,
+        };
     }
     let dev = start_source(
         scope,
@@ -51,7 +59,10 @@ pub fn overlay(
         context.config.paths.cache_root.join("dev"),
         dev.clone(),
     );
-    project(scope, local, board, dev)
+    DevSources {
+        board: project(scope, local, board, dev.clone()),
+        status: Some(dev),
+    }
 }
 
 fn worktrees(snapshot: &SourceSnapshot<Board>) -> Vec<DevWorktree> {
@@ -179,6 +190,9 @@ fn compose(
         _ => None,
     };
     for row in &mut data.rows {
+        if wt_core::is_remote_worktree_ledger_key(&row.key) {
+            continue;
+        }
         let status = dev
             .data
             .as_ref()

@@ -20,6 +20,7 @@ use crate::{
 mod app_server;
 mod events;
 mod messaging;
+mod output;
 mod usage;
 
 pub use app_server::{
@@ -28,6 +29,7 @@ pub use app_server::{
 };
 pub use events::{CodexActivityBatch, CodexActivityTracker, CodexEvent, CodexEventLevel};
 pub use messaging::{CodexMessageOutcome, CodexMessageTarget, CodexMessenger};
+pub use output::CodexOutputTracker;
 pub use usage::{CodexUsage, read_codex_usage};
 
 const CODEX_SLOT_INFIX: &str = "-codex";
@@ -450,13 +452,35 @@ fn find_rollout(
     slug: &str,
     id: &str,
 ) -> Result<Option<Rollout>, CodexHarnessError> {
+    find_rollout_cancellable(dir, cwd, slug, id, None)
+}
+
+fn find_rollout_cancellable(
+    dir: &Path,
+    cwd: &Path,
+    slug: &str,
+    id: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<Rollout>, CodexHarnessError> {
     let mut stack = vec![dir.to_path_buf()];
     let mut best: Option<Rollout> = None;
     while let Some(current) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(CodexHarnessError::Operation {
+                operation: "read output",
+                detail: "cancelled".into(),
+            });
+        }
         let Ok(entries) = fs::read_dir(current) else {
             continue;
         };
         for entry in entries.flatten() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(CodexHarnessError::Operation {
+                    operation: "read output",
+                    detail: "cancelled".into(),
+                });
+            }
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);

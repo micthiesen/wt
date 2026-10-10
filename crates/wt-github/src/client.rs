@@ -9,6 +9,7 @@ use std::{
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use wt_config::{Config, ReviewBotMode};
@@ -26,6 +27,8 @@ const GH_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_ATTEMPTS: usize = 3;
 const MAX_CHUNK_CONCURRENCY: usize = 4;
 const WORKFLOW_SCOPE_REMEDY: &str = "This is the LOCAL gh token, not the PR: run `gh auth refresh -h github.com -s workflow` (then `gh auth status` to confirm), and try again. Retrying as-is never clears it.";
+const PICKER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+type PickerCache<T> = Arc<AsyncMutex<Option<(tokio::time::Instant, T)>>>;
 
 #[derive(Clone, Debug)]
 pub struct GithubOptions {
@@ -70,6 +73,8 @@ pub struct GithubClient {
     repo: Option<RepoSlug>,
     gh_program: OsString,
     merge_requests: Arc<Mutex<HashSet<u64>>>,
+    viewer_login_cache: PickerCache<String>,
+    contributors_cache: PickerCache<Vec<Contributor>>,
 }
 
 impl GithubClient {
@@ -81,6 +86,8 @@ impl GithubClient {
             repo: None,
             gh_program: "gh".into(),
             merge_requests: Arc::new(Mutex::new(HashSet::new())),
+            viewer_login_cache: Arc::new(AsyncMutex::new(None)),
+            contributors_cache: Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -97,6 +104,13 @@ impl GithubClient {
 
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// Forget picker-only identity and contributor data after an explicit
+    /// user refresh. Cached GitHub query data is owned by the source layer.
+    pub async fn invalidate_picker_cache(&self) {
+        *self.viewer_login_cache.lock().await = None;
+        *self.contributors_cache.lock().await = None;
     }
 
     async fn run(
@@ -814,6 +828,48 @@ impl GithubClient {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<Vec<Contributor>, GithubError> {
+        let mut cache = self.contributors_cache.lock().await;
+        if let Some((updated_at, contributors)) = cache.as_ref()
+            && updated_at.elapsed() < PICKER_CACHE_TTL
+        {
+            return Ok(contributors.clone());
+        }
+        let contributors = self.fetch_repo_contributors_uncached(cancellation).await?;
+        *cache = Some((tokio::time::Instant::now(), contributors.clone()));
+        Ok(contributors)
+    }
+
+    /// Current authenticated login, cached with the picker contributor data.
+    pub async fn viewer_login(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GithubError> {
+        let mut cache = self.viewer_login_cache.lock().await;
+        if let Some((updated_at, login)) = cache.as_ref()
+            && updated_at.elapsed() < PICKER_CACHE_TTL
+        {
+            return Ok(login.clone());
+        }
+        let output = self
+            .run(["api", "user", "--jq", ".login"], cancellation)
+            .await?;
+        if !output.status.success() {
+            return Err(classify_output(&output));
+        }
+        let login = output.stdout_text().trim().to_owned();
+        if login.is_empty() {
+            return Err(GithubError::Protocol(
+                "authenticated GitHub user response omitted login".into(),
+            ));
+        }
+        *cache = Some((tokio::time::Instant::now(), login.clone()));
+        Ok(login)
+    }
+
+    async fn fetch_repo_contributors_uncached(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Contributor>, GithubError> {
         let repo = self.repository(cancellation).await?.as_str();
         let contributors = self
             .run(
@@ -1299,7 +1355,7 @@ fn human_comments(pr: &Value, bot_login: &str) -> Vec<PrComment> {
 }
 
 fn review_requests_query() -> &'static str {
-    r#"query { search(query:"is:pr is:open review-requested:@me",type:ISSUE,first:50) { nodes { ... on PullRequest { number url title isDraft createdAt updatedAt author { login } repository { nameWithOwner } headRefName additions deletions changedFiles reviewDecision comments { totalCount } commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } } } } }"#
+    r#"query { search(query:"is:pr is:open review-requested:@me",type:ISSUE,first:50) { nodes { ... on PullRequest { number url title isDraft createdAt updatedAt author { login } repository { nameWithOwner } headRefName headRefOid additions deletions changedFiles reviewDecision comments { totalCount } commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } } } } }"#
 }
 fn parse_review_request(v: &Value, options: &GithubOptions) -> Option<ReviewRequestPr> {
     let repo = str_at(v, "/repository/nameWithOwner").unwrap_or_default();
@@ -1325,6 +1381,7 @@ fn parse_review_request(v: &Value, options: &GithubOptions) -> Option<ReviewRequ
         title: str_at(v, "/title")?.into(),
         repo_name_with_owner: repo.into(),
         head_ref_name: str_at(v, "/headRefName").map(str::to_owned),
+        head_ref_oid: str_at(v, "/headRefOid").map(str::to_owned),
         author: str_at(v, "/author/login").map(str::to_owned),
         is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
         checks: if options.repo_has_ci && checks == PrChecks::None {
@@ -1624,6 +1681,58 @@ mod transport_tests {
         assert_eq!(pr.comments[0].body, "hello");
         assert_eq!(pr.unresolved_threads_total, 1);
         assert_eq!(pr.unresolved_threads, 1);
+    }
+
+    #[tokio::test]
+    async fn reviewer_picker_identity_and_contributors_are_cached_per_client() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("fake-gh");
+        let calls = dir.path().join("calls.jsonl");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, sys
+args=sys.argv[1:]
+with open({calls:?}, 'a') as f: f.write(json.dumps(args)+'\n')
+if args[:2] == ['api', 'user']:
+    print('reviewer')
+elif len(args) > 1 and args[1].startswith('repos/acme/repo/contributors'):
+    print('[{{"login":"author","contributions":7}}]')
+elif len(args) > 1 and args[1].startswith('repos/acme/repo/commits'):
+    print('[]')
+else:
+    raise SystemExit('unexpected gh args: ' + repr(args))
+"#,
+                calls = calls.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(script)
+            .with_repository(RepoSlug::parse("acme/repo").unwrap());
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            client.viewer_login(&cancellation).await.unwrap(),
+            "reviewer"
+        );
+        assert_eq!(
+            client.clone().viewer_login(&cancellation).await.unwrap(),
+            "reviewer"
+        );
+        let contributors = client.fetch_repo_contributors(&cancellation).await.unwrap();
+        let again = client
+            .clone()
+            .fetch_repo_contributors(&cancellation)
+            .await
+            .unwrap();
+        assert_eq!(contributors, again);
+        assert_eq!(contributors[0].login, "author");
+        assert_eq!(fs::read_to_string(calls).unwrap().lines().count(), 3);
     }
 
     #[test]

@@ -95,6 +95,18 @@ pub fn prepare_action(
     context: &ActionContext,
     extras: &str,
 ) -> Result<ActionPlan, ActionPlanError> {
+    prepare_action_with_vars(def, context, extras, &ActionVars::new())
+}
+
+/// Prepare the usual action plan with caller-supplied variables taking
+/// precedence over the values derived from the current row. This is used by
+/// queued automations whose inputs were frozen when the fire was evaluated.
+pub fn prepare_action_with_vars(
+    def: &ActionDef,
+    context: &ActionContext,
+    extras: &str,
+    overrides: &ActionVars,
+) -> Result<ActionPlan, ActionPlanError> {
     let availability = evaluate_requirements(&def.requires, &context.row);
     if let Some(reason) = availability {
         return Err(ActionPlanError::Requirement {
@@ -102,7 +114,8 @@ pub fn prepare_action(
             reason,
         });
     }
-    let vars = context.vars();
+    let mut vars = context.vars();
+    vars.extend(overrides.clone());
     let rendered_extras = apply_vars(extras, &vars).trim().to_owned();
     if def.kind == ActionKind::Claude && def.target != ActionTarget::Headless {
         let prompt = rendered_prompt(def, &vars, &rendered_extras)?;
@@ -147,6 +160,21 @@ pub fn prepare_action(
     });
     Ok(ActionPlan::Tracked(Box::new(PreparedAction {
         request: ActionRequest {
+            arg_history: context.arg.as_ref().map(|value| crate::ActionArgHistory {
+                value: value.clone(),
+                label_extract: def.label_extract.clone(),
+                launch_token: None,
+            }),
+            issue_status: (def.kind == ActionKind::Shell && !context.issue_id.is_empty())
+                .then(|| {
+                    def.issue_status
+                        .as_ref()
+                        .map(|status| crate::IssueStatusExpectation {
+                            issue_id: context.issue_id.clone(),
+                            status: status.clone(),
+                        })
+                })
+                .flatten(),
             action_key: if context.action_key.is_empty() {
                 context.slug.clone()
             } else {
@@ -489,5 +517,29 @@ mod tests {
         assert_eq!(prepared.request.command.first().unwrap(), "claude");
         assert_eq!(prepared.request.command.last().unwrap(), "work wk-1");
         assert_eq!(prepared.request.config_selectors, BTreeMap::new());
+    }
+
+    #[test]
+    fn tracked_action_captures_argument_and_label_extractor() {
+        let def = ActionDef {
+            id: "lookup".into(),
+            name: "Lookup".into(),
+            prompt: Some("resolve {{arg}}".into()),
+            label_extract: Some("Resolved: (.*)".into()),
+            ..ActionDef::default()
+        };
+        let mut context = context();
+        context.arg = Some("raw-key".into());
+        let ActionPlan::Tracked(prepared) = prepare_action(&def, &context, "").unwrap() else {
+            panic!("headless action should be tracked");
+        };
+        assert_eq!(
+            prepared.request.arg_history,
+            Some(crate::ActionArgHistory {
+                value: "raw-key".into(),
+                label_extract: Some("Resolved: (.*)".into()),
+                launch_token: None,
+            })
+        );
     }
 }

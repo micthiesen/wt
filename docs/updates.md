@@ -1,147 +1,93 @@
-# Updates, rollback & compatibility
+# Updates, rollback, and stored data
 
-Native installs use GitHub Releases and immutable per-build directories; they
-do not fetch or modify a source checkout. The stable launcher path remains
-`~/.local/share/wt/bin/wt` unless the installer supplies `WT_INSTALL_ROOT`.
-Release packaging and the CI manifest contract are described in
-[the distribution design](rust-distribution-design.md). The earlier source
-updater remains only as a behavior reference during the Rust rewrite; see
-[the rewrite record](rust-rewrite.md).
+Installed wt releases are native binaries fetched from GitHub Releases. Updates
+do not pull or modify a source checkout. The installer and updater verify the
+release manifest, archive checksum, build identity, and target before activation.
+The stable launcher lives under `~/.local/share/wt` by default; set
+`WT_INSTALL_ROOT` to select another install root. The release manifest and
+supported targets are documented in [the distribution design](rust-distribution-design.md).
 
-SSH worker commands use separate source packages prepared by the controller
-(see [configuration.md](configuration.md#remote--optional-ssh-worktree-host)).
-These packages have no Git metadata. Their `.wt-runtime.json` records the
-controller build for `wt version` and the worker handshake. Source-clone
-updates and rollback still use Git. Automatic runtime setup does not replace
-the worker's source clone or remove packages used by existing sessions.
+Stable follows the latest non-prerelease release. Preview follows the latest
+`preview-<fullsha>` prerelease. `wt update --channel stable|preview` persists a
+channel choice; otherwise the saved channel is used. `wt update --check` checks
+metadata without installing. `wt update --release <tag>` selects one exact
+release for testing, including `rust-test-*` tags. Those test tags are never
+selected by normal stable or preview discovery. `wt update log` prints local
+update history. The old `--head` source-update option is rejected.
 
-Stable follows the latest non-prerelease GitHub release; preview follows the
-latest `preview-<fullsha>` prerelease. `wt update --channel stable|preview`
-persists an explicit channel choice, while the default uses the saved channel.
-`wt update --check` reads metadata without downloading. For explicit release
-artifact testing, `wt update --release <tag>` selects that exact GitHub release,
-including a `rust-test-*` tag; this does not change automatic channel discovery.
-The legacy `--head` option is rejected because native updates only accept
-CI-published manifests.
-`wt update log` and `wt rollback [release-or-sha]` use the same install state.
+`wt install` installs a verified release and can create the `~/.local/bin/wt`
+launcher link. `scripts/install.sh` is the bootstrap installer for machines
+without an existing wt executable. `wt rollback [<release-or-sha>]` activates a
+previously installed version; it does not replay user arguments or infer
+success from an ordinary command exit code.
 
-## The moving parts
+## Installation and boot state
 
-- **Version identity** keeps release tag, full build SHA and target separate.
-  Each identity has an immutable directory under `versions/`; state records
-  current, last-good and pending boot identities.
-- **Memory** is `<install-root>/state.json`: saved channel, daily check time,
-  declined build, boot transition and bounded operation history. Unknown fields
-  survive read/write so newer launchers retain policy state.
-- Update and rollback commands run before repository config and database load.
-  They remain usable when repository configuration is broken and never need a
-  source checkout.
-- OS file locks serialize state transitions across launcher, app, update and
-  rollback processes. Downloads and extraction happen outside the short state
-  lock; activation uses one atomic state-file replacement.
+Each verified build is stored in an immutable version directory. Install state
+is a bounded JSON file under the install root and records the selected channel,
+current and last-good build identities, pending boot attempt, declined build,
+daily check time, and a bounded operation history. A build identity includes
+release tag, full build ID, and target architecture.
 
-## Prevent: release manifests and the boot probe
+The launcher performs a config-free boot probe before dispatching user
+arguments. It checks the candidate's compiled build and target. A new version
+is pending until the application confirms startup using the same unique attempt
+token. If the pending binary fails before confirmation, the launcher selects
+the prior fallback on the next launch. Once an ordinary command has started,
+its exit status does not trigger rollback or argument replay. Explicit early
+startup failure can restore the fallback immediately.
 
-Each stable or preview release must include `wt-release.json`. The client
-matches the manifest's full build SHA, archive name, size and digest against
-the GitHub release, then checks the archive's `wt-build-info.json` before using
-its two executables. Metadata and downloads have strict size limits; extraction
-rejects links, traversal, extra files and unexpected entry types. Preview only
-offers `preview-<fullsha>` tags. The separate `rust-test-*` workflow tags are
-never candidates for automatic preview updates. They can only be selected by
-an intentional `wt update --release rust-test-…` invocation.
+Update-state transitions use an OS file lock and atomic state-file replacement.
+Downloads and archive validation happen before activation. Extraction rejects
+path traversal, links, unexpected files, and mismatched size or digest. The
+candidate is placed in its immutable directory before state points at it, so a
+crash may leave an unused version directory but cannot select incomplete files.
 
-The stable launcher runs `--_boot-probe` without user arguments and verifies
-the candidate's compiled build and target before dispatching the real command.
-A failed pending probe selects the fallback before the command has started.
-After application initialization succeeds, wt confirms the exact release and
-attempt token. Explicit early startup failure restores its fallback. Once a real
-command starts, its exit status never triggers rollback or argument replay.
+The startup offer checks at most once per day. `[update] startup_check = false`
+or `WT_UPDATE=off` disables it. A declined build remains suppressed until a
+newer build appears; explicitly running `wt update` is the reapply path.
 
-The startup check runs at most once per day. `[update] startup_check = false`
-and `WT_UPDATE=off` disable it. A declined build stays suppressed until a newer
-build appears; explicit `wt update` is the deliberate reapply path.
+## Durable application data
 
-## Detect: the boot attempt
+Application state and release state are separate:
 
-The launcher records a pending build and fallback before dispatch. Confirmation
-clears that marker and promotes the candidate to last-good. If a process dies
-before confirming, the next launcher probe can reject the candidate without
-loading repository config or replaying user arguments. Confirmation, explicit
-startup failure and launcher rejection all compare release identity and the
-unique attempt token under the durable state lock.
+- **Repository state** lives in SQLite (`~/.local/state/wt/wt.sqlite` when the
+  repository has its own `.wt.toml`; otherwise it is under that process's cache
+  root). Rows are scoped by a repository-derived ID. It holds user-authored
+  worktree status, sections, issue overrides, fork bases, archives, removed
+  history, and related state. `wt-store` maintains SQL schema migrations and a
+  separate forward-only versioned payload migration. Unknown payload fields
+  are retained. See [configuration](configuration.md#repository-identity-is-a-property-of-the-repository-not-of-your-shell).
+- **Update state** is under the install root and is shared by the launcher and
+  installed executable. It records build transitions, not repository data.
+- **Derived caches** under the repository cache root include generated naming
+  summaries, event snapshots, remote presentation snapshots, and rebuildable
+  runtime data. `Ctrl+R` clears the generated naming and picker caches before
+  requesting live source reads; it does not clear SQLite or accepted action and
+  automation history.
+- **User configuration** is hand-written TOML. wt reads and validates one
+  merged configuration at process startup and never rewrites it. Configuration
+  changes take effect in a new process.
 
-## Recover: rollback
+`wt state migrate` imports attributable legacy JSON records into the selected
+repository's SQLite state. It makes backups, uses a transaction, is safe to run
+again, and removes only successfully imported legacy rows. `--keep-legacy`
+performs a copy-only pass; `--from <dir>` selects a relocated legacy cache.
+Migration is explicit and separate from release updates.
 
-`wt rollback [<release-or-sha>]` selects the pending fallback, last-good or
-previous confirmed identity from local history. It probes the chosen installed
-binary before activation, then records a pending rollback and declines the
-build being left behind in one state write. A bad candidate leaves the active
-version unchanged. The stable launcher still probes again on the next start.
-`wt update log` prints local update and rollback history and current, last-good
-and declined build identities.
+Do not roll back across a release that changed durable data and assume an older
+binary will merge writes made after the rollback. Older binaries may not know
+about newer fields or migrations. Keep migration backups and restart long-lived
+wt processes when changing versions that alter storage contracts.
 
-## Evolve: data compatibility across hot updates
+## Remote workers
 
-Stores have explicit compatibility policies:
+The controller and worker speak a versioned native protocol. A controller
+provisions the matching native runtime before sending commands. Same-platform
+workers can receive the verified running binary; cross-platform workers require
+an exact published release for the controller's build ID and the worker's
+target. The worker's `.wt-runtime.json` records that build identity. Remote
+commands do not update, replace, or require a source checkout on the worker.
 
-- **`~/.local/state/wt/wt.sqlite`** (fork bases, controller-owned local/remote sections, work statuses,
-  archives and removed history — durable, not rebuildable): one database for
-  the machine, with every row scoped by a path-derived `repo_id`. SQL schema
-  changes use the forward-only `schema_migrations` ledger in
-  `core/state-db.ts`. The repository-state payload retains its existing
-  forward-only `WT_STATE_VERSION` transformations, so the proven migration
-  helpers remain the compatibility boundary while storage evolves. The
-  v17 payload adds an optional trimmed `manualTitle` and its monotonic
-  `manualTitleRevision` on worktree slug records; existing titles are not
-  inferred from cached AI summaries. The
-  current-schema read path opens the existing database read-only and does not
-  refresh repository timestamps; only writes and a pending schema migration
-  need write access. This keeps `wt status` and `wt fleet` usable from a
-  restricted agent sandbox. The `repo_id` that scopes every row is derived
-  from the REPOSITORY, never from the working directory a command ran in — see
-  [configuration.md](configuration.md#repository-identity-is-a-property-of-the-repository-not-of-your-shell).
-  A build that got that wrong does not corrupt anything, it PARTITIONS: each
-  namespace stays internally consistent and simply cannot see the others, which
-  reads as data loss from every vantage point at once. `wt state migrate`
-  adopts stranded namespaces back, and is the pattern any future change to the
-  id must ship with — a source fix cannot heal state an earlier build already
-  filed elsewhere.
-- **`cache.sqlite`** (persisted queries): `CACHE_BUSTER` in
-  `src/state/client.ts` advances on shape or meaning changes. Incompatible
-  entries are discarded. The v32-to-v33 title consolidation carries forward
-  valid AI summaries on read, dropping only the obsolete `brief` field:
-  manually requested names must survive without another model call. Both
-  hash-keyed and per-slug summaries keep their original title, description,
-  and expiry; unrelated entries still bust. There is no disk rewrite.
-- **`communication-holds.json` beside the state database** stores the latest
-  resource event. Version 1 is parsed strictly; malformed or newer formats fail
-  without rewriting. Release watermarks are not a disposable cache. Hold
-  deadlines bound only transient holds, not other durable state. Older builds
-  leave this separate file untouched.
-- **User config** (hand-written TOML): never rewritten by wt. Renames
-  get loader aliases plus a deprecation warning (the
-  `TRIGGER_ALIASES` pattern in `core/config.ts`); new fields get
-  defaults or a fail-fast error with a copy-pasteable snippet. A
-  config that loaded yesterday must load today.
-
-`wt state migrate` is the boundary from the former shared JSON store. It
-selects only records attributable to the current repository, imports them in
-one SQLite transaction, backs up the source files, and removes only the rows
-successfully imported. The command is idempotent and current SQLite values
-win, so `--keep-legacy` is available for a copy-only first pass.
-
-A rollback to a pre-SQLite wt build cannot corrupt the database because that
-build does not know it exists; it will continue writing the legacy JSON files.
-Those post-migration legacy writes are intentionally not merged
-automatically. Restart long-lived wt processes together when crossing this
-storage boundary, and retain the migration backup until the new build has
-been exercised.
-
-## Escape hatches
-
-`[update] startup_check = false` disables the daily startup offer;
-`WT_UPDATE=off` disables the entire update system (check, sentinel,
-offers) for one run — the probe harness arms it. Everything the
-automation does is also just git: `git -C ~/.wt log|reset|pull` remain
-the ultimate manual override.
+See [configuration.md](configuration.md#remote--optional-ssh-worktree-host)
+for worker setup and [backends.md](backends.md) for worktree storage behavior.

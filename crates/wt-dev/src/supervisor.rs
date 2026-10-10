@@ -344,7 +344,7 @@ fn failure_signature(exit: i32, output: &str) -> Option<String> {
     Some(format!("{exit}|{last}"))
 }
 
-fn useful_crash_output(output: &str) -> String {
+pub(crate) fn useful_crash_output(output: &str) -> String {
     let text = output
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.starts_with("wt:"))

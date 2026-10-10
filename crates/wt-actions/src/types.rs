@@ -24,17 +24,48 @@ pub enum ActionRunStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct IssueStatusExpectation {
+    pub issue_id: String,
+    pub status: String,
+}
+
+/// Optional refinement data for an argument-prompt value. Kept in durable
+/// action metadata so a worker can update picker history after the TUI exits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionArgHistory {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_extract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionMeta {
     pub version: u32,
     pub slug: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_ref: Option<WorktreeRef>,
     pub run_id: String,
+    /// Worktree identity used by the caller. Older TypeScript records omit it;
+    /// those remain addressable by their slug under the per-slug lock.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action_key: String,
     pub kind: ActionRunKind,
     pub action_id: String,
     pub action_name: String,
     pub prompt: String,
     pub affects: Vec<EffectTag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_status: Option<IssueStatusExpectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_history: Option<ActionArgHistory>,
+    /// `None` means a legacy/pending run. `Some(true)` means refinement was
+    /// attempted successfully or no distinct label was available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_refined: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -73,11 +73,12 @@ pub async fn run(ctx: &AppContext, args: &StateArgs) -> Result<i32> {
     .await??;
     let mut selected = HashSet::new();
     let imported = project_state(&legacy, &live, &mut selected);
-    let remote_prefix = ctx
+    let remote_prefixes = ctx
         .config
-        .remote
-        .as_ref()
-        .map(|remote| wt_core::remote_worktree_ledger_prefix(&remote.host));
+        .remotes
+        .iter()
+        .map(|remote| wt_core::remote_worktree_ledger_prefix(&remote.key()))
+        .collect::<Vec<_>>();
     let mut selected_archive = archive
         .get("slugs")
         .and_then(Value::as_array)
@@ -85,10 +86,7 @@ pub async fn run(ctx: &AppContext, args: &StateArgs) -> Result<i32> {
         .flatten()
         .filter_map(Value::as_str)
         .filter(|key| {
-            live.contains_key(*key)
-                || remote_prefix
-                    .as_ref()
-                    .is_some_and(|prefix| key.starts_with(prefix))
+            live.contains_key(*key) || remote_prefixes.iter().any(|prefix| key.starts_with(prefix))
         })
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();

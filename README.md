@@ -12,13 +12,11 @@ The design principle behind all of it: **the human does only the work only a hum
 
 ## Requirements
 
-**Required**
-
-- [Bun](https://bun.sh) — runtime.
-- `git` — worktree mechanics.
-- `tmux` — every session wt owns (coding agent, shell, diff, dev server, action runner) lives on a wt-private tmux server, which is what makes them survive wt restarts.
-- A [Nerd Font](https://www.nerdfonts.com/) — the TUI uses Nerd Font glyphs for status, PRs, checks, merge-queue position, etc. Without one, those cells render as tofu.
-- macOS — `open` and `pbcopy` are assumed for URL/clipboard handling; the webhook daemon installs as a launchd agent; closing a worktree's browser tabs drives Chromium browsers over `osascript` (first use prompts for Automation permission).
+The published native releases support macOS and Linux on ARM64 and x86-64.
+`git` is required for worktree operations and `tmux` is required for managed
+terminal sessions. A [Nerd Font](https://www.nerdfonts.com/) is recommended for
+the status and integration glyphs. No JavaScript runtime or source checkout is
+needed to run an installed release.
 
 **Optional, per integration**
 
@@ -31,24 +29,25 @@ The design principle behind all of it: **the human does only the work only a hum
 - Review bot — the CodeRabbit badge/automation track, retargetable at any PR-review bot (`[review_bot]`), including checklist-style GitHub Actions reviewers.
 - Coding agents — live sessions are *detected* from each agent's local state; *spawning* from the TUI needs that agent's CLI on PATH (`claude`, `codex`, `opencode`). Claude and Codex support native queued inter-session delivery; OpenCode uses terminal delivery.
 - A coding-agent CLI (`claude`, `codex`, or `opencode`) — live sessions and, when `[naming]` is configured, generated worktree titles and descriptions.
-- [`rift`](https://github.com/anomalyco/rift) — an opt-in copy-on-write worktree backend (`[backend] kind = "rift"`): near-instant checkouts that bring `node_modules` across for free. See [docs/backends.md](docs/backends.md).
+- [`rift`](https://github.com/anomalyco/rift) — required only when `[backend] kind = "rift"`; see [docs/backends.md](docs/backends.md).
 
 ## Install
 
-```sh
-git clone https://github.com/micthiesen/wt.git ~/.wt
-cd ~/.wt && bun install
-```
-
-Then put the launcher on your `PATH` — a **symlink, not a shell alias**:
+Install the verified native release with the bootstrap script:
 
 ```sh
-ln -s ~/.wt/bin/wt ~/.local/bin/wt   # any PATH dir you own
+curl -fsSL https://github.com/micthiesen/wt/releases/latest/download/install.sh -o /tmp/wt-install.sh
+sh /tmp/wt-install.sh --path
 ```
 
-An alias satisfies interactive use but doesn't exist inside a script file, so anything that scripts wt (an agent looping over worktrees, a cron job) fails with `wt: command not found` partway through. The launcher resolves symlinks to find its own source tree, so linking it anywhere works. `wt doctor` warns when `wt` isn't reachable this way, or resolves to a different clone.
+The installer verifies the release checksum and installs under
+`~/.local/share/wt`; `--path` creates `~/.local/bin/wt` when it is available.
+For development builds, use the workspace's Cargo commands instead.
 
-Updating is a fast-forward of that clone: `wt update` does it on demand, and the TUI offers it at startup when new commits have landed (once a day at most, declines remembered). Updates target the newest CI-green commit, boot-probe the result before keeping it, and `wt rollback` (offered automatically after a crash) steps back to the last version that worked — see [docs/updates.md](docs/updates.md). `wt version` prints the running git hash.
+`wt update` installs a verified stable or preview release. The launcher probes
+the candidate before it becomes current, and `wt rollback` restores a previously
+installed build. See [docs/updates.md](docs/updates.md). `wt version` prints the
+native build identity and target.
 
 ## Configure
 
@@ -74,7 +73,7 @@ prefix = "yourname"   # branches you create get `yourname/<id>-<slug>`
 
 Everything else is optional and section-gated: add `[deploy.sst]`, `[issue_tracker]`, `[review_bot]`, `[naming]`, or `[github.events]` to turn on or retarget that integration; omit it and the related rows hide themselves (the review-bot track defaults to CodeRabbit). The loader validates everything at startup and prints every missing or malformed field at once.
 
-For multiple repositories, put shared personal defaults in the user config and add a `.wt.toml` at each repository root. Running `wt` within a repository recursively merges its nearest `.wt.toml` over the user config, so repository-specific paths and settings win. Durable state for every repository lives in `~/.local/state/wt/wt.sqlite`, partitioned by that namespace; disposable query caches and runtime files remain under `~/.cache/wt/<repo-id>/`.
+For multiple repositories, put shared personal defaults in the user config and add a `.wt.toml` at each repository root. Each wt process resolves one merged configuration at startup. Repository-specific values override user defaults. Durable state lives in SQLite and is partitioned by repository identity; disposable caches and runtime files live under the repository cache root.
 
 The full reference — every option, default, the `[[actions]]` menu, and `[[automations]]` — is in **[docs/configuration.md](docs/configuration.md)**.
 
@@ -86,12 +85,9 @@ The bottom pane defaults to a curated **attention feed** (status transitions, ne
 
 wt also distributes the agent skills and instructions that make all of that work: at startup it offers pending updates y/n (declines remembered per version), following your symlinks and rulesync/dotfiles setup to install them durably for every harness on the machine — see [docs/skills.md](docs/skills.md).
 
-An optional `[remote]` SSH target lets `Ctrl+N` create worktrees on a second
-machine configured with `[instance] role = "worker"`, while the controller
-keeps their layout beside local rows (marked only by
-the server icon). F10/F11/F12 route the selected row's shell, diff, or AI
-session over SSH; `!` runs the same action picker against that checkout; and
-`d` removes it on that host using the same safety checks as a local worktree. See
+Configured SSH workers run the exact matching native build. The controller
+provisions a build-matched worker runtime and keeps remote worktree state beside
+local rows; commands and sessions execute on the owning host. See
 [`docs/configuration.md`](docs/configuration.md#remote--optional-ssh-worktree-host).
 
 State is push-based: filesystem watchers on git refs, worktree dirs, and wt's own state feed the UI, so it tracks commits, pushes, installs, and deploys without manual refreshing. An optional webhook daemon extends that to GitHub-side events.

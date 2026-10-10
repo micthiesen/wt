@@ -6,6 +6,18 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner, ProcessStream};
 
+#[test]
+fn public_process_futures_do_not_embed_pipe_buffers_in_callers() {
+    let runner = ProcessRunner::default();
+    let cancel = CancellationToken::new();
+    // These futures are composed through many service layers. Large inline
+    // captures previously overflowed a runtime worker's stack in debug builds.
+    let ordinary = runner.run(CommandSpec::new("true"), &cancel);
+    let streaming = runner.run_streaming(CommandSpec::new("true"), &cancel, |_, _| {});
+    assert!(std::mem::size_of_val(&ordinary) < 4096);
+    assert!(std::mem::size_of_val(&streaming) < 4096);
+}
+
 #[tokio::test]
 async fn argv_cwd_stdin_and_nonzero_status_are_preserved() {
     let dir = tempfile::tempdir().unwrap();

@@ -97,6 +97,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
                         landed: true,
                         destroy_stage: plan.destroy_stage,
                         expected_revision: Some(plan.revision),
+                        removed_snapshot: Some(plan.removed_snapshot),
                     },
                 )
             })
@@ -116,6 +117,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
     } else {
         let service = lifecycle_ops::service(ctx)?;
         for plan in candidates {
+            let dev_port = crate::host_cleanup::stored_dev_port(ctx, plan.row.target.slug()).await;
             let result = service
                 .remove_with_revision(
                     &plan.row.target,
@@ -124,6 +126,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
                         delete_branch: true,
                         landed: true,
                         destroy_stage: plan.destroy_stage,
+                        removed_snapshot: Some(plan.removed_snapshot),
                     },
                     &plan.revision,
                     &ctx.cancellation,
@@ -132,6 +135,14 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
             match result {
                 Ok(result) => {
                     println!("✓ removed {}", plan.row.target.slug());
+                    if result.removed {
+                        for warning in
+                            crate::host_cleanup::after_remove(ctx, plan.row.target.slug(), dev_port)
+                                .await
+                        {
+                            eprintln!("warning: {warning}");
+                        }
+                    }
                     if result.destroyed_stage {
                         println!("✓ destroyed stage {}", plan.row.target.stage);
                     }

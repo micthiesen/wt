@@ -28,7 +28,7 @@ The stack rail is the `tree(1)` / `git log --graph` idiom, and each of its three
 
 There are deliberately no `01`/`02` ordinals: numbering a fork's children asserts a merge order that doesn't exist. If ordinals are ever wanted, merge **edges** are the thing that actually encodes order.
 
-**The rail describes the sub-tree on screen, not the stack.** Glyphs are laid out per contiguous rendered group (a section in the list, the member list in a folded-section summary) and in draw order, by `spineLayout` in `core/stack-layout.ts` — `buildStackIndex` supplies structure (parent, depth, lane), never glyphs. That's what makes the rail honest rather than decorative: a member whose parent is folded away or filed elsewhere tops its own spine at column 0 instead of floating one column in above an empty gutter, a member with nothing else from its stack alongside it draws nothing at all, and `├` vs `└` always agrees with what is actually above and below. The gutter is sized from the cells that get drawn, so a stack whose root lives elsewhere never reserves a column it doesn't use.
+**The rail describes the sub-tree on screen, not the stack.** Glyphs are laid out per contiguous rendered group (a section in the list, the member list in a folded-section summary) and in draw order, by the TUI stack layout projection; the shared stack index supplies structure (parent, depth, lane), never glyphs. That's what makes the rail honest rather than decorative: a member whose parent is folded away or filed elsewhere tops its own spine at column 0 instead of floating one column in above an empty gutter, a member with nothing else from its stack alongside it draws nothing at all, and `├` vs `└` always agrees with what is actually above and below. The gutter is sized from the cells that get drawn, so a stack whose root lives elsewhere never reserves a column it doesn't use.
 
 The glyph used to come from a node's own CHILD count (`┯` where a stack forked, `┌` for a root with one child). That read as box-drawing but didn't join up — a root's connector was never drawn at all, so `┌` and `┯` were unreachable and every spine hung off nothing above it.
 
@@ -37,7 +37,7 @@ The glyph used to come from a node's own CHILD count (`┯` where a stack forked
 ## The base record
 
 Every worktree carries a **fork base**: the branch it's based on, plus the
-fork-point SHA (`baseBranch` / `baseSha` in wt's state file). It's written
+fork-point SHA (`baseBranch` / `baseSha` in the versioned worktree-state payload). It's written
 three ways:
 
 - `wt new` — records the parent and the fork point at creation. Written for
@@ -45,7 +45,7 @@ three ways:
   stacked on anything and every reader normalizes `baseBranch == trunk` to
   "no parent", so this changes no grouping — but the SHA has a second
   consumer outside stacking: the vacuous-containment guard in
-  `branchIsMerged` measures "has this branch got commits of its own"
+  the landed-work predicate measures "has this branch got commits of its own"
   against it, and with no record that guard fails open and calls an
   unstarted branch merged. `merged` closes GitHub issues and feeds the
   clean sweep, so an absent anchor there is not a stacking gap, it's a

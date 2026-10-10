@@ -57,6 +57,7 @@ wt-tui = { path = "crates/wt-tui" }
 wt-harness = { path = "crates/wt-harness" }
 wt-github = { path = "crates/wt-github" }
 wt-lifecycle = { path = "crates/wt-lifecycle" }
+wt-naming = { path = "crates/wt-naming" }
 wt-update = { path = "crates/wt-update" }
 wt-launcher = { path = "crates/wt-launcher" }
 wt-skills = { path = "crates/wt-skills" }

@@ -40,6 +40,16 @@ pub async fn run(context: &AppContext, args: &ClaudeArgs) -> Result<i32> {
         eprintln!("`wt claude send` is deprecated; routing through `wt agent send`");
         return send_to(context, target, &text.join(" "), None).await;
     }
+    if let ClaudeCommand::Stop { target } = &args.command
+        && let Some((remote, slug)) = remote_claude_target(context, target)?
+    {
+        return crate::remote::remote_admin_command(
+            context,
+            remote,
+            &["claude".into(), "stop".into(), slug],
+        )
+        .await;
+    }
     let app = AppHarness::new(context);
     let routes = app.routes(context).await?;
     if routes
@@ -56,7 +66,7 @@ pub async fn run(context: &AppContext, args: &ClaudeArgs) -> Result<i32> {
             let route = resolve_target(context, target, &routes)?;
             if route.target.remote {
                 bail!(
-                    "remote Claude session control is not wired to the remote runtime; refusing local stop for {}",
+                    "remote Claude stops require a canonical @remote/<host>/<slug> target; refusing to stop a local session for {}",
                     route.target.slug
                 );
             }
@@ -71,6 +81,23 @@ pub async fn run(context: &AppContext, args: &ClaudeArgs) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn remote_claude_target<'a>(
+    context: &'a AppContext,
+    target: &str,
+) -> Result<Option<(&'a wt_config::RemoteConfig, String)>> {
+    if !target.starts_with("@remote/") {
+        return Ok(None);
+    }
+    let wt_core::WorktreeRef::Remote { host, slug } =
+        wt_core::parse_worktree_ledger_key(target).context("invalid remote worktree key")?
+    else {
+        bail!("Claude remote target must use a remote worktree key");
+    };
+    let remote = crate::commands::archive::configured_remote(&context.config.remotes, &host)
+        .context("remote host is not configured")?;
+    Ok(Some((remote, slug)))
 }
 
 fn resolve_target<'a>(
