@@ -14,7 +14,7 @@ use std::{
 use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::fs;
+use tokio::{fs, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 use wt_github::{GithubData, PullRequest};
 use wt_platform::process::CommandSpec;
@@ -27,8 +27,34 @@ use crate::{context::AppContext, local_source::Metadata};
 const MAX_CONCURRENT_ROWS: usize = 4;
 const GIT_TIMEOUT: Duration = Duration::from_secs(8);
 const GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
+/// Dirty rows re-read their diff stat at most this often: editing an already
+/// modified file changes neither the index nor the status counts. Only the
+/// working-tree probes rerun on this tick; ref-derived facts follow the row
+/// signature.
+const ACTIVITY_REFRESH: Duration = Duration::from_secs(60);
+/// Untracked files counted line by line for the diff stat; beyond either
+/// per-file bound a file still counts as changed but adds no lines.
+const MAX_UNTRACKED_FILES: usize = 500;
+const MAX_UNTRACKED_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Total untracked bytes streamed per row and pass. Counting stops there, so
+/// the added-line count is a lower bound for very large untracked trees.
+const MAX_UNTRACKED_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 
 pub type PresentationMap = BTreeMap<String, GitFact>;
+
+/// `merge-tree` results keyed on the exact `(HEAD sha, base sha)` pair, so the
+/// probe (which can write tree objects) runs once per pair. `None` values are
+/// a known-unknown result, such as a Git without `merge-tree --write-tree`.
+type ConflictCache = std::sync::Mutex<HashMap<(String, String), Option<Vec<String>>>>;
+
+/// Inputs recorded by a full enrichment that later cheap passes reuse.
+#[derive(Clone, Debug, Default)]
+struct ActivityAnchors {
+    /// Fork point the diff stat is measured from.
+    merge_base: Option<String>,
+    /// The `(HEAD sha, base sha)` pair whose conflict result this row uses.
+    conflict_pair: Option<(String, String)>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitFact {
@@ -107,6 +133,10 @@ struct CachedRow {
     identity: FactIdentity,
     presentation: GitPresentation,
     retry_after: Option<tokio::time::Instant>,
+    /// `ACTIVITY_REFRESH` bucket the diff stat was read in; `None` when
+    /// the row was clean.
+    activity_epoch: Option<u64>,
+    anchors: ActivityAnchors,
 }
 
 /// Start the host-local facts lane. It consumes prepared inputs and performs
@@ -129,8 +159,11 @@ pub fn start(
         metadata_updates.mark_changed();
         github_updates.mark_changed();
         let mut cache = HashMap::<String, CachedRow>::new();
+        let conflicts = Arc::new(ConflictCache::default());
         let mut last_published: Option<PresentationMap> = None;
         let mut last_state: Option<SourceState> = None;
+        let mut activity_tick = tokio::time::interval(ACTIVITY_REFRESH);
+        activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             let retry_at = cache.values().filter_map(|row| row.retry_after).min();
@@ -153,6 +186,7 @@ pub fn start(
                 changed = metadata_updates.changed() => if changed.is_err() { break; },
                 changed = github_updates.changed() => if changed.is_err() { break; },
                 _ = retry_timer => {},
+                _ = activity_tick.tick() => {},
             }
 
             let git_snapshot = git_updates.borrow_and_update().clone();
@@ -178,6 +212,7 @@ pub fn start(
             };
             let prs = github_snapshot.data.as_deref();
             let mut keyed = Vec::with_capacity(rows.len());
+            let mut ticked = Vec::new();
             for row in rows.iter().filter(|row| !row.worktree.is_main) {
                 let target = &row.worktree.target;
                 let key = wt_core::worktree_target_key(target);
@@ -185,12 +220,23 @@ pub fn start(
                 let signature = row_signature(row, state, pr, &context).await;
                 let serialized = serde_json::to_string(&signature).unwrap_or_default();
                 let identity = fact_identity(row, state, pr, &context.config.branch.base);
-                if cache.get(&key).is_some_and(|cached| {
+                let epoch = activity_epoch(row, SystemTime::now());
+                if let Some(cached) = cache.get(&key).filter(|cached| {
                     cached.signature == serialized
                         && cached
                             .retry_after
                             .is_none_or(|retry_after| retry_after > tokio::time::Instant::now())
                 }) {
+                    // Ref-derived facts are covered by the signature; only
+                    // the working-tree diff can drift without it changing.
+                    if cached.activity_epoch != epoch {
+                        ticked.push((
+                            key,
+                            PathBuf::from(&target.path),
+                            cached.anchors.merge_base.clone(),
+                            epoch,
+                        ));
+                    }
                     continue;
                 }
                 let previous = cache
@@ -210,6 +256,7 @@ pub fn start(
                     row.clone(),
                     pr.cloned(),
                     previous,
+                    epoch,
                 ));
             }
 
@@ -235,19 +282,52 @@ pub fn start(
             let context_for_rows = context.clone();
             let state_for_rows = state.clone();
             let updated = stream::iter(keyed)
-                .map(|(key, signature, identity, row, pr, previous)| {
+                .map(|(key, signature, identity, row, pr, previous, epoch)| {
                     let context = context_for_rows.clone();
                     let state = state_for_rows.clone();
+                    let conflicts = conflicts.clone();
                     let cancellation = cancellation.child_token();
                     async move {
-                        let (mut presentation, needs_retry) =
-                            enrich(&context, &row, &state, pr.as_ref(), &cancellation).await;
+                        let (mut presentation, needs_retry, anchors) = enrich(
+                            &context,
+                            &row,
+                            &state,
+                            pr.as_ref(),
+                            &conflicts,
+                            &cancellation,
+                        )
+                        .await;
                         if needs_retry && let Some(previous) = previous {
                             let error = presentation.error.clone();
                             presentation = previous;
                             presentation.error = error;
                         }
-                        (key, signature, identity, presentation, needs_retry)
+                        (
+                            key,
+                            signature,
+                            identity,
+                            presentation,
+                            needs_retry,
+                            epoch,
+                            anchors,
+                        )
+                    }
+                })
+                .buffer_unordered(MAX_CONCURRENT_ROWS)
+                .collect::<Vec<_>>()
+                .await;
+            let refreshed = stream::iter(ticked)
+                .map(|(key, path, merge_base, epoch)| {
+                    let context = context_for_rows.clone();
+                    let cancellation = cancellation.child_token();
+                    async move {
+                        let diff = match &merge_base {
+                            Some(merge_base) => {
+                                diff_stat(&context, &path, merge_base, &cancellation).await
+                            }
+                            None => None,
+                        };
+                        (key, diff, epoch)
                     }
                 })
                 .buffer_unordered(MAX_CONCURRENT_ROWS)
@@ -256,7 +336,9 @@ pub fn start(
             if cancellation.is_cancelled() {
                 break;
             }
-            for (key, signature, identity, presentation, needs_retry) in updated {
+            for (key, signature, identity, presentation, needs_retry, activity_epoch, anchors) in
+                updated
+            {
                 cache.insert(
                     key,
                     CachedRow {
@@ -265,8 +347,25 @@ pub fn start(
                         presentation,
                         retry_after: needs_retry
                             .then(|| tokio::time::Instant::now() + Duration::from_secs(3)),
+                        activity_epoch,
+                        anchors,
                     },
                 );
+            }
+            for (key, diff, epoch) in refreshed {
+                if let Some(cached) = cache.get_mut(&key) {
+                    cached.activity_epoch = epoch;
+                    if diff.is_some() {
+                        cached.presentation.diff = diff;
+                    }
+                }
+            }
+            if let Ok(mut conflicts) = conflicts.lock() {
+                let live = cache
+                    .values()
+                    .filter_map(|row| row.anchors.conflict_pair.as_ref())
+                    .collect::<std::collections::HashSet<_>>();
+                conflicts.retain(|pair, _| live.contains(pair));
             }
 
             let presentation = presentation_map(&cache);
@@ -463,6 +562,14 @@ fn apply_facts(
             row.git
                 .first_commit_title
                 .clone_from(&fact.presentation.first_commit_title);
+            row.git
+                .base_conflicts
+                .clone_from(&fact.presentation.base_conflicts);
+            row.git.diff = fact.presentation.diff;
+            row.git.last_commit_ms = fact.presentation.last_commit_ms;
+            row.git.created_ms = fact.presentation.created_ms;
+            row.git.base_ahead = fact.presentation.base_ahead;
+            row.git.base_behind = fact.presentation.base_behind;
             if let Some(error) = &fact.presentation.error {
                 row.git.error = Some(match row.git.error.take() {
                     Some(existing) if !existing.is_empty() => format!("{existing}; {error}"),
@@ -640,6 +747,9 @@ fn ref_paths(common_dir: &Path, reference: &str) -> Vec<PathBuf> {
     } else {
         paths.push(common_dir.join("refs/heads").join(reference));
         paths.push(common_dir.join("refs/remotes").join(reference));
+        // The activity probes prefer the remote-tracking base, so its
+        // movement must invalidate them too.
+        paths.push(common_dir.join("refs/remotes/origin").join(reference));
     }
     paths
 }
@@ -666,9 +776,11 @@ async fn enrich(
     row: &WorktreeSnapshot,
     state: &Value,
     pr: Option<&PullRequest>,
+    conflicts: &ConflictCache,
     cancellation: &CancellationToken,
-) -> (GitPresentation, bool) {
+) -> (GitPresentation, bool, ActivityAnchors) {
     let mut failures = Vec::new();
+    let mut anchors = ActivityAnchors::default();
     let status = row.status.as_ref();
     let target = &row.worktree.target;
     let mut result = GitPresentation {
@@ -722,8 +834,8 @@ async fn enrich(
     let base_sha = stored
         .and_then(|entry| entry.get("baseSha"))
         .and_then(Value::as_str);
-    let head = result.head_sha.as_deref();
-    if let Some(head) = head.filter(|head| !head.is_empty())
+    let head = result.head_sha.clone();
+    if let Some(head) = head.as_deref().filter(|head| !head.is_empty())
         && !cancellation.is_cancelled()
     {
         let (first_commit_title, failed) = first_commit_title(
@@ -805,14 +917,369 @@ async fn enrich(
                 }
             }
         }
+        // Presentation-only activity facts. These are best effort: a
+        // missing base ref or an old Git leaves them unknown rather than
+        // failing the row, since nothing decides safety from them.
+        if !cancellation.is_cancelled() {
+            anchors = read_activity(
+                context,
+                &path,
+                configured_base,
+                &context.config.branch.base,
+                head,
+                &mut result,
+                conflicts,
+                cancellation,
+            )
+            .await;
+        }
     }
+    result.created_ms = created_ms(&path).await;
     let needs_retry = !failures.is_empty();
     if needs_retry {
         failures.sort_unstable();
         failures.dedup();
         result.error = Some(format!("Could not read {}; retrying", failures.join(", ")));
     }
-    (result, needs_retry)
+    (result, needs_retry, anchors)
+}
+
+/// The refresh bucket for a dirty row's diff stat, `None` for a clean one.
+fn activity_epoch(row: &WorktreeSnapshot, now: SystemTime) -> Option<u64> {
+    let status = row.status.as_ref()?;
+    (status.tracked_changes + status.untracked_files > 0).then(|| {
+        now.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() / ACTIVITY_REFRESH.as_secs())
+    })
+}
+
+/// Diff stat since the fork point (working tree included), newest commit
+/// time, ahead/behind against the base, and a `merge-tree` conflict
+/// pre-flight against the base. Returns the anchors a later cheap diff
+/// refresh and the conflict cache reuse.
+#[allow(clippy::too_many_arguments)]
+async fn read_activity(
+    context: &AppContext,
+    path: &Path,
+    base: &str,
+    trunk: &str,
+    head: &str,
+    result: &mut GitPresentation,
+    conflicts: &ConflictCache,
+    cancel: &CancellationToken,
+) -> ActivityAnchors {
+    let mut anchors = ActivityAnchors::default();
+    if let Some(output) =
+        run_git(context, path, ["log", "-1", "--format=%ct", "HEAD"], cancel).await
+        && output.status.success()
+    {
+        result.last_commit_ms = output
+            .stdout_text()
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds.saturating_mul(1000));
+    }
+    let Some((base, base_sha)) = resolve_probe_base(context, path, base, trunk, cancel).await
+    else {
+        return anchors;
+    };
+    if let Some(output) = run_git(
+        context,
+        path,
+        [
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base}...HEAD"),
+        ],
+        cancel,
+    )
+    .await
+        && output.status.success()
+        && let Some((behind, ahead)) = parse_left_right(&output.stdout_text())
+    {
+        result.base_behind = Some(behind);
+        result.base_ahead = Some(ahead);
+    }
+    if let Some(output) = run_git(context, path, ["merge-base", &base, "HEAD"], cancel).await
+        && output.status.success()
+    {
+        let merge_base = output.stdout_text().trim().to_owned();
+        if !merge_base.is_empty() {
+            result.diff = diff_stat(context, path, &merge_base, cancel).await;
+            anchors.merge_base = Some(merge_base);
+        }
+    }
+    // Mid-rebase HEAD is transient and the rebase itself is the fact.
+    if !result.rebasing {
+        let pair = (head.to_owned(), base_sha);
+        let cached = conflicts
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&pair).cloned());
+        result.base_conflicts = match cached {
+            Some(known) => known,
+            // A base already in HEAD's history rebases trivially.
+            None if result.base_behind == Some(0) => Some(Vec::new()),
+            None => match base_conflicts(context, path, &pair.1, &pair.0, cancel).await {
+                ConflictProbe::Settled(value) => {
+                    if let Ok(mut cache) = conflicts.lock() {
+                        cache.insert(pair.clone(), value.clone());
+                    }
+                    value
+                }
+                ConflictProbe::Unknown => None,
+            },
+        };
+        anchors.conflict_pair = Some(pair);
+    }
+    anchors
+}
+
+/// Working tree against the fork point plus untracked additions. These are
+/// the only activity inputs that move without a ref or index change.
+async fn diff_stat(
+    context: &AppContext,
+    path: &Path,
+    merge_base: &str,
+    cancel: &CancellationToken,
+) -> Option<wt_tui::DiffStat> {
+    let diff = run_git(context, path, ["diff", "--shortstat", merge_base], cancel)
+        .await
+        .filter(|output| output.status.success() && !output.stdout_truncated)?;
+    let mut stat = parse_shortstat(&diff.stdout_text());
+    let (files, lines) = untracked_lines(context, path, cancel).await?;
+    stat.files = stat.files.saturating_add(files);
+    stat.added = stat.added.saturating_add(lines);
+    Some(stat)
+}
+
+enum ConflictProbe {
+    /// A result that holds for this exact commit pair, including a
+    /// known-unknown one from a Git that cannot run the probe.
+    Settled(Option<Vec<String>>),
+    /// A transient failure; probe again next time.
+    Unknown,
+}
+
+/// `merge-tree --write-tree` (Git 2.38+) between two commits. A `--quiet`
+/// pass first answers clean merges without writing tree objects; only a
+/// conflicting pair, or a Git without `--quiet`, runs the listing pass that
+/// writes them. Exit 129 from the listing means `--write-tree` itself is
+/// unsupported.
+async fn base_conflicts(
+    context: &AppContext,
+    path: &Path,
+    base_sha: &str,
+    head_sha: &str,
+    cancel: &CancellationToken,
+) -> ConflictProbe {
+    let Some(quiet) = run_git(
+        context,
+        path,
+        ["merge-tree", "--write-tree", "--quiet", base_sha, head_sha],
+        cancel,
+    )
+    .await
+    else {
+        return ConflictProbe::Unknown;
+    };
+    match quiet.status.code() {
+        Some(0) => return ConflictProbe::Settled(Some(Vec::new())),
+        Some(1 | 129) => {}
+        _ => return ConflictProbe::Unknown,
+    }
+    let Some(output) = run_git(
+        context,
+        path,
+        [
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            base_sha,
+            head_sha,
+        ],
+        cancel,
+    )
+    .await
+    .filter(|output| !output.stdout_truncated) else {
+        return ConflictProbe::Unknown;
+    };
+    if output.status.code() == Some(129) {
+        return ConflictProbe::Settled(None);
+    }
+    parse_merge_tree(output.status.code(), &output.stdout).map_or(ConflictProbe::Unknown, |files| {
+        ConflictProbe::Settled(Some(files))
+    })
+}
+
+/// The ref the activity probes compare against. Trunk resolves to its
+/// remote-tracking ref first, because a checkout's local trunk may never
+/// move; a stacked parent prefers its local branch (which carries unpushed
+/// commits), then its remote-tracking ref, then trunk.
+async fn resolve_probe_base(
+    context: &AppContext,
+    path: &Path,
+    base: &str,
+    trunk: &str,
+    cancel: &CancellationToken,
+) -> Option<(String, String)> {
+    let remote_trunk = format!("origin/{trunk}");
+    let candidates = if base == trunk || base == remote_trunk {
+        vec![remote_trunk, trunk.to_owned()]
+    } else {
+        vec![
+            base.to_owned(),
+            format!("origin/{base}"),
+            remote_trunk,
+            trunk.to_owned(),
+        ]
+    };
+    for candidate in candidates {
+        let output = run_git(
+            context,
+            path,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{candidate}^{{commit}}"),
+            ],
+            cancel,
+        )
+        .await?;
+        let sha = output.stdout_text().trim().to_owned();
+        if output.status.success() && !sha.is_empty() {
+            return Some((candidate, sha));
+        }
+    }
+    None
+}
+
+/// Untracked, non-ignored files and their line counts: what they will add
+/// once committed. `None` when the listing fails.
+async fn untracked_lines(
+    context: &AppContext,
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Option<(u32, u32)> {
+    let output = run_git(
+        context,
+        path,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+        cancel,
+    )
+    .await
+    .filter(|output| output.status.success() && !output.stdout_truncated)?;
+    let names = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect::<Vec<_>>();
+    let mut lines = 0u64;
+    let mut budget = MAX_UNTRACKED_TOTAL_BYTES;
+    let mut buffer = vec![0u8; 64 * 1024];
+    for name in names.iter().take(MAX_UNTRACKED_FILES) {
+        if cancel.is_cancelled() || budget == 0 {
+            break;
+        }
+        let file = path.join(name);
+        let Ok(metadata) = fs::symlink_metadata(&file).await else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_UNTRACKED_FILE_BYTES {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&file).await else {
+            continue;
+        };
+        // The file may have grown since `symlink_metadata`; never read past
+        // either bound.
+        let mut reader = file.take(budget.min(MAX_UNTRACKED_FILE_BYTES));
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    budget = budget.saturating_sub(read as u64);
+                    lines += buffer[..read].iter().filter(|byte| **byte == b'\n').count() as u64;
+                }
+            }
+        }
+    }
+    let lines = u32::try_from(lines).unwrap_or(u32::MAX);
+    Some((u32::try_from(names.len()).unwrap_or(u32::MAX), lines))
+}
+
+/// Checkout directory creation time: birth time where the filesystem
+/// records one, otherwise the inode change time.
+async fn created_ms(path: &Path) -> Option<u64> {
+    let metadata = fs::metadata(path).await.ok()?;
+    let created = metadata.created().ok().and_then(system_time_ns);
+    #[cfg(unix)]
+    let created = created.or_else(|| {
+        use std::os::unix::fs::MetadataExt;
+        u128::try_from(metadata.ctime())
+            .ok()
+            .map(|seconds| seconds * 1_000_000_000)
+    });
+    created.and_then(|ns| u64::try_from(ns / 1_000_000).ok())
+}
+
+/// `git rev-list --left-right --count base...HEAD` prints `behind\tahead`.
+fn parse_left_right(text: &str) -> Option<(u32, u32)> {
+    let mut parts = text.split_whitespace();
+    let behind = parts.next()?.parse().ok()?;
+    let ahead = parts.next()?.parse().ok()?;
+    Some((behind, ahead))
+}
+
+/// `git diff --shortstat`: ` 3 files changed, 10 insertions(+), 2 deletions(-)`.
+/// Empty output is an empty diff.
+fn parse_shortstat(text: &str) -> wt_tui::DiffStat {
+    let mut stat = wt_tui::DiffStat::default();
+    for part in text.trim().split(',') {
+        let mut words = part.split_whitespace();
+        let Some(count) = words.next().and_then(|count| count.parse::<u32>().ok()) else {
+            continue;
+        };
+        match words.next() {
+            Some(word) if word.starts_with("file") => stat.files = count,
+            Some(word) if word.starts_with("insertion") => stat.added = count,
+            Some(word) if word.starts_with("deletion") => stat.removed = count,
+            _ => {}
+        }
+    }
+    stat
+}
+
+/// `git merge-tree --write-tree --name-only -z`: exit 0 is clean; exit 1
+/// with a tree OID on stdout is a conflict listing the paths after it.
+/// Exit 1 with empty stdout (an unresolvable ref) or any other exit is
+/// unknown.
+fn parse_merge_tree(code: Option<i32>, stdout: &[u8]) -> Option<Vec<String>> {
+    match code {
+        Some(0) => Some(Vec::new()),
+        Some(1)
+            if stdout
+                .iter()
+                .any(|byte| !byte.is_ascii_whitespace() && *byte != 0) =>
+        {
+            let mut files = stdout
+                .split(|byte| *byte == 0)
+                .skip(1)
+                .filter(|name| !name.is_empty())
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .collect::<Vec<_>>();
+            files.sort();
+            files.dedup();
+            Some(files)
+        }
+        _ => None,
+    }
 }
 
 fn exact_merged_pr_oid<'a>(
@@ -1101,6 +1568,218 @@ mod tests {
             serde_json::to_string(&before).unwrap(),
             serde_json::to_string(&after).unwrap()
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn activity_parsers_read_git_output() {
+        assert_eq!(
+            parse_shortstat(" 3 files changed, 10 insertions(+), 2 deletions(-)\n"),
+            wt_tui::DiffStat {
+                files: 3,
+                added: 10,
+                removed: 2
+            }
+        );
+        assert_eq!(
+            parse_shortstat(" 1 file changed, 1 deletion(-)"),
+            wt_tui::DiffStat {
+                files: 1,
+                added: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(parse_shortstat(""), wt_tui::DiffStat::default());
+        assert_eq!(parse_left_right("4\t7\n"), Some((4, 7)));
+        assert_eq!(parse_left_right("garbage"), None);
+        assert_eq!(parse_merge_tree(Some(0), b"abc\0"), Some(Vec::new()));
+        assert_eq!(
+            parse_merge_tree(Some(1), b"abc\0b.rs\0a b.rs\0"),
+            Some(vec!["a b.rs".to_owned(), "b.rs".to_owned()])
+        );
+        // An unresolvable base also exits 1, but writes no tree.
+        assert_eq!(parse_merge_tree(Some(1), b""), None);
+        assert_eq!(parse_merge_tree(Some(128), b"abc\0"), None);
+    }
+
+    #[tokio::test]
+    async fn enrichment_reads_diff_activity_base_counts_and_conflicts() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(
+            &rows
+                .iter()
+                .find(|row| row.worktree.target.branch == "feature/one")
+                .unwrap()
+                .worktree
+                .target
+                .path,
+        );
+        std::fs::write(worktree.join("tracked.txt"), "feature\n").unwrap();
+        git(&worktree, &["commit", "-qam", "feature change"]);
+        std::fs::write(main.join("tracked.txt"), "trunk\n").unwrap();
+        git(&main, &["commit", "-qam", "trunk change"]);
+        std::fs::write(worktree.join("new.txt"), "one\ntwo\n").unwrap();
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.worktree.target.branch == "feature/one")
+            .unwrap();
+        let state = serde_json::json!({"slugs": {}});
+        let conflicts = ConflictCache::default();
+        let (presentation, _, anchors) = enrich(
+            &fixture.ctx,
+            row,
+            &state,
+            None,
+            &conflicts,
+            &fixture.ctx.cancellation,
+        )
+        .await;
+        assert_eq!(
+            presentation.diff,
+            Some(wt_tui::DiffStat {
+                files: 2,
+                added: 3,
+                removed: 1
+            })
+        );
+        assert_eq!(presentation.base_ahead, Some(1));
+        assert_eq!(presentation.base_behind, Some(1));
+        assert_eq!(
+            presentation.base_conflicts.as_deref(),
+            Some(&["tracked.txt".to_owned()][..])
+        );
+        assert!(presentation.last_commit_ms.is_some_and(|ms| ms > 0));
+        assert!(presentation.created_ms.is_some_and(|ms| ms > 0));
+
+        // The probe result is cached for the exact commit pair, and a cached
+        // entry answers later passes without probing again.
+        let pair = anchors.conflict_pair.clone().unwrap();
+        assert_eq!(pair.0, presentation.head_sha.clone().unwrap());
+        assert_eq!(
+            conflicts.lock().unwrap().get(&pair).cloned(),
+            Some(Some(vec!["tracked.txt".to_owned()]))
+        );
+        conflicts
+            .lock()
+            .unwrap()
+            .insert(pair.clone(), Some(vec!["cached.rs".into()]));
+        let (cached, _, _) = enrich(
+            &fixture.ctx,
+            row,
+            &state,
+            None,
+            &conflicts,
+            &fixture.ctx.cancellation,
+        )
+        .await;
+        assert_eq!(
+            cached.base_conflicts.as_deref(),
+            Some(&["cached.rs".to_owned()][..])
+        );
+
+        // The epoch refresh reruns only the working-tree diff from the
+        // recorded fork point.
+        std::fs::write(worktree.join("new.txt"), "one\ntwo\nthree\n").unwrap();
+        let merge_base = anchors.merge_base.unwrap();
+        assert_eq!(
+            diff_stat(
+                &fixture.ctx,
+                &worktree,
+                &merge_base,
+                &fixture.ctx.cancellation
+            )
+            .await,
+            Some(wt_tui::DiffStat {
+                files: 2,
+                added: 4,
+                removed: 1
+            })
+        );
+
+        // An unresolvable commit is unknown, never clean, and is not cached.
+        assert!(matches!(
+            base_conflicts(
+                &fixture.ctx,
+                &worktree,
+                "0000000000000000000000000000000000000001",
+                &pair.0,
+                &fixture.ctx.cancellation,
+            )
+            .await,
+            ConflictProbe::Unknown
+        ));
+        // A clean pair settles without listing.
+        assert!(matches!(
+            base_conflicts(
+                &fixture.ctx,
+                &worktree,
+                &pair.0,
+                &pair.0,
+                &fixture.ctx.cancellation,
+            )
+            .await,
+            ConflictProbe::Settled(Some(files)) if files.is_empty()
+        ));
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn untracked_line_counting_stops_at_the_row_byte_budget() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(
+            &rows
+                .iter()
+                .find(|row| row.worktree.target.branch == "feature/one")
+                .unwrap()
+                .worktree
+                .target
+                .path,
+        );
+        // Five files of just under the per-file cap exceed the row budget.
+        let per_file = usize::try_from(MAX_UNTRACKED_FILE_BYTES).unwrap() - 1;
+        for index in 0..5 {
+            std::fs::write(
+                worktree.join(format!("big-{index}.txt")),
+                vec![b'\n'; per_file],
+            )
+            .unwrap();
+        }
+        let (files, lines) = untracked_lines(&fixture.ctx, &worktree, &fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        assert_eq!(files, 5);
+        assert_eq!(u64::from(lines), MAX_UNTRACKED_TOTAL_BYTES);
         fixture.close().await.unwrap();
     }
 

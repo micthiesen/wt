@@ -94,12 +94,20 @@ fn compose(
                 _ => None,
             });
         prepare_work(row, now_ms);
+        if row.automations_paused {
+            // The details pane renders the typed flag; drop the inventory's
+            // prose copy so the fact is not shown twice.
+            row.details.retain(|detail| detail != PAUSED_DETAIL);
+        }
         row.detail_groups = detail_groups(row, config);
     }
     crate::board_layout::refresh_rollups(&mut board);
     source.data = Some(Arc::new(board));
     source
 }
+
+/// The inventory's prose copy of the typed `automations_paused` flag.
+const PAUSED_DETAIL: &str = "Automations paused for this worktree";
 
 fn prepare_work(row: &mut BoardRow, now_ms: i64) {
     let record = row.work.as_ref().and_then(|work| work.record.as_ref());
@@ -223,20 +231,26 @@ fn detail_groups(row: &BoardRow, config: &Config) -> Vec<PreparedDetailGroup> {
         .collect()
 }
 
+/// Groups are prepared for every configured id that applies to this
+/// repository, even when the fact is absent, so the pane can say "not
+/// running" or "no PR" instead of silently dropping a row. Line contracts
+/// the renderer relies on: `branch` is `[branch, landing base, "forked"?]`;
+/// the other ids render from the row's typed fields and keep these lines
+/// only as a plain-text fallback.
 fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDetailGroup> {
     let (id, label, lines, error) = match id {
-        "branch" => (
-            "branch",
-            "Branch",
-            nonempty_lines([
-                Some(clean(&row.branch)),
-                row.base_branch
-                    .as_deref()
-                    .filter(|base| !base.is_empty())
-                    .map(|base| format!("base: {}", clean(base))),
-            ]),
-            None,
-        ),
+        "branch" => {
+            let trunk = config.branch.base.as_str();
+            let parent = row
+                .base_branch
+                .as_deref()
+                .filter(|base| !base.is_empty() && *base != trunk);
+            let mut lines = vec![clean(&row.branch), clean(parent.unwrap_or(trunk))];
+            if parent.is_some() {
+                lines.push("forked".into());
+            }
+            ("branch", "Branch", lines, None)
+        }
         "path" => (
             "path",
             "Path",
@@ -272,7 +286,13 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
             None,
         ),
         "pr" => {
-            let pr = row.pr.as_ref()?;
+            let Some(pr) = row.pr.as_ref() else {
+                return Some(PreparedDetailGroup {
+                    id: "pr".into(),
+                    label: "Pull request".into(),
+                    ..Default::default()
+                });
+            };
             let mut lines = nonempty_lines([
                 pr.number.map(|number| format!("#{number}")),
                 pr.title.as_deref().map(clean),
@@ -380,7 +400,13 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
         }
         _ => return None,
     };
-    if lines.is_empty() && error.is_none() {
+    let configured = match id {
+        "issue" => config.issue_tracker.is_some(),
+        "stage" => config.sst.is_some(),
+        "dev" => config.dev_server.is_some(),
+        _ => true,
+    };
+    if !configured && lines.is_empty() && error.is_none() {
         return None;
     }
     Some(PreparedDetailGroup {
@@ -480,6 +506,31 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("not a typed"))
         );
+    }
+
+    #[test]
+    fn branch_group_names_the_landing_base_and_marks_only_real_forks() {
+        let config = config(&["branch", "pr", "dev"]);
+        let trunk = config.branch.base.clone();
+        let mut row = BoardRow {
+            branch: "feature-1".into(),
+            base_branch: Some(trunk.clone()),
+            ..Default::default()
+        };
+        let groups = detail_groups(&row, &config);
+        assert_eq!(groups[0].lines, ["feature-1", trunk.as_str()]);
+        // A missing PR still gets its row so the pane can say so; an
+        // unconfigured dev server with no facts gets none.
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<Vec<_>>(),
+            ["branch", "pr"]
+        );
+        row.base_branch = Some("parent".into());
+        let groups = detail_groups(&row, &config);
+        assert_eq!(groups[0].lines, ["feature-1", "parent", "forked"]);
     }
 
     #[test]

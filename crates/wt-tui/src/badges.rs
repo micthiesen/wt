@@ -344,7 +344,12 @@ pub(crate) fn rebase_badge(row: &BoardRow, session_state: Option<&str>) -> Optio
     if row.git.rebasing || !row.git.conflict_files.is_empty() {
         return Some(badge(glyphs::RESTACK, theme::WARN));
     }
-    if !row.git.base_conflicts.is_empty() {
+    if row
+        .git
+        .base_conflicts
+        .as_ref()
+        .is_some_and(|files| !files.is_empty())
+    {
         if session_state.is_some_and(|state| matches!(state, "working" | "polling" | "asking")) {
             return Some(badge(glyphs::RESTACK, theme::WARN));
         }
@@ -579,7 +584,7 @@ mod tests {
 
         let mut busy = row();
         busy.git.tracked_changes = Some(2);
-        busy.git.base_conflicts = vec!["a.rs".into()];
+        busy.git.base_conflicts = Some(vec!["a.rs".into()]);
         busy.environment_live = true;
         busy.sessions = vec![SessionView {
             harness: "Claude".into(),
@@ -640,7 +645,7 @@ mod tests {
     #[test]
     fn engaged_session_turns_a_base_conflict_into_resolving() {
         let mut conflicted = row();
-        conflicted.git.base_conflicts = vec!["a.rs".into()];
+        conflicted.git.base_conflicts = Some(vec!["a.rs".into()]);
         assert_eq!(
             rebase_badge(&conflicted, None),
             Some(badge(glyphs::CONFLICT, theme::ERR))

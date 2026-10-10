@@ -48,6 +48,7 @@ pub fn board(
             },
             branch: clean_text(&target.branch),
             path: clean_text(&target.path),
+            stage_name: Some(clean_text(&target.stage)).filter(|stage| !stage.is_empty()),
             badge,
             work_rank: wt_core::work_record_rank(work.as_ref()),
             work: work.as_ref().map(|record| {

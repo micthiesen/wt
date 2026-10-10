@@ -198,7 +198,7 @@ fn compose(
             .as_ref()
             .and_then(|rows| rows.iter().find(|status| status.slug == row.slug));
         if let Some(status) = status.and_then(|row| row.status.as_ref()) {
-            row.details.push(label(status));
+            row.dev_status = Some(label(status));
             row.environment_live |= status.running || status.starting;
             row.dev_url = status.url.as_deref().map(wt_core::sanitize_terminal_text);
         }
@@ -213,15 +213,15 @@ fn compose(
 
 fn label(status: &DevServerStatus) -> String {
     let mut text = if status.crashed {
-        "Dev: crashed".to_owned()
+        "crashed".to_owned()
     } else if status.starting {
-        "Dev: starting".to_owned()
+        "starting".to_owned()
     } else if status.running {
-        "Dev: running".to_owned()
+        "running".to_owned()
     } else if let Some(waiting) = status.waiting {
-        format!("Dev: queued #{}", waiting.rank + 1)
+        format!("queued #{}", waiting.rank + 1)
     } else {
-        "Dev: stopped".to_owned()
+        "not running".to_owned()
     };
     if (status.running || status.starting)
         && let Some(url) = &status.url
@@ -294,16 +294,16 @@ mod tests {
         let row = &result.data.as_ref().unwrap().rows[0];
         assert_eq!(row.dev_url.as_deref(), Some("http://localhost:3000"));
         assert!(
-            row.details
-                .iter()
-                .any(|line| line.contains("needs reset after rebase"))
+            row.dev_status
+                .as_deref()
+                .is_some_and(|status| status.contains("needs reset after rebase"))
         );
         assert!(
             row.details
                 .iter()
                 .any(|line| line == "Dev: tmux unavailable")
         );
-        assert!(!row.details.iter().any(|line| line.contains("stopped")));
+        assert!(!row.details.iter().any(|line| line.contains("not running")));
     }
 
     #[tokio::test(start_paused = true)]
