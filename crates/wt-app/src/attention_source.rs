@@ -77,6 +77,7 @@ pub fn overlay(
         None
     };
     let refresh_board = board.clone();
+    let section_writes = context.section_writes.clone();
     scope.spawn(async move {
         let mut boards = board.subscribe();
         let mut metadata = sources.metadata.subscribe();
@@ -93,7 +94,10 @@ pub fn overlay(
             dev.mark_changed();
         }
 
-        let mut transitions = TransitionTracker::default();
+        let mut transitions = TransitionTracker {
+            own_section_writes: section_writes,
+            ..Default::default()
+        };
         let mut login: Option<String> = None;
         let mut login_reply: Option<oneshot::Receiver<Result<String, String>>> = None;
         let mut login_attempted_revision = None;
@@ -277,6 +281,8 @@ fn observe_comments(
 
 #[derive(Default)]
 struct TransitionTracker {
+    /// This process's own section moves, which belong on the activity feed.
+    own_section_writes: crate::context::SectionWrites,
     statuses: Option<BTreeMap<String, Option<String>>>,
     sections: Option<BTreeMap<String, Option<String>>>,
     issues: Option<BTreeMap<String, String>>,
@@ -332,10 +338,17 @@ impl TransitionTracker {
                 let destination = section
                     .as_ref()
                     .map_or_else(|| "the inbox".to_owned(), Clone::clone);
-                self.push(format!(
+                let text = format!(
                     "{} moved to {destination}",
                     wt_core::worktree_ledger_label(key)
-                ));
+                );
+                // The user's own move already showed a toast; only a move
+                // made elsewhere interrupts.
+                if self.own_section_writes.consume(key, section.as_deref()) {
+                    tracing::info!(target: "wt::sections", event_text = %text, "section move");
+                } else {
+                    self.push(text);
+                }
             }
         }
         self.statuses = Some(next_statuses);
@@ -663,6 +676,20 @@ mod tests {
                 .events
                 .iter()
                 .any(|line| line.text.contains("moved to Review"))
+        );
+
+        // The same move made by this process stays off attention.
+        let mut tracker = TransitionTracker::default();
+        tracker.metadata(&initial);
+        tracker
+            .own_section_writes
+            .record(["one".to_owned()], Some("Review"));
+        tracker.metadata(&changed);
+        assert!(
+            !tracker
+                .events
+                .iter()
+                .any(|line| line.text.contains("moved to"))
         );
     }
 

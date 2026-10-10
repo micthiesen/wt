@@ -441,7 +441,7 @@ async fn dev_logs(
     let text = crate::dev::service(ctx)?
         .logs(&context.slug, DEV_LOG_LINES, &ctx.cancellation)
         .await?
-        .context("dev server is not running")?;
+        .ok_or_else(|| crate::controller::notice("dev server is not running"))?;
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let skip = lines.len().saturating_sub(DEV_LOG_LINES as usize);
     Ok(modal(UiModal::Log {

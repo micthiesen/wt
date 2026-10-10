@@ -2037,6 +2037,15 @@ impl Model {
                     self.interaction = interaction;
                     return InputResult::Unchanged;
                 }
+                // Backspace on an empty extras prompt is a no-op, as in TS:
+                // the prompt is easy to clear by accident while editing.
+                if matches!(prompt.action, TextAction::ActionExtras { .. })
+                    && code == KeyCode::Backspace
+                    && prompt.editor.text().is_empty()
+                {
+                    self.interaction = interaction;
+                    return InputResult::Unchanged;
+                }
                 let result = prompt.editor.input(key);
                 match result {
                     // Esc or Backspace on empty input inside a picker's

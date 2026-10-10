@@ -181,9 +181,33 @@ fn create_retry(action: &wt_tui::UiAction) -> Option<(Option<String>, String)> {
     }
 }
 
+/// A key with nothing to act on (no PR, already at the edge). It answers
+/// with a toast, like a success, and is not logged as a failed action.
+#[derive(Debug)]
+pub struct Notice(pub String);
+
+impl std::fmt::Display for Notice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Notice {}
+
+pub fn notice(message: impl Into<String>) -> anyhow::Error {
+    Notice(message.into()).into()
+}
+
 fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>) -> UiReply {
     let (mut reply, ambiguous) = match result {
         Ok(reply) => (reply, false),
+        Err(error) if error.downcast_ref::<Notice>().is_some() => (
+            UiReply {
+                message: error.to_string(),
+                ..Default::default()
+            },
+            false,
+        ),
         Err(error) => {
             // The full chain, so the feed names the cause, not just the step.
             tracing::error!(error = %format_args!("{error:#}"), "TUI action failed");
@@ -349,6 +373,13 @@ mod tests {
         let reply = action_reply(Err(ambiguous.into()), retry);
         assert!(reply.failed);
         assert!(reply.modal.is_none());
+    }
+
+    #[test]
+    fn a_notice_is_a_plain_toast_not_a_failure() {
+        let reply = action_reply(Err(notice("already at top")), None);
+        assert!(!reply.failed);
+        assert_eq!(reply.message, "already at top");
     }
 
     #[test]

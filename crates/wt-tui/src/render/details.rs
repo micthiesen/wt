@@ -895,8 +895,9 @@ fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> V
         lines.extend(note_lines(note, color, width));
     }
     if let Some(steps) = record.and_then(|record| record.verify_after_merge.as_deref()) {
-        // `V` flips the default, which is open exactly when the check is due.
-        let expanded = work.verification_owed != show_verification;
+        // The model holds the open state; it defaults to open exactly when
+        // the check is due and `V` toggles it.
+        let expanded = show_verification;
         lines.extend(verify_lines(
             steps,
             color,

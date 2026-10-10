@@ -285,7 +285,7 @@ impl HostService {
                     .data
                     .as_ref()
                     .and_then(|data| data.prs.get(&row.branch))
-                    .ok_or_else(|| anyhow::anyhow!("No PR for this row"))?;
+                    .ok_or_else(|| crate::controller::notice("no PR for this row"))?;
                 if pr.state != "OPEN" {
                     anyhow::bail!("PR #{} is not open", pr.number);
                 }

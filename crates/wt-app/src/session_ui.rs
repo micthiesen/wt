@@ -206,7 +206,8 @@ async fn terminal_target(
 }
 
 /// One resumable session row: TS showed the harness, the session name, and
-/// the derived state, falling back to live/dead without a state signal.
+/// the derived state, falling back to live without a state signal. A session
+/// whose process is gone reads dead whatever its transcript last said.
 fn session_row_label(
     harness: wt_core::HarnessId,
     name: &str,
@@ -214,9 +215,9 @@ fn session_row_label(
     live: bool,
 ) -> String {
     let status = match state {
+        _ if !live => "dead".into(),
         Some(state) => state.to_ascii_lowercase(),
-        None if live => "live".into(),
-        None => "dead".into(),
+        None => "live".into(),
     };
     format!("{} / {name} · {status}", harness_label(harness))
 }
@@ -285,6 +286,10 @@ mod tests {
         assert_eq!(
             session_row_label(HarnessId::Opencode, "abc", None, false),
             "OpenCode / abc · dead"
+        );
+        assert_eq!(
+            session_row_label(HarnessId::Claude, "old", Some("Idle"), false),
+            "Claude Code / old · dead"
         );
     }
 

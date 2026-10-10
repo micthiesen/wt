@@ -89,6 +89,7 @@ impl CommandFixture {
             repository,
             processes: ProcessRunner::default(),
             cancellation: CancellationToken::new(),
+            section_writes: Default::default(),
         };
         Ok(Self { _root: root, ctx })
     }

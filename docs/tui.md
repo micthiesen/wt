@@ -238,8 +238,9 @@ uncaught-error recovery overlay.
 Use `j`/`k`, arrows, page keys, and `g`/`G` to move through lists. `Enter`
 confirms; `Esc`, `q`, and `Ctrl+C` cancel, and confirmations also cancel with
 `n` or their opening key. `Space` never confirms. Repeating the opening key
-confirms the current selection. Digits `1`-`9` pick real entries (sessions,
-saved values) but not palette rows, which use their letters. Reviewer selection
+confirms the current selection. Digits `1`-`9` pick list entries, such as sessions, saved values,
+statuses, sections, bases, outputs, and harnesses, but not palette rows,
+which use their letters. Reviewer selection
 uses `Space` to toggle entries. `Esc` or `Backspace` on an empty sub-prompt,
 such as a new section or session name, returns to its picker. Text fields support cursor movement, word movement,
 Unicode-safe deletion, and `Ctrl+U`/`Ctrl+K` to clear to the start/end. A

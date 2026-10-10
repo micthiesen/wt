@@ -379,6 +379,7 @@ async fn run_application(
             repository: repository.clone(),
             processes,
             cancellation: token,
+            section_writes: Default::default(),
         };
         let result = dispatch_command(&context, command).await;
         database.shutdown().await?;
@@ -393,6 +394,7 @@ async fn run_application(
         repository,
         processes,
         cancellation: token.clone(),
+        section_writes: Default::default(),
     };
     skills::startup_check(&context).await?;
     let events_context = context.clone();

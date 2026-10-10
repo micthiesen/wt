@@ -65,11 +65,18 @@ fn aggregate_preparations(mut prepared: Vec<PreparedHost>, unexpected_failures: 
     let mut revisions = Vec::new();
     let mut lines = Vec::new();
     let mut failed = unexpected_failures > 0;
+    // With one host every line is about it; only a fleet names hosts.
+    let single = prepared.len() == 1 && unexpected_failures == 0;
     for host in prepared {
+        let label = if single {
+            String::new()
+        } else {
+            format!("{}: ", host.identity.label)
+        };
         match host.result {
             Err(error) => {
                 failed = true;
-                lines.push(format!("{}: unavailable: {}", host.identity.label, error));
+                lines.push(format!("{label}unavailable: {}", error));
             }
             Ok(reply) => {
                 if reply.failed {
@@ -92,35 +99,34 @@ fn aggregate_preparations(mut prepared: Vec<PreparedHost>, unexpected_failures: 
                                 Err(error) => {
                                     failed = true;
                                     lines.push(format!(
-                                        "{}: invalid cleanup candidate: {}",
-                                        host.identity.label, error
+                                        "{label}invalid cleanup candidate: {}",
+                                        error
                                     ));
                                 }
                             }
                         }
                         if !message.trim().is_empty() {
-                            lines.push(format!("{}: {message}", host.identity.label));
+                            lines.push(format!("{label}{message}"));
                         }
                         let had_lines = !host_lines.is_empty();
                         for line in host_lines {
-                            lines.push(format!("{}: {line}", host.identity.label));
+                            lines.push(format!("{label}{line}"));
                         }
                         if revisions.len() == start && !had_lines {
-                            lines.push(format!("{}: no safe candidates", host.identity.label));
+                            lines.push(format!("{label}no safe candidates"));
                         }
                     }
                     Some(_) => {
                         failed = true;
                         lines.push(format!(
-                            "{}: cleanup planner returned an unexpected response",
-                            host.identity.label
+                            "{label}cleanup planner returned an unexpected response"
                         ));
                     }
                     None => {
                         if !message.trim().is_empty() {
-                            lines.push(format!("{}: {message}", host.identity.label));
+                            lines.push(format!("{label}{message}"));
                         } else {
-                            lines.push(format!("{}: no safe candidates", host.identity.label));
+                            lines.push(format!("{label}no safe candidates"));
                         }
                     }
                 }
@@ -144,7 +150,11 @@ fn aggregate_preparations(mut prepared: Vec<PreparedHost>, unexpected_failures: 
         message: String::new(),
         failed,
         modal: Some(UiModal::Confirm {
-            title: format!("Clean {} landed worktree(s)?", revisions.len()),
+            title: format!(
+                "Clean {} landed worktree{}?",
+                revisions.len(),
+                if revisions.len() == 1 { "" } else { "s" }
+            ),
             lines,
             action: ConfirmAction::Cleanup { revisions },
             cancel_key: Some('c'),

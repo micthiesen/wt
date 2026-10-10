@@ -136,6 +136,8 @@ pub async fn move_row(
         })
         .unwrap_or_else(|| vec![row.key.clone()]);
     let to = destination.clone();
+    ctx.section_writes
+        .record(moving.iter().cloned(), destination.as_deref());
     let changed = ctx
         .database
         .call(move |store| Ok(store.move_worktrees_to_section(&moving, to.as_deref())?))
@@ -187,12 +189,18 @@ pub async fn reorder(
         }
         .and_then(|index| order.get(index))
         .cloned()
-        .context("already at the edge")?;
+        .ok_or_else(|| {
+            crate::controller::notice(if down {
+                "section already at bottom"
+            } else {
+                "section already at top"
+            })
+        })?;
         ctx.database
             .call(move |store| Ok(store.move_group_past(&section, &neighbor, !down, &order)?))
             .await?;
         return Ok(UiReply {
-            message: "Group moved".into(),
+            message: format!("moved section {}", if down { "down" } else { "up" }),
             ..Default::default()
         });
     }
@@ -213,12 +221,21 @@ pub async fn reorder(
         })
         .collect::<Vec<_>>();
     let stacks = build_stack_index(&members, &ctx.config.branch.base);
+    let section_rows = board.sections[group_index]
+        .rows
+        .iter()
+        .filter_map(|index| board.rows.get(*index))
+        .collect::<Vec<_>>();
+    // A stack moves as one block under its root, but only within the
+    // root's section: a split member shown here under another section's
+    // root moves on its own, so a swap never drags the root across.
     let unit_key = |row: &wt_tui::BoardRow| {
         stacks
             .by_branch
             .get(&crate::board_layout::branch_key(row, &row.branch))
             .and_then(|entry| stacks.layouts[entry.layout_index].nodes.first())
             .map(|root| root.slug.clone())
+            .filter(|root| section_rows.iter().any(|row| &row.key == root))
             .unwrap_or_else(|| row.key.clone())
     };
     let row = board
@@ -227,11 +244,6 @@ pub async fn reorder(
         .find(|row| row.key == key)
         .context("selected worktree disappeared")?;
     let mover = unit_key(row);
-    let section_rows = board.sections[group_index]
-        .rows
-        .iter()
-        .filter_map(|index| board.rows.get(*index))
-        .collect::<Vec<_>>();
     let mut units = Vec::new();
     for row in &section_rows {
         let key = unit_key(row);
@@ -264,7 +276,9 @@ pub async fn reorder(
                 .unwrap_or(99)
         };
         if ctx.config.ui.sort == wt_config::UiSort::Status && rank(&mover) != rank(&neighbor) {
-            bail!("Status sort pins this row; reorder within the same status or use manual sort");
+            return Err(crate::controller::notice(
+                "status sort pins this row; reorder within the same status or use manual sort",
+            ));
         }
         let manual_order = |key: &str| {
             let collection = if wt_core::is_remote_worktree_ledger_key(key) {
@@ -305,14 +319,23 @@ pub async fn reorder(
         .find(|group| {
             group.key != crate::board_layout::ARCHIVED && !group.key.starts_with("\0stack:")
         })
-        .context("already at the edge")?;
+        .ok_or_else(|| {
+            crate::controller::notice(if down {
+                "already at bottom"
+            } else {
+                "already at top"
+            })
+        })?;
         let section =
             (destination.key != crate::board_layout::INBOX).then(|| destination.key.clone());
+        let message = format!("moved to {}", section.as_deref().unwrap_or("Inbox"));
         let moving = section_rows
             .iter()
             .filter(|row| unit_key(row) == mover)
             .map(|row| row.key.clone())
             .collect::<Vec<_>>();
+        ctx.section_writes
+            .record(moving.iter().cloned(), section.as_deref());
         ctx.database
             .call(move |store| {
                 store.move_worktrees_to_section(&moving, section.as_deref())?;
@@ -320,11 +343,13 @@ pub async fn reorder(
                 Ok(())
             })
             .await?;
+        return Ok(UiReply {
+            message,
+            ..Default::default()
+        });
     }
-    Ok(UiReply {
-        message: "Worktree moved".into(),
-        ..Default::default()
-    })
+    // A swap within the section shows itself; no toast, as in TS.
+    Ok(UiReply::default())
 }
 
 pub async fn rename(ctx: &AppContext, old: String, new: String) -> Result<UiReply> {
@@ -342,6 +367,14 @@ pub async fn rename(ctx: &AppContext, old: String, new: String) -> Result<UiRepl
     let new = new.trim().to_owned();
     let to = section::resolve_section(&state, &new).unwrap_or(new);
     let target = to.clone();
+    let members = ["slugs", "remoteLayouts"]
+        .into_iter()
+        .filter_map(|collection| state[collection].as_object())
+        .flatten()
+        .filter(|(_, entry)| entry["section"].as_str() == Some(from.as_str()))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    ctx.section_writes.record(members, Some(&target));
     ctx.database
         .call(move |store| Ok(store.rename_section(&from, &target)?))
         .await?;

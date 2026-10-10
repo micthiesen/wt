@@ -102,7 +102,10 @@ impl GithubActions {
         };
         let branch = row.branch.clone();
         let Some(pr) = github.prs.get(&branch) else {
-            return Ok(failed(format!("no PR data for {}", row.branch)));
+            return Ok(UiReply {
+                message: "no PR for this row".into(),
+                ..UiReply::default()
+            });
         };
         if pr.state != "OPEN" {
             return Ok(failed(format!(

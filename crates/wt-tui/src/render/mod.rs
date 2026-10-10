@@ -1,7 +1,7 @@
 //! Frame composition: title bar, list, details, activity, footer, overlays.
 //! Rendering reads only the prepared snapshot and model state.
 
-mod details;
+pub(crate) mod details;
 mod list;
 mod overlays;
 pub(crate) mod text;
@@ -248,7 +248,14 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
     let prompt = match (&model.interaction, &model.title_prompt) {
         (_, Some(title)) => Some(("title:".to_owned(), &title.editor)),
         (Interaction::Text(prompt), None) => {
-            Some((prompt.prompt.trim().to_owned(), &prompt.editor))
+            // Every label ends in a colon so it never runs into the input.
+            let label = prompt.prompt.trim();
+            let label = if label.ends_with(':') {
+                label.to_owned()
+            } else {
+                format!("{label}:")
+            };
+            Some((label, &prompt.editor))
         }
         _ => None,
     };
@@ -312,7 +319,8 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             Span::styled("?", base.fg(theme::ACCENT)),
             Span::styled(" help", base.fg(theme::FG_DIM)),
         ];
-        if area.width >= 80 {
+        // `t` titles the selected worktree, which history does not have.
+        if area.width >= 80 && !model.history.active {
             spans.extend([
                 Span::styled(" · ", base.fg(theme::FG_DIM)),
                 Span::styled("t", base.fg(theme::ACCENT)),

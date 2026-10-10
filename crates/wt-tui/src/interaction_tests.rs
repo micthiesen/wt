@@ -245,6 +245,31 @@ fn new_section_prompt_esc_returns_to_the_section_picker() {
 }
 
 #[test]
+fn backspace_on_an_empty_extras_prompt_keeps_it_open() {
+    let mut model = model_with(&["one"]);
+    model.reply(UiReply {
+        modal: Some(UiModal::Text {
+            action: TextAction::ActionExtras {
+                surface: ActionSurface::Row { key: "one".into() },
+                id: "custom".into(),
+                arg: None,
+            },
+            prompt: "Prompt: ".into(),
+            initial: String::new(),
+            allow_empty: false,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        press(&mut model, KeyCode::Backspace),
+        InputResult::Unchanged
+    );
+    assert!(matches!(model.interaction, Interaction::Text(_)));
+    press(&mut model, KeyCode::Esc);
+    assert!(!matches!(model.interaction, Interaction::Text(_)));
+}
+
+#[test]
 fn confirm_cancels_on_n() {
     let mut model = model_with(&["one"]);
     model.reply(UiReply {
@@ -527,6 +552,11 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
     let mut value = board(&["a", "b"]);
     value.rows[0].verify_steps = Some("check prod".into());
     value.rows[0].work = Some(WorkPresentation {
+        record: Some(wt_core::WorkStatusRecord {
+            verify_after_merge: Some("check prod".into()),
+            ..wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "2026-10-09T00:00:00Z")
+        }),
+        effective_state: Some(wt_core::WorkState::Ready),
         verification_owed: true,
         ..Default::default()
     });
@@ -544,6 +574,20 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
     );
     ch(&mut model, 'k');
     assert!(model.show_verification, "returning resets to the default");
+    let rendered = crate::render::details::work_status_lines(
+        model.selected_row().unwrap(),
+        model.show_verification,
+    )
+    .iter()
+    .map(|line| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(rendered.contains("V collapses"), "{rendered}");
 }
 
 #[test]
