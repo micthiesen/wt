@@ -9,7 +9,7 @@ pub(crate) mod text;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
@@ -18,9 +18,6 @@ use wt_runtime::SourceState;
 
 use crate::{Interaction, Model, badges, glyphs, theme};
 use text::truncate_end;
-
-/// Retained for panes not yet moved to the palette.
-pub(crate) const MUTED: Color = theme::FG_DIM;
 
 /// The details pane never grows past this many rows; the activity pane takes
 /// the rest of the right column.
@@ -281,13 +278,23 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
         return;
     }
     let left = if let Some((message, failed)) = &model.toast {
-        vec![
-            Span::raw(" "),
-            Span::styled(
-                message.clone(),
-                base.fg(if *failed { theme::ERR } else { theme::FG }),
-            ),
-        ]
+        // Leave the slot buttons their cells; a long toast truncates.
+        let room = (area.width as usize).saturating_sub(slot_buttons_width(model) + 4);
+        if *failed {
+            vec![
+                Span::raw(" "),
+                Span::styled(format!("{} ", glyphs::CHECK_FAIL), base.fg(theme::ERR)),
+                Span::styled(
+                    truncate_end(message, room.saturating_sub(2)),
+                    base.fg(theme::ERR),
+                ),
+            ]
+        } else {
+            vec![
+                Span::raw(" "),
+                Span::styled(truncate_end(message, room), base.fg(theme::FG)),
+            ]
+        }
     } else if let SourceState::Failed(error) = &model.source_state {
         vec![
             Span::raw(" "),
@@ -317,6 +324,13 @@ const SLOTS: [(&str, char); 4] = [
     ("wt", ','),
     ("dotfiles", '/'),
 ];
+
+fn slot_buttons_width(model: &Model) -> usize {
+    slot_buttons(model, Style::new())
+        .iter()
+        .map(|span| span.content.width())
+        .sum()
+}
 
 fn slot_buttons(model: &Model, base: Style) -> Vec<Span<'static>> {
     let board = &model.board;
@@ -480,6 +494,7 @@ mod tests {
                         chord: None,
                         note: None,
                         verify_after_merge: None,
+                        detail: None,
                     })
                     .collect(),
                 selected: 27,
@@ -652,6 +667,7 @@ mod tests {
                 chord: Some('1'),
                 note: None,
                 verify_after_merge: None,
+                detail: None,
             }],
             selected: 0,
         });

@@ -1,8 +1,11 @@
 //! Prepared output only. Cursor and viewport updates never ask a source to read.
-use crate::{Interaction, Model, PickerAction, PickerOption, model::PickerPrompt};
+use crate::{
+    Interaction, Model, PickerAction, PickerOption, glyphs, model::PickerPrompt,
+    render::text::truncate_end, theme,
+};
 use ratatui::{
-    style::{Color, Style},
-    text::Line,
+    style::Style,
+    text::{Line, Span},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -116,6 +119,7 @@ impl Model {
                     chord: None,
                     note: None,
                     verify_after_merge: None,
+                    detail: None,
                 })
                 .collect(),
         });
@@ -126,70 +130,85 @@ impl Model {
         height: usize,
         width: usize,
     ) -> (String, Vec<Line<'static>>) {
+        // One cell of padding each side, as in the list.
+        let width = width.saturating_sub(2).max(1);
         let target = self.output.target.clone();
         let (title, lines, identity, count) = match &target {
             OutputTarget::Attention => {
+                let seen_ms = self.board.attention_seen_ms;
+                let events = &self.board.attention;
+                let columns = FeedColumns::new(
+                    width,
+                    events.iter().map(|event| event.source.as_str()),
+                    events.first().map(|event| self.display_time(event.at_ms)),
+                );
                 let mut lines = Vec::new();
                 let mut marked = false;
-                for event in &self.board.attention {
-                    if self.board.attention_seen_ms > 0
-                        && !marked
-                        && event.at_ms > self.board.attention_seen_ms
-                    {
-                        lines.push(Line::styled(
-                            format!(
-                                "── seen {}",
-                                self.display_time(self.board.attention_seen_ms)
-                            ),
-                            Style::new().fg(Color::DarkGray),
-                        ));
+                let mut fresh = 0;
+                for event in events {
+                    let seen = seen_ms > 0 && event.at_ms <= seen_ms;
+                    if seen_ms > 0 && !marked && !seen {
+                        lines.extend(self.seen_rule(seen_ms, width, !lines.is_empty()));
                         marked = true;
                     }
-                    let text = format!(
-                        "{} {}: {}",
-                        self.display_time(event.at_ms),
-                        event.source,
-                        event.text
-                    );
-                    lines.push(
-                        if self.board.attention_seen_ms > 0
-                            && event.at_ms <= self.board.attention_seen_ms
-                        {
-                            Line::styled(text, Style::new().fg(Color::DarkGray))
-                        } else {
-                            Line::from(text)
-                        },
-                    );
-                }
-                if self.board.attention_seen_ms > 0 && !marked && !self.board.attention.is_empty() {
-                    lines.push(Line::styled(
-                        format!(
-                            "── seen {}",
-                            self.display_time(self.board.attention_seen_ms)
-                        ),
-                        Style::new().fg(Color::DarkGray),
+                    fresh += usize::from(!seen);
+                    let text = if seen {
+                        theme::dim()
+                    } else {
+                        theme::fg(theme::FG)
+                    };
+                    lines.extend(columns.event(
+                        &self.display_time(event.at_ms),
+                        &event.source,
+                        &event.text,
+                        text,
+                        seen,
+                        true,
                     ));
                 }
-                ("Attention".to_owned(), lines, "attention".into(), 0)
+                if seen_ms > 0 && !marked && !events.is_empty() {
+                    lines.extend(self.seen_rule(seen_ms, width, true));
+                }
+                if events.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}  ", glyphs::CHECK_PASS), theme::fg(theme::OK)),
+                        Span::styled("nothing needs you", theme::dim()),
+                    ]));
+                }
+                let title = if seen_ms > 0 && fresh > 0 {
+                    format!("attention · {fresh} new")
+                } else {
+                    "attention".to_owned()
+                };
+                (title, lines, "attention".into(), 0)
             }
-            OutputTarget::Activity => (
-                "All activity".to_owned(),
-                self.board
-                    .activity
+            OutputTarget::Activity => {
+                let events = &self.board.activity;
+                let columns = FeedColumns::new(
+                    width,
+                    events.iter().map(|event| event.source.as_str()),
+                    events.first().map(|event| self.display_time(event.at_ms)),
+                );
+                // One row per event: the firehose is for scanning, and the
+                // full text stays in the log file.
+                let mut lines = events
                     .iter()
-                    .map(|event| {
-                        Line::from(format!(
-                            "{} {} [{}] {}",
-                            self.display_time(event.at_ms),
-                            event.level,
-                            event.source,
-                            event.text
-                        ))
+                    .flat_map(|event| {
+                        columns.event(
+                            &self.display_time(event.at_ms),
+                            &event.source,
+                            &event.text,
+                            level_style(&event.level),
+                            false,
+                            false,
+                        )
                     })
-                    .collect(),
-                "activity".into(),
-                0,
-            ),
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push(Line::styled("no events yet", theme::dim()));
+                }
+                ("all activity".to_owned(), lines, "activity".into(), 0)
+            }
             OutputTarget::Selected | OutputTarget::Slot(_) => {
                 let row = self.selected_row();
                 let (sessions, logs, label, identity) = match &target {
@@ -210,7 +229,7 @@ impl Model {
                     _ => (
                         row.map(|row| row.sessions.as_slice()).unwrap_or_default(),
                         row.map(|row| row.logs.as_slice()).unwrap_or_default(),
-                        row.map(|row| row.slug.as_str()).unwrap_or("No worktree"),
+                        row.map(|row| row.slug.as_str()).unwrap_or("no worktree"),
                         row.map(|row| row.key.clone()).unwrap_or_default(),
                     ),
                 };
@@ -220,18 +239,47 @@ impl Model {
                 } else {
                     self.output.stream.min(count.saturating_sub(1))
                 };
+                let position = if count > 1 {
+                    format!(" · {}/{count}", stream + 1)
+                } else {
+                    String::new()
+                };
+                let plain = |lines: &[String]| {
+                    lines
+                        .iter()
+                        .flat_map(|line| wrap_visual_lines(line, theme::fg(theme::FG), width))
+                        .collect::<Vec<_>>()
+                };
                 if let Some(session) = sessions.get(stream) {
                     let mut output = Vec::with_capacity(session.output.len() + 1);
                     if let Some(summary) = session.summary.as_deref() {
-                        output.push(Line::styled(
-                            format!("Summary: {summary}"),
-                            Style::new().fg(Color::Cyan),
-                        ));
+                        let mut wrapped = wrap_visual_lines(
+                            summary,
+                            theme::fg(theme::FG_BRIGHT),
+                            width.saturating_sub(3),
+                        )
+                        .into_iter();
+                        if let Some(first) = wrapped.next() {
+                            let mut spans = vec![Span::styled(
+                                format!("{}  ", glyphs::TASK_COMPLETE),
+                                theme::fg(theme::OK),
+                            )];
+                            spans.extend(first.spans);
+                            output.push(Line::from(spans));
+                        }
+                        output.extend(wrapped.map(|line| {
+                            let mut spans = vec![Span::raw("   ")];
+                            spans.extend(line.spans);
+                            Line::from(spans)
+                        }));
                     }
-                    output.extend(session.output.iter().cloned().map(Line::from));
+                    output.extend(plain(&session.output));
+                    if output.is_empty() {
+                        output.push(Line::styled("no output yet", theme::dim()));
+                    }
                     (
                         format!(
-                            "{label} · {} / {} · {}",
+                            "{label} · {} / {} · {}{position}",
                             session.harness, session.name, session.state
                         ),
                         output,
@@ -242,16 +290,20 @@ impl Model {
                     .checked_sub(sessions.len())
                     .and_then(|index| logs.get(index))
                 {
+                    let mut output = plain(&log.lines);
+                    if output.is_empty() {
+                        output.push(Line::styled("no output yet", theme::dim()));
+                    }
                     (
-                        format!("{label} · {}", log.title),
-                        log.lines.iter().cloned().map(Line::from).collect(),
+                        format!("{label} · {}{position}", log.title),
+                        output,
                         identity,
                         count,
                     )
                 } else {
                     (
                         format!("{label} output"),
-                        vec![Line::from("No output yet")],
+                        vec![Line::styled("no output yet", theme::dim())],
                         identity,
                         count,
                     )
@@ -264,18 +316,6 @@ impl Model {
             self.output.top = None;
         }
         self.output.stream_count = count;
-        let lines = lines
-            .into_iter()
-            .flat_map(|line| {
-                let style = line.style;
-                let text = line
-                    .spans
-                    .into_iter()
-                    .map(|span| span.content.into_owned())
-                    .collect::<String>();
-                wrap_visual_lines(&text, style, width)
-            })
-            .collect::<Vec<_>>();
         let top = self.output.viewport(lines.len(), height);
         let hint = if self.output.top.is_some() {
             " · scrolled"
@@ -283,9 +323,35 @@ impl Model {
             ""
         };
         (
-            format!("{title}{hint} · ' source · [ ] stream"),
-            lines.into_iter().skip(top).take(height).collect(),
+            format!("{title}{hint}"),
+            lines
+                .into_iter()
+                .skip(top)
+                .take(height)
+                .map(|line| {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(line.spans);
+                    Line::from(spans).style(line.style)
+                })
+                .collect(),
         )
+    }
+
+    /// `── seen 12:00:01 ────`: everything above is handled. A blank row
+    /// above gives it air.
+    fn seen_rule(&self, seen_ms: u64, width: usize, spaced: bool) -> Vec<Line<'static>> {
+        let label = format!(" seen {} ", self.display_time(seen_ms));
+        let trail = width.saturating_sub(2 + label.width());
+        let rule = Line::from(vec![
+            Span::styled("──", theme::fg(theme::BORDER)),
+            Span::styled(label, theme::dim()),
+            Span::styled("─".repeat(trail), theme::fg(theme::BORDER)),
+        ]);
+        if spaced {
+            vec![Line::default(), rule]
+        } else {
+            vec![rule]
+        }
     }
 
     fn display_time(&self, at_ms: u64) -> String {
@@ -305,6 +371,139 @@ fn utc_time_of_day(at_ms: u64) -> String {
         seconds / 60 % 60,
         seconds % 60
     )
+}
+
+/// Feed rows: a dim time column, a right-aligned source column sized to
+/// the widest source (at most 16 cells, shrinking first on narrow panes),
+/// then the message. Wrapped messages continue under a two-cell hanging
+/// indent that spans the pane, so a long note is not squeezed into the
+/// message column.
+struct FeedColumns {
+    width: usize,
+    time: usize,
+    source: usize,
+}
+
+const SOURCE_MAX: usize = 16;
+const CONTINUATION: usize = 2;
+
+impl FeedColumns {
+    fn new<'a>(
+        width: usize,
+        sources: impl Iterator<Item = &'a str>,
+        sample_time: Option<String>,
+    ) -> Self {
+        let width = width.max(1);
+        let time = sample_time
+            .map_or(8, |time| time.width())
+            .min(width.saturating_sub(1));
+        let widest = sources.map(UnicodeWidthStr::width).max().unwrap_or(0);
+        // The message keeps at least 13 cells; a source column too narrow
+        // to read is dropped rather than shown as an ellipsis.
+        let room = width.saturating_sub(time + 1 + 13);
+        let source = if room < 4 {
+            0
+        } else {
+            widest.min(SOURCE_MAX).min(room)
+        };
+        Self {
+            width,
+            time,
+            source,
+        }
+    }
+
+    fn prefix(&self) -> usize {
+        self.time + 1 + if self.source > 0 { self.source + 1 } else { 0 }
+    }
+
+    fn event(
+        &self,
+        time: &str,
+        source: &str,
+        text: &str,
+        style: Style,
+        seen: bool,
+        wrap: bool,
+    ) -> Vec<Line<'static>> {
+        let first = self.width.saturating_sub(self.prefix()).max(1);
+        let mut head = vec![Span::styled(
+            format!("{} ", truncate_end(time, self.time)),
+            theme::dim(),
+        )];
+        if self.source > 0 {
+            let source_text = truncate_end(source, self.source);
+            let pad = self.source.saturating_sub(source_text.width());
+            // Bracketed sources are cross-cutting system events; slug
+            // sources keep the brighter accent.
+            let color = if seen || source.starts_with('[') {
+                theme::FG_DIM
+            } else {
+                theme::ACCENT_ALT
+            };
+            head.push(Span::styled(
+                format!("{}{source_text} ", " ".repeat(pad)),
+                theme::fg(color),
+            ));
+        }
+        if !wrap {
+            head.push(Span::styled(truncate_end(text, first), style));
+            return vec![Line::from(head)];
+        }
+        let rest = self.width.saturating_sub(CONTINUATION).max(1);
+        let mut parts = wrap_hanging(text, first, rest).into_iter();
+        head.push(Span::styled(parts.next().unwrap_or_default(), style));
+        let mut lines = vec![Line::from(head)];
+        lines.extend(parts.map(|part| {
+            Line::from(vec![
+                Span::raw(" ".repeat(CONTINUATION.min(self.width - 1))),
+                Span::styled(part, style),
+            ])
+        }));
+        lines
+    }
+}
+
+fn level_style(level: &str) -> Style {
+    match level.to_ascii_uppercase().as_str() {
+        "ERROR" | "ERR" | "FATAL" => theme::fg(theme::ERR),
+        "WARN" | "WARNING" => theme::fg(theme::WARN),
+        "OK" | "SUCCESS" => theme::fg(theme::OK),
+        "DEBUG" | "TRACE" | "DIM" => theme::dim(),
+        _ => theme::fg(theme::FG),
+    }
+}
+
+/// Word-wrap with a different width for the first line; words longer than
+/// a line are hard-split.
+fn wrap_hanging(text: &str, first: usize, rest: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let mut used = 0;
+    let limit = |lines: &Vec<String>| if lines.len() == 1 { first } else { rest };
+    for word in text.split_whitespace() {
+        let cells = word.width();
+        if used > 0 && used + 1 + cells <= limit(&lines) {
+            let line = lines.last_mut().expect("one line");
+            line.push(' ');
+            line.push_str(word);
+            used += 1 + cells;
+            continue;
+        }
+        if used > 0 {
+            lines.push(String::new());
+            used = 0;
+        }
+        for ch in word.chars() {
+            let cell = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cell > limit(&lines) && used > 0 {
+                lines.push(String::new());
+                used = 0;
+            }
+            lines.last_mut().expect("one line").push(ch);
+            used += cell;
+        }
+    }
+    lines
 }
 
 fn wrap_visual_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
@@ -361,6 +560,56 @@ fn wrap_visual_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Line text without the pane's one-cell left padding.
+    fn text(line: &Line<'_>) -> String {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        text.strip_prefix(' ').unwrap_or(&text).to_owned()
+    }
+
+    #[test]
+    fn empty_feeds_say_so_and_the_firehose_colors_levels() {
+        let mut model = Model::default();
+        let (title, lines) = model.output_view(5, 60);
+        assert_eq!(title, "attention");
+        assert_eq!(
+            text(&lines[0]),
+            format!("{}  nothing needs you", glyphs::CHECK_PASS)
+        );
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme::OK));
+        model.output.toggle_feed();
+        let (title, lines) = model.output_view(5, 60);
+        assert_eq!(title, "all activity");
+        assert_eq!(text(&lines[0]), "no events yet");
+        Arc::make_mut(&mut model.board).activity = vec![
+            crate::ActivityLine {
+                at_ms: 1_000,
+                level: "ERROR".into(),
+                source: "[app]".into(),
+                text: "refresh failed with a long explanation that will not fit".into(),
+                ..Default::default()
+            },
+            crate::ActivityLine {
+                at_ms: 2_000,
+                level: "WARN".into(),
+                source: "feature-one".into(),
+                text: "slow".into(),
+                ..Default::default()
+            },
+        ];
+        let lines = model.output_view(5, 50).1;
+        assert_eq!(lines.len(), 2, "the firehose truncates to one row each");
+        assert!(text(&lines[0]).ends_with('…'));
+        assert_eq!(lines[0].spans[2].style.fg, Some(theme::FG_DIM));
+        assert_eq!(lines[0].spans[3].style.fg, Some(theme::ERR));
+        assert_eq!(text(&lines[1]), "00:00:02Z feature-one slow");
+        assert_eq!(lines[1].spans[2].style.fg, Some(theme::ACCENT_ALT));
+        assert_eq!(lines[1].spans[3].style.fg, Some(theme::WARN));
+    }
     use std::sync::Arc;
     #[test]
     fn scrolling_stays_put_on_append_and_refollows_at_bottom() {
@@ -418,8 +667,11 @@ mod tests {
         model.output.choose(OutputTarget::Selected);
         let (title, lines) = model.output_view(5, 80);
         assert!(title.contains("Claude"));
-        assert_eq!(lines[0].spans[0].content, "Summary: Finished the review");
-        assert_eq!(lines[1].spans[0].content, "last output line");
+        assert_eq!(
+            text(&lines[0]),
+            format!("{}  Finished the review", glyphs::TASK_COMPLETE)
+        );
+        assert_eq!(text(&lines[1]), "last output line");
     }
 
     #[test]
@@ -451,13 +703,21 @@ mod tests {
             ..Default::default()
         };
         let lines = model.output_view(5, 80).1;
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].style.fg, Some(Color::DarkGray));
-        assert!(lines[1].spans[0].content.starts_with("── seen "));
-        assert_eq!(lines[0].spans[0].content, "00:00:01 old: handled");
-        assert!(lines[1].spans[0].content.starts_with("── seen 00:00:02"));
-        assert_eq!(lines[2].spans[0].content, "00:00:03 new: unread");
-        assert_eq!(lines[2].style.fg, None);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(text(&lines[0]), "00:00:01 old handled");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|span| span.style.fg == Some(theme::FG_DIM))
+        );
+        assert!(text(&lines[1]).is_empty());
+        assert!(text(&lines[2]).starts_with("── seen 00:00:02 ──"));
+        assert_eq!(text(&lines[3]), "00:00:03 new unread");
+        assert_eq!(lines[3].spans[2].style.fg, Some(theme::ACCENT_ALT));
+        assert_eq!(lines[3].spans[3].style.fg, Some(theme::FG));
+        assert_eq!(model.output_view(5, 80).0, "attention · 1 new");
     }
 
     #[test]
@@ -475,7 +735,7 @@ mod tests {
         };
         let lines = model.output_view(5, 80).1;
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].spans[0].content, "00:00:01Z test: new");
+        assert_eq!(text(&lines[0]), "00:00:01Z test new");
     }
 
     #[test]
@@ -514,10 +774,10 @@ mod tests {
             ..Default::default()
         };
         let (_, visible) = model.output_view(2, 24);
-        assert!(visible[1].spans[0].content.starts_with("  "));
+        assert!(text(&visible[1]).starts_with("  "));
         model.output.scroll(true);
         let (_, scrolled) = model.output_view(2, 24);
-        assert!(scrolled[0].spans[0].content.starts_with("  "));
-        assert_ne!(visible[0].spans[0].content, scrolled[0].spans[0].content);
+        assert!(text(&scrolled[0]).starts_with("  "));
+        assert_ne!(text(&visible[0]), text(&scrolled[0]));
     }
 }

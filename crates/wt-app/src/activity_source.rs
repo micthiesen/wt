@@ -297,6 +297,12 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
         .get("event_text")
         .and_then(Value::as_str)
         .or_else(|| fields.get("message").and_then(Value::as_str))?;
+    // A logged failure names its cause in the `error` field; the feed shows
+    // it, since "action failed" alone tells the reader nothing.
+    let text = match fields.get("error").and_then(Value::as_str) {
+        Some(error) if fields.get("event_text").is_none() => format!("{text}: {error}"),
+        _ => text.to_owned(),
+    };
     let channel = fields
         .get("event_channel")
         .and_then(Value::as_str)
@@ -307,7 +313,7 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
         level,
         channel,
         source: wt_core::sanitize_terminal_text(&source),
-        text: wt_core::sanitize_terminal_text(text),
+        text: wt_core::sanitize_terminal_text(&text),
     })
 }
 
@@ -343,6 +349,13 @@ pub(crate) fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logged_error_field_follows_the_message() {
+        let line = r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"TUI action failed","error":"no such worktree"},"target":"wt::controller"}"#;
+        let event = parse_app_log_line(line).unwrap();
+        assert_eq!(event.text, "TUI action failed: no such worktree");
+    }
 
     #[test]
     fn parses_structured_native_log_fields_and_error_attention() {

@@ -28,6 +28,32 @@ pub(crate) fn truncate_end(text: &str, width: usize) -> String {
     out
 }
 
+/// Truncate to at most `width` cells by cutting the middle, so both the
+/// start and the distinctive end of a path or URL stay visible.
+pub(crate) fn truncate_middle(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    if width < 3 {
+        return truncate_end(text, width);
+    }
+    let tail_width = (width - 1) / 2;
+    let head = truncate_end(text, width - tail_width);
+    let head = head.trim_end_matches(ELLIPSIS);
+    let mut tail = Vec::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let cell = ch.width().unwrap_or(0);
+        if used + cell > tail_width {
+            break;
+        }
+        tail.push(ch);
+        used += cell;
+    }
+    let tail: String = tail.into_iter().rev().collect();
+    format!("{head}{ELLIPSIS}{tail}")
+}
+
 /// Word-wrap to `width` cells. Words longer than a line are hard-split.
 /// Existing line breaks are preserved; blank lines stay blank.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -110,6 +136,8 @@ mod tests {
         assert_eq!(truncate_end("界面界面", 5), "界面…");
         assert_eq!(truncate_end("anything", 0), "");
         assert_eq!(fit("ab", 4), "ab  ");
+        assert_eq!(truncate_middle("/very/long/path/name", 10), "/very…name");
+        assert_eq!(truncate_middle("short", 10), "short");
     }
 
     #[test]
