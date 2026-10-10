@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import signal
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -80,7 +82,8 @@ def main() -> None:
         cache_root = scratch / "cache"
         lock_dir = scratch / "locks"
         socket = f"wt-dev-check-{os.getpid()}"
-        healthy = 'python3 -c "import urllib.request; urllib.request.urlopen(\'http://127.0.0.1:{{port}}/\', timeout=2).read()"'
+        python = shlex.quote(sys.executable)
+        healthy = f'{python} -c "import urllib.request; urllib.request.urlopen(\'http://127.0.0.1:{{{{port}}}}/\', timeout=2).read()"'
         pid_file = scratch / "dev-child.pid"
         server_file = scratch / "server.py"
         server_file.write_text(
@@ -97,7 +100,7 @@ def main() -> None:
             encoding="utf-8",
         )
         settings = {
-            "command": f"python3 {toml_string(str(server_file))} {{{{port}}}}",
+            "command": f"{python} {toml_string(str(server_file))} {{{{port}}}}",
             "port_base": 38100,
             "port_range": 64,
             "url": "http://127.0.0.1:{{port}}/",
@@ -133,6 +136,9 @@ def main() -> None:
         env.update(
             {
                 "HOME": str(home),
+                # Use the CI shell explicitly; the host user's login shell
+                # otherwise leaks into nested `SHELL -lc` dev and health runs.
+                "SHELL": "/bin/bash",
                 "XDG_CONFIG_HOME": str(home / ".config"),
                 "XDG_CACHE_HOME": str(cache_root),
                 "XDG_DATA_HOME": str(home / ".local" / "share"),
@@ -152,6 +158,7 @@ def main() -> None:
             except (AssertionError, subprocess.TimeoutExpired):
                 # Capture evidence while the isolated server still exists.
                 # The finally block deliberately tears it down on failure.
+                status_json: dict[str, object] | None = None
                 for diagnostic in (
                     [str(binary), "dev", "status", "--all", "--json"],
                     [str(binary), "dev", "logs", "dev-one"],
@@ -160,8 +167,57 @@ def main() -> None:
                     try:
                         result = subprocess.run(diagnostic, cwd=main_clone, env=env, text=True, capture_output=True, timeout=10)
                         print(f"fixture diagnostic {diagnostic!r}:\n{result.stdout}\n{result.stderr}", flush=True)
+                        if diagnostic[1:4] == ["dev", "status", "--all"] and result.returncode == 0:
+                            try:
+                                status_json = json.loads(result.stdout)
+                            except json.JSONDecodeError:
+                                pass
                     except subprocess.TimeoutExpired:
                         print(f"fixture diagnostic timed out: {diagnostic!r}", flush=True)
+                # `wt dev status` intentionally keeps only the first nonempty
+                # health-output line. On failure that is often just Python's
+                # generic Traceback header, so execute the exact check once
+                # more and retain its complete, bounded diagnostic here.
+                if status_json is not None:
+                    rows = status_json.get("worktrees", [])
+                    row = next(
+                        (item for item in rows if isinstance(item, dict) and item.get("slug") == "dev-one"),
+                        None,
+                    ) if isinstance(rows, list) else None
+                    status = row.get("status") if isinstance(row, dict) else None
+                    port = status.get("port") if isinstance(status, dict) else None
+                    health_template = settings.get("health_command")
+                    if isinstance(port, int) and isinstance(health_template, str):
+                        health = health_template.replace("{{port}}", str(port))
+                        shell = env.get("SHELL", "/bin/bash")
+                        try:
+                            result = subprocess.run(
+                                [shell, "-lc", health],
+                                cwd=worktree_root / "dev-one",
+                                env=dict(env, PORT=str(port)),
+                                text=True,
+                                capture_output=True,
+                                timeout=5,
+                            )
+                            print(
+                                f"fixture exact health diagnostic (exit {result.returncode}):\n"
+                                f"stdout:\n{result.stdout[-4000:]}\nstderr:\n{result.stderr[-4000:]}",
+                                flush=True,
+                            )
+                        except subprocess.TimeoutExpired as error:
+                            print(f"fixture exact health diagnostic timed out: {error}", flush=True)
+                if pid_file.is_file():
+                    try:
+                        pid = pid_file.read_text(encoding="utf-8").strip()
+                        result = subprocess.run(
+                            ["ps", "-p", pid, "-o", "pid=,ppid=,stat=,command="],
+                            text=True,
+                            capture_output=True,
+                            timeout=5,
+                        )
+                        print(f"fixture dev-child process diagnostic:\n{result.stdout}\n{result.stderr}", flush=True)
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        print(f"fixture dev-child process diagnostic failed: {error}", flush=True)
                 raise
 
         waiter: subprocess.Popen[str] | None = None
@@ -174,6 +230,31 @@ def main() -> None:
             first = wt("dev", "start", "dev-one", "--wait", "--timeout", "20")
             status = json.loads(wt("dev", "status", "dev-one", "--json").stdout)
             assert status["status"]["running"] is True, status
+            if not status["health"]["ok"]:
+                port = status["status"]["port"]
+                command = settings["health_command"].replace("{{port}}", str(port))
+                diagnostic = subprocess.run(
+                    [env["SHELL"], "-lc", command],
+                    cwd=worktree_root / "dev-one",
+                    env=dict(env, PORT=str(port)),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                )
+                print(
+                    f"fixture exact health diagnostic (exit {diagnostic.returncode}):\n"
+                    f"stdout:\n{diagnostic.stdout[-4000:]}\nstderr:\n{diagnostic.stderr[-4000:]}",
+                    flush=True,
+                )
+                if pid_file.is_file():
+                    pid = pid_file.read_text(encoding="utf-8").strip()
+                    process = subprocess.run(
+                        ["ps", "-p", pid, "-o", "pid=,ppid=,stat=,command="],
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    print(f"fixture dev-child process diagnostic:\n{process.stdout}\n{process.stderr}", flush=True)
             assert status["health"]["ok"] is True, status
             port = status["status"]["port"]
             assert port and str(port) in first.stdout, first.stdout
