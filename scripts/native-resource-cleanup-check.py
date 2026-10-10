@@ -293,13 +293,21 @@ def main() -> None:
 
         dev_server = scratch / "dev-server.py"
         dev_server.write_text(
-            "import http.server, json, pathlib, sys\n"
+            "import http.server, json, pathlib, socketserver, sys\n"
             "port = int(sys.argv[1])\n"
             "pathlib.Path(sys.argv[2]).write_text(json.dumps({'pid': __import__('os').getpid(), 'port': port}))\n"
             "class Handler(http.server.BaseHTTPRequestHandler):\n"
             "    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
             "    def log_message(self, *args): pass\n"
-            "http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()\n",
+            # HTTPServer calls getfqdn between bind and listen. Hosted macOS
+            # reverse DNS can stall there even though this is a loopback-only
+            # fixture; use the same DNS-free bind as native-dev-check.py.
+            "class Server(http.server.ThreadingHTTPServer):\n"
+            "    def server_bind(self):\n"
+            "        socketserver.TCPServer.server_bind(self)\n"
+            "        self.server_name = 'localhost'\n"
+            "        self.server_port = self.server_address[1]\n"
+            "Server(('127.0.0.1', port), Handler).serve_forever()\n",
             encoding="utf-8",
         )
         health_script = (
