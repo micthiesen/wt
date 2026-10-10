@@ -38,6 +38,61 @@ def run(
     return result
 
 
+def bounded_diagnostic(
+    argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float = 5
+) -> str:
+    try:
+        result = subprocess.run(
+            argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout
+        )
+        detail = f"exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    except (OSError, subprocess.TimeoutExpired) as error:
+        detail = f"diagnostic command failed: {error}"
+    return detail[-4_000:]
+
+
+def dev_start_diagnostics(
+    binary: Path,
+    main_clone: Path,
+    env: dict[str, str],
+    socket_name: str,
+    scratch: Path,
+    config: Path,
+    dev_command: str,
+    health_command: str,
+) -> str:
+    reports = {
+        "runtime": f"binary={binary}\nsys.executable={sys.executable}\nSHELL={env.get('SHELL')}\nPATH={env.get('PATH')}\n",
+        "generated configuration": config.read_text(encoding="utf-8"),
+        "dev command": f"{dev_command}\nscript:\n{(scratch / 'dev-server.py').read_text(encoding='utf-8')}\n",
+        "health command": f"{health_command}\n",
+        "wt dev logs foo": bounded_diagnostic(
+            [str(binary), "dev", "logs", "foo", "--lines", "80"],
+            cwd=main_clone, env=env,
+        ),
+        "wt dev status foo --json": bounded_diagnostic(
+            [str(binary), "dev", "status", "foo", "--json"],
+            cwd=main_clone, env=env,
+        ),
+        "tmux pane": bounded_diagnostic(
+            ["tmux", "-L", socket_name, "capture-pane", "-p", "-S", "-200", "-t", "=foo-dev:"],
+            cwd=main_clone, env=env,
+        ),
+        "tmux pane process": bounded_diagnostic(
+            ["tmux", "-L", socket_name, "display-message", "-p", "-t", "=foo-dev:",
+             "#{pane_current_command} | dead=#{pane_dead} | exit=#{pane_dead_status} | start=#{pane_start_command}"],
+            cwd=main_clone, env=env,
+        ),
+    }
+    destination = scratch / "dev-start-diagnostics.txt"
+    destination.write_text(
+        "\n\n".join(f"=== {name} ===\n{detail}" for name, detail in reports.items()),
+        encoding="utf-8",
+    )
+    content = destination.read_text(encoding="utf-8")
+    return f"\nDev startup diagnostics (bounded; captured before fixture cleanup):\n{content[-24_000:]}"
+
+
 def git(argv: list[str], *, cwd: Path, env: dict[str, str]) -> None:
     subprocess.run(argv, cwd=cwd, env=env, check=True, capture_output=True, timeout=20)
 
@@ -211,6 +266,11 @@ def main() -> None:
         health_script = (
             "import socket; s=socket.create_connection(('127.0.0.1', {{port}}), timeout=1); s.close()"
         )
+        dev_command = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(dev_server))} "
+            f"{{{{port}}}} {shlex.quote(str(pid_dir / 'dev-server.json'))}"
+        )
+        health_command = f"{shlex.quote(sys.executable)} -c {shlex.quote(health_script)}"
         settings = [
             "[paths]",
             f"main_clone = {toml_string(str(main_clone))}",
@@ -228,16 +288,12 @@ def main() -> None:
             f"socket = {toml_string(socket_name)}",
             "[dev_server]",
             "command = "
-            + toml_string(
-                f"{shlex.quote(sys.executable)} {shlex.quote(str(dev_server))} "
-                f"{{{{port}}}} {shlex.quote(str(pid_dir))}/dev-{{{{slug}}}}.json"
-            ),
+            + toml_string(dev_command),
             "port_base = 39200",
             "port_range = 96",
             'url = "http://127.0.0.1:{{port}}/"',
             "max_concurrent = 2",
-            "health_command = "
-            + toml_string(f"{shlex.quote(sys.executable)} -c {shlex.quote(health_script)}"),
+            "health_command = " + toml_string(health_command),
         ]
         config.write_text("\n".join(settings) + "\n", encoding="utf-8")
 
@@ -399,15 +455,45 @@ def main() -> None:
 
             # Start a real private dev session to persist the port used by
             # browser cleanup, while all browser-control calls remain faked.
-            run([str(binary), "dev", "start", "foo", "--wait", "--timeout", "20"], cwd=main_clone, env=env, timeout=35)
+            try:
+                run(
+                    [str(binary), "dev", "start", "foo", "--wait", "--timeout", "20"],
+                    cwd=main_clone,
+                    env=env,
+                    timeout=35,
+                )
+            except Exception as error:
+                details = dev_start_diagnostics(
+                    binary, main_clone, env, socket_name, scratch, config, dev_command, health_command
+                )
+                raise AssertionError(f"dev start fixture failed: {error}{details}") from error
             status = json.loads(
                 run([str(binary), "dev", "status", "foo", "--json"], cwd=main_clone, env=env).stdout
             )
             port = status["status"]["port"]
             assert isinstance(port, int) and port > 0, status
+            assert status.get("health", {}).get("ok") is True, (
+                "generated health_command did not reach the fixture server: "
+                f"{status.get('health')!r}"
+            )
             env["FIXTURE_DEV_PORT"] = str(port)
             dev_pids = listener_pids(port)
             assert dev_pids, f"no owned process is listening on dev port {port}"
+            server_record_path = pid_dir / "dev-server.json"
+            if not server_record_path.exists():
+                raise AssertionError(
+                    f"server record missing despite listening port {port}; "
+                    f"records={[path.name for path in pid_dir.glob('*')]} "
+                    f"listeners={dev_pids}"
+                    + dev_start_diagnostics(
+                        binary, main_clone, env, socket_name, scratch, config, dev_command, health_command
+                    )
+                )
+            server_record = json.loads(server_record_path.read_text(encoding="utf-8"))
+            assert server_record["port"] == port and server_record["pid"] in dev_pids, (
+                "configured interpreter/server did not own the allocated port: "
+                f"record={server_record!r}; listeners={dev_pids!r}"
+            )
 
             removed = run(
                 [str(binary), "rm", "--yes", "--force", "foo"],

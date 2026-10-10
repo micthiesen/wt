@@ -146,6 +146,7 @@ class HostProcess:
         self.input = self.process.stdin
         self.output = self.process.stdout
         self.buffer = bytearray()
+        self.last_snapshot: dict[str, Any] | None = None
 
     def stderr(self) -> str:
         self.stderr_file.flush()
@@ -191,7 +192,10 @@ class HostProcess:
                 raise AssertionError("host protocol frame exceeded the fixture's 8 MiB bound")
         line, _, rest = self.buffer.partition(b"\n")
         self.buffer[:] = rest
-        return json.loads(line)
+        frame = json.loads(line)
+        if (snapshot := snapshot_frame(frame)) is not None:
+            self.last_snapshot = snapshot
+        return frame
 
     def read_available(self, timeout: float) -> list[dict[str, Any]]:
         frames: list[dict[str, Any]] = []
@@ -263,6 +267,10 @@ def row(snapshot: dict[str, Any], key: str) -> dict[str, Any] | None:
 
 
 def wait_snapshot(host: HostProcess, predicate, timeout: float = 12) -> dict[str, Any]:
+    # Snapshot and reply are independent messages. A ready snapshot can arrive
+    # while command() is waiting for its reply; it must not be discarded.
+    if host.last_snapshot is not None and predicate(host.last_snapshot):
+        return host.last_snapshot
     frame = host.wait(lambda value: (snap := snapshot_frame(value)) is not None and predicate(snap), timeout)
     return frame["Snapshot"]
 
@@ -556,7 +564,7 @@ def main() -> None:
             assert not status_reply["Reply"]["reply"]["failed"], status_reply
             status_snapshot = wait_snapshot(
                 first,
-                lambda value: value.get("layout", {}).get("same-slug", {}).get("work", {}).get("state")
+                lambda value: (value.get("layout", {}).get("same-slug", {}).get("work") or {}).get("state")
                 == "working",
             )
             assert status_snapshot["layout"]["same-slug"]["work"]["state"] == "working"
