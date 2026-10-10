@@ -45,7 +45,7 @@ pub async fn start_remove(
     tokio::fs::create_dir_all(&jobs)
         .await
         .with_context(|| format!("create job directory {}", jobs.display()))?;
-    reap_abandoned(&jobs, &ctx.processes).await?;
+    reap_abandoned(ctx, &jobs).await?;
     start_remove_inner(ctx, record, options).await
 }
 
@@ -58,7 +58,7 @@ pub async fn start_removals(
         tokio::fs::create_dir_all(&jobs)
             .await
             .with_context(|| format!("create job directory {}", jobs.display()))?;
-        reap_abandoned(&jobs, &ctx.processes).await
+        reap_abandoned(ctx, &jobs).await
     }
     .await;
     if let Err(error) = setup {
@@ -104,6 +104,12 @@ async fn start_remove_inner(
     let job_id = new_id();
     let log_path = jobs.join(format!("{job_id}.log"));
     let job_path = jobs.join(format!("{job_id}.json"));
+    let archive_key = worktree_target_key(&record.target);
+    let lookup = archive_key.clone();
+    let was_archived = ctx
+        .database
+        .call(move |store| Ok(store.read_archived_keys()?.contains(&lookup)))
+        .await?;
     let record_json = json!({
         "version": VERSION,
         "id": job_id,
@@ -115,6 +121,7 @@ async fn start_remove_inner(
             "revision": revision,
         },
         "operation": "remove",
+        "wasArchived": was_archived,
         "options": {
             "force": options.force,
             "deleteBranch": options.delete_branch,
@@ -177,6 +184,7 @@ async fn start_remove_inner(
             );
         }
         if child.try_wait()?.is_some() {
+            restore_archive(ctx, &current).await?;
             bail!(
                 "background worker exited before startup acknowledgement; see {}",
                 log_path.display()
@@ -184,6 +192,8 @@ async fn start_remove_inner(
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
+            restore_archive(ctx, &read_job(&job_path).await?).await?;
             bail!(
                 "background worker did not acknowledge startup; see {}",
                 log_path.display()
@@ -206,6 +216,19 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
     job["workerPid"] = json!(std::process::id());
     job["workerStartIdentity"] =
         json!(process_start_identity(std::process::id(), &ctx.processes).await);
+    let archive_key = job["target"]["key"]
+        .as_str()
+        .context("job missing worktree key")?
+        .to_owned();
+    if job["wasArchived"].is_boolean() {
+        let key = archive_key;
+        ctx.database
+            .call(move |store| {
+                store.set_archived(&key, true)?;
+                Ok(())
+            })
+            .await?;
+    }
     job["state"] = json!("running");
     atomic_write(&job_path, &job).await?;
 
@@ -219,6 +242,14 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             Ok(0)
         }
         Err(error) => {
+            match restore_archive(ctx, &job).await {
+                Ok(()) => {
+                    tracing::error!(%error, "Background removal failed; previous archive state restored")
+                }
+                Err(restore) => {
+                    tracing::error!(%error, %restore, "Background removal failed; cannot restore archive state")
+                }
+            }
             job["state"] = json!("failed");
             job["error"] = json!(format!("{error:#}"));
             job["completedAt"] = json!(now_string());
@@ -226,6 +257,24 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             Err(error)
         }
     }
+}
+
+async fn restore_archive(ctx: &AppContext, job: &Value) -> Result<()> {
+    // Older jobs did not change archive state.
+    let Some(was_archived) = job["wasArchived"].as_bool() else {
+        return Ok(());
+    };
+    let key = job["target"]["key"]
+        .as_str()
+        .context("job missing target key")?
+        .to_owned();
+    ctx.database
+        .call(move |store| {
+            store.set_archived(&key, was_archived)?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
 }
 
 async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
@@ -281,6 +330,9 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
         .await?;
     for warning in removed.warnings {
         eprintln!("warning: {warning}");
+    }
+    if !removed.removed {
+        bail!("background removal did not remove the worktree; see job log");
     }
     if removed.removed {
         for warning in crate::host_cleanup::after_remove(ctx, row.target.slug(), dev_port).await {
@@ -338,10 +390,7 @@ async fn atomic_write(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn reap_abandoned(
-    directory: &Path,
-    runner: &wt_platform::process::ProcessRunner,
-) -> Result<()> {
+async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
     let mut entries = tokio::fs::read_dir(directory).await?;
     while let Some(entry) = entries.next_entry().await? {
         if entry
@@ -364,11 +413,12 @@ async fn reap_abandoned(
             continue;
         };
         let expected = job["workerStartIdentity"].as_str().unwrap_or_default();
-        let actual = process_start_identity(pid, runner).await;
+        let actual = process_start_identity(pid, &ctx.processes).await;
         if expected.is_empty() || actual.is_empty() || actual == expected {
             continue;
         }
         job["state"] = json!("failed");
+        restore_archive(ctx, &job).await?;
         job["error"] = json!("worker process disappeared before recording completion");
         job["completedAt"] = json!(now_string());
         atomic_write(&entry.path(), &job).await?;

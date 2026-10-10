@@ -82,7 +82,12 @@ The output pane switches between attention, all app activity, and prepared
 session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
 
-Creation records the intended target and selects it only after the refreshed
+Creation adds a temporary selected row as soon as the request enters the
+controller queue. F12 on that row requests agent entry when the checkout is
+ready. Request IDs keep replies tied to their own temporary rows. Source
+snapshots remain unchanged; failures remove the temporary row. Dependency
+installation uses a durable background action, so it does not delay agent entry.
+Creation selects the actual target only after the refreshed
 inventory contains the actual row. A successful refresh alone is not proof the
 row is visible. When a selected row disappears, cursor fallback is based on
 the current visual row identity and section, not a stale numeric position.
@@ -139,7 +144,10 @@ Action metadata and logs remain tracked on disk so a disconnected controller
 can re-read completion and output.
 
 Worktree removal and cleanup use the lifecycle service and per-worktree
-operation locks. Cleanup does not force-remove dirty or unpushed work, and a
+operation locks. A confirmed removal moves its row to Archived with a
+`removing` label at once. The worker saves the archive state before its startup
+reply and restores the previous state on failure. Removal errors enter the
+attention feed. Cleanup does not force-remove dirty or unpushed work, and a
 landed branch with an outstanding verification gate remains protected. Missing
 GitHub or inventory facts are unknown, never proof that removal is safe.
 

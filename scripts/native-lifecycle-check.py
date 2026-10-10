@@ -11,6 +11,7 @@ import re
 import select
 import signal
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -188,6 +189,7 @@ def main() -> int:
                 },
             },
             "operation": "remove",
+            "wasArchived": False,
             "options": {"force": True, "deleteBranch": True, "landed": False, "destroyStage": False},
             "createdAt": "fixture",
             "workerPid": None,
@@ -203,6 +205,8 @@ def main() -> int:
         refused = subprocess.run([str(binary), "_destroy", stale_job_id], env=env, cwd=main_repo, text=True, capture_output=True)
         assert refused.returncode != 0 and "HEAD changed" in refused.stderr, refused.stderr
         assert stale_target.exists(), "worker removed a checkout whose HEAD did not match the job"
+        with sqlite3.connect(scratch / "state.db") as state:
+            assert not state.execute("SELECT 1 FROM archived_worktrees WHERE worktree_key = ?", ("ENG-502-stale-head",)).fetchone(), "failed removal left the worktree archived"
         print(
             "native lifecycle smoke passed: ack, durable removal, no worker leak, path/head guards, "
             f"PTY picker SIGTERM exit in {picker_exit_seconds * 1000:.1f} ms"

@@ -251,6 +251,7 @@ async fn run_inner<'a>(
                 if actions
                     .requests
                     .try_send(crate::UiRequest {
+                        id: 0,
                         generation: model.ui_generation,
                         action,
                     })
@@ -309,8 +310,10 @@ async fn run_inner<'a>(
                             InputResult::Draw => { dirty = true; input_at = Some(received); }
                             InputResult::Unchanged => {}
                             InputResult::Action(action) => {
-                                match actions.requests.try_send(crate::UiRequest { generation: model.ui_generation, action }) {
-                                    Ok(()) => model.toast = Some(("Working…".into(), ToastTone::Info)),
+                                let id = model.lifecycle.next_id();
+                                let feedback = action.clone();
+                                match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }) {
+                                    Ok(()) => { model.begin_action(id, &feedback); model.toast = Some(("Working…".into(), ToastTone::Info)); },
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)),
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)),
                                 }
@@ -335,14 +338,22 @@ async fn run_inner<'a>(
                     let history_was_open = model.history.active;
                     let perf_was_open = model.show_perf;
                     let handoff = model.reply(reply);
+                    if let Some(action) = model.follow_up.take() {
+                        let id = model.lifecycle.next_id();
+                        if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }).is_err() {
+                            model.toast = Some(("Agent start queue is busy; press F12 again".into(), ToastTone::Failed));
+                        }
+                    }
                     if history_was_open && !model.history.active {
                         let _ = actions.requests.try_send(crate::UiRequest {
+                            id: 0,
                             generation: model.ui_generation,
                             action: crate::UiAction::SetHistoryActive { active: false },
                         });
                     }
                     if perf_was_open && !model.show_perf {
                         let _ = actions.requests.try_send(crate::UiRequest {
+                            id: 0,
                             generation: model.ui_generation,
                             action: crate::UiAction::SetPerf {
                                 active: false,
@@ -401,6 +412,7 @@ async fn run_inner<'a>(
                     && matches!(model.interaction, crate::Interaction::Log { .. })
                 {
                     let _ = actions.requests.try_send(crate::UiRequest {
+                        id: 0,
                         generation: model.ui_generation,
                         action,
                     });

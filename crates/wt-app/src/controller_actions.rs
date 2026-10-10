@@ -599,6 +599,9 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
         .await?
         .into_iter()
         .find(|row| !row.is_main && row.target.branch == branch);
+    let install = existing.is_none()
+        && !args.no_install
+        && ctx.config.backend.kind == wt_config::BackendKind::GitWorktree;
     let target = if let Some(row) = existing {
         row.target
     } else {
@@ -608,13 +611,17 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
                 CreateOptions {
                     base: args.base,
                     fetch_origin: true,
-                    run_install: !args.no_install,
+                    run_install: false,
                 },
                 &ctx.cancellation,
             )
             .await?
             .target
     };
+    let mut setup_warning = None;
+    if install && let Err(error) = start_install(ctx, &target).await {
+        setup_warning = Some(format!("; dependency setup failed to start: {error:#}"));
+    }
     if let Some(issue) = args.gh {
         let slug = target.slug().to_owned();
         ctx.database
@@ -662,7 +669,11 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
             .await?;
     }
     Ok(UiReply {
-        message: format!("Created {}", target.slug()),
+        message: format!(
+            "Created {}{}",
+            target.slug(),
+            setup_warning.unwrap_or_default()
+        ),
         select_when_visible: Some(wt_core::worktree_target_key(&target)),
         ..Default::default()
     })
@@ -678,6 +689,53 @@ const STATUS_CHORDS: [(&str, char); 8] = [
     ("verified", 'v'),
     ("dropped", 'd'),
 ];
+
+async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Result<()> {
+    let config = wt_lifecycle::ServiceConfig::from_config(&ctx.config);
+    let policy = wt_platform::install::InstallPolicy {
+        command: config.install_command,
+        shell: config.shell,
+    };
+    let Some(plan) = policy.resolve(Path::new(&target.path), false).await? else {
+        return Ok(());
+    };
+    let mut command = vec![plan.spec.program.to_string_lossy().into_owned()];
+    command.extend(
+        plan.spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
+    let mut config_selectors = std::collections::BTreeMap::new();
+    if let Some(path) = &ctx.config.repository_config {
+        config_selectors.insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
+    }
+    crate::actions::service(ctx)?
+        .start(
+            wt_actions::ActionRequest {
+                action_key: wt_core::worktree_target_key(target),
+                slug: target.slug().to_owned(),
+                worktree_ref: Some(wt_core::WorktreeRef::Local {
+                    slug: target.slug().to_owned(),
+                }),
+                action_id: "builtin:create-install".into(),
+                action_name: "Install dependencies".into(),
+                arg_history: None,
+                prompt: plan.label,
+                kind: wt_actions::ActionRunKind::Shell,
+                command,
+                cwd: Path::new(&target.path).to_path_buf(),
+                affects: vec![wt_config::EffectTag::Git],
+                issue_status: None,
+                external: false,
+                auto_fire_keys: Vec::new(),
+                config_selectors,
+            },
+            &ctx.cancellation,
+        )
+        .await?;
+    Ok(())
+}
 
 async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
     let row = resolve_key(ctx, &key).await?;

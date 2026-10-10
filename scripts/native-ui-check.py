@@ -21,6 +21,7 @@ import shutil
 import signal
 import sqlite3
 import struct
+import subprocess
 import termios
 import time
 
@@ -35,6 +36,7 @@ def main():
     parser.add_argument("--exit-signal", choices=["quit", "TERM", "HUP", "INT"], default="quit")
     parser.add_argument("--sections", action="store_true", help="also exercise filing and renaming through the terminal")
     parser.add_argument("--feeds", action="store_true", help="also verify log backfill, seen state and searchable help")
+    parser.add_argument("--create", action="store_true", help="verify immediate creation feedback and background setup")
     args = parser.parse_args()
     binary = args.binary.resolve()
     root = args.output.resolve()
@@ -47,6 +49,11 @@ def main():
     config.write_text(config.read_text().replace(
         "[paths]\n", "[paths]\n" + f"log_dir = {json.dumps(str(app_logs.parent))}\n"
     ))
+    install_started = root / "install-started"
+    install_finished = root / "install-finished"
+    if args.create:
+        command = f"touch {install_started}; sleep 8; touch {install_finished}"
+        config.write_text(config.read_text() + "[lifecycle]\ninstall_command = " + json.dumps(command) + "\n")
     feed_log = app_logs / "wt-native.fixture.log"
 
     def append_feed(text, channel="activity"):
@@ -79,7 +86,7 @@ def main():
                PATH=str(tools) + os.pathsep + os.environ["PATH"], WT_UPDATE="off", WT_SKILLS="off",
                WT_GITHUB="off", WT_AUTOMATIONS="off", WT_TMUX_SOCKET=f"wt-native-qa-{os.getpid()}")
     for key in ("WT_REPO_CONFIG", "WT_REPO_ID", "WT_AGENT", "BUN_INSPECT", "XDG_CONFIG_HOME",
-                "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+                "XDG_CACHE_HOME", "XDG_STATE_HOME", "NO_COLOR"):
         env.pop(key, None)
     pid, master = pty.fork()
     if pid == 0:
@@ -227,7 +234,22 @@ def main():
             assert stored_slug("bench-001").get("manualTitle") == "Native UI title"
             assert stored_slug("bench-001").get("section") == "Today"
             drain_for(0.3)
-        if args.exit_signal == "quit":
+        if args.create:
+            delay_inventory.touch()
+            os.write(master, b"n")
+            wait_for(lambda data: b"New worktree name:" in data)
+            injected_create = time.monotonic()
+            os.write(master, b"created-feedback\r")
+            wait_for(lambda data: b"creating" in data, timeout=0.5)
+            create_feedback_ms = (time.monotonic() - injected_create) * 1000
+            delay_inventory.unlink()
+            wait_for(lambda data: b"Created created-feedback" in data, timeout=15)
+            assert (root / "worktrees/created-feedback").exists()
+            wait_for(lambda _: install_started.exists())
+            assert not install_finished.exists(), "creation waited for dependency setup"
+            wait_for(lambda _: install_finished.exists(), timeout=12)
+            os.write(master, b"q")
+        elif args.exit_signal == "quit":
             # The action has been admitted but its inventory read has not
             # completed. Quitting must drain that action, not drop its write.
             delay_inventory.touch()
@@ -247,7 +269,7 @@ def main():
                 assert os.waitstatus_to_exitcode(status) == 0
                 break
         assert reaped, "native terminal did not shut down"
-        if args.exit_signal == "quit":
+        if args.exit_signal == "quit" and not args.create:
             with sqlite3.connect(f"file:{root / 'state/wt.sqlite'}?mode=ro", uri=True) as state:
                 records = [json.loads(row[0]) for row in state.execute("SELECT data FROM repository_state")]
             assert any(record.get("slugs", {}).get("bench-001", {}).get("manualTitle") == "Queued title survives quit"
@@ -260,11 +282,15 @@ def main():
                       history_perf_and_hard_refresh=args.sections,
                       feed_backfill_append_and_seen=args.feeds,
                       searchable_help=args.feeds,
-                      accepted_write_survived_quit=args.exit_signal == "quit",
+                      accepted_write_survived_quit=args.exit_signal == "quit" and not args.create,
+                      create_feedback_ms=create_feedback_ms if args.create else None,
+                      background_setup=args.create,
                       clean_shutdown=True, exit_signal=args.exit_signal)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
     finally:
+        if args.create:
+            subprocess.run(["tmux", "-L", env["WT_TMUX_SOCKET"], "kill-server"], env=env, capture_output=True)
         (root / "terminal.ansi").write_bytes(capture)
         # Close the PTY before waiting: Darwin can leave a child exiting while
         # the still-open master holds undrained terminal output.

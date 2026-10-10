@@ -58,7 +58,7 @@ pub fn start(
         loop {
             while running.len() < 4 {
                 let Some((lane, request)) = take_available(&mut pending, &busy) else { break; };
-                let wt_tui::UiRequest { generation, action: command } = request;
+                let wt_tui::UiRequest { id, generation, action: command } = request;
                 busy.insert(lane.clone());
                 let context = context.clone();
                 let fleet = fleet.clone();
@@ -70,9 +70,10 @@ pub fn start(
                     let result = crate::host_dispatch::execute(&context, &fleet, command, &replies, &shutdown).await;
                     let mut reply = action_reply(result, retry);
                     reply.ui_generation = Some(generation);
+                    reply.operation_id = Some(id);
                     (lane, reply)
                 });
-                task_lanes.insert(task.id(), task_lane);
+                task_lanes.insert(task.id(), (task_lane, id));
             }
             if closed && pending.is_empty() && running.is_empty() { break; }
             tokio::select! {
@@ -89,11 +90,14 @@ pub fn start(
                     },
                     Some(Err(error)) => {
                         tracing::error!(%error, "action worker exited unexpectedly");
-                        let _ = port.replies.send(UiReply { failed: true, message: format!("Action worker failed: {error}"), ..Default::default() }).await;
-                        if let Some(lane) = task_lanes.remove(&error.id()) {
+                        if let Some((lane, id)) = task_lanes.remove(&error.id()) {
+                            let _ = port.replies.send(UiReply { operation_id: Some(id), failed: true, message: format!("Action worker failed: {error}"), ..Default::default() }).await;
                             failed_lanes.insert(lane.clone());
                             busy.remove(&lane);
                             let skipped = pending.iter().filter(|(queued, _)| *queued == lane).count();
+                            for (_, request) in pending.iter().filter(|(queued, _)| *queued == lane) {
+                                let _ = port.replies.send(UiReply { operation_id: Some(request.id), failed: true, message: "Host action worker failed; operation did not start".into(), ..Default::default() }).await;
+                            }
                             pending.retain(|(queued, _)| *queued != lane);
                             if skipped > 0 {
                                 let _ = port.replies.send(UiReply { failed: true, message: format!("{skipped} queued commands on the failed host were not started. Restart wt before retrying."), ..Default::default() }).await;
@@ -105,8 +109,8 @@ pub fn start(
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
                     Some(command) => match lane_for(&command.action) {
                         Ok(lane) if !failed_lanes.contains(&lane) => pending.push_back((lane, command)),
-                        Ok(_) => { let _ = port.replies.send(UiReply { failed: true, message: "Host command worker failed; this command was not started. Restart wt before retrying.".into(), ..Default::default() }).await; },
-                        Err(error) => { let _ = port.replies.send(UiReply { failed: true, message: format!("{error:#}"), ..Default::default() }).await; },
+                        Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), failed: true, message: "Host command worker failed; this command was not started. Restart wt before retrying.".into(), ..Default::default() }).await; },
+                        Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), failed: true, message: format!("{error:#}"), ..Default::default() }).await; },
                     },
                     None => closed = true,
                 },

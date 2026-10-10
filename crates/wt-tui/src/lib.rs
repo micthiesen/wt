@@ -7,6 +7,7 @@ mod editor;
 mod glyphs;
 mod help;
 mod history;
+mod lifecycle;
 mod model;
 mod mouse;
 mod output;

@@ -37,6 +37,16 @@ in `docs/rust-rewrite.md` and `docs/rust-rewrite-performance.json`. Raw runs:
 `/tmp/wt-perf-ts-final-24-20261010` and
 `/tmp/wt-perf-rust-final-24-20261010`.
 
+A lifecycle feedback fixture on the debug build showed the pending creation
+row in 35.5 ms while inventory was held for two seconds. Checkout completion
+was reported before an eight-second dependency install finished. A separate
+PTY section check drew navigation in 1.2 ms during a two-second Git stall.
+These are single local samples with optional sources disabled, not remote
+latency guarantees. The native lifecycle check also verified archive rollback
+when a worker refused a changed HEAD. Evidence:
+`/tmp/wt-create-feedback-20261010/result.json` and
+`/tmp/wt-optimistic-ui-20261010/result.json`.
+
 ## Historical machine baseline (2026-10-06)
 
 Machine: 12 cores / 32 GB Apple Silicon. The reported desktop freeze was a few
@@ -58,6 +68,12 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Lifecycle feedback is prepared in source but not installed (2026-10-10).**
+  Creation now shows a temporary row on queue admission. F12 requests agent
+  entry after checkout completion; linked-worktree dependency installation
+  runs as a durable action. Confirmed deletion shows an archive overlay and
+  restores the saved archive state on worker failure. The checks above cover
+  local behavior. A matching release and remote smoke check remain owed.
 - **Native clean/delete confirmation waits on fresh remote evidence (2026-10-10).**
   User reports a long `working` state after `c` or `d`. Source inspection:
   `controller_actions` calls `lifecycle_ops::plan` before confirmation and

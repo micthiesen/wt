@@ -74,6 +74,12 @@ yellow "blocked on" group with external gates. A review request's details show i
 author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
 shows a scrollbar when it overflows.
 
+Creation shows a selected `creating` row at once. Press F12 on this row to
+open the agent when the checkout is ready, on the selected host. Dependency
+installation continues as a background action. Other worktree actions wait
+until the real row is available. Confirmed removal moves the row to Archived
+with a `removing` label; a failed removal restores its previous archive state.
+
 The bottom pane shows the attention feed, all activity, session output, or
 tracked action output; its title names which, such as `attention · 2 new` or
 `slug · claude / name · live · 1/3`. Rows show a dim local time, the source,
@@ -93,9 +99,7 @@ the active prompt, a toast (failures in red with a glyph), a source error, or a
 static key hint, and on the right the manager, main, wt, and dotfiles slot
 sessions as `[m] [.] [,] [/]` colored by session state. The manager Claude
 session also shows context occupancy after a transcript turn provides usage.
-These are status labels, not clickable buttons. Remote session entry is
-available after its worktree is present; F12 does not queue an automatic attach
-for a worktree that is still being created.
+These are status labels, not clickable buttons.
 
 Modals share one frame: a rounded border (yellow for destructive confirms), a
 title, and their keys listed along the bottom edge. Pickers show chords or

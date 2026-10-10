@@ -474,6 +474,8 @@ pub enum UiModal {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UiReply {
     #[serde(skip)]
+    pub operation_id: Option<u64>,
+    #[serde(skip)]
     pub ui_generation: Option<u64>,
     pub message: String,
     pub failed: bool,
@@ -516,6 +518,7 @@ pub struct ActionController {
 
 #[derive(Clone, Debug)]
 pub struct UiRequest {
+    pub id: u64,
     pub generation: u64,
     pub action: UiAction,
 }

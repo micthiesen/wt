@@ -630,6 +630,9 @@ pub enum ToastTone {
     Failed,
 }
 pub struct Model {
+    pub(crate) lifecycle: crate::lifecycle::LifecycleFeedback,
+    pub(crate) source_board: Arc<Board>,
+    pub(crate) follow_up: Option<UiAction>,
     pub board: Arc<Board>,
     pub source_state: SourceState,
     pub selected: Option<usize>,
@@ -690,6 +693,9 @@ impl Default for Model {
     fn default() -> Self {
         Self {
             board: Arc::new(Board::default()),
+            source_board: Arc::new(Board::default()),
+            lifecycle: Default::default(),
+            follow_up: None,
             source_state: SourceState::Empty,
             selected: None,
             offset: 0,
@@ -732,6 +738,8 @@ impl Model {
     pub fn apply(&mut self, snapshot: SourceSnapshot<Board>) {
         self.source_state = snapshot.state;
         if let Some(mut board) = snapshot.data {
+            self.source_board = board.clone();
+            self.lifecycle.project(Arc::make_mut(&mut board));
             if let Some(key) = &self.pending_selection
                 && let Some(row) = board.rows.iter().position(|row| &row.key == key)
             {
@@ -919,13 +927,39 @@ impl Model {
         }
     }
 
+    pub(crate) fn begin_action(&mut self, id: u64, action: &UiAction) {
+        if let Some(key) = self.lifecycle.begin(id, action) {
+            self.pending_selection = Some(key);
+        }
+        if self.lifecycle.contains(id) {
+            self.apply(SourceSnapshot {
+                data: Some(self.source_board.clone()),
+                state: self.source_state.clone(),
+                updated_at: None,
+                revision: 0,
+            });
+        }
+    }
+
     pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
         if let Some(primary) = &reply.primary_harness {
             self.primary_override = Some(primary.clone());
         }
+        let selected = self.selected_row().map(|row| row.key.clone());
+        let completion = self.lifecycle.finish(&reply, selected.as_deref());
+        self.follow_up = completion.action;
+        if completion.changed {
+            self.apply(SourceSnapshot {
+                data: Some(self.source_board.clone()),
+                state: self.source_state.clone(),
+                updated_at: None,
+                revision: 0,
+            });
+        }
         let current = reply
             .ui_generation
-            .is_none_or(|generation| generation == self.ui_generation);
+            .is_none_or(|generation| generation == self.ui_generation)
+            || completion.selected_create;
         if reply.select_when_visible.is_some() && current {
             self.history.active = false;
         }
@@ -1341,6 +1375,29 @@ impl Model {
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
         self.ui_generation = self.ui_generation.wrapping_add(1);
+        if matches!(self.interaction, Interaction::None)
+            && let Some(key_id) = self.selected_row().map(|row| row.key.clone())
+            && self.lifecycle.is_placeholder(&key_id)
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            && !matches!(
+                key.code,
+                KeyCode::Char('j' | 'k' | 'g' | 'G' | 'n' | 'q' | 'r' | '?')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Esc
+            )
+        {
+            if key.code == KeyCode::F(12) {
+                if let Some(action) = self.lifecycle.request_agent(&key_id) {
+                    return InputResult::Action(action);
+                }
+                self.toast = Some((
+                    "Agent will open when the checkout is ready".into(),
+                    ToastTone::Info,
+                ));
+            }
+            return InputResult::Draw;
+        }
         let chord_allowed = matches!(
             self.interaction,
             Interaction::None
@@ -3013,6 +3070,62 @@ mod tests {
             updated_at: None,
             revision: 0,
         }
+    }
+
+    #[test]
+    fn pending_creation_queues_f12_and_selects_the_real_row() {
+        let mut model = Model::default();
+        model.apply(snapshot(&["old"]));
+        let generation = model.ui_generation;
+        model.begin_action(
+            1,
+            &UiAction::Create {
+                input: "new".into(),
+            },
+        );
+        assert!(model.selected_row().unwrap().key.starts_with("\0creating:"));
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('d')), 20),
+            InputResult::Draw
+        );
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::F(12)), 20),
+            InputResult::Draw
+        );
+        model.reply(UiReply {
+            operation_id: Some(1),
+            ui_generation: Some(generation),
+            select_when_visible: Some("new".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            model.follow_up,
+            Some(UiAction::OnHost {
+                host: None,
+                action: Box::new(UiAction::Session {
+                    key: Some("new".into()),
+                    target: SessionTarget::Harness
+                })
+            })
+        );
+        model.apply(snapshot(&["old", "new"]));
+        assert_eq!(model.selected_row().unwrap().key, "new");
+    }
+
+    #[test]
+    fn pending_creation_does_not_block_quit() {
+        let mut model = Model::default();
+        model.apply(snapshot(&["old"]));
+        model.begin_action(
+            1,
+            &UiAction::Create {
+                input: "new".into(),
+            },
+        );
+        assert_eq!(
+            model.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), 20),
+            InputResult::Quit
+        );
     }
 
     fn removal_revision(key: &str) -> crate::RemovalRevision {
