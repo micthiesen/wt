@@ -127,7 +127,7 @@ pub async fn execute(
         UiAction::OnHost { .. } => bail!("host routing must be resolved before local dispatch"),
         UiAction::PrepareCreate { initial } => Ok(modal(UiModal::Text {
             action: wt_tui::TextAction::Create,
-            prompt: "New worktree".into(),
+            prompt: "New worktree name: ".into(),
             initial,
             allow_empty: false,
         })),

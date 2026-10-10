@@ -23,6 +23,7 @@ const GITHUB_MINIMUM: Duration = Duration::from_secs(10);
 pub struct BoardSources {
     pub board: SourceHandle<Board>,
     pub local: SourceHandle<Board>,
+    pub git: SourceHandle<Vec<wt_vcs::WorktreeSnapshot>>,
     pub metadata: SourceHandle<crate::local_source::Metadata>,
     pub github: SourceHandle<GithubData>,
     pub github_actions: crate::github_actions::GithubActions,
@@ -178,7 +179,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         context,
         crate::automation_source::AutomationSources {
             board,
-            git: local_sources.git,
+            git: local_sources.git.clone(),
             metadata: local_sources.metadata.clone(),
             github: github.clone(),
             sessions: sessions.discoveries.clone(),
@@ -199,6 +200,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     BoardSources {
         board: perf.board,
         local,
+        git: local_sources.git,
         metadata: local_sources.metadata,
         github,
         github_actions,

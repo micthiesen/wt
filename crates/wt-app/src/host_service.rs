@@ -91,6 +91,7 @@ impl HostService {
             command,
             UiAction::StopSession { .. } | UiAction::StopTerminal { .. }
         );
+        let created = matches!(command, UiAction::Create { .. });
         let snapshot = self.sources.board.snapshot();
         if matches!(
             command,
@@ -350,7 +351,10 @@ impl HostService {
                 .await?
             }
         };
-        if session_changed {
+        if created && !reply.failed {
+            self.sources.git.refresh();
+            self.sources.metadata.refresh();
+        } else if session_changed {
             self.sources.sessions.inventory.refresh();
         } else if state_only {
             self.sources.metadata.refresh();

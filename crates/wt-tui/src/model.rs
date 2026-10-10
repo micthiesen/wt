@@ -421,7 +421,16 @@ impl Default for Model {
 impl Model {
     pub fn apply(&mut self, snapshot: SourceSnapshot<Board>) {
         self.source_state = snapshot.state;
-        if let Some(board) = snapshot.data {
+        if let Some(mut board) = snapshot.data {
+            if let Some(key) = &self.pending_selection
+                && let Some(row) = board.rows.iter().position(|row| &row.key == key)
+            {
+                for section in &mut Arc::make_mut(&mut board).sections {
+                    if section.rows.contains(&row) {
+                        section.folded = false;
+                    }
+                }
+            }
             let first_rows = self.board.rows.is_empty() && !board.rows.is_empty();
             let requested_selection = self.pending_selection.is_some();
             let previous_key = self.selected_row().map(|row| row.key.clone());
@@ -1257,7 +1266,7 @@ impl Model {
                 }
                 self.interaction = Interaction::Text(TextPrompt {
                     action: TextAction::Create,
-                    prompt: "new: ".into(),
+                    prompt: "New worktree name: ".into(),
                     editor: LineEditor::default(),
                     allow_empty: false,
                 });
@@ -1279,7 +1288,7 @@ impl Model {
                 }
                 self.interaction = Interaction::Text(TextPrompt {
                     action: TextAction::Create,
-                    prompt: "new: ".into(),
+                    prompt: "New worktree name: ".into(),
                     editor: LineEditor::new(&initial),
                     allow_empty: false,
                 });
@@ -2220,7 +2229,8 @@ mod tests {
             ..Default::default()
         });
         model.apply(grouped(&["old", "new"], true));
-        assert_eq!(model.pending_selection.as_deref(), Some("new"));
+        assert_eq!(model.selected_row().unwrap().key, "new");
+        assert!(model.pending_selection.is_none());
         model.apply(grouped(&["old", "new"], false));
         assert_eq!(model.selected_row().unwrap().key, "new");
         assert!(model.pending_selection.is_none());
@@ -2445,6 +2455,11 @@ mod tests {
             ..Board::default()
         });
         model.input(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), 20);
+        let Interaction::Text(prompt) = &model.interaction else {
+            panic!("create prompt did not open");
+        };
+        assert_eq!(prompt.prompt, "New worktree name: ");
+        assert!(prompt.editor.text().is_empty());
         for ch in "ENG-123 --attach --gh 12 --base origin/main".chars() {
             model.input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), 20);
         }

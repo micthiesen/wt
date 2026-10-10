@@ -87,6 +87,11 @@ details. `Enter` restores, `p` opens the PR, `i` opens the issue when known, and
 
 ### Worktrees and organization
 
+The create prompt shows `New worktree name: ` before an empty editable field.
+After creation, WT refreshes inventory and metadata and selects the new row.
+Its group opens when the row arrives, including if a folded snapshot arrives
+before the saved group state.
+
 The Archived group sits at the bottom of the worktree pane when all visible
 items fit. When the list is taller than the pane, it scrolls with the list.
 

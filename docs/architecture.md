@@ -37,6 +37,10 @@ second PR fetch. Cached merged-PR evidence applies only to its exact HEAD;
 local hazards and removal revisions remain authoritative. Git-only landing
 evidence retains the published-base check.
 
+Successful host creation refreshes Git inventory and metadata directly. Pending
+creation selection opens the containing section when the row enters a board
+snapshot, so delayed fold metadata cannot hide the new row.
+
 ## Source and presentation boundaries
 
 The TUI input loop consumes prepared `Board` snapshots. It does not run Git,

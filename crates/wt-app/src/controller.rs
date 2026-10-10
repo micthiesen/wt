@@ -206,7 +206,7 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
         reply.modal_host = host;
         reply.modal = Some(wt_tui::UiModal::Text {
             action: wt_tui::TextAction::Create,
-            prompt: "New worktree: ".into(),
+            prompt: "New worktree name: ".into(),
             initial: input,
             allow_empty: false,
         });
