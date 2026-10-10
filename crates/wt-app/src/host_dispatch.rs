@@ -72,6 +72,19 @@ pub async fn execute(
                 ..Default::default()
             });
         }
+        if !context
+            .config
+            .paths
+            .wt_source
+            .as_ref()
+            .is_some_and(|path| path.is_dir())
+        {
+            return Ok(UiReply {
+                message: "Investigate needs a wt checkout: set paths.wt_source".into(),
+                failed: true,
+                ..Default::default()
+            });
+        }
         let sent = fleet
             .local
             .execute(UiAction::RunAction {

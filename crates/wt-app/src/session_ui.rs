@@ -74,11 +74,11 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             for session in sessions {
                 options.push(PickerOption {
                     value: Some(choices.len().to_string()),
-                    label: format!(
-                        "{} / {}{}",
-                        session.selection.harness.as_str(),
-                        session.display_name,
-                        if session.is_live { " · live" } else { "" }
+                    label: session_row_label(
+                        session.selection.harness,
+                        &session.display_name,
+                        session.state.as_deref(),
+                        session.is_live,
                     ),
                     chord: None,
                     note: None,
@@ -93,8 +93,10 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             {
                 options.push(PickerOption {
                     value: Some(choices.len().to_string()),
-                    label: format!("New {} session", harness.as_str()),
-                    chord: None,
+                    label: format!("new {} session", harness_label(harness)),
+                    // The letter jumps to this row (the model's sessions
+                    // key handler); it never commits, as in TS.
+                    chord: Some(harness_letter(harness)),
                     note: None,
                     verify_after_merge: None,
                     detail: None,
@@ -203,10 +205,26 @@ async fn terminal_target(
     ))
 }
 
-/// Display name for a harness, as used in replies.
+/// One resumable session row: TS showed the harness, the session name, and
+/// the derived state, falling back to live/dead without a state signal.
+fn session_row_label(
+    harness: wt_core::HarnessId,
+    name: &str,
+    state: Option<&str>,
+    live: bool,
+) -> String {
+    let status = match state {
+        Some(state) => state.to_ascii_lowercase(),
+        None if live => "live".into(),
+        None => "dead".into(),
+    };
+    format!("{} / {name} · {status}", harness_label(harness))
+}
+
+/// Display name for a harness (TS harness `label`).
 pub fn harness_label(harness: wt_core::HarnessId) -> &'static str {
     match harness {
-        wt_core::HarnessId::Claude => "Claude",
+        wt_core::HarnessId::Claude => "Claude Code",
         wt_core::HarnessId::Codex => "Codex",
         wt_core::HarnessId::Opencode => "OpenCode",
     }
@@ -253,6 +271,22 @@ fn harness_picker(
 mod tests {
     use super::*;
     use wt_core::HarnessId;
+
+    #[test]
+    fn session_rows_name_the_harness_and_state() {
+        assert_eq!(
+            session_row_label(HarnessId::Claude, "main", Some("Working"), true),
+            "Claude Code / main · working"
+        );
+        assert_eq!(
+            session_row_label(HarnessId::Codex, "abc", None, true),
+            "Codex / abc · live"
+        );
+        assert_eq!(
+            session_row_label(HarnessId::Opencode, "abc", None, false),
+            "OpenCode / abc · dead"
+        );
+    }
 
     #[test]
     fn harness_picker_skips_hidden_and_starts_on_primary() {

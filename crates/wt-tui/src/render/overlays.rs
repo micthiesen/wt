@@ -37,6 +37,9 @@ use crate::{
 const MAX_FRAME_WIDTH: u16 = 104;
 /// Below this terminal width modals take the full width.
 const NARROW_WIDTH: u16 = 80;
+/// Content width an action palette asks for, which places a ~98-cell frame
+/// on wide terminals like the TS palette.
+const ACTION_PICKER_WIDTH: usize = 94;
 /// Widest the help keymap's key column grows; longer keys are cut.
 const HELP_KEY_MAX: usize = 22;
 
@@ -338,10 +341,14 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
             Some((group, label)) if !group.is_empty() => (Some(group), label),
             _ => (None, option.label.as_str()),
         };
-        if group != current {
-            match group {
-                Some(group) => rows.push(PickRow::Group(group.to_owned())),
-                None => rows.push(PickRow::Spacer),
+        // One blank before every group change except at the top; entries
+        // inside a group stay contiguous.
+        if index == 0 || group != current {
+            if index > 0 {
+                rows.push(PickRow::Spacer);
+            }
+            if let Some(group) = group {
+                rows.push(PickRow::Group(group.to_owned()));
             }
             current = group;
         }
@@ -370,8 +377,19 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
         }
         _ => {}
     }
-    let opener = match picker.action {
-        PickerAction::Actions { .. } => Some("!"),
+    // The key that opened this picker re-presses to confirm (see the
+    // model's opener table), so the hint names the surface's own key.
+    let opener = match &picker.action {
+        PickerAction::Actions { surface } => Some(match surface {
+            crate::ActionSurface::Row { .. } => "!",
+            crate::ActionSurface::Manager { .. } => "M",
+            crate::ActionSurface::Slot { target } => match target {
+                crate::SessionTarget::WtSource => "<",
+                crate::SessionTarget::Main => ">",
+                _ => "\\",
+            },
+        }),
+        PickerAction::Harness { .. } => Some("F12"),
         PickerAction::Status { .. } => Some("u"),
         PickerAction::Base { .. } => Some("b"),
         PickerAction::Section { .. } => Some("l"),
@@ -406,7 +424,14 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
         })
         .max()
         .unwrap_or(0);
-    let outer = modal.place(area, prefix + widest + 2, rows.len(), false);
+    // Action palettes take the wide frame (TS ~98 columns) so the
+    // trailing detail column is legible rather than cut to a stub.
+    let wanted = if actions {
+        (prefix + widest + 2).max(ACTION_PICKER_WIDTH)
+    } else {
+        prefix + widest + 2
+    };
+    let outer = modal.place(area, wanted, rows.len(), false);
     let body = modal.draw(frame, area, outer);
     let width = body.width as usize;
     let visible = body.height as usize;
@@ -554,6 +579,10 @@ fn picker_glyph(
     match action {
         PickerAction::Status { .. } => {
             match option.value.as_deref().and_then(crate::history::work_state) {
+                // Ready with post-merge steps owes a check: warn, as TS.
+                Some(state) if option.verify_after_merge.is_some() => {
+                    (badges::work_state_glyph(state), theme::WARN)
+                }
                 Some(state) => (
                     badges::work_state_glyph(state),
                     badges::work_state_color(state),
@@ -699,10 +728,13 @@ fn yank(frame: &mut Frame<'_>, model: &Model, area: Rect, selected: usize) {
             match value_lines.next().filter(|line| !line.trim().is_empty()) {
                 Some(first) => {
                     let room = width.saturating_sub(4 + label_width);
-                    spans.push(Span::styled(
-                        super::text::truncate_middle(first, room),
-                        label_style(is_selected),
-                    ));
+                    // A path keeps its end, which names the checkout.
+                    let shown = if *label == "path" {
+                        super::text::truncate_start(first, room)
+                    } else {
+                        super::text::truncate_middle(first, room)
+                    };
+                    spans.push(Span::styled(shown, label_style(is_selected)));
                     let more = value_lines.count();
                     if more > 0 {
                         spans.push(Span::styled(format!("  +{more} lines"), theme::dim()));
@@ -792,7 +824,9 @@ fn confirm_rows(confirm: &ConfirmPrompt, width: usize) -> Vec<Vec<Line<'static>>
                 style = theme::bold(theme::FG_BRIGHT);
             }
             let indent = if glyph.is_some() { 3 } else { 0 };
-            wrap(line, width.saturating_sub(indent).max(1))
+            // Nerd Font glyphs measure one cell but paint two; a spare
+            // cell keeps a hazard line off the right border.
+            wrap(line, width.saturating_sub(indent + 1).max(1))
                 .into_iter()
                 .enumerate()
                 .map(|(row, text)| {
@@ -812,7 +846,10 @@ fn confirm_rows(confirm: &ConfirmPrompt, width: usize) -> Vec<Vec<Line<'static>>
 fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) {
     let cancel = confirm
         .cancel_key
-        .map_or("n / esc".to_owned(), |key| format!("n / {key} / esc"));
+        .filter(|key| !matches!(key, 'n' | 'q'))
+        .map_or("n / esc / q".to_owned(), |key| {
+            format!("n / {key} / esc / q")
+        });
     let mut hints = vec![
         hint("y / ⏎", confirm_verb(&confirm.action)),
         hint(cancel, "cancel"),
@@ -921,13 +958,27 @@ fn log_style(line: &str) -> Style {
     }
 }
 
+/// Label column of a perf meter row.
+const PERF_LABEL_W: usize = 16;
+/// Cells in a perf meter bar.
+const PERF_BAR_W: usize = 22;
+/// Narrower than this, meter rows drop the bar and keep the numbers.
+const PERF_BAR_MIN_WIDTH: usize = PERF_LABEL_W + PERF_BAR_W + 18;
+
 fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
+    let title = match &model.board.perf_view {
+        Some(view) => format!(
+            "perf · {} downstream of wt · sampled {}",
+            perf_count(view.downstream_count, "process"),
+            view.sampled_at
+        ),
+        None => "perf · wt and everything downstream".to_owned(),
+    };
     let modal = Modal::new(
-        "performance · wt and everything downstream",
+        title,
         vec![
             hint("j/k", "scroll"),
             hint("r", "resample"),
-            hint("i", "investigate"),
             hint(
                 "c",
                 if model.perf_continuous {
@@ -936,72 +987,455 @@ fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
                     "continuous: off"
                 },
             ),
+            hint("i", "investigate"),
             hint("P / esc / q", "close"),
         ],
     );
     let outer = modal.place(area, MAX_FRAME_WIDTH as usize, 0, true);
     let body = modal.draw(frame, area, outer);
-    let (width, visible) = (body.width as usize, body.height as usize);
-    if visible < 2 || width == 0 {
+    let width = body.width as usize;
+    if body.height == 0 || width == 0 {
         return;
     }
+    let (header, lines) = match &model.board.perf_view {
+        Some(view) => {
+            let (header, mut lines) = perf_view_lines(view, model.last_frame_micros, width);
+            // Remote hosts forward their plain report after a `Host:` line.
+            if let Some(start) = model
+                .board
+                .perf
+                .iter()
+                .position(|line| line.starts_with("Host: "))
+            {
+                lines.push(Line::default());
+                lines.extend(
+                    model.board.perf[start..]
+                        .iter()
+                        .map(|line| perf_line(line, width)),
+                );
+            }
+            (header, lines)
+        }
+        None if model.board.perf.is_empty() => {
+            (vec![Line::styled("sampling…", theme::dim())], Vec::new())
+        }
+        None => (
+            Vec::new(),
+            model
+                .board
+                .perf
+                .iter()
+                .map(|line| perf_line(line, width))
+                .collect(),
+        ),
+    };
+    let header_rows = (header.len() as u16).min(body.height);
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            truncate_end(
-                &format!(
-                    "frame {} · last draw {} µs",
-                    model.frame_count, model.last_frame_micros
-                ),
-                width,
-            ),
-            theme::dim(),
-        )),
-        Rect { height: 1, ..body },
+        Paragraph::new(header),
+        Rect {
+            height: header_rows,
+            ..body
+        },
     );
+    let gap = u16::from(header_rows > 0 && body.height > header_rows + 1);
     let list = Rect {
-        y: body.y + 2.min(body.height - 1),
-        height: body.height.saturating_sub(2).max(1),
+        y: body.y + header_rows + gap,
+        height: body.height - header_rows - gap,
         ..body
     };
     let visible = list.height as usize;
-    let lines = &model.board.perf;
-    model.perf_scroll = model.perf_scroll.min(lines.len().saturating_sub(visible));
-    let rendered = if lines.is_empty() {
-        vec![Line::styled("sampling…", theme::dim())]
-    } else {
-        lines
-            .iter()
-            .skip(model.perf_scroll)
-            .take(visible)
-            .map(|line| perf_line(line, width))
-            .collect()
-    };
-    frame.render_widget(Paragraph::new(rendered), list);
-    scrollbar(
-        frame,
-        outer,
-        modal.border,
-        lines.len() + 2,
-        model.perf_scroll,
-    );
+    model.perf_max_scroll = lines.len().saturating_sub(visible);
+    model.perf_scroll = model.perf_scroll.min(model.perf_max_scroll);
+    if visible == 0 {
+        return;
+    }
+    let total = lines.len() + usize::from(header_rows + gap);
+    let shown = lines
+        .into_iter()
+        .skip(model.perf_scroll)
+        .take(visible)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(shown), list);
+    scrollbar(frame, outer, modal.border, total, model.perf_scroll);
 }
 
-/// Prepared perf lines are prose; give them a hierarchy. Headings get the
-/// section bar, headline figures are bright, and a process burning CPU
-/// warms from warn to error.
+/// The fixed header (verdict and alarms) and the scrolling body of a
+/// prepared perf sample, laid out for `width` cells.
+fn perf_view_lines(
+    view: &crate::PerfView,
+    last_frame_micros: u128,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let ceiling = f64::from(view.cores.max(1)) * 100.0;
+    let tone = match view.verdict_tone {
+        crate::PerfTone::Calm => theme::OK,
+        crate::PerfTone::Ours => theme::WARN,
+        crate::PerfTone::Elsewhere => theme::INFO,
+    };
+    let mut header = wrap(&view.verdict, width)
+        .into_iter()
+        .map(|line| Line::styled(line, theme::fg(tone)))
+        .collect::<Vec<_>>();
+    if !view.orphans.is_empty() {
+        header.push(Line::styled(
+            truncate_end(
+                &format!(
+                    "{} leaked: the terminal died but the process survived; see LEAKED below",
+                    perf_count(view.orphans.len(), "headless wt instance")
+                ),
+                width,
+            ),
+            theme::fg(theme::ERR),
+        ));
+    }
+    if let Some(error) = &view.error {
+        header.push(Line::styled(
+            truncate_end(
+                &format!("resample failed, showing the last good sample: {error}"),
+                width,
+            ),
+            theme::fg(theme::ERR),
+        ));
+    }
+
+    let mut lines = vec![
+        perf_meter(
+            "cpu (all)",
+            view.system_cpu / ceiling,
+            format!(
+                "{} of {} · {} cores",
+                perf_percent(view.system_cpu),
+                perf_percent(ceiling),
+                view.cores
+            ),
+            width,
+        ),
+        perf_meter(
+            "cpu (wt)",
+            view.wt_cpu / ceiling,
+            format!(
+                "{} · {} rss",
+                perf_percent(view.wt_cpu),
+                perf_memory(view.wt_rss_kb)
+            ),
+            width,
+        ),
+    ];
+    if let (Some(used), Some(total)) = (view.memory_used_bytes, view.memory_total_bytes) {
+        lines.push(perf_meter(
+            "memory",
+            if total == 0 {
+                0.0
+            } else {
+                used as f64 / total as f64
+            },
+            format!(
+                "{} of {}",
+                perf_memory(used / 1024),
+                perf_memory(total / 1024)
+            ),
+            width,
+        ));
+    }
+    if let Some([one, five, fifteen]) = view.load_average {
+        lines.push(perf_text_row(
+            "load avg",
+            vec![
+                Span::styled(
+                    format!("{one:.2}   {five:.2}   {fifteen:.2}"),
+                    theme::fg(theme::FG),
+                ),
+                Span::styled("   1m / 5m / 15m", theme::dim()),
+            ],
+            width,
+        ));
+    }
+    if last_frame_micros > 0 {
+        lines.push(perf_text_row(
+            "tui draw",
+            vec![Span::styled(
+                format!("{:.1} ms last frame", last_frame_micros as f64 / 1000.0),
+                theme::fg(theme::FG),
+            )],
+            width,
+        ));
+    }
+
+    lines.push(Line::default());
+    lines.push(section_bar("wt downstream by category", width));
+    if view.categories.is_empty() {
+        lines.push(Line::styled(
+            "nothing running downstream of wt",
+            theme::dim(),
+        ));
+    }
+    for group in &view.categories {
+        lines.push(perf_meter(
+            &group.label,
+            group.cpu / ceiling,
+            format!(
+                "{:>5}  {:>6}  {}",
+                perf_percent(group.cpu),
+                perf_memory(group.rss_kb),
+                perf_count(group.count, "proc")
+            ),
+            width,
+        ));
+    }
+    if !view.sessions.is_empty() {
+        lines.push(Line::default());
+        lines.push(section_bar("by session", width));
+        for group in &view.sessions {
+            lines.push(perf_meter(
+                &group.label,
+                group.cpu / ceiling,
+                format!(
+                    "{:>5}  {:>6}  {}",
+                    perf_percent(group.cpu),
+                    perf_memory(group.rss_kb),
+                    group.summary
+                ),
+                width,
+            ));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.push(section_bar("heaviest processes downstream of wt", width));
+    lines.extend(perf_note(
+        "%cpu is averaged by ps; on macOS over up to one minute. It is not instantaneous.",
+        width,
+    ));
+    lines.extend(perf_processes(&view.top_downstream, ceiling, width));
+
+    if !view.orphans.is_empty() {
+        lines.push(Line::default());
+        lines.push(section_bar(
+            &format!(
+                "LEAKED: {}",
+                perf_count(view.orphans.len(), "headless wt instance")
+            ),
+            width,
+        ));
+        lines.extend(perf_note(
+            "Reparented to launchd when a terminal died and not owned by a com.wt.* job. They keep polling until killed; verify identity first.",
+            width,
+        ));
+        for process in &view.orphans {
+            lines.push(Line::from(fit_spans(
+                vec![
+                    Span::styled(
+                        format!("{:>5}", perf_percent(process.cpu)),
+                        theme::fg(theme::ERR),
+                    ),
+                    Span::styled(format!("{:>6}", perf_memory(process.rss_kb)), theme::dim()),
+                    Span::styled(format!("  pid {}", process.pid), theme::fg(theme::FG)),
+                    Span::styled(format!("  up {}", process.elapsed), theme::dim()),
+                ],
+                width,
+                Style::new(),
+            )));
+        }
+        let pids = view
+            .orphans
+            .iter()
+            .map(|process| process.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(Line::styled(
+            truncate_end(&format!("  kill {pids}"), width),
+            theme::fg(theme::WARN),
+        ));
+    }
+
+    lines.push(Line::default());
+    lines.push(section_bar(
+        "heaviest processes not downstream of wt",
+        width,
+    ));
+    lines.extend(perf_note(
+        "If the answer to \"why is my machine slow\" is here, it is not wt or its agents.",
+        width,
+    ));
+    lines.extend(perf_processes(&view.top_other, ceiling, width));
+
+    let mut caveats = Vec::new();
+    if !view.tmux_probe_available {
+        caveats.push("tmux session attribution unavailable.");
+    }
+    if !view.orphan_probe_available {
+        caveats.push("Leaked-instance check unavailable on this platform.");
+    }
+    if !caveats.is_empty() {
+        lines.push(Line::default());
+        for caveat in caveats {
+            lines.extend(perf_note(caveat, width));
+        }
+    }
+    (header, lines)
+}
+
+/// `label  ███░░░  trailing`; narrow frames drop the bar, not the numbers.
+fn perf_meter(label: &str, fraction: f64, trailing: String, width: usize) -> Line<'static> {
+    if width < PERF_BAR_MIN_WIDTH {
+        return perf_text_row(
+            label,
+            vec![Span::styled(trailing, theme::fg(theme::FG))],
+            width,
+        );
+    }
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // A non-zero value always fills one cell: an empty bar reads as idle.
+    let filled = if fraction > 0.0 {
+        ((fraction * PERF_BAR_W as f64).round() as usize).clamp(1, PERF_BAR_W)
+    } else {
+        0
+    };
+    Line::from(fit_spans(
+        vec![
+            Span::styled(fit(label, PERF_LABEL_W - 1) + " ", theme::dim()),
+            Span::styled("█".repeat(filled), theme::fg(perf_load_color(fraction))),
+            Span::styled("░".repeat(PERF_BAR_W - filled), theme::fg(theme::BORDER)),
+            Span::styled(format!("  {trailing}"), theme::fg(theme::FG)),
+        ],
+        width,
+        Style::new(),
+    ))
+}
+
+fn perf_text_row(label: &str, mut value: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let label_width = PERF_LABEL_W.min(width / 3);
+    let mut spans = vec![Span::styled(
+        fit(label, label_width.saturating_sub(1)) + " ",
+        theme::dim(),
+    )];
+    spans.append(&mut value);
+    Line::from(fit_spans(spans, width, Style::new()))
+}
+
+fn perf_note(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap(text, width)
+        .into_iter()
+        .map(|line| Line::styled(line, theme::dim()))
+        .collect()
+}
+
+/// One row per process, `cpu mem [session] command`. Near-idle rows fold
+/// into a count: this is the heaviest list, and 0% wrappers are noise.
+fn perf_processes(
+    processes: &[crate::PerfProcessView],
+    ceiling: f64,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if processes.is_empty() {
+        return vec![Line::styled("none", theme::dim())];
+    }
+    let busy = processes
+        .iter()
+        .filter(|process| process.cpu >= 0.5 || process.rss_kb >= 100 * 1024)
+        .collect::<Vec<_>>();
+    let shown = if busy.len() >= 3 {
+        busy
+    } else {
+        processes.iter().take(3).collect()
+    };
+    let session_width = shown
+        .iter()
+        .filter_map(|process| process.session.as_deref())
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
+        .min(16)
+        .min(width.saturating_sub(27));
+    let mut lines = shown
+        .iter()
+        .map(|process| {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:>5}", perf_percent(process.cpu)),
+                    theme::fg(perf_load_color(process.cpu / ceiling)),
+                ),
+                Span::styled(
+                    format!("{:>6}  ", perf_memory(process.rss_kb)),
+                    theme::dim(),
+                ),
+            ];
+            if session_width > 0 {
+                spans.push(Span::styled(
+                    fit(process.session.as_deref().unwrap_or(""), session_width) + "  ",
+                    theme::fg(theme::ACCENT_ALT),
+                ));
+            }
+            spans.push(Span::styled(process.command.clone(), theme::fg(theme::FG)));
+            Line::from(fit_spans(spans, width, Style::new()))
+        })
+        .collect::<Vec<_>>();
+    let hidden = processes.len() - shown.len();
+    if hidden > 0 {
+        lines.push(Line::styled(
+            truncate_end(
+                &format!("      + {hidden} more near idle (<0.5% cpu, <100M)"),
+                width,
+            ),
+            theme::dim(),
+        ));
+    }
+    lines
+}
+
+/// Share of capacity above which a bar reads as pressure, not use.
+fn perf_load_color(fraction: f64) -> Color {
+    if fraction >= 0.9 {
+        theme::ERR
+    } else if fraction >= 0.6 {
+        theme::WARN
+    } else {
+        theme::OK
+    }
+}
+
+fn perf_percent(value: f64) -> String {
+    format!("{value:.0}%")
+}
+
+/// `48M` under a gigabyte, `2.3G` above, so small numbers never read `0.0G`.
+fn perf_memory(kb: u64) -> String {
+    let mib = kb as f64 / 1024.0;
+    if mib >= 1000.0 {
+        format!("{:.1}G", mib / 1024.0)
+    } else {
+        format!("{mib:.0}M")
+    }
+}
+
+fn perf_count(count: usize, noun: &str) -> String {
+    let suffix = match (count, noun.ends_with('s')) {
+        (1, _) => "",
+        (_, true) => "es",
+        _ => "s",
+    };
+    format!("{count} {noun}{suffix}")
+}
+
+/// Plain report lines (remote hosts, or a failure before the first sample):
+/// headings get the section bar and a busy process warms toward error.
 fn perf_line(line: &str, width: usize) -> Line<'static> {
     let indented = line.starts_with(' ');
     if !indented && line.ends_with(':') {
         return section_bar(line.trim_end_matches(':'), width);
     }
-    let style = if line.starts_with("Sampled at") || line.contains("unavailable") {
+    let style = if line.contains("failed") || line.starts_with("LEAKED") {
+        theme::fg(theme::ERR)
+    } else if line.starts_with("Host: ") {
+        theme::bold(theme::ACCENT)
+    } else if line.contains("unavailable") || line.starts_with("Note:") {
         theme::dim()
-    } else if line.starts_with("Orphaned") {
-        theme::fg(theme::WARN)
-    } else if line.starts_with("No orphaned") {
-        theme::fg(theme::OK)
     } else if indented {
-        match cpu_percent(line) {
+        match perf_leading_percent(line) {
             Some(cpu) if cpu >= 90.0 => theme::fg(theme::ERR),
             Some(cpu) if cpu >= 50.0 => theme::fg(theme::WARN),
             _ => theme::fg(theme::FG_MID),
@@ -1012,9 +1446,9 @@ fn perf_line(line: &str, width: usize) -> Line<'static> {
     Line::styled(truncate_end(line, width), style)
 }
 
-fn cpu_percent(line: &str) -> Option<f64> {
-    let before = &line[..line.find("% CPU")?];
-    before.rsplit(' ').next()?.parse().ok()
+/// The `12%` that opens an indented report process row.
+fn perf_leading_percent(line: &str) -> Option<f64> {
+    line.trim_start().split_once('%')?.0.parse().ok()
 }
 
 /// A full-width filled bar so a section title reads as a block.
@@ -1645,16 +2079,33 @@ fn help(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
             format!("  {matches} match{}", if matches == 1 { "" } else { "es" })
         };
         let room = width.saturating_sub(1 + count.width());
-        let (text, cursor) = model.help_query.viewport(room);
-        spans.push(Span::styled(fit(&text, room), theme::fg(theme::FG_BRIGHT)));
+        if model.help_searching {
+            // A drawn `▌` at the caret, like the TS prompt; it reserves
+            // one cell so the caret never falls off the end.
+            let (text, cursor) = model.help_query.viewport(room.saturating_sub(1));
+            let at = text
+                .char_indices()
+                .scan(0usize, |cells, (index, ch)| {
+                    let here = *cells;
+                    *cells += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    Some((index, here))
+                })
+                .find(|(_, cells)| *cells >= usize::from(cursor))
+                .map_or(text.len(), |(index, _)| index);
+            let style = theme::fg(theme::FG_BRIGHT);
+            spans.push(Span::styled(text[..at].to_owned(), style));
+            spans.push(Span::styled("▌", theme::fg(theme::ACCENT)));
+            let tail = room.saturating_sub(text[..at].width() + 1);
+            spans.push(Span::styled(fit(&text[at..], tail), style));
+        } else {
+            let (text, _) = model.help_query.viewport(room);
+            spans.push(Span::styled(fit(&text, room), theme::fg(theme::FG_BRIGHT)));
+        }
         spans.push(Span::styled(count, theme::dim()));
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect { height: 1, ..body },
         );
-        if model.help_searching {
-            frame.set_cursor_position((body.x + 1 + cursor, body.y));
-        }
         let skip = 2.min(body.height);
         list = Rect {
             y: body.y + skip,
@@ -1764,7 +2215,7 @@ mod tests {
         let text = rows(&buffer).join("\n");
         assert!(text.contains("Force remove worktree?"), "{text}");
         assert!(text.contains("y / ⏎ remove"), "{text}");
-        assert!(text.contains("n / d / esc cancel"), "{text}");
+        assert!(text.contains("n / d / esc / q cancel"), "{text}");
         let (x, y) = find(&buffer, "╭").unwrap();
         assert_eq!(buffer[(x, y)].fg, theme::WARN, "destructive border warns");
         let (x, y) = find(&buffer, "Will discard").unwrap();
@@ -1937,5 +2388,348 @@ mod tests {
         for (width, height) in [(80, 24), (40, 10), (12, 5)] {
             draw(&mut model, width, height);
         }
+    }
+
+    fn action_option(label: &str, chord: Option<char>, detail: Option<&str>) -> PickerOption {
+        PickerOption {
+            value: Some(label.into()),
+            label: label.into(),
+            chord,
+            note: None,
+            verify_after_merge: None,
+            detail: detail.map(str::to_owned),
+        }
+    }
+
+    fn action_model(surface: crate::ActionSurface) -> Model {
+        Model {
+            interaction: Interaction::Picker(PickerPrompt {
+                action: PickerAction::Actions { surface },
+                title: "actions".into(),
+                options: vec![
+                    action_option("Agent: Update status", Some('u'), Some("claude update")),
+                    action_option("Agent: Continue", Some('g'), Some("claude continue")),
+                    action_option(
+                        "Shell: Deploy",
+                        Some('d'),
+                        Some("$ deploy-to-the-staging-environment-now"),
+                    ),
+                    action_option("Custom prompt…", Some('c'), Some("freeform")),
+                ],
+                selected: 0,
+            }),
+            ..Model::default()
+        }
+    }
+
+    #[test]
+    fn action_palette_names_its_surface_opener() {
+        for (surface, key) in [
+            (crate::ActionSurface::Row { key: "one".into() }, "!"),
+            (crate::ActionSurface::Manager { key: None }, "M"),
+            (
+                crate::ActionSurface::Slot {
+                    target: crate::SessionTarget::WtSource,
+                },
+                "<",
+            ),
+            (
+                crate::ActionSurface::Slot {
+                    target: crate::SessionTarget::Main,
+                },
+                ">",
+            ),
+        ] {
+            let mut model = action_model(surface);
+            let text = rows(&draw(&mut model, 200, 50)).join("\n");
+            assert!(text.contains(&format!("{key} / ⏎ pick")), "{key}: {text}");
+        }
+    }
+
+    #[test]
+    fn action_palette_is_wide_with_one_blank_between_groups() {
+        let mut model = action_model(crate::ActionSurface::Row { key: "one".into() });
+        let buffer = draw(&mut model, 200, 50);
+        let (left, top) = find(&buffer, "╭").unwrap();
+        let (right, _) = find(&buffer, "╮").unwrap();
+        assert!(right - left + 1 >= 96, "frame {} wide", right - left + 1);
+        let text = rows(&buffer);
+        assert!(
+            text.iter()
+                .any(|row| row.contains("deploy-to-the-staging-environment-now"))
+        );
+        let body = text
+            .iter()
+            .skip(usize::from(top) + 1)
+            .map(|row| {
+                row.chars()
+                    .skip(usize::from(left) + 1)
+                    .take(usize::from(right - left - 1))
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .take_while(|row| !row.contains("pick"))
+            .collect::<Vec<_>>();
+        let first = body.iter().position(|row| !row.is_empty()).unwrap();
+        let end = body.iter().rposition(|row| !row.is_empty()).unwrap();
+        let body = &body[first..=end];
+        assert_eq!(body[0], "agent", "{body:#?}");
+        let shell = body.iter().position(|row| row == "shell").unwrap();
+        assert!(body[shell - 1].is_empty(), "{body:#?}");
+        assert!(!body[shell - 2].is_empty(), "{body:#?}");
+        // The ungrouped custom entry follows one blank, and no group has a
+        // blank inside it.
+        assert!(body[body.len() - 2].is_empty(), "{body:#?}");
+        assert_eq!(
+            body.iter().filter(|row| row.is_empty()).count(),
+            2,
+            "{body:#?}"
+        );
+    }
+
+    #[test]
+    fn confirm_body_wraps_clear_of_the_right_border_and_offers_q() {
+        let mut model = Model {
+            interaction: Interaction::Confirm(ConfirmPrompt {
+                lines: vec![
+                    "one (feature/one)".into(),
+                    // An unbroken run hard-splits at the full wrap width.
+                    format!("Will discard or abandon: {}", "x".repeat(200)),
+                ],
+                ..remove_confirm()
+            }),
+            ..Model::default()
+        };
+        let buffer = draw(&mut model, 120, 40);
+        let (_, top) = find(&buffer, "╭").unwrap();
+        let (right, _) = find(&buffer, "╮").unwrap();
+        let text = rows(&buffer).join("\n");
+        assert!(text.contains("n / d / esc / q cancel"), "{text}");
+        // The hazard glyph paints two cells in a Nerd Font terminal but
+        // measures one, so the body keeps a spare cell before the padding.
+        for y in top + 1..buffer.area.height {
+            if buffer[(right, y)].symbol() == "╯" {
+                break;
+            }
+            for gap in 1..=2 {
+                assert_eq!(
+                    buffer[(right - gap, y)].symbol(),
+                    " ",
+                    "row {y} touches the border"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ready_plus_verify_wears_the_warn_glyph() {
+        let mut model = Model {
+            interaction: Interaction::Picker(PickerPrompt {
+                action: PickerAction::Status { key: "one".into() },
+                title: "Work status".into(),
+                options: vec![PickerOption {
+                    value: Some("ready".into()),
+                    label: "ready + verify after merge".into(),
+                    chord: Some('a'),
+                    note: None,
+                    verify_after_merge: Some("probe".into()),
+                    detail: None,
+                }],
+                selected: 0,
+            }),
+            ..Model::default()
+        };
+        let buffer = draw(&mut model, 100, 30);
+        let dot = find(&buffer, &format!("{}  ready + verify", glyphs::DOT)).unwrap();
+        assert_eq!(buffer[dot].fg, theme::WARN);
+    }
+
+    #[test]
+    fn yank_paths_keep_their_end_visible() {
+        let mut model = Model {
+            board: std::sync::Arc::new(crate::Board {
+                rows: vec![BoardRow {
+                    key: "one".into(),
+                    slug: "the-slug-at-the-end".into(),
+                    branch: "feature/one".into(),
+                    path: format!("/{}/the-slug-at-the-end", "deep/".repeat(40)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Model::default()
+        };
+        model.rebuild_items();
+        model.selected = Some(0);
+        model.yank = Some(0);
+        let text = rows(&draw(&mut model, 100, 30)).join("\n");
+        let path = text
+            .lines()
+            .find(|row| row.contains(" path "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            path.contains("…") && path.contains("/the-slug-at-the-end"),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn help_search_draws_a_caret_and_finds_rebase_aliases() {
+        let mut model = Model {
+            help: true,
+            help_searching: true,
+            help_query: crate::LineEditor::new("rebase"),
+            ..Model::default()
+        };
+        let text = rows(&draw(&mut model, 160, 50)).join("\n");
+        assert!(text.contains("/rebase▌"), "{text}");
+        assert!(text.contains("Restack (rebase)"), "{text}");
+        assert!(text.contains("never rebases"), "{text}");
+
+        let mut model = Model {
+            help: true,
+            help_query: crate::LineEditor::new("ahead"),
+            ..Model::default()
+        };
+        let text = rows(&draw(&mut model, 160, 50)).join("\n");
+        assert!(text.contains("sync notation"), "{text}");
+        assert!(text.contains("[↑N ↓M]"), "{text}");
+        for query in ["--base", "mouse drag"] {
+            let mut model = Model {
+                help: true,
+                help_query: crate::LineEditor::new(query),
+                ..Model::default()
+            };
+            let text = rows(&draw(&mut model, 160, 50)).join("\n");
+            assert!(!text.contains("no matches"), "{query}: {text}");
+        }
+    }
+
+    #[test]
+    fn perf_overlay_leads_with_a_verdict_and_meters() {
+        let process =
+            |pid, cpu, rss_kb, command: &str, session: Option<&str>| crate::PerfProcessView {
+                pid,
+                cpu,
+                rss_kb,
+                elapsed: "01:00".into(),
+                command: command.into(),
+                session: session.map(Into::into),
+            };
+        let view = crate::PerfView {
+            sampled_at: "14:03:22".into(),
+            verdict: "wt is most of the load: 600% of the 800% in use (75%)".into(),
+            verdict_tone: crate::PerfTone::Ours,
+            cores: 8,
+            system_cpu: 800.0,
+            wt_cpu: 600.0,
+            wt_rss_kb: 48 * 1024,
+            downstream_count: 3,
+            load_average: Some([7.5, 6.0, 4.25]),
+            memory_used_bytes: Some(20 << 30),
+            memory_total_bytes: Some(32 << 30),
+            categories: vec![crate::PerfGroupView {
+                label: "agents".into(),
+                cpu: 590.0,
+                rss_kb: 2_411_725,
+                count: 2,
+                summary: String::new(),
+            }],
+            sessions: Vec::new(),
+            top_downstream: vec![
+                process(11, 590.0, 2_411_725, "codex --resume", Some("feature")),
+                process(12, 0.0, 10, "sleep 1", None),
+                process(13, 0.0, 10, "sleep 2", None),
+                process(14, 0.0, 10, "sleep 3", None),
+            ],
+            top_other: vec![process(20, 150.0, 1024, "WindowServer", None)],
+            orphans: vec![process(40, 1.0, 1024, "wt", None)],
+            orphan_probe_available: true,
+            tmux_probe_available: true,
+            error: None,
+        };
+        let mut board = crate::Board {
+            perf_view: Some(Box::new(view)),
+            perf: vec![
+                "report".into(),
+                "Host: box".into(),
+                "Verdict: remote calm".into(),
+            ],
+            ..Default::default()
+        };
+        board.name = "repo".into();
+        let mut model = Model {
+            show_perf: true,
+            board: board.into(),
+            ..Model::default()
+        };
+        let buffer = draw(&mut model, 120, 80);
+        let text = rows(&buffer).join("\n");
+        assert!(
+            text.contains("perf · 3 processes downstream of wt · sampled 14:03:22"),
+            "{text}"
+        );
+        let (x, y) = find(&buffer, "wt is most of the load").unwrap();
+        assert_eq!(buffer[(x, y)].fg, theme::WARN);
+        assert!(text.contains("1 headless wt instance leaked"), "{text}");
+        assert!(text.contains("cpu (all)"), "{text}");
+        assert!(text.contains("800% of 800% · 8 cores"), "{text}");
+        assert!(text.contains("600% · 48M rss"), "{text}");
+        assert!(text.contains("20.0G of 32.0G"), "{text}");
+        assert!(text.contains("7.50   6.00   4.25"), "{text}");
+        let (x, y) = find(&buffer, "agents").unwrap();
+        assert_eq!(buffer[(x + 16, y)].symbol(), "█");
+        assert!(text.contains("2.3G  2 procs"), "{text}");
+        assert!(text.contains("feature  codex --resume"), "{text}");
+        assert!(text.contains("+ 1 more near idle"), "{text}");
+        assert!(text.contains("kill 40"), "{text}");
+        assert!(text.contains("WindowServer"), "{text}");
+        assert!(
+            text.contains("Host: box") && text.contains("remote calm"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{2014}') && !text.contains("UTC"));
+
+        // Narrow frames keep the numbers and drop the bars.
+        let text = rows(&draw(&mut model, 50, 80)).join("\n");
+        assert!(text.contains("800% of 800%"), "{text}");
+        assert!(!text.contains("░"), "{text}");
+
+        // Short frames scroll the body under a fixed verdict.
+        let _ = draw(&mut model, 120, 20);
+        assert!(model.perf_max_scroll > 0);
+        model.perf_scroll = usize::MAX;
+        let text = rows(&draw(&mut model, 120, 20)).join("\n");
+        assert!(text.contains("wt is most of the load"), "{text}");
+        assert!(text.contains("remote calm"), "{text}");
+        assert_eq!(model.perf_scroll, model.perf_max_scroll);
+    }
+
+    #[test]
+    fn perf_overlay_without_a_sample_says_so() {
+        let mut model = Model {
+            show_perf: true,
+            ..Model::default()
+        };
+        let text = rows(&draw(&mut model, 100, 30)).join("\n");
+        assert!(text.contains("sampling…"), "{text}");
+        model.board = crate::Board {
+            perf: vec!["Performance snapshot failed: ps timed out".into()],
+            ..Default::default()
+        }
+        .into();
+        let buffer = draw(&mut model, 100, 30);
+        let (x, y) = find(&buffer, "Performance snapshot failed").unwrap();
+        assert_eq!(buffer[(x, y)].fg, theme::ERR);
+    }
+
+    #[test]
+    fn perf_units_and_counts_read_naturally() {
+        assert_eq!(perf_memory(48 * 1024), "48M");
+        assert_eq!(perf_memory(2_411_725), "2.3G");
+        assert_eq!(perf_count(1, "process"), "1 process");
+        assert_eq!(perf_count(2, "proc"), "2 procs");
+        assert_eq!(perf_leading_percent("  12% 48 MiB pid 1"), Some(12.0));
     }
 }

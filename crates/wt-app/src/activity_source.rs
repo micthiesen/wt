@@ -16,6 +16,7 @@ use wt_tui::{ActivityLine, AttentionLine};
 const MAX_ACTIVITY: usize = 500;
 const MAX_ATTENTION: usize = 200;
 const MAX_TAIL_BYTES: u64 = 512 * 1024;
+const REPEAT_WINDOW_MS: u64 = 5_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActivitySnapshot {
@@ -70,15 +71,19 @@ pub(crate) fn append_attention(board: &mut wt_tui::Board, source: &str, text: &s
 pub(crate) fn bound_feeds(board: &mut wt_tui::Board) {
     board.activity.sort_by_key(|event| event.at_ms);
     board.attention.sort_by_key(|event| event.at_ms);
-    board.activity.dedup_by(|left, right| {
-        left.at_ms == right.at_ms
-            && left.channel == right.channel
-            && left.source == right.source
-            && left.text == right.text
+    // Sorted feeds hold the same line twice when the in-memory copy and
+    // its log backfill meet, or when several processes report one event.
+    // A burst inside the window is one event; an attention line identical
+    // to the one directly above it adds nothing whatever the gap.
+    board.activity.dedup_by(|later, earlier| {
+        later.channel == earlier.channel
+            && later.source == earlier.source
+            && later.text == earlier.text
+            && later.at_ms.saturating_sub(earlier.at_ms) <= REPEAT_WINDOW_MS
     });
-    board.attention.dedup_by(|left, right| {
-        left.at_ms == right.at_ms && left.source == right.source && left.text == right.text
-    });
+    board
+        .attention
+        .dedup_by(|later, earlier| later.source == earlier.source && later.text == earlier.text);
     if board.activity.len() > MAX_ACTIVITY {
         board.activity.drain(..board.activity.len() - MAX_ACTIVITY);
     }
@@ -185,7 +190,7 @@ fn read_snapshot(reports: &Path, app_log_dir: &Path) -> anyhow::Result<ActivityS
         });
     }
     activity.sort_by_key(|event| event.at_ms);
-    dedupe_attention_repeats(&mut activity);
+    dedupe_repeats(&mut activity);
     let attention = attention_from_activity(&activity);
     if activity.len() > MAX_ACTIVITY {
         activity.drain(..activity.len() - MAX_ACTIVITY);
@@ -239,16 +244,19 @@ fn read_app_logs(directory: &Path) -> anyhow::Result<Vec<ActivityLine>> {
     Ok(events)
 }
 
-fn dedupe_attention_repeats(events: &mut Vec<ActivityLine>) {
-    let mut previous = HashMap::<(String, String), u64>::new();
+/// Collapses burst duplicates: N processes observing one transition each
+/// log it, and a repeated failing key logs the same error each press.
+fn dedupe_repeats(events: &mut Vec<ActivityLine>) {
+    let mut previous = HashMap::<(String, String, String), u64>::new();
     events.retain(|event| {
-        if event.channel != "attention" {
-            return true;
-        }
-        let key = (event.source.clone(), event.text.clone());
+        let key = (
+            event.channel.clone(),
+            event.source.clone(),
+            event.text.clone(),
+        );
         if previous
             .get(&key)
-            .is_some_and(|at_ms| event.at_ms.saturating_sub(*at_ms) <= 5_000)
+            .is_some_and(|at_ms| event.at_ms.saturating_sub(*at_ms) <= REPEAT_WINDOW_MS)
         {
             false
         } else {
@@ -278,6 +286,11 @@ fn read_tail(path: &Path, limit: u64) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&contents).into_owned())
 }
 
+/// Parses one native log record into a feed line. The feeds show only
+/// user-facing events, like the TypeScript `EVENT`/`ATTN` log tags:
+/// explicit `event_*` records, plus errors raised by wt itself. Plain
+/// INFO/WARN records (input latency, terminal lifecycle, scheduler
+/// telemetry) stay in the file for diagnosis and never reach the panes.
 fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
     let value: Value = serde_json::from_str(line).ok()?;
     let fields = value.get("fields")?;
@@ -287,33 +300,73 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
         .get("event_at_ms")
         .and_then(Value::as_u64)
         .or_else(|| parse_timestamp_ms(timestamp))?;
-    let source = fields
-        .get("event_source")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("target").and_then(Value::as_str))
-        .unwrap_or("wt")
-        .to_owned();
-    let text = fields
+    // An explicit event names its text, or marks itself with a channel and
+    // carries the text as its message.
+    let event_text = fields
         .get("event_text")
         .and_then(Value::as_str)
-        .or_else(|| fields.get("message").and_then(Value::as_str))?;
-    // A logged failure names its cause in the `error` field; the feed shows
-    // it, since "action failed" alone tells the reader nothing.
-    let text = match fields.get("error").and_then(Value::as_str) {
-        Some(error) if fields.get("event_text").is_none() => format!("{text}: {error}"),
-        _ => text.to_owned(),
+        .or_else(|| {
+            fields
+                .get("event_channel")
+                .and(fields.get("message"))
+                .and_then(Value::as_str)
+        });
+    let (source, text, channel) = match event_text {
+        Some(text) => (
+            fields
+                .get("event_source")
+                .and_then(Value::as_str)
+                .filter(|source| !source.trim().is_empty())
+                .unwrap_or("wt")
+                .to_owned(),
+            text.to_owned(),
+            fields
+                .get("event_channel")
+                .and_then(Value::as_str)
+                .unwrap_or("activity")
+                .to_owned(),
+        ),
+        None => {
+            let target = value.get("target").and_then(Value::as_str).unwrap_or("");
+            if level != "ERROR" || !is_user_facing_error_target(target) {
+                return None;
+            }
+            (
+                "wt".to_owned(),
+                plain_error_text(fields)?,
+                "activity".to_owned(),
+            )
+        }
     };
-    let channel = fields
-        .get("event_channel")
-        .and_then(Value::as_str)
-        .unwrap_or("activity")
-        .to_owned();
     Some(ActivityLine {
         at_ms,
         level,
         channel,
         source: wt_core::sanitize_terminal_text(&source),
         text: wt_core::sanitize_terminal_text(&text),
+    })
+}
+
+/// wt's own errors reach the feeds; terminal-driver and dependency
+/// records are diagnostics for the log file only.
+fn is_user_facing_error_target(target: &str) -> bool {
+    let crate_name = target.split("::").next().unwrap_or("");
+    (crate_name == "wt" || crate_name.starts_with("wt_")) && !target.starts_with("wt_tui::terminal")
+}
+
+/// A logged failure names its cause in the `error` field; the feed shows
+/// it, since "action failed" alone tells the reader nothing. The
+/// controller's "TUI action failed" wording names an internal layer, so
+/// the feed reads like the TypeScript `<verb> failed: <cause>` lines.
+fn plain_error_text(fields: &Value) -> Option<String> {
+    let message = fields.get("message").and_then(Value::as_str)?;
+    let message = match message {
+        "TUI action failed" => "action failed",
+        message => message,
+    };
+    Some(match fields.get("error").and_then(Value::as_str) {
+        Some(error) => format!("{message}: {error}"),
+        None => message.to_owned(),
     })
 }
 
@@ -327,6 +380,8 @@ fn attention_from_activity(activity: &[ActivityLine]) -> Vec<AttentionLine> {
             text: event.text.clone(),
         })
         .collect::<Vec<_>>();
+    attention
+        .dedup_by(|later, earlier| later.source == earlier.source && later.text == earlier.text);
     if attention.len() > MAX_ATTENTION {
         attention.drain(..attention.len() - MAX_ATTENTION);
     }
@@ -354,7 +409,59 @@ mod tests {
     fn a_logged_error_field_follows_the_message() {
         let line = r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"TUI action failed","error":"no such worktree"},"target":"wt::controller"}"#;
         let event = parse_app_log_line(line).unwrap();
-        assert_eq!(event.text, "TUI action failed: no such worktree");
+        assert_eq!(event.text, "action failed: no such worktree");
+        assert_eq!(event.source, "wt");
+    }
+
+    #[test]
+    fn internal_telemetry_never_reaches_the_feeds() {
+        for line in [
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"INFO","fields":{"message":"input latency","ms":12},"target":"wt_tui::terminal"}"#,
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"INFO","fields":{"message":"terminal stopped"},"target":"wt_tui::terminal::driver"}"#,
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"terminal stopped","error":"eof"},"target":"wt_tui::terminal"}"#,
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"activity feeds use refresh backstop"},"target":"wt::activity_source"}"#,
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"connection reset"},"target":"hyper::proto"}"#,
+        ] {
+            assert_eq!(parse_app_log_line(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn structured_events_never_show_a_module_path_source() {
+        let line = r#"{"timestamp":"2026-10-09T12:00:00Z","level":"INFO","fields":{"event_text":"fetched git origin (87ms)"},"target":"wt::origin"}"#;
+        let event = parse_app_log_line(line).unwrap();
+        assert_eq!(event.source, "wt");
+        assert_eq!(event.text, "fetched git origin (87ms)");
+    }
+
+    #[test]
+    fn identical_consecutive_attention_lines_collapse() {
+        let line = |at_ms, text: &str| ActivityLine {
+            at_ms,
+            level: "ERROR".into(),
+            channel: "activity".into(),
+            source: "wt".into(),
+            text: text.into(),
+        };
+        let attention = attention_from_activity(&[
+            line(1_000, "action failed: offline"),
+            line(60_000, "action failed: offline"),
+            line(61_000, "feature: ready"),
+            line(90_000, "action failed: offline"),
+        ]);
+        assert_eq!(
+            attention.iter().map(|line| line.at_ms).collect::<Vec<_>>(),
+            [1_000, 61_000, 90_000]
+        );
+        let mut board = wt_tui::Board::default();
+        append_attention(&mut board, "wt", "same");
+        board.attention.push(AttentionLine {
+            at_ms: board.attention[0].at_ms + 60_000,
+            source: "wt".into(),
+            text: "same".into(),
+        });
+        bound_feeds(&mut board);
+        assert_eq!(board.attention.len(), 1);
     }
 
     #[test]
@@ -395,7 +502,7 @@ mod tests {
             text: "feature: ready".into(),
         };
         let mut events = vec![line(1_000), line(4_000), line(8_000)];
-        dedupe_attention_repeats(&mut events);
+        dedupe_repeats(&mut events);
         assert_eq!(
             events.iter().map(|event| event.at_ms).collect::<Vec<_>>(),
             [1_000, 8_000]

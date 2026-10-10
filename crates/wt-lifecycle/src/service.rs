@@ -2285,7 +2285,10 @@ impl LifecycleService {
             {
                 Some(0) => {}
                 Some(count) => {
-                    hazards.push(format!("{count} unpushed commit(s)"));
+                    hazards.push(format!(
+                        "{count} unpushed commit{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
                 }
                 None => {
                     hazards.push("could not verify pushed state".to_owned());

@@ -54,6 +54,30 @@ pub(crate) fn truncate_middle(text: &str, width: usize) -> String {
     format!("{head}{ELLIPSIS}{tail}")
 }
 
+/// Truncate to at most `width` cells by cutting the start, so the end of a
+/// path (the checkout's slug) stays visible.
+pub(crate) fn truncate_start(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let cell = ch.width().unwrap_or(0);
+        if used + cell > width - 1 {
+            break;
+        }
+        kept.push(ch);
+        used += cell;
+    }
+    let mut out = String::from(ELLIPSIS);
+    out.extend(kept.into_iter().rev());
+    out
+}
+
 /// Word-wrap to `width` cells. Words longer than a line are hard-split.
 /// Existing line breaks are preserved; blank lines stay blank.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {

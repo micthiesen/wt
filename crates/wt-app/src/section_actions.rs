@@ -22,28 +22,7 @@ pub async fn prepare(
         bail!("Restore the archived row before moving it to a section");
     }
     let current = state["slugs"][&slug]["section"].as_str();
-    let mut options: Vec<_> = section::manual_sections(&state)
-        .into_iter()
-        .filter(|name| Some(name.as_str()) != current)
-        .map(|name| PickerOption {
-            value: Some(name.clone()),
-            label: name,
-            chord: None,
-            note: None,
-            verify_after_merge: None,
-            detail: None,
-        })
-        .collect();
-    if current.is_some() {
-        options.push(PickerOption {
-            value: None,
-            label: "Inbox".into(),
-            chord: None,
-            note: None,
-            verify_after_merge: None,
-            detail: None,
-        });
-    }
+    let options = section_options(section::manual_sections(&state), current);
     Ok(UiReply {
         modal: Some(UiModal::Picker {
             action: PickerAction::Section { key },
@@ -55,12 +34,59 @@ pub async fn prepare(
     })
 }
 
+/// Picker value of the "+ new section" row. A leading NUL is reserved for
+/// derived groups, so no real section can collide with it.
+const NEW_SECTION: &str = "\0new-section";
+
+fn picker_option(value: Option<String>, label: String, chord: Option<char>) -> PickerOption {
+    PickerOption {
+        value,
+        label,
+        chord,
+        note: None,
+        verify_after_merge: None,
+        detail: None,
+    }
+}
+
+/// TS order: the Inbox (only when the row is in a section), every other
+/// manual section, then the "+ new section" row on its `n` chord.
+fn section_options(sections: Vec<String>, current: Option<&str>) -> Vec<PickerOption> {
+    let mut options = Vec::new();
+    if current.is_some() {
+        options.push(picker_option(None, "Inbox".into(), None));
+    }
+    options.extend(
+        sections
+            .into_iter()
+            .filter(|name| Some(name.as_str()) != current)
+            .map(|name| picker_option(Some(name.clone()), name, None)),
+    );
+    options.push(picker_option(
+        Some(NEW_SECTION.into()),
+        "+ new section".into(),
+        Some('n'),
+    ));
+    options
+}
+
 pub async fn move_row(
     ctx: &AppContext,
     key: String,
     section: Option<String>,
     board: Option<&wt_tui::Board>,
 ) -> Result<UiReply> {
+    if section.as_deref() == Some(NEW_SECTION) {
+        return Ok(UiReply {
+            modal: Some(UiModal::Text {
+                action: wt_tui::TextAction::NewSection { key },
+                prompt: "New section".into(),
+                initial: String::new(),
+                allow_empty: false,
+            }),
+            ..Default::default()
+        });
+    }
     let board = board.context("worktree metadata is still loading")?;
     let row = board
         .rows
@@ -328,6 +354,29 @@ pub async fn rename(ctx: &AppContext, old: String, new: String) -> Result<UiRepl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_picker_lists_inbox_first_and_a_new_section_row() {
+        let labels = |options: Vec<PickerOption>| {
+            options
+                .into_iter()
+                .map(|option| (option.label, option.chord))
+                .collect::<Vec<_>>()
+        };
+        let sections = vec!["alpha".to_owned(), "beta".to_owned()];
+        assert_eq!(
+            labels(section_options(sections.clone(), Some("beta"))),
+            [
+                ("Inbox".to_owned(), None),
+                ("alpha".to_owned(), None),
+                ("+ new section".to_owned(), Some('n')),
+            ]
+        );
+        let in_inbox = section_options(sections, None);
+        assert_eq!(in_inbox[0].label, "alpha");
+        assert_eq!(in_inbox.last().unwrap().value.as_deref(), Some(NEW_SECTION));
+        assert!(section::invalid_name(NEW_SECTION).is_some());
+    }
 
     #[tokio::test]
     async fn reorder_swaps_only_same_rank_units_and_crosses_into_named_sections() {

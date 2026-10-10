@@ -277,7 +277,13 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
         }
         return;
     }
-    let left = if let Some((message, failed)) = &model.toast {
+    // A reply that only opens a modal carries an empty message; it must
+    // not blank the legend while the modal is up.
+    let toast = model
+        .toast
+        .as_ref()
+        .filter(|(message, _)| !message.trim().is_empty());
+    let left = if let Some((message, failed)) = toast {
         // Leave the slot buttons their cells; a long toast truncates.
         let room = (area.width as usize).saturating_sub(slot_buttons_width(model) + 4);
         if *failed {
@@ -682,5 +688,26 @@ mod tests {
             .collect();
         assert!(text.contains("feature/"));
         assert!(text.contains('界'));
+    }
+
+    #[test]
+    fn an_empty_toast_keeps_the_help_legend_under_a_modal() {
+        let mut model = Model {
+            toast: Some((String::new(), false)),
+            interaction: Interaction::Picker(crate::model::PickerPrompt {
+                action: PickerAction::Status { key: "one".into() },
+                title: "status".into(),
+                options: Vec::new(),
+                selected: 0,
+            }),
+            ..Model::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut model)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer = (0..100)
+            .map(|x| buffer[(x, 29)].symbol())
+            .collect::<String>();
+        assert!(footer.contains("? help · t title"), "{footer}");
     }
 }

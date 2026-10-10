@@ -84,6 +84,10 @@ pub struct Board {
     pub review_requests: Vec<ReviewRequestRow>,
     #[serde(default)]
     pub perf: Vec<String>,
+    /// Typed local perf sample for the `P` overlay; `perf` stays the plain
+    /// report that `i` hands to an agent and remote hosts forward.
+    #[serde(default)]
+    pub perf_view: Option<Box<PerfView>>,
     pub sections: Vec<BoardSection>,
     pub hosts: Vec<HostChoice>,
     #[serde(default)]
@@ -95,6 +99,74 @@ pub struct Board {
     /// Queued automation fires waiting to dispatch.
     #[serde(default)]
     pub automations_pending: usize,
+}
+
+/// One prepared perf sample. CPU values are `ps` percentages (100 per core);
+/// memory values are KiB of RSS unless named otherwise.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PerfView {
+    /// Controller-local clock label of the sample, e.g. `14:03:22`.
+    pub sampled_at: String,
+    pub verdict: String,
+    pub verdict_tone: PerfTone,
+    pub cores: u32,
+    pub system_cpu: f64,
+    pub wt_cpu: f64,
+    pub wt_rss_kb: u64,
+    pub downstream_count: usize,
+    pub load_average: Option<[f64; 3]>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
+    pub categories: Vec<PerfGroupView>,
+    pub sessions: Vec<PerfGroupView>,
+    pub top_downstream: Vec<PerfProcessView>,
+    pub top_other: Vec<PerfProcessView>,
+    pub orphans: Vec<PerfProcessView>,
+    pub orphan_probe_available: bool,
+    pub tmux_probe_available: bool,
+    /// The latest resample failure while this older sample stays shown.
+    pub error: Option<String>,
+}
+
+// Sampled values come from parsed `ps` decimals and sums of them, never NaN,
+// so equality is total for the snapshot deduplication `Board` relies on.
+impl Eq for PerfView {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfTone {
+    /// The machine is not busy.
+    #[default]
+    Calm,
+    /// wt is most of the load.
+    Ours,
+    /// The machine is busy, mostly outside wt.
+    Elsewhere,
+}
+
+/// A category or session total.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PerfGroupView {
+    pub label: String,
+    pub cpu: f64,
+    pub rss_kb: u64,
+    pub count: usize,
+    /// Session composition such as `agents + shells×2`; empty for categories.
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PerfProcessView {
+    pub pid: u32,
+    pub cpu: f64,
+    pub rss_kb: u64,
+    pub elapsed: String,
+    /// Command with the directory of argv[0] removed.
+    pub command: String,
+    pub session: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -569,6 +641,9 @@ pub struct Model {
     pub show_perf: bool,
     pub(crate) perf_continuous: bool,
     pub(crate) perf_scroll: usize,
+    /// Furthest useful perf scroll for the last drawn frame, published by
+    /// the renderer because the prepared sample's layout sets the length.
+    pub(crate) perf_max_scroll: usize,
     pub(crate) history: crate::history::HistoryView,
     pub(crate) reviews_folded: bool,
     pub frame_count: u64,
@@ -623,6 +698,7 @@ impl Default for Model {
             show_perf: false,
             perf_continuous: false,
             perf_scroll: 0,
+            perf_max_scroll: 0,
             history: Default::default(),
             reviews_folded: false,
             frame_count: 0,
@@ -1436,7 +1512,12 @@ impl Model {
                     refresh: false,
                 });
             }
-            let maximum = self.board.perf.len().saturating_sub(1);
+            let maximum = self
+                .board
+                .perf
+                .len()
+                .saturating_sub(1)
+                .max(self.perf_max_scroll);
             if overlay_scroll(key, &mut self.perf_scroll, maximum, height) {
                 return InputResult::Draw;
             }
@@ -2331,7 +2412,15 @@ impl Model {
                         })
                     }
                     PickerAction::Section { key } => {
-                        self.last_section_target = Some(option.value.clone());
+                        // The "+ new section" row (a reserved NUL value) is
+                        // not a target to remember; its name is, once typed.
+                        if !option
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.starts_with('\0'))
+                        {
+                            self.last_section_target = Some(option.value.clone());
+                        }
                         InputResult::Action(UiAction::MoveSection {
                             key: key.clone(),
                             section: option.value,

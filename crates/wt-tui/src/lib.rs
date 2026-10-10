@@ -25,9 +25,10 @@ pub use editor::LineEditor;
 pub use model::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
     DisplayPolicy, GitPresentation, HostChoice, Interaction, LandingKind, LogView, MergeQueueView,
-    Model, PrCommentView, PrPresentation, PreparedDetailGroup, RemovedHistoryRow,
-    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
-    SessionView, TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
+    Model, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
+    PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
+    ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
+    WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use terminal::{run, run_with_palette_probe};
 #[doc(hidden)]

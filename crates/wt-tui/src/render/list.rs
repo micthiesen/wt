@@ -342,7 +342,9 @@ fn blank() -> ListLine {
 
 /// `── Label ──────`: a quiet rule with a dim label.
 fn divider(label: &str, width: usize) -> ListLine {
-    let inner = width.saturating_sub(2);
+    // One cell of right margin past the leading space, like the TS rule,
+    // which stops short of the scrollbar gutter.
+    let inner = width.saturating_sub(3);
     let label = truncate_end(&format!(" {label} "), inner.saturating_sub(4));
     let trail = inner.saturating_sub(2 + label.width());
     ListLine {
@@ -380,7 +382,7 @@ fn folded_header(
     let chip = format!("[×{count:02}] ");
     let mut right: Vec<Span<'static>> = Vec::new();
     if let Some(rollup) = rollup {
-        for entry in rollup.states.iter().filter(|entry| {
+        for entry in super::details::ranked_states(&rollup.states).filter(|entry| {
             entry
                 .state
                 .is_some_and(|state| state != wt_core::WorkState::Todo)
@@ -522,5 +524,52 @@ mod tests {
     fn deep_rails_keep_their_trailing_columns() {
         assert_eq!(rail("││└", 2), "│└");
         assert_eq!(rail("┌", 3), "┌");
+    }
+
+    #[test]
+    fn section_rules_stop_one_cell_short_of_the_scrollbar_gutter() {
+        let line = divider("Active", 40);
+        let cells: usize = line
+            .line
+            .spans
+            .iter()
+            .map(|span| span.content.width())
+            .sum();
+        assert_eq!(cells, 38);
+    }
+
+    #[test]
+    fn folded_header_rollup_reads_most_urgent_first() {
+        let rollup = SectionRollup {
+            states: [
+                wt_core::WorkState::Working,
+                wt_core::WorkState::NeedsTesting,
+                wt_core::WorkState::NeedsHuman,
+                wt_core::WorkState::Ready,
+            ]
+            .into_iter()
+            .map(|state| crate::WorkStateCount {
+                state: Some(state),
+                count: 1,
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let line = folded_header("Batch", 4, Some(&rollup), false, 60, None);
+        let colors = line
+            .line
+            .spans
+            .iter()
+            .filter(|span| span.content.ends_with("1 "))
+            .map(|span| span.style.fg)
+            .collect::<Vec<_>>();
+        let expected = [
+            wt_core::WorkState::Ready,
+            wt_core::WorkState::NeedsHuman,
+            wt_core::WorkState::NeedsTesting,
+            wt_core::WorkState::Working,
+        ]
+        .map(|state| Some(badges::work_state_color(state)));
+        assert_eq!(colors, expected);
     }
 }

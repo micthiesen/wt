@@ -275,10 +275,7 @@ pub async fn execute(
                 plan.row.target.branch
             )];
             if force {
-                lines.push(format!(
-                    "Will discard or abandon: {}",
-                    plan.hazards.join(", ")
-                ));
+                lines.extend(removal_hazard_lines(&plan.hazards));
             }
             if plan.destroy_stage {
                 lines.push(format!("Destroy deployed stage {}", plan.row.target.stage));
@@ -322,10 +319,7 @@ pub async fn execute(
                     "Checkout or hazards changed since the previous confirmation.".into(),
                 ];
                 if next_force {
-                    lines.push(format!(
-                        "Will discard or abandon: {}",
-                        plan.hazards.join(", ")
-                    ));
+                    lines.extend(removal_hazard_lines(&plan.hazards));
                 }
                 if plan.destroy_stage {
                     lines.push(format!("Destroy deployed stage {}", plan.row.target.stage));
@@ -458,73 +452,42 @@ pub async fn execute(
         UiAction::PrepareBase { key } => {
             let row = resolve_key(ctx, &key).await?;
             let slug = row.target.slug().to_owned();
-            let state = ctx
+            let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
+            let (state, archived) = ctx
                 .database
-                .call(move |store| Ok(store.read_wt_state()?))
+                .call(move |store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
                 .await?;
-            let current = state["slugs"][slug]["baseBranch"]
-                .as_str()
-                .map(str::to_owned);
-            let refs = run_git(
-                ctx,
-                &ctx.config.paths.main_clone,
-                [
-                    "for-each-ref",
-                    "--format=%(refname:short)",
-                    "refs/heads",
-                    "refs/remotes/origin",
-                ],
-            )
-            .await?
-            .checked("git")?
-            .stdout_text();
-            let mut branches = refs
-                .lines()
-                .map(str::trim)
-                .filter(|branch| {
-                    !branch.is_empty()
-                        && *branch != "origin/HEAD"
-                        && *branch != row.target.branch.as_str()
+            let trunk = ctx.config.branch.base.as_str();
+            let recorded_base = |slug: &str| {
+                state["slugs"][slug]["baseBranch"]
+                    .as_str()
+                    .filter(|base| !base.is_empty() && *base != trunk)
+                    .map(str::to_owned)
+            };
+            let worktrees = inventory
+                .iter()
+                .filter(|other| {
+                    !other.is_main
+                        && !other.detached
+                        && !other.target.branch.is_empty()
+                        && !archived.contains(&wt_core::worktree_target_key(&other.target))
                 })
-                .map(str::to_owned)
-                .collect::<std::collections::BTreeSet<_>>();
-            if let Some(recorded) = &current
-                && recorded != &ctx.config.branch.base
-                && recorded != &row.target.branch
-            {
-                branches.insert(recorded.clone());
-            }
-            let mut options = vec![PickerOption {
-                value: None,
-                label: format!("{} (default)", ctx.config.branch.base),
-                chord: None,
-                note: None,
-                verify_after_merge: None,
-                detail: None,
-            }];
-            options.extend(branches.into_iter().map(|branch| PickerOption {
-                label: if current.as_deref() == Some(branch.as_str()) {
-                    format!("{branch} (current)")
-                } else {
-                    branch.clone()
-                },
-                value: Some(branch),
-                chord: None,
-                note: None,
-                verify_after_merge: None,
-                detail: None,
-            }));
-            let selected = current
-                .as_ref()
-                .and_then(|current| {
-                    options
-                        .iter()
-                        .position(|option| option.value.as_ref() == Some(current))
+                .map(|other| BaseCandidate {
+                    slug: other.target.slug().to_owned(),
+                    branch: other.target.branch.clone(),
+                    base: recorded_base(other.target.slug()),
                 })
-                .unwrap_or(0);
+                .collect::<Vec<_>>();
+            let (options, selected) = base_picker_options(
+                trunk,
+                &slug,
+                &row.target.branch,
+                recorded_base(&slug).as_deref(),
+                &worktrees,
+            );
             Ok(modal(UiModal::Picker {
                 action: PickerAction::Base { key },
-                title: "Record fork base".into(),
+                title: format!("fork base for {slug}"),
                 options,
                 selected,
             }))
@@ -847,9 +810,177 @@ fn ui_revision(revision: &wt_lifecycle::RemovalRevision) -> UiRemovalRevision {
     }
 }
 
+/// Force-remove confirm lines in the TS style: work that disappears reads
+/// "<what> will be lost."; any other hazard is its own sentence.
+fn removal_hazard_lines(hazards: &[String]) -> Vec<String> {
+    let (lost, other): (Vec<_>, Vec<_>) = hazards.iter().partition(|hazard| {
+        *hazard == "uncommitted changes"
+            || hazard.ends_with(" unpushed commit")
+            || hazard.ends_with(" unpushed commits")
+    });
+    let sentence = |text: &str| {
+        let mut chars = text.chars();
+        chars.next().map_or_else(String::new, |first| {
+            format!("{}{}.", first.to_uppercase(), chars.as_str())
+        })
+    };
+    let mut lines = Vec::new();
+    if !lost.is_empty() {
+        let joined = lost
+            .iter()
+            .map(|hazard| hazard.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(sentence(&format!("{joined} will be lost")));
+    }
+    lines.extend(other.into_iter().map(|hazard| sentence(hazard)));
+    lines
+}
+
+/// One live worktree offered as a fork base, with its own recorded base.
+struct BaseCandidate {
+    slug: String,
+    branch: String,
+    base: Option<String>,
+}
+
+/// Fork-base options as TS built them: a no-parent row, then sibling
+/// worktree branches. The row itself and anything already stacked on it,
+/// directly or transitively, are excluded because picking one would close
+/// a record cycle that the layout silently degrades to flat rows. A
+/// recorded base whose worktree is gone stays listed so "(current)" shows.
+fn base_picker_options(
+    trunk: &str,
+    slug: &str,
+    branch: &str,
+    recorded: Option<&str>,
+    worktrees: &[BaseCandidate],
+) -> (Vec<PickerOption>, usize) {
+    let parent_of = worktrees
+        .iter()
+        .filter_map(|worktree| Some((worktree.branch.as_str(), worktree.base.as_deref()?)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let based_on_current = |candidate: &str| {
+        let mut seen = std::collections::HashSet::new();
+        let mut next = Some(candidate);
+        while let Some(current) = next {
+            if current == branch {
+                return true;
+            }
+            if !seen.insert(current) {
+                return false;
+            }
+            next = parent_of.get(current).copied();
+        }
+        false
+    };
+    let mut branches = Vec::<&str>::new();
+    for worktree in worktrees {
+        if worktree.slug != slug
+            && !based_on_current(&worktree.branch)
+            && !branches.contains(&worktree.branch.as_str())
+        {
+            branches.push(&worktree.branch);
+        }
+    }
+    if let Some(recorded) = recorded
+        && !branches.contains(&recorded)
+    {
+        branches.insert(0, recorded);
+    }
+    let option = |value: Option<String>, label: String| PickerOption {
+        value,
+        label,
+        chord: None,
+        note: None,
+        verify_after_merge: None,
+        detail: None,
+    };
+    let mut options = vec![option(None, format!("none (diff against {trunk})"))];
+    options.extend(branches.into_iter().map(|candidate| {
+        let label = if recorded == Some(candidate) {
+            format!("{candidate} (current)")
+        } else {
+            candidate.to_owned()
+        };
+        option(Some(candidate.to_owned()), label)
+    }));
+    let selected = recorded
+        .and_then(|recorded| {
+            options
+                .iter()
+                .position(|option| option.value.as_deref() == Some(recorded))
+        })
+        .unwrap_or(0);
+    (options, selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_hazards_read_as_sentences() {
+        assert_eq!(
+            removal_hazard_lines(&[
+                "uncommitted changes".into(),
+                "1 unpushed commit".into(),
+                "post-merge verification still owed".into(),
+            ]),
+            [
+                "Uncommitted changes, 1 unpushed commit will be lost.",
+                "Post-merge verification still owed.",
+            ]
+        );
+        assert_eq!(
+            removal_hazard_lines(&["3 unpushed commits".into()]),
+            ["3 unpushed commits will be lost."]
+        );
+    }
+
+    #[test]
+    fn base_picker_offers_only_sibling_worktrees_without_cycles() {
+        let candidate = |slug: &str, branch: &str, base: Option<&str>| BaseCandidate {
+            slug: slug.into(),
+            branch: branch.into(),
+            base: base.map(str::to_owned),
+        };
+        let worktrees = [
+            candidate("self", "feat/self", None),
+            candidate("child", "feat/child", Some("feat/self")),
+            candidate("grandchild", "feat/grandchild", Some("feat/child")),
+            candidate("other", "feat/other", None),
+            candidate("loop-a", "feat/loop-a", Some("feat/loop-b")),
+            candidate("loop-b", "feat/loop-b", Some("feat/loop-a")),
+        ];
+        let (options, selected) =
+            base_picker_options("main", "self", "feat/self", None, &worktrees);
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "none (diff against main)",
+                "feat/other",
+                "feat/loop-a",
+                "feat/loop-b"
+            ]
+        );
+        assert_eq!(options[0].value, None);
+        assert_eq!(selected, 0);
+
+        let (options, selected) =
+            base_picker_options("main", "child", "feat/child", Some("gone"), &worktrees);
+        assert_eq!(options[1].label, "gone (current)");
+        assert_eq!(selected, 1);
+        assert!(options.iter().any(|option| option.label == "feat/self"));
+        assert!(
+            !options
+                .iter()
+                .any(|option| option.label == "feat/grandchild")
+        );
+    }
 
     #[tokio::test]
     async fn human_status_preserves_verification_until_explicitly_cleared() {

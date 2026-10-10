@@ -36,7 +36,8 @@ red. A landed branch without a newer status shows the green merge glyph.
 
 Sections fold with `Tab`. Only folded sections are cursor stops; an expanded
 section is just its rows. A folded header reads `[×NN] Name` with a
-right-aligned count per work state plus overdue verifications, conflicts, and
+right-aligned count per work state, most urgent first (ready, needs-human,
+needs-testing, review, working), plus overdue verifications, conflicts, and
 failing checks. Selecting it shows the full rollup and blocker notes in the
 details pane. `[ui].sort = "status"` orders rows by work status; manual section
 placement remains separate. Within a section, rows without a manual order sort
@@ -68,7 +69,8 @@ Below the rows come a rebase block when the branch would not rebase cleanly
 onto its base (listing up to eight conflicting files from a `git merge-tree`
 pre-flight), paused automations, the session summary, PR comments, and the
 unresolved thread count. A folded section's details show its rollup, member
-rows, and blocker notes. A review request's details show its state, branch,
+rows, a red "blocked on you" group with each needs-human member's note, and a
+yellow "blocked on" group with external gates. A review request's details show its state, branch,
 author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
 shows a scrollbar when it overflows.
 

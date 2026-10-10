@@ -32,12 +32,18 @@ pub async fn refresh(
     ctx: &AppContext,
     cancellation: &CancellationToken,
 ) -> Result<FetchOriginReport> {
+    let started = std::time::Instant::now();
     let report = ctx
         .repository
         .fetch_origin(options(ctx), cancellation)
         .await?;
+    // The activity feed shows each fetch, as TS did; ref-maintenance
+    // warnings join it so they stay visible.
+    let text = format!("fetched git origin ({}ms)", started.elapsed().as_millis());
+    tracing::info!(target: "wt::origin", event_source = "origin", event_text = %text, "origin fetch");
     for warning in &report.warnings {
-        tracing::warn!(%warning, "Git ref maintenance");
+        let text = wt_core::sanitize_terminal_text(&warning.to_string());
+        tracing::warn!(target: "wt::origin", event_source = "origin", event_text = %text, "Git ref maintenance");
     }
     Ok(report)
 }

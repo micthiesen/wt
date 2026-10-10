@@ -213,7 +213,7 @@ def main():
             os.write(master, b"h")
             wait_for(lambda data: b"removed (" in data)
             os.write(master, b"P")
-            wait_for(lambda data: b"performance" in data)
+            wait_for(lambda data: "perf ·".encode() in data)
             os.write(master, b"P")
             # Closing the overlay repaints only the cells it covered; the
             # history pane under it is unchanged, so any frame is the signal.

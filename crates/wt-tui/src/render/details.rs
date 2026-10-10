@@ -20,7 +20,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 use wt_core::WorkState;
 
-use super::text::{age, now_ms, truncate_end, wrap};
+use super::text::{age, now_ms, truncate_end, truncate_start, wrap};
 use crate::{
     BoardRow, BoardSection, CheckState, DisplayPolicy, Model, PrPresentation, PreparedDetailGroup,
     ReviewRequestRow, ReviewState, SessionView, badges, glyphs, theme,
@@ -32,6 +32,8 @@ const MAX_CONFLICT_FILES: usize = 8;
 const COLLAPSED_PREAMBLE_LINES: usize = 2;
 /// Lines each blocker note may spend in a folded-section summary.
 const SECTION_NOTE_LINES: usize = 4;
+/// Key of the board's pinned archived section (`wt-app` board layout).
+const ARCHIVED_SECTION: &str = "\0archived";
 /// Labels recognized at the start of a structured ready note.
 const NOTE_LABELS: [&str; 4] = ["IF WRONG", "UNTESTED", "REVERT", "OPS"];
 
@@ -49,11 +51,17 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         return;
     }
     // One cell of padding each side; the right one doubles as the
-    // scrollbar's gutter so a thumb never sits on text.
-    let content = inner.inner(Margin {
+    // scrollbar's gutter so a thumb never sits on text. A blank row above
+    // the content (outside the scroll region) matches the TS pane's top
+    // padding, so the title never sits against the border.
+    let mut content = inner.inner(Margin {
         vertical: 0,
         horizontal: 1,
     });
+    if content.height > 3 {
+        content.y += 1;
+        content.height -= 1;
+    }
     let width = usize::from(content.width).max(1);
     let lines = build(model, width);
     let height = usize::from(content.height);
@@ -206,9 +214,9 @@ fn title_lines(title: &str, source: Option<&str>, width: usize) -> Vec<Line<'sta
         title
     };
     let mut wrapped = wrap(text, width);
-    let style = Style::new()
-        .fg(theme::FG_BRIGHT)
-        .add_modifier(Modifier::BOLD);
+    // Regular weight, like the TS pane: the border already names the slug,
+    // and a bold title outshouts the status banner beneath it.
+    let style = Style::new().fg(theme::FG_BRIGHT);
     let tag = source.map(|source| format!(" ({source})"));
     let last = wrapped.pop().unwrap_or_default();
     let mut lines = wrapped
@@ -329,8 +337,8 @@ fn branch_value(row: &BoardRow, group: &PreparedDetailGroup, width: usize) -> Sp
         .lines
         .get(1)
         .map(String::as_str)
-        .or(row.base_branch.as_deref())
-        .filter(|base| !base.is_empty());
+        .filter(|base| !base.is_empty())
+        .or_else(|| row_base(row));
     let Some(base) = base else {
         return vec![Span::styled(
             truncate_end(branch, width),
@@ -349,6 +357,18 @@ fn branch_value(row: &BoardRow, group: &PreparedDetailGroup, width: usize) -> Sp
         spans.push(Span::styled(" (forked)", theme::dim()));
     }
     spans
+}
+
+/// The base the row forks from and lands on: the branch group's prepared
+/// base, else the row's recorded base. `None` when neither is known.
+fn row_base(row: &BoardRow) -> Option<&str> {
+    row.detail_groups
+        .iter()
+        .find(|group| group.id == "branch")
+        .and_then(|group| group.lines.get(1))
+        .map(String::as_str)
+        .or(row.base_branch.as_deref())
+        .filter(|base| !base.is_empty())
 }
 
 fn issue_value(row: &BoardRow) -> Spans {
@@ -603,7 +623,16 @@ fn session_spans(session: &SessionView) -> Spans {
 /// compacted by priority: the verb is sticky, change state (diff, sync)
 /// outranks ages, and `created` drops before `committed`.
 fn git_value(row: &BoardRow, width: usize, now: u64) -> Spans {
-    let (verb, text) = badges::status_verb(row);
+    let (verb, mut text) = badges::status_verb(row);
+    // Name where it landed, as TS does ("merged into origin/main").
+    if row.busy.is_none()
+        && !row.path_missing
+        && !row.branch_gone
+        && row.git.landed_on == Some(crate::LandingKind::Base)
+        && let Some(base) = row_base(row)
+    {
+        text = format!("merged into {base}");
+    }
     let mut segments = vec![Segment::new(
         1,
         vec![glyph_text(verb.glyph, &text, verb.color)],
@@ -735,14 +764,7 @@ fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Lin
         files(&row.git.conflict_files, &mut lines);
         return lines;
     }
-    let base = row
-        .detail_groups
-        .iter()
-        .find(|group| group.id == "branch")
-        .and_then(|group| group.lines.get(1))
-        .map(String::as_str)
-        .or(row.base_branch.as_deref())
-        .unwrap_or("its base");
+    let base = row_base(row).unwrap_or("its base");
     let base = base.strip_prefix("origin/").unwrap_or(base);
     let resolving = badge.glyph != glyphs::CONFLICT;
     let head = if resolving {
@@ -1225,14 +1247,14 @@ fn section_lines(section: &BoardSection, model: &Model, width: usize) -> Vec<Lin
             .fg(theme::FG_BRIGHT)
             .add_modifier(Modifier::BOLD),
     )];
-    let (summary, blocked) = section_summary(section, width);
-    lines.extend(summary);
-    lines.push(Line::default());
     let members = section
         .rows
         .iter()
         .filter_map(|&index| model.board.rows.get(index))
         .collect::<Vec<_>>();
+    let (summary, blocked) = section_summary(section, &members, width);
+    lines.extend(summary);
+    lines.push(Line::default());
     if members.is_empty() {
         lines.push(Line::styled("no worktrees", theme::dim()));
     }
@@ -1274,17 +1296,15 @@ fn section_lines(section: &BoardSection, model: &Model, width: usize) -> Vec<Lin
     }
     lines.extend(blocked);
     lines.push(Line::default());
-    lines.push(Line::styled(
-        truncate_end(
-            if section.folded {
-                "Tab to expand"
-            } else {
-                "Tab to fold"
-            },
-            width,
-        ),
-        theme::dim(),
-    ));
+    // The archived block is pinned and named by wt, so rename and move do
+    // nothing there; advertise only the keys it has.
+    let hint = match (section.folded, section.key == ARCHIVED_SECTION) {
+        (true, true) => "TAB expand · y yank",
+        (true, false) => "TAB expand · y yank · L rename · J/K move",
+        (false, true) => "TAB fold · y yank",
+        (false, false) => "TAB fold · y yank · L rename · J/K move",
+    };
+    lines.push(Line::styled(truncate_end(hint, width), theme::dim()));
     lines
 }
 
@@ -1299,16 +1319,18 @@ fn member_risk(row: &BoardRow) -> Option<wt_core::WorkRisk> {
 /// Rollup lines for tests that read them without a pane width.
 #[cfg(test)]
 pub(crate) fn section_rollup_lines(section: &BoardSection) -> Vec<Line<'static>> {
-    let (mut lines, blocked) = section_summary(section, 200);
+    let (mut lines, blocked) = section_summary(section, &[], 200);
     lines.extend(blocked);
     lines
 }
 
 /// The batch view: work-state rollup (most urgent first, glyph per state),
 /// risk counts, mechanical facts that decide whether the batch can move,
-/// and blocker notes. Returned as (summary, blocked block).
+/// and blocker notes: the needs-human members' notes (what is asked of
+/// you) and then the external gates. Returned as (summary, blocked block).
 fn section_summary(
     section: &BoardSection,
+    members: &[&BoardRow],
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let rollup = &section.rollup;
@@ -1317,7 +1339,7 @@ fn section_summary(
         format!("{count} worktree{}", if count == 1 { "" } else { "s" }),
         theme::dim(),
     )];
-    for entry in &rollup.states {
+    for entry in ranked_states(&rollup.states) {
         states.push(Span::styled(" · ", theme::dim()));
         let (glyph, color, name) = match entry.state {
             Some(state) => (
@@ -1392,6 +1414,33 @@ fn section_summary(
         lines.extend(wrap_spans(spans, width));
     }
     let mut blocked = Vec::new();
+    let asking = members
+        .iter()
+        .filter_map(|row| {
+            let work = row.work.as_ref()?;
+            let note = work.record.as_ref()?.note.as_deref()?.trim();
+            (work.effective_state == Some(WorkState::NeedsHuman) && !note.is_empty())
+                .then_some((*row, note))
+        })
+        .collect::<Vec<_>>();
+    if !asking.is_empty() {
+        blocked.push(Line::default());
+        blocked.push(fit_line(
+            glyph_text(glyphs::CONFLICT, "blocked on you", theme::ERR),
+            width,
+        ));
+        for (row, note) in asking {
+            blocked.push(Line::styled(
+                truncate_end(&format!("  {}", super::list::row_label(row)), width),
+                theme::dim(),
+            ));
+            blocked.extend(
+                clip_lines(note, width.saturating_sub(4).max(1), SECTION_NOTE_LINES)
+                    .into_iter()
+                    .map(|line| Line::styled(format!("    {line}"), theme::fg(theme::FG))),
+            );
+        }
+    }
     if !rollup.blocked_notes.is_empty() {
         blocked.push(Line::default());
         blocked.push(fit_line(
@@ -1407,6 +1456,17 @@ fn section_summary(
         }
     }
     (lines, blocked)
+}
+
+/// The prepared rollup's states, most urgent first by the shared section
+/// rank (ready, needs-human, needs-testing, review, working, unset, todo,
+/// then the terminal states), so the pane and the folded list header agree.
+pub(crate) fn ranked_states(
+    states: &[crate::WorkStateCount],
+) -> impl Iterator<Item = &crate::WorkStateCount> {
+    let mut ranked = states.iter().collect::<Vec<_>>();
+    ranked.sort_by_key(|entry| wt_core::work_state_rank(entry.state));
+    ranked.into_iter()
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,29 +1534,6 @@ fn wrap_spans(spans: Spans, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(current));
     }
     lines
-}
-
-/// Keep the end of a long path, which names the checkout.
-fn truncate_start(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut kept = Vec::new();
-    let mut used = 0;
-    for ch in text.chars().rev() {
-        let cells = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + cells > width - 1 {
-            break;
-        }
-        kept.push(ch);
-        used += cells;
-    }
-    let mut out = String::from(super::text::ELLIPSIS);
-    out.extend(kept.into_iter().rev());
-    out
 }
 
 /// One `·`-separated piece of a dense line: modes from most verbose to most
@@ -1767,5 +1804,118 @@ mod tests {
             .draw(|frame| render(frame, &mut model, frame.area()))
             .unwrap();
         assert!(model.details_scroll > 0 && model.details_scroll < 500);
+    }
+
+    #[test]
+    fn content_starts_below_a_blank_row_and_the_title_is_regular_weight() {
+        let mut plain = row();
+        plain.work = None;
+        for row in [row(), plain] {
+            let lines = screen(row, 70, 40);
+            assert!(lines[1].trim_matches(|c| c == '│' || c == ' ').is_empty());
+            assert!(
+                lines[2].contains("Fix the flaky login test"),
+                "{}",
+                lines[2]
+            );
+        }
+        let title = title_lines("Fix it", None, 40);
+        assert!(!title[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(title[0].style.fg, Some(theme::FG_BRIGHT));
+    }
+
+    #[test]
+    fn landed_rows_name_the_base_they_merged_into() {
+        let mut landed = row();
+        landed.git.landed_on = Some(crate::LandingKind::Base);
+        landed.detail_groups[0] = group("branch", &["feature/eng-12", "origin/main"]);
+        let lines = screen(landed, 90, 40);
+        assert!(find(&lines, "   git ").contains("merged into origin/main"));
+    }
+
+    fn section_screen(rows: Vec<BoardRow>, key: &str) -> Vec<String> {
+        let count = rows.len();
+        let mut board = Board {
+            rows,
+            sections: vec![BoardSection {
+                key: key.into(),
+                title: "To Merge".into(),
+                folded: true,
+                rows: (0..count).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        board.sections[0].rollup.states = vec![
+            crate::WorkStateCount {
+                state: Some(WorkState::Working),
+                count: 1,
+            },
+            crate::WorkStateCount {
+                state: Some(WorkState::NeedsHuman),
+                count: 1,
+            },
+            crate::WorkStateCount {
+                state: Some(WorkState::Ready),
+                count: 1,
+            },
+        ];
+        board.sections[0].rollup.blocked_notes = vec!["gated: release approval".into()];
+        let mut model = Model {
+            board: Arc::new(board),
+            ..Model::default()
+        };
+        model.rebuild_items();
+        model.selected = Some(0);
+        assert!(
+            model.selected_row().is_none(),
+            "the folded header is selected"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut model, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..40)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn folded_section_lists_needs_human_notes_and_ranks_states() {
+        let mut asking = row();
+        asking.slug = "asking".into();
+        asking.title = "Needs a credential".into();
+        asking.work = Some(WorkPresentation {
+            record: Some(WorkStatusRecord {
+                note: Some("Need the staging API key from ops".into()),
+                ..WorkStatusRecord::new(WorkState::NeedsHuman, "2026-10-09T00:00:00Z")
+            }),
+            effective_state: Some(WorkState::NeedsHuman),
+            ..Default::default()
+        });
+        let lines = section_screen(vec![row(), asking], "manual");
+        let you = lines
+            .iter()
+            .position(|line| line.contains("blocked on you"))
+            .unwrap_or_else(|| panic!("{}", lines.join("\n")));
+        assert!(
+            lines[you + 1].contains("Needs a credential"),
+            "{}",
+            lines[you + 1]
+        );
+        assert!(lines[you + 2].contains("    Need the staging API key from ops"));
+        find(&lines, "blocked on");
+        find(&lines, "gated: release approval");
+        let rollup = find(&lines, "2 worktrees");
+        let ready = rollup.find("ready").unwrap();
+        let human = rollup.find("needs-human").unwrap();
+        let working = rollup.find("working").unwrap();
+        assert!(ready < human && human < working, "{rollup}");
+        find(&lines, "TAB expand · y yank · L rename · J/K move");
+
+        let archived = section_screen(vec![row()], ARCHIVED_SECTION);
+        assert!(!archived.join("\n").contains("L rename"));
+        find(&archived, "TAB expand · y yank");
     }
 }

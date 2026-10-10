@@ -41,26 +41,34 @@ async fn palette(
     github: &GithubData,
 ) -> Result<UiReply> {
     let definitions = action_dispatch::definitions(ctx, &surface);
-    let context = action_dispatch::prepare(ctx, &surface, github, board, None).await?;
-    if let Some(run) = crate::actions::service(ctx)?
-        .list_runs(usize::MAX)
-        .await?
-        .into_iter()
-        .find(|run| {
-            let action_key = if run.meta.action_key.is_empty() {
-                &run.meta.slug
-            } else {
-                &run.meta.action_key
-            };
-            action_key == &context.action_key
-                && matches!(
-                    run.meta.status,
-                    wt_actions::ActionRunStatus::Running | wt_actions::ActionRunStatus::Ambiguous
-                )
-        })
+    // TS opened a slot palette even when its checkout was missing; every
+    // row then shows why it can't run instead of the key failing outright.
+    let blocked = slot_unavailable(ctx, &surface);
+    let context = match blocked {
+        Some(_) => None,
+        None => Some(action_dispatch::prepare(ctx, &surface, github, board, None).await?),
+    };
+    if let Some(context) = &context
+        && let Some(run) = crate::actions::service(ctx)?
+            .list_runs(usize::MAX)
+            .await?
+            .into_iter()
+            .find(|run| {
+                let action_key = if run.meta.action_key.is_empty() {
+                    &run.meta.slug
+                } else {
+                    &run.meta.action_key
+                };
+                action_key == &context.action_key
+                    && matches!(
+                        run.meta.status,
+                        wt_actions::ActionRunStatus::Running
+                            | wt_actions::ActionRunStatus::Ambiguous
+                    )
+            })
     {
         return Ok(modal(UiModal::Confirm {
-            action: wt_tui::ConfirmAction::KillAction {action_key:context.action_key, run_id:run.meta.run_id},
+            action: wt_tui::ConfirmAction::KillAction {action_key:context.action_key.clone(), run_id:run.meta.run_id},
             title: format!("Stop {}?", run.meta.action_name),
             lines: vec![format!("{} is active on {}.", run.meta.action_name, context.slug), "Stopping it terminates its worker and descendants. Partial changes remain in the worktree.".into()],
             cancel_key:Some('!'),
@@ -69,7 +77,11 @@ async fn palette(
     let keys = assign_keys(&definitions, reserved_keys(&surface));
     let mut groups: Vec<(String, Vec<PickerOption>)> = Vec::new();
     for def in definitions.iter().filter(|def| def.id != CUSTOM_ID) {
-        let reason = availability(def, &surface, &context.row);
+        let reason = match (&blocked, &context) {
+            (Some(reason), _) => Some(reason.clone()),
+            (None, Some(context)) => availability(def, &surface, &context.row),
+            (None, None) => None,
+        };
         let group = def.group.clone().unwrap_or_default();
         let label = if group.is_empty() {
             def.name.clone()
@@ -90,7 +102,7 @@ async fn palette(
             groups.push((group, vec![option]));
         }
     }
-    if matches!(surface, ActionSurface::Row { .. }) {
+    if let (ActionSurface::Row { .. }, Some(context)) = (&surface, &context) {
         let mut pinned = vec![(
             "worktree",
             PickerOption {
@@ -173,21 +185,42 @@ async fn palette(
             chord: Some('z'),
             note: None,
             verify_after_merge: None,
-            detail: Some("local".into()),
+            detail: Some(
+                blocked
+                    .as_ref()
+                    .map_or_else(|| "local".into(), |reason| format!("({reason})")),
+            ),
         });
     }
     options.push(PickerOption {
         value: Some(CUSTOM_ID.into()),
-        label: "Custom prompt…".into(),
+        // TS: manager and slot palettes message a live session.
+        label: if matches!(surface, ActionSurface::Row { .. }) {
+            "Custom prompt…"
+        } else {
+            "Custom message…"
+        }
+        .into(),
         chord: Some('c'),
         note: None,
         verify_after_merge: None,
-        detail: Some("freeform".into()),
+        detail: Some(
+            blocked
+                .as_ref()
+                .map_or_else(|| "freeform".into(), |reason| format!("({reason})")),
+        ),
     });
+    let slug = context
+        .as_ref()
+        .map(|context| context.slug.clone())
+        .unwrap_or_else(|| match &surface {
+            ActionSurface::Slot { target } => slot_label(*target).into(),
+            _ => String::new(),
+        });
     let title = match &surface {
-        ActionSurface::Row { .. } => format!("{} actions", context.slug),
+        ActionSurface::Row { .. } => format!("{slug} actions"),
         ActionSurface::Manager { .. } => "Manager commands".into(),
-        ActionSurface::Slot { .. } => format!("{} commands", context.slug),
+        ActionSurface::Slot { .. } => format!("{slug} commands"),
     };
     Ok(modal(UiModal::Picker {
         action: PickerAction::Actions { surface },
@@ -195,6 +228,37 @@ async fn palette(
         options,
         selected: 0,
     }))
+}
+
+fn slot_label(target: wt_tui::SessionTarget) -> &'static str {
+    match target {
+        wt_tui::SessionTarget::WtSource => "wt",
+        wt_tui::SessionTarget::Main => "main",
+        wt_tui::SessionTarget::Manager => "manager",
+        wt_tui::SessionTarget::Dotfiles => "dotfiles",
+        _ => "slot",
+    }
+}
+
+/// Why a slot palette's checkout can't run anything, short enough for a
+/// row detail. `None` for available slots and non-slot surfaces.
+fn slot_unavailable(ctx: &AppContext, surface: &ActionSurface) -> Option<String> {
+    let ActionSurface::Slot { target } = surface else {
+        return None;
+    };
+    let paths = &ctx.config.paths;
+    let (path, missing) = match target {
+        wt_tui::SessionTarget::WtSource => match &paths.wt_source {
+            None => return Some("paths.wt_source not set".into()),
+            Some(path) => (path, "wt source checkout missing"),
+        },
+        wt_tui::SessionTarget::Dotfiles => (&paths.dotfiles, "dotfiles checkout missing"),
+        wt_tui::SessionTarget::Main | wt_tui::SessionTarget::Manager => {
+            (&paths.main_clone, "main clone missing")
+        }
+        _ => return None,
+    };
+    (!path.is_dir()).then(|| missing.into())
 }
 
 fn availability(
@@ -219,6 +283,11 @@ async fn prepare(
     board: Option<&Board>,
     github: &GithubData,
 ) -> Result<UiReply> {
+    if let (Some(reason), ActionSurface::Slot { target }) =
+        (slot_unavailable(ctx, &surface), &surface)
+    {
+        bail!("{} slot unavailable: {reason}", slot_label(*target));
+    }
     if let ActionSurface::Slot { target } = &surface
         && id == crate::action_builtins::OPEN_EDITOR_ID
     {
@@ -309,6 +378,11 @@ async fn run(
     board: Option<&Board>,
     github: &GithubData,
 ) -> Result<UiReply> {
+    if let (Some(reason), ActionSurface::Slot { target }) =
+        (slot_unavailable(ctx, &surface), &surface)
+    {
+        bail!("{} slot unavailable: {reason}", slot_label(*target));
+    }
     let def = definition(ctx, &surface, &id)?;
     if id == CUSTOM_ID && extras.trim().is_empty() {
         bail!("custom prompt is empty");
@@ -457,6 +531,46 @@ fn assign_keys(definitions: &[ActionDef], reserved: &[char]) -> BTreeMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_slot_palette_opens_with_reasons() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        assert!(fixture.ctx.config.paths.wt_source.is_none());
+        let surface = ActionSurface::Slot {
+            target: wt_tui::SessionTarget::WtSource,
+        };
+        let github = GithubData::default();
+        let reply = palette(&fixture.ctx, surface.clone(), None, &github)
+            .await
+            .unwrap();
+        let Some(UiModal::Picker { title, options, .. }) = reply.modal else {
+            panic!("expected the slot palette");
+        };
+        assert_eq!(title, "wt commands");
+        assert!(options.len() > 2);
+        assert!(
+            options
+                .iter()
+                .all(|option| { option.detail.as_deref() == Some("(paths.wt_source not set)") })
+        );
+        assert_eq!(options.last().unwrap().label, "Custom message…");
+        let error = prepare(
+            &fixture.ctx,
+            surface,
+            "slot-continue".into(),
+            None,
+            None,
+            &github,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "wt slot unavailable: paths.wt_source not set"
+        );
+    }
 
     #[test]
     fn explicit_keys_win_before_derived_keys_and_reserved_keys_remain_free() {
