@@ -7,7 +7,8 @@ from `rusty` to `main` is not authorized.
 
 The scope and evidence are summarized in
 [rust-rewrite-inventory.md](rust-rewrite-inventory.md). This record distinguishes
-the verified application build from documentation and CI setup follow-ups.
+the verified application build from the final test, documentation, and CI setup
+follow-ups.
 
 ## Current state
 
@@ -33,6 +34,15 @@ verified selected configs and PATH in managed sessions, literal shell quoting,
 and two independent configs using the same slug. An unrelated sentinel stayed
 alive. Cleanup removed the private fixture and newly provisioned unused
 runtime: `/tmp/wt-native-boris-4ef9878/result.json` and `cleanup.json`.
+
+The final branch CI exposed a test timing assumption after that release:
+macOS could deliver a setup file-write event during an assertion that a
+neighboring file produced no event. The existing callback was extracted
+unchanged and its filtering/coalescing policy is now tested with deterministic
+events. Independent review confirmed identical runtime behavior. The real
+filesystem notification test and post-warmup output fixture remain. Release and
+performance figures identify `4ef9878`; later changes consist of this testability
+refactor, documentation, and a quiet Homebrew dependency-presence probe.
 
 Independent review covered the shared contracts, durability, remote protocol,
 distribution, and full feature inventory, followed by a final review of the

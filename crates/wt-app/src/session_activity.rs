@@ -56,8 +56,28 @@ impl CodexOutputWatch {
     fn new() -> Self {
         let (sender, updates) = mpsc::channel(1);
         let watched_paths = Arc::new(RwLock::new(BTreeSet::new()));
-        let callback_paths = Arc::clone(&watched_paths);
-        let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        let watcher =
+            notify::recommended_watcher(Self::event_handler(Arc::clone(&watched_paths), sender));
+        let watcher = match watcher {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                tracing::warn!(%error, "could not create Codex rollout watcher; polling fallback remains active");
+                None
+            }
+        };
+        Self {
+            watcher,
+            watched_paths,
+            directories: BTreeSet::new(),
+            updates,
+        }
+    }
+
+    fn event_handler(
+        callback_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
+        sender: mpsc::Sender<()>,
+    ) -> impl FnMut(notify::Result<Event>) + Send + 'static {
+        move |result| {
             let should_wake = match result {
                 Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => false,
                 Ok(event) => {
@@ -80,19 +100,6 @@ impl CodexOutputWatch {
                 // no individual queue entry.
                 let _ = sender.try_send(());
             }
-        });
-        let watcher = match watcher {
-            Ok(watcher) => Some(watcher),
-            Err(error) => {
-                tracing::warn!(%error, "could not create Codex rollout watcher; polling fallback remains active");
-                None
-            }
-        };
-        Self {
-            watcher,
-            watched_paths,
-            directories: BTreeSet::new(),
-            updates,
         }
     }
 
@@ -978,30 +985,41 @@ mod tests {
     use wt_platform::process::ProcessRunner;
     use wt_tmux::{TmuxClient, TmuxServer};
 
-    #[tokio::test]
-    async fn codex_output_watch_coalesces_exact_rollout_file_changes() {
+    #[test]
+    fn codex_output_watch_coalesces_exact_rollout_file_changes() {
         let temp = tempfile::tempdir().unwrap();
         let watched = temp.path().join("rollout-session.jsonl");
         let neighbor = temp.path().join("rollout-other-session.jsonl");
         std::fs::write(&watched, b"seed\n").unwrap();
         std::fs::write(&neighbor, b"seed\n").unwrap();
-        let mut watch = CodexOutputWatch::new();
-        watch.sync([watched.clone()].into_iter());
+        let paths = Arc::new(RwLock::new(BTreeSet::from([std::fs::canonicalize(
+            &watched,
+        )
+        .unwrap()])));
+        let (sender, mut updates) = mpsc::channel(1);
+        let mut handle = CodexOutputWatch::event_handler(paths, sender);
 
-        std::fs::write(&neighbor, b"unrelated\n").unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(75), watch.updates.recv())
-                .await
-                .is_err()
-        );
+        // FSEvents may deliver setup writes after watcher registration. Feed
+        // exact events here so a delayed seed event cannot masquerade as an
+        // unrelated-path failure. The next test checks real OS notifications
+        // and observation of appended content.
+        handle(Ok(Event::new(notify::EventKind::Any).add_path(neighbor)));
+        handle(Ok(Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Read,
+        ))
+        .add_path(watched.clone())));
+        assert!(updates.try_recv().is_err());
 
-        std::fs::write(&watched, b"seed\nnew output\n").unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), watch.updates.recv())
-                .await
-                .unwrap(),
-            Some(())
-        );
+        for _ in 0..3 {
+            handle(Ok(
+                Event::new(notify::EventKind::Any).add_path(watched.clone())
+            ));
+        }
+        assert_eq!(updates.try_recv(), Ok(()));
+        assert!(updates.try_recv().is_err());
+
+        handle(Err(notify::Error::generic("watch fixture error")));
+        assert_eq!(updates.try_recv(), Ok(()));
     }
 
     #[tokio::test]
