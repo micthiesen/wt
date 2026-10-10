@@ -158,10 +158,12 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
     let now = now_ms();
     let mut lines = title_lines(&row.title, Some(row.title_source.as_str()), width);
     let work = work_status_block(row, model.show_verification, width);
+    // The facts follow the title directly, as in TS; a status block gets a
+    // blank line after it.
     if !work.is_empty() {
         lines.extend(work);
+        lines.push(Line::default());
     }
-    lines.push(Line::default());
 
     let label_width = label_column(&row.detail_groups);
     for group in &row.detail_groups {

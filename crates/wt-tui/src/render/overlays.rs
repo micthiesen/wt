@@ -1130,10 +1130,13 @@ fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
             hint("P / esc / q", "close"),
         ],
     );
-    let outer = modal.place(area, MAX_FRAME_WIDTH as usize, 0, true);
-    let body = modal.draw(frame, area, outer);
-    let width = body.width as usize;
-    if body.height == 0 || width == 0 {
+    // Size the frame to the report, as the other modals are, measuring at
+    // the width the frame will get.
+    let width = modal
+        .place(area, MAX_FRAME_WIDTH as usize, 0, true)
+        .width
+        .saturating_sub(4) as usize;
+    if width == 0 {
         return;
     }
     let (header, lines) = match &model.board.perf_view {
@@ -1168,6 +1171,12 @@ fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
                 .collect(),
         ),
     };
+    let rows = header.len() + usize::from(!header.is_empty()) + lines.len();
+    let outer = modal.place(area, MAX_FRAME_WIDTH as usize, rows.max(1), false);
+    let body = modal.draw(frame, area, outer);
+    if body.height == 0 || body.width == 0 {
+        return;
+    }
     let header_rows = (header.len() as u16).min(body.height);
     frame.render_widget(
         Paragraph::new(header),
