@@ -23,7 +23,7 @@
 # instance and the probe harness's read-only rules don't apply: destroy
 # rows, confirm prompts, exercise anything.
 #
-# It drives the working tree's code (`bun src/main.ts`), so the fixture
+# It drives the workspace's built native binary, so the fixture
 # reflects the change you're validating, and it builds the board through
 # public CLI commands only — when a command's contract changes this
 # breaks loudly instead of drifting into a lie.
@@ -39,6 +39,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BINARY="${WT_NATIVE_BIN:-$ROOT/target/debug/wt}"
 FX="${WT_FIXTURE_ROOT:-${TMPDIR:-/tmp}/wt-fixture}"
 FX="${FX%/}"
 # Resolve symlinks in the path. macOS's $TMPDIR is /var/... which is a
@@ -48,8 +49,8 @@ FX="${FX%/}"
 mkdir -p "$(dirname "$FX")"
 FX="$(cd "$(dirname "$FX")" && pwd -P)/$(basename "$FX")"
 CONFIG="$FX/config.toml"
-SOCKET=wt-fixture
-PROBE=fixture
+SOCKET="${WT_FIXTURE_SOCKET:-wt-fixture}"
+PROBE="${WT_FIXTURE_PROBE:-fixture}"
 PREFIX=fx
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -57,16 +58,11 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # Run wt against the fixture. Every knob is pinned here rather than
 # inherited so an ambient WT_CONFIG in the caller's shell can never
 # aim these writes at the live instance.
-# `env -u BUN_INSPECT` for the same reason bin/wt does it: these scripts
-# are run by agents, so the caller is a Claude session whose environment
-# binds that session's inspector socket, and bun hands the variable to
-# every child. Going through src/main.ts directly bypasses bin/wt's
-# scrub, so each wt here died on EADDRINUSE binding a socket its parent
-# already owned.
 wtfx() {
-  WT_CONFIG="$CONFIG" WT_TMUX_SOCKET="$SOCKET" \
+  [ -x "$BINARY" ] || die 'Build wt first: cargo build -p wt-app (or set WT_NATIVE_BIN)'
+  HOME="$FX/home" WT_CONFIG="$CONFIG" WT_REPO_CONFIG="$CONFIG" WT_TMUX_SOCKET="$SOCKET" \
     WT_GITHUB=off WT_AUTOMATIONS=off WT_UPDATE=off WT_SKILLS=off \
-    env -u BUN_INSPECT bun "$ROOT/src/main.ts" "$@"
+    env -u BUN_INSPECT "$BINARY" "$@"
 }
 
 new_wt() { # slug [base-ref]
@@ -106,7 +102,7 @@ land_in_trunk() { # slug — merge the worktree's branch into origin/main
   )
 }
 
-build() {
+check_owned_directory() {
   # Refuse to rm -rf a path that isn't ours. "Ours" is judged per entry
   # rather than by origin.git alone, because the corpse of a torn-down
   # fixture is a real state: a wt process outliving the last `rm`
@@ -119,18 +115,22 @@ build() {
         # *.log: markers the fixture's own teardown hooks append to
         # (destroy_command, [dev_server] stop_command) — written by a
         # previous run of this fixture, so they are ours to delete.
-        origin.git|main-clone|wts|cache|config.toml|env.sh|*.log) ;;
+        origin.git|main-clone|wts|cache|home|config.toml|env.sh|*.log) ;;
         *) die "$FX holds ${entry##*/}, which no fixture creates — refusing to delete it" ;;
       esac
     done
   fi
+}
+
+build() {
+  check_owned_directory
   # A probe still attached to the old fixture keeps polling git in a
   # directory this is about to delete, and races the rebuild for index
   # locks. Stop it first.
   bash "$ROOT/scripts/tui-test.sh" stop "$PROBE" >/dev/null 2>&1 || true
   tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   rm -rf "$FX"
-  mkdir -p "$FX/cache" "$FX/wts"
+  mkdir -p "$FX/cache" "$FX/wts" "$FX/home"
 
   # A trunk to fork from. `origin` is a local bare repo, so nothing here
   # ever reaches a remote and `origin/main` resolves for real.
@@ -154,10 +154,18 @@ build() {
 main_clone    = "$FX/main-clone"
 worktree_root = "$FX/wts"
 cache_db      = "$FX/cache/cache.sqlite"
+cache_root    = "$FX/cache"
+state_db      = "$FX/cache/wt.sqlite"
+lock_dir      = "$FX/cache/locks"
+log_dir       = "$FX/cache/logs"
+app_log_dir   = "$FX/cache/app-logs"
 
 [branch]
 prefix = "$PREFIX"
 base   = "main"
+
+[naming]
+auto_rename = false
 
 # A real tracker, for the same reason [dev_server] is real below: the
 # issue row hides itself when this section is absent, so without it the
@@ -215,6 +223,8 @@ TOML
   cat > "$FX/env.sh" <<ENV
 # source this to point a shell at the fixture instance
 export WT_CONFIG="$CONFIG"
+export WT_REPO_CONFIG="$CONFIG"
+export HOME="$FX/home"
 export WT_TMUX_SOCKET="$SOCKET"
 export WT_GITHUB=off WT_AUTOMATIONS=off WT_UPDATE=off WT_SKILLS=off
 ENV
@@ -348,7 +358,7 @@ case "$cmd" in
   probe)
     name="${1:-$PROBE}" w="${2:-200}" h="${3:-50}"
     [ -f "$CONFIG" ] || build
-    WT_CONFIG="$CONFIG" WT_TMUX_SOCKET="$SOCKET" \
+    HOME="$FX/home" WT_CONFIG="$CONFIG" WT_REPO_CONFIG="$CONFIG" WT_TMUX_SOCKET="$SOCKET" WT_NATIVE_BIN="$BINARY" \
       bash "$ROOT/scripts/tui-test.sh" start "$name" "$w" "$h"
     echo "snap:  scripts/tui-test.sh snap $name"
     echo "keys:  scripts/tui-test.sh keys $name j j Tab   (anything goes — it's sealed)"
@@ -362,6 +372,7 @@ case "$cmd" in
     echo "$FX/env.sh"
     ;;
   rm)
+    check_owned_directory
     bash "$ROOT/scripts/tui-test.sh" stop "$PROBE" >/dev/null 2>&1 || true
     tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
     rm -rf "$FX"

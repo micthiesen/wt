@@ -84,6 +84,45 @@ def dev_start_diagnostics(
             cwd=main_clone, env=env,
         ),
     }
+    pane = subprocess.run(
+        ["tmux", "-L", socket_name, "display-message", "-p", "-t", "=foo-dev:", "#{pane_pid}"],
+        cwd=main_clone, env=env, text=True, capture_output=True, timeout=5,
+    ).stdout.strip()
+    if pane.isdigit():
+        # A silent, live supervisor needs process state, not another readiness
+        # timeout. Show only descendants of this fixture's private pane.
+        processes = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid=,pgid=,stat=,comm="],
+            cwd=main_clone, env=env, text=True, capture_output=True, timeout=5,
+        ).stdout.splitlines()
+        owned = {int(pane)}
+        while True:
+            children = {
+                int(parts[0]) for line in processes
+                if len(parts := line.split(None, 4)) >= 4
+                and parts[0].isdigit() and parts[1].isdigit()
+                and int(parts[1]) in owned
+            }
+            if children.issubset(owned):
+                break
+            owned.update(children)
+        reports["pane process tree (pid ppid pgid state executable)"] = "\n".join(
+            line for line in processes if line.split() and int(line.split()[0]) in owned
+        )[-4000:]
+        if sys.platform == "darwin":
+            sample = scratch / "supervisor-sample.txt"
+            reports["supervisor sample command"] = bounded_diagnostic(
+                ["sample", pane, "1", "-file", str(sample)], cwd=main_clone, env=env,
+            )
+            if sample.exists():
+                reports["supervisor stack sample"] = sample.read_text(errors="replace")[:12_000]
+    for directory in (scratch / "server-pids", scratch / "cache/dev", scratch / "app-logs"):
+        if directory.is_dir():
+            for path in sorted(directory.iterdir())[:10]:
+                if path.is_file():
+                    with path.open("rb") as stream:
+                        stream.seek(max(0, path.stat().st_size - 2000))
+                        reports[f"fixture file {path.relative_to(scratch)}"] = stream.read(2000).decode("utf-8", errors="replace")
     destination = scratch / "dev-start-diagnostics.txt"
     destination.write_text(
         "\n\n".join(f"=== {name} ===\n{detail}" for name, detail in reports.items()),

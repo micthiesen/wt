@@ -41,6 +41,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BINARY="${WT_NATIVE_BIN:-$ROOT/target/debug/wt}"
 SOCK=wt-tui-test
 T() { tmux -L "$SOCK" "$@"; }
 
@@ -50,34 +51,32 @@ shift || true
 case "$cmd" in
   start)
     name="${1:-probe}" w="${2:-200}" h="${3:-50}"
+    [ -x "$BINARY" ] || { echo 'Build wt first: cargo build -p wt-app (or set WT_NATIVE_BIN)' >&2; exit 1; }
+    # Pass environment values as separate arguments, including paths with spaces.
+    # Never inherit a stale selector from the private tmux server's birth env.
+    environment=(
+      -e "WT_AUTOMATIONS=${WT_AUTOMATIONS:-off}" -e "WT_GITHUB=${WT_GITHUB:-off}"
+      -e "WT_UPDATE=${WT_UPDATE:-off}" -e "WT_SKILLS=${WT_SKILLS:-off}"
+      -e "WT_REPO_CONFIG=${WT_REPO_CONFIG:-}" -e "PATH=$PATH"
+    )
+    for variable in WT_CONFIG WT_TMUX_SOCKET HOME; do
+      if [ "${!variable+x}" ]; then environment+=(-e "$variable=${!variable}"); fi
+    done
     T kill-session -t "$name" 2>/dev/null || true
     T new-session -d -s "$name" -x "$w" -y "$h" \
-      -e WT_AUTOMATIONS="${WT_AUTOMATIONS:-off}" -e WT_GITHUB="${WT_GITHUB:-off}" \
-      -e WT_UPDATE="${WT_UPDATE:-off}" -e WT_SKILLS="${WT_SKILLS:-off}" \
-      ${WT_CONFIG:+-e WT_CONFIG="$WT_CONFIG"} \
-      ${WT_TMUX_SOCKET:+-e WT_TMUX_SOCKET="$WT_TMUX_SOCKET"} \
-      ${WT_DEBUG_THROW:+-e WT_DEBUG_THROW="$WT_DEBUG_THROW"} \
-      ${GH_TOKEN:+-e GH_TOKEN="$GH_TOKEN"} \
-      ${CLAUDE_CODE_FORCE_SESSION_PERSISTENCE:+-e CLAUDE_CODE_FORCE_SESSION_PERSISTENCE="$CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"} \
-      -c "$ROOT" "exec env -u BUN_INSPECT bun src/main.ts"
-    # `env -u BUN_INSPECT` for the reason bin/wt does it: the caller is
-    # normally a Claude session, whose environment binds that session's
-    # inspector socket, and bun hands it to every child — so wt died on
-    # EADDRINUSE and `start` reported only "never painted". Going through
-    # src/main.ts is what skips bin/wt's scrub. It has to be the command
-    # prefix, not a `-e` above: a tmux session's environment comes from
-    # the SERVER's birth environment, so an -e can be silently ignored by
-    # an already-running server.
-    # Wait for the first painted frame (bun cold start + cache hydrate).
+      "${environment[@]}" -c "$ROOT" env -u BUN_INSPECT "$BINARY"
+    # Wait for an actual frame. Shell startup errors are not a successful probe.
     for _ in $(seq 1 60); do
       out="$(T capture-pane -pt "$name" 2>/dev/null || true)"
       # tmux trims an untouched pane to an empty capture. Avoid stripping
       # whitespace from a painted Unicode frame here: bash's pattern
       # replacement becomes pathologically slow as the pane grows.
-      [ -n "$out" ] && { echo "started $name (${w}x${h})"; exit 0; }
+      if [[ "$out" == *worktrees* && "$out" == *Details* ]]; then
+        echo "started $name (${w}x${h})"; exit 0
+      fi
       sleep 0.25
     done
-    echo "ERROR: $name never painted (is another probe wedged? try stop-all)" >&2
+    echo "ERROR: $name never painted: $out" >&2
     exit 1
     ;;
   keys)
@@ -97,15 +96,11 @@ case "$cmd" in
     ;;
   stop)
     name="${1:-probe}"
-    # kill-session alone HUPs the pane process, which wt (pre-fix) and a
-    # wedged bun can survive headless — reap by pane pid to guarantee
-    # death. (33 leaked instances were once found burning CPU this way.)
+    # Capture only this probe's pid before removing its tmux session.
     pid="$(T display-message -pt "$name" '#{pane_pid}' 2>/dev/null || true)"
     T kill-session -t "$name" 2>/dev/null || true
-    # Poll ~3s before SIGKILL: wt's own hangup handler allows teardown
-    # up to 2.5s before force-exiting, and the harness must not shoot
-    # a probe that's mid-graceful-shutdown (that would skip the log
-    # flush and re-create the very leak class this reaping guards).
+    # Read-only probes have no accepted writes to drain. For a fixture that
+    # intentionally runs actions, wait for completion before stopping it.
     if [ -n "$pid" ]; then
       for _ in $(seq 1 15); do
         kill -0 "$pid" 2>/dev/null || exit 0
