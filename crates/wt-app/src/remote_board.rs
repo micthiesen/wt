@@ -236,6 +236,19 @@ fn compose(
                     for line in &mut row.details {
                         *line = wt_core::sanitize_terminal_text(line);
                     }
+                    for value in [
+                        &mut row.work_state,
+                        &mut row.blocked_on,
+                        &mut row.verify_steps,
+                        &mut row.git_state,
+                        &mut row.pr_state,
+                        &mut row.issue_status,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        *value = wt_core::sanitize_terminal_text(value);
+                    }
                     if let Some(error) = &error {
                         row.details.insert(
                             0,

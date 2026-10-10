@@ -160,6 +160,21 @@ pub struct RemovedHistoryRow {
     #[serde(default)]
     pub landed_on: Option<LandingKind>,
     pub automations_paused: bool,
+    /// Saved work state at removal, such as `ready`.
+    #[serde(default)]
+    pub work_state: Option<String>,
+    #[serde(default)]
+    pub blocked_on: Option<String>,
+    /// Saved verify-after-merge steps, and whether they were still owed.
+    #[serde(default)]
+    pub verify_steps: Option<String>,
+    #[serde(default)]
+    pub verify_owed: bool,
+    /// Git and PR outcome recorded at removal, such as `merged`.
+    #[serde(default)]
+    pub git_state: Option<String>,
+    #[serde(default)]
+    pub pr_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

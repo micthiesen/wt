@@ -205,8 +205,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
     );
 }
 
-/// What a removal record says about how the branch ended, parsed from the
-/// prepared `Label: value` detail lines.
+/// What a removal record says about how the branch ended.
 #[derive(Default)]
 struct Outcome<'a> {
     work: Option<WorkState>,
@@ -215,17 +214,11 @@ struct Outcome<'a> {
 }
 
 fn outcome(row: &crate::RemovedHistoryRow) -> Outcome<'_> {
-    let mut outcome = Outcome::default();
-    for line in &row.details {
-        if let Some(state) = line.strip_prefix("Work: ") {
-            outcome.work = work_state(state);
-        } else if let Some(state) = line.strip_prefix("Git: ") {
-            outcome.git = Some(state.trim());
-        } else if let Some(state) = line.strip_prefix("PR: ") {
-            outcome.pr = Some(state.trim());
-        }
+    Outcome {
+        work: row.work_state.as_deref().and_then(work_state),
+        git: row.git_state.as_deref().map(str::trim),
+        pr: row.pr_state.as_deref().map(str::trim),
     }
-    outcome
 }
 
 pub(crate) fn work_state(value: &str) -> Option<WorkState> {
@@ -475,53 +468,65 @@ fn record_lines(row: &crate::RemovedHistoryRow) -> Vec<Line<'static>> {
             Span::styled(format!("{} paused", glyphs::PAUSE), theme::fg(theme::WARN)),
         ]));
     }
-    for detail in &row.details {
-        let parsed = detail
-            .split_once(": ")
-            .filter(|(key, _)| key.len() <= 32 && !key.contains('.'));
-        let line = match parsed {
-            Some(("Work", state)) => {
-                let color = work_state(state).map_or(theme::FG, badges::work_state_color);
-                let glyph = work_state(state).map_or(glyphs::DOT_OUTLINE, badges::work_state_glyph);
-                Line::from(vec![
-                    label("work"),
-                    Span::styled(format!("{glyph}  {state}"), theme::fg(color)),
-                ])
-            }
-            Some(("Verification is still owed", steps)) => Line::from(vec![
-                label("verify"),
-                Span::styled(format!("still owed: {steps}"), theme::fg(theme::WARN)),
-            ]),
-            Some(("Blocked on", what)) => Line::from(vec![
-                label("blocked"),
-                Span::styled(what.to_owned(), theme::fg(theme::WARN)),
-            ]),
-            Some((key, value)) => {
-                let key = key.to_lowercase();
-                let key = key
-                    .strip_prefix("verify after merge")
-                    .map_or(key.as_str(), |_| "verify");
-                Line::from(vec![
-                    label(key),
-                    Span::styled(value.to_owned(), theme::fg(theme::FG)),
-                ])
-            }
-            None if detail.starts_with("Landed on") => Line::from(vec![
-                label("landed"),
-                Span::styled(
-                    detail
-                        .trim_start_matches("Landed on ")
-                        .trim_end_matches(" when removed")
-                        .to_owned(),
-                    theme::fg(theme::OK),
+    if let Some(state) = &row.work_state {
+        let parsed = work_state(state);
+        lines.push(Line::from(vec![
+            label("work"),
+            Span::styled(
+                format!(
+                    "{}  {state}",
+                    parsed.map_or(glyphs::DOT_OUTLINE, badges::work_state_glyph)
                 ),
-            ]),
-            None => Line::from(vec![
-                Span::raw(" ".repeat(KEY)),
-                Span::styled(detail.clone(), theme::fg(theme::FG_MID)),
-            ]),
-        };
-        lines.push(line);
+                theme::fg(parsed.map_or(theme::FG, badges::work_state_color)),
+            ),
+        ]));
+    }
+    if let Some(what) = &row.blocked_on {
+        lines.push(Line::from(vec![
+            label("blocked"),
+            Span::styled(what.clone(), theme::fg(theme::WARN)),
+        ]));
+    }
+    if let Some(steps) = &row.verify_steps {
+        lines.push(Line::from(vec![
+            label("verify"),
+            if row.verify_owed {
+                Span::styled(format!("still owed: {steps}"), theme::fg(theme::WARN))
+            } else {
+                Span::styled(steps.clone(), theme::fg(theme::FG))
+            },
+        ]));
+    }
+    if let Some(landed) = row.landed_on {
+        lines.push(Line::from(vec![
+            label("landed"),
+            Span::styled(
+                match landed {
+                    crate::LandingKind::Production => "production",
+                    crate::LandingKind::Base => "base",
+                },
+                theme::fg(theme::OK),
+            ),
+        ]));
+    }
+    for (name, value) in [
+        ("issue", &row.issue_status),
+        ("git", &row.git_state),
+        ("pr", &row.pr_state),
+    ] {
+        if let Some(value) = value {
+            lines.push(Line::from(vec![
+                label(name),
+                Span::styled(value.clone(), theme::fg(theme::FG)),
+            ]));
+        }
+    }
+    // Notes and anything else the host prepared read as prose.
+    for detail in &row.details {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(KEY)),
+            Span::styled(detail.clone(), theme::fg(theme::FG_MID)),
+        ]));
     }
     lines.push(Line::default());
     let mut keys = vec![("⏎", "restore")];
@@ -562,13 +567,12 @@ mod tests {
             details: details.into_iter().map(Into::into).collect(),
             ..Default::default()
         };
-        let mut landed = row("landed", "today", vec!["Work: ready"]);
+        let mut landed = row("landed", "today", vec![]);
         landed.landed_on = Some(LandingKind::Base);
-        let rows = vec![
-            landed,
-            row("closed", "today", vec!["PR: CLOSED"]),
-            row("plain", "yesterday", vec![]),
-        ];
+        landed.work_state = Some("ready".into());
+        let mut closed = row("closed", "today", vec![]);
+        closed.pr_state = Some("CLOSED".into());
+        let rows = vec![landed, closed, row("plain", "yesterday", vec![])];
         let (lines, count) = history_lines(&rows, 0, 1, 20, 40);
         assert_eq!(count, 3);
         let text = |line: &Line<'_>| -> String {

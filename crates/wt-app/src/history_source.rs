@@ -345,24 +345,19 @@ fn present(
             github_repo.map(|repo| format!("{repo}/issues/{issue}"))
         });
     let mut details = Vec::new();
-    if let Some(work) = &entry.work {
-        details.push(format!("Work: {}", clean(&work.state)));
-        if let Some(note) = &work.note {
-            details.push(clean(note));
-        }
-        if let Some(blocked) = &work.blocked_on {
-            details.push(format!("Blocked on: {}", clean(blocked)));
-        }
-        if let Some(steps) = &work.verify_after_merge {
-            details.push(format!("Verify after merge: {}", clean(steps)));
-        }
+    if let Some(note) = entry.work.as_ref().and_then(|work| work.note.as_ref()) {
+        details.push(clean(note));
     }
-    if let Some(git_state) = entry.extra.get("gitState").and_then(Value::as_str) {
-        details.push(format!("Git: {}", clean(git_state)));
-    }
-    if let Some(pr_state) = entry.extra.get("prState").and_then(Value::as_str) {
-        details.push(format!("PR: {}", clean(pr_state)));
-    }
+    let git_state = entry
+        .extra
+        .get("gitState")
+        .and_then(Value::as_str)
+        .map(clean);
+    let pr_state = entry
+        .extra
+        .get("prState")
+        .and_then(Value::as_str)
+        .map(clean);
     let saved_landing = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
         Some("production") => Some(true),
         Some("base") => Some(false),
@@ -376,29 +371,13 @@ fn present(
             wt_tui::LandingKind::Base
         }
     });
-    if production_landed == Some(true) {
-        details.push("Landed on production when removed".into());
-    } else if production_landed == Some(false) {
-        details.push("Landed on base when removed".into());
-    }
     let issue_status = issue_id
         .as_ref()
         .and_then(|id| statuses.get(id))
         .map(|status| clean(status));
-    if let Some(status) = &issue_status {
-        details.push(format!("Issue: {status}"));
-    }
-    if let Some(verify) = entry
-        .work
-        .as_ref()
-        .and_then(|work| work.verify_after_merge.as_ref())
-        && entry
-            .work
-            .as_ref()
-            .is_some_and(|work| work.state != "verified" && work.state != "dropped")
-    {
-        details.push(format!("Verification is still owed: {}", clean(verify)));
-    }
+    let verify_owed = entry.work.as_ref().is_some_and(|work| {
+        work.verify_after_merge.is_some() && work.state != "verified" && work.state != "dropped"
+    });
     let day_label = removal_day_label(&entry.removed_at);
     let age = wt_core::work_age(&entry.removed_at, now_ms());
     RemovedHistoryRow {
@@ -415,6 +394,20 @@ fn present(
             .unwrap_or_else(|| clean(&entry.slug)),
         removed_at: entry.removed_at,
         details,
+        work_state: entry.work.as_ref().map(|work| clean(&work.state)),
+        blocked_on: entry
+            .work
+            .as_ref()
+            .and_then(|work| work.blocked_on.as_deref())
+            .map(clean),
+        verify_steps: entry
+            .work
+            .as_ref()
+            .and_then(|work| work.verify_after_merge.as_deref())
+            .map(clean),
+        verify_owed,
+        git_state,
+        pr_state,
         issue_url,
         pr_url: entry.extra.get("prUrl").and_then(Value::as_str).map(clean),
         issue_status,
@@ -905,11 +898,7 @@ mod tests {
         assert_eq!(row.production_landed, Some(false));
         assert!(row.automations_paused);
         assert!(row.details.iter().any(|detail| detail == "saved note"));
-        assert!(
-            row.details
-                .iter()
-                .any(|detail| detail == "Verify after merge: check production")
-        );
+        assert_eq!(row.verify_steps.as_deref(), Some("check production"));
     }
 
     #[test]
