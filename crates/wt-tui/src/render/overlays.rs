@@ -234,8 +234,25 @@ fn hint_lines(hints: &[&Hint], width: u16) -> Vec<Line<'static>> {
 }
 
 /// A thumb on the modal's right border while content overflows.
-fn scrollbar(frame: &mut Frame<'_>, outer: Rect, border: Color, total: usize, offset: usize) {
-    let visible = outer.height.saturating_sub(2) as usize;
+/// A thumb on the frame's right border when `total` rows overflow the
+/// `visible` rows of the content area (which excludes the hint rows).
+/// Help headings read in lowercase like the pane titles, but a key named
+/// in parentheses keeps its case: `Performance (P)` is `performance (P)`.
+fn help_heading(line: &str) -> String {
+    match line.split_once(" (") {
+        Some((name, key)) => format!("{} ({key}", name.to_lowercase()),
+        None => line.to_lowercase(),
+    }
+}
+
+fn scrollbar(
+    frame: &mut Frame<'_>,
+    outer: Rect,
+    border: Color,
+    total: usize,
+    offset: usize,
+    visible: usize,
+) {
     if total <= visible {
         return;
     }
@@ -533,7 +550,14 @@ fn picker(frame: &mut Frame<'_>, area: Rect, picker: &PickerPrompt, primary: &st
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), body);
-    scrollbar(frame, outer, modal.border, rows.len(), offset);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        rows.len(),
+        offset,
+        body.height as usize,
+    );
 }
 
 /// An action's availability reason trails its name in parentheses; the
@@ -666,7 +690,14 @@ fn reviewers(frame: &mut Frame<'_>, area: Rect, picker: &ReviewerPrompt) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), body);
-    scrollbar(frame, outer, modal.border, picker.candidates.len(), offset);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        picker.candidates.len(),
+        offset,
+        body.height as usize,
+    );
 }
 
 fn yank(frame: &mut Frame<'_>, model: &Model, area: Rect, selected: usize) {
@@ -746,7 +777,14 @@ fn yank(frame: &mut Frame<'_>, model: &Model, area: Rect, selected: usize) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), body);
-    scrollbar(frame, outer, modal.border, choices.len(), offset);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        choices.len(),
+        offset,
+        body.height as usize,
+    );
 }
 
 // ── Confirmation ────────────────────────────────────────────────────────
@@ -906,7 +944,14 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
         .take(visible)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), body);
-    scrollbar(frame, outer, modal.border, total, skipped);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        total,
+        skipped,
+        body.height as usize,
+    );
 }
 
 // ── Logs and performance ────────────────────────────────────────────────
@@ -944,7 +989,14 @@ fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll:
             .collect()
     };
     frame.render_widget(Paragraph::new(rendered), body);
-    scrollbar(frame, outer, modal.border, lines.len(), *scroll);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        lines.len(),
+        *scroll,
+        body.height as usize,
+    );
 }
 
 fn log_style(line: &str) -> Style {
@@ -1056,7 +1108,14 @@ fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         .take(visible)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(shown), list);
-    scrollbar(frame, outer, modal.border, total, model.perf_scroll);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        total,
+        model.perf_scroll,
+        body.height as usize,
+    );
 }
 
 /// The fixed header (verdict and alarms) and the scrolling body of a
@@ -1105,7 +1164,7 @@ fn perf_view_lines(
     let mut lines = vec![
         perf_meter(
             "cpu (all)",
-            view.system_cpu / ceiling,
+            perf_cpu_fraction(view.system_cpu, ceiling),
             format!(
                 "{} of {} · {} cores",
                 perf_percent(view.system_cpu),
@@ -1116,7 +1175,7 @@ fn perf_view_lines(
         ),
         perf_meter(
             "cpu (wt)",
-            view.wt_cpu / ceiling,
+            perf_cpu_fraction(view.wt_cpu, ceiling),
             format!(
                 "{} · {} rss",
                 perf_percent(view.wt_cpu),
@@ -1176,7 +1235,7 @@ fn perf_view_lines(
     for group in &view.categories {
         lines.push(perf_meter(
             &group.label,
-            group.cpu / ceiling,
+            perf_cpu_fraction(group.cpu, ceiling),
             format!(
                 "{:>5}  {:>6}  {}",
                 perf_percent(group.cpu),
@@ -1192,7 +1251,7 @@ fn perf_view_lines(
         for group in &view.sessions {
             lines.push(perf_meter(
                 &group.label,
-                group.cpu / ceiling,
+                perf_cpu_fraction(group.cpu, ceiling),
                 format!(
                     "{:>5}  {:>6}  {}",
                     perf_percent(group.cpu),
@@ -1402,6 +1461,12 @@ fn perf_load_color(fraction: f64) -> Color {
     }
 }
 
+/// A CPU meter's fill. A share that its label rounds to `0%` draws empty,
+/// so the bar never claims load the number denies.
+fn perf_cpu_fraction(cpu: f64, ceiling: f64) -> f64 {
+    if cpu < 0.5 { 0.0 } else { cpu / ceiling }
+}
+
 fn perf_percent(value: f64) -> String {
     format!("{value:.0}%")
 }
@@ -1521,7 +1586,7 @@ fn keymap_blocks() -> Vec<HelpBlock> {
             .is_some_and(|next| split(next).is_some());
         if heading || blocks.is_empty() {
             blocks.push(HelpBlock {
-                title: line.trim().to_lowercase(),
+                title: help_heading(line.trim()),
                 grid: false,
                 items: Vec::new(),
             });
@@ -2148,7 +2213,14 @@ fn help(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         .take(visible)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(shown), list);
-    scrollbar(frame, outer, modal.border, total, model.help_scroll);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        total,
+        model.help_scroll,
+        list.height as usize,
+    );
 }
 
 #[cfg(test)]
@@ -2308,6 +2380,12 @@ mod tests {
         let (x, y) = find(&buffer, "Deploy").unwrap();
         assert_eq!(buffer[(x, y)].fg, theme::FG_DIM);
         assert!(text.contains("! / ⏎ pick"), "{text}");
+    }
+
+    #[test]
+    fn help_headings_keep_the_case_of_a_named_key() {
+        assert_eq!(help_heading("Performance (P)"), "performance (P)");
+        assert_eq!(help_heading("Sync notation"), "sync notation");
     }
 
     #[test]

@@ -1350,8 +1350,10 @@ fn section_summary(
             None => (glyphs::DOT_OUTLINE, theme::FG_DIM, "unset"),
         };
         states.push(Span::styled(glyph, theme::fg(color)));
+        // No-break spaces keep a glyph, its count, and its state together
+        // when the summary wraps.
         states.push(Span::styled(
-            format!("  {} {name}", entry.count),
+            format!("\u{a0}\u{a0}{}\u{a0}{name}", entry.count),
             theme::dim(),
         ));
     }
@@ -1507,27 +1509,38 @@ fn wrap_spans(spans: Spans, width: usize) -> Vec<Line<'static>> {
     if spans_width(&spans) <= width {
         return vec![Line::from(spans)];
     }
+    // Words break only at spaces; adjacent spans with none between them
+    // (a glyph and its count) stay one word.
+    let mut words: Vec<(bool, Spans)> = Vec::new();
+    for span in spans {
+        for (index, word) in span.content.split(' ').enumerate() {
+            if index > 0 || words.is_empty() {
+                words.push((index > 0, Vec::new()));
+            }
+            if !word.is_empty()
+                && let Some((_, fragments)) = words.last_mut()
+            {
+                fragments.push(Span::styled(word.to_owned(), span.style));
+            }
+        }
+    }
     let mut lines = Vec::new();
     let mut current: Spans = Vec::new();
     let mut used = 0;
-    for span in spans {
-        for (index, word) in span.content.split(' ').enumerate() {
-            let piece = if index == 0 {
-                word.to_owned()
-            } else {
-                format!(" {word}")
-            };
-            let cells = piece.width();
-            if used + cells > width && used > 0 {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                used = 0;
-                let trimmed = piece.trim_start().to_owned();
-                used += trimmed.width();
-                current.push(Span::styled(truncate_end(&trimmed, width), span.style));
-                continue;
-            }
-            used += cells;
-            current.push(Span::styled(piece, span.style));
+    for (spaced, fragments) in words {
+        let cells = spans_width(&fragments) + usize::from(spaced);
+        if used + cells > width && used > 0 {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            used = 0;
+        } else if spaced {
+            current.push(Span::raw(" "));
+            used += 1;
+        }
+        for fragment in fragments {
+            let room = width.saturating_sub(used);
+            let text = truncate_end(&fragment.content, room);
+            used += text.width();
+            current.push(Span::styled(text, fragment.style));
         }
     }
     if !current.is_empty() {
@@ -1879,6 +1892,29 @@ mod tests {
         (0..40)
             .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn wrapping_never_splits_adjacent_spans_or_no_break_spaces() {
+        let spans = vec![
+            Span::raw("3 worktrees"),
+            Span::raw(" · "),
+            Span::raw("●"),
+            Span::raw("\u{a0}\u{a0}12\u{a0}needs-human"),
+        ];
+        let lines = wrap_spans(spans, 20)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines.last().unwrap().trim(),
+            "●\u{a0}\u{a0}12\u{a0}needs-human"
+        );
     }
 
     #[test]

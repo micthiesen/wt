@@ -133,6 +133,8 @@ impl Model {
         // One cell of padding each side, as in the list.
         let width = width.saturating_sub(2).max(1);
         let target = self.output.target.clone();
+        // Line indexes where each attention entry begins.
+        let mut entry_starts = Vec::new();
         let (title, lines, identity, count) = match &target {
             OutputTarget::Attention => {
                 let seen_ms = self.board.attention_seen_ms;
@@ -152,6 +154,7 @@ impl Model {
                         marked = true;
                     }
                     fresh += usize::from(!seen);
+                    entry_starts.push(lines.len());
                     let text = if seen {
                         theme::dim()
                     } else {
@@ -316,7 +319,15 @@ impl Model {
             self.output.top = None;
         }
         self.output.stream_count = count;
-        let top = self.output.viewport(lines.len(), height);
+        let mut top = self.output.viewport(lines.len(), height);
+        // Following the newest entries, start at an entry rather than the
+        // wrapped tail of one, so the top row always carries its time.
+        if self.output.top.is_none()
+            && let Some(start) = entry_starts.into_iter().find(|start| *start >= top)
+        {
+            top = start;
+            self.output.last_top = start;
+        }
         let hint = if self.output.top.is_some() {
             " · scrolled"
         } else {
@@ -736,6 +747,34 @@ mod tests {
         let lines = model.output_view(5, 80).1;
         assert_eq!(lines.len(), 1);
         assert_eq!(text(&lines[0]), "00:00:01Z test new");
+    }
+
+    #[test]
+    fn following_attention_starts_at_an_entry_not_a_wrapped_tail() {
+        let line = |at_ms, text: &str| crate::AttentionLine {
+            at_ms,
+            source: "wt".into(),
+            text: text.into(),
+        };
+        let mut model = Model {
+            board: Arc::new(crate::Board {
+                attention: vec![
+                    line(
+                        1_000,
+                        "first entry wraps across several rows of a narrow pane",
+                    ),
+                    line(2_000, "second"),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = model.output_view(3, 30).1;
+        assert!(
+            text(&lines[0]).starts_with("00:00:02"),
+            "{:?}",
+            text(&lines[0])
+        );
     }
 
     #[test]
