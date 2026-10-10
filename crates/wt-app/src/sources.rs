@@ -9,45 +9,19 @@ use wt_runtime::{
 };
 use wt_tui::Board;
 
-use crate::{context::AppContext, freshness, inventory};
+use crate::context::AppContext;
 
 const GITHUB_MINIMUM: Duration = Duration::from_secs(10);
-const GITHUB_BACKSTOP: Duration = Duration::from_secs(180);
 
 pub struct BoardSources {
     pub board: SourceHandle<Board>,
     pub local: SourceHandle<Board>,
+    pub metadata: SourceHandle<crate::local_source::Metadata>,
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
-    let local = start_source(
-        scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(25),
-            minimum_interval: Duration::from_millis(100),
-        },
-        {
-            let context = context.clone();
-            move |cancel| {
-                let context = context.clone();
-                async move {
-                    inventory::board(
-                        &context.config,
-                        &context.repository,
-                        &context.database,
-                        &cancel,
-                    )
-                    .await
-                }
-            }
-        },
-    );
-    freshness::start(
-        scope,
-        context.config.clone(),
-        context.repository.clone(),
-        local.clone(),
-    );
+    let local_sources = crate::local_source::start(scope, context);
+    let local = local_sources.board;
     let enabled = std::env::var("WT_GITHUB").as_deref() != Ok("off");
     let github = start_source(
         scope,
@@ -65,6 +39,11 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
                     if !enabled || branches.is_empty() {
                         return Ok::<_, wt_github::GithubError>(GithubData::default());
                     }
+                    if let Some(cached) =
+                        crate::github_events_source::load(&context, &branches).await
+                    {
+                        return Ok(cached);
+                    }
                     let ci = has_workflows(&context.config.paths.main_clone).await;
                     let client = GithubClient::new(
                         context.processes,
@@ -76,6 +55,11 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
             }
         },
     );
+    let github = if enabled {
+        crate::github_events_source::overlay(scope, context, local.clone(), github)
+    } else {
+        github
+    };
     let activity = crate::activity_source::start(scope, context.config.paths.cache_root.clone());
     let board = project(
         scope,
@@ -83,9 +67,15 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         github,
         activity,
         enabled,
-        GITHUB_BACKSTOP,
+        crate::origin::backstop(context),
     );
-    BoardSources { board, local }
+    let board = crate::dev_source::overlay(scope, context, local.clone(), board);
+    let board = crate::origin::overlay(scope, context, board, local.clone());
+    BoardSources {
+        board,
+        local,
+        metadata: local_sources.metadata,
+    }
 }
 
 async fn has_workflows(root: &Path) -> bool {
@@ -117,7 +107,7 @@ async fn has_workflows(root: &Path) -> bool {
     }
 }
 
-fn branches(snapshot: &SourceSnapshot<Board>) -> Vec<String> {
+pub(crate) fn branches(snapshot: &SourceSnapshot<Board>) -> Vec<String> {
     let mut branches: Vec<_> = snapshot
         .data
         .iter()
@@ -144,6 +134,9 @@ fn project(
         let mut local_updates = local.subscribe();
         let mut github_updates = github.subscribe();
         let mut activity_updates = activity.subscribe();
+        local_updates.mark_changed();
+        github_updates.mark_changed();
+        activity_updates.mark_changed();
         let mut previous_branches = Vec::new();
         let mut interval =
             tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
@@ -351,6 +344,31 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn projection_consumes_data_published_before_it_subscribes() {
+        let scope = TaskScope::new();
+        let (local, local_publisher) = source_channel();
+        let (github, _) = source_channel();
+        let (activity, _) = source_channel();
+        publish_local(&local_publisher, "already available", "feature");
+        let source = project(
+            &scope,
+            local,
+            github,
+            activity,
+            false,
+            Duration::from_secs(180),
+        );
+        wait_for(&source, |snapshot| {
+            snapshot
+                .data
+                .as_ref()
+                .is_some_and(|board| board.rows[0].title == "already available")
+        })
+        .await;
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner};
+use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner, ProcessStream};
 
 #[tokio::test]
 async fn argv_cwd_stdin_and_nonzero_status_are_preserved() {
@@ -48,6 +48,56 @@ async fn output_limit_stops_a_producer_instead_of_allocating_without_bound() {
         .await
         .unwrap();
     assert!(output.status.success());
+}
+
+#[tokio::test]
+async fn streaming_drains_beyond_bounded_capture_and_reports_truncation() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let mut command =
+        CommandSpec::new("sh").args(["-c", "printf 'abcdefgh'; printf 'stderr-output' >&2"]);
+    command.output_limit = 3;
+    let output = ProcessRunner::default()
+        .run_streaming(command, &CancellationToken::new(), move |stream, chunk| {
+            observed.lock().unwrap().push((stream, chunk.to_vec()));
+        })
+        .await
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"abc");
+    assert_eq!(output.stderr, b"std");
+    assert!(output.stdout_truncated);
+    assert!(output.stderr_truncated);
+    let seen = seen.lock().unwrap();
+    let stdout: Vec<_> = seen
+        .iter()
+        .filter(|(stream, _)| *stream == ProcessStream::Stdout)
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    let stderr: Vec<_> = seen
+        .iter()
+        .filter(|(stream, _)| *stream == ProcessStream::Stderr)
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    assert_eq!(stdout, b"abcdefgh");
+    assert_eq!(stderr, b"stderr-output");
+}
+
+#[tokio::test]
+async fn streaming_observer_panic_returns_error_and_cleans_process_group() {
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        ProcessRunner::default()
+            .run_streaming(
+                CommandSpec::new("sh").args(["-c", "printf x; sleep 30 & wait"]),
+                &CancellationToken::new(),
+                |_, _| panic!("fixture observer panic"),
+            )
+            .await
+    })
+    .await
+    .expect("observer failure must not strand the process");
+    assert!(matches!(result, Err(ProcessError::ObserverPanicked { .. })));
 }
 
 #[tokio::test]

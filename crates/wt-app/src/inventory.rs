@@ -1,29 +1,23 @@
-use anyhow::Result;
-use tokio_util::sync::CancellationToken;
+use std::collections::BTreeSet;
+
+use serde_json::Value;
 use wt_config::Config;
 use wt_core::parse_work_status;
 use wt_tui::{Board, BoardRow};
-use wt_vcs::GitRepository;
+use wt_vcs::WorktreeSnapshot;
 
-use crate::database::Database;
-
-pub async fn board(
+pub fn board(
     config: &Config,
-    repository: &GitRepository,
-    database: &Database,
-    cancel: &CancellationToken,
-) -> Result<Board> {
-    let (inventory, state) = tokio::try_join!(
-        async { Ok::<_, anyhow::Error>(repository.inventory_status(cancel).await?) },
-        database.call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?))),
-    )?;
-    let (state, archived) = state;
+    inventory: &[WorktreeSnapshot],
+    state: &Value,
+    archived: &BTreeSet<String>,
+) -> Board {
     let mut rows = Vec::with_capacity(inventory.len());
     for snapshot in inventory
-        .into_iter()
+        .iter()
         .filter(|snapshot| !snapshot.worktree.is_main)
     {
-        let target = snapshot.worktree.target;
+        let target = &snapshot.worktree.target;
         let stored = &state["slugs"][target.slug()];
         let work = parse_work_status(&stored["work"]);
         let title = stored["manualTitle"]
@@ -59,11 +53,11 @@ pub async fn board(
                 }
             }
         }
-        if let Some(error) = snapshot.error {
-            details.push(format!("Git: {}", clean_text(&error)));
+        if let Some(error) = &snapshot.error {
+            details.push(format!("Git: {}", clean_text(error)));
         }
         rows.push(BoardRow {
-            key: wt_core::worktree_target_key(&target),
+            key: wt_core::worktree_target_key(target),
             slug: clean_text(target.slug()),
             title: clean_text(title),
             branch: clean_text(&target.branch),
@@ -93,11 +87,13 @@ pub async fn board(
             ..BoardRow::default()
         });
     }
-    Ok(Board {
+    let mut board = Board {
         name: clean_text(&config.repo_id),
         rows,
-        activity: Vec::new(),
-    })
+        ..Board::default()
+    };
+    crate::board_layout::prepare(&mut board, state, &config.branch.base, config.ui.sort);
+    board
 }
 
 /// Strip terminal controls while preserving text and line structure. Log and

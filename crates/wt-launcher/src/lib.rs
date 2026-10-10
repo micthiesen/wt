@@ -124,7 +124,7 @@ pub fn probe_matches(plan: &LaunchPlan) -> Result<bool, LaunchError> {
 
 fn probe_matches_timeout(plan: &LaunchPlan, timeout: Duration) -> Result<bool, LaunchError> {
     let expected = format!(
-        "{BOOT_PROBE_PREFIX}{}:{}",
+        "{BOOT_PROBE_PREFIX}{}:{}\n",
         plan.version.build_id(),
         plan.version.target()
     );
@@ -222,7 +222,7 @@ mod tests {
     #[cfg(unix)]
     fn fake_app(path: &std::path::Path, version: &VersionId, log: &std::path::Path, code: i32) {
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"{BOOT_PROBE_ARGUMENT}\" ]; then printf '%s' '{BOOT_PROBE_PREFIX}{}:{}'; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\nexit {code}\n",
+            "#!/bin/sh\nif [ \"$1\" = \"{BOOT_PROBE_ARGUMENT}\" ]; then printf '%s\\n' '{BOOT_PROBE_PREFIX}{}:{}'; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\nexit {code}\n",
             version.build_id(),
             version.target(),
             log.display()

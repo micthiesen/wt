@@ -52,6 +52,10 @@ three ways:
   correctness one.
 - `wt base set <slug> <ref>` / the TUI's `b` picker — backfill or change it by
   hand (record only; nothing is rebased).
+- `wt base clear <slug>` returns the recorded parent to trunk while retaining
+  the existing `baseSha`. That anchor still marks where the branch's own
+  commits begin, including after a squash merge. Setting a different explicit
+  base computes a new merge-base anchor.
 - restacks — a reconcile rewrites the parent when it lands; a replay advances
   the fork-point SHA.
 
@@ -131,7 +135,9 @@ automatically — the bundled `/restack` skill, which knows the full recovery
 loop, is sent to the failing worktree's harness session (cold-started if
 needed) with the bail context. From the CLI, run it yourself or resolve by
 hand, then re-run; the anchor logic self-heals around hand-rebases. Leftover
-backups: `wt restack prune-backups`.
+backups: `wt restack prune-backups --days <n>` removes recognized backups
+older than the cutoff; omitting `--days` removes all recognized restack
+backups. Unrecognized refs under `backup/` are kept.
 
 The `stack.parent_merged` automation trigger paired with `builtin:restack`
 makes the whole loop hands-off: when a parent merges under open members, wt

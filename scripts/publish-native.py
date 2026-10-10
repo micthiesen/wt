@@ -12,7 +12,10 @@ build = os.environ["WT_BUILD_ID"]
 if manifest["release_version"] != release or manifest["build_id"] != build:
     raise SystemExit("release manifest identity changed before publication")
 assets = [str(Path("dist") / entry["filename"]) for entry in manifest["artifacts"]]
-assets += ["dist/wt-release.json", "dist/SHA256SUMS"]
+assets += ["dist/wt-release.json", "dist/SHA256SUMS", "dist/install.sh"]
+for asset in assets:
+    if not Path(asset).is_file():
+        raise SystemExit(f"required release asset missing: {asset}")
 with tempfile.TemporaryDirectory(prefix="wt-release-") as scratch:
     notes = Path(scratch) / "notes.md"
     notes.write_text(f"Native wt binaries for macOS and Linux, built from `{build}`.\n\n"

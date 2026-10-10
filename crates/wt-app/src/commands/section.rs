@@ -110,7 +110,7 @@ async fn list(ctx: &AppContext, state: &Value, json_output: bool) -> Result<i32>
     Ok(0)
 }
 
-fn manual_sections(state: &Value) -> Vec<String> {
+pub(crate) fn manual_sections(state: &Value) -> Vec<String> {
     state
         .get("sectionsOrder")
         .and_then(Value::as_array)
@@ -216,28 +216,16 @@ async fn move_members(
             moving.insert(slug.clone());
         }
     }
-    let changed = moving
-        .iter()
-        .filter(|slug| {
-            state
-                .get("slugs")
-                .and_then(|s| s.get(*slug))
-                .and_then(|e| e.get("section"))
-                .and_then(Value::as_str)
-                != section.as_deref()
+    let to = section.clone();
+    let changed = ctx
+        .database
+        .call(move |store| {
+            Ok(store.move_worktrees_to_section(
+                &moving.into_iter().collect::<Vec<_>>(),
+                to.as_deref(),
+            )?)
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    for slug in &changed {
-        let key = slug.clone();
-        let to = section.clone();
-        ctx.database
-            .call(move |store| {
-                store.set_worktree_section(&key, to.as_deref())?;
-                Ok(())
-            })
-            .await?;
-    }
+        .await?;
     if changed.is_empty() {
         println!(
             "{} already in {}",
@@ -332,7 +320,7 @@ async fn remove(ctx: &AppContext, state: &Value, input: &str) -> Result<i32> {
     Ok(0)
 }
 
-fn resolve_section(state: &Value, input: &str) -> Option<String> {
+pub(crate) fn resolve_section(state: &Value, input: &str) -> Option<String> {
     let names = manual_sections(state);
     if names.iter().any(|name| name == input) {
         return Some(input.to_owned());
@@ -344,7 +332,7 @@ fn resolve_section(state: &Value, input: &str) -> Option<String> {
     (matches.len() == 1).then(|| matches[0].clone())
 }
 
-fn invalid_name(name: &str) -> Option<&'static str> {
+pub(crate) fn invalid_name(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
         Some("a section name can't be empty")
     } else if name.starts_with('\0') {

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
@@ -10,8 +11,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use wt_core::{WorktreeTarget, local_worktree_target};
+use wt_platform::lock::LockError;
 use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner};
 
 use crate::status::{GitStatus, common_git_env, read_status};
@@ -98,6 +101,14 @@ pub enum RepositoryError {
     },
     #[error("Git operation cancelled")]
     Cancelled,
+    #[error("fetch origin at {path}: {message}")]
+    FetchOrigin { path: PathBuf, message: String },
+    #[error("fetch origin lock at {path}: {source}")]
+    FetchLock {
+        path: PathBuf,
+        #[source]
+        source: LockError,
+    },
 }
 
 #[derive(Clone)]
@@ -106,6 +117,7 @@ pub struct GitRepository {
     runner: ProcessRunner,
     max_concurrent_status: NonZeroUsize,
     stage_issue_pattern: Option<Regex>,
+    pub(crate) fetch_flight: Arc<Mutex<Option<Arc<crate::origin::FetchFlight>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -126,7 +138,16 @@ impl GitRepository {
             runner,
             max_concurrent_status: NonZeroUsize::new(4).expect("four is nonzero"),
             stage_issue_pattern,
+            fetch_flight: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn origin_config(&self) -> &RepositoryConfig {
+        &self.config
+    }
+
+    pub(crate) fn origin_runner(&self) -> &ProcessRunner {
+        &self.runner
     }
 
     pub fn with_max_concurrent_status(mut self, limit: NonZeroUsize) -> Self {
@@ -630,7 +651,7 @@ async fn count_lines(path: &Path) -> Result<u64, std::io::Error> {
     }
 }
 
-async fn git_metadata_paths(path: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+pub(crate) async fn git_metadata_paths(path: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
     let dot_git = path.join(".git");
     let git_dir = match fs::read_to_string(&dot_git).await {
         Ok(pointer) => pointer.trim().strip_prefix("gitdir:").map(|raw| {

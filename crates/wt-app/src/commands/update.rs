@@ -103,7 +103,7 @@ pub async fn run(
     if !args.check {
         crate::updates::require_stable_launcher(&paths)?;
     }
-    let repository = crate::updates::default_repository()?;
+    let repository = crate::updates::repository(options)?;
     let result = crate::updates::update_once(
         paths,
         repository,

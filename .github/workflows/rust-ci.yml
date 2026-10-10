@@ -2,6 +2,10 @@ name: Rust CI
 
 on:
   workflow_call:
+    inputs:
+      build_release:
+        type: boolean
+        default: true
   workflow_dispatch:
   push:
     branches: [rusty]
@@ -70,9 +74,15 @@ jobs:
         run: brew list tmux || brew install tmux
       - run: cargo nextest run --workspace --locked --profile ci
       - run: cargo test --workspace --locked --doc
-      - run: cargo build -p wt-app --locked
+      - run: cargo build --workspace --bins --examples --locked
+        env:
+          WT_BUILD_ID: ${{ github.sha }}
+      - name: Verify bootstrap installation and native launcher recovery
+        run: python3 scripts/native-install-check.py
+      - name: Verify real native installation, update, rollback and failed release recovery
+        run: python3 scripts/native-release-check.py
       - name: Verify terminal liveness and filesystem refresh
-        run: python3 scripts/native-ui-check.py --binary target/debug/wt --output "${{ runner.temp }}/wt-native-ui"
+        run: python3 scripts/native-ui-check.py --binary target/debug/wt --sections --output "${{ runner.temp }}/wt-native-ui"
       - name: Verify shutdown with Git children in flight
         run: python3 scripts/native-ui-check.py --binary target/debug/wt --exit-signal TERM --output "${{ runner.temp }}/wt-native-signal"
       - name: Verify terminal handoff to a private tmux shell and back
@@ -80,9 +90,26 @@ jobs:
       - name: Verify detached lifecycle and cancellable CLI prompts
         env:
           WT_NATIVE_BIN: target/debug/wt
+          WT_GITHUB: 'off'
         run: python3 scripts/native-lifecycle-check.py
+      - name: Verify cleanup retains dirty, empty and unlanded work and owed verification
+        run: python3 scripts/native-cleanup-check.py
+      - name: Verify dev-server health, queueing, cancellation and teardown
+        run: python3 scripts/native-dev-check.py --binary target/debug/wt
+      - name: Verify durable action workers, streamed logs and descendant cleanup
+        run: python3 scripts/native-actions-check.py --binary target/debug/wt --output "${{ runner.temp }}/wt-native-actions"
+      - name: Verify worker protocol and exact SSH forwarding
+        run: python3 scripts/native-remote-check.py --binary target/debug/wt
+      - name: Verify state migration and diagnostic commands in isolated repositories
+        run: python3 scripts/native-command-check.py target/debug/wt
+      - name: Verify SST cleanup with isolated AWS and deployment commands
+        run: python3 scripts/native-stages-check.py --binary target/debug/wt
+      - name: Verify webhook authentication, snapshots and service ownership
+        if: runner.os == 'macOS'
+        run: python3 scripts/native-events-check.py --binary target/debug/wt
 
   build:
+    if: toJSON(inputs.build_release) != 'false'
     strategy:
       fail-fast: false
       matrix:

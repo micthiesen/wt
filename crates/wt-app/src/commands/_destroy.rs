@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use wt_core::worktree_target_key;
-use wt_lifecycle::{LifecycleService, RemovalRevision, RemoveOptions, ServiceConfig};
+use wt_lifecycle::{RemovalRevision, RemoveOptions};
 use wt_platform::process::CommandSpec;
 use wt_vcs::WorktreeRecord;
 
@@ -84,11 +84,7 @@ async fn start_remove_inner(
         .head_sha
         .as_ref()
         .context("cannot schedule removal without an inventory HEAD")?;
-    let service = LifecycleService::new(
-        ServiceConfig::from_config(&ctx.config),
-        (*ctx.repository).clone(),
-        ctx.processes.clone(),
-    );
+    let service = crate::lifecycle_ops::service(ctx)?;
     let revision = match options.expected_revision.clone() {
         Some(revision) => revision,
         None => {
@@ -260,11 +256,7 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
         bail!("unsupported destroy job operation");
     }
     let options = &job["options"];
-    let service = LifecycleService::new(
-        ServiceConfig::from_config(&ctx.config),
-        (*ctx.repository).clone(),
-        ctx.processes.clone(),
-    );
+    let service = crate::lifecycle_ops::service(ctx)?;
     let removed = service
         .remove_with_revision(
             &row.target,

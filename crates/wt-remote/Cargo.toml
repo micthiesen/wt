@@ -1,0 +1,23 @@
+[package]
+name = "wt-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+wt-config.workspace = true
+wt-core.workspace = true
+wt-platform.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

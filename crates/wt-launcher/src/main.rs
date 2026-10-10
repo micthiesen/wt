@@ -18,7 +18,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<u8, Box<dyn std::error::Error>> {
-    let executable = env::current_exe()?;
+    // macOS may retain the invoked PATH symlink in current_exe(). Resolve it
+    // before locating state beside the installed launcher.
+    let executable = env::current_exe()?.canonicalize()?;
     let root = executable
         .parent()
         .and_then(std::path::Path::parent)

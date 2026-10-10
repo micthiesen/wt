@@ -4,6 +4,21 @@ use tokio::sync::{mpsc, oneshot};
 /// persistence and refresh; the terminal never waits for an action to finish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiAction {
+    FoldSection {
+        key: String,
+        folded: bool,
+    },
+    PrepareSection {
+        key: String,
+    },
+    MoveSection {
+        key: String,
+        section: Option<String>,
+    },
+    RenameSection {
+        old: String,
+        new: String,
+    },
     CyclePrimary,
     SetTitle {
         key: String,
@@ -110,11 +125,14 @@ pub enum ConfirmAction {
 pub enum PickerAction {
     Status { key: String },
     Base { key: String },
+    Section { key: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextAction {
     Create,
+    NewSection { key: String },
+    RenameSection { old: String },
     IssueOverride { key: String },
     StatusNote { key: String, state: String },
     VerifyAfterMerge { key: String, state: String },

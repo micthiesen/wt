@@ -370,6 +370,19 @@ fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
 }
 
 #[test]
+fn action_target_slot_remains_config_compatible() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let text = format!(
+        "{}\n[[actions]]\nid='slot-command'\nname='Slot command'\nprompt='Continue current work'\ntarget='slot'\n",
+        minimal_config(root.path())
+    );
+    let config = Config::from_raw(toml_value(&text), &options(root.path(), &home, &[])).unwrap();
+    assert_eq!(config.actions[0].target, wt_config::ActionTarget::Slot);
+}
+
+#[test]
 fn environment_wins_for_config_path_and_tmux_socket() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

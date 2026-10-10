@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 use wt_runtime::SourceState;
 
 use crate::{Interaction, Model};
@@ -63,7 +64,30 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
             lines.extend(row.details.iter().map(|line| Line::from(line.as_str())));
             lines
         })
-        .unwrap_or_else(|| vec![Line::from("No worktrees")]);
+        .unwrap_or_else(|| match model.selected_section() {
+            Some(section) => {
+                let mut lines = vec![
+                    Line::styled(&section.title, Style::new().add_modifier(Modifier::BOLD)),
+                    Line::from(format!(
+                        "{} worktrees · Tab to {}",
+                        section.rows.len(),
+                        if section.folded { "expand" } else { "fold" }
+                    )),
+                    Line::default(),
+                ];
+                lines.extend(
+                    section
+                        .rows
+                        .iter()
+                        .filter_map(|&index| model.board.rows.get(index))
+                        .map(|row| {
+                            Line::from(format!("{}: {}  {}", row.slug, row.title, row.badge))
+                        }),
+                );
+                lines
+            }
+            None => vec![Line::from("No worktrees")],
+        });
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel("Details"))
@@ -87,11 +111,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
     );
     if let Interaction::Text(prompt) = &model.interaction {
         let label = prompt.prompt.as_str();
-        let room = footer.width.saturating_sub(label.len() as u16) as usize;
+        let label_width = label.width().min(u16::MAX as usize) as u16;
+        let room = footer.width.saturating_sub(label_width) as usize;
         let (text, cursor) = prompt.editor.viewport(room);
         frame.render_widget(Paragraph::new(format!("{label}{text}")), footer);
         if room > 0 {
-            frame.set_cursor_position((footer.x + label.len() as u16 + cursor, footer.y));
+            frame.set_cursor_position((footer.x + label_width + cursor, footer.y));
         }
     } else {
         let (footer_text, failed) = if let Some((message, failed)) = &model.toast {
@@ -156,10 +181,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
         )).block(panel("Rendering")), overlay);
     }
     if model.help {
-        let overlay = centered(area, 62, 18);
+        let overlay = centered(area, 68, 28);
         frame.render_widget(Clear, overlay);
         frame.render_widget(Paragraph::new(
-            "j / k, ↑ / ↓    Move cursor\ng / G            First / last worktree\nPgUp / PgDn      Half-page navigation\nSpace            Next row needing attention\nCtrl+J / Ctrl+K  Scroll details\nt                Edit title\ny                Copy branch, path or slug\nr                Refresh sources\nP                Rendering metrics\n?                Help\nq / Ctrl+C       Quit\n\nEsc / q / ? closes help"
+            "j / k, ↑ / ↓    Move cursor\ng / G            First / last item\nPgUp / PgDn      Half-page navigation\nSpace            Next row needing attention\nTab              Fold / expand section\nCtrl+D / Ctrl+U  Next / previous section\nCtrl+J / Ctrl+K  Scroll details\nn / N            Create / create on selected branch\no                Open editor\nd / c            Remove / clean (confirmation)\na                Archive / restore\nt / #            Edit title / issue identity\nl / L            File into section / rename section\nu / b            Work status / fork base\ni / I / p / s    Open issue / primary / PR / stage\nF10 / F11 / F12  Agent / shell / diff\nm                Manager session\n, / . / /        wt / main / dotfiles session\ny                Copy picker\nr                Refresh sources\nP                Rendering metrics\n?                Help\nq / Ctrl+C       Quit\n\nEsc / q / ? closes help"
         ).block(panel("wt keymap")).wrap(Wrap { trim: false }), overlay);
     }
     match &model.interaction {
@@ -203,12 +228,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
         }
         Interaction::Picker(picker) => {
             let height = (picker.options.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let visible = height.saturating_sub(2) as usize;
+            let offset = picker
+                .selected
+                .saturating_sub(visible / 2)
+                .min(picker.options.len().saturating_sub(visible));
             let overlay = centered(area, area.width.saturating_sub(4).min(72), height);
             frame.render_widget(Clear, overlay);
             let lines = picker
                 .options
                 .iter()
                 .enumerate()
+                .skip(offset)
                 .take(height.saturating_sub(2) as usize)
                 .map(|(index, option)| {
                     let chord = option.chord.map(|c| format!("{c} ")).unwrap_or_default();
@@ -225,12 +256,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
                 })
                 .collect::<Vec<_>>();
             frame.render_widget(
-                Paragraph::new(lines)
-                    .block(panel_owned(format!(
-                        "{} · Enter confirms · Esc cancels",
-                        picker.title
-                    )))
-                    .wrap(Wrap { trim: false }),
+                Paragraph::new(lines).block(panel_owned(format!(
+                    "{} · Enter confirms · Esc cancels",
+                    picker.title
+                ))),
                 overlay,
             );
         }
@@ -268,26 +297,50 @@ fn render_list(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     model.keep_selection_visible(inner.height as usize);
-    let lines: Vec<_> = model
-        .board
-        .rows
-        .iter()
-        .enumerate()
+    let lines: Vec<_> = (0..model.item_count())
         .skip(model.offset)
         .take(inner.height as usize)
-        .map(|(index, row)| {
+        .map(|index| {
             let selected = model.selected == Some(index);
             let style = if selected {
                 Style::new().bg(Color::DarkGray).fg(Color::White)
             } else {
                 Style::new()
             };
-            Line::from(vec![
-                Span::raw(if selected { "› " } else { "  " }),
-                Span::raw(&row.title),
-                Span::styled(format!("  {}", row.badge), Style::new().fg(Color::Cyan)),
-            ])
-            .style(style)
+            match model.item(index) {
+                Some(crate::model::VisualItem::Row(index)) => {
+                    let row = &model.board.rows[index];
+                    Line::from(vec![
+                        Span::raw(if selected { "› " } else { "  " }),
+                        Span::styled(&row.stack_prefix, Style::new().fg(MUTED)),
+                        Span::raw(&row.title),
+                        Span::styled(format!("  {}", row.badge), Style::new().fg(Color::Cyan)),
+                    ])
+                    .style(style)
+                }
+                Some(crate::model::VisualItem::Section(index)) => {
+                    let section = &model.board.sections[index];
+                    let attention = section
+                        .rows
+                        .iter()
+                        .filter(|&&index| model.board.rows[index].needs_attention)
+                        .count();
+                    let summary = if section.folded && attention > 0 {
+                        format!(" · {attention} need attention")
+                    } else {
+                        String::new()
+                    };
+                    Line::from(format!(
+                        "{} {} {} ({}){summary}",
+                        if selected { "›" } else { " " },
+                        if section.folded { "▸" } else { "▾" },
+                        section.title,
+                        section.rows.len()
+                    ))
+                    .style(style.fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                }
+                None => Line::default(),
+            }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
@@ -300,6 +353,42 @@ mod tests {
     use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn picker_keeps_late_selection_visible_after_terminal_shrinks() {
+        let mut model = Model {
+            interaction: Interaction::Picker(crate::model::PickerPrompt {
+                action: PickerAction::Base { key: "one".into() },
+                title: "Fork base".into(),
+                options: (0..30)
+                    .map(|index| PickerOption {
+                        value: Some(index.to_string()),
+                        label: format!("branch-{index:02} {}", "wide label ".repeat(10)),
+                        chord: None,
+                        note: None,
+                        verify_after_merge: None,
+                    })
+                    .collect(),
+                selected: 27,
+            }),
+            ..Default::default()
+        };
+        for (width, height) in [(100, 30), (30, 7), (20, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut model)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                text.contains("› branch-27"),
+                "selected option missing at {width}x{height}: {text}"
+            );
+        }
+    }
 
     #[test]
     fn unicode_and_long_details_render_at_narrow_and_tiny_sizes() {

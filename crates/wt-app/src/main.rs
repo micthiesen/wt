@@ -1,17 +1,29 @@
+mod actions;
 mod activity_source;
+mod board_layout;
 mod bootstrap;
 mod commands;
 mod context;
 mod controller;
 mod controller_actions;
 mod database;
+mod dev;
+mod dev_source;
 mod editor;
+mod events;
+mod fork_base;
 mod freshness;
+mod github_events_source;
 mod harness;
+mod install;
 mod inventory;
 mod lifecycle_ops;
+mod local_source;
 mod logging;
+mod origin;
 mod prompt;
+mod remote;
+mod section_actions;
 mod skills;
 mod sources;
 mod updates;
@@ -72,6 +84,41 @@ mod cli_tests {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Execute one acknowledged, durable action job.
+    #[command(name = "_action-worker", hide = true)]
+    ActionWorker(commands::_action_worker::ActionWorkerArgs),
+    /// Manage the optional GitHub webhook daemon.
+    Events(commands::events::EventsArgs),
+    /// Inspect SST stages and safely clean confirmed orphaned stages.
+    Stages(commands::stages::StagesArgs),
+    /// Migrate legacy state into the repository's durable native store.
+    State(commands::state::StateArgs),
+    /// Inspect or change the task attached to a worktree.
+    Issue(commands::issue::IssueArgs),
+    /// Diagnose repository and coding-agent session health.
+    Doctor(commands::doctor::DoctorArgs),
+    /// Show a compact fleet report.
+    Fleet(commands::fleet::FleetArgs),
+    /// Inspect wt process resource usage and machine load.
+    Perf(commands::perf::PerfArgs),
+    /// Manage a worktree's supervised development server.
+    Dev(commands::dev::DevArgs),
+    #[command(name = "_dev-supervise", hide = true)]
+    DevSupervisor(commands::dev::DevSupervisorArgs),
+    /// Install a verified native release without a source checkout.
+    Install(commands::install::InstallArgs),
+    /// Forward a command to the configured native SSH worker.
+    Remote(commands::remote::RemoteArgs),
+    /// Replay a stack onto updated parents without replaying squash-merged work.
+    Restack(commands::restack::RestackArgs),
+    #[command(name = "_hello", hide = true)]
+    Hello { args: Vec<String> },
+    #[command(name = "_snapshot", hide = true)]
+    Snapshot { args: Vec<String> },
+    #[command(name = "_session", hide = true)]
+    Session { args: Vec<String> },
+    #[command(name = "_remote", hide = true)]
+    WorkerDispatch { args: Vec<String> },
     /// Install or inspect checked native releases.
     Update(commands::update::UpdateArgs),
     /// Activate a previously installed native version.
@@ -156,7 +203,10 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     let options = LoadOptions::default();
-    let boot = if matches!(cli.command, Some(Command::Update(_) | Command::Rollback(_))) {
+    let boot = if matches!(
+        cli.command,
+        Some(Command::Install(_) | Command::Update(_) | Command::Rollback(_))
+    ) {
         None
     } else {
         bootstrap::BootAttempt::from_options(&options)?
@@ -196,6 +246,9 @@ fn run(cli: Cli) -> Result<i32> {
                 boot.confirm().await?;
             }
             match &cli.command {
+                Some(Command::Install(args)) => {
+                    return commands::install::run(&options, args, &token).await;
+                }
                 Some(Command::Update(args)) => {
                     return commands::update::run(&options, args, &token).await;
                 }
@@ -212,6 +265,9 @@ fn run(cli: Cli) -> Result<i32> {
                 tokio::task::spawn_blocking(move || Config::load(&config_options)).await??,
             );
             let _logging = logging::initialize(&config.paths.app_log_dir)?;
+            if let Some(Command::Hello { args }) = &cli.command {
+                return commands::_hello::run(&config, args);
+            }
             if cli.command.is_none() {
                 updates::startup_check(&options, &config, &token).await?;
             }
@@ -265,33 +321,7 @@ async fn run_application(
             processes,
             cancellation: token,
         };
-        let result = match command {
-            Command::Skills(args) => commands::skills::run(&context, args).await,
-            Command::Agent(args) => commands::agent::run(&context, args).await,
-            Command::Claude(args) => commands::claude::run(&context, args).await,
-            Command::Codex(args) => commands::codex::run(&context, args).await,
-            Command::Manager(args) => commands::manager::run(&context, args).await,
-            Command::Hold(args) => commands::hold::run(&context, args).await,
-            Command::Destroy(args) => commands::_destroy::run_worker(&context, args).await,
-            Command::New(args) => commands::new::run(&context, args).await,
-            Command::Remove(args) => commands::remove::run(&context, args).await,
-            Command::Cleanup(args) => commands::cleanup::run(&context, args).await,
-            Command::List(args) => commands::list::run(&context, args).await,
-            Command::Archive(args) => commands::archive::run(&context, args).await,
-            Command::Restore(args) => commands::restore::run(&context, args).await,
-            Command::Status(args) => commands::status::run(&context, args).await,
-            Command::Base(args) => commands::base::run(&context, args).await,
-            Command::Section(args) => commands::section::run(&context, args).await,
-            Command::Edge(args) => commands::edge::run(&context, args).await,
-            Command::Merge(args) => commands::merge::run(&context, args).await,
-            Command::Open(args) => commands::open::run(&context, args).await,
-            Command::Logs(args) => commands::logs::run(&context, args).await,
-            Command::Init(_)
-            | Command::Update(_)
-            | Command::Rollback(_)
-            | Command::Inventory
-            | Command::Version => unreachable!("handled before opening state"),
-        };
+        let result = dispatch_command(&context, command).await;
         database.shutdown().await?;
         return result;
     }
@@ -306,11 +336,18 @@ async fn run_application(
         cancellation: token.clone(),
     };
     skills::startup_check(&context).await?;
+    let events_context = context.clone();
+    scope.spawn(async move {
+        if let Err(error) = events::reconcile_at_startup(&events_context).await {
+            tracing::warn!(%error, "GitHub events service reconciliation failed");
+        }
+    });
     let sources = sources::start(scope, &context);
     let controller = controller::start(
         scope,
         context,
         sources.local,
+        sources.metadata,
         sources.board.clone(),
         controller_port,
     );
@@ -325,6 +362,100 @@ async fn run_application(
     shutdown?;
     result.context("terminal")?;
     Ok(0)
+}
+
+async fn dispatch_command(context: &context::AppContext, command: &Command) -> Result<i32> {
+    match command {
+        Command::ActionWorker(args) => commands::_action_worker::run(context, args).await,
+        Command::Events(args) => commands::events::run(context, args).await,
+        Command::Stages(args) => commands::stages::run(context, args).await,
+        Command::State(args) => commands::state::run(context, args).await,
+        Command::Issue(args) => commands::issue::run(context, args).await,
+        Command::Doctor(args) => commands::doctor::run(context, args).await,
+        Command::Fleet(args) => commands::fleet::run(context, args).await,
+        Command::Perf(args) => commands::perf::run(context, args).await,
+        Command::Dev(args) => commands::dev::run(context, args).await,
+        Command::DevSupervisor(args) => commands::dev::run_supervisor_command(context, args).await,
+        Command::Skills(args) => commands::skills::run(context, args).await,
+        Command::Agent(args) => commands::agent::run(context, args).await,
+        Command::Claude(args) => commands::claude::run(context, args).await,
+        Command::Codex(args) => commands::codex::run(context, args).await,
+        Command::Manager(args) => commands::manager::run(context, args).await,
+        Command::Hold(args) => commands::hold::run(context, args).await,
+        Command::Destroy(args) => commands::_destroy::run_worker(context, args).await,
+        Command::New(args) => commands::new::run(context, args).await,
+        Command::Remove(args) => commands::remove::run(context, args).await,
+        Command::Cleanup(args) => commands::cleanup::run(context, args).await,
+        Command::List(args) => commands::list::run(context, args).await,
+        Command::Archive(args) => commands::archive::run(context, args).await,
+        Command::Restore(args) => commands::restore::run(context, args).await,
+        Command::Status(args) => commands::status::run(context, args).await,
+        Command::Base(args) => commands::base::run(context, args).await,
+        Command::Section(args) => commands::section::run(context, args).await,
+        Command::Edge(args) => commands::edge::run(context, args).await,
+        Command::Merge(args) => commands::merge::run(context, args).await,
+        Command::Open(args) => commands::open::run(context, args).await,
+        Command::Logs(args) => commands::logs::run(context, args).await,
+        Command::Remote(args) => commands::remote::run(context, args).await,
+        Command::Restack(args) => commands::restack::run(context, args).await,
+        Command::Hello { args } => commands::_hello::run(&context.config, args),
+        Command::Snapshot { args } => commands::_snapshot::run(context, args).await,
+        Command::Session { args } => commands::_session::run(context, args).await,
+        Command::WorkerDispatch { args } => Box::pin(commands::_remote::run(context, args)).await,
+        Command::Version => {
+            println!(
+                "wt {} ({}, {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("WT_BUILD_ID"),
+                env!("WT_TARGET")
+            );
+            Ok(0)
+        }
+        Command::Inventory => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &context
+                        .repository
+                        .inventory_status(&context.cancellation)
+                        .await?
+                )?
+            );
+            Ok(0)
+        }
+        Command::Install(args) => {
+            commands::install::run(&LoadOptions::default(), args, &context.cancellation).await
+        }
+        Command::Init(args) => {
+            commands::init::run(&LoadOptions::default(), args, &context.cancellation).await
+        }
+        Command::Update(args) => {
+            commands::update::run(&LoadOptions::default(), args, &context.cancellation).await
+        }
+        Command::Rollback(args) => commands::rollback::run(&LoadOptions::default(), args).await,
+    }
+}
+
+pub(crate) async fn dispatch_worker_args(
+    context: &context::AppContext,
+    argv: &[String],
+) -> Result<i32> {
+    let cli =
+        match Cli::try_parse_from(std::iter::once("wt".to_owned()).chain(argv.iter().cloned())) {
+            Ok(cli) => cli,
+            Err(error) => {
+                let code = error.exit_code();
+                error.print()?;
+                return Ok(code);
+            }
+        };
+    let command = cli
+        .command
+        .context("remote invocation requires a command; use _session for interactive sessions")?;
+    if matches!(command, Command::WorkerDispatch { .. } | Command::Remote(_)) {
+        anyhow::bail!("recursive remote forwarding is not supported");
+    }
+    dispatch_command(context, &command).await
 }
 
 mod signals {

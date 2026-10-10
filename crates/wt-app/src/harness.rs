@@ -375,6 +375,18 @@ pub async fn ui_session(
     key: Option<String>,
     target: SessionTarget,
 ) -> Result<PreparedSession> {
+    ui_session_with_harness(context, key, target, None).await
+}
+
+/// Prepare a session with an explicit harness choice. Remote session handoff
+/// uses this when the controller's selected harness differs from the worker's
+/// local primary; ordinary local UI sessions keep using `ui_session`.
+pub async fn ui_session_with_harness(
+    context: &AppContext,
+    key: Option<String>,
+    target: SessionTarget,
+    selected_harness: Option<HarnessId>,
+) -> Result<PreparedSession> {
     let app = AppHarness::new(context);
     let default_diff_base = format!("origin/{}", context.config.branch.base);
     let (slug, cwd, managed_name, kind, diff_base) = match target {
@@ -524,7 +536,7 @@ pub async fn ui_session(
         | SessionTarget::Main
         | SessionTarget::WtSource
         | SessionTarget::Dotfiles => {
-            let harness_id = app.primary();
+            let harness_id = selected_harness.unwrap_or_else(|| app.primary());
             let request = HarnessSpawnRequest {
                 worktree_path: cwd.clone(),
                 slug: slug.clone(),

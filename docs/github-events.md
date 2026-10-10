@@ -1,151 +1,59 @@
 # GitHub webhooks
 
-Without this, PR / checks / merge-queue badges stay fresh via a local `.git/refs` watcher, a 3-minute PR-fetch poll, a 3-minute `git fetch origin` backstop, and manual `r`. That works, but everything that happens on the GitHub side (CI finishing, reviews landing, someone commenting on your PR) waits out the poll — up to three minutes, and the attention feed's comment lines wait with it.
+The optional events daemon uses a repository webhook to refresh the same batched GitHub query used by wt. It does not build pull request state from webhook payloads. A signed delivery is only a signal to fetch current state through the user's existing `gh` authentication.
 
-Add a `[github.events]` section and run the small local daemon to have GitHub **push** updates instead: badges flip within a second or two of the event, far fewer `gh` calls, and the daemon keeps a warm snapshot so a freshly opened TUI already shows current state. Config keys: [configuration.md](configuration.md#githubevents--optional-webhook-daemon).
-
-It's a plain repo webhook — no GitHub App, no OAuth.
-
-**What it is not: a fix for GitHub 5xx errors.** The daemon re-runs the *same* batched `fetchGithub` the TUI uses, so it changes how OFTEN the query runs, never what one costs. A fleet large enough to cross GitHub's per-query execution ceiling failed identically with the daemon configured, just less frequently. Query cost is bounded by chunking instead (see [architecture.md](architecture.md#state--data-flow)), which the daemon inherits for free.
+Without `[github.events]`, wt uses its normal GitHub refresh backstop and no daemon is installed or started.
 
 ## Setup
 
-```sh
-wt events install     # writes a launchd agent + generates the HMAC secret
-wt events start       # load the daemon
-wt events restart     # reconcile and reload it on the current wt build
-wt events status      # liveness, last delivery, snapshot age
+Add an events section to the active wt configuration:
+
+```toml
+[github.events]
+host = "127.0.0.1"
+port = 8765
+secret_file = "~/.config/wt/github-webhook-secret"
 ```
 
-The launch agent preserves the selected repository config (`WT_REPO_CONFIG`),
-so settings in the repository’s `.wt.toml` also load when macOS starts the daemon
-outside that repository.
+Then run:
 
-`install` prints exactly what to paste into the repo's **Settings → Webhooks**: the payload URL, content type `application/json`, the generated secret, and the event checklist (`pull_request`, `pull_request_review`, `pull_request_review_thread`, `issue_comment`, `check_suite`, `check_run`, `status`, `merge_group`, `push`). `issue_comment` feeds the details-pane conversation, the attention feed's "someone commented on your PR" lines ([tui.md](tui.md)), and, for a checklist-mode [`[review_bot]`](configuration.md#review_bot--the-bot-review-track), the summary comment + checkbox ticks that drive its badge.
+```sh
+wt events secret   # create a private secret file, if it does not exist
+wt events install  # write this repository's per-user launchd agent
+wt events start
+wt events status
+```
 
-The daemon listens on `[github.events].host` (default loopback); map a public HTTPS URL to it however you route traffic into your network — a tunnel or reverse proxy on the same machine forwarding to localhost is the simple case. If a reverse proxy on a *different* host has to reach this machine, set `host` to a LAN IP or `0.0.0.0`; the HMAC secret is then the only auth boundary, so keep the listener on a trusted network.
+`wt events secret` does not replace an existing secret. If `secret_file` is not configured, it prints a new secret for you to add as `secret` under `[github.events]`. `install` requires a persistent secret before it writes the agent. Secret files are created with owner-only permissions.
 
-## Security model
+Configure a GitHub repository webhook to send `application/json` to `https://<your-domain>/webhook`, forwarding to the configured host and port. Select `pull_request`, `pull_request_review`, `pull_request_review_thread`, `issue_comment`, `check_suite`, `check_run`, `status`, `merge_group`, and `push`. A reverse proxy or tunnel can expose the HTTPS endpoint. If another machine must reach the listener, bind to a trusted LAN address; the HMAC secret is the request authentication boundary.
 
-- Every delivery is verified against `X-Hub-Signature-256` (HMAC, constant-time compare). Unsigned or mis-signed requests are rejected.
-- Webhook payloads are a **refresh signal, never a data source**: the daemon only ever re-runs the same read-only `gh` fetch the TUI already uses. A forged payload's worst case is an extra fetch.
-- `wt events secret` rotates or shows the secret; `wt events uninstall` removes the launchd agent.
+The daemon accepts only the configured event types, limits the request body to 5 MiB, bounds concurrent requests and queued deliveries, and rejects requests whose `X-Hub-Signature-256` does not match the raw request body. HMAC verification uses a constant-time tag check. When its bounded queue fills, it coalesces overflow into one conservative refresh signal instead of retaining more request bodies.
 
-Omit the `[github.events]` section entirely and nothing changes — the daemon subcommands just refuse to run, and the TUI stays in watcher + backstop mode. If the daemon dies mid-session, `backstop_poll_ms` (default 10 minutes) bounds how stale the badges can get.
+## Files and freshness
 
-## The daemon's build, and why the TUI checks it
+The daemon writes three files under `<cache_root>/events/`:
 
-`github.json` holds **parsed** `PullRequest` objects, not the raw GraphQL
-payload, so a snapshot carries the writing build's parsing rules with it. The
-writer is a launchd agent with `KeepAlive`, which means it survives every hot
-update and can be arbitrarily older than the TUI reading it. Nothing said so:
-`wt events status` reported "running", the fetches succeeded, and the TUI
-preferred the snapshot over its own fetch, so a daemon started weeks earlier
-quietly overrode every parsing fix the TUI had.
+- `github.json` contains the camelCase GitHub snapshot, covered branches, Unix-millisecond `updatedAt`, and the writer's `writerSha`.
+- `github.touch` changes after a successful snapshot so an active TUI can notice fresh data.
+- `state.json` contains daemon PID, port, build, start/event/fetch timestamps, accepted event count, and the most recent refresh error.
 
-That cost two visible wrong badges on one day, both on a TUI that already held
-the fix: a red checks badge on a PR whose only failure was a superseded
-`CANCELLED` job (the daemon predated the rollup dedupe), and a stale review-bot
-badge on a PR whose delta review named the head sha (it predated `coversHead`).
-Both read as wt bugs against a working GitHub.
+These files are separate from the SQLite query cache. A successful snapshot replaces the previous snapshot atomically. A failed branch inventory or GitHub query leaves the last good snapshot in place and records the error. Cache reads are size-bounded; malformed snapshots are ignored, and malformed daemon state is reported as unreadable rather than treated as proof that no daemon exists.
 
-Two halves, in `core/build-id.ts`:
+Snapshots include local worktree branches and configured remote worker branches. An unavailable remote inventory keeps its last known branch set and makes event relevance unknown, so a branch-scoped event is not discarded on incomplete information. Pull request, review, status, merge queue, and unscoped events refresh regardless of branch match. Plain issue comments are ignored; pull request comments are not.
 
-- **The snapshot is stamped** with `writerSha`, the source clone's HEAD.
-  `snapshotForBranches` refuses a snapshot from a different build and falls back
-  to a live fetch. It narrates once on `log.attention.*` only when the live
-  daemon's state is also on a different build: a restarted daemon writes its
-  current state before its warm-up fetch replaces the previous snapshot, and
-  that normal handoff must stay quiet. A **missing** stamp is
-  refused too — only a build predating the field writes one, so absence is the
-  diagnosis rather than a missing input. It fails *open* only when the reader
-  cannot identify itself at all (wt is not a git checkout), where there is no
-  version question to answer.
-- **The daemon stands down** when it notices the source clone move under it,
-  checked at the top of each fetch. `KeepAlive` means exiting *is* the upgrade.
-  Nothing is lost: the delivery that woke it re-arrives as the restarted
-  daemon's warm-up fetch.
+The scheduler coalesces bursts for 1.5 seconds and enforces a 10-second minimum between fetch starts. The floor is measured from the prior fetch start, so a slow query consumes part of the interval. Continuous webhook traffic cannot postpone a pending fetch indefinitely. If the bounded request queue fills, one coalesced refresh preserves correctness.
 
-`wt events status` prints a `build` line when the two disagree, so "running" and
-"up to date" stop being the same answer.
+The TUI uses a cached snapshot only when it has the current build stamp, is no more than 90 seconds old, and covers every requested branch. Otherwise it performs its normal GitHub fetch. The periodic refresh remains the recovery path for missed webhook deliveries.
 
-Every interactive startup reconciles the installed launchd agent unless
-`WT_UPDATE=off`. Repositories without `[github.events]` skip reconciliation
-before inspecting daemon state or acquiring a lock. Enabled repositories also
-skip agents whose ownership cannot be established: the installed repository
-and global config paths and daemon log paths must match the caller's config.
-A live PID or matching build is not ownership evidence.
+## Native launchd service
 
-An owned, stale or stopped daemon is restarted before the TUI starts. The
-restart child receives explicit absolute `WT_CONFIG` and `WT_REPO_CONFIG`
-selectors and keeps the caller's working directory, so the wt source clone
-cannot accidentally become its configuration source. Restart failures retain
-all stderr lines (or stdout when stderr is empty) and do not block the TUI.
+The launch agent is `~/Library/LaunchAgents/com.wt.events.plist`. It invokes the stable native launcher at `~/.local/share/wt/bin/wt` (or the configured `WT_INSTALL_ROOT`), not a source checkout, Bun, or a version-specific release directory. The plist freezes absolute global and repository config selectors, the current `PATH` used to find `git` and `gh`, and logs under `<cache_root>/events/`.
 
-The identity is the committed sha, so an **uncommitted** edit moves the code
-without moving it — a daemon started mid-edit still looks current. That gap is
-deliberate: closing it means a `git status` per read, and a daemon is stale by
-spanning commits, which is what a long-lived process does by construction.
+There is one `com.wt.events` agent per user. `start`, `stop`, `restart`, and `uninstall` require the plist's config selectors and log paths to prove that it belongs to the active repository. Unknown ownership fails closed. `install` also refuses to overwrite a foreign or unidentifiable plist. These mutations share a per-user lock.
 
-## The launchd agent execs `bin/wt`, not the interpreter
+When wt starts with events enabled, it checks an existing owned agent in the background. A live process on the current build is left alone. A stopped process or an older build is unloaded, rewritten to use the current stable launcher and absolute config selectors, and reloaded. A foreign agent is left untouched. `wt events restart` performs the same explicit reconciliation and waits for a new live process on the current build.
 
-`wt events install` used to bake `process.execPath` into the plist. On Homebrew
-that is a **version-specific** path (`/opt/homebrew/Cellar/bun/1.3.14/bin/bun`),
-and `brew upgrade bun` deletes it.
+Launchd management is available on macOS. `wt events serve` can also run in the foreground on other platforms for diagnostics or deployment under another service manager. It exits on SIGTERM/SIGINT and does not install a service there.
 
-The failure this produces has no output anywhere. launchd never execs anything,
-so `StandardOutPath` and `StandardErrorPath` both stay empty; `launchctl list`
-shows a bare exit **78**; and a daemon that is *already running* survives the
-upgrade untouched, so the agent reads healthy for as long as nobody restarts
-it. It is dead the first time anybody does — which on this machine was seven
-days later, and only because the daemon was being restarted to fix something
-else.
-
-So the program is `bin/wt`, which resolves `bun` off the PATH the plist bakes
-(and brings the `env -u BUN_INSPECT` scrub with it). bun's own directory moves
-to the END of that PATH: it is a fallback for a bun that is not on PATH, never
-the primary.
-
-A source fix cannot repair a plist an older version already wrote, so
-`wt events start` and `wt events restart` **reconcile** — they rewrite the
-plist whenever the stored one differs from what the current environment would
-generate, and say so, naming the missing program when that is why. `wt events
-status` reports an `agent cannot exec` line for the same condition. `restart`
-also waits for a new live daemon PID before returning, so a launchd load that
-never reaches daemon readiness is reported as a failure.
-
-There is still one agent per user (`com.wt.events`), not one per repository.
-Start, stop, restart, and uninstall refuse agents owned by a different or
-unidentifiable configuration. Run those commands from the owning repository.
-`install` explicitly replaces ownership. All five mutations share a per-user
-lock, and ownership is checked inside it before any unload or write; a startup
-check cannot authorize overwriting an agent installed by another repository
-while the restart child was launching. New plists persist absolute config
-selectors; legacy global-only plists are accepted only when their effective
-global config and log paths establish the same owner.
-
-## Fetch cadence
-
-A delivery does not map to a fetch. Two constraints compose in `scheduleFetch`:
-
-- **`FETCH_DEBOUNCE_MS` (1.5s)** collapses deliveries that arrive together. One CI step storm is a dozen `check_run` events at the same instant, and they are worth exactly one refetch.
-- **`MIN_FETCH_INTERVAL_MS` (10s)** floors the sustained rate, measured from the previous fetch's *start* so a slow query eats into the floor rather than adding to it.
-
-The floor exists because the debounce alone does not bound anything under a *stream*. Measured on an 18-branch fleet with a merge queue running CI: 130 accepted deliveries in 180s produced 13 full refetches at ~30 GraphQL points each, a pace of 7,760 points/hour against a 5,000/hour limit. Nothing was failing, but the budget was on track to run out before its reset window, and a rate-limited fetch is the one failure `fetchGithub` deliberately never retries (see [architecture.md](architecture.md#state--data-flow)).
-
-The 10-second floor favors faster check updates during sustained activity. The first delivery after a quiet spell still schedules a fetch in 1.5s; subsequent deliveries wait for the floor. This allows up to three times the fetch rate of the previous 30-second floor, so sustained activity can consume the GitHub API budget faster. Rate-limit errors remain non-retryable.
-
-Cadence is auditable from the daily app log: each `refetched after webhook` line carries `sinceLastMs`.
-
-**Trap for anything that adds another fetch path here.** The trailing re-run after a burst that lands mid-fetch must go through `scheduleFetch`, never straight back into `runFetch`. Running it immediately is unbounded, and it also *masks* a starvation bug in the debounce: deliveries arriving closer together than the debounce window re-arm the timer indefinitely (simulated at this fleet's measured ~43/min, the naive rule defers past 151s and climbing). `nextFetchAt` is the single scheduling rule for exactly that reason — it refuses to push out an already-pending timer, and `daemon.test.ts` pins both halves.
-
-## Remote worktree branches
-
-Both relevance filtering and snapshot fetches use the union of local worktree
-branches and the configured SSH worker's inventory, deduplicated by branch.
-Remote-only check runs and pushes therefore trigger the same marker updates
-as local ones. Branch membership is cached for up to 10 seconds between fetches.
-If remote inventory fails, the daemon retains its last known remote branches,
-continues refreshing local branches, and treats event scope as unknown rather
-than discarding potentially relevant deliveries. The next successful inventory
-read replaces the retained remote set, including removing departed branches.
+The daemon refreshes origin before each GitHub query, but a failed `git fetch origin --prune` is logged and does not prevent the GitHub refresh. Updating safe local base/`keep_fresh` refs remains owned by the shared repository freshness service and is not part of this daemon's refresh operation.

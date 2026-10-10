@@ -12,5 +12,5 @@ pub use actions::{
     TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UrlKind, action_channel,
 };
 pub use editor::LineEditor;
-pub use model::{Board, BoardRow, Interaction, Model};
+pub use model::{Board, BoardRow, BoardSection, Interaction, Model};
 pub use terminal::run;

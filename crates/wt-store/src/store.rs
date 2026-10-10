@@ -345,6 +345,53 @@ impl Store {
         Ok(())
     }
 
+    /// Merge a legacy import with current repository data under one write
+    /// transaction. Reading before `import_repository_snapshot` would lose a
+    /// concurrent process's status/title write between the read and commit.
+    /// `None` distinguishes a repository with no prior state from defaults.
+    pub fn merge_repository_snapshot(
+        &mut self,
+        archived: &BTreeSet<String>,
+        merge: impl FnOnce(Option<WtState>) -> Result<WtState, StoreError>,
+    ) -> Result<(), StoreError> {
+        let id = self.identity.id.clone();
+        let db = self.writable_db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT data FROM repository_state WHERE repo_id = ?1 LIMIT 1",
+                [&id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = stored
+            .map(|text| {
+                let parsed: serde_json::Value = serde_json::from_str(&text)?;
+                Ok::<_, StoreError>(crate::mutations::normalize_state(
+                    crate::migrate_wt_state(parsed).value,
+                ))
+            })
+            .transpose()?;
+        let merged = merge(current)?;
+        let encoded = serde_json::to_string(&merged)?;
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO repository_state (repo_id, data, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(repo_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![id, encoded, now],
+        )?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT OR IGNORE INTO archived_worktrees (repo_id, worktree_key, archived_at) VALUES (?1, ?2, ?3)",
+            )?;
+            for key in archived {
+                insert.execute(params![id, key, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Inspect candidate state databases without mutating or requiring that
     /// they belong to this store's repository.
     pub fn read_foreign_repository_rows(

@@ -21,6 +21,13 @@ const REMOVED_MAX_AGE_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 const MAX_REVIEW_REQUEST_DISMISSALS: usize = 200;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BaseUpdate {
+    Updated,
+    Stale,
+    Cycle,
+}
+
 pub(crate) fn empty_state() -> WtState {
     json!({
         "version": crate::CURRENT_WT_STATE_VERSION,
@@ -306,6 +313,49 @@ impl Store {
             object_mut(state, "remoteLayouts").insert(key.to_owned(), Value::Object(layout));
             prune_sections_order(state);
             Ok(((), true))
+        })
+    }
+
+    /// File a merge unit atomically. Re-read each layout in the transaction so
+    /// unrelated concurrent title/status writes survive and an already-filed
+    /// member keeps its position.
+    pub fn move_worktrees_to_section(
+        &mut self,
+        keys: &[String],
+        section: Option<&str>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut changed = Vec::new();
+            for key in keys {
+                let collection = if key.starts_with("@remote/") {
+                    "remoteLayouts"
+                } else {
+                    "slugs"
+                };
+                let mut layout = state[collection][key]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                if layout.get("section").and_then(Value::as_str) == section {
+                    continue;
+                }
+                if let Some(section) = section {
+                    ensure_section(state, section);
+                }
+                let order = max_layout_order(state, section).map_or(0.0, |max| max + 1.0);
+                layout.insert(
+                    "section".to_owned(),
+                    section.map_or(Value::Null, |s| json!(s)),
+                );
+                layout.insert("order".to_owned(), number(order));
+                object_mut(state, collection).insert(key.clone(), Value::Object(layout));
+                changed.push(key.clone());
+            }
+            if !changed.is_empty() {
+                prune_sections_order(state);
+            }
+            let mutated = !changed.is_empty();
+            Ok((changed, mutated))
         })
     }
 
@@ -772,6 +822,44 @@ impl Store {
             }
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
             Ok(((), true))
+        })
+    }
+
+    /// Set a user-chosen base only while the observed anchor still matches.
+    /// Check the complete parent chain within the write transaction, so two
+    /// simultaneous edits cannot each create one half of a cycle.
+    pub fn set_slug_base_checked(
+        &mut self,
+        slug: &str,
+        expected: (Option<&str>, Option<&str>),
+        branch: &str,
+        sha: &str,
+        branches: &std::collections::BTreeMap<String, String>,
+    ) -> Result<BaseUpdate, StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            if (
+                entry.get("baseBranch").and_then(Value::as_str),
+                entry.get("baseSha").and_then(Value::as_str),
+            ) != expected
+            {
+                return Ok((BaseUpdate::Stale, false));
+            }
+            let mut cursor = branch;
+            let mut visited = BTreeSet::new();
+            while let Some(parent_slug) = branches.get(cursor) {
+                if parent_slug == slug || !visited.insert(cursor) {
+                    return Ok((BaseUpdate::Cycle, false));
+                }
+                let Some(next) = state["slugs"][parent_slug]["baseBranch"].as_str() else {
+                    break;
+                };
+                cursor = next;
+            }
+            entry.insert("baseBranch".into(), json!(branch));
+            entry.insert("baseSha".into(), json!(sha));
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((BaseUpdate::Updated, true))
         })
     }
 

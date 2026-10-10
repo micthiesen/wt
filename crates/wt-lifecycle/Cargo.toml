@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 globset.workspace = true
 libc.workspace = true
 regex.workspace = true
@@ -16,8 +17,10 @@ tokio.workspace = true
 tokio-util.workspace = true
 wt-config.workspace = true
 wt-core.workspace = true
+wt-dev.workspace = true
 wt-platform.workspace = true
 wt-store.workspace = true
+wt-sst.workspace = true
 wt-vcs.workspace = true
 
 [dev-dependencies]

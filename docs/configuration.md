@@ -366,7 +366,7 @@ Omit the whole section to disable SST awareness entirely — the stage row, `wt 
 | `state_bucket` | **yes** | — | S3 bucket holding SST's Pulumi state. |
 | `state_prefix` | **yes** | — | Key prefix within the bucket (SST v3 convention: `<state_prefix><stage>.json`). |
 | `aws_profile` | **yes** | — | AWS CLI profile with read access to the state bucket. |
-| `auto_regen_paths` | no | `["sst-env.d.ts"]` | Files in the main clone that `sst` runs regenerate; restored before fetches so they never show as dirt. |
+| `auto_regen_paths` | no | `["sst-env.d.ts"]` | Tracked generated paths in the main clone, restored before fast-forwarding. Paths are literal and relative to the clone; staged edits are preserved and prevent the fast-forward. |
 
 ## `[dev_server]` — optional per-worktree dev server
 

@@ -8,7 +8,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use wt_config::Config;
 use wt_runtime::{SourceHandle, SourceState, TaskScope};
 use wt_tui::Board;
-use wt_vcs::GitRepository;
+use wt_vcs::{GitRepository, WorktreeSnapshot};
 
 const BACKSTOP: Duration = Duration::from_secs(60);
 
@@ -17,17 +17,27 @@ pub fn start(
     config: Arc<Config>,
     repository: Arc<GitRepository>,
     source: SourceHandle<Board>,
+    git: SourceHandle<Vec<WorktreeSnapshot>>,
+    metadata: SourceHandle<crate::local_source::Metadata>,
 ) {
     let cancellation = scope.token();
     scope.spawn(async move {
-        let observed = source.clone();
+        let observed_git = git.clone();
+        let observed_metadata = metadata.clone();
+        let state_db = config.paths.state_db.clone();
+        let checkout_roots = [config.paths.main_clone.clone(), config.paths.worktree_root.clone()];
         let watcher = tokio::task::spawn_blocking(move || {
             notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                Ok(event) if relevant(&event) => { observed.refresh(); }
+                Ok(event) if relevant(&event) => {
+                    let (git, metadata) = invalidations(&event.paths, &state_db, &checkout_roots);
+                    if git { observed_git.refresh(); }
+                    if metadata { observed_metadata.refresh(); }
+                }
                 Ok(_) => {},
                 Err(error) => {
                     tracing::warn!(%error, "filesystem notification lost; refreshing source");
-                    observed.refresh();
+                    observed_git.refresh();
+                    observed_metadata.refresh();
                 }
             })
         }).await;
@@ -76,7 +86,7 @@ pub fn start(
                         keys = next;
                     }
                 }
-                _ = backstop.tick() => { source.refresh(); reconcile = true; }
+                _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
             }
         }
     });
@@ -162,4 +172,76 @@ fn relevant(event: &Event) -> bool {
                 .unwrap_or_default();
             !name.ends_with(".lock") && !matches!(name, "FETCH_HEAD" | "ORIG_HEAD")
         })
+}
+
+/// SQLite writes and WAL/checkpoint churn only invalidate presentation state.
+/// Other files in the shared state directory belong to other sources/repos.
+fn invalidations(
+    paths: &[PathBuf],
+    state_db: &std::path::Path,
+    checkout_roots: &[PathBuf],
+) -> (bool, bool) {
+    if paths.is_empty() {
+        return (true, true);
+    }
+    let mut git = false;
+    let mut metadata = false;
+    for path in paths {
+        let sqlite = path == state_db
+            || ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+                let mut name = state_db.as_os_str().to_os_string();
+                name.push(suffix);
+                path.as_os_str() == name
+            });
+        if sqlite {
+            metadata = true;
+        } else if path.parent() != state_db.parent()
+            || checkout_roots.iter().any(|root| path.starts_with(root))
+        {
+            git = true;
+        }
+    }
+    (git, metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_events_do_not_rescan_git_and_unrelated_shared_files_do_not_refresh() {
+        let db = std::path::Path::new("/state/wt.sqlite");
+        for path in [
+            "/state/wt.sqlite",
+            "/state/wt.sqlite-wal",
+            "/state/wt.sqlite-shm",
+        ] {
+            assert_eq!(invalidations(&[path.into()], db, &[]), (false, true));
+        }
+        assert_eq!(
+            invalidations(&["/state/another.sqlite-wal".into()], db, &[]),
+            (false, false)
+        );
+        assert_eq!(
+            invalidations(&["/repo/.git/index".into()], db, &[]),
+            (true, false)
+        );
+        assert_eq!(
+            invalidations(
+                &["/state/wt.sqlite-wal".into(), "/repo/file".into()],
+                db,
+                &[]
+            ),
+            (true, true)
+        );
+        assert_eq!(invalidations(&[], db, &[]), (true, true));
+        assert_eq!(
+            invalidations(
+                &["/repo/file".into()],
+                std::path::Path::new("/repo/state.sqlite"),
+                &["/repo".into()]
+            ),
+            (true, false)
+        );
+    }
 }

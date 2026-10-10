@@ -1,11 +1,11 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
-use wt_lifecycle::{LifecycleService, RemoveOptions, ServiceConfig};
+use wt_lifecycle::RemoveOptions;
 
-use crate::{commands::resolve::resolve_named_worktree, context::AppContext};
+use crate::{commands::resolve::resolve_named_worktree, context::AppContext, lifecycle_ops};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RemoveArgs {
@@ -68,16 +68,20 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
         return Ok(1);
     }
 
+    let plans = lifecycle_ops::plan(ctx, vec![record.clone()]).await?;
+    if let Some(warning) = plans.warning {
+        eprintln!("warning: {warning}");
+    }
+    let plan = plans
+        .rows
+        .into_iter()
+        .next()
+        .context("worktree disappeared")?;
+
     let mut destroy_stage = args.destroy_stage;
     if args.no_destroy_stage {
         destroy_stage = false;
-    } else if !args.destroy_stage
-        && is_our_stage_deployed(
-            Path::new(&record.target.path),
-            &record.target.stage,
-            &ctx.config.stage.prefix,
-        )
-    {
+    } else if !args.destroy_stage && plan.destroy_stage {
         if args.yes {
             destroy_stage = true;
         } else if std::io::stdin().is_terminal() {
@@ -104,29 +108,26 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
             super::_destroy::DestroyOptions {
                 force: args.force,
                 delete_branch: !args.keep_branch,
-                landed: false,
+                landed: plan.landed,
                 destroy_stage,
-                expected_revision: None,
+                expected_revision: Some(plan.revision),
             },
         )
         .await?;
         println!("✓ removal queued for {} (job {job})", record.target.slug());
         return Ok(0);
     }
-    let service = LifecycleService::new(
-        ServiceConfig::from_config(&ctx.config),
-        (*ctx.repository).clone(),
-        ctx.processes.clone(),
-    );
+    let service = lifecycle_ops::service(ctx)?;
     let result = service
-        .remove(
+        .remove_with_revision(
             &record.target,
             RemoveOptions {
                 force: args.force,
                 delete_branch: !args.keep_branch,
-                landed: false,
+                landed: plan.landed,
                 destroy_stage,
             },
+            &plan.revision,
             &ctx.cancellation,
         )
         .await;
@@ -157,30 +158,15 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
     }
 }
 
-fn safe_stage(path: &Path, prefix: &str) -> Result<String, String> {
-    if prefix.is_empty() {
-        return Err("personal stage prefix is not configured".into());
-    }
-    let pin = std::fs::read_to_string(path.join(".sst/stage"))
-        .map_err(|_| "no .sst/stage pinned".to_owned())?;
-    let stage = pin.trim();
-    if !stage.starts_with(prefix) {
-        return Err(format!(
-            "pinned stage {stage:?} does not carry personal prefix {prefix:?}"
-        ));
-    }
-    Ok(stage.to_owned())
-}
-
 pub(crate) fn is_our_stage_deployed(path: &Path, stage: &str, prefix: &str) -> bool {
-    safe_stage(path, prefix).is_ok_and(|pinned| pinned == stage)
-        && std::fs::read_to_string(path.join(".sst/outputs.json"))
-            .is_ok_and(|contents| contents.contains(stage))
+    matches!(wt_sst::observe_local_deployment(path, prefix),
+        wt_sst::DeploymentObservation::Deployed {stage: pinned} if pinned == stage)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_our_stage_deployed, safe_stage};
+    use super::is_our_stage_deployed;
+    use wt_sst::safe_pinned_stage;
 
     #[test]
     fn stage_safety_requires_owned_pin_and_matching_outputs() {
@@ -188,7 +174,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".sst")).unwrap();
         std::fs::write(dir.path().join(".sst/stage"), "personal-eng-4-a1b2\n").unwrap();
         assert_eq!(
-            safe_stage(dir.path(), "personal-").unwrap(),
+            safe_pinned_stage(dir.path(), "personal-").unwrap(),
             "personal-eng-4-a1b2"
         );
         std::fs::write(
@@ -204,6 +190,16 @@ mod tests {
         assert!(!is_our_stage_deployed(
             dir.path(),
             "production",
+            "personal-"
+        ));
+        std::fs::write(
+            dir.path().join(".sst/outputs.json"),
+            "broken personal-eng-4-a1b2",
+        )
+        .unwrap();
+        assert!(!is_our_stage_deployed(
+            dir.path(),
+            "personal-eng-4-a1b2",
             "personal-"
         ));
     }

@@ -49,9 +49,10 @@ status, base, section, edge, lifecycle, merge, open and destroy-log commands.
 The terminal has a shared Unicode line editor and an asynchronous command
 channel. Local inventory and batched GitHub reads run in independent source
 lanes; a projection prepares their combined board without network work on the
-input thread. The updater and stable native launcher have isolated fixture
-coverage; config-free app boot probing and confirmation are wired before state
-migration. Release CI, installation and real update flows remain integration work.
+input thread. The updater and stable native launcher pass isolated installation,
+update and rollback flows with the actual binaries. Config-free app boot probing
+and confirmation run before state migration. Hosted release publication and
+download remain owed.
 
 The current UI slice adds create, remove/cleanup confirmation, archive, status,
 fork-base, issue and URL actions, plus explicit terminal handoff for tmux
@@ -69,7 +70,8 @@ mid-edit compiler output is not recorded as verification.
 Native release packaging validates the compiled binary's exact build/target
 identity and creates deterministic archives. Four packaging tests pass,
 including tampered archives and missing platform refusal. GitHub release
-workflow files now exist but have not yet run remotely. The build matrix covers
+CI is green on Linux and macOS at `cb34d62`; the four-target hosted release
+workflow has not yet run. The release build matrix covers
 Apple/Intel macOS and x86/ARM Linux; Linux release builders use Ubuntu 22.04 for
 the glibc baseline. Test release tags are separate from automatic preview offers.
 
@@ -141,6 +143,106 @@ established. The TypeScript tree remains unchanged as the behavior reference.
   no agent sessions. Each worktree has its own commit and eight are dirty.
 
 Additional integration evidence:
+
+- The expanded workspace gate passes formatting, strict workspace Clippy,
+  dependency boundaries, all 365 tests across 29 binaries, and doctest targets
+  (nextest run `0cd5d1a9-671c-4208-b935-e7df12cbe91e`). Packaging's four Python
+  tests and both native workflows' actionlint checks pass. Subsequent review
+  fixes still receive scoped checks and real fixtures before the next checkpoint.
+- Origin maintenance now keeps generated-file restoration, ref fast-forwarding,
+  and lockfile-gated dependency installation under one repository lock. Tests
+  cover newly introduced lockfiles, no reinstall after code-only pulls, staged
+  generated-file preservation, invalid root paths, and install-failure warnings.
+  Shared package-manager detection serves both new worktrees and main-clone sync.
+- Independent events review found stale remote-coverage authority, unbounded
+  pre-header HTTP connections, and ignored service unload failures. Coverage
+  errors now preserve old names while marking coverage unknown. HTTP has a
+  connection cap, header size/count/deadline limits, and owned connection drain;
+  partial-header clients cannot block shutdown. The launchd repair checks actual
+  job removal and recorded PID exit before changing its plist. The expanded
+  isolated fixture passes failure, malformed job tables, live-PID drain timeout,
+  already-unloaded success, webhook authentication and durable snapshots.
+- The native action fixture passes with a private tmux server: absolute config
+  selectors, live stdout/stderr logs, durable completion preserving unknown
+  metadata, duplicate-run rejection, and child reaping on cancellation. Actions
+  and automation evaluation/ledger are implemented as services; application
+  dispatch, palettes and source integration remain outstanding.
+- The rebuilt checkpoint binary passes cleanup retention and the section-enabled
+  PTY fixture again: 1.16 ms navigation during two-second Git work, zero idle
+  frames, zero Git scans for a title edit, section filing/renaming, durable writes
+  across immediate quit, and clean shutdown. Evidence:
+  `/tmp/wt-rust-native-ui-checkpoint-1/result.json`. Incremental-only cache cleanup
+  reduced Cargo output from 28 GiB to 13 GiB, preserving compiled output and test
+  evidence; multiple compilation profiles still account for the remaining size.
+- The native dev fixture passes against a private tmux server and real temporary
+  HTTP process: health readiness, capacity refusal, queue timeout/cancellation,
+  child and session reaping, failed stop-hook protection, checkout removal, and
+  crash output. Cancellation completed in 1.2 ms in this run. Independent
+  follow-up review closed all three earlier supervisor/queue findings. Promoted
+  waiter ordering is unit-tested; a simultaneous live promotion race is not yet
+  exercised.
+- Native issue, migration, doctor, fleet and perf commands pass an isolated
+  Git/HOME fixture. Migration covers shared legacy JSON, stranded SQLite
+  namespaces, archives, unknown fields, current-value precedence, harness
+  registries, durable backups and idempotence. Source migration locks now live
+  alongside the shared source so different repository lock directories cannot
+  authorize conflicting pruning writes.
+- SST stage inspection and cleanup pass fake-AWS/pnpm tests, including unknown
+  cloud state and a stage claimed by a new worktree between cleanup candidates.
+  Unknown, default-personal and foreign stages never reach removal. No live
+  AWS mutation was used. Lifecycle removal now shares native stage-pin validation
+  and rejects the protected default stage, malformed names and invalid outputs.
+- Sections, stack rails, folding, identity-preserving selection and narrow
+  picker scrolling pass the 18-test TUI suite and the real-PTY liveness fixture
+  (`/tmp/wt-rust-native-ui-sections-1/result.json`). This run measured 1.08 ms
+  injected-key-to-output during delayed Git, idle silence and accepted-write
+  drain. The subsequent local-source split passes its source regression and
+  `/tmp/wt-rust-native-ui-state-lane-1/result.json`: a real title edit starts zero
+  Git status scans, while navigation during delayed Git takes 1.12 ms. The source
+  test additionally preserves usable state edits and last-good Git facts during
+  a failed Git fetch; the error remains visible.
+- Section filing, new-section creation, sticky picker targets and folded-header
+  renaming now pass controller/model tests. Local and remote layout batches use
+  one durable transaction and preserve unrelated fields. The real terminal
+  fixture `/tmp/wt-rust-native-ui-filing-2/result.json` verifies filing, neighbor
+  selection, Ctrl+D section navigation, rename, zero Git scans for title edits,
+  and write-on-quit draining; delayed-Git navigation measured 1.20 ms.
+- The native event daemon passes seven crate tests, strict Clippy and an isolated
+  binary fixture with fake launchd tools plus a real HTTP listener. Evidence
+  covers persistent secrets, foreign-agent ownership refusal, legacy owned
+  agent migration, stale-build restart, signed requests, snapshot state, SIGTERM
+  and uninstall. TUI cache tests additionally cover an old network reply arriving
+  after a newer daemon snapshot and reject stale, incomplete or foreign-build
+  cache data. These are fixture checks, not mutation of the user's live daemon.
+
+- Checkpoint `cb34d62` is green in Linux/macOS native tests, optimized builds,
+  and strict lint: https://github.com/micthiesen/wt/actions/runs/38003329901.
+  The preceding run exposed concurrent first-open contention while changing
+  SQLite journal mode. A bounded retry covers that idempotent operation only;
+  fresh-database contention, reader release, and deadline tests pass.
+- Native installation, update, rollback, declined-build handling, checksum
+  rejection and pending-build recovery pass through a loopback release API
+  using the real app and launcher (`scripts/native-release-check.py`). It also
+  checks that an ordinary configuration error confirms executable health,
+  preserves unknown updater fields, and does not roll back. This exposed and
+  fixed the launcher's identity-probe newline and macOS PATH symlink handling.
+  Hosted release publication and download remain owed.
+- `scripts/native-cleanup-check.py` uses five real Git worktrees. It removes
+  the merged clean checkout, retains dirty files, an empty branch, unlanded
+  commits and an owed post-merge check, retains removal history, and proves a
+  repeated sweep is idempotent. Detached lifecycle checks remain green.
+- The native worker protocol, snapshot and exact remote argv forwarding passed
+  `scripts/native-remote-check.py` through a temporary unprivileged loopback
+  OpenSSH server. The fixture owns its keys, configuration and process group.
+  This proves native transport without a remote source checkout; remote TUI
+  board, cache and action integration remain owed.
+- Independent stack/installer review found two races. Force pushes now pin the
+  originally observed remote OID even if a concurrent fetch updates shared
+  tracking refs. Fork-base edits lock both child and live parent in lexical
+  order and revalidate after waiting, preventing assignment to a removed
+  parent. Real-Git regressions cover both races and opposite-edge deadlock/
+  cycle prevention. Installer migration tests preserve the old checkout and
+  archive its user files before replacing a recognized PATH link.
 
 - First remote CI run at `dcf2b8c`: Linux and macOS tests and release builds
   passed. Linux strict lint found a nested-if warning in its `/proc` process

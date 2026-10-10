@@ -296,6 +296,7 @@ pub enum ActionTarget {
     Headless,
     Session,
     Manager,
+    Slot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

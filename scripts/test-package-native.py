@@ -44,9 +44,15 @@ class ReleaseTests(unittest.TestCase):
                 info = json.load(tar.extractfile(tar.getmembers()[-1]))
                 self.assertEqual(info["build_id"], SHA)
                 self.assertEqual(info["target"], target)
+        args.installer = self.root / "install-source.sh"
+        args.installer.write_text("#!/bin/sh\necho fixture\n")
         packaging.manifest(args)
         result = json.loads((args.output / "wt-release.json").read_text())
         self.assertEqual(len(result["artifacts"]), 4)
+        installer = args.output / "install.sh"
+        self.assertEqual(installer.read_bytes(), args.installer.read_bytes())
+        self.assertIn(f"{packaging.digest(installer)}  install.sh\n",
+                      (args.output / "SHA256SUMS").read_text())
 
     def test_missing_platform_and_changed_archive_never_publish_manifest(self):
         args = self.args("aarch64-apple-darwin")

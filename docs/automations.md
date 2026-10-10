@@ -2,7 +2,9 @@
 
 `[[automations]]` bindings run an action (or a built-in flow) automatically when a condition holds for a worktree — CI failed, a review requested changes, a stack parent merged. Nothing is automated by default; the section is strictly opt-in. Config fields and examples: [configuration.md](configuration.md#automations--optional-strictly-opt-in).
 
-This page explains the runtime semantics — what "fires", when, and why it won't fire twice. (For contributors: the engine is `core/automations.ts` for the persistent ledger, `tui/automation-rules.ts` for pure condition evaluation, and `tui/hooks/useAutomations.ts` for the queue + dispatch loop.)
+This page explains the runtime semantics — what "fires", when, and why it won't fire twice. The native implementation separates pure condition evaluation and queue reconciliation in `wt-automations` from the durable ledger and typed action execution in `wt-automations` / `wt-actions`; the app supplies source snapshots and owns dispatch integration. The former TypeScript modules remain migration references and compatibility evidence, not runtime dependencies.
+
+The native evaluator is deliberately I/O-free. Its caller supplies one source snapshot, including the per-session GitHub freshness bit, lifecycle clean-candidate evidence, local-day bucket, current pause flags, branch watermarks, and frozen template values. The durable ledger then serializes dispatch claims with a sibling file lock and atomic replacement while retaining fields it does not understand. A dispatched durable prompt whose send reply is lost becomes `ambiguous` and is never blindly replayed.
 
 ## Level-triggered, ledger-deduped
 

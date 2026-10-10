@@ -214,7 +214,7 @@ defaults or stopping another task.
 
 ### `wt base <slug>` / `wt base set <slug> <ref>` / `wt base clear <slug>`
 
-Show / record / forget a worktree's fork base — the branch it's based on when that isn't trunk. This record is the stack primitive (see [stacked-prs.md](stacked-prs.md)): the TUI's base row, stack grouping, sync counts, diff, and AI summary all resolve against it, and `wt restack` replays onto it.
+Show or change a worktree's fork base. `clear` returns its parent to trunk while retaining the saved commit anchor, so a later restack can still distinguish the parent's work after a squash merge. Explicit `set` records a merge base and rejects stack cycles. This record is the stack primitive (see [stacked-prs.md](stacked-prs.md)): the TUI's base row, stack grouping, sync counts, diff, and AI summary all resolve against it, and `wt restack` replays onto it.
 
 ### `wt status [<slug>] [<state>] [-m <note>] [--risk <r>] [--blocked-on <gate>] [--verify-after-merge <steps>]`
 

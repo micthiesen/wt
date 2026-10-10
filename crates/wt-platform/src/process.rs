@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+type StreamObserver = Arc<dyn Fn(ProcessStream, &[u8]) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
@@ -68,7 +69,16 @@ pub struct ProcessOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// True when a streaming caller's bounded in-memory capture omitted bytes.
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
     pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessStream {
+    Stdout,
+    Stderr,
 }
 
 impl ProcessOutput {
@@ -117,6 +127,8 @@ pub enum ProcessError {
     },
     #[error("{program}: output pipes remained open after the process exited")]
     PipeDrain { program: String },
+    #[error("{program}: streaming observer panicked")]
+    ObserverPanicked { program: String },
     #[error("{program}: exited with {code:?}: {stderr}")]
     Exit {
         program: String,
@@ -142,6 +154,35 @@ impl ProcessRunner {
         &self,
         spec: CommandSpec,
         cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        self.run_inner(spec, cancellation, None).await
+    }
+
+    /// Run with bounded in-memory capture while forwarding every read chunk
+    /// to a synchronous, non-blocking observer. Once either capture reaches
+    /// `output_limit`, the remaining bytes are still drained and streamed but
+    /// omitted from the returned buffer; the corresponding truncation flag is
+    /// set. The observer must not block on I/O. A bounded `try_send` into an
+    /// owned writer task is the intended use; a full queue may drop log chunks
+    /// but cannot stall pipe draining or prevent cancellation/reaping.
+    pub async fn run_streaming<F>(
+        &self,
+        spec: CommandSpec,
+        cancellation: &CancellationToken,
+        observer: F,
+    ) -> Result<ProcessOutput, ProcessError>
+    where
+        F: Fn(ProcessStream, &[u8]) + Send + Sync + 'static,
+    {
+        self.run_inner(spec, cancellation, Some(Arc::new(observer)))
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        spec: CommandSpec,
+        cancellation: &CancellationToken,
+        observer: Option<StreamObserver>,
     ) -> Result<ProcessOutput, ProcessError> {
         let started = Instant::now();
         let deadline = started + spec.timeout;
@@ -201,10 +242,27 @@ impl ProcessRunner {
         let stderr = child.stderr.take().expect("stderr requested as pipe");
         let stdin = child.stdin.take();
         let capture_program = program.clone();
+        let stdout_observer = observer.clone();
+        let stderr_observer = observer;
+        let output_limit = spec.output_limit;
         let captures = async {
             let (stdout, stderr, ()) = tokio::try_join!(
-                capture(stdout, spec.output_limit, "stdout", &capture_program),
-                capture(stderr, spec.output_limit, "stderr", &capture_program),
+                capture(
+                    stdout,
+                    output_limit,
+                    "stdout",
+                    ProcessStream::Stdout,
+                    &capture_program,
+                    stdout_observer,
+                ),
+                capture(
+                    stderr,
+                    output_limit,
+                    "stderr",
+                    ProcessStream::Stderr,
+                    &capture_program,
+                    stderr_observer,
+                ),
                 async {
                     if let (Some(mut stdin), Some(input)) = (stdin, spec.input) {
                         stdin
@@ -254,8 +312,9 @@ impl ProcessRunner {
                             },
                         },
                     };
-                    break output.map(|(stdout, stderr)| ProcessOutput {
-                        status, stdout, stderr, elapsed: started.elapsed(),
+                    break output.map(|((stdout, stdout_truncated), (stderr, stderr_truncated))| ProcessOutput {
+                        status, stdout, stderr, stdout_truncated, stderr_truncated,
+                        elapsed: started.elapsed(),
                     });
                 }
             }
@@ -291,10 +350,13 @@ async fn capture(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
     stream: &'static str,
+    process_stream: ProcessStream,
     program: &str,
-) -> Result<Vec<u8>, ProcessError> {
+    observer: Option<StreamObserver>,
+) -> Result<(Vec<u8>, bool), ProcessError> {
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
     loop {
         let read = reader
             .read(&mut buffer)
@@ -305,16 +367,29 @@ async fn capture(
                 source,
             })?;
         if read == 0 {
-            return Ok(bytes);
+            return Ok((bytes, truncated));
         }
-        if read > limit.saturating_sub(bytes.len()) {
-            return Err(ProcessError::OutputLimit {
+        if let Some(observer) = &observer {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(process_stream, &buffer[..read]);
+            }))
+            .map_err(|_| ProcessError::ObserverPanicked {
                 program: program.into(),
-                stream,
-                limit,
-            });
+            })?;
         }
-        bytes.extend_from_slice(&buffer[..read]);
+        let remaining = limit.saturating_sub(bytes.len());
+        let captured = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..captured]);
+        if captured < read {
+            if observer.is_none() {
+                return Err(ProcessError::OutputLimit {
+                    program: program.into(),
+                    stream,
+                    limit,
+                });
+            }
+            truncated = true;
+        }
     }
 }
 

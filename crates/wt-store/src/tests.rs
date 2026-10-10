@@ -14,6 +14,42 @@ fn identity(id: &str, path: &str) -> RepositoryIdentity {
 }
 
 #[test]
+fn fork_base_write_checks_fresh_anchor_and_cycle_in_one_transaction() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut first = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let mut second = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let branches = [
+        ("feature/one".into(), "one".into()),
+        ("feature/two".into(), "two".into()),
+    ]
+    .into();
+    assert_eq!(
+        first
+            .set_slug_base_checked("one", (None, None), "feature/two", "parent-tip", &branches)
+            .unwrap(),
+        crate::BaseUpdate::Updated
+    );
+    assert_eq!(
+        second
+            .set_slug_base_checked("two", (None, None), "feature/one", "other-tip", &branches)
+            .unwrap(),
+        crate::BaseUpdate::Cycle
+    );
+    assert_eq!(
+        second
+            .set_slug_base_checked("one", (None, None), "main", "stale", &branches)
+            .unwrap(),
+        crate::BaseUpdate::Stale
+    );
+    assert_eq!(
+        first.read_slug_state("one").unwrap().unwrap()["baseSha"],
+        "parent-tip"
+    );
+    assert!(second.read_slug_state("two").unwrap().is_none());
+}
+
+#[test]
 fn archive_changes_are_independent_idempotent_and_repository_scoped() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
@@ -217,6 +253,62 @@ fn archive_writes_replace_and_import_is_transactional() {
     );
     assert_eq!(store.read_repository_state_json().unwrap(), None);
     assert_eq!(store.read_archived_keys().unwrap(), initial);
+    assert!(
+        store
+            .merge_repository_snapshot(&new_archives, |current| {
+                assert!(current.is_none());
+                Ok(json!({"replacement": true}))
+            })
+            .is_err()
+    );
+    assert_eq!(store.read_repository_state_json().unwrap(), None);
+    assert_eq!(store.read_archived_keys().unwrap(), initial);
+}
+
+#[test]
+fn snapshot_merge_reads_under_the_write_lock_and_preserves_concurrent_imports() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("wt.sqlite");
+    let mut reader = Store::open(&path, identity("repo", "/repos/one")).unwrap();
+    reader
+        .import_repository_snapshot(
+            &json!({"future": 42, "counter": 0}).to_string(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    let writers = (0..4)
+        .map(|_| Store::open(&path, identity("repo", "/repos/one")).unwrap())
+        .collect::<Vec<_>>();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(writers.len()));
+    let tasks = writers
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut store)| {
+            let start = start.clone();
+            thread::spawn(move || {
+                start.wait();
+                for revision in 0..20 {
+                    let key = format!("{index}-{revision}");
+                    store
+                        .merge_repository_snapshot(&BTreeSet::from([key.clone()]), |state| {
+                            let mut state = state.unwrap();
+                            state["counter"] = json!(state["counter"].as_u64().unwrap() + 1);
+                            state["slugs"][&key] = json!({"imported": true});
+                            Ok(state)
+                        })
+                        .unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.join().unwrap();
+    }
+    let state = reader.read_wt_state().unwrap();
+    assert_eq!(state["counter"], 80);
+    assert_eq!(state["future"], 42);
+    assert_eq!(state["slugs"].as_object().unwrap().len(), 80);
+    assert_eq!(reader.read_archived_keys().unwrap().len(), 80);
 }
 
 #[test]
@@ -665,6 +757,36 @@ fn section_layout_mutations_keep_controller_remote_and_local_state_separate() {
         serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap();
     assert!(state["slugs"]["local"]["section"].is_null());
     assert!(state["remoteLayouts"]["@remote/server/remote%2Fslug"]["section"].is_null());
+}
+
+#[test]
+fn batch_section_move_preserves_fields_remote_ownership_and_existing_positions() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("wt.sqlite");
+    let mut store = Store::open(&path, identity("repo", "/repo")).unwrap();
+    store.write_repository_state_json(r#"{"slugs":{"one":{"section":"Old","future":42},"already":{"section":"New","order":5}},"remoteLayouts":{"@remote/host/two":{"section":"Old","future":[1,2]}}}"#).unwrap();
+    let keys = ["one", "@remote/host/two", "already", "one"].map(str::to_owned);
+    assert_eq!(
+        store.move_worktrees_to_section(&keys, Some("New")).unwrap(),
+        ["one", "@remote/host/two"]
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["slugs"]["one"]["future"], 42);
+    assert_eq!(
+        state["remoteLayouts"]["@remote/host/two"]["future"],
+        json!([1, 2])
+    );
+    assert!(state["slugs"]["@remote/host/two"].is_null());
+    assert_eq!(state["slugs"]["already"]["order"], 5);
+    assert_eq!(state["slugs"]["one"]["order"], 6.0);
+    assert_eq!(state["remoteLayouts"]["@remote/host/two"]["order"], 7.0);
+    assert!(
+        store
+            .move_worktrees_to_section(&keys, Some("New"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.read_wt_state().unwrap(), state);
 }
 
 #[test]

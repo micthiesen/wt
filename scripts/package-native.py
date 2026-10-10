@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 
@@ -100,7 +101,12 @@ def manifest(args):
         raise ValueError(f"release target set incomplete: missing {sorted(TARGETS - seen)}")
     write_json(args.output / "wt-release.json", {"schema_version": 1, "release_version": args.release,
                                                "build_id": args.build_id, "artifacts": artifacts})
-    (args.output / "SHA256SUMS").write_text("".join(f"{a['sha256']}  {a['filename']}\n" for a in artifacts))
+    checksums = "".join(f"{a['sha256']}  {a['filename']}\n" for a in artifacts)
+    if getattr(args, "installer", None) is not None:
+        installer = args.output / "install.sh"
+        shutil.copyfile(args.installer, installer)
+        checksums += f"{digest(installer)}  install.sh\n"
+    (args.output / "SHA256SUMS").write_text(checksums)
     print(args.output / "wt-release.json")
 
 
@@ -115,6 +121,8 @@ def main():
         if name == "package":
             command.add_argument("--target", required=True, choices=sorted(TARGETS))
             command.add_argument("--bin-dir", type=Path, required=True)
+        else:
+            command.add_argument("--installer", type=Path)
     args = parser.parse_args()
     (package if args.command == "package" else manifest)(args)
 

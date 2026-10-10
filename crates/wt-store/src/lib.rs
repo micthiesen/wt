@@ -12,7 +12,7 @@ mod types;
 pub use migrations::{
     CURRENT_WT_STATE_VERSION, MigrationOutcome, migrate_wt_state, raw_wt_state_version,
 };
-pub use mutations::{is_merged_removal, verification_owed_at_removal};
+pub use mutations::{BaseUpdate, is_merged_removal, verification_owed_at_removal};
 pub use store::{Store, StoreError};
 pub use types::{
     ForeignRepositoryRow, MergeEdge, RemovedWorktree, RepositoryIdentity, ReviewRequestDismissal,

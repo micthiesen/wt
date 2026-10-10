@@ -31,6 +31,24 @@ fn modal(modal: UiModal) -> UiReply {
 
 pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) -> Result<UiReply> {
     match action {
+        UiAction::PrepareSection { key } => crate::section_actions::prepare(ctx, key).await,
+        UiAction::MoveSection { key, section } => {
+            crate::section_actions::move_row(ctx, key, section).await
+        }
+        UiAction::RenameSection { old, new } => crate::section_actions::rename(ctx, old, new).await,
+        UiAction::FoldSection { key, folded } => {
+            ctx.database
+                .call(move |store| {
+                    store.set_section_folded(&key, folded)?;
+                    Ok(())
+                })
+                .await?;
+            Ok(message(if folded {
+                "Section folded"
+            } else {
+                "Section expanded"
+            }))
+        }
         UiAction::CyclePrimary => {
             let app = crate::harness::AppHarness::new(ctx);
             let config = ctx.config.clone();
@@ -238,6 +256,9 @@ pub async fn execute(ctx: &AppContext, action: UiAction, board: Option<&Board>) 
                 .call(move |store| {
                     let archived = !store.read_archived_keys()?.contains(&slug);
                     store.set_archived(&slug, archived)?;
+                    if archived {
+                        store.set_section_folded(crate::board_layout::ARCHIVED, true)?;
+                    }
                     Ok(archived)
                 })
                 .await?;
@@ -391,7 +412,7 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
     let target = if let Some(row) = existing {
         row.target
     } else {
-        lifecycle_ops::service(ctx)
+        lifecycle_ops::service(ctx)?
             .create(
                 &branch,
                 CreateOptions {
@@ -415,6 +436,40 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
     }
     if args.open && !args.no_open {
         crate::editor::open(ctx, Path::new(&target.path)).await?;
+    }
+    let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
+    let state = ctx
+        .database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await?;
+    let mut placement = Board {
+        rows: inventory
+            .into_iter()
+            .filter(|row| !row.is_main)
+            .map(|row| wt_tui::BoardRow {
+                key: wt_core::worktree_target_key(&row.target),
+                slug: row.target.slug().to_owned(),
+                branch: row.target.branch,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    crate::board_layout::prepare(
+        &mut placement,
+        &state,
+        &ctx.config.branch.base,
+        ctx.config.ui.sort,
+    );
+    if let Some(section) =
+        crate::board_layout::section_for(&placement, &wt_core::worktree_target_key(&target))
+    {
+        ctx.database
+            .call(move |store| {
+                store.set_section_folded(&section, false)?;
+                Ok(())
+            })
+            .await?;
     }
     Ok(UiReply {
         message: format!("Created {}", target.slug()),
@@ -550,74 +605,7 @@ async fn set_status(
 }
 
 async fn set_base(ctx: &AppContext, key: &str, base: Option<String>) -> Result<UiReply> {
-    let row = resolve_key(ctx, key).await?;
-    let slug = row.target.slug().to_owned();
-    let base = base.unwrap_or_else(|| ctx.config.branch.base.clone());
-    if base != ctx.config.branch.base {
-        if base == row.target.branch {
-            bail!("a worktree cannot be based on itself");
-        }
-        let state = ctx
-            .database
-            .call(|store| Ok(store.read_wt_state()?))
-            .await?;
-        let rows = ctx.repository.inventory(&ctx.cancellation).await?;
-        let mut cursor = base.as_str();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(parent) = rows
-            .iter()
-            .find(|candidate| candidate.target.branch == cursor)
-        {
-            if parent.target.branch == row.target.branch || !visited.insert(cursor.to_owned()) {
-                bail!("that fork base would create a stack cycle");
-            }
-            let Some(next) = state["slugs"][parent.target.slug()]["baseBranch"].as_str() else {
-                break;
-            };
-            cursor = next;
-        }
-    }
-    let recorded = {
-        let path = Path::new(&row.target.path);
-        let mut found = None;
-        for reference in [base.clone(), format!("origin/{base}")] {
-            let exists = run_git(
-                ctx,
-                path,
-                [
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    "--end-of-options",
-                    &format!("{reference}^{{commit}}"),
-                ],
-            )
-            .await?;
-            if exists.status.success() {
-                found = Some(reference);
-                break;
-            }
-        }
-        let reference = found.context("fork base does not resolve to a commit")?;
-        let anchor = run_git(ctx, path, ["merge-base", "HEAD", &reference])
-            .await?
-            .checked("git")?
-            .stdout_text()
-            .trim()
-            .to_owned();
-        Some((base, anchor))
-    };
-    ctx.database
-        .call(move |store| {
-            store.set_slug_base(
-                &slug,
-                recorded
-                    .as_ref()
-                    .map(|(base, sha)| (base.as_str(), Some(sha.as_str()))),
-            )?;
-            Ok(())
-        })
-        .await?;
+    crate::fork_base::set(ctx, key, base).await?;
     Ok(message("Fork base updated"))
 }
 

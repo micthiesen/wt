@@ -14,8 +14,6 @@ use wt_update::{
     StateStore,
 };
 
-const DEFAULT_OWNER: &str = "micthiesen";
-const DEFAULT_REPOSITORY: &str = "wt";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(100);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,9 +32,23 @@ pub fn install_paths(options: &LoadOptions) -> Result<InstallPaths> {
         .unwrap_or_else(|| options.home.join(".local/share/wt"));
     InstallPaths::new(root).context("resolve native wt installation root")
 }
-pub fn default_repository() -> Result<ReleaseRepository> {
-    ReleaseRepository::new(DEFAULT_OWNER, DEFAULT_REPOSITORY)
-        .context("resolve native wt release repository")
+pub fn repository(options: &LoadOptions) -> Result<ReleaseRepository> {
+    let slug = options
+        .env
+        .get("WT_RELEASE_REPOSITORY")
+        .map(String::as_str)
+        .unwrap_or("micthiesen/wt");
+    let (owner, name) = slug
+        .split_once('/')
+        .filter(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .ok_or_else(|| anyhow::anyhow!("WT_RELEASE_REPOSITORY must be owner/name"))?;
+    let repository = ReleaseRepository::new(owner, name).context("validate release repository")?;
+    match options.env.get("WT_RELEASE_API_BASE") {
+        Some(base) => repository
+            .with_api_base(base.clone())
+            .context("validate release API base (HTTP is allowed only for loopback fixtures)"),
+        None => Ok(repository),
+    }
 }
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -115,9 +127,8 @@ pub async fn update_once(
     }
     let token = attempt_token();
     let installed_version = version.clone();
-    tokio::task::spawn_blocking(move || manager.install_verified(&verified, token, now_unix()))
-        .await
-        .context("join verified release installation")??;
+    wt_update::install_verified(manager.store().paths().clone(), verified, token, now_unix())
+        .await?;
     Ok(UpdateOutcome::Installed {
         release: installed_version.release_version().into(),
         build_id: installed_version.build_id().into(),
@@ -193,13 +204,7 @@ pub async fn rollback_once(
             candidate.build_id()
         )
     }
-    let manager = InstallManager::new(paths);
-    let activate_candidate = candidate.clone();
-    tokio::task::spawn_blocking(move || {
-        manager.activate_existing(&activate_candidate, attempt_token(), now_unix())
-    })
-    .await
-    .context("join rollback activation")??;
+    wt_update::activate_existing(paths, candidate.clone(), attempt_token(), now_unix()).await?;
     Ok(candidate)
 }
 
@@ -245,7 +250,7 @@ pub async fn startup_check(
     let channel = state.channel;
     let outcome = match update_latest(
         paths.clone(),
-        default_repository()?,
+        repository(options)?,
         env!("WT_TARGET").to_owned(),
         channel,
         None,
@@ -277,7 +282,7 @@ pub async fn startup_check(
     }
     match update_once(
         paths,
-        default_repository()?,
+        repository(options)?,
         env!("WT_TARGET").to_owned(),
         Some(channel),
         None,

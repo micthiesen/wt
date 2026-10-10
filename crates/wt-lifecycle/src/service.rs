@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +15,10 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use wt_config::{BackendKind, Config};
 use wt_core::{WorktreeTarget, local_worktree_target};
-use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner};
+use wt_platform::{
+    lock::{FileLock, LockError},
+    process::{CommandSpec, ProcessError, ProcessRunner},
+};
 use wt_store::{RemovedWorktree, RepositoryIdentity, Store, StoreError};
 use wt_vcs::{GitRepository, WorktreeRecord};
 
@@ -38,9 +39,12 @@ pub struct ServiceConfig {
     pub state: StoreLocation,
     pub branch_prefix: String,
     pub base_branch: String,
+    pub keep_fresh: Vec<String>,
+    pub auto_regen_paths: Vec<String>,
     pub branch_id_pattern: String,
     pub slug_max_len: usize,
     pub stage_prefix: String,
+    pub default_personal_stage: String,
     pub backend: BackendKind,
     pub copy_files: Vec<String>,
     pub copy_globs: Vec<String>,
@@ -67,9 +71,16 @@ impl ServiceConfig {
             },
             branch_prefix: config.branch.prefix.clone(),
             base_branch: config.branch.base.clone(),
+            keep_fresh: config.branch.keep_fresh.clone(),
+            auto_regen_paths: config
+                .sst
+                .as_ref()
+                .map(|sst| sst.auto_regen_paths.clone())
+                .unwrap_or_default(),
             branch_id_pattern: config.branch.id_pattern.clone(),
             slug_max_len: config.branch.slug_max_len.max(1.0) as usize,
             stage_prefix: config.stage.prefix.clone(),
+            default_personal_stage: config.stage.default_personal.clone(),
             backend: config.backend.kind,
             copy_files: config.lifecycle.env_files_to_copy.clone(),
             copy_globs: config.lifecycle.copy_globs.clone(),
@@ -81,7 +92,9 @@ impl ServiceConfig {
                 .map(str::to_owned)
                 .collect(),
             rift_binary: "rift".into(),
-            shell: "/bin/bash".into(),
+            shell: std::env::var_os("SHELL")
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "bash".into()),
         }
     }
 }
@@ -173,6 +186,10 @@ pub enum LifecycleError {
     Repository(#[from] wt_vcs::RepositoryError),
     #[error("durable wt state: {0}")]
     Store(#[from] StoreError),
+    #[error("operation lock: {0}")]
+    Lock(#[from] LockError),
+    #[error("stop development server before removal: {0}")]
+    Dev(#[from] wt_dev::DevServerError),
     #[error("background blocking task failed: {0}")]
     Join(String),
     #[error("lifecycle operation cancelled")]
@@ -187,6 +204,7 @@ pub struct LifecycleService {
     repository: GitRepository,
     runner: ProcessRunner,
     id_pattern: Option<Regex>,
+    dev: Option<wt_dev::DevServerService>,
 }
 
 #[derive(Default)]
@@ -194,17 +212,6 @@ struct CreateProgress {
     checkout_created: bool,
     checkout_attempted: bool,
     branch_created: bool,
-}
-
-struct OperationLock(File);
-
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
 }
 
 impl LifecycleService {
@@ -215,7 +222,13 @@ impl LifecycleService {
             repository,
             runner,
             id_pattern,
+            dev: None,
         }
+    }
+
+    pub fn with_dev_server(mut self, dev: wt_dev::DevServerService) -> Self {
+        self.dev = Some(dev);
+        self
     }
 
     pub async fn create(
@@ -261,13 +274,23 @@ impl LifecycleService {
             )));
         }
         if options.fetch_origin {
-            self.run_git(
-                &main,
-                ["fetch", "--prune", "origin"],
-                cancellation,
-                "fetch origin",
-            )
-            .await?;
+            let report = self
+                .repository
+                .fetch_origin(
+                    wt_vcs::FetchOriginOptions {
+                        keep_fresh: self.config.keep_fresh.clone(),
+                        auto_regen_paths: self.config.auto_regen_paths.clone(),
+                        sync_install: Some(wt_platform::install::InstallPolicy {
+                            command: self.config.install_command.clone(),
+                            shell: self.config.shell.clone(),
+                        }),
+                    },
+                    cancellation,
+                )
+                .await?;
+            for warning in report.warnings {
+                tracing::warn!(%warning, "Git ref maintenance before creation");
+            }
         }
         let local_exists = self
             .ref_exists(&main, &format!("refs/heads/{branch}"), cancellation)
@@ -539,7 +562,7 @@ impl LifecycleService {
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
         let slug = target.slug();
-        let _lock = self.acquire_lock(slug, "remove", cancellation).await?;
+        let lock = self.acquire_lock(slug, "remove", cancellation).await?;
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
         let main = canonicalize(&self.config.main_clone, "resolve main clone").await?;
         let requested = PathBuf::from(&target.path);
@@ -564,6 +587,13 @@ impl LifecycleService {
             self.guard_removal(&row, options.landed || cleanup, cancellation)
                 .await?;
         }
+        if let Some(dev) = &self.dev {
+            // Keep the slug lock through supervision cleanup and checkout
+            // removal. A new server cannot start in the gap, and a failed
+            // external teardown leaves its checkout available for recovery.
+            dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(&row), &lock, cancellation)
+                .await?;
+        }
         let mut warnings = Vec::new();
         let mut force = options.force;
         let mut destroyed_stage = false;
@@ -571,7 +601,13 @@ impl LifecycleService {
             if !self.config.has_sst {
                 warnings.push("skipping sst remove: [deploy.sst] is not configured".into());
             } else {
-                match safe_stage(&path, &self.config.stage_prefix).await {
+                match safe_stage(
+                    &path,
+                    &self.config.stage_prefix,
+                    &self.config.default_personal_stage,
+                )
+                .await
+                {
                     Ok(stage) => {
                         let mut spec =
                             CommandSpec::new("pnpm").args(["sst", "remove", "--stage", &stage]);
@@ -708,55 +744,14 @@ impl LifecycleService {
         slug: &str,
         operation: &'static str,
         cancellation: &CancellationToken,
-    ) -> Result<OperationLock, LifecycleError> {
+    ) -> Result<FileLock, LifecycleError> {
         validate_slug(slug)?;
-        fs::create_dir_all(&self.config.lock_dir)
+        FileLock::acquire(&self.config.lock_dir, slug, operation, cancellation)
             .await
-            .map_err(|source| LifecycleError::Io {
-                operation: "create lock directory",
-                path: self.config.lock_dir.clone(),
-                source,
-            })?;
-        let lock_path = self.config.lock_dir.join(format!("{slug}.lock"));
-        let open_path = lock_path.clone();
-        let file = tokio::task::spawn_blocking(move || {
-            OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(open_path)
-        })
-        .await
-        .map_err(|error| LifecycleError::Join(error.to_string()))?
-        .map_err(|source| LifecycleError::Io {
-            operation: "open lifecycle lock",
-            path: lock_path.clone(),
-            source,
-        })?;
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(LifecycleError::Cancelled);
-            }
-            let result = tokio::task::spawn_blocking({
-                let file = file.try_clone().map_err(|source| LifecycleError::Io {
-                    operation: "clone lifecycle lock",
-                    path: lock_path.clone(),
-                    source,
-                })?;
-                let lock_path = lock_path.clone();
-                move || try_flock(&file, &lock_path, operation)
+            .map_err(|error| match error {
+                LockError::Cancelled => LifecycleError::Cancelled,
+                error => LifecycleError::Lock(error),
             })
-            .await
-            .map_err(|error| LifecycleError::Join(error.to_string()))??;
-            if result {
-                return Ok(OperationLock(file));
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(LifecycleError::Cancelled),
-                _ = tokio::time::sleep(Duration::from_millis(80)) => {}
-            }
-        }
     }
 
     async fn mutate_store<R: Send + 'static>(
@@ -1338,44 +1333,23 @@ impl LifecycleService {
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), LifecycleError> {
-        let (program, args): (OsString, Vec<OsString>) =
-            if let Some(command) = &self.config.install_command {
-                (
-                    self.config.shell.clone(),
-                    vec!["-lc".into(), command.into()],
-                )
-            } else if fs::try_exists(path.join("bun.lock")).await.unwrap_or(false)
-                || fs::try_exists(path.join("bun.lockb"))
-                    .await
-                    .unwrap_or(false)
-            {
-                ("bun".into(), vec!["install".into()])
-            } else if fs::try_exists(path.join("pnpm-lock.yaml"))
+        let policy = wt_platform::install::InstallPolicy {
+            command: self.config.install_command.clone(),
+            shell: self.config.shell.clone(),
+        };
+        let Some(plan) =
+            policy
+                .resolve(path, false)
                 .await
-                .unwrap_or(false)
-            {
-                ("pnpm".into(), vec!["install".into()])
-            } else if fs::try_exists(path.join("yarn.lock"))
-                .await
-                .unwrap_or(false)
-            {
-                ("yarn".into(), vec!["install".into()])
-            } else if fs::try_exists(path.join("package-lock.json"))
-                .await
-                .unwrap_or(false)
-                || fs::try_exists(path.join("npm-shrinkwrap.json"))
-                    .await
-                    .unwrap_or(false)
-            {
-                ("npm".into(), vec!["install".into()])
-            } else {
-                return Ok(());
-            };
-        let mut spec = CommandSpec::new(program);
-        spec.args = args;
-        spec.cwd = Some(path.to_path_buf());
-        spec.timeout = Duration::from_secs(20 * 60);
-        spec.output_limit = PROCESS_OUTPUT_LIMIT;
+                .map_err(|source| LifecycleError::Io {
+                    operation: "detect dependency manager",
+                    path: path.to_path_buf(),
+                    source,
+                })?
+        else {
+            return Ok(());
+        };
+        let spec = plan.spec;
         let output = self
             .runner
             .run(spec, cancellation)
@@ -2016,33 +1990,6 @@ fn truncate_slug(slug: String, limit: usize) -> String {
     slug[..byte_end].to_owned()
 }
 
-fn try_flock(file: &File, path: &Path, operation: &'static str) -> Result<bool, LifecycleError> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(false);
-        }
-        Err(LifecycleError::Io {
-            operation,
-            path: path.to_path_buf(),
-            source: error,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Err(LifecycleError::Invalid(format!(
-            "{operation}: lifecycle locks are not implemented for {}",
-            path.display()
-        )))
-    }
-}
-
 async fn canonicalize(path: &Path, operation: &'static str) -> Result<PathBuf, LifecycleError> {
     fs::canonicalize(path)
         .await
@@ -2182,21 +2129,17 @@ fn validate_relative_path(path: &str) -> Result<PathBuf, LifecycleError> {
     Ok(relative.to_path_buf())
 }
 
-async fn safe_stage(path: &Path, prefix: &str) -> Result<String, String> {
-    if prefix.is_empty() {
-        return Err("personal stage prefix is not configured".into());
-    }
-    let stage_path = path.join(".sst/stage");
-    let pin = fs::read_to_string(&stage_path)
+async fn safe_stage(path: &Path, prefix: &str, default_personal: &str) -> Result<String, String> {
+    let path = path.to_owned();
+    let prefix = prefix.to_owned();
+    let stage = tokio::task::spawn_blocking(move || wt_sst::safe_pinned_stage(&path, &prefix))
         .await
-        .map_err(|_| "no .sst/stage pinned".to_owned())?;
-    let stage = pin.trim();
-    if !stage.starts_with(prefix) {
-        return Err(format!(
-            ".sst/stage is {stage:?}, which lacks personal prefix {prefix:?}"
-        ));
+        .map_err(|error| format!("inspect stage pin: {error}"))?
+        .map_err(|error| error.to_string())?;
+    if stage == default_personal {
+        return Err(format!("{stage:?} is the protected default personal stage"));
     }
-    Ok(stage.to_owned())
+    Ok(stage)
 }
 
 fn now_ms() -> i64 {
@@ -2300,6 +2243,39 @@ fn prioritized_rift_gc(rift_binary: &OsString) -> CommandSpec {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stage_removal_rejects_default_foreign_and_invalid_pins() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".sst")).unwrap();
+        let pin = root.path().join(".sst/stage");
+        for stage in [
+            "m-personal",
+            "production",
+            "m-../production",
+            "m-work\n--prod",
+        ] {
+            std::fs::write(&pin, stage).unwrap();
+            assert!(
+                super::safe_stage(root.path(), "m-", "m-personal")
+                    .await
+                    .is_err(),
+                "{stage}"
+            );
+        }
+        std::fs::write(&pin, "m-work\n").unwrap();
+        assert_eq!(
+            super::safe_stage(root.path(), "m-", "m-personal")
+                .await
+                .unwrap(),
+            "m-work"
+        );
+        assert!(
+            super::safe_stage(root.path(), "", "m-personal")
+                .await
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -2376,9 +2352,12 @@ mod tests {
             },
             branch_prefix: "michael".into(),
             base_branch: "main".into(),
+            keep_fresh: Vec::new(),
+            auto_regen_paths: Vec::new(),
             branch_id_pattern: r"([A-Z]+-\d+)".into(),
             slug_max_len: 50,
             stage_prefix: "stage".into(),
+            default_personal_stage: "stagepersonal".into(),
             backend: BackendKind::GitWorktree,
             copy_files: vec![],
             copy_globs: vec![],

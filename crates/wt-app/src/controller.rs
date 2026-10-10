@@ -38,6 +38,7 @@ pub fn start(
     scope: &TaskScope,
     mut context: AppContext,
     source: SourceHandle<Board>,
+    metadata: SourceHandle<crate::local_source::Metadata>,
     board: SourceHandle<Board>,
     mut port: ActionController,
 ) -> Controller {
@@ -62,6 +63,28 @@ pub fn start(
                 None
             };
             let snapshot = board.snapshot();
+            let state_only = matches!(
+                &command,
+                UiAction::FoldSection { .. }
+                    | UiAction::MoveSection { .. }
+                    | UiAction::RenameSection { .. }
+                    | UiAction::SetTitle { .. }
+                    | UiAction::ToggleArchive { .. }
+                    | UiAction::SetStatus { .. }
+                    | UiAction::SetBase { .. }
+                    | UiAction::SetIssueOverride { .. }
+            );
+            let read_only = matches!(
+                &command,
+                UiAction::Copy { .. }
+                    | UiAction::OpenEditor { .. }
+                    | UiAction::OpenUrl { .. }
+                    | UiAction::PrepareRemove { .. }
+                    | UiAction::PrepareCleanup
+                    | UiAction::PrepareStatus { .. }
+                    | UiAction::PrepareBase { .. }
+                    | UiAction::PrepareSection { .. }
+            );
             let result = if let UiAction::Session { key, target } = command {
                 handoff(&context, key, target, &port.replies, &shutdown).await
             } else {
@@ -70,7 +93,11 @@ pub fn start(
             };
             let reply = match result {
                 Ok(reply) => {
-                    source.refresh();
+                    if state_only {
+                        metadata.refresh();
+                    } else if !read_only {
+                        source.refresh();
+                    }
                     reply
                 }
                 Err(error) => {

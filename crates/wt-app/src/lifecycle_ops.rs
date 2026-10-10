@@ -9,12 +9,17 @@ use wt_vcs::WorktreeRecord;
 
 use crate::{commands::resolve::run_git, context::AppContext};
 
-pub fn service(ctx: &AppContext) -> LifecycleService {
-    LifecycleService::new(
+pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
+    let service = LifecycleService::new(
         ServiceConfig::from_config(&ctx.config),
         (*ctx.repository).clone(),
         ctx.processes.clone(),
-    )
+    );
+    Ok(if ctx.config.dev_server.is_some() {
+        service.with_dev_server(crate::dev::service(ctx)?)
+    } else {
+        service
+    })
 }
 
 pub async fn resolve_key(ctx: &AppContext, key: &str) -> Result<WorktreeRecord> {
@@ -65,7 +70,7 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             Err(error) => return Err(error.into()),
         }
     };
-    let lifecycle = service(ctx);
+    let lifecycle = service(ctx)?;
     let mut plans = Vec::with_capacity(rows.len());
     for row in rows {
         if row.is_main {
@@ -130,8 +135,12 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
         let stage_path = path.to_path_buf();
         let stage = row.target.stage.clone();
         let prefix = ctx.config.stage.prefix.clone();
+        let default_stage = ctx.config.stage.default_personal.clone();
+        let has_sst = ctx.config.sst.is_some();
         let destroy_stage = tokio::task::spawn_blocking(move || {
-            crate::commands::remove::is_our_stage_deployed(&stage_path, &stage, &prefix)
+            has_sst
+                && stage != default_stage
+                && crate::commands::remove::is_our_stage_deployed(&stage_path, &stage, &prefix)
         })
         .await?;
         plans.push(RemovalPlan {

@@ -50,6 +50,22 @@ pub struct Board {
     pub name: String,
     pub rows: Vec<BoardRow>,
     pub activity: Vec<String>,
+    pub sections: Vec<BoardSection>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BoardSection {
+    pub key: String,
+    pub title: String,
+    pub folded: bool,
+    /// Indices into the prepared board's rows, already sorted by the source.
+    pub rows: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisualItem {
+    Section(usize),
+    Row(usize),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -69,6 +85,7 @@ pub struct BoardRow {
     pub stage_url: Option<String>,
     pub dev_url: Option<String>,
     pub archived: bool,
+    pub stack_prefix: String,
 }
 
 pub struct Model {
@@ -86,6 +103,8 @@ pub struct Model {
     pub yank: Option<usize>,
     pub toast: Option<(String, bool)>,
     pub pending_selection: Option<String>,
+    pub(crate) last_section_target: Option<Option<String>>,
+    pub(crate) items: Vec<VisualItem>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,6 +133,8 @@ impl Default for Model {
             yank: None,
             toast: None,
             pending_selection: None,
+            last_section_target: None,
+            items: Vec::new(),
         }
     }
 }
@@ -123,17 +144,96 @@ impl Model {
         self.source_state = snapshot.state;
         if let Some(board) = snapshot.data {
             let previous_key = self.selected_row().map(|row| row.key.clone());
+            let previous_section = self.selected_section().map(|section| section.key.clone());
+            let previous_neighbors: Vec<_> = self
+                .selected_section()
+                .map(|section| {
+                    let rows: Vec<_> = section
+                        .rows
+                        .iter()
+                        .filter_map(|&index| self.board.rows.get(index))
+                        .collect();
+                    let index = rows
+                        .iter()
+                        .position(|row| Some(&row.key) == previous_key.as_ref())
+                        .unwrap_or(0);
+                    rows.iter()
+                        .skip(index + 1)
+                        .chain(rows.iter().take(index).rev())
+                        .map(|row| row.key.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let on_header = matches!(self.selected_item(), Some(VisualItem::Section(_)));
             let previous_index = self.selected.unwrap_or_default();
             self.board = board;
-            self.selected = previous_key
-                .as_ref()
-                .and_then(|key| self.board.rows.iter().position(|row| &row.key == key))
+            self.rebuild_items();
+            let left_section = previous_key.is_some()
+                && previous_section.as_deref().is_some_and(|old| {
+                    old != "\0archived"
+                        && !self.board.sections.iter().any(|section| {
+                            section.key == old
+                                && section.rows.iter().any(|&index| {
+                                    self.board
+                                        .rows
+                                        .get(index)
+                                        .is_some_and(|row| Some(&row.key) == previous_key.as_ref())
+                                })
+                        })
+                });
+            let neighbor = left_section
+                .then(|| {
+                    previous_neighbors.iter().find_map(|key| {
+                        self.row_position(key).filter(|_| {
+                            self.board.sections.iter().any(|section| {
+                                Some(&section.key) == previous_section.as_ref()
+                                    && section.rows.iter().any(|&index| {
+                                        self.board
+                                            .rows
+                                            .get(index)
+                                            .is_some_and(|row| &row.key == key)
+                                    })
+                            })
+                        })
+                    })
+                })
+                .flatten();
+            self.selected = neighbor
                 .or_else(|| {
-                    (!self.board.rows.is_empty())
-                        .then(|| previous_index.min(self.board.rows.len() - 1))
+                    (!left_section)
+                        .then_some(previous_key.as_deref())
+                        .flatten()
+                        .and_then(|key| self.row_position(key))
+                })
+                .or_else(|| {
+                    previous_section.as_deref().and_then(|key| {
+                        (on_header
+                            || self.board.sections.iter().any(|section| {
+                                section.key == key
+                                    && section.folded
+                                    && section.rows.iter().any(|&index| {
+                                        self.board.rows.get(index).is_some_and(|row| {
+                                            Some(&row.key) == previous_key.as_ref()
+                                        })
+                                    })
+                            }))
+                        .then(|| self.section_position(key))
+                        .flatten()
+                    })
+                })
+                .or_else(|| {
+                    if previous_key.is_none() && previous_section.is_none() {
+                        (0..self.item_count())
+                            .find(|&index| matches!(self.item(index), Some(VisualItem::Row(_))))
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    (self.item_count() > 0).then(|| previous_index.min(self.item_count() - 1))
                 });
             if let Some(key) = &self.pending_selection
-                && let Some(index) = self.board.rows.iter().position(|row| &row.key == key)
+                && let Some(index) = self.row_position(key)
             {
                 self.selected = Some(index);
                 self.pending_selection = None;
@@ -165,7 +265,17 @@ impl Model {
                 options,
                 selected,
             }) => {
-                let selected = selected.min(options.len().saturating_sub(1));
+                let selected = if matches!(action, PickerAction::Section { .. }) {
+                    self.last_section_target
+                        .as_ref()
+                        .and_then(|target| {
+                            options.iter().position(|option| &option.value == target)
+                        })
+                        .unwrap_or(selected)
+                } else {
+                    selected
+                }
+                .min(options.len().saturating_sub(1));
                 Interaction::Picker(PickerPrompt {
                     action,
                     title,
@@ -187,7 +297,7 @@ impl Model {
             None => Interaction::None,
         };
         if let Some(key) = reply.select_when_visible {
-            if let Some(index) = self.board.rows.iter().position(|row| row.key == key) {
+            if let Some(index) = self.row_position(&key) {
                 self.select(index);
             } else {
                 self.pending_selection = Some(key);
@@ -210,19 +320,140 @@ impl Model {
     }
 
     pub(crate) fn yank_choices(&self) -> Vec<(char, &'static str, String)> {
+        if matches!(self.selected_item(), Some(VisualItem::Section(_)))
+            && let Some(section) = self.selected_section()
+        {
+            let rows = section
+                .rows
+                .iter()
+                .filter_map(|&index| self.board.rows.get(index))
+                .collect::<Vec<_>>();
+            return vec![
+                ('n', "section", section.title.clone()),
+                (
+                    's',
+                    "slugs",
+                    rows.iter()
+                        .map(|row| row.slug.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                (
+                    'b',
+                    "branches",
+                    rows.iter()
+                        .map(|row| row.branch.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                (
+                    'l',
+                    "list",
+                    format!(
+                        "{}\n{}",
+                        section.title,
+                        rows.iter()
+                            .map(|row| format!("- {}: {}", row.slug, row.title))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                ),
+            ];
+        }
         self.selected_row()
             .map(|row| {
-                vec![
+                let mut choices = vec![
                     ('b', "branch", row.branch.clone()),
                     ('p', "path", row.path.clone()),
                     ('n', "slug", row.slug.clone()),
-                ]
+                ];
+                for (key, label, value) in [
+                    ('S', "stage URL", row.stage_url.as_ref()),
+                    ('d', "dev URL", row.dev_url.as_ref()),
+                    (
+                        'i',
+                        "issue",
+                        row.issue_url.as_ref().or(row.github_issue_url.as_ref()),
+                    ),
+                    ('I', "primary issue", row.issue_url.as_ref()),
+                    ('r', "PR URL", row.pr_url.as_ref()),
+                ] {
+                    if let Some(value) = value {
+                        choices.push((key, label, value.clone()));
+                    }
+                }
+                choices
             })
             .unwrap_or_default()
     }
 
     pub fn selected_row(&self) -> Option<&BoardRow> {
-        self.selected.and_then(|index| self.board.rows.get(index))
+        match self.selected_item()? {
+            VisualItem::Row(index) => self.board.rows.get(index),
+            VisualItem::Section(_) => None,
+        }
+    }
+
+    pub(crate) fn selected_section(&self) -> Option<&BoardSection> {
+        match self.selected_item()? {
+            VisualItem::Section(index) => self.board.sections.get(index),
+            VisualItem::Row(index) => self
+                .board
+                .sections
+                .iter()
+                .find(|section| section.rows.contains(&index)),
+        }
+    }
+
+    pub(crate) fn item_count(&self) -> usize {
+        if self.board.sections.is_empty() {
+            self.board.rows.len()
+        } else {
+            self.items.len()
+        }
+    }
+
+    pub(crate) fn item(&self, position: usize) -> Option<VisualItem> {
+        if self.board.sections.is_empty() {
+            (position < self.board.rows.len()).then_some(VisualItem::Row(position))
+        } else {
+            self.items.get(position).copied()
+        }
+    }
+
+    fn selected_item(&self) -> Option<VisualItem> {
+        self.selected.and_then(|index| self.item(index))
+    }
+
+    fn rebuild_items(&mut self) {
+        self.items.clear();
+        for (index, section) in self.board.sections.iter().enumerate() {
+            self.items.push(VisualItem::Section(index));
+            if !section.folded {
+                self.items.extend(
+                    section
+                        .rows
+                        .iter()
+                        .copied()
+                        .filter(|&row| row < self.board.rows.len())
+                        .map(VisualItem::Row),
+                );
+            }
+        }
+    }
+
+    fn row_position(&self, key: &str) -> Option<usize> {
+        (0..self.item_count()).find(|&position| match self.item(position) {
+            Some(VisualItem::Row(index)) => self.board.rows[index].key == key,
+            _ => false,
+        })
+    }
+
+    fn section_position(&self, key: &str) -> Option<usize> {
+        (0..self.item_count()).find(|&position| match self.item(position) {
+            Some(VisualItem::Section(index)) => self.board.sections[index].key == key,
+            _ => false,
+        })
     }
 
     pub fn keep_selection_visible(&mut self, height: usize) {
@@ -240,20 +471,41 @@ impl Model {
         } else if selected >= self.offset.saturating_add(height.saturating_sub(margin)) {
             self.offset = selected.saturating_add(margin + 1).saturating_sub(height);
         }
-        self.offset = self
-            .offset
-            .min(self.board.rows.len().saturating_sub(height));
+        self.offset = self.offset.min(self.item_count().saturating_sub(height));
     }
 
     fn select(&mut self, index: usize) -> InputResult {
         self.pending_selection = None;
-        let selected = (!self.board.rows.is_empty()).then(|| index.min(self.board.rows.len() - 1));
+        let selected = (self.item_count() > 0).then(|| index.min(self.item_count() - 1));
         if self.selected == selected {
             return InputResult::Unchanged;
         }
         self.selected = selected;
         self.details_scroll = 0;
         InputResult::Draw
+    }
+
+    fn jump_section(&mut self, forward: bool) -> InputResult {
+        let Some(current) = self.selected_section().and_then(|section| {
+            self.board
+                .sections
+                .iter()
+                .position(|candidate| candidate.key == section.key)
+        }) else {
+            return InputResult::Unchanged;
+        };
+        let next = if forward {
+            current.checked_add(1)
+        } else {
+            current.checked_sub(1)
+        };
+        let Some(section) = next.and_then(|index| self.board.sections.get(index)) else {
+            return InputResult::Unchanged;
+        };
+        let Some(position) = self.section_position(&section.key) else {
+            return InputResult::Unchanged;
+        };
+        self.select(position + usize::from(!section.folded && !section.rows.is_empty()))
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
@@ -348,6 +600,17 @@ impl Model {
             return InputResult::Unchanged;
         }
         match key.code {
+            KeyCode::Char('d') if control => self.jump_section(true),
+            KeyCode::Char('u') if control => self.jump_section(false),
+            KeyCode::Tab if !control => self
+                .selected_section()
+                .map(|section| {
+                    InputResult::Action(UiAction::FoldSection {
+                        key: section.key.clone(),
+                        folded: !section.folded,
+                    })
+                })
+                .unwrap_or(InputResult::Unchanged),
             KeyCode::Char('q') | KeyCode::Char('c')
                 if key.code == KeyCode::Char('q') || control =>
             {
@@ -360,6 +623,27 @@ impl Model {
             KeyCode::Char('P') => {
                 self.show_perf = !self.show_perf;
                 InputResult::Draw
+            }
+            KeyCode::Char('l') if !control => {
+                self.row_action(|key| UiAction::PrepareSection { key })
+            }
+            KeyCode::Char('L') if !control => {
+                if let Some(section) = self
+                    .selected_section()
+                    .filter(|section| !section.key.starts_with('\0'))
+                {
+                    self.interaction = Interaction::Text(TextPrompt {
+                        action: TextAction::RenameSection {
+                            old: section.key.clone(),
+                        },
+                        prompt: "Rename section".into(),
+                        editor: LineEditor::new(&section.key),
+                        allow_empty: false,
+                    });
+                    InputResult::Draw
+                } else {
+                    InputResult::Unchanged
+                }
             }
             KeyCode::Char('t') if !control => {
                 if let Some(row) = self.selected_row() {
@@ -447,7 +731,7 @@ impl Model {
                 target: SessionTarget::Dotfiles,
             }),
             KeyCode::Char('y') if !control => {
-                if self.selected_row().is_some() {
+                if !self.yank_choices().is_empty() {
                     self.yank = Some(0);
                     InputResult::Draw
                 } else {
@@ -470,16 +754,25 @@ impl Model {
                 self.select(self.selected.unwrap_or(0).saturating_sub(1))
             }
             KeyCode::Home | KeyCode::Char('g') => self.select(0),
-            KeyCode::End | KeyCode::Char('G') => {
-                self.select(self.board.rows.len().saturating_sub(1))
-            }
+            KeyCode::End | KeyCode::Char('G') => self.select(self.item_count().saturating_sub(1)),
             KeyCode::PageDown => self.select(self.selected.unwrap_or(0).saturating_add(height / 2)),
             KeyCode::PageUp => self.select(self.selected.unwrap_or(0).saturating_sub(height / 2)),
             KeyCode::Char(' ') => {
-                let length = self.board.rows.len();
+                let length = self.item_count();
                 let next = (1..=length)
                     .map(|delta| (self.selected.unwrap_or(0) + delta) % length)
-                    .find(|&index| self.board.rows[index].needs_attention);
+                    .find(|&index| match self.item(index) {
+                        Some(VisualItem::Row(row)) => self.board.rows[row].needs_attention,
+                        Some(VisualItem::Section(section)) => {
+                            let section = &self.board.sections[section];
+                            section.folded
+                                && section
+                                    .rows
+                                    .iter()
+                                    .any(|&row| self.board.rows[row].needs_attention)
+                        }
+                        None => false,
+                    });
                 next.map_or(InputResult::Unchanged, |index| self.select(index))
             }
             _ => InputResult::Unchanged,
@@ -545,6 +838,17 @@ impl Model {
                         }
                         let action = match &prompt.action {
                             TextAction::Create => UiAction::Create { input: text },
+                            TextAction::NewSection { key } => {
+                                self.last_section_target = Some(Some(text.clone()));
+                                UiAction::MoveSection {
+                                    key: key.clone(),
+                                    section: Some(text),
+                                }
+                            }
+                            TextAction::RenameSection { old } => UiAction::RenameSection {
+                                old: old.clone(),
+                                new: text,
+                            },
                             TextAction::IssueOverride { key } => UiAction::SetIssueOverride {
                                 key: key.clone(),
                                 issue_id: (!text.is_empty()).then_some(text),
@@ -599,9 +903,6 @@ impl Model {
                 InputResult::Unchanged
             }
             Interaction::Picker(picker) => {
-                if picker.options.is_empty() {
-                    return InputResult::Draw;
-                }
                 let quick_pick = match code {
                     KeyCode::Char(digit @ '1'..='9') => {
                         let index = digit as usize - '1' as usize;
@@ -669,9 +970,22 @@ impl Model {
                     });
                     return InputResult::Draw;
                 }
+                if let PickerAction::Section { key } = &picker.action
+                    && code == KeyCode::Char('n')
+                    && !control
+                {
+                    self.interaction = Interaction::Text(TextPrompt {
+                        action: TextAction::NewSection { key: key.clone() },
+                        prompt: "New section".into(),
+                        editor: LineEditor::new(""),
+                        allow_empty: false,
+                    });
+                    return InputResult::Draw;
+                }
                 let opener = match picker.action {
                     PickerAction::Status { .. } => KeyCode::Char('u'),
                     PickerAction::Base { .. } => KeyCode::Char('b'),
+                    PickerAction::Section { .. } => KeyCode::Char('l'),
                 };
                 let chosen = quick_pick.or(direct).or_else(|| {
                     (code == KeyCode::Enter || code == KeyCode::Char(' ') || code == opener)
@@ -683,6 +997,13 @@ impl Model {
                     return InputResult::Unchanged;
                 };
                 match &picker.action {
+                    PickerAction::Section { key } => {
+                        self.last_section_target = Some(option.value.clone());
+                        InputResult::Action(UiAction::MoveSection {
+                            key: key.clone(),
+                            section: option.value,
+                        })
+                    }
                     PickerAction::Base { key } => InputResult::Action(UiAction::SetBase {
                         key: key.clone(),
                         base: option.value,
@@ -766,6 +1087,166 @@ fn picker_move(code: KeyCode, selected: &mut usize, count: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grouped(keys: &[&str], folded: bool) -> SourceSnapshot<Board> {
+        let mut state = snapshot(keys);
+        let board = Arc::make_mut(state.data.as_mut().unwrap());
+        board.sections = vec![BoardSection {
+            key: "Batch".into(),
+            title: "Batch".into(),
+            folded,
+            rows: (0..keys.len()).collect(),
+        }];
+        state
+    }
+
+    #[test]
+    fn folding_keeps_the_group_selected_and_hidden_rows_cannot_receive_actions() {
+        let mut model = Model::default();
+        model.apply(grouped(&["one", "two"], false));
+        assert_eq!(model.selected_row().unwrap().key, "one");
+        assert_eq!(
+            model.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 10),
+            InputResult::Action(UiAction::FoldSection {
+                key: "Batch".into(),
+                folded: true
+            })
+        );
+        model.apply(grouped(&["one", "two"], true));
+        assert_eq!(model.selected, Some(0));
+        assert_eq!(model.item_count(), 1);
+        assert!(model.selected_row().is_none());
+        assert_eq!(
+            model.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 10),
+            InputResult::Unchanged
+        );
+        assert_eq!(model.yank_choices()[0].2, "Batch");
+        model.apply(grouped(&["one", "two"], false));
+        model.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 10);
+        assert_eq!(model.selected_row().unwrap().key, "one");
+    }
+
+    #[test]
+    fn section_picker_creates_from_empty_list_and_remembers_last_target() {
+        let mut model = Model::default();
+        model.apply(grouped(&["one", "two"], false));
+        let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        assert_eq!(
+            model.input(key('l'), 20),
+            InputResult::Action(UiAction::PrepareSection { key: "one".into() })
+        );
+        model.reply(UiReply {
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Section { key: "one".into() },
+                title: "Section".into(),
+                options: vec![],
+                selected: 0,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(model.input(key('n'), 20), InputResult::Draw);
+        model.paste("Release");
+        assert_eq!(
+            model.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 20),
+            InputResult::Action(UiAction::MoveSection {
+                key: "one".into(),
+                section: Some("Release".into())
+            })
+        );
+        let options = ["Other", "Release"]
+            .map(|name| PickerOption {
+                value: Some(name.into()),
+                label: name.into(),
+                chord: None,
+                note: None,
+                verify_after_merge: None,
+            })
+            .to_vec();
+        model.reply(UiReply {
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Section { key: "two".into() },
+                title: "Section".into(),
+                options,
+                selected: 0,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            model.input(key('l'), 20),
+            InputResult::Action(UiAction::MoveSection {
+                key: "two".into(),
+                section: Some("Release".into())
+            })
+        );
+    }
+
+    #[test]
+    fn moved_row_keeps_cursor_in_original_section_and_restore_follows_row() {
+        let mut model = Model::default();
+        model.apply(grouped(&["one", "two"], false));
+        let mut moved = grouped(&["one", "two"], false);
+        let board = Arc::make_mut(moved.data.as_mut().unwrap());
+        board.sections[0].rows = vec![1];
+        board.sections.push(BoardSection {
+            key: "\0archived".into(),
+            title: "Archived".into(),
+            rows: vec![0],
+            folded: false,
+        });
+        model.apply(moved);
+        assert_eq!(model.selected_row().unwrap().key, "two");
+        model.select(3);
+        assert_eq!(model.selected_row().unwrap().key, "one");
+        model.apply(grouped(&["one", "two"], false));
+        assert_eq!(model.selected_row().unwrap().key, "one");
+    }
+
+    #[test]
+    fn folded_manual_section_can_be_renamed_without_affecting_inbox() {
+        let mut model = Model::default();
+        model.apply(grouped(&["one"], true));
+        let key = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        assert_eq!(model.input(key, 20), InputResult::Draw);
+        assert!(matches!(
+            model.interaction,
+            Interaction::Text(TextPrompt {
+                action: TextAction::RenameSection { .. },
+                ..
+            })
+        ));
+        model.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 20);
+        let mut inbox = grouped(&["one"], true);
+        Arc::make_mut(inbox.data.as_mut().unwrap()).sections[0].key = "\0inbox".into();
+        model.apply(inbox);
+        assert_eq!(model.input(key, 20), InputResult::Unchanged);
+    }
+
+    #[test]
+    fn creation_selection_waits_until_the_new_row_is_visible_in_its_expanded_section() {
+        let mut model = Model::default();
+        model.apply(grouped(&["old"], true));
+        model.reply(UiReply {
+            select_when_visible: Some("new".into()),
+            ..Default::default()
+        });
+        model.apply(grouped(&["old", "new"], true));
+        assert_eq!(model.pending_selection.as_deref(), Some("new"));
+        model.apply(grouped(&["old", "new"], false));
+        assert_eq!(model.selected_row().unwrap().key, "new");
+        assert!(model.pending_selection.is_none());
+        model.apply(grouped(&["new", "old"], false));
+        assert_eq!(model.selected_row().unwrap().key, "new");
+    }
+
+    #[test]
+    fn removed_group_member_selects_its_visual_neighbor_instead_of_the_header() {
+        let mut model = Model::default();
+        model.apply(grouped(&["one", "two"], false));
+        model.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 10);
+        assert_eq!(model.selected_row().unwrap().key, "two");
+        model.apply(grouped(&["one"], false));
+        assert_eq!(model.selected_row().unwrap().key, "one");
+    }
 
     fn snapshot(keys: &[&str]) -> SourceSnapshot<Board> {
         SourceSnapshot {
