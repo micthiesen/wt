@@ -16,9 +16,7 @@ use wt_platform::{
     process::{CommandSpec, ProcessError, ProcessRunner},
 };
 use wt_store::{RepositoryIdentity, Store, StoreError};
-use wt_tmux::{
-    CreateSession, OptionScope, PaneTarget, TmuxClient, TmuxError, WindowTarget, shell_quote,
-};
+use wt_tmux::{CreateSession, OptionScope, PaneTarget, TmuxClient, TmuxError, WindowTarget};
 use wt_vcs::{GitRepository, RepositoryError, WorktreeRecord};
 
 use crate::{
@@ -414,45 +412,32 @@ impl DevServerService {
             "--port".to_owned(),
             port.to_string(),
         ]);
-        let launch = command
-            .iter()
-            .map(|argument| shell_quote(argument))
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Start the supervisor as the pane's command. Injecting a command into
+        // a newly created interactive shell races its startup and readline
+        // initialization, which can consume Enter without executing the line.
         self.config
             .tmux
             .create_session(
                 &CreateSession {
                     name: session.clone(),
                     cwd: worktree.path.clone(),
-                    command: Vec::new(),
+                    command,
                     width: None,
                     height: None,
                 },
                 cancellation,
             )
             .await?;
-        let pane = PaneTarget::active_session_pane(&session);
-        let launch_result = async {
-            self.config
-                .tmux
-                .set_option(
-                    &OptionScope::Window(WindowTarget::active_session_window(&session)),
-                    "remain-on-exit",
-                    Some("on"),
-                    cancellation,
-                )
-                .await?;
-            self.config
-                .tmux
-                .send_literal(&pane, &launch, cancellation)
-                .await?;
-            self.config
-                .tmux
-                .send_keys(&pane, &["Enter"], cancellation)
-                .await
-        }
-        .await;
+        let launch_result = self
+            .config
+            .tmux
+            .set_option(
+                &OptionScope::Window(WindowTarget::active_session_window(&session)),
+                "remain-on-exit",
+                Some("on"),
+                cancellation,
+            )
+            .await;
         if let Err(error) = launch_result {
             let _ = self.config.tmux.kill_session(&session, cancellation).await;
             return Err(error.into());

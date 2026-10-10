@@ -155,7 +155,7 @@ def main() -> None:
                 for diagnostic in (
                     [str(binary), "dev", "status", "--all", "--json"],
                     [str(binary), "dev", "logs", "dev-one"],
-                    ["tmux", "-L", socket, "capture-pane", "-p", "-t", "=dev-one-dev"],
+                    ["tmux", "-L", socket, "capture-pane", "-p", "-t", "=dev-one-dev:"],
                 ):
                     try:
                         result = subprocess.run(diagnostic, cwd=main_clone, env=env, text=True, capture_output=True, timeout=10)
@@ -166,6 +166,11 @@ def main() -> None:
 
         waiter: subprocess.Popen[str] | None = None
         try:
+            # A worker must supply its command to tmux, without typing into an
+            # interactive shell whose startup may swallow input. A custom
+            # default command makes that regression deterministic.
+            run(["tmux", "-L", socket, "new-session", "-d", "-s", "fixture-bootstrap", "cat"], cwd=main_clone, env=env)
+            run(["tmux", "-L", socket, "set-option", "-g", "default-command", "cat"], cwd=main_clone, env=env)
             first = wt("dev", "start", "dev-one", "--wait", "--timeout", "20")
             status = json.loads(wt("dev", "status", "dev-one", "--json").stdout)
             assert status["status"]["running"] is True, status
