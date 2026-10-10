@@ -55,6 +55,7 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
             MousePane::List => {
                 let _ = model.history_input(key, area.height.saturating_sub(4) as usize);
             }
+            MousePane::Output => model.output.scroll(up),
             _ => return false,
         }
         return true;
@@ -134,7 +135,7 @@ mod tests {
         };
         assert!(scroll(&mut model, details, area));
         assert_eq!(model.details_scroll, 3);
-        model.output_view(3);
+        model.output_view(3, 20);
         let output = MouseEvent {
             column: 80,
             row: 25,
@@ -142,7 +143,38 @@ mod tests {
             ..list
         };
         assert!(scroll(&mut model, output, area));
-        assert!(model.output_view(3).1.len() <= 3);
-        assert!(format!("{:?}", model.output_view(3).1).contains("26"));
+        assert!(model.output_view(3, 20).1.len() <= 3);
+        assert!(format!("{:?}", model.output_view(3, 20).1).contains("26"));
+    }
+
+    #[test]
+    fn output_wheel_keeps_working_while_history_view_is_open() {
+        let board = Board {
+            attention: (0..30)
+                .map(|index| AttentionLine {
+                    at_ms: index,
+                    source: "test".into(),
+                    text: index.to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut model = Model::default();
+        model.apply(wt_runtime::SourceSnapshot {
+            data: Some(Arc::new(board)),
+            state: wt_runtime::SourceState::Ready,
+            updated_at: None,
+            revision: 1,
+        });
+        model.history.active = true;
+        model.output_view(3, 30);
+        let output = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 80,
+            row: 25,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(scroll(&mut model, output, Rect::new(0, 0, 100, 30)));
+        assert!(format!("{:?}", model.output_view(3, 30).1).contains("25"));
     }
 }

@@ -166,6 +166,149 @@ fn create_and_attach_commands_keep_user_values_in_argv() {
     assert_eq!(attach.last().unwrap(), "=feature ; x");
 }
 
+#[test]
+fn session_environment_is_per_client_and_kept_in_session_argv() {
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at("/tmp/wt-tmux-test.sock").with_config_file("/dev/null"),
+    )
+    .with_session_environment([
+        ("PATH".into(), "/private/bin:/usr/bin:/bin".into()),
+        ("WT_CONFIG".into(), "/private/config.toml".into()),
+        ("WT_REPO_CONFIG".into(), String::new()),
+    ]);
+    let args = client
+        .create_session_args(&CreateSession {
+            name: "env".into(),
+            cwd: PathBuf::from("/tmp"),
+            command: vec!["sh".into(), "-c".into(), "true".into()],
+            width: None,
+            height: None,
+        })
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &args[4..12],
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "env",
+            "-c",
+            "/tmp",
+            "-e",
+            "PATH=/private/bin:/usr/bin:/bin"
+        ]
+    );
+    assert_eq!(
+        &args[12..],
+        [
+            "-e",
+            "WT_CONFIG=/private/config.toml",
+            "-e",
+            "WT_REPO_CONFIG=",
+            "'/usr/bin/env' 'PATH=/private/bin:/usr/bin:/bin' 'WT_CONFIG=/private/config.toml' 'WT_REPO_CONFIG=' 'sh' '-c' 'true'"
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn distinct_session_environments_work_on_one_existing_server() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let socket = temp.path().join("shared.sock");
+    let cancellation = CancellationToken::new();
+    let base = TmuxServer::at(&socket)
+        .with_cwd(temp.path())
+        .with_config_file("/dev/null");
+    let mut sessions = Vec::new();
+
+    for name in ["one", "two"] {
+        let bin = temp.path().join(name).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wt = bin.join("wt");
+        std::fs::write(&wt, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let observed = temp.path().join(format!("{name}.txt"));
+        let path_result = temp.path().join(format!("{name}.path"));
+        let client = TmuxClient::new(ProcessRunner::default(), base.clone())
+            .with_session_environment([
+                ("PATH".into(), format!("{}:/usr/bin:/bin", bin.display())),
+                (
+                    "WT_CONFIG".into(),
+                    temp.path()
+                        .join(format!("{name}.toml"))
+                        .display()
+                        .to_string(),
+                ),
+                (
+                    "WT_REPO_CONFIG".into(),
+                    temp.path()
+                        .join(format!("{name}.wt.toml"))
+                        .display()
+                        .to_string(),
+                ),
+            ]);
+        let script = "command -v wt > \"$1\"; wt > /dev/null; printf '%s\\n%s\\n' \"$WT_CONFIG\" \"$WT_REPO_CONFIG\" > \"$2\"; sleep 30";
+        let session = CreateSession {
+            name: name.into(),
+            cwd: temp.path().to_path_buf(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                script.into(),
+                "_".into(),
+                path_result.display().to_string(),
+                observed.display().to_string(),
+            ],
+            width: None,
+            height: None,
+        };
+        client
+            .create_session(&session, &cancellation)
+            .await
+            .unwrap();
+        sessions.push((client, name.to_owned(), wt, path_result, observed));
+    }
+
+    for _ in 0..100 {
+        if sessions
+            .iter()
+            .all(|(_, _, _, path, observed)| path.exists() && observed.exists())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let observed_values = sessions
+        .iter()
+        .map(|(_, name, wt, path_result, observed)| {
+            (
+                name.clone(),
+                wt.display().to_string(),
+                std::fs::read_to_string(path_result),
+                std::fs::read_to_string(observed),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (client, name, _, _, _) in sessions {
+        client.kill_session(&name, &cancellation).await.unwrap();
+    }
+    for (name, expected_wt, path_result, observed) in observed_values {
+        assert_eq!(
+            path_result.unwrap().trim(),
+            expected_wt,
+            "{name} must resolve and execute wt from its session PATH"
+        );
+        let values = observed.unwrap();
+        assert!(values.contains(&format!("/{name}.toml\n")));
+        assert!(values.contains(&format!("/{name}.wt.toml\n")));
+    }
+}
+
 #[tokio::test]
 async fn isolated_server_inventory_paste_options_rename_resize_and_kill() {
     let temp = tempdir().unwrap();

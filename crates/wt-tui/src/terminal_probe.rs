@@ -12,16 +12,24 @@ use crossterm::{
 pub(crate) struct ProbeResult {
     pub palette: Option<(String, String)>,
     pub events: Vec<Event>,
+    pub keyboard_supported: bool,
 }
 
 pub(crate) async fn query() -> io::Result<ProbeResult> {
-    execute!(io::stdout(), Print("\x1b]10;?\x1b\\\x1b]11;?\x1b\\"))?;
+    execute!(
+        io::stdout(),
+        Print("\x1b[?u\x1b[c\x1b]10;?\x1b\\\x1b]11;?\x1b\\")
+    )?;
     #[cfg(unix)]
     let bytes = tokio::task::spawn_blocking(read_bounded).await??;
     #[cfg(not(unix))]
     let bytes = Vec::new();
     let (palette, events) = decode_terminal_probe_bytes(&bytes);
-    Ok(ProbeResult { palette, events })
+    Ok(ProbeResult {
+        palette,
+        events,
+        keyboard_supported: keyboard_protocol_response(&bytes) == Some(true),
+    })
 }
 
 /// Decode a captured terminal reply buffer and preserve unrelated key input.
@@ -57,7 +65,10 @@ fn read_bounded() -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut foreground = false;
     let mut background = false;
-    while Instant::now() < deadline && !(foreground && background) && bytes.len() < 64 * 1024 {
+    while Instant::now() < deadline
+        && (!(foreground && background) || keyboard_protocol_response(&bytes).is_none())
+        && bytes.len() < 64 * 1024
+    {
         let mut descriptor = libc::pollfd {
             fd: 0,
             events: libc::POLLIN,
@@ -198,6 +209,21 @@ fn parse_events(bytes: &[u8]) -> Vec<Event> {
                         continue;
                     }
                     break;
+                } else if next == b'O' {
+                    if let Some(final_byte) = bytes.get(cursor + 2).copied() {
+                        let code = match final_byte {
+                            b'P' => Some(KeyCode::F(1)),
+                            b'Q' => Some(KeyCode::F(2)),
+                            b'R' => Some(KeyCode::F(3)),
+                            b'S' => Some(KeyCode::F(4)),
+                            _ => None,
+                        };
+                        if let Some(code) = code {
+                            events.push(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                            cursor += 3;
+                            continue;
+                        }
+                    }
                 } else if next == b']' {
                     if let Some(end) = osc_end(bytes, cursor + 2) {
                         cursor = end.sequence_end;
@@ -269,9 +295,97 @@ fn csi_key(sequence: &[u8], final_byte: u8) -> Option<Event> {
         b'D' => (KeyCode::Left, csi_modifiers(text)),
         b'H' => (KeyCode::Home, csi_modifiers(text)),
         b'F' => (KeyCode::End, csi_modifiers(text)),
+        b'P' => (KeyCode::F(1), csi_modifiers(text)),
+        b'Q' => (KeyCode::F(2), csi_modifiers(text)),
+        b'R' => (KeyCode::F(3), csi_modifiers(text)),
+        b'S' => (KeyCode::F(4), csi_modifiers(text)),
+        b'~' => parse_tilde_key(text)?,
+        b'u' => parse_kitty_key(text)?,
         _ => return None,
     };
     Some(Event::Key(KeyEvent::new(code, modifiers)))
+}
+
+fn parse_tilde_key(sequence: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let mut params = sequence.split(';');
+    let number = params.next()?.parse::<u16>().ok()?;
+    let modifiers = params
+        .next()
+        .and_then(|part| part.parse::<u8>().ok())
+        .map_or(KeyModifiers::NONE, csi_modifier_number);
+    let code = match number {
+        1 | 7 => KeyCode::Home,
+        2 => KeyCode::Insert,
+        3 => KeyCode::Delete,
+        4 | 8 => KeyCode::End,
+        5 => KeyCode::PageUp,
+        6 => KeyCode::PageDown,
+        11 => KeyCode::F(1),
+        12 => KeyCode::F(2),
+        13 => KeyCode::F(3),
+        14 => KeyCode::F(4),
+        15 => KeyCode::F(5),
+        17 => KeyCode::F(6),
+        18 => KeyCode::F(7),
+        19 => KeyCode::F(8),
+        20 => KeyCode::F(9),
+        21 => KeyCode::F(10),
+        23 => KeyCode::F(11),
+        24 => KeyCode::F(12),
+        _ => return None,
+    };
+    Some((code, modifiers))
+}
+
+fn parse_kitty_key(sequence: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let mut params = sequence.split(';');
+    let key = params.next()?.split(':').next()?.parse::<u32>().ok()?;
+    let modifier_number = params
+        .next()
+        .and_then(|part| part.split(':').next())
+        .and_then(|part| part.parse::<u8>().ok())
+        .unwrap_or(1);
+    let modifiers = kitty_modifier_number(modifier_number);
+    let code = match key {
+        9 => KeyCode::Tab,
+        13 => KeyCode::Enter,
+        27 => KeyCode::Esc,
+        127 => KeyCode::Backspace,
+        57364..=57387 => KeyCode::F((key - 57363) as u8),
+        _ => KeyCode::Char(char::from_u32(key)?),
+    };
+    Some((code, modifiers))
+}
+
+fn csi_modifier_number(number: u8) -> KeyModifiers {
+    match number {
+        2 => KeyModifiers::SHIFT,
+        3 => KeyModifiers::ALT,
+        4 => KeyModifiers::ALT | KeyModifiers::SHIFT,
+        5 => KeyModifiers::CONTROL,
+        6 => KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
+        8 => KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        _ => KeyModifiers::NONE,
+    }
+}
+
+fn kitty_modifier_number(number: u8) -> KeyModifiers {
+    let bits = number.saturating_sub(1);
+    let mut modifiers = KeyModifiers::NONE;
+    if bits & 1 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if bits & 2 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if bits & 4 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    if bits & 8 != 0 {
+        modifiers |= KeyModifiers::SUPER;
+    }
+    modifiers
 }
 
 fn csi_modifiers(sequence: &str) -> KeyModifiers {
@@ -280,14 +394,34 @@ fn csi_modifiers(sequence: &str) -> KeyModifiers {
         .next()
         .and_then(|part| part.parse::<u8>().ok())
     {
-        Some(2) => KeyModifiers::SHIFT,
-        Some(3) => KeyModifiers::ALT,
-        Some(5) => KeyModifiers::CONTROL,
-        Some(6) => KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        Some(7) => KeyModifiers::ALT | KeyModifiers::CONTROL,
-        Some(8) => KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        _ => KeyModifiers::NONE,
+        Some(number) => csi_modifier_number(number),
+        None => KeyModifiers::NONE,
     }
+}
+
+fn keyboard_protocol_response(input: &[u8]) -> Option<bool> {
+    let mut cursor = 0;
+    while cursor + 2 < input.len() {
+        if input[cursor..].starts_with(b"\x1b[")
+            && let Some(relative_end) = input[cursor + 2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+        {
+            let end = cursor + 2 + relative_end;
+            let sequence = &input[cursor + 2..end];
+            match (sequence.first(), input[end]) {
+                (Some(b'?'), b'u') if sequence[1..].iter().all(|byte| byte.is_ascii_digit()) => {
+                    return Some(true);
+                }
+                (Some(b'?'), b'c') => return Some(false),
+                _ => {}
+            }
+            cursor = end + 1;
+        } else {
+            cursor += 1;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -334,6 +468,27 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::Key(key) if key.code == KeyCode::Char('k')));
         assert!(matches!(events[1], Event::Key(key) if key.code == KeyCode::Char('x')));
+    }
+
+    #[test]
+    fn startup_replay_preserves_function_keys_and_kitty_control_shift_chords() {
+        let input = b"\x1b[?1u\x1b[21~\x1b[24~\x1b[5~\x1b[106;6u";
+        assert_eq!(keyboard_protocol_response(input), Some(true));
+        let (_, events) = decode_terminal_probe_bytes(input);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], Event::Key(key) if key.code == KeyCode::F(10)));
+        assert!(matches!(events[1], Event::Key(key) if key.code == KeyCode::F(12)));
+        assert!(matches!(events[2], Event::Key(key) if key.code == KeyCode::PageUp));
+        assert!(matches!(events[3], Event::Key(key)
+            if key.code == KeyCode::Char('j')
+                && key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
+    }
+
+    #[test]
+    fn unsupported_keyboard_protocol_reply_does_not_enable_enhancements() {
+        assert_eq!(keyboard_protocol_response(b"\x1b[?62c"), Some(false));
+        assert_eq!(keyboard_protocol_response(b"\x1b[?1u"), Some(true));
+        assert_eq!(keyboard_protocol_response(b"\x1b[A"), None);
     }
 
     #[test]

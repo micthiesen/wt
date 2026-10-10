@@ -1,5 +1,6 @@
 //! Cancellable, lock-scoped local worktree lifecycle operations.
 
+mod rift_binary;
 mod service;
 
 pub use service::{

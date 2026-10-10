@@ -195,11 +195,12 @@ checks the selected harness's actual skill lookup paths and fails without typing
 anything if `start` is still unavailable. This second guard also covers direct
 worker invocations and provisioning failures.
 
-The executable half is supplied at session creation rather than copied by the
-skills system: `wrapInnerArgs` prepends the directory of the `wt` launcher that
-received the remote command to every harness's `PATH`. A worker may therefore
-use a configured `wt_path` that is absent from its non-interactive SSH PATH,
-while the started agent can still run `wt status`.
+Session creation prepends the running native wt directory to every harness's
+`PATH` and pins the process's absolute config selectors in that session.
+These values belong to the session, so a pre-existing tmux server cannot lend
+it another configuration's environment. Claude's inspection shims remain first
+on its PATH. A provisioned worker can therefore launch an agent that runs bare
+`wt status` even when the runtime directory is absent from SSH's initial PATH.
 
 ## Keeping your own versions
 

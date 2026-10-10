@@ -380,6 +380,12 @@ def main() -> None:
             "#!" + sys.executable + "\n"
             "import os, pathlib, subprocess, sys\n"
             "args = sys.argv[1:]\n"
+            "def is_snapshot_ls_files(values):\n"
+            "    return values[:4] == ['ls-files', '--others', '--exclude-standard', '-z'] and values[4:] == ['--', '.']\n"
+            "if args == ['--fixture-self-test']:\n"
+            "    assert is_snapshot_ls_files(['ls-files', '--others', '--exclude-standard', '-z', '--', '.'])\n"
+            "    assert not is_snapshot_ls_files(['ls-files', '--others', '--exclude-standard', '-z'])\n"
+            "    raise SystemExit(0)\n"
             f"result = subprocess.run([{real_git!r}, *args], capture_output=True)\n"
             "sys.stdout.buffer.write(result.stdout)\n"
             "sys.stderr.buffer.write(result.stderr)\n"
@@ -388,7 +394,7 @@ def main() -> None:
             f"marker = pathlib.Path({str(late_marker)!r})\n"
             f"counter_path = pathlib.Path({str(ls_count_path)!r})\n"
             f"with pathlib.Path({str(git_trace)!r}).open('a') as trace: trace.write(repr((str(cwd), args)) + '\\n')\n"
-            "if result.returncode == 0 and cwd == target and args == ['ls-files', '--others', '--exclude-standard', '-z']:\n"
+            "if result.returncode == 0 and cwd == target and is_snapshot_ls_files(args):\n"
             "    count = int(counter_path.read_text()) if counter_path.exists() else 0\n"
             "    count += 1\n"
             "    counter_path.write_text(str(count))\n"
@@ -399,6 +405,17 @@ def main() -> None:
             encoding="utf-8",
         )
         git_wrapper.chmod(0o700)
+        wrapper_probe = subprocess.run(
+            [str(git_wrapper), "--fixture-self-test"],
+            cwd=scratch,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        assert wrapper_probe.returncode == 0, (
+            "Git snapshot race injection did not arm: "
+            f"exit={wrapper_probe.returncode}, stderr={wrapper_probe.stderr!r}"
+        )
         fake_ps = fake_bin / "ps"
         real_ps = shutil.which("ps") or "/bin/ps"
         fake_ps.write_text(
@@ -495,6 +512,11 @@ def main() -> None:
                 f"stdout={changed.stdout!r}; stderr={changed.stderr!r}"
             )
             assert late_marker.exists(), "fixture did not inject the post-snapshot file"
+            scan_count = int(ls_count_path.read_text(encoding="utf-8"))
+            assert scan_count >= 2, (
+                "fixture injection did not run after the planner's second bounded untracked-file scan: "
+                f"observed {scan_count} scans"
+            )
             assert "changed after the removal warning" in changed.stderr, changed.stderr
             assert late_listener.poll() is None, "stale revision refusal killed its listener"
             assert_session(env, socket_name, "late-shell", True)

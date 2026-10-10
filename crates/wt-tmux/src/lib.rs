@@ -237,6 +237,7 @@ impl TmuxServer {
 pub struct TmuxClient {
     runner: ProcessRunner,
     server: TmuxServer,
+    session_environment: Vec<(String, String)>,
 }
 
 #[derive(Debug, Error)]
@@ -365,7 +366,23 @@ impl WindowTarget {
 
 impl TmuxClient {
     pub fn new(runner: ProcessRunner, server: TmuxServer) -> Self {
-        Self { runner, server }
+        Self {
+            runner,
+            server,
+            session_environment: Vec::new(),
+        }
+    }
+
+    /// Set immutable environment values for each newly created session. These
+    /// are passed to tmux `new-session -e`, never written to server-global
+    /// state, so separate clients can safely share one server with distinct
+    /// configuration selectors.
+    pub fn with_session_environment(
+        mut self,
+        environment: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.session_environment = environment.into_iter().collect();
+        self
     }
 
     pub fn server(&self) -> &TmuxServer {
@@ -467,6 +484,9 @@ impl TmuxClient {
         args.extend(["new-session".into(), "-d".into()]);
         args.extend(["-s".into(), session.name.clone().into()]);
         args.extend(["-c".into(), session.cwd.as_os_str().to_owned()]);
+        for (key, value) in &self.session_environment {
+            args.extend(["-e".into(), format!("{key}={value}").into()]);
+        }
         if let Some(width) = session.width {
             args.extend(["-x".into(), width.to_string().into()]);
         }
@@ -474,8 +494,23 @@ impl TmuxClient {
             args.extend(["-y".into(), height.to_string().into()]);
         }
         if !session.command.is_empty() {
-            let command = session
-                .command
+            // `new-session -e` records the session environment, but tmux runs
+            // explicit commands through the user's configured shell first.
+            // Shell startup files can rewrite PATH, so install the same values
+            // once more at the actual command boundary.
+            let command = if self.session_environment.is_empty() {
+                session.command.clone()
+            } else {
+                std::iter::once("/usr/bin/env".to_owned())
+                    .chain(
+                        self.session_environment
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}")),
+                    )
+                    .chain(session.command.iter().cloned())
+                    .collect()
+            };
+            let command = command
                 .iter()
                 .map(|arg| shell_quote(arg))
                 .collect::<Vec<_>>()

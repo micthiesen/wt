@@ -6,7 +6,7 @@
 
 use std::ffi::OsString;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -71,6 +71,82 @@ pub struct PreparedSession {
     pub cwd: PathBuf,
 }
 
+fn harness_session_environment(
+    home: &Path,
+    cwd: &Path,
+    repository_config: Option<&Path>,
+    executable: Option<&Path>,
+    inherited: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    environment.insert("HOME".into(), absolute_session_path(home, cwd, home));
+
+    let xdg_config = inherited
+        .get("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(|value| absolute_session_path(Path::new(value), cwd, home))
+        .unwrap_or_else(|| absolute_session_path(&home.join(".config"), cwd, home));
+    environment.insert("XDG_CONFIG_HOME".into(), xdg_config.clone());
+
+    let config = inherited
+        .get("WT_CONFIG")
+        .filter(|value| !value.is_empty())
+        .map(|value| absolute_session_path(Path::new(value), cwd, home))
+        .unwrap_or_else(|| {
+            Path::new(&xdg_config)
+                .join("wt/config.toml")
+                .display()
+                .to_string()
+        });
+    environment.insert("WT_CONFIG".into(), config);
+    environment.insert(
+        "WT_REPO_CONFIG".into(),
+        repository_config
+            .map(|path| absolute_session_path(path, cwd, home))
+            .unwrap_or_default(),
+    );
+
+    let install_root = inherited
+        .get("WT_INSTALL_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(|root| absolute_session_path(Path::new(root), cwd, home))
+        .unwrap_or_else(|| absolute_session_path(&home.join(".local/share/wt"), cwd, home));
+    environment.insert("WT_INSTALL_ROOT".into(), install_root);
+
+    let inherited_path = inherited
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let mut paths = executable
+        .and_then(Path::parent)
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.extend(std::env::split_paths(inherited_path));
+    let path = std::env::join_paths(paths)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| inherited_path.to_owned());
+    environment.insert("PATH".into(), path);
+    environment
+}
+
+fn absolute_session_path(path: &Path, cwd: &Path, home: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let expanded = if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        path.to_path_buf()
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
+    absolute.display().to_string()
+}
+
 #[derive(Clone)]
 pub struct AppHarness {
     service: HarnessService,
@@ -87,15 +163,36 @@ pub struct AppHarness {
 impl AppHarness {
     pub fn new(context: &AppContext) -> Self {
         let cache_root = context.config.paths.cache_root.clone();
+        let inherited_environment = std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let session_environment = harness_session_environment(
+            &context.home,
+            &context.cwd,
+            context.config.repository_config.as_deref(),
+            std::env::current_exe().ok().as_deref(),
+            &inherited_environment,
+        );
+        let spawn_path = session_environment.get("PATH").cloned().unwrap_or_default();
         let mut server =
             TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone());
         if let Ok(config_path) = write_terminal_palette_config(&cache_root, &context.home) {
             server = server.with_config_file(config_path);
         }
-        let tmux = TmuxClient::new(context.processes.clone(), server);
+        let tmux = TmuxClient::new(context.processes.clone(), server).with_session_environment(
+            session_environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let claude_paths = ClaudePaths::new(&context.home, &cache_root);
         let claude_sessions =
-            ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone());
+            ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone())
+                .with_spawn_path(spawn_path.clone());
         let claude_injector = ClaudeInjector::new(cache_root.clone());
         let service = HarnessService::new(
             claude_paths,
@@ -103,7 +200,8 @@ impl AppHarness {
             OpenCodePaths::new(&context.home, &cache_root),
             context.processes.clone(),
             tmux.clone(),
-        );
+        )
+        .with_spawn_path(spawn_path);
         Self {
             service,
             tmux,
@@ -693,6 +791,42 @@ pub fn unavailable_source_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_environment_pins_selectors_and_prepends_running_binary_path() {
+        let inherited = BTreeMap::from([
+            ("PATH".into(), "/shim:/usr/bin".into()),
+            ("WT_CONFIG".into(), "~/profiles/one.toml".into()),
+            ("WT_REPO_CONFIG".into(), "/stale/other.wt.toml".into()),
+            ("XDG_CONFIG_HOME".into(), "/stale/xdg".into()),
+            ("WT_INSTALL_ROOT".into(), "/release/wt".into()),
+        ]);
+        let env = harness_session_environment(
+            Path::new("/users/test"),
+            Path::new("/repo/worktree"),
+            Some(Path::new("/repo/main/.wt.toml")),
+            Some(Path::new("/release/wt/versions/abc/bin/wt")),
+            &inherited,
+        );
+        assert_eq!(env["PATH"], "/release/wt/versions/abc/bin:/shim:/usr/bin");
+        assert_eq!(env["WT_CONFIG"], "/users/test/profiles/one.toml");
+        assert_eq!(env["WT_REPO_CONFIG"], "/repo/main/.wt.toml");
+        assert_eq!(env["XDG_CONFIG_HOME"], "/stale/xdg");
+        assert_eq!(env["WT_INSTALL_ROOT"], "/release/wt");
+        assert_eq!(env["HOME"], "/users/test");
+
+        let defaulted = harness_session_environment(
+            Path::new("/users/test"),
+            Path::new("/repo/worktree"),
+            None,
+            Some(Path::new("/opt/wt/bin/wt")),
+            &BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+        );
+        assert_eq!(defaulted["WT_CONFIG"], "/users/test/.config/wt/config.toml");
+        assert_eq!(defaulted["WT_REPO_CONFIG"], "");
+        assert_eq!(defaulted["XDG_CONFIG_HOME"], "/users/test/.config");
+        assert_eq!(defaulted["WT_INSTALL_ROOT"], "/users/test/.local/share/wt");
+    }
 
     #[test]
     fn live_target_matches_typescript_identity_fixture() {

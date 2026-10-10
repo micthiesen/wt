@@ -146,6 +146,10 @@ pub struct RemovalRevision {
     pub head: String,
     pub digest: String,
     pub hazards: Vec<String>,
+    /// A local-ancestry landing claim must survive delayed/background execution.
+    /// The worker rechecks this exact advertised base before destructive work.
+    #[serde(default)]
+    pub published_base: Option<Box<(String, String)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +214,7 @@ pub struct LifecycleService {
     dev: Option<wt_dev::DevServerService>,
     before_remove: Option<BeforeRemoveHook>,
     sst_program: OsString,
+    resolved_rift: Arc<tokio::sync::OnceCell<OsString>>,
 }
 
 type BeforeRemoveHook = Arc<
@@ -241,6 +246,7 @@ impl LifecycleService {
             dev: None,
             before_remove: None,
             sst_program: "pnpm".into(),
+            resolved_rift: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -1357,6 +1363,7 @@ impl LifecycleService {
             }
             BackendKind::Rift => {
                 progress.checkout_attempted = true;
+                let rift = self.rift_binary(cancellation).await?;
                 if !fs::try_exists(main.join(".rift")).await.map_err(|source| {
                     LifecycleError::Io {
                         operation: "check Rift registration",
@@ -1365,7 +1372,7 @@ impl LifecycleService {
                     }
                 })? && let Err(error) = self
                     .run_external(
-                        &self.config.rift_binary,
+                        &rift,
                         main,
                         ["init", "--here"],
                         cancellation,
@@ -1825,6 +1832,26 @@ impl LifecycleService {
         ))
     }
 
+    async fn rift_binary(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<OsString, LifecycleError> {
+        self.resolved_rift
+            .get_or_try_init(|| async {
+                crate::rift_binary::resolve(
+                    &self.config.rift_binary,
+                    &self.config.shell,
+                    &self.config.main_clone,
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                    &self.runner,
+                    cancellation,
+                )
+                .await
+            })
+            .await
+            .cloned()
+    }
+
     async fn remove_rift(
         &self,
         path: &Path,
@@ -1832,7 +1859,7 @@ impl LifecycleService {
         force: bool,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, LifecycleError> {
-        let mut spec = CommandSpec::new(self.config.rift_binary.clone());
+        let mut spec = CommandSpec::new(self.rift_binary(cancellation).await?);
         spec.args = if force {
             vec![
                 "remove".into(),
@@ -1870,7 +1897,7 @@ impl LifecycleService {
         slug: &str,
         cancellation: &CancellationToken,
     ) -> Result<wt_platform::process::ProcessOutput, LifecycleError> {
-        let mut spec = CommandSpec::new(self.config.rift_binary.clone());
+        let mut spec = CommandSpec::new(self.rift_binary(cancellation).await?);
         spec.args = ["create", "--name", slug, "--into"]
             .into_iter()
             .map(OsString::from)
@@ -1895,7 +1922,7 @@ impl LifecycleService {
         main: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), LifecycleError> {
-        let mut spec = prioritized_rift_gc(&self.config.rift_binary);
+        let mut spec = prioritized_rift_gc(&self.rift_binary(cancellation).await?);
         spec.cwd = Some(main.to_path_buf());
         spec.timeout = Duration::from_secs(20 * 60);
         spec.output_limit = PROCESS_OUTPUT_LIMIT;
@@ -2041,6 +2068,7 @@ impl LifecycleService {
             head,
             digest: format!("{:x}", digest.finalize()),
             hazards: Vec::new(),
+            published_base: None,
         })
     }
 
@@ -2095,6 +2123,7 @@ impl LifecycleService {
         }
         let mut rebased = full;
         rebased.hazards = hazards;
+        rebased.published_base = expected.published_base.clone();
         Ok(rebased)
     }
 
@@ -2111,6 +2140,41 @@ impl LifecycleService {
                 "checkout changed after the removal warning; review the new state before removing"
                     .into(),
             ));
+        }
+        if let Some((reference, tip)) = expected.published_base.as_deref() {
+            if !reference.starts_with("refs/heads/")
+                || !matches!(tip.len(), 40 | 64)
+                || !tip.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(LifecycleError::Refused(
+                    "invalid published-base removal proof".into(),
+                ));
+            }
+            // Linked worktrees can override remote.origin through worktree
+            // config. Revalidate against the same object store and origin that
+            // supplied the plan; Rift clones own their independent origin.
+            let proof_repository = match self.backend_for(Path::new(&row.target.path)).await? {
+                BackendKind::GitWorktree => self.config.main_clone.as_path(),
+                BackendKind::Rift => Path::new(&row.target.path),
+            };
+            let advertised = self
+                .run_git_raw(
+                    proof_repository,
+                    ["ls-remote", "--exit-code", "--refs", "origin", reference],
+                    cancellation,
+                    "revalidate published removal base",
+                )
+                .await?;
+            let still_published = advertised.status.success()
+                && advertised.stdout_text().lines().any(|line| {
+                    line.split_once('\t')
+                        .is_some_and(|(oid, name)| oid == tip && name == reference)
+                });
+            if !still_published {
+                return Err(LifecycleError::Refused(
+                    "published base changed or is unavailable after removal planning; review current landing evidence before removing".into(),
+                ));
+            }
         }
         let hazards = self
             .collect_removal_hazards(row, landed, cancellation)

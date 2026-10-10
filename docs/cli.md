@@ -88,7 +88,15 @@ Creation also sets `branch.<name>.gh-merge-base` to the branch's real merge targ
 
 Remove a worktree (with dirty/unpushed guards, optional SST stage destroy, optional branch delete). No slug ⇒ interactive picker.
 
-"Unpushed" is measured against `origin/<branch>`, the same `unpushed` field [`wt ls --json`](#wt-ls) reports — never against `@{u}`, whose meaning depends on the branch's local tracking configuration. The guard is suppressed entirely for a merged/gone branch: a squash-merged worktree keeps its pre-squash commits locally but the work is landed, so it removes without a spurious `--force`. The TUI's `d` and `c` apply the same rule through `destroyHazard`.
+"Unpushed" is measured against `origin/<branch>`, the same `unpushed` field [`wt ls --json`](#wt-ls) reports, never against the branch's configured upstream. Proven landing can waive this guard because squash merges leave the original commits outside the base history. Proof requires an exact merged-PR head or containment by the base tip currently advertised by origin. A cached ref or local base branch alone is insufficient. Background removal retains the advertised-base proof and checks it again under the removal lock before teardown and deletion; a changed or unavailable base requires a new review. The CLI, TUI and cleanup automations share these checks.
+
+Successful SST removal may regenerate configured `auto_regen_paths`. Those
+changes are allowed in the final removal check; edits outside that allowlist,
+changed HEAD/identity, and new verification obligations still stop removal.
+The allowlist declares disposable generated outputs, so it also allows a
+concurrent generator to rewrite those paths during teardown. Existing changes
+still require the initial dirty-work confirmation. Do not put hand-edited
+source files in this list.
 
 - `--yes` / `-y` — skip confirmations.
 - `--force` — remove despite uncommitted / unpushed work, or an outstanding post-merge verification.

@@ -24,9 +24,10 @@ on large trees. With `--copy-all` it brings project files across without a packa
 so any dependencies already present in the main clone are present immediately.
 wt passes `--copy-all` to `rift create`.
 
-wt resolves the `rift` executable from the process `PATH`. Ensure it is
-available to the environment that launches wt, including editor or agent
-processes.
+wt resolves the `rift` executable from the process `PATH`, then asks the user's
+login shell when it is missing. The fallback is bounded to ten seconds and
+only discovers an executable path; create/remove still use exact arguments.
+This supports editor, daemon and agent launches whose PATH lacks shell setup.
 
 Rift copies the project tree from the main clone. Dependencies are present
 when they exist in that tree, but wt does not synchronize package installs as
@@ -35,7 +36,7 @@ project-specific setup when required.
 
 ## Setup
 
-The `rift` binary must be on `PATH`, and the main clone must be
+The `rift` binary must be available on the process or login-shell PATH, and the main clone must be
 rift-registered (`rift init`). wt runs `rift init`
 **lazily** on the first create (idempotent, guarded on the `.rift`
 marker) rather than at startup, so launching wt never pays a rift

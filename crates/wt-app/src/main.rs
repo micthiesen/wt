@@ -18,8 +18,10 @@ mod controller_actions;
 mod database;
 mod dev;
 mod dev_source;
+mod display_time;
 mod editor;
 mod events;
+mod fleet_cleanup;
 mod fork_base;
 mod freshness;
 mod github_actions;
@@ -404,7 +406,7 @@ async fn run_application(
         commands,
     ));
     let fleet = remote_board::start(scope, &context, host);
-    let board = fleet.board.clone();
+    let board = display_time::overlay(scope, fleet.board.clone());
     let controller = controller::start(scope, context.clone(), fleet, controller_port);
     // A child cancellation token does not cancel its parent. The terminal
     // token handles Ctrl+C and explicit application shutdown owns the scope.

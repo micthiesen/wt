@@ -7,7 +7,8 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyEventKind,
+        Event, EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -21,6 +22,8 @@ use crate::{Board, Model, TerminalHandoff, UiActions, model::InputResult, render
 
 struct TerminalGuard {
     active: bool,
+    keyboard_supported: bool,
+    keyboard_enhanced: bool,
 }
 
 impl TerminalGuard {
@@ -36,7 +39,23 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        Ok(Self { active: true })
+        Ok(Self {
+            active: true,
+            keyboard_supported: false,
+            keyboard_enhanced: false,
+        })
+    }
+
+    fn enable_keyboard_enhancements(&mut self, supported: bool) -> io::Result<()> {
+        self.keyboard_supported = supported;
+        if supported && !self.keyboard_enhanced {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            self.keyboard_enhanced = true;
+        }
+        Ok(())
     }
 
     fn suspend(&mut self) -> io::Result<()> {
@@ -44,6 +63,10 @@ impl TerminalGuard {
             return Ok(());
         }
         disable_raw_mode()?;
+        if self.keyboard_enhanced {
+            execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
+            self.keyboard_enhanced = false;
+        }
         if let Err(error) = execute!(
             io::stdout(),
             DisableBracketedPaste,
@@ -59,6 +82,7 @@ impl TerminalGuard {
                 EnableMouseCapture,
                 Hide
             );
+            let _ = self.enable_keyboard_enhancements(self.keyboard_supported);
             return Err(error);
         }
         self.active = false;
@@ -80,6 +104,17 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error);
         }
+        if let Err(error) = self.enable_keyboard_enhancements(self.keyboard_supported) {
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                Show,
+                LeaveAlternateScreen
+            );
+            return Err(error);
+        }
         self.active = true;
         Ok(())
     }
@@ -91,6 +126,10 @@ impl Drop for TerminalGuard {
             return;
         }
         let _ = disable_raw_mode();
+        if self.keyboard_enhanced {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+            self.keyboard_enhanced = false;
+        }
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
@@ -148,6 +187,7 @@ async fn run_inner<'a>(
     if let Some(on_palette) = on_palette {
         match crate::terminal_probe::query().await {
             Ok(probe) => {
+                guard.enable_keyboard_enhancements(probe.keyboard_supported)?;
                 on_palette(probe.palette).await;
                 pending_events.extend(probe.events);
             }

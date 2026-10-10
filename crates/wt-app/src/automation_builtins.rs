@@ -84,6 +84,7 @@ async fn clean(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecuti
         head: plan.revision.head,
         digest: plan.revision.digest,
         hazards: plan.revision.hazards,
+        published_base: plan.revision.published_base,
     };
     let message = lifecycle_ops::cleanup_confirmed(ctx, &[revision]).await?;
     Ok(BuiltinExecution::Completed { message })
@@ -184,6 +185,7 @@ async fn restack(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecu
                     head: plan.revision.head,
                     digest: plan.revision.digest,
                     hazards: plan.revision.hazards,
+                    published_base: plan.revision.published_base,
                 })
                 .collect::<Vec<_>>();
             if !revisions.is_empty() {

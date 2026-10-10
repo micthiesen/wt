@@ -174,7 +174,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
         );
     }
     let available = activity.height.saturating_sub(2) as usize;
-    let (title, activity_lines) = model.output_view(available);
+    let available_width = activity.width.saturating_sub(2) as usize;
+    let (title, activity_lines) = model.output_view(available, available_width);
     frame.render_widget(
         Paragraph::new(activity_lines).block(panel(&title)),
         activity,
@@ -702,6 +703,7 @@ mod tests {
                         head: "abc123".into(),
                         digest: "deadbeef".into(),
                         hazards: vec!["uncommitted changes".into()],
+                        published_base: None,
                     },
                 },
                 title: "remove 界面 worktree".into(),

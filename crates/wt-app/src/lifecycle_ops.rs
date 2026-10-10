@@ -200,9 +200,24 @@ pub async fn plan_with_facts(
             automations_paused: None,
             extra,
         };
-        let revision = lifecycle
+        let mut revision = lifecycle
             .removal_revision(&row.target, landed, &ctx.cancellation)
             .await?;
+        if local_merged {
+            let repository = match ctx.config.backend.kind {
+                wt_config::BackendKind::GitWorktree => ctx.config.paths.main_clone.as_path(),
+                wt_config::BackendKind::Rift => path,
+            };
+            revision.published_base = published_bases
+                .get(repository)
+                .and_then(Option::as_ref)
+                .map(|tip| {
+                    Box::new((
+                        format!("refs/heads/{}", ctx.config.branch.base),
+                        tip.clone(),
+                    ))
+                });
+        }
         let hazards = revision.hazards.clone();
         let stage_path = path.to_path_buf();
         let stage = row.target.stage.clone();
@@ -382,6 +397,7 @@ fn same_revision(plan: &wt_lifecycle::RemovalRevision, expected: &wt_tui::Remova
         && plan.head == expected.head
         && plan.digest == expected.digest
         && plan.hazards == expected.hazards
+        && plan.published_base == expected.published_base
 }
 
 #[cfg(test)]
@@ -445,11 +461,79 @@ mod tests {
             .unwrap();
         assert!(plan.rows[0].local_merged);
         assert!(plan.rows[0].hazards.is_empty());
+        // Detached workers deserialize this revision after the planning process
+        // exits. Do not reduce the published-base witness to a `landed` bool.
+        let delayed: wt_lifecycle::RemovalRevision =
+            serde_json::from_slice(&serde_json::to_vec(&plan.rows[0].revision).unwrap()).unwrap();
+        assert_eq!(delayed.published_base.as_ref().unwrap().1, head);
+
+        // A linked checkout can override origin independently. Its alternate
+        // remote retaining the commit must not validate the main clone's proof.
+        let alternate = fixture._root.path().join("alternate-origin.git");
+        git(
+            ctx,
+            path,
+            &[
+                "clone",
+                "--bare",
+                origin.to_str().unwrap(),
+                alternate.to_str().unwrap(),
+            ],
+        )
+        .await;
+        git(ctx, path, &["config", "extensions.worktreeConfig", "true"]).await;
+        git(
+            ctx,
+            path,
+            &[
+                "config",
+                "--worktree",
+                &format!("url.{}.insteadOf", alternate.display()),
+                origin.to_str().unwrap(),
+            ],
+        )
+        .await;
 
         // Simulate a remote force-push without updating this checkout's cached
         // origin/main. The old cache still contains HEAD, but origin does not.
         git(ctx, &origin, &["update-ref", "refs/heads/main", &base]).await;
         assert_eq!(git(ctx, path, &["rev-parse", "origin/main"]).await, head);
+        assert_eq!(
+            git(ctx, path, &["ls-remote", "origin", "refs/heads/main"]).await,
+            format!("{head}\trefs/heads/main")
+        );
+        assert_eq!(
+            git(
+                ctx,
+                &ctx.config.paths.main_clone,
+                &["ls-remote", "origin", "refs/heads/main"]
+            )
+            .await,
+            format!("{base}\trefs/heads/main")
+        );
+        let refused = service(ctx)
+            .unwrap()
+            .remove_with_revision(
+                &row.target,
+                wt_lifecycle::RemoveOptions {
+                    landed: true,
+                    delete_branch: true,
+                    ..Default::default()
+                },
+                &delayed,
+                &ctx.cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("published base changed"),
+            "{refused}"
+        );
+        assert!(path.exists());
+        assert_eq!(
+            git(ctx, path, &["rev-parse", "refs/heads/feature/one"]).await,
+            head
+        );
         let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
             .await
             .unwrap();

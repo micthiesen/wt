@@ -4,6 +4,7 @@ use ratatui::{
     style::{Color, Style},
     text::Line,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutputTarget {
@@ -120,21 +121,36 @@ impl Model {
         });
     }
 
-    pub(crate) fn output_view(&mut self, height: usize) -> (String, Vec<Line<'static>>) {
+    pub(crate) fn output_view(
+        &mut self,
+        height: usize,
+        width: usize,
+    ) -> (String, Vec<Line<'static>>) {
         let target = self.output.target.clone();
         let (title, lines, identity, count) = match &target {
             OutputTarget::Attention => {
                 let mut lines = Vec::new();
                 let mut marked = false;
                 for event in &self.board.attention {
-                    if !marked && event.at_ms > self.board.attention_seen_ms {
+                    if self.board.attention_seen_ms > 0
+                        && !marked
+                        && event.at_ms > self.board.attention_seen_ms
+                    {
                         lines.push(Line::styled(
-                            format!("── seen {}", time_of_day(self.board.attention_seen_ms)),
+                            format!(
+                                "── seen {}",
+                                self.display_time(self.board.attention_seen_ms)
+                            ),
                             Style::new().fg(Color::DarkGray),
                         ));
                         marked = true;
                     }
-                    let text = format!("{}: {}", event.source, event.text);
+                    let text = format!(
+                        "{} {}: {}",
+                        self.display_time(event.at_ms),
+                        event.source,
+                        event.text
+                    );
                     lines.push(
                         if self.board.attention_seen_ms > 0
                             && event.at_ms <= self.board.attention_seen_ms
@@ -147,7 +163,10 @@ impl Model {
                 }
                 if self.board.attention_seen_ms > 0 && !marked && !self.board.attention.is_empty() {
                     lines.push(Line::styled(
-                        format!("── seen {}", time_of_day(self.board.attention_seen_ms)),
+                        format!(
+                            "── seen {}",
+                            self.display_time(self.board.attention_seen_ms)
+                        ),
                         Style::new().fg(Color::DarkGray),
                     ));
                 }
@@ -161,7 +180,7 @@ impl Model {
                     .map(|event| {
                         Line::from(format!(
                             "{} {} [{}] {}",
-                            time_of_day(event.at_ms),
+                            self.display_time(event.at_ms),
                             event.level,
                             event.source,
                             event.text
@@ -240,18 +259,13 @@ impl Model {
         let lines = lines
             .into_iter()
             .flat_map(|line| {
-                let line_style = line.style;
-                line.spans
+                let style = line.style;
+                let text = line
+                    .spans
                     .into_iter()
-                    .flat_map(|span| {
-                        span.content
-                            .lines()
-                            .map(|content| {
-                                Line::styled(content.to_owned(), line_style.patch(span.style))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>();
+                wrap_visual_lines(&text, style, width)
             })
             .collect::<Vec<_>>();
         let top = self.output.viewport(lines.len(), height);
@@ -265,9 +279,17 @@ impl Model {
             lines.into_iter().skip(top).take(height).collect(),
         )
     }
+
+    fn display_time(&self, at_ms: u64) -> String {
+        self.board
+            .local_times
+            .get(&at_ms)
+            .cloned()
+            .unwrap_or_else(|| format!("{}Z", utc_time_of_day(at_ms)))
+    }
 }
 
-fn time_of_day(at_ms: u64) -> String {
+fn utc_time_of_day(at_ms: u64) -> String {
     let seconds = at_ms / 1_000 % 86_400;
     format!(
         "{:02}:{:02}:{:02}",
@@ -275,6 +297,57 @@ fn time_of_day(at_ms: u64) -> String {
         seconds / 60 % 60,
         seconds % 60
     )
+}
+
+fn wrap_visual_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    for source in text.split('\n') {
+        let mut rest = source;
+        let mut continuation = false;
+        loop {
+            let indent = if continuation {
+                2usize.min(width.saturating_sub(1))
+            } else {
+                0
+            };
+            let available = width.saturating_sub(indent).max(1);
+            if UnicodeWidthStr::width(rest) <= available {
+                wrapped.push(Line::styled(
+                    format!("{}{}", " ".repeat(indent), rest),
+                    style,
+                ));
+                break;
+            }
+
+            let mut cells = 0;
+            let mut fit_end = 0;
+            let mut word_end = None;
+            for (index, character) in rest.char_indices() {
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if cells + character_width > available {
+                    break;
+                }
+                cells += character_width;
+                fit_end = index + character.len_utf8();
+                if character.is_whitespace() {
+                    word_end = Some(fit_end);
+                }
+            }
+            if fit_end == 0 {
+                fit_end = rest.chars().next().map_or(rest.len(), char::len_utf8);
+            }
+            let split = word_end.filter(|end| *end > 0).unwrap_or(fit_end);
+            let part = rest[..split].trim_end_matches(char::is_whitespace);
+            wrapped.push(Line::styled(
+                format!("{}{}", " ".repeat(indent), part),
+                style,
+            ));
+            rest = rest[split..].trim_start_matches(char::is_whitespace);
+            continuation = true;
+        }
+    }
+    wrapped
 }
 
 #[cfg(test)]
@@ -296,9 +369,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(format!("{:?}", model.output_view(4).1).contains("19"));
+        assert!(format!("{:?}", model.output_view(4, 40).1).contains("19"));
         model.output.scroll(true);
-        assert!(format!("{:?}", model.output_view(4).1[0]).contains("13"));
+        assert!(format!("{:?}", model.output_view(4, 40).1[0]).contains("13"));
         Arc::make_mut(&mut model.board)
             .attention
             .push(crate::AttentionLine {
@@ -306,11 +379,11 @@ mod tests {
                 source: "test".into(),
                 text: "20".into(),
             });
-        assert!(format!("{:?}", model.output_view(4).1[0]).contains("13"));
+        assert!(format!("{:?}", model.output_view(4, 40).1[0]).contains("13"));
         model.output.scroll(false);
-        model.output_view(4);
+        model.output_view(4, 40);
         model.output.scroll(false);
-        assert!(format!("{:?}", model.output_view(4).1).contains("20"));
+        assert!(format!("{:?}", model.output_view(4, 40).1).contains("20"));
         assert!(model.output.top.is_none());
     }
 
@@ -331,15 +404,85 @@ mod tests {
                     },
                 ],
                 attention_seen_ms: 2_000,
+                local_times: [
+                    (1_000, "00:00:01".into()),
+                    (2_000, "00:00:02".into()),
+                    (3_000, "00:00:03".into()),
+                ]
+                .into_iter()
+                .collect(),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let lines = model.output_view(5).1;
+        let lines = model.output_view(5, 80).1;
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].style.fg, Some(Color::DarkGray));
         assert!(lines[1].spans[0].content.starts_with("── seen "));
-        assert_eq!(lines[2].spans[0].content, "new: unread");
+        assert_eq!(lines[0].spans[0].content, "00:00:01 old: handled");
+        assert!(lines[1].spans[0].content.starts_with("── seen 00:00:02"));
+        assert_eq!(lines[2].spans[0].content, "00:00:03 new: unread");
         assert_eq!(lines[2].style.fg, None);
+    }
+
+    #[test]
+    fn unset_attention_watermark_does_not_render_a_seen_marker() {
+        let mut model = Model {
+            board: Arc::new(crate::Board {
+                attention: vec![crate::AttentionLine {
+                    at_ms: 1_000,
+                    source: "test".into(),
+                    text: "new".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = model.output_view(5, 80).1;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content, "00:00:01Z test: new");
+    }
+
+    #[test]
+    fn wraps_output_to_visual_rows_with_two_cell_hanging_indent() {
+        let lines = wrap_visual_lines(
+            "2026-10-09T12:00:00Z manager: the note has a long word boundary here",
+            Style::default(),
+            24,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| line.spans[0].content.as_ref())
+            .collect::<Vec<_>>();
+        assert!(rendered.len() > 2);
+        assert!(rendered[0].starts_with("2026-10-09"));
+        assert!(rendered[1].starts_with("  "));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| UnicodeWidthStr::width(*line) <= 24)
+        );
+        assert!(rendered.join(" ").contains("long word boundary"));
+    }
+
+    #[test]
+    fn scroll_offsets_count_wrapped_visual_lines() {
+        let mut model = Model {
+            board: Arc::new(crate::Board {
+                attention: vec![crate::AttentionLine {
+                    at_ms: 1,
+                    source: "manager".into(),
+                    text: "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty-one twenty-two twenty-three twenty-four twenty-five twenty-six twenty-seven twenty-eight twenty-nine thirty".into(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (_, visible) = model.output_view(2, 24);
+        assert!(visible[1].spans[0].content.starts_with("  "));
+        model.output.scroll(true);
+        let (_, scrolled) = model.output_view(2, 24);
+        assert!(scrolled[0].spans[0].content.starts_with("  "));
+        assert_ne!(visible[0].spans[0].content, scrolled[0].spans[0].content);
     }
 }

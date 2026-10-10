@@ -61,6 +61,9 @@ presentation model and terminal driver live in `wt-tui`.
 - Cleanup never forces removal. Dirty files, unpushed commits, live operation
   locks, and outstanding `verifyAfterMerge` checks remain explicit hazards.
   Unknown inventory, GitHub, or host state is not evidence that cleanup is safe.
+  Carry the advertised-base witness through confirmation and queued removal;
+  revalidate it under the remove lock. A planning-time `landed` boolean cannot
+  authorize a later worker to discard unpushed commits.
 - Batched GitHub reads fail closed as a whole. A missing chunk is not proof that
   a branch has no PR. Retry transient transport failures at the chunk boundary;
   never turn rate-limit or ambiguous mutation results into automatic retries.
@@ -77,6 +80,8 @@ presentation model and terminal driver live in `wt-tui`.
 - A session belongs to a host and a persisted harness identity, not merely to a
   display name or slot. Do not assign one session to multiple owners or forward
   a remote host's local control socket through SSH.
+  Pin configuration selectors and the running wt directory in each new tmux
+  session; server-global environment can belong to another configuration.
 - Release updates install immutable, checksum-verified native builds and probe
   the candidate before activation. Remote workers must run the exact matching
   build/runtime. Never describe source-clone fast-forwarding as the update path.

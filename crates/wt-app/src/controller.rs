@@ -119,11 +119,18 @@ pub fn start(
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Lane {
     Host(Option<String>),
+    FleetCleanup,
     Presentation,
     Terminal,
 }
 
 fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
+    if is_cleanup_action(action) {
+        // A single confirmation can contain revisions from several hosts.
+        // Serialize it as one accepted operation so shutdown drains the whole
+        // fleet mutation and no second cleanup races its prepared revisions.
+        return Ok(Lane::FleetCleanup);
+    }
     let (host, action, _) = crate::host_routing::resolve(action.clone())?;
     Ok(
         if matches!(
@@ -139,12 +146,28 @@ fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
     )
 }
 
+fn is_cleanup_action(action: &wt_tui::UiAction) -> bool {
+    match action {
+        wt_tui::UiAction::PrepareCleanup | wt_tui::UiAction::Cleanup { .. } => true,
+        wt_tui::UiAction::OnHost { action, .. } => is_cleanup_action(action),
+        _ => false,
+    }
+}
+
 fn take_available<T>(
     pending: &mut VecDeque<(Lane, T)>,
     busy: &BTreeSet<Lane>,
 ) -> Option<(Lane, T)> {
-    let position = pending.iter().position(|(lane, _)| !busy.contains(lane))?;
+    let position = pending
+        .iter()
+        .position(|(lane, _)| busy.iter().all(|active| !lanes_conflict(lane, active)))?;
     pending.remove(position)
+}
+
+fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
+    left == right
+        || matches!(left, Lane::FleetCleanup) && matches!(right, Lane::Host(_))
+        || matches!(right, Lane::FleetCleanup) && matches!(left, Lane::Host(_))
 }
 
 fn create_retry(action: &wt_tui::UiAction) -> Option<(Option<String>, String)> {
@@ -372,6 +395,42 @@ mod tests {
         assert_eq!(
             create_retry(&action),
             Some((Some("builder".into()), "retry title".into()))
+        );
+    }
+
+    #[test]
+    fn fleet_cleanup_uses_its_own_accepted_operation_lane() {
+        let action = UiAction::Cleanup {
+            revisions: vec![
+                wt_tui::RemovalRevision {
+                    key: "local-row".into(),
+                    path: "/local/row".into(),
+                    branch: "local-row".into(),
+                    head: "head".into(),
+                    digest: "digest".into(),
+                    hazards: vec![],
+                    published_base: None,
+                },
+                wt_tui::RemovalRevision {
+                    key: wt_core::remote_worktree_ledger_key("builder", "remote-row"),
+                    path: "/remote/row".into(),
+                    branch: "remote-row".into(),
+                    head: "head".into(),
+                    digest: "digest".into(),
+                    hazards: vec![],
+                    published_base: None,
+                },
+            ],
+        };
+        assert_eq!(lane_for(&action).unwrap(), Lane::FleetCleanup);
+
+        let host = Lane::Host(Some("builder".into()));
+        assert!(lanes_conflict(&Lane::FleetCleanup, &host));
+        assert!(lanes_conflict(&host, &Lane::FleetCleanup));
+        let mut pending = VecDeque::from([(host.clone(), "host mutation")]);
+        assert_eq!(
+            take_available(&mut pending, &BTreeSet::from([Lane::FleetCleanup])),
+            None
         );
     }
 }

@@ -746,6 +746,7 @@ fn ui_revision(revision: &wt_lifecycle::RemovalRevision) -> UiRemovalRevision {
         head: revision.head.clone(),
         digest: revision.digest.clone(),
         hazards: revision.hazards.clone(),
+        published_base: revision.published_base.clone(),
     }
 }
 

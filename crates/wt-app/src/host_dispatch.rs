@@ -12,6 +12,18 @@ pub async fn execute(
     replies: &tokio::sync::mpsc::Sender<UiReply>,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
+    // Cleanup is a fleet-wide confirmation: prepare the candidate set from
+    // every configured host, then route the captured revisions back to their
+    // owners. Explicitly host-scoped legacy requests still use the normal path.
+    if !matches!(command, UiAction::OnHost { .. }) {
+        match command {
+            UiAction::PrepareCleanup => return Ok(crate::fleet_cleanup::prepare(fleet).await),
+            UiAction::Cleanup { revisions } => {
+                return Ok(crate::fleet_cleanup::cleanup(fleet, revisions).await);
+            }
+            _ => {}
+        }
+    }
     let (host, action, explicit) = crate::host_routing::resolve(command)?;
     if let UiAction::SetPerf {
         active,

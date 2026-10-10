@@ -72,6 +72,10 @@ pub struct Board {
     pub attention: Vec<AttentionLine>,
     #[serde(default)]
     pub attention_seen_ms: u64,
+    /// Controller-local display labels prepared off the input/render thread.
+    /// The source timestamps remain UTC epoch milliseconds.
+    #[serde(default)]
+    pub local_times: std::collections::BTreeMap<u64, String>,
     #[serde(default)]
     pub slot_logs: std::collections::BTreeMap<String, Vec<LogView>>,
     #[serde(default)]
@@ -2130,6 +2134,7 @@ mod tests {
             head: "abc123".into(),
             digest: "deadbeef".into(),
             hazards: vec![],
+            published_base: None,
         }
     }
 
@@ -2282,7 +2287,7 @@ mod tests {
             ..Default::default()
         };
         let key = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
-        model.output_view(4);
+        model.output_view(4, 80);
         model.output.scroll(true);
         assert!(model.output.is_scrolled());
         assert!(matches!(

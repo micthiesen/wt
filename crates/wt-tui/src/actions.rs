@@ -252,6 +252,8 @@ pub struct RemovalRevision {
     pub head: String,
     pub digest: String,
     pub hazards: Vec<String>,
+    #[serde(default)]
+    pub published_base: Option<Box<(String, String)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

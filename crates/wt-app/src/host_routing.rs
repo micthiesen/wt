@@ -222,6 +222,7 @@ mod tests {
                 head: "abc".into(),
                 digest: "def".into(),
                 hazards: vec![],
+                published_base: None,
             },
         };
         assert!(resolve(action).is_err());
