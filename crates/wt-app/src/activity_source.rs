@@ -81,9 +81,7 @@ pub(crate) fn bound_feeds(board: &mut wt_tui::Board) {
             && later.text == earlier.text
             && later.at_ms.saturating_sub(earlier.at_ms) <= REPEAT_WINDOW_MS
     });
-    board
-        .attention
-        .dedup_by(|later, earlier| later.source == earlier.source && later.text == earlier.text);
+    collapse_repeats(&mut board.attention);
     if board.activity.len() > MAX_ACTIVITY {
         board.activity.drain(..board.activity.len() - MAX_ACTIVITY);
     }
@@ -328,7 +326,15 @@ fn parse_app_log_line(line: &str) -> Option<ActivityLine> {
         ),
         None => {
             let target = value.get("target").and_then(Value::as_str).unwrap_or("");
-            if level != "ERROR" || !is_user_facing_error_target(target) {
+            // wt's own warnings and errors reach the feeds (a background
+            // retry giving up is a warning); errors also reach attention.
+            let diagnostic = DIAGNOSTIC_TARGETS
+                .iter()
+                .any(|prefix| target.starts_with(prefix));
+            if !matches!(level.as_str(), "ERROR" | "WARN")
+                || !is_user_facing_error_target(target)
+                || (level == "WARN" && diagnostic)
+            {
                 return None;
             }
             (
@@ -354,6 +360,20 @@ fn is_user_facing_error_target(target: &str) -> bool {
     (crate_name == "wt" || crate_name.starts_with("wt_")) && !target.starts_with("wt_tui::terminal")
 }
 
+/// Modules whose warnings (not errors) describe wt's own plumbing (watcher fallbacks,
+/// terminal driving, shutdown) rather than anything the user acts on.
+const DIAGNOSTIC_TARGETS: &[&str] = &[
+    "wt_tui::terminal",
+    "wt::freshness",
+    "wt::activity_source",
+    "wt::session_activity",
+    "wt::naming",
+    "wt::controller",
+    "wt::remote_cache",
+    "wt::display_time",
+    "wt::terminal_palette",
+];
+
 /// A logged failure names its cause in the `error` field; the feed shows
 /// it, since "action failed" alone tells the reader nothing. The
 /// controller's "TUI action failed" wording names an internal layer, so
@@ -370,6 +390,19 @@ fn plain_error_text(fields: &Value) -> Option<String> {
     })
 }
 
+/// Consecutive identical attention lines collapse into the most recent one,
+/// so a failure that recurs reads with its latest time, not its first.
+fn collapse_repeats(attention: &mut Vec<AttentionLine>) {
+    let mut kept: Vec<AttentionLine> = Vec::with_capacity(attention.len());
+    for line in attention.drain(..) {
+        match kept.last_mut() {
+            Some(last) if last.source == line.source && last.text == line.text => *last = line,
+            _ => kept.push(line),
+        }
+    }
+    *attention = kept;
+}
+
 fn attention_from_activity(activity: &[ActivityLine]) -> Vec<AttentionLine> {
     let mut attention = activity
         .iter()
@@ -380,8 +413,7 @@ fn attention_from_activity(activity: &[ActivityLine]) -> Vec<AttentionLine> {
             text: event.text.clone(),
         })
         .collect::<Vec<_>>();
-    attention
-        .dedup_by(|later, earlier| later.source == earlier.source && later.text == earlier.text);
+    collapse_repeats(&mut attention);
     if attention.len() > MAX_ATTENTION {
         attention.drain(..attention.len() - MAX_ATTENTION);
     }
@@ -421,9 +453,21 @@ mod tests {
             r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"terminal stopped","error":"eof"},"target":"wt_tui::terminal"}"#,
             r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"activity feeds use refresh backstop"},"target":"wt::activity_source"}"#,
             r#"{"timestamp":"2026-10-09T12:00:00Z","level":"ERROR","fields":{"message":"connection reset"},"target":"hyper::proto"}"#,
+            r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"filesystem watcher unavailable; using refresh backstop"},"target":"wt::freshness"}"#,
         ] {
             assert_eq!(parse_app_log_line(line), None, "{line}");
         }
+    }
+
+    #[test]
+    fn a_background_failure_warning_reaches_the_activity_feed() {
+        let line = r#"{"timestamp":"2026-10-09T12:00:00Z","level":"WARN","fields":{"message":"background merge-when-ready retry failed","error":"HTTP 502"},"target":"wt::github_actions"}"#;
+        let event = parse_app_log_line(line).unwrap();
+        assert_eq!(
+            event.text,
+            "background merge-when-ready retry failed: HTTP 502"
+        );
+        assert_eq!(event.channel, "activity");
     }
 
     #[test]
@@ -451,7 +495,8 @@ mod tests {
         ]);
         assert_eq!(
             attention.iter().map(|line| line.at_ms).collect::<Vec<_>>(),
-            [1_000, 61_000, 90_000]
+            [60_000, 61_000, 90_000],
+            "a recurring failure keeps its latest time"
         );
         let mut board = wt_tui::Board::default();
         append_attention(&mut board, "wt", "same");

@@ -2262,7 +2262,7 @@ impl LifecycleService {
         let mut hazards = Vec::new();
         let status = self.repository.status(row, cancellation).await?;
         if status.dirty {
-            hazards.push("uncommitted changes".to_owned());
+            hazards.push(UNCOMMITTED_HAZARD.to_owned());
         }
         let slug = row.target.slug().to_owned();
         let state = self.read_slug_state(&slug, cancellation).await?;
@@ -2285,10 +2285,7 @@ impl LifecycleService {
             {
                 Some(0) => {}
                 Some(count) => {
-                    hazards.push(format!(
-                        "{count} unpushed commit{}",
-                        if count == 1 { "" } else { "s" }
-                    ));
+                    hazards.push(unpushed_hazard(count));
                 }
                 None => {
                     hazards.push("could not verify pushed state".to_owned());
@@ -2528,7 +2525,7 @@ fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
     hazards
         .iter()
         .map(String::as_str)
-        .filter(|hazard| *hazard != "uncommitted changes")
+        .filter(|hazard| *hazard != UNCOMMITTED_HAZARD)
         .collect()
 }
 
@@ -2762,8 +2759,39 @@ fn prioritized_rift_gc(rift_binary: &OsString) -> CommandSpec {
     spec
 }
 
+/// Removal hazard for a dirty worktree.
+pub const UNCOMMITTED_HAZARD: &str = "uncommitted changes";
+
+/// Removal hazard for commits that exist only locally.
+pub fn unpushed_hazard(count: impl std::fmt::Display + PartialEq<u32>) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} unpushed commit{plural}")
+}
+
+/// Whether a removal hazard means work that removal destroys, as opposed to
+/// an obligation or an unknown that the confirm states on its own line.
+pub fn is_lost_work_hazard(hazard: &str) -> bool {
+    hazard == UNCOMMITTED_HAZARD
+        || hazard.split_once(' ').is_some_and(|(count, rest)| {
+            count.parse::<u64>().is_ok()
+                && (rest == "unpushed commit" || rest == "unpushed commits")
+        })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lost_work_hazards_are_recognized_by_their_own_wording() {
+        use super::{UNCOMMITTED_HAZARD, is_lost_work_hazard, unpushed_hazard};
+        assert_eq!(unpushed_hazard(1u32), "1 unpushed commit");
+        assert_eq!(unpushed_hazard(3u32), "3 unpushed commits");
+        assert!(is_lost_work_hazard(UNCOMMITTED_HAZARD));
+        assert!(is_lost_work_hazard(&unpushed_hazard(1u32)));
+        assert!(is_lost_work_hazard(&unpushed_hazard(12u32)));
+        assert!(!is_lost_work_hazard("post-merge verification still owed"));
+        assert!(!is_lost_work_hazard("could not verify pushed state"));
+    }
+
     #[tokio::test]
     async fn stage_removal_rejects_default_foreign_and_invalid_pins() {
         let root = tempfile::tempdir().unwrap();

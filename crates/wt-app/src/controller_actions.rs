@@ -467,15 +467,13 @@ pub async fn execute(
             let worktrees = inventory
                 .iter()
                 .filter(|other| {
-                    !other.is_main
-                        && !other.detached
-                        && !other.target.branch.is_empty()
-                        && !archived.contains(&wt_core::worktree_target_key(&other.target))
+                    !other.is_main && !other.detached && !other.target.branch.is_empty()
                 })
                 .map(|other| BaseCandidate {
                     slug: other.target.slug().to_owned(),
                     branch: other.target.branch.clone(),
                     base: recorded_base(other.target.slug()),
+                    archived: archived.contains(&wt_core::worktree_target_key(&other.target)),
                 })
                 .collect::<Vec<_>>();
             let (options, selected) = base_picker_options(
@@ -813,11 +811,9 @@ fn ui_revision(revision: &wt_lifecycle::RemovalRevision) -> UiRemovalRevision {
 /// Force-remove confirm lines in the TS style: work that disappears reads
 /// "<what> will be lost."; any other hazard is its own sentence.
 fn removal_hazard_lines(hazards: &[String]) -> Vec<String> {
-    let (lost, other): (Vec<_>, Vec<_>) = hazards.iter().partition(|hazard| {
-        *hazard == "uncommitted changes"
-            || hazard.ends_with(" unpushed commit")
-            || hazard.ends_with(" unpushed commits")
-    });
+    let (lost, other): (Vec<_>, Vec<_>) = hazards
+        .iter()
+        .partition(|hazard| wt_lifecycle::is_lost_work_hazard(hazard));
     let sentence = |text: &str| {
         let mut chars = text.chars();
         chars.next().map_or_else(String::new, |first| {
@@ -842,6 +838,9 @@ struct BaseCandidate {
     slug: String,
     branch: String,
     base: Option<String>,
+    /// Archived worktrees are never offered, but their records still link
+    /// the chain, so restoring one cannot close a cycle.
+    archived: bool,
 }
 
 /// Fork-base options as TS built them: a no-parent row, then sibling
@@ -877,6 +876,7 @@ fn base_picker_options(
     let mut branches = Vec::<&str>::new();
     for worktree in worktrees {
         if worktree.slug != slug
+            && !worktree.archived
             && !based_on_current(&worktree.branch)
             && !branches.contains(&worktree.branch.as_str())
         {
@@ -944,8 +944,13 @@ mod tests {
             slug: slug.into(),
             branch: branch.into(),
             base: base.map(str::to_owned),
+            archived: false,
         };
+        let mut archived_link = candidate("parked", "feat/parked", Some("feat/self"));
+        archived_link.archived = true;
         let worktrees = [
+            archived_link,
+            candidate("via-parked", "feat/via-parked", Some("feat/parked")),
             candidate("self", "feat/self", None),
             candidate("child", "feat/child", Some("feat/self")),
             candidate("grandchild", "feat/grandchild", Some("feat/child")),

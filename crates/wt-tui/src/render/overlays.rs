@@ -1072,10 +1072,18 @@ fn perf_view_lines(
         crate::PerfTone::Ours => theme::WARN,
         crate::PerfTone::Elsewhere => theme::INFO,
     };
-    let mut header = wrap(&view.verdict, width)
-        .into_iter()
-        .map(|line| Line::styled(line, theme::fg(tone)))
-        .collect::<Vec<_>>();
+    // Alarms lead: on a short terminal the header is clipped from the
+    // bottom, and a stale or leaking sample must stay visible.
+    let mut header = Vec::new();
+    if let Some(error) = &view.error {
+        header.push(Line::styled(
+            truncate_end(
+                &format!("resample failed, showing the last good sample: {error}"),
+                width,
+            ),
+            theme::fg(theme::ERR),
+        ));
+    }
     if !view.orphans.is_empty() {
         header.push(Line::styled(
             truncate_end(
@@ -1088,15 +1096,11 @@ fn perf_view_lines(
             theme::fg(theme::ERR),
         ));
     }
-    if let Some(error) = &view.error {
-        header.push(Line::styled(
-            truncate_end(
-                &format!("resample failed, showing the last good sample: {error}"),
-                width,
-            ),
-            theme::fg(theme::ERR),
-        ));
-    }
+    header.extend(
+        wrap(&view.verdict, width)
+            .into_iter()
+            .map(|line| Line::styled(line, theme::fg(tone))),
+    );
 
     let mut lines = vec![
         perf_meter(

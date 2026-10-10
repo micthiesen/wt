@@ -164,7 +164,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed |
 | `l` / `L` | Move to a section / rename the section |
 | `J` / `K` | Reorder the selected row, stack, or folded group; the cursor follows the row across sections |
-| `b` | Record a fork base without rebasing |
+| `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none |
 | `R` | Restack or rebase the selected branch |
 | `h` | Open removed-worktree history |
 
