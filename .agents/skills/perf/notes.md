@@ -58,6 +58,18 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Native clean/delete confirmation waits on fresh remote evidence (2026-10-10).**
+  User reports a long `working` state after `c` or `d`. Source inspection:
+  `controller_actions` calls `lifecycle_ops::plan` before confirmation and
+  again after delete confirmation. The planner fetches GitHub, then processes
+  rows serially; local landing proof can also call `git ls-remote` once per
+  repository (once per clone for Rift). `fleet_cleanup::prepare` waits for all
+  configured hosts. GitHub's fetch budget is 100 seconds. TypeScript's initial
+  removal guards use prepared board rows. No live deletion was run and no
+  measured action timing establishes which request caused this report.
+  Proposed fix: prepare confirmation from existing board evidence, retain
+  authoritative locked checks before deletion, bound parallel planning, and
+  show the host and phase while fresh proof is needed.
 - **Local Rift creation can remain hidden until WT restarts (2026-10-09).**
   `tasks-take-2` and `secrets-check` TUI logs stop at `rift create --copy-all`
   at 20:50:13Z and 21:05:08Z. Their lock metadata records `init` at the same
