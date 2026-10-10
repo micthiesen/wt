@@ -647,7 +647,7 @@ fn session_spans(session: &SessionView) -> Spans {
 /// outranks ages, and `created` drops before `committed`.
 fn git_value(row: &BoardRow, width: usize, now: u64) -> Spans {
     let (verb, mut text) = badges::status_verb(row);
-    // Name where it landed, as TS does ("merged into origin/main").
+    // Name where it landed, using the base the branch line shows.
     if row.busy.is_none()
         && !row.path_missing
         && !row.branch_gone

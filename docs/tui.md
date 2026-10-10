@@ -283,10 +283,14 @@ and spacing. It departs from that UI only where the change is deliberate:
   log overlay.
 - `Space` jumps through a broader attention set (status, checks, review,
   failed action) and toasts when nothing needs you.
-- `Esc` output focus is global rather than per worktree, and there is no
-  separate warning toast level. Errors appear on the attention feed rather
-  than in a dedicated error overlay, and `F12` on a remote row does not
-  queue an attach.
+- `Esc` output focus is global rather than per worktree. Errors appear on
+  the attention feed rather than in a dedicated error overlay, and `F12` on
+  a remote row does not queue an attach.
+- The work-status header colors `risk low` / `risk high` by the risk, as the
+  list's risk column does, rather than by the state, so a high-risk `ready`
+  never reads green.
+- A landed row's git line names the base as the branch line does
+  (`merged into main`) rather than always saying `origin/main`.
 
 Session `; d` and `; x` act immediately, as they did in TypeScript; the
 review-requests fold is not persisted, also as before.
