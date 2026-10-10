@@ -260,17 +260,19 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
 }
 
 async fn restore_archive(ctx: &AppContext, job: &Value) -> Result<()> {
-    // Older jobs did not change archive state.
-    let Some(was_archived) = job["wasArchived"].as_bool() else {
+    // Older jobs did not change archive state, and a row that was already
+    // archived was not changed by the worker. Undo only the worker's own
+    // write, so a toggle made while the removal ran is kept.
+    if job["wasArchived"].as_bool() != Some(false) {
         return Ok(());
-    };
+    }
     let key = job["target"]["key"]
         .as_str()
         .context("job missing target key")?
         .to_owned();
     ctx.database
         .call(move |store| {
-            store.set_archived(&key, was_archived)?;
+            store.set_archived(&key, false)?;
             Ok(())
         })
         .await?;

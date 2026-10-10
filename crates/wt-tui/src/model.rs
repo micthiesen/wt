@@ -739,7 +739,10 @@ impl Model {
         self.source_state = snapshot.state;
         if let Some(mut board) = snapshot.data {
             self.source_board = board.clone();
-            self.lifecycle.project(Arc::make_mut(&mut board));
+            // Projection copies the shared board, so skip it when idle.
+            if !self.lifecycle.is_empty() {
+                self.lifecycle.project(Arc::make_mut(&mut board));
+            }
             if let Some(key) = &self.pending_selection
                 && let Some(row) = board.rows.iter().position(|row| &row.key == key)
             {

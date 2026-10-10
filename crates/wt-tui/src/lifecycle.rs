@@ -148,6 +148,11 @@ impl LifecycleFeedback {
         completion
     }
 
+    /// Whether any operation still needs projecting onto snapshots.
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
     pub fn project(&mut self, board: &mut Board) {
         self.operations.retain(|_, operation| match operation {
             Operation::Create {
