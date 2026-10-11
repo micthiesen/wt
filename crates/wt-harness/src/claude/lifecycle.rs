@@ -745,6 +745,20 @@ exec /bin/sleep 30
         };
         let started_id = started.session_id;
         let started_status = started.status;
+        // Keep another session alive while checking exact removal. This also
+        // checks that stopping the agent does not stop an unrelated session.
+        tmux.create_session(
+            &CreateSession {
+                name: "fixture-keeper".into(),
+                cwd: tmp.path().to_owned(),
+                command: vec!["/bin/sleep".into(), "60".into()],
+                width: None,
+                height: None,
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
         let exists = tmux
             .session_exists("repo-test~review", &cancel)
             .await
@@ -772,7 +786,10 @@ exec /bin/sleep 30
                 .await
                 .unwrap()
         );
-        let _ = tmux.kill_server(&cancel).await;
+        let remaining = tmux.list_sessions(&cancel).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "fixture-keeper");
+        tmux.kill_server(&cancel).await.unwrap();
         assert!(cold);
         assert_eq!(
             started_id,

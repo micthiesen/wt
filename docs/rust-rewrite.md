@@ -82,6 +82,11 @@ The retired-source CLI fixture and all nine old/new JSON comparisons passed
   file refresh, accepted writes draining on quit, section/history/feed slices,
   and tmux detach/resume. The current presentation and source changes passed
   the final gate and PTY pass described above.
+  The Claude session-removal test keeps another session on its private tmux
+  server until it checks that the agent session is gone and the other session
+  remains, then closes the server. This separates session removal from
+  automatic server shutdown and checks exact removal scope.
+  A server shutdown error still does not prove session absence in production.
 - **Integrations:** focused crates cover GitHub batching and ambiguous writes,
   SST unknown-state safety, event authentication/ownership, automation claims,
   action logs, and dev-server supervision. Local fake services prove only the

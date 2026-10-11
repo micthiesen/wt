@@ -12,6 +12,23 @@ use crate::{
 };
 
 #[test]
+fn server_shutdown_errors_do_not_prove_session_absence() {
+    assert!(crate::tmux_server_definitely_absent(
+        "no server running on /tmp/test.sock"
+    ));
+    assert!(crate::tmux_server_definitely_absent(
+        "error connecting to /tmp/test.sock (No such file or directory)"
+    ));
+    for error in [
+        "server exited unexpectedly",
+        "Permission denied",
+        "Connection refused",
+    ] {
+        assert!(!crate::tmux_server_definitely_absent(error));
+    }
+}
+
+#[test]
 fn parsers_accept_empty_output_and_keep_unusual_names() {
     assert!(parse_sessions("").unwrap().is_empty());
     assert!(parse_windows("").unwrap().is_empty());
