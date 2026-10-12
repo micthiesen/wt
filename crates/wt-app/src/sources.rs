@@ -40,6 +40,8 @@ pub struct BoardSources {
     pub github_pickers: Arc<crate::github_pickers::GithubPickers>,
     pub naming: crate::naming_source::NamingCommands,
     pub sessions: crate::session_source::SessionSources,
+    /// Harness transcripts and the persisted primary harness.
+    pub session_activity: SourceHandle<crate::session_activity::SessionActivitySnapshot>,
     pub automations: crate::automation_source::AutomationCommands,
     pub history: crate::history_source::HistoryCommands,
     pub perf: crate::perf_source::PerfCommands,
@@ -59,11 +61,16 @@ impl BoardSources {
 /// skip the events daemon's snapshot.
 #[derive(Clone)]
 pub struct GithubRefresh {
-    github: SourceHandle<GithubData>,
+    github: LeafHandle<GithubData>,
     bypass_daemon: Arc<AtomicBool>,
 }
 
 impl GithubRefresh {
+    /// The latest live GitHub read, for settling this host's own writes.
+    pub fn confirmed(&self) -> Option<wt_runtime::Confirmed<GithubData>> {
+        self.github.confirmed()
+    }
+
     pub fn refresh(&self) {
         self.github.refresh();
     }
@@ -75,8 +82,17 @@ impl GithubRefresh {
 
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
+        let (github, _) = wt_runtime::leaf_channel(
+            &TaskScope::new(),
+            SourceSpec {
+                name: "github",
+                domain: Domain::Github,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
         Self {
-            github: SourceHandle::constant(SourceSnapshot::default()),
+            github,
             bypass_daemon: Arc::default(),
         }
     }
@@ -199,6 +215,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         github_pickers,
         naming: naming.commands,
         sessions,
+        session_activity,
         automations: automations.commands,
         history: history.commands,
         perf: perf.commands,
@@ -238,7 +255,7 @@ fn start_github(
         },
     );
     let refresh = GithubRefresh {
-        github: github.view(),
+        github: github.clone(),
         bypass_daemon: lane.bypass_daemon.clone(),
     };
     spawn_deferred_reads(scope, &lane, github.view());

@@ -58,6 +58,7 @@ impl HostService {
                 Domain::Sessions => {
                     self.sources.sessions.inventory.refresh();
                     self.sources.sessions.discoveries.refresh();
+                    self.sources.session_activity.refresh();
                 }
                 Domain::Actions | Domain::Issues => board = true,
                 Domain::Activity

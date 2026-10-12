@@ -169,8 +169,11 @@ only the facts affected by the event. GitHub reads remain batched and rate
 limited (10 s minimum interval measured from fetch start); the optional events
 daemon supplies push updates stamped with its own fetch start, with a
 configured poll backstop for missed events or daemon downtime. An accepted
-GitHub write bypasses the events cache once, so the confirming read is a direct
-fetch.
+GitHub write bypasses the events cache, and while any of the worker's writes is
+unconfirmed it keeps requesting direct reads (still rate limited) until one
+shows the write or its deadline passes, so a lagging read model does not make
+the change expire. A Sessions refresh also reruns the session-activity pass,
+which re-reads the persisted primary harness.
 
 `r` requests an ordinary source refresh and keeps durable data and derived
 caches. `Ctrl+R` asks for confirmation, clears the derived naming cache and

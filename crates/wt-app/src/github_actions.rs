@@ -76,6 +76,7 @@ impl GithubActions {
             GithubOptions::from_config(&context.config, false),
         );
         let writes = Writes::new(refresh);
+        spawn_confirmer(scope, writes.clone());
         let (retry_tx, retry_rx) = mpsc::channel(16);
         spawn_retry_owner(
             scope,
@@ -643,6 +644,49 @@ struct Writes {
     ledger: Arc<Mutex<Ledger>>,
     next_op: Arc<AtomicU64>,
     refresh: GithubRefresh,
+    recorded: Arc<tokio::sync::Notify>,
+}
+
+/// Spacing of follow-up reads while a write is unconfirmed. The GitHub lane
+/// enforces its own minimum interval; this only keeps a read queued.
+const CONFIRM_POLL: Duration = Duration::from_secs(5);
+
+/// GitHub's read model lags writes, so the read right after a write may not
+/// show it. While any write is unconfirmed, keep asking for direct reads
+/// (rate-limited by the GitHub lane) until one confirms it or its deadline
+/// passes, so the displayed change is confirmed rather than expiring.
+fn spawn_confirmer(scope: &TaskScope, writes: Writes) {
+    let cancel = scope.token();
+    scope.spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = writes.recorded.notified() => {}
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(CONFIRM_POLL) => {}
+                }
+                let open = {
+                    let mut ledger = writes.lock();
+                    if let Some(github) = writes.refresh.confirmed() {
+                        settle(&mut ledger, &github, Instant::now());
+                    } else if ledger.next_deadline().is_some_and(|d| d <= Instant::now()) {
+                        // No live read at all: let deadlines lapse.
+                        ledger.settle(&GithubData::default(), |_, _| None, Instant::now());
+                    }
+                    !ledger.is_empty()
+                };
+                if !open {
+                    break;
+                }
+                writes.refresh.refresh_live();
+            }
+        }
+    });
 }
 
 impl Writes {
@@ -651,6 +695,7 @@ impl Writes {
             ledger: Arc::default(),
             next_op: Arc::new(AtomicU64::new(1)),
             refresh,
+            recorded: Arc::default(),
         }
     }
 
@@ -666,6 +711,7 @@ impl Writes {
         let at = Stamp::now();
         record_accepted(&mut self.lock(), self.op(), write, at);
         self.refresh.refresh_live();
+        self.recorded.notify_one();
         at
     }
 
@@ -677,6 +723,7 @@ impl Writes {
         ledger.uncertain(op, now);
         drop(ledger);
         self.refresh.refresh_live();
+        self.recorded.notify_one();
     }
 
     fn op(&self) -> u64 {

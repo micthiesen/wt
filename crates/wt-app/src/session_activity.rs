@@ -232,7 +232,7 @@ pub fn start(
     context: &AppContext,
     sessions: &SessionSources,
 ) -> SessionActivitySources {
-    let (activity, publisher) = leaf_channel(
+    let (activity, mut publisher) = leaf_channel(
         scope,
         SourceSpec {
             name: "session-activity",
@@ -296,6 +296,9 @@ pub fn start(
                 changed = inventory_updates.changed() => if changed.is_err() { break; } else { ActivityWake::Source },
                 changed = discovery_updates.changed() => if changed.is_err() { break; } else { ActivityWake::Source },
                 changed = git_updates.changed() => if changed.is_err() { break; } else { ActivityWake::Source },
+                // An explicit refresh (e.g. after the primary harness changed)
+                // runs a pass even when no session input changed.
+                request = publisher.requested() => if request.is_none() { break; } else { ActivityWake::Source },
                 _ = next_activity.tick(), if !active.is_empty() => ActivityWake::Backstop,
                 Some(()) = codex_watch.updates.recv(), if !active.is_empty() => ActivityWake::CodexOutput,
                 _ = tokio::time::sleep_until(next_usage) => {
