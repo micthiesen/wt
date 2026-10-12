@@ -12,6 +12,20 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_ROWS: &[&str] = &["branch", "issue", "stage", "dev", "pr", "claude", "git"];
 const DEFAULT_REGEN: &[&str] = &["sst-env.d.ts"];
+/// Variables a managed worker's environment file sets itself.
+pub const RESERVED_MANAGED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "WT_CONFIG",
+    "WT_REPO_CONFIG",
+    "WT_MANAGED_ROOT",
+    "WT_SESSION_ENV",
+    "WT_SESSION_SOURCE",
+    "CODEX_HOME",
+    "GH_CONFIG_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_TERMINAL_PROMPT",
+];
 const BADGE_SLOTS: &[&str] = &[
     "action",
     "dirty",
@@ -105,6 +119,21 @@ impl Config {
             source_path = repository_path.clone();
         }
         Self::from_raw_at(merged, options, repository, source_path)
+    }
+
+    /// Re-read the user and repository layers this config resolved from and
+    /// merge them, for generating a managed worker's configuration.
+    pub fn raw_layers(&self, options: &LoadOptions) -> Result<toml::Value, ConfigError> {
+        let user = user_config_path(options);
+        let mut merged = if user.is_file() {
+            read_toml(&user)?
+        } else {
+            toml::Value::Table(Default::default())
+        };
+        if let Some(repository) = &self.repository_config {
+            merge(&mut merged, &read_toml(repository)?);
+        }
+        Ok(merged)
     }
 
     /// Build a resolved config from an already parsed, merged TOML value.
@@ -490,7 +519,18 @@ impl Config {
                 if !hosts.insert(r.host.clone()) {
                     errors.push(format!("{field}.host duplicates SSH host {:?}", r.host));
                 }
-                let config = nonempty(r.config);
+                let mut config = nonempty(r.config);
+                let mut wt_path = nonempty(r.wt_path);
+                let managed_root = r.managed.then(|| format!(".local/share/wt/managed/{repo_id}"));
+                if let Some(root) = &managed_root {
+                    if config.is_some() || wt_path.is_some() {
+                        errors.push(format!(
+                            "{field}: managed remotes generate their worker config and runtime; remove config and wt_path"
+                        ));
+                    }
+                    config = Some(format!("~/{root}/config.toml"));
+                    wt_path = Some(format!("~/{root}/bin/wt"));
+                }
                 if let Some(path) = &config
                     && (!(path.starts_with('/') || path.starts_with("~/"))
                         || path.chars().any(char::is_control))
@@ -501,12 +541,41 @@ impl Config {
                 }
                 RemoteConfig {
                     label: nonempty(r.label).unwrap_or_else(|| r.host.clone()),
-                    wt_path: nonempty(r.wt_path).unwrap_or_else(|| "~/.wt/bin/wt".into()),
+                    wt_path: wt_path.unwrap_or_else(|| "~/.wt/bin/wt".into()),
                     host: r.host,
                     config,
+                    managed: r.managed,
+                    managed_root,
                 }
             })
             .collect();
+
+        let managed_raw: RawManaged = section(&raw, "managed", &mut errors);
+        for (name, command) in &managed_raw.env {
+            let valid_name = name
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+            if !valid_name {
+                errors.push(format!(
+                    "managed.env.{name}: names must be uppercase shell variables like CLOUDFLARE_API_TOKEN"
+                ));
+            }
+            if RESERVED_MANAGED_ENV.contains(&name.as_str()) {
+                errors.push(format!(
+                    "managed.env.{name}: wt owns this variable on managed workers"
+                ));
+            }
+            if command.trim().is_empty() {
+                errors.push(format!("managed.env.{name}: the command is empty"));
+            }
+        }
+        let managed = ManagedConfig {
+            env: managed_raw.env,
+        };
 
         let naming = optional_section::<NamingConfig>(&raw, "naming", "", &mut errors);
         if raw.get("ai").is_some() {
@@ -601,6 +670,7 @@ impl Config {
             review_bot,
             dev_server,
             remotes,
+            managed,
             harness: HarnessConfig {
                 primary: harness_raw.primary,
                 hidden,
@@ -1195,6 +1265,12 @@ struct RawRemote {
     label: String,
     wt_path: String,
     config: String,
+    managed: bool,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawManaged {
+    env: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 #[serde(default)]

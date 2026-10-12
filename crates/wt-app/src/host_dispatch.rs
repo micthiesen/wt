@@ -115,13 +115,29 @@ pub async fn execute(
             verify_after_merge: None,
             detail: None,
         }];
-        options.extend(fleet.remotes.iter().map(|remote| PickerOption {
-            value: Some(remote.endpoint.key()),
-            label: remote.endpoint.label.clone(),
-            chord: None,
-            note: None,
-            verify_after_merge: None,
-            detail: None,
+        options.extend(fleet.remotes.iter().map(|remote| {
+            let owed = remote
+                .managed
+                .borrow()
+                .as_ref()
+                .map(|status| status.report.sign_ins())
+                .unwrap_or_default();
+            PickerOption {
+                value: Some(remote.endpoint.key()),
+                label: remote.endpoint.label.clone(),
+                chord: None,
+                note: (!owed.is_empty()).then(|| {
+                    format!(
+                        "sign-in needed: {}",
+                        owed.iter()
+                            .map(|provider| provider.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }),
+                verify_after_merge: None,
+                detail: None,
+            }
         }));
         return Ok(UiReply {
             modal: Some(UiModal::Picker {
@@ -145,6 +161,31 @@ pub async fn execute(
                 .with_context(|| format!("host {host:?} is no longer configured"))
         })
         .transpose()?;
+    if let UiAction::ManagedSignIn { provider, then } = action {
+        let remote = remote.context("sign-in belongs to a managed remote host")?;
+        return Box::pin(managed_sign_in(
+            context, fleet, remote, &provider, then, replies, shutdown,
+        ))
+        .await;
+    }
+    if let Some(remote) = remote
+        && let Some(status) = remote.managed.borrow().clone()
+        && let Some(provider) = crate::managed::required_sign_in(
+            &status.report,
+            &action,
+            context.config.harness.primary,
+        )
+    {
+        return Ok(UiReply {
+            modal: Some(crate::managed::sign_in_modal(
+                &remote.endpoint.label,
+                provider,
+                action,
+            )),
+            modal_host: host,
+            ..Default::default()
+        });
+    }
     if let UiAction::SelectSession { selection } = action {
         let prepared = match remote {
             None => crate::harness::prepare_session(context, &selection).await?,
@@ -315,6 +356,80 @@ pub async fn execute(
         }
     }
     Ok(reply)
+}
+
+/// Run a sign-in on a managed worker in the terminal, re-check the worker, and
+/// continue the request that needed the sign-in once it succeeded.
+async fn managed_sign_in(
+    context: &AppContext,
+    fleet: &Fleet,
+    remote: &crate::remote_host::RemoteHost,
+    provider: &str,
+    then: Option<Box<UiAction>>,
+    replies: &tokio::sync::mpsc::Sender<UiReply>,
+    shutdown: &CancellationToken,
+) -> Result<UiReply> {
+    let provider = wt_remote::managed::SignIn::parse(provider)
+        .with_context(|| format!("unknown sign-in {provider:?}"))?;
+    let client = remote.staged_client()?;
+    let session = client.interactive_managed(
+        &["login".into(), provider.as_str().into()],
+        provider.forward_port(),
+    );
+    let handoff = crate::controller::handoff_prepared(
+        crate::harness::PreparedSession {
+            program: session.program,
+            args: session.args,
+            cwd: context.config.paths.main_clone.clone(),
+        },
+        replies,
+        shutdown,
+    )
+    .await;
+    let label = &remote.endpoint.label;
+    let report = crate::managed::provision(context, &client)
+        .await
+        .with_context(|| format!("re-check {label} after sign-in"))?;
+    let still_needed = report.sign_ins().contains(&provider);
+    remote.set_managed(report);
+    // A worker blocked on its clone retries now instead of after backoff.
+    remote.wake();
+    if still_needed {
+        if let Err(error) = handoff {
+            tracing::info!(host = %label, error = %format!("{error:#}"), "managed sign-in session ended unsuccessfully");
+        }
+        return Ok(UiReply {
+            message: format!("{} sign-in on {label} did not complete", provider.label()),
+            failed: true,
+            ..Default::default()
+        });
+    }
+    let Some(then) = then else {
+        return Ok(UiReply {
+            message: format!("Signed in to {} on {label}", provider.label()),
+            ..Default::default()
+        });
+    };
+    if !remote.wait_ready(std::time::Duration::from_secs(90)).await {
+        return Ok(UiReply {
+            message: format!(
+                "Signed in to {} on {label}; the host is still connecting, so retry the request",
+                provider.label()
+            ),
+            ..Default::default()
+        });
+    }
+    Box::pin(execute(
+        context,
+        fleet,
+        UiAction::OnHost {
+            host: Some(remote.endpoint.key()),
+            action: then,
+        },
+        replies,
+        shutdown,
+    ))
+    .await
 }
 
 /// The row palette's `t` entry is the same request as `T`, so it shares the

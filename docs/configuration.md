@@ -212,8 +212,9 @@ lifecycle over SSH; F10/F11/F12 on one of those rows attach to that
 worktree's remote tmux shell, diff, or AI session. The `!` picker is identical
 for local and remote rows: requirements/templates use one normalized row model,
 while tracked commands, custom prompts, dev controls/logs, and cancellation run
-against the selected checkout through SSH. Ordinary `n` / `N`
-continue to create locally.
+against the selected checkout through SSH. `n` creates on this machine
+until `Tab` in its prompt picks another host, which `n` then remembers; `N`
+creates beside the selected branch on that row's host.
 
 The controller checks the worker platform, protocol, and build identity before
 forwarding commands. It provisions an immutable, checksum-verified native
@@ -265,8 +266,36 @@ config = "~/.config/wt/project.toml" # optional worker config selector
 | `label` | no | `host` | Short name in the prompt, event log, and remote WezTerm tab title. |
 | `wt_path` | no | `~/.wt/bin/wt` | Configured remote executable. The `~/` prefix expands in the remote account. Controller commands use the separately prepared build-matched native runtime. |
 | `config` | no | worker's default config | Worker config selected for this connection. Must be an absolute path or start with `~/`; tilde expansion happens on the worker. |
+| `managed` | no | `false` | The controller provisions this worker: config, clone, git and GitHub credentials, Codex settings, and `[managed.env]` secrets. Cannot be combined with `config` or `wt_path`. See [managed remotes](remote.md#managed-remotes). |
 
-The remote machine needs its own `~/.config/wt/config.toml`, including
+A managed remote needs no worker config, clone, or wt install. The controller
+derives its directory, `~/.local/share/wt/managed/<repo-id>/`, from this
+repository's identity and rewrites it on each connection. Sign-ins the worker
+still needs are requested in the TUI when a request first needs them.
+
+```toml
+[[remotes]]
+host = "beast"
+label = "Beast"
+managed = true
+```
+
+## `[managed]` — settings for every managed remote
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `env` | no | `{}` | Map of uppercase variable name to a shell command run on the controller (in the main clone, 30-second limit). Its output, minus one trailing newline, becomes that variable on every managed worker, in wt commands and agent sessions. A failing command leaves the variable unset and shows a warning. |
+
+```toml
+[managed.env]
+CLOUDFLARE_API_TOKEN = "op read op://Dev/Cloudflare/token"
+```
+
+wt owns `PATH`, `HOME`, `WT_CONFIG`, `WT_REPO_CONFIG`, `WT_MANAGED_ROOT`,
+`WT_SESSION_ENV`, `WT_SESSION_SOURCE`, `CODEX_HOME`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, and
+`GIT_TERMINAL_PROMPT` on managed workers; these names are rejected.
+
+An unmanaged remote machine needs its own `~/.config/wt/config.toml`, including
 `[instance] role = "worker"`; do not point the local process at a mounted
 remote filesystem. `wt remote agent start <slug>` first runs a non-interactive
 remote `wt skills sync --yes`, provisioning missing/current bundled skills and

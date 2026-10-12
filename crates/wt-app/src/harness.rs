@@ -129,7 +129,43 @@ fn harness_session_environment(
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| inherited_path.to_owned());
     environment.insert("PATH".into(), path);
+    // A managed worker names the variables its sessions must keep, such as
+    // CODEX_HOME and its credentials, so agents use the managed setup.
+    if let Some(names) = inherited
+        .get("WT_SESSION_ENV")
+        .filter(|names| !names.is_empty())
+    {
+        for name in names.split(':') {
+            if environment.contains_key(name) {
+                continue;
+            }
+            if let Some(value) = inherited.get(name) {
+                environment.insert(name.to_owned(), value.clone());
+            }
+        }
+        environment.insert("WT_SESSION_ENV".into(), names.clone());
+    }
+    // Managed secrets are sourced inside the session, never passed as values.
+    if let Some(root) = inherited
+        .get("WT_MANAGED_ROOT")
+        .filter(|root| !root.is_empty())
+    {
+        environment.insert(
+            wt_tmux::SESSION_SOURCE.to_owned(),
+            format!("{root}/secrets/env.sh"),
+        );
+    }
     environment
+}
+
+/// Codex keeps sessions and its control socket under `$CODEX_HOME`. Managed
+/// workers point it at their own directory; otherwise it is `~/.codex`.
+pub fn codex_paths(home: &Path, cache_root: &Path) -> CodexPaths {
+    let paths = CodexPaths::new(home, cache_root);
+    match std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
+        Some(codex_home) => paths.with_codex_home(PathBuf::from(codex_home)),
+        None => paths,
+    }
 }
 
 fn absolute_session_path(path: &Path, cwd: &Path, home: &Path) -> String {
@@ -198,7 +234,7 @@ impl AppHarness {
         let claude_injector = ClaudeInjector::new(cache_root.clone());
         let service = HarnessService::new(
             claude_paths,
-            CodexPaths::new(&context.home, &cache_root),
+            codex_paths(&context.home, &cache_root),
             OpenCodePaths::new(&context.home, &cache_root),
             context.processes.clone(),
             tmux.clone(),
@@ -806,6 +842,32 @@ pub fn unavailable_source_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_session_variables_follow_the_worker_into_agent_sessions() {
+        let inherited = BTreeMap::from([
+            ("PATH".into(), "/usr/bin".into()),
+            ("CODEX_HOME".into(), "/m/codex".into()),
+            ("WT_MANAGED_ROOT".into(), "/m".into()),
+            ("CLOUDFLARE_API_TOKEN".into(), "secret".into()),
+            ("UNLISTED".into(), "x".into()),
+            ("WT_SESSION_ENV".into(), "CODEX_HOME:PATH:MISSING".into()),
+        ]);
+        let env = harness_session_environment(
+            Path::new("/users/test"),
+            Path::new("/repo/worktree"),
+            None,
+            Some(Path::new("/opt/wt/bin/wt")),
+            &inherited,
+        );
+        assert_eq!(env["CODEX_HOME"], "/m/codex");
+        assert_eq!(env["PATH"], "/opt/wt/bin:/usr/bin");
+        assert!(!env.contains_key("CLOUDFLARE_API_TOKEN"));
+        assert!(!env.contains_key("UNLISTED"));
+        assert!(!env.contains_key("MISSING"));
+        assert_eq!(env["WT_SESSION_ENV"], "CODEX_HOME:PATH:MISSING");
+        assert_eq!(env[wt_tmux::SESSION_SOURCE], "/m/secrets/env.sh");
+    }
 
     #[test]
     fn harness_environment_pins_selectors_and_prepends_running_binary_path() {

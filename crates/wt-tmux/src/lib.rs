@@ -27,6 +27,11 @@ const FORMAT_SEPARATOR: char = ':';
 static BUFFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static PALETTE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Session environment variable naming a POSIX shell file that each new
+/// session command sources before it starts, for values that must stay out
+/// of argv.
+pub const SESSION_SOURCE: &str = "WT_SESSION_SOURCE";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TmuxSocket {
     Name(String),
@@ -501,12 +506,31 @@ impl TmuxClient {
             let command = if self.session_environment.is_empty() {
                 session.command.clone()
             } else {
+                // A session source file holds secrets. Sourcing it inside
+                // the pane keeps their values out of every process's argv.
+                let source = self
+                    .session_environment
+                    .iter()
+                    .any(|(key, _)| key == SESSION_SOURCE)
+                    .then(|| {
+                        [
+                            "/bin/sh".to_owned(),
+                            "-c".to_owned(),
+                            format!(
+                                "if [ -r \"${SESSION_SOURCE}\" ]; then . \"${SESSION_SOURCE}\"; fi; exec \"$@\""
+                            ),
+                            "sh".to_owned(),
+                        ]
+                    })
+                    .into_iter()
+                    .flatten();
                 std::iter::once("/usr/bin/env".to_owned())
                     .chain(
                         self.session_environment
                             .iter()
                             .map(|(key, value)| format!("{key}={value}")),
                     )
+                    .chain(source)
                     .chain(session.command.iter().cloned())
                     .collect()
             };

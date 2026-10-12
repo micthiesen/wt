@@ -152,6 +152,7 @@ pub async fn execute(
             }))
         }
         UiAction::OnHost { .. } => bail!("host routing must be resolved before local dispatch"),
+        UiAction::ManagedSignIn { .. } => bail!("sign-in belongs to a managed remote host"),
         UiAction::PrepareCreate { initial } => Ok(modal(UiModal::Text {
             action: wt_tui::TextAction::Create,
             prompt: "New worktree name: ".into(),

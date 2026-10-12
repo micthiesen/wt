@@ -1,6 +1,8 @@
 # Remote workers
 
-wt combines local worktrees and multiple SSH hosts in one board. Each host runs
+wt combines local worktrees and multiple SSH hosts in one board. For a host
+you control, start with [managed remotes](#managed-remotes): one config line,
+and the controller provisions the rest. Each host runs
 the same native application and command handlers. A persistent SSH connection
 carries prepared snapshots and typed commands; there is no separate remote
 feature implementation. The controller owns terminal input, desktop
@@ -8,6 +10,112 @@ applications, and board layout. Each host owns its worktrees, database, tmux
 server, and agents.
 An unavailable host keeps its last known rows with a visible error while the
 other hosts continue updating.
+
+## Managed remotes
+
+A managed remote is the easiest way to use another machine. You turn it on
+with one line, and the machine running the TUI provisions everything the
+worker needs:
+
+```toml
+[[remotes]]
+host = "beast"        # SSH destination or ~/.ssh/config alias
+label = "Beast"
+managed = true
+```
+
+There is no worker config to write, no clone to make, and no `wt` to install
+on the worker. Managed remotes are opt-in: entries without `managed = true`
+keep working exactly as described in the rest of this page.
+
+The design goal is that the worker needs only an SSH account, `git`, and the
+coding agent (`codex`). Everything else comes from the controller, and anything
+that genuinely needs a person (a browser sign-in) is asked for when it is
+first needed, in the TUI. If you never use a capability, wt never asks.
+
+### What the controller provisions
+
+Connecting converges the worker on the controller. All
+managed state lives under one directory per repository,
+`~/.local/share/wt/managed/<repo-id>/`, so the worker account's own
+`~/.codex`, `~/.config/gh`, `~/.gitconfig` and wt config are never read or
+changed. On a machine you also use directly, your personal Codex and GitHub
+accounts keep working there unchanged.
+
+| What | How |
+|---|---|
+| wt | The build-matched runtime, linked at `bin/wt` so agents can call `wt` by name. |
+| Worker config | Generated from the controller's merged config with worker paths; remotes, the update channel, the webhook daemon, and the tmux socket are left out. |
+| Repository | `repo/` is cloned over HTTPS from the controller's `origin`; SSH GitHub URLs are rewritten to HTTPS. A partial clone never looks complete. |
+| Project files | Untracked files listed in `lifecycle.env_files_to_copy` and `copy_globs` (for example `.env`) are copied from the controller's main clone. Files tracked on either side, and paths through a symlink, are never written. |
+| Git | `gitconfig` copies the controller's global settings except credentials, signing, includes, URL rewrites, HTTP and email settings, and paths to controller programs (editor, hooks, askpass, templates). A credential helper answers `github.com` HTTPS requests from the managed token. |
+| GitHub | `gh auth token` from the controller's main clone, written for both git and `gh` (`gh/hosts.yml`). |
+| Codex | `codex/` holds the controller's `config.toml` (credentials in a file, managed paths trusted), `AGENTS.md`, `hooks.json`, `rules/`, and skills from `$CODEX_HOME/skills` and `~/.agents/skills`. |
+| Other secrets | `[managed.env]` commands run on the controller; each output becomes a variable on the worker. |
+| PATH | The worker's login-shell PATH is captured, so Homebrew and version managers work in sessions started over SSH. |
+
+`env.sh` sets `CODEX_HOME`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, `PATH`, and
+the `[managed.env]` variables before every worker command. Agent tmux sessions
+inherit the paths and source `secrets/env.sh` when they start, so secret
+values never appear in process arguments. Secrets are written with mode
+`0600` inside a `0700` directory. Skills and rules that Codex creates on the
+worker itself are kept when the controller's copies change. Signing out of
+`gh` on the controller removes the token from the worker on its next
+connection.
+
+A worker that reconnects within ten minutes of its last provisioning reuses
+it; later reconnects provision again, so a rotated token or an edited setting
+reaches the worker without a restart.
+
+```toml
+[managed.env]
+CLOUDFLARE_API_TOKEN = "op read op://Dev/Cloudflare/token"
+NPM_TOKEN = "security find-generic-password -s npm -w"
+```
+
+Prefer API tokens over OAuth logins for these. A copied OAuth refresh token
+breaks once either machine refreshes it, which is also why Codex is not
+copied.
+
+### Sign-ins
+
+Codex keeps its own sign-in on the worker. Copying the controller's
+`auth.json` would let the two machines invalidate each other's rotating
+refresh token, so the worker signs in once and refreshes on its own. Agents
+keep running while the controller sleeps.
+
+wt asks for a sign-in only when a request needs it:
+
+- Starting or entering a Codex agent on a host whose Codex is signed out
+  opens `Sign in on <host>`. Confirming runs `codex login` on the worker
+  over SSH and forwards port 1455, so the link it prints completes in the
+  controller's browser. wt then checks again and continues the original
+  request.
+- Creating a worktree on a host without GitHub credentials offers `gh auth
+  login` on the worker. Signing in to `gh` on the controller instead lets wt
+  supply the token automatically, which is the usual case.
+
+Owed sign-ins and degraded capabilities (for example `gh` not installed) also
+appear in the attention feed and as a note in the `Ctrl+N` host picker.
+
+### Choosing where a worktree runs
+
+`n` opens `New worktree on <host> (Tab: host):`. `Tab` cycles through this
+machine and every remote, and `n` starts on the host chosen last. A stacked
+create (`N`) stays on its parent's host. Rows from every host share one board;
+the host label on each row is the only difference.
+
+### Current limits
+
+- Managed remotes are tested with macOS controllers and macOS workers. A
+  Linux worker needs a published release for its target, as for any remote.
+- The repository must be on GitHub, and the worker must be able to reach it.
+- Commits made on the worker are unsigned, because the controller's signing
+  configuration and key stay on the controller.
+- The worker must already have `codex` (and preferably `gh`) on its
+  login-shell PATH, for example from Homebrew. wt reports a missing tool.
+- Dev servers run on the worker; open their URLs from the worker, or forward
+  the port with SSH.
 
 ## Configure the worker
 

@@ -27,6 +27,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
     let (changed, mut changes) = tokio::sync::mpsc::channel(1);
     for remote in &remotes {
         let mut updates = remote.snapshot.subscribe();
+        let mut managed = remote.managed.clone();
         let changed = changed.clone();
         let cancelled = scope.token();
         scope.spawn(async move {
@@ -36,6 +37,11 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
                     next = updates.changed() => {
                         if next.is_err() { break; }
                         updates.borrow_and_update();
+                        let _ = changed.try_send(());
+                    }
+                    next = managed.changed() => {
+                        if next.is_err() { break; }
+                        managed.borrow_and_update();
                         let _ = changed.try_send(());
                     }
                 }
@@ -65,7 +71,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
                 update = metadata.changed() => { if update.is_err() { break; } metadata.borrow_and_update(); }
                 _ = changes.recv(), if !owned_remotes.is_empty() => {}
             }
-            let snapshots = owned_remotes.iter().map(|remote| (&remote.endpoint, remote.snapshot.snapshot())).collect::<Vec<_>>();
+            let snapshots = owned_remotes.iter().map(|remote| (&remote.endpoint, remote.snapshot.snapshot(), remote.managed.borrow().clone())).collect::<Vec<_>>();
             let snapshot = compose(&config, updates.borrow().clone(), metadata.borrow().clone(), &snapshots);
             if previous.as_ref().is_some_and(|old| old.data == snapshot.data && old.state == snapshot.state) { continue; }
             previous = Some(snapshot.clone());
@@ -79,11 +85,18 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
     }
 }
 
+/// One remote's latest snapshot and, for a managed remote, its provisioning report.
+type ComposedHost<'a> = (
+    &'a wt_config::RemoteConfig,
+    SourceSnapshot<HostSnapshot>,
+    Option<Arc<crate::managed::ManagedStatus>>,
+);
+
 fn compose(
     config: &wt_config::Config,
     mut snapshot: SourceSnapshot<Board>,
     metadata: SourceSnapshot<Metadata>,
-    hosts: &[(&wt_config::RemoteConfig, SourceSnapshot<HostSnapshot>)],
+    hosts: &[ComposedHost<'_>],
 ) -> SourceSnapshot<Board> {
     let mut board = snapshot.data.as_deref().cloned().unwrap_or_else(|| Board {
         name: config.repo_id.clone(),
@@ -106,9 +119,26 @@ fn compose(
     }
     board.attention_seen_ms = state["attentionSeenTs"].as_u64().unwrap_or_default();
     let archived = metadata.data.as_ref().map(|m| &m.1);
-    for (endpoint, source) in hosts {
+    for (endpoint, source, managed) in hosts {
         let host = endpoint.key();
         let label = wt_core::sanitize_terminal_text(&endpoint.label);
+        if let Some(status) = managed {
+            for line in crate::managed::notices(&status.report) {
+                let text = wt_core::sanitize_terminal_text(&line);
+                board.activity.push(wt_tui::ActivityLine {
+                    at_ms: status.at_ms,
+                    level: "WARN".into(),
+                    channel: "attention".into(),
+                    source: label.clone(),
+                    text: text.clone(),
+                });
+                board.attention.push(wt_tui::AttentionLine {
+                    at_ms: status.at_ms,
+                    source: label.clone(),
+                    text,
+                });
+            }
+        }
         board.hosts.push(HostChoice {
             id: Some(host.clone()),
             label: label.clone(),
@@ -408,7 +438,7 @@ mod tests {
                 ..Default::default()
             }),
             metadata,
-            &[(&endpoint, source)],
+            &[(&endpoint, source, None)],
         );
         let board = result.data.unwrap();
         assert_eq!(
@@ -485,7 +515,7 @@ mod tests {
             &fixture.ctx.config,
             local,
             metadata,
-            &[(&first, source), (&second, failed)],
+            &[(&first, source, None), (&second, failed, None)],
         );
         let board = result.data.unwrap();
         assert_eq!(board.rows.len(), 3);
@@ -505,6 +535,64 @@ mod tests {
                 .details
                 .iter()
                 .any(|line| line.contains("SSH disconnected"))
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_host_needing_sign_in_reaches_attention_before_it_has_rows() {
+        use wt_remote::managed::{CheckState, ManagedCheck, ManagedReport, SignIn};
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let endpoint = wt_config::RemoteConfig {
+            host: "beast".into(),
+            label: "Beast".into(),
+            managed: true,
+            ..Default::default()
+        };
+        let status = Arc::new(crate::managed::ManagedStatus {
+            report: ManagedReport {
+                protocol: 1,
+                checks: vec![
+                    ManagedCheck::ok("repository", "cloned"),
+                    ManagedCheck::new(
+                        "codex-login",
+                        CheckState::SignInNeeded,
+                        "Codex sign-in needed before agents can start",
+                        Some(SignIn::Codex),
+                    ),
+                ],
+            },
+            at_ms: 42,
+        });
+        let empty = ready(HostSnapshot {
+            board: Some(Board::default()),
+            state: HostState::Ready,
+            layout: Default::default(),
+        });
+        let result = compose(
+            &fixture.ctx.config,
+            ready(Board::default()),
+            ready((serde_json::json!({"slugs": {}}), Default::default())),
+            &[(&endpoint, empty, Some(status))],
+        );
+        let board = result.data.unwrap();
+        let line = board
+            .attention
+            .iter()
+            .find(|line| line.source == "Beast")
+            .expect("managed notice");
+        assert_eq!(line.at_ms, 42);
+        assert!(
+            line.text
+                .starts_with("Codex sign-in needed before agents can start.")
+        );
+        assert!(
+            !board
+                .attention
+                .iter()
+                .any(|line| line.text.contains("cloned"))
         );
         fixture.close().await.unwrap();
     }

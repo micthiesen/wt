@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use wt_core::HarnessId;
 use wt_harness::{
     ActivityKind, ClaudeEventParser, ClaudePaths, CodexActivityTracker, CodexEventLevel,
-    CodexHarness, CodexOutputTracker, CodexPaths, HarnessOutputKind, HarnessOutputTarget,
+    CodexHarness, CodexOutputTracker, HarnessOutputKind, HarnessOutputTarget,
     OpenCodeActivityTracker, OpenCodeEventLevel, OpenCodeHarness, OpenCodeOutputTracker,
     OpenCodePaths, session_jsonl_path,
 };
@@ -237,7 +237,7 @@ pub fn start(
         TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone()),
     );
     let codex = CodexHarness::new(
-        CodexPaths::new(&context.home, &context.config.paths.cache_root),
+        crate::harness::codex_paths(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         tmux.clone(),
     );
@@ -1052,7 +1052,7 @@ mod tests {
 
         let runner = ProcessRunner::new(NonZeroUsize::new(1).unwrap());
         let codex = CodexHarness::new(
-            CodexPaths::new(&home, temp.path().join("cache")),
+            wt_harness::CodexPaths::new(&home, temp.path().join("cache")),
             runner.clone(),
             TmuxClient::new(runner, TmuxServer::named("test-output-tail")),
         );

@@ -24,7 +24,8 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::MoveSection { .. }
         | UiAction::Reorder { .. }
         | UiAction::RenameSection { .. }
-        | UiAction::ToggleArchive { .. } => true,
+        | UiAction::ToggleArchive { .. }
+        | UiAction::ManagedSignIn { .. } => true,
         UiAction::OnHost { action, .. } => controller_owned(action),
         UiAction::PrepareHardRefresh
         | UiAction::HardRefresh
@@ -204,6 +205,7 @@ fn visit_keys(
         | UiAction::PrepareCreate { .. }
         | UiAction::Create { .. }
         | UiAction::PrepareCleanup
+        | UiAction::ManagedSignIn { .. }
         | UiAction::CancelAutomations => {}
     }
     Ok(())

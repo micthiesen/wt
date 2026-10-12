@@ -135,9 +135,24 @@ pub struct RemoteConfig {
     /// Select exactly one worker configuration through WT_CONFIG. Relative
     /// paths are not accepted; `~/` is expanded on the worker, not here.
     pub config: Option<String>,
+    /// The controller provisions this worker: it generates the worker config,
+    /// clones the repository, and supplies credentials on every connection.
+    pub managed: bool,
+    /// Home-relative directory that holds everything a managed worker owns.
+    /// Derived from the controller repository identity; never configured.
+    #[serde(skip)]
+    pub managed_root: Option<String>,
 }
 
 impl RemoteConfig {
+    /// The POSIX environment file a managed worker sources before every
+    /// command, so sessions, actions and git see the managed credentials.
+    pub fn env_file(&self) -> Option<String> {
+        self.managed_root
+            .as_ref()
+            .map(|root| format!("~/{root}/env.sh"))
+    }
+
     pub fn key(&self) -> String {
         match &self.config {
             Some(config) => format!("{} [config: {config}]", self.host),
@@ -555,6 +570,14 @@ pub struct BackendConfig {
     pub kind: BackendKind,
 }
 
+/// Settings shared by every managed remote. `env` maps a variable name to a
+/// shell command run on the controller; its output becomes that variable on
+/// each managed worker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedConfig {
+    pub env: BTreeMap<String, String>,
+}
+
 /// Fully resolved, validated configuration. Optional integrations remain
 /// `None` when their section is absent; generic settings always have a value.
 #[derive(Clone, Debug, PartialEq)]
@@ -576,6 +599,7 @@ pub struct Config {
     pub dev_server: Option<DevServerConfig>,
     /// All SSH hosts. The legacy `[remote]` table is normalized into this list.
     pub remotes: Vec<RemoteConfig>,
+    pub managed: ManagedConfig,
     pub harness: HarnessConfig,
     pub naming: Option<NamingConfig>,
     pub diff: DiffConfig,

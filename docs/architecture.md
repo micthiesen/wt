@@ -128,6 +128,19 @@ artifact. A protocol/build mismatch is reported rather than silently running a
 different command implementation. Configuration is resolved independently on
 each host, so each process has one selected config and its own repository state.
 
+A managed remote adds one step between staging the runtime and the handshake.
+`wt-app::managed` builds a `wt_remote::managed::ManagedRequest` from the
+controller's config layers, git settings, GitHub token, Codex home, and
+`[managed.env]`, and the runtime's config-free `_managed apply` command writes
+it under the worker's managed root, ensures the clone, and returns typed
+checks. The host actor keeps the latest checks in a watch channel; the fleet
+projection turns them into attention lines, and `host_dispatch` turns an owed
+sign-in into a confirmation before the request that needs it. The worker
+sources the generated `env.sh` before every command. `WT_SESSION_ENV` names
+the variables that agent tmux sessions inherit, and each session command
+sources `secrets/env.sh` itself (`WT_SESSION_SOURCE`) so secret values never
+appear in a process's arguments.
+
 ## Durable state, caches, and operation safety
 
 `wt-store` is the authority for repository-scoped status, sections, issue

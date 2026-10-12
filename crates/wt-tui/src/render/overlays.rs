@@ -877,6 +877,7 @@ fn confirm_verb(action: &ConfirmAction) -> &'static str {
         ConfirmAction::Github { ship: false, .. } => "mark ready",
         ConfirmAction::Remove { .. } => "remove",
         ConfirmAction::Cleanup { .. } => "clean",
+        ConfirmAction::ManagedSignIn { .. } => "sign in",
         #[allow(unreachable_patterns)]
         _ => "confirm",
     }

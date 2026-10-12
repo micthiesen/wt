@@ -138,6 +138,11 @@ opens the main clone as it does on the board.
 ### Worktrees and organization
 
 The create prompt shows `New worktree name: ` before an empty editable field.
+With remotes configured it shows `New worktree on <host> (Tab: host): `
+instead. `Tab` cycles through this machine and each remote, and `n` starts on
+the host chosen last in this session. A stacked create (`N`) opens on its
+parent's host, and `Tab` does nothing once the text carries `--base`; a
+`--base` typed after choosing a host resolves on that host.
 After creation, WT refreshes inventory and metadata and selects the new row.
 Its group opens when the row arrives, including if a folded snapshot arrives
 before the saved group state.
@@ -153,8 +158,9 @@ WT still checks the published base. Missing evidence does not mean merged.
 
 | Key | Action |
 |---|---|
-| `n` / `N` | Create a worktree on this machine / create from the selected branch |
-| `Ctrl+N` | Create on a chosen host; toasts when `[remote]` is not configured |
+| `n` / `N` | Create a worktree on the last chosen host (this machine by default) / create from the selected branch on its host |
+| `Tab` (create prompt) | Cycle the new worktree's host |
+| `Ctrl+N` | Create on a chosen host; toasts when `[remote]` is not configured. Managed hosts that owe a sign-in say so |
 | `o` | Open the selected worktree in the configured editor |
 | `d` | Remove the selected worktree after confirmation |
 | `c` | Review and clean eligible merged or gone worktrees |
@@ -173,7 +179,10 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `h` | Open removed-worktree history |
 
 Creation selects the row after it appears in the prepared board. Remote
-worktrees use the same host service for commands and sessions. Removal and
+worktrees use the same host service for commands and sessions. On a
+[managed remote](remote.md#managed-remotes), a request that needs a missing
+sign-in (Codex for agents, GitHub for creation) first asks `Sign in on
+<host>`; confirming runs the sign-in over SSH and then continues the request. Removal and
 cleanup revalidate current hazards; unknown state does not authorize force
 removal.
 

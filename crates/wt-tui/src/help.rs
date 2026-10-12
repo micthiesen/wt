@@ -76,6 +76,7 @@ pub(crate) const LINES: &[&str] = &[
     "Global",
     "  n / N              New worktree / based on the selected branch",
     "  Ctrl+N             New worktree on a chosen host",
+    "  Tab (in n prompt)  Cycle the new worktree's host; n remembers it",
     "  c                  Clean landed worktrees (all hosts)",
     "  h                  Removed-worktree history",
     "  r / Ctrl+R         Refresh / clear derived caches",

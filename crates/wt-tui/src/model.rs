@@ -662,6 +662,8 @@ pub struct Model {
     pub title_prompt: Option<TitlePrompt>,
     pub interaction: Interaction,
     pub(crate) interaction_host: Option<String>,
+    /// Host chosen with Tab in the last new-worktree prompt; `None` is local.
+    pub(crate) last_create_host: Option<String>,
     pub yank: Option<usize>,
     pub toast: Option<(String, ToastTone)>,
     pub pending_selection: Option<String>,
@@ -720,6 +722,7 @@ impl Default for Model {
             title_prompt: None,
             interaction: Interaction::None,
             interaction_host: None,
+            last_create_host: None,
             yank: None,
             toast: None,
             pending_selection: None,
@@ -1062,12 +1065,21 @@ impl Model {
                 prompt,
                 initial,
                 allow_empty,
-            }) => Interaction::Text(TextPrompt {
-                action,
-                prompt,
-                editor: LineEditor::new(&initial),
-                allow_empty,
-            }),
+            }) => {
+                // A plain create prompt names its host like `n` does, so a
+                // host picked in the Ctrl+N picker is visible and Tab works.
+                let prompt = if matches!(action, TextAction::Create) && initial.is_empty() {
+                    self.create_prompt(self.interaction_host.as_deref())
+                } else {
+                    prompt
+                };
+                Interaction::Text(TextPrompt {
+                    action,
+                    prompt,
+                    editor: LineEditor::new(&initial),
+                    allow_empty,
+                })
+            }
             None => std::mem::take(&mut self.interaction),
         };
         if current && let Some(key) = reply.select_when_visible {
@@ -1831,10 +1843,18 @@ impl Model {
                 }
             }
             KeyCode::Char('n') if !control && !shift => {
-                // Always local, as in TS; Ctrl+N chooses a host.
+                // The host chosen last with Tab, local by default; Tab in the
+                // prompt changes it and Ctrl+N still offers a picker.
+                let host = self.last_create_host.clone().filter(|host| {
+                    self.board
+                        .hosts
+                        .iter()
+                        .any(|choice| choice.id.as_deref() == Some(host.as_str()))
+                });
+                self.interaction_host = host.clone();
                 self.interaction = Interaction::Text(TextPrompt {
                     action: TextAction::Create,
-                    prompt: "New worktree name: ".into(),
+                    prompt: self.create_prompt(host.as_deref()),
                     editor: LineEditor::default(),
                     allow_empty: false,
                 });
@@ -2042,6 +2062,22 @@ impl Model {
         })
     }
 
+    /// The new-worktree label names the target host whenever there is more
+    /// than one to choose from.
+    fn create_prompt(&self, host: Option<&str>) -> String {
+        if self.board.hosts.len() <= 1 {
+            return "New worktree name: ".into();
+        }
+        let label = self
+            .board
+            .hosts
+            .iter()
+            .find(|choice| choice.id.as_deref() == host)
+            .map(|choice| choice.label.as_str())
+            .unwrap_or("This machine");
+        format!("New worktree on {label} (Tab: host): ")
+    }
+
     fn interaction_input(
         &mut self,
         key: KeyEvent,
@@ -2103,6 +2139,31 @@ impl Model {
                 }
             }
             Interaction::Text(prompt) => {
+                // Tab moves a new worktree between hosts. A stacked create
+                // (`--base`) stays on its parent's host.
+                if matches!(prompt.action, TextAction::Create)
+                    && code == KeyCode::Tab
+                    && !control
+                    && self.board.hosts.len() > 1
+                    && !prompt.editor.text().contains("--base")
+                {
+                    let ids = self
+                        .board
+                        .hosts
+                        .iter()
+                        .map(|choice| choice.id.clone())
+                        .collect::<Vec<_>>();
+                    let current = ids
+                        .iter()
+                        .position(|id| *id == self.interaction_host)
+                        .unwrap_or(0);
+                    let next = ids[(current + 1) % ids.len()].clone();
+                    prompt.prompt = self.create_prompt(next.as_deref());
+                    self.interaction_host = next.clone();
+                    self.last_create_host = next;
+                    self.interaction = interaction;
+                    return InputResult::Draw;
+                }
                 // Session names are restricted to the Claude name charset.
                 if matches!(prompt.action, TextAction::SessionName { .. })
                     && let KeyCode::Char(ch) = code
@@ -2276,6 +2337,12 @@ impl Model {
                         ConfirmAction::Cleanup { revisions } => UiAction::Cleanup {
                             revisions: revisions.clone(),
                         },
+                        ConfirmAction::ManagedSignIn { provider, then } => {
+                            UiAction::ManagedSignIn {
+                                provider: provider.clone(),
+                                then: then.clone(),
+                            }
+                        }
                     });
                 }
                 self.interaction = interaction;

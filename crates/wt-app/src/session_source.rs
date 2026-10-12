@@ -14,9 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wt_core::HarnessId;
-use wt_harness::{
-    ClaudePaths, CodexPaths, DiscoveryRequest, HarnessService, HarnessSession, OpenCodePaths,
-};
+use wt_harness::{ClaudePaths, DiscoveryRequest, HarnessService, HarnessSession, OpenCodePaths};
 use wt_runtime::{
     SourceHandle, SourcePublisher, SourceSnapshot, SourceState, TaskScope, source_channel,
 };
@@ -130,7 +128,7 @@ pub fn start(
     let (requests, request_rx) = mpsc::channel(32);
     let service = HarnessService::new(
         ClaudePaths::new(&context.home, &context.config.paths.cache_root),
-        CodexPaths::new(&context.home, &context.config.paths.cache_root),
+        crate::harness::codex_paths(&context.home, &context.config.paths.cache_root),
         OpenCodePaths::new(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         TmuxClient::new(

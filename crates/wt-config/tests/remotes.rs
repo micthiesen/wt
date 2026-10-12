@@ -149,3 +149,64 @@ fn option_like_or_whitespace_hosts_and_relative_or_control_paths_are_rejected() 
         );
     }
 }
+
+#[test]
+fn managed_remote_derives_its_worker_layout_from_repository_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let raw = toml::from_str(&minimal_config(
+        "\n[[remotes]]\nhost = 'beast'\nmanaged = true\n\n[[remotes]]\nhost = 'plain'\n\n[managed.env]\nCLOUDFLARE_API_TOKEN = 'op read op://dev/cf/token'\n",
+    ))
+    .unwrap();
+    let config = Config::from_raw(raw, &options(root.path(), root.path(), &[])).unwrap();
+
+    let managed = &config.remotes[0];
+    let root_dir = format!(".local/share/wt/managed/{}", config.repo_id);
+    assert!(managed.managed);
+    assert_eq!(managed.managed_root.as_deref(), Some(root_dir.as_str()));
+    assert_eq!(
+        managed.config.as_deref(),
+        Some(format!("~/{root_dir}/config.toml").as_str())
+    );
+    assert_eq!(managed.wt_path, format!("~/{root_dir}/bin/wt"));
+    assert_eq!(
+        managed.env_file().as_deref(),
+        Some(format!("~/{root_dir}/env.sh").as_str())
+    );
+
+    let plain = &config.remotes[1];
+    assert!(!plain.managed);
+    assert_eq!(plain.env_file(), None);
+    assert_eq!(plain.config, None);
+    assert_eq!(
+        config.managed.env["CLOUDFLARE_API_TOKEN"],
+        "op read op://dev/cf/token"
+    );
+}
+
+#[test]
+fn managed_remote_rejects_hand_selected_config_and_reserved_variables() {
+    let root = tempfile::tempdir().unwrap();
+    let raw = toml::from_str(&minimal_config(
+        "\n[[remotes]]\nhost = 'beast'\nmanaged = true\nconfig = '/etc/wt.toml'\n\n[managed.env]\nCODEX_HOME = 'echo x'\nlower = 'echo y'\nEMPTY = ' '\n",
+    ))
+    .unwrap();
+    let error = Config::from_raw(raw, &options(root.path(), root.path(), &[]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("managed remotes generate their worker config"),
+        "{error}"
+    );
+    assert!(
+        error.contains("managed.env.CODEX_HOME: wt owns this variable"),
+        "{error}"
+    );
+    assert!(
+        error.contains("managed.env.lower: names must be uppercase"),
+        "{error}"
+    );
+    assert!(
+        error.contains("managed.env.EMPTY: the command is empty"),
+        "{error}"
+    );
+}

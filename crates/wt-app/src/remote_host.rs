@@ -39,6 +39,9 @@ const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const COMMAND_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// A managed worker reconnecting sooner than this after its last provisioning
+/// reuses it; a flapping link must not re-upload the whole managed tree.
+const REPROVISION_AFTER: Duration = Duration::from_secs(10 * 60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -64,12 +67,17 @@ enum Request {
     Refresh {
         connection: u64,
     },
+    /// Retry preparation now, e.g. after a sign-in on a blocked managed host.
+    Wake,
 }
 
 #[derive(Clone)]
 pub struct RemoteHost {
     pub endpoint: RemoteConfig,
     pub snapshot: SourceHandle<HostSnapshot>,
+    /// The latest managed-worker checks; always `None` for unmanaged hosts.
+    pub managed: watch::Receiver<Option<Arc<crate::managed::ManagedStatus>>>,
+    managed_status: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
     requests: mpsc::Sender<Request>,
     ready: watch::Receiver<Option<u64>>,
     client: watch::Receiver<Option<RemoteClient>>,
@@ -84,10 +92,13 @@ impl RemoteHost {
         let (ready, readiness) = watch::channel(None);
         let (client, client_state) = watch::channel(None);
         let (views, view_state) = watch::channel(protocol::HostViews::default());
+        let (managed_status, managed) = watch::channel(None);
+        let managed_status = Arc::new(managed_status);
         let cancellation = scope.token();
         let app_cancel = context.cancellation.clone();
         let context = context.clone();
         let host = endpoint.clone();
+        let actor_managed = managed_status.clone();
         scope.spawn(async move {
             run_host_actor(
                 context,
@@ -98,6 +109,7 @@ impl RemoteHost {
                     readiness: ready,
                     prepared_client: client,
                     views: view_state,
+                    managed: actor_managed,
                 },
                 cancellation,
                 app_cancel,
@@ -107,11 +119,42 @@ impl RemoteHost {
         Self {
             endpoint,
             snapshot,
+            managed,
+            managed_status,
             requests,
             ready: readiness,
             client: client_state,
             views,
         }
+    }
+
+    /// The staged runtime client, available as soon as the runtime is staged
+    /// even when a managed worker is blocked on a sign-in.
+    pub fn staged_client(&self) -> Result<RemoteClient> {
+        self.client.borrow().clone().with_context(|| {
+            format!(
+                "remote host {} has not been reached yet",
+                self.endpoint.label
+            )
+        })
+    }
+
+    pub fn set_managed(&self, report: wt_remote::managed::ManagedReport) {
+        self.managed_status
+            .send_replace(Some(Arc::new(crate::managed::ManagedStatus::now(report))));
+    }
+
+    /// Ask a disconnected or blocked host to retry preparation now.
+    pub fn wake(&self) {
+        let _ = self.requests.try_send(Request::Wake);
+    }
+
+    /// Wait until the worker stream is ready, up to `limit`.
+    pub async fn wait_ready(&self, limit: Duration) -> bool {
+        let mut ready = self.ready.clone();
+        tokio::time::timeout(limit, ready.wait_for(Option::is_some))
+            .await
+            .is_ok_and(|result| result.is_ok())
     }
 
     pub fn refresh(&self) -> bool {
@@ -190,6 +233,40 @@ struct HostChannels {
     readiness: watch::Sender<Option<u64>>,
     prepared_client: watch::Sender<Option<RemoteClient>>,
     views: watch::Receiver<protocol::HostViews>,
+    managed: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
+}
+
+/// Stage the runtime, provision a managed worker, then handshake. The staged
+/// client is published before provisioning so a sign-in can reach a worker
+/// that is blocked waiting for one.
+async fn prepare_host(
+    context: &AppContext,
+    endpoint: &RemoteConfig,
+    prepared_client: &watch::Sender<Option<RemoteClient>>,
+    managed: &watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>,
+) -> Result<(RemoteClient, WorkerInfo)> {
+    // A report from an earlier connection no longer describes a worker this
+    // controller cannot reach, so it must not keep prompting for sign-ins.
+    let unreachable = |error: anyhow::Error| {
+        managed.send_replace(None);
+        error
+    };
+    let staged = crate::remote::stage_remote_runtime(context, endpoint)
+        .await
+        .map_err(unreachable)?;
+    if endpoint.managed {
+        prepared_client.send_replace(Some(staged.clone()));
+        let report = crate::managed::provision(context, &staged)
+            .await
+            .map_err(unreachable)?;
+        let blocking = report.blocking_failure().map(|check| check.detail.clone());
+        managed.send_replace(Some(Arc::new(crate::managed::ManagedStatus::now(report))));
+        if let Some(detail) = blocking {
+            anyhow::bail!("{detail}");
+        }
+    }
+    let worker = staged.require_worker(&context.cancellation).await?;
+    Ok((staged, worker))
 }
 
 async fn run_host_actor(
@@ -205,6 +282,7 @@ async fn run_host_actor(
         readiness,
         prepared_client,
         mut views,
+        managed,
     } = channels;
     let operation_cancel = CancellationToken::new();
     let cancel_signal = operation_cancel.clone();
@@ -232,14 +310,16 @@ async fn run_host_actor(
     let mut backoff = RECONNECT_MIN;
     let mut command_id = 0u64;
     let mut connection_id = 0u64;
+    let mut provisioned_at: Option<tokio::time::Instant> = None;
     loop {
         if scope_cancel.is_cancelled() || app_cancel.is_cancelled() {
             break;
         }
         if client.is_none() {
-            match crate::remote::prepare_remote_client(&context, &endpoint).await {
+            match prepare_host(&context, &endpoint, &prepared_client, &managed).await {
                 Ok(prepared) => {
                     prepared_client.send_replace(Some(prepared.0.clone()));
+                    provisioned_at = Some(tokio::time::Instant::now());
                     client = Some(prepared);
                     backoff = RECONNECT_MIN;
                 }
@@ -302,6 +382,13 @@ async fn run_host_actor(
                     ConnectionEnd::Disconnected(detail) => {
                         if connected_at.elapsed() >= RECONNECT_MAX {
                             backoff = RECONNECT_MIN;
+                        }
+                        // A managed worker is provisioned again on reconnect,
+                        // so credentials rotated meanwhile reach it.
+                        if endpoint.managed
+                            && provisioned_at.is_none_or(|at| at.elapsed() >= REPROVISION_AFTER)
+                        {
+                            client = None;
                         }
                         publish_failed(&mut publisher, &mut last_good, detail);
                         drain_offline(&mut requests, &endpoint.key());
@@ -367,7 +454,7 @@ async fn wait_offline(
                     let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.to_owned(), detail: "the SSH stream is reconnecting; no command was sent".into() }));
                     true
                 }
-                Some(Request::Refresh { .. }) => true,
+                Some(Request::Refresh { .. } | Request::Wake) => true,
                 None => false,
             }
         }
@@ -598,6 +685,7 @@ async fn serve_connection(
                 Some(ReaderMessage::Eof) | None => return ConnectionEnd::Disconnected(format!("SSH host stream closed; {}", stderr_text(connection))),
             },
             request = requests.recv() => match request {
+                Some(Request::Wake) => {}
                 Some(Request::Refresh { connection })
                     if !belongs_to_connection(connection, active_connection) => {}
                 Some(Request::Refresh { .. }) => {

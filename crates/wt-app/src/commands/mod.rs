@@ -39,6 +39,7 @@ pub mod _claude_hook;
 pub mod _destroy;
 pub mod _dev_giveup;
 pub mod _hello;
+pub mod _managed;
 pub mod _remote;
 pub mod _restack_worker;
 pub mod _session;

@@ -46,6 +46,7 @@ mod issue_source;
 mod lifecycle_ops;
 mod local_source;
 mod logging;
+mod managed;
 mod naming;
 mod naming_source;
 mod origin;
@@ -180,6 +181,9 @@ enum Command {
     WorkerDispatch { args: Vec<String> },
     #[command(name = "_host", hide = true)]
     Host,
+    /// Converge a controller-managed worker; runs before any config exists.
+    #[command(name = "_managed", hide = true)]
+    Managed { args: Vec<String> },
     /// Install or inspect checked native releases.
     Update(commands::update::UpdateArgs),
     /// Activate a previously installed native version.
@@ -313,6 +317,9 @@ fn run(cli: Cli) -> Result<i32> {
                 }
                 Some(Command::Rollback(args)) => {
                     return commands::rollback::run(&options, args).await;
+                }
+                Some(Command::Managed { args }) => {
+                    return commands::_managed::run(args, &token).await;
                 }
                 _ => {}
             }
@@ -493,6 +500,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
             commands::update::run(&LoadOptions::default(), args, &context.cancellation).await
         }
         Command::Rollback(args) => commands::rollback::run(&LoadOptions::default(), args).await,
+        Command::Managed { args } => commands::_managed::run(args, &context.cancellation).await,
     }
 }
 

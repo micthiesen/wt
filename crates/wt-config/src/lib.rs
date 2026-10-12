@@ -10,7 +10,7 @@ mod load;
 mod schema;
 
 pub use error::ConfigError;
-pub use load::LoadOptions;
+pub use load::{LoadOptions, RESERVED_MANAGED_ENV};
 pub use schema::*;
 
 /// The stable namespace used for repository caches, state and tmux sockets.

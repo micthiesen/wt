@@ -80,12 +80,14 @@ mod tests {
             label: "one".into(),
             wt_path: "~/one".into(),
             config: Some("/etc/wt-one.toml".into()),
+            ..Default::default()
         };
         let second = RemoteConfig {
             host: "devbox".into(),
             label: "two".into(),
             wt_path: "~/two".into(),
             config: Some("/etc/wt-two.toml".into()),
+            ..Default::default()
         };
         let remotes = [first, second];
         let first_key = remotes[0].key();

@@ -88,8 +88,11 @@ wt also distributes the agent skills and instructions that make all of that work
 
 Configured SSH workers run the exact matching native build. The controller
 provisions a build-matched worker runtime and keeps remote worktree state beside
-local rows; commands and sessions execute on the owning host. See
-[`docs/configuration.md`](docs/configuration.md#remote--optional-ssh-worktree-host).
+local rows; commands and sessions execute on the owning host. Add
+`managed = true` to a remote and the controller also provisions its config,
+clone, GitHub credentials, and Codex setup, asking for a sign-in only when one
+is first needed; `Tab` in the `n` prompt picks where a worktree runs. See
+[`docs/remote.md`](docs/remote.md#managed-remotes).
 
 State is push-based: filesystem watchers on git refs, worktree dirs, and wt's own state feed the UI, so it tracks commits, pushes, installs, and deploys without manual refreshing. An optional webhook daemon extends that to GitHub-side events.
 

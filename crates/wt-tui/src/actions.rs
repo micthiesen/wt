@@ -14,6 +14,12 @@ pub enum UiAction {
     PrepareCreate {
         initial: String,
     },
+    /// Sign in on a managed host through an interactive SSH session, then
+    /// continue the request that needed it.
+    ManagedSignIn {
+        provider: String,
+        then: Option<Box<UiAction>>,
+    },
     PrepareHardRefresh,
     HardRefresh,
     SetAttentionSeen {
@@ -319,6 +325,10 @@ pub enum ConfirmAction {
     },
     Cleanup {
         revisions: Vec<RemovalRevision>,
+    },
+    ManagedSignIn {
+        provider: String,
+        then: Option<Box<UiAction>>,
     },
 }
 

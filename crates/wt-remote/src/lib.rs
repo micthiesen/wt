@@ -1,5 +1,7 @@
 //! SSH transport and versioned worker protocol for native remote wt hosts.
 
+pub mod managed;
+
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use base64::Engine as _;
@@ -346,7 +348,12 @@ impl RemoteClient {
         let runtime_path = runtime_path(&candidate.target, &candidate.sha256);
         let cached = self
             .run_remote_shell(
-                &cache_probe_script(&candidate.target, &candidate.sha256, &candidate.build_id),
+                &cache_probe_script(
+                    &candidate.target,
+                    &candidate.sha256,
+                    &candidate.build_id,
+                    self.remote.managed,
+                ),
                 None,
                 PROVISION_TIMEOUT,
                 cancellation,
@@ -401,6 +408,7 @@ impl RemoteClient {
             &candidate.sha256,
             &candidate.build_id,
             &nonce,
+            self.remote.managed,
         );
         let output = self
             .run_remote_shell(&publish, None, PROVISION_TIMEOUT, cancellation)
@@ -482,6 +490,61 @@ impl RemoteClient {
             .args(ssh_command_args(&self.remote, &command));
         spec.timeout = SSH_TIMEOUT;
         Ok(self.runner.run(spec, cancellation).await?)
+    }
+
+    /// Run the runtime's config-free managed provisioning command with a
+    /// JSON request on stdin. It never loads or requires a worker config.
+    pub async fn run_managed(
+        &self,
+        argv: &[String],
+        input: Vec<u8>,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, RemoteError> {
+        let command = managed_command(&self.remote, self.selected_runtime_path(), argv);
+        let mut spec = CommandSpec::new(self.ssh_program.clone())
+            .args(ssh_command_args(&self.remote, &command));
+        spec.timeout = timeout;
+        spec.input = Some(input);
+        Ok(self.runner.run(spec, cancellation).await?)
+    }
+
+    /// An interactive PTY running a managed sign-in on the worker. A local
+    /// port forward carries a browser callback back to the worker's loopback.
+    pub fn interactive_managed(
+        &self,
+        argv: &[String],
+        forward_port: Option<u16>,
+    ) -> PreparedRemoteSession {
+        let command = managed_command(&self.remote, self.selected_runtime_path(), argv);
+        let mut args: Vec<OsString> = Vec::new();
+        args.push("-t".into());
+        if let Some(port) = forward_port {
+            args.extend([
+                OsString::from("-o"),
+                OsString::from("ExitOnForwardFailure=yes"),
+                OsString::from("-L"),
+                OsString::from(format!("127.0.0.1:{port}:127.0.0.1:{port}")),
+            ]);
+        }
+        args.extend(
+            [
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=3",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        args.push(self.remote.host.clone().into());
+        args.push(command.into());
+        PreparedRemoteSession {
+            program: self.ssh_program.clone(),
+            args,
+        }
     }
 
     pub fn interactive_tui(&self) -> PreparedRemoteSession {
@@ -571,17 +634,30 @@ fn remote_wt_command_at(remote: &RemoteConfig, path: &str, argv: &[String]) -> S
     )
 }
 
+fn managed_command(remote: &RemoteConfig, path: &str, argv: &[String]) -> String {
+    format!(
+        "{}exec {} _managed {}",
+        remote_environment(remote),
+        remote_executable(path),
+        encode_remote_args(argv)
+    )
+}
+
 fn remote_environment(remote: &RemoteConfig) -> String {
-    remote
-        .config
-        .as_ref()
+    let mut environment = remote
+        .env_file()
         .map(|path| {
-            format!(
-                "export WT_CONFIG={}; export WT_REPO_CONFIG=\"$WT_CONFIG\"; ",
-                remote_executable(path),
-            )
+            let path = remote_executable(&path);
+            format!("if [ -r {path} ]; then . {path}; fi; ")
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Some(path) = &remote.config {
+        environment.push_str(&format!(
+            "export WT_CONFIG={}; export WT_REPO_CONFIG=\"$WT_CONFIG\"; ",
+            remote_executable(path),
+        ));
+    }
+    environment
 }
 
 pub fn ssh_args(remote: &RemoteConfig, argv: &[String]) -> Vec<OsString> {
@@ -757,15 +833,19 @@ validate() {
   [ "$actual_hash" = "$expected_hash" ] || return 1
   probe=$("$file" --_boot-probe 2>&1) || return 1
   [ "$probe" = "$expected_probe" ] || return 1
+  # A managed worker has no config until it is provisioned; its handshake
+  # is verified after provisioning instead.
+  [ "$skip_hello" = 1 ] && return 0
   hello=$("$file" _hello 2>&1) || return 1
   [ "$hello" = "$expected_hello" ] || return 1
 }"#
 }
 
-fn cache_probe_script(target: &str, sha256: &str, build_id: &str) -> String {
+fn cache_probe_script(target: &str, sha256: &str, build_id: &str, managed: bool) -> String {
     let directory = runtime_directory(target, sha256);
     format!(
         r#"set -eu
+skip_hello={skip_hello}
 dir="$HOME/{directory}"
 final="$dir/wt"
 expected_hash='{sha256}'
@@ -780,13 +860,21 @@ fi
 "#,
         protocol = WORKER_PROTOCOL_VERSION,
         validation_functions = runtime_validation_functions(),
+        skip_hello = u8::from(managed),
     )
 }
 
-fn publish_script(target: &str, sha256: &str, build_id: &str, nonce: &str) -> String {
+fn publish_script(
+    target: &str,
+    sha256: &str,
+    build_id: &str,
+    nonce: &str,
+    managed: bool,
+) -> String {
     let directory = runtime_directory(target, sha256);
     format!(
         r#"set -eu
+skip_hello={skip_hello}
 dir="$HOME/{directory}"
 stage="$dir/.wt-stage-{nonce}"
 final="$dir/wt"
@@ -809,6 +897,7 @@ echo WT_RUNTIME_READY
 "#,
         protocol = WORKER_PROTOCOL_VERSION,
         validation_functions = runtime_validation_functions(),
+        skip_hello = u8::from(managed),
     )
 }
 
@@ -967,6 +1056,7 @@ mod tests {
             label: "worker".into(),
             wt_path: "~/.wt/bin/wt".into(),
             config: None,
+            ..Default::default()
         }
     }
 
@@ -977,6 +1067,45 @@ mod tests {
             decode_remote_args(&encode_remote_args(&argv)).unwrap(),
             argv
         );
+    }
+
+    #[test]
+    fn managed_worker_sources_its_environment_before_selecting_config() {
+        let mut remote = remote();
+        remote.managed = true;
+        remote.managed_root = Some(".local/share/wt/managed/code-app".into());
+        remote.config = Some("~/.local/share/wt/managed/code-app/config.toml".into());
+        let command = remote_wt_command(&remote, &["ls".into()]);
+        let env = "\"$HOME\"/'.local/share/wt/managed/code-app/env.sh'";
+        assert!(command.starts_with(&format!(
+            "if [ -r {env} ]; then . {env}; fi; export WT_CONFIG="
+        )));
+        let managed = managed_command(&remote, "/runtime/wt", &["apply".into()]);
+        assert!(managed.contains("exec '/runtime/wt' _managed "));
+        assert!(!managed.contains("apply"));
+    }
+
+    #[test]
+    fn managed_sign_in_forwards_only_the_requested_loopback_port() {
+        let client = RemoteClient::new(ProcessRunner::default(), remote());
+        let prepared = client.interactive_managed(&["login".into(), "codex".into()], Some(1455));
+        let args = prepared
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..5],
+            [
+                "-t",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                "127.0.0.1:1455:127.0.0.1:1455"
+            ]
+        );
+        let plain = client.interactive_managed(&["login".into(), "github".into()], None);
+        assert!(!plain.args.iter().any(|arg| arg == "-L"));
     }
 
     #[test]
@@ -1209,6 +1338,7 @@ mod tests {
             label: "Fixture".into(),
             wt_path: "~/.local/bin/wt".into(),
             config: None,
+            ..Default::default()
         };
         let client = RemoteClient::new(ProcessRunner::default(), configured.clone())
             .with_ssh_program(ssh.as_os_str());

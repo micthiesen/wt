@@ -36,6 +36,23 @@ pub async fn prepare_remote_client(
     context: &AppContext,
     remote: &RemoteConfig,
 ) -> Result<(RemoteClient, WorkerInfo)> {
+    let client = stage_remote_runtime(context, remote).await?;
+    if remote.managed {
+        let report = crate::managed::provision(context, &client).await?;
+        if let Some(blocking) = report.blocking_failure() {
+            bail!("{}: {}", remote.label, blocking.detail);
+        }
+    }
+    let worker = client.require_worker(&context.cancellation).await?;
+    Ok((client, worker))
+}
+
+/// Stage the build-matched runtime without requiring a worker config. A
+/// managed worker is provisioned between this step and the handshake.
+pub async fn stage_remote_runtime(
+    context: &AppContext,
+    remote: &RemoteConfig,
+) -> Result<RemoteClient> {
     let base_client = RemoteClient::new(context.processes.clone(), remote.clone());
     let platform = base_client.probe_platform(&context.cancellation).await?;
     let (candidate, scratch) =
@@ -44,8 +61,7 @@ pub async fn prepare_remote_client(
         .prepare_runtime(&candidate, &context.cancellation)
         .await?;
     drop(scratch);
-    let worker = client.require_worker(&context.cancellation).await?;
-    Ok((client, worker))
+    Ok(client)
 }
 
 async fn native_candidate_for_platform(

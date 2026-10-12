@@ -466,6 +466,67 @@ fn n_is_always_local_and_ctrl_n_needs_a_remote() {
 }
 
 #[test]
+fn tab_moves_a_new_worktree_between_hosts_and_n_remembers_the_choice() {
+    let mut remote = board(&["one"]);
+    remote.hosts = vec![
+        HostChoice {
+            id: None,
+            label: "This machine".into(),
+        },
+        HostChoice {
+            id: Some("beast".into()),
+            label: "Beast".into(),
+        },
+    ];
+    let mut model = Model::default();
+    model.apply(ready(remote));
+    let prompt = |model: &Model| match &model.interaction {
+        Interaction::Text(prompt) => prompt.prompt.clone(),
+        _ => String::new(),
+    };
+
+    ch(&mut model, 'n');
+    assert_eq!(prompt(&model), "New worktree on This machine (Tab: host): ");
+    assert_eq!(press(&mut model, KeyCode::Tab), InputResult::Draw);
+    assert_eq!(prompt(&model), "New worktree on Beast (Tab: host): ");
+    for letter in "fix".chars() {
+        ch(&mut model, letter);
+    }
+    assert_eq!(
+        press(&mut model, KeyCode::Enter),
+        InputResult::Action(UiAction::OnHost {
+            host: Some("beast".into()),
+            action: Box::new(UiAction::Create {
+                input: "fix".into()
+            }),
+        })
+    );
+
+    // The next `n` starts on the remembered host; Tab wraps back to local.
+    ch(&mut model, 'n');
+    assert_eq!(prompt(&model), "New worktree on Beast (Tab: host): ");
+    press(&mut model, KeyCode::Tab);
+    assert_eq!(prompt(&model), "New worktree on This machine (Tab: host): ");
+    ch(&mut model, 'x');
+    assert_eq!(
+        press(&mut model, KeyCode::Enter),
+        InputResult::Action(UiAction::Create { input: "x".into() })
+    );
+}
+
+#[test]
+fn a_single_host_keeps_the_plain_create_prompt_and_tab_edits_nothing() {
+    let mut model = model_with(&["one"]);
+    ch(&mut model, 'n');
+    match &model.interaction {
+        Interaction::Text(prompt) => assert_eq!(prompt.prompt, "New worktree name: "),
+        _ => panic!("create prompt expected"),
+    }
+    press(&mut model, KeyCode::Tab);
+    assert!(model.interaction_host.is_none());
+}
+
+#[test]
 fn esc_returns_output_focus_and_o_opens_the_main_clone() {
     let mut model = model_with(&["one"]);
     ch(&mut model, '"');

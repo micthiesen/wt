@@ -5,10 +5,10 @@ use tokio_util::sync::CancellationToken;
 use wt_platform::process::ProcessRunner;
 
 use crate::{
-    CreateSession, CreateWindow, OptionScope, PaneTarget, TmuxClient, TmuxServer, WindowTarget,
-    exact_pane_target, exact_session_target, exact_window_target, parse_panes, parse_sessions,
-    parse_windows, save_terminal_palette, shell_quote, terminal_palette, terminal_palette_config,
-    write_terminal_palette_config,
+    CreateSession, CreateWindow, OptionScope, PaneTarget, SESSION_SOURCE, TmuxClient, TmuxServer,
+    WindowTarget, exact_pane_target, exact_session_target, exact_window_target, parse_panes,
+    parse_sessions, parse_windows, save_terminal_palette, shell_quote, terminal_palette,
+    terminal_palette_config, write_terminal_palette_config,
 };
 
 #[test]
@@ -228,6 +228,44 @@ fn session_environment_is_per_client_and_kept_in_session_argv() {
             "'/usr/bin/env' 'PATH=/private/bin:/usr/bin:/bin' 'WT_CONFIG=/private/config.toml' 'WT_REPO_CONFIG=' 'sh' '-c' 'true'"
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_source_file_supplies_secrets_without_argv() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("secrets.sh");
+    std::fs::write(&source, "export WT_TEST_SECRET='s3cret'\n").unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at("/tmp/wt-tmux-test.sock").with_config_file("/dev/null"),
+    )
+    .with_session_environment([
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        (SESSION_SOURCE.into(), source.to_string_lossy().into_owned()),
+    ]);
+    let args = client.create_session_args(&CreateSession {
+        name: "secret".into(),
+        cwd: PathBuf::from("/tmp"),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "printf %s \"$WT_TEST_SECRET\"".into(),
+        ],
+        width: None,
+        height: None,
+    });
+    let command = args.last().unwrap().to_string_lossy().into_owned();
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("s3cret"))
+    );
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", &command])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "s3cret");
 }
 
 #[cfg(unix)]
