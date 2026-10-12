@@ -552,6 +552,12 @@ fn invalidations(
     for path in paths {
         if is_state_db_path(path, state_db) {
             metadata = true;
+        } else if Some(path.as_path()) == state_db.parent() {
+            // Creating/removing a WAL changes its parent directory's mtime.
+            // The metadata probe samples that directory too; it is not a Git
+            // edit unless the shared state directory is inside a checkout.
+            metadata = true;
+            git |= checkout_roots.iter().any(|root| path.starts_with(root));
         } else if path.parent() != state_db.parent()
             || checkout_roots.iter().any(|root| path.starts_with(root))
         {
@@ -584,6 +590,11 @@ mod tests {
         ] {
             assert_eq!(invalidations(&[path.into()], db, &[]), (false, true));
         }
+        assert_eq!(invalidations(&["/state".into()], db, &[]), (false, true));
+        assert_eq!(
+            invalidations(&["/state".into()], db, &["/state".into()]),
+            (true, true)
+        );
         assert_eq!(
             invalidations(&["/state/another.sqlite-wal".into()], db, &[]),
             (false, false)

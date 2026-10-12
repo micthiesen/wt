@@ -27,6 +27,9 @@ import time
 
 # The list marks the cursor row with the selection background, not a glyph.
 SELECTED_ROW = b"48;2;59;66;82m"
+# Freshness probes file metadata once per second. Observe a full interval plus
+# source debounce/scheduling margin before assigning scans to the next phase.
+GIT_QUIET_WINDOW = 1.5
 
 
 def main():
@@ -123,6 +126,24 @@ def main():
         while time.monotonic() < end:
             read()
 
+    def status_call_count():
+        return status_calls.read_text().count("status\n")
+
+    def wait_for_git_quiet(timeout=10):
+        previous = status_call_count()
+        unchanged_since = time.monotonic()
+
+        def quiet(_):
+            nonlocal previous, unchanged_since
+            current = status_call_count()
+            if current != previous:
+                previous = current
+                unchanged_since = time.monotonic()
+            return time.monotonic() - unchanged_since >= GIT_QUIET_WINDOW
+
+        wait_for(quiet, timeout=timeout)
+        return previous
+
     def stored_slug(slug):
         with sqlite3.connect(f"file:{root / 'state/wt.sqlite'}?mode=ro", uri=True) as state:
             records = [json.loads(row[0]) for row in state.execute("SELECT data FROM repository_state")]
@@ -182,18 +203,23 @@ def main():
         # A fast refresh can settle before the renderer observes Refreshing;
         # require the watcher-driven scan and a changed terminal frame instead.
         wait_for(lambda data: status_calls.read_text().count("status\n") > scans_before_edit and bool(data))
-        drain_for(0.5)
+        # Native notifications may scan immediately while the one-second
+        # metadata fallback sees this same file edit later. Wait for a complete
+        # quiet interval, bounded above, so that scan cannot be attributed to
+        # the following title-only write. Continuous rescans still fail here.
+        scans_before_title = wait_for_git_quiet()
         # Editing a title is a real controller command and durable write. Check
         # the resulting store, rather than mistaking input echo for success.
-        scans_before_title = status_calls.read_text().count("status\n")
         os.write(master, b"t\x15Native UI title\r")
         wait_for(lambda data: b"Title saved" in data)
         with sqlite3.connect(f"file:{root / 'state/wt.sqlite'}?mode=ro", uri=True) as state:
             records = [json.loads(row[0]) for row in state.execute("SELECT data FROM repository_state")]
         assert any(record.get("slugs", {}).get("bench-001", {}).get("manualTitle") == "Native UI title"
                    for record in records), "title was not persisted on the selected worktree"
-        drain_for(0.5)
-        assert status_calls.read_text().count("status\n") == scans_before_title, "a title-only edit rescanned Git worktrees"
+        # Include at least one metadata fallback tick after the SQLite write;
+        # do not wait for quiet here, which would hide an unwanted Git refresh.
+        drain_for(GIT_QUIET_WINDOW)
+        assert status_call_count() == scans_before_title, "a title-only edit rescanned Git worktrees"
         if args.sections:
             os.write(master, b"l")
             wait_for(lambda data: b"Move bench-001 to section" in data)

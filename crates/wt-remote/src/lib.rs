@@ -17,6 +17,7 @@ use wt_platform::process::{CommandSpec, ProcessError, ProcessOutput, ProcessRunn
 
 pub const WORKER_PROTOCOL_VERSION: u32 = 3;
 const SSH_TIMEOUT: Duration = Duration::from_secs(15);
+const WORKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PLATFORM_TIMEOUT: Duration = Duration::from_secs(15);
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_CANDIDATE_BYTES: u64 = 192 * 1024 * 1024;
@@ -251,6 +252,10 @@ pub enum RemoteError {
     #[error("remote worker command failed: {detail}")]
     Command { detail: String },
     #[error(
+        "remote worker command outcome is unknown: {detail}; it may have completed on the worker. Inspect the remote state before retrying; wt did not retry the command"
+    )]
+    CommandUncertain { detail: String },
+    #[error(
         "native remote worker platform is unsupported: {os} {architecture}; supported targets are aarch64-apple-darwin, aarch64-unknown-linux-gnu, and x86_64-unknown-linux-gnu"
     )]
     UnsupportedPlatform { os: String, architecture: String },
@@ -475,8 +480,39 @@ impl RemoteClient {
         args: &[String],
         cancellation: &CancellationToken,
     ) -> Result<WorkerCommandOutput, RemoteError> {
+        self.run_worker_with_timeout(args, WORKER_COMMAND_TIMEOUT, cancellation)
+            .await
+    }
+
+    async fn run_worker_with_timeout(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkerCommandOutput, RemoteError> {
         self.require_worker(cancellation).await?;
-        let output = self.run_raw(args, cancellation).await?;
+        let output = self
+            .runner
+            .run(self.worker_command_spec(args, timeout), cancellation)
+            .await
+            .map_err(|error| match error {
+                ProcessError::Io {
+                    operation: "spawn", ..
+                } => RemoteError::Transport(error),
+                _ => RemoteError::CommandUncertain {
+                    detail: error.to_string(),
+                },
+            })?;
+        // SSH's transport-failure status cannot prove whether the command
+        // ran before the connection was lost. Never turn this into a retry.
+        if output.status.code() == Some(255) {
+            return Err(RemoteError::CommandUncertain {
+                detail: format!(
+                    "SSH exited with status 255: {}",
+                    output.stderr_text().trim()
+                ),
+            });
+        }
         Ok(command_output(output))
     }
 
@@ -485,11 +521,18 @@ impl RemoteClient {
         args: &[String],
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, RemoteError> {
+        Ok(self
+            .runner
+            .run(self.worker_command_spec(args, SSH_TIMEOUT), cancellation)
+            .await?)
+    }
+
+    fn worker_command_spec(&self, args: &[String], timeout: Duration) -> CommandSpec {
         let command = remote_wt_command_at(&self.remote, self.selected_runtime_path(), args);
         let mut spec = CommandSpec::new(self.ssh_program.clone())
             .args(ssh_command_args(&self.remote, &command));
-        spec.timeout = SSH_TIMEOUT;
-        Ok(self.runner.run(spec, cancellation).await?)
+        spec.timeout = timeout;
+        spec
     }
 
     /// Run the runtime's config-free managed provisioning command with a
@@ -1254,6 +1297,62 @@ mod tests {
         let info = client.hello(&CancellationToken::new()).await.unwrap();
         assert_eq!(info.build, "fixture");
         assert!(Path::new(&script).exists());
+    }
+
+    #[test]
+    fn administrative_commands_have_a_long_deadline_without_relaxing_probes() {
+        let client = RemoteClient::new(ProcessRunner::default(), remote());
+        let probe = client.worker_command_spec(&["_hello".into()], SSH_TIMEOUT);
+        let admin =
+            client.worker_command_spec(&["rm".into(), "fixture".into()], WORKER_COMMAND_TIMEOUT);
+        assert_eq!(probe.timeout, Duration::from_secs(15));
+        assert_eq!(PLATFORM_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(admin.timeout, Duration::from_secs(30 * 60));
+    }
+
+    #[tokio::test]
+    async fn administrative_timeout_reports_uncertainty_without_replaying_the_command() {
+        assert_uncertain_admin("exec sleep 30", Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn lost_administrative_connection_reports_uncertainty_without_replaying() {
+        assert_uncertain_admin("exit 255", WORKER_COMMAND_TIMEOUT).await;
+    }
+
+    async fn assert_uncertain_admin(ending: &str, timeout: Duration) {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("ssh-fake");
+        let calls = temp.path().join("calls");
+        let completed = temp.path().join("completed");
+        let hello = remote_wt_command(&remote(), &["_hello".into()]);
+        fs::write(&script, format!(
+            "#!/bin/sh\nfor arg do command=\"$arg\"; done\nprintf 'call\\n' >> {calls}\nif [ \"$command\" = {hello} ]; then\n printf '%s\\n' '{{\"role\":\"worker\",\"protocol\":3,\"build\":\"fixture\"}}'\n exit 0\nfi\nprintf 'completed\\n' >> {completed}\n{ending}\n",
+            calls = shell_quote(&calls.display().to_string()),
+            completed = shell_quote(&completed.display().to_string()),
+            hello = shell_quote(&hello),
+        )).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let client = RemoteClient::new(ProcessRunner::default(), remote())
+            .with_ssh_program(script.as_os_str());
+        let error = client
+            .run_worker_with_timeout(
+                &["rm".into(), "fixture".into()],
+                timeout,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RemoteError::CommandUncertain { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("may have completed"));
+        assert!(error.to_string().contains("before retrying"));
+        assert_eq!(fs::read_to_string(calls).unwrap(), "call\ncall\n");
+        assert_eq!(fs::read_to_string(completed).unwrap(), "completed\n");
     }
 
     #[tokio::test]

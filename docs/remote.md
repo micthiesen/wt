@@ -190,6 +190,12 @@ Omitting `--host` is accepted only when exactly one host is configured. The
 TUI asks which host should own a new worktree or a cleanup operation, and
 row commands stay bound to the selected row's host throughout confirmation.
 
+Administrative commands such as `wt remote --host builder rm ...` can run for
+up to 30 minutes; handshakes and snapshot reads retain their 15-second limit.
+If the administrative connection times out or is lost, the command may already
+have completed on the worker. wt reports that uncertainty and never retries it.
+Inspect the remote state before submitting the command again.
+
 ## Compatibility and ownership
 
 The worker duplicates the stdin and stdout descriptors supplied by SSH and
