@@ -42,14 +42,14 @@ def main() -> None:
         bin_dir.mkdir()
         shutil.copy2(binary, bin_dir / "wt")
         shutil.copy2(args.launcher, bin_dir / "wt-launcher")
-        # Debug ELF binaries can exceed the installer's release-size guard.
-        # Strip only fixture copies, matching the release profile's debuginfo
-        # policy without weakening production archive limits or losing local
-        # debugging symbols. The four-platform release job also exercises its
-        # actual optimized binaries through this same fixture.
-        strip_flag = "-S" if platform.system() == "Darwin" else "--strip-debug"
+        # Debug binaries can exceed the installer's release-size guard.
+        # On macOS, -S leaves a large local symbol table, so remove it with -x.
+        # Strip only fixture copies. Keep production archive limits and the
+        # original binaries' debugging symbols. The release job also tests its
+        # actual optimized binaries through this fixture.
+        strip_flags = ["-S", "-x"] if platform.system() == "Darwin" else ["--strip-debug"]
         for executable in (bin_dir / "wt", bin_dir / "wt-launcher"):
-            subprocess.run(["strip", strip_flag, str(executable)], check=True)
+            subprocess.run(["strip", *strip_flags, str(executable)], check=True)
         responses: dict[str, bytes] = {}
 
         class Handler(http.server.BaseHTTPRequestHandler):

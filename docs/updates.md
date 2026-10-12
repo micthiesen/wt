@@ -43,6 +43,10 @@ path traversal, links, unexpected files, and mismatched size or digest. The
 candidate is placed in its immutable directory before state points at it, so a
 crash may leave an unused version directory but cannot select incomplete files.
 
+The native release test strips copies of debug binaries before packaging them.
+On macOS, it removes debug and local symbols so the fixture stays below the
+128 MiB limit for each binary. The original build files keep their symbols.
+
 The startup offer checks at most once per day. `[update] startup_check = false`
 or `WT_UPDATE=off` disables it. A declined build remains suppressed until a
 newer build appears; explicitly running `wt update` is the reapply path.
