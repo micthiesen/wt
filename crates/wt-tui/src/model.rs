@@ -99,6 +99,15 @@ pub struct Board {
     /// Queued automation fires waiting to dispatch.
     #[serde(default)]
     pub automations_pending: usize,
+    /// Provenance and observation stamps of each remote host's domains, keyed
+    /// by `BoardRow::host`. The local host's come with the snapshot itself.
+    #[serde(default)]
+    pub host_domains: std::collections::BTreeMap<String, wt_runtime::DomainMap>,
+    /// Changes shown before a fetch confirms them: host-side projections
+    /// (e.g. an issue status an action is setting) and, in the model's
+    /// presented board, the user's own pending requests.
+    #[serde(default)]
+    pub pending: Vec<wt_runtime::PendingView>,
 }
 
 /// One prepared perf sample. CPU values are `ps` percentages (100 per core);
@@ -630,7 +639,14 @@ pub enum ToastTone {
     Failed,
 }
 pub struct Model {
-    pub(crate) lifecycle: crate::lifecycle::LifecycleFeedback,
+    /// Requested changes shown over `source_board` until a fetch confirms
+    /// them. The only optimistic state in the TUI.
+    pub(crate) pending: wt_runtime::Pending<Board, crate::UiMutation>,
+    pub(crate) next_op: u64,
+    /// Creation-only interaction state, keyed by operation id.
+    pub(crate) creates: std::collections::BTreeMap<u64, CreateUi>,
+    /// Provenance and fetch-start stamps of the local host's domains.
+    pub(crate) local_domains: wt_runtime::DomainMap,
     pub(crate) source_board: Arc<Board>,
     pub(crate) follow_up: Option<UiAction>,
     pub board: Arc<Board>,
@@ -669,9 +685,6 @@ pub struct Model {
     pub pending_selection: Option<String>,
     pub(crate) last_section_target: Option<Option<String>>,
     pub(crate) items: Vec<VisualItem>,
-    /// Optimistic primary harness from a just-accepted cycle, held until the
-    /// board reports the same value.
-    pub(crate) primary_override: Option<String>,
     /// Extra close key and periodic refresh request of the open Log overlay.
     pub(crate) log_close_key: Option<char>,
     pub(crate) log_refresh: Option<UiAction>,
@@ -680,6 +693,22 @@ pub struct Model {
     pub list_free_scroll: bool,
     /// Mouse drag selection, in screen cells, while a button is held.
     pub(crate) mouse_selection: Option<crate::mouse::Selection>,
+}
+
+/// Interaction state of a pending creation (its placeholder row and F12).
+#[derive(Clone, Debug)]
+pub(crate) struct CreateUi {
+    pub placeholder: String,
+    pub host: Option<String>,
+    pub resolved: Option<String>,
+    pub open_agent: bool,
+}
+
+fn on_host(host: Option<String>, action: UiAction) -> UiAction {
+    UiAction::OnHost {
+        host,
+        action: Box::new(action),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -696,7 +725,10 @@ impl Default for Model {
         Self {
             board: Arc::new(Board::default()),
             source_board: Arc::new(Board::default()),
-            lifecycle: Default::default(),
+            pending: Default::default(),
+            next_op: 0,
+            creates: Default::default(),
+            local_domains: Default::default(),
             follow_up: None,
             source_state: SourceState::Empty,
             selected: None,
@@ -728,7 +760,6 @@ impl Default for Model {
             pending_selection: None,
             last_section_target: None,
             items: Vec::new(),
-            primary_override: None,
             log_close_key: None,
             log_refresh: None,
             list_free_scroll: false,
@@ -739,13 +770,177 @@ impl Default for Model {
 
 impl Model {
     pub fn apply(&mut self, snapshot: SourceSnapshot<Board>) {
-        self.source_state = snapshot.state;
-        if let Some(mut board) = snapshot.data {
+        self.source_state = snapshot.state().clone();
+        self.local_domains = snapshot.domains().clone();
+        if let Some(board) = snapshot.data() {
             self.source_board = board.clone();
-            // Projection copies the shared board, so skip it when idle.
-            if !self.lifecycle.is_empty() {
-                self.lifecycle.project(Arc::make_mut(&mut board));
+            self.reproject(tokio::time::Instant::now());
+        }
+    }
+
+    /// The latest fetch-start stamp for a host's domain. Restored data has no
+    /// ordered stamp, so it can never confirm a pending change.
+    fn observed(
+        &self,
+        target: &wt_runtime::Target,
+        domain: wt_runtime::Domain,
+    ) -> Option<wt_runtime::Stamp> {
+        let domains = match &target.host {
+            None => &self.local_domains,
+            Some(host) => self.source_board.host_domains.get(host)?,
+        };
+        domains
+            .get(&domain)
+            .filter(|meta| meta.is_live())
+            .map(|meta| meta.observed())
+    }
+
+    /// Settle pending changes against the latest source board and present it
+    /// with the remaining ones applied.
+    pub(crate) fn reproject(&mut self, now: tokio::time::Instant) {
+        let source = self.source_board.clone();
+        let expired = {
+            let model = &*self;
+            let observed = |target: &wt_runtime::Target, domain| model.observed(target, domain);
+            let mut pending = model.pending.clone();
+            let expired = pending.settle(&source, observed, now);
+            (pending, expired)
+        };
+        let (pending, expired) = expired;
+        self.pending = pending;
+        self.creates.retain(|op, _| self.pending.contains(*op));
+        if let Some(first) = expired.first() {
+            use wt_runtime::Mutation;
+            let domain = first
+                .mutation
+                .domains()
+                .first()
+                .map_or("source", |domain| domain.label());
+            let text = match first.phase {
+                wt_runtime::PendingPhase::Unconfirmed => format!(
+                    "{} is unconfirmed and {domain} does not show it; check before retrying",
+                    first.mutation.label()
+                ),
+                wt_runtime::PendingPhase::InFlight => {
+                    format!("{}: no answer from the host", first.mutation.label())
+                }
+                wt_runtime::PendingPhase::Accepted => format!(
+                    "{} accepted, but {domain} does not show it yet",
+                    first.mutation.label()
+                ),
+            };
+            self.toast = Some((text, ToastTone::Notice));
+        }
+        let mut board = if self.pending.is_empty() {
+            source
+        } else {
+            Arc::new(self.pending.project(&source))
+        };
+        if !self.pending.is_empty() {
+            Arc::make_mut(&mut board)
+                .pending
+                .extend(self.pending.views());
+        }
+        self.present(board);
+    }
+
+    /// When a pending change next needs re-checking against its deadline.
+    pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending.next_deadline()
+    }
+
+    pub(crate) fn next_op_id(&mut self) -> u64 {
+        self.next_op = self.next_op.wrapping_add(1);
+        self.next_op
+    }
+
+    pub(crate) fn is_placeholder(&self, key: &str) -> bool {
+        self.creates
+            .values()
+            .any(|create| create.placeholder == key)
+    }
+
+    /// F12 on a creation placeholder: open the agent now if the checkout is
+    /// ready, otherwise as soon as the host reports it.
+    fn request_agent(&mut self, key: &str) -> Option<UiAction> {
+        let create = self
+            .creates
+            .values_mut()
+            .find(|create| create.placeholder == key)?;
+        create.open_agent = true;
+        create.resolved.clone().map(|resolved| {
+            on_host(
+                create.host.clone(),
+                UiAction::Session {
+                    key: Some(resolved),
+                    target: SessionTarget::Harness,
+                },
+            )
+        })
+    }
+
+    /// Resolve what the user saw into the request the host executes: toggles
+    /// become explicit directions and GitHub writes carry the PR they named.
+    pub(crate) fn resolve(&self, action: UiAction) -> UiAction {
+        let pin = |key: &str| {
+            self.board
+                .rows
+                .iter()
+                .find(|row| row.key == key)
+                .and_then(|row| row.pr.as_ref())
+                .and_then(|pr| {
+                    pr.number.map(|number| crate::PrPin {
+                        number,
+                        head_sha: pr.head_sha.clone(),
+                    })
+                })
+        };
+        match action {
+            UiAction::OnHost { host, action } => UiAction::OnHost {
+                host,
+                action: Box::new(self.resolve(*action)),
+            },
+            UiAction::PrepareAction {
+                surface: crate::ActionSurface::Row { key },
+                id,
+                ..
+            } if id == crate::AUTO_MERGE_ACTION_ID => {
+                let armed = self
+                    .board
+                    .rows
+                    .iter()
+                    .find(|row| row.key == key)
+                    .and_then(|row| row.pr.as_ref())
+                    .is_some_and(|pr| pr.auto_merge_armed || pr.merge_queue.is_some());
+                UiAction::GithubSetAutoMerge {
+                    pin: pin(&key),
+                    key,
+                    enable: !armed,
+                }
             }
+            UiAction::GithubSetAutoMerge {
+                key,
+                enable,
+                pin: None,
+            } => UiAction::GithubSetAutoMerge {
+                pin: pin(&key),
+                key,
+                enable,
+            },
+            UiAction::GithubMarkReady { key, pin: None } => UiAction::GithubMarkReady {
+                pin: pin(&key),
+                key,
+            },
+            UiAction::GithubShip { key, pin: None } => UiAction::GithubShip {
+                pin: pin(&key),
+                key,
+            },
+            action => action,
+        }
+    }
+
+    fn present(&mut self, mut board: Arc<Board>) {
+        {
             if let Some(key) = &self.pending_selection
                 && let Some(row) = board.rows.iter().position(|row| &row.key == key)
             {
@@ -754,13 +949,6 @@ impl Model {
                         section.folded = false;
                     }
                 }
-            }
-            if self
-                .primary_override
-                .as_deref()
-                .is_some_and(|primary| primary.eq_ignore_ascii_case(&board.display.primary_harness))
-            {
-                self.primary_override = None;
             }
             let first_rows = self.board.rows.is_empty() && !board.rows.is_empty();
             let requested_selection = self.pending_selection.is_some();
@@ -920,52 +1108,119 @@ impl Model {
         }
     }
 
-    /// The primary harness to display: a just-cycled value wins until the
-    /// board catches up; an unset board means the default, Claude.
+    /// The primary harness to display (a just-cycled one is projected by its
+    /// pending change); an unset board means the default, Claude.
     pub(crate) fn primary_harness(&self) -> &str {
-        match (
-            &self.primary_override,
-            self.board.display.primary_harness.as_str(),
-        ) {
-            (Some(primary), _) => primary,
-            (None, "") => "Claude",
-            (None, primary) => primary,
+        match self.board.display.primary_harness.as_str() {
+            "" => "Claude",
+            primary => primary,
         }
     }
 
+    /// Show the change an accepted request will make, before the host runs it.
     pub(crate) fn begin_action(&mut self, id: u64, action: &UiAction) {
-        if let Some(key) = self.lifecycle.begin(id, action) {
-            self.pending_selection = Some(key);
+        let crate::Effect::Mutation(mut mutation) = action.effect(&self.board) else {
+            return;
+        };
+        if let crate::MutationKind::Create { placeholder, .. } = &mut mutation.kind {
+            *placeholder = format!("\0creating:{id}");
+            self.creates.insert(
+                id,
+                CreateUi {
+                    placeholder: placeholder.clone(),
+                    host: mutation.target.host.clone(),
+                    resolved: None,
+                    open_agent: false,
+                },
+            );
+            self.pending_selection = Some(placeholder.clone());
         }
-        if self.lifecycle.contains(id) {
-            self.apply(SourceSnapshot {
-                data: Some(self.source_board.clone()),
-                state: self.source_state.clone(),
-                updated_at: None,
-                revision: 0,
-            });
+        let now = tokio::time::Instant::now();
+        self.pending.begin(id, mutation, now);
+        self.reproject(now);
+    }
+
+    /// Advance pending changes whose deadline passed.
+    pub fn tick(&mut self, now: tokio::time::Instant) {
+        if self.next_deadline().is_some_and(|deadline| deadline <= now) {
+            self.reproject(now);
         }
+    }
+
+    /// Classify the host's answer for a pending change.
+    fn finish_pending(&mut self, reply: &UiReply) -> bool {
+        let Some(id) = reply.operation_id.filter(|id| self.pending.contains(*id)) else {
+            return false;
+        };
+        let now = tokio::time::Instant::now();
+        let is_create = self.creates.contains_key(&id);
+        if reply.failed || reply.modal.is_some() {
+            self.pending.remove(id);
+        } else {
+            match reply.outcome {
+                Some(crate::ReplyOutcome::Accepted(at)) => {
+                    let resolved = reply.select_when_visible.clone();
+                    if is_create && resolved.is_none() {
+                        self.pending.remove(id);
+                    } else {
+                        let primary = reply.primary_harness.clone();
+                        self.pending.accept_with(id, at, now, |mutation| {
+                            match &mut mutation.kind {
+                                crate::MutationKind::Create { resolved: slot, .. } => {
+                                    *slot = resolved.clone()
+                                }
+                                crate::MutationKind::Primary { harness } => *harness = primary,
+                                _ => {}
+                            }
+                        });
+                        if let Some(create) = self.creates.get_mut(&id) {
+                            create.resolved = resolved;
+                        }
+                    }
+                }
+                Some(crate::ReplyOutcome::NoChange | crate::ReplyOutcome::Deferred) => {
+                    self.pending.remove(id);
+                }
+                // An unclassified reply is treated as uncertain so a missing
+                // classification shows up instead of silently reverting.
+                Some(crate::ReplyOutcome::Uncertain) | None => {
+                    self.pending.uncertain(id, now);
+                }
+            }
+        }
+        true
     }
 
     pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
-        if let Some(primary) = &reply.primary_harness {
-            self.primary_override = Some(primary.clone());
-        }
         let selected = self.selected_row().map(|row| row.key.clone());
-        let completion = self.lifecycle.finish(&reply, selected.as_deref());
-        self.follow_up = completion.action;
-        if completion.changed {
-            self.apply(SourceSnapshot {
-                data: Some(self.source_board.clone()),
-                state: self.source_state.clone(),
-                updated_at: None,
-                revision: 0,
-            });
+        let create = reply
+            .operation_id
+            .and_then(|id| self.creates.get(&id))
+            .cloned();
+        let selected_create = create
+            .as_ref()
+            .is_some_and(|create| selected.as_deref() == Some(create.placeholder.as_str()));
+        if self.finish_pending(&reply) {
+            if let Some(create) = &create
+                && selected_create
+                && create.open_agent
+                && !reply.failed
+                && let Some(resolved) = &reply.select_when_visible
+            {
+                self.follow_up = Some(on_host(
+                    create.host.clone(),
+                    UiAction::Session {
+                        key: Some(resolved.clone()),
+                        target: SessionTarget::Harness,
+                    },
+                ));
+            }
+            self.reproject(tokio::time::Instant::now());
         }
         let current = reply
             .ui_generation
             .is_none_or(|generation| generation == self.ui_generation)
-            || completion.selected_create;
+            || selected_create;
         if reply.select_when_visible.is_some() && current {
             self.history.active = false;
         }
@@ -1392,7 +1647,7 @@ impl Model {
         self.ui_generation = self.ui_generation.wrapping_add(1);
         if matches!(self.interaction, Interaction::None)
             && let Some(key_id) = self.selected_row().map(|row| row.key.clone())
-            && self.lifecycle.is_placeholder(&key_id)
+            && self.is_placeholder(&key_id)
             && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
             && !matches!(
                 key.code,
@@ -1403,7 +1658,7 @@ impl Model {
             )
         {
             if key.code == KeyCode::F(12) {
-                if let Some(action) = self.lifecycle.request_agent(&key_id) {
+                if let Some(action) = self.request_agent(&key_id) {
                     return InputResult::Action(action);
                 }
                 self.toast = Some((
@@ -2314,11 +2569,19 @@ impl Model {
                             removed_at: removed_at.clone(),
                             branch: branch.clone(),
                         },
-                        ConfirmAction::Github { key, ship } => {
+                        // The confirmation's pin is the PR the prompt described;
+                        // the host refuses if its data now names another one.
+                        ConfirmAction::Github { key, ship, pin } => {
                             if *ship {
-                                UiAction::GithubShip { key: key.clone() }
+                                UiAction::GithubShip {
+                                    key: key.clone(),
+                                    pin: pin.clone(),
+                                }
                             } else {
-                                UiAction::GithubMarkReady { key: key.clone() }
+                                UiAction::GithubMarkReady {
+                                    key: key.clone(),
+                                    pin: pin.clone(),
+                                }
                             }
                         }
                         ConfirmAction::KillAction { action_key, run_id } => UiAction::KillAction {
@@ -2793,14 +3056,14 @@ mod tests {
     fn first_inventory_selects_a_visible_row_after_empty_inbox() {
         let mut model = Model::default();
         let mut empty = snapshot(&[]);
-        Arc::make_mut(empty.data.as_mut().unwrap()).sections = vec![BoardSection {
+        empty.test_data_mut().sections = vec![BoardSection {
             key: "\0inbox".into(),
             title: "Inbox".into(),
             ..Default::default()
         }];
         model.apply(empty);
         let mut populated = snapshot(&["one", "two"]);
-        Arc::make_mut(populated.data.as_mut().unwrap()).sections = vec![BoardSection {
+        populated.test_data_mut().sections = vec![BoardSection {
             key: "\0inbox".into(),
             title: "Inbox".into(),
             rows: vec![0, 1],
@@ -2828,6 +3091,10 @@ mod tests {
                 action: ConfirmAction::Github {
                     key: "one".into(),
                     ship: true,
+                    pin: Some(crate::PrPin {
+                        number: 7,
+                        head_sha: Some("abc".into()),
+                    }),
                 },
                 title: "Ship?".into(),
                 lines: vec![],
@@ -2837,7 +3104,13 @@ mod tests {
         });
         assert_eq!(
             model.input(KeyEvent::from(KeyCode::Enter), 20),
-            InputResult::Action(UiAction::GithubShip { key: "one".into() })
+            InputResult::Action(UiAction::GithubShip {
+                key: "one".into(),
+                pin: Some(crate::PrPin {
+                    number: 7,
+                    head_sha: Some("abc".into()),
+                }),
+            })
         );
     }
 
@@ -2869,7 +3142,7 @@ mod tests {
 
     fn grouped(keys: &[&str], folded: bool) -> SourceSnapshot<Board> {
         let mut state = snapshot(keys);
-        let board = Arc::make_mut(state.data.as_mut().unwrap());
+        let board = state.test_data_mut();
         board.sections = vec![BoardSection {
             key: "Batch".into(),
             title: "Batch".into(),
@@ -3058,7 +3331,7 @@ mod tests {
         let mut model = Model::default();
         model.apply(grouped(&["one", "two"], false));
         let mut moved = grouped(&["one", "two"], false);
-        let board = Arc::make_mut(moved.data.as_mut().unwrap());
+        let board = moved.test_data_mut();
         board.sections[0].rows = vec![1];
         board.sections.push(BoardSection {
             key: "\0archived".into(),
@@ -3090,7 +3363,7 @@ mod tests {
         ));
         model.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 20);
         let mut inbox = grouped(&["one"], true);
-        Arc::make_mut(inbox.data.as_mut().unwrap()).sections[0].key = "\0inbox".into();
+        inbox.test_data_mut().sections[0].key = "\0inbox".into();
         model.apply(inbox);
         assert_eq!(model.input(key, 20), InputResult::Unchanged);
     }
@@ -3124,8 +3397,8 @@ mod tests {
     }
 
     fn snapshot(keys: &[&str]) -> SourceSnapshot<Board> {
-        SourceSnapshot {
-            data: Some(Arc::new(Board {
+        SourceSnapshot::test_live(
+            Some(Board {
                 rows: keys
                     .iter()
                     .map(|key| BoardRow {
@@ -3135,11 +3408,10 @@ mod tests {
                     })
                     .collect(),
                 ..Board::default()
-            })),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 0,
-        }
+            }),
+            SourceState::Ready,
+            wt_runtime::Domain::Git,
+        )
     }
 
     #[test]
@@ -3166,6 +3438,7 @@ mod tests {
             operation_id: Some(1),
             ui_generation: Some(generation),
             select_when_visible: Some("new".into()),
+            outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
             ..Default::default()
         });
         assert_eq!(

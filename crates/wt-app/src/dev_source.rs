@@ -5,8 +5,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use notify::{RecursiveMode, Watcher};
 use wt_dev::{DevServerStatus, DevStatusRow, DevWorktree};
 use wt_runtime::{
-    RefreshPolicy, SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel,
-    start_source,
+    DiskCache, Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot,
+    SourceSpec, SourceState, TaskScope, derived_channel, start_source,
 };
 use wt_tui::Board;
 
@@ -16,7 +16,7 @@ const BACKSTOP: Duration = Duration::from_secs(15);
 
 pub struct DevSources {
     pub board: SourceHandle<Board>,
-    pub status: Option<SourceHandle<Vec<DevStatusRow>>>,
+    pub status: Option<LeafHandle<Vec<DevStatusRow>>>,
 }
 
 pub fn overlay(
@@ -31,44 +31,50 @@ pub fn overlay(
             status: None,
         };
     }
-    let dev = start_source(
-        scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(50),
-            minimum_interval: Duration::from_millis(500),
-        },
-        {
+    let dev = start_source(scope, status_spec(context), {
+        let context = context.clone();
+        let local = local.clone();
+        move |cancel| {
             let context = context.clone();
-            let local = local.clone();
-            move |cancel| {
-                let context = context.clone();
-                let rows = worktrees(&local.snapshot());
-                async move {
-                    Ok::<_, anyhow::Error>(
-                        crate::dev::service(&context)?
-                            .status_all(&rows, &cancel)
-                            .await?
-                            .worktrees,
-                    )
-                }
+            let rows = worktrees(&local.snapshot());
+            async move {
+                Ok::<_, anyhow::Error>(
+                    crate::dev::service(&context)?
+                        .status_all(&rows, &cancel)
+                        .await?
+                        .worktrees,
+                )
             }
-        },
-    );
+        }
+    });
     watch(
         scope,
         context.config.paths.cache_root.join("dev"),
-        dev.clone(),
+        dev.view(),
     );
     DevSources {
-        board: project(scope, local, board, dev.clone()),
+        board: project(scope, local, board, dev.view()),
         status: Some(dev),
+    }
+}
+
+/// Last known dev-server status survives restarts as restored display data.
+fn status_spec(context: &AppContext) -> SourceSpec<Vec<DevStatusRow>> {
+    SourceSpec {
+        name: "dev-status",
+        domain: Domain::Dev,
+        persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+        policy: RefreshPolicy {
+            debounce: Duration::from_millis(50),
+            minimum_interval: Duration::from_millis(500),
+        },
     }
 }
 
 fn worktrees(snapshot: &SourceSnapshot<Board>) -> Vec<DevWorktree> {
     snapshot
-        .data
-        .iter()
+        .data()
+        .into_iter()
         .flat_map(|board| &board.rows)
         .map(|row| DevWorktree {
             slug: row.slug.clone(),
@@ -84,7 +90,7 @@ fn project(
     board: SourceHandle<Board>,
     dev: SourceHandle<Vec<DevStatusRow>>,
 ) -> SourceHandle<Board> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "dev-board");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut local_updates = local.subscribe();
@@ -178,14 +184,14 @@ fn watch(scope: &TaskScope, directory: PathBuf, source: SourceHandle<Vec<DevStat
 }
 
 fn compose(
-    mut board: SourceSnapshot<Board>,
+    board: SourceSnapshot<Board>,
     dev: SourceSnapshot<Vec<DevStatusRow>>,
 ) -> SourceSnapshot<Board> {
-    let Some(data) = board.data.as_ref() else {
+    let Some(data) = board.data() else {
         return board;
     };
     let mut data = data.as_ref().clone();
-    let error = match &dev.state {
+    let error = match dev.state() {
         SourceState::Failed(error) => Some(error.as_ref()),
         _ => None,
     };
@@ -194,8 +200,7 @@ fn compose(
             continue;
         }
         let status = dev
-            .data
-            .as_ref()
+            .data()
             .and_then(|rows| rows.iter().find(|status| status.slug == row.slug));
         if let Some(status) = status.and_then(|row| row.status.as_ref()) {
             row.dev_status = Some(label(status));
@@ -207,8 +212,7 @@ fn compose(
                 .push(format!("Dev: {}", wt_core::sanitize_terminal_text(error)));
         }
     }
-    board.data = Some(Arc::new(data));
-    board
+    board.with_data(Some(Arc::new(data))).with_input(&dev)
 }
 
 fn label(status: &DevServerStatus) -> String {
@@ -243,14 +247,19 @@ fn label(status: &DevServerStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wt_runtime::{Stamp, leaf_channel};
     use wt_tui::BoardRow;
 
-    fn snapshot<T>(data: T) -> SourceSnapshot<T> {
-        SourceSnapshot {
-            data: Some(Arc::new(data)),
-            state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
-            revision: 0,
+    fn snapshot<T>(data: T, domain: Domain) -> SourceSnapshot<T> {
+        SourceSnapshot::test_live(Some(data), SourceState::Ready, domain)
+    }
+
+    fn test_spec<T>(domain: Domain) -> SourceSpec<T> {
+        SourceSpec {
+            name: "test",
+            domain,
+            persistence: Persistence::Never("test"),
+            policy: RefreshPolicy::default(),
         }
     }
 
@@ -288,10 +297,12 @@ mod tests {
 
     #[test]
     fn failed_dev_fetch_keeps_last_good_status_visible_and_reports_the_error() {
-        let mut status = snapshot(dev());
-        status.state = SourceState::Failed("tmux unavailable".into());
-        let result = compose(snapshot(board()), status);
-        let row = &result.data.as_ref().unwrap().rows[0];
+        let status =
+            snapshot(dev(), Domain::Dev).with_state(SourceState::Failed("tmux unavailable".into()));
+        let result = compose(snapshot(board(), Domain::Git), status);
+        assert!(result.domains().contains_key(&Domain::Dev));
+        assert!(result.domains().contains_key(&Domain::Git));
+        let row = &result.data().unwrap().rows[0];
         assert_eq!(row.dev_url.as_deref(), Some("http://localhost:3000"));
         assert!(
             row.dev_status
@@ -309,20 +320,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn dev_updates_do_not_refresh_upstream_and_title_updates_do_not_refetch_dev() {
         let scope = TaskScope::new();
-        let (local, mut local_writer) = source_channel();
-        let (upstream, mut upstream_writer) = source_channel();
-        let (status, mut status_writer) = source_channel();
+        let (local, mut local_writer) = derived_channel(&scope, "test");
+        let (upstream, mut upstream_writer) = derived_channel(&scope, "test");
+        let (status, mut status_writer) = leaf_channel(&scope, test_spec(Domain::Dev));
         // Exercise startup after the input already contains data.
-        local_writer.publish(snapshot(board()));
-        upstream_writer.publish(snapshot(board()));
-        let output = project(&scope, local, upstream, status);
+        local_writer.publish(snapshot(board(), Domain::Git));
+        upstream_writer.publish(snapshot(board(), Domain::Git));
+        let output = project(&scope, local, upstream, status.view());
         assert_eq!(status_writer.requested().await, Some(()));
-        status_writer.publish(snapshot(dev()));
+        status_writer.publish_live(dev(), Stamp::now());
         tokio::time::timeout(
             Duration::from_secs(1),
             output
                 .subscribe()
-                .wait_for(|s| s.data.as_ref().is_some_and(|b| b.rows[0].dev_url.is_some())),
+                .wait_for(|s| s.data().is_some_and(|b| b.rows[0].dev_url.is_some())),
         )
         .await
         .unwrap()
@@ -339,15 +350,13 @@ mod tests {
         );
         let mut renamed = board();
         renamed.rows[0].title = "Renamed".into();
-        local_writer.publish(snapshot(renamed.clone()));
-        upstream_writer.publish(snapshot(renamed));
+        local_writer.publish(snapshot(renamed.clone(), Domain::Git));
+        upstream_writer.publish(snapshot(renamed, Domain::Git));
         tokio::time::timeout(
             Duration::from_secs(1),
-            output.subscribe().wait_for(|s| {
-                s.data
-                    .as_ref()
-                    .is_some_and(|b| b.rows[0].title == "Renamed")
-            }),
+            output
+                .subscribe()
+                .wait_for(|s| s.data().is_some_and(|b| b.rows[0].title == "Renamed")),
         )
         .await
         .unwrap()
@@ -361,5 +370,31 @@ mod tests {
         assert_eq!(upstream_writer.requested().await, Some(()));
         assert_eq!(status_writer.requested().await, Some(()));
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dev_status_meets_the_persisted_source_contract() {
+        let mut rows = dev();
+        rows[0].status.as_mut().unwrap().restarts = Some(wt_dev::RestartStatus {
+            count: 2,
+            last_exit: 137,
+        });
+        rows.push(DevStatusRow {
+            slug: "two".into(),
+            status: Some(DevServerStatus {
+                waiting: Some(wt_dev::WaitingStatus {
+                    rank: 0,
+                    since: 1_700_000_000_000.0,
+                }),
+                ..DevServerStatus::default()
+            }),
+            error: None,
+        });
+        rows.push(DevStatusRow {
+            slug: "three".into(),
+            status: None,
+            error: Some("tmux unavailable".into()),
+        });
+        wt_runtime::conformance::persisted_source("dev-status", Domain::Dev, rows).await
     }
 }

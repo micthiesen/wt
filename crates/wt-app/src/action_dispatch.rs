@@ -12,6 +12,7 @@ use wt_actions::{
 use wt_config::{ActionDef, HarnessId};
 use wt_github::GithubData;
 use wt_harness::{ClaudeMessageOutcome, CodexMessageOutcome, HarnessMessageOutcome};
+use wt_runtime::Confirmed;
 use wt_tui::{ActionSurface, Board, SessionTarget};
 use wt_vcs::WorktreeRecord;
 
@@ -25,7 +26,7 @@ use crate::harness::{
 pub async fn dispatch_automation(
     context: &AppContext,
     fire: &wt_automations::AutomationFire,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
     board: Option<&Board>,
 ) -> crate::automation_engine::AutomationOutcome {
     use crate::automation_engine::{AutomationOutcome, DeliverySlot};
@@ -228,7 +229,7 @@ pub fn definitions(context: &AppContext, surface: &ActionSurface) -> Vec<ActionD
 pub async fn prepare(
     context: &AppContext,
     surface: &ActionSurface,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
     board: Option<&Board>,
     arg: Option<String>,
 ) -> Result<ActionContext> {
@@ -289,7 +290,8 @@ pub async fn prepare(
         crate::issue_identity::resolve(&slug, issue_override.as_deref()).unwrap_or_default();
     let pr = row_snapshot
         .as_ref()
-        .and_then(|snapshot| github.prs.get(&snapshot.target.branch));
+        .zip(github)
+        .and_then(|(snapshot, github)| github.prs.get(&snapshot.target.branch));
     let pr_number = pr.map(|pr| pr.number.to_string());
     let board_row = board.and_then(|board| board.rows.iter().find(|row| row.slug == slug));
     let deployed = if let Some(snapshot) = &row_snapshot {
@@ -366,7 +368,7 @@ pub async fn dispatch(
     context: &AppContext,
     surface: &ActionSurface,
     definition: &ActionDef,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
     board: Option<&Board>,
     arg: Option<String>,
     extras: &str,
@@ -810,15 +812,9 @@ mod tests {
             .find(|record| record.target.slug() == "one")
             .unwrap();
         let key = wt_core::worktree_target_key(&record.target);
-        let prepared = prepare(
-            &fixture.ctx,
-            &ActionSurface::Row { key },
-            &GithubData::default(),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let prepared = prepare(&fixture.ctx, &ActionSurface::Row { key }, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(prepared.slug, "one");
         assert_eq!(prepared.branch, "feature/one");
         assert_eq!(
@@ -837,7 +833,7 @@ mod tests {
             &ActionSurface::Row {
                 key: "missing-key".into(),
             },
-            &GithubData::default(),
+            None,
             None,
             None,
         )

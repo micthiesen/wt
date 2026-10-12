@@ -3201,6 +3201,9 @@ name = "wt-runtime"
 version = "0.1.2"
 dependencies = [
  "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

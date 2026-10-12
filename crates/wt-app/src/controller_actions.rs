@@ -5,6 +5,7 @@ use clap::{Args, FromArgMatches};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_lifecycle::CreateOptions;
 use wt_platform::lock::FileLock;
+use wt_runtime::{Confirmed, Domain, Provenance, SourceState};
 use wt_tui::{
     Board, ConfirmAction, PickerAction, PickerOption, RemovalRevision as UiRemovalRevision,
     UiAction, UiModal, UiReply, UrlKind,
@@ -42,7 +43,7 @@ pub async fn execute(
     ctx: &AppContext,
     action: UiAction,
     board: Option<&Board>,
-    github: &wt_github::GithubData,
+    github: Option<&Confirmed<wt_github::GithubData>>,
 ) -> Result<UiReply> {
     match action {
         UiAction::PrepareHardRefresh
@@ -347,8 +348,17 @@ pub async fn execute(
                     cancel_key: Some('d'),
                 }));
             }
+            // The history title is durable. Take it from the board only when
+            // its source cannot be restored cache data: manual titles come
+            // from SQLite and generated ones from the naming service. PR
+            // titles already come from confirmed GitHub data in the plan;
+            // otherwise the history falls back to the slug.
             if let Some(visible) =
                 board.and_then(|board| board.rows.iter().find(|row| row.key == key))
+                && matches!(
+                    visible.title_source,
+                    wt_tui::TitleSource::Manual | wt_tui::TitleSource::Llm
+                )
                 && visible.title != visible.slug
                 && !visible.title.trim().is_empty()
             {
@@ -415,9 +425,10 @@ pub async fn execute(
         )),
         UiAction::ToggleArchive { key } => {
             if wt_core::is_remote_worktree_ledger_key(&key) {
-                board
+                let row = board
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
                     .context("remote worktree metadata is still loading")?;
+                require_live_host(board, row.host.as_deref())?;
             } else {
                 let row = resolve_key(ctx, &key).await?;
                 let slug = row.target.slug().to_owned();
@@ -560,6 +571,29 @@ pub async fn execute(
         }
         UiAction::Session { .. } => unreachable!("session handoff is owned by the controller"),
     }
+}
+
+/// A remote row is only known to exist while its host's snapshot is live. A
+/// restored, failed or still-connecting host shows last known rows, which
+/// cannot justify a durable write keyed by them.
+fn require_live_host(board: Option<&Board>, host: Option<&str>) -> Result<()> {
+    let host = host.context("remote worktree has no host")?;
+    let domains = board
+        .and_then(|board| board.host_domains.get(host))
+        .filter(|domains| !domains.is_empty())
+        .with_context(|| format!("{host} is still connecting; try again once it is live"))?;
+    // The connection must be live and current, and the host's own worktree
+    // inventory must be live there too (not its restored cache).
+    let connected = domains.get(&Domain::Host).is_some_and(|meta| {
+        meta.provenance() == Provenance::Live && !matches!(meta.state(), SourceState::Failed(_))
+    });
+    let inventory = domains
+        .get(&Domain::Git)
+        .is_some_and(|meta| meta.provenance() == Provenance::Live);
+    if !connected || !inventory {
+        bail!("{host} is showing cached data; try again once it is live");
+    }
+    Ok(())
 }
 
 /// The checkout a special slot works in.
@@ -1226,7 +1260,7 @@ mod tests {
                 issue_id: None,
             },
             None,
-            &wt_github::GithubData::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1245,11 +1279,43 @@ mod tests {
                     title: "new".into()
                 },
                 None,
-                &wt_github::GithubData::default()
+                None
             )
             .await
             .is_err()
         );
         fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn remote_archive_requires_the_hosts_live_data() {
+        use wt_runtime::{SourceSnapshot, merge_domains};
+        let live = |domain| {
+            SourceSnapshot::test_live(Some(()), SourceState::Ready, domain)
+                .domains()
+                .clone()
+        };
+        let mut board = Board::default();
+        assert!(require_live_host(Some(&board), Some("devbox")).is_err());
+        // Restored host cache: last known rows, never authority for a write.
+        let mut restored = SourceSnapshot::test_restored((), Domain::Host, 1)
+            .domains()
+            .clone();
+        merge_domains(&mut restored, &live(Domain::Git));
+        board.host_domains.insert("devbox".into(), restored);
+        assert!(require_live_host(Some(&board), Some("devbox")).is_err());
+        // Connected, but the host itself still shows its restored inventory.
+        let mut connected = live(Domain::Host);
+        merge_domains(
+            &mut connected,
+            SourceSnapshot::test_restored((), Domain::Git, 1).domains(),
+        );
+        board.host_domains.insert("devbox".into(), connected);
+        assert!(require_live_host(Some(&board), Some("devbox")).is_err());
+        let mut current = live(Domain::Host);
+        merge_domains(&mut current, &live(Domain::Git));
+        board.host_domains.insert("devbox".into(), current);
+        require_live_host(Some(&board), Some("devbox")).unwrap();
+        assert!(require_live_host(Some(&board), None).is_err());
     }
 }

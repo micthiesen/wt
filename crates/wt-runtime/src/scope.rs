@@ -18,6 +18,7 @@ pub struct TaskScope {
     tracker: TaskTracker,
     task_origins: Arc<Mutex<std::collections::BTreeMap<u64, String>>>,
     next_task_id: AtomicU64,
+    registry: crate::source::Registry,
 }
 
 #[derive(Debug, Error)]
@@ -37,7 +38,17 @@ impl TaskScope {
             tracker: TaskTracker::new(),
             task_origins: Arc::default(),
             next_task_id: AtomicU64::new(0),
+            registry: crate::source::Registry::default(),
         }
+    }
+
+    pub(crate) fn registry(&self) -> &crate::source::Registry {
+        &self.registry
+    }
+
+    /// Every source constructed in this scope, with its persistence decision.
+    pub fn sources(&self) -> Vec<crate::SourceInfo> {
+        self.registry.entries()
     }
 
     pub fn token(&self) -> CancellationToken {

@@ -15,7 +15,7 @@ use crate::{
     LandingKind,
     badges::{self, Badge},
     glyphs,
-    render::{panel, panel_owned, text::truncate_end},
+    render::text::truncate_end,
     theme,
 };
 
@@ -174,10 +174,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
         ];
     }
     frame.render_widget(
-        Paragraph::new(lines).block(panel_owned(format!("removed ({})", rows.len()))),
+        Paragraph::new(lines).block(crate::render::status::pane(
+            format!("removed ({})", rows.len()),
+            crate::render::status::HISTORY,
+            model,
+        )),
         list,
     );
-    let block = panel("removal record");
+    let block = crate::render::status::pane(
+        "removal record".into(),
+        crate::render::status::HISTORY,
+        model,
+    );
     let inner = block.inner(details);
     frame.render_widget(block, details);
     let lines = rows

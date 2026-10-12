@@ -1,0 +1,7 @@
+# Board data reaches the TUI only through wt-runtime sources, which carry
+# provenance and a persistence decision. A raw watch channel elsewhere needs
+# `#[expect(clippy::disallowed_methods, reason = "...")]` saying why it is not
+# board data (e.g. a control signal).
+disallowed-methods = [
+    { path = "tokio::sync::watch::channel", reason = "publish board data through wt_runtime sources (start_source, leaf_channel, derived_channel)" },
+]

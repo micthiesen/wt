@@ -10,7 +10,9 @@ use std::{
 use notify::Watcher;
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use wt_runtime::{RefreshPolicy, SourceHandle, TaskScope, start_source};
+use wt_runtime::{
+    Domain, LeafHandle, Persistence, RefreshPolicy, SourceSpec, TaskScope, start_source,
+};
 use wt_tui::{ActivityLine, AttentionLine};
 
 const MAX_ACTIVITY: usize = 500;
@@ -96,15 +98,20 @@ pub fn start(
     scope: &TaskScope,
     cache_root: PathBuf,
     app_log_dir: PathBuf,
-) -> SourceHandle<ActivitySnapshot> {
+) -> LeafHandle<ActivitySnapshot> {
     let manager_dir = cache_root.join("manager");
     let reports = manager_dir.join("reports.jsonl");
     let watched_log_dir = app_log_dir.clone();
     let source = start_source(
         scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(50),
-            minimum_interval: Duration::from_millis(100),
+        SourceSpec {
+            name: "activity",
+            domain: Domain::Activity,
+            persistence: Persistence::Never("log files are the source"),
+            policy: RefreshPolicy {
+                debounce: Duration::from_millis(50),
+                minimum_interval: Duration::from_millis(100),
+            },
         },
         move |_| {
             let reports = reports.clone();
@@ -114,7 +121,7 @@ pub fn start(
             }
         },
     );
-    let observed = source.clone();
+    let observed = source.view();
     let cancellation = scope.token();
     scope.spawn(async move {
         let callback = observed.clone();

@@ -7,8 +7,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_github::{GithubClient, GithubOptions, PrChecks, ReviewRequestPr};
 use wt_lifecycle::{CreateOptions, CreateResult};
 use wt_runtime::{
-    RefreshPolicy, SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel,
-    start_source,
+    DerivedPublisher, DiskCache, Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
+    SourceSnapshot, SourceSpec, SourceState, TaskScope, derived_channel, start_source,
 };
 use wt_store::ReviewRequestDismissal;
 use wt_tui::{Board, ReviewRequestRow};
@@ -37,7 +37,8 @@ pub struct ReviewCheckout {
 pub struct ReviewRequests {
     context: AppContext,
     client: GithubClient,
-    dismissals: SourceHandle<Vec<ReviewRequestDismissal>>,
+    requests: LeafHandle<Vec<ReviewRequestPr>>,
+    dismissals: LeafHandle<Vec<ReviewRequestDismissal>>,
 }
 
 impl ReviewRequests {
@@ -53,9 +54,14 @@ impl ReviewRequests {
         let enabled = std::env::var("WT_GITHUB").as_deref() != Ok("off");
         let requests = start_source(
             scope,
-            RefreshPolicy {
-                debounce: Duration::from_millis(100),
-                minimum_interval: MIN_REFRESH_INTERVAL,
+            SourceSpec {
+                name: "review-requests",
+                domain: Domain::Reviews,
+                persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+                policy: RefreshPolicy {
+                    debounce: Duration::from_millis(100),
+                    minimum_interval: MIN_REFRESH_INTERVAL,
+                },
             },
             {
                 let client = client.clone();
@@ -70,7 +76,7 @@ impl ReviewRequests {
                 }
             },
         );
-        let dismissals = start_source(scope, RefreshPolicy::default(), {
+        let dismissals = start_source(scope, dismissals_spec(), {
             let database = context.database.clone();
             move |_cancellation| {
                 let database = database.clone();
@@ -83,8 +89,8 @@ impl ReviewRequests {
         });
         let snapshot = combine_snapshot(
             scope,
-            requests.clone(),
-            dismissals.clone(),
+            requests.view(),
+            dismissals.view(),
             context
                 .config
                 .issue_tracker
@@ -97,7 +103,8 @@ impl ReviewRequests {
         let service = Self {
             context: context.clone(),
             client,
-            dismissals: dismissals.clone(),
+            requests,
+            dismissals,
         };
         if enabled {
             let interval =
@@ -129,6 +136,12 @@ impl ReviewRequests {
             });
         }
         (service, snapshot)
+    }
+
+    /// Re-read review requests after a write that changes them.
+    pub fn refresh(&self) {
+        self.requests.refresh();
+        self.dismissals.refresh();
     }
 
     pub async fn dismiss(&self, url: &str, updated_at: &str) -> Result<()> {
@@ -205,13 +218,22 @@ impl ReviewRequests {
     }
 }
 
+fn dismissals_spec() -> SourceSpec<Vec<ReviewRequestDismissal>> {
+    SourceSpec {
+        name: "review-dismissals",
+        domain: Domain::Reviews,
+        persistence: Persistence::Never("authoritative SQLite; read directly"),
+        policy: RefreshPolicy::default(),
+    }
+}
+
 fn combine_snapshot(
     scope: &TaskScope,
     requests: SourceHandle<Vec<ReviewRequestPr>>,
     dismissals: SourceHandle<Vec<ReviewRequestDismissal>>,
     issue_url_template: Option<String>,
 ) -> SourceHandle<ReviewRequestSnapshot> {
-    let (handle, mut publisher) = source_channel();
+    let (handle, mut publisher) = derived_channel(scope, "review-requests-snapshot");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut request_updates = requests.subscribe();
@@ -220,9 +242,11 @@ fn combine_snapshot(
         dismissal_updates.mark_changed();
         let mut latest_requests = request_updates.borrow().clone();
         let mut latest_dismissals = dismissal_updates.borrow().clone();
+        let mut last = None;
         loop {
             publish_snapshot(
                 &publisher,
+                &mut last,
                 &latest_requests,
                 &latest_dismissals,
                 issue_url_template.as_deref(),
@@ -249,23 +273,35 @@ fn combine_snapshot(
     handle
 }
 
+/// Publish unless only stamps changed.
+fn publish_changed<T: PartialEq>(
+    publisher: &DerivedPublisher<T>,
+    last: &mut Option<SourceSnapshot<T>>,
+    next: SourceSnapshot<T>,
+) {
+    if last.as_ref().is_some_and(|last| last.same_view(&next)) {
+        return;
+    }
+    *last = Some(next.clone());
+    publisher.publish(next);
+}
+
 fn publish_snapshot(
-    publisher: &wt_runtime::SourcePublisher<ReviewRequestSnapshot>,
+    publisher: &DerivedPublisher<ReviewRequestSnapshot>,
+    last: &mut Option<SourceSnapshot<ReviewRequestSnapshot>>,
     requests: &SourceSnapshot<Vec<ReviewRequestPr>>,
     dismissals: &SourceSnapshot<Vec<ReviewRequestDismissal>>,
     issue_url_template: Option<&str>,
 ) {
-    let data =
-        requests
-            .data
-            .as_ref()
-            .zip(dismissals.data.as_ref())
-            .map(|(requests, dismissals)| ReviewRequestSnapshot {
-                requests: requests.as_ref().clone(),
-                dismissals: dismissals.as_ref().clone(),
-                issue_url_template: issue_url_template.map(str::to_owned),
-            });
-    let state = match (&requests.state, &dismissals.state) {
+    let data = requests
+        .data()
+        .zip(dismissals.data())
+        .map(|(requests, dismissals)| ReviewRequestSnapshot {
+            requests: requests.as_ref().clone(),
+            dismissals: dismissals.as_ref().clone(),
+            issue_url_template: issue_url_template.map(str::to_owned),
+        });
+    let state = match (requests.state(), dismissals.state()) {
         (SourceState::Failed(error), _) | (_, SourceState::Failed(error)) => {
             SourceState::Failed(error.clone())
         }
@@ -273,16 +309,11 @@ fn publish_snapshot(
         (SourceState::Ready, SourceState::Ready) => SourceState::Ready,
         _ => SourceState::Empty,
     };
-    let updated_at = requests
-        .updated_at
-        .zip(dismissals.updated_at)
-        .map(|(a, b)| a.min(b));
-    publisher.publish(SourceSnapshot {
-        data: data.map(Arc::new),
-        state,
-        updated_at,
-        revision: requests.revision.max(dismissals.revision),
-    });
+    let next = requests
+        .derive(data.map(Arc::new))
+        .with_input(dismissals)
+        .with_state(state);
+    publish_changed(publisher, last, next);
 }
 
 pub fn overlay(
@@ -290,7 +321,7 @@ pub fn overlay(
     board: SourceHandle<Board>,
     requests: SourceHandle<ReviewRequestSnapshot>,
 ) -> SourceHandle<Board> {
-    let (handle, mut publisher) = source_channel();
+    let (handle, mut publisher) = derived_channel(scope, "review-requests-board");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
@@ -299,8 +330,13 @@ pub fn overlay(
         request_updates.mark_changed();
         let mut latest_board = board_updates.borrow().clone();
         let mut latest_requests = request_updates.borrow().clone();
+        let mut last = None;
         loop {
-            publish_board(&publisher, &latest_board, &latest_requests);
+            publish_changed(
+                &publisher,
+                &mut last,
+                board_snapshot(&latest_board, &latest_requests),
+            );
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
@@ -323,33 +359,28 @@ pub fn overlay(
     handle
 }
 
-fn publish_board(
-    publisher: &wt_runtime::SourcePublisher<Board>,
+fn board_snapshot(
     base: &SourceSnapshot<Board>,
     requests: &SourceSnapshot<ReviewRequestSnapshot>,
-) {
-    let Some(board) = base.data.as_deref() else {
-        publisher.publish(base.clone());
-        return;
+) -> SourceSnapshot<Board> {
+    let Some(board) = base.data() else {
+        return base.clone();
     };
-    let mut projected = board.clone();
+    let mut projected = board.as_ref().clone();
     projected.review_requests = requests
-        .data
-        .as_deref()
+        .data()
         .map(|snapshot| review_rows(board, snapshot))
         .unwrap_or_default();
-    let state = match (&base.state, &requests.state, requests.data.is_some()) {
+    let state = match (base.state(), requests.state(), requests.data().is_some()) {
         (SourceState::Ready, SourceState::Failed(error), false) => {
             SourceState::Failed(error.clone())
         }
         (state, _, _) => state.clone(),
     };
-    publisher.publish(SourceSnapshot {
-        data: Some(Arc::new(projected)),
-        state,
-        updated_at: base.updated_at,
-        revision: base.revision.max(requests.revision),
-    });
+    base.clone()
+        .with_data(Some(Arc::new(projected)))
+        .with_input(requests)
+        .with_state(state)
 }
 
 fn review_rows(board: &Board, snapshot: &ReviewRequestSnapshot) -> Vec<ReviewRequestRow> {
@@ -493,5 +524,28 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].updated_at, "new");
         assert_eq!(rows[1].branch, "feature/visible");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_requests_meet_the_persisted_source_contract() {
+        let sample = vec![ReviewRequestPr {
+            number: 812,
+            url: "https://github.com/org/repo/pull/812".into(),
+            title: "Batch GitHub reads by chunk".into(),
+            repo_name_with_owner: "org/repo".into(),
+            head_ref_name: Some("feature/batched-reads".into()),
+            head_ref_oid: Some("3f2a".repeat(10)),
+            author: Some("octocat".into()),
+            is_draft: false,
+            checks: PrChecks::Pass,
+            review_decision: Some("REVIEW_REQUIRED".into()),
+            additions: 120,
+            deletions: 14,
+            changed_files: 6,
+            comment_count: 2,
+            created_at: "2026-10-01T09:00:00Z".into(),
+            updated_at: "2026-10-02T11:30:00Z".into(),
+        }];
+        wt_runtime::conformance::persisted_source("review-requests", Domain::Reviews, sample).await;
     }
 }

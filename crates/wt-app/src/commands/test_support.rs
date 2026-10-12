@@ -81,6 +81,7 @@ impl CommandFixture {
             ProcessRunner::default(),
         ));
         let database = Database::open(&config).await?;
+        let caches = crate::query_cache::store(&config);
         let ctx = AppContext {
             config,
             home,
@@ -90,6 +91,7 @@ impl CommandFixture {
             processes: ProcessRunner::default(),
             cancellation: CancellationToken::new(),
             section_writes: Default::default(),
+            caches,
         };
         Ok(Self { _root: root, ctx })
     }

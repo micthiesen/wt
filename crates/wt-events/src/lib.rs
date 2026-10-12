@@ -64,6 +64,11 @@ impl EventDaemonConfig {
 #[serde(rename_all = "camelCase")]
 pub struct GithubSnapshot {
     pub updated_at: u64,
+    /// Wall-clock epoch ms when the GitHub read that produced this snapshot
+    /// started. Older writers omit it; readers then cannot order the data
+    /// against their own writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_started_at_ms: Option<u64>,
     pub branches: Vec<String>,
     #[serde(default)]
     pub prs: Value,
@@ -218,3 +223,31 @@ pub async fn read_state(
 }
 
 mod daemon;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_without_a_fetch_start_still_parse_and_round_trip() {
+        let old: GithubSnapshot = serde_json::from_value(serde_json::json!({
+            "updatedAt": 5, "branches": ["feature"], "writerSha": "build"
+        }))
+        .unwrap();
+        assert_eq!(old.fetch_started_at_ms, None);
+        assert!(
+            !serde_json::to_value(&old)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("fetchStartedAtMs")
+        );
+        let new = GithubSnapshot {
+            fetch_started_at_ms: Some(3),
+            ..old
+        };
+        let json = serde_json::to_value(&new).unwrap();
+        assert_eq!(json["fetchStartedAtMs"], 3);
+        assert_eq!(serde_json::from_value::<GithubSnapshot>(json).unwrap(), new);
+    }
+}

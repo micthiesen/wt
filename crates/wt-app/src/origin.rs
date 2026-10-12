@@ -3,7 +3,8 @@ use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use wt_runtime::{
-    RefreshPolicy, SourceHandle, SourceState, TaskScope, source_channel, start_source,
+    Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState,
+    TaskScope, derived_channel, start_source,
 };
 use wt_tui::Board;
 use wt_vcs::{FetchOriginOptions, FetchOriginReport};
@@ -63,7 +64,7 @@ pub fn backstop(ctx: &AppContext) -> Duration {
 /// work, but a local title/status write never reaches this owner.
 pub struct OriginSources {
     pub board: SourceHandle<Board>,
-    pub origin: Option<SourceHandle<FetchOriginReport>>,
+    pub origin: Option<LeafHandle<FetchOriginReport>>,
 }
 
 pub fn overlay(
@@ -80,9 +81,14 @@ pub fn overlay(
     }
     let origin = start_source(
         scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(50),
-            minimum_interval: Duration::from_secs(10),
+        SourceSpec {
+            name: "origin",
+            domain: Domain::Origin,
+            persistence: Persistence::Never("maintenance, not display data"),
+            policy: RefreshPolicy {
+                debounce: Duration::from_millis(50),
+                minimum_interval: Duration::from_secs(10),
+            },
         },
         {
             let ctx = ctx.clone();
@@ -92,7 +98,7 @@ pub fn overlay(
             }
         },
     );
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "origin-board");
     let cancellation = scope.token();
     let refresh = origin.clone();
     let backstop = backstop(ctx);
@@ -117,21 +123,22 @@ pub fn overlay(
                 }
                 changed = origin_updates.changed() => {
                     if changed.is_err() { break; }
-                    if matches!(origin_updates.borrow_and_update().state, SourceState::Ready) { local.refresh(); }
+                    if matches!(origin_updates.borrow_and_update().state(), SourceState::Ready) { local.refresh(); }
                 }
                 _ = interval.tick() => { origin.refresh(); continue; }
             }
-            let mut snapshot = board_updates.borrow().clone();
+            let snapshot = board_updates.borrow().clone();
             let origin = origin_updates.borrow().clone();
-            if let SourceState::Failed(error) = origin.state {
-                if let Some(board) = snapshot.data.as_mut() {
+            let mut data = snapshot.data().cloned();
+            if let SourceState::Failed(error) = origin.state() {
+                if let Some(board) = data.as_mut() {
                     crate::activity_source::append_attention(
                         Arc::make_mut(board),
                         "Fetch origin",
-                        &error,
+                        error,
                     );
                 }
-            } else if let (Some(board), Some(report)) = (snapshot.data.as_mut(), origin.data) {
+            } else if let (Some(board), Some(report)) = (data.as_mut(), origin.data()) {
                 for warning in &report.warnings {
                     crate::activity_source::append_activity(
                         Arc::make_mut(board),
@@ -141,7 +148,7 @@ pub fn overlay(
                     );
                 }
             }
-            publisher.publish(snapshot);
+            publisher.publish(snapshot.with_data(data).with_input(&origin));
         }
     });
     OriginSources {

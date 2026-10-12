@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 use wt_config::RemoteConfig;
 use wt_remote::{RemoteClient, WorkerInfo};
 use wt_runtime::{
-    SourceHandle, SourcePublisher, SourceSnapshot, SourceState, TaskScope, source_channel,
+    DiskCache, Domain, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceSpec,
+    SourceState, Stamp, TaskScope, leaf_channel,
 };
 use wt_tui::{UiAction, UiReply};
 
@@ -74,7 +75,9 @@ enum Request {
 #[derive(Clone)]
 pub struct RemoteHost {
     pub endpoint: RemoteConfig,
-    pub snapshot: SourceHandle<HostSnapshot>,
+    /// The worker's latest snapshot. Persisted, so a restart shows the last
+    /// one as `Restored` while connecting; it never authorizes a command.
+    pub snapshot: LeafHandle<HostSnapshot>,
     /// The latest managed-worker checks; always `None` for unmanaged hosts.
     pub managed: watch::Receiver<Option<Arc<crate::managed::ManagedStatus>>>,
     managed_status: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
@@ -86,12 +89,36 @@ pub struct RemoteHost {
 
 impl RemoteHost {
     pub fn start(scope: &TaskScope, context: &AppContext, endpoint: RemoteConfig) -> Self {
-        let (snapshot, publisher) = source_channel();
-        crate::remote_cache::start_writer(scope, context, &endpoint, snapshot.clone());
+        let (snapshot, publisher) = leaf_channel(
+            scope,
+            SourceSpec {
+                name: source_name(&endpoint),
+                domain: Domain::Host,
+                persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+                // Fetches are driven by the worker's stream, not by a timer.
+                policy: RefreshPolicy::default(),
+            },
+        );
         let (requests, receiver) = mpsc::channel(COMMAND_QUEUE);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "connection readiness control signal, not board data"
+        )]
         let (ready, readiness) = watch::channel(None);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "prepared SSH client handle, not board data"
+        )]
         let (client, client_state) = watch::channel(None);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "view subscriptions sent to the worker, not board data"
+        )]
         let (views, view_state) = watch::channel(protocol::HostViews::default());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "managed-worker provisioning report, composed into the fleet board by remote_board"
+        )]
         let (managed_status, managed) = watch::channel(None);
         let managed_status = Arc::new(managed_status);
         let cancellation = scope.token();
@@ -227,9 +254,19 @@ impl RemoteHost {
     }
 }
 
+/// Cache name of one endpoint's snapshot leaf: `host-` and the first 16 hex
+/// digits of the SHA-256 of the endpoint key, so another endpoint or config
+/// selection never reads it. Leaked once per configured remote at startup.
+pub(crate) fn source_name(endpoint: &RemoteConfig) -> &'static str {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(endpoint.key().as_bytes());
+    let hex = format!("{digest:x}");
+    Box::leak(format!("host-{}", &hex[..16]).into_boxed_str())
+}
+
 struct HostChannels {
     requests: mpsc::Receiver<Request>,
-    publisher: SourcePublisher<HostSnapshot>,
+    publisher: LeafPublisher<HostSnapshot>,
     readiness: watch::Sender<Option<u64>>,
     prepared_client: watch::Sender<Option<RemoteClient>>,
     views: watch::Receiver<protocol::HostViews>,
@@ -278,7 +315,7 @@ async fn run_host_actor(
 ) {
     let HostChannels {
         mut requests,
-        mut publisher,
+        publisher,
         readiness,
         prepared_client,
         mut views,
@@ -299,14 +336,6 @@ async fn run_host_actor(
     let mut context = context;
     context.cancellation = operation_cancel.clone();
     let mut client: Option<(RemoteClient, WorkerInfo)> = None;
-    let mut last_good = crate::remote_cache::load(&context, &endpoint).await;
-    if last_good.is_some() {
-        publish_failed(
-            &mut publisher,
-            &mut last_good,
-            "Cached snapshot; connecting to host".into(),
-        );
-    }
     let mut backoff = RECONNECT_MIN;
     let mut command_id = 0u64;
     let mut connection_id = 0u64;
@@ -324,11 +353,7 @@ async fn run_host_actor(
                     backoff = RECONNECT_MIN;
                 }
                 Err(error) => {
-                    publish_failed(
-                        &mut publisher,
-                        &mut last_good,
-                        format!("worker preparation: {error:#}"),
-                    );
+                    publish_failed(&publisher, format!("worker preparation: {error:#}"));
                     mark_not_ready(&readiness);
                     if !wait_offline(
                         &mut requests,
@@ -360,8 +385,7 @@ async fn run_host_actor(
                     ConnectionState {
                         requests: &mut requests,
                         views: &mut views,
-                        publisher: &mut publisher,
-                        last_good: &mut last_good,
+                        publisher: &publisher,
                         command_id: &mut command_id,
                         active_connection,
                         host: &endpoint.key(),
@@ -375,7 +399,7 @@ async fn run_host_actor(
                 match result {
                     ConnectionEnd::Cancelled => break,
                     ConnectionEnd::Fatal(detail) => {
-                        publish_failed(&mut publisher, &mut last_good, detail);
+                        publish_failed(&publisher, detail);
                         drain_offline(&mut requests, &endpoint.key());
                         break;
                     }
@@ -390,7 +414,7 @@ async fn run_host_actor(
                         {
                             client = None;
                         }
-                        publish_failed(&mut publisher, &mut last_good, detail);
+                        publish_failed(&publisher, detail);
                         drain_offline(&mut requests, &endpoint.key());
                         if !wait_offline(
                             &mut requests,
@@ -409,7 +433,7 @@ async fn run_host_actor(
             }
             Err(ConnectionFailure { detail, fatal }) => {
                 mark_not_ready(&readiness);
-                publish_failed(&mut publisher, &mut last_good, detail.clone());
+                publish_failed(&publisher, detail.clone());
                 if fatal {
                     drain_offline(&mut requests, &endpoint.key());
                     break;
@@ -642,8 +666,7 @@ async fn drain_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<VecDeque<u8>>>) {
 struct ConnectionState<'a> {
     requests: &'a mut mpsc::Receiver<Request>,
     views: &'a mut watch::Receiver<protocol::HostViews>,
-    publisher: &'a mut SourcePublisher<HostSnapshot>,
-    last_good: &'a mut Option<HostSnapshot>,
+    publisher: &'a LeafPublisher<HostSnapshot>,
     command_id: &'a mut u64,
     active_connection: u64,
     host: &'a str,
@@ -659,7 +682,6 @@ async fn serve_connection(
         requests,
         views,
         publisher,
-        last_good,
         command_id,
         active_connection,
         host,
@@ -679,7 +701,7 @@ async fn serve_connection(
             },
             incoming = connection.incoming.recv() => match incoming {
                 Some(ReaderMessage::Frame(frame)) => {
-                    if let Err(error) = handle_frame(frame, &mut latest, publisher, last_good, host) { return ConnectionEnd::Fatal(error); }
+                    if let Err(error) = handle_frame(frame, &mut latest, publisher, host) { return ConnectionEnd::Fatal(error); }
                 }
                 Some(ReaderMessage::Error(error)) => return ConnectionEnd::Disconnected(format!("host stream read failed: {error}; {}", stderr_text(connection))),
                 Some(ReaderMessage::Eof) | None => return ConnectionEnd::Disconnected(format!("SSH host stream closed; {}", stderr_text(connection))),
@@ -726,7 +748,7 @@ async fn serve_connection(
                         } => result.map_err(|error| error.to_string()),
                     };
                     if let Err(error) = write_result {
-                        let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, last_good, host).await;
+                        let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, host).await;
                         let result = drained.map_err(|drain_error| RemoteHostError::Ambiguous {
                             host: host.to_owned(),
                             detail: format!("{error}; reply drain failed: {drain_error}"),
@@ -739,13 +761,13 @@ async fn serve_connection(
                         tokio::select! {
                             biased;
                             _ = scope_cancel.cancelled() => {
-                                let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, last_good, host).await;
+                                let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, host).await;
                                 let result = drained.map_err(|detail| RemoteHostError::Ambiguous { host: host.to_owned(), detail: format!("connection cancelled while waiting for command reply: {detail}") });
                                 let _ = reply.send(result);
                                 return ConnectionEnd::Cancelled;
                             }
                             _ = app_cancel.cancelled() => {
-                                let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, last_good, host).await;
+                                let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, host).await;
                                 let result = drained.map_err(|detail| RemoteHostError::Ambiguous { host: host.to_owned(), detail: format!("application stopped while waiting for command reply: {detail}") });
                                 let _ = reply.send(result);
                                 return ConnectionEnd::Cancelled;
@@ -760,7 +782,7 @@ async fn serve_connection(
                                     break;
                                 }
                                 Some(ReaderMessage::Frame(ServerFrame::Snapshot(snapshot))) => {
-                                    if let Err(error) = publish_snapshot(snapshot, &mut latest, publisher, last_good, host) {
+                                    if let Err(error) = publish_snapshot(snapshot, &mut latest, publisher, host) {
                                         let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: format!("invalid worker snapshot while command reply was pending: {error}") }));
                                         return ConnectionEnd::Fatal(error);
                                     }
@@ -799,8 +821,7 @@ async fn drain_command_reply(
     incoming: &mut mpsc::Receiver<ReaderMessage>,
     command_id: u64,
     latest: &mut Option<HostSnapshot>,
-    publisher: &mut SourcePublisher<HostSnapshot>,
-    last_good: &mut Option<HostSnapshot>,
+    publisher: &LeafPublisher<HostSnapshot>,
     host: &str,
 ) -> Result<UiReply, String> {
     let drain = async {
@@ -812,7 +833,7 @@ async fn drain_command_reply(
                     return Ok(reply);
                 }
                 Some(ReaderMessage::Frame(ServerFrame::Snapshot(snapshot))) => {
-                    publish_snapshot(snapshot, latest, publisher, last_good, host)?;
+                    publish_snapshot(snapshot, latest, publisher, host)?;
                 }
                 Some(ReaderMessage::Frame(ServerFrame::Reply { id, .. })) => {
                     return Err(format!(
@@ -843,14 +864,11 @@ async fn drain_command_reply(
 fn handle_frame(
     frame: ServerFrame,
     latest: &mut Option<HostSnapshot>,
-    publisher: &mut SourcePublisher<HostSnapshot>,
-    last_good: &mut Option<HostSnapshot>,
+    publisher: &LeafPublisher<HostSnapshot>,
     host: &str,
 ) -> Result<(), String> {
     match frame {
-        ServerFrame::Snapshot(snapshot) => {
-            publish_snapshot(snapshot, latest, publisher, last_good, host)
-        }
+        ServerFrame::Snapshot(snapshot) => publish_snapshot(snapshot, latest, publisher, host),
         ServerFrame::Reply { id, .. } => Err(format!("unsolicited worker reply id {id}")),
         ServerFrame::Hello { .. } => Err("worker repeated hello after handshake".into()),
     }
@@ -859,8 +877,7 @@ fn handle_frame(
 fn publish_snapshot(
     snapshot: HostSnapshot,
     latest: &mut Option<HostSnapshot>,
-    publisher: &mut SourcePublisher<HostSnapshot>,
-    last_good: &mut Option<HostSnapshot>,
+    publisher: &LeafPublisher<HostSnapshot>,
     host: &str,
 ) -> Result<(), String> {
     snapshot
@@ -870,39 +887,22 @@ fn publish_snapshot(
         return Ok(());
     }
     *latest = Some(snapshot.clone());
-    *last_good = Some(snapshot.clone());
     let state = match &snapshot.state {
         protocol::HostState::Empty => SourceState::Empty,
         protocol::HostState::Refreshing => SourceState::Refreshing,
         protocol::HostState::Ready => SourceState::Ready,
         protocol::HostState::Failed(error) => SourceState::Failed(error.clone().into()),
     };
-    publisher.publish(SourceSnapshot {
-        data: Some(Arc::new(snapshot)),
-        state,
-        updated_at: Some(tokio::time::Instant::now()),
-        revision: 0,
-    });
+    // Received over this connection now: live, stamped on our clock. The
+    // host's own domains keep their stamps on the host's clock.
+    publisher.publish_live_with_state(snapshot, Stamp::now(), state);
     Ok(())
 }
 
-fn publish_failed(
-    publisher: &mut SourcePublisher<HostSnapshot>,
-    last_good: &mut Option<HostSnapshot>,
-    detail: String,
-) {
-    let mut snapshot = last_good.clone().unwrap_or(HostSnapshot {
-        board: None,
-        state: protocol::HostState::Empty,
-        layout: Default::default(),
-    });
-    snapshot.state = protocol::HostState::Failed(detail.clone());
-    publisher.publish(SourceSnapshot {
-        data: Some(Arc::new(snapshot)),
-        state: SourceState::Failed(detail.into()),
-        updated_at: None,
-        revision: 0,
-    });
+/// The connection is down: keep the last data (live or restored) and its
+/// provenance, and report why it is not current.
+fn publish_failed(publisher: &LeafPublisher<HostSnapshot>, detail: String) {
+    publisher.set_state(SourceState::Failed(detail.into()));
 }
 
 enum ConnectionEnd {
@@ -968,7 +968,7 @@ fn belongs_to_connection(request_connection: u64, active_connection: u64) -> boo
 mod tests {
     use super::{ReaderMessage, belongs_to_connection, drain_command_reply};
     use crate::host_protocol::{HostSnapshot, ServerFrame};
-    use wt_runtime::source_channel;
+    use wt_runtime::{Domain, Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
     use wt_tui::UiReply;
 
     #[test]
@@ -1003,19 +1003,20 @@ mod tests {
                 .is_ok()
         );
 
-        let (_source, mut publisher) = source_channel::<HostSnapshot>();
+        let scope = TaskScope::new();
+        let (_source, publisher) = leaf_channel::<HostSnapshot>(
+            &scope,
+            SourceSpec {
+                name: "host-test",
+                domain: Domain::Host,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
         let mut latest = None;
-        let mut last_good = None;
-        let reply = drain_command_reply(
-            &mut incoming,
-            42,
-            &mut latest,
-            &mut publisher,
-            &mut last_good,
-            "test-host",
-        )
-        .await
-        .expect("a reply received during shutdown drain is authoritative");
+        let reply = drain_command_reply(&mut incoming, 42, &mut latest, &publisher, "test-host")
+            .await
+            .expect("a reply received during shutdown drain is authoritative");
         assert_eq!(reply.message, "completed");
     }
 }

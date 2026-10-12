@@ -34,7 +34,7 @@ The daemon accepts only the configured event types, limits the request body to 5
 
 The daemon writes three files under `<cache_root>/events/`:
 
-- `github.json` contains the camelCase GitHub snapshot, covered branches, Unix-millisecond `updatedAt`, and the writer's `writerSha`.
+- `github.json` contains the camelCase GitHub snapshot, covered branches, Unix-millisecond `updatedAt` (when the write finished), `fetchStartedAtMs` (when the GitHub read started), and the writer's `writerSha`.
 - `github.touch` changes after a successful snapshot so an active TUI can notice fresh data.
 - `state.json` contains daemon PID, port, build, start/event/fetch timestamps, accepted event count, and the most recent refresh error.
 
@@ -44,7 +44,7 @@ Snapshots include local worktree branches and configured remote worker branches.
 
 The scheduler coalesces bursts for 1.5 seconds and enforces a 10-second minimum between fetch starts. The floor is measured from the prior fetch start, so a slow query consumes part of the interval. Continuous webhook traffic cannot postpone a pending fetch indefinitely. If the bounded request queue fills, one coalesced refresh preserves correctness.
 
-The TUI uses a cached snapshot only when it has the current build stamp, is no more than 90 seconds old, and covers every requested branch. Otherwise it performs its normal GitHub fetch. The periodic refresh remains the recovery path for missed webhook deliveries.
+The TUI uses a cached snapshot only when it has the current build stamp, is no more than 90 seconds old, and covers every requested branch. Otherwise it performs its normal GitHub fetch. The periodic refresh remains the recovery path for missed webhook deliveries. A daemon snapshot counts as observed when its GitHub read *started*, so a read that began before one of your writes can never confirm that write; a snapshot without `fetchStartedAtMs` can be shown but never confirms a pending change. After an accepted GitHub write, wt bypasses the daemon snapshot once and reads GitHub directly.
 
 ## Native launchd service
 

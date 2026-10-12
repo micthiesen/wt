@@ -96,7 +96,7 @@ version warning so development snapshots can be synchronized deliberately.
 | `worktree_root` | **yes** | — | Directory where worktrees are created (`<worktree_root>/<slug>`). |
 | `log_dir` | no | `<cache root>/logs` | Per-worktree destroy logs live here; daily structured app logs go to the derived `<log_dir>/app` subdirectory. |
 | `lock_dir` | no | `<cache root>/locks` | Per-slug operation locks (what drives the "setting up…" busy state). |
-| `cache_db` | no | repository with a `.wt.toml`: `~/.cache/wt/<repo-id>/cache.sqlite`; otherwise `~/.cache/wt/cache.sqlite` | Cache-root path setting. The native app uses its parent as the **cache root** for rebuildable/runtime files: session registries, automation delivery files, manager reports, logs, locks, generated `tmux.conf`, message sockets, and shims. Durable section/status/archive state lives in the SQLite state database, not this cache root. |
+| `cache_db` | no | repository with a `.wt.toml`: `~/.cache/wt/<repo-id>/cache.sqlite`; otherwise `~/.cache/wt/cache.sqlite` | Cache-root path setting. The native app uses its parent as the **cache root** for rebuildable/runtime files: session registries, automation delivery files, manager reports, logs, locks, generated `tmux.conf`, message sockets, shims, and the per-source query cache under `query/` (last known board data shown at launch; deleted and rebuilt whenever the repository, configuration or build changes). Durable section/status/archive state lives in the SQLite state database, not this cache root. |
 | `state_db` | no | repository with a `.wt.toml`: `~/.local/state/wt/wt.sqlite`; user-config-only compatibility mode: `<cache root>/wt.sqlite` | Authoritative SQLite state shared by local repositories and partitioned by `repo_id`. Normally leave this unset. The canonical repository path stored with each id is a collision guard. |
 | `wezterm_cli` | no | macOS: `/Applications/WezTerm.app/Contents/MacOS/wezterm`; elsewhere: `wezterm` from `PATH` | WezTerm CLI executable used to set the tab title to `wt` when `WEZTERM_PANE` is present. Supports `~` expansion. |
 | `wt_source` | no | absent | Optional wt source checkout for the `,` developer session and `<` palette. Supports `~`; the slot is hidden when unset or missing. Native installs do not require a checkout. |
@@ -224,9 +224,11 @@ need the exact published native artifact. Source files and project dependencies
 are not uploaded. Each worker process resolves one configuration of its own.
 
 The last successful remote inventory is persisted with the rest of wt's query
-cache. If the host sleeps or becomes unreachable, those rows remain visible as
-last-known state and are marked `host unavailable`; they are not interpreted as
-deleted worktrees. The inventory carries agent work-status assertions and the
+cache (`<cache root>/query/host-<id>.json`). At launch those rows appear at once
+with the list marked `cached`; if the host sleeps or becomes unreachable, they
+remain visible as last-known state and are marked `host unavailable`. They are
+never interpreted as deleted worktrees and never authorize an action on that
+host. The inventory carries agent work-status assertions and the
 worker's full dev-server health snapshot, so the controller renders the same
 status dot, live bolt, URL, startup/restart/queue state, and crash diagnostics
 as it does for local rows.

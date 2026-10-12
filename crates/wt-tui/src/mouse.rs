@@ -239,7 +239,6 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
 mod tests {
     use super::*;
     use crate::{AttentionLine, Board, BoardRow};
-    use std::sync::Arc;
 
     #[test]
     fn wheel_scrolls_the_pane_under_the_pointer() {
@@ -267,12 +266,11 @@ mod tests {
             ..Default::default()
         };
         let mut model = Model::default();
-        model.apply(wt_runtime::SourceSnapshot {
-            data: Some(Arc::new(board)),
-            state: wt_runtime::SourceState::Ready,
-            updated_at: None,
-            revision: 1,
-        });
+        model.apply(wt_runtime::SourceSnapshot::test_live(
+            Some(board),
+            wt_runtime::SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         let area = Rect::new(0, 0, 100, 30);
         let list = MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -315,12 +313,11 @@ mod tests {
             ..Default::default()
         };
         let mut model = Model::default();
-        model.apply(wt_runtime::SourceSnapshot {
-            data: Some(Arc::new(board)),
-            state: wt_runtime::SourceState::Ready,
-            updated_at: None,
-            revision: 1,
-        });
+        model.apply(wt_runtime::SourceSnapshot::test_live(
+            Some(board),
+            wt_runtime::SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         model.history.active = true;
         model.output_view(3, 30);
         let output = MouseEvent {

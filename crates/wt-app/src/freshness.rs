@@ -13,7 +13,10 @@ use std::{
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use wt_config::Config;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    Domain, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
+    leaf_channel,
+};
 use wt_tui::Board;
 use wt_vcs::{GitRepository, WorktreeSnapshot};
 
@@ -27,13 +30,22 @@ pub fn start(
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<crate::local_source::Metadata>,
 ) -> SourceHandle<BTreeMap<String, i64>> {
-    let (edits, mut edit_publisher) = source_channel();
+    let (edits, mut edit_publisher) = leaf_channel(
+        scope,
+        SourceSpec {
+            name: "edit-times",
+            domain: Domain::Git,
+            persistence: Persistence::Never("live filesystem events"),
+            policy: RefreshPolicy::default(),
+        },
+    );
+    let edits = edits.view();
     let edit_roots = Arc::new(RwLock::new(BTreeMap::<PathBuf, String>::new()));
     let pending_edits = Arc::new(Mutex::new(BTreeMap::<String, i64>::new()));
     let edit_changed = Arc::new(tokio::sync::Notify::new());
     let cancellation = scope.token();
     scope.spawn(async move {
-        if let Some(board) = source.snapshot().data
+        if let Some(board) = source.snapshot().data().cloned()
             && let Ok(mut roots) = edit_roots.write()
         {
             *roots = board
@@ -166,12 +178,7 @@ pub fn start(
                                 }
                                 if !edits_published {
                                     edits_published = true;
-                                    edit_publisher.publish(SourceSnapshot {
-                                        data: Some(Arc::new(latest_edits.clone())),
-                                        state: SourceState::Ready,
-                                        updated_at: Some(tokio::time::Instant::now()),
-                                        revision: 0,
-                                    });
+                                    edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
                                 }
                             }
                             Err(error) => {
@@ -195,7 +202,7 @@ pub fn start(
                 changed = updates.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = updates.borrow_and_update().clone();
-                    if snapshot.state == SourceState::Ready && let Some(board) = snapshot.data {
+                    if *snapshot.state() == SourceState::Ready && let Some(board) = snapshot.data() {
                         let next: Vec<_> = board.rows.iter().map(|row| (row.key.clone(), row.path.clone())).collect();
                         if let Ok(mut roots) = edit_roots.write() {
                             *roots = board.rows.iter()
@@ -218,12 +225,7 @@ pub fn start(
                             latest_edits.entry(slug).and_modify(|current| *current = (*current).max(timestamp)).or_insert(timestamp);
                         }
                     }
-                    edit_publisher.publish(SourceSnapshot {
-                        data: Some(Arc::new(latest_edits.clone())),
-                        state: SourceState::Ready,
-                        updated_at: Some(tokio::time::Instant::now()),
-                        revision: 0,
-                    });
+                    edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
                 }
                 _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
             }
@@ -531,7 +533,7 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(5),
             git_updates.wait_for(|snapshot| {
-                snapshot.state == SourceState::Ready && snapshot.data.is_some()
+                *snapshot.state() == SourceState::Ready && snapshot.data().is_some()
             }),
         )
         .await
@@ -540,13 +542,13 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(5),
             edit_updates.wait_for(|snapshot| {
-                snapshot.state == SourceState::Ready && snapshot.data.is_some()
+                *snapshot.state() == SourceState::Ready && snapshot.data().is_some()
             }),
         )
         .await
         .expect("freshness watcher registration should complete")
         .expect("edit source should stay open");
-        let initial_revision = git_updates.borrow().revision;
+        let initial_revision = git_updates.borrow().revision();
 
         // This receiver is optional: with automations disabled nobody observes
         // edit timestamps. The Git and metadata invalidation watcher must live on.
@@ -558,8 +560,8 @@ mod tests {
         let first_revision = tokio::time::timeout(
             Duration::from_secs(5),
             git_updates.wait_for(|snapshot| {
-                snapshot.revision > initial_revision
-                    && snapshot.data.as_ref().is_some_and(|rows| {
+                snapshot.revision() > initial_revision
+                    && snapshot.data().is_some_and(|rows| {
                         rows.iter().any(|row| {
                             row.worktree.target.path == worktree
                                 && row.status.as_ref().is_some_and(|status| status.dirty)
@@ -570,7 +572,7 @@ mod tests {
         .await
         .expect("first filesystem event should refresh Git after edit stream closes")
         .expect("Git source should stay open")
-        .revision;
+        .revision();
 
         tokio::fs::write(&tracked_file, "second external edit\n")
             .await
@@ -578,8 +580,8 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(5),
             git_updates.wait_for(|snapshot| {
-                snapshot.revision > first_revision
-                    && snapshot.data.as_ref().is_some_and(|rows| {
+                snapshot.revision() > first_revision
+                    && snapshot.data().is_some_and(|rows| {
                         rows.iter().any(|row| {
                             row.worktree.target.path == worktree
                                 && row.status.as_ref().is_some_and(|status| status.dirty)

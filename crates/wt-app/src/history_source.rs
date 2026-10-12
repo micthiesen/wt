@@ -17,7 +17,10 @@ use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
 use wt_platform::process::CommandSpec;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    Domain, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
+    derived_channel, leaf_channel,
+};
 use wt_store::RemovedWorktree;
 use wt_tui::{Board, RemovedHistoryRow, RemovedHistorySnapshot};
 use wt_vcs::WorktreeSnapshot;
@@ -57,7 +60,19 @@ pub fn start(
     metadata: SourceHandle<Metadata>,
     live: SourceHandle<Vec<WorktreeSnapshot>>,
 ) -> HistorySources {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = leaf_channel(
+        scope,
+        SourceSpec {
+            name: "removed-history",
+            domain: Domain::History,
+            persistence: Persistence::Never("authoritative SQLite; read directly"),
+            policy: RefreshPolicy::default(),
+        },
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "pane activity control signal, not board data"
+    )]
     let (active_sender, mut active) = watch::channel(false);
     let cancellation = scope.token();
     let context = context.clone();
@@ -68,7 +83,6 @@ pub fn start(
         live_updates.mark_changed();
         let mut is_active = false;
         let mut refresh_needed = false;
-        let mut last_data: Option<Arc<RemovedHistorySnapshot>> = None;
 
         loop {
             tokio::select! {
@@ -90,13 +104,7 @@ pub fn start(
                         live.refresh();
                         refresh_needed = true;
                     } else {
-                        last_data = None;
-                        publisher.publish(SourceSnapshot {
-                            data: Some(Arc::new(RemovedHistorySnapshot::default())),
-                            state: SourceState::Ready,
-                            updated_at: Some(tokio::time::Instant::now()),
-                            revision: 0,
-                        });
+                        publisher.publish_live(RemovedHistorySnapshot::default(), Stamp::now());
                     }
                 }
                 changed = metadata_updates.changed() => {
@@ -118,10 +126,10 @@ pub fn start(
 
             let metadata_snapshot = metadata_updates.borrow().clone();
             let live_snapshot = live_updates.borrow().clone();
-            if !matches!(live_snapshot.state, SourceState::Ready)
-                || !matches!(metadata_snapshot.state, SourceState::Ready)
+            if !matches!(live_snapshot.state(), SourceState::Ready)
+                || !matches!(metadata_snapshot.state(), SourceState::Ready)
             {
-                let state = match (&live_snapshot.state, &metadata_snapshot.state) {
+                let state = match (live_snapshot.state(), metadata_snapshot.state()) {
                     (SourceState::Failed(error), _) => {
                         SourceState::Failed(format!("inventory: {error}").into())
                     }
@@ -130,19 +138,15 @@ pub fn start(
                     }
                     _ => SourceState::Refreshing,
                 };
-                publisher.publish(SourceSnapshot {
-                    data: last_data.clone(),
-                    state,
-                    updated_at: None,
-                    revision: 0,
-                });
+                // The last prepared history stays visible.
+                publisher.set_state(state);
                 continue;
             }
-            let Some(live_rows) = live_snapshot.data.as_deref() else {
+            let Some(live_rows) = live_snapshot.data() else {
                 live.refresh();
                 continue;
             };
-            if metadata_snapshot.data.is_none() {
+            if metadata_snapshot.data().is_none() {
                 metadata.refresh();
                 continue;
             }
@@ -153,6 +157,7 @@ pub fn start(
                 .map(|row| row.worktree.target.slug().to_owned())
                 .collect::<BTreeSet<_>>();
             let request_cancellation = cancellation.child_token();
+            let observed = Stamp::now();
             let prepared = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
@@ -163,13 +168,7 @@ pub fn start(
                     if is_active {
                         refresh_needed = true;
                     } else {
-                        last_data = None;
-                        publisher.publish(SourceSnapshot {
-                            data: Some(Arc::new(RemovedHistorySnapshot::default())),
-                            state: SourceState::Ready,
-                            updated_at: Some(tokio::time::Instant::now()),
-                            revision: 0,
-                        });
+                        publisher.publish_live(RemovedHistorySnapshot::default(), Stamp::now());
                     }
                     continue;
                 }
@@ -177,34 +176,26 @@ pub fn start(
             };
             match prepared {
                 Ok((snapshot, fact_error)) if !cancellation.is_cancelled() => {
-                    let snapshot = Arc::new(snapshot);
-                    last_data = Some(snapshot.clone());
-                    publisher.publish(SourceSnapshot {
-                        data: Some(snapshot),
-                        state: fact_error
+                    publisher.publish_live_with_state(
+                        snapshot,
+                        observed,
+                        fact_error
                             .map(|error| SourceState::Failed(error.into()))
                             .unwrap_or(SourceState::Ready),
-                        updated_at: Some(tokio::time::Instant::now()),
-                        revision: 0,
-                    });
+                    );
                 }
                 Ok(_) => break,
                 Err(_error) if cancellation.is_cancelled() => break,
                 Err(error) => {
                     tracing::warn!(%error, "removed-worktree history refresh failed");
-                    publisher.publish(SourceSnapshot {
-                        data: last_data.clone(),
-                        state: SourceState::Failed(format!("history: {error:#}").into()),
-                        updated_at: None,
-                        revision: 0,
-                    });
+                    publisher.set_state(SourceState::Failed(format!("history: {error:#}").into()));
                 }
             }
         }
     });
 
     HistorySources {
-        snapshot: source,
+        snapshot: source.view(),
         commands: HistoryCommands {
             active: active_sender,
         },
@@ -219,7 +210,7 @@ pub fn overlay(
     board: SourceHandle<Board>,
     history: SourceHandle<RemovedHistorySnapshot>,
 ) -> SourceHandle<Board> {
-    let (output, mut publisher) = source_channel();
+    let (output, mut publisher) = derived_channel(scope, "history-board");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut boards = board.subscribe();
@@ -241,24 +232,22 @@ pub fn overlay(
             }
             let base = boards.borrow_and_update().clone();
             let history_snapshot = histories.borrow_and_update().clone();
-            let mut data = base.data.as_deref().cloned();
+            let mut data = base.data().map(|board| board.as_ref().clone());
             if let Some(board) = data.as_mut() {
-                if let Some(history) = history_snapshot.data.as_deref() {
-                    board.removed_history = history.clone();
+                if let Some(history) = history_snapshot.data() {
+                    board.removed_history = history.as_ref().clone();
                 }
-                if let SourceState::Failed(error) = &history_snapshot.state {
+                if let SourceState::Failed(error) = history_snapshot.state() {
                     let detail = clean(&format!("History: {error}"));
                     if !board.attention.iter().any(|line| line.text == detail) {
                         crate::activity_source::append_attention(board, "History", &detail);
                     }
                 }
             }
-            publisher.publish(SourceSnapshot {
-                data: data.map(Arc::new),
-                state: base.state,
-                updated_at: base.updated_at.or(history_snapshot.updated_at),
-                revision: 0,
-            });
+            publisher.publish(
+                base.with_data(data.map(Arc::new))
+                    .with_input(&history_snapshot),
+            );
         }
     });
     output
@@ -851,7 +840,7 @@ fn parse_timestamp_ms(value: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use serde_json::{Map, json};
-    use wt_runtime::source_channel;
+    use wt_runtime::leaf_channel;
 
     #[test]
     fn presentation_preserves_manual_snapshot_links_and_unknown_landing() {
@@ -1084,39 +1073,37 @@ mod tests {
             .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
             .await
             .unwrap();
-        let (metadata, metadata_publisher) = source_channel();
-        let (live, live_publisher) = source_channel();
-        metadata_publisher.publish(SourceSnapshot {
-            data: Some(Arc::new(metadata_value)),
-            state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
-            revision: 0,
-        });
-        live_publisher.publish(SourceSnapshot {
-            data: Some(Arc::new(inventory)),
-            state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
-            revision: 0,
-        });
-
         let scope = TaskScope::new();
-        let history = start(&scope, &fixture.ctx, metadata, live);
-        assert!(history.snapshot.snapshot().data.is_none());
+        fn spec<T>(domain: Domain) -> SourceSpec<T> {
+            SourceSpec {
+                name: "test",
+                domain,
+                persistence: Persistence::Never("test"),
+                policy: RefreshPolicy::default(),
+            }
+        }
+        let (metadata, metadata_publisher) = leaf_channel(&scope, spec(Domain::Metadata));
+        let (live, live_publisher) = leaf_channel(&scope, spec(Domain::Git));
+        metadata_publisher.publish_live(metadata_value, Stamp::now());
+        live_publisher.publish_live(inventory, Stamp::now());
+
+        let history = start(&scope, &fixture.ctx, metadata.view(), live.view());
+        assert!(history.snapshot.snapshot().data().is_none());
         history.commands.set_active(true);
         let mut updates = history.snapshot.subscribe();
         let snapshot = tokio::time::timeout(
             Duration::from_secs(2),
             updates.wait_for(|snapshot| {
                 snapshot
-                    .data
-                    .as_ref()
+                    .data()
                     .is_some_and(|data| data.rows.iter().any(|row| row.slug == "historical"))
             }),
         )
         .await
         .unwrap()
         .unwrap();
-        let rows = snapshot.data.as_ref().unwrap().rows.clone();
+        assert!(snapshot.domains().contains_key(&Domain::History));
+        let rows = snapshot.data().unwrap().rows.clone();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].slug, "historical");
         drop(snapshot);
@@ -1124,12 +1111,7 @@ mod tests {
         history.commands.set_active(false);
         tokio::time::timeout(
             Duration::from_secs(2),
-            updates.wait_for(|snapshot| {
-                snapshot
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data.rows.is_empty())
-            }),
+            updates.wait_for(|snapshot| snapshot.data().is_some_and(|data| data.rows.is_empty())),
         )
         .await
         .unwrap()

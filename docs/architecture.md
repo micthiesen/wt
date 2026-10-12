@@ -14,7 +14,7 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-config` | Config discovery, merge, validation, resolved process configuration |
 | `wt-core` | Pure identity, work-status, section and safety rules shared across domains |
 | `wt-store` | Durable SQLite state, repository scoping, payload migrations |
-| `wt-runtime` | Scoped task lifetimes, refreshable source handles and source scheduling |
+| `wt-runtime` | Scoped task lifetimes, the query layer (sources with provenance, per-source disk cache, confirmed-only safety inputs, optimistic-change engine) and source scheduling |
 | `wt-platform` | Bounded subprocess execution, locks and platform services |
 | `wt-vcs`, `wt-stack`, `wt-lifecycle` | Git inventory/ref operations, stack replay, and worktree creation/removal safety |
 | `wt-github` | GitHub reads and mutations, checks, review requests and merge behavior |
@@ -31,27 +31,24 @@ worker protocol. `sources.rs` composes the host-local source graph. A remote
 host runs the same source and action pipeline as a local host; the controller
 combines the resulting snapshots for display.
 
-TUI cleanup and removal pass the host's current GitHub snapshot to the
-lifecycle planner, including the confirmation recheck. They do not start a
-second PR fetch. Cached merged-PR evidence applies only to its exact HEAD;
-local hazards and removal revisions remain authoritative. Git-only landing
-evidence retains the published-base check.
-
-Successful host creation refreshes Git inventory and metadata directly. Pending
-creation selection opens the containing section when the row enters a board
-snapshot, so delayed fold metadata cannot hide the new row.
+Safety decisions never read display data. TUI cleanup, removal, GitHub
+writes, action requirements, restack and automations take
+`wt_runtime::Confirmed<T>` values, which only a leaf source can produce from
+data this process fetched live (see the query layer below). Cached merged-PR
+evidence applies only to its exact HEAD; local hazards and removal revisions
+remain authoritative. Git-only landing evidence retains the published-base
+check.
 
 ## Source and presentation boundaries
 
 The TUI input loop consumes prepared `Board` snapshots. It does not run Git,
 GitHub, harness, tracker, or filesystem scans while handling a key. Each
-independent reader is a `wt-runtime` source with a `SourceHandle<T>` and a
-refresh request lane. `start_source` applies its debounce and minimum interval,
-publishes loading/ready/failed state, and retains last-good data on fetch errors.
-`TaskScope` owns source tasks and cancels them together at the host boundary.
+independent reader is a `wt-runtime` source; actions go through the host
+service. `TaskScope` owns source tasks and cancels them together at the host
+boundary.
 
-`wt-app::sources::start` builds the local inventory and metadata readers, then
-projects GitHub, action history/log tails, naming, sessions, removed history,
+`wt-app::sources::start` builds the local leaves and the derived stages that
+project GitHub, action history/log tails, naming, sessions, removed history,
 automation status, and optional diagnostics into the board. Fetches are batched
 by domain, never issued once per rendered row. Watchers and activity sources
 publish only meaningful changes; timers are backstops for inputs without a
@@ -82,23 +79,98 @@ The output pane switches between attention, all app activity, and prepared
 session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
 
-Creation adds a temporary selected row as soon as the request enters the
-controller queue. F12 on that row requests agent entry when the checkout is
-ready. Request IDs keep replies tied to their own temporary rows. Source
-snapshots remain unchanged; failures remove the temporary row. Dependency
-installation uses a durable background action, so it does not delay agent entry.
-Creation selects the actual target only after the refreshed
-inventory contains the actual row. A successful refresh alone is not proof the
-row is visible. When a selected row disappears, cursor fallback is based on
-the current visual row identity and section, not a stale numeric position.
+## Query layer
+
+All board data and all optimistic display go through one layer in
+`wt-runtime`. Its guarantees are enforced by types, a lint and conformance
+tests rather than by convention.
+
+**Sources and provenance.** A *leaf* source observes one `Domain` (Git,
+metadata, GitHub, reviews, issues, sessions, and so on) and is built with a
+required `SourceSpec { name, domain, persistence, policy }`. Only a leaf
+publisher can mark data live, and every live observation carries a `Stamp`:
+the moment its fetch *started*, on the host's own process clock. A *derived*
+source (`derived_channel`) combines snapshots it read; its snapshot inherits
+their per-domain provenance (`derive`, `with_input`), so a board built from any
+restored input reads as restored for that domain. `SourceSnapshot` fields are
+private, so nothing can publish restored data as live. `clippy.toml` bans raw
+`tokio::sync::watch::channel` outside `wt-runtime`; a control channel that is
+not board data says why with `#[expect(clippy::disallowed_methods)]`.
+
+**Persistence.** Each leaf declares `Persistence::Disk(DiskCache)` or
+`Persistence::Never(reason)`. Disk leaves (Git inventory, GitHub PR data,
+review requests, issue statuses, dev status, session discoveries, Git
+presentation facts, remote host snapshots) restore their last live value at
+start, off the input path, as `Provenance::Restored` in the `Refreshing` state,
+unless a live publish arrived first. They save live, ready data at most every
+10 seconds and once at shutdown within a one-second budget that never fails
+shutdown. Files live under `<cache root>/query/<name>.json` in an envelope
+whose scope hashes the repository id, canonical main clone, merged
+configuration and build (plus the executable's size and mtime for `dev-`
+builds). A mismatched, corrupt, oversized or week-old file is deleted and
+ignored. Sources that read SQLite, logs or live process state are `Never`:
+durable state is read directly and never cached here.
+
+**Confirmed inputs.** `LeafHandle::confirmed()` returns `Confirmed<T>` only for
+live data; a derived handle has no such method, and `Confirmed` has no public
+constructor. Remove, cleanup, GitHub writes, reviewer edits, action
+requirements, restack and automation facts take `Confirmed` inputs (or `None`,
+which behaves like "still loading" and fails closed). `Confirmed::fresh_within`
+replaces ad-hoc age checks. A fetch whose key set comes from another source
+(GitHub branches, issue ids, events-cache coverage) reads that input through
+`confirmed()` and skips while it is restored, so a restored inventory never
+produces "live" data. Automation quiescence requires confirmed session data and
+treats anything else as busy.
+
+**Optimistic changes.** `wt_runtime::Pending<T, M: Mutation<T>>` is the only
+optimistic engine. It never writes, so it cannot retry. An entry is *in flight*
+until the host answers, then *accepted* with the host's stamp, or *unconfirmed*
+when the outcome is ambiguous. It is shown over confirmed data until a fetch
+that started at or after the accept stamp shows the change, the write fails, or
+a bounded deadline passes (60 s in flight; 30 s accepted for GitHub, reviews and
+issues; 12 s for local domains; 30 s unconfirmed). An older or out-of-order
+fetch, a restored value or a stamp from another process can never settle it.
+An expiry while confirmed data still disagrees shows one notice.
+
+- The TUI model begins a `UiMutation` for every write at keypress. Each
+  `UiAction` declares its effect in an exhaustive match
+  (`UiAction::effect(&Board)`), resolved against the board the user sees, so
+  toggles carry an explicit direction and GitHub writes carry the PR number and
+  head SHA they target (`PrPin`). The executing host refreshes the domains the
+  effect names and replies with a `ReplyOutcome` (`Accepted(stamp)`,
+  `NoChange`, `Deferred`, or `Uncertain`).
+- Creation is a `UiMutation` too: a selected placeholder row appears at
+  keypress, F12 on it requests agent entry once the checkout is ready, and the
+  operation id keeps each reply tied to its own placeholder. The reply names the
+  real row; selection moves to it only after the prepared visible rows contain
+  it, and its section opens then. A successful refresh alone is not proof the
+  row is visible. Dependency installation uses a durable background action, so
+  it does not delay agent entry. When a selected row disappears, cursor fallback
+  uses the current visual row identity and section, not a stale position.
+- The GitHub action worker keeps a private ledger of its own accepted and
+  uncertain writes for its no-op guards (disarm is sent whenever the ledger
+  shows the PR armed; enable is refused while an earlier enable is
+  unconfirmed). The ledger is never published, so automations and planners see
+  only confirmed GitHub data.
+- Host-side projections (issue statuses an action run is setting) use the same
+  engine and publish `PendingView`s in `Board.pending`.
+
+**Uniform display.** Every pane draws its border through
+`wt-tui::render::status::pane`, naming the domains it shows; the title reads
+`cached 3m`, `↻`, `loading…` or `<domain> failed` from the same per-domain
+provenance on every host. Rows and the details title show pending changes with
+one marker (`…` in flight, `↻` accepted, `? … (unconfirmed)`).
 
 ## Freshness and refresh
 
 Local Git inventory, metadata, edit timestamps, sessions, action logs, and
 GitHub observations have separate source lanes. Filesystem watchers invalidate
 only the facts affected by the event. GitHub reads remain batched and rate
-limited; the optional events daemon supplies push updates, with a configured
-poll backstop for missed events or daemon downtime.
+limited (10 s minimum interval measured from fetch start); the optional events
+daemon supplies push updates stamped with its own fetch start, with a
+configured poll backstop for missed events or daemon downtime. An accepted
+GitHub write bypasses the events cache once, so the confirming read is a direct
+fetch.
 
 `r` requests an ordinary source refresh and keeps durable data and derived
 caches. `Ctrl+R` asks for confirmation, clears the derived naming cache and
@@ -150,8 +222,8 @@ versioned worktree-state payload migrations are distinct compatibility
 boundaries. `wt state migrate` imports legacy records; it does not run as an
 implicit cache clear.
 
-Generated naming summaries, remote snapshots, event observations, action log
-tails, and source snapshots are rebuildable. Hard refresh may clear derived
+Generated naming summaries, the per-source query cache, event observations,
+action log tails, and source snapshots are rebuildable. Hard refresh may clear derived
 summaries; it must not delete durable state or resend an accepted operation.
 Action metadata and logs remain tracked on disk so a disconnected controller
 can re-read completion and output.

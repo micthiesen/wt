@@ -2,10 +2,10 @@
 
 use anyhow::Result;
 use wt_github::{Contributor, GithubClient, GithubData, GithubOptions, PullRequest};
-use wt_runtime::SourceHandle;
-use wt_tui::{Board, ReviewerOption, UiModal, UiReply};
+use wt_runtime::{Confirmed, Stamp};
+use wt_tui::{Board, ReplyOutcome, ReviewerOption, UiModal, UiReply};
 
-use crate::{context::AppContext, github_actions::GithubActions};
+use crate::context::AppContext;
 
 pub struct GithubPickers {
     client: GithubClient,
@@ -19,12 +19,12 @@ pub struct ReviewerSubmission<'a> {
     pub original: &'a [String],
     pub selected: &'a [String],
     pub board: &'a Board,
-    pub github: &'a GithubData,
-    pub actions: &'a GithubActions,
+    /// The submission is checked against confirmed data, never the display.
+    pub github: Option<&'a Confirmed<GithubData>>,
 }
 
 impl GithubPickers {
-    pub fn start(context: &AppContext, _github: SourceHandle<GithubData>) -> Self {
+    pub fn start(context: &AppContext) -> Self {
         Self {
             client: GithubClient::new(
                 context.processes.clone(),
@@ -44,11 +44,14 @@ impl GithubPickers {
         &self,
         key: &str,
         board: &Board,
-        github: &GithubData,
+        github: Option<&Confirmed<GithubData>>,
     ) -> Result<UiReply> {
         if !self.reviewers_enabled {
             return Ok(reply("reviewers are disabled for this repository"));
         }
+        let Some(github) = github else {
+            return Ok(failed("GitHub data is still loading"));
+        };
         let Some(row) = resolve_row(board, key) else {
             return Ok(failed(format!(
                 "worktree {key:?} is no longer on the board"
@@ -107,11 +110,15 @@ impl GithubPickers {
             selected,
             board,
             github,
-            actions,
         } = request;
         if !self.reviewers_enabled {
             return Ok(failed("reviewers are disabled for this repository"));
         }
+        let Some(github) = github else {
+            return Ok(failed(
+                "GitHub data is still loading; reviewer edit aborted",
+            ));
+        };
         let Some(row) = resolve_row(board, key) else {
             return Ok(failed(
                 "worktree is no longer on the board; reviewer edit aborted",
@@ -166,7 +173,10 @@ impl GithubPickers {
             .cloned()
             .collect::<Vec<_>>();
         if add.is_empty() && remove.is_empty() {
-            return Ok(reply("no reviewer changes"));
+            return Ok(UiReply {
+                outcome: Some(ReplyOutcome::NoChange),
+                ..reply("no reviewer changes")
+            });
         }
 
         let result = self
@@ -180,11 +190,7 @@ impl GithubPickers {
                     .unwrap_or_else(|| "reviewer edit failed".into()),
             ));
         }
-        let count = pr
-            .review_requests
-            .saturating_add(add.len() as u32)
-            .saturating_sub(remove.len() as u32);
-        actions.optimistic_reviewers(branch, selected.to_vec(), count);
+        let at = Stamp::now();
         let mut changes = Vec::new();
         if !add.is_empty() {
             changes.push(format!("added {}", add.join(", ")));
@@ -192,10 +198,14 @@ impl GithubPickers {
         if !remove.is_empty() {
             changes.push(format!("removed {}", remove.join(", ")));
         }
-        Ok(reply(format!(
-            "edited reviewers for PR #{pr_number}: {}",
-            changes.join("; ")
-        )))
+        // The host requests a direct GitHub read for accepted GitHub writes.
+        Ok(UiReply {
+            outcome: Some(ReplyOutcome::Accepted(at)),
+            ..reply(format!(
+                "edited reviewers for PR #{pr_number}: {}",
+                changes.join("; ")
+            ))
+        })
     }
 }
 
@@ -395,5 +405,47 @@ mod tests {
             &["a".into(), "b".into()],
             &["b".into(), "a".into()]
         ));
+    }
+
+    #[tokio::test]
+    async fn submissions_are_checked_against_confirmed_data_and_report_their_outcome() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let pickers = GithubPickers {
+            reviewers_enabled: true,
+            ..GithubPickers::start(&fixture.ctx)
+        };
+        let board = Board {
+            rows: vec![wt_tui::BoardRow {
+                key: "one".into(),
+                slug: "one".into(),
+                branch: "feature/42".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut data = GithubData::default();
+        data.prs.insert("feature/42".into(), pr());
+        let confirmed = Confirmed::for_test(data);
+        let original = vec!["maintainer".to_owned()];
+        let submit = |github, pr_number| {
+            pickers.submit_reviewers(ReviewerSubmission {
+                key: "one",
+                pr_number,
+                original: &original,
+                selected: &original,
+                board: &board,
+                github,
+            })
+        };
+        let loading = submit(None, 42).await.unwrap();
+        assert!(loading.failed && loading.message.contains("still loading"));
+        let replaced = submit(Some(&confirmed), 41).await.unwrap();
+        assert!(replaced.failed && replaced.message.contains("PR changed"));
+        let unchanged = submit(Some(&confirmed), 42).await.unwrap();
+        assert!(!unchanged.failed);
+        assert_eq!(unchanged.outcome, Some(ReplyOutcome::NoChange));
+        fixture.close().await.unwrap();
     }
 }

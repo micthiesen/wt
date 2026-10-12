@@ -5,6 +5,7 @@ use wt_actions::{ActionRequest, ActionRunKind};
 use wt_config::EffectTag;
 use wt_github::{GithubClient, GithubData, GithubOptions};
 use wt_platform::lock::FileLock;
+use wt_runtime::Confirmed;
 use wt_stack::{
     RestackOptions, RestackOutcome, StackConfig, StackEvent, StackService, StateConfig,
 };
@@ -21,7 +22,7 @@ const ACTION_ID: &str = "wt-restack";
 pub async fn start(
     context: &AppContext,
     key: &str,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
     board: Option<&Board>,
 ) -> Result<UiReply> {
     let Some(row_view) = board

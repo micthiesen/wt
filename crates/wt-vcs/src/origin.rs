@@ -86,6 +86,10 @@ impl GitRepository {
             if let Some(flight) = slot.as_ref() {
                 (Arc::clone(flight), false, None)
             } else {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "single-flight result for concurrent fetch callers, not board data"
+                )]
                 let (sender, receiver) = watch::channel(None);
                 let flight = Arc::new(FetchFlight { result: receiver });
                 *slot = Some(Arc::clone(&flight));

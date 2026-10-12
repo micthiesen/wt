@@ -8,7 +8,9 @@ use tokio::{
     task::JoinSet,
 };
 use wt_automations::AutomationLedger;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    Confirmed, LeafHandle, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel,
+};
 use wt_tui::Board;
 
 use crate::{
@@ -20,14 +22,18 @@ use crate::{
     session_source::{SessionDiscoveries, SessionInventory},
 };
 
+/// Facts that drive fires are read through the leaves' `confirmed()` views:
+/// live data only, never restored cache data or optimistic projections. The
+/// board is display data and only supplies presentation hints.
 #[derive(Clone)]
 pub struct AutomationSources {
     pub board: SourceHandle<Board>,
-    pub git: SourceHandle<Vec<wt_vcs::WorktreeSnapshot>>,
-    pub metadata: SourceHandle<Metadata>,
-    pub github: SourceHandle<wt_github::GithubData>,
-    pub sessions: SourceHandle<SessionDiscoveries>,
-    pub inventory: SourceHandle<SessionInventory>,
+    pub git: LeafHandle<Vec<wt_vcs::WorktreeSnapshot>>,
+    pub metadata: LeafHandle<Metadata>,
+    /// Raw confirmed PR data, with no optimistic overlay.
+    pub github: LeafHandle<wt_github::GithubData>,
+    pub sessions: LeafHandle<SessionDiscoveries>,
+    pub inventory: LeafHandle<SessionInventory>,
     pub activity: SourceHandle<SessionActivitySnapshot>,
     pub edits: SourceHandle<std::collections::BTreeMap<String, i64>>,
 }
@@ -63,6 +69,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     }
     let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
     let commands = AutomationCommands { cancel: cancel_tx };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "engine status signal folded into the derived automations board, not board data itself"
+    )]
     let (status_tx, status_rx) = watch::channel((0usize, None::<String>));
     let board = overlay(scope, sources.board.clone(), status_rx);
     let token = scope.token();
@@ -156,21 +166,23 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let activity = activity_rx.borrow_and_update().clone();
             let edits = edits_rx.borrow_and_update().clone();
             let base_board = board_rx.borrow_and_update().clone();
-            let github_fresh = github.state == SourceState::Ready
-                && github.updated_at.is_some_and(|at| at.elapsed() <= Duration::from_secs(90));
-            let metadata_key = metadata_facts_key(metadata.data.as_deref());
+            let confirmed_git = sources.git.confirm(&git);
+            let confirmed_metadata = sources.metadata.confirm(&metadata);
+            let confirmed_sessions = sources.sessions.confirm(&sessions);
+            let confirmed_inventory = sources.inventory.confirm(&inventory);
+            let fresh_github = automation_facts::fresh_github(sources.github.confirm(&github));
+            let lanes_ready = *git.state() == SourceState::Ready
+                && *metadata.state() == SourceState::Ready;
+            let metadata_key = metadata_facts_key(confirmed_metadata.as_deref());
             let key = (
-                git.data.as_deref().cloned(),
-                git.state.clone(),
+                confirmed_git.as_deref().cloned(),
+                lanes_ready,
                 metadata_key,
-                metadata.state.clone(),
-                github.data.as_deref().cloned(),
-                github.state.clone(),
-                github_fresh,
+                fresh_github.as_deref().cloned(),
             );
             if cache_key.as_ref() != Some(&key) {
-                if previous_git_revision != Some(git.revision) {
-                    if let Some(snapshots) = git.data.as_deref() {
+                if previous_git_revision != Some(git.revision()) {
+                    if let Some(snapshots) = confirmed_git.as_deref() {
                         let now = now_ms();
                         for snapshot in snapshots {
                             let slug = snapshot.worktree.target.slug().to_owned();
@@ -181,21 +193,20 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             }
                         }
                     }
-                    previous_git_revision = Some(git.revision);
+                    previous_git_revision = Some(git.revision());
                 }
-                let pass_edits = merged_edits(edits.data.as_deref(), &last_edit);
+                let pass_edits = merged_edits(edits.data().map(|edits| &**edits), &last_edit);
                 let lifecycle_key = (
-                    git.data.as_deref().cloned(),
-                    lifecycle_metadata_key(metadata.data.as_deref()),
-                    facts_github(&github),
-                    github_fresh,
+                    confirmed_git.as_deref().cloned(),
+                    lifecycle_metadata_key(confirmed_metadata.as_deref()),
+                    fresh_github.as_deref().cloned(),
                 );
                 if lifecycle_cache_key.as_ref() != Some(&lifecycle_key) {
                     match automation_facts::lifecycle_facts(
                         &context,
-                        &git,
-                        &metadata,
-                        &facts_github(&github),
+                        confirmed_git.as_ref(),
+                        confirmed_metadata.as_ref(),
+                        fresh_github.as_ref(),
                         &context.config.automations,
                     ).await {
                         Ok(next) => {
@@ -210,13 +221,14 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     }
                 }
                 let prepared = automation_facts::prepare(&context, AutomationInputs {
-                    git: &git,
-                    metadata: &metadata,
-                    github: &github,
-                    discoveries: &sessions,
-                    inventory: &inventory,
-                    activity: &activity,
-                    board: &base_board,
+                    git: confirmed_git.as_ref(),
+                    metadata: confirmed_metadata.as_ref(),
+                    lanes_ready,
+                    github: fresh_github.as_ref(),
+                    discoveries: confirmed_sessions.as_ref(),
+                    inventory: confirmed_inventory.as_ref(),
+                    activity: activity.data().map(|activity| &**activity),
+                    board: base_board.data().map(|board| &**board),
                     last_edit_at_ms: &pass_edits,
                     rules: &context.config.automations,
                     lifecycle: &lifecycle_cache,
@@ -244,22 +256,22 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 continue;
             }
             let Some(facts) = facts.as_mut() else { continue; };
-            let current_edits = merged_edits(edits.data.as_deref(), &last_edit);
+            let current_edits = merged_edits(edits.data().map(|edits| &**edits), &last_edit);
             automation_facts::refresh_quiescence_edits(
                 facts,
                 &current_edits,
-                activity.data.as_deref(),
+                activity.data().map(|activity| &**activity),
             );
             for (branch, tip) in &mut facts.context.branch_tips {
                 if let Some(seen) = persisted_tips.get(branch) { tip.seen = Some(seen.clone()); }
             }
-            automation_facts::refresh_sessions(facts, sessions.data.as_deref(), inventory.data.as_deref());
-            if requirements_board_revision != Some(base_board.revision) {
-                automation_facts::refresh_requirements(&context, facts, base_board.data.as_deref());
-                requirements_board_revision = Some(base_board.revision);
+            automation_facts::refresh_sessions(facts, confirmed_sessions.as_ref(), confirmed_inventory.as_ref());
+            if requirements_board_revision != Some(base_board.revision()) {
+                automation_facts::refresh_requirements(&context, facts, base_board.data().map(|board| &**board));
+                requirements_board_revision = Some(base_board.revision());
             }
             facts.context.now_ms = now_ms();
-            facts.context.github_fresh = github.state == SourceState::Ready && github.updated_at.is_some_and(|at| at.elapsed() <= Duration::from_secs(90));
+            facts.context.github_fresh = fresh_github.is_some();
             let pass = pass_input(&context, facts, facts.context.now_ms);
             let tick = match engine.tick(pass).await {
                 Ok(tick) => tick,
@@ -267,8 +279,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             };
             for claim in tick.claims {
                 let context = context.clone();
-                let github = facts_github(&github);
-                let board = base_board.data.as_deref().cloned();
+                let github = fresh_github.clone();
+                let board = base_board.data().map(|board| (**board).clone());
                 dispatches.spawn(async move { dispatch_claim(context, claim, github, board).await });
             }
             let _ = status_tx.send((tick.pending, latest_error.clone()));
@@ -305,7 +317,7 @@ fn passthrough(scope: &TaskScope, board: SourceHandle<Board>) -> AutomationHandl
 async fn dispatch_claim(
     context: AppContext,
     claim: ClaimedFire,
-    github: wt_github::GithubData,
+    github: Option<Confirmed<wt_github::GithubData>>,
     board: Option<Board>,
 ) -> (ClaimedFire, AutomationOutcome, Option<String>) {
     let fire = claim.fire().clone();
@@ -336,8 +348,13 @@ async fn dispatch_claim(
         }
     } else {
         (
-            crate::action_dispatch::dispatch_automation(&context, &fire, &github, board.as_ref())
-                .await,
+            crate::action_dispatch::dispatch_automation(
+                &context,
+                &fire,
+                github.as_ref(),
+                board.as_ref(),
+            )
+            .await,
             None,
         )
     };
@@ -349,12 +366,12 @@ fn overlay(
     input: SourceHandle<Board>,
     mut status_rx: watch::Receiver<(usize, Option<String>)>,
 ) -> SourceHandle<Board> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "automations");
     let cancel = scope.token();
     let mut updates = input.subscribe();
     scope.spawn(async move {
         updates.mark_changed();
-        let mut previous: Option<(Board, SourceState)> = None;
+        let mut previous: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -369,7 +386,7 @@ fn overlay(
             }
             let snapshot = updates.borrow_and_update().clone();
             let (pending, error) = status_rx.borrow_and_update().clone();
-            let Some(mut board) = snapshot.data.as_deref().cloned() else {
+            let Some(mut board) = snapshot.data().map(|board| (**board).clone()) else {
                 continue;
             };
             board.activity.retain(|line| {
@@ -395,15 +412,15 @@ fn overlay(
                     &format!("Automation error: {error}"),
                 );
             }
-            if previous.as_ref() != Some(&(board.clone(), snapshot.state.clone())) {
-                let state = snapshot.state.clone();
-                publisher.publish(SourceSnapshot {
-                    data: Some(Arc::new(board.clone())),
-                    state,
-                    updated_at: snapshot.updated_at,
-                    revision: 0,
-                });
-                previous = Some((board, snapshot.state));
+            // The status lines are derived from the board's own inputs, so
+            // the board keeps its provenance. Stamps alone never republish.
+            let next = snapshot.derive(Some(Arc::new(board)));
+            if previous
+                .as_ref()
+                .is_none_or(|previous| !previous.same_view(&next))
+            {
+                publisher.publish(next.clone());
+                previous = Some(next);
             }
         }
     });
@@ -426,18 +443,6 @@ fn pass_input<'a>(
         requirements: &facts.requirements,
         quiescence: &facts.quiescence,
         activity: &facts.activity,
-    }
-}
-
-fn facts_github(snapshot: &SourceSnapshot<wt_github::GithubData>) -> wt_github::GithubData {
-    if snapshot.state == SourceState::Ready
-        && snapshot
-            .updated_at
-            .is_some_and(|at| at.elapsed() <= Duration::from_secs(90))
-    {
-        snapshot.data.as_deref().cloned().unwrap_or_default()
-    } else {
-        wt_github::GithubData::default()
     }
 }
 
@@ -542,26 +547,24 @@ mod tests {
     #[tokio::test]
     async fn passthrough_keeps_board_refresh_and_stops_command_responder() {
         let scope = TaskScope::new();
-        let (board, publisher) = source_channel();
-        publisher.publish(SourceSnapshot {
-            data: Some(Arc::new(Board::default())),
-            state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
-            revision: 1,
-        });
+        let (board, publisher) = derived_channel(&scope, "board");
+        publisher.publish(SourceSnapshot::test_live(
+            Some(Board::default()),
+            SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         let handle = passthrough(&scope, board.clone());
         let mut updates = handle.board.subscribe();
-        assert_eq!(updates.borrow().revision, 1);
+        assert_eq!(updates.borrow().revision(), 1);
         assert_eq!(handle.commands.cancel_pending().await.unwrap(), 0);
-        publisher.publish(SourceSnapshot {
-            data: Some(Arc::new(Board::default())),
-            state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
-            revision: 2,
-        });
+        publisher.publish(SourceSnapshot::test_live(
+            Some(Board::default()),
+            SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         tokio::time::timeout(
             Duration::from_secs(1),
-            updates.wait_for(|snapshot| snapshot.revision == 2),
+            updates.wait_for(|snapshot| snapshot.revision() == 2),
         )
         .await
         .unwrap()

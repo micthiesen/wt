@@ -78,7 +78,6 @@ impl Model {
 mod tests {
     use super::*;
     use crate::Board;
-    use std::sync::Arc;
     use wt_runtime::{SourceSnapshot, SourceState};
 
     #[test]
@@ -94,22 +93,22 @@ mod tests {
             }],
             ..Default::default()
         };
-        model.apply(SourceSnapshot {
-            data: Some(Arc::new(board)),
-            state: SourceState::Ready,
-            ..Default::default()
-        });
+        model.apply(SourceSnapshot::test_live(
+            Some(board),
+            SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         model.selected = Some(0);
         assert!(model.selected_row().is_none());
         assert!(
             matches!(model.input(KeyEvent::from(KeyCode::Char('w')), 20),
             InputResult::Action(UiAction::OnHost { host: Some(host), .. }) if host == "builder")
         );
-        model.apply(SourceSnapshot {
-            data: Some(model.board.clone()),
-            state: SourceState::Ready,
-            ..Default::default()
-        });
+        model.apply(SourceSnapshot::test_live(
+            Some(model.board.clone()).map(|data| (*data).clone()),
+            SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         assert_eq!(model.selected, Some(0));
         assert_eq!(
             model.input(KeyEvent::from(KeyCode::Char('t')), 20),

@@ -9,7 +9,8 @@ feature implementation. The controller owns terminal input, desktop
 applications, and board layout. Each host owns its worktrees, database, tmux
 server, and agents.
 An unavailable host keeps its last known rows with a visible error while the
-other hosts continue updating.
+other hosts continue updating. Its last snapshot is also restored at launch,
+marked `cached` until the host answers.
 
 ## Managed remotes
 

@@ -10,16 +10,18 @@ use std::{
 use wt_config::Config;
 use wt_core::DerivedState;
 use wt_github::{GithubData, PrChecks, PrReview, PullRequest};
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, BoardRow, PreparedDetailGroup, WorkPresentation};
 
+/// `github` is display-only PR data (callers pass the leaf's `view()`); its
+/// provenance joins the board's.
 pub fn overlay(
     scope: &TaskScope,
     config: Arc<Config>,
     board: SourceHandle<Board>,
     github: SourceHandle<GithubData>,
 ) -> SourceHandle<Board> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "work-presentation");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
@@ -27,7 +29,7 @@ pub fn overlay(
         board_updates.mark_changed();
         github_updates.mark_changed();
         let mut age_refresh = tokio::time::interval(Duration::from_secs(60));
-        let mut last = None;
+        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -49,27 +51,28 @@ pub fn overlay(
                 &config,
                 now_ms(),
             );
-            let visible = (prepared.data.as_deref().cloned(), prepared.state.clone());
-            if last.as_ref() != Some(&visible) {
-                last = Some(visible);
-                publisher.publish(prepared);
+            // Stamps alone do not change what the board shows.
+            if last.as_ref().is_some_and(|last| last.same_view(&prepared)) {
+                continue;
             }
+            last = Some(prepared.clone());
+            publisher.publish(prepared);
         }
     });
     source
 }
 
 fn compose(
-    mut source: SourceSnapshot<Board>,
+    source: SourceSnapshot<Board>,
     github: SourceSnapshot<GithubData>,
     config: &Config,
     now_ms: i64,
 ) -> SourceSnapshot<Board> {
-    let Some(prepared) = source.data.as_ref() else {
+    let Some(prepared) = source.data() else {
         return source;
     };
     let mut board = prepared.as_ref().clone();
-    let data = github.data.as_deref();
+    let data = github.data().map(Arc::as_ref);
     for row in &mut board.rows {
         row.pr = data
             .and_then(|data| {
@@ -86,7 +89,7 @@ fn compose(
                 presentation.comments = comments(pr, now_ms);
                 Some(presentation)
             })
-            .or_else(|| match &github.state {
+            .or_else(|| match github.state() {
                 SourceState::Failed(error) => Some(wt_tui::PrPresentation {
                     error: Some(clean(error)),
                     ..Default::default()
@@ -102,8 +105,7 @@ fn compose(
         row.detail_groups = detail_groups(row, config);
     }
     crate::board_layout::refresh_rollups(&mut board);
-    source.data = Some(Arc::new(board));
-    source
+    source.with_data(Some(Arc::new(board))).with_input(&github)
 }
 
 /// The inventory's prose copy of the typed `automations_paused` flag.

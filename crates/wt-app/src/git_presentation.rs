@@ -12,13 +12,16 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{fs, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 use wt_github::{GithubData, PullRequest};
 use wt_platform::process::CommandSpec;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    DiskCache, Domain, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot, SourceSpec,
+    SourceState, Stamp, TaskScope, derived_channel, leaf_channel,
+};
 use wt_tui::{Board, GitPresentation, LandingKind};
 use wt_vcs::WorktreeSnapshot;
 
@@ -56,13 +59,13 @@ struct ActivityAnchors {
     conflict_pair: Option<(String, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitFact {
     identity: FactIdentity,
     presentation: GitPresentation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct FactIdentity {
     path: String,
     branch: String,
@@ -72,7 +75,7 @@ struct FactIdentity {
     pr: Option<PrIdentity>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PrIdentity {
     number: u64,
     title: String,
@@ -139,6 +142,18 @@ struct CachedRow {
     anchors: ActivityAnchors,
 }
 
+/// The facts survive restarts as restored display data. A restored fact only
+/// applies to a row whose current identity (path, branch, HEAD, base, PR)
+/// still matches, so stale facts never attach to a changed worktree.
+fn facts_spec(context: &AppContext) -> SourceSpec<PresentationMap> {
+    SourceSpec {
+        name: "git-presentation",
+        domain: Domain::Presentation,
+        persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+        policy: RefreshPolicy::default(),
+    }
+}
+
 /// Start the host-local facts lane. It consumes prepared inputs and performs
 /// bounded Git work off the input/render path; it never refreshes Git itself.
 pub fn start(
@@ -148,7 +163,7 @@ pub fn start(
     metadata: SourceHandle<Metadata>,
     github: SourceHandle<GithubData>,
 ) -> SourceHandle<PresentationMap> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = leaf_channel(scope, facts_spec(context));
     let cancellation = scope.token();
     let context = context.clone();
     scope.spawn(async move {
@@ -189,28 +204,20 @@ pub fn start(
                 _ = activity_tick.tick() => {},
             }
 
+            let observed = Stamp::now();
             let git_snapshot = git_updates.borrow_and_update().clone();
             let metadata_snapshot = metadata_updates.borrow_and_update().clone();
             let github_snapshot = github_updates.borrow_and_update().clone();
-            let Some(rows) = git_snapshot.data.as_deref() else {
-                publisher.publish(SourceSnapshot {
-                    data: last_published.clone().map(Arc::new),
-                    state: git_snapshot.state.clone(),
-                    updated_at: git_snapshot.updated_at,
-                    revision: 0,
-                });
+            // Without inputs the last facts (live or restored) stay shown.
+            let Some(rows) = git_snapshot.data().map(Arc::as_ref) else {
+                publisher.set_state(git_snapshot.state().clone());
                 continue;
             };
-            let Some((state, _)) = metadata_snapshot.data.as_deref() else {
-                publisher.publish(SourceSnapshot {
-                    data: last_published.clone().map(Arc::new),
-                    state: metadata_snapshot.state.clone(),
-                    updated_at: metadata_snapshot.updated_at,
-                    revision: 0,
-                });
+            let Some((state, _)) = metadata_snapshot.data().map(Arc::as_ref) else {
+                publisher.set_state(metadata_snapshot.state().clone());
                 continue;
             };
-            let prs = github_snapshot.data.as_deref();
+            let prs = github_snapshot.data().map(Arc::as_ref);
             let mut keyed = Vec::with_capacity(rows.len());
             let mut ticked = Vec::new();
             for row in rows.iter().filter(|row| !row.worktree.is_main) {
@@ -267,14 +274,19 @@ pub fn start(
                 .collect::<std::collections::HashSet<_>>();
             cache.retain(|key, _| current_keys.contains(key));
 
+            // Drop facts for changed rows before awaiting their probes. The
+            // first pass has nothing live to retain; restored facts stay shown
+            // until it completes (rows they no longer match are ignored).
             let retained = presentation_map(&cache);
-            if last_published.as_ref() != Some(&retained) {
-                publisher.publish(SourceSnapshot {
-                    data: Some(Arc::new(retained.clone())),
-                    state: SourceState::Refreshing,
-                    updated_at: git_snapshot.updated_at,
-                    revision: 0,
-                });
+            if last_published
+                .as_ref()
+                .is_some_and(|published| *published != retained)
+            {
+                publisher.publish_live_with_state(
+                    retained.clone(),
+                    observed,
+                    SourceState::Refreshing,
+                );
                 last_published = Some(retained);
                 last_state = Some(SourceState::Refreshing);
             }
@@ -370,9 +382,9 @@ pub fn start(
 
             let presentation = presentation_map(&cache);
             let mut state = match (
-                &git_snapshot.state,
-                &metadata_snapshot.state,
-                &github_snapshot.state,
+                git_snapshot.state(),
+                metadata_snapshot.state(),
+                github_snapshot.state(),
             ) {
                 (SourceState::Failed(error), _, _) => {
                     SourceState::Failed(format!("Git: {error}").into())
@@ -403,21 +415,13 @@ pub fn start(
             }
             if last_published.as_ref() != Some(&presentation) || last_state.as_ref() != Some(&state)
             {
-                publisher.publish(SourceSnapshot {
-                    data: Some(Arc::new(presentation.clone())),
-                    state: state.clone(),
-                    updated_at: git_snapshot
-                        .updated_at
-                        .or(metadata_snapshot.updated_at)
-                        .or(github_snapshot.updated_at),
-                    revision: 0,
-                });
+                publisher.publish_live_with_state(presentation.clone(), observed, state.clone());
                 last_published = Some(presentation);
                 last_state = Some(state);
             }
         }
     });
-    source
+    source.view()
 }
 
 /// Attach Git facts to rows by stable target key. Remote rows without a local
@@ -431,7 +435,7 @@ pub fn overlay(
     github: SourceHandle<GithubData>,
     configured_base: String,
 ) -> SourceHandle<Board> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "git-presentation-board");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
@@ -444,8 +448,7 @@ pub fn overlay(
         git_updates.mark_changed();
         metadata_updates.mark_changed();
         github_updates.mark_changed();
-        let mut last_board: Option<Board> = None;
-        let mut last_state: Option<SourceState> = None;
+        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -474,31 +477,31 @@ pub fn overlay(
             // Facts supplement a prepared board. Their first Git probes may
             // take seconds, so their absence or failure must never hold back
             // metadata, titles, or the rest of the base rows.
-            let prepared = base.data.as_ref().map(|base| {
+            let prepared = base.data().map(|base| {
                 let mut prepared = base.as_ref().clone();
-                if let Some(facts) = fact_snapshot.data.as_deref() {
+                if let Some(facts) = fact_snapshot.data() {
                     apply_facts(&mut prepared, facts, &current);
                 }
-                prepared
+                Arc::new(prepared)
             });
-            let state = match (&base.state, &fact_snapshot.state) {
+            let state = match (base.state(), fact_snapshot.state()) {
                 (SourceState::Failed(error), _) => SourceState::Failed(error.clone()),
                 (_, SourceState::Failed(error)) => {
                     SourceState::Failed(format!("Git presentation: {error}").into())
                 }
-                _ => base.state.clone(),
+                (state, _) => state.clone(),
             };
-            if prepared == last_board && last_state.as_ref() == Some(&state) {
+            // The base board already carries the Git, metadata and GitHub
+            // provenance that `current` was computed from.
+            let next = base
+                .with_data(prepared)
+                .with_input(&fact_snapshot)
+                .with_state(state);
+            if last.as_ref().is_some_and(|last| last.same_view(&next)) {
                 continue;
             }
-            last_board = prepared.clone();
-            last_state = Some(state.clone());
-            publisher.publish(SourceSnapshot {
-                data: prepared.map(Arc::new),
-                state,
-                updated_at: base.updated_at,
-                revision: 0,
-            });
+            last = Some(next.clone());
+            publisher.publish(next);
         }
     });
     source
@@ -525,11 +528,9 @@ fn current_identities(
     github: &SourceSnapshot<GithubData>,
     configured_base: &str,
 ) -> HashMap<String, FactIdentity> {
-    let (Some(rows), Some((state, _)), Some(github_data)) = (
-        git.data.as_deref(),
-        metadata.data.as_deref(),
-        github.data.as_deref(),
-    ) else {
+    let (Some(rows), Some((state, _)), Some(github_data)) =
+        (git.data(), metadata.data().map(Arc::as_ref), github.data())
+    else {
         return HashMap::new();
     };
     rows.iter()
@@ -1418,10 +1419,10 @@ fn parse_unmerged_paths(bytes: &[u8]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use super::*;
-    use wt_runtime::{SourceSnapshot, source_channel};
+    use wt_runtime::{DerivedPublisher, SourceSnapshot};
     use wt_tui::BoardRow;
 
     #[test]
@@ -1786,11 +1787,11 @@ mod tests {
     #[tokio::test]
     async fn overlay_publishes_board_without_waiting_for_git_facts() {
         let scope = TaskScope::new();
-        let (board_input, board_publisher) = source_channel();
-        let (facts_input, _facts_publisher) = source_channel();
-        let (git_input, _git_publisher) = source_channel();
-        let (metadata_input, _metadata_publisher) = source_channel();
-        let (github_input, _github_publisher) = source_channel();
+        let (board_input, board_publisher) = derived_channel(&scope, "test-board");
+        let (facts_input, _facts_publisher) = derived_channel(&scope, "test-facts");
+        let (git_input, _git_publisher) = derived_channel(&scope, "test-git");
+        let (metadata_input, _metadata_publisher) = derived_channel(&scope, "test-metadata");
+        let (github_input, _github_publisher) = derived_channel(&scope, "test-github");
         let output = overlay(
             &scope,
             board_input.clone(),
@@ -1802,31 +1803,29 @@ mod tests {
         );
         let mut updates = output.subscribe();
 
-        let publish_board =
-            |publisher: &wt_runtime::SourcePublisher<Board>, title: &str, head: &str| {
-                publisher.publish(SourceSnapshot {
-                    data: Some(Arc::new(Board {
-                        rows: vec![BoardRow {
-                            key: "alpha".into(),
-                            title: title.into(),
-                            git: GitPresentation {
-                                head_sha: Some(head.into()),
-                                ..GitPresentation::default()
-                            },
-                            ..BoardRow::default()
-                        }],
-                        ..Board::default()
-                    })),
-                    state: SourceState::Ready,
-                    updated_at: Some(tokio::time::Instant::now()),
-                    revision: 0,
-                });
-            };
+        let publish_board = |publisher: &DerivedPublisher<Board>, title: &str, head: &str| {
+            publisher.publish(SourceSnapshot::test_live(
+                Some(Board {
+                    rows: vec![BoardRow {
+                        key: "alpha".into(),
+                        title: title.into(),
+                        git: GitPresentation {
+                            head_sha: Some(head.into()),
+                            ..GitPresentation::default()
+                        },
+                        ..BoardRow::default()
+                    }],
+                    ..Board::default()
+                }),
+                SourceState::Ready,
+                Domain::Git,
+            ));
+        };
         publish_board(&board_publisher, "first title", "old-head");
         tokio::time::timeout(
             Duration::from_secs(1),
             updates.wait_for(|snapshot| {
-                snapshot.data.as_ref().is_some_and(|board| {
+                snapshot.data().is_some_and(|board| {
                     board
                         .rows
                         .first()
@@ -1842,7 +1841,7 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(1),
             updates.wait_for(|snapshot| {
-                snapshot.data.as_ref().is_some_and(|board| {
+                snapshot.data().is_some_and(|board| {
                     board.rows.first().is_some_and(|row| {
                         row.title == "updated title"
                             && row.git.head_sha.as_deref() == Some("new-head")
@@ -1854,10 +1853,52 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let current = updates.borrow().data.as_ref().unwrap().rows[0].clone();
+        let current = updates.borrow().data().unwrap().rows[0].clone();
         assert_eq!(current.title, "updated title");
         assert_eq!(current.git.head_sha.as_deref(), Some("new-head"));
         assert_eq!(current.git.landed_on, None);
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn git_presentation_facts_meet_the_persisted_source_contract() {
+        let sample = PresentationMap::from([(
+            "feature-one".to_owned(),
+            GitFact {
+                identity: FactIdentity {
+                    path: "/repo/worktrees/feature-one".into(),
+                    branch: "feature/one".into(),
+                    head: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".into()),
+                    base_branch: "main".into(),
+                    base_sha: Some("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into()),
+                    pr: Some(PrIdentity {
+                        number: 812,
+                        title: "Batch GitHub reads".into(),
+                        head_oid: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".into()),
+                        state: "OPEN".into(),
+                        base: "main".into(),
+                        merge_oid: None,
+                    }),
+                },
+                presentation: GitPresentation {
+                    head_sha: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".into()),
+                    pr_title: Some("Batch GitHub reads".into()),
+                    first_commit_title: Some("Batch reads by chunk".into()),
+                    base_conflicts: Some(Vec::new()),
+                    diff: Some(wt_tui::DiffStat {
+                        files: 4,
+                        added: 120,
+                        removed: 14,
+                    }),
+                    last_commit_ms: Some(1_760_000_000_000),
+                    created_ms: Some(1_759_900_000_000),
+                    base_ahead: Some(3),
+                    base_behind: Some(1),
+                    ..GitPresentation::default()
+                },
+            },
+        )]);
+        wt_runtime::conformance::persisted_source("git-presentation", Domain::Presentation, sample)
+            .await;
     }
 }

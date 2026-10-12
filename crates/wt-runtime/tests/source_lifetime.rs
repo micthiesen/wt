@@ -4,21 +4,29 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use wt_runtime::{RefreshPolicy, SourceState, TaskScope, start_source};
+use wt_runtime::{
+    Domain, Persistence, RefreshPolicy, SourceSpec, SourceState, TaskScope, start_source,
+};
+
+fn spec<T>(policy: RefreshPolicy) -> SourceSpec<T> {
+    SourceSpec {
+        name: "test",
+        domain: Domain::Git,
+        persistence: Persistence::Never("test fixture"),
+        policy,
+    }
+}
 
 #[tokio::test]
 async fn projected_snapshots_do_not_request_fetches_and_explicit_requests_coalesce() {
-    let (source, mut publisher) = wt_runtime::source_channel();
+    let scope = TaskScope::new();
+    let (source, mut publisher) = wt_runtime::derived_channel(&scope, "test");
     for revision in 1..=20 {
-        publisher.publish(wt_runtime::SourceSnapshot {
-            data: Some(Arc::new(revision)),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 0,
-        });
+        publisher
+            .publish(wt_runtime::SourceSnapshot::default().with_data(Some(Arc::new(revision))));
     }
-    assert_eq!(source.snapshot().revision, 20);
-    assert_eq!(source.snapshot().data.as_deref(), Some(&20));
+    assert_eq!(source.snapshot().revision(), 20);
+    assert_eq!(source.snapshot().data().map(|d| **d), Some(20));
     assert!(
         tokio::time::timeout(Duration::ZERO, publisher.requested())
             .await
@@ -41,7 +49,7 @@ async fn projected_snapshots_do_not_request_fetches_and_explicit_requests_coales
 async fn idle_sources_do_no_work_and_failures_keep_successful_data() {
     let scope = TaskScope::new();
     let calls = Arc::new(AtomicUsize::new(0));
-    let source = start_source(&scope, RefreshPolicy::default(), {
+    let source = start_source(&scope, spec(RefreshPolicy::default()), {
         let calls = calls.clone();
         move |_| {
             let index = calls.fetch_add(1, Ordering::SeqCst);
@@ -53,18 +61,21 @@ async fn idle_sources_do_no_work_and_failures_keep_successful_data() {
     source.refresh();
     let mut updates = source.subscribe();
     updates
-        .wait_for(|s| s.state == SourceState::Ready)
+        .wait_for(|s| *s.state() == SourceState::Ready)
         .await
         .unwrap();
     let first = source.snapshot();
     source.refresh();
     updates
-        .wait_for(|s| matches!(s.state, SourceState::Failed(_)))
+        .wait_for(|s| matches!(s.state(), SourceState::Failed(_)))
         .await
         .unwrap();
     let failed = source.snapshot();
-    assert_eq!(failed.data.as_deref(), Some(&42));
-    assert_eq!(failed.updated_at, first.updated_at);
+    assert_eq!(failed.data().map(|d| **d), Some(42));
+    assert_eq!(
+        failed.domains()[&Domain::Git].observed(),
+        first.domains()[&Domain::Git].observed()
+    );
     scope.shutdown(Duration::from_secs(1)).await.unwrap();
     assert!(!source.refresh());
 }
@@ -73,7 +84,7 @@ async fn idle_sources_do_no_work_and_failures_keep_successful_data() {
 async fn bursts_have_one_trailing_refresh_and_never_overlap() {
     let scope = TaskScope::new();
     let calls = Arc::new(AtomicUsize::new(0));
-    let source = start_source(&scope, RefreshPolicy::default(), {
+    let source = start_source(&scope, spec(RefreshPolicy::default()), {
         let calls = calls.clone();
         move |_| {
             let n = calls.fetch_add(1, Ordering::SeqCst);
@@ -104,10 +115,10 @@ async fn continuous_invalidations_do_not_starve_a_scheduled_refresh() {
     let calls = Arc::new(AtomicUsize::new(0));
     let source = start_source(
         &scope,
-        RefreshPolicy {
+        spec(RefreshPolicy {
             minimum_interval: Duration::from_secs(10),
             debounce: Duration::from_secs(1),
-        },
+        }),
         {
             let calls = calls.clone();
             move |_| {
@@ -134,7 +145,7 @@ async fn continuous_invalidations_do_not_starve_a_scheduled_refresh() {
 async fn shutdown_waits_for_cancellation_cleanup() {
     let scope = TaskScope::new();
     let cleaned = Arc::new(AtomicUsize::new(0));
-    let source = start_source(&scope, RefreshPolicy::default(), {
+    let source = start_source(&scope, spec(RefreshPolicy::default()), {
         let cleaned = cleaned.clone();
         move |cancel| {
             let cleaned = cleaned.clone();
@@ -157,7 +168,7 @@ async fn shutdown_waits_for_cancellation_cleanup() {
 async fn factory_and_future_panics_are_visible_and_the_source_can_recover() {
     let scope = TaskScope::new();
     let mut calls = 0;
-    let source = start_source(&scope, RefreshPolicy::default(), move |_| {
+    let source = start_source(&scope, spec(RefreshPolicy::default()), move |_| {
         calls += 1;
         let call = calls;
         if call == 2 {
@@ -173,30 +184,33 @@ async fn factory_and_future_panics_are_visible_and_the_source_can_recover() {
     let mut updates = source.subscribe();
     source.refresh();
     updates
-        .wait_for(|s| s.state == SourceState::Ready)
+        .wait_for(|s| *s.state() == SourceState::Ready)
         .await
         .unwrap();
     let first = source.snapshot();
     for expected in ["factory failure", "future failure"] {
-        let revision = source.snapshot().revision;
+        let revision = source.snapshot().revision();
         assert!(source.refresh());
         updates
-            .wait_for(|s| s.revision > revision && matches!(s.state, SourceState::Failed(_)))
+            .wait_for(|s| s.revision() > revision && matches!(s.state(), SourceState::Failed(_)))
             .await
             .unwrap();
         let failed = source.snapshot();
-        assert_eq!(failed.data.as_deref(), Some(&1));
-        assert_eq!(failed.updated_at, first.updated_at);
+        assert_eq!(failed.data().map(|d| **d), Some(1));
         assert_eq!(
-            failed.state,
+            failed.domains()[&Domain::Git].observed(),
+            first.domains()[&Domain::Git].observed()
+        );
+        assert_eq!(
+            *failed.state(),
             SourceState::Failed(format!("background source panicked: {expected}").into())
         );
     }
     assert!(source.refresh());
     updates
-        .wait_for(|s| s.state == SourceState::Ready)
+        .wait_for(|s| *s.state() == SourceState::Ready)
         .await
         .unwrap();
-    assert_eq!(source.snapshot().data.as_deref(), Some(&4));
+    assert_eq!(source.snapshot().data().map(|d| **d), Some(4));
     scope.shutdown(Duration::from_secs(1)).await.unwrap();
 }

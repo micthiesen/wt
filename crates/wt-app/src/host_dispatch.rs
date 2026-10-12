@@ -270,8 +270,7 @@ pub async fn execute(
             && let Some(remote) = remote
         {
             let row = snapshot
-                .data
-                .as_ref()
+                .data()
                 .and_then(|board| board.rows.iter().find(|row| row.key == *key))
                 .context("remote worktree metadata is still loading")?;
             let uri = crate::editor::remote_uri(&remote.endpoint.host, &row.path)?;
@@ -284,8 +283,10 @@ pub async fn execute(
             crate::controller_actions::execute(
                 context,
                 action,
-                snapshot.data.as_deref(),
-                &wt_github::GithubData::default(),
+                snapshot.data().map(|board| board.as_ref()),
+                // The controller owns no GitHub leaf; these actions act on
+                // local presentation and durable state only.
+                None,
             )
             .await?
         };

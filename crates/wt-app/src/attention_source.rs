@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use wt_dev::DevStatusRow;
 use wt_github::{GithubClient, GithubData, GithubOptions, PrComment};
 use wt_harness::DerivedState;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::Board;
 
 use crate::{
@@ -43,7 +43,7 @@ pub fn overlay(
     board: SourceHandle<Board>,
     sources: AttentionSources,
 ) -> SourceHandle<Board> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "attention-board");
     let cancel = scope.token();
     let github_enabled = std::env::var("WT_GITHUB").as_deref() != Ok("off");
     let github_client = GithubClient::new(
@@ -101,24 +101,23 @@ pub fn overlay(
         let mut login: Option<String> = None;
         let mut login_reply: Option<oneshot::Receiver<Result<String, String>>> = None;
         let mut login_attempted_revision = None;
-        let mut last_projection: Option<(Option<Arc<Board>>, SourceState)> = None;
+        let mut last_projection: Option<SourceSnapshot<Board>> = None;
 
         loop {
             if github_enabled
                 && login.is_none()
                 && login_reply.is_none()
-                && matches!(github.borrow().state, SourceState::Ready)
+                && matches!(github.borrow().state(), SourceState::Ready)
                 && github
                     .borrow()
-                    .data
-                    .as_ref()
+                    .data()
                     .is_some_and(|data| has_comments(data.as_ref()))
-                && login_attempted_revision != Some(github.borrow().revision)
+                && login_attempted_revision != Some(github.borrow().revision())
             {
                 let (reply, result) = oneshot::channel();
                 if login_tx.as_ref().is_some_and(|sender| sender.try_send(reply).is_ok()) {
                     login_reply = Some(result);
-                    login_attempted_revision = Some(github.borrow().revision);
+                    login_attempted_revision = Some(github.borrow().revision());
                 }
             }
 
@@ -163,8 +162,7 @@ pub fn overlay(
             observe_metadata(&mut transitions, &metadata_snapshot);
             observe_issues(&mut transitions, &issue_snapshot);
             let visible = board_snapshot
-                .data
-                .as_deref()
+                .data()
                 .map(|board| {
                     board
                         .rows
@@ -183,20 +181,29 @@ pub fn overlay(
                     &mut transitions,
                     &github_snapshot,
                     viewer,
-                    board_snapshot.data.as_deref(),
+                    board_snapshot.data().map(Arc::as_ref),
                 );
             }
 
             let seen_ms = metadata_snapshot
-                .data
-                .as_deref()
-                .and_then(|(state, _)| state.get("attentionSeenTs"))
+                .data()
+                .and_then(|metadata| metadata.0.get("attentionSeenTs"))
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
-            let projection = compose(board_snapshot, &transitions.events, seen_ms);
-            let key = (projection.data.clone(), projection.state.clone());
-            if last_projection.as_ref() != Some(&key) {
-                last_projection = Some(key);
+            let mut projection = compose(board_snapshot, &transitions.events, seen_ms)
+                .with_input(&metadata_snapshot)
+                .with_input(&github_snapshot)
+                .with_input(&issue_snapshot)
+                .with_input(&manager_snapshot);
+            if let Some(dev_snapshot) = dev_snapshot.as_ref() {
+                projection = projection.with_input(dev_snapshot);
+            }
+            // Stamps alone do not change what the board shows.
+            if !last_projection
+                .as_ref()
+                .is_some_and(|last| last.same_view(&projection))
+            {
+                last_projection = Some(projection.clone());
                 publisher.publish(projection);
             }
         }
@@ -205,11 +212,11 @@ pub fn overlay(
 }
 
 fn compose(
-    mut board: SourceSnapshot<Board>,
+    board: SourceSnapshot<Board>,
     events: &VecDeque<wt_tui::AttentionLine>,
     seen_ms: u64,
 ) -> SourceSnapshot<Board> {
-    let Some(existing) = board.data.as_ref() else {
+    let Some(existing) = board.data() else {
         return board;
     };
     let mut prepared = existing.as_ref().clone();
@@ -225,22 +232,21 @@ fn compose(
     }
     prepared.attention_seen_ms = seen_ms;
     crate::activity_source::bound_feeds(&mut prepared);
-    board.data = Some(Arc::new(prepared));
-    board
+    board.with_data(Some(Arc::new(prepared)))
 }
 
 fn observe_metadata(tracker: &mut TransitionTracker, snapshot: &SourceSnapshot<Metadata>) {
-    if !matches!(snapshot.state, SourceState::Ready) {
+    if !matches!(snapshot.state(), SourceState::Ready) {
         return;
     }
-    if let Some((state, _)) = snapshot.data.as_deref() {
+    if let Some((state, _)) = snapshot.data().map(Arc::as_ref) {
         tracker.metadata(state);
     }
 }
 
 fn observe_issues(tracker: &mut TransitionTracker, snapshot: &SourceSnapshot<StatusBatch>) {
-    if matches!(snapshot.state, SourceState::Ready)
-        && let Some(batch) = snapshot.data.as_deref()
+    if matches!(snapshot.state(), SourceState::Ready)
+        && let Some(batch) = snapshot.data().map(Arc::as_ref)
     {
         tracker.issue_statuses(batch);
     }
@@ -251,16 +257,16 @@ fn observe_dev(
     snapshot: &SourceSnapshot<Vec<DevStatusRow>>,
     visible: &BTreeSet<&str>,
 ) {
-    if matches!(snapshot.state, SourceState::Ready)
-        && let Some(rows) = snapshot.data.as_deref()
+    if matches!(snapshot.state(), SourceState::Ready)
+        && let Some(rows) = snapshot.data().map(Arc::as_ref)
     {
         tracker.dev_status(rows, visible);
     }
 }
 
 fn observe_manager(tracker: &mut TransitionTracker, snapshot: &SourceSnapshot<SessionDiscoveries>) {
-    if matches!(snapshot.state, SourceState::Ready)
-        && let Some(discoveries) = snapshot.data.as_deref()
+    if matches!(snapshot.state(), SourceState::Ready)
+        && let Some(discoveries) = snapshot.data().map(Arc::as_ref)
     {
         tracker.manager_state(discoveries);
     }
@@ -272,8 +278,8 @@ fn observe_comments(
     viewer: &str,
     board: Option<&Board>,
 ) {
-    if matches!(snapshot.state, SourceState::Ready)
-        && let Some(data) = snapshot.data.as_deref()
+    if matches!(snapshot.state(), SourceState::Ready)
+        && let Some(data) = snapshot.data().map(Arc::as_ref)
     {
         tracker.comments(data, viewer, board);
     }
@@ -777,38 +783,35 @@ mod tests {
     #[test]
     fn failed_source_keeps_last_good_transition_baseline() {
         let mut tracker = TransitionTracker::default();
-        let first = SourceSnapshot {
-            data: Some(Arc::new(StatusBatch {
+        let first = SourceSnapshot::test_live(
+            Some(StatusBatch {
                 ids: vec!["ENG-1".into()],
                 statuses: [("ENG-1".into(), "Open".into())].into(),
-            })),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 1,
-        };
+            }),
+            SourceState::Ready,
+            wt_runtime::Domain::Issues,
+        );
         observe_issues(&mut tracker, &first);
-        let failed = SourceSnapshot {
-            data: Some(Arc::new(StatusBatch {
+        let failed = SourceSnapshot::test_live(
+            Some(StatusBatch {
                 ids: vec!["ENG-1".into()],
                 statuses: [("ENG-1".into(), "Unknown".into())].into(),
-            })),
-            state: SourceState::Failed("temporary".into()),
-            updated_at: None,
-            revision: 2,
-        };
+            }),
+            SourceState::Failed("temporary".into()),
+            wt_runtime::Domain::Issues,
+        );
         observe_issues(&mut tracker, &failed);
         assert!(tracker.events.is_empty());
         observe_issues(
             &mut tracker,
-            &SourceSnapshot {
-                data: Some(Arc::new(StatusBatch {
+            &SourceSnapshot::test_live(
+                Some(StatusBatch {
                     ids: vec!["ENG-1".into()],
                     statuses: [("ENG-1".into(), "Review".into())].into(),
-                })),
-                state: SourceState::Ready,
-                updated_at: None,
-                revision: 3,
-            },
+                }),
+                SourceState::Ready,
+                wt_runtime::Domain::Issues,
+            ),
         );
         assert!(
             tracker

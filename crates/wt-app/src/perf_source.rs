@@ -5,7 +5,10 @@ use std::{future::Future, sync::Arc, time::Duration};
 use anyhow::Result;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    Domain, Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
+    derived_channel, leaf_channel,
+};
 use wt_tui::{Board, PerfView};
 
 use crate::context::AppContext;
@@ -96,7 +99,19 @@ where
     F: Fn(CancellationToken) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<PerfSample>> + Send + 'static,
 {
-    let (perf, perf_publisher) = source_channel::<PerfSample>();
+    let (perf, perf_publisher) = leaf_channel::<PerfSample>(
+        scope,
+        SourceSpec {
+            name: "perf",
+            domain: Domain::Perf,
+            persistence: Persistence::Never("live process sampling"),
+            policy: Default::default(),
+        },
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "sampling controls, not board data"
+    )]
     let (control_tx, mut control_rx) = watch::channel(Controls::default());
     let cancellation = scope.token();
     scope.spawn(async move {
@@ -125,6 +140,7 @@ where
             }
 
             let sample_token = cancellation.child_token();
+            let observed = Stamp::now();
             let sample = sampler.clone()(sample_token.clone());
             tokio::pin!(sample);
             enum SampleResult<T> {
@@ -172,12 +188,10 @@ where
                 continue;
             }
 
-            let now = tokio::time::Instant::now();
             let (data, state) = match sampled {
                 Ok(sample) => {
-                    let data = Arc::new(sample);
-                    latest = Some(data.clone());
-                    (Some(data), SourceState::Ready)
+                    latest = Some(Arc::new(sample.clone()));
+                    (sample, SourceState::Ready)
                 }
                 Err(error) => {
                     let error_line = format!("Performance snapshot failed: {error:#}");
@@ -189,16 +203,11 @@ where
                     if let Some(view) = &mut sample.view {
                         view.error = Some(format!("{error:#}"));
                     }
-                    let data = Arc::new(sample);
-                    (Some(data), SourceState::Failed(Arc::from(error_line)))
+                    (sample, SourceState::Failed(Arc::from(error_line)))
                 }
             };
-            perf_publisher.publish(SourceSnapshot {
-                data,
-                state,
-                updated_at: Some(now),
-                revision: 0,
-            });
+            // A failed sample still shows the last report with its error line.
+            perf_publisher.publish_live_with_state(data, observed, state);
             should_sample = false;
 
             if !controls.active || !controls.continuous {
@@ -221,7 +230,7 @@ where
         }
     });
 
-    let output = overlay(scope, board, perf);
+    let output = overlay(scope, board, perf.view());
     PerfSources {
         board: output,
         commands: PerfCommands {
@@ -235,12 +244,12 @@ fn overlay(
     board: SourceHandle<Board>,
     perf: SourceHandle<PerfSample>,
 ) -> SourceHandle<Board> {
-    let (output, mut publisher) = source_channel();
+    let (output, mut publisher) = derived_channel(scope, "perf-board");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
         let mut perf_updates = perf.subscribe();
-        let mut previous: Option<(Board, SourceState)> = None;
+        let mut previous: Option<SourceSnapshot<Board>> = None;
         board_updates.mark_changed();
         loop {
             tokio::select! {
@@ -263,22 +272,27 @@ fn overlay(
             }
             let base = board_updates.borrow().clone();
             let perf_snapshot = perf_updates.borrow().clone();
-            let mut projected = base.data.as_deref().cloned().unwrap_or_default();
-            let sample = perf_snapshot.data.as_deref();
+            let mut projected = base
+                .data()
+                .map(|board| board.as_ref().clone())
+                .unwrap_or_default();
+            let sample = perf_snapshot.data().map(Arc::as_ref);
             projected.perf = sample.map_or_else(Vec::new, |sample| sample.report.clone());
             projected.perf_view = sample.and_then(|sample| sample.view.clone()).map(Box::new);
-            let state = base.state.clone();
-            let key = (projected.clone(), state.clone());
-            if previous.as_ref() == Some(&key) {
+            // The board keeps its own state; the sample's provenance and
+            // stamps (formerly `updated_at`) travel in the perf domain.
+            let next = base
+                .derive(Some(Arc::new(projected)))
+                .with_input(&perf_snapshot);
+            // Stamps alone do not change what the board shows.
+            if previous
+                .as_ref()
+                .is_some_and(|previous| previous.same_view(&next))
+            {
                 continue;
             }
-            previous = Some(key);
-            publisher.publish(SourceSnapshot {
-                data: Some(Arc::new(projected)),
-                state,
-                updated_at: base.updated_at,
-                revision: 0,
-            });
+            previous = Some(next.clone());
+            publisher.publish(next);
         }
     });
     output
@@ -291,18 +305,17 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use wt_runtime::{SourceState, source_channel};
+    use wt_runtime::{Domain, SourceState, derived_channel};
 
     #[tokio::test]
     async fn remains_dormant_until_open_and_stops_sampling_when_closed() {
         let scope = TaskScope::new();
-        let (board, board_writer) = source_channel();
-        board_writer.publish(SourceSnapshot {
-            data: Some(Arc::new(Board::default())),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 0,
-        });
+        let (board, board_writer) = derived_channel(&scope, "test");
+        board_writer.publish(SourceSnapshot::test_live(
+            Some(Board::default()),
+            SourceState::Ready,
+            Domain::Git,
+        ));
         let calls = Arc::new(AtomicUsize::new(0));
         let sampler_calls = calls.clone();
         let perf = start_with_sampler(&scope, board, move |_cancel| {
@@ -329,6 +342,18 @@ mod tests {
         })
         .await
         .expect("opening the overlay triggers one sample");
+        let mut board_updates = perf.board.subscribe();
+        let board = tokio::time::timeout(
+            Duration::from_secs(1),
+            board_updates.wait_for(|board| board.domains().contains_key(&Domain::Perf)),
+        )
+        .await
+        .expect("the sample reaches the board")
+        .unwrap()
+        .clone();
+        assert!(board.domains()[&Domain::Perf].is_live());
+        assert!(board.domains()[&Domain::Git].is_live());
+        assert_eq!(board.data().unwrap().perf, ["sample"]);
         perf.commands.set_active(false);
         perf.commands.set_continuous(true);
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -339,13 +364,12 @@ mod tests {
     #[tokio::test]
     async fn closing_overlay_cancels_an_in_flight_snapshot() {
         let scope = TaskScope::new();
-        let (board, board_writer) = source_channel();
-        board_writer.publish(SourceSnapshot {
-            data: Some(Arc::new(Board::default())),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 0,
-        });
+        let (board, board_writer) = derived_channel(&scope, "test");
+        board_writer.publish(SourceSnapshot::test_live(
+            Some(Board::default()),
+            SourceState::Ready,
+            Domain::Git,
+        ));
         let cancelled = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(AtomicUsize::new(0));
         let sampler_cancelled = cancelled.clone();

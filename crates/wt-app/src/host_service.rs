@@ -2,10 +2,10 @@
 //! SSH worker call this service, so commands and sources have one implementation.
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
-use wt_runtime::TaskScope;
-use wt_tui::{UiAction, UiReply};
+use wt_runtime::{Domain, SourceSnapshot, Stamp, TaskScope};
+use wt_tui::{Board, PrPin, ReplyOutcome, UiAction, UiReply};
 
-use crate::{context::AppContext, sources::BoardSources};
+use crate::{context::AppContext, github_actions::GithubAction, sources::BoardSources};
 
 pub struct HostService {
     pub context: AppContext,
@@ -22,7 +22,64 @@ impl HostService {
         Self { context, sources }
     }
 
+    /// Run one host-owned request, then refresh exactly the domains its
+    /// effect names and classify the reply for the TUI's pending engine.
     pub async fn execute(&self, command: UiAction) -> Result<UiReply> {
+        let snapshot = self.sources.board.snapshot();
+        let empty = Board::default();
+        let effect = command.effect(snapshot.data().map_or(&empty, |board| board.as_ref()));
+        let mut reply = self.run(command, &snapshot).await?;
+        self.refresh_after(&effect, &reply);
+        if !reply.failed && reply.outcome.is_none() && matches!(effect, wt_tui::Effect::Mutation(_))
+        {
+            reply.outcome = Some(ReplyOutcome::Accepted(Stamp::now()));
+        }
+        Ok(reply)
+    }
+
+    fn refresh_after(&self, effect: &wt_tui::Effect, reply: &UiReply) {
+        let mut local = false;
+        let mut board = false;
+        for domain in effect.domains() {
+            match domain {
+                Domain::Git => {
+                    self.sources.git.refresh();
+                }
+                Domain::Metadata => {
+                    self.sources.metadata.refresh();
+                }
+                // The read that may confirm an accepted write must be a
+                // direct fetch that started after it, not a daemon snapshot.
+                Domain::Github if matches!(reply.outcome, Some(ReplyOutcome::Accepted(_))) => {
+                    self.sources.refresh_github_live()
+                }
+                Domain::Github => self.sources.github_refresh.refresh(),
+                Domain::Reviews => self.sources.review_requests.refresh(),
+                Domain::Sessions => {
+                    self.sources.sessions.inventory.refresh();
+                    self.sources.sessions.discoveries.refresh();
+                }
+                Domain::Actions | Domain::Issues => board = true,
+                Domain::Activity
+                | Domain::Dev
+                | Domain::Origin
+                | Domain::Naming
+                | Domain::Presentation
+                | Domain::History
+                | Domain::Perf
+                | Domain::Automations
+                | Domain::Host => local = true,
+            }
+        }
+        if board {
+            self.sources.board.refresh();
+        }
+        if local {
+            self.sources.local.refresh();
+        }
+    }
+
+    async fn run(&self, command: UiAction, snapshot: &SourceSnapshot<Board>) -> Result<UiReply> {
         if matches!(command, UiAction::PrepareHardRefresh) {
             return Ok(UiReply {
                 modal: Some(wt_tui::UiModal::Confirm {
@@ -45,75 +102,22 @@ impl HostService {
                 ..Default::default()
             });
         }
-        let state_only = matches!(
-            command,
-            UiAction::FoldSection { .. }
-                | UiAction::MoveSection { .. }
-                | UiAction::RenameSection { .. }
-                | UiAction::SetTitle { .. }
-                | UiAction::ToggleArchive { .. }
-                | UiAction::SetStatus { .. }
-                | UiAction::SetBase { .. }
-                | UiAction::SetIssueOverride { .. }
-        );
-        let state_only = state_only
-            || matches!(
-                command,
-                UiAction::ToggleAutomations { .. }
-                    | UiAction::CancelAutomations
-                    | UiAction::ToggleRemovedAutomations { .. }
-            );
-        let read_only = matches!(
-            command,
-            UiAction::Copy { .. }
-                | UiAction::OpenEditor { .. }
-                | UiAction::OpenUrl { .. }
-                | UiAction::PrepareRemove { .. }
-                | UiAction::PrepareCleanup
-                | UiAction::PrepareStatus { .. }
-                | UiAction::PrepareBase { .. }
-                | UiAction::PrepareSection { .. }
-                | UiAction::PrepareActions { .. }
-                | UiAction::PrepareAction { .. }
-                | UiAction::GenerateTitle { .. }
-                | UiAction::PrepareCreate { .. }
-                | UiAction::PrepareGithub { .. }
-                | UiAction::PrepareRestoreRemoved { .. }
-        );
-        let read_only = read_only
-            || matches!(
-                command,
-                UiAction::PrepareSessions { .. }
-                    | UiAction::PrepareHarnesses { .. }
-                    | UiAction::PrepareStopTerminal { .. }
-            );
-        let session_changed = matches!(
-            command,
-            UiAction::StopSession { .. }
-                | UiAction::KillSession { .. }
-                | UiAction::StopTerminal { .. }
-        );
-        let created = matches!(command, UiAction::Create { .. });
-        let snapshot = self.sources.board.snapshot();
+        // Safety and identity checks read only live-fetched GitHub data; the
+        // board is display data used to resolve rows.
+        let github = self.sources.github.confirmed();
+        let github = github.as_ref();
+        let board = snapshot.data().map(|board| board.as_ref());
         if matches!(
             command,
             UiAction::PrepareReviewers { .. } | UiAction::SubmitReviewers { .. }
         ) {
-            let github = self.sources.github.snapshot();
-            let board = snapshot
-                .data
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("worktree board is still loading"))?;
-            let data = github
-                .data
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
+            let board = board.ok_or_else(|| anyhow::anyhow!("worktree board is still loading"))?;
             return match command {
                 UiAction::PrepareReviewers { key } => {
                     Box::pin(
                         self.sources
                             .github_pickers
-                            .prepare_reviewers(&key, board, data),
+                            .prepare_reviewers(&key, board, github),
                     )
                     .await
                 }
@@ -130,8 +134,7 @@ impl HostService {
                             original: &original,
                             selected: &selected,
                             board,
-                            github: data,
-                            actions: &self.sources.github_actions,
+                            github,
                         },
                     ))
                     .await
@@ -140,41 +143,38 @@ impl HostService {
             };
         }
         let github_action = match &command {
-            UiAction::GithubMarkReady { key } => {
-                Some(crate::github_actions::GithubAction::MarkReady { key: key.clone() })
-            }
-            UiAction::GithubSetAutoMerge { key, enable } => {
-                Some(crate::github_actions::GithubAction::SetAutoMerge {
-                    key: key.clone(),
-                    enable: *enable,
-                })
-            }
-            UiAction::GithubShip { key } => {
-                Some(crate::github_actions::GithubAction::Ship { key: key.clone() })
-            }
+            UiAction::GithubMarkReady { key, pin } => Some(GithubAction::MarkReady {
+                key: key.clone(),
+                pin: pin.clone(),
+            }),
+            UiAction::GithubSetAutoMerge { key, enable, pin } => Some(GithubAction::SetAutoMerge {
+                key: key.clone(),
+                enable: *enable,
+                pin: pin.clone(),
+            }),
+            UiAction::GithubShip { key, pin } => Some(GithubAction::Ship {
+                key: key.clone(),
+                pin: pin.clone(),
+            }),
             UiAction::GithubFailedChecks { key } => {
-                Some(crate::github_actions::GithubAction::FailedChecks { key: key.clone() })
+                Some(GithubAction::FailedChecks { key: key.clone() })
             }
-            UiAction::PrepareAction {
-                surface: wt_tui::ActionSurface::Row { key },
-                id,
-                ..
-            } if id == crate::action_palette::AUTO_MERGE_ID => {
-                Some(crate::github_actions::GithubAction::ToggleAutoMerge { key: key.clone() })
+            // The TUI resolves this toggle into an explicit direction from
+            // what the user saw. The host never guesses a direction.
+            UiAction::PrepareAction { id, .. } if id == wt_tui::AUTO_MERGE_ACTION_ID => {
+                return Ok(UiReply {
+                    message:
+                        "merge when ready needs an explicit arm or disarm; update wt and retry"
+                            .into(),
+                    failed: true,
+                    ..Default::default()
+                });
             }
             _ => None,
         };
         if let Some(action) = github_action {
-            let github = self.sources.github.snapshot();
-            let board = snapshot
-                .data
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("worktree board is still loading"))?;
-            let data = github
-                .data
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
-            return Box::pin(self.sources.github_actions.execute(action, board, data)).await;
+            let board = board.ok_or_else(|| anyhow::anyhow!("worktree board is still loading"))?;
+            return Box::pin(self.sources.github_actions.execute(action, board, github)).await;
         }
         let reply = match command {
             UiAction::PrepareReviewCheckout {
@@ -182,9 +182,7 @@ impl HostService {
                 updated_at,
                 branch,
             } => {
-                let row = snapshot
-                    .data
-                    .as_ref()
+                let row = board
                     .and_then(|board| {
                         board.review_requests.iter().find(|row| {
                             row.url == url && row.updated_at == updated_at && row.branch == branch
@@ -193,7 +191,7 @@ impl HostService {
                     .ok_or_else(|| {
                         anyhow::anyhow!("review request changed; refresh and select it again")
                     })?;
-                return Ok(UiReply {
+                UiReply {
                     modal: Some(wt_tui::UiModal::Confirm {
                         title: format!("Check out PR #{} for review?", row.number),
                         lines: vec![
@@ -209,7 +207,7 @@ impl HostService {
                         cancel_key: Some('w'),
                     }),
                     ..Default::default()
-                });
+                }
             }
             UiAction::ReviewCheckout {
                 url,
@@ -235,10 +233,10 @@ impl HostService {
                     .review_requests
                     .dismiss(&url, &updated_at)
                     .await?;
-                return Ok(UiReply {
+                UiReply {
                     message: "Review request dismissed until it changes".into(),
                     ..Default::default()
-                });
+                }
             }
             UiAction::PrepareRestoreRemoved { key } => {
                 Box::pin(crate::history_actions::prepare_restore(&self.context, &key)).await?
@@ -264,27 +262,23 @@ impl HostService {
                 .await?
             }
             UiAction::Restack { key } => {
-                let github = self.sources.github.snapshot();
-                let empty = wt_github::GithubData::default();
                 Box::pin(crate::restack_action::start(
                     &self.context,
                     &key,
-                    github.data.as_deref().unwrap_or(&empty),
-                    snapshot.data.as_deref(),
+                    github,
+                    board,
                 ))
                 .await?
             }
             UiAction::PrepareGithub { key, ship } => {
-                let github = self.sources.github.snapshot();
-                let row = snapshot
-                    .data
-                    .as_ref()
+                let row = board
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
                     .ok_or_else(|| anyhow::anyhow!("worktree is no longer on the board"))?;
+                let github =
+                    github.ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
                 let pr = github
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.prs.get(&row.branch))
+                    .prs
+                    .get(&row.branch)
                     .ok_or_else(|| crate::controller::notice("no PR for this row"))?;
                 if pr.state != "OPEN" {
                     anyhow::bail!("PR #{} is not open", pr.number);
@@ -301,7 +295,15 @@ impl HostService {
                     },
                     GithubPrompt::Confirm(title) => UiReply {
                         modal: Some(wt_tui::UiModal::Confirm {
-                            action: wt_tui::ConfirmAction::Github { key, ship },
+                            // The write executes only against this same PR and head.
+                            action: wt_tui::ConfirmAction::Github {
+                                key,
+                                ship,
+                                pin: Some(PrPin {
+                                    number: pr.number,
+                                    head_sha: pr.head_ref_oid.clone(),
+                                }),
+                            },
                             title,
                             lines: vec![format!("{}: {}", row.branch, pr.title)],
                             cancel_key: Some(if ship { 'E' } else { 'e' }),
@@ -332,38 +334,24 @@ impl HostService {
             action @ (UiAction::PrepareActions { .. }
             | UiAction::PrepareAction { .. }
             | UiAction::RunAction { .. }) => {
-                let github = self.sources.github.snapshot();
-                let empty = wt_github::GithubData::default();
                 Box::pin(crate::action_palette::execute(
                     &self.context,
                     action,
-                    snapshot.data.as_deref(),
-                    github.data.as_deref().unwrap_or(&empty),
+                    board,
+                    github,
                 ))
                 .await?
             }
             command => {
-                let github = self.sources.github.snapshot();
-                let empty = wt_github::GithubData::default();
                 Box::pin(crate::controller_actions::execute(
                     &self.context,
                     command,
-                    snapshot.data.as_deref(),
-                    github.data.as_deref().unwrap_or(&empty),
+                    board,
+                    github,
                 ))
                 .await?
             }
         };
-        if created && !reply.failed {
-            self.sources.git.refresh();
-            self.sources.metadata.refresh();
-        } else if session_changed {
-            self.sources.sessions.inventory.refresh();
-        } else if state_only {
-            self.sources.metadata.refresh();
-        } else if !read_only {
-            self.sources.local.refresh();
-        }
         Ok(reply)
     }
 }

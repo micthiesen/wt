@@ -23,7 +23,10 @@ use wt_harness::{
     OpenCodeActivityTracker, OpenCodeEventLevel, OpenCodeHarness, OpenCodeOutputTracker,
     OpenCodePaths, session_jsonl_path,
 };
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    Domain, Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
+    leaf_channel,
+};
 use wt_tmux::{TmuxClient, TmuxServer};
 
 use crate::{
@@ -229,7 +232,15 @@ pub fn start(
     context: &AppContext,
     sessions: &SessionSources,
 ) -> SessionActivitySources {
-    let (activity, publisher) = source_channel();
+    let (activity, publisher) = leaf_channel(
+        scope,
+        SourceSpec {
+            name: "session-activity",
+            domain: Domain::Sessions,
+            persistence: Persistence::Never("live harness transcripts"),
+            policy: Default::default(),
+        },
+    );
     let app = AppHarness::new(context);
     let paths = ClaudePaths::new(&context.home, &context.config.paths.cache_root);
     let tmux = TmuxClient::new(
@@ -250,8 +261,8 @@ pub fn start(
     let primary_fallback = context.config.harness.primary;
     let cancellation = scope.token();
     let scope_cancel = scope.token();
-    let inventory = sessions.inventory.clone();
-    let discoveries = sessions.discoveries.clone();
+    let inventory = sessions.inventory.view();
+    let discoveries = sessions.discoveries.view();
     let git = sessions.git.clone();
     let commands = sessions.commands.clone();
     scope.spawn(async move {
@@ -308,6 +319,8 @@ pub fn start(
             if scope_cancel.is_cancelled() || cancellation.is_cancelled() {
                 break;
             }
+            // The pass observes transcripts from here on.
+            let observed = Stamp::now();
             let active = active_from_sources(
                 &app,
                 git_updates.borrow().clone(),
@@ -367,18 +380,20 @@ pub fn start(
             if snapshot != last_published || last_error != last_published_error {
                 last_published_error = last_error.clone();
                 last_published = snapshot.clone();
-                publisher.publish(SourceSnapshot {
-                    data: Some(Arc::new(snapshot.clone())),
-                    state: last_error.as_ref().map_or(SourceState::Ready, |error| {
+                // Partial failures still carry the tails that did update.
+                publisher.publish_live_with_state(
+                    snapshot.clone(),
+                    observed,
+                    last_error.as_ref().map_or(SourceState::Ready, |error| {
                         SourceState::Failed(error.clone().into())
                     }),
-                    updated_at: Some(tokio::time::Instant::now()),
-                    revision: 0,
-                });
+                );
             }
         }
     });
-    SessionActivitySources { activity }
+    SessionActivitySources {
+        activity: activity.view(),
+    }
 }
 
 #[derive(Clone)]
@@ -431,17 +446,17 @@ fn active_from_sources(
     inventory: SourceSnapshot<SessionInventory>,
     discoveries: SourceSnapshot<SessionDiscoveries>,
 ) -> Vec<ActiveSession> {
-    if matches!(git.state, SourceState::Failed(_))
-        || matches!(inventory.state, SourceState::Failed(_))
-        || matches!(discoveries.state, SourceState::Failed(_))
+    if matches!(git.state(), SourceState::Failed(_))
+        || matches!(inventory.state(), SourceState::Failed(_))
+        || matches!(discoveries.state(), SourceState::Failed(_))
     {
         return Vec::new();
     }
     current_active(
         app,
-        git.data.as_deref(),
-        inventory.data.as_deref(),
-        discoveries.data.as_deref(),
+        git.data().map(Arc::as_ref),
+        inventory.data().map(Arc::as_ref),
+        discoveries.data().map(Arc::as_ref),
     )
 }
 

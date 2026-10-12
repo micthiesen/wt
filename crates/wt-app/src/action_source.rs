@@ -14,7 +14,8 @@ use wt_actions::{ActionRun, ActionRunStatus, ActionService};
 use wt_config::EffectTag;
 use wt_platform::process::ProcessStream;
 use wt_runtime::{
-    RefreshPolicy, SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel,
+    Confirmed, Domain, LeafHandle, Mutation, Pending, Persistence, RefreshPolicy, SourceHandle,
+    SourceSnapshot, SourceSpec, SourceState, Stamp, Target, TaskScope, derived_channel,
     start_source,
 };
 use wt_tui::{Board, LogView};
@@ -51,12 +52,15 @@ const TAIL_LINES: usize = 100;
 const TAIL_SEED_BYTES: usize = 64 * 1024;
 const TAIL_DELTA_BYTES: usize = 32 * 1024;
 
+/// Sources an action's declared effects refresh on completion. The issue
+/// statuses leaf also settles issue-status expectations, so it must be the
+/// confirmable leaf, not a display view.
 pub struct RefreshTargets {
-    pub git: SourceHandle<Vec<wt_vcs::WorktreeSnapshot>>,
-    pub github: SourceHandle<wt_github::GithubData>,
-    pub dev: Option<SourceHandle<Vec<wt_dev::DevStatusRow>>>,
-    pub origin: Option<SourceHandle<wt_vcs::FetchOriginReport>>,
-    pub issues: SourceHandle<StatusBatch>,
+    pub git: LeafHandle<Vec<wt_vcs::WorktreeSnapshot>>,
+    pub github: LeafHandle<wt_github::GithubData>,
+    pub dev: Option<LeafHandle<Vec<wt_dev::DevStatusRow>>>,
+    pub origin: Option<LeafHandle<wt_vcs::FetchOriginReport>>,
+    pub issues: LeafHandle<StatusBatch>,
 }
 
 impl RefreshTargets {
@@ -100,9 +104,14 @@ pub fn overlay(
     let run_reconciled = reconciled.clone();
     let runs = start_source(
         scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(50),
-            minimum_interval: Duration::from_millis(250),
+        SourceSpec {
+            name: "action-runs",
+            domain: Domain::Actions,
+            persistence: Persistence::Never("authoritative action store; read directly"),
+            policy: RefreshPolicy {
+                debounce: Duration::from_millis(50),
+                minimum_interval: Duration::from_millis(250),
+            },
         },
         move |cancel| {
             let service = run_service.clone();
@@ -127,9 +136,14 @@ pub fn overlay(
     let log_cursors = cursors.clone();
     let logs = start_source(
         scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(30),
-            minimum_interval: Duration::from_millis(250),
+        SourceSpec {
+            name: "action-logs",
+            domain: Domain::Actions,
+            persistence: Persistence::Never("log files are the source"),
+            policy: RefreshPolicy {
+                debounce: Duration::from_millis(30),
+                minimum_interval: Duration::from_millis(250),
+            },
         },
         move |_| {
             let service = log_service.clone();
@@ -137,17 +151,17 @@ pub fn overlay(
             let cursors = log_cursors.clone();
             async move {
                 let service = service.map_err(anyhow::Error::msg)?;
-                load_logs(&service, runs.data.as_deref(), &cursors).await
+                load_logs(&service, runs.data().map(Arc::as_ref), &cursors).await
             }
         },
     );
     watch(
         scope,
         context.config.paths.log_dir.join("actions"),
-        runs.clone(),
-        logs.clone(),
+        runs.view(),
+        logs.view(),
     );
-    project(scope, board, runs, logs, targets)
+    project(scope, board, runs.view(), logs.view(), targets)
 }
 
 fn watch(
@@ -344,7 +358,7 @@ fn push_tail_line(lines: &mut VecDeque<String>, label: &str, line: String) {
 }
 
 fn has_active_runs(history: &SourceSnapshot<ActionHistory>) -> bool {
-    history.data.as_ref().is_some_and(|history| {
+    history.data().is_some_and(|history| {
         history.runs.iter().any(|run| {
             matches!(
                 run.meta.status,
@@ -361,7 +375,7 @@ fn project(
     logs: SourceHandle<ActionLogs>,
     targets: RefreshTargets,
 ) -> SourceHandle<Board> {
-    let (output, mut publisher) = source_channel();
+    let (output, mut publisher) = derived_channel(scope, "action-board");
     let cancel = scope.token();
     scope.spawn(async move {
         let mut boards = board.subscribe();
@@ -372,6 +386,7 @@ fn project(
         let mut tracker = Tracker::new(epoch_ms());
         let mut last_runs = None;
         let mut last_error = None;
+        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             let next_expiry = tracker.next_expiry();
             tokio::select! {
@@ -388,10 +403,11 @@ fn project(
                 changed = updates.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = updates.borrow_and_update().clone();
-                    let error = match &snapshot.state {SourceState::Failed(error) => Some(error.clone()), _ => None};
-                    if snapshot.data == last_runs && error == last_error { continue; }
-                    last_runs = snapshot.data.clone(); last_error = error;
-                    if let Some(history) = &snapshot.data {
+                    let error = match snapshot.state() {SourceState::Failed(error) => Some(error.clone()), _ => None};
+                    let data = snapshot.data().cloned();
+                    if data == last_runs && error == last_error { continue; }
+                    last_runs = data; last_error = error;
+                    if let Some(history) = snapshot.data() {
                         for run in tracker.observe(&history.runs, tokio::time::Instant::now()) {
                             targets.completed(run);
                             tracing::info!(slug = run.meta.slug, action = run.meta.action_name, status = ?run.meta.status, "action completed");
@@ -411,29 +427,85 @@ fn project(
                     None => std::future::pending::<()>().await,
                 }} => {}
             }
-            tracker.settle(&statuses.borrow(), tokio::time::Instant::now());
-            publisher.publish(compose(
+            let now = tokio::time::Instant::now();
+            tracker.renew_running(now);
+            tracker.settle(targets.issues.confirmed().as_ref(), now);
+            let next = compose(
                 boards.borrow().clone(),
                 updates.borrow().clone(),
                 log_updates.borrow().clone(),
                 &tracker,
-            ));
+            );
+            if last.as_ref().is_some_and(|last| last.same_view(&next)) {
+                continue;
+            }
+            last = Some(next.clone());
+            publisher.publish(next);
         }
     });
     output
 }
 
-struct Expected {
+/// An action that sets an issue's status, shown on its row until the issue
+/// tracker reports it. Display-only: nothing decides on this projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IssueExpectation {
     run_id: String,
+    row_key: String,
+    issue_id: String,
     status: String,
-    completed: Option<tokio::time::Instant>,
 }
 
+impl Mutation<StatusBatch> for IssueExpectation {
+    /// The newest run for an issue replaces older ones.
+    fn key(&self) -> String {
+        self.issue_id.clone()
+    }
+
+    fn target(&self) -> Target {
+        Target::row(None, self.row_key.clone())
+    }
+
+    fn label(&self) -> String {
+        wt_core::sanitize_terminal_text(&format!("moving {} to {}", self.issue_id, self.status))
+    }
+
+    fn domains(&self) -> &'static [Domain] {
+        &[Domain::Issues]
+    }
+
+    fn apply(&self, view: &mut StatusBatch) {
+        view.statuses
+            .insert(self.issue_id.clone(), self.status.clone());
+    }
+
+    fn observed(&self, confirmed: &StatusBatch) -> bool {
+        confirmed.statuses.get(&self.issue_id) == Some(&self.status)
+    }
+}
+
+/// Completed-action attention and issue-status expectations.
+///
+/// A running run's expectation is in flight. The engine bounds in-flight
+/// entries (60s), but an action may legitimately run longer, so every pass
+/// re-begins the expectations of runs that are still running; one stays
+/// visible exactly while its run is live. A successful completion accepts it
+/// at the moment the completion was observed: only a tracker read that
+/// started afterwards and shows the status settles it, otherwise the
+/// accepted deadline drops it. A failed, killed or uncertain run drops it at
+/// once. A settled run never comes back.
 struct Tracker {
     boot_ms: u64,
     handled: BTreeSet<String>,
     seen: BTreeSet<String>,
-    expected: BTreeMap<String, Expected>,
+    pending: Pending<StatusBatch, IssueExpectation>,
+    /// Operation id of each run with a pending expectation.
+    ops: BTreeMap<String, u64>,
+    next_op: u64,
+    /// Runs whose expectation was accepted (completion observed).
+    accepted: BTreeSet<String>,
+    /// Expectations of runs that were running at the last observation.
+    running: BTreeMap<String, IssueExpectation>,
     settled: BTreeSet<String>,
     attention: VecDeque<wt_tui::AttentionLine>,
 }
@@ -444,7 +516,11 @@ impl Tracker {
             boot_ms,
             handled: BTreeSet::new(),
             seen: BTreeSet::new(),
-            expected: BTreeMap::new(),
+            pending: Pending::default(),
+            ops: BTreeMap::new(),
+            next_op: 0,
+            accepted: BTreeSet::new(),
+            running: BTreeMap::new(),
             settled: BTreeSet::new(),
             attention: VecDeque::new(),
         }
@@ -456,6 +532,7 @@ impl Tracker {
         now: tokio::time::Instant,
     ) -> Vec<&'a ActionRun> {
         let mut completed = Vec::new();
+        self.running.clear();
         // Input is newest first. A failed newer command must suppress an older
         // successful command's pending projection for the same issue.
         let mut latest_issue = BTreeSet::new();
@@ -515,70 +592,129 @@ impl Tracker {
             let valid = meta.status == ActionRunStatus::Running
                 || (meta.status == ActionRunStatus::Succeeded && current);
             if !valid {
-                self.expected.remove(&expectation.issue_id);
+                self.drop_issue(&expectation.issue_id);
                 self.settled.insert(meta.run_id.clone());
                 continue;
             }
-            let entry = self
-                .expected
-                .entry(expectation.issue_id.clone())
-                .or_insert_with(|| Expected {
-                    run_id: meta.run_id.clone(),
-                    status: expectation.status.clone(),
-                    completed: None,
-                });
-            if entry.run_id != meta.run_id {
-                *entry = Expected {
-                    run_id: meta.run_id.clone(),
-                    status: expectation.status.clone(),
-                    completed: None,
-                };
+            let mutation = IssueExpectation {
+                run_id: meta.run_id.clone(),
+                row_key: meta
+                    .worktree_ref
+                    .as_ref()
+                    .map(wt_core::worktree_ledger_key)
+                    .unwrap_or_else(|| meta.slug.clone()),
+                issue_id: expectation.issue_id.clone(),
+                status: expectation.status.clone(),
+            };
+            let op = match self.ops.get(&meta.run_id) {
+                Some(op) => *op,
+                None => {
+                    self.next_op = self.next_op.wrapping_add(1);
+                    self.ops.insert(meta.run_id.clone(), self.next_op);
+                    self.next_op
+                }
+            };
+            if !self.pending.contains(op) {
+                self.pending.begin(op, mutation.clone(), now);
             }
-            if terminal && entry.completed.is_none() {
-                entry.completed = Some(now);
+            if terminal {
+                if self.accepted.insert(meta.run_id.clone()) {
+                    self.pending.accept(op, Stamp::at(now), now);
+                }
+            } else {
+                self.running.insert(meta.run_id.clone(), mutation);
             }
         }
+        self.sweep();
         completed
     }
 
-    fn settle(&mut self, statuses: &SourceSnapshot<StatusBatch>, now: tokio::time::Instant) {
-        self.expected.retain(|id, expected| {
-            let Some(completed) = expected.completed else {
-                return true;
-            };
-            let caught_up = matches!(statuses.state, SourceState::Ready)
-                && statuses.updated_at.is_some_and(|at| at >= completed)
-                && statuses
-                    .data
-                    .as_ref()
-                    .is_some_and(|batch| batch.statuses.get(id) == Some(&expected.status));
-            let keep = !caught_up && now < completed + Duration::from_secs(12);
-            if !keep {
-                self.settled.insert(expected.run_id.clone());
+    /// Keep expectations of still-running runs in flight past the engine's
+    /// in-flight bound.
+    fn renew_running(&mut self, now: tokio::time::Instant) {
+        for (run_id, mutation) in &self.running {
+            if let Some(op) = self.ops.get(run_id)
+                && self.pending.contains(*op)
+                && !self.accepted.contains(run_id)
+            {
+                self.pending.begin(*op, mutation.clone(), now);
             }
-            keep
+        }
+    }
+
+    fn drop_issue(&mut self, issue_id: &str) {
+        let ops = self
+            .ops
+            .values()
+            .copied()
+            .filter(|op| {
+                self.pending
+                    .mutation(*op)
+                    .is_some_and(|mutation| mutation.issue_id == issue_id)
+            })
+            .collect::<Vec<_>>();
+        for op in ops {
+            self.pending.remove(op);
+        }
+    }
+
+    /// Settle against the confirmed tracker read. Without one (empty or
+    /// restored) only deadlines apply.
+    fn settle(&mut self, statuses: Option<&Confirmed<StatusBatch>>, now: tokio::time::Instant) {
+        let empty = StatusBatch::default();
+        let confirmed = statuses.map_or(&empty, |statuses| &**statuses);
+        let observed = statuses.map(Confirmed::observed);
+        for expired in self.pending.settle(confirmed, |_, _| observed, now) {
+            tracing::info!(
+                issue = expired.mutation.issue_id,
+                status = expired.mutation.status,
+                "issue tracker did not reflect the action's status before the deadline"
+            );
+        }
+        self.sweep();
+    }
+
+    /// Forget runs whose expectation is gone; they never reappear.
+    fn sweep(&mut self) {
+        let pending = &self.pending;
+        let settled = &mut self.settled;
+        let accepted = &mut self.accepted;
+        self.ops.retain(|run_id, op| {
+            let live = pending.contains(*op);
+            if !live {
+                settled.insert(run_id.clone());
+                accepted.remove(run_id);
+            }
+            live
         });
+        let ops = &self.ops;
+        self.running.retain(|run_id, _| ops.contains_key(run_id));
     }
 
     fn next_expiry(&self) -> Option<tokio::time::Instant> {
-        self.expected
-            .values()
-            .filter_map(|e| e.completed.map(|at| at + Duration::from_secs(12)))
-            .min()
+        self.pending.next_deadline()
+    }
+
+    /// Issue statuses the pending expectations show.
+    fn projected_statuses(&self) -> BTreeMap<String, String> {
+        if self.pending.is_empty() {
+            return BTreeMap::new();
+        }
+        self.pending.project(&StatusBatch::default()).statuses
     }
 }
 
 fn compose(
-    mut board: SourceSnapshot<Board>,
+    board: SourceSnapshot<Board>,
     runs: SourceSnapshot<ActionHistory>,
     logs: SourceSnapshot<ActionLogs>,
     tracker: &Tracker,
 ) -> SourceSnapshot<Board> {
-    let Some(data) = &board.data else {
+    let Some(data) = board.data() else {
         return board;
     };
     let mut data = data.as_ref().clone();
-    if let SourceState::Failed(error) = &runs.state {
+    if let SourceState::Failed(error) = runs.state() {
         crate::activity_source::append_attention(
             &mut data,
             "Action history",
@@ -586,16 +722,13 @@ fn compose(
         );
     }
     data.slot_logs.clear();
+    let projected = tracker.projected_statuses();
     for row in &mut data.rows {
         row.logs.clear();
-        if let Some(expected) = row
-            .issue_id
-            .as_ref()
-            .and_then(|id| tracker.expected.get(id))
-        {
-            row.issue_status = Some(expected.status.clone());
+        if let Some(status) = row.issue_id.as_ref().and_then(|id| projected.get(id)) {
+            row.issue_status = Some(status.clone());
         }
-        let history = runs.data.as_deref();
+        let history = runs.data().map(Arc::as_ref);
         let latest = history
             .into_iter()
             .flat_map(|history| history.runs.iter())
@@ -640,15 +773,14 @@ fn compose(
                 }
             }
             if let Some(log) = logs
-                .data
-                .as_deref()
+                .data()
                 .and_then(|history| history.logs.get(&run.meta.run_id))
             {
                 row.logs.push(log.clone());
             }
         }
     }
-    if let Some(history) = runs.data.as_deref() {
+    if let Some(history) = runs.data() {
         let row_keys = data
             .rows
             .iter()
@@ -658,8 +790,7 @@ fn compose(
             if !row_keys.contains(run.meta.action_key.as_str())
                 && !row_keys.contains(run.meta.slug.as_str())
                 && let Some(log) = logs
-                    .data
-                    .as_deref()
+                    .data()
                     .and_then(|history| history.logs.get(&run.meta.run_id))
             {
                 data.slot_logs
@@ -690,8 +821,11 @@ fn compose(
     }
     data.attention.extend(tracker.attention.iter().cloned());
     crate::activity_source::bound_feeds(&mut data);
-    board.data = Some(Arc::new(data));
+    data.pending.extend(tracker.pending.views());
     board
+        .with_data(Some(Arc::new(data)))
+        .with_input(&runs)
+        .with_input(&logs)
 }
 
 fn epoch_ms() -> u64 {
@@ -725,6 +859,21 @@ mod tests {
         })).unwrap()
     }
 
+    fn expected_runs(tracker: &Tracker) -> Vec<String> {
+        tracker
+            .pending
+            .mutations()
+            .map(|mutation| mutation.run_id.clone())
+            .collect()
+    }
+
+    fn batch(status: &str) -> StatusBatch {
+        StatusBatch {
+            ids: vec!["ENG-1".into()],
+            statuses: [("ENG-1".into(), status.into())].into(),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn completion_refreshes_once_and_newer_failure_cannot_revive_older_guard() {
         let now = tokio::time::Instant::now();
@@ -734,13 +883,13 @@ mod tests {
                 .observe(&[run("old", "succeeded", 90)], now)
                 .is_empty()
         );
-        assert!(tracker.expected.is_empty());
+        assert!(tracker.pending.is_empty());
         assert!(
             tracker
                 .observe(&[run("new", "running", 110)], now)
                 .is_empty()
         );
-        assert_eq!(tracker.expected["ENG-1"].run_id, "new");
+        assert_eq!(expected_runs(&tracker), ["new"]);
         assert_eq!(
             tracker.observe(&[run("new", "succeeded", 110)], now).len(),
             1
@@ -754,35 +903,119 @@ mod tests {
             &[run("later", "failed", 120), run("new", "succeeded", 110)],
             now,
         );
-        assert!(tracker.expected.is_empty());
+        assert!(tracker.pending.is_empty());
+        tracker.observe(&[run("new", "succeeded", 110)], now);
+        assert!(
+            tracker.pending.is_empty(),
+            "a dropped expectation never revives"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn expectation_waits_for_fresh_reader_or_deadline_and_never_reappears() {
-        let now = tokio::time::Instant::now();
         let mut tracker = Tracker::new(100);
-        tracker.observe(&[run("new", "running", 110)], now);
-        let complete = now + Duration::from_secs(1);
-        tracker.observe(&[run("new", "succeeded", 110)], complete);
-        let mut statuses = SourceSnapshot {
-            data: Some(Arc::new(StatusBatch {
-                ids: vec!["ENG-1".into()],
-                statuses: [("ENG-1".into(), "Review".into())].into(),
-            })),
-            state: SourceState::Ready,
-            updated_at: Some(now),
-            revision: 0,
+        tracker.observe(&[run("new", "running", 110)], tokio::time::Instant::now());
+        // A tracker read that started before the run completed.
+        let stale = Confirmed::for_test(batch("Review"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tracker.observe(&[run("new", "succeeded", 110)], tokio::time::Instant::now());
+        tracker.settle(Some(&stale), tokio::time::Instant::now());
+        assert_eq!(expected_runs(&tracker), ["new"]);
+        assert_eq!(
+            tracker.pending.views()[0].phase,
+            wt_runtime::PendingPhase::Accepted
+        );
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let fresh = Confirmed::for_test(batch("Review"));
+        tracker.settle(Some(&fresh), tokio::time::Instant::now());
+        assert!(tracker.pending.is_empty());
+        tracker.observe(&[run("new", "succeeded", 110)], tokio::time::Instant::now());
+        assert!(tracker.pending.is_empty());
+        // Without a confirming read the accepted deadline drops it.
+        tracker.observe(
+            &[run("second", "succeeded", 120)],
+            tokio::time::Instant::now(),
+        );
+        assert_eq!(expected_runs(&tracker), ["second"]);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tracker.settle(None, tokio::time::Instant::now());
+        assert_eq!(expected_runs(&tracker), ["second"]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tracker.settle(None, tokio::time::Instant::now());
+        assert!(tracker.pending.is_empty());
+        tracker.observe(
+            &[run("second", "succeeded", 120)],
+            tokio::time::Instant::now(),
+        );
+        assert!(tracker.pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_running_action_stays_in_flight_while_it_runs() {
+        let mut tracker = Tracker::new(100);
+        tracker.observe(&[run("slow", "running", 110)], tokio::time::Instant::now());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(50)).await;
+            let now = tokio::time::Instant::now();
+            tracker.renew_running(now);
+            tracker.settle(Some(&Confirmed::for_test(batch("Review"))), now);
+            assert_eq!(expected_runs(&tracker), ["slow"]);
+            assert_eq!(
+                tracker.pending.views()[0].phase,
+                wt_runtime::PendingPhase::InFlight
+            );
+        }
+        // An uncertain start drops it at once.
+        tracker.observe(
+            &[run("slow", "ambiguous", 110)],
+            tokio::time::Instant::now(),
+        );
+        assert!(tracker.pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_status_is_projected_onto_the_row_and_marked() {
+        let mut tracker = Tracker::new(100);
+        tracker.observe(&[run("new", "running", 110)], tokio::time::Instant::now());
+        let board = Board {
+            rows: vec![wt_tui::BoardRow {
+                key: "row".into(),
+                issue_id: Some("ENG-1".into()),
+                issue_status: Some("Todo".into()),
+                ..wt_tui::BoardRow::default()
+            }],
+            ..Board::default()
         };
-        tracker.settle(&statuses, complete);
-        assert!(!tracker.expected.is_empty());
-        statuses.updated_at = Some(complete);
-        tracker.settle(&statuses, complete);
-        assert!(tracker.expected.is_empty());
-        tracker.observe(&[run("new", "succeeded", 110)], complete);
-        assert!(tracker.expected.is_empty());
-        tracker.observe(&[run("second", "succeeded", 120)], complete);
-        statuses.updated_at = None;
-        tracker.settle(&statuses, complete + Duration::from_secs(12));
-        assert!(tracker.expected.is_empty());
+        let output = compose(
+            SourceSnapshot::test_live(Some(board), SourceState::Ready, Domain::Git),
+            SourceSnapshot::default(),
+            SourceSnapshot::default(),
+            &tracker,
+        );
+        let data = output.data().unwrap();
+        assert_eq!(data.rows[0].issue_status.as_deref(), Some("Review"));
+        assert_eq!(
+            data.pending,
+            vec![wt_runtime::PendingView {
+                target: Target::row(None, "row"),
+                label: "moving ENG-1 to Review".into(),
+                phase: wt_runtime::PendingPhase::InFlight,
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_status_expectation_meets_the_mutation_contract() {
+        wt_runtime::conformance::mutation(
+            IssueExpectation {
+                run_id: "run-1".into(),
+                row_key: "row".into(),
+                issue_id: "ENG-1".into(),
+                status: "Review".into(),
+            },
+            batch("Todo"),
+            batch("Review"),
+        )
+        .await;
     }
 }

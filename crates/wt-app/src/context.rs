@@ -21,6 +21,8 @@ pub struct AppContext {
     /// Section moves this process made, so the attention feed can tell the
     /// user's own moves from moves made elsewhere.
     pub section_writes: SectionWrites,
+    /// Disposable per-source snapshot cache for this configuration.
+    pub caches: wt_runtime::CacheStore,
 }
 
 /// Section assignments this process wrote and has not yet seen come back

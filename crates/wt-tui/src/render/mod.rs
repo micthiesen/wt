@@ -4,6 +4,7 @@
 pub(crate) mod details;
 mod list;
 mod overlays;
+pub(crate) mod status;
 pub(crate) mod text;
 
 use ratatui::{
@@ -11,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 use wt_runtime::SourceState;
@@ -115,7 +116,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
     let available_width = panes.activity.width.saturating_sub(2) as usize;
     let (title, activity_lines) = model.output_view(available, available_width);
     frame.render_widget(
-        Paragraph::new(activity_lines).block(panel(&title)),
+        Paragraph::new(activity_lines).block(status::pane(title, status::OUTPUT, model)),
         panes.activity,
     );
     footer(frame, model, panes.footer);
@@ -144,11 +145,11 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             base.fg(theme::FG_BRIGHT).add_modifier(Modifier::BOLD),
         ),
     ];
-    match &model.source_state {
-        SourceState::Empty => left.push(Span::styled(" · loading…", base.fg(theme::FG_DIM))),
-        SourceState::Refreshing => left.push(Span::styled(" ↻", base.fg(theme::FG_DIM))),
-        SourceState::Failed(_) => left.push(Span::styled(" · refresh failed", base.fg(theme::ERR))),
-        SourceState::Ready => {}
+    left.extend(status::chip(&status::status(model, status::ALL), base));
+    let pending = status::board_pending(model);
+    if !pending.is_empty() {
+        left.push(Span::styled("  ", base));
+        left.extend(status::pending_chip(&pending, base));
     }
 
     let mut right: Vec<Span<'static>> = Vec::new();
@@ -437,23 +438,6 @@ pub(crate) fn mouse_pane(area: Rect, full_width_activity: bool, x: u16, y: u16) 
     } else {
         MousePane::Other
     }
-}
-
-/// A bordered pane with a lowercase title set into the top rule.
-pub(crate) fn panel(title: &str) -> Block<'static> {
-    panel_owned(title.to_owned())
-}
-
-pub(crate) fn panel_owned(title: String) -> Block<'static> {
-    Block::new()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(theme::fg(theme::BORDER))
-        .title(Line::from(vec![
-            Span::styled("─ ", theme::fg(theme::BORDER)),
-            Span::styled(title, theme::fg(theme::FG_DIM)),
-            Span::styled(" ", theme::fg(theme::BORDER)),
-        ]))
 }
 
 pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {

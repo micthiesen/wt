@@ -1114,6 +1114,13 @@ fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         ),
         None => "perf · wt and everything downstream".to_owned(),
     };
+    // Same status wording as every pane; a modal title is plain text.
+    let title = super::status::chip(
+        &super::status::status(model, super::status::PERF),
+        ratatui::style::Style::new(),
+    )
+    .iter()
+    .fold(title, |title, span| title + &span.content);
     let modal = Modal::new(
         title,
         vec![

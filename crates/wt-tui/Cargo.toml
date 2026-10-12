@@ -17,5 +17,8 @@ unicode-width.workspace = true
 wt-runtime.workspace = true
 wt-core.workspace = true
 
+[dev-dependencies]
+wt-runtime = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true

@@ -221,14 +221,23 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
                 .is_some_and(|error| {
                     matches!(error, crate::remote_host::RemoteHostError::Ambiguous { .. })
                 });
-            (
+            // A lost reply after sending is not a failure: the write may
+            // have happened. The TUI keeps showing it as unconfirmed until
+            // a read settles it or its deadline passes; nothing is resent.
+            let reply = if ambiguous {
+                UiReply {
+                    message: format!("{error:#}; waiting for refresh to confirm"),
+                    outcome: Some(wt_tui::ReplyOutcome::Uncertain),
+                    ..Default::default()
+                }
+            } else {
                 UiReply {
                     message: format!("{error:#}"),
                     failed: true,
                     ..Default::default()
-                },
-                ambiguous,
-            )
+                }
+            };
+            (reply, ambiguous)
         }
     };
     if reply.failed
@@ -376,7 +385,9 @@ mod tests {
             detail: "SSH stream closed".into(),
         };
         let reply = action_reply(Err(ambiguous.into()), retry);
-        assert!(reply.failed);
+        assert!(!reply.failed);
+        assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::Uncertain));
+        assert!(reply.message.contains("ambiguous"));
         assert!(reply.modal.is_none());
     }
 

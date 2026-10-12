@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail};
 use wt_config::{ActionDef, ActionKind};
 use wt_github::GithubData;
+use wt_runtime::Confirmed;
 use wt_tui::{
     ActionSurface, Board, PickerAction, PickerOption, TextAction, UiAction, UiModal, UiReply,
 };
@@ -11,13 +12,12 @@ use wt_tui::{
 use crate::{action_dispatch, context::AppContext};
 
 pub const CUSTOM_ID: &str = "__custom__";
-pub const AUTO_MERGE_ID: &str = "__auto_merge__";
 
 pub async fn execute(
     ctx: &AppContext,
     request: UiAction,
     board: Option<&Board>,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<UiReply> {
     match request {
         UiAction::PrepareActions { surface } => palette(ctx, surface, board, github).await,
@@ -38,7 +38,7 @@ async fn palette(
     ctx: &AppContext,
     surface: ActionSurface,
     board: Option<&Board>,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<UiReply> {
     let definitions = action_dispatch::definitions(ctx, &surface);
     // TS opened a slot palette even when its checkout was missing; every
@@ -173,7 +173,7 @@ async fn palette(
             .and_then(|board| board.rows.iter().find(|row| &row.key == key))
             .is_some_and(|row| row.pr.as_ref().is_some_and(|pr| pr.number.is_some()));
         options.push(PickerOption {
-            value: Some(AUTO_MERGE_ID.into()),
+            value: Some(wt_tui::AUTO_MERGE_ACTION_ID.into()),
             label: "github: Toggle merge when ready".into(),
             chord: Some('m'),
             note: None,
@@ -288,7 +288,7 @@ async fn prepare(
     id: String,
     arg: Option<String>,
     board: Option<&Board>,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<UiReply> {
     if let (Some(reason), ActionSurface::Slot { target }) =
         (slot_unavailable(ctx, &surface), &surface)
@@ -383,7 +383,7 @@ async fn run(
     arg: Option<String>,
     extras: String,
     board: Option<&Board>,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<UiReply> {
     if let (Some(reason), ActionSurface::Slot { target }) =
         (slot_unavailable(ctx, &surface), &surface)
@@ -442,7 +442,7 @@ async fn dev_logs(
     ctx: &AppContext,
     surface: ActionSurface,
     board: Option<&Board>,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<UiReply> {
     let context = action_dispatch::prepare(ctx, &surface, github, board, None).await?;
     let text = crate::dev::service(ctx)?
@@ -549,8 +549,7 @@ mod tests {
         let surface = ActionSurface::Slot {
             target: wt_tui::SessionTarget::WtSource,
         };
-        let github = GithubData::default();
-        let reply = palette(&fixture.ctx, surface.clone(), None, &github)
+        let reply = palette(&fixture.ctx, surface.clone(), None, None)
             .await
             .unwrap();
         let Some(UiModal::Picker { title, options, .. }) = reply.modal else {
@@ -570,7 +569,7 @@ mod tests {
             "slot-continue".into(),
             None,
             None,
-            &github,
+            None,
         )
         .await
         .unwrap_err();

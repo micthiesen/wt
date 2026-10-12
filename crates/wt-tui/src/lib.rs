@@ -7,9 +7,9 @@ mod editor;
 mod glyphs;
 mod help;
 mod history;
-mod lifecycle;
 mod model;
 mod mouse;
+mod mutations;
 mod output;
 mod render;
 mod reviews;
@@ -18,9 +18,10 @@ mod terminal_probe;
 mod theme;
 
 pub use actions::{
-    ActionController, ActionSurface, ConfirmAction, PickerAction, PickerOption, RemovalRevision,
-    ReviewerOption, SessionMode, SessionSelection, SessionTarget, TerminalHandoff, TextAction,
-    UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
+    ActionController, ActionSurface, ConfirmAction, PickerAction, PickerOption, PrPin,
+    RemovalRevision, ReplyOutcome, ReviewerOption, SessionMode, SessionSelection, SessionTarget,
+    TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind,
+    action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
@@ -32,6 +33,7 @@ pub use model::{
     ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
     WorkPresentation, WorkRiskCount, WorkStateCount,
 };
+pub use mutations::{AUTO_MERGE_ACTION_ID, Effect, MutationKind, UiMutation};
 pub use terminal::{run, run_with_palette_probe};
 #[doc(hidden)]
 pub use terminal_probe::{decode_terminal_probe_bytes, decode_terminal_probe_chunks};

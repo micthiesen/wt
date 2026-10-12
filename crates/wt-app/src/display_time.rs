@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use wt_runtime::{SourceHandle, SourceSnapshot, TaskScope, source_channel};
+use wt_runtime::{SourceHandle, TaskScope, derived_channel};
 use wt_tui::Board;
 
 const MAX_LABELLED_TIMESTAMPS: usize = 1_024;
@@ -13,7 +13,7 @@ const MAX_LABELLED_TIMESTAMPS: usize = 1_024;
 /// Adds local clock labels to the current board snapshot without doing timezone
 /// work on the terminal input or render thread.
 pub fn overlay(scope: &TaskScope, board: SourceHandle<Board>) -> SourceHandle<Board> {
-    let (output, mut publisher) = source_channel();
+    let (output, mut publisher) = derived_channel(scope, "display-time");
     let cancellation = scope.token();
     scope.spawn(async move {
         let mut updates = board.subscribe();
@@ -35,7 +35,7 @@ pub fn overlay(scope: &TaskScope, board: SourceHandle<Board>) -> SourceHandle<Bo
             }
 
             let base = updates.borrow().clone();
-            let Some(data) = base.data.as_deref() else {
+            let Some(data) = base.data().map(Arc::as_ref) else {
                 publisher.publish(base);
                 continue;
             };
@@ -59,12 +59,10 @@ pub fn overlay(scope: &TaskScope, board: SourceHandle<Board>) -> SourceHandle<Bo
 
             let mut projected = data.clone();
             projected.local_times.clone_from(&cache);
-            publisher.publish(SourceSnapshot {
-                data: Some(Arc::new(projected)),
-                state: base.state,
-                updated_at: base.updated_at,
-                revision: 0,
-            });
+            // Labels add no observation of their own: the board's state,
+            // domains and observation stamps pass through unchanged, which
+            // replaces the old pass-through of `updated_at`.
+            publisher.publish(base.derive(Some(Arc::new(projected))));
         }
     });
     output
@@ -158,9 +156,9 @@ pub(crate) fn local_time_components(_timestamp_ms: u64) -> Option<(i32, u8, u8, 
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
-    use wt_runtime::{SourceSnapshot, SourceState, TaskScope, source_channel};
+    use wt_runtime::{Domain, SourceSnapshot, SourceState, TaskScope, derived_channel};
     use wt_tui::{ActivityLine, AttentionLine, Board};
 
     use super::{overlay, visible_timestamps};
@@ -193,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn overlay_prepares_labels_and_forwards_refresh() {
         let scope = TaskScope::new();
-        let (input, mut input_publisher) = source_channel();
+        let (input, mut input_publisher) = derived_channel(&scope, "test");
         let output = overlay(&scope, input.clone());
         let mut updates = output.subscribe();
         let board = Board {
@@ -208,25 +206,27 @@ mod tests {
             attention_seen_ms: 1_700_000_002_000,
             ..Board::default()
         };
-        input_publisher.publish(SourceSnapshot {
-            data: Some(Arc::new(board)),
-            state: SourceState::Ready,
-            updated_at: Some(tokio::time::Instant::now()),
-            revision: 1,
-        });
+        input_publisher.publish(SourceSnapshot::test_live(
+            Some(board),
+            SourceState::Ready,
+            Domain::Activity,
+        ));
         tokio::time::timeout(
             Duration::from_secs(1),
             updates.wait_for(|snapshot| {
                 snapshot
-                    .data
-                    .as_ref()
+                    .data()
                     .is_some_and(|board| board.local_times.len() == 3)
             }),
         )
         .await
         .unwrap()
         .unwrap();
-        let labels = updates.borrow().data.as_ref().unwrap().local_times.clone();
+        let labels = updates.borrow().data().unwrap().local_times.clone();
+        assert!(
+            updates.borrow().domains()[&Domain::Activity].is_live(),
+            "labels keep the board's provenance"
+        );
         assert_eq!(labels.len(), 3);
         assert!(labels.values().all(|label| label.len() == 8));
 

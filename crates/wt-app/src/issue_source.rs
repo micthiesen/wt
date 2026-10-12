@@ -7,17 +7,18 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wt_platform::process::CommandSpec;
 use wt_runtime::{
-    RefreshPolicy, SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel,
-    start_source,
+    DiskCache, Domain, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
+    SourceSnapshot, SourceSpec, Stamp, TaskScope, derived_channel, start_skippable_source,
 };
 use wt_tui::Board;
 
 use crate::{context::AppContext, issue_identity};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StatusBatch {
     pub ids: Vec<String>,
     pub statuses: BTreeMap<String, String>,
@@ -25,7 +26,19 @@ pub struct StatusBatch {
 
 pub struct IssueSources {
     pub board: SourceHandle<Board>,
-    pub statuses: SourceHandle<StatusBatch>,
+    pub statuses: LeafHandle<StatusBatch>,
+}
+
+fn statuses_spec(context: &AppContext) -> SourceSpec<StatusBatch> {
+    SourceSpec {
+        name: "issue-statuses",
+        domain: Domain::Issues,
+        persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+        policy: RefreshPolicy {
+            debounce: Duration::from_millis(50),
+            minimum_interval: Duration::from_secs(1),
+        },
+    }
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>) -> IssueSources {
@@ -35,56 +48,63 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
         .and_then(|tracker| tracker.status_command.clone());
     let prefix = tracker.as_ref().and_then(|tracker| tracker.prefix.clone());
     let enabled = command.is_some();
-    let statuses = start_source(
-        scope,
-        RefreshPolicy {
-            debounce: Duration::from_millis(50),
-            minimum_interval: Duration::from_secs(1),
-        },
-        {
+    let statuses = start_skippable_source(scope, statuses_spec(context), {
+        let context = context.clone();
+        let board = board.clone();
+        let prefix = prefix.clone();
+        move |cancel| {
             let context = context.clone();
-            let board = board.clone();
-            let prefix = prefix.clone();
-            move |cancel| {
-                let context = context.clone();
-                let command = command.clone();
-                let ids = ids(&board.snapshot(), prefix.as_deref());
-                async move {
-                    let Some(command) = command.filter(|_| !ids.is_empty()) else {
-                        return Ok::<_, anyhow::Error>(StatusBatch {
+            let command = command.clone();
+            // The id set comes from the derived board. Restored Git or
+            // metadata may name issues that no longer exist, so the reader
+            // waits for both to be live (rule E2); the board's next change
+            // re-arms it.
+            let ids = confirmed_ids(&board.snapshot(), prefix.as_deref());
+            let observed = Stamp::now();
+            async move {
+                let Some(ids) = ids else {
+                    return Ok(None);
+                };
+                let Some(command) = command.filter(|_| !ids.is_empty()) else {
+                    return Ok::<_, anyhow::Error>(Some(Fetched::new(
+                        StatusBatch {
                             ids,
                             statuses: BTreeMap::new(),
-                        });
-                    };
-                    let argv = arguments(&command, &ids);
-                    let (program, args) = argv
-                        .split_first()
-                        .context("issue status reader has no executable")?;
-                    let mut spec = CommandSpec::new(program)
-                        .args(args)
-                        .cwd(&context.config.paths.main_clone);
-                    spec.timeout = Duration::from_secs(30);
-                    let output = context
-                        .processes
-                        .run(spec, &cancel)
-                        .await
-                        .context("issue status reader")?;
-                    if !output.status.success() {
-                        bail!(
-                            "issue status reader exited {}: {}",
-                            output.status,
-                            output.stderr_text().trim()
-                        );
-                    }
-                    Ok(StatusBatch {
+                        },
+                        observed,
+                    )));
+                };
+                let argv = arguments(&command, &ids);
+                let (program, args) = argv
+                    .split_first()
+                    .context("issue status reader has no executable")?;
+                let mut spec = CommandSpec::new(program)
+                    .args(args)
+                    .cwd(&context.config.paths.main_clone);
+                spec.timeout = Duration::from_secs(30);
+                let output = context
+                    .processes
+                    .run(spec, &cancel)
+                    .await
+                    .context("issue status reader")?;
+                if !output.status.success() {
+                    bail!(
+                        "issue status reader exited {}: {}",
+                        output.status,
+                        output.stderr_text().trim()
+                    );
+                }
+                Ok(Some(Fetched::new(
+                    StatusBatch {
                         statuses: parse(&output.stdout, &ids)?,
                         ids,
-                    })
-                }
+                    },
+                    observed,
+                )))
             }
-        },
-    );
-    let output = project(scope, board, statuses.clone(), prefix, enabled);
+        }
+    });
+    let output = project(scope, board, statuses.view(), prefix, enabled);
     IssueSources {
         board: output,
         statuses,
@@ -93,8 +113,8 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
 
 fn ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Vec<String> {
     board
-        .data
-        .iter()
+        .data()
+        .into_iter()
         .flat_map(|board| &board.rows)
         .filter_map(|row| row.issue_id.as_ref())
         .filter(|id| issue_identity::is_tracker(id, prefix))
@@ -102,6 +122,19 @@ fn ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// The id set, only when the rows it comes from were scanned live by this
+/// process. `None` while Git or metadata is restored or missing.
+fn confirmed_ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Option<Vec<String>> {
+    let live = |domain| {
+        board
+            .domains()
+            .get(&domain)
+            .is_some_and(|meta| meta.is_live())
+    };
+    (board.data().is_some() && live(Domain::Git) && live(Domain::Metadata))
+        .then(|| ids(board, prefix))
 }
 
 fn arguments(command: &[String], ids: &[String]) -> Vec<String> {
@@ -168,76 +201,92 @@ fn project(
     prefix: Option<String>,
     enabled: bool,
 ) -> SourceHandle<Board> {
-    let (output, mut publisher) = source_channel();
+    let (output, mut publisher) = derived_channel(scope, "issue-board");
     let cancel = scope.token();
     scope.spawn(async move {
         let mut boards = board.subscribe();
         let mut updates = statuses.subscribe();
         boards.mark_changed();
         updates.mark_changed();
+        // Displayed ids select which statuses apply; confirmed ids decide
+        // when to read. Restored rows can show restored statuses, but only a
+        // live inventory triggers the reader.
         let mut previous = Vec::new();
+        let mut confirmed = None::<Vec<String>>;
+        let mut last: Option<SourceSnapshot<Board>> = None;
         let backstop = Duration::from_secs(180);
-        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let readable = enabled && confirmed.as_ref().is_some_and(|ids| !ids.is_empty());
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
                 request = publisher.requested() => {
                     if request.is_none() { break; }
                     board.refresh();
-                    if enabled && !previous.is_empty() { statuses.refresh(); }
+                    if readable { statuses.refresh(); }
                     continue;
                 }
                 changed = boards.changed() => {
                     if changed.is_err() { break; }
-                    let next = ids(&boards.borrow_and_update(), prefix.as_deref());
-                    if next != previous {
-                        previous = next;
-                        if enabled && !previous.is_empty() { statuses.refresh(); }
+                    let snapshot = boards.borrow_and_update().clone();
+                    previous = ids(&snapshot, prefix.as_deref());
+                    let next = confirmed_ids(&snapshot, prefix.as_deref());
+                    if next.is_some() && next != confirmed {
+                        confirmed = next;
+                        if enabled && confirmed.as_ref().is_some_and(|ids| !ids.is_empty()) {
+                            statuses.refresh();
+                        }
                     }
                 }
                 changed = updates.changed() => {
                     if changed.is_err() { break; }
                     updates.borrow_and_update();
                 }
-                _ = interval.tick(), if enabled && !previous.is_empty() => { statuses.refresh(); continue; }
+                _ = interval.tick(), if readable => { statuses.refresh(); continue; }
             }
-            publisher.publish(compose(boards.borrow().clone(), updates.borrow().clone(), &previous));
+            let next = compose(boards.borrow().clone(), updates.borrow().clone(), &previous);
+            if last.as_ref().is_some_and(|last| last.same_view(&next)) {
+                continue;
+            }
+            last = Some(next.clone());
+            publisher.publish(next);
         }
     });
     output
 }
 
 fn compose(
-    mut board: SourceSnapshot<Board>,
+    board: SourceSnapshot<Board>,
     statuses: SourceSnapshot<StatusBatch>,
     expected: &[String],
 ) -> SourceSnapshot<Board> {
-    let Some(data) = &board.data else {
+    let Some(data) = board.data() else {
         return board;
     };
     let mut data = data.as_ref().clone();
-    let matching = statuses.data.as_ref().filter(|batch| batch.ids == expected);
+    let matching = statuses.data().filter(|batch| batch.ids == expected);
     for row in &mut data.rows {
         let Some(id) = row.issue_id.as_ref().filter(|id| expected.contains(id)) else {
             continue;
         };
         row.issue_status = matching.and_then(|batch| batch.statuses.get(id)).cloned();
-        if let SourceState::Failed(error) = &statuses.state {
+        if let wt_runtime::SourceState::Failed(error) = statuses.state() {
             row.details.push(format!(
                 "Tracker: {}",
                 wt_core::sanitize_terminal_text(error)
             ));
         }
     }
-    board.data = Some(Arc::new(data));
-    board
+    board.with_data(Some(Arc::new(data))).with_input(&statuses)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wt_runtime::SourceState;
     use wt_tui::BoardRow;
 
     #[test]
@@ -266,12 +315,14 @@ mod tests {
     }
 
     fn snapshot<T>(value: T) -> SourceSnapshot<T> {
-        SourceSnapshot {
-            data: Some(Arc::new(value)),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 0,
-        }
+        SourceSnapshot::test_live(Some(value), SourceState::Ready, Domain::Issues)
+    }
+
+    /// A board scanned live by this process: Git and metadata both live.
+    fn live_board(board: Board) -> SourceSnapshot<Board> {
+        SourceSnapshot::test_live(Some(board), SourceState::Ready, Domain::Git).with_input(
+            &SourceSnapshot::<()>::test_live(None, SourceState::Ready, Domain::Metadata),
+        )
     }
 
     fn board(id: &str) -> Board {
@@ -284,57 +335,66 @@ mod tests {
         }
     }
 
+    fn leaf<T: Send + Sync + 'static>(
+        scope: &TaskScope,
+    ) -> (LeafHandle<T>, wt_runtime::LeafPublisher<T>) {
+        wt_runtime::leaf_channel(
+            scope,
+            SourceSpec {
+                name: "test",
+                domain: Domain::Issues,
+                persistence: Persistence::Never("test"),
+                policy: RefreshPolicy::default(),
+            },
+        )
+    }
+
     #[test]
     fn changed_inventory_never_borrows_previous_answer_and_failure_keeps_matching_data() {
-        let mut statuses = snapshot(StatusBatch {
+        let statuses = snapshot(StatusBatch {
             ids: vec!["ENG-1".into()],
             statuses: [("ENG-1".into(), "Open".into())].into(),
-        });
-        statuses.state = SourceState::Failed("offline".into());
+        })
+        .with_state(SourceState::Failed("offline".into()));
         let prior = compose(
-            snapshot(board("ENG-1")),
+            live_board(board("ENG-1")),
             statuses.clone(),
             &["ENG-1".into()],
         );
         assert_eq!(
-            prior.data.as_ref().unwrap().rows[0].issue_status.as_deref(),
+            prior.data().unwrap().rows[0].issue_status.as_deref(),
             Some("Open")
         );
-        let changed = compose(snapshot(board("ENG-2")), statuses, &["ENG-2".into()]);
-        assert_eq!(changed.data.as_ref().unwrap().rows[0].issue_status, None);
+        let changed = compose(live_board(board("ENG-2")), statuses, &["ENG-2".into()]);
+        assert_eq!(changed.data().unwrap().rows[0].issue_status, None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn title_changes_and_status_results_never_trigger_another_reader() {
         let scope = TaskScope::new();
-        let (boards, mut boards_writer) = source_channel();
-        let (statuses, mut status_writer) = source_channel();
-        let output = project(&scope, boards, statuses, Some("ENG".into()), true);
-        boards_writer.publish(snapshot(board("ENG-1")));
+        let (boards, mut boards_writer) = derived_channel(&scope, "test-board");
+        let (statuses, mut status_writer) = leaf::<StatusBatch>(&scope);
+        let output = project(&scope, boards, statuses.view(), Some("ENG".into()), true);
+        boards_writer.publish(live_board(board("ENG-1")));
         assert_eq!(status_writer.requested().await, Some(()));
-        status_writer.publish(snapshot(StatusBatch {
-            ids: vec!["ENG-1".into()],
-            statuses: [("ENG-1".into(), "Open".into())].into(),
-        }));
+        status_writer.publish_live(
+            StatusBatch {
+                ids: vec!["ENG-1".into()],
+                statuses: [("ENG-1".into(), "Open".into())].into(),
+            },
+            Stamp::now(),
+        );
         output
             .subscribe()
-            .wait_for(|s| {
-                s.data
-                    .as_ref()
-                    .is_some_and(|b| b.rows[0].issue_status.is_some())
-            })
+            .wait_for(|s| s.data().is_some_and(|b| b.rows[0].issue_status.is_some()))
             .await
             .unwrap();
         let mut renamed = board("ENG-1");
         renamed.rows[0].title = "Renamed".into();
-        boards_writer.publish(snapshot(renamed));
+        boards_writer.publish(live_board(renamed));
         output
             .subscribe()
-            .wait_for(|s| {
-                s.data
-                    .as_ref()
-                    .is_some_and(|b| b.rows[0].title == "Renamed")
-            })
+            .wait_for(|s| s.data().is_some_and(|b| b.rows[0].title == "Renamed"))
             .await
             .unwrap();
         assert!(
@@ -348,5 +408,54 @@ mod tests {
                 .is_err()
         );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restored_rows_never_trigger_the_tracker_reader() {
+        let scope = TaskScope::new();
+        let (boards, boards_writer) = derived_channel(&scope, "test-board");
+        let (statuses, mut status_writer) = leaf::<StatusBatch>(&scope);
+        let output = project(&scope, boards, statuses.view(), Some("ENG".into()), true);
+        let restored = SourceSnapshot::test_restored(board("ENG-1"), Domain::Git, 1).with_input(
+            &SourceSnapshot::<()>::test_live(None, SourceState::Ready, Domain::Metadata),
+        );
+        assert_eq!(confirmed_ids(&restored, Some("ENG")), None);
+        boards_writer.publish(restored);
+        output
+            .subscribe()
+            .wait_for(|s| s.data().is_some())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), status_writer.requested())
+                .await
+                .is_err(),
+            "restored ids must not start a tracker read"
+        );
+        // The same ids, now scanned live, start the first read.
+        boards_writer.publish(live_board(board("ENG-1")));
+        assert_eq!(status_writer.requested().await, Some(()));
+        assert_eq!(
+            confirmed_ids(&live_board(board("ENG-1")), Some("ENG")),
+            Some(vec!["ENG-1".to_owned()])
+        );
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_statuses_meet_the_persisted_source_contract() {
+        wt_runtime::conformance::persisted_source(
+            "issue-statuses",
+            Domain::Issues,
+            StatusBatch {
+                ids: vec!["ENG-101".into(), "ENG-102".into()],
+                statuses: [
+                    ("ENG-101".into(), "In Review".into()),
+                    ("ENG-102".into(), "Todo".into()),
+                ]
+                .into(),
+            },
+        )
+        .await;
     }
 }

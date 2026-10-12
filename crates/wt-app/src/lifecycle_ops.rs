@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use wt_github::{GithubClient, GithubData, GithubOptions};
 use wt_lifecycle::{LifecycleService, ServiceConfig};
+use wt_runtime::Confirmed;
 use wt_vcs::WorktreeRecord;
 
 use crate::{commands::resolve::run_git, context::AppContext};
@@ -108,15 +109,17 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             Err(error) => return Err(error.into()),
         }
     };
-    plan_with_facts(ctx, rows, &state, &github, warning).await
+    plan_with_evidence(ctx, rows, &state, &github, warning).await
 }
 
-/// Read local hazards with the host's existing GitHub evidence. A merged PR
-/// must still match the current HEAD; Git ancestry keeps its published-base check.
+/// Read local hazards with the host's confirmed GitHub evidence. A merged PR
+/// must still match the current HEAD; Git ancestry keeps its published-base
+/// check. `None` (GitHub still loading, or only restored data) is no evidence:
+/// no branch lands through a PR.
 pub async fn plan_cached(
     ctx: &AppContext,
     rows: Vec<WorktreeRecord>,
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<RemovalPlans> {
     let state = ctx
         .database
@@ -125,10 +128,24 @@ pub async fn plan_cached(
     plan_with_facts(ctx, rows, &state, github, None).await
 }
 
-/// Build removal evidence from caller-prepared wtstate and GitHub snapshots.
-/// This keeps automation evaluation on the same authoritative safety path as
-/// explicit cleanup without launching another GitHub fetch.
-pub async fn plan_with_facts(
+/// Build removal evidence from caller-prepared wtstate and confirmed GitHub
+/// data. This keeps automation evaluation on the same authoritative safety
+/// path as explicit cleanup without launching another GitHub fetch.
+pub(crate) async fn plan_with_facts(
+    ctx: &AppContext,
+    rows: Vec<WorktreeRecord>,
+    state: &serde_json::Value,
+    github: Option<&Confirmed<GithubData>>,
+    warning: Option<String>,
+) -> Result<RemovalPlans> {
+    let empty = GithubData::default();
+    let github = github.map_or(&empty, |github| &**github);
+    plan_with_evidence(ctx, rows, state, github, warning).await
+}
+
+/// `github` is either this process's fresh fetch or confirmed leaf data; the
+/// public entry points never accept displayed or restored data.
+async fn plan_with_evidence(
     ctx: &AppContext,
     rows: Vec<WorktreeRecord>,
     state: &serde_json::Value,
@@ -334,21 +351,29 @@ pub async fn cleanup_confirmed(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
 ) -> Result<String> {
-    cleanup_with_evidence(ctx, confirmed, None).await
+    cleanup_with_evidence(ctx, confirmed, Evidence::Fresh).await
 }
 
+/// Re-plan with the host's confirmed GitHub evidence instead of a new fetch.
+/// `None` proves nothing, so PR-only landings are kept.
 pub async fn cleanup_cached(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
-    github: &GithubData,
+    github: Option<&Confirmed<GithubData>>,
 ) -> Result<String> {
-    cleanup_with_evidence(ctx, confirmed, Some(github)).await
+    cleanup_with_evidence(ctx, confirmed, Evidence::Cached(github)).await
+}
+
+enum Evidence<'a> {
+    /// Fetch GitHub now, as the CLI does.
+    Fresh,
+    Cached(Option<&'a Confirmed<GithubData>>),
 }
 
 async fn cleanup_with_evidence(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
-    github: Option<&GithubData>,
+    evidence: Evidence<'_>,
 ) -> Result<String> {
     let live = ctx.repository.inventory(&ctx.cancellation).await?;
     let selected = live
@@ -362,10 +387,9 @@ async fn cleanup_with_evidence(
             })
         })
         .collect();
-    let plans = if let Some(github) = github {
-        plan_cached(ctx, selected, github).await?
-    } else {
-        plan(ctx, selected).await?
+    let plans = match evidence {
+        Evidence::Cached(github) => plan_cached(ctx, selected, github).await?,
+        Evidence::Fresh => plan(ctx, selected).await?,
     };
     let mut by_key: BTreeMap<_, _> = plans
         .rows
@@ -494,7 +518,7 @@ mod tests {
             .into_iter()
             .find(|row| row.target.slug() == "one")
             .unwrap();
-        let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+        let plan = plan_with_facts(ctx, vec![row.clone()], &state, None, None)
             .await
             .unwrap();
         assert!(plan.rows[0].local_merged);
@@ -573,7 +597,7 @@ mod tests {
             git(ctx, path, &["rev-parse", "refs/heads/feature/one"]).await,
             head
         );
-        let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+        let plan = plan_with_facts(ctx, vec![row.clone()], &state, None, None)
             .await
             .unwrap();
         assert!(!plan.rows[0].landed);
@@ -597,7 +621,13 @@ mod tests {
             }))
             .unwrap(),
         );
-        let reused = plan_cached(ctx, vec![row.clone()], &github).await.unwrap();
+        let reused = plan_cached(
+            ctx,
+            vec![row.clone()],
+            Some(&Confirmed::for_test(github.clone())),
+        )
+        .await
+        .unwrap();
         assert!(!reused.rows[0].landed);
         let history = &reused.rows[0].removed_snapshot;
         assert_eq!(history.extra["landedOnAtRemoval"], "unlanded");
@@ -614,13 +644,39 @@ mod tests {
             &["remote", "set-url", "origin", "/missing-wt-origin"],
         )
         .await;
-        let cached = plan_cached(ctx, vec![row.clone()], &github).await.unwrap();
+        let cached = plan_cached(
+            ctx,
+            vec![row.clone()],
+            Some(&Confirmed::for_test(github.clone())),
+        )
+        .await
+        .unwrap();
         assert!(cached.rows[0].landed);
         assert!(!cached.rows[0].local_merged);
         assert!(cached.warning.is_none());
         assert!(cached.rows[0].hazards.is_empty());
+        // The same merged PR, while GitHub is still loading or only restored
+        // from the cache, is no evidence at all: nothing lands through it.
+        let loading = plan_cached(ctx, vec![row.clone()], None).await.unwrap();
+        assert!(!loading.rows[0].landed);
+        assert!(!loading.rows[0].hazards.is_empty());
+        assert!(
+            !loading.rows[0]
+                .removed_snapshot
+                .extra
+                .contains_key("prNumber")
+        );
+        assert!(!wt_store::is_merged_removal(
+            &loading.rows[0].removed_snapshot
+        ));
         std::fs::write(path.join("work.txt"), "new uncommitted work\n").unwrap();
-        let dirty = plan_cached(ctx, vec![row.clone()], &github).await.unwrap();
+        let dirty = plan_cached(
+            ctx,
+            vec![row.clone()],
+            Some(&Confirmed::for_test(github.clone())),
+        )
+        .await
+        .unwrap();
         assert!(dirty.rows[0].landed);
         assert!(!dirty.rows[0].hazards.is_empty());
         std::fs::write(path.join("work.txt"), "unpublished branch work\n").unwrap();
@@ -633,14 +689,14 @@ mod tests {
 
         // Neither a deleted remote base nor a matching local main is a proof.
         git(ctx, &origin, &["update-ref", "-d", "refs/heads/main"]).await;
-        let plan = plan_with_facts(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+        let plan = plan_with_facts(ctx, vec![row.clone()], &state, None, None)
             .await
             .unwrap();
         assert!(!plan.rows[0].landed);
         assert!(plan.warning.is_some());
         git(ctx, path, &["update-ref", "-d", "refs/remotes/origin/main"]).await;
         git(ctx, path, &["update-ref", "refs/heads/main", &head]).await;
-        let plan = plan_with_facts(ctx, vec![row], &state, &GithubData::default(), None)
+        let plan = plan_with_facts(ctx, vec![row], &state, None, None)
             .await
             .unwrap();
         assert!(!plan.rows[0].landed);

@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use wt_runtime::SourceState;
 use wt_tui::{Board, UiAction, UiReply};
 
-pub const HOST_PROTOCOL: u32 = 1;
+/// 2: snapshots carry the host board's per-domain provenance.
+pub const HOST_PROTOCOL: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,10 @@ pub struct RowLayout {
 pub struct HostSnapshot {
     pub board: Option<Board>,
     pub state: HostState,
+    /// The host board's per-domain provenance and observation stamps, on the
+    /// host's own process clock. Equality ignores stamps, so a refetch that
+    /// changes nothing is not a new frame.
+    pub domains: wt_runtime::DomainMap,
     /// Only facts used in cross-host layout. Controller sections and ordering
     /// stay in its own database, independent of the worker's personal layout.
     pub layout: BTreeMap<String, RowLayout>,
@@ -77,12 +82,9 @@ impl HostSnapshot {
         let snapshot = host.sources.board.snapshot();
         let metadata = host.sources.metadata.snapshot();
         let mut layout = BTreeMap::new();
-        if let Some(board) = &snapshot.data {
+        if let Some(board) = snapshot.data() {
             for row in &board.rows {
-                let entry = metadata
-                    .data
-                    .as_ref()
-                    .map(|data| &data.0["slugs"][&row.key]);
+                let entry = metadata.data().map(|data| &data.0["slugs"][&row.key]);
                 layout.insert(
                     row.key.clone(),
                     RowLayout {
@@ -95,8 +97,9 @@ impl HostSnapshot {
             }
         }
         Self {
-            board: snapshot.data.as_deref().cloned(),
-            state: (&snapshot.state).into(),
+            board: snapshot.data().map(|board| (**board).clone()),
+            state: snapshot.state().into(),
+            domains: snapshot.domains().clone(),
             layout,
         }
     }
@@ -221,6 +224,7 @@ mod tests {
                 ..Default::default()
             }),
             state: HostState::Ready,
+            domains: Default::default(),
             layout: BTreeMap::new(),
         };
         assert!(snapshot.validate().is_err());
@@ -228,5 +232,50 @@ mod tests {
         snapshot.validate().unwrap();
         snapshot.board.as_mut().unwrap().rows[0].key = "@remote/other/one".into();
         assert!(snapshot.validate().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_snapshots_meet_the_persisted_source_contract() {
+        use wt_runtime::{Domain, SourceSnapshot, SourceState};
+        let endpoint = wt_config::RemoteConfig {
+            host: "builder".into(),
+            label: "Builder".into(),
+            ..Default::default()
+        };
+        let name = crate::remote_host::source_name(&endpoint);
+        assert!(name.starts_with("host-") && name.len() == "host-".len() + 16);
+        let mut domains = SourceSnapshot::test_live(Some(()), SourceState::Ready, Domain::Git)
+            .domains()
+            .clone();
+        wt_runtime::merge_domains(
+            &mut domains,
+            SourceSnapshot::test_restored((), Domain::Github, 1_700_000_000_000).domains(),
+        );
+        let sample = HostSnapshot {
+            board: Some(Board {
+                name: "worker".into(),
+                rows: vec![wt_tui::BoardRow {
+                    key: "one".into(),
+                    slug: "one".into(),
+                    title: "Fix the flaky test".into(),
+                    branch: "feature/one".into(),
+                    path: "/srv/wt/one".into(),
+                    details: vec!["PR #42 open".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            state: HostState::Ready,
+            domains,
+            layout: BTreeMap::from([(
+                "one".to_owned(),
+                RowLayout {
+                    base_branch: Some("main".into()),
+                    work: None,
+                },
+            )]),
+        };
+        sample.validate().unwrap();
+        wt_runtime::conformance::persisted_source(name, Domain::Host, sample).await;
     }
 }

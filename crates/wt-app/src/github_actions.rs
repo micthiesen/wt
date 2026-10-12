@@ -1,12 +1,18 @@
 //! Host-local GitHub actions used by the TUI controller.
 //!
 //! Mutations go through `wt-github`; this module owns their bounded retry
-//! lifetime and the short-lived overlay needed while GitHub's read model catches
-//! up with a successful write.
+//! lifetime and a private ledger of the writes it made. GitHub's read model
+//! lags writes, so the ledger keeps the enable/disable no-op guards and retry
+//! cancellation honest until a read that started after a write shows it. The
+//! ledger is never published: displays, automations and planners read only
+//! confirmed GitHub data.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -17,32 +23,44 @@ use tokio::{
     time::{Instant, sleep},
 };
 use tokio_util::sync::CancellationToken;
-use wt_github::{GithubClient, GithubData, GithubOptions, PrChecks, PrMergeTarget};
-use wt_runtime::{SourceHandle, SourceSnapshot, TaskScope, source_channel};
-use wt_tui::{Board, UiModal, UiReply};
+use wt_github::{GithubClient, GithubData, GithubOptions, PrChecks, PrMergeTarget, PullRequest};
+use wt_runtime::{Confirmed, Domain, Mutation, Pending, PendingPhase, Stamp, Target, TaskScope};
+use wt_tui::{Board, PrPin, ReplyOutcome, UiModal, UiReply};
 
-use crate::context::AppContext;
+use crate::{context::AppContext, sources::GithubRefresh};
 
 const RETRY_EVERY: Duration = Duration::from_secs(30);
 const RETRY_LIMIT: Duration = Duration::from_secs(20 * 60);
 const MAX_RETRIES: usize = 4;
 const FAILED_LOG_LIMIT: usize = 200;
-const OVERLAY_LIFETIME: Duration = Duration::from_secs(12);
+/// The write named a PR the host cannot confirm as the one the user saw.
+pub(crate) const STALE_PIN: &str = "PR changed or still loading; review again";
+const UNCONFIRMED_ENABLE: &str = "previous attempt unconfirmed; waiting for refresh";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GithubAction {
-    MarkReady { key: String },
-    SetAutoMerge { key: String, enable: bool },
-    ToggleAutoMerge { key: String },
-    Ship { key: String },
-    FailedChecks { key: String },
+    MarkReady {
+        key: String,
+        pin: Option<PrPin>,
+    },
+    SetAutoMerge {
+        key: String,
+        enable: bool,
+        pin: Option<PrPin>,
+    },
+    Ship {
+        key: String,
+        pin: Option<PrPin>,
+    },
+    FailedChecks {
+        key: String,
+    },
 }
 
 #[derive(Clone)]
 pub struct GithubActions {
     client: GithubClient,
-    github: SourceHandle<GithubData>,
-    overlay_tx: mpsc::Sender<OverlayUpdate>,
+    writes: Writes,
     retry_tx: mpsc::Sender<RetryCommand>,
     cancellation: CancellationToken,
     reviewers_enabled: bool,
@@ -50,49 +68,39 @@ pub struct GithubActions {
 }
 
 impl GithubActions {
-    /// Starts the refresh overlay and the single scoped retry owner.
-    pub fn start(
-        scope: &TaskScope,
-        context: &AppContext,
-        github: SourceHandle<GithubData>,
-    ) -> (Self, SourceHandle<GithubData>) {
+    /// Starts the single scoped retry owner.
+    pub fn start(scope: &TaskScope, context: &AppContext, refresh: GithubRefresh) -> Self {
         let client = GithubClient::new(
             context.processes.clone(),
             context.config.paths.main_clone.clone(),
             GithubOptions::from_config(&context.config, false),
         );
-        let (overlay_tx, overlay_rx) = mpsc::channel(16);
-        let overlaid_github = overlay_github(scope, github.clone(), overlay_rx);
+        let writes = Writes::new(refresh);
         let (retry_tx, retry_rx) = mpsc::channel(16);
-        let cancellation = scope.token();
         spawn_retry_owner(
             scope,
             client.clone(),
-            github.clone(),
-            overlay_tx.clone(),
-            cancellation.clone(),
+            writes.clone(),
+            scope.token(),
             retry_rx,
         );
-
-        (
-            Self {
-                client,
-                github,
-                overlay_tx,
-                retry_tx,
-                cancellation: context.cancellation.clone(),
-                reviewers_enabled: context.config.github.reviewers,
-                default_reviewer: context.config.github.default_reviewer.clone(),
-            },
-            overlaid_github,
-        )
+        Self {
+            client,
+            writes,
+            retry_tx,
+            cancellation: context.cancellation.clone(),
+            reviewers_enabled: context.config.github.reviewers,
+            default_reviewer: context.config.github.default_reviewer.clone(),
+        }
     }
 
+    /// The board resolves the row only; PR identity, head and state come
+    /// from confirmed GitHub data, checked against the PR the user saw.
     pub async fn execute(
         &self,
         action: GithubAction,
         board: &Board,
-        github: &GithubData,
+        github: Option<&Confirmed<GithubData>>,
     ) -> Result<UiReply> {
         let key = action.key();
         let Some(row) = resolve_row(board, key) else {
@@ -101,10 +109,19 @@ impl GithubActions {
             )));
         };
         let branch = row.branch.clone();
+        if let Some(pin) = action.write_pin()
+            && !pin_matches(pin, github.and_then(|data| data.prs.get(&branch)))
+        {
+            return Ok(failed(STALE_PIN));
+        }
+        let Some(github) = github else {
+            return Ok(failed("GitHub data is still loading"));
+        };
         let Some(pr) = github.prs.get(&branch) else {
             return Ok(UiReply {
                 message: "no PR for this row".into(),
                 notice: true,
+                outcome: Some(ReplyOutcome::NoChange),
                 ..UiReply::default()
             });
         };
@@ -117,55 +134,66 @@ impl GithubActions {
         }
 
         match action {
-            GithubAction::MarkReady { .. } => {
-                self.mark_ready(pr.number, &branch, pr.is_draft).await
-            }
+            GithubAction::MarkReady { .. } => self.mark_ready(pr, &branch, github).await,
             GithubAction::SetAutoMerge { enable, .. } => {
                 self.set_auto_merge(pr, &branch, github, enable).await
             }
-            GithubAction::ToggleAutoMerge { .. } => {
-                self.toggle_auto_merge(pr, &branch, github).await
-            }
-            GithubAction::Ship { .. } => self.ship(pr, &branch).await,
+            GithubAction::Ship { .. } => self.ship(pr, &branch, github).await,
             GithubAction::FailedChecks { .. } => self.failed_checks(pr, &branch).await,
         }
     }
 
-    async fn mark_ready(&self, number: u64, branch: &str, is_draft: bool) -> Result<UiReply> {
-        if !is_draft {
-            return Ok(reply(format!("PR #{number} is already ready")));
+    async fn mark_ready(
+        &self,
+        pr: &PullRequest,
+        branch: &str,
+        github: &Confirmed<GithubData>,
+    ) -> Result<UiReply> {
+        let number = pr.number;
+        let effective = self.writes.effective(github);
+        if !effective_pr(&effective, branch, number).is_some_and(|pr| pr.is_draft) {
+            return Ok(no_change(format!("PR #{number} is already ready")));
         }
         let result = self
             .client
             .mark_pull_request_ready(number, &self.cancellation)
             .await;
+        let write = GithubWrite::ready(branch, number);
         if !result.ok {
-            return Ok(failed(
+            return Ok(self.write_failed(
+                write,
                 result.error.unwrap_or_else(|| "mark ready failed".into()),
             ));
         }
-        self.overlay(OverlayUpdate::Ready(branch.to_owned()));
-        self.refresh_github();
-        Ok(reply(format!("marked PR #{number} ready for review")))
+        let at = self.writes.accepted(write);
+        Ok(accepted(
+            format!("marked PR #{number} ready for review"),
+            at,
+        ))
     }
 
     async fn set_auto_merge(
         &self,
-        pr: &wt_github::PullRequest,
+        pr: &PullRequest,
         branch: &str,
-        github: &GithubData,
+        github: &Confirmed<GithubData>,
         enable: bool,
     ) -> Result<UiReply> {
         let number = pr.number;
-        let armed = pr.auto_merge.is_some() || github.merge_queue.contains_key(branch);
         if enable {
-            if armed {
-                return Ok(reply(format!(
-                    "merge when ready is already armed for PR #{number}"
-                )));
+            match self.writes.guard(github, branch, number, true) {
+                Guard::Send => {}
+                Guard::AlreadyDone => {
+                    return Ok(no_change(format!(
+                        "merge when ready is already armed for PR #{number}"
+                    )));
+                }
+                Guard::Unconfirmed => return Ok(failed(UNCONFIRMED_ENABLE)),
             }
             if self.retry_pending(number).await? {
-                return Ok(reply(format!("PR #{number} is already waiting on checks")));
+                return Ok(deferred(format!(
+                    "PR #{number} is already waiting on checks"
+                )));
             }
             let Some(target) = merge_target(pr) else {
                 return Ok(failed(format!(
@@ -176,20 +204,25 @@ impl GithubActions {
                 .client
                 .enable_auto_merge(&target, &self.cancellation)
                 .await;
+            let write = GithubWrite::auto_merge(branch, number, true);
             if result.ok {
-                self.overlay(OverlayUpdate::Armed(branch.to_owned()));
-                self.refresh_github();
-                return Ok(reply(format!("merge when ready armed for PR #{number}")));
+                let at = self.writes.accepted(write);
+                return Ok(accepted(
+                    format!("merge when ready armed for PR #{number}"),
+                    at,
+                ));
             }
             if result.retryable == Some(true) {
                 match self.start_retry(target.clone(), branch.to_owned()).await? {
                     RetryStart::Started => {
-                        return Ok(reply(format!(
+                        return Ok(deferred(format!(
                             "PR #{number}: required checks have not reported; will arm when they do"
                         )));
                     }
                     RetryStart::AlreadyRunning => {
-                        return Ok(reply(format!("PR #{number} is already waiting on checks")));
+                        return Ok(deferred(format!(
+                            "PR #{number} is already waiting on checks"
+                        )));
                     }
                     RetryStart::AtCapacity => {
                         return Ok(failed(
@@ -198,7 +231,8 @@ impl GithubActions {
                     }
                 }
             }
-            return Ok(failed(
+            return Ok(self.write_failed(
+                write,
                 result.error.unwrap_or_else(|| "auto-merge failed".into()),
             ));
         }
@@ -207,11 +241,18 @@ impl GithubActions {
         if let Some(result) = self.finish_retry_cancel(pr, branch, cancellation).await {
             return Ok(result);
         }
-        if !armed {
-            return Ok(reply(format!(
+        // Sent whenever this host's own writes say the PR may be armed, even
+        // when the lagging read still shows it disarmed.
+        if self.writes.guard(github, branch, number, false) != Guard::Send {
+            return Ok(no_change(format!(
                 "merge when ready is not armed for PR #{number}"
             )));
         }
+        self.disable(pr, branch).await
+    }
+
+    async fn disable(&self, pr: &PullRequest, branch: &str) -> Result<UiReply> {
+        let number = pr.number;
         let Some(target) = merge_target_for_disable(pr) else {
             return Ok(failed(format!(
                 "cannot inspect PR #{number}: missing PR node id"
@@ -221,69 +262,38 @@ impl GithubActions {
             .client
             .disable_auto_merge(&target, &self.cancellation)
             .await;
+        let write = GithubWrite::auto_merge(branch, number, false);
         if !result.ok {
-            return Ok(failed(
+            return Ok(self.write_failed(
+                write,
                 result
                     .error
                     .unwrap_or_else(|| "disable auto-merge failed".into()),
             ));
         }
-        self.overlay(OverlayUpdate::Disarmed(branch.to_owned()));
-        self.refresh_github();
-        Ok(reply(format!(
-            "cancelled merge-when-ready for PR #{number}"
-        )))
-    }
-
-    /// Toggle the actual queue/classic armed state. A queued retry counts as
-    /// pending even though GitHub has not accepted an arm yet, so a second
-    /// toggle cancels it instead of reporting that nothing is armed.
-    pub async fn toggle_auto_merge(
-        &self,
-        pr: &wt_github::PullRequest,
-        branch: &str,
-        github: &GithubData,
-    ) -> Result<UiReply> {
-        let cancellation = self.cancel_retry(pr.number).await?;
-        if let Some(result) = self.finish_retry_cancel(pr, branch, cancellation).await {
-            return Ok(result);
-        }
-        let armed = pr.auto_merge.is_some() || github.merge_queue.contains_key(branch);
-        self.set_auto_merge(pr, branch, github, !armed).await
-    }
-
-    /// Optimistically project a completed reviewer edit and request a fresh
-    /// source read, using the same bounded settle behavior as PR mutations.
-    pub fn optimistic_reviewers(
-        &self,
-        branch: impl Into<String>,
-        requested: Vec<String>,
-        review_requests: u32,
-    ) {
-        self.overlay(OverlayUpdate::Reviewers {
-            branch: branch.into(),
-            requested,
-            review_requests,
-        });
-        self.refresh_github();
+        let at = self.writes.accepted(write);
+        Ok(accepted(
+            format!("cancelled merge-when-ready for PR #{number}"),
+            at,
+        ))
     }
 
     async fn finish_retry_cancel(
         &self,
-        pr: &wt_github::PullRequest,
+        pr: &PullRequest,
         branch: &str,
         cancellation: RetryCancel,
     ) -> Option<UiReply> {
         let number = pr.number;
         match cancellation {
             RetryCancel::NotPending => None,
-            RetryCancel::Cancelled => Some(reply(format!(
+            RetryCancel::Cancelled => Some(no_change(format!(
                 "cancelled pending merge-when-ready arm for PR #{number}"
             ))),
             RetryCancel::Armed => {
                 // Cancellation raced with a successful in-flight request. Wait
                 // for that request to finish, then remove the actual queue or
-                // classic arm before acknowledging the toggle.
+                // classic arm before acknowledging the request.
                 let Some(target) = merge_target_for_disable(pr) else {
                     return Some(failed(format!(
                         "PR #{number} armed while cancellation was in flight, but its node id is missing; refresh and inspect the PR"
@@ -293,32 +303,43 @@ impl GithubActions {
                     .client
                     .disable_auto_merge(&target, &self.cancellation)
                     .await;
+                let write = GithubWrite::auto_merge(branch, number, false);
                 if !result.ok {
-                    return Some(failed(format!(
-                        "PR #{number} armed while cancellation was in flight; could not disarm it: {}",
-                        result
-                            .error
-                            .unwrap_or_else(|| "unknown GitHub error".into())
-                    )));
+                    return Some(self.write_failed(
+                        write,
+                        format!(
+                            "PR #{number} armed while cancellation was in flight; could not disarm it: {}",
+                            result
+                                .error
+                                .unwrap_or_else(|| "unknown GitHub error".into())
+                        ),
+                    ));
                 }
-                self.overlay(OverlayUpdate::Disarmed(branch.to_owned()));
-                self.refresh_github();
-                Some(reply(format!(
-                    "cancelled pending arm and disarmed merge-when-ready for PR #{number}"
-                )))
+                let at = self.writes.accepted(write);
+                Some(accepted(
+                    format!("cancelled pending arm and disarmed merge-when-ready for PR #{number}"),
+                    at,
+                ))
             }
             RetryCancel::Failed(error) => Some(failed(format!(
                 "pending merge request for PR #{number} ended while cancellation was in flight: {error}; refresh GitHub to inspect its state"
             ))),
-            RetryCancel::GaveUp => Some(reply(format!(
+            RetryCancel::GaveUp => Some(no_change(format!(
                 "pending merge-when-ready retry for PR #{number} stopped waiting"
             ))),
         }
     }
 
-    async fn ship(&self, pr: &wt_github::PullRequest, branch: &str) -> Result<UiReply> {
+    async fn ship(
+        &self,
+        pr: &PullRequest,
+        branch: &str,
+        github: &Confirmed<GithubData>,
+    ) -> Result<UiReply> {
         let number = pr.number;
-        let was_draft = pr.is_draft;
+        let effective = self.writes.effective(github);
+        let shown = effective_pr(&effective, branch, number).unwrap_or(pr);
+        let was_draft = shown.is_draft;
         let reviewer = self
             .reviewers_enabled
             .then_some(self.default_reviewer.as_deref())
@@ -331,7 +352,7 @@ impl GithubActions {
             .map(str::to_owned);
         // Preserve the existing TUI's ship contract: it checks classic auto
         // merge, but not a queue entry, before deciding whether arming is needed.
-        let needs_arm = pr.auto_merge.is_none();
+        let needs_arm = shown.auto_merge.is_none();
         let target = if needs_arm {
             match merge_target(pr) {
                 Some(target) => Some(target),
@@ -345,7 +366,7 @@ impl GithubActions {
             None
         };
         if !was_draft && reviewer.is_none() && !needs_arm {
-            return Ok(reply(format!("PR #{number} is already shipped")));
+            return Ok(no_change(format!("PR #{number} is already shipped")));
         }
 
         let mark_ready = async {
@@ -376,19 +397,20 @@ impl GithubActions {
             }
         };
         let (ready_result, reviewer_result) = tokio::join!(mark_ready, request_reviewer);
+        let mut at = None;
         if reviewer_result.as_ref().is_some_and(|result| result.ok) {
-            self.refresh_github();
+            at = Some(Stamp::now());
+            self.writes.refresh.refresh_live();
         }
-        if let Some(result) = ready_result.as_ref() {
+        if let Some(result) = ready_result {
+            let write = GithubWrite::ready(branch, number);
             if !result.ok {
-                return Ok(failed(
-                    result
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "mark ready failed".into()),
+                return Ok(self.write_failed(
+                    write,
+                    result.error.unwrap_or_else(|| "mark ready failed".into()),
                 ));
             }
-            self.overlay(OverlayUpdate::Ready(branch.to_owned()));
+            at = Some(self.writes.accepted(write));
         }
 
         let reviewer_error = reviewer_result
@@ -401,25 +423,29 @@ impl GithubActions {
                 .client
                 .enable_auto_merge(target, &self.cancellation)
                 .await;
+            let write = GithubWrite::auto_merge(branch, number, true);
             if !result.ok {
                 let mut message = result.error.unwrap_or_else(|| "auto-merge failed".into());
                 if let Some(reviewer_error) = reviewer_error {
                     message.push_str("; ");
                     message.push_str(&reviewer_error);
                 }
-                return Ok(failed(message));
+                return Ok(self.write_failed(write, message));
             }
-            self.overlay(OverlayUpdate::Armed(branch.to_owned()));
+            at = Some(self.writes.accepted(write));
         }
-        self.refresh_github();
         let message = match reviewer_error {
             Some(error) => format!("shipped PR #{number}; {error}"),
             None => format!("shipped PR #{number}"),
         };
-        Ok(reply(message))
+        Ok(match at {
+            Some(at) => accepted(message, at),
+            // Only the reviewer request ran, and it failed.
+            None => failed(message),
+        })
     }
 
-    async fn failed_checks(&self, pr: &wt_github::PullRequest, branch: &str) -> Result<UiReply> {
+    async fn failed_checks(&self, pr: &PullRequest, branch: &str) -> Result<UiReply> {
         if pr.checks != PrChecks::Fail {
             return Ok(reply("no failing checks"));
         }
@@ -447,14 +473,19 @@ impl GithubActions {
         })
     }
 
-    fn overlay(&self, update: OverlayUpdate) {
-        if self.overlay_tx.try_send(update).is_err() {
-            tracing::warn!("GitHub mutation overlay queue is unavailable; refreshing source only");
+    /// A failed write is definite unless the command drain cancelled it
+    /// mid-request: then GitHub may have applied it, so it stays recorded as
+    /// unconfirmed and is never resent automatically.
+    fn write_failed(&self, write: GithubWrite, error: String) -> UiReply {
+        if !self.cancellation.is_cancelled() {
+            return failed(error);
         }
-    }
-
-    fn refresh_github(&self) {
-        let _ = self.github.refresh();
+        self.writes.uncertain(write);
+        UiReply {
+            message: format!("{error}; the request may have reached GitHub and is unconfirmed"),
+            outcome: Some(ReplyOutcome::Uncertain),
+            ..UiReply::default()
+        }
     }
 
     async fn start_retry(&self, target: PrMergeTarget, branch: String) -> Result<RetryStart> {
@@ -495,176 +526,263 @@ impl GithubActions {
     }
 }
 
-#[derive(Clone, Debug)]
-enum OverlayUpdate {
-    Ready(String),
-    Armed(String),
-    Disarmed(String),
-    Reviewers {
-        branch: String,
-        requested: Vec<String>,
-        review_requests: u32,
-    },
+/// A write this host made, or may have made, to one PR field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GithubWrite {
+    branch: String,
+    number: u64,
+    change: WriteChange,
 }
 
-#[derive(Clone, Debug)]
-enum OverlayValue {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteChange {
+    AutoMerge { enable: bool },
     Ready,
-    Armed,
-    Disarmed,
-    Reviewers {
-        requested: Vec<String>,
-        review_requests: u32,
-    },
 }
 
-#[derive(Clone, Debug)]
-struct OverlayEntry {
-    value: OverlayValue,
-    expires_at: Instant,
-}
-
-fn overlay_github(
-    scope: &TaskScope,
-    input: SourceHandle<GithubData>,
-    mut updates: mpsc::Receiver<OverlayUpdate>,
-) -> SourceHandle<GithubData> {
-    let (handle, mut publisher) = source_channel();
-    let cancellation = scope.token();
-    scope.spawn(async move {
-        let mut upstream = input.subscribe();
-        let mut overlays: BTreeMap<String, Vec<OverlayEntry>> = BTreeMap::new();
-        let mut latest = upstream.borrow().clone();
-        loop {
-            publish_overlay(&publisher, &latest, &mut overlays);
-            let deadline = overlays
-                .values()
-                .flatten()
-                .map(|entry| entry.expires_at)
-                .min();
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => break,
-                changed = upstream.changed() => {
-                    if changed.is_err() { break; }
-                    latest = upstream.borrow_and_update().clone();
-                }
-                update = updates.recv() => {
-                    let Some(update) = update else { break; };
-                    let (branch, value) = match update {
-                        OverlayUpdate::Ready(branch) => (branch, OverlayValue::Ready),
-                        OverlayUpdate::Armed(branch) => (branch, OverlayValue::Armed),
-                        OverlayUpdate::Disarmed(branch) => (branch, OverlayValue::Disarmed),
-                        OverlayUpdate::Reviewers { branch, requested, review_requests } =>
-                            (branch, OverlayValue::Reviewers { requested, review_requests }),
-                    };
-                    let entries = overlays.entry(branch).or_default();
-                    entries.retain(|entry| !same_overlay_field(&entry.value, &value));
-                    entries.push(OverlayEntry {
-                        value,
-                        expires_at: Instant::now() + OVERLAY_LIFETIME,
-                    });
-                }
-                _ = publisher.requested() => {
-                    let _ = input.refresh();
-                }
-                _ = async {
-                    if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; }
-                    else { std::future::pending::<()>().await; }
-                } => {
-                    let now = Instant::now();
-                    overlays.retain(|_, entries| {
-                        entries.retain(|entry| entry.expires_at > now);
-                        !entries.is_empty()
-                    });
-                }
-            }
+impl GithubWrite {
+    pub(crate) fn auto_merge(branch: &str, number: u64, enable: bool) -> Self {
+        Self {
+            branch: branch.to_owned(),
+            number,
+            change: WriteChange::AutoMerge { enable },
         }
-    });
-    handle
+    }
+
+    fn ready(branch: &str, number: u64) -> Self {
+        Self {
+            branch: branch.to_owned(),
+            number,
+            change: WriteChange::Ready,
+        }
+    }
 }
 
-fn publish_overlay(
-    publisher: &wt_runtime::SourcePublisher<GithubData>,
-    upstream: &SourceSnapshot<GithubData>,
-    overlays: &mut BTreeMap<String, Vec<OverlayEntry>>,
-) {
-    let Some(data) = upstream.data.as_deref() else {
-        publisher.publish(upstream.clone());
-        return;
-    };
-    let mut projected = data.clone();
-    overlays.retain(|branch, entries| {
-        let Some(pr) = projected.prs.get_mut(branch) else {
-            entries.retain(|entry| entry.expires_at > Instant::now());
-            return !entries.is_empty();
+impl Mutation<GithubData> for GithubWrite {
+    fn key(&self) -> String {
+        let field = match self.change {
+            WriteChange::AutoMerge { .. } => "merge",
+            WriteChange::Ready => "ready",
         };
-        entries.retain(|entry| {
-            let caught_up = match &entry.value {
-                OverlayValue::Ready => !pr.is_draft,
-                OverlayValue::Armed => {
-                    pr.auto_merge.is_some() || projected.merge_queue.contains_key(branch)
-                }
-                OverlayValue::Disarmed => {
-                    pr.auto_merge.is_none() && !projected.merge_queue.contains_key(branch)
-                }
-                OverlayValue::Reviewers {
-                    requested,
-                    review_requests,
-                } => pr.requested_reviewers == *requested && pr.review_requests == *review_requests,
-            };
-            if caught_up || entry.expires_at <= Instant::now() {
-                return false;
-            }
-            match &entry.value {
-                OverlayValue::Ready => pr.is_draft = false,
-                OverlayValue::Armed => {
-                    if pr.auto_merge.is_none() {
-                        pr.auto_merge = Some(wt_github::AutoMerge {
-                            enabled_at: time::OffsetDateTime::now_utc()
-                                .format(&time::format_description::well_known::Rfc3339)
-                                .unwrap_or_default(),
-                            merge_method: wt_github::AutoMergeMethod::Rebase,
-                        });
-                    }
-                }
-                OverlayValue::Disarmed => {
-                    pr.auto_merge = None;
-                    projected.merge_queue.remove(branch);
-                }
-                OverlayValue::Reviewers {
-                    requested,
-                    review_requests,
-                } => {
-                    pr.requested_reviewers = requested.clone();
-                    pr.review_requests = *review_requests;
+        format!("{}#{}:{field}", self.branch, self.number)
+    }
+
+    fn target(&self) -> Target {
+        Target::row(None, self.branch.clone())
+    }
+
+    fn label(&self) -> String {
+        match self.change {
+            WriteChange::AutoMerge { enable: true } => "arming merge".into(),
+            WriteChange::AutoMerge { enable: false } => "disarming merge".into(),
+            WriteChange::Ready => "marking ready".into(),
+        }
+    }
+
+    fn domains(&self) -> &'static [Domain] {
+        &[Domain::Github]
+    }
+
+    fn apply(&self, view: &mut GithubData) {
+        let Some(pr) = view
+            .prs
+            .get_mut(&self.branch)
+            .filter(|pr| pr.number == self.number)
+        else {
+            return;
+        };
+        match self.change {
+            WriteChange::AutoMerge { enable: true } => {
+                if pr.auto_merge.is_none() && !view.merge_queue.contains_key(&self.branch) {
+                    pr.auto_merge = Some(wt_github::AutoMerge {
+                        enabled_at: String::new(),
+                        merge_method: wt_github::AutoMergeMethod::Rebase,
+                    });
                 }
             }
-            true
-        });
-        !entries.is_empty()
-    });
-    publisher.publish(SourceSnapshot {
-        data: Some(Arc::new(projected)),
-        state: upstream.state.clone(),
-        updated_at: upstream.updated_at,
-        revision: upstream.revision,
-    });
+            WriteChange::AutoMerge { enable: false } => {
+                pr.auto_merge = None;
+                view.merge_queue.remove(&self.branch);
+            }
+            WriteChange::Ready => pr.is_draft = false,
+        }
+    }
+
+    fn observed(&self, confirmed: &GithubData) -> bool {
+        // A different or missing PR makes the record irrelevant.
+        let Some(pr) = confirmed
+            .prs
+            .get(&self.branch)
+            .filter(|pr| pr.number == self.number)
+        else {
+            return true;
+        };
+        match self.change {
+            WriteChange::AutoMerge { enable } => armed(confirmed, &self.branch, pr) == enable,
+            WriteChange::Ready => !pr.is_draft,
+        }
+    }
 }
 
-fn same_overlay_field(left: &OverlayValue, right: &OverlayValue) -> bool {
-    matches!(
-        (left, right),
-        (OverlayValue::Ready, OverlayValue::Ready)
-            | (OverlayValue::Armed, OverlayValue::Armed)
-            | (OverlayValue::Armed, OverlayValue::Disarmed)
-            | (OverlayValue::Disarmed, OverlayValue::Armed)
-            | (OverlayValue::Disarmed, OverlayValue::Disarmed)
-            | (
-                OverlayValue::Reviewers { .. },
-                OverlayValue::Reviewers { .. }
-            )
-    )
+pub(crate) type Ledger = Pending<GithubData, GithubWrite>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Guard {
+    /// The write would change something; send it.
+    Send,
+    /// Confirmed data plus this host's own writes already show the result.
+    AlreadyDone,
+    /// An earlier enable may or may not have happened. Refuse rather than
+    /// resend: lost mutation replies are never retried automatically.
+    Unconfirmed,
+}
+
+/// This host's GitHub writes, settled against confirmed reads.
+#[derive(Clone)]
+struct Writes {
+    ledger: Arc<Mutex<Ledger>>,
+    next_op: Arc<AtomicU64>,
+    refresh: GithubRefresh,
+}
+
+impl Writes {
+    fn new(refresh: GithubRefresh) -> Self {
+        Self {
+            ledger: Arc::default(),
+            next_op: Arc::new(AtomicU64::new(1)),
+            refresh,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a write GitHub acknowledged just now and ask for a direct read,
+    /// not the events daemon's older snapshot, to confirm it.
+    fn accepted(&self, write: GithubWrite) -> Stamp {
+        let at = Stamp::now();
+        record_accepted(&mut self.lock(), self.op(), write, at);
+        self.refresh.refresh_live();
+        at
+    }
+
+    fn uncertain(&self, write: GithubWrite) {
+        let op = self.op();
+        let now = Instant::now();
+        let mut ledger = self.lock();
+        ledger.begin(op, write, now);
+        ledger.uncertain(op, now);
+        drop(ledger);
+        self.refresh.refresh_live();
+    }
+
+    fn op(&self) -> u64 {
+        self.next_op.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn guard(
+        &self,
+        github: &Confirmed<GithubData>,
+        branch: &str,
+        number: u64,
+        enable: bool,
+    ) -> Guard {
+        auto_merge_guard(
+            &mut self.lock(),
+            github,
+            branch,
+            number,
+            enable,
+            Instant::now(),
+        )
+    }
+
+    fn effective(&self, github: &Confirmed<GithubData>) -> GithubData {
+        let mut ledger = self.lock();
+        settle(&mut ledger, github, Instant::now());
+        ledger.project(github)
+    }
+}
+
+fn record_accepted(ledger: &mut Ledger, op: u64, write: GithubWrite, at: Stamp) {
+    let now = Instant::now();
+    ledger.begin(op, write, now);
+    ledger.accept(op, at, now);
+}
+
+/// Drop records a read that started after them shows, and expired ones.
+fn settle(ledger: &mut Ledger, github: &Confirmed<GithubData>, now: Instant) {
+    let observed = github.observed();
+    for expired in ledger.settle(github, |_, _| Some(observed), now) {
+        tracing::info!(
+            write = %expired.mutation.key(),
+            phase = ?expired.phase,
+            "GitHub write not yet reflected by GitHub reads"
+        );
+    }
+}
+
+/// D3: disable is sent whenever this host's writes say the PR may be armed;
+/// enable is refused while an earlier enable is unconfirmed.
+fn auto_merge_guard(
+    ledger: &mut Ledger,
+    github: &Confirmed<GithubData>,
+    branch: &str,
+    number: u64,
+    enable: bool,
+    now: Instant,
+) -> Guard {
+    settle(ledger, github, now);
+    let unconfirmed = |wanted: bool| {
+        ledger.mutations().zip(ledger.views()).any(|(write, view)| {
+            view.phase == PendingPhase::Unconfirmed
+                && write.branch == branch
+                && write.number == number
+                && write.change == WriteChange::AutoMerge { enable: wanted }
+        })
+    };
+    if enable && unconfirmed(true) {
+        return Guard::Unconfirmed;
+    }
+    let effective = ledger.project(github);
+    let effective_armed =
+        effective_pr(&effective, branch, number).is_some_and(|pr| armed(&effective, branch, pr));
+    if enable {
+        return if effective_armed {
+            Guard::AlreadyDone
+        } else {
+            Guard::Send
+        };
+    }
+    // An unconfirmed disable may not have happened: trust the read then.
+    let confirmed_armed =
+        effective_pr(github, branch, number).is_some_and(|pr| armed(github, branch, pr));
+    if effective_armed || (confirmed_armed && unconfirmed(false)) {
+        Guard::Send
+    } else {
+        Guard::AlreadyDone
+    }
+}
+
+fn effective_pr<'a>(data: &'a GithubData, branch: &str, number: u64) -> Option<&'a PullRequest> {
+    data.prs.get(branch).filter(|pr| pr.number == number)
+}
+
+fn armed(data: &GithubData, branch: &str, pr: &PullRequest) -> bool {
+    pr.auto_merge.is_some() || data.merge_queue.contains_key(branch)
+}
+
+/// The PR the user saw must be the PR confirmed data names now, at the same
+/// head. With neither a pin nor a PR there is nothing to write to.
+fn pin_matches(pin: Option<&PrPin>, pr: Option<&PullRequest>) -> bool {
+    match (pin, pr) {
+        (None, None) => true,
+        (Some(pin), Some(pr)) => pin.number == pr.number && pin.head_sha == pr.head_ref_oid,
+        _ => false,
+    }
 }
 
 enum RetryCommand {
@@ -723,8 +841,7 @@ fn retry_cancel_result(outcome: &RetryOutcome) -> RetryCancel {
 fn spawn_retry_owner(
     scope: &TaskScope,
     client: GithubClient,
-    github: SourceHandle<GithubData>,
-    overlay_tx: mpsc::Sender<OverlayUpdate>,
+    writes: Writes,
     cancellation: CancellationToken,
     mut commands: mpsc::Receiver<RetryCommand>,
 ) {
@@ -748,10 +865,9 @@ fn spawn_retry_owner(
                                 let token = cancellation.child_token();
                                 active.insert(target.number, token.clone());
                                 let client = client.clone();
-                                let github = github.clone();
-                                let overlay_tx = overlay_tx.clone();
+                                let writes = writes.clone();
                                 jobs.spawn(async move {
-                                    let result = retry_arm(client, github, overlay_tx, target.clone(), branch, token).await;
+                                    let result = retry_arm(client, writes, target.clone(), branch, token).await;
                                     RetryFinished { number: target.number, result }
                                 });
                                 RetryStart::Started
@@ -805,8 +921,7 @@ fn spawn_retry_owner(
 
 async fn retry_arm(
     client: GithubClient,
-    github: SourceHandle<GithubData>,
-    overlay_tx: mpsc::Sender<OverlayUpdate>,
+    writes: Writes,
     target: PrMergeTarget,
     branch: String,
     cancellation: CancellationToken,
@@ -822,8 +937,8 @@ async fn retry_arm(
         }
         let result = client.enable_auto_merge(&target, &cancellation).await;
         if result.ok {
-            let _ = overlay_tx.send(OverlayUpdate::Armed(branch.clone())).await;
-            let _ = github.refresh();
+            // Recorded so a disarm before the next read still sends disable.
+            writes.accepted(GithubWrite::auto_merge(&branch, target.number, true));
             return RetryOutcome::Armed;
         }
         if result.retryable != Some(true) {
@@ -837,11 +952,20 @@ async fn retry_arm(
 impl GithubAction {
     fn key(&self) -> &str {
         match self {
-            Self::MarkReady { key }
+            Self::MarkReady { key, .. }
             | Self::SetAutoMerge { key, .. }
-            | Self::ToggleAutoMerge { key }
-            | Self::Ship { key }
+            | Self::Ship { key, .. }
             | Self::FailedChecks { key } => key,
+        }
+    }
+
+    /// The PR a write must still target; `None` for reads.
+    fn write_pin(&self) -> Option<Option<&PrPin>> {
+        match self {
+            Self::MarkReady { pin, .. }
+            | Self::SetAutoMerge { pin, .. }
+            | Self::Ship { pin, .. } => Some(pin.as_ref()),
+            Self::FailedChecks { .. } => None,
         }
     }
 }
@@ -855,7 +979,7 @@ fn resolve_row<'a>(board: &'a Board, key: &str) -> Option<&'a wt_tui::BoardRow> 
     matching.next().is_none().then_some(first)
 }
 
-fn merge_target(pr: &wt_github::PullRequest) -> Option<PrMergeTarget> {
+fn merge_target(pr: &PullRequest) -> Option<PrMergeTarget> {
     Some(PrMergeTarget {
         id: pr.id.clone().filter(|id| !id.is_empty())?,
         number: pr.number,
@@ -864,7 +988,7 @@ fn merge_target(pr: &wt_github::PullRequest) -> Option<PrMergeTarget> {
     })
 }
 
-fn merge_target_for_disable(pr: &wt_github::PullRequest) -> Option<PrMergeTarget> {
+fn merge_target_for_disable(pr: &PullRequest) -> Option<PrMergeTarget> {
     Some(PrMergeTarget {
         id: pr.id.clone().filter(|id| !id.is_empty())?,
         number: pr.number,
@@ -880,6 +1004,27 @@ fn reply(message: impl Into<String>) -> UiReply {
     }
 }
 
+fn accepted(message: impl Into<String>, at: Stamp) -> UiReply {
+    UiReply {
+        outcome: Some(ReplyOutcome::Accepted(at)),
+        ..reply(message)
+    }
+}
+
+fn no_change(message: impl Into<String>) -> UiReply {
+    UiReply {
+        outcome: Some(ReplyOutcome::NoChange),
+        ..reply(message)
+    }
+}
+
+fn deferred(message: impl Into<String>) -> UiReply {
+    UiReply {
+        outcome: Some(ReplyOutcome::Deferred),
+        ..reply(message)
+    }
+}
+
 fn failed(message: impl Into<String>) -> UiReply {
     UiReply {
         message: message.into(),
@@ -889,10 +1034,9 @@ fn failed(message: impl Into<String>) -> UiReply {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use wt_github::{AutoMerge, PullRequest};
-    use wt_runtime::SourceState;
+    use wt_github::AutoMerge;
 
     fn pr(branch: &str) -> PullRequest {
         PullRequest {
@@ -922,6 +1066,35 @@ mod tests {
             merged_at: None,
             closed_at: None,
         }
+    }
+
+    /// GitHub data with one open draft PR #7 on `branch`.
+    pub(crate) fn open_pr_data(branch: &str) -> GithubData {
+        let mut data = GithubData::default();
+        data.prs.insert(branch.into(), pr(branch));
+        data
+    }
+
+    /// The same data with classic auto-merge armed on every PR.
+    pub(crate) fn with_auto_merge(mut data: GithubData) -> GithubData {
+        for pr in data.prs.values_mut() {
+            pr.auto_merge = Some(AutoMerge {
+                enabled_at: "then".into(),
+                merge_method: wt_github::AutoMergeMethod::Rebase,
+            });
+        }
+        data
+    }
+
+    pub(crate) fn ledger_with_accepted_enable(branch: &str, number: u64, at: Stamp) -> Ledger {
+        let mut ledger = Ledger::default();
+        record_accepted(
+            &mut ledger,
+            1,
+            GithubWrite::auto_merge(branch, number, true),
+            at,
+        );
+        ledger
     }
 
     #[test]
@@ -965,18 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn overlay_preserves_other_pr_and_merge_queue_data() {
-        let mut data = GithubData::default();
-        let mut first = pr("feature/one");
-        first.is_draft = true;
-        let mut second = pr("feature/two");
+    fn ledger_projection_touches_only_its_pr_and_settles_on_matching_data() {
+        let mut data = open_pr_data("feature/one");
+        let mut second = with_auto_merge(open_pr_data("feature/two")).prs["feature/two"].clone();
         second.number = 8;
-        second.auto_merge = Some(AutoMerge {
-            enabled_at: "then".into(),
-            merge_method: wt_github::AutoMergeMethod::Rebase,
-        });
-        data.prs.insert("feature/one".into(), first);
-        data.prs.insert("feature/two".into(), second.clone());
+        data.prs.insert("feature/two".into(), second);
         data.merge_queue.insert(
             "feature/two".into(),
             wt_github::MergeQueueEntry {
@@ -987,125 +1153,142 @@ mod tests {
                 estimated_time_to_merge: None,
             },
         );
-        let upstream = SourceSnapshot {
-            data: Some(Arc::new(data.clone())),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 1,
-        };
-        let mut overlays = BTreeMap::from([(
-            "feature/one".into(),
-            vec![
-                OverlayEntry {
-                    value: OverlayValue::Ready,
-                    expires_at: Instant::now() + Duration::from_secs(10),
-                },
-                OverlayEntry {
-                    value: OverlayValue::Reviewers {
-                        requested: vec!["new-reviewer".into()],
-                        review_requests: 1,
-                    },
-                    expires_at: Instant::now() + Duration::from_secs(10),
-                },
-            ],
-        )]);
-        let (handle, publisher) = source_channel();
-        publish_overlay(&publisher, &upstream, &mut overlays);
-        let result = handle.snapshot();
-        let result = result.data.unwrap();
-        assert!(!result.prs["feature/one"].is_draft);
-        assert_eq!(
-            result.prs["feature/one"].requested_reviewers,
-            ["new-reviewer"]
-        );
-        assert_eq!(result.prs["feature/one"].review_requests, 1);
-        assert_eq!(result.prs["feature/two"], second);
-        assert_eq!(result.merge_queue["feature/two"].position, 3);
-        assert_eq!(
-            overlays["feature/one"].len(),
-            2,
-            "stale upstream must keep the optimistic overlay"
-        );
+        let mut view = data.clone();
+        GithubWrite::ready("feature/one", 7).apply(&mut view);
+        GithubWrite::auto_merge("feature/two", 8, false).apply(&mut view);
+        // A record for another PR number on the same branch is inert.
+        GithubWrite::auto_merge("feature/one", 99, true).apply(&mut view);
+        assert!(!view.prs["feature/one"].is_draft);
+        assert!(view.prs["feature/one"].auto_merge.is_none());
+        assert!(view.prs["feature/two"].auto_merge.is_none());
+        assert!(!view.merge_queue.contains_key("feature/two"));
+        assert!(GithubWrite::ready("feature/one", 7).observed(&view));
+        assert!(!GithubWrite::ready("feature/one", 7).observed(&data));
+        assert!(GithubWrite::auto_merge("feature/two", 8, false).observed(&view));
+        assert!(!GithubWrite::auto_merge("feature/two", 8, false).observed(&data));
+        assert!(GithubWrite::auto_merge("gone", 1, true).observed(&data));
+    }
 
-        let mut caught_up = data;
-        caught_up.prs.get_mut("feature/one").unwrap().is_draft = false;
-        caught_up
-            .prs
-            .get_mut("feature/one")
-            .unwrap()
-            .requested_reviewers = vec!["new-reviewer".into()];
-        caught_up
-            .prs
-            .get_mut("feature/one")
-            .unwrap()
-            .review_requests = 1;
-        let caught_up = SourceSnapshot {
-            data: Some(Arc::new(caught_up)),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 2,
-        };
-        publish_overlay(&publisher, &caught_up, &mut overlays);
-        assert!(overlays.is_empty());
+    /// D2/D3: arm, then disarm before any read shows the arm. The lagging
+    /// read says "not armed", but this host armed it, so disable is sent.
+    #[tokio::test(start_paused = true)]
+    async fn arm_then_disarm_within_the_github_floor_sends_disable() {
+        let _ = Stamp::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let stale = Confirmed::for_test(open_pr_data("feature"));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let mut ledger = ledger_with_accepted_enable("feature", 7, Stamp::now());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        // Without the ledger the read alone would call this a no-op.
+        assert_eq!(
+            auto_merge_guard(
+                &mut Ledger::default(),
+                &stale,
+                "feature",
+                7,
+                false,
+                Instant::now()
+            ),
+            Guard::AlreadyDone
+        );
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, false, Instant::now()),
+            Guard::Send
+        );
+        // A second arm is a no-op, not a resend.
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, true, Instant::now()),
+            Guard::AlreadyDone
+        );
+        // After the disable is accepted, a repeated disarm is a no-op and a
+        // re-arm is sent, still before any read caught up.
+        record_accepted(
+            &mut ledger,
+            2,
+            GithubWrite::auto_merge("feature", 7, false),
+            Stamp::now(),
+        );
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, false, Instant::now()),
+            Guard::AlreadyDone
+        );
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, true, Instant::now()),
+            Guard::Send
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_enable_refuses_enable_and_still_allows_disable() {
+        let stale = Confirmed::for_test(open_pr_data("feature"));
+        let mut ledger = Ledger::default();
+        ledger.begin(
+            1,
+            GithubWrite::auto_merge("feature", 7, true),
+            Instant::now(),
+        );
+        ledger.uncertain(1, Instant::now());
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, true, Instant::now()),
+            Guard::Unconfirmed
+        );
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, false, Instant::now()),
+            Guard::Send
+        );
+        // An unconfirmed disable keeps a confirmed arm disarmable.
+        let armed = Confirmed::for_test(with_auto_merge(open_pr_data("feature")));
+        let mut ledger = Ledger::default();
+        ledger.begin(
+            1,
+            GithubWrite::auto_merge("feature", 7, false),
+            Instant::now(),
+        );
+        ledger.uncertain(1, Instant::now());
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &armed, "feature", 7, false, Instant::now()),
+            Guard::Send
+        );
+        // The record expires at its deadline; the read decides again.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &stale, "feature", 7, false, Instant::now()),
+            Guard::AlreadyDone
+        );
     }
 
     #[test]
-    fn disarmed_overlay_removes_stale_queue_and_classic_badges() {
-        let mut data = GithubData::default();
-        let mut row = pr("feature/one");
-        row.auto_merge = Some(AutoMerge {
-            enabled_at: "old".into(),
-            merge_method: wt_github::AutoMergeMethod::Rebase,
-        });
-        data.prs.insert("feature/one".into(), row);
-        data.merge_queue.insert(
-            "feature/one".into(),
-            wt_github::MergeQueueEntry {
-                head_ref_name: "feature/one".into(),
-                position: 2,
-                state: wt_github::MergeQueueState::Queued,
-                enqueued_at: "old".into(),
-                estimated_time_to_merge: None,
-            },
-        );
-        let upstream = SourceSnapshot {
-            data: Some(Arc::new(data)),
-            state: wt_runtime::SourceState::Ready,
-            updated_at: None,
-            revision: 1,
+    fn pins_require_the_same_pr_and_head() {
+        let pin = PrPin {
+            number: 7,
+            head_sha: Some("deadbeef".into()),
         };
-        let mut overlays = BTreeMap::from([(
-            "feature/one".into(),
-            vec![OverlayEntry {
-                value: OverlayValue::Disarmed,
-                expires_at: Instant::now() + Duration::from_secs(10),
-            }],
-        )]);
-        let (handle, publisher) = source_channel();
-        publish_overlay(&publisher, &upstream, &mut overlays);
-        let result = handle.snapshot().data.unwrap();
-        assert!(result.prs["feature/one"].auto_merge.is_none());
-        assert!(!result.merge_queue.contains_key("feature/one"));
-        assert_eq!(overlays["feature/one"].len(), 1);
-    }
-
-    #[tokio::test]
-    async fn overlay_forwards_refresh_requests_to_the_original_github_source() {
-        let scope = TaskScope::new();
-        let (input, mut input_publisher) = source_channel::<GithubData>();
-        let (_updates_tx, updates_rx) = mpsc::channel(2);
-        let output = overlay_github(&scope, input, updates_rx);
-        assert!(output.refresh());
-        tokio::time::timeout(Duration::from_secs(1), input_publisher.requested())
-            .await
-            .expect("derived refresh should reach the underlying source")
-            .expect("original source stays open");
-        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+        let current = pr("feature");
+        assert!(pin_matches(Some(&pin), Some(&current)));
+        assert!(pin_matches(None, None));
+        assert!(!pin_matches(None, Some(&current)));
+        assert!(!pin_matches(Some(&pin), None));
+        let moved = PullRequest {
+            head_ref_oid: Some("cafe".into()),
+            ..current.clone()
+        };
+        assert!(!pin_matches(Some(&pin), Some(&moved)));
+        let replaced = PullRequest {
+            number: 8,
+            ..current
+        };
+        assert!(!pin_matches(Some(&pin), Some(&replaced)));
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn mark_ready_targets_the_selected_open_pr_and_publishes_an_overlay() {
+    struct FakeGh {
+        fixture: crate::commands::test_support::CommandFixture,
+        calls: std::path::PathBuf,
+        actions: GithubActions,
+    }
+
+    #[cfg(unix)]
+    async fn fake_gh() -> FakeGh {
         use std::{fs, os::unix::fs::PermissionsExt};
 
         let fixture = crate::commands::test_support::CommandFixture::new()
@@ -1128,21 +1311,24 @@ mod tests {
             GithubOptions::from_config(&fixture.ctx.config, false),
         )
         .with_gh_program(fake);
-        let (github_source, _publisher) = source_channel::<GithubData>();
-        let (overlay_tx, mut overlay_rx) = mpsc::channel(2);
         let (retry_tx, _retry_rx) = mpsc::channel(2);
         let actions = GithubActions {
             client,
-            github: github_source,
-            overlay_tx,
+            writes: Writes::new(GithubRefresh::detached()),
             retry_tx,
             cancellation: fixture.ctx.cancellation.clone(),
             reviewers_enabled: false,
             default_reviewer: None,
         };
-        let mut github = GithubData::default();
-        github.prs.insert("feature/one".into(), pr("feature/one"));
-        let board = Board {
+        FakeGh {
+            fixture,
+            calls,
+            actions,
+        }
+    }
+
+    fn board() -> Board {
+        Board {
             rows: vec![wt_tui::BoardRow {
                 key: "one".into(),
                 slug: "one".into(),
@@ -1150,25 +1336,92 @@ mod tests {
                 ..Default::default()
             }],
             ..Default::default()
-        };
+        }
+    }
 
-        let reply = actions
+    fn seen() -> Option<PrPin> {
+        Some(PrPin {
+            number: 7,
+            head_sha: Some("deadbeef".into()),
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mark_ready_targets_the_selected_open_pr_and_records_the_write() {
+        let fake = fake_gh().await;
+        let github = Confirmed::for_test(open_pr_data("feature/one"));
+        let reply = fake
+            .actions
             .execute(
-                GithubAction::MarkReady { key: "one".into() },
-                &board,
-                &github,
+                GithubAction::MarkReady {
+                    key: "one".into(),
+                    pin: seen(),
+                },
+                &board(),
+                Some(&github),
             )
             .await
             .unwrap();
         assert!(!reply.failed);
         assert!(reply.message.contains("ready for review"));
-        assert!(
-            matches!(overlay_rx.recv().await, Some(OverlayUpdate::Ready(branch)) if branch == "feature/one")
-        );
+        assert!(matches!(reply.outcome, Some(ReplyOutcome::Accepted(_))));
+        // The lagging read still shows a draft; the record makes a repeat a no-op.
+        assert!(!fake.actions.writes.effective(&github).prs["feature/one"].is_draft);
         assert_eq!(
-            fs::read_to_string(calls).unwrap().trim(),
+            std::fs::read_to_string(&fake.calls).unwrap().trim(),
             r#"["pr", "ready", "7"]"#
         );
-        fixture.close().await.unwrap();
+        fake.fixture.close().await.unwrap();
+    }
+
+    /// C1: a write names the PR the user reviewed. A different PR, a moved
+    /// head, or no confirmed data refuses the write before anything is sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pin_mismatch_or_missing_confirmed_data_refuses_the_write() {
+        let fake = fake_gh().await;
+        let mut moved = open_pr_data("feature/one");
+        moved.prs.get_mut("feature/one").unwrap().head_ref_oid = Some("cafe".into());
+        let moved = Confirmed::for_test(moved);
+        let current = Confirmed::for_test(open_pr_data("feature/one"));
+        let requests = [
+            (
+                GithubAction::SetAutoMerge {
+                    key: "one".into(),
+                    enable: true,
+                    pin: seen(),
+                },
+                Some(&moved),
+            ),
+            (
+                GithubAction::Ship {
+                    key: "one".into(),
+                    pin: Some(PrPin {
+                        number: 6,
+                        head_sha: Some("deadbeef".into()),
+                    }),
+                },
+                Some(&current),
+            ),
+            (
+                GithubAction::MarkReady {
+                    key: "one".into(),
+                    pin: seen(),
+                },
+                None,
+            ),
+        ];
+        for (action, github) in requests {
+            let reply = fake
+                .actions
+                .execute(action, &board(), github)
+                .await
+                .unwrap();
+            assert!(reply.failed);
+            assert_eq!(reply.message, STALE_PIN);
+        }
+        assert!(!fake.calls.exists(), "no GitHub request may be sent");
+        fake.fixture.close().await.unwrap();
     }
 }

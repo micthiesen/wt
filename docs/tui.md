@@ -80,6 +80,26 @@ installation continues as a background action. Other worktree actions wait
 until the real row is available. Confirmed removal moves the row to Archived
 with a `removing` label; a failed removal restores its previous archive state.
 
+### Cached, pending and failed states
+
+At launch every pane shows the last data wt saved for it, so the board is
+populated before the first fetch. Each pane's title names its state the same
+way: `cached 3m` while it shows saved data (from this or a remote host),
+`loading…` before any data exists, `↻` while refreshing, and `<source> failed`
+when a fetch failed (the last good data stays visible; the footer shows the
+error). The header summarizes every source the same way.
+
+Every change you make appears at once and is marked on its row (and in the
+details title) until a fresh read shows it: `… arming merge` while the request
+is in flight, `↻ arming merge` once the host accepted it, and
+`? arming merge (unconfirmed)` when the outcome is unknown. Board-wide changes,
+such as switching the primary harness, show in the header. A failed request
+rolls back at once with an error toast. A change that a fresh read still does
+not show after its deadline (30 seconds for GitHub, reviews and issue statuses;
+12 seconds for local state) is dropped with a notice; nothing is resent
+automatically. Toggles act on what the row shows, and GitHub writes are refused
+if the PR or its head commit changed since you saw it.
+
 The bottom pane shows the attention feed, all activity, session output, or
 tracked action output; its title names which, such as `attention · 2 new` or
 `slug · claude / name · live · 1/3`. Rows show a dim local time, the source,
@@ -143,9 +163,9 @@ instead. `Tab` cycles through this machine and each remote, and `n` starts on
 the host chosen last in this session. A stacked create (`N`) opens on its
 parent's host, and `Tab` does nothing once the text carries `--base`; a
 `--base` typed after choosing a host resolves on that host.
-After creation, WT refreshes inventory and metadata and selects the new row.
-Its group opens when the row arrives, including if a folded snapshot arrives
-before the saved group state.
+After creation, WT refreshes inventory and metadata and selects the new row
+once it appears; the placeholder stays until then. Its group opens when the row
+arrives, including if a folded snapshot arrives before the saved group state.
 
 The Archived group sits at the bottom of the worktree pane when all visible
 items fit. When the list is taller than the pane, it scrolls with the list.
@@ -201,8 +221,11 @@ removal.
 | `d` on a review request | Dismiss that review request |
 
 Merge-when-ready uses the PR's base branch to choose merge queue or classic
-auto-merge. Pending-check retries retain the expected head SHA. A second `! m`
-cancels an idle retry; an uncertain external result is not retried blindly.
+auto-merge. `! m` arms or disarms based on what the row shows, so a quick
+second press cancels even before GitHub reports the arm. Pending-check retries
+retain the expected head SHA. A second `! m` cancels an idle retry; an
+uncertain external result is not retried blindly, and arming again is refused
+until a fresh read settles it.
 
 ### Sessions and actions
 

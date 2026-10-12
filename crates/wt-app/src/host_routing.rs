@@ -169,9 +169,9 @@ fn visit_keys(
             }
         }
         UiAction::PrepareGithub { key, .. }
-        | UiAction::GithubMarkReady { key }
+        | UiAction::GithubMarkReady { key, .. }
         | UiAction::GithubSetAutoMerge { key, .. }
-        | UiAction::GithubShip { key }
+        | UiAction::GithubShip { key, .. }
         | UiAction::GithubFailedChecks { key } => visit(key)?,
         UiAction::PrepareActions { surface }
         | UiAction::PrepareAction { surface, .. }

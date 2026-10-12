@@ -102,13 +102,19 @@ pub enum UiAction {
     },
     GithubMarkReady {
         key: String,
+        #[serde(default)]
+        pin: Option<PrPin>,
     },
     GithubSetAutoMerge {
         key: String,
         enable: bool,
+        #[serde(default)]
+        pin: Option<PrPin>,
     },
     GithubShip {
         key: String,
+        #[serde(default)]
+        pin: Option<PrPin>,
     },
     GithubFailedChecks {
         key: String,
@@ -279,6 +285,14 @@ pub enum SessionTarget {
     Dotfiles,
 }
 
+/// The pull request the user saw when asking for a GitHub write. The host
+/// refuses the write when its confirmed data names a different PR or head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrPin {
+    pub number: u64,
+    pub head_sha: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemovalRevision {
     pub key: String,
@@ -313,6 +327,8 @@ pub enum ConfirmAction {
     Github {
         key: String,
         ship: bool,
+        #[serde(default)]
+        pin: Option<PrPin>,
     },
     KillAction {
         action_key: String,
@@ -508,6 +524,26 @@ pub struct UiReply {
     /// until the board's own value catches up.
     #[serde(default)]
     pub primary_harness: Option<String>,
+    /// What happened to a write. `None` on a reply that the host has not
+    /// classified; the host service fills it for every executed action.
+    #[serde(default)]
+    pub outcome: Option<ReplyOutcome>,
+}
+
+/// How a pending mutation ends or continues after the host answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplyOutcome {
+    /// The write happened at this moment on the executing host's clock. Only
+    /// a fetch that started at or after it can confirm the change.
+    Accepted(wt_runtime::Stamp),
+    /// Nothing needed to change; stop showing the request.
+    NoChange,
+    /// The host will act later (e.g. arm once checks report); the board shows
+    /// that through its own data, not this request.
+    Deferred,
+    /// The write may or may not have happened. Shown until its deadline and
+    /// never resent automatically.
+    Uncertain,
 }
 
 #[derive(Debug)]

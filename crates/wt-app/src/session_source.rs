@@ -6,7 +6,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
     time::Duration,
 };
 
@@ -16,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use wt_core::HarnessId;
 use wt_harness::{ClaudePaths, DiscoveryRequest, HarnessService, HarnessSession, OpenCodePaths};
 use wt_runtime::{
-    SourceHandle, SourcePublisher, SourceSnapshot, SourceState, TaskScope, source_channel,
+    DiskCache, Domain, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle,
+    SourceSpec, SourceState, Stamp, TaskScope, leaf_channel,
 };
 use wt_tmux::{SessionInfo, TmuxClient, TmuxServer};
 use wt_vcs::WorktreeSnapshot;
@@ -104,8 +104,8 @@ impl SessionCommands {
 }
 
 pub struct SessionSources {
-    pub inventory: SourceHandle<SessionInventory>,
-    pub discoveries: SourceHandle<SessionDiscoveries>,
+    pub inventory: LeafHandle<SessionInventory>,
+    pub discoveries: LeafHandle<SessionDiscoveries>,
     pub commands: SessionCommands,
     /// Shared host-local Git facts, passed through without rescanning.
     pub git: SourceHandle<Vec<WorktreeSnapshot>>,
@@ -121,10 +121,28 @@ pub fn start(
         context.processes.clone(),
         TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone()),
     );
-    let (inventory, inventory_publisher) = source_channel();
+    let (inventory, inventory_publisher) = leaf_channel(
+        scope,
+        SourceSpec {
+            name: "session-inventory",
+            domain: Domain::Sessions,
+            persistence: Persistence::Never("live process state"),
+            policy: RefreshPolicy::default(),
+        },
+    );
     spawn_inventory(scope, tmux, inventory_publisher);
 
-    let (discoveries, publisher) = source_channel();
+    // Last known discoveries are shown at launch; automations still require a
+    // live discovery pass (`confirmed()`) before treating a slug as idle.
+    let (discoveries, publisher) = leaf_channel(
+        scope,
+        SourceSpec {
+            name: "session-discoveries",
+            domain: Domain::Sessions,
+            persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+            policy: RefreshPolicy::default(),
+        },
+    );
     let (requests, request_rx) = mpsc::channel(32);
     let service = HarnessService::new(
         ClaudePaths::new(&context.home, &context.config.paths.cache_root),
@@ -143,7 +161,7 @@ pub fn start(
         context.cancellation.clone(),
         DiscoveryInputs {
             git: git.clone(),
-            inventory: inventory.clone(),
+            inventory: inventory.view(),
         },
         publisher,
         request_rx,
@@ -160,7 +178,7 @@ pub fn start(
 fn spawn_inventory(
     scope: &TaskScope,
     tmux: TmuxClient,
-    mut publisher: SourcePublisher<SessionInventory>,
+    mut publisher: LeafPublisher<SessionInventory>,
 ) {
     let cancel = scope.token();
     scope.spawn(async move {
@@ -175,6 +193,7 @@ fn spawn_inventory(
                 _ = requests.tick() => {},
                 requested = publisher.requested() => if requested.is_none() { break; },
             }
+            let observed = Stamp::now();
             let fetched = tmux.list_sessions(&cancel).await;
             if cancel.is_cancelled() {
                 break;
@@ -184,12 +203,7 @@ fn spawn_inventory(
                     let inventory = classify_sessions(sessions);
                     if previous.as_ref() != Some(&inventory) || !healthy {
                         previous = Some(inventory.clone());
-                        publisher.publish(SourceSnapshot {
-                            data: Some(Arc::new(inventory)),
-                            state: SourceState::Ready,
-                            updated_at: Some(tokio::time::Instant::now()),
-                            revision: 0,
-                        });
+                        publisher.publish_live(inventory, observed);
                     }
                     healthy = true;
                 }
@@ -197,14 +211,9 @@ fn spawn_inventory(
                     healthy = false;
                     // Preserve last-known sessions while making uncertainty
                     // visible to consumers that make lifecycle decisions.
-                    publisher.publish(SourceSnapshot {
-                        data: previous.clone().map(Arc::new),
-                        state: SourceState::Failed(
-                            format!("tmux session inventory: {error}").into(),
-                        ),
-                        updated_at: None,
-                        revision: 0,
-                    });
+                    publisher.set_state(SourceState::Failed(
+                        format!("tmux session inventory: {error}").into(),
+                    ));
                 }
             }
         }
@@ -300,7 +309,7 @@ fn spawn_discoveries(
     service: HarnessService,
     cancel: CancellationToken,
     inputs: DiscoveryInputs,
-    publisher: SourcePublisher<SessionDiscoveries>,
+    publisher: LeafPublisher<SessionDiscoveries>,
     mut requests: mpsc::Receiver<(String, HarnessId)>,
 ) {
     let DiscoveryInputs { git, inventory } = inputs;
@@ -312,6 +321,9 @@ fn spawn_discoveries(
         let mut prior_targets = None;
         let mut data = SessionDiscoveries::new();
         let mut pending = BTreeSet::<(String, HarnessId)>::new();
+        // Start of the discovery pass that produced `data`. A liveness-only
+        // republish keeps it: liveness is not a newer discovery.
+        let mut discovered_at = Stamp::now();
         let mut backstop = tokio::time::interval(Duration::from_secs(30));
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -320,7 +332,7 @@ fn spawn_discoveries(
                 _ = scope_cancel.cancelled() => break,
                 _ = cancel.cancelled() => break,
                 _ = backstop.tick() => {
-                    if let Some(inventory) = inventory_updates.borrow().data.as_ref() {
+                    if let Some(inventory) = inventory_updates.borrow().data() {
                         pending.extend(live_discovery_requests(inventory));
                     }
                 }
@@ -339,17 +351,17 @@ fn spawn_discoveries(
             }
 
             let inv_snapshot = inventory_updates.borrow().clone();
-            let Some(inv) = inv_snapshot.data.as_deref() else {
+            let Some(inv) = inv_snapshot.data().map(|data| data.as_ref()) else {
                 continue;
             };
-            if matches!(inv_snapshot.state, SourceState::Failed(_)) {
+            if matches!(inv_snapshot.state(), SourceState::Failed(_)) {
                 continue;
             }
             let git_snapshot = git_updates.borrow().clone();
-            let Some(worktrees) = git_snapshot.data.as_deref() else {
+            let Some(worktrees) = git_snapshot.data().map(|data| data.as_ref()) else {
                 continue;
             };
-            if matches!(git_snapshot.state, SourceState::Failed(_)) {
+            if matches!(git_snapshot.state(), SourceState::Failed(_)) {
                 continue;
             }
 
@@ -385,12 +397,7 @@ fn spawn_discoveries(
             }
             if pending.is_empty() {
                 if liveness_changed {
-                    publisher.publish(SourceSnapshot {
-                        data: Some(Arc::new(data.clone())),
-                        state: SourceState::Ready,
-                        updated_at: Some(tokio::time::Instant::now()),
-                        revision: 0,
-                    });
+                    publisher.publish_live(data.clone(), discovered_at);
                 }
                 continue;
             }
@@ -400,6 +407,7 @@ fn spawn_discoveries(
                 .map(|target| (target.slug.clone(), target))
                 .collect::<BTreeMap<_, _>>();
             let sessions = inv.all.keys().cloned().collect::<Vec<_>>();
+            let observed = Stamp::now();
             let batch = std::mem::take(&mut pending);
             let mut work = batch
                 .into_iter()
@@ -462,16 +470,16 @@ fn spawn_discoveries(
             }
             if !scope_cancel.is_cancelled() && !cancel.is_cancelled() {
                 data.sort_by(|a, b| a.key.cmp(&b.key));
-                publisher.publish(SourceSnapshot {
-                    data: Some(Arc::new(data.clone())),
-                    state: if errors.is_empty() {
+                discovered_at = observed;
+                publisher.publish_live_with_state(
+                    data.clone(),
+                    observed,
+                    if errors.is_empty() {
                         SourceState::Ready
                     } else {
                         SourceState::Failed(errors.join("; ").into())
                     },
-                    updated_at: Some(tokio::time::Instant::now()),
-                    revision: 0,
-                });
+                );
             }
         }
     });
@@ -637,5 +645,35 @@ mod tests {
             Some("review-v2")
         );
         assert!(inventory.kinds.opencode.contains("slug"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_discoveries_meet_the_persisted_source_contract() {
+        let sample: SessionDiscoveries = vec![DiscoveredSession {
+            key: SessionKey {
+                slug: "feature-one".into(),
+                harness: HarnessId::Claude,
+                session_id: "0b5c6a8e-3f0d-4c1e-9d55-1f2a7c9e4b10".into(),
+            },
+            session: HarnessSession {
+                display_name: "Fix the restack prompt".into(),
+                session_id: "0b5c6a8e-3f0d-4c1e-9d55-1f2a7c9e4b10".into(),
+                tmux_session_name: "feature-one".into(),
+                last_active_ms: Some(1_760_000_000_000),
+                is_live: true,
+                extras: wt_harness::HarnessExtras {
+                    derived_state: Some(wt_harness::DerivedState::Idle),
+                    session_summary: Some("Restack prompt fixed".into()),
+                    context_percent: Some(42),
+                    ..Default::default()
+                },
+            },
+        }];
+        wt_runtime::conformance::persisted_source(
+            "session-discoveries",
+            wt_runtime::Domain::Sessions,
+            sample,
+        )
+        .await;
     }
 }

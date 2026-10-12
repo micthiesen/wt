@@ -14,7 +14,7 @@ use wt_config::{ActionKind, ActionTarget, AutomationDef};
 use wt_core::{ChainMember, WorkStatusRecord, build_stack_index};
 use wt_github::{GithubData, PrChecks, PrReview};
 use wt_platform::lock::FileLock;
-use wt_runtime::{SourceSnapshot, SourceState};
+use wt_runtime::Confirmed;
 use wt_tui::Board;
 use wt_vcs::WorktreeSnapshot;
 
@@ -39,14 +39,29 @@ pub struct PreparedAutomationFacts {
     pub globally_paused: bool,
 }
 
+/// GitHub evidence older than this cannot prove a merge or drive a fire.
+pub const GITHUB_FRESH_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Confirmed GitHub data recent enough for automation decisions. Restored,
+/// failed-first or stale data is never evidence.
+pub fn fresh_github(github: Option<Confirmed<GithubData>>) -> Option<Confirmed<GithubData>> {
+    github.filter(|github| github.fresh_within(GITHUB_FRESH_WITHIN))
+}
+
+/// Facts that drive actions come only from confirmed leaves: data this
+/// process fetched live, never restored cache or optimistic projections.
 pub struct AutomationInputs<'a> {
-    pub git: &'a SourceSnapshot<Vec<WorktreeSnapshot>>,
-    pub metadata: &'a SourceSnapshot<Metadata>,
-    pub github: &'a SourceSnapshot<GithubData>,
-    pub discoveries: &'a SourceSnapshot<SessionDiscoveries>,
-    pub inventory: &'a SourceSnapshot<SessionInventory>,
-    pub activity: &'a SourceSnapshot<SessionActivitySnapshot>,
-    pub board: &'a SourceSnapshot<Board>,
+    pub git: Option<&'a Confirmed<Vec<WorktreeSnapshot>>>,
+    pub metadata: Option<&'a Confirmed<Metadata>>,
+    /// Both the Git and metadata lanes report Ready (not mid-refresh or failed).
+    pub lanes_ready: bool,
+    /// Already filtered by `fresh_github`.
+    pub github: Option<&'a Confirmed<GithubData>>,
+    pub discoveries: Option<&'a Confirmed<SessionDiscoveries>>,
+    pub inventory: Option<&'a Confirmed<SessionInventory>>,
+    pub activity: Option<&'a SessionActivitySnapshot>,
+    /// Display board, used only for the presentation-level `deployed` hint.
+    pub board: Option<&'a Board>,
     pub last_edit_at_ms: &'a BTreeMap<String, i64>,
     pub rules: &'a [AutomationDef],
     pub lifecycle: &'a BTreeMap<String, LifecycleFacts>,
@@ -60,9 +75,9 @@ pub struct LifecycleFacts {
 
 pub async fn lifecycle_facts(
     ctx: &AppContext,
-    git: &SourceSnapshot<Vec<WorktreeSnapshot>>,
-    metadata: &SourceSnapshot<Metadata>,
-    github: &GithubData,
+    git: Option<&Confirmed<Vec<WorktreeSnapshot>>>,
+    metadata: Option<&Confirmed<Metadata>>,
+    github: Option<&Confirmed<GithubData>>,
     rules: &[AutomationDef],
 ) -> Result<BTreeMap<String, LifecycleFacts>> {
     let required = rules.iter().any(|rule| {
@@ -77,13 +92,10 @@ pub async fn lifecycle_facts(
     if !required {
         return Ok(BTreeMap::new());
     }
-    if git.state != SourceState::Ready || metadata.state != SourceState::Ready {
-        return Ok(BTreeMap::new());
-    }
-    let (Some(snapshots), Some((state, _))) = (git.data.as_deref(), metadata.data.as_deref())
-    else {
+    let (Some(snapshots), Some(metadata)) = (git, metadata) else {
         return Ok(BTreeMap::new());
     };
+    let (state, _) = &**metadata;
     let rows = snapshots
         .iter()
         .map(|snapshot| snapshot.worktree.clone())
@@ -111,23 +123,18 @@ pub async fn prepare(
     input: AutomationInputs<'_>,
 ) -> Result<PreparedAutomationFacts> {
     let now_ms = epoch_ms();
-    let Some(git) = input.git.data.as_deref() else {
+    let Some(git) = input.git else {
         return Ok(PreparedAutomationFacts::default());
     };
-    let Some((state, archived_keys)) = input.metadata.data.as_deref() else {
+    let Some(metadata) = input.metadata else {
         return Ok(PreparedAutomationFacts::default());
     };
-    let github_fresh = input.github.state == SourceState::Ready
-        && input
-            .github
-            .updated_at
-            .is_some_and(|at| at.elapsed() <= std::time::Duration::from_secs(90));
-    // A failed or stale GitHub source is never allowed to prove a PR merge.
-    let github = if github_fresh {
-        input.github.data.as_deref().cloned().unwrap_or_default()
-    } else {
-        GithubData::default()
-    };
+    let (state, archived_keys) = &**metadata;
+    // A failed, stale or restored GitHub source is never allowed to prove a
+    // PR merge.
+    let github_fresh = input.github.is_some();
+    let empty = GithubData::default();
+    let github = input.github.map_or(&empty, |github| &**github);
     let records = git
         .iter()
         .map(|snapshot| snapshot.worktree.clone())
@@ -233,16 +240,8 @@ pub async fn prepare(
                 true
             }
         };
-        let session_busy = session_busy(
-            input.discoveries.data.as_deref(),
-            input.inventory.data.as_deref(),
-            &slug,
-        );
-        let action_running = input
-            .inventory
-            .data
-            .as_deref()
-            .is_some_and(|inventory| inventory.kinds.action.contains(&slug));
+        let session_busy = session_busy(input.discoveries, input.inventory, &slug);
+        let action_running = action_running(input.inventory, &slug);
         let row = AutomationRow {
             slug: slug.clone(),
             branch: branch.clone(),
@@ -264,10 +263,7 @@ pub async fn prepare(
             .get(&slug)
             .copied()
             .into_iter()
-            .chain(latest_session_activity_ms(
-                input.activity.data.as_deref(),
-                &slug,
-            ))
+            .chain(latest_session_activity_ms(input.activity, &slug))
             .max();
         quiescence.insert(
             slug.clone(),
@@ -285,32 +281,8 @@ pub async fn prepare(
         .iter()
         .map(|row| row.slug.as_str())
         .collect::<BTreeSet<_>>();
-    let busy_sessions = input
-        .discoveries
-        .data
-        .as_deref()
-        .into_iter()
-        .flatten()
-        .filter(|discovered| {
-            discovered.session.is_live
-                && discovered.session.extras.derived_state.is_none_or(|state| {
-                    !matches!(
-                        state,
-                        wt_harness::DerivedState::Waiting
-                            | wt_harness::DerivedState::Idle
-                            | wt_harness::DerivedState::Abandoned
-                    )
-                })
-        })
-        .map(|discovered| discovered.key.slug.clone())
-        .filter(|slug| active_slug_set.contains(slug.as_str()) || slug == "manager")
-        .collect::<BTreeSet<_>>();
-    let headless_running = input
-        .inventory
-        .data
-        .as_deref()
-        .map(|inventory| inventory.kinds.action.clone())
-        .unwrap_or_default();
+    let busy_sessions = busy_sessions(input.discoveries, &active_slug_set);
+    let headless_running = headless_running(input.inventory, &active_slug_set);
     let actions = ctx
         .config
         .actions
@@ -400,8 +372,6 @@ pub async fn prepare(
         .map(|fire| {
             let deployed = input
                 .board
-                .data
-                .as_deref()
                 .and_then(|board| board.rows.iter().find(|row| row.slug == fire.slug))
                 .is_some_and(|row| row.stage_url.is_some());
             let result = requirement_state(ctx, fire, &rows, deployed);
@@ -420,8 +390,7 @@ pub async fn prepare(
             busy_sessions,
         },
         initial_branch_tips,
-        state_ready: input.metadata.state == SourceState::Ready
-            && input.git.state == SourceState::Ready,
+        state_ready: input.lanes_ready,
         globally_paused,
     })
 }
@@ -469,42 +438,74 @@ pub fn refresh_requirements(
         .collect();
 }
 
+/// Session facts come only from confirmed discoveries and inventory. Until
+/// both are live (e.g. right after a restart that restored last session
+/// states), every slug is busy so nothing is injected twice.
 pub fn refresh_sessions(
     facts: &mut PreparedAutomationFacts,
-    discoveries: Option<&SessionDiscoveries>,
-    inventory: Option<&SessionInventory>,
+    discoveries: Option<&Confirmed<SessionDiscoveries>>,
+    inventory: Option<&Confirmed<SessionInventory>>,
 ) {
-    let mut busy_sessions = BTreeSet::new();
     for row in &facts.rows {
         let quiescence = facts.quiescence.entry(row.slug.clone()).or_default();
         quiescence.session_busy = session_busy(discoveries, inventory, &row.slug);
-        quiescence.action_running =
-            inventory.is_some_and(|inventory| inventory.kinds.action.contains(&row.slug));
+        quiescence.action_running = action_running(inventory, &row.slug);
     }
     let active_slugs = facts
         .rows
         .iter()
         .map(|row| row.slug.as_str())
         .collect::<BTreeSet<_>>();
-    for discovered in discoveries.into_iter().flatten().filter(|discovered| {
-        discovered.session.is_live
-            && discovered.session.extras.derived_state.is_none_or(|state| {
-                !matches!(
-                    state,
-                    wt_harness::DerivedState::Waiting
-                        | wt_harness::DerivedState::Idle
-                        | wt_harness::DerivedState::Abandoned
-                )
-            })
-    }) {
-        if active_slugs.contains(discovered.key.slug.as_str()) || discovered.key.slug == "manager" {
-            busy_sessions.insert(discovered.key.slug.clone());
-        }
+    facts.activity.busy_sessions = busy_sessions(discoveries, &active_slugs);
+    facts.activity.headless_running = headless_running(inventory, &active_slugs);
+}
+
+fn session_working(discovered: &crate::session_source::DiscoveredSession) -> bool {
+    discovered.session.is_live
+        && discovered.session.extras.derived_state.is_none_or(|state| {
+            !matches!(
+                state,
+                wt_harness::DerivedState::Waiting
+                    | wt_harness::DerivedState::Idle
+                    | wt_harness::DerivedState::Abandoned
+            )
+        })
+}
+
+/// Unknown session state keeps every delivery slot occupied.
+fn busy_sessions(
+    discoveries: Option<&Confirmed<SessionDiscoveries>>,
+    active: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let relevant = |slug: &str| active.contains(slug) || slug == "manager";
+    match discoveries {
+        Some(discoveries) => discoveries
+            .iter()
+            .filter(|discovered| session_working(discovered))
+            .map(|discovered| discovered.key.slug.clone())
+            .filter(|slug| relevant(slug))
+            .collect(),
+        None => active
+            .iter()
+            .map(|slug| (*slug).to_owned())
+            .chain(std::iter::once("manager".to_owned()))
+            .collect(),
     }
-    facts.activity.busy_sessions = busy_sessions;
-    facts.activity.headless_running = inventory
-        .map(|inventory| inventory.kinds.action.clone())
-        .unwrap_or_default();
+}
+
+/// Unknown tmux inventory keeps every headless slot occupied.
+fn headless_running(
+    inventory: Option<&Confirmed<SessionInventory>>,
+    active: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    match inventory {
+        Some(inventory) => inventory.kinds.action.clone(),
+        None => active.iter().map(|slug| (*slug).to_owned()).collect(),
+    }
+}
+
+fn action_running(inventory: Option<&Confirmed<SessionInventory>>, slug: &str) -> bool {
+    inventory.is_none_or(|inventory| inventory.kinds.action.contains(slug))
 }
 
 pub fn refresh_quiescence_edits(
@@ -615,35 +616,32 @@ fn requirement_state(
     }
 }
 
+/// Quiescence requires confirmed discoveries and inventory (judge E1):
+/// restored or not-yet-fetched session state makes the slug busy.
 fn session_busy(
-    discoveries: Option<&SessionDiscoveries>,
-    inventory: Option<&SessionInventory>,
+    discoveries: Option<&Confirmed<SessionDiscoveries>>,
+    inventory: Option<&Confirmed<SessionInventory>>,
     slug: &str,
 ) -> bool {
-    let has_live = inventory.is_some_and(|inventory| {
+    let (Some(discoveries), Some(inventory)) = (discoveries, inventory) else {
+        return true;
+    };
+    let has_live = {
         inventory.kinds.claude.iter().any(|slot| slot.slug == slug)
             || inventory.kinds.codex.contains(slug)
             || inventory.kinds.opencode.contains(slug)
-    });
+    };
     if !has_live {
         return false;
     }
     let mut observed = false;
     let mut busy = false;
     for discovered in discoveries
-        .into_iter()
-        .flatten()
+        .iter()
         .filter(|item| item.key.slug == slug && item.session.is_live)
     {
         observed = true;
-        busy |= discovered.session.extras.derived_state.is_none_or(|state| {
-            !matches!(
-                state,
-                wt_harness::DerivedState::Waiting
-                    | wt_harness::DerivedState::Idle
-                    | wt_harness::DerivedState::Abandoned
-            )
-        });
+        busy |= session_working(discovered);
     }
     busy || !observed
 }
@@ -657,4 +655,97 @@ fn primary_skill_prefix(ctx: &AppContext) -> String {
 
 fn epoch_ms() -> i64 {
     i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_source::{DiscoveredSession, SessionKey, SessionKinds};
+    use wt_runtime::{
+        Domain, Persistence, RefreshPolicy, SourceSnapshot, SourceSpec, TaskScope, leaf_channel,
+    };
+
+    fn idle_session(slug: &str) -> DiscoveredSession {
+        DiscoveredSession {
+            key: SessionKey {
+                slug: slug.into(),
+                harness: wt_core::HarnessId::Codex,
+                session_id: "s1".into(),
+            },
+            session: wt_harness::HarnessSession {
+                display_name: slug.into(),
+                session_id: "s1".into(),
+                tmux_session_name: slug.into(),
+                last_active_ms: None,
+                is_live: true,
+                extras: wt_harness::HarnessExtras {
+                    derived_state: Some(wt_harness::DerivedState::Idle),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_session_discoveries_keep_the_slug_busy() {
+        let scope = TaskScope::new();
+        let (discoveries, _publisher) = leaf_channel::<SessionDiscoveries>(
+            &scope,
+            SourceSpec {
+                name: "session-discoveries",
+                domain: Domain::Sessions,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let idle = vec![idle_session("one")];
+        // Restored at launch: the last known state says Idle, but this
+        // process has not observed it, so it cannot authorize injection.
+        let restored = SourceSnapshot::test_restored(idle.clone(), Domain::Sessions, 1);
+        let unconfirmed = discoveries.confirm(&restored);
+        assert!(unconfirmed.is_none());
+        let inventory = Confirmed::for_test(SessionInventory {
+            kinds: SessionKinds {
+                codex: ["one".to_owned()].into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut facts = PreparedAutomationFacts {
+            rows: vec![AutomationRow {
+                slug: "one".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        refresh_sessions(&mut facts, unconfirmed.as_ref(), Some(&inventory));
+        assert!(facts.quiescence["one"].session_busy);
+        assert!(facts.activity.busy_sessions.contains("one"));
+
+        // Unconfirmed inventory is equally unknown.
+        let confirmed = Confirmed::for_test(idle);
+        refresh_sessions(&mut facts, Some(&confirmed), None);
+        assert!(facts.quiescence["one"].session_busy);
+        assert!(facts.quiescence["one"].action_running);
+        assert!(facts.activity.headless_running.contains("one"));
+
+        // Both observed live: the idle session is quiescent.
+        refresh_sessions(&mut facts, Some(&confirmed), Some(&inventory));
+        assert!(!facts.quiescence["one"].session_busy);
+        assert!(!facts.quiescence["one"].action_running);
+        assert!(facts.activity.busy_sessions.is_empty());
+        scope
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_github_evidence_is_not_fresh() {
+        let github = Confirmed::for_test(GithubData::default());
+        assert!(fresh_github(Some(github.clone())).is_some());
+        tokio::time::advance(GITHUB_FRESH_WITHIN + std::time::Duration::from_secs(1)).await;
+        assert!(fresh_github(Some(github)).is_none());
+        assert!(fresh_github(None).is_none());
+    }
 }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use wt_harness::DerivedState;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, SessionView};
 
 use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto};
@@ -15,10 +15,10 @@ pub fn overlay(
     sessions: &SessionSources,
     activity: SourceHandle<SessionActivitySnapshot>,
 ) -> SourceHandle<Board> {
-    let (source, mut publisher) = source_channel();
+    let (source, mut publisher) = derived_channel(scope, "session-board");
     let cancel = scope.token();
-    let inventory = sessions.inventory.clone();
-    let discoveries = sessions.discoveries.clone();
+    let inventory = sessions.inventory.view();
+    let discoveries = sessions.discoveries.view();
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
         let mut inventory_updates = inventory.subscribe();
@@ -28,7 +28,7 @@ pub fn overlay(
         inventory_updates.mark_changed();
         discovery_updates.mark_changed();
         activity_updates.mark_changed();
-        let mut last = None;
+        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -49,30 +49,31 @@ pub fn overlay(
                 discovery_updates.borrow_and_update().clone(),
                 activity_updates.borrow_and_update().clone(),
             );
-            let visible = (prepared.data.clone(), prepared.state.clone());
-            if last.as_ref() != Some(&visible) {
-                last = Some(visible);
-                publisher.publish(prepared);
+            // Stamps alone do not change what the board shows.
+            if last.as_ref().is_some_and(|last| last.same_view(&prepared)) {
+                continue;
             }
+            last = Some(prepared.clone());
+            publisher.publish(prepared);
         }
     });
     source
 }
 
 fn compose(
-    mut source: SourceSnapshot<Board>,
+    source: SourceSnapshot<Board>,
     inventory: SourceSnapshot<SessionInventory>,
     discoveries: SourceSnapshot<SessionDiscoveries>,
     activity: SourceSnapshot<SessionActivitySnapshot>,
 ) -> SourceSnapshot<Board> {
-    let Some(prepared) = source.data.as_ref() else {
+    let Some(prepared) = source.data() else {
         return source;
     };
     let mut board = prepared.as_ref().clone();
     for (label, state) in [
-        ("Session inventory", &inventory.state),
-        ("Session discovery", &discoveries.state),
-        ("Agent activity", &activity.state),
+        ("Session inventory", inventory.state()),
+        ("Session discovery", discoveries.state()),
+        ("Agent activity", activity.state()),
     ] {
         if let SourceState::Failed(error) = state {
             crate::activity_source::append_attention(
@@ -82,12 +83,12 @@ fn compose(
             );
         }
     }
-    let inventory_ok = matches!(inventory.state, SourceState::Ready);
-    let discoveries_ok = matches!(discoveries.state, SourceState::Ready);
-    for entry in discoveries.data.iter().flat_map(|data| data.iter()) {
+    let inventory_ok = matches!(inventory.state(), SourceState::Ready);
+    let discoveries_ok = matches!(discoveries.state(), SourceState::Ready);
+    for entry in discoveries.data().iter().flat_map(|data| data.iter()) {
         let session = &entry.session;
         let live = inventory_ok
-            && inventory.data.as_ref().is_some_and(|all| {
+            && inventory.data().is_some_and(|all| {
                 all.all.contains_key(&session.tmux_session_name)
                     && all
                         .harness_session_ids
@@ -100,8 +101,7 @@ fn compose(
             state_name(session.extras.derived_state)
         };
         let output = activity
-            .data
-            .as_ref()
+            .data()
             .and_then(|data| data.tails.iter().find(|tail| tail.key == entry.key))
             .map(|tail| {
                 tail.lines
@@ -148,8 +148,8 @@ fn compose(
                 .push(view);
         }
     }
-    if let Some(activity) = activity.data.as_ref() {
-        for event in activity.events.iter().rev().take(100).rev() {
+    if let Some(feed) = activity.data() {
+        for event in feed.events.iter().rev().take(100).rev() {
             let at_ms = u64::try_from(event.timestamp_ms).unwrap_or_default();
             let text = clean(&event.text);
             let (level, attention) = match event.level {
@@ -172,7 +172,7 @@ fn compose(
                 });
             }
         }
-        if let Some(usage) = &activity.usage {
+        if let Some(usage) = &feed.usage {
             for (harness, five, week) in [
                 ("Claude", &usage.claude_five_hour, &usage.claude_seven_day),
                 ("Codex", &usage.codex_five_hour, &usage.codex_seven_day),
@@ -201,13 +201,16 @@ fn compose(
                 }
             }
         }
-        if let Some(primary) = &activity.primary {
+        if let Some(primary) = &feed.primary {
             board.display.primary_harness = primary.clone();
         }
     }
     crate::activity_source::bound_feeds(&mut board);
-    source.data = Some(Arc::new(board));
     source
+        .with_data(Some(Arc::new(board)))
+        .with_input(&inventory)
+        .with_input(&discoveries)
+        .with_input(&activity)
 }
 
 fn usage_item(
@@ -250,23 +253,24 @@ mod tests {
     use super::*;
     use crate::session_source::{DiscoveredSession, SessionKey};
     use wt_harness::{HarnessExtras, HarnessSession};
+    use wt_runtime::Domain;
     use wt_tui::BoardRow;
 
     #[test]
     fn failed_inventory_does_not_claim_a_cached_session_is_live() {
-        let board = SourceSnapshot {
-            data: Some(Arc::new(Board {
+        let board = SourceSnapshot::test_live(
+            Some(Board {
                 rows: vec![BoardRow {
                     slug: "one".into(),
                     ..Default::default()
                 }],
                 ..Default::default()
-            })),
-            state: SourceState::Ready,
-            ..Default::default()
-        };
-        let discoveries = SourceSnapshot {
-            data: Some(Arc::new(vec![DiscoveredSession {
+            }),
+            SourceState::Ready,
+            Domain::Git,
+        );
+        let discoveries = SourceSnapshot::test_live(
+            Some(vec![DiscoveredSession {
                 key: SessionKey {
                     slug: "one".into(),
                     harness: wt_core::HarnessId::Codex,
@@ -284,20 +288,18 @@ mod tests {
                         ..Default::default()
                     },
                 },
-            }])),
-            state: SourceState::Ready,
-            ..Default::default()
-        };
+            }]),
+            SourceState::Ready,
+            Domain::Sessions,
+        );
         let result = compose(
             board,
-            SourceSnapshot {
-                state: SourceState::Failed("tmux unavailable".into()),
-                ..Default::default()
-            },
+            SourceSnapshot::default().with_state(SourceState::Failed("tmux unavailable".into())),
             discoveries,
             SourceSnapshot::default(),
         );
-        let board = result.data.unwrap();
+        assert!(result.domains()[&Domain::Sessions].is_live());
+        let board = result.data().unwrap();
         assert_eq!(board.rows[0].sessions[0].state, "unknown");
         assert_eq!(
             board.rows[0].sessions[0].summary.as_deref(),

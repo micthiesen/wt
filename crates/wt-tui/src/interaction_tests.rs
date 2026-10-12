@@ -1,5 +1,4 @@
 //! Key sequence -> action/selection/toast pins for TS interaction parity.
-use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use wt_runtime::{SourceSnapshot, SourceState};
@@ -40,12 +39,7 @@ fn board(keys: &[&str]) -> Board {
 }
 
 fn ready(board: Board) -> SourceSnapshot<Board> {
-    SourceSnapshot {
-        data: Some(Arc::new(board)),
-        state: SourceState::Ready,
-        updated_at: None,
-        revision: 0,
-    }
+    SourceSnapshot::test_live(Some(board), SourceState::Ready, wt_runtime::Domain::Git)
 }
 
 fn section(key: &str, rows: Vec<usize>, folded: bool) -> BoardSection {

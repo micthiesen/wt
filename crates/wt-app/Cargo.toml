@@ -53,5 +53,8 @@ wt-tmux.workspace = true
 wt-update.workspace = true
 wt-vcs.workspace = true
 
+[dev-dependencies]
+wt-runtime = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true

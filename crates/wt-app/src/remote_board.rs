@@ -7,7 +7,10 @@ use crate::{
     remote_host::RemoteHost,
 };
 use std::sync::Arc;
-use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, source_channel};
+use wt_runtime::{
+    Domain, DomainMap, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel,
+    merge_domains,
+};
 use wt_tui::{Board, HostChoice};
 
 pub struct Fleet {
@@ -23,7 +26,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
         .iter()
         .map(|remote| RemoteHost::start(scope, context, remote.clone()))
         .collect::<Vec<_>>();
-    let (board, mut publisher) = source_channel();
+    let (board, mut publisher) = derived_channel(scope, "fleet");
     let (changed, mut changes) = tokio::sync::mpsc::channel(1);
     for remote in &remotes {
         let mut updates = remote.snapshot.subscribe();
@@ -73,7 +76,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
             }
             let snapshots = owned_remotes.iter().map(|remote| (&remote.endpoint, remote.snapshot.snapshot(), remote.managed.borrow().clone())).collect::<Vec<_>>();
             let snapshot = compose(&config, updates.borrow().clone(), metadata.borrow().clone(), &snapshots);
-            if previous.as_ref().is_some_and(|old| old.data == snapshot.data && old.state == snapshot.state) { continue; }
+            if previous.as_ref().is_some_and(|old| old.same_view(&snapshot)) { continue; }
             previous = Some(snapshot.clone());
             publisher.publish(snapshot);
         }
@@ -92,23 +95,27 @@ type ComposedHost<'a> = (
     Option<Arc<crate::managed::ManagedStatus>>,
 );
 
+/// The fleet board carries the local board's provenance; each remote's
+/// provenance goes to `Board.host_domains`, keyed by the rows' `host`.
 fn compose(
     config: &wt_config::Config,
-    mut snapshot: SourceSnapshot<Board>,
+    snapshot: SourceSnapshot<Board>,
     metadata: SourceSnapshot<Metadata>,
     hosts: &[ComposedHost<'_>],
 ) -> SourceSnapshot<Board> {
-    let mut board = snapshot.data.as_deref().cloned().unwrap_or_else(|| Board {
-        name: config.repo_id.clone(),
-        ..Board::default()
-    });
+    let mut board = snapshot
+        .data()
+        .map(|board| (**board).clone())
+        .unwrap_or_else(|| Board {
+            name: config.repo_id.clone(),
+            ..Board::default()
+        });
     board.hosts = vec![HostChoice {
         id: None,
         label: "This machine".into(),
     }];
     let mut state = metadata
-        .data
-        .as_ref()
+        .data()
         .map(|m| m.0.clone())
         .unwrap_or_else(|| serde_json::json!({"slugs": {}}));
     if !state.is_object() {
@@ -118,7 +125,7 @@ fn compose(
         state["slugs"] = serde_json::json!({});
     }
     board.attention_seen_ms = state["attentionSeenTs"].as_u64().unwrap_or_default();
-    let archived = metadata.data.as_ref().map(|m| &m.1);
+    let archived = metadata.data().map(|m| &m.1);
     for (endpoint, source, managed) in hosts {
         let host = endpoint.key();
         let label = wt_core::sanitize_terminal_text(&endpoint.label);
@@ -143,14 +150,26 @@ fn compose(
             id: Some(host.clone()),
             label: label.clone(),
         });
-        let error = match &source.state {
+        let restored = source.is_restored();
+        // Restored data skipped the stream's validation; never show a cache
+        // that no longer has valid row identities.
+        let data = source
+            .data()
+            .filter(|data| !restored || data.validate().is_ok());
+        let error = match source.state() {
             SourceState::Failed(error) => Some(error.to_string()),
-            _ => source.data.as_ref().and_then(|s| match &s.state {
+            _ => data.and_then(|s| match &s.state {
                 HostState::Failed(error) => Some(error.clone()),
                 _ => None,
             }),
         };
-        if let Some(data) = &source.data {
+        // Rows from a cache or a lost connection are last known state: their
+        // sessions are not known to be live.
+        let current = error.is_none() && !restored;
+        if let Some(domains) = host_domains(source, data) {
+            board.host_domains.insert(host.clone(), domains);
+        }
+        if let Some(data) = data {
             for mut row in data.board.iter().flat_map(|b| &b.rows).cloned() {
                 let local_key = row.key.clone();
                 row.key = wt_core::remote_worktree_ledger_key(&host, &local_key);
@@ -164,6 +183,8 @@ fn compose(
                         format!("Unavailable: {}", wt_core::sanitize_terminal_text(error)),
                     );
                     row.needs_attention = true;
+                }
+                if !current {
                     for session in &mut row.sessions {
                         session.live = false;
                         session.state = "unknown".into();
@@ -321,12 +342,12 @@ fn compose(
                     for session in &mut sessions {
                         session.name = wt_core::sanitize_terminal_text(&session.name);
                         session.harness = wt_core::sanitize_terminal_text(&session.harness);
-                        session.state = if error.is_some() {
-                            "unknown".into()
-                        } else {
+                        session.state = if current {
                             wt_core::sanitize_terminal_text(&session.state)
+                        } else {
+                            "unknown".into()
                         };
-                        session.live &= error.is_none();
+                        session.live &= current;
                         for line in &mut session.output {
                             *line = wt_core::sanitize_terminal_text(line);
                         }
@@ -362,20 +383,39 @@ fn compose(
     crate::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
     crate::board_layout::refresh_rollups(&mut board);
     crate::activity_source::bound_feeds(&mut board);
-    snapshot.data = Some(Arc::new(board));
-    snapshot
+    snapshot.derive(Some(Arc::new(board)))
+}
+
+/// A remote's per-domain provenance: the host's own board domains plus this
+/// controller's connection lane (`Domain::Host`). While the lane is not live
+/// and connected (restored cache, or a lost connection), every domain reads
+/// as the lane does, so nothing shown from it counts as current there.
+fn host_domains(
+    source: &SourceSnapshot<HostSnapshot>,
+    data: Option<&Arc<HostSnapshot>>,
+) -> Option<DomainMap> {
+    let lane = source.domains();
+    let mut domains = data.map(|data| data.domains.clone()).unwrap_or_default();
+    if let Some(meta) = lane.get(&Domain::Host)
+        && !(meta.is_live() && !matches!(meta.state(), SourceState::Failed(_)))
+    {
+        let remote = domains.keys().copied().collect::<Vec<_>>();
+        for domain in remote {
+            merge_domains(&mut domains, &DomainMap::from([(domain, meta.clone())]));
+        }
+    }
+    merge_domains(&mut domains, lane);
+    (!domains.is_empty()).then_some(domains)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn ready<T>(data: T) -> SourceSnapshot<T> {
-        SourceSnapshot {
-            data: Some(Arc::new(data)),
-            state: SourceState::Ready,
-            updated_at: None,
-            revision: 0,
-        }
+        SourceSnapshot::test_live(Some(data), SourceState::Ready, Domain::Metadata)
+    }
+    fn host(data: HostSnapshot) -> SourceSnapshot<HostSnapshot> {
+        SourceSnapshot::test_live(Some(data), SourceState::Ready, Domain::Host)
     }
     #[tokio::test]
     async fn remote_layout_uses_controller_section_and_preserves_worker_title() {
@@ -401,7 +441,7 @@ mod tests {
         let mut remote_work =
             wt_core::WorkStatusRecord::new(wt_core::WorkState::NeedsHuman, "2026-10-09T00:00:00Z");
         remote_work.blocked_on = Some("waiting for review".into());
-        let source = ready(HostSnapshot {
+        let source = host(HostSnapshot {
             board: Some(Board {
                 rows: vec![wt_tui::BoardRow {
                     key: "one".into(),
@@ -418,6 +458,7 @@ mod tests {
                 ..Default::default()
             }),
             state: HostState::Ready,
+            domains: Default::default(),
             layout: Default::default(),
         });
         let local_work = wt_tui::BoardRow {
@@ -440,7 +481,7 @@ mod tests {
             metadata,
             &[(&endpoint, source, None)],
         );
-        let board = result.data.unwrap();
+        let board = result.data().cloned().unwrap();
         assert_eq!(
             board
                 .rows
@@ -501,23 +542,25 @@ mod tests {
             label: "B".into(),
             ..Default::default()
         };
-        let source = ready(HostSnapshot {
+        let source = host(HostSnapshot {
             board: Some(Board {
                 rows: vec![row],
                 ..Default::default()
             }),
             state: HostState::Ready,
+            domains: Default::default(),
             layout: Default::default(),
         });
-        let mut failed = source.clone();
-        failed.state = SourceState::Failed("SSH disconnected".into());
+        let failed = source
+            .clone()
+            .with_state(SourceState::Failed("SSH disconnected".into()));
         let result = compose(
             &fixture.ctx.config,
             local,
             metadata,
             &[(&first, source, None), (&second, failed, None)],
         );
-        let board = result.data.unwrap();
+        let board = result.data().cloned().unwrap();
         assert_eq!(board.rows.len(), 3);
         assert_eq!(
             board
@@ -566,9 +609,10 @@ mod tests {
             },
             at_ms: 42,
         });
-        let empty = ready(HostSnapshot {
+        let empty = host(HostSnapshot {
             board: Some(Board::default()),
             state: HostState::Ready,
+            domains: Default::default(),
             layout: Default::default(),
         });
         let result = compose(
@@ -577,7 +621,7 @@ mod tests {
             ready((serde_json::json!({"slugs": {}}), Default::default())),
             &[(&endpoint, empty, Some(status))],
         );
-        let board = result.data.unwrap();
+        let board = result.data().cloned().unwrap();
         let line = board
             .attention
             .iter()
@@ -594,6 +638,86 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("cloned"))
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_remote_reads_as_cached_until_its_stream_is_live() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let endpoint = wt_config::RemoteConfig {
+            host: "builder".into(),
+            label: "Builder".into(),
+            ..Default::default()
+        };
+        let host = endpoint.key();
+        let remote = HostSnapshot {
+            board: Some(Board {
+                rows: vec![wt_tui::BoardRow {
+                    key: "one".into(),
+                    slug: "one".into(),
+                    branch: "feature/one".into(),
+                    sessions: vec![wt_tui::SessionView {
+                        name: "codex".into(),
+                        live: true,
+                        state: "working".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            state: HostState::Ready,
+            // The worker's own Git lane was live when this was saved.
+            domains: SourceSnapshot::test_live(Some(()), SourceState::Ready, Domain::Git)
+                .domains()
+                .clone(),
+            layout: Default::default(),
+        };
+        let restored = SourceSnapshot::test_restored(remote.clone(), Domain::Host, 1_000);
+        let result = compose(
+            &fixture.ctx.config,
+            ready(Board::default()),
+            ready((serde_json::json!({"slugs": {}}), Default::default())),
+            &[(&endpoint, restored, None)],
+        );
+        // The fleet snapshot keeps the local board's provenance.
+        assert!(!result.is_restored());
+        let board = result.data().cloned().unwrap();
+        let domains = &board.host_domains[&host];
+        for domain in [Domain::Host, Domain::Git] {
+            assert_eq!(
+                domains[&domain].provenance(),
+                wt_runtime::Provenance::Restored { saved_at_ms: 1_000 },
+                "{domain:?}"
+            );
+        }
+        let row = &board.rows[0];
+        assert_eq!(row.host.as_deref(), Some(host.as_str()));
+        // Cached is not unavailable: no failure text, but sessions are unknown.
+        assert!(
+            !row.details
+                .iter()
+                .any(|line| line.starts_with("Unavailable:"))
+        );
+        assert!(!row.needs_attention);
+        assert!(!row.sessions[0].live);
+        assert!(board.attention.is_empty());
+
+        // Once the stream delivers, the worker's own provenance shows through.
+        let live = SourceSnapshot::test_live(Some(remote), SourceState::Ready, Domain::Host);
+        let result = compose(
+            &fixture.ctx.config,
+            ready(Board::default()),
+            ready((serde_json::json!({"slugs": {}}), Default::default())),
+            &[(&endpoint, live, None)],
+        );
+        let board = result.data().cloned().unwrap();
+        let domains = &board.host_domains[&host];
+        assert!(domains[&Domain::Host].is_live());
+        assert!(domains[&Domain::Git].is_live());
+        assert!(board.rows[0].sessions[0].live);
         fixture.close().await.unwrap();
     }
 }

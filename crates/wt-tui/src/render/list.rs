@@ -35,7 +35,7 @@ struct ListLine {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
-    let block = super::panel("worktrees");
+    let block = super::status::pane("worktrees".into(), super::status::LIST, model);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 4 || inner.height == 0 {
@@ -100,7 +100,9 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
     let mut lines = Vec::new();
     if model.item_count() == 0 {
         lines.push(blank());
-        let message = if matches!(model.source_state, wt_runtime::SourceState::Empty) {
+        let message = if super::status::status(model, super::status::LIST).loading
+            || matches!(model.source_state, wt_runtime::SourceState::Empty)
+        {
             vec![Span::styled(" Loading worktrees…", theme::dim())]
         } else {
             vec![
@@ -246,7 +248,12 @@ impl RowContext<'_> {
             background.map_or(style, |bg| style.bg(bg))
         };
         let cluster = badges::cluster(row, policy);
-        let cluster_width = badges::cluster_width(&cluster);
+        let pending = super::status::pending_chip(
+            &super::status::row_pending(self.model, &row.key),
+            background.map_or(Style::new(), |bg| Style::new().bg(bg)),
+        );
+        let pending_width: usize = pending.iter().map(|span| span.content.width() + 1).sum();
+        let cluster_width = badges::cluster_width(&cluster) + pending_width;
         let remote = row.host.is_some();
         let remote_cells = if remote { 2 } else { 0 };
         // One cell of padding on each side, the rail gutter, and the
@@ -302,6 +309,10 @@ impl RowContext<'_> {
             spans.push(Span::styled(reference, style(theme::FG_DIM)));
         }
         spans.push(Span::styled(" ".repeat(filler), style(theme::FG)));
+        for span in pending {
+            spans.push(span);
+            spans.push(Span::styled(" ", style(theme::FG)));
+        }
         spans.extend(badges::cluster_spans(&cluster, background));
         spans.push(Span::styled(" ", style(theme::FG)));
         ListLine {
@@ -520,10 +531,9 @@ mod tests {
     #[test]
     fn archive_uses_bottom_space_without_changing_selection() {
         use ratatui::{Terminal, backend::TestBackend};
-        use std::sync::Arc;
         let mut model = Model::default();
-        model.apply(wt_runtime::SourceSnapshot {
-            data: Some(Arc::new(crate::Board {
+        model.apply(wt_runtime::SourceSnapshot::test_live(
+            Some(crate::Board {
                 rows: vec![
                     BoardRow {
                         key: "one".into(),
@@ -553,11 +563,10 @@ mod tests {
                     },
                 ],
                 ..Default::default()
-            })),
-            state: wt_runtime::SourceState::Ready,
-            updated_at: None,
-            revision: 1,
-        });
+            }),
+            wt_runtime::SourceState::Ready,
+            wt_runtime::Domain::Git,
+        ));
         let selected = model.selected;
         for height in [14u16, 7] {
             let mut terminal = Terminal::new(TestBackend::new(50, height)).unwrap();

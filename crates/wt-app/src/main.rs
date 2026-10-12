@@ -52,9 +52,9 @@ mod naming_source;
 mod origin;
 mod perf_source;
 mod prompt;
+mod query_cache;
 mod remote;
 mod remote_board;
-mod remote_cache;
 mod remote_host;
 mod restack_action;
 mod review_requests;
@@ -387,12 +387,14 @@ async fn run_application(
             processes,
             cancellation: token,
             section_writes: Default::default(),
+            caches: crate::query_cache::store(&config),
         };
         let result = dispatch_command(&context, command).await;
         database.shutdown().await?;
         return result;
     }
     let (actions, controller_port) = wt_tui::action_channel();
+    let caches = query_cache::store(&config);
     let context = context::AppContext {
         config,
         home: options.home,
@@ -402,6 +404,7 @@ async fn run_application(
         processes,
         cancellation: token.clone(),
         section_writes: Default::default(),
+        caches,
     };
     skills::startup_check(&context).await?;
     let events_context = context.clone();

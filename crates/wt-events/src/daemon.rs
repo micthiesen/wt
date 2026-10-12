@@ -494,10 +494,14 @@ async fn scheduler(
                 }
                 cached_inventory_at = Some(now);
                 if let Err(e) = source.fetch_origin(&cancel).await { warn!(error = %e, "git fetch origin failed before GitHub refresh"); }
+                // Readers order this observation by when the GitHub read
+                // began: a write accepted after this moment may be missing.
+                let fetch_started_at_ms = now_millis();
                 match source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await {
                     Ok(data) => {
                         let snapshot = GithubSnapshot {
-                            updated_at: now_millis(), branches: fetch_branches.into_iter().collect(), prs: data.prs,
+                            updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
+                            branches: fetch_branches.into_iter().collect(), prs: data.prs,
                             merge_queue: data.merge_queue, writer_sha: config.writer_sha.clone(),
                             extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
                         };

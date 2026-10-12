@@ -277,6 +277,7 @@ async fn run_inner<'a>(
             }
             dirty = false;
         }
+        let pending_deadline = model.next_deadline();
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -310,7 +311,8 @@ async fn run_inner<'a>(
                             InputResult::Draw => { dirty = true; input_at = Some(received); }
                             InputResult::Unchanged => {}
                             InputResult::Action(action) => {
-                                let id = model.lifecycle.next_id();
+                                let id = model.next_op_id();
+                                let action = model.resolve(action);
                                 let feedback = action.clone();
                                 match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }) {
                                     Ok(()) => { model.begin_action(id, &feedback); model.toast = Some(("Working…".into(), ToastTone::Info)); },
@@ -339,7 +341,7 @@ async fn run_inner<'a>(
                     let perf_was_open = model.show_perf;
                     let handoff = model.reply(reply);
                     if let Some(action) = model.follow_up.take() {
-                        let id = model.lifecycle.next_id();
+                        let id = model.next_op_id();
                         if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }).is_err() {
                             model.toast = Some(("Agent start queue is busy; press F12 again".into(), ToastTone::Failed));
                         }
@@ -418,9 +420,28 @@ async fn run_inner<'a>(
                     });
                 }
             }
+            // A pending change reached its deadline: stop showing it, and say
+            // so when the confirmed data still disagrees.
+            _ = async {
+                match pending_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let before = model.toast.clone();
+                model.tick(tokio::time::Instant::now());
+                if model.toast != before {
+                    toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+                }
+                dirty = true;
+            }
             changed = snapshots.changed() => {
                 if changed.is_err() { break; }
+                let before = model.toast.clone();
                 model.apply(snapshots.borrow_and_update().clone());
+                if model.toast != before {
+                    toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+                }
                 dirty = true;
             }
         }

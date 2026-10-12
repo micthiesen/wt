@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use wt_core::worktree_target_key;
 use wt_naming::{AiSummary, HarnessPrograms, NamingCacheKey, NamingService, NamingServiceConfig};
 use wt_platform::{lock::FileLock, process::CommandSpec};
-use wt_runtime::{SourceHandle, SourcePublisher, SourceSnapshot, TaskScope, source_channel};
+use wt_runtime::{
+    DerivedPublisher, DomainMap, SourceHandle, SourceSnapshot, SourceState, TaskScope,
+    derived_channel,
+};
 use wt_tui::Board;
 use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
@@ -154,7 +157,7 @@ pub fn start(
     upstream: SourceHandle<Board>,
 ) -> NamingSources {
     let configured = context.config.naming.is_some();
-    let (board, mut publisher) = source_channel();
+    let (board, mut publisher) = derived_channel(scope, "naming-board");
     let (sender, mut requests) = mpsc::channel(MAX_PENDING_REQUESTS);
     let (invalidate, mut invalidations) = mpsc::channel(1);
     let active = Arc::new(Mutex::new(HashMap::new()));
@@ -205,7 +208,7 @@ pub fn start(
         let mut errors = HashMap::<String, String>::new();
         let mut tasks = JoinSet::<NamingOutcome>::new();
         let mut generation = 0_u64;
-        let mut output_fingerprint = String::new();
+        let mut output_fingerprint = None;
         publish_board(&mut publisher, &latest_board, &last_metadata, &visible, &errors, &mut output_fingerprint);
 
         loop {
@@ -251,7 +254,7 @@ pub fn start(
                         publish_board(&mut publisher, &latest_board, &last_metadata, &visible, &errors, &mut output_fingerprint);
                         continue;
                     }
-                    if let Some(snapshot) = last_git.data.as_deref().and_then(|rows| rows.iter().find(|row| worktree_target_key(&row.worktree.target) == request.key && !row.worktree.is_main)).cloned() {
+                    if let Some(snapshot) = last_git.data().map(Arc::as_ref).and_then(|rows| rows.iter().find(|row| worktree_target_key(&row.worktree.target) == request.key && !row.worktree.is_main)).cloned() {
                         let token = request.cancellation.clone();
                         let engine = engine.clone();
                         let signature = snapshot_signature(&context, &snapshot.worktree, &last_metadata);
@@ -295,7 +298,7 @@ pub fn start(
                         let current = explicit_current && match outcome.mode {
                             RequestMode::Automatic => outcome.generation == generation
                                 && latest_signature.as_deref() == Some(&outcome.signature),
-                            RequestMode::Explicit { .. } => last_git.data.as_deref().is_some_and(|rows| {
+                            RequestMode::Explicit { .. } => last_git.data().is_some_and(|rows| {
                                 rows.iter().any(|row| !row.worktree.is_main
                                     && row.error.is_none()
                                     && worktree_target_key(&row.worktree.target) == outcome.key
@@ -345,7 +348,7 @@ fn candidates(
     {
         return Vec::new();
     }
-    let (Some(rows), Some((state, _))) = (git.data.as_deref(), metadata.data.as_deref()) else {
+    let (Some(rows), Some((state, _))) = (git.data(), metadata.data().map(Arc::as_ref)) else {
         return Vec::new();
     };
     rows.iter()
@@ -369,7 +372,7 @@ fn snapshot_signature(
     worktree: &WorktreeRecord,
     metadata: &SourceSnapshot<Metadata>,
 ) -> String {
-    let state = metadata.data.as_deref().map(|m| &m.0);
+    let state = metadata.data().map(|m| &m.0);
     let slug = worktree.target.slug();
     let recorded = state
         .and_then(|state| state["slugs"][slug]["baseBranch"].as_str())
@@ -748,24 +751,19 @@ fn summary_cache_key_for_diff(context: &AppContext, slug: &str, hash: &str) -> N
 }
 
 fn publish_board(
-    publisher: &mut SourcePublisher<Board>,
+    publisher: &mut DerivedPublisher<Board>,
     upstream: &SourceSnapshot<Board>,
     metadata: &SourceSnapshot<Metadata>,
     visible: &HashMap<String, (NamingCacheKey, AiSummary)>,
     errors: &HashMap<String, String>,
-    previous: &mut String,
+    previous: &mut Option<(String, SourceState, DomainMap)>,
 ) {
-    let Some(source) = upstream.data.as_deref() else {
-        publisher.publish(SourceSnapshot {
-            data: None,
-            state: upstream.state.clone(),
-            updated_at: upstream.updated_at,
-            revision: 0,
-        });
+    let Some(source) = upstream.data() else {
+        publisher.publish(upstream.derive(None));
         return;
     };
-    let state = metadata.data.as_deref().map(|value| &value.0);
-    let mut board = source.clone();
+    let state = metadata.data().map(|value| &value.0);
+    let mut board = source.as_ref().clone();
     for row in &mut board.rows {
         // Remote rows can share a slug with a local checkout. Their metadata
         // and title are owned by the remote controller, never local naming.
@@ -801,16 +799,20 @@ fn publish_board(
         }
     }
     let fingerprint = board_fingerprint(&board, upstream);
-    if fingerprint == *previous {
+    // Manual titles come from the metadata snapshot, so it shares provenance.
+    let snapshot = upstream.derive(Some(Arc::new(board))).with_input(metadata);
+    // Domain metadata equality ignores stamps, so a refetch of unchanged data
+    // does not republish.
+    let key = (
+        fingerprint,
+        snapshot.state().clone(),
+        snapshot.domains().clone(),
+    );
+    if previous.as_ref() == Some(&key) {
         return;
     }
-    *previous = fingerprint;
-    publisher.publish(SourceSnapshot {
-        data: Some(Arc::new(board)),
-        state: upstream.state.clone(),
-        updated_at: upstream.updated_at,
-        revision: 0,
-    });
+    *previous = Some(key);
+    publisher.publish(snapshot);
 }
 
 fn title_fallback(
@@ -843,7 +845,7 @@ fn title_fallback(
 }
 
 fn board_fingerprint(board: &Board, upstream: &SourceSnapshot<Board>) -> String {
-    let mut text = format!("{}:{}", upstream.revision, board.name);
+    let mut text = format!("{}:{}", upstream.revision(), board.name);
     for row in &board.rows {
         text.push_str(&format!(
             "\0{}\0{}\0{}\0{}\0{}",

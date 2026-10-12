@@ -41,10 +41,24 @@ type Spans = Vec<Span<'static>>;
 
 pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let title = pane_title(model);
-    let block = super::panel_owned(truncate_end(
-        &title,
-        usize::from(area.width).saturating_sub(6),
-    ));
+    let pending = model
+        .selected_row()
+        .map(|row| super::status::row_pending(model, &row.key))
+        .unwrap_or_default();
+    let pending = super::status::pending_chip(&pending, ratatui::style::Style::new());
+    let pending_width: usize = pending
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()) + 1)
+        .sum();
+    let block = super::status::pane_with(
+        truncate_end(
+            &title,
+            usize::from(area.width).saturating_sub(6 + pending_width),
+        ),
+        pending,
+        super::status::DETAILS,
+        model,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 3 || inner.height == 0 {

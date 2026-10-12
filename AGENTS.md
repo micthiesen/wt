@@ -88,9 +88,17 @@ presentation model and terminal driver live in `wt-tui`.
 - Creation may record a pending selection, but select the new row only after it
   appears in the prepared visible rows. A refresh completing alone is not proof
   that the UI has rendered that row.
-- Optimistic external mutations keep their clobber guard until a fetched value
-  catches up, the mutation fails, or the bounded deadline expires. A resolved
-  request alone does not prove the read source has observed the write.
+- Board data flows only through `wt-runtime` sources. Every leaf declares its
+  persistence (`Disk` or `Never` with a reason); sources that read SQLite, logs
+  or live process state are `Never`. Restored cache data is display-only:
+  safety decisions take `Confirmed<T>` from a leaf handle, and a fetch keyed by
+  another source's data skips while that input is unconfirmed.
+- Optimistic display uses only `wt_runtime::Pending`. A change stays shown until
+  a fetch that *started* at or after the host's accept stamp shows it, the
+  write fails, or its bounded deadline expires. A resolved request, an older
+  fetch, a restored value or another process's stamp never settles it. Every
+  new `UiAction` declares its effect in `UiAction::effect`; toggles resolve
+  against the board the user saw, and GitHub writes carry a `PrPin`.
 - Hold state is self-expiring and resource-scoped. Recheck the exact hold ID
   immediately before honoring it; an unknown or stale copy creates no freeze.
 
