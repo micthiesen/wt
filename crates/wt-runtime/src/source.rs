@@ -264,7 +264,9 @@ pub struct DerivedPublisher<T> {
 }
 
 impl<T> DerivedPublisher<T> {
-    /// Publish unconditionally. Prefer `publish_if_changed`.
+    /// Publish unconditionally, e.g. a failure state that must reach the
+    /// pane. Ordinary results use `publish_if_changed`; this also resets its
+    /// memory so the next ordinary result is always published.
     pub fn publish(&self, snapshot: SourceSnapshot<T>) {
         if let Ok(mut last) = self.last.lock() {
             *last = None;

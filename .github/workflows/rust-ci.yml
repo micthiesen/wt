@@ -22,7 +22,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
-# Lint metadata, test executables and optimized builds have distinct caches.
+# Lint metadata, unit-test executables, end-to-end binaries and optimized builds
+# have distinct caches.
 # All work can start together; release publication must depend on their success.
 jobs:
   lint:
@@ -54,8 +55,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
-      # One build identity for every step, so later steps reuse the test
-      # build instead of recompiling wt-app for a new environment value.
+      # The same build identity as the native job and releases, so tests see
+      # the identity a shipped binary carries.
       WT_BUILD_ID: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,6 +95,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
+      # The release check requires a full commit SHA as the build identity.
       WT_BUILD_ID: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

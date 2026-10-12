@@ -27,7 +27,9 @@ tree; its behavior baseline is commit `d9cd2f4`.
 `crates/wt-app/src/main.rs` is the binary composition root. It resolves one
 configuration for the process, opens the repository-scoped database, builds an
 `AppContext`, and starts either a CLI operation, the local host, or the remote
-worker protocol. `sources.rs` composes the host-local source graph. A remote
+worker protocol. `sources.rs` composes the host-local source graph; the GitHub
+leaf's fetch scheduling (rate floor, events-daemon arbitration, deferred reads)
+lives in `github_source.rs`. A remote
 host runs the same source and action pipeline as a local host; the controller
 combines the resulting snapshots for display.
 

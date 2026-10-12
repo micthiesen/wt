@@ -84,8 +84,8 @@ impl From<LifecycleChange> for MutationKind {
     }
 }
 
-/// What one family of changes does to the board. `target` names the host
-/// and, for a row change, the row's key.
+/// What one family of changes does to the board. `apply` and `observed`
+/// receive the change's target: its host and, for a row change, the row key.
 trait Family {
     /// The field the change writes; with the target it identifies the change.
     fn field(&self) -> String;

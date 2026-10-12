@@ -97,7 +97,8 @@ mod tests {
 
     #[test]
     fn all_lists_every_domain_once() {
-        // Adding a variant without listing it fails to compile here.
+        // A new variant fails to compile here until it is matched; listing it
+        // in `ALL` (and updating the array length) is still a manual step.
         for domain in Domain::ALL {
             match domain {
                 Domain::Git

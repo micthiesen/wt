@@ -36,13 +36,15 @@ pub(crate) use pending::CreateUi;
 pub(crate) use selection::VisualItem;
 
 /// How a footer toast reads: plain feedback, a notice that the key had
-/// nothing to act on (yellow, as in TS), or a failure.
+/// nothing to act on (yellow), or a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastTone {
     Info,
     Notice,
     Failed,
 }
+/// Everything the terminal shows and the keys act on: the presented board
+/// (source board with pending changes applied), cursor, panes and prompts.
 pub struct Model {
     /// Requested changes shown over `source_board` until a fetch confirms
     /// them. The only optimistic state in the TUI.
@@ -100,6 +102,7 @@ pub struct Model {
     pub(crate) mouse_selection: Option<crate::mouse::Selection>,
 }
 
+/// What a key press asks the terminal loop to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum InputResult {
     Unchanged,

@@ -1,4 +1,4 @@
-//! Key sequence -> action/selection/toast pins for TS interaction parity.
+//! Key sequences pinned to the actions, selection and toasts they produce.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use wt_runtime::{SourceSnapshot, SourceState};
