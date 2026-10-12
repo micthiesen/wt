@@ -107,8 +107,10 @@ the host label on each row is the only difference.
 
 ### Current limits
 
-- Managed remotes are tested with macOS controllers and macOS workers. A
-  Linux worker needs a published release for its target, as for any remote.
+- Managed remotes are tested with a macOS controller and macOS or Linux
+  workers. A worker whose target differs from the controller's needs the
+  controller to run an installed release, as for any remote; a development
+  build can only provision a worker of its own target.
 - The repository must be on GitHub, and the worker must be able to reach it.
 - Commits made on the worker are unsigned, because the controller's signing
   configuration and key stay on the controller.
