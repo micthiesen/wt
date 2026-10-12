@@ -103,6 +103,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> DiskCache<T> {
         Self {
             slot: Arc::new(SerdeSlot::<T> {
                 store: store.clone(),
+                written: std::sync::Mutex::new(None),
                 _type: PhantomData,
             }),
         }
@@ -127,6 +128,9 @@ impl<T> DiskCache<T> {
 
 struct SerdeSlot<T> {
     store: CacheStore,
+    /// Digest of the payload last written, so an identical refetch does not
+    /// rewrite the file.
+    written: std::sync::Mutex<Option<u64>>,
     _type: PhantomData<fn() -> T>,
 }
 
@@ -154,6 +158,20 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T> for S
     }
 
     fn write(&self, name: &str, data: &T) -> std::io::Result<()> {
+        let payload = serde_json::to_vec(data).map_err(std::io::Error::other)?;
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            payload.hash(&mut hasher);
+            hasher.finish()
+        };
+        let mut written = self
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *written == Some(digest) && self.store.path(name).exists() {
+            return Ok(());
+        }
         let bytes = serde_json::to_vec(&EnvelopeOut {
             format: FORMAT,
             name,
@@ -166,13 +184,41 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T> for S
             return Err(std::io::Error::other("source cache exceeds size limit"));
         }
         let directory = self.store.directory();
-        std::fs::create_dir_all(directory)?;
+        prepare_directory(directory)?;
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         file.write_all(&bytes)?;
         file.persist(self.store.path(name))
             .map_err(|error| error.error)?;
+        *written = Some(digest);
         Ok(())
     }
+}
+
+/// Create the cache directory owner-only (it holds PR titles and branch
+/// names of possibly private repositories) and remove temporary files a
+/// crashed writer left behind.
+fn prepare_directory(directory: &Path) -> std::io::Result<()> {
+    if !directory.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(directory)?;
+    }
+    let stale = std::time::SystemTime::now() - Duration::from_secs(60 * 60);
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let leftover = entry.file_name().to_string_lossy().starts_with(".tmp")
+                && entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| modified < stale);
+            if leftover {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_envelope<T: DeserializeOwned>(
@@ -226,6 +272,27 @@ mod tests {
 
     fn store(directory: &Path, scope: &str) -> DiskCache<Vec<String>> {
         DiskCache::new(&CacheStore::new(directory.to_path_buf(), scope))
+    }
+
+    #[test]
+    fn identical_data_is_not_rewritten_and_the_directory_is_private() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("query");
+        let cache = store(&directory, "scope-a");
+        cache.write("git", &vec!["row".into()]).unwrap();
+        let path = directory.join("git.json");
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        cache.write("git", &vec!["row".into()]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), first);
+        cache.write("git", &vec!["changed".into()]).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().modified().unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&directory).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
     }
 
     #[test]

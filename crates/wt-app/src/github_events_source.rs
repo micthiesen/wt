@@ -51,11 +51,22 @@ pub(crate) async fn load(context: &AppContext, branches: &[String]) -> Option<Da
     read(
         context.config.paths.cache_root.join("events"),
         branches.to_vec(),
+        repository_identity(&context.config),
     )
     .await
 }
 
-async fn read(directory: PathBuf, branches: Vec<String>) -> Option<DaemonRead> {
+/// Which repository and configuration a daemon snapshot belongs to. A
+/// snapshot written for anything else is never read as this repository's.
+pub(crate) fn repository_identity(config: &wt_config::Config) -> String {
+    format!(
+        "{}:{}",
+        config.repo_id,
+        config.paths.main_clone.to_string_lossy()
+    )
+}
+
+async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> Option<DaemonRead> {
     let result = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         const LIMIT: u64 = 16 * 1024 * 1024;
@@ -70,7 +81,13 @@ async fn read(directory: PathBuf, branches: Vec<String>) -> Option<DaemonRead> {
             anyhow::bail!("GitHub snapshot exceeds 16 MiB");
         }
         let snapshot = serde_json::from_slice(&bytes)?;
-        Ok::<_, anyhow::Error>(validate(snapshot, &branches, now_ms(), env!("WT_BUILD_ID")))
+        Ok::<_, anyhow::Error>(validate(
+            snapshot,
+            &branches,
+            now_ms(),
+            env!("WT_BUILD_ID"),
+            &repository,
+        ))
     })
     .await;
     match result {
@@ -90,9 +107,13 @@ fn validate(
     branches: &[String],
     now: u64,
     build: &str,
+    repository: &str,
 ) -> Option<DaemonRead> {
     let age = now.checked_sub(snapshot.updated_at)?;
-    if age > FRESH.as_millis() as u64 || snapshot.writer_sha.as_deref() != Some(build) {
+    if age > FRESH.as_millis() as u64
+        || snapshot.writer_sha.as_deref() != Some(build)
+        || snapshot.repository.as_deref() != Some(repository)
+    {
         return None;
     }
     if branches
@@ -201,6 +222,7 @@ mod tests {
             fetch_started_at_ms: Some(98_000),
             branches: vec!["feature".into()],
             writer_sha: Some("current".into()),
+            repository: Some("repo".into()),
             prs: serde_json::json!({}),
             merge_queue: serde_json::json!({}),
             ..GithubSnapshot::default()
@@ -210,15 +232,20 @@ mod tests {
     #[test]
     fn cache_requires_fresh_time_current_build_full_coverage_and_valid_payloads() {
         let branches = vec!["feature".into()];
-        assert!(validate(snapshot(), &branches, 101_000, "current").is_some());
-        assert!(validate(snapshot(), &[], 101_000, "current").is_some());
-        assert!(validate(snapshot(), &branches, 190_001, "current").is_none());
-        assert!(validate(snapshot(), &branches, 99_000, "current").is_none());
-        assert!(validate(snapshot(), &branches, 101_000, "other").is_none());
-        assert!(validate(snapshot(), &["missing".into()], 101_000, "current").is_none());
+        assert!(validate(snapshot(), &branches, 101_000, "current", "repo").is_some());
+        assert!(validate(snapshot(), &[], 101_000, "current", "repo").is_some());
+        assert!(validate(snapshot(), &branches, 190_001, "current", "repo").is_none());
+        assert!(validate(snapshot(), &branches, 99_000, "current", "repo").is_none());
+        assert!(validate(snapshot(), &branches, 101_000, "other", "repo").is_none());
+        // Another repository's or configuration's daemon is never read.
+        assert!(validate(snapshot(), &branches, 101_000, "current", "elsewhere").is_none());
+        let mut unscoped = snapshot();
+        unscoped.repository = None;
+        assert!(validate(unscoped, &branches, 101_000, "current", "repo").is_none());
+        assert!(validate(snapshot(), &["missing".into()], 101_000, "current", "repo").is_none());
         let mut malformed = snapshot();
         malformed.prs = serde_json::json!({"feature":{"number":42}});
-        assert!(validate(malformed, &branches, 101_000, "current").is_none());
+        assert!(validate(malformed, &branches, 101_000, "current", "repo").is_none());
         assert!(snapshot_event(Path::new("/events/.github.json.123.tmp")));
         assert!(!snapshot_event(Path::new("/events/state.json")));
     }
@@ -228,7 +255,7 @@ mod tests {
         // Fix the process clock origin before the moments this test names.
         let _ = Stamp::now();
         tokio::time::advance(Duration::from_secs(10)).await;
-        let read = validate(snapshot(), &["feature".into()], 101_000, "current").unwrap();
+        let read = validate(snapshot(), &["feature".into()], 101_000, "current", "repo").unwrap();
         // Started 3s ago, written 1s ago.
         assert_eq!(
             read.written + Duration::from_secs(2),
@@ -242,7 +269,7 @@ mod tests {
             fetch_started_at_ms: None,
             ..snapshot()
         };
-        let read = validate(legacy, &["feature".into()], 101_000, "current").unwrap();
+        let read = validate(legacy, &["feature".into()], 101_000, "current", "repo").unwrap();
         assert!(!read.stamp().is_ordered());
     }
 
@@ -270,7 +297,7 @@ mod tests {
         daemon.fetch_started_at_ms = Some(100_000);
         daemon.updated_at = 101_900;
         daemon.prs = serde_json::to_value(with_auto_merge(open_pr_data("feature")).prs).unwrap();
-        let read = validate(daemon, &["feature".into()], 102_000, "current").unwrap();
+        let read = validate(daemon, &["feature".into()], 102_000, "current", "repo").unwrap();
         // The arm was accepted 1s ago: after the daemon request started.
         let accepted = Stamp::at(Instant::now() - Duration::from_secs(1));
         let mut ledger = ledger_with_accepted_enable("feature", 7, accepted);

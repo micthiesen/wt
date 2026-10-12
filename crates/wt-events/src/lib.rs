@@ -22,6 +22,9 @@ pub struct EventDaemonConfig {
     pub events_dir: PathBuf,
     pub base_branch: String,
     pub writer_sha: Option<String>,
+    /// Repository identity written into every snapshot, so a reader for
+    /// another repository or configuration rejects it.
+    pub repository: Option<String>,
     pub debounce_ms: u64,
     pub min_fetch_interval_ms: u64,
     pub inventory_ttl_ms: u64,
@@ -32,6 +35,11 @@ pub struct EventDaemonConfig {
 }
 
 impl EventDaemonConfig {
+    pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
+
     pub fn new(
         host: impl Into<String>,
         port: u16,
@@ -47,6 +55,7 @@ impl EventDaemonConfig {
             events_dir,
             base_branch: base_branch.into(),
             writer_sha,
+            repository: None,
             debounce_ms: 1_500,
             min_fetch_interval_ms: 10_000,
             inventory_ttl_ms: 10_000,
@@ -76,6 +85,9 @@ pub struct GithubSnapshot {
     pub merge_queue: Value,
     #[serde(default)]
     pub writer_sha: Option<String>,
+    /// The writer's repository identity (see `EventDaemonConfig::repository`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }

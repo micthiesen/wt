@@ -503,6 +503,7 @@ async fn scheduler(
                             updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
                             branches: fetch_branches.into_iter().collect(), prs: data.prs,
                             merge_queue: data.merge_queue, writer_sha: config.writer_sha.clone(),
+                            repository: config.repository.clone(),
                             extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
                         };
                         match durable.write_snapshot(&snapshot).await {

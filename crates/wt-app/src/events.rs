@@ -120,7 +120,10 @@ pub async fn serve(context: &AppContext) -> Result<()> {
         context.config.paths.cache_root.join("events"),
         context.config.branch.base.clone(),
         Some(env!("WT_BUILD_ID").to_owned()),
-    );
+    )
+    .with_repository(crate::github_events_source::repository_identity(
+        &context.config,
+    ));
     let daemon = wt_events::start_daemon(
         config,
         Arc::new(AppEventSource {

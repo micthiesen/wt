@@ -402,3 +402,20 @@ pub fn stamps_advanced(old: &DomainMap, new: &DomainMap) -> bool {
             .is_some_and(|previous| previous.observed != meta.observed)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_data_ages_out_of_bounded_decisions() {
+        let read = Confirmed::for_test(1u8);
+        assert!(read.fresh_within(Duration::from_secs(600)));
+        tokio::time::advance(Duration::from_secs(601)).await;
+        assert!(!read.fresh_within(Duration::from_secs(600)));
+        // An observation with no known start is never fresh.
+        let unordered = Confirmed::new(Arc::new(1u8), Stamp::unordered());
+        assert!(!unordered.fresh_within(Duration::from_secs(600)));
+    }
+}

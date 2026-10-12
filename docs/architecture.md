@@ -109,7 +109,8 @@ ms, so a skipped or quick refresh causes no redraw. Files live under `<cache roo
 whose scope hashes the repository id, canonical main clone, merged
 configuration and build (plus the executable's size and mtime for `dev-`
 builds). A mismatched, corrupt, oversized or week-old file is deleted and
-ignored. Sources that read SQLite, logs or live process state are `Never`:
+ignored. The directory is owner-only, identical data is not rewritten, and
+temporary files a crashed writer left behind are removed. Sources that read SQLite, logs or live process state are `Never`:
 durable state is read directly and never cached here.
 
 **Confirmed inputs.** `LeafHandle::confirmed()` returns `Confirmed<T>` only for
@@ -118,7 +119,12 @@ read by the daemon stamped with its own fetch start, not a restored cache); a de
 constructor. Remove, cleanup, GitHub writes, reviewer edits, action
 requirements, restack and automation facts take `Confirmed` inputs (or `None`,
 which behaves like "still loading" and fails closed). `Confirmed::fresh_within`
-replaces ad-hoc age checks. A fetch whose key set comes from another source
+replaces ad-hoc age checks; GitHub writes and reviewer edits also refuse
+confirmed data older than 10 minutes, while landing evidence for cleanup stays
+valid at any age because a merged PR at the checked head never un-merges. An
+events-daemon snapshot is read only when it names this repository and
+configuration (`repository`), was written by this build, and is under 90
+seconds old. A fetch whose key set comes from another source
 (GitHub branches, issue ids, events-cache coverage) reads that input through
 `confirmed()` and skips while it is restored, so a restored inventory never
 produces "live" data. Automation quiescence requires confirmed session data and

@@ -34,7 +34,7 @@ The daemon accepts only the configured event types, limits the request body to 5
 
 The daemon writes three files under `<cache_root>/events/`:
 
-- `github.json` contains the camelCase GitHub snapshot, covered branches, Unix-millisecond `updatedAt` (when the write finished), `fetchStartedAtMs` (when the GitHub read started), and the writer's `writerSha`.
+- `github.json` contains the camelCase GitHub snapshot, covered branches, Unix-millisecond `updatedAt` (when the write finished), `fetchStartedAtMs` (when the GitHub read started), the writer's `writerSha`, and `repository` (the repository and configuration it was written for; a reader for anything else ignores it).
 - `github.touch` changes after a successful snapshot so an active TUI can notice fresh data.
 - `state.json` contains daemon PID, port, build, start/event/fetch timestamps, accepted event count, and the most recent refresh error.
 

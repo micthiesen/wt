@@ -16,6 +16,9 @@ pub struct HostService {
 /// longest pending deadline for an accepted or unconfirmed change.
 const SETTLEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The oldest GitHub read a GitHub write may rely on for its PR checks.
+const WRITE_EVIDENCE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 impl HostService {
     pub fn start(scope: &TaskScope, mut context: AppContext, commands: CancellationToken) -> Self {
         // Closing the view stops reads. An accepted mutation instead belongs to
@@ -131,6 +134,10 @@ impl HostService {
         // board is display data used to resolve rows.
         let github = self.sources.github.confirmed();
         let github = github.as_ref();
+        // A GitHub write must also not act on a read from long ago (a lane
+        // that has been failing, say): its PR and head checks need a recent
+        // read. Landing evidence for cleanup stays valid at any age.
+        let github_for_writes = github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE));
         let board = snapshot.data().map(|board| board.as_ref());
         if matches!(
             command,
@@ -159,7 +166,7 @@ impl HostService {
                             original: &original,
                             selected: &selected,
                             board,
-                            github,
+                            github: github_for_writes,
                         },
                     ))
                     .await
@@ -199,7 +206,12 @@ impl HostService {
         };
         if let Some(action) = github_action {
             let board = board.ok_or_else(|| anyhow::anyhow!("worktree board is still loading"))?;
-            return Box::pin(self.sources.github_actions.execute(action, board, github)).await;
+            return Box::pin(
+                self.sources
+                    .github_actions
+                    .execute(action, board, github_for_writes),
+            )
+            .await;
         }
         let reply = match command {
             UiAction::PrepareReviewCheckout {
