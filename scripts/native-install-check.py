@@ -28,8 +28,6 @@ def target_for(os_name: str, machine: str) -> str:
     if os_name == "Darwin":
         if machine in {"arm64", "aarch64"}:
             return "aarch64-apple-darwin"
-        if machine in {"x86_64", "amd64"}:
-            return "x86_64-apple-darwin"
     if os_name == "Linux":
         if machine in {"arm64", "aarch64"}:
             return "aarch64-unknown-linux-gnu"
@@ -228,7 +226,8 @@ class NativeInstallCheck(unittest.TestCase):
         self.assertEqual(target_for("Linux", "x86_64"), "x86_64-unknown-linux-gnu")
         self.assertEqual(target_for("Linux", "aarch64"), "aarch64-unknown-linux-gnu")
         self.assertEqual(target_for("Darwin", "arm64"), "aarch64-apple-darwin")
-        self.assertEqual(target_for("Darwin", "x86_64"), "x86_64-apple-darwin")
+        with self.assertRaises(AssertionError):
+            target_for("Darwin", "x86_64")
 
     @unittest.skipUnless(os.name == "posix", "stable launcher uses Unix executable layout")
     def test_real_launcher_reads_prior_state_and_probes_pending_fallback(self) -> None:

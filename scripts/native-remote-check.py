@@ -33,8 +33,6 @@ def native_target() -> str:
     machine = os.uname().machine
     if (system, machine) in (("Darwin", "arm64"), ("Darwin", "aarch64")):
         return "aarch64-apple-darwin"
-    if (system, machine) in (("Darwin", "x86_64"), ("Darwin", "amd64")):
-        return "x86_64-apple-darwin"
     if (system, machine) in (("Linux", "aarch64"), ("Linux", "arm64")):
         return "aarch64-unknown-linux-gnu"
     if (system, machine) in (("Linux", "x86_64"), ("Linux", "amd64")):

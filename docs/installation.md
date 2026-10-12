@@ -1,6 +1,6 @@
 # Installing native wt
 
-The native release runs without a source checkout, Bun, or a JavaScript runtime. Supported release targets are macOS Apple Silicon and Intel, plus Linux x86_64 and arm64. The Linux binaries target the release workflow's glibc baseline.
+The native release runs without a source checkout, Bun, or a JavaScript runtime. Supported release targets are macOS Apple Silicon plus Linux x86_64 and arm64. Intel Macs have no prebuilt release; build from source with `cargo build --release -p wt-app -p wt-launcher`. The Linux binaries target the release workflow's glibc baseline.
 
 ## Install
 

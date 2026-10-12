@@ -67,7 +67,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_binary_with_wrong_embedded_identity_is_rejected(self):
         args = self.args("aarch64-apple-darwin")
-        args.target = "x86_64-apple-darwin"
+        args.target = "x86_64-unknown-linux-gnu"
         with self.assertRaisesRegex(ValueError, "disagrees"):
             packaging.package(args)
         self.assertFalse(args.output.exists())

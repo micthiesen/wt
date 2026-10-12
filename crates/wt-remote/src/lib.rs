@@ -251,7 +251,7 @@ pub enum RemoteError {
     #[error("remote worker command failed: {detail}")]
     Command { detail: String },
     #[error(
-        "native remote worker platform is unsupported: {os} {architecture}; supported targets are aarch64-apple-darwin, x86_64-apple-darwin, aarch64-unknown-linux-gnu, and x86_64-unknown-linux-gnu"
+        "native remote worker platform is unsupported: {os} {architecture}; supported targets are aarch64-apple-darwin, aarch64-unknown-linux-gnu, and x86_64-unknown-linux-gnu"
     )]
     UnsupportedPlatform { os: String, architecture: String },
     #[error("invalid native worker binary candidate: {0}")]
@@ -735,7 +735,6 @@ pub fn parse_remote_platform(raw: &str) -> Result<RemotePlatform, RemoteError> {
     let architecture = values[1].to_owned();
     let target = match (os.as_str(), architecture.as_str()) {
         ("Darwin", "arm64" | "aarch64") => "aarch64-apple-darwin",
-        ("Darwin", "x86_64" | "amd64") => "x86_64-apple-darwin",
         ("Linux", "aarch64" | "arm64") => "aarch64-unknown-linux-gnu",
         ("Linux", "x86_64" | "amd64") => "x86_64-unknown-linux-gnu",
         _ => {
@@ -752,10 +751,7 @@ pub fn parse_remote_platform(raw: &str) -> Result<RemotePlatform, RemoteError> {
 fn validate_target(target: &str) -> Result<(), RemoteError> {
     if matches!(
         target,
-        "aarch64-apple-darwin"
-            | "x86_64-apple-darwin"
-            | "aarch64-unknown-linux-gnu"
-            | "x86_64-unknown-linux-gnu"
+        "aarch64-apple-darwin" | "aarch64-unknown-linux-gnu" | "x86_64-unknown-linux-gnu"
     ) {
         Ok(())
     } else {
@@ -1267,7 +1263,6 @@ mod tests {
         fs::create_dir_all(&worker_home).unwrap();
         let target = match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => "aarch64-apple-darwin",
-            ("macos", "x86_64") => "x86_64-apple-darwin",
             ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
             ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
             other => panic!("test host target is unsupported: {other:?}"),
