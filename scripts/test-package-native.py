@@ -48,7 +48,7 @@ class ReleaseTests(unittest.TestCase):
         args.installer.write_text("#!/bin/sh\necho fixture\n")
         packaging.manifest(args)
         result = json.loads((args.output / "wt-release.json").read_text())
-        self.assertEqual(len(result["artifacts"]), 4)
+        self.assertEqual(len(result["artifacts"]), len(packaging.TARGETS))
         installer = args.output / "install.sh"
         self.assertEqual(installer.read_bytes(), args.installer.read_bytes())
         self.assertIn(f"{packaging.digest(installer)}  install.sh\n",
