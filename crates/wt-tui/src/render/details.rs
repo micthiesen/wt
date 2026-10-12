@@ -50,15 +50,21 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         .iter()
         .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()) + 1)
         .sum();
-    let block = super::status::pane_with(
-        truncate_end(
-            &title,
-            usize::from(area.width).saturating_sub(6 + pending_width),
-        ),
-        pending,
-        super::status::DETAILS,
-        model,
+    let title = truncate_end(
+        &title,
+        usize::from(area.width).saturating_sub(6 + pending_width),
     );
+    // A row's details reflect only its own host's sources.
+    let block = match model.selected_row() {
+        Some(row) => super::status::row_pane(
+            title,
+            pending,
+            row.host.as_deref(),
+            super::status::DETAILS,
+            model,
+        ),
+        None => super::status::pane_with(title, pending, super::status::DETAILS, model),
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 3 || inner.height == 0 {

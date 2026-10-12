@@ -71,9 +71,24 @@ pub(crate) struct Status {
 }
 
 pub(crate) fn status(model: &Model, domains: &[Domain]) -> Status {
-    let mut status = Status::default();
     let hosts =
         std::iter::once(&model.local_domains).chain(model.source_board.host_domains.values());
+    combine(hosts, domains)
+}
+
+/// The status of one host's domains, for panes about a single row.
+pub(crate) fn host_status(model: &Model, host: Option<&str>, domains: &[Domain]) -> Status {
+    match host {
+        None => combine(std::iter::once(&model.local_domains), domains),
+        Some(host) => combine(model.source_board.host_domains.get(host), domains),
+    }
+}
+
+fn combine<'a>(
+    hosts: impl IntoIterator<Item = &'a wt_runtime::DomainMap>,
+    domains: &[Domain],
+) -> Status {
+    let mut status = Status::default();
     for map in hosts {
         for domain in domains {
             let Some(meta) = map.get(domain) else {
@@ -100,19 +115,24 @@ pub(crate) fn status(model: &Model, domains: &[Domain]) -> Status {
 }
 
 /// Short spans describing a status, or nothing when everything is live and
-/// ready. Failure wins, then cached, then refreshing.
+/// ready. Saved data says how old it is; a failure is named beside it; while
+/// neither applies, a pane is loading or refreshing.
 pub(crate) fn chip(status: &Status, base: Style) -> Vec<Span<'static>> {
-    if let Some((domain, _)) = &status.failed {
-        return vec![Span::styled(
-            format!(" · {} failed", domain.label()),
-            base.fg(theme::ERR),
-        )];
-    }
+    let mut spans = Vec::new();
     if let Some(saved) = status.cached_since {
-        return vec![Span::styled(
+        spans.push(Span::styled(
             format!(" · cached {}", age(saved, now_ms())),
             base.fg(theme::WARN),
-        )];
+        ));
+    }
+    if let Some((domain, _)) = &status.failed {
+        spans.push(Span::styled(
+            format!(" · {} failed", domain.label()),
+            base.fg(theme::ERR),
+        ));
+    }
+    if !spans.is_empty() {
+        return spans;
     }
     if status.loading {
         return vec![Span::styled(" · loading…", base.fg(theme::FG_DIM))];
@@ -136,6 +156,22 @@ pub(crate) fn pane_with(
     domains: &[Domain],
     model: &Model,
 ) -> Block<'static> {
+    let status = (!domains.is_empty()).then(|| status(model, domains));
+    frame(title, extra, status)
+}
+
+/// A pane about one row: only that row's host's sources set its status.
+pub(crate) fn row_pane(
+    title: String,
+    extra: Vec<Span<'static>>,
+    host: Option<&str>,
+    domains: &[Domain],
+    model: &Model,
+) -> Block<'static> {
+    frame(title, extra, Some(host_status(model, host, domains)))
+}
+
+fn frame(title: String, extra: Vec<Span<'static>>, status: Option<Status>) -> Block<'static> {
     let mut spans = vec![
         Span::styled("─ ", theme::fg(theme::BORDER)),
         Span::styled(title, theme::fg(theme::FG_DIM)),
@@ -144,8 +180,8 @@ pub(crate) fn pane_with(
         spans.push(Span::raw(" "));
         spans.extend(extra);
     }
-    if !domains.is_empty() {
-        spans.extend(chip(&status(model, domains), Style::new()));
+    if let Some(status) = &status {
+        spans.extend(chip(status, Style::new()));
     }
     spans.push(Span::styled(" ", theme::fg(theme::BORDER)));
     Block::new()
@@ -205,17 +241,37 @@ mod tests {
     use super::*;
     use wt_runtime::{SourceSnapshot, Target};
 
-    fn model_with(domain: Domain, snapshot: SourceSnapshot<crate::Board>) -> Model {
+    fn model_with(snapshot: SourceSnapshot<crate::Board>) -> Model {
         let mut model = Model::default();
         model.apply(snapshot);
-        let _ = domain;
         model
+    }
+
+    #[test]
+    fn a_remote_hosts_failure_marks_the_list_but_not_a_local_rows_details() {
+        let failed = SourceSnapshot::<()>::test_live(
+            None,
+            SourceState::Failed("offline".into()),
+            Domain::Github,
+        );
+        let mut board = crate::Board::default();
+        board
+            .host_domains
+            .insert("box".into(), failed.domains().clone());
+        let model = model_with(SourceSnapshot::test_live(
+            Some(board),
+            SourceState::Ready,
+            Domain::Git,
+        ));
+        assert!(status(&model, LIST).failed.is_some());
+        assert!(host_status(&model, None, DETAILS).failed.is_none());
+        assert!(host_status(&model, Some("box"), DETAILS).failed.is_some());
     }
 
     #[test]
     fn restored_failed_and_pending_states_render_the_same_way_everywhere() {
         let restored = SourceSnapshot::test_restored(crate::Board::default(), Domain::Github, 0);
-        let model = model_with(Domain::Github, restored);
+        let model = model_with(restored);
         let shown = status(&model, LIST);
         assert!(shown.cached_since.is_some());
         let text: String = chip(&shown, Style::new())
@@ -231,7 +287,7 @@ mod tests {
             SourceState::Failed("offline".into()),
             Domain::Git,
         );
-        let model = model_with(Domain::Git, failed);
+        let model = model_with(failed);
         let text: String = chip(&status(&model, DETAILS), Style::new())
             .iter()
             .map(|span| span.content.to_string())

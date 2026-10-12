@@ -85,9 +85,10 @@ with a `removing` label; a failed removal restores its previous archive state.
 At launch every pane shows the last data wt saved for it, so the board is
 populated before the first fetch. Each pane's title names its state the same
 way: `cached 3m` while it shows saved data (from this or a remote host),
-`loading…` before any data exists, `↻` while refreshing, and `<source> failed`
-when a fetch failed (the last good data stays visible; the footer shows the
-error). The header summarizes every source the same way.
+`loading…` before any data exists, `↻` while a fetch takes a moment, and
+`<source> failed` when a fetch failed (the last good data stays visible; saved
+data that also failed to refresh reads `cached 3m · GitHub failed`). The list
+and header summarize every host; a row's details reflect only that row's host.
 
 Every change you make appears at once and is marked on its row (and in the
 details title) until a fresh read shows it: `… arming merge` while the request

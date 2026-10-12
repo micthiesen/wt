@@ -1172,6 +1172,14 @@ impl Model {
                     } else {
                         let primary = reply.primary_harness.clone();
                         self.pending.accept_with(id, at, now, |mutation| {
+                            // The stamp names the host that executed the
+                            // write. The controller runs some writes for
+                            // remote rows itself (archive, sections, session
+                            // entry); those are confirmed by this process's
+                            // own reads, on the clock the stamp came from.
+                            if at.local_instant().is_some() {
+                                mutation.target.host = None;
+                            }
                             match &mut mutation.kind {
                                 crate::MutationKind::Create { resolved: slot, .. } => {
                                     *slot = resolved.clone()
@@ -3460,6 +3468,49 @@ mod tests {
         );
         model.apply(snapshot(&["old", "new"]));
         assert_eq!(model.selected_row().unwrap().key, "new");
+    }
+
+    /// A remote row's archive runs on the controller: its accept stamp is
+    /// this process's, so this process's own reads confirm it.
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_owned_write_on_a_remote_row_settles_on_local_reads() {
+        let mut model = Model::default();
+        let mut board = Board {
+            rows: vec![BoardRow {
+                key: "@box/alpha".into(),
+                host: Some("box".into()),
+                title: "alpha".into(),
+                ..BoardRow::default()
+            }],
+            ..Board::default()
+        };
+        model.apply(SourceSnapshot::test_live(
+            Some(board.clone()),
+            SourceState::Ready,
+            wt_runtime::Domain::Metadata,
+        ));
+        let action = UiAction::ToggleArchive {
+            key: "@box/alpha".into(),
+        };
+        model.begin_action(1, &action);
+        assert!(model.board.rows[0].archived, "shown at once");
+        tokio::time::advance(std::time::Duration::from_millis(5)).await;
+        model.reply(UiReply {
+            operation_id: Some(1),
+            outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+            ..Default::default()
+        });
+        tokio::time::advance(std::time::Duration::from_millis(5)).await;
+        board.rows[0].archived = true;
+        model.apply(SourceSnapshot::test_live(
+            Some(board),
+            SourceState::Ready,
+            wt_runtime::Domain::Metadata,
+        ));
+        assert!(
+            model.pending.is_empty(),
+            "a local read after the write settles it"
+        );
     }
 
     #[test]

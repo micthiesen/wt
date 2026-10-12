@@ -55,6 +55,9 @@ const TAIL_DELTA_BYTES: usize = 32 * 1024;
 /// Sources an action's declared effects refresh on completion. The issue
 /// statuses leaf also settles issue-status expectations, so it must be the
 /// confirmable leaf, not a display view.
+/// Spacing of follow-up tracker reads while an expectation is unconfirmed.
+const CONFIRM_POLL: Duration = Duration::from_secs(5);
+
 pub struct RefreshTargets {
     pub git: LeafHandle<Vec<wt_vcs::WorktreeSnapshot>>,
     pub github: LeafHandle<wt_github::GithubData>,
@@ -387,8 +390,15 @@ fn project(
         let mut last_runs = None;
         let mut last_error = None;
         let mut last: Option<SourceSnapshot<Board>> = None;
+        // The tracker's read model can lag the action's write past the read
+        // its completion triggered. While an accepted expectation waits, keep
+        // a tracker read queued (the issue lane enforces its own floor) so it
+        // is confirmed rather than expiring.
+        let mut confirm = tokio::time::interval(CONFIRM_POLL);
+        confirm.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let next_expiry = tracker.next_expiry();
+            let awaiting = tracker.awaiting_confirmation();
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
@@ -426,6 +436,9 @@ fn project(
                     Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending::<()>().await,
                 }} => {}
+                _ = confirm.tick(), if awaiting => {
+                    targets.issues.refresh();
+                }
             }
             let now = tokio::time::Instant::now();
             tracker.renew_running(now);
@@ -689,6 +702,14 @@ impl Tracker {
         });
         let ops = &self.ops;
         self.running.retain(|run_id, _| ops.contains_key(run_id));
+    }
+
+    /// An accepted expectation is waiting for a tracker read to show it.
+    fn awaiting_confirmation(&self) -> bool {
+        self.pending
+            .views()
+            .iter()
+            .any(|view| view.phase == wt_runtime::PendingPhase::Accepted)
     }
 
     fn next_expiry(&self) -> Option<tokio::time::Instant> {

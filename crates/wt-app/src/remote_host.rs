@@ -893,8 +893,10 @@ fn publish_snapshot(
     let state = match &snapshot.state {
         protocol::HostState::Empty => SourceState::Empty,
         protocol::HostState::Refreshing => SourceState::Refreshing,
-        protocol::HostState::Ready => SourceState::Ready,
-        protocol::HostState::Failed(error) => SourceState::Failed(error.clone().into()),
+        // The connection lane reports the connection. A failure inside the
+        // host's board (e.g. its GitHub read) arrives in the host's own
+        // per-domain states, so each pane names the source that failed.
+        protocol::HostState::Ready | protocol::HostState::Failed(_) => SourceState::Ready,
     };
     // Received over this connection now: live, stamped on our clock. The
     // host's own domains keep their stamps on the host's clock.
@@ -1021,5 +1023,32 @@ mod tests {
             .await
             .expect("a reply received during shutdown drain is authoritative");
         assert_eq!(reply.message, "completed");
+    }
+
+    /// A failure inside the worker's board (its GitHub read, say) is not a
+    /// connection failure: the lane stays ready and the worker's own domain
+    /// states say which source failed.
+    #[tokio::test]
+    async fn a_worker_side_failure_leaves_the_connection_lane_ready() {
+        let scope = TaskScope::new();
+        let (source, publisher) = leaf_channel::<HostSnapshot>(
+            &scope,
+            SourceSpec {
+                name: "host-test",
+                domain: Domain::Host,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let snapshot = HostSnapshot {
+            board: Some(wt_tui::Board::default()),
+            state: crate::host_protocol::HostState::Failed("GitHub: offline".into()),
+            layout: Default::default(),
+            domains: Default::default(),
+        };
+        let mut latest = None;
+        super::publish_snapshot(snapshot, &mut latest, &publisher, "test-host").unwrap();
+        assert_eq!(*source.snapshot().state(), wt_runtime::SourceState::Ready);
+        assert!(source.confirmed().is_some());
     }
 }
