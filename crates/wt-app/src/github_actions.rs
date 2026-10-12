@@ -23,8 +23,9 @@ use tokio::{
     time::{Instant, sleep},
 };
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_github::{GithubClient, GithubData, GithubOptions, PrChecks, PrMergeTarget, PullRequest};
-use wt_runtime::{Confirmed, Domain, Mutation, Pending, PendingPhase, Stamp, Target, TaskScope};
+use wt_runtime::{Confirmed, Mutation, Pending, PendingPhase, Stamp, Target, TaskScope};
 use wt_tui::{Board, PrPin, ReplyOutcome, UiModal, UiReply};
 
 use crate::{context::AppContext, sources::GithubRefresh};
@@ -1299,7 +1300,7 @@ pub(crate) mod tests {
     async fn github_data_meets_the_persisted_source_contract() {
         let mut data = with_auto_merge(open_pr_data("feature"));
         data.prs.insert("other".into(), pr("other"));
-        wt_runtime::conformance::persisted_source("github", wt_runtime::Domain::Github, data).await;
+        wt_runtime::conformance::persisted_source("github", wt_core::Domain::Github, data).await;
     }
 
     #[tokio::test(start_paused = true)]

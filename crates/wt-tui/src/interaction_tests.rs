@@ -39,7 +39,7 @@ fn board(keys: &[&str]) -> Board {
 }
 
 fn ready(board: Board) -> SourceSnapshot<Board> {
-    SourceSnapshot::test_live(Some(board), SourceState::Ready, wt_runtime::Domain::Git)
+    SourceSnapshot::test_live(Some(board), SourceState::Ready, wt_core::Domain::Git)
 }
 
 fn section(key: &str, rows: Vec<usize>, folded: bool) -> BoardSection {

@@ -11,11 +11,11 @@ use std::{
 };
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_github::{GithubClient, GithubData, GithubError, GithubOptions, PrChecks, PrReview};
 use wt_runtime::{
-    DiskCache, Domain, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
-    SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope, derived_channel,
-    start_skippable_source,
+    DiskCache, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot,
+    SourceSpec, SourceState, Stamp, TaskScope, derived_channel, start_skippable_source,
 };
 use wt_tui::Board;
 use wt_vcs::WorktreeSnapshot;

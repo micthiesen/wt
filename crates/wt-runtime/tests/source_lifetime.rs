@@ -4,9 +4,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use wt_runtime::{
-    Domain, Persistence, RefreshPolicy, SourceSpec, SourceState, TaskScope, start_source,
-};
+use wt_core::Domain;
+use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, SourceState, TaskScope, start_source};
 
 fn spec<T>(policy: RefreshPolicy) -> SourceSpec<T> {
     SourceSpec {

@@ -5,8 +5,9 @@ use std::{future::Future, sync::Arc, time::Duration};
 use anyhow::Result;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_runtime::{
-    Domain, Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
+    Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
     derived_channel, leaf_channel,
 };
 use wt_tui::{Board, PerfView};
@@ -305,7 +306,8 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use wt_runtime::{Domain, SourceState, derived_channel};
+    use wt_core::Domain;
+    use wt_runtime::{SourceState, derived_channel};
 
     #[tokio::test]
     async fn remains_dormant_until_open_and_stops_sampling_when_closed() {

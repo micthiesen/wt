@@ -16,6 +16,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_core::HarnessId;
 use wt_harness::{
     ActivityKind, ClaudeEventParser, ClaudePaths, CodexActivityTracker, CodexEventLevel,
@@ -24,7 +25,7 @@ use wt_harness::{
     OpenCodePaths, session_jsonl_path,
 };
 use wt_runtime::{
-    Domain, Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
+    Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
     leaf_channel,
 };
 use wt_tmux::{TmuxClient, TmuxServer};

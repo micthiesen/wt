@@ -3,10 +3,11 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use notify::{RecursiveMode, Watcher};
+use wt_core::Domain;
 use wt_dev::{DevServerStatus, DevStatusRow, DevWorktree};
 use wt_runtime::{
-    DiskCache, Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot,
-    SourceSpec, SourceState, TaskScope, derived_channel, start_source,
+    DiskCache, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot, SourceSpec,
+    SourceState, TaskScope, derived_channel, start_source,
 };
 use wt_tui::Board;
 

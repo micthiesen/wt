@@ -12,11 +12,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_core::HarnessId;
 use wt_harness::{ClaudePaths, DiscoveryRequest, HarnessService, HarnessSession, OpenCodePaths};
 use wt_runtime::{
-    DiskCache, Domain, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle,
-    SourceSpec, SourceState, Stamp, TaskScope, leaf_channel,
+    DiskCache, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle, SourceSpec,
+    SourceState, Stamp, TaskScope, leaf_channel,
 };
 use wt_tmux::{SessionInfo, TmuxClient, TmuxServer};
 use wt_vcs::WorktreeSnapshot;
@@ -671,7 +672,7 @@ mod tests {
         }];
         wt_runtime::conformance::persisted_source(
             "session-discoveries",
-            wt_runtime::Domain::Sessions,
+            wt_core::Domain::Sessions,
             sample,
         )
         .await;

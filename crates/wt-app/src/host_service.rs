@@ -2,7 +2,8 @@
 //! SSH worker call this service, so commands and sources have one implementation.
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
-use wt_runtime::{Domain, SourceSnapshot, Stamp, TaskScope};
+use wt_core::Domain;
+use wt_runtime::{SourceSnapshot, Stamp, TaskScope};
 use wt_tui::{Board, PrPin, ReplyOutcome, UiAction, UiReply};
 
 use crate::{context::AppContext, github_actions::GithubAction, sources::BoardSources};

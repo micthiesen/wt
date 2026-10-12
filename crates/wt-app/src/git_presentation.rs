@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{fs, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_github::{GithubData, PullRequest};
 use wt_platform::process::CommandSpec;
 use wt_runtime::{
-    DiskCache, Domain, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot, SourceSpec,
-    SourceState, Stamp, TaskScope, derived_channel, leaf_channel,
+    DiskCache, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot, SourceSpec, SourceState,
+    Stamp, TaskScope, derived_channel, leaf_channel,
 };
 use wt_tui::{Board, GitPresentation, LandingKind};
 use wt_vcs::WorktreeSnapshot;

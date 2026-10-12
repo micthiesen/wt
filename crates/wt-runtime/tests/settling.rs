@@ -2,7 +2,8 @@
 //! test binary.
 use std::time::Duration;
 
-use wt_runtime::{Domain, Persistence, RefreshPolicy, SourceSpec, Stamp, TaskScope};
+use wt_core::Domain;
+use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, Stamp, TaskScope};
 
 #[tokio::test(start_paused = true)]
 async fn identical_refetches_carry_stamps_only_while_a_write_settles() {

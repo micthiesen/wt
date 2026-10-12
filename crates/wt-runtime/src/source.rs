@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cache::{CacheSlot, DiskCache};
 use crate::snapshot::DomainMeta;
-use crate::{Confirmed, Domain, SourceSnapshot, SourceState, Stamp, TaskScope};
+use crate::{Confirmed, SourceSnapshot, SourceState, Stamp, TaskScope};
+use wt_core::Domain;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RefreshPolicy {
@@ -259,10 +260,40 @@ fn set_state<T>(sender: &watch::Sender<SourceSnapshot<T>>, domain: Domain, state
 pub struct DerivedPublisher<T> {
     sender: watch::Sender<SourceSnapshot<T>>,
     requests: mpsc::Receiver<()>,
+    last: Mutex<Option<SourceSnapshot<T>>>,
 }
 
 impl<T> DerivedPublisher<T> {
+    /// Publish unconditionally. Prefer `publish_if_changed`.
     pub fn publish(&self, snapshot: SourceSnapshot<T>) {
+        if let Ok(mut last) = self.last.lock() {
+            *last = None;
+        }
+        self.send(snapshot);
+    }
+
+    /// Publish only when it changes what anyone sees (`SourceSnapshot::
+    /// same_view`), so an input that woke without a visible change does not
+    /// ripple through later stages or redraw the TUI. Returns whether it
+    /// published.
+    pub fn publish_if_changed(&self, snapshot: SourceSnapshot<T>) -> bool
+    where
+        T: PartialEq,
+    {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.as_ref().is_some_and(|last| last.same_view(&snapshot)) {
+            return false;
+        }
+        *last = Some(snapshot.clone());
+        drop(last);
+        self.send(snapshot);
+        true
+    }
+
+    fn send(&self, snapshot: SourceSnapshot<T>) {
         self.sender.send_modify(|current| {
             let revision = current.revision().wrapping_add(1);
             *current = snapshot;
@@ -295,6 +326,7 @@ pub fn derived_channel<T>(
         DerivedPublisher {
             sender,
             requests: pending,
+            last: Mutex::new(None),
         },
     )
 }

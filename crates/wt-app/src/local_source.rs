@@ -4,8 +4,9 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use serde_json::Value;
 use wt_config::Config;
+use wt_core::Domain;
 use wt_runtime::{
-    DerivedPublisher, DiskCache, Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
+    DerivedPublisher, DiskCache, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
     SourceSnapshot, SourceSpec, SourceState, TaskScope, derived_channel, start_source,
 };
 use wt_tui::Board;

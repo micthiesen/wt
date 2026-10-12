@@ -8,9 +8,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::Instant;
 
 use crate::{
-    CacheStore, DiskCache, Domain, Mutation, Pending, PendingPhase, Persistence, RefreshPolicy,
-    SourceSpec, SourceState, Stamp, TaskScope, leaf_channel, start_source,
+    CacheStore, DiskCache, Mutation, Pending, PendingPhase, Persistence, RefreshPolicy, SourceSpec,
+    SourceState, Stamp, TaskScope, leaf_channel, start_source,
 };
+use wt_core::Domain;
 
 /// A persisted source type survives a restart as restored, non-confirmable
 /// display data; a live fetch replaces it and becomes confirmable; a failed

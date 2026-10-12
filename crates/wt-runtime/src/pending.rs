@@ -8,7 +8,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::{Domain, Stamp};
+use crate::Stamp;
+use wt_core::Domain;
 
 /// What a pending entry is about, for markers and per-host observation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -102,10 +103,7 @@ impl Default for PendingLimits {
 
 impl PendingLimits {
     fn accepted(&self, domains: &[Domain]) -> Duration {
-        if domains
-            .iter()
-            .any(|d| matches!(d, Domain::Github | Domain::Reviews | Domain::Issues))
-        {
+        if domains.iter().any(|domain| domain.slow_reads()) {
             self.accepted_remote
         } else {
             self.accepted_local

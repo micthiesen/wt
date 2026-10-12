@@ -565,7 +565,7 @@ mod tests {
                 ..Default::default()
             }),
             wt_runtime::SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         let selected = model.selected;
         for height in [14u16, 7] {

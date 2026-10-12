@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Domain, Stamp};
+use crate::Stamp;
+use wt_core::Domain;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceState {
@@ -18,6 +19,34 @@ pub enum SourceState {
 }
 
 impl SourceState {
+    /// The state of something built from several inputs, in the given order:
+    /// the first failure wins and is prefixed with its input's label (so the
+    /// pane names the source), then any input still refreshing, then ready
+    /// when every input is ready, else empty.
+    pub fn combine<'a>(
+        inputs: impl IntoIterator<Item = (&'a str, &'a SourceState)>,
+    ) -> SourceState {
+        let mut refreshing = false;
+        let mut ready = true;
+        for (label, state) in inputs {
+            match state {
+                SourceState::Failed(error) => {
+                    return SourceState::Failed(format!("{label}: {error}").into());
+                }
+                SourceState::Refreshing => refreshing = true,
+                SourceState::Empty => ready = false,
+                SourceState::Ready => {}
+            }
+        }
+        if refreshing {
+            SourceState::Refreshing
+        } else if ready {
+            SourceState::Ready
+        } else {
+            SourceState::Empty
+        }
+    }
+
     /// Failed over Refreshing over Empty over Ready.
     pub fn worst(self, other: SourceState) -> SourceState {
         fn rank(state: &SourceState) -> u8 {
@@ -407,6 +436,30 @@ pub fn stamps_advanced(old: &DomainMap, new: &DomainMap) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn combined_state_names_the_first_failed_input() {
+        let ready = SourceState::Ready;
+        let failed = SourceState::Failed("offline".into());
+        let refreshing = SourceState::Refreshing;
+        let empty = SourceState::Empty;
+        assert_eq!(
+            SourceState::combine([("Git", &ready), ("State", &failed), ("GitHub", &refreshing)]),
+            SourceState::Failed("State: offline".into())
+        );
+        assert_eq!(
+            SourceState::combine([("Git", &ready), ("GitHub", &refreshing)]),
+            SourceState::Refreshing
+        );
+        assert_eq!(
+            SourceState::combine([("Git", &ready), ("State", &empty)]),
+            SourceState::Empty
+        );
+        assert_eq!(
+            SourceState::combine([("Git", &ready), ("State", &ready)]),
+            SourceState::Ready
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn confirmed_data_ages_out_of_bounded_decisions() {

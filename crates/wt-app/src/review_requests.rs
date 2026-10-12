@@ -4,10 +4,11 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use wt_core::Domain;
 use wt_github::{GithubClient, GithubOptions, PrChecks, ReviewRequestPr};
 use wt_lifecycle::{CreateOptions, CreateResult};
 use wt_runtime::{
-    DerivedPublisher, DiskCache, Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
+    DerivedPublisher, DiskCache, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
     SourceSnapshot, SourceSpec, SourceState, TaskScope, derived_channel, start_source,
 };
 use wt_store::ReviewRequestDismissal;

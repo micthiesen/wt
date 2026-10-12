@@ -8,10 +8,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use wt_core::Domain;
 use wt_platform::process::CommandSpec;
 use wt_runtime::{
-    DiskCache, Domain, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle,
-    SourceSnapshot, SourceSpec, Stamp, TaskScope, derived_channel, start_skippable_source,
+    DiskCache, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot,
+    SourceSpec, Stamp, TaskScope, derived_channel, start_skippable_source,
 };
 use wt_tui::Board;
 

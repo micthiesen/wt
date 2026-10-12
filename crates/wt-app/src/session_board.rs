@@ -252,8 +252,8 @@ fn state_name(state: Option<DerivedState>) -> &'static str {
 mod tests {
     use super::*;
     use crate::session_source::{DiscoveredSession, SessionKey};
+    use wt_core::Domain;
     use wt_harness::{HarnessExtras, HarnessSession};
-    use wt_runtime::Domain;
     use wt_tui::BoardRow;
 
     #[test]

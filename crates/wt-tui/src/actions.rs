@@ -546,6 +546,57 @@ pub struct UiReply {
     pub outcome: Option<ReplyOutcome>,
 }
 
+impl UiReply {
+    /// Plain feedback; for a write the host fills in `Accepted`.
+    pub fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The request failed; any pending change is rolled back.
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            failed: true,
+            ..Self::message(message)
+        }
+    }
+
+    /// The write happened at `at` on the executing host's clock.
+    pub fn accepted(message: impl Into<String>, at: wt_runtime::Stamp) -> Self {
+        Self {
+            outcome: Some(ReplyOutcome::Accepted(at)),
+            ..Self::message(message)
+        }
+    }
+
+    /// Nothing needed to change.
+    pub fn no_change(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Some(ReplyOutcome::NoChange),
+            ..Self::message(message)
+        }
+    }
+
+    /// The host will act later; the board shows it through its own data.
+    pub fn deferred(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Some(ReplyOutcome::Deferred),
+            ..Self::message(message)
+        }
+    }
+
+    /// The write may or may not have happened and is never resent.
+    pub fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            notice: true,
+            outcome: Some(ReplyOutcome::Uncertain),
+            ..Self::message(message)
+        }
+    }
+}
+
 /// How a pending mutation ends or continues after the host answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplyOutcome {

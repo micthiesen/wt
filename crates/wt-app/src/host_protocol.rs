@@ -244,7 +244,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn host_snapshots_meet_the_persisted_source_contract() {
-        use wt_runtime::{Domain, SourceSnapshot, SourceState};
+        use wt_core::Domain;
+        use wt_runtime::{SourceSnapshot, SourceState};
         let endpoint = wt_config::RemoteConfig {
             host: "builder".into(),
             label: "Builder".into(),

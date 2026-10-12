@@ -786,7 +786,7 @@ impl Model {
     fn observed(
         &self,
         target: &wt_runtime::Target,
-        domain: wt_runtime::Domain,
+        domain: wt_core::Domain,
     ) -> Option<wt_runtime::Stamp> {
         let domains = match &target.host {
             None => &self.local_domains,
@@ -3439,7 +3439,7 @@ mod tests {
                 ..Board::default()
             }),
             SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         )
     }
 
@@ -3501,7 +3501,7 @@ mod tests {
         model.apply(SourceSnapshot::test_live(
             Some(board.clone()),
             SourceState::Ready,
-            wt_runtime::Domain::Metadata,
+            wt_core::Domain::Metadata,
         ));
         let action = UiAction::ToggleArchive {
             key: "@box/alpha".into(),
@@ -3519,7 +3519,7 @@ mod tests {
         model.apply(SourceSnapshot::test_live(
             Some(board),
             SourceState::Ready,
-            wt_runtime::Domain::Metadata,
+            wt_core::Domain::Metadata,
         ));
         assert!(
             model.pending.is_empty(),

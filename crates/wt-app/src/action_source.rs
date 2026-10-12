@@ -12,9 +12,10 @@ use std::{
 use notify::{RecursiveMode, Watcher};
 use wt_actions::{ActionRun, ActionRunStatus, ActionService};
 use wt_config::EffectTag;
+use wt_core::Domain;
 use wt_platform::process::ProcessStream;
 use wt_runtime::{
-    Confirmed, Domain, LeafHandle, Mutation, Pending, Persistence, RefreshPolicy, SourceHandle,
+    Confirmed, LeafHandle, Mutation, Pending, Persistence, RefreshPolicy, SourceHandle,
     SourceSnapshot, SourceSpec, SourceState, Stamp, Target, TaskScope, derived_channel,
     start_source,
 };

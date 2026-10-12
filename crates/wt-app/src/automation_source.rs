@@ -551,7 +551,7 @@ mod tests {
         publisher.publish(SourceSnapshot::test_live(
             Some(Board::default()),
             SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         let handle = passthrough(&scope, board.clone());
         let mut updates = handle.board.subscribe();
@@ -560,7 +560,7 @@ mod tests {
         publisher.publish(SourceSnapshot::test_live(
             Some(Board::default()),
             SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         tokio::time::timeout(
             Duration::from_secs(1),

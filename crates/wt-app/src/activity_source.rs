@@ -10,9 +10,8 @@ use std::{
 use notify::Watcher;
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use wt_runtime::{
-    Domain, LeafHandle, Persistence, RefreshPolicy, SourceSpec, TaskScope, start_source,
-};
+use wt_core::Domain;
+use wt_runtime::{LeafHandle, Persistence, RefreshPolicy, SourceSpec, TaskScope, start_source};
 use wt_tui::{ActivityLine, AttentionLine};
 
 const MAX_ACTIVITY: usize = 500;

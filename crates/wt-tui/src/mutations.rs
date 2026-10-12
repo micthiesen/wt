@@ -1,7 +1,8 @@
 //! What each user action does to the board before a fetch confirms it. Every
 //! `UiAction` declares its effect here with an exhaustive match, so a new
 //! action cannot ship without deciding how it appears while pending.
-use wt_runtime::{Domain, Mutation, Target};
+use wt_core::Domain;
+use wt_runtime::{Mutation, Target};
 
 use crate::{Board, BoardRow, BoardSection, BusyView, UiAction};
 

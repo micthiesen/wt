@@ -269,7 +269,7 @@ mod tests {
         model.apply(wt_runtime::SourceSnapshot::test_live(
             Some(board),
             wt_runtime::SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         let area = Rect::new(0, 0, 100, 30);
         let list = MouseEvent {
@@ -316,7 +316,7 @@ mod tests {
         model.apply(wt_runtime::SourceSnapshot::test_live(
             Some(board),
             wt_runtime::SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         model.history.active = true;
         model.output_view(3, 30);

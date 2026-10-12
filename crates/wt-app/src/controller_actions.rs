@@ -3,9 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use clap::{Args, FromArgMatches};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use wt_core::Domain;
 use wt_lifecycle::CreateOptions;
 use wt_platform::lock::FileLock;
-use wt_runtime::{Confirmed, Domain, Provenance, SourceState};
+use wt_runtime::{Confirmed, Provenance, SourceState};
 use wt_tui::{
     Board, ConfirmAction, PickerAction, PickerOption, RemovalRevision as UiRemovalRevision,
     UiAction, UiModal, UiReply, UrlKind,

@@ -7,7 +7,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders},
 };
-use wt_runtime::{Domain, PendingPhase, PendingView, Provenance, SourceState};
+use wt_core::Domain;
+use wt_runtime::{PendingPhase, PendingView, Provenance, SourceState};
 
 use super::text::{age, now_ms};
 use crate::{Model, theme};

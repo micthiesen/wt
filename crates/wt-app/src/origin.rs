@@ -2,9 +2,10 @@
 use anyhow::Result;
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
+use wt_core::Domain;
 use wt_runtime::{
-    Domain, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState,
-    TaskScope, derived_channel, start_source,
+    LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, TaskScope,
+    derived_channel, start_source,
 };
 use wt_tui::Board;
 use wt_vcs::{FetchOriginOptions, FetchOriginReport};

@@ -214,7 +214,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wt_runtime::{Domain, Persistence, RefreshPolicy, SourceSpec, leaf_channel};
+    use wt_core::Domain;
+    use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, leaf_channel};
 
     fn snapshot() -> GithubSnapshot {
         GithubSnapshot {

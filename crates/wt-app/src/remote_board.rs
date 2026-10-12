@@ -7,9 +7,9 @@ use crate::{
     remote_host::RemoteHost,
 };
 use std::sync::Arc;
+use wt_core::Domain;
 use wt_runtime::{
-    Domain, DomainMap, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel,
-    merge_domains,
+    DomainMap, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel, merge_domains,
 };
 use wt_tui::{Board, HostChoice};
 

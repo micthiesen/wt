@@ -1,5 +1,6 @@
 //! Pure domain types and transforms shared by wt's Rust application.
 
+mod domain;
 mod harness;
 mod merge_edges;
 mod stack_layout;
@@ -10,6 +11,7 @@ mod work_status;
 mod worktree_ref;
 mod worktree_target;
 
+pub use domain::Domain;
 pub use harness::HarnessId;
 pub use merge_edges::*;
 pub use stack_layout::*;

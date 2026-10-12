@@ -789,7 +789,7 @@ mod tests {
                 statuses: [("ENG-1".into(), "Open".into())].into(),
             }),
             SourceState::Ready,
-            wt_runtime::Domain::Issues,
+            wt_core::Domain::Issues,
         );
         observe_issues(&mut tracker, &first);
         let failed = SourceSnapshot::test_live(
@@ -798,7 +798,7 @@ mod tests {
                 statuses: [("ENG-1".into(), "Unknown".into())].into(),
             }),
             SourceState::Failed("temporary".into()),
-            wt_runtime::Domain::Issues,
+            wt_core::Domain::Issues,
         );
         observe_issues(&mut tracker, &failed);
         assert!(tracker.events.is_empty());
@@ -810,7 +810,7 @@ mod tests {
                     statuses: [("ENG-1".into(), "Review".into())].into(),
                 }),
                 SourceState::Ready,
-                wt_runtime::Domain::Issues,
+                wt_core::Domain::Issues,
             ),
         );
         assert!(

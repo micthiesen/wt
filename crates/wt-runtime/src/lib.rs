@@ -5,7 +5,6 @@
 mod cache;
 #[cfg(any(test, feature = "testing"))]
 pub mod conformance;
-mod domain;
 mod pending;
 mod scope;
 mod snapshot;
@@ -13,7 +12,6 @@ mod source;
 mod stamp;
 
 pub use cache::{CacheStore, DiskCache, MAX_CACHE_AGE, MAX_CACHE_BYTES};
-pub use domain::Domain;
 pub use pending::{
     Deadlines, Expired, Mutation, Pending, PendingLimits, PendingPhase, PendingView, Target,
 };

@@ -96,7 +96,7 @@ mod tests {
         model.apply(SourceSnapshot::test_live(
             Some(board),
             SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         model.selected = Some(0);
         assert!(model.selected_row().is_none());
@@ -107,7 +107,7 @@ mod tests {
         model.apply(SourceSnapshot::test_live(
             Some(model.board.clone()).map(|data| (*data).clone()),
             SourceState::Ready,
-            wt_runtime::Domain::Git,
+            wt_core::Domain::Git,
         ));
         assert_eq!(model.selected, Some(0));
         assert_eq!(

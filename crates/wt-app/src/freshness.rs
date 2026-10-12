@@ -13,8 +13,9 @@ use std::{
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use wt_config::Config;
+use wt_core::Domain;
 use wt_runtime::{
-    Domain, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
+    Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
     leaf_channel,
 };
 use wt_tui::Board;

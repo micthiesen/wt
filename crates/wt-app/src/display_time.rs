@@ -158,7 +158,8 @@ pub(crate) fn local_time_components(_timestamp_ms: u64) -> Option<(i32, u8, u8, 
 mod tests {
     use std::time::Duration;
 
-    use wt_runtime::{Domain, SourceSnapshot, SourceState, TaskScope, derived_channel};
+    use wt_core::Domain;
+    use wt_runtime::{SourceSnapshot, SourceState, TaskScope, derived_channel};
     use wt_tui::{ActivityLine, AttentionLine, Board};
 
     use super::{overlay, visible_timestamps};

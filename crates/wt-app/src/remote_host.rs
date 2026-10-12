@@ -21,10 +21,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use wt_config::RemoteConfig;
+use wt_core::Domain;
 use wt_remote::{RemoteClient, WorkerInfo};
 use wt_runtime::{
-    DiskCache, Domain, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceSpec,
-    SourceState, Stamp, TaskScope, leaf_channel,
+    DiskCache, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceSpec, SourceState,
+    Stamp, TaskScope, leaf_channel,
 };
 use wt_tui::{UiAction, UiReply};
 
@@ -973,7 +974,8 @@ fn belongs_to_connection(request_connection: u64, active_connection: u64) -> boo
 mod tests {
     use super::{ReaderMessage, belongs_to_connection, drain_command_reply};
     use crate::host_protocol::{HostSnapshot, ServerFrame};
-    use wt_runtime::{Domain, Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
+    use wt_core::Domain;
+    use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
     use wt_tui::UiReply;
 
     #[test]

@@ -661,8 +661,9 @@ fn epoch_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::session_source::{DiscoveredSession, SessionKey, SessionKinds};
+    use wt_core::Domain;
     use wt_runtime::{
-        Domain, Persistence, RefreshPolicy, SourceSnapshot, SourceSpec, TaskScope, leaf_channel,
+        Persistence, RefreshPolicy, SourceSnapshot, SourceSpec, TaskScope, leaf_channel,
     };
 
     fn idle_session(slug: &str) -> DiscoveredSession {

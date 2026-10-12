@@ -16,9 +16,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
+use wt_core::Domain;
 use wt_platform::process::CommandSpec;
 use wt_runtime::{
-    Domain, Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
+    Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
     derived_channel, leaf_channel,
 };
 use wt_store::RemovedWorktree;
