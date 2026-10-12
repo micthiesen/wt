@@ -182,6 +182,11 @@ row commands stay bound to the selected row's host throughout confirmation.
 
 ## Compatibility and ownership
 
+The worker duplicates the stdin and stdout descriptors supplied by SSH and
+makes them nonblocking. It does not reopen `/dev/stdin` or `/dev/stdout`.
+On Linux, SSH can supply root-owned pipes that the worker can use through
+inherited descriptors but cannot reopen by path.
+
 The hidden `_hello` handshake reports the worker role, protocol version, and
 build identifier. Remote commands require worker role and an exact protocol
 version match. The controller provisions its exact native build automatically;
