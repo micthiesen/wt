@@ -54,7 +54,7 @@ pub(crate) const MERGE_QUEUE: &str = "\u{F4DB}";
 pub(crate) const BOLT: &str = "\u{F0E7}"; // environment live (stage deployed / dev running)
 pub(crate) const BAN: &str = "\u{F05E}"; // environment not running
 pub(crate) const COMMENT: &str = "\u{F41F}"; // headless action running
-pub(crate) const REMOTE: &str = "\u{F048B}"; // SSH host
+pub(crate) const REMOTE: &str = "\u{F233}"; // server: SSH host
 
 // Harnesses.
 pub(crate) const CLAUDE: &str = "\u{F06A9}";

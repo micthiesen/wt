@@ -291,7 +291,7 @@ impl RowContext<'_> {
                 style(if row.archived {
                     theme::FG_DIM
                 } else {
-                    theme::INFO
+                    theme::REMOTE
                 }),
             ));
         }

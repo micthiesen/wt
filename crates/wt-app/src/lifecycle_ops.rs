@@ -351,7 +351,7 @@ pub async fn cleanup_confirmed(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
 ) -> Result<String> {
-    cleanup_with_evidence(ctx, confirmed, Evidence::Fresh).await
+    cleanup_with_evidence(ctx, confirmed, Evidence::Fresh, None).await
 }
 
 /// Re-plan with the host's confirmed GitHub evidence instead of a new fetch.
@@ -361,11 +361,20 @@ pub async fn cleanup_cached(
     confirmed: &[wt_tui::RemovalRevision],
     github: Option<&Confirmed<GithubData>>,
 ) -> Result<String> {
-    cleanup_with_evidence(ctx, confirmed, Evidence::Cached(github)).await
+    cleanup_with_evidence(ctx, confirmed, Evidence::Cached(github), None).await
+}
+
+/// Check the exact board-selected rows after confirmation. Only confirmed
+/// GitHub evidence can prove a PR landing; local hazards are checked again.
+pub async fn cleanup_targets_cached(
+    ctx: &AppContext,
+    targets: &[wt_tui::CleanupTarget],
+    github: Option<&Confirmed<GithubData>>,
+) -> Result<String> {
+    cleanup_with_evidence(ctx, &[], Evidence::Cached(github), Some(targets)).await
 }
 
 enum Evidence<'a> {
-    /// Fetch GitHub now, as the CLI does.
     Fresh,
     Cached(Option<&'a Confirmed<GithubData>>),
 }
@@ -374,17 +383,19 @@ async fn cleanup_with_evidence(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
     evidence: Evidence<'_>,
+    targets: Option<&[wt_tui::CleanupTarget]>,
 ) -> Result<String> {
     let live = ctx.repository.inventory(&ctx.cancellation).await?;
     let selected = live
         .into_iter()
         .filter(|row| {
-            confirmed.iter().any(|item| {
-                item.key == wt_core::worktree_target_key(&row.target)
-                    && item.path == row.target.path
-                    && item.branch == row.target.branch
-                    && item.head == row.head_sha.as_deref().unwrap_or_default()
-            })
+            targets.is_some_and(|targets| targets.iter().any(|item| target_matches(row, item)))
+                || confirmed.iter().any(|item| {
+                    item.key == wt_core::worktree_target_key(&row.target)
+                        && item.path == row.target.path
+                        && item.branch == row.target.branch
+                        && item.head == row.head_sha.as_deref().unwrap_or_default()
+                })
         })
         .collect();
     let plans = match evidence {
@@ -398,10 +409,21 @@ async fn cleanup_with_evidence(
         .collect();
     let mut requests = Vec::new();
     let mut kept = Vec::new();
-    for expected in confirmed {
-        match by_key.remove(&expected.key) {
+    // Board selections carry identity only. Current hazards and landing proof
+    // must pass before the worker receives its locked removal revision.
+    let selections = if let Some(targets) = targets {
+        targets
+            .iter()
+            .map(CleanupSelection::Target)
+            .collect::<Vec<_>>()
+    } else {
+        confirmed.iter().map(CleanupSelection::Revision).collect()
+    };
+    for expected in selections {
+        let key = expected.key();
+        match by_key.remove(key) {
             Some(plan)
-                if same_revision(&plan.revision, expected)
+                if expected.matches_revision(&plan.revision)
                     && plan.landed
                     && plan.hazards.is_empty() =>
             {
@@ -417,7 +439,7 @@ async fn cleanup_with_evidence(
                     },
                 ))
             }
-            Some(plan) if !same_revision(&plan.revision, expected) => kept.push(format!(
+            Some(plan) if !expected.matches_revision(&plan.revision) => kept.push(format!(
                 "{}: checkout changed after confirmation",
                 plan.row.target.slug()
             )),
@@ -430,10 +452,7 @@ async fn cleanup_with_evidence(
                     plan.hazards.join(", ")
                 }
             )),
-            None => kept.push(format!(
-                "{}: no longer present or identity changed",
-                expected.key
-            )),
+            None => kept.push(format!("{}: no longer present or identity changed", key)),
         }
     }
     let mut queued = 0;
@@ -452,6 +471,41 @@ async fn cleanup_with_evidence(
     Ok(format!("Cleanup queued for {queued} worktrees"))
 }
 
+enum CleanupSelection<'a> {
+    Revision(&'a wt_tui::RemovalRevision),
+    Target(&'a wt_tui::CleanupTarget),
+}
+
+impl CleanupSelection<'_> {
+    fn key(&self) -> &str {
+        match self {
+            Self::Revision(revision) => &revision.key,
+            Self::Target(target) => &target.key,
+        }
+    }
+
+    fn matches_revision(&self, revision: &wt_lifecycle::RemovalRevision) -> bool {
+        match self {
+            Self::Revision(expected) => same_revision(revision, expected),
+            Self::Target(target) => {
+                target.key == revision.key
+                    && target.path == revision.path
+                    && target.branch == revision.branch
+                    && target.head == revision.head
+                    && !target.head.is_empty()
+            }
+        }
+    }
+}
+
+fn target_matches(row: &WorktreeRecord, target: &wt_tui::CleanupTarget) -> bool {
+    target.key == wt_core::worktree_target_key(&row.target)
+        && target.path == row.target.path
+        && target.branch == row.target.branch
+        && Some(target.head.as_str()) == row.head_sha.as_deref()
+        && !target.head.is_empty()
+}
+
 fn same_revision(plan: &wt_lifecycle::RemovalRevision, expected: &wt_tui::RemovalRevision) -> bool {
     plan.key == expected.key
         && plan.path == expected.path
@@ -466,6 +520,29 @@ fn same_revision(plan: &wt_lifecycle::RemovalRevision, expected: &wt_tui::Remova
 mod tests {
     use super::*;
     use crate::commands::test_support::CommandFixture;
+
+    #[test]
+    fn board_confirmation_rejects_head_changes_during_planning() {
+        let target = wt_tui::CleanupTarget {
+            key: "one".into(),
+            path: "/worktrees/one".into(),
+            branch: "feature/one".into(),
+            head: "old-head".into(),
+        };
+        let mut revision = wt_lifecycle::RemovalRevision {
+            key: target.key.clone(),
+            path: target.path.clone(),
+            branch: target.branch.clone(),
+            head: target.head.clone(),
+            digest: "current-digest".into(),
+            hazards: vec![],
+            published_base: None,
+        };
+        let selected = CleanupSelection::Target(&target);
+        assert!(selected.matches_revision(&revision));
+        revision.head = "new-head".into();
+        assert!(!selected.matches_revision(&revision));
+    }
 
     async fn git(ctx: &AppContext, path: &Path, args: &[&str]) -> String {
         run_git(ctx, path, args.iter().copied())
@@ -669,6 +746,12 @@ mod tests {
         assert!(!wt_store::is_merged_removal(
             &loading.rows[0].removed_snapshot
         ));
+        let target = wt_tui::CleanupTarget {
+            key: wt_core::worktree_target_key(&row.target),
+            path: row.target.path.clone(),
+            branch: row.target.branch.clone(),
+            head: head.clone(),
+        };
         std::fs::write(path.join("work.txt"), "new uncommitted work\n").unwrap();
         let dirty = plan_cached(
             ctx,
@@ -679,7 +762,71 @@ mod tests {
         .unwrap();
         assert!(dirty.rows[0].landed);
         assert!(!dirty.rows[0].hazards.is_empty());
+        let refused = cleanup_targets_cached(
+            ctx,
+            std::slice::from_ref(&target),
+            Some(&Confirmed::for_test(github.clone())),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains("uncommitted"), "{refused}");
+        assert!(path.exists());
         std::fs::write(path.join("work.txt"), "unpublished branch work\n").unwrap();
+        ctx.database
+            .call(|store| {
+                let mut status = wt_core::WorkStatusRecord::new(
+                    wt_core::WorkState::Ready,
+                    "2026-10-12T00:00:00Z",
+                );
+                status.verify_after_merge = Some("Check the deployed result".into());
+                let stored = serde_json::from_value(serde_json::to_value(status)?)?;
+                store.set_slug_work_status("one", Some(&stored))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let refused = cleanup_targets_cached(
+            ctx,
+            std::slice::from_ref(&target),
+            Some(&Confirmed::for_test(github.clone())),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("verification still owed"),
+            "{refused}"
+        );
+        ctx.database
+            .call(|store| {
+                store.set_slug_work_status("one", None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for changed in [
+            wt_tui::CleanupTarget {
+                head: base.clone(),
+                ..target.clone()
+            },
+            wt_tui::CleanupTarget {
+                path: "/different-checkout".into(),
+                ..target.clone()
+            },
+            wt_tui::CleanupTarget {
+                branch: "different-branch".into(),
+                ..target.clone()
+            },
+        ] {
+            let refused =
+                cleanup_targets_cached(ctx, &[changed], Some(&Confirmed::for_test(github.clone())))
+                    .await
+                    .unwrap_err();
+            assert!(
+                refused.to_string().contains("identity changed"),
+                "{refused}"
+            );
+            assert!(path.exists());
+        }
         git(
             ctx,
             path,
@@ -694,6 +841,11 @@ mod tests {
             .unwrap();
         assert!(!plan.rows[0].landed);
         assert!(plan.warning.is_some());
+        let refused = cleanup_targets_cached(ctx, &[target], None)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("unpushed"), "{refused}");
+        assert!(path.exists());
         git(ctx, path, &["update-ref", "-d", "refs/remotes/origin/main"]).await;
         git(ctx, path, &["update-ref", "refs/heads/main", &head]).await;
         let plan = plan_with_facts(ctx, vec![row], &state, None, None)

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use tokio::task::JoinSet;
-use wt_tui::{ConfirmAction, RemovalRevision, UiAction, UiModal, UiReply};
+use wt_tui::{CleanupTarget, ConfirmAction, RemovalRevision, UiAction, UiModal, UiReply};
 
 use crate::{remote_board::Fleet, remote_host::RemoteHost};
 
@@ -199,12 +199,45 @@ fn qualify_revision(
 /// Route only the revisions captured by the combined confirmation. Unknown
 /// or reconfigured hosts are reported and skipped; no host is replanned.
 pub async fn cleanup(fleet: &Fleet, revisions: Vec<RemovalRevision>) -> UiReply {
+    cleanup_items(fleet, revisions).await
+}
+
+pub async fn cleanup_targets(fleet: &Fleet, targets: Vec<CleanupTarget>) -> UiReply {
+    cleanup_items(fleet, targets).await
+}
+
+trait CleanupItem: Send + 'static {
+    fn key_mut(&mut self) -> &mut String;
+    fn action(items: Vec<Self>) -> UiAction
+    where
+        Self: Sized;
+}
+
+impl CleanupItem for RemovalRevision {
+    fn key_mut(&mut self) -> &mut String {
+        &mut self.key
+    }
+    fn action(revisions: Vec<Self>) -> UiAction {
+        UiAction::Cleanup { revisions }
+    }
+}
+
+impl CleanupItem for CleanupTarget {
+    fn key_mut(&mut self) -> &mut String {
+        &mut self.key
+    }
+    fn action(targets: Vec<Self>) -> UiAction {
+        UiAction::CleanupTargets { targets }
+    }
+}
+
+async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiReply {
     let hosts = fleet
         .remotes
         .iter()
         .map(|remote| remote.endpoint.key())
         .collect::<Vec<_>>();
-    let mut partition = partition_revisions(revisions, &hosts);
+    let mut partition = partition_items(revisions, &hosts);
     let mut lines = std::mem::take(&mut partition.lines);
     let mut failed = partition.failed;
     let local = std::mem::take(&mut partition.local);
@@ -218,7 +251,7 @@ pub async fn cleanup(fleet: &Fleet, revisions: Vec<RemovalRevision>) -> UiReply 
             (
                 "This machine".to_owned(),
                 revisions.len(),
-                service.execute(UiAction::Cleanup { revisions }).await,
+                service.execute(T::action(revisions)).await,
             )
         });
     }
@@ -248,7 +281,7 @@ pub async fn cleanup(fleet: &Fleet, revisions: Vec<RemovalRevision>) -> UiReply 
                 label,
                 count,
                 endpoint
-                    .execute(UiAction::Cleanup { revisions })
+                    .execute(T::action(revisions))
                     .await
                     .map_err(anyhow::Error::from),
             )
@@ -288,7 +321,7 @@ pub async fn cleanup(fleet: &Fleet, revisions: Vec<RemovalRevision>) -> UiReply 
                     label,
                     count,
                     endpoint
-                        .execute(UiAction::Cleanup { revisions })
+                        .execute(T::action(revisions))
                         .await
                         .map_err(anyhow::Error::from),
                 )
@@ -303,21 +336,25 @@ pub async fn cleanup(fleet: &Fleet, revisions: Vec<RemovalRevision>) -> UiReply 
     }
 }
 
-#[derive(Default)]
-struct CleanupPartition {
-    local: Vec<RemovalRevision>,
-    remote: BTreeMap<String, Vec<RemovalRevision>>,
+struct CleanupPartition<T> {
+    local: Vec<T>,
+    remote: BTreeMap<String, Vec<T>>,
     lines: Vec<String>,
     failed: bool,
 }
 
-fn partition_revisions(
-    revisions: Vec<RemovalRevision>,
+fn partition_items<T: CleanupItem>(
+    revisions: Vec<T>,
     configured_hosts: &[String],
-) -> CleanupPartition {
-    let mut partition = CleanupPartition::default();
+) -> CleanupPartition<T> {
+    let mut partition = CleanupPartition {
+        local: vec![],
+        remote: BTreeMap::new(),
+        lines: vec![],
+        failed: false,
+    };
     for mut revision in revisions {
-        match wt_core::parse_worktree_ledger_key(&revision.key) {
+        match wt_core::parse_worktree_ledger_key(revision.key_mut()) {
             Some(wt_core::WorktreeRef::Local { .. }) => partition.local.push(revision),
             Some(wt_core::WorktreeRef::Remote { host, slug }) => {
                 if !configured_hosts
@@ -330,14 +367,14 @@ fn partition_revisions(
                     ));
                     continue;
                 }
-                revision.key = slug;
+                *revision.key_mut() = slug;
                 partition.remote.entry(host).or_default().push(revision);
             }
             None => {
                 partition.failed = true;
                 partition.lines.push(format!(
                     "Invalid cleanup identity {:?}: candidate skipped",
-                    revision.key
+                    revision.key_mut()
                 ));
             }
         }
@@ -348,6 +385,36 @@ fn partition_revisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_targets_keep_host_and_checkout_identity_through_partitioning() {
+        let target = |key: String, path: &str| CleanupTarget {
+            key,
+            path: path.into(),
+            branch: "feature/same".into(),
+            head: "head".into(),
+        };
+        let partition = partition_items(
+            vec![
+                target("same".into(), "/local/same"),
+                target(
+                    wt_core::remote_worktree_ledger_key("builder", "same"),
+                    "/remote/same",
+                ),
+                target(
+                    wt_core::remote_worktree_ledger_key("unknown", "same"),
+                    "/unknown/same",
+                ),
+            ],
+            &["builder".into()],
+        );
+        assert_eq!(partition.local.len(), 1);
+        assert_eq!(partition.local[0].path, "/local/same");
+        assert_eq!(partition.remote["builder"][0].key, "same");
+        assert_eq!(partition.remote["builder"][0].path, "/remote/same");
+        assert!(partition.failed);
+        assert!(!partition.remote.contains_key("unknown"));
+    }
 
     fn revision(key: &str, path: &str) -> RemovalRevision {
         RemovalRevision {
@@ -477,7 +544,7 @@ mod tests {
             ),
         ];
         let partition =
-            partition_revisions(confirmed, &[first_host.to_owned(), second_host.to_owned()]);
+            partition_items(confirmed, &[first_host.to_owned(), second_host.to_owned()]);
 
         assert_eq!(partition.local.len(), 1);
         assert_eq!(partition.local[0].key, "same");

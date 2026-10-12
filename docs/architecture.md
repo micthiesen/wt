@@ -39,6 +39,21 @@ evidence applies only to its exact HEAD; local hazards and removal revisions
 remain authoritative. Git-only landing evidence retains the published-base
 check.
 
+The `c` cleanup menu opens directly from the prepared board, including archived
+rows. It does not enqueue a command, scan checkouts, or wait for SSH. If no row
+is eligible, it shows the keep reasons in a persistent, scrollable overlay.
+Opening the menu also requests the ordinary background refresh. The existing
+source graph combines repeated requests and publishes updated facts without
+delaying the menu. The open confirmation keeps the displayed candidate set;
+reopening it uses the latest results.
+Confirmation captures only the displayed keys, paths, branches, and HEADs.
+Each host then checks the selected rows with its confirmed GitHub evidence and
+captures removal revisions for the worker's locked recheck. It does not start
+a second PR fetch. Cached merged-PR evidence applies only to its exact HEAD;
+local hazards and removal revisions remain authoritative. Git-only landing
+evidence retains the published-base check. The prepared board nominates rows;
+it cannot authorize removal by itself.
+
 ## Source and presentation boundaries
 
 The TUI input loop consumes prepared `Board` snapshots. It does not run Git,

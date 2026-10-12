@@ -169,6 +169,15 @@ fn compose(
         if let Some(domains) = host_domains(source, data) {
             board.host_domains.insert(host.clone(), domains);
         }
+        if let Some(error) = &error {
+            board
+                .host_errors
+                .insert(host.clone(), wt_core::sanitize_terminal_text(error));
+        } else if data.is_none_or(|data| data.board.is_none()) {
+            board
+                .host_errors
+                .insert(host.clone(), "background inventory is still loading".into());
+        }
         if let Some(data) = data {
             for mut row in data.board.iter().flat_map(|b| &b.rows).cloned() {
                 let local_key = row.key.clone();
@@ -572,6 +581,10 @@ mod tests {
             3
         );
         assert!(board.rows[2].needs_attention);
+        assert_eq!(
+            board.host_errors.get(&second.key()).map(String::as_str),
+            Some("SSH disconnected")
+        );
         assert!(!board.rows[1].needs_attention);
         assert!(
             board.rows[2]

@@ -420,6 +420,9 @@ pub async fn execute(
                 cancel_key: Some('c'),
             }))
         }
+        UiAction::CleanupTargets { targets } => Ok(message(
+            lifecycle_ops::cleanup_targets_cached(ctx, &targets, github).await?,
+        )),
         UiAction::Cleanup { revisions } => Ok(message(
             lifecycle_ops::cleanup_cached(ctx, &revisions, github).await?,
         )),

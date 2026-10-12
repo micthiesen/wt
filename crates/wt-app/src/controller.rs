@@ -155,7 +155,9 @@ fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
 
 fn is_cleanup_action(action: &wt_tui::UiAction) -> bool {
     match action {
-        wt_tui::UiAction::PrepareCleanup | wt_tui::UiAction::Cleanup { .. } => true,
+        wt_tui::UiAction::PrepareCleanup
+        | wt_tui::UiAction::Cleanup { .. }
+        | wt_tui::UiAction::CleanupTargets { .. } => true,
         wt_tui::UiAction::OnHost { action, .. } => is_cleanup_action(action),
         _ => false,
     }
@@ -481,6 +483,10 @@ mod tests {
             ],
         };
         assert_eq!(lane_for(&action).unwrap(), Lane::FleetCleanup);
+        assert_eq!(
+            lane_for(&UiAction::CleanupTargets { targets: vec![] }).unwrap(),
+            Lane::FleetCleanup
+        );
 
         let host = Lane::Host(Some("builder".into()));
         assert!(lanes_conflict(&Lane::FleetCleanup, &host));

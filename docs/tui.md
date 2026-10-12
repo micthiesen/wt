@@ -186,7 +186,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `Ctrl+N` | Create on a chosen host; toasts when `[remote]` is not configured. Managed hosts that owe a sign-in say so |
 | `o` | Open the selected worktree in the configured editor |
 | `d` | Remove the selected worktree after confirmation |
-| `c` | Review and clean eligible merged or gone worktrees |
+| `c` | Open cleanup review from background results, including archived rows |
 | `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
 | `t` / `T` | Edit title / regenerate its AI title |
 | `#` | Set or clear the worktree's issue identity |
@@ -208,6 +208,16 @@ sign-in (Codex for agents, GitHub for creation) first asks `Sign in on
 <host>`; confirming runs the sign-in over SSH and then continues the request. Removal and
 cleanup revalidate current hazards; unknown state does not authorize force
 removal.
+
+The `c` menu opens at once from the prepared background board. It does not wait
+for Git, GitHub, or SSH. It also requests the same background refresh as `r`.
+With no candidates, the overlay stays open and shows
+why each row is kept. Press `c` or `Esc` to close it. Reopen it to use newer
+background results. Confirmation checks only the displayed candidate identities
+against current landing evidence and removal hazards before queuing removal.
+
+Remote worktree names have a server icon in salmon before the name. Archived
+rows use the dim foreground color for this icon.
 
 ### Pull requests
 

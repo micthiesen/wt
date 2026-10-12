@@ -30,6 +30,7 @@ pub(crate) const OK: Color = rgb(0xa3be8c);
 pub(crate) const WARN: Color = rgb(0xebcb8b);
 pub(crate) const ERR: Color = rgb(0xbf616a);
 pub(crate) const INFO: Color = rgb(0xb48ead);
+pub(crate) const REMOTE: Color = rgb(0xe9967a);
 pub(crate) const CLAUDE: Color = rgb(0xc47b3a);
 pub(crate) const CODEX: Color = rgb(0x4d56d6);
 /// Amber, the indigo complement, so Codex `working` contrasts in hue.

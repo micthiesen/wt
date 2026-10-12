@@ -328,6 +328,12 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 keys: vec![key.clone()],
             },
         ),
+        UiAction::CleanupTargets { targets } => on_board(
+            host,
+            K::Remove {
+                keys: targets.iter().map(|target| target.key.clone()).collect(),
+            },
+        ),
         UiAction::Cleanup { revisions } => on_board(
             host,
             K::Remove {

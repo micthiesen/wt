@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use wt_runtime::SourceState;
 use wt_tui::{Board, UiAction, UiReply};
 
-/// 2: snapshots carry the host board's per-domain provenance.
-pub const HOST_PROTOCOL: u32 = 2;
+/// 3: cleanup confirmations can carry board-selected identities.
+pub const HOST_PROTOCOL: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

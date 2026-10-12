@@ -90,6 +90,9 @@ pub struct Board {
     pub perf_view: Option<Box<PerfView>>,
     pub sections: Vec<BoardSection>,
     pub hosts: Vec<HostChoice>,
+    /// Prepared host failures. Retained rows are not current host observations.
+    #[serde(default)]
+    pub host_errors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub usage: Vec<UsageItem>,
     #[serde(default)]
@@ -2171,7 +2174,15 @@ impl Model {
             KeyCode::Char('d') if !control => {
                 self.row_action(|key| UiAction::PrepareRemove { key })
             }
-            KeyCode::Char('c') if !control => InputResult::Action(UiAction::PrepareCleanup),
+            KeyCode::Char('c') if !control => {
+                self.reply(UiReply {
+                    modal: Some(crate::cleanup::menu(&self.board)),
+                    ..Default::default()
+                });
+                // Use the normal background refresh path after opening the
+                // cached menu. The displayed confirmation keeps its targets.
+                InputResult::Refresh
+            }
             KeyCode::Char('a') if !control => {
                 if let Some(row) = self.selected_row()
                     && row.host.is_none()
@@ -2621,6 +2632,9 @@ impl Model {
                                 then: then.clone(),
                             }
                         }
+                        ConfirmAction::CleanupTargets { targets } => UiAction::CleanupTargets {
+                            targets: targets.clone(),
+                        },
                     });
                 }
                 self.interaction = interaction;
@@ -3811,6 +3825,57 @@ mod tests {
             model.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), 20),
             InputResult::Action(UiAction::Cleanup {
                 revisions: vec![removal_revision("a")]
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_key_opens_cached_menu_and_requests_background_refresh() {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one"]));
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('c')), 20),
+            InputResult::Refresh
+        );
+        assert!(matches!(model.interaction, Interaction::Log { .. }));
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('c')), 20),
+            InputResult::Draw
+        );
+        assert!(matches!(model.interaction, Interaction::None));
+        let mut board = Board::default();
+        board.rows.push(BoardRow {
+            key: "one".into(),
+            slug: "one".into(),
+            path: "/worktrees/one".into(),
+            branch: "feature/one".into(),
+            git: GitPresentation {
+                head_sha: Some("old-head".into()),
+                landed_on: Some(LandingKind::Base),
+                tracked_changes: Some(0),
+                untracked_files: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        model.board = Arc::new(board);
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('c')), 20),
+            InputResult::Refresh
+        );
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+        // Later source results cannot expand or change this confirmation.
+        model.apply(snapshot(&["two"]));
+        model.input(KeyEvent::from(KeyCode::Char('l')), 20);
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Enter), 20),
+            InputResult::Action(UiAction::CleanupTargets {
+                targets: vec![crate::CleanupTarget {
+                    key: "one".into(),
+                    path: "/worktrees/one".into(),
+                    branch: "feature/one".into(),
+                    head: "old-head".into()
+                }]
             })
         );
     }

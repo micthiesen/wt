@@ -187,6 +187,9 @@ pub enum UiAction {
     Cleanup {
         revisions: Vec<RemovalRevision>,
     },
+    CleanupTargets {
+        targets: Vec<CleanupTarget>,
+    },
     ToggleArchive {
         key: String,
     },
@@ -305,6 +308,16 @@ pub struct RemovalRevision {
     pub published_base: Option<Box<(String, String)>>,
 }
 
+/// A row selected from prepared facts. The host must check its current hazards
+/// and capture a removal revision before it can queue removal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupTarget {
+    pub key: String,
+    pub path: String,
+    pub branch: String,
+    pub head: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfirmAction {
     HardRefresh,
@@ -345,6 +358,9 @@ pub enum ConfirmAction {
     ManagedSignIn {
         provider: String,
         then: Option<Box<UiAction>>,
+    },
+    CleanupTargets {
+        targets: Vec<CleanupTarget>,
     },
 }
 

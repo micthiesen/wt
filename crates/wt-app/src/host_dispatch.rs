@@ -19,6 +19,9 @@ pub async fn execute(
     if !matches!(command, UiAction::OnHost { .. }) {
         match command {
             UiAction::PrepareCleanup => return Ok(crate::fleet_cleanup::prepare(fleet).await),
+            UiAction::CleanupTargets { targets } => {
+                return Ok(crate::fleet_cleanup::cleanup_targets(fleet, targets).await);
+            }
             UiAction::Cleanup { revisions } => {
                 return Ok(crate::fleet_cleanup::cleanup(fleet, revisions).await);
             }

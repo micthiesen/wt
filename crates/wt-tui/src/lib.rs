@@ -3,6 +3,7 @@
 
 mod actions;
 mod badges;
+mod cleanup;
 mod editor;
 mod glyphs;
 mod help;
@@ -18,10 +19,10 @@ mod terminal_probe;
 mod theme;
 
 pub use actions::{
-    ActionController, ActionSurface, ConfirmAction, PickerAction, PickerOption, PrPin,
-    RemovalRevision, ReplyOutcome, ReviewerOption, SessionMode, SessionSelection, SessionTarget,
-    TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind,
-    action_channel,
+    ActionController, ActionSurface, CleanupTarget, ConfirmAction, PickerAction, PickerOption,
+    PrPin, RemovalRevision, ReplyOutcome, ReviewerOption, SessionMode, SessionSelection,
+    SessionTarget, TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest,
+    UrlKind, action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
