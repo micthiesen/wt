@@ -486,9 +486,6 @@ impl GithubActions {
         })
     }
 
-    /// A failed write is definite unless the command drain cancelled it
-    /// mid-request: then GitHub may have applied it, so it stays recorded as
-    /// unconfirmed and is never resent automatically.
     /// A write that did not succeed. When it may still have reached GitHub
     /// (timeout, interruption, unconfirmed async merge, or the command drain
     /// stopping mid-write), record it as unconfirmed so neither the guards
@@ -803,7 +800,15 @@ fn auto_merge_guard(
     // earlier attempt is still unconfirmed.
     let confirmed_armed =
         effective_pr(github, branch, number).is_some_and(|pr| armed(github, branch, pr));
-    if enable && confirmed_armed {
+    // A read cannot answer an arm while one of our disarms is unconfirmed:
+    // it may predate the disarm.
+    let disarm_unconfirmed = ledger.mutations().zip(ledger.views()).any(|(write, view)| {
+        view.phase == PendingPhase::Unconfirmed
+            && write.branch == branch
+            && write.number == number
+            && write.change == WriteChange::AutoMerge { enable: false }
+    });
+    if enable && confirmed_armed && !disarm_unconfirmed {
         return Guard::AlreadyDone;
     }
     let unconfirmed = |wanted: bool| {
@@ -1316,6 +1321,22 @@ pub(crate) mod tests {
         )
         .await;
         wt_runtime::conformance::mutation(GithubWrite::ready("feature", 7), draft, ready).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_cannot_answer_an_arm_while_a_disarm_is_unconfirmed() {
+        let armed = Confirmed::for_test(with_auto_merge(open_pr_data("feature")));
+        let mut ledger = Ledger::default();
+        ledger.begin(
+            1,
+            GithubWrite::auto_merge("feature", 7, false),
+            Instant::now(),
+        );
+        ledger.uncertain(1, Instant::now());
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &armed, "feature", 7, true, Instant::now()),
+            Guard::Send
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -1639,6 +1639,48 @@ mod transport_tests {
         }
     }
 
+    /// A write interrupted after `gh` started may have reached GitHub and is
+    /// unknown; a rejected request or a missing CLI is a definite failure.
+    #[tokio::test]
+    async fn interrupted_writes_are_unknown_and_rejections_are_definite() {
+        let dir = tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let client = |program: std::path::PathBuf| {
+            GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+                .with_gh_program(program)
+        };
+        let slow = client(script("slow-gh", "sleep 30"));
+        let cancel = CancellationToken::new();
+        let pending = slow.mark_pull_request_ready(7, &cancel);
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = &mut pending => panic!("the write should still be running"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => cancel.cancel(),
+        }
+        let result = pending.await;
+        assert!(!result.ok && result.ambiguous, "{result:?}");
+
+        let rejected = client(script(
+            "rejecting-gh",
+            "echo 'GraphQL: not allowed' >&2; exit 1",
+        ))
+        .mark_pull_request_ready(7, &CancellationToken::new())
+        .await;
+        assert!(!rejected.ok && !rejected.ambiguous, "{rejected:?}");
+
+        let missing = client(dir.path().join("no-such-gh"))
+            .mark_pull_request_ready(7, &CancellationToken::new())
+            .await;
+        assert!(!missing.ok && !missing.ambiguous, "{missing:?}");
+    }
+
     #[tokio::test]
     async fn fake_gh_graphql_fixture_preserves_pr_fields() {
         let dir = tempdir().unwrap();

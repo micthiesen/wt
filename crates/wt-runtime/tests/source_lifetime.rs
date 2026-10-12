@@ -266,3 +266,64 @@ async fn a_state_change_before_the_cache_read_does_not_discard_the_restore() {
     assert!(source.confirmed().is_none());
     scope.shutdown(Duration::from_secs(2)).await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn only_a_slow_fetch_reads_as_refreshing_and_a_skip_publishes_nothing() {
+    let scope = TaskScope::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source = wt_runtime::start_skippable_source(&scope, spec(RefreshPolicy::default()), {
+        let calls = calls.clone();
+        move |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match call {
+                    // Quick fetch: one publish, never refreshing.
+                    0 => Ok::<_, String>(Some(wt_runtime::Fetched::new(
+                        1u8,
+                        wt_runtime::Stamp::now(),
+                    ))),
+                    // Quick skip: nothing published at all.
+                    1 => Ok(None),
+                    // Slow fetch: announced as refreshing, then live.
+                    _ => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok(Some(wt_runtime::Fetched::new(
+                            2u8,
+                            wt_runtime::Stamp::now(),
+                        )))
+                    }
+                }
+            }
+        }
+    });
+    let mut updates = source.subscribe();
+    source.refresh();
+    updates.wait_for(|s| s.data().is_some()).await.unwrap();
+    assert_eq!(
+        source.snapshot().revision(),
+        1,
+        "a quick fetch publishes once"
+    );
+    source.refresh();
+    while calls.load(Ordering::SeqCst) < 2 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(500)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        source.snapshot().revision(),
+        1,
+        "a quick skip publishes nothing"
+    );
+    source.refresh();
+    updates
+        .wait_for(|s| *s.state() == SourceState::Refreshing)
+        .await
+        .unwrap();
+    updates
+        .wait_for(|s| s.data().map(|d| **d) == Some(2))
+        .await
+        .unwrap();
+    assert_eq!(*source.snapshot().state(), SourceState::Ready);
+    scope.shutdown(Duration::from_secs(1)).await.unwrap();
+}
