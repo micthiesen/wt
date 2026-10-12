@@ -22,6 +22,14 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def stripped_fixture_binary(source: Path, destination: Path) -> Path:
+    """Provision release-sized copies while keeping the build's debug symbols."""
+    shutil.copy2(source, destination)
+    flags = ["-S", "-x"] if sys.platform == "darwin" else ["--strip-all"]
+    subprocess.run(["strip", *flags, str(destination)], check=True)
+    return destination
+
+
 def native_target() -> str:
     system = (
         "Darwin"
@@ -220,6 +228,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="wt-native-remote-check-", dir="/tmp") as temporary:
         root = Path(temporary)
+        binary = stripped_fixture_binary(binary, root / "wt")
         worker_home = root / "worker-home"
         controller_home = root / "controller-home"
         worker_home.mkdir()

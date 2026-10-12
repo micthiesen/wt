@@ -495,8 +495,8 @@ def check_active_action_survives_remote_runtime_upgrade(
     candidates.mkdir()
     first = candidates / "wt-v1"
     second = candidates / "wt-v2"
-    shutil.copy2(binary, first)
-    shutil.copy2(binary, second)
+    remote_fixture.stripped_fixture_binary(binary, first)
+    shutil.copy2(first, second)
     with second.open("ab") as upgraded:
         upgraded.write(b"fixture-runtime-revision-2\n")
 

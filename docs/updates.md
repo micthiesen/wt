@@ -43,7 +43,8 @@ path traversal, links, unexpected files, and mismatched size or digest. The
 candidate is placed in its immutable directory before state points at it, so a
 crash may leave an unused version directory but cannot select incomplete files.
 
-The native release test strips copies of debug binaries before packaging them.
+The native release and remote provisioning tests strip copies of debug binaries
+before packaging or transferring them.
 On macOS, it removes debug and local symbols so the fixture stays below the
 128 MiB limit for each binary. The original build files keep their symbols.
 
