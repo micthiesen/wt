@@ -211,7 +211,12 @@ one marker (`…` in flight, `↻` accepted, `? … (unconfirmed)`).
 
 Local Git inventory, metadata, edit timestamps, sessions, action logs, and
 GitHub observations have separate source lanes. Filesystem watchers invalidate
-only the facts affected by the event. GitHub reads remain batched and rate
+only the facts affected by the event. A one-second metadata backstop detects
+lost Git notifications over the same declared watch paths: immediate checkout
+children and recursive Git refs/worktree metadata, excluding generated trees
+and symlink traversal. Each scan is capped at 8,192 entries and 200 ms, runs off
+the input path, and refreshes only the domains whose file metadata changed.
+Incomplete scans retain the 60-second full reconciliation backstop. GitHub reads remain batched and rate
 limited (10 s minimum interval measured from fetch start); the optional events
 daemon supplies push updates stamped with its own fetch start, with a
 configured poll backstop for missed events or daemon downtime. An accepted

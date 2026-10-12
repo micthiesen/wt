@@ -130,15 +130,30 @@ impl CodexMessenger {
                 .recover_live_identity(&tmux_name, &discovered, cancel)
                 .await?;
             if let Some(id) = session_id.as_deref() {
-                let _ = self
-                    .tmux
-                    .set_option(
-                        &OptionScope::Session(tmux_name.clone()),
-                        "@wt-harness-session-id",
-                        Some(id),
-                        cancel,
-                    )
-                    .await;
+                let current = self.tmux.list_sessions(cancel).await?;
+                let slot = initial_inventory.iter().find(|slot| slot.name == tmux_name);
+                let same_slot = slot.filter(|slot| {
+                    current.iter().any(|now| {
+                        now.id == slot.id
+                            && now.created_at == slot.created_at
+                            && now.name == slot.name
+                    })
+                });
+                if let Some(slot) = same_slot {
+                    self.tmux
+                        .set_option(
+                            &OptionScope::Session(slot.id.clone()),
+                            "@wt-harness-session-id",
+                            Some(id),
+                            cancel,
+                        )
+                        .await?;
+                } else {
+                    return Ok(CodexMessageOutcome::Failed {
+                        reason: "Codex slot changed while recovering its conversation identity"
+                            .into(),
+                    });
+                }
             }
         }
 
@@ -234,7 +249,7 @@ impl CodexMessenger {
         .await
     }
 
-    async fn recover_live_identity(
+    pub(super) async fn recover_live_identity(
         &self,
         tmux_name: &str,
         sessions: &[crate::HarnessSession],
@@ -243,7 +258,16 @@ impl CodexMessenger {
         if sessions.is_empty() {
             return Ok(None);
         }
-        let panes = self.tmux.list_panes(tmux_name, cancel).await?;
+        let Some(before) = self
+            .tmux
+            .list_sessions(cancel)
+            .await?
+            .into_iter()
+            .find(|session| session.name == tmux_name)
+        else {
+            return Ok(None);
+        };
+        let panes = self.tmux.list_panes(&before.id, cancel).await?;
         if panes.len() != 1 {
             return Ok(None);
         }
@@ -254,34 +278,38 @@ impl CodexMessenger {
             CommandSpec::new("lsof").args(["-nP", "-a", "-p", &pid.to_string(), "-Fn"]);
         command.cwd = Some(self.paths.home.clone());
         command.timeout = Duration::from_secs(2);
-        let result = self.runner.run(command, cancel).await?;
+        let result = match self.runner.run(command, cancel).await {
+            Ok(result) => result,
+            Err(error @ ProcessError::Cancelled { .. }) => return Err(error.into()),
+            // lsof is optional proof, not a requirement for reconnecting to
+            // an explicitly selected physical tmux session.
+            Err(_) => return Ok(None),
+        };
         if !result.status.success() {
             return Ok(None);
         }
-        let candidates = sessions
-            .iter()
-            .map(|s| s.session_id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut found = std::collections::HashSet::new();
-        for line in result.stdout_text().lines() {
-            let Some(path) = line.strip_prefix('n') else {
-                continue;
-            };
-            let Some((_, file)) = path.rsplit_once("/thread-writer-locks/") else {
-                continue;
-            };
-            if let Some(id) = file.strip_suffix(".lock")
-                && candidates.contains(id)
-            {
-                found.insert(id.to_owned());
-            }
-        }
-        if found.len() != 1 {
+        let found = writer_identity(&result.stdout_text(), &self.paths.codex_home, sessions);
+        if found.is_none() {
             return Ok(None);
         }
-        let after = self.tmux.list_panes(tmux_name, cancel).await?;
-        if after.len() == 1 && after[0].pid == Some(pid) {
-            Ok(found.into_iter().next())
+        let after = self.tmux.list_panes(&before.id, cancel).await?;
+        let same_session = self
+            .tmux
+            .list_sessions(cancel)
+            .await?
+            .iter()
+            .any(|session| {
+                session.id == before.id
+                    && session.created_at == before.created_at
+                    && session.name == before.name
+            });
+        if same_session
+            && after.len() == 1
+            && after[0].id == panes[0].id
+            && after[0].pid == Some(pid)
+            && !after[0].dead
+        {
+            Ok(found)
         } else {
             Ok(None)
         }
@@ -451,6 +479,35 @@ impl CodexMessenger {
     }
 }
 
+/// Only the pane process's exact writer lock under this Codex home proves
+/// ownership. A shared daemon's loaded threads, resume arguments, and rollout
+/// recency cannot identify which conversation its TUI currently displays.
+fn writer_identity(
+    output: &str,
+    codex_home: &Path,
+    sessions: &[crate::HarnessSession],
+) -> Option<String> {
+    let locks = codex_home.join("thread-writer-locks");
+    let mut found = std::collections::HashSet::new();
+    for path in output.lines().filter_map(|line| line.strip_prefix('n')) {
+        let path = Path::new(path);
+        if path.parent() != Some(locks.as_path()) {
+            continue;
+        }
+        if let Some(id) = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .and_then(|file| file.strip_suffix(".lock"))
+            && sessions.iter().any(|session| session.session_id == id)
+        {
+            found.insert(id.to_owned());
+        }
+    }
+    (found.len() == 1)
+        .then(|| found.into_iter().next())
+        .flatten()
+}
+
 #[derive(Clone, Debug)]
 enum CliQueueResult {
     Accepted,
@@ -513,6 +570,42 @@ fn closed_turn(parse_complete: bool, last_event: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(id: &str) -> crate::HarnessSession {
+        crate::HarnessSession {
+            display_name: id.into(),
+            session_id: id.into(),
+            tmux_session_name: "feature-codex".into(),
+            last_active_ms: None,
+            is_live: false,
+            extras: crate::HarnessExtras::default(),
+        }
+    }
+
+    #[test]
+    fn identity_requires_one_exact_writer_lock_in_the_selected_codex_home() {
+        let home = Path::new("/managed/codex");
+        let sessions = [session("thread-a"), session("thread-b")];
+        assert_eq!(
+            writer_identity(
+                "p10\nn/managed/codex/thread-writer-locks/thread-a.lock\n",
+                home,
+                &sessions
+            ),
+            Some("thread-a".into())
+        );
+        for output in [
+            // Other Codex homes and unrelated files cannot prove ownership.
+            "n/other/codex/thread-writer-locks/thread-a.lock\n",
+            "n/managed/codex/sessions/rollout-thread-a.jsonl\n",
+            "n/managed/codex/thread-writer-locks/thread-unknown.lock\n",
+            // Multiple writers could be a shared daemon, never a TUI identity.
+            "n/managed/codex/thread-writer-locks/thread-a.lock\nn/managed/codex/thread-writer-locks/thread-b.lock\n",
+            "",
+        ] {
+            assert_eq!(writer_identity(output, home, &sessions), None, "{output}");
+        }
+    }
 
     #[test]
     fn commands_require_a_closed_turn_and_an_empty_ordinary_composer() {

@@ -311,19 +311,40 @@ pub(crate) async fn handoff_prepared(
             .current_dir(prepared.cwd)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("attach tmux client")?;
-        let status = tokio::select! {
-            _ = shutdown.cancelled() => { child.kill().await?; return Ok(()); },
-            status = child.wait() => status?,
+        let mut stderr_tail = Vec::new();
+        let status = {
+            let stderr = child.stderr.take().context("attach stderr pipe")?;
+            let capture = forward_attach_stderr(stderr, std::io::stderr(), &mut stderr_tail);
+            tokio::pin!(capture);
+            let mut drained = false;
+            let status = loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => { child.kill().await?; return Ok(()); },
+                    status = child.wait() => break status?,
+                    _ = &mut capture, if !drained => drained = true,
+                }
+            };
+            // A descendant may inherit the pipe. It must not keep the board
+            // suspended after the attach client has already exited.
+            if !drained {
+                let _ = tokio::time::timeout(Duration::from_millis(250), capture).await;
+            }
+            status
         };
         // The previous wt tmux bindings detach with 110/111/112 for the
         // shell/diff/harness keys. Existing agent servers retain those bindings
         // across application upgrades; returning to the board is not a failure.
         if !status.success() && !matches!(status.code(), Some(110..=112)) {
-            bail!("tmux client exited with {status}");
+            let detail = wt_core::sanitize_terminal_text(&String::from_utf8_lossy(&stderr_tail));
+            let detail = detail.trim();
+            if detail.is_empty() {
+                bail!("tmux client exited with {status}");
+            }
+            bail!("tmux client exited with {status}: {detail}");
         }
         Ok(())
     }
@@ -338,10 +359,75 @@ pub(crate) async fn handoff_prepared(
     Ok(UiReply::message("Returned from session"))
 }
 
+/// Keep stderr visible during the handoff and retain a bounded diagnostic for
+/// the board, which otherwise replaces that output as soon as attach fails.
+async fn forward_attach_stderr(
+    mut input: impl tokio::io::AsyncRead + Unpin,
+    mut terminal: impl std::io::Write,
+    tail: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    const LIMIT: usize = 8 * 1024;
+    let mut chunk = [0; 4096];
+    loop {
+        let count = input.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        tail.extend_from_slice(&chunk[..count]);
+        if tail.len() > LIMIT {
+            tail.drain(..tail.len() - LIMIT);
+        }
+        // A failed terminal write must not stop draining the child's pipe.
+        let _ = terminal.write_all(&chunk[..count]);
+        let _ = terminal.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wt_tui::UiAction;
+
+    #[tokio::test]
+    async fn attach_stderr_is_forwarded_in_full_but_only_keeps_a_bounded_tail() {
+        let mut output = Vec::new();
+        let mut tail = Vec::new();
+        let mut diagnostic = vec![b'x'; 32 * 1024];
+        diagnostic.extend_from_slice(b"\nno such session: missing\n");
+        forward_attach_stderr(diagnostic.as_slice(), &mut output, &mut tail)
+            .await
+            .unwrap();
+        assert_eq!(output, diagnostic);
+        assert_eq!(tail, diagnostic[diagnostic.len() - 8 * 1024..]);
+    }
+
+    #[tokio::test]
+    async fn failed_attach_retains_the_cause_after_resuming_the_board() {
+        let (replies, mut received) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handoff_prepared(
+                crate::harness::PreparedSession {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf '\\033[31mno such session: missing\\033[0m\\n' >&2; exit 1".into(),
+                    ],
+                    cwd: std::env::temp_dir(),
+                },
+                &replies,
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let handoff = received.recv().await.unwrap().handoff.unwrap();
+        handoff.ready.send(()).unwrap();
+        let resumed = handoff.resumed.await.unwrap().unwrap_err();
+        assert!(resumed.contains("no such session: missing"), "{resumed}");
+        assert!(!resumed.contains('\x1b'));
+        let error = task.await.unwrap().unwrap_err().to_string();
+        assert_eq!(resumed, error);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_keeps_accepted_work_alive_past_the_notice_deadline() {

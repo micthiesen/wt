@@ -2635,6 +2635,7 @@ mod tests {
             target: SessionTarget::Harness,
             harness: wt_core::HarnessId::Claude,
             session_id: id.map(str::to_owned),
+            live_slot: None,
             managed_name: None,
             mode,
             live: false,

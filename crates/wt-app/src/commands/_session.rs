@@ -23,6 +23,16 @@ enum RemoteTarget {
 }
 
 pub async fn run(context: &AppContext, args: &[String]) -> Result<i32> {
+    let result = run_inner(context, args).await;
+    if let Err(error) = &result {
+        // SSH allocates a remote PTY, merging stderr into stdout. Retain the
+        // cause in the worker activity feed before the controller redraws.
+        tracing::error!(error = %format!("{error:#}"), "session attachment failed");
+    }
+    result
+}
+
+async fn run_inner(context: &AppContext, args: &[String]) -> Result<i32> {
     if context.config.instance.role != InstanceRole::Worker {
         bail!("remote session requires [instance] role = \"worker\" on this host");
     }
@@ -92,9 +102,87 @@ async fn attach(context: &AppContext, prepared: crate::harness::PreparedSession)
         }
         status = child.wait() => status.context("wait for tmux client")?,
     };
-    if status.success() {
+    if status.success() || matches!(status.code(), Some(110..=112)) {
         Ok(0)
     } else {
+        tracing::error!(error = %format!("tmux client exited with {status}"), "session attachment failed");
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[derive(Clone)]
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_failure_is_retained_in_the_worker_log() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer({
+                let output = output.clone();
+                move || LogWriter(output.clone())
+            })
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let error = super::run(&fixture.ctx, &[]).await.unwrap_err();
+        drop(guard);
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("session attachment failed"), "{log}");
+        assert!(log.contains(&error.to_string()), "{log}");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_attach_logs_failures_but_accepts_legacy_detach_status() {
+        use tracing::instrument::WithSubscriber;
+
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer({
+                let output = output.clone();
+                move || LogWriter(output.clone())
+            })
+            .finish();
+        async {
+            for (exit, expected) in [(1, 1), (110, 0), (111, 0), (112, 0)] {
+                let prepared = crate::harness::PreparedSession {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), format!("exit {exit}").into()],
+                    cwd: std::env::temp_dir(),
+                };
+                assert_eq!(
+                    super::attach(&fixture.ctx, prepared).await.unwrap(),
+                    expected
+                );
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("session attachment failed").count(), 1, "{log}");
+        assert!(log.contains("exit status: 1"), "{log}");
+        fixture.close().await.unwrap();
     }
 }

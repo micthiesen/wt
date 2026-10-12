@@ -22,6 +22,8 @@ use wt_tui::Board;
 use wt_vcs::{GitRepository, WorktreeSnapshot};
 
 const BACKSTOP: Duration = Duration::from_secs(60);
+const METADATA_BACKSTOP: Duration = Duration::from_secs(1);
+const MAX_METADATA_ENTRIES: usize = 8192;
 
 pub fn start(
     scope: &TaskScope,
@@ -30,6 +32,18 @@ pub fn start(
     source: SourceHandle<Board>,
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<crate::local_source::Metadata>,
+) -> SourceHandle<BTreeMap<String, i64>> {
+    start_with_notifications(scope, config, repository, source, git, metadata, true)
+}
+
+fn start_with_notifications(
+    scope: &TaskScope,
+    config: Arc<Config>,
+    repository: Arc<GitRepository>,
+    source: SourceHandle<Board>,
+    git: SourceHandle<Vec<WorktreeSnapshot>>,
+    metadata: SourceHandle<crate::local_source::Metadata>,
+    notifications: bool,
 ) -> SourceHandle<BTreeMap<String, i64>> {
     let (edits, mut edit_publisher) = leaf_channel(
         scope,
@@ -62,6 +76,8 @@ pub fn start(
             canonical_watch_path(&config.paths.main_clone).await,
             canonical_watch_path(&config.paths.worktree_root).await,
         ];
+        let probe_state_db = state_db.clone();
+        let probe_checkout_roots = checkout_roots.clone();
         let callback_roots = edit_roots.clone();
         let callback_pending = pending_edits.clone();
         let callback_changed = edit_changed.clone();
@@ -135,6 +151,12 @@ pub fn start(
         let mut reconcile = true;
         let mut backstop = tokio::time::interval_at(tokio::time::Instant::now() + BACKSTOP, BACKSTOP);
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut metadata_backstop = tokio::time::interval_at(
+            tokio::time::Instant::now() + METADATA_BACKSTOP,
+            METADATA_BACKSTOP,
+        );
+        metadata_backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut fingerprint = None;
         loop {
             if reconcile && let Some(active) = watcher.take() {
                 let desired = tokio::select! {
@@ -150,7 +172,11 @@ pub fn start(
                         let previous_registered = registered.clone();
                         let update_cancel = cancellation.clone();
                         let mut update = tokio::task::spawn_blocking(move || {
-                            update_watches(active, registered, paths, &update_cancel)
+                            if notifications {
+                                update_watches(active, registered, paths, &update_cancel)
+                            } else {
+                                (active, paths, false)
+                            }
                         });
                         let update = tokio::select! {
                             biased;
@@ -231,11 +257,92 @@ pub fn start(
                     }
                     edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
                 }
+                _ = metadata_backstop.tick() => {
+                    let paths = registered.clone();
+                    let probe_cancel = cancellation.clone();
+                    let next = tokio::task::spawn_blocking(move || watch_fingerprint(&paths, &probe_cancel)).await;
+                    if let Ok(Some(next)) = next {
+                        // Refresh on the first sample too: an edit may occur
+                        // between watcher registration and this baseline.
+                        let changed = changed_paths(fingerprint.as_ref(), &next);
+                        if !changed.is_empty() {
+                            let (git_changed, metadata_changed) = invalidations(&changed, &probe_state_db, &probe_checkout_roots);
+                            if git_changed { git.refresh(); }
+                            if metadata_changed { metadata.refresh(); }
+                        }
+                        fingerprint = Some(next);
+                    }
+                }
                 _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
             }
         }
     });
     edits
+}
+
+/// A bounded notification-loss backstop, not a recursive checkout scan. The
+/// watch contract includes immediate checkout children and recursive Git
+/// metadata only. Symlinks and generated dependency trees are never followed.
+type WatchFingerprint = BTreeMap<PathBuf, (u64, Option<SystemTime>, bool)>;
+
+fn changed_paths(previous: Option<&WatchFingerprint>, next: &WatchFingerprint) -> Vec<PathBuf> {
+    let Some(previous) = previous else {
+        return next.keys().cloned().collect();
+    };
+    previous
+        .keys()
+        .chain(next.keys())
+        .filter(|path| previous.get(*path) != next.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn watch_fingerprint(
+    paths: &BTreeMap<PathBuf, bool>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Option<WatchFingerprint> {
+    let started = std::time::Instant::now();
+    let mut result = BTreeMap::new();
+    let mut pending: Vec<_> = paths
+        .iter()
+        .map(|(path, recursive)| (path.clone(), *recursive, true))
+        .collect();
+    while let Some((path, recursive, descend)) = pending.pop() {
+        if cancellation.is_cancelled() || started.elapsed() > Duration::from_millis(200) {
+            return None;
+        }
+        if generated_path(&path) {
+            continue;
+        }
+        if result.len() >= MAX_METADATA_ENTRIES {
+            return None;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        result.insert(
+            path.clone(),
+            (metadata.len(), metadata.modified().ok(), metadata.is_dir()),
+        );
+        if descend && metadata.is_dir() {
+            let entries = std::fs::read_dir(&path).ok()?;
+            for entry in entries {
+                if cancellation.is_cancelled() || started.elapsed() > Duration::from_millis(200) {
+                    return None;
+                }
+                let path = entry.ok()?.path();
+                if !generated_path(&path) {
+                    if pending.len() + result.len() >= MAX_METADATA_ENTRIES {
+                        return None;
+                    }
+                    pending.push((path, recursive, recursive));
+                }
+            }
+        }
+    }
+    Some(result)
 }
 
 fn now_ms() -> i64 {
@@ -505,6 +612,39 @@ mod tests {
     }
 
     #[test]
+    fn metadata_probe_is_bounded_to_watch_contract_and_skips_generated_trees() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/deep")).unwrap();
+        std::fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.path().join(".git/refs/heads")).unwrap();
+        std::fs::write(root.path().join("tracked.txt"), "a").unwrap();
+        std::fs::write(root.path().join("src/deep/code.rs"), "a").unwrap();
+        std::fs::write(root.path().join("node_modules/pkg/data"), "a").unwrap();
+        std::fs::write(root.path().join(".git/refs/heads/main"), "a").unwrap();
+        let paths = BTreeMap::from([
+            (root.path().to_owned(), false),
+            (root.path().join(".git/refs"), true),
+        ]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = watch_fingerprint(&paths, &cancel).unwrap();
+        assert!(first.contains_key(&root.path().join("tracked.txt")));
+        assert!(first.contains_key(&root.path().join(".git/refs/heads/main")));
+        assert!(!first.contains_key(&root.path().join("src/deep")));
+        assert!(!first.keys().any(|path| generated_path(path)));
+        assert!(
+            changed_paths(Some(&first), &watch_fingerprint(&paths, &cancel).unwrap()).is_empty()
+        );
+        std::fs::write(root.path().join("tracked.txt"), "changed").unwrap();
+        let next = watch_fingerprint(&paths, &cancel).unwrap();
+        assert_eq!(
+            changed_paths(Some(&first), &next),
+            vec![root.path().join("tracked.txt")]
+        );
+        cancel.cancel();
+        assert!(watch_fingerprint(&paths, &cancel).is_none());
+    }
+
+    #[test]
     fn edit_times_match_nested_worktree_files_but_skip_generated_and_git_paths() {
         let roots = BTreeMap::from([
             (PathBuf::from("/repo/wt/one"), "one".to_owned()),
@@ -539,6 +679,15 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_optional_edit_stream_does_not_stop_git_watch_invalidation() {
+        edit_stream_regression(true).await;
+    }
+
+    #[tokio::test]
+    async fn metadata_backstop_observes_edits_without_native_notifications() {
+        edit_stream_regression(false).await;
+    }
+
+    async fn edit_stream_regression(notifications: bool) {
         let fixture = crate::commands::test_support::CommandFixture::new()
             .await
             .unwrap();
@@ -557,14 +706,47 @@ mod tests {
             );
         }
         let scope = TaskScope::new();
-        let sources = crate::local_source::start(&scope, &fixture.ctx);
+        let git = wt_runtime::start_source(
+            &scope,
+            SourceSpec {
+                name: "test-git",
+                domain: Domain::Git,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            },
+            {
+                let repository = fixture.ctx.repository.clone();
+                move |cancel| {
+                    let repository = repository.clone();
+                    async move { repository.inventory_status(&cancel).await }
+                }
+            },
+        );
+        let (metadata, _metadata_publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-metadata",
+                domain: Domain::Metadata,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let (board, _board_publisher) = wt_runtime::derived_channel(&scope, "test-board");
+        let edits = start_with_notifications(
+            &scope,
+            fixture.ctx.config.clone(),
+            fixture.ctx.repository.clone(),
+            board,
+            git.view(),
+            metadata.view(),
+            notifications,
+        );
         let worktree = tokio::fs::canonicalize(fixture.ctx.config.paths.worktree_root.join("one"))
             .await
             .unwrap();
-        let mut git_updates = sources.git.subscribe();
-        let mut edit_updates = sources.edits.subscribe();
-        sources.git.refresh();
-        sources.metadata.refresh();
+        let mut git_updates = git.subscribe();
+        let mut edit_updates = edits.subscribe();
+        git.refresh();
         tokio::time::timeout(
             Duration::from_secs(5),
             git_updates.wait_for(|snapshot| {
@@ -587,7 +769,7 @@ mod tests {
 
         // This receiver is optional: with automations disabled nobody observes
         // edit timestamps. The Git and metadata invalidation watcher must live on.
-        drop(sources.edits);
+        drop(edits);
         let tracked_file = worktree.join("tracked.txt");
         tokio::fs::write(&tracked_file, "first external edit\n")
             .await
@@ -628,6 +810,28 @@ mod tests {
         .expect("the filesystem watcher should remain alive for later edits")
         .expect("Git source should stay open");
 
+        if !notifications {
+            // A later edit must be detected after the first fingerprint, too.
+            let clean_revision = git_updates.borrow().revision();
+            tokio::fs::write(&tracked_file, "another edit\n")
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                git_updates.wait_for(|snapshot| {
+                    snapshot.revision() > clean_revision
+                        && snapshot.data().is_some_and(|rows| {
+                            rows.iter().any(|row| {
+                                row.worktree.target.path == worktree
+                                    && row.status.as_ref().is_some_and(|status| status.dirty)
+                            })
+                        })
+                }),
+            )
+            .await
+            .expect("later metadata samples must detect edits without native events")
+            .expect("Git source should stay open");
+        }
         scope.shutdown(Duration::from_secs(2)).await.unwrap();
         fixture.close().await.unwrap();
     }

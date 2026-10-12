@@ -370,12 +370,21 @@ pub enum SessionMode {
     Resume,
 }
 
+/// Physical session captured by the picker. This is not a conversation UUID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSessionIdentity {
+    pub id: String,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSelection {
     pub key: Option<String>,
     pub target: SessionTarget,
     pub harness: wt_core::HarnessId,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub live_slot: Option<LiveSessionIdentity>,
     /// A Claude `New` selection with no name gets the next automatic name.
     pub managed_name: Option<String>,
     pub mode: SessionMode,

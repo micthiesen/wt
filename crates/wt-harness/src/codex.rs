@@ -114,6 +114,21 @@ impl CodexHarness {
         &self.paths
     }
 
+    /// Read-only recovery for an unstamped live slot. Returns only a UUID
+    /// proven by that pane's open writer lock; daemon-backed TUIs may remain
+    /// unidentified. Callers must revalidate their captured tmux slot before
+    /// attaching, stopping, or persisting the result.
+    pub async fn recover_live_identity(
+        &self,
+        tmux_name: &str,
+        sessions: &[HarnessSession],
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, CodexHarnessError> {
+        CodexMessenger::new(self.paths.clone(), self.runner.clone(), self.tmux.clone())
+            .recover_live_identity(tmux_name, sessions, cancel)
+            .await
+    }
+
     /// Read-only initialize handshake for `wt codex selftest`. This does not
     /// resume a thread, inspect a queue, or subscribe to live activity.
     pub async fn app_server_info(

@@ -272,6 +272,7 @@ mod tests {
                 target: wt_tui::SessionTarget::Harness,
                 harness: wt_core::HarnessId::Codex,
                 session_id: Some("exact-uuid".into()),
+                live_slot: None,
                 managed_name: None,
                 mode: wt_tui::SessionMode::Resume,
                 live: false,

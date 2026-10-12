@@ -76,9 +76,12 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   reports every second; Codex checks exact active rollout files every 500 ms.
   Both refresh only changed files and avoid reading unchanged contents. All
   15 focused activity tests pass, including native-watcher-disabled regressions
-  under their original deadlines. The strengthened freshness dirty-to-clean
-  event regression still fails intermittently, including an isolated 5.43s
-  run; its existing 60-second inventory backstop remains. Canonical watcher
+  under their original deadlines. Git freshness now checks metadata every
+  second over immediate checkout children and recursive Git metadata only,
+  bounded to 8,192 entries and 200 ms per scan. Unchanged samples trigger no
+  Git commands; incomplete samples retain the 60-second backstop. Native-on
+  and native-disabled dirty-to-clean regressions pass with the original
+  five-second deadlines. Canonical watcher
   registration fixes mixed `/var` and `/private/var` aliases but does not prove
   reliable OS delivery. notify 8.2 teardown purges device events through the
   current id; interference from other streams remains unproven. No test

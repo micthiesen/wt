@@ -164,6 +164,15 @@ pub async fn execute(
                 .with_context(|| format!("host {host:?} is no longer configured"))
         })
         .transpose()?;
+    if matches!(action, UiAction::PrepareSessions { .. }) {
+        let location = remote
+            .map(|remote| remote.endpoint.label.as_str())
+            .unwrap_or("this machine");
+        replies
+            .send(UiReply::message(format!("Loading sessions on {location}…")))
+            .await
+            .context("show session discovery progress")?;
+    }
     if let UiAction::ManagedSignIn { provider, then } = action {
         let remote = remote.context("sign-in belongs to a managed remote host")?;
         return Box::pin(managed_sign_in(
@@ -486,6 +495,7 @@ fn new_claude_selection(key: String) -> wt_tui::SessionSelection {
         target: SessionTarget::Harness,
         harness: wt_core::HarnessId::Claude,
         session_id: None,
+        live_slot: None,
         managed_name: None,
         mode: wt_tui::SessionMode::New,
         live: false,

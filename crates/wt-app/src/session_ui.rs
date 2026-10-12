@@ -106,6 +106,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                     target,
                     harness,
                     session_id: None,
+                    live_slot: None,
                     managed_name: None,
                     mode: SessionMode::New,
                     live: false,

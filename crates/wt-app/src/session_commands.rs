@@ -9,7 +9,7 @@ use wt_core::HarnessId;
 use wt_harness::{DiscoveryRequest, HarnessSession, HarnessSpawnRequest};
 use wt_platform::lock::FileLock;
 use wt_tmux::PaneTarget;
-use wt_tui::{SessionMode, SessionSelection, SessionTarget};
+use wt_tui::{LiveSessionIdentity, SessionMode, SessionSelection, SessionTarget};
 
 use crate::{
     context::AppContext,
@@ -79,12 +79,30 @@ pub async fn list_session_options(
             )
             .await
             .with_context(|| format!("discover {harness:?} sessions for {}", agent.slug))?;
+        let mut slots = tmux.clone();
+        if harness == HarnessId::Codex
+            && let Some(slot) = slots.iter_mut().find(|slot| slot.name == tmux_name)
+            && slot.harness_session_id.is_none()
+        {
+            slot.harness_session_id = app
+                .service
+                .recover_codex_live_identity(&tmux_name, &discovered, &context.cancellation)
+                .await?;
+        }
         for session in discovered {
-            let is_live = tmux.iter().any(|live| {
+            let live = slots.iter().find(|live| {
                 live.name == session.tmux_session_name
                     && slot_matches_selection(harness, live, &session.session_id)
             });
-            options.push(option_for(target, key.clone(), harness, session, is_live));
+            options.push(option_for(target, key.clone(), harness, session, live));
+        }
+        if harness != HarnessId::Claude
+            && let Some(slot) = slots.iter().find(|slot| slot.name == tmux_name)
+            && !options
+                .iter()
+                .any(|option| option.selection.harness == harness && option.is_live)
+        {
+            options.push(live_slot_option(target, key.clone(), harness, slot));
         }
     }
     options.sort_by(|left, right| {
@@ -155,6 +173,19 @@ pub async fn prepare_session(
         .session_id
         .as_deref()
         .or(expected_claude_id.as_deref());
+    let tmux_name = session_name(&agent, selection.harness);
+    if selection.live_slot.is_some() {
+        if selection.mode != SessionMode::Resume {
+            bail!("new session selection must not include a live slot");
+        }
+        let sessions = app.session_inventory(context).await?;
+        let live = sessions
+            .iter()
+            .find(|slot| slot.name == tmux_name)
+            .context("selected live session has ended; reopen the session picker")?;
+        validate_live_selection(context, &app, &agent, selection, live).await?;
+        return Ok(app.attach_command(&live.id, &agent.cwd));
+    }
     if selection.mode == SessionMode::Resume && wanted_id.is_none() {
         bail!("resume selection is missing its exact session id");
     }
@@ -162,7 +193,6 @@ pub async fn prepare_session(
         bail!("new session selection must not include an existing session id");
     }
 
-    let tmux_name = session_name(&agent, selection.harness);
     let live = app.session_inventory(context).await?;
     if let Some(live_session) = live.iter().find(|session| session.name == tmux_name) {
         if let Some(wanted_id) = wanted_id
@@ -302,6 +332,29 @@ pub async fn stop_managed_session(
         agent.managed_name = Some(managed_name.clone());
     }
     let name = session_name(&agent, selection.harness);
+    if selection.live_slot.is_some() {
+        let lock_dir = context.config.paths.cache_root.join("locks");
+        let _guard = FileLock::acquire(
+            &lock_dir,
+            &format!("__start__{name}"),
+            "stop selected harness session",
+            &context.cancellation,
+        )
+        .await?;
+        let sessions = app.session_inventory(context).await?;
+        let live = sessions
+            .iter()
+            .find(|slot| slot.name == name)
+            .context("selected live session has ended; reopen the session picker")?;
+        validate_live_selection(context, &app, &agent, selection, live).await?;
+        if end == SessionEnd::Kill || selection.harness == HarnessId::Claude {
+            return Ok(app
+                .tmux
+                .kill_session_id(&live.id, &context.cancellation)
+                .await?);
+        }
+        return close_exact_pane(context, &app, &agent, selection, live).await;
+    }
     let expected = if selection.harness == HarnessId::Claude {
         wt_harness::claude_session_id(
             &agent.cwd,
@@ -356,16 +409,51 @@ pub async fn stop_managed_session(
                 .kill_session_id(&live.id, &context.cancellation)
                 .await?);
         }
-        let pane = PaneTarget::active_session_pane(&name);
-        app.tmux
-            .send_keys(&pane, &["C-d"], &context.cancellation)
-            .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        app.tmux
-            .send_keys(&pane, &["C-d"], &context.cancellation)
-            .await?;
-        Ok(true)
+        close_exact_pane(context, &app, &agent, selection, live).await
     }
+}
+
+/// Keep both EOFs bound to the pane process selected before the first send.
+/// Closing a pane can focus another pane without ending the tmux session.
+async fn close_exact_pane(
+    context: &AppContext,
+    app: &AppHarness,
+    agent: &AgentTarget,
+    selection: &SessionSelection,
+    live: &wt_tmux::SessionInfo,
+) -> Result<bool> {
+    let before = app.tmux.list_panes(&live.id, &context.cancellation).await?;
+    let pane = before
+        .iter()
+        .find(|pane| pane.active && !pane.dead && pane.pid.is_some())
+        .context("selected session has no live active pane; no input was sent")?;
+    let target = PaneTarget::id(&pane.id);
+    app.tmux
+        .send_keys(&target, &["C-d"], &context.cancellation)
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let after = app.session_inventory(context).await?;
+    let Some(after) = after.iter().find(|slot| slot.name == live.name) else {
+        return Ok(true);
+    };
+    let mut captured = selection.clone();
+    captured.live_slot = Some(live_identity(live));
+    validate_live_selection(context, app, agent, &captured, after).await?;
+    let panes = app.tmux.list_panes(&live.id, &context.cancellation).await?;
+    let Some(current) = panes.iter().find(|current| current.id == pane.id) else {
+        return Ok(true);
+    };
+    if !same_pane_process(pane, current) {
+        bail!("selected pane process changed while closing it; no further input was sent");
+    }
+    app.tmux
+        .send_keys(&target, &["C-d"], &context.cancellation)
+        .await?;
+    Ok(true)
+}
+
+fn same_pane_process(before: &wt_tmux::PaneInfo, after: &wt_tmux::PaneInfo) -> bool {
+    before.id == after.id && before.pid.is_some() && before.pid == after.pid && !after.dead
 }
 
 /// Forget a dead Claude session's stored name so it leaves the picker.
@@ -402,14 +490,16 @@ fn option_for(
     key: Option<String>,
     harness: HarnessId,
     session: HarnessSession,
-    is_live: bool,
+    live: Option<&wt_tmux::SessionInfo>,
 ) -> SessionOption {
+    let is_live = live.is_some();
     SessionOption {
         selection: SessionSelection {
             key,
             target,
             harness,
             session_id: Some(session.session_id),
+            live_slot: live.map(live_identity),
             managed_name: session.extras.managed_name,
             mode: SessionMode::Resume,
             live: is_live,
@@ -424,6 +514,96 @@ fn option_for(
             .map(|state| format!("{state:?}")),
         waiting_for: session.extras.waiting_for,
     }
+}
+
+fn live_identity(slot: &wt_tmux::SessionInfo) -> LiveSessionIdentity {
+    LiveSessionIdentity {
+        id: slot.id.clone(),
+        created_at: slot.created_at,
+    }
+}
+
+fn live_slot_option(
+    target: SessionTarget,
+    key: Option<String>,
+    harness: HarnessId,
+    slot: &wt_tmux::SessionInfo,
+) -> SessionOption {
+    SessionOption {
+        selection: SessionSelection {
+            key,
+            target,
+            harness,
+            session_id: None,
+            live_slot: Some(live_identity(slot)),
+            managed_name: None,
+            mode: SessionMode::Resume,
+            live: true,
+        },
+        display_name: "current session (conversation not identified)".into(),
+        tmux_session_name: slot.name.clone(),
+        last_active_ms: None,
+        is_live: true,
+        state: None,
+        waiting_for: None,
+    }
+}
+
+fn witness_matches(selection: &SessionSelection, live: &wt_tmux::SessionInfo) -> bool {
+    selection
+        .live_slot
+        .as_ref()
+        .is_some_and(|witness| witness.id == live.id && witness.created_at == live.created_at)
+}
+
+async fn validate_live_selection(
+    context: &AppContext,
+    app: &AppHarness,
+    agent: &AgentTarget,
+    selection: &SessionSelection,
+    live: &wt_tmux::SessionInfo,
+) -> Result<()> {
+    if !witness_matches(selection, live) {
+        bail!("live session changed since selection; reopen the session picker");
+    }
+    let Some(id) = selection.session_id.as_deref() else {
+        return Ok(());
+    };
+    if selection.harness == HarnessId::Claude {
+        let expected = wt_harness::claude_session_id(
+            &agent.cwd,
+            selection
+                .managed_name
+                .as_deref()
+                .or(agent.managed_name.as_deref()),
+        );
+        if id != expected {
+            bail!("selected Claude identity no longer matches its managed name");
+        }
+    }
+    if slot_matches_selection(selection.harness, live, id) {
+        return Ok(());
+    }
+    if selection.harness == HarnessId::Codex && live.harness_session_id.is_none() {
+        let candidate = HarnessSession {
+            display_name: String::new(),
+            session_id: id.into(),
+            tmux_session_name: live.name.clone(),
+            last_active_ms: None,
+            is_live: false,
+            extras: Default::default(),
+        };
+        if app
+            .service
+            .recover_codex_live_identity(&live.name, &[candidate], &context.cancellation)
+            .await?
+            .as_deref()
+            == Some(id)
+        {
+            return Ok(());
+        }
+    }
+    bail!("live session no longer matches the selected conversation; reopen the session picker")
 }
 
 async fn resolve_target(
@@ -521,6 +701,99 @@ mod tests {
             window_count: 1,
             harness_session_id: session_id.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn graceful_close_never_retargets_a_new_active_pane_or_restarted_process() {
+        let before = wt_tmux::PaneInfo {
+            id: "%10".into(),
+            session_name: "feature-codex".into(),
+            window_id: "@1".into(),
+            window_index: 0,
+            index: 0,
+            active: true,
+            pid: Some(100),
+            current_path: PathBuf::from("/tmp"),
+            width: 80,
+            height: 24,
+            dead: false,
+        };
+        let target = PaneTarget::id(&before.id);
+        let mut other = before.clone();
+        other.id = "%11".into();
+        other.pid = Some(101);
+        assert!(!same_pane_process(&before, &other));
+        assert_eq!(target.as_str(), "%10");
+        let mut restarted = before.clone();
+        restarted.pid = Some(102);
+        assert!(!same_pane_process(&before, &restarted));
+        restarted.pid = before.pid;
+        restarted.dead = true;
+        assert!(!same_pane_process(&before, &restarted));
+        let mut unfocused = before.clone();
+        unfocused.active = false;
+        assert!(same_pane_process(&before, &unfocused));
+        let mut unknown = before.clone();
+        unknown.pid = None;
+        assert!(!same_pane_process(&unknown, &unknown));
+    }
+
+    #[test]
+    fn unidentified_live_slot_is_explicit_and_never_assigned_a_conversation() {
+        let slot = info("feature-codex", None);
+        let option = live_slot_option(
+            SessionTarget::Harness,
+            Some("feature".into()),
+            HarnessId::Codex,
+            &slot,
+        );
+        assert!(option.is_live);
+        assert!(option.selection.session_id.is_none());
+        assert_eq!(
+            option.display_name,
+            "current session (conversation not identified)"
+        );
+        assert!(witness_matches(&option.selection, &slot));
+        let mut replacement = slot.clone();
+        replacement.id = "$2".into();
+        assert!(!witness_matches(&option.selection, &replacement));
+        replacement.id = slot.id.clone();
+        replacement.created_at += 1;
+        assert!(!witness_matches(&option.selection, &replacement));
+        assert!(!slot_matches_selection(
+            HarnessId::Codex,
+            &slot,
+            "historical-thread"
+        ));
+        let wire = serde_json::to_value(&option.selection).unwrap();
+        let restored: SessionSelection = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored, option.selection);
+        let mut legacy = wire;
+        legacy.as_object_mut().unwrap().remove("live_slot");
+        let legacy: SessionSelection = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.live_slot.is_none());
+    }
+
+    #[test]
+    fn identified_live_choice_captures_physical_witness() {
+        let slot = info("feature-codex", Some("thread-a"));
+        let session = HarnessSession {
+            session_id: "thread-a".into(),
+            tmux_session_name: slot.name.clone(),
+            display_name: "primary".into(),
+            last_active_ms: None,
+            is_live: false,
+            extras: Default::default(),
+        };
+        let option = option_for(
+            SessionTarget::Harness,
+            None,
+            HarnessId::Codex,
+            session,
+            Some(&slot),
+        );
+        assert_eq!(option.selection.session_id.as_deref(), Some("thread-a"));
+        assert_eq!(option.selection.live_slot, Some(live_identity(&slot)));
     }
 
     #[test]

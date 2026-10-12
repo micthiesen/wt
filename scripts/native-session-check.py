@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify real TUI -> private tmux shell -> TUI terminal ownership handoff."""
+"""Verify TUI shell handoff and the live agent-session picker in private tmux."""
 import argparse
 import errno
 import fcntl
@@ -33,7 +33,15 @@ def main():
     spec.loader.exec_module(fixture)
     main_clone, home, config = fixture.fixture(root, 2)
     socket = f"wt-native-session-{os.getpid()}"
+    # Fail closed if the picker accidentally starts a new agent instead of
+    # attaching the witnessed slot. Never launch the user's actual Codex.
+    unexpected_launch = root / "unexpected-codex-launch"
+    codex_stub = root / "fixture-bin" / "codex"
+    codex_stub.write_text(f"#!/bin/sh\nprintf unexpected > {shlex.quote(str(unexpected_launch))}\nexit 97\n")
+    codex_stub.chmod(0o700)
     env = dict(os.environ, HOME=str(home), WT_CONFIG=str(config), TERM="xterm-256color",
+               CODEX_HOME=str(home / ".codex"),
+               PATH=str(root / "fixture-bin") + os.pathsep + os.environ["PATH"],
                WT_TMUX_SOCKET=socket, SHELL="/bin/sh", WT_UPDATE="off", WT_SKILLS="off",
                WT_GITHUB="off", WT_AUTOMATIONS="off")
     for key in ("WT_REPO_CONFIG", "WT_REPO_ID", "WT_AGENT", "TMUX", "TMUX_PANE",
@@ -69,6 +77,14 @@ def main():
         return subprocess.run(["tmux", "-L", socket, *args], env=env, cwd=home,
                               capture_output=True, text=True, timeout=5)
 
+    def session_id(name):
+        sessions = tmux("list-sessions", "-F", "#{session_name}|#{session_id}")
+        assert sessions.returncode == 0, sessions.stderr
+        matches = [line.split("|", 1)[1] for line in sessions.stdout.splitlines()
+                   if line.startswith(name + "|")]
+        assert len(matches) == 1 and matches[0].startswith("$"), (name, sessions.stdout)
+        return matches[0]
+
     def printed(data):
         return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", data).replace(b" ", b"")
 
@@ -84,6 +100,67 @@ def main():
         assert detached.returncode == 0, detached.stderr
         # Ratatui may advance over unchanged blank cells with cursor commands.
         wait_for(lambda data: b"Returnedfromsession" in printed(data))
+        # Model the startup window before Codex publishes a conversation UUID.
+        # These are plain shells in this test's private server, never agents.
+        for name in ("bench-000-codex", "picker-unrelated"):
+            created = tmux("new-session", "-d", "-s", name, "-c",
+                           str(root / "worktrees" / "bench-000"), "/bin/sh")
+            assert created.returncode == 0, created.stderr
+        unknown_id = session_id("bench-000-codex")
+        unrelated_id = session_id("picker-unrelated")
+        assert not tmux("show-option", "-qv", "-t", "=bench-000-codex", "@wt-harness-session-id").stdout.strip()
+        os.write(terminal, b";")
+        wait_for(lambda data: b"currentsession(conversationnotidentified)" in printed(data)
+                 and b"live" in printed(data))
+        os.write(terminal, b"\r")
+        wait_for(lambda _: tmux("list-clients", "-F", "#{session_id}").stdout.strip() == unknown_id)
+        picker_marker = root / "picker-input-received"
+        os.write(terminal, f"printf picker-ok > {shlex.quote(str(picker_marker))}\r".encode())
+        wait_for(lambda _: picker_marker.exists())
+        assert picker_marker.read_text() == "picker-ok", "picker did not attach the live shell slot"
+        assert not unexpected_launch.exists(), "picker started Codex instead of attaching the existing slot"
+        detached = tmux("detach-client", "-s", "bench-000-codex")
+        assert detached.returncode == 0, detached.stderr
+        wait_for(lambda data: b"Returnedfromsession" in printed(data))
+        os.write(terminal, b";")
+        wait_for(lambda data: b"currentsession(conversationnotidentified)" in printed(data)
+                 and b"live" in printed(data))
+        os.write(terminal, b"x")  # Kill only the picker row's witnessed live slot.
+        wait_for(lambda _: tmux("has-session", "-t", "=bench-000-codex").returncode != 0)
+        assert session_id("picker-unrelated") == unrelated_id
+        assert tmux("has-session", "-t", "=bench-000-shell").returncode == 0
+        # Graceful close must remain pinned to the original pane. When EOF
+        # closes it, tmux activates the second pane; another EOF must not leak
+        # into that unrelated shell after the 200 ms close retry delay.
+        created = tmux("new-session", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}",
+                       "-s", "bench-000-codex", "-c",
+                       str(root / "worktrees" / "bench-000"), "/bin/sh")
+        assert created.returncode == 0, created.stderr
+        first_pane, first_pid = created.stdout.strip().split("|")
+        split = tmux("split-window", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}",
+                     "-t", first_pane, "/bin/sh")
+        assert split.returncode == 0, split.stderr
+        other_pane, other_pid = split.stdout.strip().split("|")
+        assert first_pane.startswith("%") and other_pane.startswith("%")
+        assert first_pane != other_pane and first_pid != other_pid
+        selected = tmux("select-pane", "-t", first_pane)
+        assert selected.returncode == 0, selected.stderr
+        graceful_session = session_id("bench-000-codex")
+        os.write(terminal, b";")
+        wait_for(lambda data: b"currentsession(conversationnotidentified)" in printed(data)
+                 and b"live" in printed(data))
+        close_started = time.monotonic()
+        os.write(terminal, b"d")
+        wait_for(lambda data: b"ClosedCodexsession" in printed(data))
+        wait_for(lambda _: time.monotonic() - close_started >= 0.3)
+        panes = tmux("list-panes", "-s", "-t", graceful_session,
+                     "-F", "#{pane_id}|#{pane_pid}")
+        assert panes.returncode == 0, "graceful close killed the other pane's session"
+        assert f"{first_pane}|{first_pid}" not in panes.stdout.splitlines(), "selected pane did not close"
+        assert f"{other_pane}|{other_pid}" in panes.stdout.splitlines(), "EOF leaked into the replacement active pane"
+        os.kill(int(other_pid), 0)  # The exact other shell process must still exist.
+        assert session_id("picker-unrelated") == unrelated_id
+        assert tmux("has-session", "-t", "=bench-000-shell").returncode == 0
         os.write(terminal, b"j")
         wait_for(lambda data: SELECTED_ROW in data)
         os.write(terminal, b"t\x15After session\r")
@@ -106,7 +183,11 @@ def main():
         assert status == 0, f"UI did not exit cleanly after session handoff: {status}"
         assert tmux("has-session", "-t", "=bench-000-shell").returncode == 0, "UI quit killed user shell"
         result = {"shell_received_input": True, "ui_resumed": True, "title_saved_after_resume": True,
-                  "shell_survived_ui_exit": True, "clean_shutdown": True}
+                  "shell_survived_ui_exit": True, "clean_shutdown": True,
+                  "unidentified_live_picker_attached": True, "picker_received_input": True,
+                  "picker_killed_exact_slot": True, "unrelated_session_preserved": True,
+                  "graceful_close_preserved_other_pane": True,
+                  "no_agent_launched": not unexpected_launch.exists()}
         (root / "result.json").write_text(json.dumps(result) + "\n")
         print(json.dumps(result))
     finally:

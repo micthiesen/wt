@@ -68,6 +68,7 @@ fn selection(harness: wt_core::HarnessId, mode: SessionMode, live: bool) -> Sess
         target: SessionTarget::Harness,
         harness,
         session_id: (mode == SessionMode::Resume).then(|| "id".into()),
+        live_slot: None,
         managed_name: None,
         mode,
         live,
@@ -114,6 +115,42 @@ fn picker_selected(model: &Model) -> Option<usize> {
     match &model.interaction {
         Interaction::Picker(picker) => Some(picker.selected),
         _ => None,
+    }
+}
+
+#[test]
+fn unidentified_live_session_keeps_its_witness_for_attach_and_stop() {
+    let mut choice = selection(wt_core::HarnessId::Codex, SessionMode::Resume, true);
+    choice.session_id = None;
+    choice.live_slot = Some(crate::LiveSessionIdentity {
+        id: "$42".into(),
+        created_at: 100,
+    });
+    for key in [KeyCode::Enter, KeyCode::Char('d'), KeyCode::Char('x')] {
+        let mut model = model_with(&["one"]);
+        model.reply(UiReply {
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Sessions {
+                    choices: vec![choice.clone()],
+                },
+                title: "Sessions".into(),
+                options: vec![option(0, "current session (conversation not identified)")],
+                selected: 0,
+            }),
+            ..Default::default()
+        });
+        let expected = match key {
+            KeyCode::Enter => UiAction::SelectSession {
+                selection: choice.clone(),
+            },
+            KeyCode::Char('d') => UiAction::StopSession {
+                selection: choice.clone(),
+            },
+            _ => UiAction::KillSession {
+                selection: choice.clone(),
+            },
+        };
+        assert_eq!(press(&mut model, key), InputResult::Action(expected));
     }
 }
 

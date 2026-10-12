@@ -118,6 +118,20 @@ impl HarnessService {
         Ok(self.codex.app_server_info(cancel).await?)
     }
 
+    /// Recover a live Codex UUID only when the terminal process proves it.
+    /// This never resumes a thread or writes a tmux identity stamp.
+    pub async fn recover_codex_live_identity(
+        &self,
+        tmux_name: &str,
+        sessions: &[HarnessSession],
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, HarnessServiceError> {
+        Ok(self
+            .codex
+            .recover_live_identity(tmux_name, sessions, cancel)
+            .await?)
+    }
+
     pub async fn discover(
         &self,
         id: HarnessId,

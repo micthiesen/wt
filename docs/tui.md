@@ -263,6 +263,13 @@ armed or the unconfirmed attempt expires.
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
 
+The session picker runs on the selected host. A running Codex or OpenCode slot
+whose conversation UUID cannot be proven appears as **current session
+(conversation not identified)**. Enter reconnects to that exact terminal;
+historical conversations remain separate. Live selections capture the tmux
+session ID and creation time. If the session changes or ends, attachment and
+stop actions refuse the stale selection and ask you to reopen the picker.
+
 While attached, the configured terminal handoff returns to the TUI. `/compact`
 is available in harness command palettes that support it. Manager and special
 session controls remain reachable by these keys. The footer shows live

@@ -19,10 +19,10 @@ mod terminal_probe;
 mod theme;
 
 pub use actions::{
-    ActionController, ActionSurface, CleanupTarget, ConfirmAction, PickerAction, PickerOption,
-    PrPin, RemovalRevision, ReplyOutcome, ReviewerOption, SessionMode, SessionSelection,
-    SessionTarget, TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest,
-    UrlKind, action_channel,
+    ActionController, ActionSurface, CleanupTarget, ConfirmAction, LiveSessionIdentity,
+    PickerAction, PickerOption, PrPin, RemovalRevision, ReplyOutcome, ReviewerOption, SessionMode,
+    SessionSelection, SessionTarget, TerminalHandoff, TextAction, UiAction, UiActions, UiModal,
+    UiReply, UiRequest, UrlKind, action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
