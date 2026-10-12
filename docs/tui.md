@@ -130,6 +130,8 @@ digits in a key column and a `›` cursor. Confirm hazards are red. Help (`?`)
 groups the keymap by area and ends with a glyph legend built from the same
 rules the list uses; `/` filters with a match count and highlights hits.
 
+History rows are prepared in the background and retained when the pane closes.
+`h` shows them immediately while tracker and landing facts refresh.
 When `h` opens removed-worktree history, the list pane reads `removed (N)`
 and groups rows under day rules, each day starting at 04:00 local time. A row
 shows a marker (the work-status color when a landing is proved, otherwise
@@ -166,6 +168,8 @@ instead. `Tab` cycles through this machine and each remote, and `n` starts on
 the host chosen last in this session. A stacked create (`N`) opens on its
 parent's host, and `Tab` does nothing once the text carries `--base`; a
 `--base` typed after choosing a host resolves on that host.
+A failed create keeps the name and chosen host editable, with the error shown
+in red above the prompt.
 After creation, WT refreshes inventory and metadata and selects the new row
 once it appears; the placeholder stays until then. Its group opens when the row
 arrives, including if a folded snapshot arrives before the saved group state.
@@ -212,7 +216,10 @@ removal.
 The `c` menu opens at once from the prepared background board. It does not wait
 for Git, GitHub, or SSH. It also requests the same background refresh as `r`.
 With no candidates, the overlay stays open and shows
-why each row is kept. Press `c` or `Esc` to close it. Reopen it to use newer
+why each row is kept. Candidates appear first with green trash glyphs; kept
+worktrees and their reasons are muted under a separate count. Long names and
+reasons wrap below their own column, including in the no-candidates view.
+Press `c` or `Esc` to close it. Reopen it to use newer
 background results. Confirmation checks only the displayed candidate identities
 against current landing evidence and removal hazards before queuing removal.
 

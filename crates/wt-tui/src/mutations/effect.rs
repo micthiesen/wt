@@ -117,7 +117,9 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         // A palette entry only opens its prompt; merge-when-ready is resolved
         // into `GithubSetAutoMerge` before sending (`Model::resolve`).
         UiAction::PrepareAction { .. } => Effect::ReadOnly,
-        UiAction::ManagedSignIn { .. } => unprojected(host, None, "signing in", &[]),
+        // Credentials and any resumed action are handled by the interactive
+        // sign-in flow; there is no sign-in board mutation to confirm.
+        UiAction::ManagedSignIn { .. } => Effect::ReadOnly,
         UiAction::HardRefresh => unprojected(host, None, "refreshing", &[]),
         UiAction::SetAttentionSeen { at_ms } => {
             on_board(host, LayoutChange::AttentionSeen { at_ms: *at_ms })
@@ -290,17 +292,14 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 issue_id: issue_id.clone(),
             },
         ),
-        UiAction::Session { key, .. } => {
-            unprojected(host, key.as_deref(), "opening session", &[Domain::Sessions])
-        }
-        UiAction::SelectSession { .. } => {
-            unprojected(host, None, "opening session", &[Domain::Sessions])
-        }
+        // Entry hands the terminal to an interactive process, which may run
+        // indefinitely. It has no host write stamp to settle against; session
+        // inventory independently observes anything the process creates.
+        UiAction::Session { .. }
+        | UiAction::SelectSession { .. }
+        | UiAction::EnterHarness { .. } => Effect::ReadOnly,
         UiAction::KillSession { .. } => {
             unprojected(host, None, "stopping session", &[Domain::Sessions])
-        }
-        UiAction::EnterHarness { key, .. } => {
-            unprojected(host, Some(key), "opening harness", &[Domain::Sessions])
         }
         UiAction::StopTerminal { key, .. } => {
             unprojected(host, Some(key), "stopping terminal", &[Domain::Sessions])

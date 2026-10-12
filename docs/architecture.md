@@ -81,10 +81,21 @@ separate activity source. The GitHub comment observer fetches the authenticated
 viewer once on demand and never treats comments as foreign while that identity
 is unknown.
 
+The history source prepares the bounded SQLite removal ledger when metadata or
+inventory changes, even while the pane is closed. Opening history displays
+those prepared rows immediately and enriches tracker and landing facts in the
+background. Closing history cancels external enrichment but retains its rows.
+
 The activity source backfills a bounded tail from the seven rolling native
 JSON logs and manager reports. Attention transitions are written to that same
 log with their event timestamp, so both feeds can recover them after restart
-without a second durable event database. The attention watermark is stored in
+without a second durable event database. A one-second metadata backstop checks
+only the latest seven log files and manager reports, refreshing the activity
+source only when a file changes. Active Codex rollouts have a separate 500 ms
+metadata backstop over their exact retained paths. Both keep file I/O off the
+input path, detect same-second appends without hashing transcript contents,
+and remain responsive when native filesystem notifications are lost.
+The attention watermark is stored in
 the repository-scoped state and projected into every board snapshot.
 
 `wt-tui::model` owns cursor, pane, modal, and key dispatch state. The terminal
@@ -169,6 +180,11 @@ An expiry while confirmed data still disagrees shows one notice.
   head SHA they target (`PrPin`). The executing host refreshes the domains the
   effect names and replies with a `ReplyOutcome` (`Accepted(stamp)`,
   `NoChange`, `Deferred`, or `Uncertain`).
+- Interactive session entry is a terminal handoff, not a pending board write.
+  Shell, diff, harness entry and managed sign-in have no expected board
+  postcondition or host write stamp; session sources independently observe any
+  sessions they create.
+  Connection progress and failures still arrive through normal action replies.
 - Creation is a `UiMutation` too: a selected placeholder row appears at
   keypress, F12 on it requests agent entry once the checkout is ready, and the
   operation id keeps each reply tied to its own placeholder. The reply names the

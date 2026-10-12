@@ -68,6 +68,21 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
+  Codex rollout append watcher received no callbacks within either 2 or 15
+  seconds, including a fixture under the home directory. Host sampling showed
+  fseventsd at 100% CPU, load 9.41, wt at 234% of 683% CPU in use (decaying
+  `ps` averages). Activity now checks metadata for its latest seven logs plus
+  reports every second; Codex checks exact active rollout files every 500 ms.
+  Both refresh only changed files and avoid reading unchanged contents. All
+  15 focused activity tests pass, including native-watcher-disabled regressions
+  under their original deadlines. The strengthened freshness dirty-to-clean
+  event regression still fails intermittently, including an isolated 5.43s
+  run; its existing 60-second inventory backstop remains. Canonical watcher
+  registration fixes mixed `/var` and `/private/var` aliases but does not prove
+  reliable OS delivery. notify 8.2 teardown purges device events through the
+  current id; interference from other streams remains unproven. No test
+  deadlines were increased to hide missing notifications.
 - **Lifecycle feedback is prepared in source but not installed (2026-10-10).**
   Creation now shows a temporary row on queue admission. F12 requests agent
   entry after checkout completion; linked-worktree dependency installation

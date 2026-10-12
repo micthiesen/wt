@@ -98,9 +98,20 @@ pub fn start(
     cache_root: PathBuf,
     app_log_dir: PathBuf,
 ) -> LeafHandle<ActivitySnapshot> {
+    start_with_watcher(scope, cache_root, app_log_dir, true)
+}
+
+fn start_with_watcher(
+    scope: &TaskScope,
+    cache_root: PathBuf,
+    app_log_dir: PathBuf,
+    native_watch: bool,
+) -> LeafHandle<ActivitySnapshot> {
     let manager_dir = cache_root.join("manager");
     let reports = manager_dir.join("reports.jsonl");
     let watched_log_dir = app_log_dir.clone();
+    let polled_reports = reports.clone();
+    let polled_logs = app_log_dir.clone();
     let source = start_source(
         scope,
         SourceSpec {
@@ -127,6 +138,9 @@ pub fn start(
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&manager_dir)?;
             std::fs::create_dir_all(&watched_log_dir)?;
+            if !native_watch {
+                return Ok(None);
+            }
             let mut watcher = notify::recommended_watcher(
                 move |event: notify::Result<notify::Event>| match event {
                     Ok(event)
@@ -146,19 +160,35 @@ pub fn start(
                     _ => {}
                 },
             )?;
-            watcher.watch(&manager_dir, notify::RecursiveMode::NonRecursive)?;
-            watcher.watch(&watched_log_dir, notify::RecursiveMode::NonRecursive)?;
-            Ok::<_, anyhow::Error>(watcher)
+            // notify filters FSEvents with canonical paths; register that same
+            // spelling so aliases such as /tmp do not lose log notifications.
+            watcher.watch(
+                &std::fs::canonicalize(&manager_dir)?,
+                notify::RecursiveMode::NonRecursive,
+            )?;
+            watcher.watch(
+                &std::fs::canonicalize(&watched_log_dir)?,
+                notify::RecursiveMode::NonRecursive,
+            )?;
+            Ok::<_, anyhow::Error>(Some(watcher))
         })
         .await;
         let _watcher = match watcher {
-            Ok(Ok(watcher)) => Some(watcher),
+            Ok(Ok(watcher)) => watcher,
             error => {
                 tracing::warn!(?error, "activity feeds use refresh backstop");
                 None
             }
         };
+        let fingerprint = || {
+            let reports = polled_reports.clone();
+            let logs = polled_logs.clone();
+            tokio::task::spawn_blocking(move || feed_fingerprint(&reports, &logs))
+        };
+        let mut previous = fingerprint().await.ok();
         observed.refresh();
+        let mut changed_files = tokio::time::interval(Duration::from_secs(1));
+        changed_files.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let period = Duration::from_secs(30);
         let mut backstop = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -166,10 +196,45 @@ pub fn start(
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = backstop.tick() => { observed.refresh(); },
+                _ = changed_files.tick() => {
+                    let current = fingerprint().await.ok();
+                    if current != previous {
+                        previous = current;
+                        observed.refresh();
+                    }
+                }
             }
         }
     });
     source
+}
+
+/// Bound polling to the same seven rolling logs read by the source, plus the
+/// manager report file. Precise timestamps and lengths detect same-second
+/// appends without hashing or repeatedly parsing unchanged log contents.
+fn feed_fingerprint(reports: &Path, directory: &Path) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
+    let mut paths = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("wt-native") && name.ends_with(".log")
+            })
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut paths = paths.into_iter().rev().take(7).collect::<Vec<_>>();
+    paths.push(reports.to_owned());
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(&path).ok()?;
+            Some((path, metadata.len(), metadata.modified().ok()))
+        })
+        .collect()
 }
 
 fn read_snapshot(reports: &Path, app_log_dir: &Path) -> anyhow::Result<ActivitySnapshot> {
@@ -418,6 +483,39 @@ pub(crate) fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn log_append_refreshes_without_native_notifications() {
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("wt-native.fixture.log");
+        std::fs::write(&log, "").unwrap();
+        let scope = TaskScope::new();
+        let source = start_with_watcher(&scope, root.path().join("cache"), logs, false);
+        let mut updates = source.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            updates.wait_for(|snapshot| snapshot.data().is_some()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // The append can occur in the same timestamp second as creation.
+        std::fs::write(&log, concat!(r#"{"timestamp":"2026-10-09T12:00:00Z","level":"INFO","fields":{"event_at_ms":10,"event_channel":"attention","event_source":"fixture","event_text":"live append"},"target":"wt_attention"}"#, "\n")).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            updates.wait_for(|snapshot| {
+                snapshot
+                    .data()
+                    .is_some_and(|data| data.activity.iter().any(|line| line.text == "live append"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
 
     #[test]
     fn a_logged_error_field_follows_the_message() {

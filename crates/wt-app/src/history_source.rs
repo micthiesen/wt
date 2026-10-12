@@ -1,8 +1,7 @@
-//! On-demand projection of the durable removed-worktree ledger.
+//! Prepared projection of the durable removed-worktree ledger.
 //!
-//! History is deliberately dormant while the ordinary fleet view is shown.
-//! Opening it reads the bounded ledger and hydrates tracker statuses in one
-//! batch; metadata and inventory changes refresh the same prepared snapshot.
+//! Ledger rows stay ready even while history is closed. Opening the pane
+//! hydrates tracker and landing facts in the background without hiding rows.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -42,7 +41,7 @@ pub struct HistoryCommands {
 }
 
 impl HistoryCommands {
-    /// Enable or suspend the history-only readers. Repeated values are cheap.
+    /// Enable or suspend external history enrichment. Repeated values are cheap.
     pub fn set_active(&self, active: bool) {
         self.active.send_if_modified(|current| {
             if *current == active {
@@ -84,6 +83,7 @@ pub fn start(
         live_updates.mark_changed();
         let mut is_active = false;
         let mut refresh_needed = false;
+        let mut last_prepared = RemovedHistorySnapshot::default();
 
         loop {
             tokio::select! {
@@ -91,11 +91,7 @@ pub fn start(
                 _ = cancellation.cancelled() => break,
                 request = publisher.requested() => {
                     if request.is_none() { break; }
-                    if is_active {
-                        metadata_updates.mark_changed();
-                        live_updates.mark_changed();
-                        refresh_needed = true;
-                    }
+                    refresh_needed = true;
                 }
                 changed = active.changed() => {
                     if changed.is_err() { break; }
@@ -104,23 +100,21 @@ pub fn start(
                         metadata.refresh();
                         live.refresh();
                         refresh_needed = true;
-                    } else {
-                        publisher.publish_live(RemovedHistorySnapshot::default(), Stamp::now());
                     }
                 }
                 changed = metadata_updates.changed() => {
                     if changed.is_err() { break; }
                     metadata_updates.borrow_and_update();
-                    refresh_needed = is_active;
+                    refresh_needed = true;
                 }
                 changed = live_updates.changed() => {
                     if changed.is_err() { break; }
                     live_updates.borrow_and_update();
-                    refresh_needed = is_active;
+                    refresh_needed = true;
                 }
             }
 
-            if !is_active || !refresh_needed {
+            if !refresh_needed {
                 continue;
             }
             refresh_needed = false;
@@ -156,8 +150,20 @@ pub fn start(
                 .filter(|row| !row.worktree.is_main)
                 .map(|row| row.worktree.target.slug().to_owned())
                 .collect::<BTreeSet<_>>();
-            let request_cancellation = cancellation.child_token();
             let observed = Stamp::now();
+            let records = match read_records(&context, &live_slugs).await {
+                Ok(records) => records,
+                Err(error) => {
+                    publisher.set_state(SourceState::Failed(format!("history: {error:#}").into()));
+                    continue;
+                }
+            };
+            last_prepared = prepare_ledger(&context, &records, &last_prepared);
+            publisher.publish_live(last_prepared.clone(), observed);
+            if !is_active {
+                continue;
+            }
+            let request_cancellation = cancellation.child_token();
             let prepared = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,
@@ -167,15 +173,14 @@ pub fn start(
                     request_cancellation.cancel();
                     if is_active {
                         refresh_needed = true;
-                    } else {
-                        publisher.publish_live(RemovedHistorySnapshot::default(), Stamp::now());
                     }
                     continue;
                 }
-                result = prepare(&context, live_slugs, &request_cancellation) => result,
+                result = enrich(&context, records, &request_cancellation) => result,
             };
             match prepared {
                 Ok((snapshot, fact_error)) if !cancellation.is_cancelled() => {
+                    last_prepared = snapshot.clone();
                     publisher.publish_live_with_state(
                         snapshot,
                         observed,
@@ -202,9 +207,8 @@ pub fn start(
     }
 }
 
-/// Attach the dormant history lane to each host's prepared board. Board refresh
-/// requests reach the history lane too; its active gate decides whether that
-/// request performs any disk or tracker work.
+/// Attach prepared history to each host's board. Refreshes always read the
+/// durable ledger; only an open pane requests external enrichment.
 pub fn overlay(
     scope: &TaskScope,
     board: SourceHandle<Board>,
@@ -253,18 +257,61 @@ pub fn overlay(
     output
 }
 
-async fn prepare(
+async fn read_records(
     context: &AppContext,
-    live_slugs: BTreeSet<String>,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> Result<(RemovedHistorySnapshot, Option<String>)> {
+    live_slugs: &BTreeSet<String>,
+) -> Result<Vec<RemovedWorktree>> {
     let records = context
         .database
         .call(|store| Ok(store.read_removed_worktrees()?))
         .await?;
     let cutoff = now_ms().saturating_sub(MAX_AGE.as_millis().min(i64::MAX as u128) as i64);
-    let records = filter_records(records, &live_slugs, cutoff);
+    Ok(filter_records(records, live_slugs, cutoff))
+}
 
+/// Publish durable facts before any external I/O. Preserve enriched display
+/// fields for the same removal record until the background read replaces them.
+fn prepare_ledger(
+    context: &AppContext,
+    records: &[RemovedWorktree],
+    previous: &RemovedHistorySnapshot,
+) -> RemovedHistorySnapshot {
+    let statuses = BTreeMap::new();
+    let rows = records
+        .iter()
+        .cloned()
+        .map(|entry| {
+            let mut row = present(
+                context
+                    .config
+                    .issue_tracker
+                    .as_ref()
+                    .and_then(|tracker| tracker.url_template.as_deref()),
+                entry,
+                &statuses,
+                None,
+                None,
+            );
+            if let Some(old) = previous
+                .rows
+                .iter()
+                .find(|old| old.key == row.key && old.removed_at == row.removed_at)
+            {
+                row.issue_status = old.issue_status.clone();
+                row.issue_url = row.issue_url.or_else(|| old.issue_url.clone());
+                row.landed_on = old.landed_on.or(row.landed_on);
+            }
+            row
+        })
+        .collect();
+    RemovedHistorySnapshot { rows }
+}
+
+async fn enrich(
+    context: &AppContext,
+    records: Vec<RemovedWorktree>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<(RemovedHistorySnapshot, Option<String>)> {
     let statuses = read_issue_statuses(context, &records, cancellation).await;
     let legacy_merges = read_legacy_pr_merges(context, &records, cancellation).await;
     let landing = read_landing_facts(context, &records, &legacy_merges, cancellation).await;
@@ -1030,10 +1077,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_source_is_dormant_until_open_and_hides_restored_slug() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+    async fn history_is_prepared_before_open_and_survives_close_and_refresh() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
             .await
             .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let started = scratch.path().join("tracker-started");
+        Arc::make_mut(&mut fixture.ctx.config).issue_tracker =
+            Some(wt_config::IssueTrackerConfig {
+                prefix: Some("coz".into()),
+                status_command: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "touch \"$1\"; sleep 30".into(),
+                    "history-test".into(),
+                    started.to_string_lossy().into_owned(),
+                ]),
+                ..Default::default()
+            });
         let inventory = fixture
             .ctx
             .repository
@@ -1061,7 +1122,10 @@ mod tests {
                         removed_at: timestamp.clone(),
                         work: None,
                         automations_paused: None,
-                        extra: Map::new(),
+                        extra: Map::from_iter([(
+                            "issueId".into(),
+                            Value::String("coz-123".into()),
+                        )]),
                     })
                     .collect::<Vec<_>>();
                 store.record_removed_worktrees(&entries, now_ms())?;
@@ -1092,7 +1156,6 @@ mod tests {
 
         let history = start(&scope, &fixture.ctx, metadata.view(), live.view());
         assert!(history.snapshot.snapshot().data().is_none());
-        history.commands.set_active(true);
         let mut updates = history.snapshot.subscribe();
         let snapshot = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1111,14 +1174,45 @@ mod tests {
         assert_eq!(rows[0].slug, "historical");
         drop(snapshot);
 
+        assert!(
+            !started.exists(),
+            "external readers remain dormant while closed"
+        );
+        history.commands.set_active(true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            history.snapshot.snapshot().data().unwrap().rows,
+            rows,
+            "slow tracker enrichment cannot hide prepared rows"
+        );
+
         history.commands.set_active(false);
+        live_publisher.set_state(SourceState::Refreshing);
         tokio::time::timeout(
             Duration::from_secs(2),
-            updates.wait_for(|snapshot| snapshot.data().is_some_and(|data| data.rows.is_empty())),
+            updates.wait_for(|snapshot| matches!(snapshot.state(), SourceState::Refreshing)),
         )
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(
+            history.snapshot.snapshot().data().unwrap().rows,
+            rows,
+            "closing history retains its prepared rows during input refresh"
+        );
+        history.commands.set_active(true);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            history.snapshot.snapshot().data().unwrap().rows,
+            rows,
+            "reopening uses existing rows immediately"
+        );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
         fixture.close().await.unwrap();
     }

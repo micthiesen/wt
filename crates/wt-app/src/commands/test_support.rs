@@ -26,6 +26,9 @@ impl CommandFixture {
         fs::create_dir_all(&worktree_root)?;
         fs::create_dir_all(&repo)?;
         run_git(&repo, &["init", "-b", "main"])?;
+        // Tiny temporary repositories must not inherit a host fsmonitor daemon:
+        // its filesystem event waits can dominate every fixture status/diff.
+        run_git(&repo, &["config", "core.fsmonitor", "false"])?;
         run_git(&repo, &["config", "user.name", "Fixture"])?;
         run_git(&repo, &["config", "user.email", "fixture@example.invalid"])?;
         fs::write(repo.join("tracked.txt"), "base\n")?;

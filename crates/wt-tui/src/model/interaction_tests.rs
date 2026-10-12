@@ -870,3 +870,115 @@ fn drag_selects_inside_the_pane_and_copies_trimmed_text() {
     );
     assert!(model.mouse_selection.is_none());
 }
+
+#[test]
+fn failed_remote_create_keeps_host_name_and_retry_input() {
+    let mut data = board(&["one"]);
+    data.hosts = vec![
+        HostChoice {
+            id: None,
+            label: "This machine".into(),
+        },
+        HostChoice {
+            id: Some("maxbook".into()),
+            label: "MaxBook".into(),
+        },
+    ];
+    let mut model = Model::default();
+    model.apply(ready(data));
+    ch(&mut model, 'n');
+    press(&mut model, KeyCode::Tab);
+    for letter in "remote-task".chars() {
+        ch(&mut model, letter);
+    }
+    let InputResult::Action(action) = press(&mut model, KeyCode::Enter) else {
+        panic!("create action");
+    };
+    model.begin_action(91, &action);
+    assert!(model.selected_row().unwrap().key.starts_with("\0creating:"));
+    model.reply(UiReply {
+        operation_id: Some(91),
+        failed: true,
+        message: "MaxBook worker is not connected; no command was sent".into(),
+        modal_host: Some("maxbook".into()),
+        modal: Some(UiModal::Text {
+            action: TextAction::Create,
+            prompt: "New worktree name: ".into(),
+            initial: "remote-task".into(),
+            allow_empty: false,
+        }),
+        ..Default::default()
+    });
+    let Interaction::Text(prompt) = &model.interaction else {
+        panic!("retry input");
+    };
+    assert_eq!(prompt.prompt, "New worktree on MaxBook (Tab: host): ");
+    assert_eq!(prompt.editor.text(), "remote-task");
+    model.expire_toast();
+    assert!(
+        matches!(model.toast, Some((_, ToastTone::Failed))),
+        "retry errors remain visible after the ordinary toast deadline"
+    );
+    assert!(
+        !model
+            .board
+            .rows
+            .iter()
+            .any(|row| row.key.starts_with("\0creating:"))
+    );
+    assert_eq!(
+        press(&mut model, KeyCode::Enter),
+        InputResult::Action(action)
+    );
+    assert!(
+        model.toast.is_none(),
+        "submitting a retry clears the old error"
+    );
+}
+
+#[test]
+fn deferred_remote_create_confirms_sign_in_with_original_input_and_host() {
+    let mut model = model_with(&["one"]);
+    let create = UiAction::Create {
+        input: "remote-task --no-install".into(),
+    };
+    model.begin_action(
+        92,
+        &UiAction::OnHost {
+            host: Some("maxbook".into()),
+            action: Box::new(create.clone()),
+        },
+    );
+    model.reply(UiReply {
+        operation_id: Some(92),
+        outcome: Some(crate::ReplyOutcome::Deferred),
+        modal_host: Some("maxbook".into()),
+        modal: Some(UiModal::Confirm {
+            action: ConfirmAction::ManagedSignIn {
+                provider: "github".into(),
+                then: Some(Box::new(create.clone())),
+            },
+            title: "Sign in on MaxBook".into(),
+            lines: vec!["GitHub sign-in is needed before creating this worktree.".into()],
+            cancel_key: None,
+        }),
+        ..Default::default()
+    });
+    assert!(
+        !model
+            .board
+            .rows
+            .iter()
+            .any(|row| row.key.starts_with("\0creating:"))
+    );
+    assert_eq!(
+        press(&mut model, KeyCode::Enter),
+        InputResult::Action(UiAction::OnHost {
+            host: Some("maxbook".into()),
+            action: Box::new(UiAction::ManagedSignIn {
+                provider: "github".into(),
+                then: Some(Box::new(create))
+            }),
+        })
+    );
+}

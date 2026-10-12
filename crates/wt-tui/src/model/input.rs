@@ -11,6 +11,15 @@ use crate::{
 };
 
 impl Model {
+    pub(crate) fn expire_toast(&mut self) {
+        if matches!(self.interaction, Interaction::Text(_))
+            && matches!(self.toast, Some((_, ToastTone::Failed)))
+        {
+            return;
+        }
+        self.toast = None;
+    }
+
     /// Feedback for a key that has nothing to act on.
     pub(crate) fn notify(&mut self, text: impl Into<String>) -> InputResult {
         self.toast = Some((text.into(), ToastTone::Info));

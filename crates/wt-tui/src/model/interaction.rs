@@ -169,6 +169,7 @@ impl Model {
                     // Esc or Backspace on empty input inside a picker's
                     // sub-prompt returns to that picker; Ctrl+C closes all.
                     EditResult::Cancel if !(control && code == KeyCode::Char('c')) => {
+                        self.toast = None;
                         match &prompt.action {
                             TextAction::NewSection { key } => {
                                 InputResult::Action(UiAction::PrepareSection { key: key.clone() })
@@ -182,7 +183,10 @@ impl Model {
                             _ => InputResult::Draw,
                         }
                     }
-                    EditResult::Cancel => InputResult::Draw,
+                    EditResult::Cancel => {
+                        self.toast = None;
+                        InputResult::Draw
+                    }
                     EditResult::Changed => {
                         self.interaction = interaction;
                         InputResult::Draw
@@ -197,6 +201,7 @@ impl Model {
                             self.interaction = interaction;
                             return InputResult::Unchanged;
                         }
+                        self.toast = None;
                         let action = match &prompt.action {
                             TextAction::SessionName { selection } => {
                                 let mut selection = selection.clone();

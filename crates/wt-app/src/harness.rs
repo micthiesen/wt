@@ -18,7 +18,7 @@ use wt_harness::{
     CodexPaths, DiscoveryRequest, HarnessId, HarnessMessageOutcome, HarnessService,
     HarnessSpawnRequest, HarnessTarget, OpenCodePaths,
 };
-use wt_tmux::{CreateSession, SessionInfo, TmuxClient, TmuxServer, write_terminal_palette_config};
+use wt_tmux::{CreateSession, SessionInfo, TmuxClient, TmuxServer, write_terminal_config};
 use wt_tui::SessionTarget;
 
 use crate::context::AppContext;
@@ -219,7 +219,11 @@ impl AppHarness {
         let spawn_path = session_environment.get("PATH").cloned().unwrap_or_default();
         let mut server =
             TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone());
-        if let Ok(config_path) = write_terminal_palette_config(&cache_root, &context.home) {
+        if let Ok(config_path) = write_terminal_config(
+            &cache_root,
+            &context.home,
+            context.config.tmux.terminal_config.as_deref(),
+        ) {
             server = server.with_config_file(config_path);
         }
         let tmux = TmuxClient::new(context.processes.clone(), server).with_session_environment(

@@ -171,6 +171,32 @@ pub async fn execute(
         ))
         .await;
     }
+    // A create submitted during initial provisioning has not been sent yet.
+    // Keep its placeholder and wait for the connection instead of immediately
+    // bouncing the user back into the input prompt. No sent command is retried.
+    if let Some(remote) = remote
+        && !remote.is_ready()
+    {
+        replies
+            .send(UiReply::message(format!(
+                "Connecting to {}…",
+                remote.endpoint.label
+            )))
+            .await
+            .context("show remote connection progress")?;
+        remote.wake();
+        let ready = tokio::select! {
+            _ = shutdown.cancelled() => bail!("remote connection cancelled; no command was sent"),
+            ready = remote.wait_for_action(&action, context.config.harness.primary, std::time::Duration::from_secs(90)) => ready,
+        };
+        if !ready {
+            bail!(
+                "{} is not ready; no command was sent: {}",
+                remote.endpoint.label,
+                remote.connection_detail()
+            );
+        }
+    }
     if let Some(remote) = remote
         && let Some(status) = remote.managed.borrow().clone()
         && let Some(provider) = crate::managed::required_sign_in(

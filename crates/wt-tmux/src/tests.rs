@@ -628,3 +628,93 @@ async fn assert_no_injection_buffers(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn generated_terminal_config_reloads_navigation_without_replacing_sessions() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("empty home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cache = temp.path().join("cache");
+    let config = crate::write_terminal_config(&cache, &home, None).unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("tmux.sock")).with_config_file(&config),
+    );
+    let cancel = CancellationToken::new();
+    let result = async {
+        client
+            .create_session(
+                &CreateSession {
+                    name: "retained".into(),
+                    cwd: home.clone(),
+                    command: vec!["cat".into()],
+                    width: Some(80),
+                    height: Some(24),
+                },
+                &cancel,
+            )
+            .await?;
+        let original = client.list_sessions(&cancel).await?;
+        let keys = client
+            .run("list-keys", ["list-keys", "-T", "root"], None, &cancel)
+            .await?;
+        assert!(keys.status.success(), "{}", keys.stderr_text());
+        for key in ["F10", "F11", "F12"] {
+            assert!(
+                keys.stdout_text()
+                    .lines()
+                    .any(|line| line.contains(key) && line.ends_with("detach-client")),
+                "{}",
+                keys.stdout_text()
+            );
+        }
+        let options = client
+            .run(
+                "show-options",
+                ["show-options", "-g", "status"],
+                None,
+                &cancel,
+            )
+            .await?;
+        assert_eq!(options.stdout_text().trim(), "status off");
+        crate::write_terminal_config(&cache, &home, Some("set -g status on\n")).unwrap();
+        let args = client.attach_session_args("retained");
+        let source = args.iter().position(|arg| arg == "source-file").unwrap();
+        let attach = args.iter().position(|arg| arg == "attach-session").unwrap();
+        assert!(source < attach);
+        let loaded = client
+            .run(
+                "source-file",
+                ["source-file", args[source + 1].to_str().unwrap()],
+                None,
+                &cancel,
+            )
+            .await?;
+        assert!(loaded.status.success(), "{}", loaded.stderr_text());
+        let options = client
+            .run(
+                "show-options",
+                ["show-options", "-g", "status"],
+                None,
+                &cancel,
+            )
+            .await?;
+        assert_eq!(options.stdout_text().trim(), "status on");
+        assert_eq!(client.list_sessions(&cancel).await?, original);
+        Ok::<(), crate::TmuxError>(())
+    }
+    .await;
+    client.kill_server(&cancel).await.unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn empty_terminal_preamble_still_has_palette_and_board_return_keys() {
+    let temp = tempdir().unwrap();
+    save_terminal_palette(temp.path(), "#ffffff", "#000000").unwrap();
+    let config = crate::write_terminal_config(temp.path(), temp.path(), Some("")).unwrap();
+    let content = std::fs::read_to_string(config).unwrap();
+    assert!(!content.contains("set -g mouse"));
+    assert!(content.contains("window-active-style 'fg=#ffffff,bg=#000000'"));
+    assert!(content.contains("bind-key -n F12 detach-client"));
+}

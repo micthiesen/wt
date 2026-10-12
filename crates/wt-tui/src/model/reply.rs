@@ -114,7 +114,7 @@ impl Model {
             }) => {
                 // A plain create prompt names its host like `n` does, so a
                 // host picked in the Ctrl+N picker is visible and Tab works.
-                let prompt = if matches!(action, TextAction::Create) && initial.is_empty() {
+                let prompt = if matches!(action, TextAction::Create) {
                     self.create_prompt(self.interaction_host.as_deref())
                 } else {
                     prompt

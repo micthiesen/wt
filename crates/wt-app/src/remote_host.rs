@@ -185,6 +185,46 @@ impl RemoteHost {
             .is_ok_and(|result| result.is_ok())
     }
 
+    pub fn is_ready(&self) -> bool {
+        self.ready.borrow().is_some()
+    }
+
+    /// Preparation can require authentication before a stream can exist.
+    /// Wake the request as soon as either outcome is known.
+    pub async fn wait_for_action(
+        &self,
+        action: &UiAction,
+        primary: wt_core::HarnessId,
+        limit: Duration,
+    ) -> bool {
+        let mut ready = self.ready.clone();
+        let mut managed = self.managed.clone();
+        tokio::time::timeout(limit, async {
+            loop {
+                if ready.borrow().is_some()
+                    || managed.borrow().as_ref().is_some_and(|status| {
+                        crate::managed::required_sign_in(&status.report, action, primary).is_some()
+                    })
+                {
+                    return true;
+                }
+                tokio::select! {
+                    result = ready.changed() => if result.is_err() { return false; },
+                    result = managed.changed() => if result.is_err() { return false; },
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub fn connection_detail(&self) -> String {
+        match self.snapshot.snapshot().state() {
+            SourceState::Failed(detail) => detail.to_string(),
+            _ => "the worker is still being prepared or connected".into(),
+        }
+    }
+
     pub fn refresh(&self) -> bool {
         let Some(connection) = *self.ready.borrow() else {
             return false;
@@ -213,7 +253,7 @@ impl RemoteHost {
         let Some(connection) = *self.ready.borrow() else {
             return Err(RemoteHostError::NotStarted {
                 host: self.endpoint.key(),
-                detail: "the authenticated worker stream is not ready".into(),
+                detail: self.connection_detail(),
             });
         };
         let (reply, result) = oneshot::channel();
@@ -986,6 +1026,140 @@ mod tests {
     use wt_core::Domain;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
     use wt_tui::UiReply;
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "isolated connection control channels for tests"
+    )]
+    fn waiting_host(
+        scope: &TaskScope,
+    ) -> (super::RemoteHost, tokio::sync::watch::Sender<Option<u64>>) {
+        let (snapshot, _) = leaf_channel(
+            scope,
+            SourceSpec {
+                name: "waiting-host-test",
+                domain: Domain::Host,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let (readiness, ready) = tokio::sync::watch::channel(None);
+        let (managed_status, managed) = tokio::sync::watch::channel(None);
+        let (requests, _) = tokio::sync::mpsc::channel(1);
+        let (_, client) = tokio::sync::watch::channel(None);
+        let (views, _) = tokio::sync::watch::channel(Default::default());
+        (
+            super::RemoteHost {
+                endpoint: wt_config::RemoteConfig {
+                    host: "worker".into(),
+                    managed: true,
+                    ..Default::default()
+                },
+                snapshot,
+                managed,
+                managed_status: std::sync::Arc::new(managed_status),
+                requests,
+                ready,
+                client,
+                views,
+            },
+            readiness,
+        )
+    }
+
+    fn github_sign_in_report() -> wt_remote::managed::ManagedReport {
+        use wt_remote::managed::{CheckState, ManagedCheck, ManagedReport, SignIn};
+        ManagedReport {
+            checks: vec![ManagedCheck::new(
+                "repository",
+                CheckState::SignInNeeded,
+                "Sign in to clone",
+                Some(SignIn::Github),
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn action_wait_returns_for_known_blocking_sign_in() {
+        let scope = TaskScope::new();
+        let (host, _readiness) = waiting_host(&scope);
+        host.set_managed(github_sign_in_report());
+        assert!(
+            host.wait_for_action(
+                &wt_tui::UiAction::Create {
+                    input: "test".into()
+                },
+                wt_core::HarnessId::Codex,
+                std::time::Duration::from_millis(100)
+            )
+            .await
+        );
+        assert!(!host.is_ready());
+    }
+
+    #[tokio::test]
+    async fn action_wait_returns_when_blocking_sign_in_arrives() {
+        let scope = TaskScope::new();
+        let (host, _readiness) = waiting_host(&scope);
+        let action = wt_tui::UiAction::Create {
+            input: "test".into(),
+        };
+        let mut waiting = Box::pin(host.wait_for_action(
+            &action,
+            wt_core::HarnessId::Codex,
+            std::time::Duration::from_secs(1),
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("must wait until preparation has an outcome"),
+            _ = tokio::task::yield_now() => {},
+        }
+        host.set_managed(github_sign_in_report());
+        assert!(waiting.await);
+        assert!(!host.is_ready());
+    }
+
+    #[tokio::test]
+    async fn action_wait_returns_when_stream_becomes_ready() {
+        let scope = TaskScope::new();
+        let (host, readiness) = waiting_host(&scope);
+        let action = wt_tui::UiAction::Create {
+            input: "test".into(),
+        };
+        let mut waiting = Box::pin(host.wait_for_action(
+            &action,
+            wt_core::HarnessId::Codex,
+            std::time::Duration::from_secs(1),
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("must wait until stream is ready"),
+            _ = tokio::task::yield_now() => {},
+        }
+        super::mark_ready(&readiness, 1);
+        assert!(waiting.await);
+    }
+
+    #[tokio::test]
+    async fn action_wait_times_out_without_readiness_or_relevant_sign_in() {
+        let scope = TaskScope::new();
+        let (host, _readiness) = waiting_host(&scope);
+        host.set_managed(github_sign_in_report());
+        let action = wt_tui::UiAction::Session {
+            key: None,
+            target: wt_tui::SessionTarget::Shell,
+        };
+        assert!(
+            !host
+                .wait_for_action(
+                    &action,
+                    wt_core::HarnessId::Codex,
+                    std::time::Duration::from_millis(10)
+                )
+                .await
+        );
+    }
 
     #[test]
     fn queued_requests_cannot_cross_an_ssh_reconnect() {

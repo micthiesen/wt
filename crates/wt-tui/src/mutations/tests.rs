@@ -275,6 +275,61 @@ fn every_action_declares_an_effect_and_toggles_use_the_shown_state() {
 }
 
 #[test]
+fn interactive_entry_never_waits_for_a_board_mutation_stamp() {
+    use crate::{SessionMode, SessionSelection, SessionTarget};
+    let mut actions = [
+        SessionTarget::Shell,
+        SessionTarget::Diff,
+        SessionTarget::Harness,
+        SessionTarget::Main,
+        SessionTarget::Manager,
+        SessionTarget::WtSource,
+        SessionTarget::Dotfiles,
+    ]
+    .into_iter()
+    .map(|target| UiAction::Session {
+        key: Some("a".into()),
+        target,
+    })
+    .collect::<Vec<_>>();
+    actions.push(UiAction::SelectSession {
+        selection: SessionSelection {
+            key: Some("a".into()),
+            target: SessionTarget::Harness,
+            harness: wt_core::HarnessId::Codex,
+            session_id: None,
+            managed_name: None,
+            mode: SessionMode::New,
+            live: false,
+        },
+    });
+    actions.push(UiAction::EnterHarness {
+        key: "a".into(),
+        harness: wt_core::HarnessId::Codex,
+    });
+    for then in [
+        None,
+        Some(Box::new(UiAction::Session {
+            key: Some("a".into()),
+            target: SessionTarget::Harness,
+        })),
+    ] {
+        actions.push(UiAction::ManagedSignIn {
+            provider: "codex".into(),
+            then,
+        });
+    }
+    for action in actions {
+        assert_eq!(action.effect(&board()), Effect::ReadOnly);
+        let remote = UiAction::OnHost {
+            host: Some("MaxBook".into()),
+            action: Box::new(action),
+        };
+        assert_eq!(remote.effect(&board()), Effect::ReadOnly);
+    }
+}
+
+#[test]
 fn every_declared_domain_can_settle() {
     use crate::{ActionSurface, RemovalRevision, SessionMode, SessionSelection, SessionTarget};
     let revision = RemovalRevision {
@@ -296,10 +351,6 @@ fn every_declared_domain_can_settle() {
         live: false,
     };
     let actions = vec![
-        UiAction::ManagedSignIn {
-            provider: "gh".into(),
-            then: None,
-        },
         UiAction::HardRefresh,
         UiAction::SetAttentionSeen { at_ms: 1 },
         UiAction::ToggleAutomations {
@@ -406,21 +457,10 @@ fn every_declared_domain_can_settle() {
             key: "a".into(),
             issue_id: None,
         },
-        UiAction::Session {
-            key: Some("a".into()),
-            target: SessionTarget::Harness,
-        },
-        UiAction::SelectSession {
-            selection: selection.clone(),
-        },
         UiAction::KillSession {
             selection: selection.clone(),
         },
         UiAction::StopSession { selection },
-        UiAction::EnterHarness {
-            key: "a".into(),
-            harness: wt_core::HarnessId::Claude,
-        },
         UiAction::StopTerminal {
             key: "a".into(),
             target: SessionTarget::Shell,

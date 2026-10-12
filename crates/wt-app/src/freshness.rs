@@ -57,8 +57,11 @@ pub fn start(
         }
         let observed_git = git.clone();
         let observed_metadata = metadata.clone();
-        let state_db = config.paths.state_db.clone();
-        let checkout_roots = [config.paths.main_clone.clone(), config.paths.worktree_root.clone()];
+        let state_db = canonical_watch_path(&config.paths.state_db).await;
+        let checkout_roots = [
+            canonical_watch_path(&config.paths.main_clone).await,
+            canonical_watch_path(&config.paths.worktree_root).await,
+        ];
         let callback_roots = edit_roots.clone();
         let callback_pending = pending_edits.clone();
         let callback_changed = edit_changed.clone();
@@ -309,7 +312,24 @@ async fn desired_paths(
             }
         }
     }
-    Ok(paths)
+    // FSEvents reports the spelling supplied to its stream, while notify's
+    // event filter compares canonical paths. Mixed /var and /private/var
+    // registrations can therefore silently discard all notifications.
+    let mut canonical = BTreeMap::new();
+    for (path, recursive) in paths {
+        let path = canonical_watch_path(&path).await;
+        canonical
+            .entry(path)
+            .and_modify(|value| *value |= recursive)
+            .or_insert(recursive);
+    }
+    Ok(canonical)
+}
+
+async fn canonical_watch_path(path: &Path) -> PathBuf {
+    tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_owned())
 }
 
 fn update_watches(
@@ -522,6 +542,20 @@ mod tests {
         let fixture = crate::commands::test_support::CommandFixture::new()
             .await
             .unwrap();
+        let paths = desired_paths(
+            &fixture.ctx.config,
+            &fixture.ctx.repository,
+            &fixture.ctx.cancellation,
+        )
+        .await
+        .unwrap();
+        for path in paths.keys() {
+            assert_eq!(
+                path,
+                &tokio::fs::canonicalize(path).await.unwrap(),
+                "watch registration must use the same canonical spelling as notify's event filter"
+            );
+        }
         let scope = TaskScope::new();
         let sources = crate::local_source::start(&scope, &fixture.ctx);
         let worktree = tokio::fs::canonicalize(fixture.ctx.config.paths.worktree_root.join("one"))
@@ -575,9 +609,9 @@ mod tests {
         .expect("Git source should stay open")
         .revision();
 
-        tokio::fs::write(&tracked_file, "second external edit\n")
-            .await
-            .unwrap();
+        // Require a different observable state, not merely another revision
+        // from an in-flight follow-up scan of the first edit.
+        tokio::fs::write(&tracked_file, "base\n").await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
             git_updates.wait_for(|snapshot| {
@@ -585,7 +619,7 @@ mod tests {
                     && snapshot.data().is_some_and(|rows| {
                         rows.iter().any(|row| {
                             row.worktree.target.path == worktree
-                                && row.status.as_ref().is_some_and(|status| status.dirty)
+                                && row.status.as_ref().is_some_and(|status| !status.dirty)
                         })
                     })
             }),

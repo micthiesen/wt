@@ -38,10 +38,14 @@ pub(crate) struct Panes {
 /// details pane gets the space on wide terminals. Below 60 columns the panes
 /// stack vertically instead of squeezing both.
 pub(crate) fn panes(area: Rect, full_width_activity: bool) -> Panes {
+    panes_with_footer(area, full_width_activity, 1)
+}
+
+fn panes_with_footer(area: Rect, full_width_activity: bool, footer_height: u16) -> Panes {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(footer_height),
     ])
     .areas(area);
     if area.width < 60 {
@@ -104,7 +108,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
         );
         return;
     }
-    let panes = panes(area, model.board.full_width_activity);
+    // A restored input must not cover the failure that explains why it returned.
+    let error = prompt_error(model);
+    let error_height = error.map_or(0, |message| {
+        text::wrap(
+            &format!("{} {message}", glyphs::CHECK_FAIL),
+            area.width.saturating_sub(2) as usize,
+        )
+        .len()
+        .min(3)
+        .min(area.height.saturating_sub(5) as usize) as u16
+    });
+    let panes = panes_with_footer(area, model.board.full_width_activity, 1 + error_height);
     header(frame, model, panes.header);
     if model.history.active {
         crate::history::render(frame, model, panes.list, panes.details);
@@ -241,11 +256,44 @@ fn usage_spans(model: &Model, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
-/// The legend (or a toast, or an active text prompt) on the left; on the
-/// right, the special-session slots tinted by their live state.
+/// Keep a failed reply visible while its retry input is open.
+fn prompt_error(model: &Model) -> Option<&str> {
+    if !matches!(model.interaction, Interaction::Text(_)) || model.title_prompt.is_some() {
+        return None;
+    }
+    model.toast.as_ref().and_then(|(message, tone)| {
+        (*tone == crate::model::ToastTone::Failed && !message.trim().is_empty())
+            .then_some(message.as_str())
+    })
+}
+
+/// The legend, toast or input, plus a failure above a restored prompt.
 fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
     let base = Style::new().bg(theme::BG_ALT);
     frame.render_widget(Block::new().style(base), area);
+    let area = if let Some(error) = prompt_error(model).filter(|_| area.height > 1) {
+        let [error_area, input_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(
+                text::wrap(
+                    &format!("{} {error}", glyphs::CHECK_FAIL),
+                    area.width.saturating_sub(2) as usize,
+                )
+                .join("\n"),
+            )
+            .style(base.fg(theme::ERR)),
+            Rect::new(
+                error_area.x + 1,
+                error_area.y,
+                error_area.width.saturating_sub(2),
+                error_area.height,
+            ),
+        );
+        input_area
+    } else {
+        area
+    };
     let prompt = match (&model.interaction, &model.title_prompt) {
         (_, Some(title)) => Some(("title:".to_owned(), &title.editor)),
         (Interaction::Text(prompt), None) => {
@@ -708,5 +756,32 @@ mod tests {
             .map(|x| buffer[(x, 29)].symbol())
             .collect::<String>();
         assert!(footer.contains("? help · t title"), "{footer}");
+    }
+
+    #[test]
+    fn failed_create_shows_error_and_editable_name_together() {
+        let mut model = Model::default();
+        model.reply(crate::UiReply {
+            failed: true,
+            message: "MaxBook worker is not connected; no command was sent".into(),
+            modal: Some(crate::UiModal::Text {
+                action: crate::TextAction::Create,
+                prompt: "New worktree name: ".into(),
+                initial: "remote-task".into(),
+                allow_empty: false,
+            }),
+            ..Default::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut model)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let line = |y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(line(28).contains("MaxBook worker is not connected; no command was sent"));
+        assert!(line(29).contains("remote-task"));
+        assert_eq!(buffer[(1, 28)].fg, theme::ERR);
     }
 }

@@ -8,6 +8,12 @@ symlink or rulesync topology your dotfiles use. The point is that you never
 hand-maintain wt-related agent config: bundled updates ship in the native
 release and are offered on the next launch.
 
+Managed SSH workers also mirror the controller's Codex and shared skills,
+including bundled executable dependencies. Mirrors allow 64 MiB per file and
+128 MiB per tree. Unreadable, oversized, or excessively nested trees produce
+a notice and keep the previous complete worker mirror; they are not published
+with individual dependencies missing. See [managed remotes](remote.md#managed-remotes).
+
 The native Rust binary embeds these files at compile time and does not need a
 source checkout at runtime. `wt skills` tracks installed hashes and saved
 template answers in `~/.cache/wt/skills.json`.

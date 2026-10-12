@@ -24,8 +24,8 @@ use crate::context::AppContext;
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_TREE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_TREE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TREE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_TREE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REPO_FILE_BYTES: u64 = 1024 * 1024;
 const TREE_DEPTH: usize = 12;
 
@@ -375,6 +375,11 @@ pub(crate) fn worker_config_from(raw: toml::Value) -> Result<String> {
         toml::Value::String(format!("{ROOT_PLACEHOLDER}/worktrees")),
     );
     table.insert("paths".into(), toml::Value::Table(paths));
+    // Managed workers promise Git as their only repository dependency. Rift
+    // belongs to the controller's storage setup and may not exist remotely.
+    let mut backend = toml::Table::new();
+    backend.insert("kind".into(), toml::Value::String("git-worktree".into()));
+    table.insert("backend".into(), toml::Value::Table(backend));
     let mut skills = toml::Table::new();
     skills.insert("startup_check".into(), toml::Value::Boolean(false));
     table.insert("skills".into(), toml::Value::Table(skills));
@@ -579,7 +584,7 @@ pub(crate) fn https_clone_url(origin: &str) -> Option<String> {
 
 /// Gather files from several directories into one mirror, later directories
 /// replacing earlier ones file by file. Symlinks are followed with a depth
-/// bound; an oversized file is skipped with a warning. `None` means the tree
+/// bound; an oversized file leaves the previous mirror intact. `None` means the tree
 /// could not be read completely and must not replace the worker's copy.
 fn collect_tree(sources: &[PathBuf], warnings: &mut Vec<String>) -> Option<Vec<ManagedFile>> {
     let mut files: BTreeMap<String, ManagedFile> = BTreeMap::new();
@@ -625,20 +630,27 @@ fn collect_tree(sources: &[PathBuf], warnings: &mut Vec<String>) -> Option<Vec<M
                 } else {
                     format!("{prefix}/{name}")
                 };
-                let Ok(metadata) = std::fs::metadata(&path) else {
-                    continue;
+                let metadata = match std::fs::metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        warnings.push(format!("Did not mirror {} to managed workers: {error}; keeping the previous complete tree", path.display()));
+                        return None;
+                    }
                 };
                 if metadata.is_dir() {
                     if depth < TREE_DEPTH {
                         pending.push((path, relative, depth + 1));
+                    } else {
+                        warnings.push(format!("Did not mirror {} to managed workers: directory nesting exceeds {TREE_DEPTH}; keeping the previous complete tree", path.display()));
+                        return None;
                     }
                 } else if metadata.is_file() {
                     if metadata.len() > MAX_TREE_FILE_BYTES {
                         warnings.push(format!(
-                            "Skipped {} on managed workers: larger than 8 MiB",
+                            "Did not mirror {} to managed workers: a file exceeds the 64 MiB limit; keeping the previous complete tree",
                             path.display()
                         ));
-                        continue;
+                        return None;
                     }
                     let Ok(content) = std::fs::read(&path) else {
                         warnings.push(format!(
@@ -662,22 +674,14 @@ fn collect_tree(sources: &[PathBuf], warnings: &mut Vec<String>) -> Option<Vec<M
                         total = total.saturating_sub(previous.content.len() as u64);
                     }
                     total += content.len() as u64;
+                    if total > MAX_TREE_BYTES {
+                        warnings.push("Did not mirror skills or rules to managed workers: the tree exceeds the 128 MiB limit; keeping the previous complete tree".into());
+                        return None;
+                    }
                     files.insert(relative.clone(), file(&relative, content, mode));
                 }
             }
         }
-    }
-    if total > MAX_TREE_BYTES {
-        warnings.push(format!(
-            "Did not mirror {} to managed workers: {} MiB exceeds the 32 MiB limit",
-            sources
-                .iter()
-                .map(|source| source.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" and "),
-            total / (1024 * 1024)
-        ));
-        return None;
     }
     Some(files.into_values().collect())
 }
@@ -838,6 +842,8 @@ reviewers = false
 port = 9000
 [harness]
 primary = "codex"
+[backend]
+kind = "rift"
 [lifecycle]
 env_files_to_copy = [".env"]
 "#,
@@ -845,6 +851,7 @@ env_files_to_copy = [".env"]
         .unwrap();
         let generated: toml::Table = toml::from_str(&worker_config_from(raw).unwrap()).unwrap();
         assert_eq!(generated["instance"]["role"].as_str(), Some("worker"));
+        assert_eq!(generated["backend"]["kind"].as_str(), Some("git-worktree"));
         assert_eq!(
             generated["paths"]["main_clone"].as_str(),
             Some("@@WT_MANAGED_ROOT@@/repo")
@@ -977,5 +984,47 @@ env_files_to_copy = [".env"]
         assert_eq!(warnings.len(), 1);
         let missing = collect_tree(&[temp.path().join("absent")], &mut warnings);
         assert_eq!(missing, Some(Vec::new()));
+    }
+
+    #[test]
+    fn skill_dependencies_larger_than_eight_mib_are_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tsc");
+        let content = vec![b'x'; 24 * 1024 * 1024];
+        std::fs::write(&path, &content).unwrap();
+        let mut warnings = Vec::new();
+        let files = collect_tree(&[temp.path().to_owned()], &mut warnings).unwrap();
+        assert_eq!(files[0].content, content);
+        assert!(warnings.is_empty());
+        std::fs::File::create(path)
+            .unwrap()
+            .set_len(MAX_TREE_FILE_BYTES + 1)
+            .unwrap();
+        assert!(collect_tree(&[temp.path().to_owned()], &mut warnings).is_none());
+        assert!(warnings[0].contains("keeping the previous complete tree"));
+    }
+
+    #[test]
+    fn aggregate_limit_preserves_the_previous_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::File::create(temp.path().join(name))
+                .unwrap()
+                .set_len(MAX_TREE_FILE_BYTES)
+                .unwrap();
+        }
+        let mut warnings = Vec::new();
+        assert!(collect_tree(&[temp.path().to_owned()], &mut warnings).is_none());
+        assert!(warnings[0].contains("128 MiB"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_skill_links_do_not_replace_a_complete_mirror() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing", temp.path().join("dependency")).unwrap();
+        let mut warnings = Vec::new();
+        assert!(collect_tree(&[temp.path().to_owned()], &mut warnings).is_none());
+        assert!(warnings[0].contains("keeping the previous complete tree"));
     }
 }

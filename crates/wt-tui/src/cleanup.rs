@@ -4,7 +4,10 @@ use crate::{Board, BoardRow, CleanupTarget, ConfirmAction, UiModal};
 pub(crate) fn menu(board: &Board) -> UiModal {
     let mut targets = Vec::new();
     let mut lines = vec!["From background results. Removal checks current state again.".into()];
+    let mut kept = Vec::new();
+    let mut removed = Vec::new();
     for (host, error) in &board.host_errors {
+        let host = host_label(board, host);
         lines.push(format!("{host}: unavailable: {error}"));
     }
     for row in &board.rows {
@@ -13,7 +16,7 @@ pub(crate) fn menu(board: &Board) -> UiModal {
             continue;
         }
         let label = match &row.host {
-            Some(host) => format!("{host}: "),
+            Some(host) => format!("{}: ", host_label(board, host)),
             None => String::new(),
         };
         let name = if row.slug.is_empty() {
@@ -31,9 +34,9 @@ pub(crate) fn menu(board: &Board) -> UiModal {
             keep_reason(row)
         };
         if let Some(reason) = reason {
-            lines.push(format!("{label}Keep {name}: {reason}"));
+            kept.push(format!("{label}Keep {name}: {reason}"));
         } else {
-            lines.push(format!("{label}Remove {name}"));
+            removed.push(format!("{label}Remove {name}"));
             targets.push(CleanupTarget {
                 key: row.key.clone(),
                 path: row.path.clone(),
@@ -41,6 +44,16 @@ pub(crate) fn menu(board: &Board) -> UiModal {
                 head: row.git.head_sha.clone().expect("candidate HEAD is known"),
             });
         }
+    }
+    if !removed.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Ready to remove · {}", removed.len()));
+        lines.extend(removed);
+    }
+    if !kept.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Keeping · {}", kept.len()));
+        lines.extend(kept);
     }
     if targets.is_empty() {
         lines.insert(0, "Nothing safe to clean in the background results.".into());
@@ -61,6 +74,14 @@ pub(crate) fn menu(board: &Board) -> UiModal {
         action: ConfirmAction::CleanupTargets { targets },
         cancel_key: Some('c'),
     }
+}
+
+fn host_label<'a>(board: &'a Board, host: &'a str) -> &'a str {
+    board
+        .hosts
+        .iter()
+        .find(|choice| choice.id.as_deref() == Some(host))
+        .map_or(host, |choice| choice.label.as_str())
 }
 
 fn keep_reason(row: &BoardRow) -> Option<&'static str> {
@@ -184,5 +205,34 @@ mod tests {
         };
         assert!(lines.contains(&"builder: unavailable: Permission denied".into()));
         assert!(lines.contains(&"builder: Keep one: host is unavailable".into()));
+    }
+
+    #[test]
+    fn managed_host_labels_never_replace_cleanup_target_identity() {
+        let host =
+            "michael@10.10.1.90 [config: ~/.local/share/wt/managed/code-cozee-dev/config.toml]";
+        let mut row = landed("done");
+        row.host = Some(host.into());
+        row.key = wt_core::remote_worktree_ledger_key(host, "done");
+        let key = row.key.clone();
+        let board = Board {
+            hosts: vec![crate::HostChoice {
+                id: Some(host.into()),
+                label: "MaxBook".into(),
+            }],
+            rows: vec![row],
+            ..Default::default()
+        };
+        let UiModal::Confirm {
+            lines,
+            action: ConfirmAction::CleanupTargets { targets },
+            ..
+        } = menu(&board)
+        else {
+            panic!("candidate expected")
+        };
+        assert!(lines.contains(&"MaxBook: Remove done".into()));
+        assert!(lines.iter().all(|line| !line.contains("config.toml")));
+        assert_eq!(targets[0].key, key);
     }
 }

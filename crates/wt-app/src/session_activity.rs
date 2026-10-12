@@ -45,21 +45,58 @@ const MAX_DELTA_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_LINES_PER_SESSION: usize = 1_000;
 const MAX_EVENT_LINES: usize = 500;
 
+type RolloutFingerprint = Option<(u64, std::time::SystemTime)>;
+
 /// Coalesced notifications for the exact active Codex rollout files. Watching
 /// their parent directories avoids recursive session-tree watches; the event
-/// handler filters back to retained UUID paths. The 2.5s source timer remains
-/// a recovery path for dropped or unsupported notifications.
+/// handler filters back to retained UUID paths. A metadata-only 500ms backstop
+/// catches dropped notifications without rereading unchanged transcripts.
 struct CodexOutputWatch {
     watcher: Option<RecommendedWatcher>,
     watched_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
     directories: BTreeSet<PathBuf>,
     updates: mpsc::Receiver<()>,
+    fingerprints: Arc<RwLock<BTreeMap<PathBuf, RolloutFingerprint>>>,
+    fallback: tokio::task::JoinHandle<()>,
 }
 
 impl CodexOutputWatch {
     fn new() -> Self {
         let (sender, updates) = mpsc::channel(1);
         let watched_paths = Arc::new(RwLock::new(BTreeSet::new()));
+        let fingerprints = Arc::new(RwLock::new(BTreeMap::<PathBuf, RolloutFingerprint>::new()));
+        let polled = fingerprints.clone();
+        let fallback_sender = sender.clone();
+        let fallback = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_millis(500));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                if polled.read().is_ok_and(|paths| paths.is_empty()) {
+                    continue;
+                }
+                let polled = polled.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    let Ok(mut paths) = polled.write() else {
+                        return false;
+                    };
+                    let mut changed = false;
+                    for (path, previous) in paths.iter_mut() {
+                        let current = rollout_fingerprint(path);
+                        if current != *previous {
+                            *previous = current;
+                            changed = true;
+                        }
+                    }
+                    changed
+                })
+                .await
+                .unwrap_or(false);
+                if changed {
+                    let _ = fallback_sender.try_send(());
+                }
+            }
+        });
         let watcher =
             notify::recommended_watcher(Self::event_handler(Arc::clone(&watched_paths), sender));
         let watcher = match watcher {
@@ -74,6 +111,8 @@ impl CodexOutputWatch {
             watched_paths,
             directories: BTreeSet::new(),
             updates,
+            fingerprints,
+            fallback,
         }
     }
 
@@ -107,10 +146,29 @@ impl CodexOutputWatch {
         }
     }
 
-    fn sync(&mut self, paths: impl Iterator<Item = PathBuf>) {
-        let paths = paths
-            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-            .collect::<BTreeSet<_>>();
+    async fn sync(&mut self, paths: impl Iterator<Item = PathBuf>) {
+        let paths = paths.collect::<Vec<_>>();
+        let seeded = tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let path = std::fs::canonicalize(&path).unwrap_or(path);
+                    let stamp = rollout_fingerprint(&path);
+                    (path, stamp)
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await
+        .unwrap_or_default();
+        let paths = seeded.keys().cloned().collect::<BTreeSet<_>>();
+        // Seed before returning so an immediate append cannot become the first
+        // polling baseline. Never read transcript contents for this backstop.
+        if let Ok(mut fingerprints) = self.fingerprints.write() {
+            fingerprints.retain(|path, _| paths.contains(path));
+            for (path, stamp) in seeded {
+                fingerprints.entry(path).or_insert(stamp);
+            }
+        }
         let next_directories = paths
             .iter()
             .filter_map(|path| path.parent().map(Path::to_path_buf))
@@ -130,6 +188,17 @@ impl CodexOutputWatch {
             *watched = paths;
         }
     }
+}
+
+impl Drop for CodexOutputWatch {
+    fn drop(&mut self) {
+        self.fallback.abort();
+    }
+}
+
+fn rollout_fingerprint(path: &Path) -> RolloutFingerprint {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,7 +433,7 @@ pub fn start(
                 errors.extend(output_errors);
                 (changed, discovery_changed, errors)
             };
-            codex_watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf));
+            codex_watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf)).await;
             if discovery_changed {
                 for entry in &active {
                     commands.discover(entry.key.slug.clone(), entry.key.harness);
@@ -1107,7 +1176,11 @@ mod tests {
         );
 
         let mut watch = CodexOutputWatch::new();
-        watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf));
+        // Prove the metadata backstop independently of OS event delivery.
+        watch.watcher = None;
+        watch
+            .sync(cursors.codex_output.watched_paths().map(Path::to_path_buf))
+            .await;
         let appended = serde_json::json!({
             "type": "event_msg", "timestamp": "2026-10-09T00:00:02Z",
             "payload": { "type": "agent_message", "message": "notify_append_visible" }

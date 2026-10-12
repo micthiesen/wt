@@ -48,6 +48,7 @@ accounts keep working there unchanged.
 | wt | The build-matched runtime, linked at `bin/wt` so agents can call `wt` by name. |
 | Worker config | Generated from the controller's merged config with worker paths; remotes, the update channel, the webhook daemon, and the tmux socket are left out. |
 | Repository | `repo/` is cloned over HTTPS from the controller's `origin`; SSH GitHub URLs are rewritten to HTTPS. A partial clone never looks complete. |
+| Worktrees | Managed workers use Git's built-in worktree backend, independent of the controller's Rift installation. |
 | Project files | Untracked files listed in `lifecycle.env_files_to_copy` and `copy_globs` (for example `.env`) are copied from the controller's main clone. Files tracked on either side, and paths through a symlink, are never written. |
 | Git | `gitconfig` copies the controller's global settings except credentials, signing, includes, URL rewrites, HTTP and email settings, and paths to controller programs (editor, hooks, askpass, templates). A credential helper answers `github.com` HTTPS requests from the managed token. |
 | GitHub | `gh auth token` from the controller's main clone, written for both git and `gh` (`gh/hosts.yml`). |
@@ -67,6 +68,10 @@ connection.
 A worker that reconnects within ten minutes of its last provisioning reuses
 it; later reconnects provision again, so a rotated token or an edited setting
 reaches the worker without a restart.
+
+Skill and rule mirrors include files up to 64 MiB and total trees up to
+128 MiB, including bundled executable dependencies. If a limit is exceeded,
+wt reports it and preserves the previous complete mirror.
 
 ```toml
 [managed.env]
@@ -105,6 +110,11 @@ appear in the attention feed and as a note in the `Ctrl+N` host picker.
 machine and every remote, and `n` starts on the host chosen last. A stacked
 create (`N`) stays on its parent's host. Rows from every host share one board;
 the host label on each row is the only difference.
+
+A request submitted while its host is connecting keeps its pending state and
+shows connection progress for up to 90 seconds. Required sign-ins interrupt
+that wait immediately. If connection fails, the error and original create
+input stay visible together; no command that was sent is automatically retried.
 
 ### Current limits
 

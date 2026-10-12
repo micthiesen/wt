@@ -165,15 +165,8 @@ fn color_to_hex(value: &str) -> Option<String> {
 /// there was no trustworthy observation. When active, source the user's
 /// ordinary tmux config first so adding palette styles does not hide it.
 pub fn write_terminal_palette_config(cache_root: &Path, home: &Path) -> io::Result<PathBuf> {
-    let palette_path = cache_root.join("terminal-palette.json");
     fs::create_dir_all(cache_root)?;
-    let styles = fs::metadata(&palette_path)
-        .ok()
-        .filter(|metadata| metadata.is_file() && metadata.len() <= 64 * 1024)
-        .and_then(|_| fs::read(&palette_path).ok())
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .map(|value| terminal_palette_config(&value))
-        .unwrap_or_default();
+    let styles = cached_palette_styles(cache_root);
     let target = cache_root.join("tmux-palette.conf");
     let sequence = PALETTE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = cache_root.join(format!(
@@ -186,6 +179,61 @@ pub fn write_terminal_palette_config(cache_root: &Path, home: &Path) -> io::Resu
         "source-file -q {}\n{styles}",
         tmux_config_quote(&user_config.to_string_lossy())
     );
+    let result = fs::write(&temporary, content).and_then(|()| fs::rename(&temporary, &target));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(target)
+}
+
+fn cached_palette_styles(cache_root: &Path) -> String {
+    let palette_path = cache_root.join("terminal-palette.json");
+    fs::metadata(&palette_path)
+        .ok()
+        .filter(|metadata| metadata.is_file() && metadata.len() <= 64 * 1024)
+        .and_then(|_| fs::read(&palette_path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|value| terminal_palette_config(&value))
+        .unwrap_or_default()
+}
+
+/// Defaults for wt's private server, including workers with no user tmux config.
+pub const DEFAULT_TERMINAL_CONFIG: &str = r#"set -g status off
+set -g alternate-screen on
+set -g set-titles off
+set -s escape-time 0
+set -g mouse on
+set -g focus-events on
+set -g default-terminal tmux-256color
+set -s set-clipboard on
+set -g allow-passthrough on
+set -s extended-keys always
+set -sq extended-keys-format csi-u
+set -s terminal-features 'xterm*:RGB:sync:extkeys:hyperlinks,tmux*:RGB:sync:extkeys:hyperlinks,alacritty*:RGB:sync:extkeys:hyperlinks'
+"#;
+
+/// Generate the complete private-server configuration separately from the
+/// palette file, which is refreshed independently as terminals report colors.
+pub fn write_terminal_config(
+    cache_root: &Path,
+    home: &Path,
+    preamble: Option<&str>,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(cache_root)?;
+    let styles = cached_palette_styles(cache_root);
+    let content = format!(
+        "source-file -q {}\n{}\n{}\nbind-key -n F10 detach-client\nbind-key -n F11 detach-client\nbind-key -n F12 detach-client\n",
+        tmux_config_quote(&home.join(".tmux.conf").to_string_lossy()),
+        preamble.unwrap_or(DEFAULT_TERMINAL_CONFIG),
+        styles,
+    );
+    let target = cache_root.join("tmux-session.conf");
+    let temporary = cache_root.join(format!(
+        "tmux-session.{}.{}.tmp",
+        std::process::id(),
+        PALETTE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let result = fs::write(&temporary, content).and_then(|()| fs::rename(&temporary, &target));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -565,6 +613,13 @@ impl TmuxClient {
 
     pub fn attach_session_args(&self, session: &str) -> Vec<OsString> {
         let mut args = self.prefix_args();
+        if let Some(config) = &self.server.config_file {
+            args.extend([
+                "source-file".into(),
+                config.as_os_str().to_owned(),
+                ";".into(),
+            ]);
+        }
         args.extend([
             "attach-session".into(),
             "-t".into(),

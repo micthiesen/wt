@@ -143,7 +143,7 @@ Pick it with `WT_CONFIG=/path/to/config.toml` (or let a repo `.wt.toml` supply t
 | key | required | default | meaning |
 |---|---|---|---|
 | `socket` | no | repository with a `.wt.toml`: `"wt-<repo-id>"`; otherwise `"wt"` | Socket name (`tmux -L <socket>`) for the wt-private tmux server that hosts every agent, shell, diff, dev-server and action session. `WT_TMUX_SOCKET` wins when set. |
-| `terminal_config` | no | built-in terminal preamble | Literal tmux configuration replacing the entire terminal preamble, including mouse, clipboard, hyperlinks, terminal features, extended keys, alternate-screen, status and title settings. Omit to follow wt defaults; set to a TOML multiline literal string to pin or customize every terminal setting. An empty string deliberately removes the preamble. wt still appends the observed terminal palette and F10/F11/F12 navigation bindings. Applies when the server starts or an interactive attach reloads its config; terminal capability changes can require detaching and reattaching. |
+| `terminal_config` | no | built-in terminal preamble | Literal tmux configuration replacing the entire terminal preamble, including mouse, clipboard, hyperlinks, terminal features, extended keys, alternate-screen, status and title settings. Omit to follow wt defaults; set to a TOML multiline literal string to pin or customize every terminal setting. An empty string deliberately removes the preamble. wt still appends the observed terminal palette and F10/F11/F12 bindings that detach to the wt board. Applies when the server starts or an interactive attach reloads its config; terminal capability changes can require detaching and reattaching. |
 
 ## Codex terminal settings
 
@@ -274,6 +274,8 @@ A managed remote needs no worker config, clone, or wt install. The controller
 derives its directory, `~/.local/share/wt/managed/<repo-id>/`, from this
 repository's identity and rewrites it on each connection. Sign-ins the worker
 still needs are requested in the TUI when a request first needs them.
+Managed workers use `git-worktree` storage even when the controller uses Rift,
+so the worker does not require a separate Rift installation.
 
 ```toml
 [[remotes]]

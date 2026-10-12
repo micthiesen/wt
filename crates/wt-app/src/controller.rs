@@ -319,7 +319,10 @@ pub(crate) async fn handoff_prepared(
             _ = shutdown.cancelled() => { child.kill().await?; return Ok(()); },
             status = child.wait() => status?,
         };
-        if !status.success() {
+        // The previous wt tmux bindings detach with 110/111/112 for the
+        // shell/diff/harness keys. Existing agent servers retain those bindings
+        // across application upgrades; returning to the board is not a failure.
+        if !status.success() && !matches!(status.code(), Some(110..=112)) {
             bail!("tmux client exited with {status}");
         }
         Ok(())

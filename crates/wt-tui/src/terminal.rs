@@ -396,7 +396,7 @@ async fn run_inner<'a>(
                 if let Some(deadline) = toast_until { tokio::time::sleep_until(deadline).await; }
                 else { std::future::pending::<()>().await; }
             } => {
-                model.toast = None;
+                model.expire_toast();
                 toast_until = None;
                 dirty = true;
             }

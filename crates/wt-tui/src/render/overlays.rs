@@ -930,6 +930,12 @@ fn confirm_line_kind(line: &str) -> (Option<(&'static str, Color)>, Style) {
 /// Wrapped confirmation body: one entry of styled visual rows per logical
 /// line. The first line names the subject, so it is bright.
 fn confirm_rows(confirm: &ConfirmPrompt, width: usize) -> Vec<Vec<Line<'static>>> {
+    if matches!(
+        confirm.action,
+        ConfirmAction::CleanupTargets { .. } | ConfirmAction::Cleanup { .. }
+    ) {
+        return cleanup_rows(&confirm.lines, width);
+    }
     confirm
         .lines
         .iter()
@@ -955,6 +961,92 @@ fn confirm_rows(confirm: &ConfirmPrompt, width: usize) -> Vec<Vec<Line<'static>>
                     Line::from(vec![lead, Span::styled(text, style)])
                 })
                 .collect()
+        })
+        .collect()
+}
+
+/// Keep the decision and its reason together, with continuation lines below
+/// the subject rather than spilling back into the glyph/decision columns.
+fn cleanup_rows(lines: &[String], width: usize) -> Vec<Vec<Line<'static>>> {
+    lines
+        .iter()
+        .map(|line| {
+            let (host, body) = if line.starts_with("Keep ") || line.starts_with("Remove ") {
+                (None, line.as_str())
+            } else {
+                line.split_once(": Keep ")
+                    .or_else(|| line.split_once(": Remove "))
+                    .map(|(host, _)| (host, &line[host.len() + 2..]))
+                    .or_else(|| line.split_once(": "))
+                    .map_or((None, line.as_str()), |(host, body)| (Some(host), body))
+            };
+            let decision = body
+                .strip_prefix("Keep ")
+                .map(|text| (false, text))
+                .or_else(|| body.strip_prefix("Remove ").map(|text| (true, text)));
+            if let Some((remove, subject)) = decision {
+                let (name, reason) = if remove {
+                    (subject, None)
+                } else {
+                    subject
+                        .split_once(": ")
+                        .map_or((subject, None), |(name, reason)| (name, Some(reason)))
+                };
+                let label = host.map_or_else(|| name.to_owned(), |host| format!("{name} · {host}"));
+                let color = if remove { theme::OK } else { theme::FG_DIM };
+                let glyph = if remove { glyphs::TRASH } else { glyphs::SLASH };
+                let mut rows: Vec<_> = wrap(&label, width.saturating_sub(4).max(1))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        Line::from(vec![
+                            Span::styled(
+                                if index == 0 {
+                                    format!("{glyph}  ")
+                                } else {
+                                    "   ".into()
+                                },
+                                theme::fg(color),
+                            ),
+                            Span::styled(
+                                text,
+                                if remove {
+                                    theme::bold(theme::FG_BRIGHT)
+                                } else {
+                                    theme::dim()
+                                },
+                            ),
+                        ])
+                    })
+                    .collect();
+                if let Some(reason) = reason {
+                    rows.extend(
+                        wrap(reason, width.saturating_sub(6).max(1))
+                            .into_iter()
+                            .map(|text| {
+                                Line::from(vec![
+                                    Span::raw("     "),
+                                    Span::styled(text, theme::dim()),
+                                ])
+                            }),
+                    );
+                }
+                rows
+            } else {
+                let style = if line.starts_with("Ready to remove") {
+                    theme::bold(theme::OK)
+                } else if line.starts_with("Keeping") {
+                    theme::bold(theme::FG_MID)
+                } else if line.contains("unavailable:") {
+                    theme::fg(theme::WARN)
+                } else {
+                    theme::dim()
+                };
+                wrap(line, width.saturating_sub(1).max(1))
+                    .into_iter()
+                    .map(|text| Line::styled(text, style))
+                    .collect()
+            }
         })
         .collect()
 }
@@ -1045,6 +1137,10 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
 // ── Logs and performance ────────────────────────────────────────────────
 
 fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll: &mut usize) {
+    if title == "Clean worktrees" {
+        cleanup_log(frame, area, title, lines, scroll);
+        return;
+    }
     let modal = Modal::new(
         title,
         vec![
@@ -1083,6 +1179,45 @@ fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll:
         modal.border,
         lines.len(),
         *scroll,
+        body.height as usize,
+    );
+}
+
+fn cleanup_log(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    scroll: &mut usize,
+) {
+    let modal = Modal::new(
+        title,
+        vec![
+            hint("j/k", "scroll"),
+            hint("g/G", "top / bottom"),
+            hint("c / esc / q", "close"),
+        ],
+    );
+    let width = modal.place(area, 76, 1, false).width.saturating_sub(4) as usize;
+    let total: usize = cleanup_rows(lines, width).iter().map(Vec::len).sum();
+    let outer = modal.place(area, 76, total, false);
+    let body = modal.draw(frame, area, outer);
+    let rows = cleanup_rows(lines, body.width as usize);
+    *scroll = (*scroll).min(rows.len().saturating_sub(1));
+    let skipped: usize = rows[..*scroll].iter().map(Vec::len).sum();
+    let rendered: Vec<_> = rows
+        .into_iter()
+        .skip(*scroll)
+        .flatten()
+        .take(body.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(rendered), body);
+    scrollbar(
+        frame,
+        outer,
+        modal.border,
+        total,
+        skipped,
         body.height as usize,
     );
 }
@@ -2173,22 +2308,21 @@ fn help_lines(
             let column = (width - 3) / 2;
             let per = block.items.len().div_ceil(2);
             for row in 0..per {
-                let mut spans = Vec::new();
-                for (side, item) in [block.items.get(row), block.items.get(row + per)]
-                    .into_iter()
-                    .enumerate()
-                {
-                    let Some(item) = item else { continue };
-                    if side == 1 {
-                        spans.push(Span::raw("   "));
+                let cells = [block.items.get(row), block.items.get(row + per)].map(|item| {
+                    item.map(|item| help_item_lines(item, column, key_width, query))
+                        .unwrap_or_default()
+                });
+                for continuation in 0..cells.iter().map(Vec::len).max().unwrap_or(0) {
+                    let mut spans = Vec::new();
+                    for (side, cell) in cells.iter().enumerate() {
+                        if side == 1 {
+                            spans.push(Span::raw("   "));
+                        }
+                        let cell = cell.get(continuation).cloned().unwrap_or_default();
+                        spans.extend(fit_spans(cell.spans, column, Style::new()));
                     }
-                    let cell = help_item_lines(item, column, key_width, query)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default();
-                    spans.extend(fit_spans(cell.spans, column, Style::new()));
+                    lines.push(Line::from(spans));
                 }
-                lines.push(Line::from(spans));
             }
         } else {
             for item in &block.items {
@@ -2411,6 +2545,86 @@ mod tests {
             theme::FG_BRIGHT,
             "subject line is bright"
         );
+    }
+
+    #[test]
+    fn cleanup_log_keeps_muted_reasons_visible_and_indented() {
+        let mut model = Model {
+            interaction: Interaction::Log {
+                title: "Clean worktrees".into(),
+                lines: vec![
+                    "Nothing safe to clean in the background results.".into(),
+                    String::new(),
+                    "Keeping · 1".into(),
+                    "MaxBook: Keep auth-proxy: post-merge verification still owed before cleanup"
+                        .into(),
+                ],
+                scroll: 0,
+            },
+            ..Model::default()
+        };
+        let buffer = draw(&mut model, 44, 24);
+        let screen = rows(&buffer).join("\n");
+        let (x, y) = find(&buffer, "auth-proxy · MaxBook").expect(&screen);
+        assert_eq!(buffer[(x, y)].fg, theme::FG_DIM);
+        let (reason_x, reason_y) = find(&buffer, "post-merge verification").expect(&screen);
+        find(&buffer, "before cleanup").expect(&screen);
+        assert_ne!(buffer[(reason_x, reason_y + 1)].symbol(), " ");
+        assert_eq!(buffer[(reason_x - 1, reason_y + 1)].symbol(), " ");
+        assert!(reason_x > x);
+        assert_eq!(buffer[(reason_x, reason_y)].fg, theme::FG_DIM);
+        assert!(screen.contains("c / esc / q close"));
+    }
+
+    #[test]
+    fn cleanup_candidates_are_bright_and_kept_rows_recede() {
+        let lines = vec![
+            "Ready to remove · 1".into(),
+            "Remove done".into(),
+            "Keeping · 1".into(),
+            "Keep dirty: uncommitted changes".into(),
+        ];
+        let rendered = cleanup_rows(&lines, 50);
+        assert_eq!(rendered[0][0].style.fg, Some(theme::OK));
+        assert_eq!(rendered[1][0].spans[0].style.fg, Some(theme::OK));
+        assert_eq!(rendered[1][0].spans[1].style.fg, Some(theme::FG_BRIGHT));
+        assert_eq!(rendered[3][0].spans[1].style.fg, Some(theme::FG_DIM));
+        assert_eq!(rendered[3][1].spans[1].style.fg, Some(theme::FG_DIM));
+    }
+
+    #[test]
+    fn cleanup_host_colons_do_not_hide_the_keep_decision() {
+        let rows = cleanup_rows(
+            &["MaxBook: work: Keep smoke: landing is not proven".into()],
+            80,
+        );
+        assert_eq!(rows[0][0].spans[0].style.fg, Some(theme::FG_DIM));
+        assert_eq!(rows[0][0].spans[1].content, "smoke · MaxBook: work");
+        assert_eq!(rows[0][1].spans[1].content, "landing is not proven");
+    }
+
+    #[test]
+    fn help_grid_wraps_both_columns_without_dropping_continuations() {
+        let blocks = vec![HelpBlock {
+            title: "Two columns".into(),
+            grid: true,
+            items: vec![
+                HelpItem::Key {
+                    key: "l".into(),
+                    label: "left description continues onto another line".into(),
+                },
+                HelpItem::Key {
+                    key: "r".into(),
+                    label: "right description continues onto another line".into(),
+                },
+            ],
+        }];
+        let lines = help_lines(&blocks, 64, 3, "");
+        let text: Vec<_> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(text.len(), 3, "{text:?}");
+        assert!(text[2].starts_with("   onto another line"), "{text:?}");
+        assert!(text[2][36..].starts_with("onto another line"), "{text:?}");
+        assert!(lines.iter().all(|line| line.width() <= 64));
     }
 
     #[test]
