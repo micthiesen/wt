@@ -1153,6 +1153,13 @@ impl Model {
             return false;
         };
         let now = tokio::time::Instant::now();
+        if matches!(
+            reply.outcome,
+            Some(crate::ReplyOutcome::Accepted(_) | crate::ReplyOutcome::Uncertain)
+        ) {
+            // Remote replies settle against stamps relayed by this process.
+            wt_runtime::hold_for_settlement(std::time::Duration::from_secs(30));
+        }
         let is_create = self.creates.contains_key(&id);
         if reply.failed || reply.modal.is_some() {
             self.pending.remove(id);

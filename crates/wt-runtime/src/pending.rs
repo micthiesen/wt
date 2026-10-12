@@ -46,6 +46,19 @@ pub trait Mutation<T>: Clone + Send + Sync + 'static {
     fn apply(&self, view: &mut T);
     /// Whether confirmed data already shows the requested result.
     fn observed(&self, confirmed: &T) -> bool;
+    /// Bounds for work that legitimately runs long (a checkout, a queued
+    /// removal). `None` uses the engine's limits. Still bounded: a change is
+    /// never shown forever.
+    fn deadlines(&self) -> Option<Deadlines> {
+        None
+    }
+}
+
+/// Per-mutation bounds for the in-flight and accepted phases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadlines {
+    pub in_flight: Duration,
+    pub accepted: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,11 +202,14 @@ impl<T, M: Mutation<T>> Pending<T, M> {
     pub fn begin(&mut self, op: u64, mutation: M, now: Instant) {
         let key = mutation.key();
         self.entries.retain(|entry| entry.mutation.key() != key);
+        let in_flight = mutation
+            .deadlines()
+            .map_or(self.limits.in_flight, |bounds| bounds.in_flight);
         self.entries.push(Entry {
             op,
             mutation,
             phase: Phase::InFlight {
-                deadline: now + self.limits.in_flight,
+                deadline: now + in_flight,
             },
         });
     }
@@ -218,9 +234,13 @@ impl<T, M: Mutation<T>> Pending<T, M> {
             return false;
         };
         refine(&mut entry.mutation);
+        let accepted = entry.mutation.deadlines().map_or_else(
+            || limits.accepted(entry.mutation.domains()),
+            |bounds| bounds.accepted,
+        );
         entry.phase = Phase::Accepted {
             at,
-            deadline: now + limits.accepted(entry.mutation.domains()),
+            deadline: now + accepted,
         };
         true
     }

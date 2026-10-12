@@ -214,3 +214,55 @@ async fn factory_and_future_panics_are_visible_and_the_source_can_recover() {
     assert_eq!(source.snapshot().data().map(|d| **d), Some(4));
     scope.shutdown(Duration::from_secs(1)).await.unwrap();
 }
+
+// Real time: the restore runs on a blocking thread that paused time does not
+// wait for.
+#[tokio::test]
+async fn a_state_change_before_the_cache_read_does_not_discard_the_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = wt_runtime::CacheStore::new(directory.path().to_path_buf(), "scope");
+    {
+        let scope = TaskScope::new();
+        let (_, publisher) = wt_runtime::leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "rows",
+                domain: Domain::Git,
+                persistence: Persistence::Disk(wt_runtime::DiskCache::new(&store)),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        publisher.publish_live(vec![1u8, 2], wt_runtime::Stamp::now());
+        let path = directory.path().join("rows.json");
+        while !path.exists() {
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        scope.shutdown(Duration::from_secs(2)).await.unwrap();
+    }
+    let scope = TaskScope::new();
+    let (source, publisher) = wt_runtime::leaf_channel::<Vec<u8>>(
+        &scope,
+        SourceSpec {
+            name: "rows",
+            domain: Domain::Git,
+            persistence: Persistence::Disk(wt_runtime::DiskCache::new(&store)),
+            policy: RefreshPolicy::default(),
+        },
+    );
+    // The first fetch starts (and fails) before the blocking read returns.
+    publisher.set_state(SourceState::Failed("offline".into()));
+    let mut updates = source.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        updates.wait_for(|s| s.data().is_some()),
+    )
+    .await
+    .expect("restore still lands")
+    .unwrap();
+    let snapshot = source.snapshot();
+    assert!(snapshot.is_restored());
+    assert!(matches!(snapshot.state(), SourceState::Failed(_)));
+    assert!(source.confirmed().is_none());
+    scope.shutdown(Duration::from_secs(2)).await.unwrap();
+}

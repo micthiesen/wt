@@ -192,6 +192,11 @@ pub struct GhActionResult {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    /// The request may have reached GitHub (timeout, interruption, or an
+    /// accepted request whose result could not be confirmed). Callers must
+    /// treat the write as unconfirmed and never resend it automatically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ambiguous: bool,
 }
 
 impl GhActionResult {
@@ -200,6 +205,7 @@ impl GhActionResult {
             ok: true,
             error: None,
             retryable: None,
+            ambiguous: false,
         }
     }
     pub fn error(message: impl Into<String>) -> Self {
@@ -207,6 +213,7 @@ impl GhActionResult {
             ok: false,
             error: Some(message.into()),
             retryable: None,
+            ambiguous: false,
         }
     }
     pub fn failed(message: impl Into<String>, retryable: bool) -> Self {
@@ -214,6 +221,16 @@ impl GhActionResult {
             ok: false,
             error: Some(message.into()),
             retryable: Some(retryable),
+            ambiguous: false,
+        }
+    }
+    /// The request may have taken effect; its outcome is unknown.
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(message.into()),
+            retryable: Some(false),
+            ambiguous: true,
         }
     }
     pub fn is_ok(&self) -> bool {

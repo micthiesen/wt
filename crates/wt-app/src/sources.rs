@@ -540,6 +540,7 @@ fn project(
     activity: SourceHandle<crate::activity_source::ActivitySnapshot>,
 ) -> SourceHandle<Board> {
     let (source, mut publisher) = derived_channel(scope, "github-board");
+    let mut last: Option<SourceSnapshot<Board>> = None;
     let cancel = scope.token();
     scope.spawn(async move {
         let mut local_updates = local.subscribe();
@@ -583,7 +584,15 @@ fn project(
             })
             .await;
             match result {
-                Ok(snapshot) if !cancel.is_cancelled() => publisher.publish(snapshot),
+                Ok(snapshot) if !cancel.is_cancelled() => {
+                    // An input that woke without changing anything visible
+                    // does not ripple through every later stage.
+                    if last.as_ref().is_some_and(|last| last.same_view(&snapshot)) {
+                        continue;
+                    }
+                    last = Some(snapshot.clone());
+                    publisher.publish(snapshot)
+                }
                 Ok(_) => break,
                 Err(error) => {
                     tracing::error!(%error, "board projection failed");
@@ -671,6 +680,83 @@ fn compose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Persisted sources whose type runs `wt_runtime::conformance::
+    /// persisted_source` in its owning module. Adding a `Disk` source without
+    /// a conformance test (and an entry here) fails `every_source_declares_and_is_covered`.
+    const PERSISTED_WITH_CONFORMANCE: &[&str] = &[
+        "git",
+        "github",
+        "review-requests",
+        "issue-statuses",
+        "dev-status",
+        "session-discoveries",
+        "git-presentation",
+    ];
+
+    /// Sources that read durable SQLite; it is authoritative and never cached.
+    const SQLITE_READERS: &[&str] = &["metadata", "review-dismissals", "removed-history"];
+
+    #[tokio::test]
+    async fn every_source_declares_and_is_covered() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let scope = TaskScope::new();
+        // Construction registers every source; nothing needs to run.
+        let _sources = start(&scope, &fixture.ctx);
+        let entries = scope.sources();
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+        assert!(entries.len() > 20, "the whole graph registers: {entries:?}");
+        let mut names = std::collections::BTreeSet::new();
+        let mut leaf_domains = std::collections::BTreeSet::new();
+        for entry in &entries {
+            let wt_runtime::SourceKind::Leaf {
+                domain,
+                persisted,
+                never_reason,
+            } = &entry.kind
+            else {
+                continue;
+            };
+            assert!(
+                names.insert(entry.name),
+                "duplicate leaf name {}",
+                entry.name
+            );
+            leaf_domains.insert(*domain);
+            if *persisted {
+                assert!(
+                    PERSISTED_WITH_CONFORMANCE.contains(&entry.name),
+                    "{} persists without a conformance test",
+                    entry.name
+                );
+            } else {
+                assert!(
+                    never_reason.is_some_and(|reason| !reason.trim().is_empty()),
+                    "{} must say why it is never persisted",
+                    entry.name
+                );
+            }
+            if SQLITE_READERS.contains(&entry.name) {
+                assert!(
+                    !persisted,
+                    "{} reads SQLite and must not be cached",
+                    entry.name
+                );
+            }
+        }
+        for name in SQLITE_READERS {
+            assert!(names.contains(name), "{name} is still a leaf");
+        }
+        for domain in wt_tui::SETTLING_DOMAINS {
+            assert!(
+                leaf_domains.contains(domain),
+                "pending changes wait on {domain:?}, which no source publishes"
+            );
+        }
+        fixture.close().await.unwrap();
+    }
     use wt_runtime::{DerivedPublisher, LeafPublisher, leaf_channel};
     use wt_tui::BoardRow;
 

@@ -12,6 +12,10 @@ pub struct HostService {
     pub sources: BoardSources,
 }
 
+/// How long stamp-only changes keep flowing after an accepted write; the
+/// longest pending deadline for an accepted or unconfirmed change.
+const SETTLEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl HostService {
     pub fn start(scope: &TaskScope, mut context: AppContext, commands: CancellationToken) -> Self {
         // Closing the view stops reads. An accepted mutation instead belongs to
@@ -28,12 +32,32 @@ impl HostService {
         let snapshot = self.sources.board.snapshot();
         let empty = Board::default();
         let effect = command.effect(snapshot.data().map_or(&empty, |board| board.as_ref()));
-        let mut reply = self.run(command, &snapshot).await?;
-        self.refresh_after(&effect, &reply);
+        let result = self.run(command, &snapshot).await;
+        // Stamp the write before any refresh is queued, so the confirming
+        // fetch always starts at or after it.
+        let done = Stamp::now();
+        let mut reply = match result {
+            Ok(reply) => reply,
+            Err(error) => {
+                // A mutation that failed partway may still have changed
+                // something; re-read what it touches.
+                self.refresh_after(&effect, &UiReply::default());
+                return Err(error);
+            }
+        };
         if !reply.failed && reply.outcome.is_none() && matches!(effect, wt_tui::Effect::Mutation(_))
         {
-            reply.outcome = Some(ReplyOutcome::Accepted(Stamp::now()));
+            reply.outcome = Some(ReplyOutcome::Accepted(done));
         }
+        if matches!(
+            reply.outcome,
+            Some(ReplyOutcome::Accepted(_) | ReplyOutcome::Uncertain)
+        ) {
+            // Let identical refetches carry their stamps to the TUI until
+            // the change is confirmed.
+            wt_runtime::hold_for_settlement(SETTLEMENT_WINDOW);
+        }
+        self.refresh_after(&effect, &reply);
         Ok(reply)
     }
 

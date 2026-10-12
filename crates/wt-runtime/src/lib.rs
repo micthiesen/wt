@@ -14,10 +14,13 @@ mod stamp;
 
 pub use cache::{CacheStore, DiskCache, MAX_CACHE_AGE, MAX_CACHE_BYTES};
 pub use domain::Domain;
-pub use pending::{Expired, Mutation, Pending, PendingLimits, PendingPhase, PendingView, Target};
+pub use pending::{
+    Deadlines, Expired, Mutation, Pending, PendingLimits, PendingPhase, PendingView, Target,
+};
 pub use scope::{ShutdownError, TaskScope};
 pub use snapshot::{
-    Confirmed, DomainMap, DomainMeta, Provenance, SourceSnapshot, SourceState, merge_domains,
+    Confirmed, DomainMap, DomainMeta, Provenance, SourceSnapshot, SourceState, hold_for_settlement,
+    merge_domains, settling, stamps_advanced,
 };
 pub use source::{
     DerivedPublisher, Fetched, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle,

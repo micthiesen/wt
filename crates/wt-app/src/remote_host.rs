@@ -883,7 +883,10 @@ fn publish_snapshot(
     snapshot
         .validate()
         .map_err(|error| format!("invalid snapshot from {host}: {error:#}"))?;
-    if latest.as_ref() == Some(&snapshot) {
+    if latest
+        .as_ref()
+        .is_some_and(|latest| latest.same_frame(&snapshot))
+    {
         return Ok(());
     }
     *latest = Some(snapshot.clone());

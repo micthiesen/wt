@@ -10,6 +10,19 @@ pub(crate) const ARCHIVED: &str = "\0archived";
 /// The palette entry the controller offers for merge-when-ready. The model
 /// resolves it into an explicit enable/disable before sending.
 pub const AUTO_MERGE_ACTION_ID: &str = "__auto_merge__";
+/// Domains a pending change may wait on. Each must be published by a leaf
+/// source on every host (wt-app's registry test checks that), otherwise a
+/// change could only end at its deadline. An empty list settles as soon as
+/// the host accepts.
+pub const SETTLING_DOMAINS: &[Domain] = &[
+    Domain::Git,
+    Domain::Metadata,
+    Domain::Github,
+    Domain::Reviews,
+    Domain::Sessions,
+    Domain::Actions,
+];
+
 /// Sentinel from the section picker that opens the "new section" prompt.
 const NEW_SECTION: &str = "\0new-section";
 
@@ -141,6 +154,12 @@ fn other(
     label: &'static str,
     domains: &'static [Domain],
 ) -> Effect {
+    debug_assert!(
+        domains
+            .iter()
+            .all(|domain| SETTLING_DOMAINS.contains(domain)),
+        "{label} waits on a domain no source publishes"
+    );
     Effect::Mutation(UiMutation {
         target: Target {
             host: host.clone(),
@@ -183,7 +202,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         // A palette entry only opens its prompt; merge-when-ready is resolved
         // into `GithubSetAutoMerge` before sending (`Model::resolve`).
         UiAction::PrepareAction { .. } => Effect::ReadOnly,
-        UiAction::ManagedSignIn { .. } => other(host, None, "signing in", &[Domain::Host]),
+        UiAction::ManagedSignIn { .. } => other(host, None, "signing in", &[]),
         UiAction::HardRefresh => other(host, None, "refreshing", &[]),
         UiAction::SetAttentionSeen { at_ms } => on_board(host, K::AttentionSeen { at_ms: *at_ms }),
         UiAction::ToggleAutomations { key: Some(key) } => {
@@ -196,21 +215,16 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 paused: !board.automations_paused,
             },
         ),
-        UiAction::CancelAutomations => {
-            other(host, None, "cancelling automations", &[Domain::Automations])
-        }
+        UiAction::CancelAutomations => other(host, None, "cancelling automations", &[]),
         UiAction::RestoreRemoved { key, .. } => other(
             host,
             Some(key),
             "restoring",
-            &[Domain::Git, Domain::Metadata, Domain::History],
+            &[Domain::Git, Domain::Metadata],
         ),
-        UiAction::ToggleRemovedAutomations { key } => other(
-            host,
-            Some(key),
-            "toggling automations",
-            &[Domain::History, Domain::Metadata],
-        ),
+        UiAction::ToggleRemovedAutomations { key } => {
+            other(host, Some(key), "toggling automations", &[Domain::Metadata])
+        }
         UiAction::PerfInvestigate { .. } => {
             other(host, None, "sending investigation", &[Domain::Sessions])
         }
@@ -502,7 +516,7 @@ impl Mutation<Board> for UiMutation {
             | MutationKind::Issue { .. }
             | MutationKind::Automations { .. }
             | MutationKind::AttentionSeen { .. } => &[Domain::Metadata],
-            MutationKind::Title { .. } => &[Domain::Metadata, Domain::Naming],
+            MutationKind::Title { .. } => &[Domain::Metadata],
             MutationKind::DismissReview { .. } => &[Domain::Reviews],
             MutationKind::Create { .. } | MutationKind::Remove { .. } => {
                 &[Domain::Git, Domain::Metadata]
@@ -689,6 +703,20 @@ impl Mutation<Board> for UiMutation {
             }
             MutationKind::Other { .. } => {}
         }
+    }
+
+    fn deadlines(&self) -> Option<wt_runtime::Deadlines> {
+        // A checkout or a queued removal (stage teardown, a large tree) can
+        // take minutes; the placeholder stays until inventory shows the
+        // result rather than flicking back at the usual deadline.
+        matches!(
+            self.kind,
+            MutationKind::Create { .. } | MutationKind::Remove { .. }
+        )
+        .then_some(wt_runtime::Deadlines {
+            in_flight: std::time::Duration::from_secs(600),
+            accepted: std::time::Duration::from_secs(600),
+        })
     }
 
     fn observed(&self, board: &Board) -> bool {
@@ -1050,6 +1078,173 @@ mod tests {
             .effect(&shown),
             Effect::ReadOnly
         );
+    }
+
+    #[test]
+    fn every_declared_domain_can_settle() {
+        use crate::{ActionSurface, RemovalRevision, SessionMode, SessionSelection, SessionTarget};
+        let revision = RemovalRevision {
+            key: "a".into(),
+            path: String::new(),
+            branch: String::new(),
+            head: String::new(),
+            digest: String::new(),
+            hazards: Vec::new(),
+            published_base: None,
+        };
+        let selection = SessionSelection {
+            key: Some("a".into()),
+            target: SessionTarget::Harness,
+            harness: wt_core::HarnessId::Claude,
+            session_id: None,
+            managed_name: None,
+            mode: SessionMode::New,
+            live: false,
+        };
+        let actions = vec![
+            UiAction::ManagedSignIn {
+                provider: "gh".into(),
+                then: None,
+            },
+            UiAction::HardRefresh,
+            UiAction::SetAttentionSeen { at_ms: 1 },
+            UiAction::ToggleAutomations {
+                key: Some("a".into()),
+            },
+            UiAction::ToggleAutomations { key: None },
+            UiAction::CancelAutomations,
+            UiAction::RestoreRemoved {
+                key: "a".into(),
+                removed_at: String::new(),
+                branch: String::new(),
+            },
+            UiAction::ToggleRemovedAutomations { key: "a".into() },
+            UiAction::PerfInvestigate { report: Vec::new() },
+            UiAction::Restack { key: "a".into() },
+            UiAction::ReviewCheckout {
+                url: String::new(),
+                updated_at: String::new(),
+                branch: String::new(),
+            },
+            UiAction::DismissReviewRequest {
+                url: "u".into(),
+                updated_at: String::new(),
+            },
+            UiAction::SubmitReviewers {
+                key: "a".into(),
+                pr_number: 7,
+                original: Vec::new(),
+                selected: Vec::new(),
+            },
+            UiAction::GithubMarkReady {
+                key: "a".into(),
+                pin: None,
+            },
+            UiAction::GithubSetAutoMerge {
+                key: "a".into(),
+                enable: true,
+                pin: None,
+            },
+            UiAction::GithubShip {
+                key: "a".into(),
+                pin: None,
+            },
+            UiAction::GithubFailedChecks { key: "a".into() },
+            UiAction::KillAction {
+                action_key: String::new(),
+                run_id: String::new(),
+            },
+            UiAction::RunAction {
+                surface: ActionSurface::Row { key: "a".into() },
+                id: String::new(),
+                arg: None,
+                extras: String::new(),
+            },
+            UiAction::FoldSection {
+                key: "Batch".into(),
+                folded: true,
+            },
+            UiAction::MoveSection {
+                key: "a".into(),
+                section: Some("Batch".into()),
+            },
+            UiAction::Reorder {
+                key: Some("a".into()),
+                section: String::new(),
+                down: true,
+            },
+            UiAction::RenameSection {
+                old: "Batch".into(),
+                new: "Later".into(),
+            },
+            UiAction::CyclePrimary,
+            UiAction::SetTitle {
+                key: "a".into(),
+                title: "t".into(),
+            },
+            UiAction::Create { input: "n".into() },
+            UiAction::Remove {
+                key: "a".into(),
+                force: false,
+                revision: revision.clone(),
+            },
+            UiAction::Cleanup {
+                revisions: vec![revision],
+            },
+            UiAction::ToggleArchive { key: "a".into() },
+            UiAction::SetStatus {
+                key: "a".into(),
+                state: Some("review".into()),
+                note: None,
+                verify_after_merge: None,
+            },
+            UiAction::SetStatus {
+                key: "a".into(),
+                state: None,
+                note: None,
+                verify_after_merge: None,
+            },
+            UiAction::SetBase {
+                key: "a".into(),
+                base: None,
+            },
+            UiAction::SetIssueOverride {
+                key: "a".into(),
+                issue_id: None,
+            },
+            UiAction::Session {
+                key: Some("a".into()),
+                target: SessionTarget::Harness,
+            },
+            UiAction::SelectSession {
+                selection: selection.clone(),
+            },
+            UiAction::KillSession {
+                selection: selection.clone(),
+            },
+            UiAction::StopSession { selection },
+            UiAction::EnterHarness {
+                key: "a".into(),
+                harness: wt_core::HarnessId::Claude,
+            },
+            UiAction::StopTerminal {
+                key: "a".into(),
+                target: SessionTarget::Shell,
+                session_id: String::new(),
+                created_at: 0,
+            },
+        ];
+        for action in actions {
+            let Effect::Mutation(mutation) = action.effect(&board()) else {
+                panic!("{action:?} is a write");
+            };
+            for domain in mutation.domains() {
+                assert!(
+                    SETTLING_DOMAINS.contains(domain),
+                    "{action:?} waits on {domain:?}, which no source publishes"
+                );
+            }
+        }
     }
 
     #[test]

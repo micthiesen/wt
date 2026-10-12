@@ -78,6 +78,14 @@ pub enum ServerFrame {
 }
 
 impl HostSnapshot {
+    /// Whether sending `other` after `self` would change nothing anyone sees.
+    /// Stamps alone count only while a write waits for confirmation.
+    pub fn same_frame(&self, other: &Self) -> bool {
+        self == other
+            && !(wt_runtime::settling()
+                && wt_runtime::stamps_advanced(&self.domains, &other.domains))
+    }
+
     pub fn capture(host: &crate::host_service::HostService) -> Self {
         let snapshot = host.sources.board.snapshot();
         let metadata = host.sources.metadata.snapshot();

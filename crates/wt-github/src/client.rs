@@ -471,6 +471,11 @@ impl GithubClient {
                 };
                 GhActionResult::error(error)
             }
+            // A timeout or interruption after `gh` started may have sent
+            // the request; a missing CLI or spawn failure did not.
+            Err(error @ GithubError::Transient { .. }) => {
+                GhActionResult::unknown(error.to_string())
+            }
             Err(error) => GhActionResult::error(error.to_string()),
         }
     }
@@ -566,26 +571,20 @@ impl GithubClient {
                             return GhActionResult::success();
                         }
                         Ok(true) => {
-                            return GhActionResult::failed(
-                                format!(
-                                    "async merge response for PR #{} was successful but gh exited unsuccessfully; inspect GitHub before retrying",
-                                    target.number
-                                ),
-                                false,
-                            );
+                            return GhActionResult::unknown(format!(
+                                "async merge response for PR #{} was successful but gh exited unsuccessfully; inspect GitHub before retrying",
+                                target.number
+                            ));
                         }
                         Ok(false) => {
                             let Some(uuid) = crate::mutations::async_uuid(&response) else {
-                                return GhActionResult::failed(
-                                    format!(
-                                        "GitHub accepted the async merge but returned no request UUID for PR #{}; inspect GitHub before retrying",
-                                        target.number
-                                    ),
-                                    false,
-                                );
+                                return GhActionResult::unknown(format!(
+                                    "GitHub accepted the async merge but returned no request UUID for PR #{}; inspect GitHub before retrying",
+                                    target.number
+                                ));
                             };
                             for _ in 0..60 {
-                                tokio::select! { _=cancellation.cancelled()=>return GhActionResult::failed(format!("PR #{} async merge outcome remains unknown; inspect GitHub before retrying",target.number),false), _=sleep(Duration::from_secs(1))=>{} }
+                                tokio::select! { _=cancellation.cancelled()=>return GhActionResult::unknown(format!("PR #{} async merge outcome remains unknown; inspect GitHub before retrying",target.number)), _=sleep(Duration::from_secs(1))=>{} }
                                 let polled = self
                                     .run(
                                         [
@@ -603,23 +602,17 @@ impl GithubClient {
                                     )
                                     .await;
                                 let Ok(polled) = polled else {
-                                    return GhActionResult::failed(
-                                        format!(
-                                            "Cannot confirm async merge for PR #{}; inspect GitHub before retrying",
-                                            target.number
-                                        ),
-                                        false,
-                                    );
+                                    return GhActionResult::unknown(format!(
+                                        "Cannot confirm async merge for PR #{}; inspect GitHub before retrying",
+                                        target.number
+                                    ));
                                 };
                                 if !polled.status.success() {
-                                    return GhActionResult::failed(
-                                        format!(
-                                            "Cannot confirm async merge for PR #{}: {}; inspect GitHub before retrying",
-                                            target.number,
-                                            output_failure(&polled).0
-                                        ),
-                                        false,
-                                    );
+                                    return GhActionResult::unknown(format!(
+                                        "Cannot confirm async merge for PR #{}: {}; inspect GitHub before retrying",
+                                        target.number,
+                                        output_failure(&polled).0
+                                    ));
                                 }
                                 match crate::mutations::parse_async_merge_response(
                                     &polled.stdout_text(),
@@ -628,23 +621,17 @@ impl GithubClient {
                                     Ok(true) => return GhActionResult::success(),
                                     Ok(false) => continue,
                                     Err(error) => {
-                                        return GhActionResult::failed(
-                                            format!(
-                                                "Cannot confirm async merge for PR #{}: {error}; inspect GitHub before retrying",
-                                                target.number
-                                            ),
-                                            false,
-                                        );
+                                        return GhActionResult::unknown(format!(
+                                            "Cannot confirm async merge for PR #{}: {error}; inspect GitHub before retrying",
+                                            target.number
+                                        ));
                                     }
                                 }
                             }
-                            return GhActionResult::failed(
-                                format!(
-                                    "Async merge is still pending for PR #{} after 60 seconds; inspect GitHub before retrying",
-                                    target.number
-                                ),
-                                false,
-                            );
+                            return GhActionResult::unknown(format!(
+                                "Async merge is still pending for PR #{} after 60 seconds; inspect GitHub before retrying",
+                                target.number
+                            ));
                         }
                         Err(error) => {
                             if missing_workflow_scope(&error) {
@@ -671,13 +658,10 @@ impl GithubClient {
                     }
                 }
                 Err(e) => {
-                    return GhActionResult::failed(
-                        format!(
-                            "async merge outcome unknown: {e}; inspect PR #{} before retrying",
-                            target.number
-                        ),
-                        false,
-                    );
+                    return GhActionResult::unknown(format!(
+                        "async merge outcome unknown: {e}; inspect PR #{} before retrying",
+                        target.number
+                    ));
                 }
             }
         }

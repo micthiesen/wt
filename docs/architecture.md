@@ -104,7 +104,8 @@ presentation facts, remote host snapshots) restore their last live value at
 start, off the input path, as `Provenance::Restored` in the `Refreshing` state,
 unless a live publish arrived first. They save live, ready data at most every
 10 seconds and once at shutdown within a one-second budget that never fails
-shutdown. Files live under `<cache root>/query/<name>.json` in an envelope
+shutdown. A fetch shows its lane as refreshing only if it runs longer than 100
+ms, so a skipped or quick refresh causes no redraw. Files live under `<cache root>/query/<name>.json` in an envelope
 whose scope hashes the repository id, canonical main clone, merged
 configuration and build (plus the executable's size and mtime for `dev-`
 builds). A mismatched, corrupt, oversized or week-old file is deleted and
@@ -112,7 +113,8 @@ ignored. Sources that read SQLite, logs or live process state are `Never`:
 durable state is read directly and never cached here.
 
 **Confirmed inputs.** `LeafHandle::confirmed()` returns `Confirmed<T>` only for
-live data; a derived handle has no such method, and `Confirmed` has no public
+live data (for GitHub this includes an events-daemon snapshot, which is a fresh
+read by the daemon stamped with its own fetch start, not a restored cache); a derived handle has no such method, and `Confirmed` has no public
 constructor. Remove, cleanup, GitHub writes, reviewer edits, action
 requirements, restack and automation facts take `Confirmed` inputs (or `None`,
 which behaves like "still loading" and fails closed). `Confirmed::fresh_within`
@@ -128,7 +130,12 @@ until the host answers, then *accepted* with the host's stamp, or *unconfirmed*
 when the outcome is ambiguous. It is shown over confirmed data until a fetch
 that started at or after the accept stamp shows the change, the write fails, or
 a bounded deadline passes (60 s in flight; 30 s accepted for GitHub, reviews and
-issues; 12 s for local domains; 30 s unconfirmed). An older or out-of-order
+issues; 12 s for local domains; 30 s unconfirmed; creation and removal, which can
+legitimately take minutes, 10 minutes). A change waits only on domains that a
+leaf publishes (`wt_tui::SETTLING_DOMAINS`, checked by the source registry
+test). While a write waits, `hold_for_settlement` lets identical refetches carry
+their newer stamps through derived stages and remote frames, which otherwise
+skip republishing when nothing visible changed. An older or out-of-order
 fetch, a restored value or a stamp from another process can never settle it.
 An expiry while confirmed data still disagrees shows one notice.
 

@@ -73,9 +73,9 @@ where
                         if changed.is_err() { break; }
                         updates.borrow_and_update();
                         let snapshot = HostSnapshot::capture(&writer_host);
-                        // Equality ignores observation stamps (`DomainMeta`),
-                        // so a refetch that changes nothing sends no frame.
-                        if previous.as_ref() == Some(&snapshot) { continue; }
+                        // A refetch that changes nothing sends no frame, unless
+                        // a write is settling and needs its newer stamps.
+                        if previous.as_ref().is_some_and(|previous: &HostSnapshot| previous.same_frame(&snapshot)) { continue; }
                         previous = Some(snapshot.clone());
                         ServerFrame::Snapshot(snapshot)
                     }

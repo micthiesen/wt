@@ -164,6 +164,7 @@ impl GithubActions {
             return Ok(self.write_failed(
                 write,
                 result.error.unwrap_or_else(|| "mark ready failed".into()),
+                result.ambiguous,
             ));
         }
         let at = self.writes.accepted(write);
@@ -235,6 +236,7 @@ impl GithubActions {
             return Ok(self.write_failed(
                 write,
                 result.error.unwrap_or_else(|| "auto-merge failed".into()),
+                result.ambiguous,
             ));
         }
 
@@ -270,6 +272,7 @@ impl GithubActions {
                 result
                     .error
                     .unwrap_or_else(|| "disable auto-merge failed".into()),
+                result.ambiguous,
             ));
         }
         let at = self.writes.accepted(write);
@@ -314,6 +317,7 @@ impl GithubActions {
                                 .error
                                 .unwrap_or_else(|| "unknown GitHub error".into())
                         ),
+                        result.ambiguous,
                     ));
                 }
                 let at = self.writes.accepted(write);
@@ -399,6 +403,7 @@ impl GithubActions {
         };
         let (ready_result, reviewer_result) = tokio::join!(mark_ready, request_reviewer);
         let mut at = None;
+        let mut marked_ready = false;
         if reviewer_result.as_ref().is_some_and(|result| result.ok) {
             at = Some(Stamp::now());
             self.writes.refresh.refresh_live();
@@ -406,12 +411,15 @@ impl GithubActions {
         if let Some(result) = ready_result {
             let write = GithubWrite::ready(branch, number);
             if !result.ok {
-                return Ok(self.write_failed(
-                    write,
-                    result.error.unwrap_or_else(|| "mark ready failed".into()),
-                ));
+                let mut message = result.error.unwrap_or_else(|| "mark ready failed".into());
+                // Say what already happened, so a retry does not repeat it.
+                if at.is_some() {
+                    message = format!("requested a reviewer, but marking ready failed: {message}");
+                }
+                return Ok(self.write_failed(write, message, result.ambiguous));
             }
             at = Some(self.writes.accepted(write));
+            marked_ready = true;
         }
 
         let reviewer_error = reviewer_result
@@ -426,12 +434,16 @@ impl GithubActions {
                 .await;
             let write = GithubWrite::auto_merge(branch, number, true);
             if !result.ok {
+                let ambiguous = result.ambiguous;
                 let mut message = result.error.unwrap_or_else(|| "auto-merge failed".into());
+                if marked_ready {
+                    message = format!("marked PR #{number} ready, but arming failed: {message}");
+                }
                 if let Some(reviewer_error) = reviewer_error {
                     message.push_str("; ");
                     message.push_str(&reviewer_error);
                 }
-                return Ok(self.write_failed(write, message));
+                return Ok(self.write_failed(write, message, ambiguous));
             }
             at = Some(self.writes.accepted(write));
         }
@@ -477,8 +489,12 @@ impl GithubActions {
     /// A failed write is definite unless the command drain cancelled it
     /// mid-request: then GitHub may have applied it, so it stays recorded as
     /// unconfirmed and is never resent automatically.
-    fn write_failed(&self, write: GithubWrite, error: String) -> UiReply {
-        if !self.cancellation.is_cancelled() {
+    /// A write that did not succeed. When it may still have reached GitHub
+    /// (timeout, interruption, unconfirmed async merge, or the command drain
+    /// stopping mid-write), record it as unconfirmed so neither the guards
+    /// nor the user resend it blindly.
+    fn write_failed(&self, write: GithubWrite, error: String, ambiguous: bool) -> UiReply {
+        if !ambiguous && !self.cancellation.is_cancelled() {
             return failed(error);
         }
         self.writes.uncertain(write);
@@ -783,6 +799,13 @@ fn auto_merge_guard(
     now: Instant,
 ) -> Guard {
     settle(ledger, github, now);
+    // A read that already shows the PR armed answers an arm request, whatever
+    // earlier attempt is still unconfirmed.
+    let confirmed_armed =
+        effective_pr(github, branch, number).is_some_and(|pr| armed(github, branch, pr));
+    if enable && confirmed_armed {
+        return Guard::AlreadyDone;
+    }
     let unconfirmed = |wanted: bool| {
         ledger.mutations().zip(ledger.views()).any(|(write, view)| {
             view.phase == PendingPhase::Unconfirmed
@@ -805,8 +828,6 @@ fn auto_merge_guard(
         };
     }
     // An unconfirmed disable may not have happened: trust the read then.
-    let confirmed_armed =
-        effective_pr(github, branch, number).is_some_and(|pr| armed(github, branch, pr));
     if effective_armed || (confirmed_armed && unconfirmed(false)) {
         Guard::Send
     } else {
@@ -989,6 +1010,10 @@ async fn retry_arm(
             return RetryOutcome::Armed;
         }
         if result.retryable != Some(true) {
+            if result.ambiguous || cancellation.is_cancelled() {
+                // It may have armed: guards must not treat it as never sent.
+                writes.uncertain(GithubWrite::auto_merge(&branch, target.number, true));
+            }
             return RetryOutcome::Failed(
                 result.error.unwrap_or_else(|| "auto-merge failed".into()),
             );
@@ -1262,6 +1287,50 @@ pub(crate) mod tests {
         assert_eq!(
             auto_merge_guard(&mut ledger, &stale, "feature", 7, true, Instant::now()),
             Guard::Send
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn github_data_meets_the_persisted_source_contract() {
+        let mut data = with_auto_merge(open_pr_data("feature"));
+        data.prs.insert("other".into(), pr("other"));
+        wt_runtime::conformance::persisted_source("github", wt_runtime::Domain::Github, data).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_ledger_write_meets_the_mutation_contract() {
+        let draft = open_pr_data("feature");
+        let mut ready = draft.clone();
+        ready.prs.get_mut("feature").unwrap().is_draft = false;
+        let armed = with_auto_merge(draft.clone());
+        wt_runtime::conformance::mutation(
+            GithubWrite::auto_merge("feature", 7, true),
+            draft.clone(),
+            armed.clone(),
+        )
+        .await;
+        wt_runtime::conformance::mutation(
+            GithubWrite::auto_merge("feature", 7, false),
+            armed,
+            draft.clone(),
+        )
+        .await;
+        wt_runtime::conformance::mutation(GithubWrite::ready("feature", 7), draft, ready).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_showing_the_arm_answers_an_unconfirmed_enable() {
+        let armed = Confirmed::for_test(with_auto_merge(open_pr_data("feature")));
+        let mut ledger = Ledger::default();
+        ledger.begin(
+            1,
+            GithubWrite::auto_merge("feature", 7, true),
+            Instant::now(),
+        );
+        ledger.uncertain(1, Instant::now());
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &armed, "feature", 7, true, Instant::now()),
+            Guard::AlreadyDone
         );
     }
 

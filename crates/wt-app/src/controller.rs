@@ -206,9 +206,12 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
     let (mut reply, ambiguous) = match result {
         Ok(reply) => (reply, false),
         Err(error) if error.downcast_ref::<Notice>().is_some() => (
+            // A notice means nothing was written (e.g. already at the top),
+            // so a pending change ends at once instead of waiting.
             UiReply {
                 message: error.to_string(),
                 notice: true,
+                outcome: Some(wt_tui::ReplyOutcome::NoChange),
                 ..Default::default()
             },
             false,
@@ -226,7 +229,10 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
             // a read settles it or its deadline passes; nothing is resent.
             let reply = if ambiguous {
                 UiReply {
-                    message: format!("{error:#}; waiting for refresh to confirm"),
+                    message: format!(
+                        "{error:#}; the result is unknown and will not be resent; check before retrying"
+                    ),
+                    notice: true,
                     outcome: Some(wt_tui::ReplyOutcome::Uncertain),
                     ..Default::default()
                 }

@@ -232,7 +232,15 @@ fn publish_live<T>(
 }
 
 fn set_state<T>(sender: &watch::Sender<SourceSnapshot<T>>, domain: Domain, state: SourceState) {
-    sender.send_modify(|snapshot| {
+    sender.send_if_modified(|snapshot| {
+        if *snapshot.state() == state
+            && snapshot
+                .domains()
+                .get(&domain)
+                .is_some_and(|meta| *meta.state() == state)
+        {
+            return false;
+        }
         let revision = snapshot.revision().wrapping_add(1);
         let meta = match snapshot.domains().get(&domain) {
             Some(meta) => meta.with_state(state.clone()),
@@ -243,6 +251,7 @@ fn set_state<T>(sender: &watch::Sender<SourceSnapshot<T>>, domain: Domain, state
         snapshot.set_meta(domain, meta);
         *snapshot = std::mem::take(snapshot).with_state(state);
         snapshot.set_revision(revision);
+        true
     });
 }
 
@@ -334,6 +343,9 @@ fn register_leaf<T>(scope: &TaskScope, spec: &SourceSpec<T>) {
     });
 }
 
+/// A fetch running longer than this shows its lane as refreshing.
+const REFRESHING_AFTER: Duration = Duration::from_millis(100);
+
 /// Minimum spacing between cache writes of one source.
 const WRITE_INTERVAL: Duration = Duration::from_secs(10);
 /// Bound on the final write at shutdown. A skipped write loses only a cache.
@@ -363,13 +375,25 @@ fn attach_cache<T: Send + Sync + 'static>(
             };
             let data = Arc::new(data);
             sender.send_if_modified(|snapshot| {
-                if snapshot.domains().contains_key(&domain) {
+                // Live data that landed first wins. A lane that has only
+                // reported a state (a fetch started, or failed) has no data
+                // yet, so the restore still applies and keeps that state.
+                if snapshot.data().is_some() {
                     return false;
                 }
+                let state = match snapshot.domains().get(&domain).map(|meta| meta.state()) {
+                    Some(state @ (SourceState::Refreshing | SourceState::Failed(_))) => {
+                        state.clone()
+                    }
+                    _ => SourceState::Refreshing,
+                };
                 let revision = snapshot.revision().wrapping_add(1);
                 snapshot.set_data(Some(data));
-                snapshot.set_meta(domain, DomainMeta::restored(saved_at_ms));
-                *snapshot = std::mem::take(snapshot).with_state(SourceState::Refreshing);
+                snapshot.set_meta(
+                    domain,
+                    DomainMeta::restored(saved_at_ms).with_state(state.clone()),
+                );
+                *snapshot = std::mem::take(snapshot).with_state(state);
                 snapshot.set_revision(revision);
                 true
             });
@@ -533,13 +557,22 @@ where
             while publisher.requests.try_recv().is_ok() {}
             let previous = publisher.sender.borrow().state().clone();
             let started = Instant::now();
-            publisher.set_state(SourceState::Refreshing);
             // Include the factory call inside the protected future: it can
             // panic before producing its future. Keep this lane alive and its
             // last good data visible so the next invalidation can recover.
-            let result = AssertUnwindSafe(async { fetch(token.child_token()).await })
-                .catch_unwind()
-                .await;
+            let work = AssertUnwindSafe(async { fetch(token.child_token()).await }).catch_unwind();
+            tokio::pin!(work);
+            // Only a fetch that takes a while reads as refreshing; a quick
+            // fetch or a skip publishes nothing until it has a result.
+            let mut announced = false;
+            let result = tokio::select! {
+                result = &mut work => result,
+                _ = tokio::time::sleep(REFRESHING_AFTER) => {
+                    announced = true;
+                    publisher.set_state(SourceState::Refreshing);
+                    work.await
+                }
+            };
             let result = match result {
                 Ok(result) => result.map_err(|error| error.to_string()),
                 Err(payload) => {
@@ -562,6 +595,7 @@ where
                 }
                 // Nothing was fetched, so the rate-limit floor is untouched.
                 // Restored data that arrived meanwhile keeps reading as stale.
+                Ok(None) if !announced => {}
                 Ok(None) => {
                     let has_data = publisher.sender.borrow().data().is_some();
                     publisher.set_state(match previous {

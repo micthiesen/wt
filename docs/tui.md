@@ -96,8 +96,10 @@ is in flight, `↻ arming merge` once the host accepted it, and
 such as switching the primary harness, show in the header. A failed request
 rolls back at once with an error toast. A change that a fresh read still does
 not show after its deadline (30 seconds for GitHub, reviews and issue statuses;
-12 seconds for local state) is dropped with a notice; nothing is resent
-automatically. Toggles act on what the row shows, and GitHub writes are refused
+12 seconds for local state; 10 minutes for creating or removing a worktree) is
+dropped with a notice; nothing is resent automatically. A key that turns out to
+have nothing to do (for example, moving a row that is already at the top) ends
+its marker at once. Toggles act on what the row shows, and GitHub writes are refused
 if the PR or its head commit changed since you saw it.
 
 The bottom pane shows the attention feed, all activity, session output, or
@@ -224,8 +226,9 @@ Merge-when-ready uses the PR's base branch to choose merge queue or classic
 auto-merge. `! m` arms or disarms based on what the row shows, so a quick
 second press cancels even before GitHub reports the arm. Pending-check retries
 retain the expected head SHA. A second `! m` cancels an idle retry; an
-uncertain external result is not retried blindly, and arming again is refused
-until a fresh read settles it.
+uncertain external result (a timeout or interrupted request) is shown as
+unconfirmed and never resent; arming again is refused until a read shows the PR
+armed or the unconfirmed attempt expires.
 
 ### Sessions and actions
 

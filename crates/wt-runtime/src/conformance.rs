@@ -105,10 +105,9 @@ where
         let scope = TaskScope::new();
         let (source, publisher) = leaf_channel(&scope, disk_spec(name, domain, &store));
         publisher.publish_live(sample.clone(), Stamp::now());
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-            tokio::time::advance(Duration::from_millis(5)).await;
-        }
+        // The restore reads on a real blocking thread; give it real time to
+        // finish (a small file takes well under this) before asserting.
+        settle_real_time(Duration::from_millis(300)).await;
         assert!(
             !source.snapshot().is_restored(),
             "{name}: live data stays live"
@@ -126,17 +125,19 @@ where
     let source = start_source(&scope, disk_spec(name, domain, &other), |_| async {
         Err::<T, _>("offline")
     });
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(5)).await;
+    // Deletion is the observable end of the rejected restore.
+    let path = directory.path().join(format!("{name}.json"));
+    for _ in 0..2000 {
+        if !path.exists() {
+            break;
+        }
+        settle_real_time(Duration::from_millis(1)).await;
     }
+    assert!(!path.exists(), "{name}: foreign cache deleted");
+    settle_real_time(Duration::from_millis(20)).await;
     assert!(
         source.snapshot().data().is_none(),
         "{name}: foreign cache ignored"
-    );
-    assert!(
-        !directory.path().join(format!("{name}.json")).exists(),
-        "{name}: foreign cache deleted"
     );
     scope
         .shutdown(Duration::from_secs(2))
@@ -154,6 +155,17 @@ where
         persistence: Persistence::Disk(DiskCache::new(store)),
         policy: RefreshPolicy::default(),
     }
+}
+
+/// Let blocking-pool work progress for `duration` of real time while the
+/// test runtime's clock may be paused.
+async fn settle_real_time(duration: Duration) {
+    let until = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < until {
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    tokio::task::yield_now().await;
 }
 
 async fn wait_for_file(store: &CacheStore, name: &str) {
@@ -248,7 +260,10 @@ where
     // The deadline is bounded and reports the unobserved change.
     pending.begin(3, mutation.clone(), Instant::now());
     pending.accept(3, Stamp::now(), Instant::now());
-    tokio::time::advance(Duration::from_secs(31)).await;
+    let bound = mutation
+        .deadlines()
+        .map_or(Duration::from_secs(30), |bounds| bounds.accepted);
+    tokio::time::advance(bound + Duration::from_secs(1)).await;
     let expired = pending.settle(&before, |_, _| Some(Stamp::now()), Instant::now());
     assert_eq!(expired.len(), 1, "{label}: deadline is bounded");
     assert!(pending.is_empty());

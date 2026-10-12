@@ -284,12 +284,19 @@ impl<T> SourceSnapshot<T> {
         snapshot
     }
 
-    /// Whether data, state and provenance match, ignoring stamps and revision.
+    /// Whether a republish would change what anyone sees: data, state and
+    /// provenance, ignoring revision. Stamps alone are not a visible change,
+    /// except while a recent write waits for confirmation (`hold_for_settlement`):
+    /// then a newer fetch-start stamp must reach the pending engine even when
+    /// the data is identical, or the change could only settle at its deadline.
     pub fn same_view(&self, other: &Self) -> bool
     where
         T: PartialEq,
     {
-        self.data == other.data && self.state == other.state && self.domains == other.domains
+        self.data == other.data
+            && self.state == other.state
+            && self.domains == other.domains
+            && !(settling() && stamps_advanced(&self.domains, &other.domains))
     }
 }
 
@@ -361,4 +368,37 @@ impl<T> Confirmed<T> {
             observed: Stamp::now(),
         }
     }
+}
+
+static SETTLE_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    // Process-local monotonic milliseconds; only compared within this process.
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Keep stamp-only changes flowing for `window`, because a write this process
+/// accepted (or relayed) is waiting for a fetch that started after it. Outside
+/// such windows, an identical refetch does not republish or redraw.
+pub fn hold_for_settlement(window: std::time::Duration) {
+    let until = now_ms().saturating_add(window.as_millis() as u64);
+    SETTLE_UNTIL_MS.fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a write is waiting for confirmation in this process.
+pub fn settling() -> bool {
+    now_ms() < SETTLE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether any domain's fetch-start stamp differs between two maps.
+pub fn stamps_advanced(old: &DomainMap, new: &DomainMap) -> bool {
+    new.iter().any(|(domain, meta)| {
+        old.get(domain)
+            .is_some_and(|previous| previous.observed != meta.observed)
+    })
 }
