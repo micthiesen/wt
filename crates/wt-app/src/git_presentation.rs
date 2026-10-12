@@ -382,26 +382,11 @@ pub fn start(
             }
 
             let presentation = presentation_map(&cache);
-            let mut state = match (
-                git_snapshot.state(),
-                metadata_snapshot.state(),
-                github_snapshot.state(),
-            ) {
-                (SourceState::Failed(error), _, _) => {
-                    SourceState::Failed(format!("Git: {error}").into())
-                }
-                (_, SourceState::Failed(error), _) => {
-                    SourceState::Failed(format!("State: {error}").into())
-                }
-                (_, _, SourceState::Failed(error)) => {
-                    SourceState::Failed(format!("GitHub: {error}").into())
-                }
-                (SourceState::Refreshing, _, _) | (_, SourceState::Refreshing, _) => {
-                    SourceState::Refreshing
-                }
-                (SourceState::Ready, SourceState::Ready, SourceState::Ready) => SourceState::Ready,
-                _ => SourceState::Empty,
-            };
+            let mut state = SourceState::combine([
+                ("Git", git_snapshot.state()),
+                ("State", metadata_snapshot.state()),
+                ("GitHub", github_snapshot.state()),
+            ]);
             let failed_rows = presentation
                 .values()
                 .filter(|row| row.presentation.error.is_some())
@@ -449,7 +434,6 @@ pub fn overlay(
         git_updates.mark_changed();
         metadata_updates.mark_changed();
         github_updates.mark_changed();
-        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -498,11 +482,7 @@ pub fn overlay(
                 .with_data(prepared)
                 .with_input(&fact_snapshot)
                 .with_state(state);
-            if last.as_ref().is_some_and(|last| last.same_view(&next)) {
-                continue;
-            }
-            last = Some(next.clone());
-            publisher.publish(next);
+            publisher.publish_if_changed(next);
         }
     });
     source

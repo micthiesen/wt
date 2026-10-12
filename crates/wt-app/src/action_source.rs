@@ -390,7 +390,6 @@ fn project(
         let mut tracker = Tracker::new(epoch_ms());
         let mut last_runs = None;
         let mut last_error = None;
-        let mut last: Option<SourceSnapshot<Board>> = None;
         // The tracker's read model can lag the action's write past the read
         // its completion triggered. While an accepted expectation waits, keep
         // a tracker read queued (the issue lane enforces its own floor) so it
@@ -450,11 +449,7 @@ fn project(
                 log_updates.borrow().clone(),
                 &tracker,
             );
-            if last.as_ref().is_some_and(|last| last.same_view(&next)) {
-                continue;
-            }
-            last = Some(next.clone());
-            publisher.publish(next);
+            publisher.publish_if_changed(next);
         }
     });
     output
@@ -843,7 +838,7 @@ fn compose(
     }
     data.attention.extend(tracker.attention.iter().cloned());
     crate::activity_source::bound_feeds(&mut data);
-    data.pending.extend(tracker.pending.views());
+    data.pending_views.extend(tracker.pending.views());
     board
         .with_data(Some(Arc::new(data)))
         .with_input(&runs)
@@ -1017,7 +1012,7 @@ mod tests {
         let data = output.data().unwrap();
         assert_eq!(data.rows[0].issue_status.as_deref(), Some("Review"));
         assert_eq!(
-            data.pending,
+            data.pending_views,
             vec![wt_runtime::PendingView {
                 target: Target::row(None, "row"),
                 label: "moving ENG-1 to Review".into(),

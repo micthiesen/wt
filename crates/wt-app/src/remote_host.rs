@@ -257,12 +257,21 @@ impl RemoteHost {
 
 /// Cache name of one endpoint's snapshot leaf: `host-` and the first 16 hex
 /// digits of the SHA-256 of the endpoint key, so another endpoint or config
-/// selection never reads it. Leaked once per configured remote at startup.
+/// selection never reads it. Each distinct name is allocated once per process.
 pub(crate) fn source_name(endpoint: &RemoteConfig) -> &'static str {
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<BTreeMap<String, &'static str>>> = OnceLock::new();
     let digest = Sha256::digest(endpoint.key().as_bytes());
-    let hex = format!("{digest:x}");
-    Box::leak(format!("host-{}", &hex[..16]).into_boxed_str())
+    let name = format!("host-{}", &format!("{digest:x}")[..16]);
+    let mut names = NAMES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    names
+        .entry(name)
+        .or_insert_with_key(|name| Box::leak(name.clone().into_boxed_str()))
 }
 
 struct HostChannels {

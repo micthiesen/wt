@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::watch;
-use wt_core::Domain;
+use wt_core::{Domain, sanitize_terminal_text};
 use wt_platform::process::CommandSpec;
 use wt_runtime::{
     Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
@@ -130,14 +130,13 @@ pub fn start(
             if !matches!(live_snapshot.state(), SourceState::Ready)
                 || !matches!(metadata_snapshot.state(), SourceState::Ready)
             {
-                let state = match (live_snapshot.state(), metadata_snapshot.state()) {
-                    (SourceState::Failed(error), _) => {
-                        SourceState::Failed(format!("inventory: {error}").into())
-                    }
-                    (_, SourceState::Failed(error)) => {
-                        SourceState::Failed(format!("state: {error}").into())
-                    }
-                    _ => SourceState::Refreshing,
+                // Inputs that are not ready yet read as refreshing.
+                let state = match SourceState::combine([
+                    ("Git", live_snapshot.state()),
+                    ("State", metadata_snapshot.state()),
+                ]) {
+                    SourceState::Empty => SourceState::Refreshing,
+                    state => state,
                 };
                 // The last prepared history stays visible.
                 publisher.set_state(state);
@@ -239,7 +238,7 @@ pub fn overlay(
                     board.removed_history = history.as_ref().clone();
                 }
                 if let SourceState::Failed(error) = history_snapshot.state() {
-                    let detail = clean(&format!("History: {error}"));
+                    let detail = sanitize_terminal_text(&format!("History: {error}"));
                     if !board.attention.iter().any(|line| line.text == detail) {
                         crate::activity_source::append_attention(board, "History", &detail);
                     }
@@ -336,18 +335,18 @@ fn present(
         });
     let mut details = Vec::new();
     if let Some(note) = entry.work.as_ref().and_then(|work| work.note.as_ref()) {
-        details.push(clean(note));
+        details.push(sanitize_terminal_text(note));
     }
     let git_state = entry
         .extra
         .get("gitState")
         .and_then(Value::as_str)
-        .map(clean);
+        .map(sanitize_terminal_text);
     let pr_state = entry
         .extra
         .get("prState")
         .and_then(Value::as_str)
-        .map(clean);
+        .map(sanitize_terminal_text);
     let saved_landing = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
         Some("production") => Some(true),
         Some("base") => Some(false),
@@ -364,7 +363,7 @@ fn present(
     let issue_status = issue_id
         .as_ref()
         .and_then(|id| statuses.get(id))
-        .map(|status| clean(status));
+        .map(|status| sanitize_terminal_text(status));
     let verify_owed = entry.work.as_ref().is_some_and(|work| {
         work.verify_after_merge.is_some() && work.state != "verified" && work.state != "dropped"
     });
@@ -373,33 +372,40 @@ fn present(
     RemovedHistoryRow {
         key: entry.slug.clone(),
         host: None,
-        slug: clean(&entry.slug),
-        branch: clean(&entry.branch),
+        slug: sanitize_terminal_text(&entry.slug),
+        branch: sanitize_terminal_text(&entry.branch),
         title: entry
             .extra
             .get("title")
             .and_then(Value::as_str)
-            .map(clean)
+            .map(sanitize_terminal_text)
             .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| clean(&entry.slug)),
+            .unwrap_or_else(|| sanitize_terminal_text(&entry.slug)),
         removed_at: entry.removed_at,
         details,
-        work_state: entry.work.as_ref().map(|work| clean(&work.state)),
+        work_state: entry
+            .work
+            .as_ref()
+            .map(|work| sanitize_terminal_text(&work.state)),
         blocked_on: entry
             .work
             .as_ref()
             .and_then(|work| work.blocked_on.as_deref())
-            .map(clean),
+            .map(sanitize_terminal_text),
         verify_steps: entry
             .work
             .as_ref()
             .and_then(|work| work.verify_after_merge.as_deref())
-            .map(clean),
+            .map(sanitize_terminal_text),
         verify_owed,
         git_state,
         pr_state,
         issue_url,
-        pr_url: entry.extra.get("prUrl").and_then(Value::as_str).map(clean),
+        pr_url: entry
+            .extra
+            .get("prUrl")
+            .and_then(Value::as_str)
+            .map(sanitize_terminal_text),
         issue_status,
         production_landed,
         landed_on,
@@ -820,10 +826,6 @@ fn repo_web_url(remote: &str) -> Option<String> {
         "https://{}/{}/{}",
         &captures[1], &captures[2], &captures[3]
     ))
-}
-
-fn clean(text: &str) -> String {
-    wt_core::sanitize_terminal_text(text)
 }
 
 fn now_ms() -> i64 {

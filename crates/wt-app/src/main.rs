@@ -28,6 +28,7 @@ mod git_presentation;
 mod github_actions;
 mod github_events_source;
 mod github_pickers;
+mod github_source;
 mod hard_refresh;
 mod harness;
 mod history_actions;

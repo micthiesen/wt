@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use wt_core::sanitize_terminal_text;
 use wt_harness::DerivedState;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, SessionView};
@@ -28,7 +29,6 @@ pub fn overlay(
         inventory_updates.mark_changed();
         discovery_updates.mark_changed();
         activity_updates.mark_changed();
-        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -49,12 +49,7 @@ pub fn overlay(
                 discovery_updates.borrow_and_update().clone(),
                 activity_updates.borrow_and_update().clone(),
             );
-            // Stamps alone do not change what the board shows.
-            if last.as_ref().is_some_and(|last| last.same_view(&prepared)) {
-                continue;
-            }
-            last = Some(prepared.clone());
-            publisher.publish(prepared);
+            publisher.publish_if_changed(prepared);
         }
     });
     source
@@ -79,7 +74,7 @@ fn compose(
             crate::activity_source::append_attention(
                 &mut board,
                 label,
-                &format!("{}: {}", label, clean(error)),
+                &format!("{}: {}", label, sanitize_terminal_text(error)),
             );
         }
     }
@@ -109,7 +104,12 @@ fn compose(
                     .rev()
                     .take(120)
                     .rev()
-                    .map(|line| clean(&line.text).chars().take(2048).collect())
+                    .map(|line| {
+                        sanitize_terminal_text(&line.text)
+                            .chars()
+                            .take(2048)
+                            .collect()
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -121,7 +121,7 @@ fn compose(
                 wt_core::HarnessId::Opencode => "OpenCode",
             }
             .into(),
-            name: clean(&session.display_name),
+            name: sanitize_terminal_text(&session.display_name),
             state: state.into(),
             live,
             queued: session.extras.queued,
@@ -129,7 +129,7 @@ fn compose(
                 .extras
                 .session_summary
                 .as_deref()
-                .map(clean)
+                .map(sanitize_terminal_text)
                 .filter(|summary| !summary.is_empty()),
             context_percent: session.extras.context_percent,
             output,
@@ -151,7 +151,7 @@ fn compose(
     if let Some(feed) = activity.data() {
         for event in feed.events.iter().rev().take(100).rev() {
             let at_ms = u64::try_from(event.timestamp_ms).unwrap_or_default();
-            let text = clean(&event.text);
+            let text = sanitize_terminal_text(&event.text);
             let (level, attention) = match event.level {
                 crate::session_activity::ActivityKindDto::Warn => ("WARN", true),
                 crate::session_activity::ActivityKindDto::ToolError => ("ERROR", true),
@@ -230,10 +230,6 @@ fn usage_item(
             .and_then(|ms| u64::try_from(ms).ok()),
         cost: None,
     })
-}
-
-fn clean(value: &str) -> String {
-    wt_core::sanitize_terminal_text(value)
 }
 
 fn state_name(state: Option<DerivedState>) -> &'static str {

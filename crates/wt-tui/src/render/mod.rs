@@ -145,7 +145,7 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             base.fg(theme::FG_BRIGHT).add_modifier(Modifier::BOLD),
         ),
     ];
-    left.extend(status::chip(&status::status(model, status::ALL), base));
+    left.extend(status::chip(&status::status(model, &status::HEADER), base));
     let pending = status::board_pending(model);
     if !pending.is_empty() {
         left.push(Span::styled("  ", base));

@@ -101,7 +101,6 @@ pub fn overlay(
         let mut login: Option<String> = None;
         let mut login_reply: Option<oneshot::Receiver<Result<String, String>>> = None;
         let mut login_attempted_revision = None;
-        let mut last_projection: Option<SourceSnapshot<Board>> = None;
 
         loop {
             if github_enabled
@@ -198,14 +197,7 @@ pub fn overlay(
             if let Some(dev_snapshot) = dev_snapshot.as_ref() {
                 projection = projection.with_input(dev_snapshot);
             }
-            // Stamps alone do not change what the board shows.
-            if !last_projection
-                .as_ref()
-                .is_some_and(|last| last.same_view(&projection))
-            {
-                last_projection = Some(projection.clone());
-                publisher.publish(projection);
-            }
+            publisher.publish_if_changed(projection);
         }
     });
     source

@@ -23,7 +23,7 @@ use wt_core::WorkState;
 use super::text::{age, now_ms, truncate_end, truncate_start, wrap};
 use crate::{
     BoardRow, BoardSection, CheckState, DisplayPolicy, Model, PrPresentation, PreparedDetailGroup,
-    ReviewRequestRow, ReviewState, SessionView, badges, glyphs, theme,
+    ReviewRequestRow, ReviewState, SessionView, badges, glyphs, model::ARCHIVED_SECTION, theme,
 };
 
 /// Conflicting files listed before collapsing into a `+N more` tail.
@@ -32,8 +32,6 @@ const MAX_CONFLICT_FILES: usize = 8;
 const COLLAPSED_PREAMBLE_LINES: usize = 2;
 /// Lines each blocker note may spend in a folded-section summary.
 const SECTION_NOTE_LINES: usize = 4;
-/// Key of the board's pinned archived section (`wt-app` board layout).
-const ARCHIVED_SECTION: &str = "\0archived";
 /// Labels recognized at the start of a structured ready note.
 const NOTE_LABELS: [&str; 4] = ["IF WRONG", "UNTESTED", "REVERT", "OPS"];
 

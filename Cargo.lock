@@ -3208,6 +3208,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wt-core",
 ]
 
 [[package]]

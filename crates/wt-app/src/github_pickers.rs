@@ -3,7 +3,7 @@
 use anyhow::Result;
 use wt_github::{Contributor, GithubClient, GithubData, GithubOptions, PullRequest};
 use wt_runtime::{Confirmed, Stamp};
-use wt_tui::{Board, ReplyOutcome, ReviewerOption, UiModal, UiReply};
+use wt_tui::{Board, ReviewerOption, UiModal, UiReply};
 
 use crate::context::AppContext;
 
@@ -47,13 +47,15 @@ impl GithubPickers {
         github: Option<&Confirmed<GithubData>>,
     ) -> Result<UiReply> {
         if !self.reviewers_enabled {
-            return Ok(reply("reviewers are disabled for this repository"));
+            return Ok(UiReply::message(
+                "reviewers are disabled for this repository",
+            ));
         }
         let Some(github) = github else {
-            return Ok(failed("GitHub data is still loading"));
+            return Ok(UiReply::failure("GitHub data is still loading"));
         };
         let Some(row) = resolve_row(board, key) else {
-            return Ok(failed(format!(
+            return Ok(UiReply::failure(format!(
                 "worktree {key:?} is no longer on the board"
             )));
         };
@@ -61,14 +63,14 @@ impl GithubPickers {
         let Some(pr) = github.prs.get(&branch) else {
             return Ok(UiReply {
                 notice: true,
-                ..reply("no PR for this row")
+                ..UiReply::message("no PR for this row")
             });
         };
         if pr.state != "OPEN" {
-            return Ok(reply(format!("PR #{} is not open", pr.number)));
+            return Ok(UiReply::message(format!("PR #{} is not open", pr.number)));
         }
         if pr.is_draft {
-            return Ok(reply(format!(
+            return Ok(UiReply::message(format!(
                 "PR #{} is a draft (mark it ready first)",
                 pr.number
             )));
@@ -80,25 +82,28 @@ impl GithubPickers {
         );
         let contributors = match contributors {
             Ok(contributors) => contributors,
-            Err(error) => return Ok(failed(format!("reviewers unavailable: {error}"))),
+            Err(error) => return Ok(UiReply::failure(format!("reviewers unavailable: {error}"))),
         };
         let viewer = match viewer {
             Ok(viewer) => viewer,
-            Err(error) => return Ok(failed(format!("reviewer identity unavailable: {error}"))),
+            Err(error) => {
+                return Ok(UiReply::failure(format!(
+                    "reviewer identity unavailable: {error}"
+                )));
+            }
         };
         let candidates = reviewer_candidates(pr, &contributors, &viewer);
         if candidates.is_empty() {
-            return Ok(reply("no reviewer candidates"));
+            return Ok(UiReply::message("no reviewer candidates"));
         }
         Ok(UiReply {
-            message: format!("edit reviewers for PR #{}", pr.number),
             modal: Some(UiModal::Reviewers {
                 key: key.to_owned(),
                 pr_number: pr.number,
                 original: pr.requested_reviewers.clone(),
                 candidates,
             }),
-            ..UiReply::default()
+            ..UiReply::message(format!("edit reviewers for PR #{}", pr.number))
         })
     }
 
@@ -112,46 +117,54 @@ impl GithubPickers {
             github,
         } = request;
         if !self.reviewers_enabled {
-            return Ok(failed("reviewers are disabled for this repository"));
+            return Ok(UiReply::failure(
+                "reviewers are disabled for this repository",
+            ));
         }
         let Some(github) = github else {
-            return Ok(failed(
+            return Ok(UiReply::failure(
                 "GitHub data is still loading; reviewer edit aborted",
             ));
         };
         let Some(row) = resolve_row(board, key) else {
-            return Ok(failed(
+            return Ok(UiReply::failure(
                 "worktree is no longer on the board; reviewer edit aborted",
             ));
         };
         let branch = row.branch.clone();
         let Some(pr) = github.prs.get(&branch) else {
-            return Ok(failed(
+            return Ok(UiReply::failure(
                 "PR data is no longer available; reviewer edit aborted",
             ));
         };
         if pr.number != pr_number || pr.state != "OPEN" || pr.is_draft {
-            return Ok(failed(
+            return Ok(UiReply::failure(
                 "PR changed since the reviewer picker opened; refresh and retry",
             ));
         }
         if !same_reviewers(original, &pr.requested_reviewers) {
-            return Ok(failed(
+            return Ok(UiReply::failure(
                 "the requested reviewer list changed; refresh and reopen the picker",
             ));
         }
         if original.len() > 100 || selected.len() > 100 {
-            return Ok(failed("reviewer selection exceeds the 100-entry limit"));
+            return Ok(UiReply::failure(
+                "reviewer selection exceeds the 100-entry limit",
+            ));
         }
         if original
             .iter()
             .chain(selected)
             .any(|login| !valid_login(login))
         {
-            return Ok(failed("reviewer selection contains an invalid login"));
+            return Ok(UiReply::failure(
+                "reviewer selection contains an invalid login",
+            ));
         }
         if has_duplicates(selected) {
-            return Ok(failed("reviewer selection contains duplicate logins"));
+            return Ok(UiReply::failure(
+                "reviewer selection contains duplicate logins",
+            ));
         }
 
         let original_set = original
@@ -173,10 +186,7 @@ impl GithubPickers {
             .cloned()
             .collect::<Vec<_>>();
         if add.is_empty() && remove.is_empty() {
-            return Ok(UiReply {
-                outcome: Some(ReplyOutcome::NoChange),
-                ..reply("no reviewer changes")
-            });
+            return Ok(UiReply::no_change("no reviewer changes"));
         }
 
         let result = self
@@ -184,7 +194,7 @@ impl GithubPickers {
             .edit_reviewers(pr_number, &add, &remove, &self.cancellation)
             .await;
         if !result.ok {
-            return Ok(failed(
+            return Ok(UiReply::failure(
                 result
                     .error
                     .unwrap_or_else(|| "reviewer edit failed".into()),
@@ -199,13 +209,13 @@ impl GithubPickers {
             changes.push(format!("removed {}", remove.join(", ")));
         }
         // The host requests a direct GitHub read for accepted GitHub writes.
-        Ok(UiReply {
-            outcome: Some(ReplyOutcome::Accepted(at)),
-            ..reply(format!(
+        Ok(UiReply::accepted(
+            format!(
                 "edited reviewers for PR #{pr_number}: {}",
                 changes.join("; ")
-            ))
-        })
+            ),
+            at,
+        ))
     }
 }
 
@@ -303,25 +313,11 @@ fn valid_login(login: &str) -> bool {
         && login.matches('/').count() <= 1
 }
 
-fn reply(message: impl Into<String>) -> UiReply {
-    UiReply {
-        message: message.into(),
-        ..UiReply::default()
-    }
-}
-
-fn failed(message: impl Into<String>) -> UiReply {
-    UiReply {
-        message: message.into(),
-        failed: true,
-        ..UiReply::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use wt_github::{PrChecks, PrReview, SuggestedReviewer};
+    use wt_tui::ReplyOutcome;
 
     fn pr() -> PullRequest {
         PullRequest {

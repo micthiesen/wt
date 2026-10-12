@@ -114,7 +114,6 @@ async fn run_projection(
     let mut metadata_updates = metadata.subscribe();
     git_updates.mark_changed();
     metadata_updates.mark_changed();
-    let mut last: Option<SourceSnapshot<Board>> = None;
     loop {
         tokio::select! {
             biased;
@@ -144,12 +143,7 @@ async fn run_projection(
                     failure.with_state(SourceState::Failed(format!("local board: {error}").into()))
                 }
             };
-        // Stamps alone do not change what the board shows.
-        if last.as_ref().is_some_and(|last| last.same_view(&snapshot)) {
-            continue;
-        }
-        last = Some(snapshot.clone());
-        publisher.publish(snapshot);
+        publisher.publish_if_changed(snapshot);
     }
 }
 
@@ -158,13 +152,7 @@ fn compose(
     git: SourceSnapshot<Vec<WorktreeSnapshot>>,
     metadata: SourceSnapshot<Metadata>,
 ) -> SourceSnapshot<Board> {
-    let state = match (git.state(), metadata.state()) {
-        (_, SourceState::Failed(error)) => SourceState::Failed(format!("State: {error}").into()),
-        (SourceState::Failed(error), _) => SourceState::Failed(format!("Git: {error}").into()),
-        (SourceState::Refreshing, _) | (_, SourceState::Refreshing) => SourceState::Refreshing,
-        (SourceState::Ready, SourceState::Ready) => SourceState::Ready,
-        _ => SourceState::Empty,
-    };
+    let state = SourceState::combine([("Git", git.state()), ("State", metadata.state())]);
     let data = git
         .data()
         .zip(metadata.data())

@@ -7,8 +7,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use wt_core::Domain;
 use wt_runtime::{
-    Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
-    derived_channel, leaf_channel,
+    Persistence, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope, derived_channel,
+    leaf_channel,
 };
 use wt_tui::{Board, PerfView};
 
@@ -250,7 +250,6 @@ fn overlay(
     scope.spawn(async move {
         let mut board_updates = board.subscribe();
         let mut perf_updates = perf.subscribe();
-        let mut previous: Option<SourceSnapshot<Board>> = None;
         board_updates.mark_changed();
         loop {
             tokio::select! {
@@ -285,15 +284,7 @@ fn overlay(
             let next = base
                 .derive(Some(Arc::new(projected)))
                 .with_input(&perf_snapshot);
-            // Stamps alone do not change what the board shows.
-            if previous
-                .as_ref()
-                .is_some_and(|previous| previous.same_view(&next))
-            {
-                continue;
-            }
-            previous = Some(next.clone());
-            publisher.publish(next);
+            publisher.publish_if_changed(next);
         }
     });
     output
@@ -307,6 +298,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use wt_core::Domain;
+    use wt_runtime::SourceSnapshot;
     use wt_runtime::{SourceState, derived_channel};
 
     #[tokio::test]

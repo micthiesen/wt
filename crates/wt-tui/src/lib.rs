@@ -34,7 +34,10 @@ pub use model::{
     ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
     WorkPresentation, WorkRiskCount, WorkStateCount,
 };
-pub use mutations::{AUTO_MERGE_ACTION_ID, Effect, MutationKind, SETTLING_DOMAINS, UiMutation};
+pub use mutations::{
+    AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,
+    RowChange, SETTLING_DOMAINS, UiMutation,
+};
 pub use terminal::{run, run_with_palette_probe};
 #[doc(hidden)]
 pub use terminal_probe::{decode_terminal_probe_bytes, decode_terminal_probe_chunks};

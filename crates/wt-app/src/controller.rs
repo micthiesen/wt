@@ -91,16 +91,16 @@ pub fn start(
                     Some(Err(error)) => {
                         tracing::error!(%error, "action worker exited unexpectedly");
                         if let Some((lane, id)) = task_lanes.remove(&error.id()) {
-                            let _ = port.replies.send(UiReply { operation_id: Some(id), failed: true, message: format!("Action worker failed: {error}"), ..Default::default() }).await;
+                            let _ = port.replies.send(UiReply { operation_id: Some(id), ..UiReply::failure(format!("Action worker failed: {error}")) }).await;
                             failed_lanes.insert(lane.clone());
                             busy.remove(&lane);
                             let skipped = pending.iter().filter(|(queued, _)| *queued == lane).count();
                             for (_, request) in pending.iter().filter(|(queued, _)| *queued == lane) {
-                                let _ = port.replies.send(UiReply { operation_id: Some(request.id), failed: true, message: "Host action worker failed; operation did not start".into(), ..Default::default() }).await;
+                                let _ = port.replies.send(UiReply { operation_id: Some(request.id), ..UiReply::failure("Host action worker failed; operation did not start") }).await;
                             }
                             pending.retain(|(queued, _)| *queued != lane);
                             if skipped > 0 {
-                                let _ = port.replies.send(UiReply { failed: true, message: format!("{skipped} queued commands on the failed host were not started. Restart wt before retrying."), ..Default::default() }).await;
+                                let _ = port.replies.send(UiReply::failure(format!("{skipped} queued commands on the failed host were not started. Restart wt before retrying."))).await;
                             }
                         }
                     },
@@ -109,8 +109,8 @@ pub fn start(
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
                     Some(command) => match lane_for(&command.action) {
                         Ok(lane) if !failed_lanes.contains(&lane) => pending.push_back((lane, command)),
-                        Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), failed: true, message: "Host command worker failed; this command was not started. Restart wt before retrying.".into(), ..Default::default() }).await; },
-                        Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), failed: true, message: format!("{error:#}"), ..Default::default() }).await; },
+                        Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure("Host command worker failed; this command was not started. Restart wt before retrying.") }).await; },
+                        Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure(format!("{error:#}")) }).await; },
                     },
                     None => closed = true,
                 },
@@ -211,10 +211,8 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
             // A notice means nothing was written (e.g. already at the top),
             // so a pending change ends at once instead of waiting.
             UiReply {
-                message: error.to_string(),
                 notice: true,
-                outcome: Some(wt_tui::ReplyOutcome::NoChange),
-                ..Default::default()
+                ..UiReply::no_change(error.to_string())
             },
             false,
         ),
@@ -230,20 +228,11 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
             // have happened. The TUI keeps showing it as unconfirmed until
             // a read settles it or its deadline passes; nothing is resent.
             let reply = if ambiguous {
-                UiReply {
-                    message: format!(
-                        "{error:#}; the result is unknown and will not be resent; check before retrying"
-                    ),
-                    notice: true,
-                    outcome: Some(wt_tui::ReplyOutcome::Uncertain),
-                    ..Default::default()
-                }
+                UiReply::uncertain(format!(
+                    "{error:#}; the result is unknown and will not be resent; check before retrying"
+                ))
             } else {
-                UiReply {
-                    message: format!("{error:#}"),
-                    failed: true,
-                    ..Default::default()
-                }
+                UiReply::failure(format!("{error:#}"))
             };
             (reply, ambiguous)
         }
@@ -343,10 +332,7 @@ pub(crate) async fn handoff_prepared(
             .map_err(|error| format!("{error:#}")),
     );
     result?;
-    Ok(UiReply {
-        message: "Returned from session".into(),
-        ..Default::default()
-    })
+    Ok(UiReply::message("Returned from session"))
 }
 
 #[cfg(test)]

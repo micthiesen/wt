@@ -214,7 +214,6 @@ fn project(
         // live inventory triggers the reader.
         let mut previous = Vec::new();
         let mut confirmed = None::<Vec<String>>;
-        let mut last: Option<SourceSnapshot<Board>> = None;
         let backstop = Duration::from_secs(180);
         let mut interval =
             tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
@@ -249,11 +248,7 @@ fn project(
                 _ = interval.tick(), if readable => { statuses.refresh(); continue; }
             }
             let next = compose(boards.borrow().clone(), updates.borrow().clone(), &previous);
-            if last.as_ref().is_some_and(|last| last.same_view(&next)) {
-                continue;
-            }
-            last = Some(next.clone());
-            publisher.publish(next);
+            publisher.publish_if_changed(next);
         }
     });
     output

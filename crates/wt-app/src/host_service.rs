@@ -66,8 +66,10 @@ impl HostService {
     }
 
     fn refresh_after(&self, effect: &wt_tui::Effect, reply: &UiReply) {
-        let mut local = false;
-        let mut board = false;
+        // Domains without a handle here are reread through the board
+        // pipeline: from its last stage, or from the local board stage.
+        let mut refresh_full_board = false;
+        let mut refresh_local_board = false;
         for domain in effect.domains() {
             match domain {
                 Domain::Git => {
@@ -79,7 +81,7 @@ impl HostService {
                 // The read that may confirm an accepted write must be a
                 // direct fetch that started after it, not a daemon snapshot.
                 Domain::Github if matches!(reply.outcome, Some(ReplyOutcome::Accepted(_))) => {
-                    self.sources.refresh_github_live()
+                    self.sources.github_refresh.refresh_live()
                 }
                 Domain::Github => self.sources.github_refresh.refresh(),
                 Domain::Reviews => self.sources.review_requests.refresh(),
@@ -88,7 +90,7 @@ impl HostService {
                     self.sources.sessions.discoveries.refresh();
                     self.sources.session_activity.refresh();
                 }
-                Domain::Actions | Domain::Issues => board = true,
+                Domain::Actions | Domain::Issues => refresh_full_board = true,
                 Domain::Activity
                 | Domain::Dev
                 | Domain::Origin
@@ -97,13 +99,13 @@ impl HostService {
                 | Domain::History
                 | Domain::Perf
                 | Domain::Automations
-                | Domain::Host => local = true,
+                | Domain::Host => refresh_local_board = true,
             }
         }
-        if board {
+        if refresh_full_board {
             self.sources.board.refresh();
         }
-        if local {
+        if refresh_local_board {
             self.sources.local.refresh();
         }
     }

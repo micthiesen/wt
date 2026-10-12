@@ -243,11 +243,9 @@ fn combine_snapshot(
         dismissal_updates.mark_changed();
         let mut latest_requests = request_updates.borrow().clone();
         let mut latest_dismissals = dismissal_updates.borrow().clone();
-        let mut last = None;
         loop {
             publish_snapshot(
                 &publisher,
-                &mut last,
                 &latest_requests,
                 &latest_dismissals,
                 issue_url_template.as_deref(),
@@ -274,22 +272,8 @@ fn combine_snapshot(
     handle
 }
 
-/// Publish unless only stamps changed.
-fn publish_changed<T: PartialEq>(
-    publisher: &DerivedPublisher<T>,
-    last: &mut Option<SourceSnapshot<T>>,
-    next: SourceSnapshot<T>,
-) {
-    if last.as_ref().is_some_and(|last| last.same_view(&next)) {
-        return;
-    }
-    *last = Some(next.clone());
-    publisher.publish(next);
-}
-
 fn publish_snapshot(
     publisher: &DerivedPublisher<ReviewRequestSnapshot>,
-    last: &mut Option<SourceSnapshot<ReviewRequestSnapshot>>,
     requests: &SourceSnapshot<Vec<ReviewRequestPr>>,
     dismissals: &SourceSnapshot<Vec<ReviewRequestDismissal>>,
     issue_url_template: Option<&str>,
@@ -314,7 +298,7 @@ fn publish_snapshot(
         .derive(data.map(Arc::new))
         .with_input(dismissals)
         .with_state(state);
-    publish_changed(publisher, last, next);
+    publisher.publish_if_changed(next);
 }
 
 pub fn overlay(
@@ -331,13 +315,8 @@ pub fn overlay(
         request_updates.mark_changed();
         let mut latest_board = board_updates.borrow().clone();
         let mut latest_requests = request_updates.borrow().clone();
-        let mut last = None;
         loop {
-            publish_changed(
-                &publisher,
-                &mut last,
-                board_snapshot(&latest_board, &latest_requests),
-            );
+            publisher.publish_if_changed(board_snapshot(&latest_board, &latest_requests));
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => break,

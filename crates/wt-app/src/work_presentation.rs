@@ -8,7 +8,7 @@ use std::{
 };
 
 use wt_config::Config;
-use wt_core::DerivedState;
+use wt_core::{DerivedState, sanitize_terminal_text};
 use wt_github::{GithubData, PrChecks, PrReview, PullRequest};
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, BoardRow, PreparedDetailGroup, WorkPresentation};
@@ -29,7 +29,6 @@ pub fn overlay(
         board_updates.mark_changed();
         github_updates.mark_changed();
         let mut age_refresh = tokio::time::interval(Duration::from_secs(60));
-        let mut last: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -51,12 +50,7 @@ pub fn overlay(
                 &config,
                 now_ms(),
             );
-            // Stamps alone do not change what the board shows.
-            if last.as_ref().is_some_and(|last| last.same_view(&prepared)) {
-                continue;
-            }
-            last = Some(prepared.clone());
-            publisher.publish(prepared);
+            publisher.publish_if_changed(prepared);
         }
     });
     source
@@ -91,7 +85,7 @@ fn compose(
             })
             .or_else(|| match github.state() {
                 SourceState::Failed(error) => Some(wt_tui::PrPresentation {
-                    error: Some(clean(error)),
+                    error: Some(sanitize_terminal_text(error)),
                     ..Default::default()
                 }),
                 _ => None,
@@ -166,18 +160,22 @@ fn pr_presentation(pr: &PullRequest) -> wt_tui::PrPresentation {
     wt_tui::PrPresentation {
         head_sha: pr.head_ref_oid.clone(),
         number: Some(pr.number),
-        url: Some(clean(&pr.url)),
-        title: Some(clean(&pr.title)),
-        state: Some(clean(&pr.state).to_ascii_uppercase()),
+        url: Some(sanitize_terminal_text(&pr.url)),
+        title: Some(sanitize_terminal_text(&pr.title)),
+        state: Some(sanitize_terminal_text(&pr.state).to_ascii_uppercase()),
         draft: pr.is_draft,
-        base_branch: Some(clean(&pr.base_ref_name)),
+        base_branch: Some(sanitize_terminal_text(&pr.base_ref_name)),
         checks: match pr.checks {
             PrChecks::Pass => wt_tui::CheckState::Pass,
             PrChecks::Fail => wt_tui::CheckState::Fail,
             PrChecks::Pending => wt_tui::CheckState::Pending,
             PrChecks::None => wt_tui::CheckState::None,
         },
-        failed_checks: pr.failed_checks.iter().map(|line| clean(line)).collect(),
+        failed_checks: pr
+            .failed_checks
+            .iter()
+            .map(|line| sanitize_terminal_text(line))
+            .collect(),
         review: match pr.review {
             PrReview::Approved => wt_tui::ReviewState::Approved,
             PrReview::ChangesRequested => wt_tui::ReviewState::ChangesRequested,
@@ -188,10 +186,10 @@ fn pr_presentation(pr: &PullRequest) -> wt_tui::PrPresentation {
         reviewers: pr
             .requested_reviewers
             .iter()
-            .map(|login| clean(login))
+            .map(|login| sanitize_terminal_text(login))
             .collect(),
         review_bot: pr.review_bot.as_ref().map(|bot| wt_tui::ReviewBotView {
-            state: clean(&bot.state).to_ascii_lowercase(),
+            state: sanitize_terminal_text(&bot.state).to_ascii_lowercase(),
             unresolved: bot.unresolved,
             stale: bot.stale.unwrap_or(false),
         }),
@@ -217,8 +215,8 @@ fn comments(pr: &PullRequest, now_ms: i64) -> Vec<wt_tui::PrCommentView> {
     pr.comments
         .iter()
         .map(|comment| wt_tui::PrCommentView {
-            author: clean(&comment.author),
-            body: clean(&comment.body),
+            author: sanitize_terminal_text(&comment.author),
+            body: sanitize_terminal_text(&comment.body),
             age: wt_core::work_age(&comment.created_at, now_ms),
         })
         .collect()
@@ -247,7 +245,10 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                 .base_branch
                 .as_deref()
                 .filter(|base| !base.is_empty() && *base != trunk);
-            let mut lines = vec![clean(&row.branch), clean(parent.unwrap_or(trunk))];
+            let mut lines = vec![
+                sanitize_terminal_text(&row.branch),
+                sanitize_terminal_text(parent.unwrap_or(trunk)),
+            ];
             if parent.is_some() {
                 lines.push("forked".into());
             }
@@ -257,7 +258,7 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
             "path",
             "Path",
             (!row.path.is_empty())
-                .then(|| clean(&row.path))
+                .then(|| sanitize_terminal_text(&row.path))
                 .into_iter()
                 .collect(),
             None,
@@ -266,25 +267,33 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
             "issue",
             "Issue",
             nonempty_lines([
-                row.issue_id.as_deref().map(clean),
-                row.issue_status.as_deref().map(clean),
+                row.issue_id.as_deref().map(sanitize_terminal_text),
+                row.issue_status.as_deref().map(sanitize_terminal_text),
                 row.issue_url
                     .as_deref()
                     .or(row.github_issue_url.as_deref())
-                    .map(clean),
+                    .map(sanitize_terminal_text),
             ]),
             None,
         ),
         "stage" => (
             "stage",
             "Stage",
-            row.stage_url.as_deref().map(clean).into_iter().collect(),
+            row.stage_url
+                .as_deref()
+                .map(sanitize_terminal_text)
+                .into_iter()
+                .collect(),
             None,
         ),
         "dev" => (
             "dev",
             "Dev",
-            row.dev_url.as_deref().map(clean).into_iter().collect(),
+            row.dev_url
+                .as_deref()
+                .map(sanitize_terminal_text)
+                .into_iter()
+                .collect(),
             None,
         ),
         "pr" => {
@@ -297,18 +306,18 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
             };
             let mut lines = nonempty_lines([
                 pr.number.map(|number| format!("#{number}")),
-                pr.title.as_deref().map(clean),
+                pr.title.as_deref().map(sanitize_terminal_text),
                 pr.state.as_deref().map(|state| {
                     if pr.draft {
                         "draft".into()
                     } else {
-                        clean(state)
+                        sanitize_terminal_text(state)
                     }
                 }),
-                pr.url.as_deref().map(clean),
+                pr.url.as_deref().map(sanitize_terminal_text),
                 pr.base_branch
                     .as_deref()
-                    .map(|base| format!("base: {}", clean(base))),
+                    .map(|base| format!("base: {}", sanitize_terminal_text(base))),
                 (pr.checks != wt_tui::CheckState::None)
                     .then(|| format!("checks: {:?}", pr.checks).to_lowercase()),
                 (pr.review != wt_tui::ReviewState::None)
@@ -317,7 +326,11 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                     format!("review bot: {} · {} unresolved", bot.state, bot.unresolved)
                 }),
             ]);
-            lines.extend(pr.failed_checks.iter().map(|check| clean(check)));
+            lines.extend(
+                pr.failed_checks
+                    .iter()
+                    .map(|check| sanitize_terminal_text(check)),
+            );
             if !pr.reviewers.is_empty() {
                 lines.push(format!("reviewers: {}", pr.reviewers.join(", ")));
             }
@@ -337,7 +350,12 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                     .iter()
                     .map(|comment| format!("{}: {}", comment.author, comment.body)),
             );
-            ("pr", "Pull request", lines, pr.error.as_deref().map(clean))
+            (
+                "pr",
+                "Pull request",
+                lines,
+                pr.error.as_deref().map(sanitize_terminal_text),
+            )
         }
         "claude" => {
             let mut lines: Vec<String> = row
@@ -346,9 +364,9 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                 .map(|session| {
                     format!(
                         "{} {} · {}{}",
-                        clean(&session.harness),
-                        clean(&session.name),
-                        clean(&session.state),
+                        sanitize_terminal_text(&session.harness),
+                        sanitize_terminal_text(&session.name),
+                        sanitize_terminal_text(&session.state),
                         if session.queued > 0 {
                             format!(" · {} queued", session.queued)
                         } else {
@@ -378,7 +396,7 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                     (Some(ahead), Some(behind)) => format!(" · {ahead} ahead, {behind} behind"),
                     _ => String::new(),
                 };
-                lines.push(format!("{}{}", clean(upstream), counts));
+                lines.push(format!("{}{}", sanitize_terminal_text(upstream), counts));
             }
             if row.git.rebasing {
                 lines.push("Rebase in progress".into());
@@ -387,7 +405,7 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                 row.git
                     .conflict_files
                     .iter()
-                    .map(|path| format!("conflict: {}", clean(path))),
+                    .map(|path| format!("conflict: {}", sanitize_terminal_text(path))),
             );
             if let Some(landing) = row.git.landed_on {
                 lines.push(format!(
@@ -398,7 +416,12 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                     }
                 ));
             }
-            ("git", "Git", lines, row.git.error.as_deref().map(clean))
+            (
+                "git",
+                "Git",
+                lines,
+                row.git.error.as_deref().map(sanitize_terminal_text),
+            )
         }
         _ => return None,
     };
@@ -433,10 +456,6 @@ fn nonempty_lines<const N: usize>(values: [Option<String>; N]) -> Vec<String> {
         .flatten()
         .filter(|value| !value.trim().is_empty())
         .collect()
-}
-
-fn clean(text: &str) -> String {
-    wt_core::sanitize_terminal_text(text)
 }
 
 fn now_ms() -> i64 {

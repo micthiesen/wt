@@ -53,6 +53,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    env:
+      # One build identity for every step, so later steps reuse the test
+      # build instead of recompiling wt-app for a new environment value.
+      WT_BUILD_ID: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -79,9 +83,40 @@ jobs:
           fi
       - run: cargo nextest run --workspace --locked --profile ci
       - run: cargo test --workspace --locked --doc
-      - run: cargo build --workspace --bins --examples --locked
+
+  # The end-to-end checks drive the built binary; they run beside the unit
+  # tests instead of after them.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      WT_BUILD_ID: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native-${{ matrix.os }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install terminal integration dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux openssh-server
+      - name: Install terminal integration dependencies (macOS)
+        if: runner.os == 'macOS'
         env:
-          WT_BUILD_ID: ${{ github.sha }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          if ! brew list --versions tmux >/dev/null 2>&1; then
+            brew install tmux
+          fi
+      - run: cargo build --workspace --bins --examples --locked
       - name: Verify bootstrap installation and native launcher recovery
         run: python3 scripts/native-install-check.py
       - name: Verify real native installation, update, rollback and failed release recovery

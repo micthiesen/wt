@@ -7,8 +7,8 @@ use wt_tui::Board;
 use wt_vcs::FetchOriginReport;
 
 use crate::github_pickers::GithubPickers;
+use crate::github_source::GithubRefresh;
 use crate::naming_source::NamingCommands;
-use crate::sources::GithubRefresh;
 
 #[derive(Clone)]
 pub struct HardRefreshCommands {

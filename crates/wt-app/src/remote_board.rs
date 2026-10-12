@@ -59,7 +59,6 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
         let mut updates = owned_local.sources.board.subscribe();
         let mut metadata = owned_local.sources.metadata.subscribe();
         updates.mark_changed(); metadata.mark_changed();
-        let mut previous: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -76,9 +75,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
             }
             let snapshots = owned_remotes.iter().map(|remote| (&remote.endpoint, remote.snapshot.snapshot(), remote.managed.borrow().clone())).collect::<Vec<_>>();
             let snapshot = compose(&config, updates.borrow().clone(), metadata.borrow().clone(), &snapshots);
-            if previous.as_ref().is_some_and(|old| old.same_view(&snapshot)) { continue; }
-            previous = Some(snapshot.clone());
-            publisher.publish(snapshot);
+            publisher.publish_if_changed(snapshot);
         }
     });
     Fleet {

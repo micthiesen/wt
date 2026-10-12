@@ -8,9 +8,7 @@ use tokio::{
     task::JoinSet,
 };
 use wt_automations::AutomationLedger;
-use wt_runtime::{
-    Confirmed, LeafHandle, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel,
-};
+use wt_runtime::{Confirmed, LeafHandle, SourceHandle, SourceState, TaskScope, derived_channel};
 use wt_tui::Board;
 
 use crate::{
@@ -371,7 +369,6 @@ fn overlay(
     let mut updates = input.subscribe();
     scope.spawn(async move {
         updates.mark_changed();
-        let mut previous: Option<SourceSnapshot<Board>> = None;
         loop {
             tokio::select! {
                 biased;
@@ -413,15 +410,8 @@ fn overlay(
                 );
             }
             // The status lines are derived from the board's own inputs, so
-            // the board keeps its provenance. Stamps alone never republish.
-            let next = snapshot.derive(Some(Arc::new(board)));
-            if previous
-                .as_ref()
-                .is_none_or(|previous| !previous.same_view(&next))
-            {
-                publisher.publish(next.clone());
-                previous = Some(next);
-            }
+            // the board keeps its provenance.
+            publisher.publish_if_changed(snapshot.derive(Some(Arc::new(board))));
         }
     });
     source
@@ -543,6 +533,7 @@ fn lifecycle_metadata_key(metadata: Option<&crate::local_source::Metadata>) -> s
 mod tests {
     use super::*;
     use std::time::Duration;
+    use wt_runtime::SourceSnapshot;
 
     #[tokio::test]
     async fn passthrough_keeps_board_refresh_and_stops_command_responder() {

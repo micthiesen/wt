@@ -8,10 +8,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders},
 };
 use wt_core::Domain;
-use wt_runtime::{PendingPhase, PendingView, Provenance, SourceState};
+use wt_runtime::{Expired, Mutation, PendingPhase, PendingView, Provenance, SourceState};
 
 use super::text::{age, now_ms};
-use crate::{Model, theme};
+use crate::{Model, UiMutation, theme};
 
 /// Domains behind the worktree list and its review section.
 pub(crate) const LIST: &[Domain] = &[
@@ -41,24 +41,22 @@ pub(crate) const DETAILS: &[Domain] = &[
 pub(crate) const OUTPUT: &[Domain] = &[Domain::Activity, Domain::Actions, Domain::Sessions];
 pub(crate) const HISTORY: &[Domain] = &[Domain::History];
 pub(crate) const PERF: &[Domain] = &[Domain::Perf];
-/// Everything, for the header summary.
-pub(crate) const ALL: &[Domain] = &[
-    Domain::Git,
-    Domain::Metadata,
-    Domain::Github,
-    Domain::Reviews,
-    Domain::Issues,
-    Domain::Sessions,
-    Domain::Activity,
-    Domain::Actions,
-    Domain::Dev,
-    Domain::Origin,
-    Domain::Naming,
-    Domain::Presentation,
-    Domain::History,
-    Domain::Automations,
-    Domain::Host,
-];
+/// Every domain but `Perf`, which only the perf overlay shows, for the
+/// header summary.
+pub(crate) const HEADER: [Domain; Domain::ALL.len() - 1] = header_domains();
+
+const fn header_domains() -> [Domain; Domain::ALL.len() - 1] {
+    let mut domains = [Domain::Git; Domain::ALL.len() - 1];
+    let (mut from, mut to) = (0, 0);
+    while from < Domain::ALL.len() {
+        if !matches!(Domain::ALL[from], Domain::Perf) {
+            domains[to] = Domain::ALL[from];
+            to += 1;
+        }
+        from += 1;
+    }
+    domains
+}
 
 /// The combined condition of some domains across every host.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -204,7 +202,7 @@ fn phase_style(phase: PendingPhase) -> (&'static str, Color) {
 pub(crate) fn row_pending<'a>(model: &'a Model, key: &str) -> Vec<&'a PendingView> {
     model
         .board
-        .pending
+        .pending_views
         .iter()
         .filter(|view| view.target.key.as_deref() == Some(key))
         .collect()
@@ -214,10 +212,28 @@ pub(crate) fn row_pending<'a>(model: &'a Model, key: &str) -> Vec<&'a PendingVie
 pub(crate) fn board_pending(model: &Model) -> Vec<&PendingView> {
     model
         .board
-        .pending
+        .pending_views
         .iter()
         .filter(|view| view.target.key.is_none())
         .collect()
+}
+
+/// The notice for a pending change whose deadline passed before its
+/// domains showed it.
+pub(crate) fn expired_notice(expired: &Expired<UiMutation>) -> String {
+    let label = expired.mutation.label();
+    let domain = expired
+        .mutation
+        .domains()
+        .first()
+        .map_or("source", |domain| domain.label());
+    match expired.phase {
+        PendingPhase::Unconfirmed => {
+            format!("{label} is unconfirmed and {domain} does not show it; check before retrying")
+        }
+        PendingPhase::InFlight => format!("{label}: no answer from the host"),
+        PendingPhase::Accepted => format!("{label} accepted, but {domain} does not show it yet"),
+    }
 }
 
 /// One marker for pending changes: the newest one's label, with a glyph for
@@ -313,5 +329,11 @@ mod tests {
             .map(|span| span.content.to_string())
             .collect();
         assert_eq!(text, "? setting ready (unconfirmed) +1");
+    }
+
+    #[test]
+    fn the_header_summarizes_every_domain_but_perf() {
+        assert!(!HEADER.contains(&Domain::Perf));
+        assert_eq!(HEADER.len() + 1, Domain::ALL.len());
     }
 }
