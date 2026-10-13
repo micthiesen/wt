@@ -497,9 +497,11 @@ impl TmuxClient {
         if result.status.success() {
             return Ok(true);
         }
-        let stderr = result.stderr_text();
-        if tmux_server_definitely_absent(&stderr) || tmux_session_absent(&stderr) {
-            return Ok(false);
+        if let Some(present) =
+            session_presence_after_failure(&result, &target, self.list_sessions(cancellation))
+                .await?
+        {
+            return Ok(present);
         }
         Err(command_error("has-session", result))
     }
@@ -1115,8 +1117,9 @@ exit "$wt_terminal_status""#;
         if result.status.success() {
             return Ok(true);
         }
-        let stderr = result.stderr_text();
-        if tmux_server_definitely_absent(&stderr) || tmux_session_absent(&stderr) {
+        if session_presence_after_failure(&result, target, self.list_sessions(cancellation)).await?
+            == Some(false)
+        {
             return Ok(false);
         }
         Err(command_error("kill-session", result))
@@ -1479,6 +1482,33 @@ fn show_option_args(scope: &OptionScope, option: &str, value_only: bool) -> Vec<
 
 fn tmux_session_absent(stderr: &str) -> bool {
     stderr.to_ascii_lowercase().contains("can't find session")
+}
+
+/// Older tmux resolves a current session before an explicit target. During
+/// last-session teardown it can report `no current target` without inspecting
+/// our target. Reconcile with target-free inventory; never infer absence from
+/// that error or replay a failed mutation. Other ambiguous failures stay errors.
+async fn session_presence_after_failure(
+    result: &ProcessOutput,
+    target: &str,
+    inventory: impl std::future::Future<Output = Result<Vec<SessionInfo>, TmuxError>>,
+) -> Result<Option<bool>, TmuxError> {
+    let stderr = result.stderr_text();
+    if tmux_server_definitely_absent(&stderr) || tmux_session_absent(&stderr) {
+        return Ok(Some(false));
+    }
+    if result.status.code() == Some(1) && stderr.trim() == "no current target" {
+        let sessions = inventory.await?;
+        let present = sessions.iter().any(|session| {
+            if let Some(name) = target.strip_prefix('=') {
+                session.name == name
+            } else {
+                session.id == target
+            }
+        });
+        return Ok(Some(present));
+    }
+    Ok(None)
 }
 
 fn checked(operation: &'static str, output: ProcessOutput) -> Result<ProcessOutput, TmuxError> {

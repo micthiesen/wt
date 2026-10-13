@@ -1023,6 +1023,109 @@ fn probe_output(code: i32, stderr: &str) -> wt_platform::process::ProcessOutput 
     }
 }
 
+#[tokio::test]
+async fn missing_current_target_requires_inventory_and_keeps_exact_identity() {
+    for (target, names, expected) in [
+        ("=gone", vec![], false),
+        ("=gone", vec![("gone-other", "$1")], false),
+        ("=gone", vec![("gone", "$1")], true),
+        ("$1", vec![("renamed", "$1")], true),
+        ("$2", vec![("renamed", "$1")], false),
+    ] {
+        let mut observed = false;
+        let result = crate::session_presence_after_failure(
+            &probe_output(1, "no current target\n"),
+            target,
+            async {
+                observed = true;
+                Ok(names
+                    .into_iter()
+                    .map(|(name, id)| crate::SessionInfo {
+                        name: name.into(),
+                        id: id.into(),
+                        created_at: 0,
+                        attached_clients: 0,
+                        window_count: 1,
+                        harness_session_id: None,
+                    })
+                    .collect())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(observed);
+        assert_eq!(result, Some(expected));
+    }
+    let failure = crate::session_presence_after_failure(
+        &probe_output(1, "no current target"),
+        "=gone",
+        async {
+            Err(crate::command_error(
+                "list-sessions",
+                probe_output(1, "Permission denied"),
+            ))
+        },
+    )
+    .await;
+    assert!(failure.is_err(), "failed inventory is not proof of absence");
+    for message in [
+        "server exited unexpectedly",
+        "Permission denied",
+        "no current target\nextra failure",
+    ] {
+        let result =
+            crate::session_presence_after_failure(&probe_output(1, message), "=gone", async {
+                panic!("unclassified errors must not request inventory")
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
+}
+
+#[tokio::test]
+async fn exact_session_probes_and_removal_work_on_a_live_empty_server() {
+    if std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("tmux.conf");
+    std::fs::write(&config, "set -g exit-empty off\n").unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("tmux.sock")).with_config_file(config),
+    );
+    let cancel = CancellationToken::new();
+    let result = async {
+        client
+            .create_session(
+                &CreateSession {
+                    name: "kept-other".into(),
+                    cwd: temp.path().into(),
+                    command: vec!["cat".into()],
+                    width: None,
+                    height: None,
+                },
+                &cancel,
+            )
+            .await?;
+        assert!(!client.session_exists("kept", &cancel).await?);
+        assert!(client.session_exists("kept-other", &cancel).await?);
+        assert!(client.kill_session("kept-other", &cancel).await?);
+        assert!(client.list_sessions(&cancel).await?.is_empty());
+        assert!(!client.session_exists("kept-other", &cancel).await?);
+        assert!(!client.kill_session("kept-other", &cancel).await?);
+        Ok::<(), crate::TmuxError>(())
+    }
+    .await;
+    client.kill_server(&cancel).await.unwrap();
+    result.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn shutdown_read_race_requires_a_new_observation_and_preserves_uncertainty() {
     for (code, stderr) in [
