@@ -14,6 +14,7 @@ const DEFAULT_ROWS: &[&str] = &["branch", "issue", "stage", "dev", "pr", "claude
 const DEFAULT_REGEN: &[&str] = &["sst-env.d.ts"];
 /// Variables a managed worker's environment file sets itself.
 pub const RESERVED_MANAGED_ENV: &[&str] = &[
+    "WT_MANAGED_FILES",
     "PATH",
     "HOME",
     "WT_CONFIG",
@@ -575,7 +576,30 @@ impl Config {
         }
         let managed = ManagedConfig {
             env: managed_raw.env,
+            files: managed_raw.files.into_iter().map(|(destination, source)| {
+                if destination.split('/').any(|part| matches!(part, "" | "." | ".."))
+                    || destination.contains('\\')
+                    || destination.chars().any(char::is_control)
+                    || matches!(destination.split('/').next(), Some(".wt-tree-sha256" | ".wt-tree-files"))
+                {
+                    errors.push(format!("managed.files.{destination}: destination must be a plain relative file path without `..` or reserved manifest names"));
+                }
+                if source.trim().is_empty() {
+                    errors.push(format!("managed.files.{destination}: source path is empty"));
+                }
+                let source = absolute(&expand_home(&source, &options.home), &absolute(&paths.main_clone, &options.cwd));
+                (destination, source)
+            }).collect(),
         };
+        for destination in managed.files.keys() {
+            if managed
+                .files
+                .keys()
+                .any(|other| other != destination && other.starts_with(&format!("{destination}/")))
+            {
+                errors.push(format!("managed.files.{destination}: destination is also a directory for another declared file"));
+            }
+        }
 
         let naming = optional_section::<NamingConfig>(&raw, "naming", "", &mut errors);
         if raw.get("ai").is_some() {
@@ -1271,6 +1295,7 @@ struct RawRemote {
 #[serde(default, deny_unknown_fields)]
 struct RawManaged {
     env: BTreeMap<String, String>,
+    files: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 #[serde(default)]

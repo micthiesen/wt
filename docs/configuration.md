@@ -289,14 +289,30 @@ managed = true
 | key | required | default | meaning |
 |---|---|---|---|
 | `env` | no | `{}` | Map of uppercase variable name to a shell command run on the controller (in the main clone, 30-second limit). Its output, minus one trailing newline, becomes that variable on every managed worker, in wt commands and agent sessions. A failing command leaves the variable unset and shows a warning. |
+| `files` | no | `{}` | Map of worker-relative destination to a controller source file. Files are mirrored beneath `$WT_MANAGED_FILES` (`$WT_MANAGED_ROOT/files`) on each connection. Sources beginning with `~/` use the controller home; relative sources use the main clone. |
 
 ```toml
 [managed.env]
 CLOUDFLARE_API_TOKEN = "op read op://Dev/Cloudflare/token"
+
+[managed.files]
+"scripts/cleanup.py" = "~/.dotfiles/scripts/cleanup.py"
 ```
 
+Hooks can use `"${WT_MANAGED_FILES:-$HOME/.dotfiles}/scripts/cleanup.py"`
+to share the same command locally and on managed workers. Destinations must
+be relative without `.` or `..` components; internal tree manifest names are
+reserved. Declared sources must be readable regular files. Missing sources
+fail provisioning before any worker update is sent. Executable files stay
+executable; worker copies are private (0700 or 0600). Limits are 64 MiB per
+file and 128 MiB total. Contents are copied byte for byte; missing, modified,
+or incorrectly permissioned copies are repaired on the next connection.
+Removing a declaration removes its previously
+provisioned copy on the next connection. Commands are never scanned for
+undeclared dependencies.
+
 wt owns `PATH`, `HOME`, `WT_CONFIG`, `WT_REPO_CONFIG`, `WT_MANAGED_ROOT`,
-`WT_SESSION_ENV`, `WT_SESSION_SOURCE`, `CODEX_HOME`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, and
+`WT_MANAGED_FILES`, `WT_SESSION_ENV`, `WT_SESSION_SOURCE`, `CODEX_HOME`, `GH_CONFIG_DIR`, `GIT_CONFIG_GLOBAL`, and
 `GIT_TERMINAL_PROMPT` on managed workers; these names are rejected.
 
 An unmanaged remote machine needs its own `~/.config/wt/config.toml`, including

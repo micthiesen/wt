@@ -576,6 +576,8 @@ pub struct BackendConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManagedConfig {
     pub env: BTreeMap<String, String>,
+    /// Worker files-root relative destination to resolved controller source.
+    pub files: BTreeMap<String, PathBuf>,
 }
 
 /// Fully resolved, validated configuration. Optional integrations remain

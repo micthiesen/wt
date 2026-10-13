@@ -132,6 +132,18 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   and quit in 0.003 seconds after refresh (`/tmp/wt-live-final-06cb306/result.json`).
   This lower measurement includes the unknown-session limitation above; the
   separate permissive-selection comparison proves the feedback fix itself.
+  The optimized `d272490` candidate measured 8.55% over 60 seconds and quit in
+  0.0034 seconds after refresh (`/tmp/wt-live-final-d272490/result.json`).
+  Its full local gate and 15 native checks passed, as did cross-platform CI.
+  Live MaxBook testing then blocked promotion: its legitimate 9 KiB PATH was
+  duplicated into a 20 KiB tmux launch request. Session creation now streams
+  tmux-native escaped arguments through stdin; a real 40 KiB environment test
+  covers cold/warm servers and retained retries. Repeated managed PATH setup
+  also preserves first occurrence order without growth. Candidate `848a223`
+  passed all 899 tests and 15 native checks, plus three 20-second managed
+  Codex attach/F12 cycles without a trust prompt or early exit. Nonforce remote
+  cleanup exposed a missing controller-owned stop hook; provisioning that
+  declared dependency and completing cleanup remain owed before promotion.
   Final release installation and its live measurement remain owed.
 - **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
   Codex rollout append watcher received no callbacks within either 2 or 15

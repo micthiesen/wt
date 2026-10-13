@@ -477,6 +477,7 @@ fn child_environment(root: &Path, login_path: &str) -> Vec<(OsString, Option<OsS
     vec![
         ("PATH".into(), Some(path)),
         ("WT_MANAGED_ROOT".into(), Some(root.into())),
+        ("WT_MANAGED_FILES".into(), Some(root.join("files").into())),
         ("CODEX_HOME".into(), Some(root.join("codex").into())),
         ("GH_CONFIG_DIR".into(), Some(root.join("gh").into())),
         (
@@ -589,13 +590,17 @@ pub(crate) fn adapt_codex_config(raw: &str, root: &Path) -> Result<String> {
 }
 
 fn write_managed(base: &Path, file: &ManagedFile, root_text: &str) -> Result<()> {
-    let relative = safe_relative(&file.path)?;
     let content = substitute(&file.content, root_text);
+    write_managed_content(base, file, &content)
+}
+
+fn write_managed_content(base: &Path, file: &ManagedFile, content: &[u8]) -> Result<()> {
+    let relative = safe_relative(&file.path)?;
     let path = base.join(relative);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    write_if_changed(&path, &content, file.mode)
+    write_if_changed(&path, content, file.mode)
 }
 
 /// Copy the controller's untracked project files into the managed clone.
@@ -667,6 +672,9 @@ fn substitute(content: &[u8], root_text: &str) -> Vec<u8> {
 /// Replace a directory only when its manifest changed, through a staged copy,
 /// so a reader never sees a half-written tree.
 fn mirror_tree(root: &Path, path: &str, files: &[ManagedFile], root_text: &str) -> Result<()> {
+    if path == "files" && crosses_symlink(root, &safe_relative(path)?) {
+        bail!("managed dependency destination must not be a symlink");
+    }
     let destination = root.join(safe_relative(path)?);
     let mut hasher = Sha256::new();
     for file in files {
@@ -677,7 +685,9 @@ fn mirror_tree(root: &Path, path: &str, files: &[ManagedFile], root_text: &str) 
         hasher.update([0]);
     }
     let digest = format!("{:x}", hasher.finalize());
-    if std::fs::read_to_string(destination.join(TREE_MARKER)).is_ok_and(|seen| seen == digest) {
+    if std::fs::read_to_string(destination.join(TREE_MARKER)).is_ok_and(|seen| seen == digest)
+        && (path != "files" || declared_files_current(&destination, files))
+    {
         return Ok(());
     }
     let parent = destination
@@ -694,7 +704,11 @@ fn mirror_tree(root: &Path, path: &str, files: &[ManagedFile], root_text: &str) 
     let _ = std::fs::remove_dir_all(&retired);
     create_private_dir(&staging)?;
     for file in files {
-        write_managed(&staging, file, root_text)?;
+        if path == "files" {
+            write_managed_content(&staging, file, &file.content)?;
+        } else {
+            write_managed(&staging, file, root_text)?;
+        }
     }
     write_if_changed(&staging.join(TREE_MARKER), digest.as_bytes(), 0o600)?;
     // Keep what the worker created itself (Codex's `.system` skills, rules it
@@ -730,6 +744,42 @@ fn mirror_tree(root: &Path, path: &str, files: &[ManagedFile], root_text: &str) 
         .with_context(|| format!("publish {}", destination.display()))?;
     let _ = std::fs::remove_dir_all(&retired);
     Ok(())
+}
+
+/// Unlike optional skill caches, declared hook dependencies must be restored
+/// even when their controller-side manifest has not changed.
+fn declared_files_current(destination: &Path, files: &[ManagedFile]) -> bool {
+    files.iter().all(|file| {
+        let Ok(relative) = safe_relative(&file.path) else {
+            return false;
+        };
+        if crosses_symlink(destination, &relative) {
+            return false;
+        }
+        let path = destination.join(relative);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.len() != file.content.len() as u64 {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o7777 != file.mode & 0o7777 {
+                return false;
+            }
+        }
+        let Ok(input) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut actual = Vec::new();
+        input
+            .take(file.content.len() as u64 + 1)
+            .read_to_end(&mut actual)
+            .is_ok()
+            && actual == file.content
+    })
 }
 
 fn write_if_changed(path: &Path, content: &[u8], mode: u32) -> Result<()> {
@@ -804,6 +854,78 @@ fn tail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_dependencies_repair_drift_and_preserve_literal_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = [ManagedFile {
+            path: "scripts/helper".into(),
+            content: format!("literal {ROOT_PLACEHOLDER}\n").into_bytes(),
+            mode: 0o700,
+        }];
+        let helper = temp.path().join("files/scripts/helper");
+        mirror_tree(temp.path(), "files", &files, "/worker").unwrap();
+        assert_eq!(std::fs::read(&helper).unwrap(), files[0].content);
+        std::fs::write(&helper, vec![b'x'; files[0].content.len()]).unwrap();
+        mirror_tree(temp.path(), "files", &files, "/worker").unwrap();
+        assert_eq!(std::fs::read(&helper).unwrap(), files[0].content);
+        std::fs::remove_file(&helper).unwrap();
+        mirror_tree(temp.path(), "files", &files, "/worker").unwrap();
+        assert_eq!(std::fs::read(&helper).unwrap(), files[0].content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o777)).unwrap();
+            mirror_tree(temp.path(), "files", &files, "/worker").unwrap();
+            assert_eq!(
+                std::fs::metadata(&helper).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("helper"), "untouched").unwrap();
+            std::fs::remove_dir_all(helper.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), helper.parent().unwrap()).unwrap();
+            mirror_tree(temp.path(), "files", &files, "/worker").unwrap();
+            assert_eq!(std::fs::read(&helper).unwrap(), files[0].content);
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("helper")).unwrap(),
+                "untouched"
+            );
+            assert!(
+                !std::fs::symlink_metadata(helper.parent().unwrap())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn declared_dependency_mirror_removes_old_files_and_refuses_symlink_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = [ManagedFile {
+            path: "scripts/helper".into(),
+            content: b"helper".to_vec(),
+            mode: 0o700,
+        }];
+        mirror_tree(temp.path(), "files", &files, "/worker").unwrap();
+        assert!(temp.path().join("files/scripts/helper").exists());
+        mirror_tree(temp.path(), "files", &[], "/worker").unwrap();
+        assert!(!temp.path().join("files/scripts/helper").exists());
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("keep"), "untouched").unwrap();
+            std::fs::remove_dir_all(temp.path().join("files")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), temp.path().join("files")).unwrap();
+            assert!(mirror_tree(temp.path(), "files", &files, "/worker").is_err());
+            assert_eq!(
+                std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+                "untouched"
+            );
+            assert!(!outside.path().join("scripts/helper").exists());
+        }
+    }
 
     #[test]
     fn requested_paths_cannot_escape_their_base() {

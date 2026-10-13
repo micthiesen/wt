@@ -351,6 +351,10 @@ sources the generated `env.sh` before every command. `WT_SESSION_ENV` names
 the variables that agent tmux sessions inherit, and each session command
 sources `secrets/env.sh` itself (`WT_SESSION_SOURCE`) so secret values never
 appear in a process's arguments.
+Controller-owned hook dependencies are declared in `[managed.files]` and mirrored
+under `WT_MANAGED_FILES`. Missing or unreadable declared inputs fail provisioning
+before sending an update. Their isolated tree preserves literal bytes and repairs
+worker drift; it cannot overwrite generated configuration or credentials.
 
 ## Durable state, caches, and operation safety
 

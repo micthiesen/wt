@@ -184,6 +184,54 @@ fn managed_remote_derives_its_worker_layout_from_repository_identity() {
 }
 
 #[test]
+fn managed_files_resolve_controller_sources_and_reject_unsafe_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    let raw = toml::from_str(&minimal_config("\n[managed.files]\n'scripts/helper.py' = '~/.dotfiles/helper.py'\n'data/file' = 'assets/file'\n")).unwrap();
+    let config = Config::from_raw(raw, &options(root.path(), root.path(), &[])).unwrap();
+    assert_eq!(
+        config.managed.files["scripts/helper.py"],
+        root.path().join(".dotfiles/helper.py")
+    );
+    assert_eq!(
+        config.managed.files["data/file"],
+        Path::new("/repo/assets/file")
+    );
+    for destination in [
+        "../escape",
+        "/absolute",
+        "./relative",
+        "a/../b",
+        "a//b",
+        ".wt-tree-files",
+        "line\nbreak",
+    ] {
+        let mut raw: toml::Value = toml::from_str(&minimal_config("")).unwrap();
+        raw.as_table_mut().unwrap().insert(
+            "managed".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "files".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    destination.into(),
+                    toml::Value::String("source".into()),
+                )])),
+            )])),
+        );
+        let error = Config::from_raw(raw, &options(root.path(), root.path(), &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("managed.files"), "{destination}: {error}");
+    }
+    for extra in [
+        "\n[managed.files]\n'a' = 'source'\n'a/b' = 'source'",
+        "\n[managed.files]\n'a' = ''",
+        "\n[managed.env]\nWT_MANAGED_FILES = 'echo nope'",
+    ] {
+        let raw = toml::from_str(&minimal_config(extra)).unwrap();
+        assert!(Config::from_raw(raw, &options(root.path(), root.path(), &[])).is_err());
+    }
+}
+
+#[test]
 fn managed_remote_rejects_hand_selected_config_and_reserved_variables() {
     let root = tempfile::tempdir().unwrap();
     let raw = toml::from_str(&minimal_config(
