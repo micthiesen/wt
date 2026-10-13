@@ -242,15 +242,16 @@ An expiry while confirmed data still disagrees shows one notice.
   postcondition or host write stamp; session sources independently observe any
   sessions they create.
   Connection progress and failures still arrive through normal action replies.
-- Creation is a `UiMutation` too, but never inserts synthetic inventory rows.
-  Progress and its F12 intent are tracked by operation id outside `Board.rows`.
-  Inventory may publish the real checkout before its command replies without
-  producing a second row. F12 requests agent entry once the host resolves the
-  checkout identity; Esc or list navigation leaves creation focus. Other board
-  controls remain available. The reply names the real row; selection moves to
-  it only after the prepared visible rows contain
-  it, and its section opens then. A successful refresh alone is not proof the
-  row is visible. Dependency installation uses a durable background action, so
+- Creation is a `UiMutation` too: `Pending` projects a selected, non-actionable
+  operation row immediately. A read-only host plan pins the canonical branch
+  and checkout key; the controller waits for the TUI to bind that identity
+  before sending the creation mutation. Inventory can then replace the
+  projected row by exact host and key even before the final reply. Neither
+  stage guesses identity from a title, issue number or newly observed row.
+  Normal navigation remains available and late replies cannot reclaim a
+  manually changed selection. F12 is a normal action once the real row is
+  ready, never queued against an unfinished checkout. Dependency installation
+  uses a durable background action, so
   it does not delay agent entry. When a selected row disappears, cursor fallback
   uses the current visual row identity and section, not a stale position.
 - The GitHub action worker keeps a private ledger of its own accepted and
@@ -311,14 +312,24 @@ when their host scope ends.
 Attention, history, and performance controls have a separate serialized slot
 reserved beyond the four ordinary action slots, so long host operations cannot
 delay them. Attention acknowledgement returns its own accept stamp before
-refreshing metadata.
+refreshing metadata. Read-only preparations and worktree creation also have
+reserved capacity. Preparations do not wait behind mutations because the
+confirmed write revalidates its inputs. Removals serialize by host and target;
+unrelated creates and removals can proceed concurrently, while broader host
+operations and fleet cleanup retain their conflict boundaries. Lifecycle
+per-target locks serialize create/remove races on the same slug.
 Quitting closes command admission and cancels source reads, including automation
 evidence preparation. Already-claimed automation dispatches and accepted local
 writes retain their command token until their outcomes have been persisted;
-after three seconds their drain reports that it is still waiting. Each operation
-owns its timeout and safe stopping points, so a UI deadline cannot interrupt a
-write. After those accepted operations finish, background source cleanup gets
-one five-second grace period, followed by database shutdown. Runtime teardown
+after three seconds and every ten seconds their drains report the operation,
+target, and elapsed time. Each operation owns its timeout and safe stopping
+points, so a UI deadline cannot interrupt a write. A local removal may stop
+waiting only after its durable worker record says running and the recorded PID
+and process start identity still match. The accepted worker continues
+independently; wt reports that status as accepted and points to `wt logs`, never
+as a completed removal. After accepted operations finish or detach at that
+durable boundary, background source cleanup gets one five-second grace period,
+followed by database shutdown. Runtime teardown
 gets at most one additional second for residual blocking reads. The source
 cleanup grace is not a deadline for accepted writes, and an error does not start
 a second source grace period.

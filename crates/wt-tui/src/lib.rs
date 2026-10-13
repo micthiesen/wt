@@ -20,18 +20,18 @@ mod terminal_probe;
 mod theme;
 
 pub use actions::{
-    ActionController, ActionSurface, CleanupTarget, ConfirmAction, LiveSessionIdentity,
-    PickerAction, PickerOption, PrPin, RemovalRevision, ReplyOutcome, ReviewerOption, SessionMode,
-    SessionSelection, SessionTarget, TerminalHandoff, TextAction, UiAction, UiActions, UiModal,
-    UiReply, UiRequest, UrlKind, action_channel,
+    ActionController, ActionSurface, CleanupTarget, ConfirmAction, CreatePlan, CreationPrepared,
+    LiveSessionIdentity, PickerAction, PickerOption, PrPin, RemovalRevision, ReplyOutcome,
+    ReviewerOption, SessionMode, SessionSelection, SessionTarget, TerminalHandoff, TextAction,
+    UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
 pub use model::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
-    DisplayPolicy, GitPresentation, HostChoice, Interaction, LandingKind, LogView, MergeQueueView,
-    Model, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
-    PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
+    DisplayPolicy, GitPresentation, HostChoice, Interaction, LandingKind, LiveSlotView, LogView,
+    MergeQueueView, Model, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
+    PrPresentation, PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
     ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
     WorkPresentation, WorkRiskCount, WorkStateCount,
 };

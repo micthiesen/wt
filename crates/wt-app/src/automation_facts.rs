@@ -82,6 +82,8 @@ pub struct LifecycleFacts {
 pub struct PreparedLifecycleFacts {
     pub rows: BTreeMap<String, LifecycleFacts>,
     pub errors: BTreeMap<String, String>,
+    /// A live lifecycle operation owns some evidence; retry once it settles.
+    pub deferred: bool,
 }
 
 pub async fn lifecycle_facts(
@@ -107,29 +109,51 @@ pub async fn lifecycle_facts(
         return Ok(PreparedLifecycleFacts::default());
     };
     let (state, _) = &**metadata;
-    let rows = snapshots
+    let mut result = PreparedLifecycleFacts::default();
+    let mut rows = Vec::new();
+    for snapshot in snapshots
         .iter()
-        .map(|snapshot| snapshot.worktree.clone())
-        .collect();
+        .filter(|snapshot| !snapshot.worktree.is_main)
+    {
+        let slug = snapshot.worktree.target.slug();
+        match crate::commands::diagnostics::operation_lock(ctx, slug).await {
+            Ok(Some(_)) => result.deferred = true,
+            Ok(None) => rows.push(snapshot.worktree.clone()),
+            Err(error) => {
+                result.errors.insert(
+                    slug.to_owned(),
+                    format!("inspect lifecycle operation: {error:#}"),
+                );
+            }
+        }
+    }
     let plans = crate::lifecycle_ops::plan_automation_facts(ctx, rows, state, github)
         .await
         .context("prepare automation lifecycle evidence")?;
-    Ok(PreparedLifecycleFacts {
-        errors: plans.row_errors,
-        rows: plans
-            .rows
-            .into_iter()
-            .map(|plan| {
-                (
-                    plan.row.target.slug().to_owned(),
-                    LifecycleFacts {
-                        local_merged: plan.local_merged.then_some(true),
-                        clean_candidate: plan.landed && plan.hazards.is_empty(),
-                    },
-                )
-            })
-            .collect(),
-    })
+    for (slug, error) in plans.row_errors {
+        // An operation can start after the initial probe. Its changing checkout
+        // contributes no facts, but an expected race is not a failed Git install.
+        match crate::commands::diagnostics::operation_lock(ctx, &slug).await {
+            Ok(Some(_)) => result.deferred = true,
+            _ => {
+                result.errors.insert(slug, error);
+            }
+        }
+    }
+    result.rows = plans
+        .rows
+        .into_iter()
+        .map(|plan| {
+            (
+                plan.row.target.slug().to_owned(),
+                LifecycleFacts {
+                    local_merged: plan.local_merged.then_some(true),
+                    clean_candidate: plan.landed && plan.hazards.is_empty(),
+                },
+            )
+        })
+        .collect();
+    Ok(result)
 }
 
 pub async fn prepare(
@@ -846,6 +870,37 @@ mod tests {
         assert!(evidence.errors.contains_key("two"));
         assert!(!evidence.rows.contains_key("two"));
         assert!(evidence.rows["one"].clean_candidate);
+        // Removal may already have unlinked the checkout while finishing its
+        // hooks. A proven live lock defers evidence, without declaring it safe.
+        let removing = FileLock::try_acquire(&ctx.config.paths.lock_dir, "two", "remove")
+            .await
+            .unwrap()
+            .unwrap();
+        let busy = lifecycle_facts(
+            ctx,
+            Some(&git),
+            Some(&metadata),
+            None,
+            &ctx.config.automations,
+        )
+        .await
+        .unwrap();
+        assert!(busy.deferred);
+        assert!(!busy.errors.contains_key("two"));
+        assert!(!busy.rows.contains_key("two"));
+        assert!(busy.rows["one"].clean_candidate);
+        drop(removing);
+        let unlocked = lifecycle_facts(
+            ctx,
+            Some(&git),
+            Some(&metadata),
+            None,
+            &ctx.config.automations,
+        )
+        .await
+        .unwrap();
+        assert!(!unlocked.deferred);
+        assert!(unlocked.errors.contains_key("two"));
         let edits = BTreeMap::new();
         let prepared = prepare(
             ctx,

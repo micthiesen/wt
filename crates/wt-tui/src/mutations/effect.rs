@@ -90,6 +90,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
     match action {
         UiAction::OnHost { host, action } => effect(action, host.clone(), board),
         UiAction::PrepareCreate { .. }
+        | UiAction::ResolveCreation { .. }
         | UiAction::PrepareHardRefresh
         | UiAction::SetHistoryActive { .. }
         | UiAction::SetPerf { .. }
@@ -242,6 +243,14 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 request_id: 0,
                 input: input.clone(),
                 resolved: None,
+            },
+        ),
+        UiAction::CreateResolved { plan } => on_board(
+            host,
+            LifecycleChange::Create {
+                request_id: 0,
+                input: plan.branch.clone(),
+                resolved: Some(plan.key.clone()),
             },
         ),
         UiAction::Remove { key, .. } => on_row(

@@ -122,6 +122,7 @@ impl UiMutation {
             return false;
         };
         *request_id = id;
+        self.target.key = Some(format!("\0creating:{id}"));
         true
     }
 
@@ -131,6 +132,7 @@ impl UiMutation {
         match &mut self.kind {
             MutationKind::Lifecycle(LifecycleChange::Create { resolved, .. }) => {
                 *resolved = reply.select_when_visible.clone();
+                self.target.key = resolved.clone().or_else(|| self.target.key.clone());
             }
             MutationKind::Row(RowChange::Primary { harness }) => {
                 *harness = reply.primary_harness.clone();

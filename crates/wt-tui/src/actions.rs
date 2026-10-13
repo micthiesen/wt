@@ -14,6 +14,12 @@ pub enum UiAction {
     PrepareCreate {
         initial: String,
     },
+    ResolveCreation {
+        input: String,
+    },
+    CreateResolved {
+        plan: CreatePlan,
+    },
     /// Sign in on a managed host through an interactive SSH session, then
     /// continue the request that needed it.
     ManagedSignIn {
@@ -259,6 +265,83 @@ pub enum UiAction {
     StopSession {
         selection: SessionSelection,
     },
+}
+
+impl UiAction {
+    /// Whether this request prepares a prompt, picker, or other presentation
+    /// from read-only data. Controllers may cancel these requests during
+    /// shutdown without cancelling an accepted mutation.
+    pub fn is_preparation(&self) -> bool {
+        match self {
+            Self::OnHost { action, .. } => action.is_preparation(),
+            Self::PrepareCreate { .. }
+            | Self::PrepareHardRefresh
+            | Self::ResolveCreation { .. }
+            | Self::PrepareRestoreRemoved { .. }
+            | Self::PrepareGithub { .. }
+            | Self::PrepareReviewers { .. }
+            | Self::PrepareReviewCheckout { .. }
+            | Self::GithubFailedChecks { .. }
+            | Self::PrepareActions { .. }
+            | Self::PrepareAction { .. }
+            | Self::PrepareSection { .. }
+            | Self::PrepareRemove { .. }
+            | Self::PrepareCleanup
+            | Self::PrepareStatus { .. }
+            | Self::PrepareBase { .. }
+            | Self::PrepareSessions { .. }
+            | Self::PrepareHarnesses { .. }
+            | Self::PrepareStopTerminal { .. } => true,
+            Self::ManagedSignIn { .. }
+            | Self::HardRefresh
+            | Self::SetAttentionSeen { .. }
+            | Self::ToggleAutomations { .. }
+            | Self::CancelAutomations
+            | Self::SetHistoryActive { .. }
+            | Self::SetPerf { .. }
+            | Self::RestoreRemoved { .. }
+            | Self::ToggleRemovedAutomations { .. }
+            | Self::OpenLink { .. }
+            | Self::OpenPrLink { .. }
+            | Self::OpenPrDefault { .. }
+            | Self::OpenSlotEditor { .. }
+            | Self::PerfInvestigate { .. }
+            | Self::Restack { .. }
+            | Self::ReviewCheckout { .. }
+            | Self::DismissReviewRequest { .. }
+            | Self::SubmitReviewers { .. }
+            | Self::GithubMarkReady { .. }
+            | Self::GithubSetAutoMerge { .. }
+            | Self::GithubShip { .. }
+            | Self::KillAction { .. }
+            | Self::RunAction { .. }
+            | Self::FoldSection { .. }
+            | Self::MoveSection { .. }
+            | Self::Reorder { .. }
+            | Self::RenameSection { .. }
+            | Self::CyclePrimary
+            | Self::SetTitle { .. }
+            | Self::GenerateTitle { .. }
+            | Self::Copy { .. }
+            | Self::Create { .. }
+            | Self::CreateResolved { .. }
+            | Self::OpenEditor { .. }
+            | Self::Remove { .. }
+            | Self::Cleanup { .. }
+            | Self::CleanupTargets { .. }
+            | Self::ToggleArchive { .. }
+            | Self::SetStatus { .. }
+            | Self::SetBase { .. }
+            | Self::SetIssueOverride { .. }
+            | Self::OpenUrl { .. }
+            | Self::Session { .. }
+            | Self::SelectSession { .. }
+            | Self::KillSession { .. }
+            | Self::EnterHarness { .. }
+            | Self::StopTerminal { .. }
+            | Self::StopSession { .. } => false,
+        }
+    }
 }
 
 /// Captured when opening a palette; moving the board later cannot retarget it.
@@ -524,6 +607,13 @@ pub enum UiModal {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UiReply {
+    /// Read-only host preparation; never starts a checkout by itself.
+    #[serde(default)]
+    pub creation_plan: Option<CreatePlan>,
+    /// The controller waits for presentation to bind the optimistic row to
+    /// its exact host-owned key before a checkout can enter inventory.
+    #[serde(skip)]
+    pub creation_prepared: Option<CreationPrepared>,
     #[serde(skip)]
     pub operation_id: Option<u64>,
     #[serde(skip)]
@@ -553,6 +643,22 @@ pub struct UiReply {
     /// classified; the host service fills it for every executed action.
     #[serde(default)]
     pub outcome: Option<ReplyOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePlan {
+    pub key: String,
+    pub branch: String,
+    pub base: Option<String>,
+    pub install: bool,
+    pub open: bool,
+    pub github_issue: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct CreationPrepared {
+    pub key: String,
+    pub ready: oneshot::Sender<()>,
 }
 
 impl UiReply {
@@ -643,6 +749,8 @@ pub struct UiRequest {
     pub id: u64,
     pub generation: u64,
     pub action: UiAction,
+    /// Only read-only preparations may be abandoned by their presentation owner.
+    pub cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 pub fn action_channel() -> (UiActions, ActionController) {

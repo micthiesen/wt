@@ -11,6 +11,8 @@ mod selection;
 #[cfg(test)]
 mod interaction_tests;
 #[cfg(test)]
+mod request_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use crate::UiAction;
 pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION};
 pub use board::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
-    DisplayPolicy, GitPresentation, HostChoice, LandingKind, LogView, MergeQueueView,
+    DisplayPolicy, GitPresentation, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
     PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
     PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
     ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
@@ -32,7 +34,6 @@ pub use interaction::{
     ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,
 };
 pub(crate) use interaction::{digit_rows, overlay_scroll};
-pub(crate) use pending::CreateUi;
 pub(crate) use selection::VisualItem;
 
 /// How a footer toast reads: plain feedback, a notice that the key had
@@ -43,6 +44,18 @@ pub enum ToastTone {
     Notice,
     Failed,
 }
+
+/// The request currently owning foreground feedback. This tracks transport
+/// completion, not optimistic board data (which belongs exclusively to Pending).
+pub(crate) struct PendingRequest {
+    pub id: u64,
+    pub generation: u64,
+    pub preparation: bool,
+    pub palette: bool,
+    pub chord: Option<char>,
+    pub action: UiAction,
+    pub _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
+}
 /// Everything the terminal shows and the keys act on: the presented board
 /// (source board with pending changes applied), cursor, panes and prompts.
 pub struct Model {
@@ -50,10 +63,6 @@ pub struct Model {
     /// them. The only optimistic state in the TUI.
     pub(crate) pending: wt_runtime::Pending<Board, crate::UiMutation>,
     pub(crate) next_op: u64,
-    /// Creation-only interaction state, keyed by operation id.
-    pub(crate) creates: std::collections::BTreeMap<u64, CreateUi>,
-    /// Focused creation progress is never represented by a fake worktree row.
-    pub(crate) creation_focus: Option<u64>,
     /// Provenance and fetch-start stamps of the local host's domains.
     pub(crate) local_domains: wt_runtime::DomainMap,
     pub(crate) source_board: Arc<Board>,
@@ -65,8 +74,7 @@ pub struct Model {
     pub details_scroll: u16,
     pub(crate) output: crate::output::OutputState,
     pub(crate) ui_generation: u64,
-    /// Accepted menu request: operation, input generation, and one early chord.
-    pub(crate) pending_palette: Option<(u64, u64, Option<char>)>,
+    pub(crate) pending_request: Option<PendingRequest>,
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
     pub(crate) help_scroll: usize,
@@ -124,8 +132,6 @@ impl Default for Model {
             source_board: Arc::new(Board::default()),
             pending: Default::default(),
             next_op: 0,
-            creates: Default::default(),
-            creation_focus: None,
             local_domains: Default::default(),
             follow_up: None,
             source_state: SourceState::Empty,
@@ -134,7 +140,7 @@ impl Default for Model {
             details_scroll: 0,
             output: Default::default(),
             ui_generation: 0,
-            pending_palette: None,
+            pending_request: None,
             pr_chord: None,
             help: false,
             help_scroll: 0,

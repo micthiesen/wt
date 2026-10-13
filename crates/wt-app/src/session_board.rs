@@ -80,6 +80,36 @@ fn compose(
     }
     let inventory_ok = matches!(inventory.state(), SourceState::Ready);
     let discoveries_ok = matches!(discoveries.state(), SourceState::Ready);
+    board.live_slots.clear();
+    if inventory_ok && let Some(inventory) = inventory.data() {
+        for name in inventory.all.keys() {
+            let (slug, harness) = if board.rows.iter().any(|row| row.slug == *name) {
+                (name.as_str(), "Claude")
+            } else if let Some(slug) = name.strip_suffix("-codex") {
+                (slug, "Codex")
+            } else if let Some(slug) = name.strip_suffix("-opencode") {
+                (slug, "OpenCode")
+            } else if let Some((slug, _)) = name.split_once('~') {
+                (slug, "Claude")
+            } else if ["main", "manager", "wt", "dotfiles"].contains(&name.as_str()) {
+                (name.as_str(), "Claude")
+            } else {
+                continue;
+            };
+            board
+                .live_slots
+                .entry(slug.into())
+                .or_default()
+                .push(wt_tui::LiveSlotView {
+                    harness: harness.into(),
+                    state: inventory
+                        .pane_activity
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".into()),
+                });
+        }
+    }
     for entry in discoveries.data().iter().flat_map(|data| data.iter()) {
         let session = &entry.session;
         let inventory_data = inventory.data();
@@ -261,6 +291,64 @@ mod tests {
     use wt_core::Domain;
     use wt_harness::{HarnessExtras, HarnessSession};
     use wt_tui::BoardRow;
+
+    #[test]
+    fn physical_slot_activity_does_not_require_or_fabricate_history_identity() {
+        let source =
+            SourceSnapshot::test_live(Some(Board::default()), SourceState::Ready, Domain::Git);
+        let mut inventory = SessionInventory::default();
+        inventory.all.insert(
+            "manager-codex".into(),
+            crate::session_source::SessionDescriptor {
+                name: "manager-codex".into(),
+                id: "$42".into(),
+                created_at: 42,
+                attached_clients: 0,
+                window_count: 1,
+                harness_session_id: None,
+            },
+        );
+        for state in ["working", "asking", "unknown"] {
+            inventory
+                .pane_activity
+                .insert("manager-codex".into(), state.into());
+            let result = compose(
+                source.clone(),
+                SourceSnapshot::test_live(
+                    Some(inventory.clone()),
+                    SourceState::Ready,
+                    Domain::Sessions,
+                ),
+                SourceSnapshot::default(),
+                SourceSnapshot::default(),
+            );
+            let board = result.data().unwrap();
+            assert_eq!(board.live_slots["manager"][0].state, state);
+            assert!(board.slot_sessions.is_empty());
+        }
+        let result = compose(
+            source.clone(),
+            SourceSnapshot::test_live(
+                Some(inventory),
+                SourceState::Failed("offline".into()),
+                Domain::Sessions,
+            ),
+            SourceSnapshot::default(),
+            SourceSnapshot::default(),
+        );
+        assert!(result.data().unwrap().live_slots.is_empty());
+        let result = compose(
+            source,
+            SourceSnapshot::test_live(
+                Some(SessionInventory::default()),
+                SourceState::Ready,
+                Domain::Sessions,
+            ),
+            SourceSnapshot::default(),
+            SourceSnapshot::default(),
+        );
+        assert!(result.data().unwrap().live_slots.is_empty());
+    }
 
     #[test]
     fn failed_inventory_does_not_claim_a_cached_session_is_live() {

@@ -223,6 +223,25 @@ impl std::error::Error for RemovalUncertain {}
 /// belongs to the host's accepted-command drain and deliberately ignores UI
 /// cancellation. CLI background mode continues to return the startup ack.
 pub async fn wait_for_completion(ctx: &AppContext, job_id: &str) -> Result<()> {
+    match wait_for_completion_or_shutdown(ctx, job_id, None).await? {
+        RemovalWait::Completed => Ok(()),
+        RemovalWait::ContinuesInBackground => unreachable!("without shutdown, wait cannot detach"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovalWait {
+    Completed,
+    /// The durable worker was proven alive after its UI owner shut down.
+    /// The caller must report ambiguity, never successful completion.
+    ContinuesInBackground,
+}
+
+pub async fn wait_for_completion_or_shutdown(
+    ctx: &AppContext,
+    job_id: &str,
+    shutdown: Option<&CancellationToken>,
+) -> Result<RemovalWait> {
     validate_job_id(job_id)?;
     let path = job_dir(ctx).join(format!("{job_id}.json"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(29 * 60);
@@ -235,9 +254,25 @@ pub async fn wait_for_completion(ctx: &AppContext, job_id: &str) -> Result<()> {
             ))
         })?;
         match job["state"].as_str() {
-            Some("succeeded") => return Ok(()),
+            Some("succeeded") => return Ok(RemovalWait::Completed),
             Some("failed") => bail!("{}", job["error"].as_str().unwrap_or("removal failed")),
-            Some("starting" | "running") => {}
+            Some("starting" | "running") => {
+                if shutdown.is_some_and(CancellationToken::is_cancelled)
+                    && job["state"].as_str() == Some("running")
+                {
+                    if worker_is_proven_alive(&job, &ctx.processes).await {
+                        tracing::info!(
+                            job_id,
+                            "detaching terminal wait; durable removal worker continues in background"
+                        );
+                        return Ok(RemovalWait::ContinuesInBackground);
+                    }
+                    return Err(RemovalUncertain(format!(
+                        "removal job {job_id} is running but its worker identity cannot be verified; inspect {} before retrying",
+                        path.display()
+                    )).into());
+                }
+            }
             _ => {
                 return Err(RemovalUncertain(format!(
                     "invalid removal job state; inspect {}",
@@ -287,8 +322,32 @@ pub async fn wait_for_completion(ctx: &AppContext, job_id: &str) -> Result<()> {
                 }
             }
         }
-        sleep(Duration::from_millis(100)).await;
+        if let Some(shutdown) = shutdown.filter(|shutdown| !shutdown.is_cancelled()) {
+            tokio::select! {
+                _ = sleep(Duration::from_millis(100)) => {},
+                _ = shutdown.cancelled() => {},
+            }
+        } else {
+            sleep(Duration::from_millis(100)).await;
+        }
     }
+}
+
+async fn worker_is_proven_alive(job: &Value, runner: &wt_platform::process::ProcessRunner) -> bool {
+    let Some(pid) = job["workerPid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return false;
+    };
+    let Some(expected) = job["workerStartIdentity"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let actual = process_start_identity(pid, runner).await;
+    !actual.is_empty() && actual == expected
 }
 
 pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i32> {
@@ -613,6 +672,45 @@ mod tests {
             .await
             .unwrap();
         waiter.await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_detaches_only_after_proving_the_durable_worker_is_live() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let jobs = job_dir(&fixture.ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let path = jobs.join("1-a.json");
+        let pid = std::process::id();
+        let identity = process_start_identity(pid, &fixture.ctx.processes).await;
+        assert!(
+            !identity.is_empty(),
+            "test process identity must be available"
+        );
+        atomic_write(
+            &path,
+            &json!({
+                "state": "running",
+                "workerPid": pid,
+                "workerStartIdentity": identity,
+            }),
+        )
+        .await
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let outcome = wait_for_completion_or_shutdown(&fixture.ctx, "1-a", Some(&shutdown))
+            .await
+            .unwrap();
+        assert_eq!(outcome, RemovalWait::ContinuesInBackground);
+
+        atomic_write(&path, &json!({"state": "running"}))
+            .await
+            .unwrap();
+        let error = wait_for_completion_or_shutdown(&fixture.ctx, "1-a", Some(&shutdown))
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<RemovalUncertain>().is_some());
         fixture.close().await.unwrap();
     }
 }

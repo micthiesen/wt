@@ -186,7 +186,7 @@ fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
             message: "other work finished".into(),
             ..Default::default()
         });
-        assert!(model.pending_palette.is_some());
+        assert!(model.pending_request.is_some());
         model.apply(snapshot(&["two", "one"]));
         let surface = crate::ActionSurface::Row { key: "one".into() };
         model.reply(UiReply {
@@ -210,7 +210,7 @@ fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
             }),
             ..Default::default()
         });
-        assert!(model.pending_palette.is_none());
+        assert!(model.pending_request.is_none());
         let expected = UiAction::PrepareAction {
             surface,
             id: crate::AUTO_MERGE_ACTION_ID.into(),
@@ -258,7 +258,7 @@ fn ignored_key_does_not_discard_prepared_menu_but_escape_and_navigation_do() {
             matches!(model.interaction, Interaction::Picker(_)),
             key == KeyCode::Null
         );
-        assert!(model.pending_palette.is_none());
+        assert!(model.pending_request.is_none());
         assert!(model.follow_up.is_none());
     }
 }
@@ -280,7 +280,7 @@ fn pending_palette_cancellation_keys_discard_early_chord_immediately() {
         model.begin_action(42, &action);
         model.input(KeyEvent::from(KeyCode::Char('m')), 20);
         assert_eq!(model.input(key, 20), InputResult::Draw);
-        assert!(model.pending_palette.is_none());
+        assert!(model.pending_request.is_none());
         assert_eq!(
             model.toast,
             Some(("Menu cancelled".into(), ToastTone::Info))
@@ -316,7 +316,7 @@ fn palette_failure_clears_buffer_and_never_runs_board_chord() {
         operation_id: Some(42),
         ..UiReply::failure("remote unavailable")
     });
-    assert!(model.pending_palette.is_none());
+    assert!(model.pending_request.is_none());
     assert!(model.follow_up.is_none());
     assert_eq!(
         model.toast,
@@ -585,47 +585,62 @@ fn snapshot(keys: &[&str]) -> SourceSnapshot<Board> {
     )
 }
 
+fn bind_creation(model: &mut Model, id: u64, key: &str) {
+    let (ready, mut received) = tokio::sync::oneshot::channel();
+    model.reply(UiReply {
+        operation_id: Some(id),
+        creation_prepared: Some(crate::CreationPrepared {
+            key: key.into(),
+            ready,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(received.try_recv(), Ok(()));
+}
+
 #[test]
-fn pending_creation_queues_f12_and_selects_the_real_row() {
+fn creation_immediately_selects_one_pending_row_and_f12_never_queues_entry() {
     let mut model = Model::default();
     model.apply(snapshot(&["old"]));
-    let generation = model.ui_generation;
     model.begin_action(
         1,
         &UiAction::Create {
             input: "new".into(),
         },
     );
-    assert!(model.selected_row().is_none());
-    assert_eq!(model.board.rows.len(), 1);
-    assert_eq!(model.creation_focus, Some(1));
-    assert_eq!(
-        model.input(KeyEvent::from(KeyCode::Char('d')), 20),
-        InputResult::Draw
-    );
+    assert_eq!(model.board.rows.len(), 2);
+    assert_eq!(model.selected_row().unwrap().title, "new");
+    assert!(model.selected_row().unwrap().pending_creation);
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::F(12)), 20),
         InputResult::Draw
     );
+    assert!(model.follow_up.is_none());
+    assert_eq!(
+        model.input(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT), 20),
+        InputResult::Draw
+    );
+    assert!(matches!(model.interaction, Interaction::None));
+    bind_creation(&mut model, 1, "new");
+    assert_eq!(model.selected_row().unwrap().key, "new");
+    model.apply(snapshot(&["old", "new"]));
+    assert_eq!(model.board.rows.len(), 2);
+    assert!(model.selected_row().unwrap().pending_creation);
     model.reply(UiReply {
         operation_id: Some(1),
-        ui_generation: Some(generation),
         select_when_visible: Some("new".into()),
         outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
         ..Default::default()
     });
+    assert!(!model.selected_row().unwrap().pending_creation);
+    assert!(model.follow_up.is_none());
     assert_eq!(
-        model.follow_up,
-        Some(UiAction::OnHost {
-            host: None,
-            action: Box::new(UiAction::Session {
-                key: Some("new".into()),
-                target: SessionTarget::Harness
-            })
+        model.input(KeyEvent::from(KeyCode::F(12)), 20),
+        InputResult::Action(UiAction::Session {
+            key: Some("new".into()),
+            target: SessionTarget::Harness,
         })
     );
-    model.apply(snapshot(&["old", "new"]));
-    assert_eq!(model.selected_row().unwrap().key, "new");
 }
 
 /// A remote row's archive runs on the controller: its accept stamp is
@@ -1186,43 +1201,40 @@ fn remote_inventory_before_create_reply_never_duplicates_rows_or_blocks_attentio
     let host = "maxbook/config";
     let key = wt_core::remote_worktree_ledger_key(host, "new");
     let mut model = Model::default();
-    model.apply(snapshot(&["old", "new"])); // same slug on this machine is unrelated
-    let create = UiAction::OnHost {
-        host: Some(host.into()),
-        action: Box::new(UiAction::Create {
-            input: "new --no-install".into(),
-        }),
-    };
-    model.begin_action(1, &create);
-    assert_eq!(model.board.rows.len(), 2);
-    model.apply(snapshot(&["old", "new", &key])); // inventory wins the race
+    model.apply(snapshot(&["old", "new"]));
+    model.begin_action(
+        1,
+        &UiAction::OnHost {
+            host: Some(host.into()),
+            action: Box::new(UiAction::Create {
+                input: "42 --no-install".into(),
+            }),
+        },
+    );
+    assert_eq!(model.board.rows.len(), 3);
+    assert_eq!(model.selected_row().unwrap().host.as_deref(), Some(host));
+    bind_creation(&mut model, 1, &key);
+    let mut arrived = snapshot(&["old", "new", &key]);
+    arrived.test_data_mut().rows[2].host = Some(host.into());
+    arrived
+        .test_data_mut()
+        .attention
+        .push(crate::AttentionLine {
+            at_ms: 1,
+            source: "test".into(),
+            text: "event".into(),
+        });
+    model.apply(arrived);
     assert_eq!(model.board.rows.len(), 3);
     assert_eq!(
         model.board.rows.iter().filter(|row| row.key == key).count(),
         1
     );
-    assert!(model.selected_row().is_none());
-    assert_eq!(
-        model.input(KeyEvent::from(KeyCode::F(12)), 20),
-        InputResult::Draw
-    );
-    let mut board = (*model.source_board).clone();
-    board.attention.push(crate::AttentionLine {
-        at_ms: 1,
-        source: "test".into(),
-        text: "event".into(),
-    });
-    model.apply(SourceSnapshot::test_live(
-        Some(board),
-        SourceState::Ready,
-        wt_core::Domain::Git,
+    assert_eq!(model.selected_row().unwrap().key, key);
+    assert!(matches!(
+        model.input(KeyEvent::from(KeyCode::Char('X')), 20),
+        InputResult::Action(UiAction::SetAttentionSeen { .. })
     ));
-    let mark = model.input(KeyEvent::from(KeyCode::Char('X')), 20);
-    let InputResult::Action(action @ UiAction::SetAttentionSeen { .. }) = mark else {
-        panic!("attention key was swallowed: {mark:?}")
-    };
-    model.begin_action(2, &action);
-    assert!(model.board.attention_seen_ms > 0);
     model.reply(UiReply {
         operation_id: Some(1),
         select_when_visible: Some(key.clone()),
@@ -1230,27 +1242,142 @@ fn remote_inventory_before_create_reply_never_duplicates_rows_or_blocks_attentio
         ..Default::default()
     });
     assert_eq!(model.board.rows.len(), 3);
-    assert_eq!(model.selected_row().unwrap().key, key);
-    assert!(matches!(
-        model.follow_up,
-        Some(UiAction::OnHost { host: Some(_), .. })
-    ));
+    assert!(!model.selected_row().unwrap().pending_creation);
+    assert!(model.follow_up.is_none());
 }
 
 #[test]
-fn leaving_creation_progress_cancels_automatic_session_entry() {
+fn manual_navigation_survives_delayed_creation_plan_reply_and_inventory() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["first", "second"]));
+    let generation = model.ui_generation;
+    model.begin_action(1, &UiAction::Create { input: "42".into() });
+    assert_eq!(model.selected_row().unwrap().title, "42");
+    model.input(KeyEvent::from(KeyCode::Char('k')), 20);
+    assert_eq!(model.selected_row().unwrap().key, "second");
+    bind_creation(&mut model, 1, "resolved-issue-slug");
+    assert_eq!(model.selected_row().unwrap().key, "second");
+    model.reply(UiReply {
+        operation_id: Some(1),
+        ui_generation: Some(generation),
+        select_when_visible: Some("resolved-issue-slug".into()),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    model.apply(snapshot(&["first", "second", "resolved-issue-slug"]));
+    assert_eq!(model.selected_row().unwrap().key, "second");
+    assert_eq!(model.board.rows.len(), 3);
+    assert!(model.follow_up.is_none());
+}
+
+#[test]
+fn failed_or_expired_creation_does_not_acknowledge_a_late_plan() {
     let mut model = Model::default();
     model.apply(snapshot(&["old"]));
-    let generation = model.ui_generation;
     model.begin_action(
         1,
         &UiAction::Create {
             input: "new".into(),
         },
     );
-    model.input(KeyEvent::from(KeyCode::F(12)), 20);
-    model.input(KeyEvent::from(KeyCode::Esc), 20);
-    assert!(model.creation_focus.is_none());
+    model.reply(UiReply {
+        operation_id: Some(1),
+        failed: true,
+        ..Default::default()
+    });
+    assert_eq!(model.board.rows.len(), 1);
+    let (ready, mut received) = tokio::sync::oneshot::channel();
+    model.reply(UiReply {
+        operation_id: Some(1),
+        creation_prepared: Some(crate::CreationPrepared {
+            key: "new".into(),
+            ready,
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(
+        received.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+    assert_eq!(model.selected_row().unwrap().key, "old");
+}
+
+#[test]
+fn failed_creation_cannot_replace_a_new_prompt_on_the_same_selected_row() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["old"]));
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            input: "first".into(),
+        },
+    );
+    let generation = model.ui_generation;
+    model.input(KeyEvent::from(KeyCode::Char('n')), 20);
+    assert!(model.paste("second"));
+    model.reply(UiReply {
+        operation_id: Some(1),
+        ui_generation: Some(generation),
+        failed: true,
+        modal: Some(UiModal::Text {
+            action: TextAction::Create,
+            prompt: "retry".into(),
+            initial: "first".into(),
+            allow_empty: false,
+        }),
+        ..Default::default()
+    });
+    assert!(
+        matches!(&model.interaction, Interaction::Text(prompt) if prompt.editor.text() == "second")
+    );
+}
+
+#[test]
+fn paste_invalidates_pending_presentation_but_ignored_paste_does_not() {
+    let mut model = Model::default();
+    model.input(KeyEvent::from(KeyCode::Char('n')), 20);
+    model.begin_action(
+        1,
+        &UiAction::PrepareCreate {
+            initial: String::new(),
+        },
+    );
+    let generation = model.ui_generation;
+    assert!(!model.paste(""));
+    assert_eq!(model.ui_generation, generation);
+    assert!(model.pending_request.is_some());
+    assert!(model.paste("typed"));
+    assert!(model.pending_request.is_none());
+    model.reply(UiReply {
+        operation_id: Some(1),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Text {
+            action: TextAction::Create,
+            prompt: "stale".into(),
+            initial: "stale".into(),
+            allow_empty: false,
+        }),
+        ..Default::default()
+    });
+    assert!(
+        matches!(&model.interaction, Interaction::Text(prompt) if prompt.editor.text() == "typed")
+    );
+}
+
+#[test]
+fn creation_completion_does_not_close_newer_history_view() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["old"]));
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            input: "new".into(),
+        },
+    );
+    let generation = model.ui_generation;
+    bind_creation(&mut model, 1, "new");
+    model.input(KeyEvent::from(KeyCode::Char('h')), 20);
+    assert!(model.history.active);
     model.reply(UiReply {
         operation_id: Some(1),
         ui_generation: Some(generation),
@@ -1258,21 +1385,34 @@ fn leaving_creation_progress_cancels_automatic_session_entry() {
         outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
         ..Default::default()
     });
-    assert!(model.follow_up.is_none());
-    assert_eq!(model.selected_row().unwrap().key, "old");
+    assert!(model.history.active);
 }
 
 #[test]
-fn first_navigation_out_of_creation_selects_the_first_item() {
+fn resolved_creation_of_existing_checkout_reuses_its_row_until_acceptance() {
     let mut model = Model::default();
-    model.apply(snapshot(&["first", "second"]));
+    model.apply(snapshot(&["existing"]));
     model.begin_action(
         1,
         &UiAction::Create {
-            input: "new".into(),
+            input: "issue-alias".into(),
         },
     );
-    model.input(KeyEvent::from(KeyCode::Down), 20);
-    assert_eq!(model.selected_row().unwrap().key, "first");
-    assert!(model.creation_focus.is_none());
+    let deadline = model.next_deadline();
+    bind_creation(&mut model, 1, "existing");
+    assert_eq!(model.next_deadline(), deadline);
+    assert_eq!(model.board.rows.len(), 1);
+    assert!(model.selected_row().unwrap().pending_creation);
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::F(12)), 20),
+        InputResult::Draw
+    );
+    model.reply(UiReply {
+        operation_id: Some(1),
+        select_when_visible: Some("existing".into()),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    assert_eq!(model.board.rows.len(), 1);
+    assert!(!model.selected_row().unwrap().pending_creation);
 }

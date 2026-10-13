@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use clap::{Args, FromArgMatches};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio_util::sync::CancellationToken;
 use wt_core::Domain;
 use wt_lifecycle::CreateOptions;
 use wt_platform::lock::FileLock;
@@ -45,6 +46,16 @@ pub async fn execute(
     action: UiAction,
     board: Option<&Board>,
     github: Option<&Confirmed<wt_github::GithubData>>,
+) -> Result<UiReply> {
+    execute_with_shutdown(ctx, action, board, github, None).await
+}
+
+pub async fn execute_with_shutdown(
+    ctx: &AppContext,
+    action: UiAction,
+    board: Option<&Board>,
+    github: Option<&Confirmed<wt_github::GithubData>>,
+    shutdown: Option<&CancellationToken>,
 ) -> Result<UiReply> {
     match action {
         UiAction::PrepareHardRefresh
@@ -257,7 +268,14 @@ pub async fn execute(
                 .checked(name)?;
             Ok(message(format!("Copied {label}")))
         }
-        UiAction::Create { input } => create(ctx, &input).await,
+        UiAction::Create { input } => {
+            create_resolved(ctx, resolve_creation(ctx, &input).await?).await
+        }
+        UiAction::ResolveCreation { input } => Ok(UiReply {
+            creation_plan: Some(resolve_creation(ctx, &input).await?),
+            ..Default::default()
+        }),
+        UiAction::CreateResolved { plan } => create_resolved(ctx, plan).await,
         UiAction::OpenEditor { key } => {
             let row = resolve_key(ctx, &key).await?;
             crate::editor::open(ctx, Path::new(&row.target.path)).await?;
@@ -380,8 +398,20 @@ pub async fn execute(
                 },
             )
             .await?;
-            crate::commands::_destroy::wait_for_completion(ctx, &job).await?;
-            Ok(message(format!("Removed {}", plan.row.target.slug())))
+            match crate::commands::_destroy::wait_for_completion_or_shutdown(ctx, &job, shutdown)
+                .await?
+            {
+                crate::commands::_destroy::RemovalWait::Completed => {
+                    Ok(message(format!("Removed {}", plan.row.target.slug())))
+                }
+                crate::commands::_destroy::RemovalWait::ContinuesInBackground => Ok(UiReply {
+                    message: format!(
+                        "Removal job {job} continues in the background; use `wt logs` to follow it"
+                    ),
+                    outcome: Some(wt_tui::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+                    ..Default::default()
+                }),
+            }
         }
         UiAction::PrepareCleanup => {
             let rows = ctx.repository.inventory(&ctx.cancellation).await?;
@@ -622,7 +652,7 @@ pub(crate) fn slot_path(
     }
 }
 
-async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
+async fn resolve_creation(ctx: &AppContext, input: &str) -> Result<wt_tui::CreatePlan> {
     let words = shlex::split(input).context("unterminated quote in new-worktree input")?;
     let matches = NewArgs::augment_args(clap::Command::new("new"))
         .try_get_matches_from(std::iter::once("new".to_owned()).chain(words))?;
@@ -636,9 +666,36 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
         .await?
         .into_iter()
         .find(|row| !row.is_main && row.target.branch == branch);
-    let install = existing.is_none()
-        && !args.no_install
-        && ctx.config.backend.kind == wt_config::BackendKind::GitWorktree;
+    Ok(wt_tui::CreatePlan {
+        key: existing
+            .as_ref()
+            .map(|row| wt_core::worktree_target_key(&row.target))
+            .unwrap_or(lifecycle_ops::service(ctx)?.creation_key(&branch)),
+        branch,
+        base: args.base,
+        install: !args.no_install && ctx.config.backend.kind == wt_config::BackendKind::GitWorktree,
+        open: args.open && !args.no_open,
+        github_issue: args.gh,
+    })
+}
+
+async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<UiReply> {
+    let branch = plan.branch;
+    let existing = ctx
+        .repository
+        .inventory(&ctx.cancellation)
+        .await?
+        .into_iter()
+        .find(|row| !row.is_main && row.target.branch == branch);
+    let expected = existing
+        .as_ref()
+        .map(|row| wt_core::worktree_target_key(&row.target))
+        .unwrap_or(lifecycle_ops::service(ctx)?.creation_key(&branch));
+    anyhow::ensure!(
+        expected == plan.key,
+        "Creation identity changed; submit the request again"
+    );
+    let install = existing.is_none() && plan.install;
     let target = if let Some(row) = existing {
         row.target
     } else {
@@ -646,7 +703,7 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
             .create(
                 &branch,
                 CreateOptions {
-                    base: args.base,
+                    base: plan.base,
                     fetch_origin: true,
                     run_install: false,
                 },
@@ -659,7 +716,7 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
     if install && let Err(error) = start_install(ctx, &target).await {
         setup_warning = Some(format!("; dependency setup failed to start: {error:#}"));
     }
-    if let Some(issue) = args.gh {
+    if let Some(issue) = plan.github_issue {
         let slug = target.slug().to_owned();
         ctx.database
             .call(move |store| {
@@ -668,7 +725,7 @@ async fn create(ctx: &AppContext, input: &str) -> Result<UiReply> {
             })
             .await?;
     }
-    if args.open && !args.no_open {
+    if plan.open {
         crate::editor::open(ctx, Path::new(&target.path)).await?;
     }
     let inventory = ctx.repository.inventory(&ctx.cancellation).await?;

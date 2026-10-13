@@ -5,7 +5,7 @@
 //! command whose write was attempted is never retried after a lost reply.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -49,6 +49,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RemoteHostError {
+    #[error("remote host {host} read-only request failed: {detail}")]
+    ReadFailed { host: String, detail: String },
     #[error("remote host {host} is not connected; no command was sent: {detail}")]
     NotStarted { host: String, detail: String },
     #[error(
@@ -257,6 +259,7 @@ impl RemoteHost {
                 detail: self.connection_detail(),
             });
         };
+        let preparation = action.is_preparation();
         let (reply, result) = oneshot::channel();
         match self.requests.try_send(Request::Command {
             connection,
@@ -276,9 +279,12 @@ impl RemoteHost {
             }
         }
         result.await.unwrap_or_else(|_| {
-            Err(RemoteHostError::Ambiguous {
-                host: self.endpoint.key(),
-                detail: "the connection actor stopped after accepting the request; delivery state is unknown".into(),
+            let host = self.endpoint.key();
+            let detail = "connection actor stopped before replying".into();
+            Err(if preparation {
+                RemoteHostError::ReadFailed { host, detail }
+            } else {
+                RemoteHostError::Ambiguous { host, detail }
             })
         })
     }
@@ -738,186 +744,163 @@ async fn serve_connection(
         host,
     } = state;
     let mut latest = None::<HostSnapshot>;
-    loop {
+    let mut outstanding = BTreeMap::<u64, Outstanding>::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let end = 'connection: loop {
         tokio::select! {
             biased;
-            _ = scope_cancel.cancelled() => return ConnectionEnd::Cancelled,
-            _ = app_cancel.cancelled() => return ConnectionEnd::Cancelled,
+            _ = scope_cancel.cancelled() => break ConnectionEnd::Cancelled,
+            _ = app_cancel.cancelled() => break ConnectionEnd::Cancelled,
+            _ = tick.tick(), if !outstanding.is_empty() => {
+                if outstanding.values().any(|pending| tokio::time::Instant::now() >= pending.deadline) {
+                    break ConnectionEnd::Disconnected("worker command reply deadline exceeded; accepted mutations may still be running".into());
+                }
+                for (id, pending) in &mut outstanding {
+                    if pending.preparation && pending.reply.is_closed() && !pending.cancel_sent {
+                        pending.cancel_sent = true;
+                        if let Err(error) = send_frame(&mut connection.stdin, &ClientFrame::CancelPreparation { id: *id }, scope_cancel, app_cancel).await {
+                            break 'connection ConnectionEnd::Disconnected(format!("cancel read-only request: {error}"));
+                        }
+                    }
+                }
+            },
             changed = views.changed() => {
-                if changed.is_err() { return ConnectionEnd::Cancelled; }
+                if changed.is_err() { break ConnectionEnd::Cancelled; }
                 let current = views.borrow_and_update().clone();
                 if let Err(error) = send_frame(&mut connection.stdin, &ClientFrame::Views(current), scope_cancel, app_cancel).await {
-                    return ConnectionEnd::Disconnected(format!("send view subscriptions: {error}"));
+                    break ConnectionEnd::Disconnected(format!("send view subscriptions: {error}"));
                 }
             },
             incoming = connection.incoming.recv() => match incoming {
+                Some(ReaderMessage::Frame(ServerFrame::Reply { id, reply })) => {
+                    let Some(pending) = outstanding.remove(&id) else { break ConnectionEnd::Fatal(format!("unsolicited worker reply id {id}")); };
+                    let _ = pending.reply.send(Ok(reply));
+                },
                 Some(ReaderMessage::Frame(frame)) => {
-                    if let Err(error) = handle_frame(frame, &mut latest, publisher, host) { return ConnectionEnd::Fatal(error); }
+                    if let Err(error) = handle_frame(frame, &mut latest, publisher, host) { break ConnectionEnd::Fatal(error); }
                 }
-                Some(ReaderMessage::Error(error)) => return ConnectionEnd::Disconnected(format!("host stream read failed: {error}; {}", stderr_text(connection))),
-                Some(ReaderMessage::Eof) | None => return ConnectionEnd::Disconnected(format!("SSH host stream closed; {}", stderr_text(connection))),
+                Some(ReaderMessage::Error(error)) => break ConnectionEnd::Disconnected(format!("host stream read failed: {error}; {}", stderr_text(connection))),
+                Some(ReaderMessage::Eof) | None => break ConnectionEnd::Disconnected(format!("SSH host stream closed; {}", stderr_text(connection))),
             },
-            request = requests.recv() => match request {
+            request = requests.recv(), if outstanding.len() < COMMAND_QUEUE => match request {
                 Some(Request::Wake) => {}
-                Some(Request::Refresh { connection })
-                    if !belongs_to_connection(connection, active_connection) => {}
+                Some(Request::Refresh { connection }) if !belongs_to_connection(connection, active_connection) => {}
                 Some(Request::Refresh { .. }) => {
                     if let Err(error) = send_frame(&mut connection.stdin, &ClientFrame::Refresh, scope_cancel, app_cancel).await {
-                        return ConnectionEnd::Disconnected(format!("send refresh request: {error}; {}", stderr_text(connection)));
+                        break ConnectionEnd::Disconnected(format!("send refresh request: {error}; {}", stderr_text(connection)));
                     }
                 }
-                Some(Request::Command { connection, reply, .. })
-                    if !belongs_to_connection(connection, active_connection) =>
-                {
-                    let _ = reply.send(Err(RemoteHostError::NotStarted {
-                        host: host.to_owned(),
-                        detail: "the request was queued for an earlier SSH connection; no command was sent".into(),
-                    }));
+                Some(Request::Command { connection, reply, .. }) if !belongs_to_connection(connection, active_connection) => {
+                    let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.into(), detail: "request belonged to an earlier connection; no command was sent".into() }));
                 }
                 Some(Request::Command { action, reply, .. }) => {
                     if crate::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
-                        let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.to_owned(), detail: "action is controller-owned and was not sent".into() }));
+                        let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.into(), detail: "action is controller-owned and was not sent".into() }));
                         continue;
                     }
+                    let preparation = action.is_preparation();
+                    if preparation && reply.is_closed() { continue; }
                     *command_id = command_id.saturating_add(1);
                     let id = *command_id;
-                    // SST teardown alone may take twenty minutes. Removal
-                    // replies now report completion, rather than startup.
-                    let reply_timeout = if matches!(action, UiAction::Remove { .. } | UiAction::Cleanup { .. } | UiAction::CleanupTargets { .. }) {
-                        REMOVAL_REPLY_TIMEOUT
-                    } else {
-                        COMMAND_REPLY_TIMEOUT
-                    };
+                    let reply_timeout = if matches!(action, UiAction::Remove { .. } | UiAction::Cleanup { .. } | UiAction::CleanupTargets { .. }) { REMOVAL_REPLY_TIMEOUT } else { COMMAND_REPLY_TIMEOUT };
                     let frame = ClientFrame::Command { id, action };
                     let encoded = match protocol::encode(&frame) {
                         Ok(bytes) => bytes,
-                        Err(error) => {
-                            let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.to_owned(), detail: format!("could not encode command: {error:#}") }));
-                            continue;
-                        }
+                        Err(error) => { let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.into(), detail: format!("could not encode command: {error:#}") })); continue; },
                     };
-                    let write_result = tokio::select! {
-                        biased;
-                        _ = scope_cancel.cancelled() => Err("connection cancelled after command write was attempted".to_owned()),
-                        _ = app_cancel.cancelled() => Err("application stopped after command write was attempted".to_owned()),
-                        result = async {
+                    // Once a write is attempted, loss of its reply never
+                    // permits mutation replay. Track it before touching stdin.
+                    outstanding.insert(id, Outstanding { reply, preparation, cancel_sent: false, deadline: tokio::time::Instant::now() + reply_timeout });
+                    let written = tokio::select! {
+                        _ = scope_cancel.cancelled() => Err("connection cancelled during write".to_owned()),
+                        _ = app_cancel.cancelled() => Err("application stopped during write".to_owned()),
+                        result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
                             connection.stdin.write_all(&encoded).await?;
                             connection.stdin.flush().await
-                        } => result.map_err(|error| error.to_string()),
+                        }) => match result { Ok(result) => result.map_err(|error| error.to_string()), Err(_) => Err("command write timed out".into()) },
                     };
-                    if let Err(error) = write_result {
-                        let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, host).await;
-                        let result = drained.map_err(|drain_error| RemoteHostError::Ambiguous {
-                            host: host.to_owned(),
-                            detail: format!("{error}; reply drain failed: {drain_error}"),
-                        });
-                        let _ = reply.send(result);
-                        return if scope_cancel.is_cancelled() || app_cancel.is_cancelled() { ConnectionEnd::Cancelled } else { ConnectionEnd::Disconnected(format!("command write failed: {}; {}", error, stderr_text(connection))) };
-                    }
-                    let deadline = tokio::time::Instant::now() + reply_timeout;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = scope_cancel.cancelled() => {
-                                let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, host).await;
-                                let result = drained.map_err(|detail| RemoteHostError::Ambiguous { host: host.to_owned(), detail: format!("connection cancelled while waiting for command reply: {detail}") });
-                                let _ = reply.send(result);
-                                return ConnectionEnd::Cancelled;
-                            }
-                            _ = app_cancel.cancelled() => {
-                                let drained = drain_command_reply(&mut connection.incoming, id, &mut latest, publisher, host).await;
-                                let result = drained.map_err(|detail| RemoteHostError::Ambiguous { host: host.to_owned(), detail: format!("application stopped while waiting for command reply: {detail}") });
-                                let _ = reply.send(result);
-                                return ConnectionEnd::Cancelled;
-                            }
-                            _ = tokio::time::sleep_until(deadline) => {
-                                let detail = format!("command reply timed out after {} minutes; the accepted operation may still be running", reply_timeout.as_secs() / 60);
-                                let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: detail.clone() }));
-                                return ConnectionEnd::Disconnected(detail);
-                            }
-                            incoming = connection.incoming.recv() => match incoming {
-                                Some(ReaderMessage::Frame(ServerFrame::Reply { id: reply_id, reply: response })) if reply_id == id => {
-                                    let _ = reply.send(Ok(response));
-                                    break;
-                                }
-                                Some(ReaderMessage::Frame(ServerFrame::Snapshot(snapshot))) => {
-                                    if let Err(error) = publish_snapshot(snapshot, &mut latest, publisher, host) {
-                                        let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: format!("invalid worker snapshot while command reply was pending: {error}") }));
-                                        return ConnectionEnd::Fatal(error);
-                                    }
-                                }
-                                Some(ReaderMessage::Frame(ServerFrame::Reply { id: received, .. })) => {
-                                    let detail = format!("reply id {received} did not match outstanding command {id}");
-                                    let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: detail.clone() }));
-                                    return ConnectionEnd::Fatal(detail);
-                                }
-                                Some(ReaderMessage::Frame(ServerFrame::Hello { .. })) => {
-                                    let detail = "worker repeated hello after handshake".to_owned();
-                                    let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: detail.clone() }));
-                                    return ConnectionEnd::Fatal(detail);
-                                }
-                                Some(ReaderMessage::Error(error)) => {
-                                    let detail = format!("reply stream failed after command write: {error}; {}", stderr_text(connection));
-                                    let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: detail.clone() }));
-                                    return ConnectionEnd::Disconnected(detail);
-                                }
-                                Some(ReaderMessage::Eof) | None => {
-                                    let detail = format!("worker disconnected after command write; {}", stderr_text(connection));
-                                    let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: detail.clone() }));
-                                    return ConnectionEnd::Disconnected(detail);
-                                }
-                            }
-                        }
-                    }
+                    if let Err(error) = written { break ConnectionEnd::Disconnected(error); }
                 }
-                None => return ConnectionEnd::Cancelled,
-            }
-        }
-    }
-}
-
-async fn drain_command_reply(
-    incoming: &mut mpsc::Receiver<ReaderMessage>,
-    command_id: u64,
-    latest: &mut Option<HostSnapshot>,
-    publisher: &LeafPublisher<HostSnapshot>,
-    host: &str,
-) -> Result<UiReply, String> {
-    let drain = async {
-        loop {
-            match incoming.recv().await {
-                Some(ReaderMessage::Frame(ServerFrame::Reply { id, reply }))
-                    if id == command_id =>
-                {
-                    return Ok(reply);
-                }
-                Some(ReaderMessage::Frame(ServerFrame::Snapshot(snapshot))) => {
-                    publish_snapshot(snapshot, latest, publisher, host)?;
-                }
-                Some(ReaderMessage::Frame(ServerFrame::Reply { id, .. })) => {
-                    return Err(format!(
-                        "reply id {id} did not match outstanding command {command_id}"
-                    ));
-                }
-                Some(ReaderMessage::Frame(ServerFrame::Hello { .. })) => {
-                    return Err("worker repeated hello while draining command reply".into());
-                }
-                Some(ReaderMessage::Error(error)) => {
-                    return Err(format!("reply stream failed while draining: {error}"));
-                }
-                Some(ReaderMessage::Eof) | None => {
-                    return Err("worker disconnected while draining command reply".into());
-                }
+                None => break ConnectionEnd::Cancelled,
             }
         }
     };
-    match tokio::time::timeout(COMMAND_DRAIN_GRACE, drain).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "no command reply arrived within {} seconds",
-            COMMAND_DRAIN_GRACE.as_secs()
-        )),
+    // Keep the reply pipe open while notifying the worker to close admission.
+    // Its durable-removal wait may now detach after proving a running job;
+    // other accepted mutations still finish before the worker exits.
+    if matches!(end, ConnectionEnd::Cancelled) {
+        if let Ok(bytes) = protocol::encode(&ClientFrame::Shutdown) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                connection.stdin.write_all(&bytes).await?;
+                connection.stdin.flush().await
+            })
+            .await;
+        }
+    } else {
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection.stdin.shutdown()).await;
     }
+    // A single bounded drain reconciles every in-flight ID, irrespective of
+    // completion order. Accepted worker mutations are never cancelled here.
+    drain_pending_replies(
+        &mut connection.incoming,
+        &mut outstanding,
+        &mut latest,
+        publisher,
+        host,
+    )
+    .await;
+    for (_, pending) in outstanding {
+        let detail = "worker connection ended without a confirmed reply".to_owned();
+        let error = if pending.preparation {
+            RemoteHostError::ReadFailed {
+                host: host.into(),
+                detail,
+            }
+        } else {
+            RemoteHostError::Ambiguous {
+                host: host.into(),
+                detail,
+            }
+        };
+        let _ = pending.reply.send(Err(error));
+    }
+    end
+}
+
+struct Outstanding {
+    reply: oneshot::Sender<Result<UiReply, RemoteHostError>>,
+    preparation: bool,
+    cancel_sent: bool,
+    deadline: tokio::time::Instant,
+}
+
+async fn drain_pending_replies(
+    incoming: &mut mpsc::Receiver<ReaderMessage>,
+    outstanding: &mut BTreeMap<u64, Outstanding>,
+    latest: &mut Option<HostSnapshot>,
+    publisher: &LeafPublisher<HostSnapshot>,
+    host: &str,
+) {
+    if outstanding.is_empty() {
+        return;
+    }
+    let _ = tokio::time::timeout(COMMAND_DRAIN_GRACE, async {
+        while !outstanding.is_empty() {
+            match incoming.recv().await {
+                Some(ReaderMessage::Frame(ServerFrame::Reply { id, reply })) => {
+                    let pending = outstanding.remove(&id).ok_or(())?;
+                    let _ = pending.reply.send(Ok(reply));
+                }
+                Some(ReaderMessage::Frame(ServerFrame::Snapshot(snapshot))) => {
+                    publish_snapshot(snapshot, latest, publisher, host).map_err(|_| ())?;
+                }
+                _ => return Err(()),
+            }
+        }
+        Ok::<(), ()>(())
+    })
+    .await;
 }
 
 fn handle_frame(
@@ -986,7 +969,7 @@ async fn send_frame(
         biased;
         _ = scope_cancel.cancelled() => anyhow::bail!("host stream cancelled"),
         _ = app_cancel.cancelled() => anyhow::bail!("application stopped"),
-        result = async { writer.write_all(&bytes).await?; writer.flush().await } => result.context("write host protocol frame"),
+        result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async { writer.write_all(&bytes).await?; writer.flush().await }) => result.context("host protocol write timed out")?.context("write host protocol frame"),
     }
 }
 
@@ -1030,11 +1013,10 @@ fn belongs_to_connection(request_connection: u64, active_connection: u64) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{ReaderMessage, belongs_to_connection, drain_command_reply};
-    use crate::host_protocol::{HostSnapshot, ServerFrame};
+    use super::belongs_to_connection;
+    use crate::host_protocol::HostSnapshot;
     use wt_core::Domain;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
-    use wt_tui::UiReply;
 
     #[allow(
         clippy::disallowed_methods,
@@ -1087,6 +1069,143 @@ mod tests {
             )],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn connection_multiplexes_commands_and_cancels_only_dropped_preparations() {
+        use super::*;
+        // A private echo process exposes the exact client frames. Worker
+        // replies are injected independently, including reverse completion.
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut sent = BufReader::new(child.stdout.take().unwrap());
+        let (incoming_tx, incoming) = mpsc::channel(8);
+        let mut connection = Connection {
+            stdin: BufWriter::new(child.stdin.take().unwrap()),
+            child,
+            incoming,
+            reader: tokio::spawn(async {}),
+            stderr_reader: tokio::spawn(async {}),
+            stderr: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let (requests, mut received) = mpsc::channel(8);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test view-subscription control signal, not board data"
+        )]
+        let (_views_tx, mut views) = watch::channel(protocol::HostViews::default());
+        let scope = TaskScope::new();
+        let (_, publisher) = leaf_channel::<HostSnapshot>(
+            &scope,
+            SourceSpec {
+                name: "multiplex-fixture",
+                domain: Domain::Host,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let task = tokio::spawn(async move {
+            let mut command_id = 0;
+            let end = serve_connection(
+                &mut connection,
+                ConnectionState {
+                    requests: &mut received,
+                    views: &mut views,
+                    publisher: &publisher,
+                    command_id: &mut command_id,
+                    active_connection: 1,
+                    host: "fixture",
+                },
+                &CancellationToken::new(),
+                &CancellationToken::new(),
+            )
+            .await;
+            terminate_connection(&mut connection).await;
+            end
+        });
+        let (first, first_result) = oneshot::channel();
+        let (second, second_result) = oneshot::channel();
+        requests
+            .send(Request::Command {
+                connection: 1,
+                action: UiAction::SetTitle {
+                    key: "one".into(),
+                    title: "first".into(),
+                },
+                reply: first,
+            })
+            .await
+            .unwrap();
+        requests
+            .send(Request::Command {
+                connection: 1,
+                action: UiAction::PrepareHardRefresh,
+                reply: second,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for expected in [1, 2] {
+                assert!(matches!(protocol::read::<ClientFrame, _>(&mut sent).await.unwrap(), Some(ClientFrame::Command { id, .. }) if id == expected));
+            }
+        }).await.expect("second command must be sent before first completes");
+        incoming_tx
+            .send(ReaderMessage::Frame(ServerFrame::Reply {
+                id: 2,
+                reply: UiReply::message("second"),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(second_result.await.unwrap().unwrap().message, "second");
+        incoming_tx
+            .send(ReaderMessage::Frame(ServerFrame::Reply {
+                id: 1,
+                reply: UiReply::message("first"),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(first_result.await.unwrap().unwrap().message, "first");
+        let (third, third_result) = oneshot::channel();
+        requests
+            .send(Request::Command {
+                connection: 1,
+                action: UiAction::PrepareHardRefresh,
+                reply: third,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            protocol::read::<ClientFrame, _>(&mut sent).await.unwrap(),
+            Some(ClientFrame::Command { id: 3, .. })
+        ));
+        drop(third_result);
+        let cancellation = tokio::time::timeout(
+            Duration::from_secs(2),
+            protocol::read::<ClientFrame, _>(&mut sent),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            cancellation,
+            Some(ClientFrame::CancelPreparation { id: 3 })
+        ));
+        incoming_tx
+            .send(ReaderMessage::Frame(ServerFrame::Reply {
+                id: 3,
+                reply: UiReply::failure("cancelled"),
+            }))
+            .await
+            .unwrap();
+        drop(requests);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1186,37 +1305,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_drain_returns_a_reply_that_arrives_during_grace() {
-        let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel(1);
-        let response = UiReply {
-            message: "completed".into(),
-            ..Default::default()
-        };
-        assert!(
+    async fn cancellation_drain_reconciles_multiple_out_of_order_replies() {
+        use super::*;
+        let (incoming_tx, mut incoming) = mpsc::channel(2);
+        let (first, first_result) = oneshot::channel();
+        let (second, second_result) = oneshot::channel();
+        let mut pending = [(1, first), (2, second)]
+            .into_iter()
+            .map(|(id, reply)| {
+                (
+                    id,
+                    Outstanding {
+                        reply,
+                        preparation: false,
+                        cancel_sent: false,
+                        deadline: tokio::time::Instant::now(),
+                    },
+                )
+            })
+            .collect();
+        for id in [2, 1] {
             incoming_tx
                 .send(ReaderMessage::Frame(ServerFrame::Reply {
-                    id: 42,
-                    reply: response,
+                    id,
+                    reply: UiReply::message(id.to_string()),
                 }))
                 .await
-                .is_ok()
-        );
-
+                .unwrap();
+        }
         let scope = TaskScope::new();
-        let (_source, publisher) = leaf_channel::<HostSnapshot>(
+        let (_, publisher) = leaf_channel::<HostSnapshot>(
             &scope,
             SourceSpec {
-                name: "host-test",
+                name: "drain-test",
                 domain: Domain::Host,
-                persistence: Persistence::Never("test fixture"),
+                persistence: Persistence::Never("fixture"),
                 policy: RefreshPolicy::default(),
             },
         );
-        let mut latest = None;
-        let reply = drain_command_reply(&mut incoming, 42, &mut latest, &publisher, "test-host")
-            .await
-            .expect("a reply received during shutdown drain is authoritative");
-        assert_eq!(reply.message, "completed");
+        drain_pending_replies(
+            &mut incoming,
+            &mut pending,
+            &mut None,
+            &publisher,
+            "fixture",
+        )
+        .await;
+        assert!(pending.is_empty());
+        assert_eq!(first_result.await.unwrap().unwrap().message, "1");
+        assert_eq!(second_result.await.unwrap().unwrap().message, "2");
     }
 
     /// A failure inside the worker's board (its GitHub read, say) is not a

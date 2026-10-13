@@ -705,6 +705,7 @@ mod tests {
     #[test]
     fn graceful_close_never_retargets_a_new_active_pane_or_restarted_process() {
         let before = wt_tmux::PaneInfo {
+            title: String::new(),
             id: "%10".into(),
             session_name: "feature-codex".into(),
             window_id: "@1".into(),

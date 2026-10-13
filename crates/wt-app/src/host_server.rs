@@ -6,7 +6,11 @@ use crate::{
     host_service::HostService,
 };
 use anyhow::{Context, Result, bail};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use wt_runtime::TaskScope;
@@ -94,70 +98,148 @@ where
         writer_closed.cancel();
         result
     });
-    let result: Result<()> = async {
-        let mut last_id = 0;
-        let mut perf_revision = 0;
+    // Keep frame reads in one owning task: select cancellation must never
+    // discard a partially consumed length-prefixed frame.
+    let (frames, mut received) = tokio::sync::mpsc::channel(32);
+    let reader = tokio::spawn(async move {
         loop {
-            // Only one read future exists at a time; a partial frame is never
-            // abandoned merely because a snapshot changed.
-            let frame = tokio::select! {
-                biased;
-                _ = context.cancellation.cancelled() => break,
-                _ = disconnected.cancelled() => break,
-                frame = protocol::read::<ClientFrame, _>(&mut input) => frame?,
-            };
-            match frame {
-                None => break,
-                Some(ClientFrame::Hello { .. }) => bail!("duplicate host handshake"),
-                Some(ClientFrame::Refresh) => {
-                    host.sources.board.refresh();
+            let frame = protocol::read::<ClientFrame, _>(&mut input).await;
+            let terminal = !matches!(&frame, Ok(Some(_)));
+            if frames.send(frame).await.is_err() || terminal {
+                break;
+            }
+        }
+    });
+    let mut work = tokio::task::JoinSet::new();
+    let mut queued = VecDeque::<(crate::controller::Lane, (u64, UiAction))>::new();
+    let mut busy = BTreeSet::new();
+    let mut running = BTreeMap::new();
+    let mut last_id = 0;
+    let mut perf_revision = 0;
+    let mut result = Ok(());
+    let mut closed = false;
+    let shutdown_wait = CancellationToken::new();
+    loop {
+        if closed {
+            shutdown_wait.cancel();
+            // Read preparations may stop. Every admitted mutation, including
+            // queued work, retains ownership and drains before command teardown.
+            let mut mutations = VecDeque::new();
+            while let Some((lane, (id, action))) = queued.pop_front() {
+                if action.is_preparation() {
+                    send_reply(
+                        &replies,
+                        &disconnected,
+                        id,
+                        UiReply::failure("Read-only request cancelled during worker shutdown"),
+                    )
+                    .await;
+                } else {
+                    mutations.push_back((lane, (id, action)));
                 }
-                Some(ClientFrame::Views(views)) => {
-                    host.sources.history.set_active(views.history);
-                    host.sources.perf.set_active(views.perf);
-                    host.sources.perf.set_continuous(views.perf_continuous);
-                    if views.perf_revision != perf_revision {
-                        perf_revision = views.perf_revision;
-                        host.sources.perf.refresh();
-                    }
-                }
-                Some(ClientFrame::Command { id, action }) => {
-                    if id <= last_id {
-                        bail!("host command IDs must increase; replay is refused");
-                    }
-                    last_id = id;
-                    let result = if crate::host_routing::controller_owned(&action)
-                        || matches!(action, UiAction::OnHost { .. })
-                    {
-                        Err(anyhow::anyhow!(
-                            "controller-owned action cannot run on the worker"
-                        ))
-                    } else {
-                        host.execute(action).await
-                    };
-                    let reply = match result {
-                        Ok(reply) => reply,
-                        Err(error) => UiReply {
-                            failed: true,
-                            message: format!("{error:#}"),
-                            ..Default::default()
-                        },
-                    };
-                    if replies
-                        .send(ServerFrame::Reply { id, reply })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+            }
+            queued = mutations;
+            for (_, _, cancellation) in running.values() {
+                if let Some(cancellation) = cancellation {
+                    CancellationToken::cancel(cancellation);
                 }
             }
         }
-        Ok(())
+        while let Some((lane, (id, action))) = crate::controller::take_available(&mut queued, &busy)
+        {
+            busy.insert(lane.clone());
+            let host = host.clone();
+            let cancellation = action.is_preparation().then(CancellationToken::new);
+            let token = cancellation.clone();
+            let shutdown_wait = shutdown_wait.clone();
+            let task = work.spawn(async move {
+                let outcome = if let Some(token) = token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => Ok(UiReply::failure("Read-only request cancelled")),
+                        outcome = host.execute(action) => outcome,
+                    }
+                } else { host.execute_with_shutdown(action, Some(&shutdown_wait)).await };
+                outcome.unwrap_or_else(|error| UiReply::failure(format!("{error:#}")))
+            });
+            running.insert(task.id(), (id, lane, cancellation));
+        }
+        if closed && work.is_empty() && queued.is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled(), if !closed => closed = true,
+            _ = disconnected.cancelled(), if !closed => closed = true,
+            completed = work.join_next_with_id(), if !work.is_empty() => {
+                let completed = completed.expect("nonempty worker tasks");
+                let task_id = match &completed { Ok((id, _)) => *id, Err(error) => error.id() };
+                if let Some((id, lane, _)) = running.remove(&task_id) {
+                    busy.remove(&lane);
+                    let reply = match completed {
+                        Ok((_, reply)) => reply,
+                        Err(error) => {
+                            // A panicked mutation may have changed state. Close
+                            // admission; never replay it or release conflicting queued work.
+                            result = Err(anyhow::anyhow!("host command worker failed: {error}"));
+                            let mut retained = VecDeque::new();
+                            while let Some((other, (queued_id, action))) = queued.pop_front() {
+                                if crate::controller::lanes_conflict(&lane, &other) {
+                                    send_reply(&replies, &disconnected, queued_id, UiReply::failure("Conflicting worker failed; queued command was not started")).await;
+                                } else { retained.push_back((other, (queued_id, action))); }
+                            }
+                            queued = retained;
+                            closed = true;
+                            UiReply::uncertain(format!("Host command worker failed; its result is unknown: {error}"))
+                        }
+                    };
+                    send_reply(&replies, &disconnected, id, reply).await;
+                }
+            },
+            frame = received.recv(), if !closed => {
+                let frame = match frame {
+                    Some(Ok(Some(frame))) => frame,
+                    Some(Err(error)) => { result = Err(error); closed = true; continue; },
+                    Some(Ok(None)) | None => { closed = true; continue; },
+                };
+                match frame {
+                    ClientFrame::Hello { .. } => { result = Err(anyhow::anyhow!("duplicate host handshake")); closed = true; },
+                    ClientFrame::Refresh => { host.sources.board.refresh(); },
+                    ClientFrame::Shutdown => closed = true,
+                    ClientFrame::Views(views) => {
+                        host.sources.history.set_active(views.history);
+                        host.sources.perf.set_active(views.perf);
+                        host.sources.perf.set_continuous(views.perf_continuous);
+                        if views.perf_revision != perf_revision { perf_revision = views.perf_revision; host.sources.perf.refresh(); }
+                    },
+                    ClientFrame::CancelPreparation { id } => {
+                        if let Some(position) = queued.iter().position(|(_, (queued_id, action))| *queued_id == id && action.is_preparation()) {
+                            queued.remove(position);
+                            send_reply(&replies, &disconnected, id, UiReply::failure("Read-only request cancelled")).await;
+                        }
+                        for (running_id, _, token) in running.values() {
+                            if *running_id == id && let Some(token) = token { token.cancel(); }
+                        }
+                    },
+                    ClientFrame::Command { id, action } => {
+                        if id <= last_id { result = Err(anyhow::anyhow!("host command IDs must increase; replay is refused")); closed = true; continue; }
+                        last_id = id;
+                        let lane = if crate::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
+                            Err(anyhow::anyhow!("controller-owned action cannot run on the worker"))
+                        } else if queued.len() >= 32 {
+                            Err(anyhow::anyhow!("worker command queue is full; command was not started"))
+                        } else { crate::controller::lane_for(&action) };
+                        match lane {
+                            Ok(lane) => queued.push_back((lane, (id, action))),
+                            Err(error) => { send_reply(&replies, &disconnected, id, UiReply::failure(format!("{error:#}"))).await; },
+                        }
+                    },
+                }
+            }
+        }
     }
-    .await;
-    // No accepted UI command remains. Stop read sources, then join any
-    // admitted automation mutations before releasing command ownership.
+    reader.abort();
+    let _ = reader.await;
     drop(replies);
     scope.cancel();
     // Detached actions and the user's tmux sessions outlive this host stream.
@@ -177,6 +259,21 @@ where
     write_result?;
     stopped?;
     Ok(())
+}
+
+async fn send_reply(
+    replies: &tokio::sync::mpsc::Sender<ServerFrame>,
+    disconnected: &CancellationToken,
+    id: u64,
+    reply: UiReply,
+) {
+    tokio::select! {
+        biased;
+        _ = disconnected.cancelled() => {},
+        result = tokio::time::timeout(Duration::from_secs(15), replies.send(ServerFrame::Reply { id, reply })) => {
+            if !matches!(result, Ok(Ok(()))) { disconnected.cancel(); }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +422,21 @@ mod tests {
         })
         .await
         .unwrap();
+        // Hold the real state actor, making the first mutation stay active.
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let database = fixture.ctx.database.clone();
+        let blocker = tokio::spawn(async move {
+            database
+                .call(move |_| {
+                    let _ = entered.send(());
+                    held.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
         client_output
             .write_all(
                 &protocol::encode(&ClientFrame::Command {
@@ -338,10 +450,91 @@ mod tests {
             )
             .await
             .unwrap();
+        // Cancellation cannot cancel a write; a second read-only prompt must
+        // reply while that accepted write is still blocked.
+        for frame in [
+            ClientFrame::CancelPreparation { id: 1 },
+            ClientFrame::Command {
+                id: 2,
+                action: UiAction::PrepareHardRefresh,
+            },
+        ] {
+            client_output
+                .write_all(&protocol::encode(&frame).unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match protocol::read::<ServerFrame, _>(&mut client_input)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    ServerFrame::Reply { id: 2, reply } => {
+                        assert!(!reply.failed, "{}", reply.message);
+                        assert!(reply.modal.is_some());
+                        break;
+                    }
+                    ServerFrame::Reply { id: 1, .. } => {
+                        panic!("held mutation must not complete before its independent menu")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // A read blocked on the same state actor can be cancelled without
+        // cancelling the accepted write or blocking the next preparation.
+        for frame in [
+            ClientFrame::Command {
+                id: 3,
+                action: UiAction::PrepareStatus { key: "one".into() },
+            },
+            ClientFrame::CancelPreparation { id: 3 },
+            ClientFrame::Command {
+                id: 4,
+                action: UiAction::PrepareHardRefresh,
+            },
+        ] {
+            client_output
+                .write_all(&protocol::encode(&frame).unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (mut cancelled, mut next_ready) = (false, false);
+            while !cancelled || !next_ready {
+                match protocol::read::<ServerFrame, _>(&mut client_input)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    ServerFrame::Reply { id: 3, reply } => {
+                        assert!(reply.failed);
+                        cancelled = true;
+                    }
+                    ServerFrame::Reply { id: 4, reply } => {
+                        assert!(!reply.failed);
+                        assert!(reply.modal.is_some());
+                        next_ready = true;
+                    }
+                    ServerFrame::Reply { id: 1, .. } => {
+                        panic!("cancelling read preparation must not release the held mutation")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
         // Drop both halves only after the full frame was flushed. The worker
         // must finish accepted work even though it can no longer reply.
         drop(client_input);
         drop(client_output);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
         let serve_result = tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .unwrap()

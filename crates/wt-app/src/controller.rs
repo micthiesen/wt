@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
@@ -20,18 +20,28 @@ pub struct Controller {
     automations: Arc<crate::automation_source::AutomationDrain>,
 }
 
+struct RunningAction {
+    lane: Lane,
+    request_id: u64,
+    name: &'static str,
+    target: Option<String>,
+    started: Instant,
+}
+
+#[derive(Clone)]
+struct ActionLogContext {
+    operation_id: u64,
+    operation: &'static str,
+    host: String,
+    target: Option<String>,
+}
+
 impl Controller {
-    pub async fn shutdown(mut self) -> Result<()> {
-        let result = match tokio::time::timeout(Duration::from_secs(3), &mut self.task).await {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::warn!("waiting for accepted commands to finish before exiting");
-                eprintln!("wt: waiting for accepted commands to finish before exiting");
-                // Service operations own their timeouts and commit boundaries.
-                // A UI shutdown deadline cannot safely cancel an accepted write.
-                self.task.await
-            }
-        };
+    pub async fn shutdown(self) -> Result<()> {
+        // The controller reports the exact accepted operations it is draining.
+        // Do not impose a second deadline here: accepted writes own their
+        // timeout and commit boundary and cannot safely be cancelled by UI quit.
+        let result = self.task.await;
         let automations = self.automations.shutdown().await;
         self.cancel.cancel();
         result.context("action controller exited")?;
@@ -56,28 +66,59 @@ pub fn start(
         let mut busy = BTreeSet::new();
         let mut running = tokio::task::JoinSet::new();
         let mut task_lanes = HashMap::new();
+        let mut progress_tick = Box::pin(tokio::time::sleep(Duration::from_secs(3)));
         let mut failed_lanes = BTreeSet::new();
         let mut closed = false;
         let mut draining = false;
         loop {
-            while let Some((lane, request)) = take_available(&mut pending, &busy) {
-                let wt_tui::UiRequest { id, generation, action: command } = request;
+            while let Some((lane, (request, accepted_at))) = take_available(&mut pending, &busy) {
+                let wt_tui::UiRequest { id, generation, action: command, cancellation } = request;
                 busy.insert(lane.clone());
-                let context = context.clone();
+                let operation_cancellation = command
+                    .is_preparation()
+                    .then(|| cancellation.unwrap_or_else(|| shutdown.child_token()));
+                let mut request_context = (*context).clone();
+                if let Some(cancellation) = &operation_cancellation {
+                    request_context.cancellation = cancellation.clone();
+                }
+                let context = Arc::new(request_context);
                 let fleet = fleet.clone();
                 let replies = port.replies.clone();
                 let shutdown = shutdown.clone();
                 let task_lane = lane.clone();
+                let operation_name = action_name(&command);
+                let operation_target = action_target(&command);
+                let log_context = ActionLogContext {
+                    operation_id: id,
+                    operation: operation_name,
+                    host: lane_host(&task_lane).to_owned(),
+                    target: operation_target.clone(),
+                };
                 let task = running.spawn(async move {
                     let retry = create_retry(&command);
                     let request_replies = RequestReplies { sender: replies, id, generation };
-                    let result = crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown).await;
-                    let mut reply = action_reply(result, retry);
+                    let result = if let Some(cancellation) = operation_cancellation {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => Err(anyhow::anyhow!("preparation cancelled during shutdown")),
+                            _ = cancellation.cancelled() => Err(anyhow::anyhow!("preparation cancelled by the UI")),
+                            result = crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown) => result,
+                        }
+                    } else {
+                        crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown).await
+                    };
+                    let mut reply = action_reply_with_context(result, retry, Some(&log_context));
                     reply.ui_generation = Some(generation);
                     reply.operation_id = Some(id);
                     (lane, reply)
                 });
-                task_lanes.insert(task.id(), (task_lane, id));
+                task_lanes.insert(task.id(), RunningAction {
+                    lane: task_lane,
+                    request_id: id,
+                    name: operation_name,
+                    target: operation_target,
+                    started: accepted_at,
+                });
             }
             if closed && pending.is_empty() && running.is_empty() { break; }
             tokio::select! {
@@ -85,24 +126,40 @@ pub fn start(
                 _ = shutdown.cancelled(), if !draining => {
                     draining = true;
                     port.requests.close();
+                    progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
+                    // Pending prompts and pickers have no accepted side effect
+                    // to preserve. Drop them so shutdown drains only work the
+                    // user already committed.
+                    pending.retain(|(_, (request, _))| !request.action.is_preparation());
                 },
                 finished = running.join_next_with_id(), if !running.is_empty() => match finished {
                     Some(Ok((id, (lane, reply)))) => {
-                        task_lanes.remove(&id);
+                        if let Some(active) = task_lanes.remove(&id)
+                            && (reply.failed || reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain))
+                        {
+                            tracing::warn!(
+                                operation_id = active.request_id,
+                                operation = active.name,
+                                host = lane_host(&active.lane),
+                                target = active.target.as_deref().unwrap_or("-"),
+                                uncertain = reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain),
+                                "action worker returned a failed or unconfirmed outcome"
+                            );
+                        }
                         busy.remove(&lane);
                         let _ = port.replies.send(sanitize_reply(reply)).await;
                     },
                     Some(Err(error)) => {
                         tracing::error!(%error, "action worker exited unexpectedly");
-                        if let Some((lane, id)) = task_lanes.remove(&error.id()) {
-                            let _ = port.replies.send(UiReply { operation_id: Some(id), ..UiReply::failure(format!("Action worker failed: {error}")) }).await;
-                            failed_lanes.insert(lane.clone());
-                            busy.remove(&lane);
-                            let skipped = pending.iter().filter(|(queued, _)| *queued == lane).count();
-                            for (_, request) in pending.iter().filter(|(queued, _)| *queued == lane) {
+                        if let Some(active) = task_lanes.remove(&error.id()) {
+                            let _ = port.replies.send(UiReply { operation_id: Some(active.request_id), ..UiReply::failure(format!("Action worker failed: {error}")) }).await;
+                            failed_lanes.insert(active.lane.clone());
+                            busy.remove(&active.lane);
+                            let skipped = pending.iter().filter(|(queued, _)| *queued == active.lane).count();
+                            for (_, (request, _)) in pending.iter().filter(|(queued, _)| *queued == active.lane) {
                                 let _ = port.replies.send(UiReply { operation_id: Some(request.id), ..UiReply::failure("Host action worker failed; operation did not start") }).await;
                             }
-                            pending.retain(|(queued, _)| *queued != lane);
+                            pending.retain(|(queued, _)| *queued != active.lane);
                             if skipped > 0 {
                                 let _ = port.replies.send(UiReply::failure(format!("{skipped} queued commands on the failed host were not started. Restart wt before retrying."))).await;
                             }
@@ -112,11 +169,25 @@ pub fn start(
                 },
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
                     Some(command) => match lane_for(&command.action) {
-                        Ok(lane) if !failed_lanes.contains(&lane) => pending.push_back((lane, command)),
+                        Ok(lane) if !failed_lanes.contains(&lane) => pending.push_back((lane, (command, Instant::now()))),
                         Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure("Host command worker failed; this command was not started. Restart wt before retrying.") }).await; },
                         Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure(format!("{error:#}")) }).await; },
                     },
                     None => closed = true,
+                },
+                _ = &mut progress_tick, if draining && !task_lanes.is_empty() => {
+                    for active in task_lanes.values() {
+                        eprintln!("{}", shutdown_progress(active, Instant::now()));
+                    }
+                    for (lane, (request, accepted_at)) in &pending {
+                        eprintln!("wt: shutdown waiting: {} on {} is queued ({} elapsed, operation {})",
+                            action_name(&request.action),
+                            lane_host(lane),
+                            elapsed(accepted_at.elapsed()),
+                            request.id,
+                        );
+                    }
+                    progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(10));
                 },
             }
         }
@@ -129,8 +200,17 @@ pub fn start(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Lane {
+pub(crate) enum Lane {
     Host(Option<String>),
+    /// Create operations serialize with each other, but a durable removal of
+    /// an existing target must not hold up creating an unrelated target.
+    Creation(Option<String>),
+    /// Removal jobs are durable and already own the target's lifecycle lock.
+    /// Keep the same target serialized while allowing unrelated work through.
+    Removal(Option<String>, String),
+    /// Read-only prompts and pickers must not sit behind a long accepted
+    /// mutation on the same host. The final mutation still revalidates.
+    Preparation(Option<String>),
     FleetCleanup,
     Presentation,
     /// Bounded, device-local controls must remain responsive while host jobs
@@ -139,7 +219,82 @@ enum Lane {
     Terminal,
 }
 
-fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
+fn action_name(action: &wt_tui::UiAction) -> &'static str {
+    match action {
+        wt_tui::UiAction::OnHost { action, .. } => action_name(action),
+        wt_tui::UiAction::Create { .. } | wt_tui::UiAction::CreateResolved { .. } => {
+            "create worktree"
+        }
+        wt_tui::UiAction::Remove { .. } => "remove worktree",
+        wt_tui::UiAction::Cleanup { .. } | wt_tui::UiAction::CleanupTargets { .. } => {
+            "clean worktrees"
+        }
+        wt_tui::UiAction::PrepareCreate { .. } => "prepare worktree creation",
+        wt_tui::UiAction::PrepareRemove { .. } => "prepare worktree removal",
+        wt_tui::UiAction::PrepareCleanup => "prepare worktree cleanup",
+        wt_tui::UiAction::PrepareGithub { .. } => "prepare GitHub action",
+        wt_tui::UiAction::PrepareSessions { .. } => "prepare session picker",
+        wt_tui::UiAction::PrepareHarnesses { .. } => "prepare harness picker",
+        wt_tui::UiAction::ResolveCreation { .. } => "resolve worktree creation",
+        _ => "host action",
+    }
+}
+
+fn action_target(action: &wt_tui::UiAction) -> Option<String> {
+    let key = match action {
+        wt_tui::UiAction::OnHost { action, .. } => return action_target(action),
+        wt_tui::UiAction::Remove { key, .. } | wt_tui::UiAction::PrepareRemove { key } => key,
+        wt_tui::UiAction::CreateResolved { plan } => &plan.key,
+        _ => return None,
+    };
+    match wt_core::parse_worktree_ledger_key(key)? {
+        wt_core::WorktreeRef::Local { slug } | wt_core::WorktreeRef::Remote { slug, .. } => {
+            Some(slug)
+        }
+    }
+}
+
+fn lane_host(lane: &Lane) -> &str {
+    match lane {
+        Lane::Host(Some(host))
+        | Lane::Creation(Some(host))
+        | Lane::Removal(Some(host), _)
+        | Lane::Preparation(Some(host)) => host,
+        Lane::Host(None)
+        | Lane::Creation(None)
+        | Lane::Removal(None, _)
+        | Lane::Preparation(None) => "local host",
+        Lane::FleetCleanup => "local and remote hosts",
+        Lane::Presentation | Lane::ViewControl | Lane::Terminal => "local host",
+    }
+}
+
+fn elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn shutdown_progress(active: &RunningAction, now: Instant) -> String {
+    let target = active
+        .target
+        .as_deref()
+        .map(|target| format!(" for {target}"))
+        .unwrap_or_default();
+    format!(
+        "wt: shutdown waiting: {}{} on {} is running ({} elapsed, operation {})",
+        active.name,
+        target,
+        lane_host(&active.lane),
+        elapsed(now.saturating_duration_since(active.started)),
+        active.request_id,
+    )
+}
+
+pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
     if is_cleanup_action(action) {
         // A single confirmation can contain revisions from several hosts.
         // Serialize it as one accepted operation so shutdown drains the whole
@@ -165,6 +320,15 @@ fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
             Lane::Terminal
         } else if crate::host_routing::controller_owned(&action) {
             Lane::Presentation
+        } else if action.is_preparation() {
+            Lane::Preparation(host)
+        } else if matches!(
+            action,
+            wt_tui::UiAction::Create { .. } | wt_tui::UiAction::CreateResolved { .. }
+        ) {
+            Lane::Creation(host)
+        } else if let wt_tui::UiAction::Remove { key, .. } = action {
+            Lane::Removal(host, key)
         } else {
             Lane::Host(host)
         },
@@ -173,36 +337,69 @@ fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
 
 fn is_cleanup_action(action: &wt_tui::UiAction) -> bool {
     match action {
-        wt_tui::UiAction::PrepareCleanup
-        | wt_tui::UiAction::Cleanup { .. }
-        | wt_tui::UiAction::CleanupTargets { .. } => true,
+        wt_tui::UiAction::Cleanup { .. } | wt_tui::UiAction::CleanupTargets { .. } => true,
         wt_tui::UiAction::OnHost { action, .. } => is_cleanup_action(action),
         _ => false,
     }
 }
 
-fn take_available<T>(
+pub(crate) fn take_available<T>(
     pending: &mut VecDeque<(Lane, T)>,
     busy: &BTreeSet<Lane>,
 ) -> Option<(Lane, T)> {
-    // Reserve one separate slot for quick local view controls. Ordinary host,
-    // terminal and presentation work keeps its four-task bound.
+    // Reserve slots for quick view controls, read-only preparations, and
+    // worktree creation. A destructive removal must not strand a new-worktree
+    // request behind the ordinary host-action limit.
     let ordinary_full = busy
         .iter()
-        .filter(|lane| **lane != Lane::ViewControl)
+        .filter(|lane| {
+            !matches!(
+                lane,
+                Lane::ViewControl | Lane::Preparation(_) | Lane::Creation(_)
+            )
+        })
         .count()
         >= 4;
+    let preparation_busy = busy.iter().any(|lane| matches!(lane, Lane::Preparation(_)));
+    let creation_busy = busy.iter().any(|lane| matches!(lane, Lane::Creation(_)));
     let position = pending.iter().position(|(lane, _)| {
-        (!ordinary_full || *lane == Lane::ViewControl)
-            && busy.iter().all(|active| !lanes_conflict(lane, active))
+        let has_capacity = match lane {
+            Lane::ViewControl => true,
+            Lane::Preparation(_) => !preparation_busy,
+            Lane::Creation(_) => !creation_busy,
+            _ => !ordinary_full,
+        };
+        has_capacity && busy.iter().all(|active| !lanes_conflict(lane, active))
     })?;
     pending.remove(position)
 }
 
-fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
-    left == right
-        || matches!(left, Lane::FleetCleanup) && matches!(right, Lane::Host(_))
-        || matches!(right, Lane::FleetCleanup) && matches!(left, Lane::Host(_))
+pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
+    if left == right {
+        return true;
+    }
+    if matches!(left, Lane::FleetCleanup) || matches!(right, Lane::FleetCleanup) {
+        return matches!(
+            (left, right),
+            (
+                Lane::FleetCleanup,
+                Lane::Host(_) | Lane::Creation(_) | Lane::Removal(_, _)
+            ) | (
+                Lane::Host(_) | Lane::Creation(_) | Lane::Removal(_, _),
+                Lane::FleetCleanup
+            )
+        );
+    }
+    match (left, right) {
+        (Lane::Host(left), Lane::Creation(right))
+        | (Lane::Creation(left), Lane::Host(right))
+        | (Lane::Host(left), Lane::Removal(right, _))
+        | (Lane::Removal(left, _), Lane::Host(right)) => left == right,
+        (Lane::Removal(left_host, left_key), Lane::Removal(right_host, right_key)) => {
+            left_host == right_host && left_key == right_key
+        }
+        _ => false,
+    }
 }
 
 fn create_retry(action: &wt_tui::UiAction) -> Option<(Option<String>, String)> {
@@ -230,7 +427,16 @@ pub fn notice(message: impl Into<String>) -> anyhow::Error {
     Notice(message.into()).into()
 }
 
+#[cfg(test)]
 fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>) -> UiReply {
+    action_reply_with_context(result, retry, None)
+}
+
+fn action_reply_with_context(
+    result: Result<UiReply>,
+    retry: Option<(Option<String>, String)>,
+    context: Option<&ActionLogContext>,
+) -> UiReply {
     let (mut reply, ambiguous) = match result {
         Ok(reply) => (reply, false),
         Err(error) if error.downcast_ref::<Notice>().is_some() => (
@@ -262,21 +468,9 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
         }
     };
     if reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
-        tracing::warn!(
-            target: "wt_attention",
-            event_channel = "attention",
-            event_source = "wt",
-            event_text = %reply.message,
-            "action outcome unknown"
-        );
+        log_action_outcome(context, &reply, true);
     } else if reply.failed {
-        tracing::error!(
-            target: "wt_attention",
-            event_channel = "attention",
-            event_source = "wt",
-            event_text = %reply.message,
-            "action failed"
-        );
+        log_action_outcome(context, &reply, false);
     }
     if reply.failed
         && !ambiguous
@@ -292,6 +486,66 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
         });
     }
     reply
+}
+
+fn log_action_outcome(context: Option<&ActionLogContext>, reply: &UiReply, uncertain: bool) {
+    let event_text = context.map_or_else(
+        || reply.message.clone(),
+        |context| {
+            let target = context
+                .target
+                .as_deref()
+                .map(|target| format!(" for {target}"))
+                .unwrap_or_default();
+            wt_core::sanitize_terminal_text(&format!(
+                "{} on {}{}: {}",
+                context.operation, context.host, target, reply.message
+            ))
+        },
+    );
+    if let Some(context) = context {
+        if uncertain {
+            tracing::warn!(
+                target: "wt_attention",
+                event_channel = "attention",
+                event_source = "wt",
+                event_text = %event_text,
+                operation_id = context.operation_id,
+                operation = context.operation,
+                host = %context.host,
+                worktree = context.target.as_deref().unwrap_or("-"),
+                "action outcome unknown"
+            );
+        } else {
+            tracing::error!(
+                target: "wt_attention",
+                event_channel = "attention",
+                event_source = "wt",
+                event_text = %event_text,
+                operation_id = context.operation_id,
+                operation = context.operation,
+                host = %context.host,
+                worktree = context.target.as_deref().unwrap_or("-"),
+                "action failed"
+            );
+        }
+    } else if uncertain {
+        tracing::warn!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = "wt",
+            event_text = %event_text,
+            "action outcome unknown"
+        );
+    } else {
+        tracing::error!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = "wt",
+            event_text = %event_text,
+            "action failed"
+        );
+    }
 }
 
 fn sanitize_reply(mut reply: UiReply) -> UiReply {
@@ -337,9 +591,33 @@ pub(crate) struct RequestReplies {
 }
 
 impl RequestReplies {
+    /// A creation cannot enter inventory until its optimistic row has the
+    /// exact key. No acknowledgement means no checkout mutation is sent.
+    pub(crate) async fn prepare_creation(
+        &self,
+        key: String,
+        shutdown: &CancellationToken,
+    ) -> Result<bool> {
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let reply = UiReply {
+            creation_prepared: Some(wt_tui::CreationPrepared { key, ready }),
+            ..Default::default()
+        };
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(false),
+            result = self.send(reply) => result?,
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Ok(false),
+            result = received => Ok(result.is_ok()),
+        }
+    }
+
     pub(crate) async fn send(&self, mut reply: UiReply) -> Result<()> {
         reply.ui_generation = Some(self.generation);
-        if reply.handoff.is_some() {
+        if reply.handoff.is_some() || reply.creation_prepared.is_some() {
             reply.operation_id = Some(self.id);
         }
         self.sender
@@ -453,6 +731,62 @@ async fn forward_attach_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn creation_waits_for_exact_identity_presentation_before_permission_to_mutate() {
+        for acknowledge in [false, true] {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let replies = RequestReplies {
+                sender,
+                id: 71,
+                generation: 8,
+            };
+            let shutdown = CancellationToken::new();
+            let worker = tokio::spawn(async move {
+                replies
+                    .prepare_creation("canonical-key".into(), &shutdown)
+                    .await
+                    .unwrap()
+            });
+            let mut reply = receiver.recv().await.unwrap();
+            assert_eq!(reply.operation_id, Some(71));
+            assert_eq!(reply.ui_generation, Some(8));
+            let ticket = reply.creation_prepared.take().unwrap();
+            assert_eq!(ticket.key, "canonical-key");
+            assert!(
+                !worker.is_finished(),
+                "host mutation escaped before presentation"
+            );
+            if acknowledge {
+                ticket.ready.send(()).unwrap();
+            } else {
+                drop(ticket);
+            }
+            assert_eq!(worker.await.unwrap(), acknowledge);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_creation_waiting_for_identity_acknowledgement() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let replies = RequestReplies {
+            sender,
+            id: 72,
+            generation: 8,
+        };
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+        let worker = tokio::spawn(async move {
+            replies
+                .prepare_creation("canonical-key".into(), &cancel)
+                .await
+                .unwrap()
+        });
+        let ticket = receiver.recv().await.unwrap();
+        shutdown.cancel();
+        assert!(!worker.await.unwrap());
+        drop(ticket);
+    }
     use wt_tui::UiAction;
 
     #[tokio::test]
@@ -640,9 +974,21 @@ mod tests {
             })
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
+        // These callsites may have been evaluated earlier by parallel tests
+        // with no thread-local subscriber installed.
+        tracing::callsite::rebuild_interest_cache();
 
         action_reply(Ok(UiReply::failure("GitHub rejected the update")), None);
-        action_reply(Err(anyhow::anyhow!("remote connection failed")), None);
+        action_reply_with_context(
+            Err(anyhow::anyhow!("remote connection failed")),
+            None,
+            Some(&ActionLogContext {
+                operation_id: 7,
+                operation: "remove worktree",
+                host: "MaxBook".into(),
+                target: Some("new-frontend".into()),
+            }),
+        );
         action_reply(
             Err(crate::remote_host::RemoteHostError::Ambiguous {
                 host: "builder".into(),
@@ -653,6 +999,7 @@ mod tests {
         );
         action_reply(Err(notice("already at top")), None);
         drop(guard);
+        tracing::callsite::rebuild_interest_cache();
 
         let output = output.lock().unwrap().clone();
         let log = String::from_utf8(output).unwrap();
@@ -692,6 +1039,19 @@ mod tests {
                 .count(),
             1,
             "{log}"
+        );
+        let contextual = events
+            .iter()
+            .find(|event| event["fields"]["operation_id"] == 7)
+            .expect("contextual failure event");
+        assert_eq!(contextual["fields"]["operation"], "remove worktree");
+        assert_eq!(contextual["fields"]["host"], "MaxBook");
+        assert_eq!(contextual["fields"]["worktree"], "new-frontend");
+        assert!(
+            contextual["fields"]["event_text"]
+                .as_str()
+                .unwrap()
+                .contains("remove worktree on MaxBook for new-frontend")
         );
         assert_eq!(
             events
@@ -744,6 +1104,131 @@ mod tests {
     }
 
     #[test]
+    fn read_only_preparations_run_in_a_lane_separate_from_host_mutations() {
+        let preparation = UiAction::PrepareRemove { key: "row".into() };
+        let mutation = UiAction::Remove {
+            key: "row".into(),
+            force: false,
+            revision: wt_tui::RemovalRevision {
+                key: "row".into(),
+                path: "/work/row".into(),
+                branch: "row".into(),
+                head: "head".into(),
+                digest: "digest".into(),
+                hazards: vec![],
+                published_base: None,
+            },
+        };
+        let preparation_lane = lane_for(&preparation).unwrap();
+        let mutation_lane = lane_for(&mutation).unwrap();
+        assert_eq!(preparation_lane, Lane::Preparation(None));
+        assert_eq!(mutation_lane, Lane::Removal(None, "row".into()));
+        assert!(!lanes_conflict(&preparation_lane, &mutation_lane));
+
+        let mut pending = VecDeque::from([
+            (preparation_lane.clone(), preparation.clone()),
+            (mutation_lane.clone(), mutation),
+        ]);
+        let busy = BTreeSet::from([Lane::Host(None)]);
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((preparation_lane, preparation))
+        );
+    }
+
+    #[test]
+    fn cleanup_preparation_does_not_claim_the_mutation_lane() {
+        assert_eq!(
+            lane_for(&UiAction::PrepareCleanup).unwrap(),
+            Lane::Preparation(None)
+        );
+        assert_eq!(
+            lane_for(&UiAction::Cleanup { revisions: vec![] }).unwrap(),
+            Lane::FleetCleanup
+        );
+    }
+
+    #[test]
+    fn durable_removal_only_blocks_same_target_and_global_host_operations() {
+        let active = Lane::Removal(None, "old-worktree".into());
+        let other_remove = Lane::Removal(None, "other-worktree".into());
+        let create = lane_for(&UiAction::Create {
+            input: "new".into(),
+        })
+        .unwrap();
+        assert_eq!(create, Lane::Creation(None));
+        assert!(!lanes_conflict(&active, &other_remove));
+        assert!(!lanes_conflict(&active, &create));
+        assert!(lanes_conflict(&active, &Lane::Host(None)));
+        assert!(lanes_conflict(&active, &Lane::FleetCleanup));
+
+        let mut pending = VecDeque::from([
+            (other_remove.clone(), "other removal"),
+            (create.clone(), "new creation"),
+            (
+                Lane::Removal(None, "old-worktree".into()),
+                "same-target removal",
+            ),
+            (Lane::Host(None), "global host write"),
+        ]);
+        let busy = BTreeSet::from([active]);
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((other_remove, "other removal"))
+        );
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((create, "new creation"))
+        );
+        assert_eq!(take_available(&mut pending, &busy), None);
+    }
+
+    #[test]
+    fn operation_log_targets_are_safe_slugs_not_qualified_keys_or_user_input() {
+        let key = wt_core::remote_worktree_ledger_key("MaxBook", "new-frontend");
+        assert_eq!(
+            action_target(&UiAction::Remove {
+                key,
+                force: true,
+                revision: wt_tui::RemovalRevision {
+                    key: "new-frontend".into(),
+                    path: "/work/new-frontend".into(),
+                    branch: "new-frontend".into(),
+                    head: "head".into(),
+                    digest: "digest".into(),
+                    hazards: vec![],
+                    published_base: None,
+                },
+            }),
+            Some("new-frontend".into())
+        );
+        assert_eq!(
+            action_target(&UiAction::Create {
+                input: "potentially sensitive title".into(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn shutdown_progress_identifies_the_accepted_operation_and_host() {
+        let started = Instant::now() - Duration::from_secs(75);
+        let progress = shutdown_progress(
+            &RunningAction {
+                lane: Lane::Host(Some("MaxBook".into())),
+                request_id: 42,
+                name: "remove worktree",
+                target: Some("new-frontend".into()),
+                started,
+            },
+            Instant::now(),
+        );
+        assert!(progress.contains("remove worktree for new-frontend on MaxBook is running"));
+        assert!(progress.contains("1m15s elapsed"));
+        assert!(progress.contains("operation 42"));
+    }
+
+    #[test]
     fn view_controls_have_reserved_capacity_while_host_work_is_saturated() {
         let busy = BTreeSet::from([
             Lane::Host(None),
@@ -769,6 +1254,50 @@ mod tests {
             Some((control_lane, control))
         );
         assert_eq!(take_available(&mut pending, &busy), None);
+    }
+
+    #[test]
+    fn preparation_has_one_reserved_slot_beyond_four_ordinary_actions() {
+        let busy = BTreeSet::from([
+            Lane::Host(None),
+            Lane::Host(Some("builder-a".into())),
+            Lane::Host(Some("builder-b".into())),
+            Lane::Presentation,
+        ]);
+        let preparation = UiAction::PrepareRemove { key: "row".into() };
+        let preparation_lane = lane_for(&preparation).unwrap();
+        let fifth_host_lane = Lane::Host(Some("builder-c".into()));
+        // Use an unrelated remote host so the test isolates the reserved
+        // creation slot from same-host serialization with Host actions.
+        let creation_lane = Lane::Creation(Some("builder-c".into()));
+        let mut pending = VecDeque::from([
+            (fifth_host_lane, UiAction::HardRefresh),
+            (preparation_lane.clone(), preparation.clone()),
+            (
+                creation_lane.clone(),
+                UiAction::Create {
+                    input: "new-row".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((preparation_lane.clone(), preparation))
+        );
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((
+                creation_lane.clone(),
+                UiAction::Create {
+                    input: "new-row".into()
+                }
+            ))
+        );
+        let with_reserved = busy
+            .into_iter()
+            .chain([preparation_lane, creation_lane])
+            .collect::<BTreeSet<_>>();
+        assert_eq!(take_available(&mut pending, &with_reserved), None);
     }
 
     #[test]
@@ -856,6 +1385,16 @@ mod tests {
         let host = Lane::Host(Some("builder".into()));
         assert!(lanes_conflict(&Lane::FleetCleanup, &host));
         assert!(lanes_conflict(&host, &Lane::FleetCleanup));
+        assert!(!lanes_conflict(
+            &Lane::FleetCleanup,
+            &Lane::Preparation(Some("builder".into()))
+        ));
+        let preparation = Lane::Preparation(Some("builder".into()));
+        let mut pending = VecDeque::from([(preparation.clone(), "open removal review")]);
+        assert_eq!(
+            take_available(&mut pending, &BTreeSet::from([Lane::FleetCleanup])),
+            Some((preparation, "open removal review"))
+        );
         let mut pending = VecDeque::from([(host.clone(), "host mutation")]);
         assert_eq!(
             take_available(&mut pending, &BTreeSet::from([Lane::FleetCleanup])),

@@ -191,6 +191,16 @@ impl<T, M: Mutation<T>> Pending<T, M> {
             .map(|entry| &entry.mutation)
     }
 
+    /// Refine an operation's display identity without accepting it or renewing
+    /// its lifetime. Intermediate host replies must not extend the deadline.
+    pub fn refine(&mut self, op: u64, refine: impl FnOnce(&mut M)) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.op == op) else {
+            return false;
+        };
+        refine(&mut entry.mutation);
+        true
+    }
+
     pub fn mutations(&self) -> impl Iterator<Item = &M> {
         self.entries.iter().map(|entry| &entry.mutation)
     }
@@ -437,6 +447,25 @@ mod tests {
                 .is_empty()
         );
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refining_identity_preserves_phase_and_original_deadline() {
+        let mut pending = Pending::default();
+        pending.begin(1, Set("provisional", true), Instant::now());
+        let deadline = pending.next_deadline();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(pending.refine(1, |change| change.0 = "canonical"));
+        assert_eq!(pending.next_deadline(), deadline);
+        assert_eq!(pending.views()[0].phase, PendingPhase::InFlight);
+        assert_eq!(pending.mutation(1), Some(&Set("canonical", true)));
+        pending.accept(1, Stamp::now(), Instant::now());
+        let deadline = pending.next_deadline();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(pending.refine(1, |change| change.1 = false));
+        assert_eq!(pending.next_deadline(), deadline);
+        assert_eq!(pending.views()[0].phase, PendingPhase::Accepted);
+        assert!(!pending.refine(2, |_| panic!("missing operations must not run refinement")));
     }
 
     #[tokio::test(start_paused = true)]

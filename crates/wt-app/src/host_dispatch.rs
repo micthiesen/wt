@@ -380,9 +380,55 @@ pub async fn execute(
     } else {
         None
     };
+    let action = if let UiAction::Create { input } = action {
+        // Resolving identity has not accepted a filesystem mutation. It must
+        // remain cancellable even though the outer user request is Create.
+        let preparation = async {
+            match remote {
+                Some(remote) => remote
+                    .execute(UiAction::ResolveCreation { input })
+                    .await
+                    .map_err(anyhow::Error::from),
+                None => {
+                    fleet
+                        .local
+                        .execute(UiAction::ResolveCreation { input })
+                        .await
+                }
+            }
+        };
+        let prepared = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(UiReply::no_change("Creation cancelled before checkout started")),
+            prepared = preparation => prepared?,
+        };
+        if prepared.failed {
+            return Ok(prepared);
+        }
+        let plan = prepared
+            .creation_plan
+            .context("host did not resolve creation identity")?;
+        let key = host.as_ref().map_or_else(
+            || plan.key.clone(),
+            |host| wt_core::remote_worktree_ledger_key(host, &plan.key),
+        );
+        if !replies.prepare_creation(key, shutdown).await? {
+            return Ok(UiReply::no_change(
+                "Creation cancelled before checkout started",
+            ));
+        }
+        UiAction::CreateResolved { plan }
+    } else {
+        action
+    };
     let mut reply = match remote {
         Some(remote) => remote.execute(action).await?,
-        None => fleet.local.execute(action).await?,
+        None => {
+            fleet
+                .local
+                .execute_with_shutdown(action, Some(shutdown))
+                .await?
+        }
     };
     if !reply.failed
         && let Some((key, revision)) = migrated_pin

@@ -42,10 +42,21 @@ impl HostService {
     /// Run one host-owned request, then refresh exactly the domains its
     /// effect names and classify the reply for the TUI's pending engine.
     pub async fn execute(&self, command: UiAction) -> Result<UiReply> {
+        self.execute_with_shutdown(command, None).await
+    }
+
+    /// Run a request owned by the interactive controller. Shutdown may stop
+    /// waiting for a durable removal only after its worker is proven running;
+    /// other accepted mutations continue through their normal completion.
+    pub async fn execute_with_shutdown(
+        &self,
+        command: UiAction,
+        shutdown: Option<&CancellationToken>,
+    ) -> Result<UiReply> {
         let snapshot = self.sources.board.snapshot();
         let empty = Board::default();
         let effect = command.effect(snapshot.data().map_or(&empty, |board| board.as_ref()));
-        let result = self.run(command, &snapshot).await;
+        let result = self.run(command, &snapshot, shutdown).await;
         // Stamp the write before any refresh is queued, so the confirming
         // fetch always starts at or after it.
         let done = Stamp::now();
@@ -126,7 +137,12 @@ impl HostService {
         }
     }
 
-    async fn run(&self, command: UiAction, snapshot: &SourceSnapshot<Board>) -> Result<UiReply> {
+    async fn run(
+        &self,
+        command: UiAction,
+        snapshot: &SourceSnapshot<Board>,
+        shutdown: Option<&CancellationToken>,
+    ) -> Result<UiReply> {
         if matches!(command, UiAction::PrepareHardRefresh) {
             return Ok(UiReply {
                 modal: Some(wt_tui::UiModal::Confirm {
@@ -421,11 +437,12 @@ impl HostService {
                 .await?
             }
             command => {
-                Box::pin(crate::controller_actions::execute(
+                Box::pin(crate::controller_actions::execute_with_shutdown(
                     &self.context,
                     command,
                     board,
                     github,
+                    shutdown,
                 ))
                 .await?
             }

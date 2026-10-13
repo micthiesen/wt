@@ -46,6 +46,8 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::SetTitle { .. }
         | UiAction::GenerateTitle { .. }
         | UiAction::PrepareCreate { .. }
+        | UiAction::ResolveCreation { .. }
+        | UiAction::CreateResolved { .. }
         | UiAction::Create { .. }
         | UiAction::PrepareRemove { .. }
         | UiAction::Remove { .. }
@@ -209,6 +211,8 @@ fn visit_keys(
         | UiAction::Copy { .. }
         | UiAction::CyclePrimary
         | UiAction::PrepareCreate { .. }
+        | UiAction::ResolveCreation { .. }
+        | UiAction::CreateResolved { .. }
         | UiAction::Create { .. }
         | UiAction::PrepareCleanup
         | UiAction::ManagedSignIn { .. }

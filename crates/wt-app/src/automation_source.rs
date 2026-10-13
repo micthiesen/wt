@@ -1,6 +1,10 @@
 //! Host-local automation engine adapter over the shared source snapshots.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use tokio::{
@@ -83,15 +87,7 @@ impl AutomationDrain {
         self.cancel.cancel();
         let mut task = self.task.lock().await;
         if let Some(handle) = task.as_mut() {
-            let result = match tokio::time::timeout(Duration::from_secs(3), &mut *handle).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!("waiting for accepted automations to finish before exiting");
-                    eprintln!("wt: waiting for accepted automations to finish before exiting");
-                    handle.await
-                }
-            }
-            .context("automation owner exited");
+            let result = handle.await.context("automation owner exited");
             task.take();
             result?;
         }
@@ -154,6 +150,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut requirements_board_revision = None;
         let mut latest_error: Option<String> = None;
         let mut dispatches: JoinSet<(ClaimedFire, AutomationOutcome, Option<String>)> = JoinSet::new();
+        let mut active_dispatches = HashMap::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -177,9 +174,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 changed = activity_rx.changed() => if changed.is_err() { break; },
                 changed = edits_rx.changed() => if changed.is_err() { break; },
                 changed = board_rx.changed() => if changed.is_err() { break; },
-                completed = dispatches.join_next(), if !dispatches.is_empty() => {
+                completed = dispatches.join_next_with_id(), if !dispatches.is_empty() => {
                     match completed {
-                        Some(Ok((claim, outcome, error))) => {
+                        Some(Ok((id, (claim, outcome, error))) ) => {
+                            active_dispatches.remove(&id);
                             if let Some(error) = error { latest_error = Some(error); }
                             let advanced_tip = claim.fire().branch_range.as_ref().map(|range| (range.branch.clone(), range.to.clone()));
                             let started = !matches!(outcome, AutomationOutcome::NotStarted);
@@ -197,7 +195,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             }
                             let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                         }
-                        Some(Err(error)) => latest_error = Some(format!("automation dispatch task failed: {error}")),
+                        Some(Err(error)) => {
+                            active_dispatches.remove(&error.id());
+                            latest_error = Some(format!("automation dispatch task failed: {error}"));
+                        }
                         None => {}
                     }
                     continue;
@@ -257,7 +258,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                         &context.config.automations,
                     ).await {
                         Ok(next) => {
-                            lifecycle_retry.completed(!next.errors.is_empty());
+                            lifecycle_retry.completed(!next.errors.is_empty() || next.deferred);
                             for (slug, error) in &next.errors {
                                 if lifecycle_errors.get(slug) != Some(error) {
                                     tracing::warn!(
@@ -342,17 +343,42 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 let context = accepted_context.clone();
                 let github = fresh_github.clone();
                 let board = base_board.data().map(|board| (**board).clone());
-                dispatches.spawn(async move { dispatch_claim(context, claim, github, board).await });
+                let slug = claim.fire().slug.clone();
+                let task = dispatches.spawn(async move { dispatch_claim(context, claim, github, board).await });
+                active_dispatches.insert(task.id(), (slug, Instant::now()));
             }
             let _ = status_tx.send((tick.pending, latest_error.clone()));
         }
-        while let Some(result) = dispatches.join_next().await {
-            if let Ok((claim, outcome, _)) = result
-                && let Err(error) = engine.finish_with_cancellation(
-                    &claim, outcome, now_ms(), &accepted_context.cancellation,
-                ).await
-            {
-                tracing::warn!(%error, "cannot finish automation dispatch during shutdown");
+        let mut progress = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(10),
+        );
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while !dispatches.is_empty() {
+            tokio::select! {
+                completed = dispatches.join_next_with_id() => match completed {
+                    Some(Ok((id, (claim, outcome, _)))) => {
+                        active_dispatches.remove(&id);
+                        if let Err(error) = engine.finish_with_cancellation(
+                            &claim, outcome, now_ms(), &accepted_context.cancellation,
+                        ).await {
+                            tracing::warn!(%error, "cannot finish automation dispatch during shutdown");
+                        }
+                    }
+                    Some(Err(error)) => {
+                        active_dispatches.remove(&error.id());
+                        tracing::warn!(%error, "automation dispatch task failed during shutdown");
+                    }
+                    None => break,
+                },
+                _ = progress.tick() => {
+                    for (slug, started) in active_dispatches.values() {
+                        eprintln!(
+                            "wt: shutdown waiting: automation for {slug} on this machine is running ({} elapsed)",
+                            shutdown_elapsed(started.elapsed()),
+                        );
+                    }
+                }
             }
         }
     });
@@ -360,6 +386,14 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         board,
         commands,
         drain: AutomationDrain::new(drain_token, task),
+    }
+}
+
+fn shutdown_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_secs() >= 60 {
+        format!("{}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    } else {
+        format!("{}s", elapsed.as_secs())
     }
 }
 

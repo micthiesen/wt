@@ -53,6 +53,8 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         check("host reconnect and runtime updates", "host", "--binary", binary),
         check("state migration and diagnostics", "command", binary),
         check("SST cleanup", "stages", "--binary", binary),
+        check("optimistic creation and navigation", "ui", "--binary", binary,
+              "--create", "--output", str(output / "wt-native-create")),
     ]
     if system == "Darwin":
         checks.append(check("webhooks and service ownership", "events", "--binary", binary))

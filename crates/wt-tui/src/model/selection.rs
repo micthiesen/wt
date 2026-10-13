@@ -179,20 +179,6 @@ impl Model {
                 });
             }
         }
-        if let Some(id) = self.creation_focus {
-            let ready = self
-                .creates
-                .get(&id)
-                .and_then(|create| create.resolved.as_ref())
-                .and_then(|key| self.row_position(key));
-            if let Some(index) = ready {
-                self.creation_focus = None;
-                self.selected = Some(index);
-                self.pending_selection = None;
-            } else {
-                self.selected = None;
-            }
-        }
     }
 
     pub fn selected_row(&self) -> Option<&BoardRow> {
@@ -329,7 +315,6 @@ impl Model {
     }
 
     pub(super) fn select(&mut self, index: usize) -> InputResult {
-        self.creation_focus = None;
         self.pending_selection = None;
         let selected = (self.item_count() > 0).then(|| index.min(self.item_count() - 1));
         let freed = std::mem::take(&mut self.list_free_scroll);

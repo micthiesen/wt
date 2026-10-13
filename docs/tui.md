@@ -74,12 +74,13 @@ yellow "blocked on" group with external gates. A review request's details show i
 author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
 shows a scrollbar when it overflows.
 
-Creation shows progress in the header and footer, separate from worktree rows.
-F12 queues agent entry on the chosen host once the checkout is ready. Esc or
-list navigation returns focus to existing worktrees. Attention and other board
-controls remain available. Inventory is the only source of worktree rows, even
-when it arrives before the creation reply. Dependency installation continues
-as a background action. Confirmed removal moves the row to Archived with a
+Creation immediately selects one optimistic row with its title and a progress
+glyph. Normal list navigation and attention controls remain available. The
+chosen host resolves the exact checkout identity before creation starts, so
+inventory replaces that row without a duplicate. Navigation away is preserved
+when preparation or creation finishes. Worktree actions, including F12, become
+available when the real checkout is ready; F12 is never queued automatically.
+Dependency installation continues as a background action. Confirmed removal moves the row to Archived with a
 removal glyph; a failed removal restores its previous archive state.
 
 ### Cached, pending and failed states
@@ -138,6 +139,12 @@ static key hint, and on the right the manager, main, wt, and dotfiles slot
 sessions as `[m] [.] [,] [/]` colored by session state. The manager Claude
 session also shows context occupancy after a transcript turn provides usage.
 These are status labels, not clickable buttons.
+Physical terminal presence is separate from conversation identity. A live Codex
+terminal can show its explicit working or action-required title signal before
+wt knows its thread UUID. A live terminal without a reliable activity signal
+uses the unknown-state color rather than the absent-terminal muted style. Title signals
+never assign history, route messages, or establish that automation may act on
+an idle session.
 
 Modals share one frame: a rounded border (yellow for destructive confirms), a
 title, and their keys listed along the bottom edge. Pickers show chords or
@@ -185,9 +192,10 @@ parent's host, and `Tab` does nothing once the text carries `--base`; a
 `--base` typed after choosing a host resolves on that host.
 A failed create keeps the name and chosen host editable, with the error shown
 in red above the prompt.
-After creation, WT refreshes inventory and metadata and selects the new row
-once it appears; progress stays until then. Its group opens when the row
-arrives, including if a folded snapshot arrives before the saved group state.
+Submitting selects a pending row immediately. Inventory and metadata replace
+that same row once creation finishes; progress stays until then. Its group
+opens while the pending row remains selected. Navigating elsewhere prevents
+the later creation result from changing selection.
 
 The Archived group sits at the bottom of the worktree pane when all visible
 items fit. When the list is taller than the pane, it scrolls with the list.

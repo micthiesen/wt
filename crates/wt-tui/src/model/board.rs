@@ -41,6 +41,10 @@ pub struct Board {
     pub usage: Vec<UsageItem>,
     #[serde(default)]
     pub slot_sessions: std::collections::BTreeMap<String, Vec<SessionView>>,
+    /// Physical managed terminals, independent of historical conversation IDs.
+    /// Presentation only: never authorizes session routing or idle automation.
+    #[serde(default)]
+    pub live_slots: std::collections::BTreeMap<String, Vec<LiveSlotView>>,
     #[serde(default)]
     pub display: DisplayPolicy,
     /// Queued automation fires waiting to dispatch.
@@ -139,6 +143,12 @@ pub struct AttentionLine {
     pub at_ms: u64,
     pub source: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LiveSlotView {
+    pub harness: String,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -501,6 +511,10 @@ pub(crate) const ARCHIVED_SECTION: &str = "\0archived";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoardRow {
+    /// Optimistic creation has no actionable inventory identity yet. Only the
+    /// pending projection sets this; sources publish real rows with false.
+    #[serde(default)]
+    pub pending_creation: bool,
     pub key: String,
     pub host: Option<String>,
     pub slug: String,

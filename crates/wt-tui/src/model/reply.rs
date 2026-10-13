@@ -6,7 +6,11 @@ use super::{
 use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 
 impl Model {
-    pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
+    pub fn reply(&mut self, mut reply: UiReply) -> Option<crate::TerminalHandoff> {
+        if let Some(prepared) = reply.creation_prepared.take() {
+            self.creation_prepared(reply.operation_id, prepared);
+            return None;
+        }
         let accepts_palette_chord = !reply.failed
             && matches!(
                 &reply.modal,
@@ -15,21 +19,20 @@ impl Model {
                     ..
                 })
             );
-        let palette_chord = if self
-            .pending_palette
+        let completed_request = if self
+            .pending_request
             .as_ref()
-            .is_some_and(|(id, _, _)| Some(*id) == reply.operation_id)
+            .is_some_and(|request| Some(request.id) == reply.operation_id)
         {
-            self.pending_palette
-                .take()
-                .and_then(|(_, generation, chord)| {
-                    (generation == self.ui_generation)
-                        .then_some(chord)
-                        .flatten()
-                })
+            self.pending_request.take()
         } else {
             None
         };
+        let palette_chord = completed_request.as_ref().and_then(|request| {
+            (request.generation == self.ui_generation && request.palette)
+                .then_some(request.chord)
+                .flatten()
+        });
         let selected_create = self.reply_pending(&reply);
         let presentation_current = reply
             .ui_generation
@@ -39,11 +42,17 @@ impl Model {
             // without suspending this newer interaction or attaching a client.
             return None;
         }
-        let current = presentation_current || selected_create;
-        if reply.select_when_visible.is_some() && current {
+        let selection_current = presentation_current
+            || (selected_create
+                && !self.history.active
+                && !self.help
+                && !self.show_perf
+                && self.title_prompt.is_none()
+                && matches!(self.interaction, Interaction::None));
+        if reply.select_when_visible.is_some() && selection_current {
             self.history.active = false;
         }
-        if reply.modal.is_some() && current {
+        if reply.modal.is_some() && presentation_current {
             self.interaction_host = reply.modal_host;
         }
         if reply.handoff.is_some() {
@@ -59,10 +68,36 @@ impl Model {
         } else {
             ToastTone::Info
         };
-        if self.pending_palette.is_none() || reply.failed || reply.notice {
-            self.toast = Some((reply.message, tone));
+        // A different operation finishing cannot clear the request the user
+        // is waiting on. Failures are already persisted in the attention feed.
+        let preserves_failure = completed_request.is_none()
+            && self
+                .toast
+                .as_ref()
+                .is_some_and(|(_, tone)| *tone == ToastTone::Failed)
+            && !reply.failed;
+        if self.pending_request.is_none() && !preserves_failure {
+            let message = if reply.message.is_empty()
+                && reply.modal.is_none()
+                && reply.handoff.is_none()
+                && completed_request.is_some()
+            {
+                if reply.failed {
+                    "Command failed; see attention".into()
+                } else if completed_request
+                    .as_ref()
+                    .is_some_and(|request| request.preparation)
+                {
+                    "Request finished without opening a menu".into()
+                } else {
+                    "Done".into()
+                }
+            } else {
+                reply.message
+            };
+            self.toast = Some((message, tone));
         }
-        self.interaction = match reply.modal.filter(|_| current) {
+        self.interaction = match reply.modal.filter(|_| presentation_current) {
             Some(UiModal::Reviewers {
                 key,
                 pr_number,
@@ -158,7 +193,7 @@ impl Model {
             }
             None => std::mem::take(&mut self.interaction),
         };
-        if current && let Some(key) = reply.select_when_visible {
+        if selection_current && let Some(key) = reply.select_when_visible {
             if let Some(index) = self.row_position(&key) {
                 self.select(index);
             } else {
@@ -166,7 +201,7 @@ impl Model {
             }
         }
         if let Some(chord) = palette_chord
-            && current
+            && presentation_current
             && accepts_palette_chord
             && matches!(&self.interaction, Interaction::Picker(picker) if matches!(picker.action, PickerAction::Actions { .. }) && picker.options.iter().any(|option| option.chord == Some(chord)))
             && let super::InputResult::Action(action) = self.input(

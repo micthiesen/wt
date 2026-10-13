@@ -1,27 +1,12 @@
 //! The user's pending requests over the source board: beginning, settling
-//! and projecting them, and the separate creation progress they show.
+//! and projecting them, including creation rows bound before host mutation.
 
 use std::sync::Arc;
 
 use wt_runtime::SourceSnapshot;
 
 use super::{Board, Model, ToastTone};
-use crate::{SessionTarget, UiAction, UiReply};
-
-/// Interaction state of a pending creation, independent of worktree rows.
-#[derive(Clone, Debug)]
-pub(crate) struct CreateUi {
-    pub host: Option<String>,
-    pub resolved: Option<String>,
-    pub open_agent: bool,
-}
-
-fn on_host(host: Option<String>, action: UiAction) -> UiAction {
-    UiAction::OnHost {
-        host,
-        action: Box::new(action),
-    }
-}
+use crate::{UiAction, UiReply};
 
 impl Model {
     pub fn apply(&mut self, snapshot: SourceSnapshot<Board>) {
@@ -57,19 +42,18 @@ impl Model {
         let mut pending = std::mem::take(&mut self.pending);
         let expired = pending.settle(&source, |target, domain| self.observed(target, domain), now);
         self.pending = pending;
-        self.creates.retain(|op, _| self.pending.contains(*op));
-        if self
-            .creation_focus
-            .is_some_and(|id| !self.creates.contains_key(&id))
-        {
-            self.creation_focus = None;
-        }
         for change in &expired {
             let text = crate::render::status::expired_notice(change);
             let source = change.mutation.target.key.as_deref().unwrap_or("wt");
             tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = %source, event_text = %text, "pending change expired");
         }
-        if let Some(first) = expired.first() {
+        if let Some(first) = expired.first()
+            && self.pending_request.is_none()
+            && !self
+                .toast
+                .as_ref()
+                .is_some_and(|(_, tone)| *tone == ToastTone::Failed)
+        {
             self.toast = Some((
                 crate::render::status::expired_notice(first),
                 ToastTone::Notice,
@@ -95,20 +79,32 @@ impl Model {
         self.next_op
     }
 
-    /// F12 while creation has focus opens the resolved checkout, or queues
-    /// opening until its host returns the canonical identity.
-    pub(super) fn request_agent(&mut self, id: u64) -> Option<UiAction> {
-        let create = self.creates.get_mut(&id)?;
-        create.open_agent = true;
-        create.resolved.clone().map(|resolved| {
-            on_host(
-                create.host.clone(),
-                UiAction::Session {
-                    key: Some(resolved),
-                    target: SessionTarget::Harness,
-                },
-            )
-        })
+    /// Bind the operation row before the controller lets its host create a
+    /// checkout. Manual navigation is independent and is never undone here.
+    pub(super) fn creation_prepared(&mut self, id: Option<u64>, prepared: crate::CreationPrepared) {
+        let Some(id) = id else {
+            return;
+        };
+        let Some(mutation) = self.pending.mutation(id) else {
+            return;
+        };
+        if !matches!(
+            mutation.kind,
+            crate::MutationKind::Lifecycle(crate::LifecycleChange::Create { .. })
+        ) {
+            return;
+        }
+        let selected = self.selected_row().is_some_and(|row| {
+            Some(&row.key) == mutation.target.key.as_ref() && row.host == mutation.target.host
+        });
+        self.pending.refine(id, |mutation| {
+            mutation.target.key = Some(prepared.key.clone())
+        });
+        if selected {
+            self.pending_selection = Some(prepared.key);
+        }
+        self.reproject(tokio::time::Instant::now());
+        let _ = prepared.ready.send(());
     }
 
     /// Resolve what the user saw into the request the host executes: toggles
@@ -177,23 +173,20 @@ impl Model {
         while let UiAction::OnHost { action, .. } = inner {
             inner = action;
         }
-        if matches!(inner, UiAction::PrepareActions { .. }) {
-            self.pending_palette = Some((id, self.ui_generation, None));
-        }
+        self.pending_request = Some(super::PendingRequest {
+            id,
+            generation: self.ui_generation,
+            preparation: inner.is_preparation(),
+            palette: matches!(inner, UiAction::PrepareActions { .. }),
+            chord: None,
+            action: inner.clone(),
+            _cancel_on_drop: None,
+        });
         let crate::Effect::Mutation(mut mutation) = action.effect(&self.board) else {
             return;
         };
         if mutation.assign_creation(id) {
-            self.creates.insert(
-                id,
-                CreateUi {
-                    host: mutation.target.host.clone(),
-                    resolved: None,
-                    open_agent: false,
-                },
-            );
-            self.creation_focus = Some(id);
-            self.pending_selection = None;
+            self.pending_selection = mutation.target.key.clone();
         }
         let now = tokio::time::Instant::now();
         self.pending.begin(id, mutation, now);
@@ -207,32 +200,25 @@ impl Model {
         }
     }
 
-    /// Apply the host's answer to its pending change, and open the agent of
-    /// a finished creation the user asked for with F12 while focused on its
-    /// progress. Returns whether that creation is focused, which keeps
-    /// the reply current for the user.
+    /// Finish the same pending row without allowing late replies to reclaim
+    /// selection after the user navigated elsewhere.
     pub(super) fn reply_pending(&mut self, reply: &UiReply) -> bool {
-        let create = reply
+        let selected_create = reply
             .operation_id
-            .and_then(|id| self.creates.get(&id))
-            .cloned();
-        let selected_create =
-            reply.operation_id.is_some() && self.creation_focus == reply.operation_id;
+            .and_then(|id| self.pending.mutation(id))
+            .filter(|mutation| {
+                matches!(
+                    mutation.kind,
+                    crate::MutationKind::Lifecycle(crate::LifecycleChange::Create { .. })
+                )
+            })
+            .is_some_and(|mutation| {
+                self.selected_row().is_some_and(|row| {
+                    Some(&row.key) == mutation.target.key.as_ref()
+                        && row.host == mutation.target.host
+                })
+            });
         if self.finish_pending(reply) {
-            if let Some(create) = &create
-                && selected_create
-                && create.open_agent
-                && !reply.failed
-                && let Some(resolved) = &reply.select_when_visible
-            {
-                self.follow_up = Some(on_host(
-                    create.host.clone(),
-                    UiAction::Session {
-                        key: Some(resolved.clone()),
-                        target: SessionTarget::Harness,
-                    },
-                ));
-            }
             self.reproject(tokio::time::Instant::now());
         }
         selected_create
@@ -251,7 +237,12 @@ impl Model {
             // Remote replies settle against stamps relayed by this process.
             wt_runtime::hold_for_settlement(std::time::Duration::from_secs(30));
         }
-        let is_create = self.creates.contains_key(&id);
+        let is_create = self.pending.mutation(id).is_some_and(|mutation| {
+            matches!(
+                mutation.kind,
+                crate::MutationKind::Lifecycle(crate::LifecycleChange::Create { .. })
+            )
+        });
         if reply.failed || reply.modal.is_some() {
             self.pending.remove(id);
         } else {
@@ -267,14 +258,11 @@ impl Model {
                             // remote rows itself (archive, sections, session
                             // entry); those are confirmed by this process's
                             // own reads, on the clock the stamp came from.
-                            if at.local_instant().is_some() {
+                            if at.local_instant().is_some() && !is_create {
                                 mutation.target.host = None;
                             }
                             mutation.on_accepted(reply);
                         });
-                        if let Some(create) = self.creates.get_mut(&id) {
-                            create.resolved = resolved;
-                        }
                     }
                 }
                 Some(crate::ReplyOutcome::NoChange | crate::ReplyOutcome::Deferred) => {

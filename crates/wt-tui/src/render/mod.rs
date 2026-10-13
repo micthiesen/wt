@@ -394,11 +394,6 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
                 ),
             ]
         }
-    } else if model.creation_focus.is_some() {
-        vec![Span::styled(
-            " Creating…  F12: open when ready · Esc: return to list",
-            base.fg(theme::ACCENT),
-        )]
     } else if let SourceState::Failed(error) = &model.source_state {
         vec![
             Span::raw(" "),
@@ -456,20 +451,31 @@ fn slot_buttons(model: &Model, base: Style) -> Vec<Span<'static>> {
     }
     for (index, (slot, key)) in SLOTS.into_iter().enumerate() {
         let sessions = board.slot_sessions.get(slot);
-        if slot == "dotfiles" && sessions.is_none() {
+        let physical = board.live_slots.get(slot).and_then(|slots| {
+            slots
+                .iter()
+                .find(|slot| slot.harness.eq_ignore_ascii_case(primary))
+                .or_else(|| slots.first())
+        });
+        if slot == "dotfiles" && sessions.is_none() && physical.is_none() {
             continue;
         }
-        let state = sessions
+        let transcript = sessions
             .and_then(|sessions| sessions.iter().find(|session| session.live))
-            .map(|session| session.state.as_str());
+            .map(|session| (session.harness.as_str(), session.state.as_str()));
+        let state = physical
+            .filter(|slot| slot.state != "unknown")
+            .map(|slot| (slot.harness.as_str(), slot.state.as_str()))
+            .or(transcript)
+            .or_else(|| physical.map(|slot| (slot.harness.as_str(), slot.state.as_str())));
         if index > 0 {
             spans.push(Span::styled("  ", base));
         }
         spans.push(Span::styled("[", base.fg(theme::FG_DIM)));
         spans.push(Span::styled(
             key.to_string(),
-            base.fg(state.map_or(theme::FG_DIM, |state| {
-                badges::session_state_color(primary, state)
+            base.fg(state.map_or(theme::FG_DIM, |(harness, state)| {
+                badges::session_state_color(harness, state)
             })),
         ));
         spans.push(Span::styled("]", base.fg(theme::FG_DIM)));
@@ -541,6 +547,49 @@ mod tests {
     use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn footer_physical_slots_show_activity_without_inventing_a_transcript() {
+        let mut model = Model::default();
+        for (state, color) in [
+            ("working", theme::CODEX_ALT),
+            ("asking", theme::INFO),
+            ("unknown", theme::ACCENT_ALT),
+        ] {
+            model.board = Arc::new(Board {
+                live_slots: [(
+                    "manager".into(),
+                    vec![crate::LiveSlotView {
+                        harness: "Codex".into(),
+                        state: state.into(),
+                    }],
+                )]
+                .into(),
+                ..Default::default()
+            });
+            assert!(model.board.slot_sessions.is_empty());
+            let spans = slot_buttons(&model, Style::default());
+            assert_eq!(
+                spans
+                    .iter()
+                    .find(|span| span.content == "m")
+                    .unwrap()
+                    .style
+                    .fg,
+                Some(color)
+            );
+        }
+        model.board = Arc::new(Board::default());
+        assert_eq!(
+            slot_buttons(&model, Style::default())
+                .iter()
+                .find(|span| span.content == "m")
+                .unwrap()
+                .style
+                .fg,
+            Some(theme::FG_DIM)
+        );
+    }
 
     #[test]
     fn footer_slots_take_the_live_session_color_and_manager_context() {

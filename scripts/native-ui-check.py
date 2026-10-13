@@ -321,14 +321,27 @@ def main():
             wait_for(lambda data: b"New worktree name:" in data)
             injected_create = time.monotonic()
             os.write(master, b"created-feedback\r")
-            wait_for(lambda data: b"creating" in data, timeout=0.5)
+            wait_for(lambda data: b"created-feedback" in data, timeout=0.5)
             create_feedback_ms = (time.monotonic() - injected_create) * 1000
+            # The submitted row is selected immediately, before Git resolves
+            # its canonical identity. F12 reports its pending state instead of
+            # attaching a different row or queueing an eventual attachment.
+            os.write(master, b"\x1b[24~")
+            wait_for(lambda data: b"Worktree is still being created" in data)
+            # Navigation remains ordinary while the creation read is blocked.
+            # Its delayed plan and completion must not reclaim this selection.
+            os.write(master, b"k")
+            drain_for(0.1)
             delay_inventory.unlink()
             wait_for(lambda data: b"Created created-feedback" in data, timeout=15)
             assert (root / "worktrees/created-feedback").exists()
             wait_for(lambda _: install_started.exists())
             assert not install_finished.exists(), "creation waited for dependency setup"
             wait_for(lambda _: install_finished.exists(), timeout=12)
+            os.write(master, b"t\x15Creation did not steal selection\r")
+            wait_for(lambda _: any(stored_slug(f"bench-{index:03}").get("manualTitle")
+                                   == "Creation did not steal selection" for index in range(3)))
+            assert stored_slug("created-feedback").get("manualTitle") != "Creation did not steal selection"
             os.write(master, b"q")
         elif args.exit_signal == "quit":
             # The action has been admitted but its inventory read has not

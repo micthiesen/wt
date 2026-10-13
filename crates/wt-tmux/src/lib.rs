@@ -338,6 +338,8 @@ pub struct WindowInfo {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneInfo {
+    /// Presentation only. Never establishes a conversation's identity.
+    pub title: String,
     pub id: String,
     pub session_name: String,
     pub window_id: String,
@@ -527,14 +529,21 @@ impl TmuxClient {
         session: &str,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PaneInfo>, TmuxError> {
-        let format = format!(
-            "#{{pane_id}}{FORMAT_SEPARATOR}#{{session_name}}{FORMAT_SEPARATOR}#{{window_id}}{FORMAT_SEPARATOR}#{{window_index}}{FORMAT_SEPARATOR}#{{pane_index}}{FORMAT_SEPARATOR}#{{pane_active}}{FORMAT_SEPARATOR}#{{pane_pid}}{FORMAT_SEPARATOR}#{{pane_width}}{FORMAT_SEPARATOR}#{{pane_height}}{FORMAT_SEPARATOR}#{{pane_dead}}{FORMAT_SEPARATOR}#{{pane_current_path}}"
+        let format = String::from(
+            "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{q:pane_title}\t#{pane_current_path}",
         );
         let target = exact_session_target(session);
         let result = self
             .run(
                 "list-panes",
-                ["list-panes", "-t", target.as_str(), "-F", format.as_str()],
+                [
+                    "-u",
+                    "list-panes",
+                    "-t",
+                    target.as_str(),
+                    "-F",
+                    format.as_str(),
+                ],
                 None,
                 cancellation,
             )
@@ -548,13 +557,13 @@ impl TmuxClient {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PaneInfo>, TmuxError> {
-        let format = format!(
-            "#{{pane_id}}{FORMAT_SEPARATOR}#{{session_name}}{FORMAT_SEPARATOR}#{{window_id}}{FORMAT_SEPARATOR}#{{window_index}}{FORMAT_SEPARATOR}#{{pane_index}}{FORMAT_SEPARATOR}#{{pane_active}}{FORMAT_SEPARATOR}#{{pane_pid}}{FORMAT_SEPARATOR}#{{pane_width}}{FORMAT_SEPARATOR}#{{pane_height}}{FORMAT_SEPARATOR}#{{pane_dead}}{FORMAT_SEPARATOR}#{{pane_current_path}}"
+        let format = String::from(
+            "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{q:pane_title}\t#{pane_current_path}",
         );
         let result = self
             .run(
                 "list-panes",
-                ["list-panes", "-a", "-F", &format],
+                ["-u", "list-panes", "-a", "-F", &format],
                 None,
                 cancellation,
             )
@@ -1325,8 +1334,24 @@ pub fn parse_panes(output: &str) -> Result<Vec<PaneInfo>, TmuxError> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let fields = split_fields(line, 11, "list-panes")?;
+            let titled = line.contains('\t');
+            let fields = if titled {
+                line.splitn(12, '\t').collect::<Vec<_>>()
+            } else {
+                line.splitn(11, FORMAT_SEPARATOR).collect::<Vec<_>>()
+            };
+            if fields.len() != if titled { 12 } else { 11 } {
+                return Err(TmuxError::MalformedOutput {
+                    operation: "list-panes",
+                    line: line.into(),
+                });
+            }
             Ok(PaneInfo {
+                title: if titled {
+                    decode_title(fields[10])
+                } else {
+                    String::new()
+                },
                 id: fields[0].to_owned(),
                 session_name: fields[1].to_owned(),
                 window_id: fields[2].to_owned(),
@@ -1339,10 +1364,28 @@ pub fn parse_panes(output: &str) -> Result<Vec<PaneInfo>, TmuxError> {
                 width: parse_number(fields[7], "list-panes", line)?,
                 height: parse_number(fields[8], "list-panes", line)?,
                 dead: parse_bool(fields[9], "list-panes", line)?,
-                current_path: PathBuf::from(fields[10]),
+                current_path: PathBuf::from(fields[if titled { 11 } else { 10 }]),
             })
         })
         .collect()
+}
+
+// `q:` prevents control characters in user-configurable titles from breaking
+// the line-oriented inventory. Undo shell quoting only for visible characters;
+// octal/control escapes remain text and never become terminal controls.
+fn decode_title(quoted: &str) -> String {
+    let mut chars = quoted.chars();
+    let mut title = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                title.push(next);
+            }
+        } else {
+            title.push(ch);
+        }
+    }
+    title
 }
 
 pub fn exact_session_target(name: &str) -> String {

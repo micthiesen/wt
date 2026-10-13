@@ -12,12 +12,11 @@ use crate::{
 
 impl Model {
     pub(crate) fn expire_toast(&mut self) {
-        if self.pending_palette.is_some() {
+        if self.pending_request.is_some() {
             return;
         }
-        if matches!(self.interaction, Interaction::Text(_))
-            && matches!(self.toast, Some((_, ToastTone::Failed)))
-        {
+        // An error is an outcome to acknowledge, not a four-second animation.
+        if matches!(self.toast, Some((_, ToastTone::Failed))) {
             return;
         }
         self.toast = None;
@@ -30,58 +29,72 @@ impl Model {
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
-        if let Some((_, generation, chord)) = &mut self.pending_palette
-            && *generation == self.ui_generation
+        if let Some(request) = &mut self.pending_request
+            && request.generation == self.ui_generation
+            && request.preparation
         {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('!' | 'q'))
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                || (request.palette && key.code == KeyCode::Char('!'))
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c' | 'C')))
             {
-                self.pending_palette = None;
+                self.pending_request = None;
                 self.ui_generation = self.ui_generation.wrapping_add(1);
                 return self.notify("Menu cancelled");
             }
-            if key.modifiers.is_empty()
+            if request.palette
+                && key.modifiers.is_empty()
                 && let KeyCode::Char(ch) = key.code
                 && ch.is_ascii_alphanumeric()
             {
                 // A fast palette chord belongs to the requested menu, never
                 // to the board underneath it. Keep at most one queued choice.
-                if chord.is_none() {
-                    *chord = Some(ch);
+                if request.chord.is_none() {
+                    request.chord = Some(ch);
                 }
                 return InputResult::Draw;
             }
         }
         let generation = self.ui_generation;
+        let toast_before = self.toast.clone();
         self.ui_generation = self.ui_generation.wrapping_add(1);
         let result = self.input_inner(key, height);
+        if let InputResult::Action(action) = &result
+            && let Some(request) = &self.pending_request
+            && request.preparation
+        {
+            let mut inner = action;
+            while let UiAction::OnHost { action, .. } = inner {
+                inner = action;
+            }
+            if *inner == request.action {
+                self.pending_request = None;
+                return self.notify("Menu cancelled");
+            }
+        }
         if matches!(result, InputResult::Unchanged) {
             self.ui_generation = generation;
         } else {
-            self.pending_palette = None;
+            let cancelled_menu = self
+                .pending_request
+                .take()
+                .is_some_and(|request| request.preparation);
+            if cancelled_menu
+                && matches!(result, InputResult::Draw | InputResult::Refresh)
+                && self.toast == toast_before
+            {
+                self.toast = Some(("Menu cancelled".into(), ToastTone::Info));
+            } else if matches!(toast_before, Some((_, ToastTone::Failed)))
+                && self.toast == toast_before
+                && !matches!(self.interaction, Interaction::Text(_))
+            {
+                self.toast = None;
+            }
         }
         result
     }
 
     fn input_inner(&mut self, key: KeyEvent, height: usize) -> InputResult {
-        if matches!(self.interaction, Interaction::None)
-            && self.title_prompt.is_none()
-            && !self.history.active
-            && !self.help
-            && !self.show_perf
-            && let Some(id) = self.creation_focus
-        {
-            if key.code == KeyCode::F(12) {
-                if let Some(action) = self.request_agent(id) {
-                    return InputResult::Action(action);
-                }
-                return self.notify("Agent will open when the checkout is ready");
-            }
-            if key.code == KeyCode::Esc {
-                return self.select(0);
-            }
-        }
         let chord_allowed = matches!(
             self.interaction,
             Interaction::None
@@ -111,7 +124,7 @@ impl Model {
             // Requested reviews arm the chord too. A row without a PR keeps
             // an earlier chord alive, as in TS `usePrTargetChord.ts:54-57`.
             if let Some(url) = self
-                .selected_row()
+                .actionable_row()
                 .and_then(|row| row.pr_url.clone())
                 .or_else(|| self.selected_review().map(|review| review.url.clone()))
             {
@@ -394,7 +407,7 @@ impl Model {
                 self.row_action(|key| UiAction::GenerateTitle { key })
             }
             KeyCode::Char('V') if !control => {
-                let Some(row) = self.selected_row() else {
+                let Some(row) = self.actionable_row() else {
                     return self.notify("select a worktree first");
                 };
                 let has_steps = row.verify_steps.is_some()
@@ -412,7 +425,7 @@ impl Model {
             KeyCode::Char('M') if !control => InputResult::Action(UiAction::PrepareActions {
                 surface: crate::ActionSurface::Manager {
                     key: (!self.history.active)
-                        .then(|| self.selected_row())
+                        .then(|| self.actionable_row())
                         .flatten()
                         .map(|row| row.key.clone()),
                 },
@@ -430,11 +443,14 @@ impl Model {
             }
             KeyCode::Char('d') if control => self.jump_section(true),
             KeyCode::Char('J' | 'K') if !control => {
+                if self.selected_row().is_some_and(|row| row.pending_creation) {
+                    return self.notify("Worktree is still being created");
+                }
                 let Some(section) = self.selected_section().map(|section| section.key.clone())
                 else {
                     return self.notify("select a worktree first");
                 };
-                let row = self.selected_row().map(|row| row.key.clone());
+                let row = self.actionable_row().map(|row| row.key.clone());
                 // The cursor follows a moved row, including across a section
                 // boundary (TS docs/tui.md "J / K").
                 self.pending_selection = row.clone();
@@ -500,7 +516,7 @@ impl Model {
                 }
             }
             KeyCode::Char('t') if !control => {
-                if let Some(row) = self.selected_row() {
+                if let Some(row) = self.actionable_row() {
                     self.title_prompt = Some(TitlePrompt {
                         key: row.key.clone(),
                         editor: LineEditor::new(&row.title),
@@ -547,11 +563,14 @@ impl Model {
                 InputResult::Draw
             }
             KeyCode::Char('N') | KeyCode::Char('n') if !control && shift => {
+                if self.selected_row().is_some_and(|row| row.pending_creation) {
+                    return self.notify("Worktree is still being created");
+                }
                 let initial = self
-                    .selected_row()
+                    .actionable_row()
                     .map(|row| format!("--base {}", row.branch))
                     .unwrap_or_default();
-                if let Some(host) = self.selected_row().and_then(|row| row.host.as_ref()) {
+                if let Some(host) = self.actionable_row().and_then(|row| row.host.as_ref()) {
                     return InputResult::Action(UiAction::OnHost {
                         host: Some(host.clone()),
                         action: Box::new(UiAction::PrepareCreate { initial }),
@@ -580,7 +599,7 @@ impl Model {
                 InputResult::Refresh
             }
             KeyCode::Char('a') if !control => {
-                if let Some(row) = self.selected_row()
+                if let Some(row) = self.actionable_row()
                     && row.host.is_none()
                     && let Some(busy) = &row.busy
                 {
@@ -601,7 +620,7 @@ impl Model {
             }
             KeyCode::Char('b') if !control => self.row_action(|key| UiAction::PrepareBase { key }),
             KeyCode::Char('#') => {
-                if let Some(row) = self.selected_row() {
+                if let Some(row) = self.actionable_row() {
                     self.interaction = Interaction::Text(TextPrompt {
                         action: TextAction::IssueOverride {
                             key: row.key.clone(),
@@ -701,8 +720,17 @@ impl Model {
         }
     }
 
+    /// Projected creation rows participate in selection and rendering, but
+    /// never provide an inventory identity to a worktree command.
+    fn actionable_row(&self) -> Option<&super::BoardRow> {
+        self.selected_row().filter(|row| !row.pending_creation)
+    }
+
     pub(super) fn row_action(&mut self, build: impl FnOnce(String) -> UiAction) -> InputResult {
-        match self.selected_row() {
+        if self.selected_row().is_some_and(|row| row.pending_creation) {
+            return self.notify("Worktree is still being created");
+        }
+        match self.actionable_row() {
             Some(row) => InputResult::Action(build(row.key.clone())),
             None => self.notify("select a worktree first"),
         }
@@ -716,7 +744,7 @@ impl Model {
     }
 
     pub(super) fn url_action(&mut self, kind: UrlKind) -> InputResult {
-        let Some(row) = self.selected_row() else {
+        let Some(row) = self.actionable_row() else {
             return self.notify("select a worktree first");
         };
         let missing = match kind {
@@ -755,7 +783,23 @@ impl Model {
         format!("New worktree on {label} (Tab: host): ")
     }
 
+    /// User edits and focus changes outside keyboard dispatch invalidate only
+    /// presentation requests. Accepted domain mutations remain in Pending.
+    pub(crate) fn presentation_changed(&mut self) {
+        self.ui_generation = self.ui_generation.wrapping_add(1);
+        if self
+            .pending_request
+            .take()
+            .is_some_and(|request| request.preparation)
+        {
+            self.notify("Menu cancelled");
+        }
+    }
+
     pub(crate) fn paste(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
         if let Interaction::Text(prompt) = &mut self.interaction {
             // Action prompts keep pasted line breaks (TS `! c`); footer
             // prompts stay one line.
@@ -764,10 +808,12 @@ impl Model {
             } else {
                 prompt.editor.paste(text);
             }
+            self.presentation_changed();
             return true;
         }
         if let Some(prompt) = &mut self.title_prompt {
             prompt.editor.paste(text);
+            self.presentation_changed();
             true
         } else {
             false
@@ -815,7 +861,7 @@ impl Model {
                 ),
             ];
         }
-        self.selected_row()
+        self.actionable_row()
             .map(|row| {
                 // Unavailable entries stay listed with an empty value so
                 // digit positions are stable; picking one says so.

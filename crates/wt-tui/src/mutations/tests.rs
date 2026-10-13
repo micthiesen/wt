@@ -513,34 +513,30 @@ fn every_declared_domain_can_settle() {
 }
 
 #[test]
-fn creation_never_fabricates_inventory_rows_before_or_after_reply() {
+fn creation_projection_replaces_placeholder_with_the_exact_inventory_row() {
     let mut creating = whole(LifecycleChange::Create {
         request_id: 1,
-        input: "new --base staging".into(),
+        input: "new".into(),
         resolved: None,
     });
-    for resolved in [None, Some("new".to_owned())] {
-        if let MutationKind::Lifecycle(LifecycleChange::Create { resolved: key, .. }) =
-            &mut creating.kind
-        {
-            *key = resolved;
-        }
-        for arrived in [false, true] {
-            let mut inventory = board();
-            if arrived {
-                inventory.rows.push(BoardRow {
-                    key: "new".into(),
-                    ..Default::default()
-                });
-            }
-            let original = inventory.clone();
-            creating.apply(&mut inventory);
-            assert_eq!(
-                inventory, original,
-                "creation progress cannot insert inventory identities"
-            );
-        }
-    }
+    creating.assign_creation(1);
+    let mut projected = board();
+    creating.apply(&mut projected);
+    assert!(projected.rows.last().unwrap().pending_creation);
+    creating.target.key = Some("new".into());
+    let mut source = board();
+    source.rows.push(BoardRow {
+        key: "new".into(),
+        title: "Real title".into(),
+        path: "/actual/new".into(),
+        ..Default::default()
+    });
+    creating.apply(&mut source);
+    assert_eq!(source.rows.iter().filter(|row| row.key == "new").count(), 1);
+    let actual = source.rows.last().unwrap();
+    assert_eq!(actual.title, "Real title");
+    assert_eq!(actual.path, "/actual/new");
+    assert!(actual.pending_creation);
 }
 
 #[test]

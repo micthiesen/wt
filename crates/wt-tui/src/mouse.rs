@@ -200,7 +200,7 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
                 };
             }
             MousePane::List => {
-                let _ = model.history_input(key, area.height.saturating_sub(4) as usize);
+                let _ = model.input(key, area.height.saturating_sub(4) as usize);
             }
             MousePane::Output => model.output.scroll(up),
             _ => return false,
@@ -239,6 +239,45 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
 mod tests {
     use super::*;
     use crate::{AttentionLine, Board, BoardRow};
+
+    #[test]
+    fn history_wheel_invalidates_pending_menu_but_viewport_scroll_does_not() {
+        let mut model = Model::default();
+        let mut board = Board::default();
+        board.removed_history.rows = ["first", "second"]
+            .into_iter()
+            .map(|key| crate::RemovedHistoryRow {
+                key: key.into(),
+                ..Default::default()
+            })
+            .collect();
+        model.apply(wt_runtime::SourceSnapshot::test_live(
+            Some(board),
+            wt_runtime::SourceState::Ready,
+            wt_core::Domain::Git,
+        ));
+        let event = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        model.begin_action(
+            1,
+            &crate::UiAction::PrepareCreate {
+                initial: String::new(),
+            },
+        );
+        let generation = model.ui_generation;
+        assert!(scroll(&mut model, event, Rect::new(0, 0, 100, 30)));
+        assert_eq!(model.ui_generation, generation);
+        assert!(model.pending_request.is_some());
+        model.history.active = true;
+        assert!(scroll(&mut model, event, Rect::new(0, 0, 100, 30)));
+        assert_eq!(model.history.selected, 1);
+        assert_ne!(model.ui_generation, generation);
+        assert!(model.pending_request.is_none());
+    }
 
     #[test]
     fn wheel_scrolls_the_pane_under_the_pointer() {

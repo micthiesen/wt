@@ -75,6 +75,9 @@ pub struct SessionInventory {
     /// Exact resumed UUID by live tmux session name. This must win over a
     /// bounded recent-rollout scan for long-lived Codex sessions.
     pub harness_session_ids: BTreeMap<String, String>,
+    /// Normalized terminal activity only; not transcript identity or idle proof.
+    #[serde(default)]
+    pub pane_activity: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -245,12 +248,44 @@ fn running_session_inventory(
         .filter(|pane| !pane.dead)
         .map(|pane| pane.session_name.as_str())
         .collect::<BTreeSet<_>>();
-    classify_sessions(
+    let mut inventory = classify_sessions(
         sessions
             .into_iter()
             .filter(|session| live.contains(session.name.as_str()))
             .collect(),
-    )
+    );
+    for name in inventory.all.keys() {
+        let mut candidates = panes
+            .iter()
+            .filter(|pane| pane.session_name == *name && !pane.dead);
+        if let Some(pane) = candidates.next()
+            && candidates.next().is_none()
+            && name.ends_with("-codex")
+            && let Some(state) = codex_terminal_activity(&pane.title)
+        {
+            inventory.pane_activity.insert(name.clone(), state.into());
+        }
+    }
+    inventory
+}
+
+/// Codex's explicit terminal activity prefixes (status_surfaces.rs). Absence
+/// is not idle proof: users may disable/customize titles or animations.
+fn codex_terminal_activity(title: &str) -> Option<&'static str> {
+    if ["[ ! ] Action Required", "[ . ] Action Required"]
+        .iter()
+        .any(|prefix| {
+            title == *prefix
+                || title
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(' '))
+        })
+    {
+        return Some("asking");
+    }
+    let (first, rest) = title.split_once(' ')?;
+    (!rest.is_empty() && ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"].contains(&first))
+        .then_some("working")
 }
 
 fn classify_sessions(sessions: Vec<SessionInfo>) -> SessionInventory {
@@ -855,8 +890,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_terminal_status_is_presentation_only_and_requires_explicit_markers() {
+        for spinner in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
+            assert_eq!(
+                codex_terminal_activity(&format!("{spinner} task | project")),
+                Some("working")
+            );
+        }
+        for title in ["[ ! ] Action Required | task", "[ . ] Action Required"] {
+            assert_eq!(codex_terminal_activity(title), Some("asking"));
+        }
+        for title in [
+            "",
+            "Ready",
+            "Working on a task",
+            "task | project",
+            "_ task",
+            "[ ! ] Action Requiredness",
+            "⠋",
+        ] {
+            assert_eq!(codex_terminal_activity(title), None);
+        }
+    }
+
+    #[test]
     fn retained_failed_panes_are_not_running_agents() {
         let pane = wt_tmux::PaneInfo {
+            title: String::new(),
             id: "%1".into(),
             session_name: "branch-codex".into(),
             window_id: "@1".into(),

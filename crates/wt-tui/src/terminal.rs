@@ -255,6 +255,7 @@ async fn run_inner<'a>(
                     .requests
                     .try_send(crate::UiRequest {
                         id: 0,
+                        cancellation: None,
                         generation: model.ui_generation,
                         action,
                     })
@@ -333,10 +334,14 @@ async fn run_inner<'a>(
                                 let id = model.next_op_id();
                                 let action = model.resolve(action);
                                 let feedback = action.clone();
-                                match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }) {
+                                let cancellation = action.is_preparation().then(CancellationToken::new);
+                                match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }) {
                                     Ok(()) => {
                                         model.begin_action(id, &feedback);
-                                        model.toast = Some((if model.pending_palette.is_some() { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
+                                        if let Some(request) = &mut model.pending_request {
+                                            request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
+                                        }
+                                        model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
                                     },
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)),
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)),
@@ -366,15 +371,21 @@ async fn run_inner<'a>(
                         let id = model.next_op_id();
                         let action = model.resolve(action);
                         let feedback = action.clone();
-                        if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }).is_err() {
+                        let cancellation = action.is_preparation().then(CancellationToken::new);
+                        if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }).is_err() {
                             model.toast = Some(("Action queue is busy; retry the action".into(), ToastTone::Failed));
                         } else {
                             model.begin_action(id, &feedback);
+                            if let Some(request) = &mut model.pending_request {
+                                request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
+                            }
+                            model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
                         }
                     }
                     if history_was_open && !model.history.active {
                         let _ = actions.requests.try_send(crate::UiRequest {
                             id: 0,
+                        cancellation: None,
                             generation: model.ui_generation,
                             action: crate::UiAction::SetHistoryActive { active: false },
                         });
@@ -382,6 +393,7 @@ async fn run_inner<'a>(
                     if perf_was_open && !model.show_perf {
                         let _ = actions.requests.try_send(crate::UiRequest {
                             id: 0,
+                        cancellation: None,
                             generation: model.ui_generation,
                             action: crate::UiAction::SetPerf {
                                 active: false,
@@ -416,7 +428,7 @@ async fn run_inner<'a>(
                     }
                 } else {
                     controller_open = false;
-                    model.pending_palette = None;
+                    model.pending_request = None;
                     model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed));
                     dirty = true;
                 }
@@ -444,6 +456,7 @@ async fn run_inner<'a>(
                 {
                     let _ = actions.requests.try_send(crate::UiRequest {
                         id: 0,
+                        cancellation: None,
                         generation: model.ui_generation,
                         action,
                     });

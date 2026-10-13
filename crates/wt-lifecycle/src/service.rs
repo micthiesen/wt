@@ -272,6 +272,14 @@ impl LifecycleService {
         self
     }
 
+    /// The stable inventory key a branch will use under this host's naming
+    /// policy. Preparation does not create directories or Git objects.
+    pub fn creation_key(&self, branch: &str) -> String {
+        wt_core::worktree_ledger_key(&wt_core::WorktreeRef::Local {
+            slug: self.dir_slug(branch),
+        })
+    }
+
     pub async fn create(
         &self,
         branch: &str,

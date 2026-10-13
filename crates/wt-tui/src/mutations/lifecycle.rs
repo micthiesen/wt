@@ -1,12 +1,12 @@
-//! Creating and removing worktrees. Creation tracks progress without inventing
-//! inventory rows; only the host can establish a checkout identity.
+//! Creating and removing worktrees. Creation projects one non-actionable row;
+//! the host binds its exact identity before creating the checkout.
 use std::time::Duration;
 
 use wt_core::Domain;
 use wt_runtime::{Deadlines, Target};
 
-use super::{ARCHIVED_SECTION, ARCHIVED_TITLE, Family, place};
-use crate::{Board, BusyView};
+use super::{ARCHIVED_SECTION, ARCHIVED_TITLE, Family, INBOX_SECTION, place};
+use crate::{Board, BoardRow, BusyView};
 
 /// Label, badge and busy label of a removal.
 const REMOVING: &str = "removing";
@@ -59,12 +59,39 @@ impl Family for LifecycleChange {
         &[Domain::Git, Domain::Metadata]
     }
 
-    fn apply(&self, _target: &Target, board: &mut Board) {
+    fn apply(&self, target: &Target, board: &mut Board) {
         match self {
-            // A creation is an operation, not a worktree. Inventory may publish
-            // its row before the command replies, including on remote hosts.
-            // Never fabricate a second identity that needs deduplication.
-            Self::Create { .. } => {}
+            Self::Create {
+                input, resolved, ..
+            } => {
+                let Some(key) = target.key.as_ref() else {
+                    return;
+                };
+                if let Some(row) = board
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.key == *key && row.host == target.host)
+                {
+                    row.pending_creation = resolved.is_none();
+                    if row.pending_creation {
+                        row.busy = busy("creating", "create");
+                    }
+                } else {
+                    let index = board.rows.len();
+                    board.rows.push(BoardRow {
+                        key: key.clone(),
+                        host: target.host.clone(),
+                        slug: input.clone(),
+                        title: input.clone(),
+                        pending_creation: true,
+                        busy: busy("creating", "create"),
+                        ..Default::default()
+                    });
+                    if !board.sections.is_empty() {
+                        place(board, index, INBOX_SECTION, "Inbox");
+                    }
+                }
+            }
             Self::Remove { keys } => {
                 for key in keys {
                     if let Some(index) = board.rows.iter().position(|row| &row.key == key) {
@@ -79,11 +106,14 @@ impl Family for LifecycleChange {
         }
     }
 
-    fn observed(&self, _target: &Target, board: &Board) -> bool {
+    fn observed(&self, target: &Target, board: &Board) -> bool {
         match self {
-            Self::Create { resolved, .. } => resolved
-                .as_ref()
-                .is_some_and(|key| board.rows.iter().any(|row| &row.key == key)),
+            Self::Create { resolved, .. } => resolved.as_ref().is_some_and(|key| {
+                board
+                    .rows
+                    .iter()
+                    .any(|row| &row.key == key && row.host == target.host)
+            }),
             // The worker archives before acknowledging startup. That is
             // progress, not removal: keep showing the operation until Git
             // inventory no longer contains the checkout.

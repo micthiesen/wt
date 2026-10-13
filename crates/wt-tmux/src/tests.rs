@@ -12,6 +12,21 @@ use crate::{
 };
 
 #[test]
+fn pane_title_transport_preserves_activity_and_paths_without_controls() {
+    let panes = parse_panes(
+        "%1\tmanager-codex\t@1\t0\t0\t1\t42\t80\t24\t0\t⠋\\ task:\\ project\t/tmp/a:b\n",
+    )
+    .unwrap();
+    assert_eq!(panes[0].title, "⠋ task: project");
+    assert_eq!(panes[0].current_path, PathBuf::from("/tmp/a:b"));
+    assert_eq!(
+        crate::decode_title(r"\[\ !\ \]\ Action\ Required"),
+        "[ ! ] Action Required"
+    );
+    assert!(!crate::decode_title(r"line\012next").contains('\n'));
+}
+
+#[test]
 fn server_shutdown_errors_do_not_prove_session_absence() {
     assert!(crate::tmux_server_definitely_absent(
         "no server running on /tmp/test.sock"
@@ -417,6 +432,20 @@ async fn isolated_server_inventory_paste_options_rename_resize_and_kill() {
             assert_eq!(panes.len(), 1);
             assert!(panes[0].active);
             let pane = PaneTarget::id(panes[0].id.clone());
+            let title = "⠋ task: project";
+            client
+                .run(
+                    "select-pane",
+                    ["select-pane", "-t", pane.as_str(), "-T", title],
+                    None,
+                    &cancellation,
+                )
+                .await?;
+            assert_eq!(
+                client.list_panes(&session.name, &cancellation).await?[0].title,
+                title
+            );
+            assert_eq!(client.list_all_panes(&cancellation).await?[0].title, title);
 
             client.resize_pane(&pane, 70, 20, &cancellation).await?;
             client

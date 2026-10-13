@@ -343,6 +343,14 @@ fn compose(
                         .slot_logs
                         .insert(wt_core::remote_worktree_ledger_key(&host, slot), logs);
                 }
+                if current {
+                    for (slot, statuses) in &remote.live_slots {
+                        board.live_slots.insert(
+                            wt_core::remote_worktree_ledger_key(&host, slot),
+                            statuses.clone(),
+                        );
+                    }
+                }
                 for (slot, sessions) in &remote.slot_sessions {
                     let mut sessions = sessions.clone();
                     for session in &mut sessions {

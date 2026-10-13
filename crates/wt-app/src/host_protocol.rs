@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use wt_runtime::SourceState;
 use wt_tui::{Board, UiAction, UiReply};
 
-/// 3: cleanup confirmations can carry board-selected identities.
-pub const HOST_PROTOCOL: u32 = 3;
+/// 4: concurrent command replies and cancellation of read-only preparations.
+pub const HOST_PROTOCOL: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,8 +62,14 @@ pub enum ClientFrame {
         protocol: u32,
     },
     Refresh,
+    /// Close command admission and drain accepted mutations while replies
+    /// remain readable. Does not cancel any accepted mutation.
+    Shutdown,
     /// Read subscriptions are idempotent connection state, never mutations.
     Views(HostViews),
+    CancelPreparation {
+        id: u64,
+    },
     Command {
         id: u64,
         action: UiAction,
