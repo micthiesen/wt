@@ -230,7 +230,7 @@ fn watch(
                 }
             }
         }
-        drop(watcher);
+        crate::watcher_cleanup::drop_watcher(watcher).await;
     });
 }
 

@@ -140,7 +140,7 @@ fn start_with_notifications(
                 // watcher created concurrently with shutdown is dropped here
                 // instead of being detached from the source lifetime.
                 if let Ok(Ok(watcher)) = watcher.await {
-                    drop(watcher);
+                    crate::watcher_cleanup::drop_watcher(watcher).await;
                 }
                 return;
             }
@@ -176,7 +176,7 @@ fn start_with_notifications(
                 let desired = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
-                        drop(active);
+                        crate::watcher_cleanup::drop_watcher(active).await;
                         break;
                     }
                     desired = desired_paths(&config, &repository, &cancellation) => desired,
@@ -199,7 +199,7 @@ fn start_with_notifications(
                                 // Join it and drop the returned watcher before
                                 // this source task exits.
                                 if let Ok((watcher, _, _)) = update.await {
-                                    drop(watcher);
+                                    crate::watcher_cleanup::drop_watcher(watcher).await;
                                 }
                                 break;
                             }
@@ -208,7 +208,7 @@ fn start_with_notifications(
                         match update {
                             Ok((active, paths, cancelled)) => {
                                 if cancelled {
-                                    drop(active);
+                                    crate::watcher_cleanup::drop_watcher(active).await;
                                     break;
                                 }
                                 let watch_set_changed = paths != previous_registered;
@@ -296,6 +296,7 @@ fn start_with_notifications(
                 _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
             }
         }
+        crate::watcher_cleanup::drop_watcher(watcher).await;
     });
     edits
 }
@@ -964,7 +965,10 @@ mod tests {
             .expect("later metadata samples must detect edits without native events")
             .expect("Git source should stay open");
         }
-        scope.shutdown(Duration::from_secs(2)).await.unwrap();
+        // Match the production source grace. Native teardown used to block
+        // this executor, preventing the old two-second timer from firing;
+        // joined blocking-pool cleanup now makes that deadline real.
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();
     }
 }

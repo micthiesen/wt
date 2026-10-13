@@ -173,15 +173,41 @@ impl CodexOutputWatch {
             .iter()
             .filter_map(|path| path.parent().map(Path::to_path_buf))
             .collect::<BTreeSet<_>>();
-        if let Some(watcher) = self.watcher.as_mut() {
-            for directory in self.directories.difference(&next_directories) {
-                let _ = watcher.unwatch(directory);
-            }
-            for directory in next_directories.difference(&self.directories) {
-                if let Err(error) = watcher.watch(directory, RecursiveMode::NonRecursive) {
-                    tracing::warn!(path = %directory.display(), %error, "could not watch Codex rollout directory; polling fallback remains active");
+        if self.directories != next_directories
+            && let Some(mut watcher) = self.watcher.take()
+        {
+            let remove = self
+                .directories
+                .difference(&next_directories)
+                .cloned()
+                .collect::<Vec<_>>();
+            let add = next_directories
+                .difference(&self.directories)
+                .cloned()
+                .collect::<Vec<_>>();
+            // FSEvents restarts its stream when the watch set changes. Batch
+            // those edits once, off the executor, and keep ownership until done.
+            self.watcher = match tokio::task::spawn_blocking(move || {
+                let mut changes = watcher.paths_mut();
+                for directory in remove {
+                    let _ = changes.remove(&directory);
                 }
-            }
+                for directory in add {
+                    if let Err(error) = changes.add(&directory, RecursiveMode::NonRecursive) {
+                        tracing::warn!(path = %directory.display(), %error, "could not watch Codex rollout directory; polling fallback remains active");
+                    }
+                }
+                if let Err(error) = changes.commit() {
+                    tracing::warn!(%error, "could not update Codex rollout watches; polling fallback remains active");
+                }
+                watcher
+            }).await {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    tracing::warn!(%error, "Codex rollout watcher stopped; polling fallback remains active");
+                    None
+                }
+            };
         }
         self.directories = next_directories;
         if let Ok(mut watched) = self.watched_paths.write() {
@@ -461,6 +487,7 @@ pub fn start(
                 );
             }
         }
+        crate::watcher_cleanup::drop_watcher(codex_watch).await;
     });
     SessionActivitySources {
         activity: activity.view(),

@@ -135,7 +135,11 @@ fn start_with_watcher(
     let cancellation = scope.token();
     scope.spawn(async move {
         let callback = observed.clone();
+        let setup_cancel = cancellation.clone();
         let watcher = tokio::task::spawn_blocking(move || {
+            if setup_cancel.is_cancelled() {
+                return Ok(None);
+            }
             std::fs::create_dir_all(&manager_dir)?;
             std::fs::create_dir_all(&watched_log_dir)?;
             if !native_watch {
@@ -162,28 +166,39 @@ fn start_with_watcher(
             )?;
             // notify filters FSEvents with canonical paths; register that same
             // spelling so aliases such as /tmp do not lose log notifications.
-            watcher.watch(
+            let mut paths = watcher.paths_mut();
+            paths.add(
                 &std::fs::canonicalize(&manager_dir)?,
                 notify::RecursiveMode::NonRecursive,
             )?;
-            watcher.watch(
+            paths.add(
                 &std::fs::canonicalize(&watched_log_dir)?,
                 notify::RecursiveMode::NonRecursive,
             )?;
+            if !setup_cancel.is_cancelled() {
+                paths.commit()?;
+            } else {
+                drop(paths);
+            }
             Ok::<_, anyhow::Error>(Some(watcher))
         })
         .await;
-        let _watcher = match watcher {
+        let watcher = match watcher {
             Ok(Ok(watcher)) => watcher,
             error => {
                 tracing::warn!(?error, "activity feeds use refresh backstop");
                 None
             }
         };
+        if cancellation.is_cancelled() {
+            crate::watcher_cleanup::drop_watcher(watcher).await;
+            return;
+        }
         let fingerprint = || {
             let reports = polled_reports.clone();
             let logs = polled_logs.clone();
-            tokio::task::spawn_blocking(move || feed_fingerprint(&reports, &logs))
+            let cancellation = cancellation.clone();
+            tokio::task::spawn_blocking(move || feed_fingerprint(&reports, &logs, &cancellation))
         };
         let mut previous = fingerprint().await.ok();
         observed.refresh();
@@ -194,6 +209,7 @@ fn start_with_watcher(
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => break,
                 _ = backstop.tick() => { observed.refresh(); },
                 _ = changed_files.tick() => {
@@ -205,6 +221,7 @@ fn start_with_watcher(
                 }
             }
         }
+        crate::watcher_cleanup::drop_watcher(watcher).await;
     });
     source
 }
@@ -212,11 +229,16 @@ fn start_with_watcher(
 /// Bound polling to the same seven rolling logs read by the source, plus the
 /// manager report file. Precise timestamps and lengths detect same-second
 /// appends without hashing or repeatedly parsing unchanged log contents.
-fn feed_fingerprint(reports: &Path, directory: &Path) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
+fn feed_fingerprint(
+    reports: &Path,
+    directory: &Path,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
     let mut paths = std::fs::read_dir(directory)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
+        .take_while(|_| !cancellation.is_cancelled())
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name().is_some_and(|name| {
@@ -483,6 +505,31 @@ pub(crate) fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_watchers_drain_when_cancelled_during_startup() {
+        let mut hosts = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            hosts.spawn(async {
+                let root = tempfile::tempdir().unwrap();
+                let scope = TaskScope::new();
+                let source = start(&scope, root.path().join("cache"), root.path().join("logs"));
+                let mut updates = source.subscribe();
+                // A first data snapshot can precede native watcher setup.
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    updates.wait_for(|snapshot| snapshot.data().is_some()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                scope.shutdown(Duration::from_secs(5)).await.unwrap();
+            });
+        }
+        while let Some(result) = hosts.join_next().await {
+            result.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn log_append_refreshes_without_native_notifications() {

@@ -180,7 +180,7 @@ fn watch(scope: &TaskScope, directory: PathBuf, source: SourceHandle<Vec<DevStat
                 _ = interval.tick() => { source.refresh(); }
             }
         }
-        drop(watcher);
+        crate::watcher_cleanup::drop_watcher(watcher).await;
     });
 }
 

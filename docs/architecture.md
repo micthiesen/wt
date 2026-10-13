@@ -347,6 +347,9 @@ followed by database shutdown. Runtime teardown
 gets at most one additional second for residual blocking reads. The source
 cleanup grace is not a deadline for accepted writes, and an error does not start
 a second source grace period.
+Native filesystem watcher setup and teardown run on the blocking pool. Sources
+await teardown, including cancellation during setup, so OS thread joins cannot
+block the async executor or outlive successful source cleanup.
 Known create failures retain the input and selected host for correction. A lost
 remote reply remains ambiguous and never opens an automatic retry path.
 Both failed action replies and raised errors produce one persistent attention
