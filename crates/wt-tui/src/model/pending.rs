@@ -59,6 +59,11 @@ impl Model {
         let expired = pending.settle(&source, |target, domain| self.observed(target, domain), now);
         self.pending = pending;
         self.creates.retain(|op, _| self.pending.contains(*op));
+        for change in &expired {
+            let text = crate::render::status::expired_notice(change);
+            let source = change.mutation.target.key.as_deref().unwrap_or("wt");
+            tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = %source, event_text = %text, "pending change expired");
+        }
         if let Some(first) = expired.first() {
             self.toast = Some((
                 crate::render::status::expired_notice(first),

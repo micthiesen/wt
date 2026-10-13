@@ -1,6 +1,6 @@
 //! The one place that turns source provenance and pending changes into
 //! pixels. Panes draw their border through `pane`, naming the domains they
-//! show; rows and the details title use `pending_chip`. No pane formats
+//! show; rows use `pending_glyph`, details use `pending_chip`. No pane formats
 //! cached, refreshing, failed, pending or unconfirmed states itself.
 use ratatui::{
     style::{Color, Style},
@@ -190,12 +190,25 @@ fn frame(title: String, extra: Vec<Span<'static>>, status: Option<Status>) -> Bl
         .title(Line::from(spans))
 }
 
-fn phase_style(phase: PendingPhase) -> (&'static str, Color) {
+fn phase_style(phase: PendingPhase) -> (char, Color) {
     match phase {
-        PendingPhase::InFlight => ("…", theme::FG_DIM),
-        PendingPhase::Accepted => ("↻", theme::ACCENT),
-        PendingPhase::Unconfirmed => ("?", theme::WARN),
+        PendingPhase::InFlight => ('…', theme::FG_DIM),
+        PendingPhase::Accepted => ('↻', theme::ACCENT),
+        PendingPhase::Unconfirmed => ('?', theme::WARN),
     }
+}
+
+/// List rows accept one glyph, never a pending label or status sentence.
+/// Keep uncertainty visible even when a newer operation is in flight.
+pub(crate) fn pending_glyph(views: &[&PendingView]) -> Option<(char, Color)> {
+    views
+        .iter()
+        .max_by_key(|view| match view.phase {
+            PendingPhase::Accepted => 0,
+            PendingPhase::InFlight => 1,
+            PendingPhase::Unconfirmed => 2,
+        })
+        .map(|view| phase_style(view.phase))
 }
 
 /// Pending changes aimed at one row, newest last.
@@ -329,6 +342,10 @@ mod tests {
             .map(|span| span.content.to_string())
             .collect();
         assert_eq!(text, "? setting ready (unconfirmed) +1");
+        assert_eq!(pending_glyph(&refs), Some(('?', theme::WARN)));
+        let reversed: Vec<_> = refs.into_iter().rev().collect();
+        assert_eq!(pending_glyph(&reversed), Some(('?', theme::WARN)));
+        assert_eq!(pending_glyph(&[]), None);
     }
 
     #[test]

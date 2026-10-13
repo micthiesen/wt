@@ -20,6 +20,7 @@ use crate::{
         CHUNK_SIZE, checks_still_pending, chunk_branches, is_rate_limit, missing_workflow_scope,
         not_yet_enqueueable, output_failure, rollup_checks,
     },
+    mutations::{AsyncMergeEndpoint, AsyncMergeOutcome},
     types::*,
 };
 
@@ -566,23 +567,18 @@ impl GithubClient {
                     match crate::mutations::parse_async_merge_response(
                         &response,
                         &target.head_ref_oid,
+                        AsyncMergeEndpoint::Submission,
                     ) {
-                        Ok(true) if out.status.success() => {
+                        Ok(AsyncMergeOutcome::Succeeded) if out.status.success() => {
                             return GhActionResult::success();
                         }
-                        Ok(true) => {
+                        Ok(AsyncMergeOutcome::Succeeded) => {
                             return GhActionResult::unknown(format!(
                                 "async merge response for PR #{} was successful but gh exited unsuccessfully; inspect GitHub before retrying",
                                 target.number
                             ));
                         }
-                        Ok(false) => {
-                            let Some(uuid) = crate::mutations::async_uuid(&response) else {
-                                return GhActionResult::unknown(format!(
-                                    "GitHub accepted the async merge but returned no request UUID for PR #{}; inspect GitHub before retrying",
-                                    target.number
-                                ));
-                            };
+                        Ok(AsyncMergeOutcome::Pending { uuid }) => {
                             for _ in 0..60 {
                                 tokio::select! { _=cancellation.cancelled()=>return GhActionResult::unknown(format!("PR #{} async merge outcome remains unknown; inspect GitHub before retrying",target.number)), _=sleep(Duration::from_secs(1))=>{} }
                                 let polled = self
@@ -617,9 +613,24 @@ impl GithubClient {
                                 match crate::mutations::parse_async_merge_response(
                                     &polled.stdout_text(),
                                     &target.head_ref_oid,
+                                    AsyncMergeEndpoint::Poll,
                                 ) {
-                                    Ok(true) => return GhActionResult::success(),
-                                    Ok(false) => continue,
+                                    Ok(AsyncMergeOutcome::Succeeded) => {
+                                        return GhActionResult::success();
+                                    }
+                                    Ok(AsyncMergeOutcome::Pending { uuid: polled_uuid })
+                                        if polled_uuid == uuid =>
+                                    {
+                                        continue;
+                                    }
+                                    Ok(AsyncMergeOutcome::Pending { .. }) => {
+                                        return GhActionResult::unknown(
+                                            "GitHub returned a different async merge request UUID; inspect GitHub before retrying",
+                                        );
+                                    }
+                                    Ok(AsyncMergeOutcome::Failed(error)) => {
+                                        return GhActionResult::error(error);
+                                    }
                                     Err(error) => {
                                         return GhActionResult::unknown(format!(
                                             "Cannot confirm async merge for PR #{}: {error}; inspect GitHub before retrying",
@@ -633,7 +644,7 @@ impl GithubClient {
                                 target.number
                             ));
                         }
-                        Err(error) => {
+                        Ok(AsyncMergeOutcome::Failed(error)) => {
                             if missing_workflow_scope(&error) {
                                 return GhActionResult::error(format!(
                                     "{error} {WORKFLOW_SCOPE_REMEDY}"
@@ -646,6 +657,9 @@ impl GithubClient {
                             if armed.is_ok() {
                                 return armed;
                             }
+                            if armed.ambiguous {
+                                return armed;
+                            }
                             let pending = checks_still_pending(&error);
                             return GhActionResult::failed(
                                 format!(
@@ -654,6 +668,12 @@ impl GithubClient {
                                 ),
                                 pending,
                             );
+                        }
+                        Err(error) => {
+                            return GhActionResult::unknown(format!(
+                                "Cannot confirm async merge for PR #{}: {error}; inspect GitHub before retrying",
+                                target.number
+                            ));
                         }
                     }
                 }
@@ -1910,6 +1930,138 @@ else:
                 .contains("refusing to arm classic auto-merge")
         );
         assert_eq!(fs::read_to_string(calls).unwrap().lines().count(), 1);
+    }
+
+    /// Exercise the wire contract with the real process runner. The fake gh
+    /// sends one pending submission, one pending GET, then a terminal result.
+    async fn async_merge_fixture(
+        terminal: &str,
+        wrong_head: bool,
+        submission_code: u16,
+    ) -> (GhActionResult, String) {
+        let dir = tempdir().unwrap();
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        let pending = |code, head| {
+            format!(
+                "HTTP/2 {code}\r\n\r\n{}",
+                serde_json::json!({
+                    "status":"pending", "details":{"message":"pending", "uuid":uuid,
+                    "expected_head_sha":head,"merge_action":"merge_queue","merge_method":"default","bypass_rules":false}
+                })
+            )
+        };
+        fs::write(
+            dir.path().join("submit"),
+            pending(submission_code, "deadbeef"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("poll"),
+            pending(200, if wrong_head { "other" } else { "deadbeef" }),
+        )
+        .unwrap();
+        fs::write(dir.path().join("terminal"), terminal).unwrap();
+        let script = dir.path().join("fake-gh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *'query=query('* ) printf '%s' '{"data":{"repository":{"mergeQueue":{"id":"MQ"}}}}' ;;
+  *'--method PUT'* ) cat submit; if head -1 submit | grep -q 409; then exit 1; fi ;;
+  *'--method GET'* )
+    if test -f polled; then cat terminal; else touch polled; cat poll; fi ;;
+  * ) exit 99 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(script)
+            .with_repository(RepoSlug::parse("acme/app").unwrap());
+        let result = client
+            .enable_auto_merge(
+                &PrMergeTarget {
+                    id: "PR_node".into(),
+                    number: 42,
+                    base_ref_name: "release".into(),
+                    head_ref_oid: "deadbeef".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        (
+            result,
+            fs::read_to_string(dir.path().join("calls")).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn async_merge_polls_http_200_pending_until_enqueued_without_resubmitting() {
+        let (result, calls) = async_merge_fixture(
+            "HTTP/2 200\n\n{\"status\":\"enqueued\",\"details\":{\"message\":\"added\"}}",
+            false,
+            202,
+        )
+        .await;
+        assert!(result.ok, "{result:?}");
+        assert_eq!(calls.matches("--method PUT").count(), 1);
+        assert_eq!(calls.matches("--method GET").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_merge_existing_matching_request_is_polled_despite_gh_conflict_exit() {
+        let (result, calls) = async_merge_fixture(
+            "HTTP/2 200\n\n{\"status\":\"enqueued\",\"details\":{\"message\":\"added\"}}",
+            false,
+            409,
+        )
+        .await;
+        assert!(result.ok, "{result:?}");
+        assert_eq!(calls.matches("--method PUT").count(), 1);
+        assert_eq!(calls.matches("--method GET").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_merge_malformed_submission_is_unknown_without_a_fallback_write() {
+        let (result, calls) = async_merge_fixture("unused", false, 200).await;
+        assert!(result.ambiguous);
+        assert_ne!(result.retryable, Some(true));
+        assert_eq!(calls.lines().count(), 2); // queue probe and the one submission
+    }
+
+    #[tokio::test]
+    async fn async_merge_polled_failure_is_definitive_without_resubmitting() {
+        let (result, calls) = async_merge_fixture(
+            "HTTP/2 200\n\n{\"status\":\"failed\",\"details\":{\"message\":\"head changed\"}}",
+            false,
+            202,
+        )
+        .await;
+        assert!(!result.ok);
+        assert!(!result.ambiguous);
+        assert_ne!(result.retryable, Some(true));
+        assert_eq!(result.error.as_deref(), Some("head changed"));
+        assert_eq!(calls.matches("--method PUT").count(), 1);
+        assert_eq!(calls.matches("--method GET").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_merge_mismatched_or_unreadable_poll_remains_ambiguous() {
+        for wrong_head in [true, false] {
+            let (result, calls) = async_merge_fixture("broken response", wrong_head, 202).await;
+            assert!(!result.ok);
+            assert!(result.ambiguous);
+            assert_ne!(result.retryable, Some(true));
+            assert_eq!(calls.matches("--method PUT").count(), 1);
+            assert_eq!(
+                calls.matches("--method GET").count(),
+                if wrong_head { 1 } else { 2 }
+            );
+        }
     }
 
     #[test]

@@ -248,11 +248,9 @@ impl RowContext<'_> {
             background.map_or(style, |bg| style.bg(bg))
         };
         let cluster = badges::cluster(row, policy);
-        let pending = super::status::pending_chip(
-            &super::status::row_pending(self.model, &row.key),
-            background.map_or(Style::new(), |bg| Style::new().bg(bg)),
-        );
-        let pending_width: usize = pending.iter().map(|span| span.content.width() + 1).sum();
+        let pending =
+            super::status::pending_glyph(&super::status::row_pending(self.model, &row.key));
+        let pending_width = if pending.is_some() { 3 } else { 0 };
         let cluster_width = badges::cluster_width(&cluster) + pending_width;
         let remote = row.host.is_some();
         let remote_cells = if remote { 2 } else { 0 };
@@ -309,9 +307,8 @@ impl RowContext<'_> {
             spans.push(Span::styled(reference, style(theme::FG_DIM)));
         }
         spans.push(Span::styled(" ".repeat(filler), style(theme::FG)));
-        for span in pending {
-            spans.push(span);
-            spans.push(Span::styled(" ", style(theme::FG)));
+        if let Some((glyph, color)) = pending {
+            spans.push(Span::styled(format!(" {glyph} "), style(color)));
         }
         spans.extend(badges::cluster_spans(&cluster, background));
         spans.push(Span::styled(" ", style(theme::FG)));
@@ -577,6 +574,64 @@ mod tests {
             let bottom: String = (0..50).map(|x| buffer[(x, height - 2)].symbol()).collect();
             assert!(bottom.contains("Archived"), "{height}: {bottom:?}");
             assert_eq!(model.selected, selected);
+        }
+    }
+
+    #[test]
+    fn pending_status_never_replaces_the_title_with_text() {
+        use wt_runtime::{PendingPhase, PendingView, Target};
+        for phase in [
+            PendingPhase::InFlight,
+            PendingPhase::Accepted,
+            PendingPhase::Unconfirmed,
+        ] {
+            let row = BoardRow {
+                key: "auth-proxy-endpoints".into(),
+                title: "auth-proxy-endpoints".into(),
+                badge: "legacy status must not render".into(),
+                busy: Some(crate::BusyView {
+                    label: "busy text must not render".into(),
+                    op: "restack".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let model = Model {
+                board: std::sync::Arc::new(crate::Board {
+                    pending_views: vec![
+                        PendingView {
+                            target: Target::row(None, &row.key),
+                            label: "arming merge (unconfirmed) very long status message".repeat(10),
+                            phase,
+                        };
+                        10
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            for width in [32, 40, 52] {
+                let context = RowContext {
+                    model: &model,
+                    width,
+                    gutter: 0,
+                };
+                let rendered = context.row(&row, Some(0));
+                let text: String = rendered
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert!(text.contains(&row.title), "{text}");
+                assert_eq!(text.width(), width);
+                assert!(
+                    !text.contains("arming")
+                        && !text.contains("unconfirmed")
+                        && !text.contains("text"),
+                    "{text}"
+                );
+            }
         }
     }
 

@@ -364,9 +364,9 @@ fn shows(policy: &DisplayPolicy, slot: &str) -> bool {
 
 /// One fixed-width cell group in the right-hand cluster.
 pub(crate) struct ClusterSlot {
-    pub text: String,
-    pub color: Color,
-    pub width: usize,
+    text: String,
+    color: Color,
+    width: usize,
 }
 
 /// The right-aligned badge cluster for a worktree row, in a fixed slot

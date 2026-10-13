@@ -63,58 +63,72 @@ fn response(text: &str) -> Result<AsyncResponse, String> {
     })
 }
 
-/// Validate a queue request/poll response. `Ok(true)` is terminal success,
-/// `Ok(false)` is a valid pending result, and `Err` is definitive or malformed.
-pub fn parse_async_merge_response(text: &str, expected_head_sha: &str) -> Result<bool, String> {
+/// The asynchronous operation has its own state, independent of HTTP success.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AsyncMergeOutcome {
+    Pending { uuid: String },
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Clone, Copy)]
+pub enum AsyncMergeEndpoint {
+    Submission,
+    Poll,
+}
+
+/// Submission uses 202/409 for pending and 400 for failure. Polling returns
+/// HTTP 200 for every operation state, including pending and failed. Invalid
+/// responses are unknown outcomes, never proof that resending is safe.
+pub fn parse_async_merge_response(
+    text: &str,
+    expected_head_sha: &str,
+    endpoint: AsyncMergeEndpoint,
+) -> Result<AsyncMergeOutcome, String> {
     let value = response(text)?;
-    let message = value
-        .details
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("async merge failed");
-    if value.status == "failed" {
-        return if value.code == 400 {
-            Err(message.into())
-        } else {
-            Err(format!(
-                "GitHub returned incompatible failed async merge HTTP status {}",
-                value.code
-            ))
-        };
+    let valid_code = match (endpoint, value.status.as_str()) {
+        (AsyncMergeEndpoint::Poll, _) => value.code == 200,
+        (AsyncMergeEndpoint::Submission, "pending") => matches!(value.code, 202 | 409),
+        (AsyncMergeEndpoint::Submission, "failed") => value.code == 400,
+        (AsyncMergeEndpoint::Submission, _) => value.code == 200,
+    };
+    if !valid_code {
+        return Err(format!(
+            "GitHub returned incompatible async merge HTTP status {}",
+            value.code
+        ));
     }
-    let terminal_success = value.status == "enqueued"
-        || (value.status == "merged"
-            && value
+    let message = value.details["message"].as_str().unwrap();
+    match value.status.as_str() {
+        "failed" => return Ok(AsyncMergeOutcome::Failed(message.into())),
+        "enqueued" => return Ok(AsyncMergeOutcome::Succeeded),
+        "merged"
+            if value
                 .details
                 .get("sha")
                 .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty()));
-    if terminal_success {
-        return if value.code == 200 {
-            Ok(true)
-        } else {
-            Err(format!(
-                "GitHub returned incompatible async merge HTTP status {}",
-                value.code
-            ))
-        };
+                .is_some_and(|s| !s.is_empty()) =>
+        {
+            return Ok(AsyncMergeOutcome::Succeeded);
+        }
+        "pending" => {}
+        _ => {
+            return Err(format!(
+                "GitHub returned incompatible async merge response: {message}"
+            ));
+        }
     }
-    if value.status != "pending" {
-        return Err(format!(
-            "GitHub returned incompatible async merge response: {message}"
-        ));
-    }
-    if !valid_uuid(
-        value
-            .details
-            .get("uuid")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    ) || value
+    let uuid = value
         .details
-        .get("expected_head_sha")
+        .get("uuid")
         .and_then(Value::as_str)
-        != Some(expected_head_sha)
+        .unwrap_or("");
+    if !valid_uuid(uuid)
+        || value
+            .details
+            .get("expected_head_sha")
+            .and_then(Value::as_str)
+            != Some(expected_head_sha)
         || value.details.get("merge_action").and_then(Value::as_str) != Some("merge_queue")
         || !matches!(
             value.details.get("merge_method").and_then(Value::as_str),
@@ -127,19 +141,7 @@ pub fn parse_async_merge_response(text: &str, expected_head_sha: &str) -> Result
     {
         return Err("GitHub returned malformed or incompatible async merge result".into());
     }
-    if value.code != 202 && value.code != 409 {
-        return Err(format!(
-            "GitHub returned incompatible async merge HTTP status {}",
-            value.code
-        ));
-    }
-    Ok(false)
-}
-
-pub(crate) fn async_uuid(text: &str) -> Option<String> {
-    let value = response(text).ok()?;
-    let uuid = value.details.get("uuid")?.as_str()?;
-    valid_uuid(uuid).then(|| uuid.into())
+    Ok(AsyncMergeOutcome::Pending { uuid: uuid.into() })
 }
 
 fn valid_uuid(s: &str) -> bool {
@@ -172,17 +174,56 @@ mod tests {
         assert_eq!(merge_arm_kind(&serde_json::json!({})), "none");
     }
 
+    const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+    fn pending(code: u16) -> String {
+        format!(
+            "HTTP/2 {code}\r\n\r\n{}",
+            serde_json::json!({"status":"pending","details":{"message":"pending","uuid":UUID,"expected_head_sha":"deadbeef","merge_action":"merge_queue","merge_method":"default","bypass_rules":false}})
+        )
+    }
+
     #[test]
-    fn async_merge_requires_matching_fixed_sha_and_terminal_state() {
-        let pending = "HTTP/2 202 Accepted\r\ncontent-type: application/json\r\n\r\n{\"status\":\"pending\",\"details\":{\"message\":\"pending\",\"uuid\":\"01234567-89ab-cdef-0123-456789abcdef\",\"expected_head_sha\":\"deadbeef\",\"merge_action\":\"merge_queue\",\"merge_method\":\"default\",\"bypass_rules\":false}}";
-        assert_eq!(parse_async_merge_response(pending, "deadbeef"), Ok(false));
-        assert!(parse_async_merge_response(pending, "other").is_err());
-        let enqueued =
-            "HTTP/1.1 200 OK\n\n{\"status\":\"enqueued\",\"details\":{\"message\":\"added\"}}";
-        assert_eq!(parse_async_merge_response(enqueued, "deadbeef"), Ok(true));
-        let pending_on_200 = pending.replace("202 Accepted", "200 OK");
-        assert!(parse_async_merge_response(&pending_on_200, "deadbeef").is_err());
-        let enqueued_on_202 = enqueued.replace("200 OK", "202 Accepted");
-        assert!(parse_async_merge_response(&enqueued_on_202, "deadbeef").is_err());
+    fn async_merge_distinguishes_submission_from_poll_statuses() {
+        use AsyncMergeEndpoint::*;
+        let expected = || Ok(AsyncMergeOutcome::Pending { uuid: UUID.into() });
+        for code in [202, 409] {
+            assert_eq!(
+                parse_async_merge_response(&pending(code), "deadbeef", Submission),
+                expected()
+            );
+            assert!(parse_async_merge_response(&pending(code), "deadbeef", Poll).is_err());
+        }
+        assert_eq!(
+            parse_async_merge_response(&pending(200), "deadbeef", Poll),
+            expected()
+        );
+        assert!(parse_async_merge_response(&pending(200), "deadbeef", Submission).is_err());
+        assert!(parse_async_merge_response(&pending(200), "other", Poll).is_err());
+        for endpoint in [Submission, Poll] {
+            let enqueued =
+                "HTTP/1.1 200 OK\n\n{\"status\":\"enqueued\",\"details\":{\"message\":\"added\"}}";
+            assert_eq!(
+                parse_async_merge_response(enqueued, "deadbeef", endpoint),
+                Ok(AsyncMergeOutcome::Succeeded)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failure_is_distinct_from_an_unreadable_outcome() {
+        for (code, endpoint) in [
+            (400, AsyncMergeEndpoint::Submission),
+            (200, AsyncMergeEndpoint::Poll),
+        ] {
+            let failed = format!(
+                "HTTP/2 {code}\n\n{{\"status\":\"failed\",\"details\":{{\"message\":\"head changed\"}}}}"
+            );
+            assert_eq!(
+                parse_async_merge_response(&failed, "deadbeef", endpoint),
+                Ok(AsyncMergeOutcome::Failed("head changed".into()))
+            );
+            assert!(parse_async_merge_response("broken", "deadbeef", endpoint).is_err());
+        }
     }
 }

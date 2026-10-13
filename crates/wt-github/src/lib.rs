@@ -13,7 +13,9 @@ pub use checks::{
     not_yet_enqueueable, rollup_checks,
 };
 pub use client::{GithubClient, GithubOptions};
-pub use mutations::{merge_arm_kind, parse_async_merge_response};
+pub use mutations::{
+    AsyncMergeEndpoint, AsyncMergeOutcome, merge_arm_kind, parse_async_merge_response,
+};
 pub use types::*;
 
 /// Route an ordinary GitHub pull request URL to Linear Reviews when selected.

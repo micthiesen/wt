@@ -284,7 +284,7 @@ can re-read completion and output.
 
 Worktree removal and cleanup use the lifecycle service and per-worktree
 operation locks. A confirmed removal moves its row to Archived with a
-`removing` label at once. The worker saves the archive state before its startup
+removal glyph at once. The worker saves the archive state before its startup
 reply and restores the previous state on failure. TUI actions await the durable
 job's terminal outcome off the input path, so startup does not settle the pending
 removal and a later failure rolls it back. CLI background mode returns the startup
@@ -313,7 +313,10 @@ missing PR result is not an empty-success result. Mutations that can be
 ambiguous are not retried unless the service can prove the first operation did
 not start. Merge-queue submission and classic auto-merge are distinct paths:
 arming follows the PR base branch, while cancellation inspects the PR's actual
-armed state. Retries retain the expected head SHA.
+armed state. Retries retain the expected head SHA. Async merge submissions use
+HTTP 202/409 for pending; a successful HTTP 200 poll may still describe a
+pending or failed operation. Only a terminal operation outcome settles the
+command; an unknown outcome never authorizes resubmission.
 
 Codex queued message delivery is not idempotent. After a lost response, wt
 reconciles the queue and recent thread items. If neither proves whether the

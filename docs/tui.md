@@ -90,10 +90,13 @@ way: `cached 3m` while it shows saved data (from this or a remote host),
 data that also failed to refresh reads `cached 3m · GitHub failed`). The list
 and header summarize every host; a row's details reflect only that row's host.
 
-Every change you make appears at once and is marked on its row (and in the
-details title) until a fresh read shows it: `… arming merge` while the request
-is in flight, `↻ arming merge` once the host accepted it, and
-`? arming merge (unconfirmed)` when the outcome is unknown. Board-wide changes,
+Every change you make appears at once. Worktree rows contain their title,
+issue identifier, stack references and status glyphs only, never status text.
+One fixed-width pending glyph marks `…` while a request is in flight, `↻`
+once accepted, or `?` when its outcome is unknown. Uncertainty takes precedence
+when several changes are pending. Full explanations, such as
+`? arming merge (unconfirmed)`, stay in the details title. Unknown action
+outcomes and expired updates also enter the attention feed. Board-wide changes,
 such as switching the primary harness, show in the header. A failed request
 rolls back at once with an error toast. A change that a fresh read still does
 not show after its deadline (30 seconds for GitHub, reviews and issue statuses;

@@ -237,6 +237,9 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
             (reply, ambiguous)
         }
     };
+    if reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
+        tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = "wt", event_text = %reply.message, "action outcome unknown");
+    }
     if reply.failed
         && !ambiguous
         && reply.modal.is_none()
