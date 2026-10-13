@@ -36,7 +36,13 @@ The daemon writes three files under `<cache_root>/events/`:
 
 - `github.json` contains the camelCase GitHub snapshot, covered branches, Unix-millisecond `updatedAt` (when the write finished), `fetchStartedAtMs` (when the GitHub read started), the writer's `writerSha`, and `repository` (the repository and configuration it was written for; a reader for anything else ignores it).
 - `github.touch` changes after a successful snapshot so an active TUI can notice fresh data.
-- `state.json` contains daemon PID, port, build, start/event/fetch timestamps, accepted event count, and the most recent refresh error.
+- `state.json` contains daemon PID, port, build (`writerSha`), version (`writerVersion`), start/event/fetch timestamps, accepted event count, and the most recent refresh error.
+
+`wt events status` displays the version and build recorded by the daemon itself,
+which can differ from the CLI inspecting it. Older daemons that do not record a
+version show `unknown`. The version is bound to `writerVersionSha`, so a rollback
+that preserves unknown fields cannot report a leftover version from another build.
+When stopped, these fields describe the last recorded run.
 
 These files are separate from the SQLite query cache. A successful snapshot replaces the previous snapshot atomically. A failed branch inventory or GitHub query leaves the last good snapshot in place and records the error. Cache reads are size-bounded; malformed snapshots are ignored, and malformed daemon state is reported as unreadable rather than treated as proof that no daemon exists.
 

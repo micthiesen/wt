@@ -121,6 +121,7 @@ pub async fn serve(context: &AppContext) -> Result<()> {
         context.config.branch.base.clone(),
         Some(env!("WT_BUILD_ID").to_owned()),
     )
+    .with_version(env!("CARGO_PKG_VERSION"))
     .with_repository(crate::github_events_source::repository_identity(
         &context.config,
     ));
@@ -495,6 +496,20 @@ pub(crate) async fn status(context: &AppContext) -> Result<()> {
     );
     if let Some(state) = state {
         println!(
+            "  version      {}",
+            state
+                .writer_version
+                .as_deref()
+                .filter(
+                    |_| state.writer_sha.is_some() && state.writer_version_sha == state.writer_sha
+                )
+                .unwrap_or("unknown")
+        );
+        println!(
+            "  build        {}",
+            state.writer_sha.as_deref().unwrap_or("unknown")
+        );
+        println!(
             "  pid          {}",
             state.pid.map_or("unknown".into(), |p| p.to_string())
         );
@@ -510,7 +525,7 @@ pub(crate) async fn status(context: &AppContext) -> Result<()> {
         if state.pid.is_some_and(pid_alive)
             && state.writer_sha.as_deref() != Some(env!("WT_BUILD_ID"))
         {
-            println!("  build        stale; run `wt events restart`");
+            println!("  daemon build stale; run `wt events restart`");
         }
         if let Some(error) = state.last_error {
             println!("  last error   {error}");

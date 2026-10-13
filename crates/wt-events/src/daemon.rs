@@ -90,6 +90,8 @@ pub(super) async fn start(
             pid: Some(std::process::id()),
             port: Some(local_addr.port()),
             writer_sha: config.writer_sha.clone(),
+            writer_version: config.writer_version.clone(),
+            writer_version_sha: config.writer_sha.clone(),
             started_at: Some(now_millis()),
             extra: read_json::<EventDaemonState>(config.events_dir.join("state.json"))
                 .await

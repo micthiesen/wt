@@ -22,6 +22,7 @@ pub struct EventDaemonConfig {
     pub events_dir: PathBuf,
     pub base_branch: String,
     pub writer_sha: Option<String>,
+    pub writer_version: Option<String>,
     /// Repository identity written into every snapshot, so a reader for
     /// another repository or configuration rejects it.
     pub repository: Option<String>,
@@ -35,6 +36,11 @@ pub struct EventDaemonConfig {
 }
 
 impl EventDaemonConfig {
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.writer_version = Some(version.into());
+        self
+    }
+
     pub fn with_repository(mut self, repository: impl Into<String>) -> Self {
         self.repository = Some(repository.into());
         self
@@ -55,6 +61,7 @@ impl EventDaemonConfig {
             events_dir,
             base_branch: base_branch.into(),
             writer_sha,
+            writer_version: None,
             repository: None,
             debounce_ms: 1_500,
             min_fetch_interval_ms: 10_000,
@@ -98,6 +105,13 @@ pub struct EventDaemonState {
     pub pid: Option<u32>,
     pub port: Option<u16>,
     pub writer_sha: Option<String>,
+    /// Version reported by the daemon itself, absent in older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_version: Option<String>,
+    /// Older daemons preserve unknown fields; bind the version to its writer
+    /// so a rollback cannot advertise a leftover version from a newer daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_version_sha: Option<String>,
     pub started_at: Option<u64>,
     pub last_event_at: Option<u64>,
     pub last_fetch_at: Option<u64>,

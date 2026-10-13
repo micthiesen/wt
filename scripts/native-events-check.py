@@ -195,6 +195,25 @@ def main() -> int:
         assert state["pid"] == os.getpid() and state["writerSha"] == build
         assert (root / "launchctl.log").read_text().splitlines()[-2:] == ["unload -w " + str(plist_path), "load -w " + str(plist_path)]
 
+        # Status describes the writer, never the CLI inspecting its state.
+        legacy_status = checked([str(binary), "events", "status"], env=env, cwd=repo).stdout
+        assert "  version      unknown" in legacy_status, legacy_status
+        state["writerVersion"] = "0.0.1-old-runner"
+        state["writerSha"] = "old-runner-build"
+        state["writerVersionSha"] = "old-runner-build"
+        (events_dir / "state.json").write_text(json.dumps(state))
+        older_status = checked([str(binary), "events", "status"], env=env, cwd=repo).stdout
+        assert "  version      0.0.1-old-runner" in older_status, older_status
+        assert "  build        old-runner-build" in older_status, older_status
+        assert "daemon build stale; run `wt events restart`" in older_status, older_status
+
+        # An old daemon may carry unknown version fields through a rollback.
+        state["writerSha"] = "rolled-back-build"
+        (events_dir / "state.json").write_text(json.dumps(state))
+        rollback_status = checked([str(binary), "events", "status"], env=env, cwd=repo).stdout
+        assert "  version      unknown" in rollback_status, rollback_status
+        assert "  build        rolled-back-build" in rollback_status, rollback_status
+
         daemon = subprocess.Popen([str(binary), "events", "serve"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             state_path = events_dir / "state.json"
@@ -209,6 +228,14 @@ def main() -> int:
                 time.sleep(0.05)
             else:
                 raise RuntimeError("native events daemon did not write state and initial snapshot")
+
+            version = checked([str(binary), "--version"], env=env, cwd=repo).stdout.split()[1]
+            assert state["writerVersion"] == version, state
+            assert state["writerVersionSha"] == build, state
+            status = checked([str(binary), "events", "status"], env=env, cwd=repo).stdout
+            assert f"  version      {version}" in status, status
+            assert f"  build        {build}" in status, status
+            assert "daemon build stale" not in status, status
 
             base = f"http://127.0.0.1:{port}"
             with urllib.request.urlopen(base + "/health", timeout=3) as response:
