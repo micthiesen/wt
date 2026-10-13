@@ -8,6 +8,7 @@ processes are blocked, external file invalidation, and clean terminal shutdown.
 
 import argparse
 import codecs
+import copy
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -195,6 +196,43 @@ class AnsiScreen:
         return False
 
 
+def assert_idle_frames(screen, output):
+    """A half-second idle sample may cross either fixture age's second boundary.
+
+    Filesystem birth times cannot be backdated portably. Permit each age to
+    advance once, but reject all other updates, including redundant redraws.
+    Ratatui finishes each differential frame by hiding the cursor.
+    """
+    clock = re.compile(r"\b(committed|created) ([0-9]+)([sm])\b")
+
+    def snapshot():
+        text = screen.text().decode()
+        ages = {label: (int(age), unit) for label, age, unit in clock.findall(text)}
+        # A digit-width transition shifts only the detail line's right padding.
+        stable = "\n".join(re.sub(r" +(?=│ *$)", "", clock.sub(r"\1 <age>", line))
+                           if clock.search(line) else line for line in text.splitlines())
+        return stable, ages
+
+    previous, ages = snapshot()
+    advanced = set()
+    marker = b"\x1b[?25l"
+    frames = output.split(marker)
+    assert not frames[-1], "idle terminal emitted an incomplete frame"
+    for frame in frames[:-1]:
+        screen.feed(frame + marker)
+        current, updated = snapshot()
+        assert current == previous and updated.keys() == ages.keys(), "idle terminal changed non-clock content"
+        changes = {label for label in ages if ages[label] != updated[label]}
+        assert changes, "idle terminal emitted a redundant frame"
+        assert not changes & advanced, "idle terminal redrew a clock repeatedly"
+        assert all(updated[label] == (ages[label][0] + 1, ages[label][1])
+                   or (ages[label], updated[label]) == ((59, "s"), (1, "m"))
+                   for label in changes), "idle terminal clock jumped"
+        advanced.update(changes)
+        ages = updated
+    return len(frames) - 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -322,7 +360,7 @@ def main():
         # The first visible titles do not mean every startup source is done.
         # Let the refresh wave finish its bounded drain before measuring idle.
         # A timer that keeps repainting at 10 Hz never meets this condition
-        # and fails within the timeout; the strict idle assertion follows.
+        # and fails within the timeout; the bounded clock-only check follows.
         previous = len(capture)
         unchanged_since = time.monotonic()
 
@@ -370,8 +408,9 @@ def main():
         ) for title in (b"Fixturework0", b"Fixturework1", b"Fixturework2")))
         wait_for_terminal_quiet()
         before = len(capture)
+        idle_screen = copy.deepcopy(screen)
         drain_for(0.5)
-        assert len(capture) == before, "idle terminal kept emitting frames"
+        idle_clock_frames = assert_idle_frames(idle_screen, bytes(capture[before:]))
         if args.feeds:
             wait_for(lambda _: b"Retained-attention-fixture" in capture)
             os.write(master, b'"')
@@ -602,7 +641,8 @@ def main():
             assert (root / "worktrees" / second_retained).exists(), "cancelled second prompt removed its target"
         assert b"\x1b[?1049l" in capture, "alternate screen was not restored"
         result = dict(slow_git_seconds=2, injected_key_to_output_ms=latency_ms,
-                      idle_no_frames=True, external_edit_refreshed=True, title_persisted=True,
+                      idle_no_unexpected_frames=True, idle_clock_frames=idle_clock_frames,
+                      external_edit_refreshed=True, title_persisted=True,
                       title_edit_git_scans=0, background_origin_fetches=0,
                       section_controls=args.sections,
                       history_perf_and_hard_refresh=args.sections,

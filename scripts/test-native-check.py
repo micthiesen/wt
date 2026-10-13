@@ -18,6 +18,25 @@ ui_spec.loader.exec_module(ui)
 
 
 class AnsiScreenTests(unittest.TestCase):
+    def test_idle_accepts_only_bounded_real_age_ticks(self):
+        def fixture(age):
+            screen = ui.AnsiScreen(rows=2, columns=80)
+            screen.feed(f"│ git committed {age} · created {age} · tail".ljust(79).encode() + "│".encode())
+            return screen
+
+        def frame(committed, created, tail="tail"):
+            return b"\x1b[1;1H" + f"│ git committed {committed} · created {created} · {tail}".ljust(79).encode() + "│".encode() + b"\x1b[?25l"
+
+        ui.assert_idle_frames(fixture("9s"), b"")
+        ui.assert_idle_frames(fixture("9s"), frame("10s", "9s") + frame("10s", "10s"))
+        ui.assert_idle_frames(fixture("59s"), frame("1m", "1m"))
+        for output in [frame("9s", "9s"), frame("10s", "9s") * 2,
+                       frame("10s", "9s") + frame("11s", "9s"),
+                       frame("11s", "9s"), frame("10s", "9s", "changed"),
+                       b"\x1b[2;1Hunrelated\x1b[?25l", b"\x1b[1;1Hpartial"]:
+            with self.subTest(output=output), self.assertRaises(AssertionError):
+                ui.assert_idle_frames(fixture("9s"), output)
+
     def test_creation_differential_frames_reuse_existing_characters(self):
         screen = ui.AnsiScreen(rows=3, columns=60)
         screen.feed(b"\x1b[2;3HWorking\xe2\x80\xa6")
