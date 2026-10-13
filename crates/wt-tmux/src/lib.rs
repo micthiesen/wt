@@ -2,8 +2,9 @@
 //!
 //! `TmuxClient` never reads wt configuration or ambient `$TMUX`. The caller
 //! chooses a named socket (`-L`) or socket path (`-S`) and a stable server cwd.
-//! All commands use argv through `wt-platform`; pane text is sent through a
-//! uniquely named tmux buffer on stdin and pasted without submitting Enter.
+//! Commands use `wt-platform`; session creation streams a quoted tmux command
+//! on stdin to avoid the client argv frame limit. Pane text uses a uniquely
+//! named tmux buffer on stdin and is pasted without submitting Enter.
 
 use std::{
     ffi::OsString,
@@ -659,11 +660,18 @@ exit "$wt_terminal_status""#;
     ) -> Result<(), TmuxError> {
         let args = self.create_session_args(session);
         let prefix_len = self.prefix_args().len();
+        // tmux's client command frame is bounded. Managed PATH and other
+        // pinned environment values can exceed it even though the server can
+        // execute the command. Stream one quoted command through source-file
+        // instead; tmux retains the same environment and pane command for
+        // respawn. start-server also supports the first session on a cold
+        // socket. This is one mutation, never an automatic retry.
+        let command = tmux_command_source(&args[prefix_len..]);
         let result = self
             .run_os(
                 "new-session",
-                args.into_iter().skip(prefix_len),
-                None,
+                ["start-server", ";", "source-file", "-"].map(OsString::from),
+                Some(command),
                 None,
                 cancellation,
             )
@@ -1197,6 +1205,34 @@ exit "$wt_terminal_status""#;
         }
         args
     }
+}
+
+fn tmux_command_source(args: &[OsString]) -> Vec<u8> {
+    let mut source = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index != 0 {
+            source.push(b' ');
+        }
+        source.push(b'"');
+        for byte in arg.as_encoded_bytes() {
+            match *byte {
+                b'"' | b'\\' | b'$' | b'~' => source.extend_from_slice(&[b'\\', *byte]),
+                // tmux treats a physical line beginning with '#' as a comment
+                // even inside a multiline quoted argument. Octal escapes keep
+                // the source on one line and preserve the original bytes.
+                0..=31 | 127 => source.extend_from_slice(&[
+                    b'\\',
+                    b'0' + (byte >> 6),
+                    b'0' + ((byte >> 3) & 7),
+                    b'0' + (byte & 7),
+                ]),
+                _ => source.push(*byte),
+            }
+        }
+        source.push(b'"');
+    }
+    source.push(b'\n');
+    source
 }
 
 // A read can connect just as the last pane exits and the server shuts down.

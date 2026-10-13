@@ -473,12 +473,7 @@ async fn probe(
 /// file may not exist yet on a first connection, so they are set explicitly.
 fn child_environment(root: &Path, login_path: &str) -> Vec<(OsString, Option<OsString>)> {
     let live = std::env::var_os("PATH").unwrap_or_default();
-    let path = std::env::join_paths(
-        std::iter::once(root.join("bin"))
-            .chain(std::env::split_paths(login_path))
-            .chain(std::env::split_paths(&live)),
-    )
-    .unwrap_or_else(|_| OsString::from(login_path));
+    let path = child_path(root, login_path, &live);
     vec![
         ("PATH".into(), Some(path)),
         ("WT_MANAGED_ROOT".into(), Some(root.into())),
@@ -490,6 +485,17 @@ fn child_environment(root: &Path, login_path: &str) -> Vec<(OsString, Option<OsS
         ),
         ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
     ]
+}
+
+fn child_path(root: &Path, login_path: &str, live: &std::ffi::OsStr) -> OsString {
+    let mut seen = BTreeSet::new();
+    std::env::join_paths(
+        std::iter::once(root.join("bin"))
+            .chain(std::env::split_paths(login_path))
+            .chain(std::env::split_paths(live))
+            .filter(|entry| seen.insert(entry.clone())),
+    )
+    .unwrap_or_else(|_| OsString::from(login_path))
 }
 
 /// Read PATH from the user's login shell. Non-interactive SSH commands on
@@ -823,6 +829,21 @@ mod tests {
             ["/home/me/m/repo", "/home/me/m/worktrees"]
         );
         assert!(adapted["mcp_servers"]["docs"].is_table());
+    }
+
+    #[test]
+    fn child_path_is_idempotent_and_keeps_managed_then_login_then_live_order() {
+        let root = Path::new("/managed");
+        let login = "/tools with spaces:/usr/bin:/tools with spaces";
+        let live = std::ffi::OsStr::new("/usr/bin:/managed/bin::/live-only:");
+        let first = child_path(root, login, live);
+        assert_eq!(
+            first,
+            OsString::from("/managed/bin:/tools with spaces:/usr/bin::/live-only")
+        );
+        for _ in 0..25 {
+            assert_eq!(child_path(root, login, &first), first);
+        }
     }
 
     #[test]

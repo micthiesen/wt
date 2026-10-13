@@ -136,7 +136,12 @@ inspectable. Enter retries only a dead pane and clears its stale harness identit
 successful exits close normally. A pane-owned supervisor resets retention before
 each foreground command, records its exit status, and enables pane-local retention
 only for failures. This avoids older tmux/libutempter exit-status races; background
-action and development-server sessions do not use the supervisor. Codex identity
+action and development-server sessions do not use the supervisor.
+Session creation streams a quoted tmux command through stdin rather than the
+bounded client command frame, preserving long pinned environments and retained
+retry commands. Managed and harness PATH composition retains each component's
+first occurrence, so repeated sourcing does not grow the environment.
+Codex identity
 recovery may inspect its sole direct child only after validating the supervisor
 marker, then rechecks the child's PID, start time and executable with the pane.
 The session

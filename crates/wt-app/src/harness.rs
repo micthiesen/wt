@@ -125,6 +125,8 @@ fn harness_session_environment(
         .map(Path::to_path_buf)
         .collect::<Vec<_>>();
     paths.extend(std::env::split_paths(inherited_path));
+    let mut seen = BTreeSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
     let path = std::env::join_paths(paths)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| inherited_path.to_owned());
@@ -1001,6 +1003,24 @@ mod tests {
         assert!(!env.contains_key("MISSING"));
         assert_eq!(env["WT_SESSION_ENV"], "CODEX_HOME:PATH:MISSING");
         assert_eq!(env[wt_tmux::SESSION_SOURCE], "/m/secrets/env.sh");
+    }
+
+    #[test]
+    fn repeated_harness_environment_keeps_runtime_first_without_path_growth() {
+        let mut inherited = BTreeMap::from([(
+            "PATH".into(),
+            "/shim:/runtime/bin:/usr/bin:/shim::/bin:".into(),
+        )]);
+        for _ in 0..25 {
+            inherited = harness_session_environment(
+                Path::new("/users/test"),
+                Path::new("/repo"),
+                None,
+                Some(Path::new("/runtime/bin/wt")),
+                &inherited,
+            );
+            assert_eq!(inherited["PATH"], "/runtime/bin:/shim:/usr/bin::/bin");
+        }
     }
 
     #[test]

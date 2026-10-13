@@ -721,6 +721,92 @@ fn empty_terminal_preamble_still_has_palette_and_board_return_keys() {
 }
 
 #[tokio::test]
+async fn large_pinned_environment_survives_command_transport_and_retained_retry() {
+    let temp = tempdir().unwrap();
+    let value = format!(
+        "quote'\"\\\t\r\n$HOME; new-session -s injected\n#{}",
+        "x".repeat(40_000)
+    );
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("tmux.sock")).with_config_file(PathBuf::from("/dev/null")),
+    )
+    .with_session_environment([("WT_QA_VALUE".into(), value.clone())])
+    .with_failure_retention();
+    let cancel = CancellationToken::new();
+    let result = async {
+        // Exercise both the cold server and an already running server. Each
+        // request exceeds tmux's client frame even before its shell command.
+        for name in ["~first", "second"] {
+            let cwd = temp.path().join(name);
+            std::fs::create_dir(&cwd).unwrap();
+            client
+                .create_session(
+                    &CreateSession {
+                        name: name.into(),
+                        cwd: cwd.clone(),
+                        command: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            "printf '%s' \"$WT_QA_VALUE\" > observed; exit 23".into(),
+                        ],
+                        width: Some(80),
+                        height: Some(24),
+                    },
+                    &cancel,
+                )
+                .await?;
+            for attempt in 0..2 {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if client
+                        .list_panes(name, &cancel)
+                        .await?
+                        .iter()
+                        .any(|pane| pane.dead)
+                    {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        let panes = client.list_panes(name, &cancel).await?;
+                        let command = client.run("display-message", ["display-message", "-p", "-t", name, "#{pane_start_command}"], None, &cancel).await?;
+                        let output = client.capture_pane(&PaneTarget::active_session_pane(name), Some(20), &cancel).await?;
+                        return Err(crate::TmuxError::MalformedOutput {
+                            operation: "retained-pane-test",
+                            line: format!("pane was not retained: session={name} attempt={attempt} panes={panes:?} command_len={} output={output:?}", command.stdout.len()),
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join("observed")).unwrap(),
+                    value
+                );
+                if attempt == 0 {
+                    std::fs::remove_file(cwd.join("observed")).unwrap();
+                    let target = format!("{}:", exact_session_target(name));
+                    let retry = client
+                        .run(
+                            "respawn-pane",
+                            ["respawn-pane", "-t", &target],
+                            None,
+                            &cancel,
+                        )
+                        .await?;
+                    assert!(retry.status.success(), "{}", retry.stderr_text());
+                }
+            }
+        }
+        let sessions = client.list_sessions(&cancel).await?;
+        assert_eq!(sessions.len(), 2, "quoted environment injected a command");
+        Ok::<(), crate::TmuxError>(())
+    }
+    .await;
+    client.kill_server(&CancellationToken::new()).await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn failed_commands_remain_visible_and_retry_without_killing_live_commands() {
     let temp = tempdir().unwrap();
     let config =

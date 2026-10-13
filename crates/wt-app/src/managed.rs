@@ -406,12 +406,26 @@ WT_MANAGED_ROOT="$HOME/{root}"
 export WT_MANAGED_ROOT
 # The login shell's PATH (Homebrew, version managers) comes first; the live
 # PATH stays as a fallback for entries that changed since it was captured.
+WT_LOGIN_PATH=
 if [ -r "$WT_MANAGED_ROOT/login-path" ]; then
   IFS= read -r WT_LOGIN_PATH < "$WT_MANAGED_ROOT/login-path" || true
-  PATH="${{WT_LOGIN_PATH:+$WT_LOGIN_PATH:}}$PATH"
-  unset WT_LOGIN_PATH
 fi
-PATH="$WT_MANAGED_ROOT/bin:$PATH"
+# Retain the first occurrence of each component, including an empty component
+# (the current directory). Re-sourcing this file must not grow PATH. Shell
+# builtins avoid relying on tools which this PATH is still being prepared for.
+WT_PATH_REMAINING="${{WT_LOGIN_PATH:+$WT_LOGIN_PATH:}}$PATH"
+WT_PATH_UNIQUE="$WT_MANAGED_ROOT/bin"
+while :; do
+  WT_PATH_ENTRY=${{WT_PATH_REMAINING%%:*}}
+  case ":$WT_PATH_UNIQUE:" in
+    *":$WT_PATH_ENTRY:"*) ;;
+    *) WT_PATH_UNIQUE="$WT_PATH_UNIQUE:$WT_PATH_ENTRY" ;;
+  esac
+  [ "$WT_PATH_REMAINING" = "$WT_PATH_ENTRY" ] && break
+  WT_PATH_REMAINING=${{WT_PATH_REMAINING#*:}}
+done
+PATH=$WT_PATH_UNIQUE
+unset WT_LOGIN_PATH WT_PATH_REMAINING WT_PATH_UNIQUE WT_PATH_ENTRY
 export PATH
 export CODEX_HOME="$WT_MANAGED_ROOT/codex"
 export GH_CONFIG_DIR="$WT_MANAGED_ROOT/gh"
@@ -902,6 +916,41 @@ env_files_to_copy = [".env"]
             "export WT_SESSION_ENV=\"WT_MANAGED_ROOT:CODEX_HOME:GH_CONFIG_DIR:GIT_CONFIG_GLOBAL:GIT_TERMINAL_PROMPT\""
         ));
         assert!(script.contains(". \"$WT_MANAGED_ROOT/secrets/env.sh\""));
+    }
+
+    #[test]
+    fn managed_environment_path_is_idempotent_and_preserves_long_unique_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed space");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut entries = vec![
+            "/tools with spaces".to_owned(),
+            "/literal*?[glob]".to_owned(),
+            "/usr/bin".to_owned(),
+        ];
+        entries.extend(
+            (0..150).map(|index| format!("/long/unique/toolchain/{index:04}/{}", "x".repeat(50))),
+        );
+        let login = entries.join(":");
+        assert!(login.len() > 9000);
+        std::fs::write(root.join("login-path"), &login).unwrap();
+        let script = root.join("env.sh");
+        std::fs::write(&script, environment_script("managed space")).unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", ". \"$1\"; first=$PATH; n=0; while [ \"$n\" -lt 25 ]; do . \"$1\"; n=$((n + 1)); done; [ \"$PATH\" = \"$first\" ] || exit 9; printf '%s' \"$PATH\"", "path-test"])
+            .arg(script)
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin::/tools with spaces:/live-only:/usr/bin:")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}:{login}::/live-only", root.join("bin").display())
+        );
     }
 
     #[test]
