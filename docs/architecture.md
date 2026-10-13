@@ -312,6 +312,8 @@ cleanup grace is not a deadline for accepted writes, and an error does not start
 a second source grace period.
 Known create failures retain the input and selected host for correction. A lost
 remote reply remains ambiguous and never opens an automatic retry path.
+Both failed action replies and raised errors produce one persistent attention
+event. Uncertain writes produce a warning there; no-op notices remain transient.
 
 The SSH protocol is framed and versioned. The controller probes the worker,
 checks its role and protocol, and provisions the exact native build before

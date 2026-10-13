@@ -144,7 +144,10 @@ and it drives the rest of the design:
   `crates/wt-harness/src/claude/`), Codex in `$CODEX_HOME/config.toml`
   (`[projects."<path>"] trust_level = "trusted"`,
   `crates/wt-harness/src/codex/`). Codex launch awaits an idempotent exact-root
-  trust write after resolving live inventory. The writer preserves TOML settings,
+  trust write after resolving live inventory. The shared launch/message boundary
+  covers F12, picker sessions, cold message starts, automations, and configured
+  manager/main/source roots; a stale route cannot authorize another directory.
+  The writer preserves TOML settings,
   comments and config symlinks, uses atomic private-file replacement, and refuses
   malformed or concurrently changed config. It never trusts a parent or sibling
   as a shortcut. Entries remain in the harness config after teardown. OpenCode

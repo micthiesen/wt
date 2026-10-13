@@ -629,7 +629,9 @@ impl GithubClient {
                                         );
                                     }
                                     Ok(AsyncMergeOutcome::Failed(error)) => {
-                                        return GhActionResult::error(error);
+                                        return self
+                                            .queue_rejected(target, error, cancellation)
+                                            .await;
                                     }
                                     Err(error) => {
                                         return GhActionResult::unknown(format!(
@@ -645,29 +647,7 @@ impl GithubClient {
                             ));
                         }
                         Ok(AsyncMergeOutcome::Failed(error)) => {
-                            if missing_workflow_scope(&error) {
-                                return GhActionResult::error(format!(
-                                    "{error} {WORKFLOW_SCOPE_REMEDY}"
-                                ));
-                            }
-                            if !not_yet_enqueueable(&error) && !checks_still_pending(&error) {
-                                return GhActionResult::error(error);
-                            }
-                            let armed = self.classic_arm(target, cancellation).await;
-                            if armed.is_ok() {
-                                return armed;
-                            }
-                            if armed.ambiguous {
-                                return armed;
-                            }
-                            let pending = checks_still_pending(&error);
-                            return GhActionResult::failed(
-                                format!(
-                                    "{error} (arming instead also failed: {})",
-                                    result_error(&armed)
-                                ),
-                                pending,
-                            );
+                            return self.queue_rejected(target, error, cancellation).await;
                         }
                         Err(error) => {
                             return GhActionResult::unknown(format!(
@@ -686,6 +666,34 @@ impl GithubClient {
             }
         }
         self.classic_arm(target, cancellation).await
+    }
+
+    /// Only a proven terminal rejection permits the alternate arm operation.
+    /// Immediate and asynchronously polled failures have identical semantics.
+    async fn queue_rejected(
+        &self,
+        target: &PrMergeTarget,
+        error: String,
+        cancellation: &CancellationToken,
+    ) -> GhActionResult {
+        if missing_workflow_scope(&error) {
+            return GhActionResult::error(format!("{error} {WORKFLOW_SCOPE_REMEDY}"));
+        }
+        if !not_yet_enqueueable(&error) && !checks_still_pending(&error) {
+            return GhActionResult::error(error);
+        }
+        let armed = self.classic_arm(target, cancellation).await;
+        if armed.is_ok() || armed.ambiguous {
+            return armed;
+        }
+        let pending = checks_still_pending(&error);
+        GhActionResult::failed(
+            format!(
+                "{error} (arming instead also failed: {})",
+                result_error(&armed)
+            ),
+            pending,
+        )
     }
 
     async fn classic_arm(
@@ -1939,6 +1947,15 @@ else:
         wrong_head: bool,
         submission_code: u16,
     ) -> (GhActionResult, String) {
+        merge_rejection_fixture(terminal, wrong_head, submission_code, false).await
+    }
+
+    async fn merge_rejection_fixture(
+        terminal: &str,
+        wrong_head: bool,
+        submission_code: u16,
+        classic_fails: bool,
+    ) -> (GhActionResult, String) {
         let dir = tempdir().unwrap();
         let uuid = "01234567-89ab-cdef-0123-456789abcdef";
         let pending = |code, head| {
@@ -1952,7 +1969,11 @@ else:
         };
         fs::write(
             dir.path().join("submit"),
-            pending(submission_code, "deadbeef"),
+            if submission_code == 400 {
+                terminal.to_owned()
+            } else {
+                pending(submission_code, "deadbeef")
+            },
         )
         .unwrap();
         fs::write(
@@ -1961,6 +1982,9 @@ else:
         )
         .unwrap();
         fs::write(dir.path().join("terminal"), terminal).unwrap();
+        if classic_fails {
+            fs::write(dir.path().join("classic-fails"), "").unwrap();
+        }
         let script = dir.path().join("fake-gh");
         fs::write(
             &script,
@@ -1968,9 +1992,12 @@ else:
 printf '%s\n' "$*" >> calls
 case "$*" in
   *'query=query('* ) printf '%s' '{"data":{"repository":{"mergeQueue":{"id":"MQ"}}}}' ;;
-  *'--method PUT'* ) cat submit; if head -1 submit | grep -q 409; then exit 1; fi ;;
+  *'--method PUT'* ) cat submit; if head -1 submit | grep -Eq '400|409'; then exit 1; fi ;;
   *'--method GET'* )
     if test -f polled; then cat terminal; else touch polled; cat poll; fi ;;
+  *'enablePullRequestAutoMerge'* )
+    if test -f classic-fails; then echo 'required checks have not reported' >&2; exit 1; fi
+    printf '%s' '{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42}}}}' ;;
   * ) exit 99 ;;
 esac
 "#,
@@ -1997,6 +2024,29 @@ esac
             result,
             fs::read_to_string(dir.path().join("calls")).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn terminal_queue_rejections_arm_identically_before_or_after_polling() {
+        for classic_fails in [false, true] {
+            for submission_code in [400, 202] {
+                let terminal_code = if submission_code == 400 { 400 } else { 200 };
+                let terminal = format!(
+                    "HTTP/2 {terminal_code}\n\n{{\"status\":\"failed\",\"details\":{{\"message\":\"Required status check CI is pending\"}}}}"
+                );
+                let (result, calls) =
+                    merge_rejection_fixture(&terminal, false, submission_code, classic_fails).await;
+                assert_eq!(result.ok, !classic_fails, "{result:?}");
+                assert!(!result.ambiguous);
+                assert_eq!(result.retryable == Some(true), classic_fails);
+                assert_eq!(calls.matches("enablePullRequestAutoMerge").count(), 1);
+                assert_eq!(calls.matches("--method PUT").count(), 1);
+                assert_eq!(
+                    calls.matches("--method GET").count(),
+                    if submission_code == 400 { 0 } else { 2 }
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2056,6 +2106,7 @@ esac
             assert!(!result.ok);
             assert!(result.ambiguous);
             assert_ne!(result.retryable, Some(true));
+            assert!(!calls.contains("enablePullRequestAutoMerge"));
             assert_eq!(calls.matches("--method PUT").count(), 1);
             assert_eq!(
                 calls.matches("--method GET").count(),

@@ -275,12 +275,8 @@ pub async fn prepare_session(
             .then(|| wanted_id.unwrap().to_owned()),
         display_label: None,
     };
-    if selection.harness == HarnessId::Codex && selection.target == SessionTarget::Harness {
-        crate::harness::trust_codex_worktree(context, &agent.cwd).await?;
-    }
     if let Err(error) = app
-        .service
-        .ensure_started(selection.harness, &request, &context.cancellation)
+        .ensure_started(selection.harness, &request, context)
         .await
     {
         if named_added {

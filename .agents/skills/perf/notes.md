@@ -127,8 +127,12 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   They now remain busy/unknown rather than claiming historical threads live.
   Empty-thread preallocation was tested and rejected: Codex 0.162.1 did not
   reliably materialize a resumable rollout before a turn, so no such startup
-  change ships (`/tmp/wt-empty-thread-proof.txt`). Final release installation
-  and its live measurement remain owed.
+  change ships (`/tmp/wt-empty-thread-proof.txt`). The optimized `06cb306`
+  candidate with strict identity filtering measured 11.08% over 60 seconds
+  and quit in 0.003 seconds after refresh (`/tmp/wt-live-final-06cb306/result.json`).
+  This lower measurement includes the unknown-session limitation above; the
+  separate permissive-selection comparison proves the feedback fix itself.
+  Final release installation and its live measurement remain owed.
 - **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
   Codex rollout append watcher received no callbacks within either 2 or 15
   seconds, including a fixture under the home directory. Host sampling showed

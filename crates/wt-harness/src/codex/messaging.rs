@@ -438,6 +438,18 @@ impl CodexMessenger {
                     reason: format!("Codex slot {name} exited before terminal fallback"),
                 });
             };
+            let pane = self
+                .tmux
+                .capture_pane(&target, Some(40), cancel)
+                .await
+                .unwrap_or_default();
+            if let Some(blocker) = codex_pane_blocker(&pane) {
+                return Ok(CodexMessageOutcome::Failed {
+                    reason: format!(
+                        "Codex is waiting for {blocker}; open this session with F12 to continue. No input was sent"
+                    ),
+                });
+            }
             let ready = if let Some(id) = session_id {
                 // Ownership is rechecked under the cross-process injection
                 // lock immediately before typing.
@@ -449,22 +461,12 @@ impl CodexMessenger {
                         .is_some_and(|tail| {
                             closed_turn(tail.parse_complete, tail.last_task_event.as_deref())
                         });
-                    thread_ready
-                        && self
-                            .tmux
-                            .capture_pane(&target, Some(40), cancel)
-                            .await
-                            .map(|pane| codex_pane_is_idle(&pane))
-                            .unwrap_or(false)
+                    thread_ready && codex_pane_is_idle(&pane)
                 } else {
                     false
                 }
             } else {
-                self.tmux
-                    .capture_pane(&target, Some(40), cancel)
-                    .await
-                    .map(|pane| codex_pane_is_idle(&pane))
-                    .unwrap_or(false)
+                codex_pane_is_idle(&pane)
             };
             if ready {
                 let still_live = self
@@ -622,6 +624,22 @@ fn compact(stderr: &str, stdout: &str) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
+fn codex_pane_blocker(text: &str) -> Option<&'static str> {
+    // Match the active menu, not an earlier trust/login explanation in the
+    // transcript. Never dismiss an interactive decision by typing a message.
+    let selected = text
+        .lines()
+        .map(str::trim)
+        .rfind(|line| line.starts_with("› "))?;
+    if selected == "› 1. Trust and continue" && text.contains("Trust this folder?") {
+        Some("folder trust")
+    } else if selected == "› 1. Sign in with ChatGPT" && text.contains("API key") {
+        Some("sign-in")
+    } else {
+        None
+    }
+}
+
 fn codex_pane_is_idle(text: &str) -> bool {
     if text.to_ascii_lowercase().contains("esc to interrupt") {
         return false;
@@ -867,6 +885,92 @@ mod tests {
                 matches!(outcome, CodexMessageOutcome::Failed { reason } if reason.contains("control characters"))
             );
         }
+    }
+
+    #[test]
+    fn interactive_setup_blockers_name_the_active_menu_only() {
+        let trust = "Folder access\n/repo\nTrust this folder? Codex can read files.\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back";
+        assert_eq!(codex_pane_blocker(trust), Some("folder trust"));
+        assert!(!codex_pane_is_idle(trust));
+        assert_eq!(
+            codex_pane_blocker(&format!("{trust}\n› Ask Codex to do anything")),
+            None
+        );
+        let login = "Welcome to Codex\n› 1. Sign in with ChatGPT\n  2. Provide an API key";
+        assert_eq!(codex_pane_blocker(login), Some("sign-in"));
+        assert_eq!(
+            codex_pane_blocker("› Explain Sign in with ChatGPT and API key"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_reports_trust_prompt_without_waiting_or_typing() {
+        use wt_tmux::{CreateSession, TmuxServer};
+        let temp = tempfile::tempdir().unwrap();
+        let runner = ProcessRunner::default();
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            TmuxServer::at(temp.path().join("tmux.sock")).with_config_file("/dev/null"),
+        );
+        let cancel = CancellationToken::new();
+        let name = "trust-codex";
+        tmux.create_session(
+            &CreateSession {
+                name: name.into(),
+                cwd: temp.path().into(),
+                command: vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import time; print('Folder access\\n/repo\\nTrust this folder?\\n› 1. Trust and continue\\n  2. Back to Agent Command Center', flush=True); time.sleep(30)".into(),
+                ],
+                width: Some(120),
+                height: Some(30),
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let target = PaneTarget::active_session_pane(name);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !tmux
+            .capture_pane(&target, Some(40), &cancel)
+            .await
+            .unwrap()
+            .contains("Trust and continue")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "trust fixture did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let messenger = CodexMessenger::new(
+            CodexPaths::new(temp.path(), temp.path().join("cache")),
+            runner,
+            tmux.clone(),
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            messenger.terminal_fallback(
+                name,
+                temp.path(),
+                "trust",
+                None,
+                "DO NOT TYPE",
+                false,
+                "unknown UUID",
+                &cancel,
+            ),
+        )
+        .await;
+        let pane = tmux.capture_pane(&target, Some(40), &cancel).await.unwrap();
+        tmux.kill_session(name, &cancel).await.unwrap();
+        assert!(
+            matches!(outcome.unwrap().unwrap(), CodexMessageOutcome::Failed { reason } if reason.contains("folder trust") && reason.contains("F12"))
+        );
+        assert!(!pane.contains("DO NOT TYPE"));
+        assert!(pane.contains("Trust and continue"));
     }
 
     #[test]

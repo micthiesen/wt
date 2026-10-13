@@ -193,6 +193,7 @@ pub struct AppHarness {
     claude_injector: ClaudeInjector,
     cache_root: PathBuf,
     primary_fallback: HarnessId,
+    codex_config: PathBuf,
     main_clone: PathBuf,
     dotfiles: PathBuf,
     wt_source: Option<PathBuf>,
@@ -201,6 +202,8 @@ pub struct AppHarness {
 impl AppHarness {
     pub fn new(context: &AppContext) -> Self {
         let cache_root = context.config.paths.cache_root.clone();
+        let codex_paths = codex_paths(&context.home, &cache_root);
+        let codex_config = codex_paths.codex_home.join("config.toml");
         let inherited_environment = std::env::vars_os()
             .map(|(key, value)| {
                 (
@@ -240,7 +243,7 @@ impl AppHarness {
         let claude_injector = ClaudeInjector::new(cache_root.clone());
         let service = HarnessService::new(
             claude_paths,
-            codex_paths(&context.home, &cache_root),
+            codex_paths,
             OpenCodePaths::new(&context.home, &cache_root),
             context.processes.clone(),
             tmux.clone(),
@@ -253,6 +256,7 @@ impl AppHarness {
             claude_injector,
             cache_root,
             primary_fallback: context.config.harness.primary,
+            codex_config,
             main_clone: context.config.paths.main_clone.clone(),
             dotfiles: context.config.paths.dotfiles.clone(),
             wt_source: context.config.paths.wt_source.clone(),
@@ -432,6 +436,8 @@ impl AppHarness {
                 "could not inspect wt's tmux session registry; no harness was selected or started"
             )
         })?;
+        self.prepare_start(id, &route.target.slug, &route.target.cwd, context)
+            .await?;
         self.service
             .send(
                 &HarnessTarget {
@@ -446,6 +452,70 @@ impl AppHarness {
             )
             .await
             .context("deliver agent message")
+    }
+
+    pub(crate) async fn ensure_started(
+        &self,
+        id: HarnessId,
+        request: &HarnessSpawnRequest,
+        context: &AppContext,
+    ) -> Result<bool> {
+        self.prepare_start(id, &request.slug, &request.worktree_path, context)
+            .await?;
+        Ok(self
+            .service
+            .ensure_started(id, request, &context.cancellation)
+            .await?)
+    }
+
+    /// Every app-owned launch and message wake passes through this boundary.
+    /// Authorize the exact checkout from current local inventory or an explicit
+    /// configured special target before updating Codex's selected home.
+    async fn prepare_start(
+        &self,
+        id: HarnessId,
+        slug: &str,
+        cwd: &Path,
+        context: &AppContext,
+    ) -> Result<()> {
+        if id != HarnessId::Codex {
+            return Ok(());
+        }
+        let authorized = match slug {
+            "main" | "manager" => Some(self.main_clone.clone()),
+            "wt" => self.wt_source.clone(),
+            "dotfiles" => Some(self.dotfiles.clone()),
+            _ => context
+                .repository
+                .inventory(&context.cancellation)
+                .await?
+                .into_iter()
+                .find(|record| {
+                    record.target.slug() == slug
+                        && matches!(record.target.location(), wt_core::WorktreeLocation::Local)
+                })
+                .map(|record| PathBuf::from(record.target.path)),
+        }
+        .with_context(|| {
+            format!(
+                "Codex target {slug} is not a current local worktree or configured special root"
+            )
+        })?;
+        let cwd = cwd.to_path_buf();
+        let config = self.codex_config.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let root = fs::canonicalize(&cwd).context("resolve Codex target root")?;
+            let authorized =
+                fs::canonicalize(&authorized).context("resolve authorized Codex root")?;
+            if root != authorized {
+                bail!("Codex target path no longer matches its authorized checkout");
+            }
+            wt_harness::ensure_trusted_project(&config, &root)?;
+            Ok(())
+        })
+        .await
+        .context("prepare Codex target trust")??;
+        Ok(())
     }
 
     pub async fn discover(
@@ -701,9 +771,6 @@ pub async fn ui_session_with_harness(
                 .session_exists(&tmux_name, &context.cancellation)
                 .await?
             {
-                if harness_id == HarnessId::Codex && kind == SessionTarget::Harness {
-                    trust_codex_worktree(context, &cwd).await?;
-                }
                 let discovered = app
                     .service
                     .discover(
@@ -722,35 +789,20 @@ pub async fn ui_session_with_harness(
                 } else {
                     primary_single_slot_session(&discovered).map(|entry| entry.session_id.clone())
                 };
-                app.service
-                    .ensure_started(
-                        harness_id,
-                        &HarnessSpawnRequest {
-                            resume_session_id: resume,
-                            ..request
-                        },
-                        &context.cancellation,
-                    )
-                    .await?;
+                app.ensure_started(
+                    harness_id,
+                    &HarnessSpawnRequest {
+                        resume_session_id: resume,
+                        ..request
+                    },
+                    context,
+                )
+                .await?;
             }
             tmux_name
         }
     };
     Ok(app.attach_command(&session, &cwd))
-}
-
-/// Call only after resolving a real worktree from this repository's inventory.
-/// Rift clones have independent Git roots, so trusting the parent directory
-/// cannot stand in for trusting the checkout the user explicitly entered.
-pub(crate) async fn trust_codex_worktree(context: &AppContext, path: &Path) -> Result<()> {
-    let config = codex_paths(&context.home, &context.config.paths.cache_root)
-        .codex_home
-        .join("config.toml");
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || wt_harness::ensure_trusted_project(&config, &path))
-        .await
-        .context("prepare Codex worktree trust")??;
-    Ok(())
 }
 
 fn primary_single_slot_session(
@@ -865,6 +917,65 @@ pub fn unavailable_source_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn message_wakes_prepare_exact_worktree_and_special_root_trust_before_dispatch() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut app = AppHarness::new(&fixture.ctx);
+        // Do not inherit the test runner's selected CODEX_HOME.
+        app.codex_config = fixture.ctx.home.join("selected-codex/config.toml");
+        for (slug, cwd) in [
+            ("one", fixture.ctx.cwd.clone()),
+            ("manager", fixture.ctx.config.paths.main_clone.clone()),
+        ] {
+            let route = AgentRoute {
+                target: special_target(slug, cwd.clone(), None),
+                choice: HarnessChoice {
+                    selected: Some(HarnessId::Codex),
+                    source: SelectionSource::Primary,
+                    live: Some(Vec::new()),
+                },
+            };
+            // Empty text stops at the adapter dispatch boundary. It exercises
+            // the formerly bypassed send preparation without starting a real
+            // agent or sending a message to any account.
+            let error = app.send(&route, "", None, &fixture.ctx).await.unwrap_err();
+            assert!(format!("{error:#}").contains("empty"));
+            let config: toml::Value =
+                toml::from_str(&fs::read_to_string(&app.codex_config).unwrap()).unwrap();
+            let canonical = fs::canonicalize(cwd).unwrap();
+            assert_eq!(
+                config["projects"][canonical.to_str().unwrap()]["trust_level"].as_str(),
+                Some("trusted")
+            );
+        }
+        assert!(!fixture.ctx.home.join(".codex/config.toml").exists());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_preparation_rejects_unowned_and_mismatched_roots() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut app = AppHarness::new(&fixture.ctx);
+        app.codex_config = fixture.ctx.home.join("selected-codex/config.toml");
+        for (slug, cwd) in [
+            ("unregistered", fixture.ctx.cwd.clone()),
+            ("one", fixture.ctx.config.paths.main_clone.clone()),
+            ("manager", fixture.ctx.cwd.clone()),
+        ] {
+            assert!(
+                app.prepare_start(HarnessId::Codex, slug, &cwd, &fixture.ctx)
+                    .await
+                    .is_err()
+            );
+            assert!(!app.codex_config.exists());
+        }
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn managed_session_variables_follow_the_worker_into_agent_sessions() {

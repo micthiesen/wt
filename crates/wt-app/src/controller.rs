@@ -242,8 +242,6 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
             false,
         ),
         Err(error) => {
-            // The full chain, so the feed names the cause, not just the step.
-            tracing::error!(error = %format_args!("{error:#}"), "TUI action failed");
             let ambiguous = error
                 .downcast_ref::<crate::remote_host::RemoteHostError>()
                 .is_some_and(|error| {
@@ -263,7 +261,21 @@ fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>
         }
     };
     if reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
-        tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = "wt", event_text = %reply.message, "action outcome unknown");
+        tracing::warn!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = "wt",
+            event_text = %reply.message,
+            "action outcome unknown"
+        );
+    } else if reply.failed {
+        tracing::error!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = "wt",
+            event_text = %reply.message,
+            "action failed"
+        );
     }
     if reply.failed
         && !ambiguous
@@ -522,6 +534,109 @@ mod tests {
         assert!(!reply.failed);
         assert!(reply.notice);
         assert_eq!(reply.message, "already at top");
+    }
+
+    #[test]
+    fn failures_and_ambiguity_are_logged_once_as_attention_but_notice_is_not() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer({
+                let output = output.clone();
+                move || LogWriter(output.clone())
+            })
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        action_reply(Ok(UiReply::failure("GitHub rejected the update")), None);
+        action_reply(Err(anyhow::anyhow!("remote connection failed")), None);
+        action_reply(
+            Err(crate::remote_host::RemoteHostError::Ambiguous {
+                host: "builder".into(),
+                detail: "reply was lost after send".into(),
+            }
+            .into()),
+            None,
+        );
+        action_reply(Err(notice("already at top")), None);
+        drop(guard);
+
+        let output = output.lock().unwrap().clone();
+        let log = String::from_utf8(output).unwrap();
+        let events = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3, "{log}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["fields"]["event_channel"] == "attention")
+                .count(),
+            3,
+            "{log}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event["fields"]["event_source"] == "wt"),
+            "{log}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["fields"]["event_text"] == "GitHub rejected the update")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["fields"]["event_text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("remote connection failed")))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["fields"]["event_text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("result is unknown")))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["level"] == "WARN")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(!log.contains("already at top"), "{log}");
     }
 
     #[test]
