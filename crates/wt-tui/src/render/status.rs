@@ -75,6 +75,15 @@ pub(crate) fn status(model: &Model, domains: &[Domain]) -> Status {
     combine(hosts, domains)
 }
 
+/// Count prepared refreshing lanes, never perform work to animate progress.
+pub(crate) fn refreshing_count(model: &Model) -> usize {
+    std::iter::once(&model.local_domains)
+        .chain(model.source_board.host_domains.values())
+        .flat_map(|map| HEADER.iter().filter_map(|domain| map.get(domain)))
+        .filter(|meta| matches!(meta.state(), SourceState::Refreshing))
+        .count()
+}
+
 /// The status of one host's domains, for panes about a single row.
 pub(crate) fn host_status(model: &Model, host: Option<&str>, domains: &[Domain]) -> Status {
     match host {

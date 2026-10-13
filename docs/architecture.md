@@ -103,6 +103,10 @@ driver polls input and prepared snapshots and renders them with Ratatui. Actions
 cross a typed `UiAction` boundary into the application controller. This keeps
 terminal rendering separate from I/O and lets the same host service handle
 local and SSH-routed requests.
+The header's refresh wave counts prepared refreshing lanes and has a 10 Hz timer
+only while moving. Animation copies the last rendered screen and repaints its
+header, without rebuilding pane models or requesting source work. Resize falls
+back to a full render; modals and mouse selection suspend the animation timer.
 The output pane switches between attention, all app activity, and prepared
 session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
@@ -225,6 +229,9 @@ lost Git notifications over the same declared watch paths: immediate checkout
 children and recursive Git refs/worktree metadata, excluding generated trees
 and symlink traversal. Each scan is capped at 8,192 entries and 200 ms, runs off
 the input path, and refreshes only the domains whose file metadata changed.
+Native notifications for regular files already observed by that probe are
+deduplicated against current size, modification time, inode, device and change
+time. Directory and unknown-path events remain conservative invalidations.
 Incomplete scans retain the 60-second full reconciliation backstop. GitHub reads remain batched and rate
 limited (10 s minimum interval measured from fetch start); the optional events
 daemon supplies push updates stamped with its own fetch start, with a

@@ -58,6 +58,9 @@ fn start_with_notifications(
     let edit_roots = Arc::new(RwLock::new(BTreeMap::<PathBuf, String>::new()));
     let pending_edits = Arc::new(Mutex::new(BTreeMap::<String, i64>::new()));
     let edit_changed = Arc::new(tokio::sync::Notify::new());
+    // Native notifications can arrive after the metadata backstop already
+    // observed and invalidated an edit. Share that witness across both lanes.
+    let observed_files = Arc::new(RwLock::new(None::<Arc<WatchFingerprint>>));
     let cancellation = scope.token();
     scope.spawn(async move {
         if let Some(board) = source.snapshot().data().cloned()
@@ -81,10 +84,21 @@ fn start_with_notifications(
         let callback_roots = edit_roots.clone();
         let callback_pending = pending_edits.clone();
         let callback_changed = edit_changed.clone();
+        let callback_observed_files = observed_files.clone();
         let mut watcher = tokio::task::spawn_blocking(move || {
             notify::recommended_watcher(move |event: notify::Result<Event>| match event {
                 Ok(event) if relevant(&event) => {
-                    let (git, metadata) = invalidations(&event.paths, &state_db, &checkout_roots);
+                    let paths = if event.need_rescan() {
+                        event.paths.clone()
+                    } else {
+                        unobserved_paths(&event.paths, &callback_observed_files)
+                    };
+                    let (git, metadata) = if !event.paths.is_empty() && paths.is_empty() {
+                        (false, false)
+                    } else {
+                        invalidations(&paths, &state_db, &checkout_roots)
+                    };
+                    tracing::debug!(?event, ?paths, git, metadata, "filesystem notification invalidation");
                     if git { observed_git.refresh(); }
                     if metadata { observed_metadata.refresh(); }
                     if edit_event(&event) {
@@ -201,6 +215,7 @@ fn start_with_notifications(
                                 watcher = Some(active);
                                 registered = paths;
                                 if watch_set_changed {
+                                    tracing::debug!("watch registration invalidates Git");
                                     // Inventory can finish before its paths are
                                     // watched. A single follow-up scan closes that
                                     // gap without delaying the first board render.
@@ -262,13 +277,18 @@ fn start_with_notifications(
                     let probe_cancel = cancellation.clone();
                     let next = tokio::task::spawn_blocking(move || watch_fingerprint(&paths, &probe_cancel)).await;
                     if let Ok(Some(next)) = next {
+                        let next = Arc::new(next);
                         // Refresh on the first sample too: an edit may occur
                         // between watcher registration and this baseline.
-                        let changed = changed_paths(fingerprint.as_ref(), &next);
+                        let changed = changed_paths(fingerprint.as_deref(), &next);
                         if !changed.is_empty() {
                             let (git_changed, metadata_changed) = invalidations(&changed, &probe_state_db, &probe_checkout_roots);
+                            tracing::debug!(?changed, git_changed, metadata_changed, "filesystem metadata invalidation");
                             if git_changed { git.refresh(); }
                             if metadata_changed { metadata.refresh(); }
+                        }
+                        if let Ok(mut observed) = observed_files.write() {
+                            *observed = Some(next.clone());
                         }
                         fingerprint = Some(next);
                     }
@@ -283,7 +303,62 @@ fn start_with_notifications(
 /// A bounded notification-loss backstop, not a recursive checkout scan. The
 /// watch contract includes immediate checkout children and recursive Git
 /// metadata only. Symlinks and generated dependency trees are never followed.
-type WatchFingerprint = BTreeMap<PathBuf, (u64, Option<SystemTime>, bool)>;
+type WatchFingerprint = BTreeMap<PathBuf, FileSignature>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+    is_file: bool,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl FileSignature {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            is_file: metadata.is_file(),
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        }
+    }
+}
+
+fn unobserved_paths(
+    paths: &[PathBuf],
+    observed: &RwLock<Option<Arc<WatchFingerprint>>>,
+) -> Vec<PathBuf> {
+    let Ok(observed) = observed.read() else {
+        return paths.to_vec();
+    };
+    let Some(observed) = observed.as_ref() else {
+        return paths.to_vec();
+    };
+    paths
+        .iter()
+        .filter(|path| {
+            let Some(prior) = observed.get(*path) else {
+                return true;
+            };
+            // Directory metadata cannot prove its descendants unchanged. Missing,
+            // renamed, symlink and unknown paths retain conservative invalidation.
+            !prior.is_file
+                || !std::fs::symlink_metadata(path)
+                    .is_ok_and(|current| FileSignature::from_metadata(&current) == *prior)
+        })
+        .cloned()
+        .collect()
+}
 
 fn changed_paths(previous: Option<&WatchFingerprint>, next: &WatchFingerprint) -> Vec<PathBuf> {
     let Some(previous) = previous else {
@@ -322,10 +397,7 @@ fn watch_fingerprint(
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        result.insert(
-            path.clone(),
-            (metadata.len(), metadata.modified().ok(), metadata.is_dir()),
-        );
+        result.insert(path.clone(), FileSignature::from_metadata(&metadata));
         if descend && metadata.is_dir() {
             let entries = std::fs::read_dir(&path).ok()?;
             for entry in entries {
@@ -579,6 +651,55 @@ fn is_state_db_path(path: &Path, state_db: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_native_events_do_not_repeat_an_observed_file_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("tracked.txt");
+        std::fs::write(&file, "old").unwrap();
+        let paths = BTreeMap::from([(root.path().to_owned(), false)]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let before = watch_fingerprint(&paths, &cancel).unwrap();
+        std::fs::write(&file, "new").unwrap();
+        let after = watch_fingerprint(&paths, &cancel).unwrap();
+        assert_eq!(
+            changed_paths(Some(&before), &after),
+            std::slice::from_ref(&file)
+        );
+        let observed = RwLock::new(Some(Arc::new(after)));
+        assert!(unobserved_paths(std::slice::from_ref(&file), &observed).is_empty());
+        std::fs::write(&file, "newer").unwrap();
+        assert_eq!(
+            unobserved_paths(std::slice::from_ref(&file), &observed),
+            std::slice::from_ref(&file)
+        );
+
+        let after = watch_fingerprint(&paths, &cancel).unwrap();
+        *observed.write().unwrap() = Some(Arc::new(after));
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, "newer").unwrap();
+        std::fs::rename(&replacement, &file).unwrap();
+        assert_eq!(
+            unobserved_paths(std::slice::from_ref(&file), &observed),
+            std::slice::from_ref(&file)
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            unobserved_paths(std::slice::from_ref(&file), &observed),
+            [file]
+        );
+        let directory = root.path().to_owned();
+        assert_eq!(
+            unobserved_paths(std::slice::from_ref(&directory), &observed),
+            [directory]
+        );
+        let unknown = root.path().join("deep/new.txt");
+        assert_eq!(
+            unobserved_paths(std::slice::from_ref(&unknown), &observed),
+            [unknown]
+        );
+        assert!(unobserved_paths(&[], &observed).is_empty());
+    }
 
     #[test]
     fn sqlite_events_do_not_rescan_git_and_unrelated_shared_files_do_not_refresh() {

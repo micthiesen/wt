@@ -160,12 +160,20 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             base.fg(theme::FG_BRIGHT).add_modifier(Modifier::BOLD),
         ),
     ];
-    left.extend(status::chip(&status::status(model, &status::HEADER), base));
+    left.push(Span::styled(
+        format!("  {}", model.refresh_wave.text()),
+        base.fg(theme::FG_DIM),
+    ));
     let pending = status::board_pending(model);
     if !pending.is_empty() {
         left.push(Span::styled("  ", base));
         left.extend(status::pending_chip(&pending, base));
     }
+    // Refresh motion has a permanent slot. Other state follows pending text,
+    // so starting/stopping a fetch never moves that text or right telemetry.
+    let mut source_status = status::status(model, &status::HEADER);
+    source_status.refreshing = false;
+    left.extend(status::chip(&source_status, base));
 
     let mut right: Vec<Span<'static>> = Vec::new();
     if board.automations_paused {
@@ -198,6 +206,28 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
     ));
     right.push(Span::styled(" ", base));
     draw_split(frame, area, left, right);
+}
+
+pub(crate) fn refreshing_count(model: &Model) -> usize {
+    status::refreshing_count(model)
+}
+
+/// Never repaint over a modal or a drag selection.
+pub(crate) fn wave_visible(model: &Model) -> bool {
+    matches!(model.interaction, Interaction::None)
+        && !model.help
+        && !model.show_perf
+        && model.title_prompt.is_none()
+        && model.mouse_selection.is_none()
+}
+
+/// Repaint only the header over the retained screen, without rebuilding rows,
+/// details or outputs. Tiny screens keep the resize message intact.
+pub(crate) fn refresh_header(frame: &mut Frame<'_>, model: &Model) {
+    let area = frame.area();
+    if area.width >= 20 && area.height >= 5 {
+        header(frame, model, Rect::new(area.x, area.y, area.width, 1));
+    }
 }
 
 /// The primary harness's rate-limit windows, each colored by how close it is

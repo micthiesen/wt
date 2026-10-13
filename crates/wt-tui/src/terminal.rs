@@ -210,6 +210,8 @@ async fn run_inner<'a>(
     let mut controller_open = true;
     let mut toast_until = None;
     let mut log_refresh_at: Option<tokio::time::Instant> = None;
+    let mut wave_at: Option<tokio::time::Instant> = None;
+    let mut screen: Option<ratatui::buffer::Buffer> = None;
     source.refresh();
     loop {
         // A Log overlay replaced by another interaction leaves nothing to
@@ -226,7 +228,7 @@ async fn run_inner<'a>(
         if dirty {
             let start = Instant::now();
             let mut copied = None;
-            terminal.draw(|frame| {
+            let drawn = terminal.draw(|frame| {
                 render(frame, &mut model);
                 // Drag selection: highlight while the button is held; on
                 // release, copy the rendered text and clear the highlight.
@@ -239,6 +241,7 @@ async fn run_inner<'a>(
                     }
                 }
             })?;
+            screen = Some(drawn.buffer.clone());
             if let Some(text) = copied.filter(|text| !text.trim().is_empty()) {
                 let chars = text.chars().count();
                 let lines = text.lines().count();
@@ -262,7 +265,12 @@ async fn run_inner<'a>(
                         ToastTone::Failed,
                     ));
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
-                    terminal.draw(|frame| render(frame, &mut model))?;
+                    screen = Some(
+                        terminal
+                            .draw(|frame| render(frame, &mut model))?
+                            .buffer
+                            .clone(),
+                    );
                 }
             }
             model.last_frame_micros = start.elapsed().as_micros();
@@ -276,6 +284,17 @@ async fn run_inner<'a>(
                 }
             }
             dirty = false;
+        }
+        let wave_count = crate::render::refreshing_count(&model);
+        let wave_visible = crate::render::wave_visible(&model)
+            && screen
+                .as_ref()
+                .is_some_and(|screen| screen.area.width >= 20 && screen.area.height >= 5);
+        if wave_visible && model.refresh_wave.active(wave_count) {
+            wave_at
+                .get_or_insert_with(|| tokio::time::Instant::now() + crate::refresh_wave::PERIOD);
+        } else {
+            wave_at = None;
         }
         let pending_deadline = model.next_deadline();
         tokio::select! {
@@ -443,6 +462,36 @@ async fn run_inner<'a>(
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                 }
                 dirty = true;
+            }
+            // No timer at rest. Motion reuses the last complete screen and
+            // only rebuilds its one-row header; sources and pane models are
+            // untouched. Scheduling from now skips missed frames after a busy
+            // input burst or terminal handoff rather than catching up.
+            _ = async {
+                match wave_at {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                wave_at = None;
+                model.refresh_wave.tick(wave_count);
+                if let Some(retained) = &screen {
+                    let mut resized = false;
+                    let drawn = terminal.draw(|frame| {
+                        if frame.area() == retained.area {
+                            frame.buffer_mut().clone_from(retained);
+                            crate::render::refresh_header(frame, &model);
+                        } else {
+                            // A resize can precede its input event.
+                            resized = true;
+                            render(frame, &mut model);
+                        }
+                    })?;
+                    if resized {
+                        screen = Some(drawn.buffer.clone());
+                    }
+                    model.frame_count += 1;
+                }
             }
         }
     }

@@ -119,6 +119,15 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   reliable OS delivery. notify 8.2 teardown purges device events through the
   current id; interference from other streams remains unproven. No test
   deadlines were increased to hide missing notifications.
+  A later macOS CI title-only edit test observed an unexpected Git rescan;
+  its exact triggering event was not logged. Local tracing reproduced only
+  the metadata lane and passed. Inspection found that delayed native file
+  notifications could duplicate an invalidation already issued by that lane.
+  Both now share a file-identity witness; unchanged known regular files skip
+  the redundant invalidation, while directory/unknown paths and OS rescan
+  flags remain conservative. A deterministic delayed-event regression covers
+  later edits, replacements and deletion. The strict CI assertion remains,
+  with bounded event diagnostics if the unexplained failure recurs.
 - **Creation feedback must not create inventory (2026-10-13).** Earlier
   temporary creation rows could overlap the real row during remote refresh.
   Creation progress now lives in the header/footer; only host inventory can
@@ -185,6 +194,16 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   reread up to 2 MiB to prove slot ownership. Match-only caches miss most of
   that cost. Validate negative entries against full file identity and retain
   exact activity paths; unchanged files should cause no content reads.
+- **Refresh animation should stop with its finite drain.** The restored bar
+  wave uses a 10 Hz timer only while refreshing/draining and reuses the prior
+  screen to repaint its header. An isolated debug PTY fixture measured 0.25%
+  of one core idle and 2.50% refreshing (including normal source work), 28
+  distinct header frames in four seconds, 4.8 ms navigation, and zero bytes
+  during settled idle or a help overlay. Header text positions remained fixed;
+  resize and overlay resume passed. Evidence: `/tmp/wt-wave-native-59044/`.
+  This is not an optimized production-board benchmark. Startup checks wait
+  for bounded quiescence before their strict idle assertion; continuous frame
+  emission still fails the fixed deadline.
 - **Batch macOS watcher registration.** notify 8.2 restarts its FSEvents stream
   on each `watch` or `unwatch`. Per-path setup exceeded the native freshness
   regression's five-second registration limit under four test processes.

@@ -122,7 +122,12 @@ returns to the default. The feed is restored from the app log on startup.
 
 The header shows worktree and archive counts, refresh state, paused or queued
 automations, the primary harness's rate-limit windows (colored as they near
-the limit, with time to reset), and the primary harness glyph. The footer shows
+the limit, with time to reset), and the primary harness glyph. Refreshing uses
+a traveling bar wave in a reserved 12-cell slot, so counts, pending text, and
+right-aligned telemetry stay put as refreshes start and finish. The wave follows
+the number of refreshing source lanes across hosts and eases to rest. Its 10 Hz
+timer stops when idle or covered by a modal; animation only repaints the header.
+The footer shows
 the active prompt, a toast (failures in red with a glyph), a source error, or a
 static key hint, and on the right the manager, main, wt, and dotfiles slot
 sessions as `[m] [.] [,] [/]` colored by session state. The manager Claude

@@ -87,6 +87,7 @@ def main():
     shim.chmod(0o755)
     env = dict(os.environ, HOME=str(home), WT_CONFIG=str(config), TERM="xterm-256color",
                PATH=str(tools) + os.pathsep + os.environ["PATH"], WT_UPDATE="off", WT_SKILLS="off",
+               WT_LOG="info,wt::freshness=debug",
                WT_GITHUB="off", WT_AUTOMATIONS="off", WT_TMUX_SOCKET=f"wt-native-qa-{os.getpid()}")
     for key in ("WT_REPO_CONFIG", "WT_REPO_ID", "WT_AGENT", "BUN_INSPECT", "XDG_CONFIG_HOME",
                 "XDG_CACHE_HOME", "XDG_STATE_HOME", "NO_COLOR"):
@@ -126,6 +127,24 @@ def main():
         while time.monotonic() < end:
             read()
 
+    def wait_for_terminal_quiet(timeout=10):
+        # The first visible titles do not mean every startup source is done.
+        # Let the refresh wave finish its bounded drain before measuring idle.
+        # A timer that keeps repainting at 10 Hz never meets this condition
+        # and fails within the timeout; the strict idle assertion follows.
+        previous = len(capture)
+        unchanged_since = time.monotonic()
+
+        def quiet(_):
+            nonlocal previous, unchanged_since
+            current = len(capture)
+            if current != previous:
+                previous = current
+                unchanged_since = time.monotonic()
+            return time.monotonic() - unchanged_since >= 0.5
+
+        wait_for(quiet, timeout=timeout)
+
     def status_call_count():
         return status_calls.read_text().count("status\n")
 
@@ -158,7 +177,7 @@ def main():
         wait_for(lambda data: all(title in re.sub(
             rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data
         ) for title in (b"Fixturework0", b"Fixturework1", b"Fixturework2")))
-        drain_for(1)
+        wait_for_terminal_quiet()
         before = len(capture)
         drain_for(0.5)
         assert len(capture) == before, "idle terminal kept emitting frames"
@@ -208,6 +227,7 @@ def main():
         # quiet interval, bounded above, so that scan cannot be attributed to
         # the following title-only write. Continuous rescans still fail here.
         scans_before_title = wait_for_git_quiet()
+        title_started = time.time()
         # Editing a title is a real controller command and durable write. Check
         # the resulting store, rather than mistaking input echo for success.
         os.write(master, b"t\x15Native UI title\r")
@@ -219,6 +239,24 @@ def main():
         # Include at least one metadata fallback tick after the SQLite write;
         # do not wait for quiet here, which would hide an unwanted Git refresh.
         drain_for(GIT_QUIET_WINDOW)
+        if status_call_count() != scans_before_title:
+            # Preserve the strict assertion while making an intermittent
+            # watcher race diagnosable in CI. These are isolated fixture logs.
+            events = []
+            for path in sorted(app_logs.glob("wt-native.*.log"))[-4:]:
+                with path.open("rb") as log:
+                    log.seek(max(0, path.stat().st_size - 65536))
+                    for line in log:
+                        try:
+                            record = json.loads(line)
+                            timestamp = datetime.fromisoformat(record["timestamp"]).timestamp()
+                        except (ValueError, KeyError, TypeError):
+                            continue
+                        if record.get("target", "").endswith("::freshness") and timestamp >= title_started - 3:
+                            events.append(record)
+            print(json.dumps(dict(title_git_scans_before=scans_before_title,
+                                  title_git_scans_after=status_call_count(),
+                                  recent_freshness_events=events[-30:])), flush=True)
         assert status_call_count() == scans_before_title, "a title-only edit rescanned Git worktrees"
         if args.sections:
             os.write(master, b"l")

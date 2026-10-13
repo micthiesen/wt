@@ -102,6 +102,7 @@ pub struct Model {
     pub list_free_scroll: bool,
     /// Mouse drag selection, in screen cells, while a button is held.
     pub(crate) mouse_selection: Option<crate::mouse::Selection>,
+    pub(crate) refresh_wave: crate::refresh_wave::RefreshWave,
 }
 
 /// What a key press asks the terminal loop to do.
@@ -159,6 +160,7 @@ impl Default for Model {
             log_refresh: None,
             list_free_scroll: false,
             mouse_selection: None,
+            refresh_wave: Default::default(),
         }
     }
 }

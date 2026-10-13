@@ -12,6 +12,7 @@ mod model;
 mod mouse;
 mod mutations;
 mod output;
+mod refresh_wave;
 mod render;
 mod reviews;
 mod terminal;
