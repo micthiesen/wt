@@ -98,14 +98,28 @@ pub fn start(
     cache_root: PathBuf,
     app_log_dir: PathBuf,
 ) -> LeafHandle<ActivitySnapshot> {
-    start_with_watcher(scope, cache_root, app_log_dir, true)
+    start_with_watcher(
+        scope,
+        cache_root,
+        app_log_dir,
+        true,
+        #[cfg(test)]
+        None,
+    )
 }
+
+#[cfg(test)]
+type WatcherSetupGate = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 fn start_with_watcher(
     scope: &TaskScope,
     cache_root: PathBuf,
     app_log_dir: PathBuf,
     native_watch: bool,
+    #[cfg(test)] setup_gate: Option<WatcherSetupGate>,
 ) -> LeafHandle<ActivitySnapshot> {
     let manager_dir = cache_root.join("manager");
     let reports = manager_dir.join("reports.jsonl");
@@ -179,6 +193,13 @@ fn start_with_watcher(
                 paths.commit()?;
             } else {
                 drop(paths);
+            }
+            #[cfg(test)]
+            if let Some((entered, release)) = setup_gate {
+                // Hold the native watcher before ownership returns to the
+                // async source, making startup cancellation deterministic.
+                let _ = entered.send(());
+                release.recv_timeout(Duration::from_secs(10))?;
             }
             Ok::<_, anyhow::Error>(Some(watcher))
         })
@@ -513,16 +534,23 @@ mod tests {
             hosts.spawn(async {
                 let root = tempfile::tempdir().unwrap();
                 let scope = TaskScope::new();
-                let source = start(&scope, root.path().join("cache"), root.path().join("logs"));
-                let mut updates = source.subscribe();
-                // A first data snapshot can precede native watcher setup.
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    updates.wait_for(|snapshot| snapshot.data().is_some()),
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, held) = std::sync::mpsc::channel();
+                let _source = start_with_watcher(
+                    &scope,
+                    root.path().join("cache"),
+                    root.path().join("logs"),
+                    true,
+                    Some((entered, held)),
+                );
+                // This only bounds a broken test harness. The behavioral
+                // deadline starts below, after native setup is held in flight.
+                tokio::time::timeout(Duration::from_secs(10), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                scope.cancel();
+                release.send(()).unwrap();
                 scope.shutdown(Duration::from_secs(5)).await.unwrap();
             });
         }
@@ -539,7 +567,7 @@ mod tests {
         let log = logs.join("wt-native.fixture.log");
         std::fs::write(&log, "").unwrap();
         let scope = TaskScope::new();
-        let source = start_with_watcher(&scope, root.path().join("cache"), logs, false);
+        let source = start_with_watcher(&scope, root.path().join("cache"), logs, false, None);
         let mut updates = source.subscribe();
         tokio::time::timeout(
             Duration::from_secs(2),
