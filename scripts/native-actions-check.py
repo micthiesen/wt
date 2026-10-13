@@ -68,7 +68,17 @@ def write_job(root, run_id, command, config, repo_config, cwd, *, extra=None):
 
 
 def tmux(env, *args, check=True):
-    return subprocess.run(["tmux", *args], env=env, check=check, capture_output=True, text=True)
+    return run_captured(["tmux", *args], env=env, check=check)
+
+
+def run_captured(command, **kwargs):
+    """Keep captured failure evidence visible in CI, including timeout output."""
+    try:
+        return subprocess.run(command, capture_output=True, text=True, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise AssertionError(
+            f"{error}\nstdout:\n{error.stdout!r}\nstderr:\n{error.stderr!r}"
+        ) from error
 
 
 def wait_for(predicate, timeout=8, detail="condition"):
@@ -149,7 +159,10 @@ def main():
         env.pop(key, None)
     tmux(env, "-L", socket, "new-session", "-d", "-s", "smoke-hold", "/bin/sleep", "60")
     tmux(env, "-L", socket, "set-option", "-g", "remain-on-exit", "on")
-    tmux(env, "-L", socket, "kill-session", "-t", "smoke-hold")
+    # Keep the private server alive through both worker phases. Killing its
+    # sole session here destroys the configured server; a replacement loses
+    # remain-on-exit and may exit between the next service's read-only probes.
+    # The finally block owns this holder and the rest of the server together.
 
     run_dir = write_job(
         root,
@@ -212,34 +225,56 @@ def main():
         assert str(global_config) in output and str(repo_config) in output and str(main_clone) in output
         assert "done-stdout" in output and "done-stderr" in errors
         assert meta["futureActionField"] == {"preserve": ["unknown", "metadata"]}
+        assert tmux(env, "-L", socket, "show-option", "-gv", "remain-on-exit").stdout.strip() == "on", \
+            "the configured private tmux server did not survive the first worker"
 
-        helper = subprocess.run(
-            [
-                str(service_fixture),
-                str(binary),
-                str(root),
-                str(main_clone),
-                socket,
-                str(global_config),
-                str(repo_config),
-            ],
-            env=env,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-        service_lines = helper.stdout.strip().splitlines()
-        assert len(service_lines) >= 3, helper.stdout
-        service_run_id, service_run_dir, service_session = service_lines[-3:]
-        service_run_dir = Path(service_run_dir)
-        service_child = root / "child.pid"
-        service_pid = int(service_child.read_text())
-        wait_for(lambda: (service_run_dir / "done.json").exists(), detail="service kill completion")
-        service_done = json.loads((service_run_dir / "done.json").read_text())
-        assert service_done["status"] == "killed", service_done
-        wait_for(lambda: not process_is_live(service_pid), detail="service descendant reaping")
-        assert service_run_id in service_run_dir.name
+        def check_service(service_root, service_socket, service_repo_config):
+            try:
+                helper = run_captured(
+                    [
+                        str(service_fixture), str(binary), str(service_root), str(main_clone),
+                        service_socket, str(global_config), str(service_repo_config),
+                    ],
+                    env=dict(env, WT_TMUX_SOCKET=service_socket, WT_REPO_CONFIG=str(service_repo_config)),
+                    check=True,
+                    timeout=90,
+                )
+            except AssertionError as error:
+                panes = tmux(env, "-L", service_socket, "list-panes", "-a", "-F",
+                             "#{pane_id} #{session_name} dead=#{pane_dead} status=#{pane_dead_status}", check=False)
+                captures = []
+                for line in panes.stdout.splitlines()[:8]:
+                    capture = tmux(env, "-L", service_socket, "capture-pane", "-p", "-t", line.split()[0], check=False)
+                    captures.append(f"{line}\n{capture.stdout}\n{capture.stderr}")
+                raise AssertionError(f"{error}\nworker panes: {panes.stdout!r} {panes.stderr!r}\n" + "\n".join(captures)) from error
+            service_lines = helper.stdout.strip().splitlines()
+            assert len(service_lines) >= 3, helper.stdout
+            service_run_id, service_run_dir, service_session = service_lines[-3:]
+            service_run_dir = Path(service_run_dir)
+            service_pid = int((service_root / "child.pid").read_text())
+            wait_for(lambda: (service_run_dir / "done.json").exists(), detail="service kill completion")
+            service_done = json.loads((service_run_dir / "done.json").read_text())
+            assert service_done["status"] == "killed", service_done
+            wait_for(lambda: not process_is_live(service_pid), detail="service descendant reaping")
+            assert service_run_id in service_run_dir.name
+
+        check_service(root, socket, repo_config)
+        # Production headless actions must also start with no tmux server.
+        # Exercise that contract separately from the configured warm server.
+        cold_root = root / "cold-service"
+        cold_root.mkdir()
+        cold_config = cold_root / "repo-config.toml"
+        cold_config.write_text(repo_config.read_text().replace(
+            "[paths]\n", "[paths]\n" +
+            f"log_dir = {json.dumps(str(cold_root / 'logs'))}\n" +
+            f"lock_dir = {json.dumps(str(cold_root / 'locks'))}\n"
+        ))
+        cold_socket = socket + "-cold"
+        absent = tmux(env, "-L", cold_socket, "has-session", check=False)
+        assert absent.returncode != 0 and (
+            "no server running" in absent.stderr or "no such file or directory" in absent.stderr.lower()
+        ), absent
+        check_service(cold_root, cold_socket, cold_config)
 
         result = {
             "selector_paths_preserved": True,
@@ -247,14 +282,16 @@ def main():
             "durable_done_record": done["status"],
             "unknown_metadata_preserved": True,
             "service_duplicate_guard": "AlreadyRunning",
-            "service_kill_status": service_done["status"],
+            "service_kill_status": "killed",
             "service_descendant_reaped": True,
+            "service_cold_server_start": True,
             "private_tmux_socket": socket,
         }
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
     finally:
         tmux(env, "-L", socket, "kill-server", check=False)
+        tmux(env, "-L", socket + "-cold", "kill-server", check=False)
 
 
 if __name__ == "__main__":

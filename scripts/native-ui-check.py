@@ -75,9 +75,11 @@ def main():
     delay_inventory = root / "delay-inventory"
     started = root / "git-delayed"
     status_calls = root / "git-status-calls"
+    fetch_calls = root / "git-fetch-calls"
     real_git = shutil.which("git")
     shim = tools / "git"
     shim.write_text("#!/usr/bin/env python3\nimport os, sys, time\nfrom pathlib import Path\n"
+                    f"if 'fetch' in sys.argv:\n    with open({str(fetch_calls)!r}, 'a') as log: log.write('fetch\\n')\n"
                     f"if 'status' in sys.argv:\n    with open({str(status_calls)!r}, 'a') as log: log.write('status\\n')\n"
                     f"if 'status' in sys.argv and Path({str(delay)!r}).exists():\n"
                     f"    Path({str(started)!r}).touch()\n    time.sleep(2)\n"
@@ -88,7 +90,11 @@ def main():
     env = dict(os.environ, HOME=str(home), WT_CONFIG=str(config), TERM="xterm-256color",
                PATH=str(tools) + os.pathsep + os.environ["PATH"], WT_UPDATE="off", WT_SKILLS="off",
                WT_LOG="info,wt::freshness=debug",
-               WT_GITHUB="off", WT_AUTOMATIONS="off", WT_TMUX_SOCKET=f"wt-native-qa-{os.getpid()}")
+               # A manual refresh queues origin work behind its ten-second floor.
+               # That fetch legitimately invalidates Git, even if it completes
+               # during the later title-only assertion. This fixture measures
+               # local source isolation; origin maintenance has its own checks.
+               WT_FETCH_ORIGIN="off", WT_GITHUB="off", WT_AUTOMATIONS="off", WT_TMUX_SOCKET=f"wt-native-qa-{os.getpid()}")
     for key in ("WT_REPO_CONFIG", "WT_REPO_ID", "WT_AGENT", "BUN_INSPECT", "XDG_CONFIG_HOME",
                 "XDG_CACHE_HOME", "XDG_STATE_HOME", "NO_COLOR"):
         env.pop(key, None)
@@ -257,6 +263,7 @@ def main():
             print(json.dumps(dict(title_git_scans_before=scans_before_title,
                                   title_git_scans_after=status_call_count(),
                                   recent_freshness_events=events[-30:])), flush=True)
+        assert not fetch_calls.exists(), "background origin fetch escaped the local UI fixture isolation"
         assert status_call_count() == scans_before_title, "a title-only edit rescanned Git worktrees"
         if args.sections:
             os.write(master, b"l")
@@ -341,7 +348,7 @@ def main():
         assert b"\x1b[?1049l" in capture, "alternate screen was not restored"
         result = dict(slow_git_seconds=2, injected_key_to_output_ms=latency_ms,
                       idle_no_frames=True, external_edit_refreshed=True, title_persisted=True,
-                      title_edit_git_scans=0,
+                      title_edit_git_scans=0, background_origin_fetches=0,
                       section_controls=args.sections,
                       history_perf_and_hard_refresh=args.sections,
                       feed_backfill_append_and_seen=args.feeds,

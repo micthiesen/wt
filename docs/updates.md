@@ -52,6 +52,51 @@ The startup offer checks at most once per day. `[update] startup_check = false`
 or `WT_UPDATE=off` disables it. A declined build remains suppressed until a
 newer build appears; explicitly running `wt update` is the reapply path.
 
+## Contributor validation and release gate
+
+The complete native end-to-end suite has one entry point shared with the Linux
+and macOS CI jobs: `python3 scripts/native-check.py`. It runs installation,
+release recovery, both terminal/UI checks, session handoff, lifecycle, cleanup,
+resource ownership, dev servers, actions, remote workers, host reconnect,
+commands and stages, plus the macOS events-service check on macOS. Child output
+streams directly to the terminal; a failing check stops the suite with its exit
+status and name. The runner prints the retained diagnostics directory.
+
+Install the pinned Rust toolchain, Python 3, tmux, SSH tools and lsof first
+(Linux CI also installs openssh-server). From the repository root, set
+`WT_BUILD_ID` to the full candidate commit SHA, then run:
+
+```sh
+cargo build --workspace --bins --examples --locked
+python3 scripts/native-check.py --binary target/debug/wt --output /tmp/wt-native-validation
+```
+
+The runner requires `WT_BUILD_ID` and existing `wt` and `wt-launcher` binaries.
+It probes the candidate and refuses a build identity that differs from
+`WT_BUILD_ID`, so an older local binary cannot silently pass as the candidate.
+`--build` performs the same prerequisite Cargo build when needed; CI keeps its
+separate cached build step. The existing bootstrap fixture also builds its
+launcher. Unit tests and lint are separate gates: run the workspace nextest and
+doc tests, formatting, Clippy and dependency checks as defined in Rust CI.
+Running only those gates does not verify native end-to-end behavior.
+
+Before updating `main` or publishing a stable release:
+
+1. Run the complete local unit/lint gate and native suite against the candidate.
+2. Push the candidate commit to a verification branch, then run
+   `gh workflow run release.yml --ref <verification-branch>`. Manual dispatch
+   defaults to `publish=false`, so this verifies without publishing a release.
+3. Require green Linux and macOS unit and native jobs, lint, and all release
+   packaging jobs for that exact commit SHA. A green run for an earlier commit
+   or only one platform is insufficient.
+4. Fast-forward `main` to that same verified SHA. Tag only that proven commit
+   when ready to publish. If `main` has moved or the code changes, reconcile it
+   on the verification branch and repeat validation before promotion.
+
+Use the verification branch to discover and fix failures before they reach
+`main`. This is a procedure using the existing release workflow, not a separate
+publishing system.
+
 ## Durable application data
 
 Application state and release state are separate:

@@ -1329,10 +1329,26 @@ fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Act
 }
 
 fn tmux_start_rejected(error: &TmuxError) -> bool {
-    // A completed non-zero tmux command is a server response. Timeout,
-    // cancellation, spawn, and transport failures do not prove the request was
-    // rejected and therefore leave its durable start claim ambiguous.
-    matches!(error, TmuxError::Command { .. })
+    // A non-zero client exit can also mean the server disappeared after
+    // accepting the command. Only an explicit pre-execution rejection proves
+    // this run did not start; unknown responses retain the durable claim.
+    let TmuxError::Command {
+        operation: "new-session",
+        stderr,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    let message = stderr.trim();
+    [
+        "invalid session name",
+        "bad session name:",
+        "duplicate session:",
+        "usage: new-session",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
 }
 
 fn start_ambiguous_error(
@@ -1395,6 +1411,29 @@ mod tests {
             classify_start_error(&rejected, &Ok(true)),
             StartErrorDisposition::Active
         );
+        for stderr in [
+            "server exited unexpectedly",
+            "lost server",
+            "Connection reset by peer",
+            "unrecognized server failure",
+        ] {
+            let lost = TmuxError::Command {
+                operation: "new-session",
+                code: Some(1),
+                stderr: stderr.into(),
+                stdout: String::new(),
+            };
+            assert_eq!(
+                classify_start_error(&lost, &Ok(false)),
+                StartErrorDisposition::Ambiguous,
+                "{stderr}"
+            );
+            assert_eq!(
+                classify_start_error(&lost, &Ok(true)),
+                StartErrorDisposition::Active,
+                "{stderr}"
+            );
+        }
         let cancelled = TmuxError::Process {
             operation: "new-session",
             source: ProcessError::Cancelled {

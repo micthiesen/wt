@@ -3,6 +3,7 @@
 
 use std::{collections::BTreeMap, env, path::PathBuf, time::Duration};
 
+use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 use wt_actions::{
     ActionRequest, ActionRunKind, ActionService, ActionServiceConfig, ActionServiceError,
@@ -66,7 +67,10 @@ async fn main() -> anyhow::Result<()> {
         ]),
     };
     let cancellation = CancellationToken::new();
-    let started = service.start(request.clone(), &cancellation).await?;
+    let started = service
+        .start(request.clone(), &cancellation)
+        .await
+        .context("start fixture action")?;
     let duplicate = service.start(request, &cancellation).await;
     if !matches!(duplicate, Err(ActionServiceError::AlreadyRunning(_))) {
         anyhow::bail!("duplicate action was not rejected: {duplicate:?}");
@@ -77,8 +81,13 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
-    if !service.kill("fixture-action", &cancellation).await? {
+    .await
+    .context("wait for fixture child.pid")?;
+    if !service
+        .kill("fixture-action", &cancellation)
+        .await
+        .context("kill fixture action")?
+    {
         anyhow::bail!("running action disappeared before kill");
     }
     println!(

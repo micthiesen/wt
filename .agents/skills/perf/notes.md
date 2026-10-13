@@ -126,8 +126,17 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   Both now share a file-identity witness; unchanged known regular files skip
   the redundant invalidation, while directory/unknown paths and OS rescan
   flags remain conservative. A deterministic delayed-event regression covers
-  later edits, replacements and deletion. The strict CI assertion remains,
-  with bounded event diagnostics if the unexplained failure recurs.
+  later edits, replacements and deletion. Subsequent CI run 38439981305
+  identified the title-test failure precisely: SQLite invalidated metadata
+  only, then a queued origin fetch changed `FETCH_HEAD`, objects and remote
+  refs. The earlier `r` scheduled that fetch behind its ten-second floor;
+  `WT_GITHUB=off` does not disable origin maintenance. Holding a real second
+  fetch until the title save reproduced the failure locally (29 to 34 Git
+  scans; `/tmp/wt-ui-origin-repro-20261013`). The local UI fixture now sets
+  `WT_FETCH_ORIGIN=off` and asserts zero fetch attempts before evaluating
+  title isolation. Sections/feeds and TERM checks pass with zero title Git
+  scans and the unchanged deadlines. This fixes fixture attribution, not a
+  production watcher defect; broad OS-delivery reliability remains open.
 - **Creation feedback must not create inventory (2026-10-13).** Earlier
   temporary creation rows could overlap the real row during remote refresh.
   Creation progress now lives in the header/footer; only host inventory can
