@@ -223,7 +223,7 @@ pub fn write_terminal_config(
     fs::create_dir_all(cache_root)?;
     let styles = cached_palette_styles(cache_root);
     let content = format!(
-        "source-file -q {}\n{}\n{}\nset -g remain-on-exit-format 'Command exited (#{{pane_dead_status}}). Enter: retry | F12: return to wt'\nbind-key -n Enter if-shell -F '#{{pane_dead}}' 'set-option -u @wt-harness-session-id ; respawn-pane' 'send-keys Enter'\nbind-key -n F10 detach-client\nbind-key -n F11 detach-client\nbind-key -n F12 detach-client\n",
+        "source-file -q {}\n{}\n{}\nset -g remain-on-exit-format 'Command exited (#{{?@wt-terminal-exit-status,#{{@wt-terminal-exit-status}},#{{pane_dead_status}}}}). Enter: retry | F12: return to wt'\nbind-key -n Enter if-shell -F '#{{pane_dead}}' 'set-option -u @wt-harness-session-id ; respawn-pane' 'send-keys Enter'\nbind-key -n F10 detach-client\nbind-key -n F11 detach-client\nbind-key -n F12 detach-client\n",
         tmux_config_quote(&home.join(".tmux.conf").to_string_lossy()),
         preamble.unwrap_or(DEFAULT_TERMINAL_CONFIG),
         styles,
@@ -580,10 +580,30 @@ impl TmuxClient {
         }
         if !session.command.is_empty() {
             let session_command = if self.retain_failure {
-                // Set this before exec, so even immediate failure is retained.
-                // Global retention would strand background action/dev workers.
-                ["/bin/sh".to_owned(), "-c".to_owned(), "tmux set-option -p -t \"$TMUX_PANE\" remain-on-exit failed || exit; exec \"$@\"".to_owned(), "sh".to_owned()]
-                    .into_iter().chain(session.command.iter().cloned()).collect::<Vec<_>>()
+                // Decide retention before the pane process exits instead of
+                // relying on tmux's `failed` status reaper. Linux tmux with
+                // libutempter can lose SIGCHLD and retain successful commands
+                // forever (upstream tmux/tmux#4559). Reset on every retry.
+                let supervisor = r#"tmux set-option -p -t "$TMUX_PANE" remain-on-exit off || exit
+tmux set-option -p -t "$TMUX_PANE" @wt-terminal-supervisor "$$" || exit
+tmux set-option -pu -t "$TMUX_PANE" @wt-terminal-exit-status
+trap ':' INT QUIT
+"$@"
+wt_terminal_status=$?
+if [ "$wt_terminal_status" -ne 0 ]; then
+    tmux set-option -p -t "$TMUX_PANE" @wt-terminal-exit-status "$wt_terminal_status"
+    tmux set-option -p -t "$TMUX_PANE" remain-on-exit on
+fi
+exit "$wt_terminal_status""#;
+                [
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    supervisor.to_owned(),
+                    "sh".to_owned(),
+                ]
+                .into_iter()
+                .chain(session.command.iter().cloned())
+                .collect::<Vec<_>>()
             } else {
                 session.command.clone()
             };

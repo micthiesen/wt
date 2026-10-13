@@ -112,8 +112,13 @@ session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
 Interactive tmux panes retain nonzero command exits so startup failures remain
 inspectable. Enter retries only a dead pane and clears its stale harness identity;
-successful exits close normally. Retention is pane-local and enabled before exec,
-never imposed on background action or development-server sessions. The session
+successful exits close normally. A pane-owned supervisor resets retention before
+each foreground command, records its exit status, and enables pane-local retention
+only for failures. This avoids older tmux/libutempter exit-status races; background
+action and development-server sessions do not use the supervisor. Codex identity
+recovery may inspect its sole direct child only after validating the supervisor
+marker, then rechecks the child's PID, start time and executable with the pane.
+The session
 source batches pane inventory with session inventory, reports new failed panes to
 attention, and excludes dead panes from live-agent observations.
 

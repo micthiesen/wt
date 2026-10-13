@@ -293,8 +293,16 @@ impl CodexMessenger {
         let Some(pid) = panes[0].pid else {
             return Ok(None);
         };
-        let mut command =
-            CommandSpec::new("lsof").args(["-nP", "-a", "-p", &pid.to_string(), "-Fn"]);
+        // wt's terminal supervisor remains the pane process so it can retain
+        // failures reliably on older tmux. Its foreground harness is a direct
+        // child; include only children whose ownership we can recheck below.
+        let child = self.supervised_child(&panes[0], cancel).await;
+        let pids = std::iter::once(pid)
+            .chain(child.iter().map(|child| child.0))
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut command = CommandSpec::new("lsof").args(["-nP", "-a", "-p", &pids, "-Fn"]);
         command.cwd = Some(self.paths.home.clone());
         command.timeout = Duration::from_secs(2);
         let result = match self.runner.run(command, cancel).await {
@@ -327,11 +335,42 @@ impl CodexMessenger {
             && after[0].id == panes[0].id
             && after[0].pid == Some(pid)
             && !after[0].dead
+            && (child.is_none() || self.supervised_child(&after[0], cancel).await == child)
         {
             Ok(found)
         } else {
             Ok(None)
         }
+    }
+
+    async fn supervised_child(
+        &self,
+        pane: &wt_tmux::PaneInfo,
+        cancel: &CancellationToken,
+    ) -> Option<(u32, String)> {
+        let pid = pane.pid?;
+        let owner = self
+            .tmux
+            .get_option(
+                &OptionScope::Pane(PaneTarget::id(&pane.id)),
+                "@wt-terminal-supervisor",
+                cancel,
+            )
+            .await
+            .ok()
+            .flatten()?;
+        if owner != pid.to_string() {
+            return None;
+        }
+        let mut command = CommandSpec::new("ps").args([
+            "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "comm=",
+        ]);
+        command.timeout = Duration::from_secs(2);
+        let output = self.runner.run(command, cancel).await.ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        sole_child(&output.stdout_text(), pid)
     }
 
     async fn cli_queue(
@@ -513,6 +552,19 @@ impl CodexMessenger {
 /// Only the pane process's exact writer lock under this Codex home proves
 /// ownership. A shared daemon's loaded threads, resume arguments, and rollout
 /// recency cannot identify which conversation its TUI currently displays.
+fn sole_child(processes: &str, parent: u32) -> Option<(u32, String)> {
+    let mut children = processes.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let pid = fields.next()?.parse::<u32>().ok()?;
+        let ppid = fields.next()?.parse::<u32>().ok()?;
+        let started = fields.collect::<Vec<_>>();
+        (ppid == parent && pid > 0 && pid != parent && started.len() >= 6)
+            .then(|| (pid, started.join(" ")))
+    });
+    let child = children.next()?;
+    children.next().is_none().then_some(child)
+}
+
 fn writer_identity(
     output: &str,
     codex_home: &Path,
@@ -648,6 +700,104 @@ mod tests {
         ] {
             assert_eq!(writer_identity(output, home, &sessions), None, "{output}");
         }
+    }
+
+    #[test]
+    fn supervised_identity_requires_one_exact_child_and_keeps_birth_identity() {
+        let processes = "12 10 Tue Oct 13 10:00:00 2026 codex\n13 12 Tue Oct 13 10:00:00 2026 codex\n14 1 Tue Oct 13 10:00:00 2026 codex\ninvalid\n";
+        assert_eq!(
+            sole_child(processes, 10),
+            Some((12, "Tue Oct 13 10:00:00 2026 codex".into()))
+        );
+        assert_eq!(
+            sole_child(
+                &format!("{processes}15 10 Tue Oct 13 10:00:00 2026 codex\n"),
+                10
+            ),
+            None
+        );
+        assert_eq!(sole_child("12 10 missing-birth\n", 10), None);
+        assert_ne!(
+            sole_child(processes, 10),
+            sole_child(&processes.replace("10:00:00", "10:00:01"), 10)
+        );
+        assert_ne!(
+            sole_child(processes, 10),
+            sole_child(&processes.replace("codex", "tmux"), 10)
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_identity_recovers_supervised_and_exec_owners_but_not_unmarked_children() {
+        use wt_platform::process::ProcessRunner;
+        use wt_tmux::{CreateSession, TmuxServer};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = CodexPaths::new(&root, root.join("cache"));
+        let locks = paths.codex_home.join("thread-writer-locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let tmux = TmuxClient::new(
+            ProcessRunner::default(),
+            TmuxServer::at(temp.path().join("tmux.sock")).with_config_file("/dev/null"),
+        );
+        let cancel = CancellationToken::new();
+        let messenger = CodexMessenger::new(paths, ProcessRunner::default(), tmux.clone());
+        for (name, supervised, child_only) in [
+            ("exec", false, false),
+            ("wrapped", true, false),
+            ("unmarked", false, true),
+        ] {
+            let ready = temp.path().join(name);
+            let script = if child_only {
+                "sh -c 'exec 3>\"$1\"; touch \"$2\"; exec sleep 60' sh \"$1\" \"$2\" & wait"
+            } else {
+                "exec 3>\"$1\"; touch \"$2\"; exec sleep 60"
+            };
+            let client = if supervised {
+                tmux.clone().with_failure_retention()
+            } else {
+                tmux.clone()
+            };
+            client
+                .create_session(
+                    &CreateSession {
+                        name: name.into(),
+                        cwd: temp.path().into(),
+                        command: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            script.into(),
+                            "sh".into(),
+                            locks.join("thread-a.lock").to_string_lossy().into_owned(),
+                            ready.to_string_lossy().into_owned(),
+                        ],
+                        width: None,
+                        height: None,
+                    },
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "writer did not start"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let found = messenger
+                .recover_live_identity(name, &[session("thread-a")], &cancel)
+                .await
+                .unwrap();
+            assert_eq!(
+                found.as_deref(),
+                (!child_only).then_some("thread-a"),
+                "{name}"
+            );
+            client.kill_session(name, &cancel).await.unwrap();
+        }
+        // The last kill stops this private server.
     }
 
     #[test]

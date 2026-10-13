@@ -73,7 +73,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y tmux openssh-server
+          sudo apt-get install -y tmux openssh-server lsof
       - name: Install terminal integration dependencies (macOS)
         if: runner.os == 'macOS'
         env:
@@ -109,7 +109,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y tmux openssh-server
+          sudo apt-get install -y tmux openssh-server lsof
       - name: Install terminal integration dependencies (macOS)
         if: runner.os == 'macOS'
         env:

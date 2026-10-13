@@ -307,7 +307,7 @@ async fn distinct_session_environments_work_on_one_existing_server() {
                         .to_string(),
                 ),
             ]);
-        let script = "command -v wt > \"$1\"; wt > /dev/null; printf '%s\\n%s\\n' \"$WT_CONFIG\" \"$WT_REPO_CONFIG\" > \"$2\"; sleep 30";
+        let script = "command -v wt > \"$1\"; wt > /dev/null; printf '%s\\n%s\\n' \"$WT_CONFIG\" \"$WT_REPO_CONFIG\" > \"$2.tmp\"; mv \"$2.tmp\" \"$2\"; sleep 30";
         let session = CreateSession {
             name: name.into(),
             cwd: temp.path().to_path_buf(),
@@ -754,27 +754,144 @@ async fn failed_commands_remain_visible_and_retry_without_killing_live_commands(
         let enter = client.run("if-shell", ["if-shell", "-t", "=failure:", "-F", "#{pane_dead}", "respawn-pane -t =failure:", "send-keys -t =failure: Enter"], None, &cancel).await?;
         assert!(enter.status.success());
         assert_eq!(client.list_panes("failure", &cancel).await?[0].pid, pid);
+        // A successful retry must clear its previous failure retention.
+        client.send_keys(&PaneTarget::active_session_pane("failure"), &["C-d"], &cancel).await?;
+        await_session_exit(&client, "failure", &cancel).await?;
         client.create_session(&CreateSession {
             name: "success".into(), cwd: temp.path().into(),
             command: vec!["true".into()], width: None, height: None,
         }, &cancel).await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while client.session_exists("success", &cancel).await? {
-            assert!(tokio::time::Instant::now() < deadline, "successful exit was retained");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        await_session_exit(&client, "success", &cancel).await?;
         let background = TmuxClient::new(ProcessRunner::default(), client.server().clone());
         background.create_session(&CreateSession {
             name: "background".into(), cwd: temp.path().into(),
             command: vec!["false".into()], width: None, height: None,
         }, &cancel).await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while background.session_exists("background", &cancel).await? {
-            assert!(tokio::time::Instant::now() < deadline, "background worker was retained");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        await_session_exit(&background, "background", &cancel).await?;
         Ok::<(), crate::TmuxError>(())
     }.await;
     client.kill_server(&cancel).await.unwrap();
     result.unwrap();
+}
+
+async fn await_session_exit(
+    client: &TmuxClient,
+    name: &str,
+    cancel: &CancellationToken,
+) -> Result<(), crate::TmuxError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.session_exists(name, cancel).await? {
+        if tokio::time::Instant::now() >= deadline {
+            let target = exact_pane_target(name);
+            let detail = client.run("list-panes", ["list-panes", "-t", &target, "-F", "pid=#{pane_pid} dead=#{pane_dead} status=#{pane_dead_status} command=#{pane_current_command}"], None, cancel).await?;
+            let screen = client
+                .capture_pane(&PaneTarget::active_session_pane(name), None, cancel)
+                .await?;
+            panic!(
+                "session {name} unexpectedly retained: {}\n{screen}",
+                detail.stdout_text()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervised_terminal_retains_signal_failures_and_preserves_quoted_arguments() {
+    let temp = tempdir().unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("tmux.sock")).with_config_file("/dev/null"),
+    )
+    .with_failure_retention();
+    let cancel = CancellationToken::new();
+    for (name, command, expected) in [
+        ("exit", vec!["sh", "-c", "exit 27"], 27),
+        ("signal", vec!["sh", "-c", "kill -TERM $$"], 143),
+        ("interrupt", vec!["sh", "-c", "kill -INT $$"], 130),
+        (
+            "terminal",
+            vec![
+                "sh",
+                "-c",
+                "test -t 0 && test -t 1 && printf READY && exec cat",
+            ],
+            130,
+        ),
+        (
+            "quoted",
+            vec![
+                "sh",
+                "-c",
+                "test \"$1\" = 'spaces ; $(false)'",
+                "sh",
+                "spaces ; $(false)",
+            ],
+            0,
+        ),
+    ] {
+        client
+            .create_session(
+                &CreateSession {
+                    name: name.into(),
+                    cwd: temp.path().into(),
+                    command: command.into_iter().map(str::to_owned).collect(),
+                    width: None,
+                    height: None,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+        if name == "terminal" {
+            let target = PaneTarget::active_session_pane(name);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !client
+                .capture_pane(&target, Some(10), &cancel)
+                .await
+                .unwrap()
+                .contains("READY")
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "foreground command lacks a TTY"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            client.send_keys(&target, &["C-c"], &cancel).await.unwrap();
+        }
+        if expected == 0 {
+            await_session_exit(&client, name, &cancel).await.unwrap();
+            continue;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = client
+                .run(
+                    "display-message",
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &exact_pane_target(name),
+                        "#{pane_dead}:#{@wt-terminal-exit-status}",
+                    ],
+                    None,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            if status.stdout_text().trim() == format!("1:{expected}") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{name}: expected {expected}, got {}",
+                status.stdout_text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    client.kill_server(&cancel).await.unwrap();
 }
