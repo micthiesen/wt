@@ -18,6 +18,8 @@ import pty
 import re
 import select
 import shutil
+import shlex
+import sys
 import signal
 import sqlite3
 import struct
@@ -40,7 +42,10 @@ def main():
     parser.add_argument("--sections", action="store_true", help="also exercise filing and renaming through the terminal")
     parser.add_argument("--feeds", action="store_true", help="also verify log backfill, seen state and searchable help")
     parser.add_argument("--create", action="store_true", help="verify immediate creation feedback and background setup")
+    parser.add_argument("--removal", action="store_true", help="verify overlapping removal menus and quit while a durable removal is held")
     args = parser.parse_args()
+    if args.removal and (args.create or args.sections or args.exit_signal != "quit"):
+        parser.error("--removal uses its own quit scenario; do not combine with --create, --sections or --exit-signal")
     binary = args.binary.resolve()
     root = args.output.resolve()
     spec = importlib.util.spec_from_file_location("wt_perf", Path(__file__).with_name("perf-baseline.py"))
@@ -57,6 +62,23 @@ def main():
     if args.create:
         command = f"touch {install_started}; sleep 8; touch {install_finished}"
         config.write_text(config.read_text() + "[lifecycle]\ninstall_command = " + json.dumps(command) + "\n")
+    removal_started = root / "removal-started"
+    removal_release = root / "removal-release"
+    removal_locks = root / "removal-locks"
+    if args.removal:
+        hook = root / "held-removal.py"
+        hook.write_text(
+            "from pathlib import Path\nimport time\n"
+            f"started = Path({str(removal_started)!r}); release = Path({str(removal_release)!r})\n"
+            "started.write_text(Path.cwd().name)\n"
+            "deadline = time.monotonic() + 45\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() > deadline: raise SystemExit('owned removal fixture timed out')\n"
+            "    time.sleep(.05)\n"
+        )
+        config.write_text(config.read_text().replace(
+            "[paths]\n", "[paths]\nlock_dir = " + json.dumps(str(removal_locks)) + "\n"
+        ) + "\n[lifecycle]\ndestroy_command = " + json.dumps(shlex.join([sys.executable, str(hook)])) + "\n")
     feed_log = app_logs / "wt-native.fixture.log"
 
     def append_feed(text, channel="activity"):
@@ -315,7 +337,36 @@ def main():
             assert stored_slug("bench-001").get("manualTitle") == "Native UI title"
             assert stored_slug("bench-001").get("section") == "Today"
             drain_for(0.3)
-        if args.create:
+        removal_menu_ms = None
+        removal_quit_started = None
+        if args.removal:
+            def compact_terminal(data):
+                return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data).lower()
+
+            os.write(master, b"gd")
+            first_menu = wait_for(lambda data: b"removeworktree?" in compact_terminal(data))
+            (root / "first-removal-confirm.ansi").write_bytes(first_menu)
+            os.write(master, b"y")
+            wait_for(lambda _: removal_started.exists(), timeout=10)
+            first_removed = removal_started.read_text()
+            assert first_removed == "bench-000", first_removed
+            drain_for(0.1)
+            # Pending removal archives A in presentation. g must now select B;
+            # its prompt must not wait for A's accepted teardown to finish.
+            removal_menu_started = time.monotonic()
+            os.write(master, b"gd")
+            second_menu = wait_for(lambda data: b"removeworktree?" in compact_terminal(data)
+                                   and re.search(rb"(bench-00[12])\(bench/\1\)", compact_terminal(data)), timeout=3)
+            second_retained = re.search(rb"(bench-00[12])\(bench/\1\)", compact_terminal(second_menu)).group(1).decode()
+            removal_menu_ms = (time.monotonic() - removal_menu_started) * 1000
+            (root / "second-removal-confirm.ansi").write_bytes(second_menu)
+            assert not removal_release.exists()
+            assert (root / "worktrees" / first_removed).exists()
+            os.write(master, b"\x1b")
+            wait_for(lambda data: bool(data))
+            removal_quit_started = time.monotonic()
+            os.write(master, b"q")
+        elif args.create:
             delay_inventory.touch()
             os.write(master, b"n")
             wait_for(lambda data: b"New worktree name:" in data)
@@ -327,7 +378,10 @@ def main():
             # its canonical identity. F12 reports its pending state instead of
             # attaching a different row or queueing an eventual attachment.
             os.write(master, b"\x1b[24~")
-            wait_for(lambda data: b"Worktree is still being created" in data)
+            # Differential rendering can reuse "Work" from the preceding
+            # "Working…" toast. Assert the distinctive fresh pending-state
+            # words rather than requiring the entire sentence in one patch.
+            wait_for(lambda data: all(word in data for word in (b"still", b"being", b"created")))
             # Navigation remains ordinary while the creation read is blocked.
             # Its delayed plan and completion must not reclaim this selection.
             os.write(master, b"k")
@@ -363,11 +417,26 @@ def main():
                 assert os.waitstatus_to_exitcode(status) == 0
                 break
         assert reaped, "native terminal did not shut down"
-        if args.exit_signal == "quit" and not args.create:
+        if args.exit_signal == "quit" and not args.create and not args.removal:
             with sqlite3.connect(f"file:{root / 'state/wt.sqlite'}?mode=ro", uri=True) as state:
                 records = [json.loads(row[0]) for row in state.execute("SELECT data FROM repository_state")]
             assert any(record.get("slugs", {}).get("bench-001", {}).get("manualTitle") == "Queued title survives quit"
                        for record in records), "quitting dropped an accepted title write"
+        removal_quit_ms = None
+        if args.removal:
+            removal_quit_ms = (time.monotonic() - removal_quit_started) * 1000
+            assert removal_quit_ms < 4000, "quit waited for held durable removal"
+            assert (root / "worktrees" / first_removed).exists(), "removal finished before release"
+            removal_release.touch()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                jobs = [json.loads(path.read_text()) for path in (removal_locks / "destroy-jobs").glob("*.json")]
+                if any(job["state"] == "succeeded" for job in jobs):
+                    break
+                select.select([], [], [], 0.05)
+            assert any(job["state"] == "succeeded" for job in jobs), jobs
+            assert not (root / "worktrees" / first_removed).exists()
+            assert (root / "worktrees" / second_retained).exists(), "cancelled second prompt removed its target"
         assert b"\x1b[?1049l" in capture, "alternate screen was not restored"
         result = dict(slow_git_seconds=2, injected_key_to_output_ms=latency_ms,
                       idle_no_frames=True, external_edit_refreshed=True, title_persisted=True,
@@ -377,13 +446,18 @@ def main():
                       feed_backfill_append_and_seen=args.feeds,
                       searchable_help=args.feeds,
                       delayed_palette_chord=True,
-                      accepted_write_survived_quit=args.exit_signal == "quit" and not args.create,
+                      accepted_write_survived_quit=args.exit_signal == "quit" and not args.create and not args.removal,
+                      overlapping_removal_menu_ms=removal_menu_ms,
+                      held_removal_quit_ms=removal_quit_ms,
+                      durable_removal_completed_after_exit=args.removal,
                       create_feedback_ms=create_feedback_ms if args.create else None,
                       background_setup=args.create,
                       clean_shutdown=True, exit_signal=args.exit_signal)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
     finally:
+        if args.removal:
+            removal_release.touch()
         if args.create:
             subprocess.run(["tmux", "-L", env["WT_TMUX_SOCKET"], "kill-server"], env=env, capture_output=True)
         (root / "terminal.ansi").write_bytes(capture)

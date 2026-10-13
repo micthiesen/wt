@@ -24,6 +24,19 @@ increase. Brave PID 83591 still used 90.5% of one core. The two inspected local
 cron launchers used 0%; their scheduled execution remains paused, not repaired.
 Evidence: `/tmp/wt-final-machine-load-20261014.txt` (captured October 13 UTC).
 
+## Overlapping removal and quit (2026-10-13 UTC)
+
+On debug candidate `36be59a`, an isolated PTY fixture held one durable removal
+inside its destroy hook. The second worktree's delete confirmation appeared in
+87.8 ms, and quitting took 22.1 ms while the first hook remained blocked. After
+exit, releasing the hook let the worker finish and persist success; the second
+worktree stayed intact. Evidence: `/tmp/wt-held-removal-ui-36be59a-v2/result.json`.
+These are single local samples with optional sources disabled and other native
+checks running, not remote latency or CPU measurements. The previous multi-minute
+quit was waiting for an independently owned removal; PID/start-identity proof
+now permits detaching that wait without cancelling the worker. Menu preparation
+has separate bounded capacity through both the controller and remote transport.
+
 ## Controlled native comparison (2026-10-10 UTC)
 
 On the same Apple M2 Pro (12 cores, 32 GiB, macOS 26.6.2), the optimized

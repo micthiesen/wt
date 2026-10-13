@@ -56,7 +56,8 @@ newer build appears; explicitly running `wt update` is the reapply path.
 
 The complete native end-to-end suite has one entry point shared with the Linux
 and macOS CI jobs: `python3 scripts/native-check.py`. It runs installation,
-release recovery, terminal liveness, optimistic creation and navigation, session handoff, lifecycle, cleanup,
+release recovery, terminal liveness, optimistic creation and navigation,
+overlapping removal menus and quit, session handoff, lifecycle, cleanup,
 resource ownership, dev servers, actions, remote workers, host reconnect,
 commands and stages, plus the macOS events-service check on macOS. Child output
 streams directly to the terminal; a failing check stops the suite with its exit
