@@ -131,7 +131,7 @@ where
                         &replies,
                         &disconnected,
                         id,
-                        UiReply::failure("Read-only request cancelled during worker shutdown"),
+                        UiReply::no_change("Read-only request cancelled during worker shutdown"),
                     )
                     .await;
                 } else {
@@ -156,7 +156,7 @@ where
                 let outcome = if let Some(token) = token {
                     tokio::select! {
                         biased;
-                        _ = token.cancelled() => Ok(UiReply::failure("Read-only request cancelled")),
+                        _ = token.cancelled() => Ok(UiReply::no_change("Read-only request cancelled")),
                         outcome = host.execute(action) => outcome,
                     }
                 } else { host.execute_with_shutdown(action, Some(&shutdown_wait)).await };
@@ -215,7 +215,7 @@ where
                     ClientFrame::CancelPreparation { id } => {
                         if let Some(position) = queued.iter().position(|(_, (queued_id, action))| *queued_id == id && action.is_preparation()) {
                             queued.remove(position);
-                            send_reply(&replies, &disconnected, id, UiReply::failure("Read-only request cancelled")).await;
+                            send_reply(&replies, &disconnected, id, UiReply::no_change("Read-only request cancelled")).await;
                         }
                         for (running_id, _, token) in running.values() {
                             if *running_id == id && let Some(token) = token { token.cancel(); }
@@ -512,7 +512,8 @@ mod tests {
                     .unwrap()
                 {
                     ServerFrame::Reply { id: 3, reply } => {
-                        assert!(reply.failed);
+                        assert!(!reply.failed);
+                        assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::NoChange));
                         cancelled = true;
                     }
                     ServerFrame::Reply { id: 4, reply } => {

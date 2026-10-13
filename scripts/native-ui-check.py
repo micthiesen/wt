@@ -362,8 +362,9 @@ def main():
             (root / "second-removal-confirm.ansi").write_bytes(second_menu)
             assert not removal_release.exists()
             assert (root / "worktrees" / first_removed).exists()
-            os.write(master, b"\x1b")
-            wait_for(lambda data: bool(data))
+            # Toggle the same delete key to cancel. A bare ESC followed by q
+            # before the terminal's escape timeout is Alt-q, not two keys.
+            os.write(master, b"d")
             removal_quit_started = time.monotonic()
             os.write(master, b"q")
         elif args.create:

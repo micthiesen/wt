@@ -23,9 +23,11 @@ pub struct Controller {
 struct RunningAction {
     lane: Lane,
     request_id: u64,
+    generation: u64,
     name: &'static str,
     target: Option<String>,
     started: Instant,
+    preparation: bool,
 }
 
 #[derive(Clone)]
@@ -87,6 +89,7 @@ pub fn start(
                 let shutdown = shutdown.clone();
                 let task_lane = lane.clone();
                 let operation_name = action_name(&command);
+                let is_preparation = command.is_preparation();
                 let operation_target = action_target(&command);
                 let log_context = ActionLogContext {
                     operation_id: id,
@@ -98,12 +101,18 @@ pub fn start(
                     let retry = create_retry(&command);
                     let request_replies = RequestReplies { sender: replies, id, generation };
                     let result = if let Some(cancellation) = operation_cancellation {
-                        tokio::select! {
-                            biased;
-                            _ = shutdown.cancelled() => Err(anyhow::anyhow!("preparation cancelled during shutdown")),
-                            _ = cancellation.cancelled() => Err(anyhow::anyhow!("preparation cancelled by the UI")),
-                            result = crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown) => result,
-                        }
+                        run_preparation_or_cancel(
+                            &shutdown,
+                            &cancellation,
+                            crate::host_dispatch::execute(
+                                &context,
+                                &fleet,
+                                command,
+                                &request_replies,
+                                &shutdown,
+                            ),
+                        )
+                        .await
                     } else {
                         crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown).await
                     };
@@ -115,9 +124,11 @@ pub fn start(
                 task_lanes.insert(task.id(), RunningAction {
                     lane: task_lane,
                     request_id: id,
+                    generation,
                     name: operation_name,
                     target: operation_target,
                     started: accepted_at,
+                    preparation: is_preparation,
                 });
             }
             if closed && pending.is_empty() && running.is_empty() { break; }
@@ -134,7 +145,8 @@ pub fn start(
                 },
                 finished = running.join_next_with_id(), if !running.is_empty() => match finished {
                     Some(Ok((id, (lane, reply)))) => {
-                        if let Some(active) = task_lanes.remove(&id)
+                        let active = task_lanes.remove(&id);
+                        if let Some(active) = &active
                             && (reply.failed || reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain))
                         {
                             tracing::warn!(
@@ -147,19 +159,38 @@ pub fn start(
                             );
                         }
                         busy.remove(&lane);
-                        let _ = port.replies.send(sanitize_reply(reply)).await;
+                        let reply = sanitize_reply(reply);
+                        if let Err(error) = port.replies.send(reply).await
+                            && let Some(active) = &active
+                        {
+                            report_unobserved_reply(active, &error.0);
+                        }
                     },
                     Some(Err(error)) => {
                         tracing::error!(%error, "action worker exited unexpectedly");
                         if let Some(active) = task_lanes.remove(&error.id()) {
-                            let _ = port.replies.send(UiReply { operation_id: Some(active.request_id), ..UiReply::failure(format!("Action worker failed: {error}")) }).await;
+                            let reply = worker_panic_reply(&active, &error.to_string());
+                            let log_context = ActionLogContext {
+                                operation_id: active.request_id,
+                                operation: active.name,
+                                host: lane_host(&active.lane).to_owned(),
+                                target: active.target.clone(),
+                            };
+                            log_action_outcome(
+                                Some(&log_context),
+                                &reply,
+                                reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain),
+                            );
+                            if let Err(error) = port.replies.send(reply).await {
+                                report_unobserved_reply(&active, &error.0);
+                            }
                             failed_lanes.insert(active.lane.clone());
                             busy.remove(&active.lane);
-                            let skipped = pending.iter().filter(|(queued, _)| *queued == active.lane).count();
-                            for (_, (request, _)) in pending.iter().filter(|(queued, _)| *queued == active.lane) {
+                            let skipped = pending.iter().filter(|(queued, _)| lanes_conflict(queued, &active.lane)).count();
+                            for (_, (request, _)) in pending.iter().filter(|(queued, _)| lanes_conflict(queued, &active.lane)) {
                                 let _ = port.replies.send(UiReply { operation_id: Some(request.id), ..UiReply::failure("Host action worker failed; operation did not start") }).await;
                             }
-                            pending.retain(|(queued, _)| *queued != active.lane);
+                            pending.retain(|(queued, _)| !lanes_conflict(queued, &active.lane));
                             if skipped > 0 {
                                 let _ = port.replies.send(UiReply::failure(format!("{skipped} queued commands on the failed host were not started. Restart wt before retrying."))).await;
                             }
@@ -169,7 +200,7 @@ pub fn start(
                 },
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
                     Some(command) => match lane_for(&command.action) {
-                        Ok(lane) if !failed_lanes.contains(&lane) => pending.push_back((lane, (command, Instant::now()))),
+                        Ok(lane) if !lane_failed(&lane, &failed_lanes) => pending.push_back((lane, (command, Instant::now()))),
                         Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure("Host command worker failed; this command was not started. Restart wt before retrying.") }).await; },
                         Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure(format!("{error:#}")) }).await; },
                     },
@@ -292,6 +323,90 @@ fn shutdown_progress(active: &RunningAction, now: Instant) -> String {
         elapsed(now.saturating_duration_since(active.started)),
         active.request_id,
     )
+}
+
+fn report_unobserved_reply(active: &RunningAction, reply: &UiReply) {
+    let Some(status) = unobserved_reply_status(reply) else {
+        return;
+    };
+    if active.request_id == 0 {
+        return;
+    }
+    let target = active
+        .target
+        .as_deref()
+        .map(|target| format!(" for {target}"))
+        .unwrap_or_default();
+    let detail = reply.message.trim();
+    if detail.is_empty() {
+        eprintln!(
+            "wt: shutdown: {} on {}{} {status} (operation {})",
+            active.name,
+            lane_host(&active.lane),
+            target,
+            active.request_id,
+        );
+    } else {
+        eprintln!(
+            "wt: shutdown: {} on {}{} {status} (operation {}): {detail}",
+            active.name,
+            lane_host(&active.lane),
+            target,
+            active.request_id,
+        );
+    }
+}
+
+fn unobserved_reply_status(reply: &UiReply) -> Option<&'static str> {
+    if reply.failed {
+        Some("failed")
+    } else if reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
+        Some("has an uncertain outcome")
+    } else if matches!(reply.outcome, Some(wt_tui::ReplyOutcome::Accepted(_))) {
+        Some("was accepted")
+    } else if reply.outcome == Some(wt_tui::ReplyOutcome::NoChange) || reply.notice {
+        None
+    } else {
+        Some("finished")
+    }
+}
+
+async fn run_preparation_or_cancel<F>(
+    shutdown: &CancellationToken,
+    cancellation: &CancellationToken,
+    operation: F,
+) -> Result<UiReply>
+where
+    F: std::future::Future<Output = Result<UiReply>>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(UiReply::no_change("Preparation cancelled during shutdown")),
+        _ = cancellation.cancelled() => Ok(UiReply::no_change("Preparation cancelled")),
+        result = operation => result,
+    }
+}
+
+fn lane_failed(lane: &Lane, failed: &BTreeSet<Lane>) -> bool {
+    failed.iter().any(|failed| lanes_conflict(lane, failed))
+}
+
+fn worker_panic_reply(active: &RunningAction, error: &str) -> UiReply {
+    if active.preparation {
+        UiReply {
+            operation_id: Some(active.request_id),
+            ui_generation: Some(active.generation),
+            ..UiReply::failure(format!("Preparation worker failed: {error}"))
+        }
+    } else {
+        UiReply {
+            operation_id: Some(active.request_id),
+            ui_generation: Some(active.generation),
+            ..UiReply::uncertain(format!(
+                "Action worker stopped unexpectedly: {error}; the outcome is unknown and will not be resent. Check its result before retrying."
+            ))
+        }
+    }
 }
 
 pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
@@ -634,15 +749,23 @@ pub(crate) async fn handoff_prepared(
 ) -> Result<UiReply> {
     let (ready, suspended) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
-    replies
-        .send(UiReply {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(UiReply::no_change("")),
+        result = replies.send(UiReply {
             handoff: Some(wt_tui::TerminalHandoff { ready, resumed }),
             ..Default::default()
-        })
-        .await
-        .context("terminal closed before session attach")?;
+        }) => {
+            if result.is_err() {
+                if shutdown.is_cancelled() {
+                    return Ok(UiReply::no_change(""));
+                }
+                bail!("terminal closed before session attach");
+            }
+        }
+    }
     tokio::select! {
-        _ = shutdown.cancelled() => bail!("session attach cancelled"),
+        _ = shutdown.cancelled() => return Ok(UiReply::no_change("")),
         result = suspended => if result.is_err() {
             // A newer UI intent can decline this ticket before suspension.
             // No attach client was spawned; the prepared session stays alive.
@@ -731,6 +854,85 @@ async fn forward_attach_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_preparations_complete_as_no_change_without_failure() {
+        let shutdown = CancellationToken::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = run_preparation_or_cancel(
+            &shutdown,
+            &cancellation,
+            std::future::pending::<Result<UiReply>>(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.failed);
+        assert_eq!(result.outcome, Some(wt_tui::ReplyOutcome::NoChange));
+        let reply = action_reply(Ok(result), None);
+        assert!(!reply.failed);
+        assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::NoChange));
+    }
+
+    #[test]
+    fn failed_lane_blocks_every_conflicting_lane_after_worker_panic() {
+        let host = Lane::Host(Some("builder".into()));
+        let failed = BTreeSet::from([host.clone()]);
+        assert!(lane_failed(
+            &Lane::Creation(Some("builder".into())),
+            &failed
+        ));
+        assert!(lane_failed(
+            &Lane::Removal(Some("builder".into()), "row".into()),
+            &failed
+        ));
+        assert!(!lane_failed(&Lane::Host(Some("other".into())), &failed));
+
+        let removal = Lane::Removal(Some("builder".into()), "row".into());
+        let failed = BTreeSet::from([removal.clone()]);
+        assert!(lane_failed(&removal, &failed));
+        assert!(lane_failed(&Lane::Host(Some("builder".into())), &failed));
+        assert!(!lane_failed(
+            &Lane::Removal(Some("builder".into()), "other".into()),
+            &failed
+        ));
+    }
+
+    #[test]
+    fn mutation_worker_panic_is_uncertain_but_preparation_panic_is_failure() {
+        let mut active = RunningAction {
+            lane: Lane::Removal(None, "row".into()),
+            request_id: 7,
+            generation: 3,
+            name: "remove worktree",
+            target: Some("row".into()),
+            started: Instant::now(),
+            preparation: false,
+        };
+        let reply = worker_panic_reply(&active, "panic");
+        assert!(!reply.failed);
+        assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::Uncertain));
+
+        active.preparation = true;
+        let reply = worker_panic_reply(&active, "panic");
+        assert!(reply.failed);
+        assert!(reply.outcome.is_none());
+    }
+
+    #[test]
+    fn shutdown_reports_background_acceptance_without_calling_it_finished() {
+        let ongoing = UiReply {
+            message: "Removal job 12-a continues in the background; use `wt logs` to follow it"
+                .into(),
+            outcome: Some(wt_tui::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+            ..Default::default()
+        };
+        assert_eq!(unobserved_reply_status(&ongoing), Some("was accepted"));
+        assert_eq!(
+            unobserved_reply_status(&UiReply::no_change("Preparation cancelled")),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn creation_waits_for_exact_identity_presentation_before_permission_to_mutate() {
@@ -876,6 +1078,34 @@ mod tests {
         assert!(!resumed.contains('\x1b'));
         let error = task.await.unwrap().unwrap_err().to_string();
         assert_eq!(resumed, error);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_handoff_is_a_no_change_not_an_attach_failure() {
+        let (replies, mut received) = tokio::sync::mpsc::channel(1);
+        let shutdown = CancellationToken::new();
+        let worker_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            handoff_prepared(
+                crate::harness::PreparedSession {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "exit 9".into()],
+                    cwd: std::env::temp_dir(),
+                },
+                &RequestReplies {
+                    sender: replies,
+                    id: 3,
+                    generation: 4,
+                },
+                &worker_shutdown,
+            )
+            .await
+        });
+        let ticket = received.recv().await.unwrap().handoff.unwrap();
+        shutdown.cancel();
+        let reply = task.await.unwrap().unwrap();
+        assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::NoChange));
+        drop(ticket);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1217,6 +1447,8 @@ mod tests {
             &RunningAction {
                 lane: Lane::Host(Some("MaxBook".into())),
                 request_id: 42,
+                generation: 0,
+                preparation: false,
                 name: "remove worktree",
                 target: Some("new-frontend".into()),
                 started,
