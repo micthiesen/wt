@@ -1206,43 +1206,22 @@ impl DevServerService {
         slug: &str,
         cancellation: &CancellationToken,
     ) -> Result<u16, DevServerError> {
-        let mut candidates = Vec::new();
-        let state = self.read_state(slug).await?;
-        let recorded = state
-            .get("devPort")
-            .and_then(Value::as_u64)
-            .and_then(|value| u16::try_from(value).ok());
+        let recorded = self.read_port(slug).await?;
         let range_start = u32::from(self.config.settings.port_base);
         let range_end = range_start
             .saturating_add(self.config.settings.port_range)
             .min(u16::MAX as u32 + 1);
-        if let Some(recorded) =
-            recorded.filter(|port| u32::from(*port) >= range_start && u32::from(*port) < range_end)
-            && probe_port(recorded).await == PortProbe::Free
-        {
-            candidates.push(recorded);
-        }
-        for value in range_start..range_end {
-            let port = value as u16;
-            if !candidates.contains(&port) && probe_port(port).await == PortProbe::Free {
-                candidates.push(port);
-                if candidates.len() >= 8 {
-                    break;
-                }
-            }
-            if cancellation.is_cancelled() {
-                return Err(DevServerError::Cancelled);
-            }
-        }
-        if cancellation.is_cancelled() {
-            return Err(DevServerError::Cancelled);
-        }
-        let owned_slug = slug.to_owned();
-        let port = self
-            .mutate_store(move |store| store.claim_dev_port(&owned_slug, &candidates))
-            .await?
-            .ok_or(DevServerError::NoPort)?;
-        Ok(port)
+        claim_available_port(
+            range_start..range_end,
+            recorded,
+            cancellation,
+            probe_port,
+            |candidates| {
+                let owned_slug = slug.to_owned();
+                self.mutate_store(move |store| store.claim_dev_port(&owned_slug, &candidates))
+            },
+        )
+        .await
     }
 
     async fn read_port(&self, slug: &str) -> Result<Option<u16>, DevServerError> {
@@ -1458,6 +1437,57 @@ enum PortProbe {
     Unknown,
 }
 
+/// Bound each probe/claim batch, not the search range. OS-free ports can still
+/// belong to stopped worktrees, and only the atomic store claim can decide that.
+async fn claim_available_port<P, PF, C, CF>(
+    range: std::ops::Range<u32>,
+    recorded: Option<u16>,
+    cancellation: &CancellationToken,
+    mut probe: P,
+    mut claim: C,
+) -> Result<u16, DevServerError>
+where
+    P: FnMut(u16) -> PF,
+    PF: std::future::Future<Output = PortProbe>,
+    C: FnMut(Vec<u16>) -> CF,
+    CF: std::future::Future<Output = Result<Option<u16>, DevServerError>>,
+{
+    let recorded = recorded.filter(|port| range.contains(&u32::from(*port)));
+    let ports = recorded.into_iter().chain(
+        range
+            .map(|port| port as u16)
+            .filter(|port| Some(*port) != recorded),
+    );
+    let mut candidates = Vec::with_capacity(8);
+    for port in ports {
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(DevServerError::Cancelled),
+            result = probe(port) => result,
+        };
+        if result == PortProbe::Free {
+            candidates.push(port);
+        }
+        if candidates.len() == 8 {
+            if cancellation.is_cancelled() {
+                return Err(DevServerError::Cancelled);
+            }
+            if let Some(port) = claim(std::mem::take(&mut candidates)).await? {
+                return Ok(port);
+            }
+        }
+    }
+    if cancellation.is_cancelled() {
+        return Err(DevServerError::Cancelled);
+    }
+    if !candidates.is_empty()
+        && let Some(port) = claim(candidates).await?
+    {
+        return Ok(port);
+    }
+    Err(DevServerError::NoPort)
+}
+
 async fn probe_port(port: u16) -> PortProbe {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     match tokio::time::timeout(PORT_PROBE_TIMEOUT, TcpStream::connect(address)).await {
@@ -1563,6 +1593,144 @@ fn first_nonempty(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn port_store(path: &Path) -> Store {
+        Store::open(
+            path,
+            RepositoryIdentity::new("port-test", "/isolated/port-test"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn port_allocation_searches_past_reserved_prefix_without_stealing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = port_store(&temp.path().join("state.sqlite"));
+        for port in 8100..8112 {
+            store
+                .set_slug_dev_port(&format!("owner-{port}"), Some(port))
+                .unwrap();
+        }
+        let mut probes = Vec::new();
+        let port = claim_available_port(
+            8100..8200,
+            None,
+            &CancellationToken::new(),
+            |port| {
+                probes.push(port);
+                std::future::ready(PortProbe::Free)
+            },
+            |batch| std::future::ready(store.claim_dev_port("new", &batch).map_err(Into::into)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, 8112);
+        assert_eq!(probes.len(), 16, "stop probing after the successful batch");
+        for port in 8100..8112 {
+            assert_eq!(
+                store.read_slug_dev_port(&format!("owner-{port}")).unwrap(),
+                Some(port)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn port_allocation_reports_exhaustion_only_after_entire_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = port_store(&temp.path().join("state.sqlite"));
+        for port in 8100..8119 {
+            store
+                .set_slug_dev_port(&format!("owner-{port}"), Some(port))
+                .unwrap();
+        }
+        let mut probes = Vec::new();
+        let result = claim_available_port(
+            8100..8120,
+            None,
+            &CancellationToken::new(),
+            |port| {
+                probes.push(port);
+                std::future::ready(if port == 8119 {
+                    PortProbe::Listening
+                } else {
+                    PortProbe::Free
+                })
+            },
+            |batch| std::future::ready(store.claim_dev_port("new", &batch).map_err(Into::into)),
+        )
+        .await;
+        assert!(matches!(result, Err(DevServerError::NoPort)));
+        assert_eq!(probes, (8100..8120).collect::<Vec<_>>());
+        assert_eq!(store.read_slug_dev_port("new").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn port_allocation_retries_after_competing_atomic_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let mut store = port_store(&path);
+        let mut competing = port_store(&path);
+        let mut batches = 0;
+        let port = claim_available_port(
+            8100..8120,
+            Some(8200),
+            &CancellationToken::new(),
+            |_| std::future::ready(PortProbe::Free),
+            |batch| {
+                batches += 1;
+                if batches == 1 {
+                    // Another connection wins after OS probes but before our claim.
+                    for &port in &batch {
+                        assert_eq!(
+                            competing
+                                .claim_dev_port(&format!("winner-{port}"), &[port])
+                                .unwrap(),
+                            Some(port)
+                        );
+                    }
+                }
+                std::future::ready(store.claim_dev_port("new", &batch).map_err(Into::into))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, 8108);
+        assert_eq!(batches, 2);
+        for port in 8100..8108 {
+            assert_eq!(
+                store.read_slug_dev_port(&format!("winner-{port}")).unwrap(),
+                Some(port)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn port_allocation_reuses_own_reservation_and_cancels_without_claiming() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = port_store(&temp.path().join("state.sqlite"));
+        store.set_slug_dev_port("own", Some(8111)).unwrap();
+        let port = claim_available_port(
+            8100..8120,
+            Some(8111),
+            &CancellationToken::new(),
+            |_| std::future::ready(PortProbe::Free),
+            |batch| std::future::ready(store.claim_dev_port("own", &batch).map_err(Into::into)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(port, 8111);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = claim_available_port(
+            8100..8120,
+            None,
+            &cancellation,
+            |_| std::future::ready(PortProbe::Free),
+            |_| std::future::ready(Err(DevServerError::NoPort)),
+        )
+        .await;
+        assert!(matches!(result, Err(DevServerError::Cancelled)));
+    }
 
     fn holder(slug: &str) -> DevSlotHolder {
         DevSlotHolder {

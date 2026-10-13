@@ -6,6 +6,12 @@ agent terminal while remaining tied to the worktree. Each slug keeps its
 allocated port in wtstate. `{{port}}`, `{{slug}}`, and `{{path}}` are available
 to configured command hooks.
 
+Port reservations survive stopped servers. Allocation checks the entire
+configured port range in bounded batches, skipping both listening ports and
+other worktrees' durable reservations. Claims are atomic, so concurrent starts
+cannot take each other's ports. A full server-slot count and an exhausted port
+range are separate conditions.
+
 `wt dev start [slug]` starts a server, or joins an existing startup. A server
 that is already serving is restarted; a crashed server is recycled. It reports
 that the process launched, not that the project is ready. Add `--wait` to wait

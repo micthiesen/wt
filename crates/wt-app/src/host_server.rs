@@ -355,18 +355,23 @@ mod tests {
         })
         .await
         .unwrap();
-        // The stream is a persistent protocol session. End it explicitly so
-        // this test exercises the server's graceful disconnect path instead
-        // of waiting forever for a second command.
-        drop(input);
-        drop(output);
-        // The server allows five seconds for owned source cleanup. The test
-        // must not impose a shorter deadline while watchers/children drain.
-        tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        // Graceful shutdown closes admission while keeping the reader alive
+        // for any already-prepared snapshots. Dropping both halves instead
+        // races those writes with BrokenPipe and is an abrupt disconnect.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            output
+                .write_all(&protocol::encode(&ClientFrame::Shutdown).unwrap())
+                .await
+                .unwrap();
+            while protocol::read::<ServerFrame, _>(&mut input)
+                .await
+                .unwrap()
+                .is_some()
+            {}
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
         let state = fixture
             .ctx
             .database

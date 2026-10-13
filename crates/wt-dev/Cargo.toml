@@ -18,5 +18,8 @@ wt-store.workspace = true
 wt-tmux.workspace = true
 wt-vcs.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
