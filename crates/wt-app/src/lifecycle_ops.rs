@@ -32,20 +32,13 @@ pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
             .await
             {
                 Ok(cleanup) => {
-                    let mut messages = cleanup.warnings;
-                    messages.extend(
-                        cleanup
-                            .stopped_sessions
-                            .into_iter()
-                            .map(|session| format!("stopped session {session}")),
-                    );
-                    messages.extend(
-                        cleanup
-                            .reaped_listeners
-                            .into_iter()
-                            .map(|pid| format!("reaped listener pid {pid}")),
-                    );
-                    messages
+                    for session in cleanup.stopped_sessions {
+                        tracing::info!(%session, "stopped worktree session before removal");
+                    }
+                    for pid in cleanup.reaped_listeners {
+                        tracing::info!(pid, "reaped worktree listener before removal");
+                    }
+                    cleanup.warnings
                 }
                 Err(_) if cancellation.is_cancelled() => Vec::new(),
                 Err(error) => vec![format!("host cleanup failed: {error:#}")],
@@ -455,20 +448,36 @@ async fn cleanup_with_evidence(
             None => kept.push(format!("{}: no longer present or identity changed", key)),
         }
     }
-    let mut queued = 0;
+    let mut removed = 0;
+    let mut uncertain = false;
     for (request, result) in requests
         .iter()
         .zip(crate::commands::_destroy::start_removals(ctx, &requests).await)
     {
         match result {
-            Ok(_) => queued += 1,
+            Ok(job) => match crate::commands::_destroy::wait_for_completion(ctx, &job).await {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    uncertain |= error
+                        .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                        .is_some();
+                    kept.push(format!("{}: {error:#}", request.0.target.slug()));
+                }
+            },
             Err(error) => kept.push(format!("{}: {error:#}", request.0.target.slug())),
         }
     }
     if !kept.is_empty() {
-        bail!("Queued {queued}; kept {}", kept.join("; "));
+        if uncertain {
+            return Err(crate::commands::_destroy::RemovalUncertain(format!(
+                "Removed {removed}; unresolved: {}",
+                kept.join("; ")
+            ))
+            .into());
+        }
+        bail!("Removed {removed}; kept {}", kept.join("; "));
     }
-    Ok(format!("Cleanup queued for {queued} worktrees"))
+    Ok(format!("Removed {removed} worktrees"))
 }
 
 enum CleanupSelection<'a> {

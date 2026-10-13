@@ -285,7 +285,10 @@ can re-read completion and output.
 Worktree removal and cleanup use the lifecycle service and per-worktree
 operation locks. A confirmed removal moves its row to Archived with a
 `removing` label at once. The worker saves the archive state before its startup
-reply and restores the previous state on failure. Removal errors enter the
+reply and restores the previous state on failure. TUI actions await the durable
+job's terminal outcome off the input path, so startup does not settle the pending
+removal and a later failure rolls it back. CLI background mode returns the startup
+acknowledgement. Removal errors and completion enter the
 attention feed. Cleanup does not force-remove dirty or unpushed work, and a
 landed branch with an outstanding verification gate remains protected. Missing
 GitHub or inventory facts are unknown, never proof that removal is safe.

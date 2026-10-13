@@ -70,6 +70,13 @@ impl CodexMessenger {
         text: &str,
         cancel: &CancellationToken,
     ) -> Result<CodexQueueDelivery, CodexAppServerError> {
+        if is_codex_command(text) {
+            return Err(CodexAppServerError {
+                operation: "queue/add",
+                kind: CodexAppServerFailureKind::Rejected,
+                detail: "slash commands require an interactive target; use send_target".into(),
+            });
+        }
         app_server::queue_message(&self.paths.app_server_socket(), thread_id, text, cancel).await
     }
 
@@ -81,6 +88,18 @@ impl CodexMessenger {
         if target.text.trim().is_empty() {
             return Ok(CodexMessageOutcome::Failed {
                 reason: "message is empty".into(),
+            });
+        }
+        // Normalize at the harness boundary so palettes, CLI sends and
+        // configured actions cannot accidentally turn compact into chat.
+        let target = CodexMessageTarget {
+            text: terminal_text(&target.text).to_owned(),
+            ..target.clone()
+        };
+        if is_codex_command(&target.text) && target.text.chars().any(char::is_control) {
+            return Ok(CodexMessageOutcome::Failed {
+                reason: "Codex slash commands must be a single line without control characters"
+                    .into(),
             });
         }
         let tmux_name = format!("{}-codex", target.slug);
@@ -418,18 +437,30 @@ impl CodexMessenger {
                 if let Some(live) = still_live
                     && (session_id.is_none() || live.harness_session_id.as_deref() == session_id)
                 {
-                    if let Err(error) = self.tmux.send_literal(&target, text, cancel).await {
+                    let command = is_codex_command(text);
+                    let typed = if command {
+                        self.tmux.type_literal(&target, text, cancel).await
+                    } else {
+                        self.tmux.send_literal(&target, text, cancel).await
+                    };
+                    if let Err(error) = typed {
                         return Ok(CodexMessageOutcome::Ambiguous {
-                            reason: format!("terminal paste may have reached Codex: {error}"),
+                            reason: format!("terminal input may have reached Codex: {error}"),
                         });
                     }
-                    if let Err(error) = self
-                        .tmux
-                        .send_keys(&target, &["Enter", "Enter"], cancel)
-                        .await
-                    {
+                    // Let Codex finish the typed input burst. Commands take
+                    // one submit key and never go through bracketed paste.
+                    if command {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let keys: &[&str] = if command {
+                        &["Enter"]
+                    } else {
+                        &["Enter", "Enter"]
+                    };
+                    if let Err(error) = self.tmux.send_keys(&target, keys, cancel).await {
                         return Ok(CodexMessageOutcome::Ambiguous {
-                            reason: format!("Codex paste was submitted ambiguously: {error}"),
+                            reason: format!("Codex input was submitted ambiguously: {error}"),
                         });
                     }
                     return Ok(CodexMessageOutcome::Terminal {
@@ -548,6 +579,18 @@ fn codex_pane_is_idle(text: &str) -> bool {
         .rfind(|line| line.starts_with("› "))
         == Some("› Ask Codex to do anything")
 }
+fn terminal_text(text: &str) -> &str {
+    if text.split_whitespace().next() == Some("/compact") {
+        // Codex rejects inline compact arguments by interpreting them as a
+        // normal user turn. Claude/OpenCode keep their instructions elsewhere.
+        "/compact"
+    } else if is_codex_command(text) {
+        text.trim()
+    } else {
+        text
+    }
+}
+
 fn is_codex_command(text: &str) -> bool {
     let first = text.split_whitespace().next().unwrap_or_default();
     let Some(command) = first.strip_prefix('/') else {
@@ -604,6 +647,75 @@ mod tests {
             "",
         ] {
             assert_eq!(writer_identity(output, home, &sessions), None, "{output}");
+        }
+    }
+
+    #[test]
+    fn command_transport_preserves_arguments_except_native_compact() {
+        for command in [
+            "/compact",
+            " /compact focus on fleet ",
+            "/compact\nToday is Monday",
+        ] {
+            assert_eq!(terminal_text(command), "/compact");
+            assert!(is_codex_command(terminal_text(command)));
+        }
+        assert_eq!(
+            terminal_text(" /review current changes "),
+            "/review current changes"
+        );
+        for message in [
+            "Explain /compact",
+            "/Users/michael/file",
+            "$manager",
+            " ordinary text ",
+        ] {
+            assert_eq!(terminal_text(message), message);
+            assert!(!is_codex_command(message));
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_only_delivery_rejects_commands_before_contacting_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = ProcessRunner::default();
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            wt_tmux::TmuxServer::at(temp.path().join("absent.sock")),
+        );
+        let mut messenger = CodexMessenger::new(
+            CodexPaths::new(temp.path(), temp.path().join("cache")),
+            runner,
+            tmux,
+        );
+        for command in ["/compact focus", "/review", " /model next"] {
+            let error = messenger
+                .send("thread", command, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, CodexAppServerFailureKind::Rejected);
+            assert!(error.detail.contains("interactive target"));
+        }
+        for text in [
+            "/review\nsecond command",
+            "/review\tchanges",
+            "/review \u{1b}",
+        ] {
+            let outcome = messenger
+                .send_target(
+                    &CodexMessageTarget {
+                        slug: "unused".into(),
+                        cwd: temp.path().into(),
+                        managed_name: None,
+                        text: text.into(),
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, CodexMessageOutcome::Failed { reason } if reason.contains("control characters"))
+            );
         }
     }
 

@@ -60,6 +60,12 @@ thread ownership and an empty idle composer, protecting drafts and approval
 prompts. A command is never automatically retried after submission.
 Command submission does not prove native compaction completed.
 
+The Codex delivery boundary applies this rule to every interactive caller,
+including CLI sends and configured actions. All slash commands use literal
+key input and one Enter rather than the ordinary message queue or bracketed
+paste. Other commands retain their arguments. Thread-only queue APIs reject
+slash commands because they lack the interactive target needed to execute one.
+
 `python3 scripts/native-codex-compact-smoke.py` runs installed Codex in an
 isolated tmux session with a loopback fake Responses provider. A Rust bridge
 calls the production `CodexMessenger` fallback, including its exact-UUID and

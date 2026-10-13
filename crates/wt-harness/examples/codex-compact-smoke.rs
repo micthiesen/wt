@@ -29,7 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         slug: "manager".into(),
         cwd,
         managed_name: None,
-        text: "/compact".into(),
+        // The palettes supply Claude-style focus instructions. Every Codex
+        // entry point must normalize these at the shared delivery boundary.
+        text: "/compact Today is Monday. Preserve fleet state and standing briefs.".into(),
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(40),

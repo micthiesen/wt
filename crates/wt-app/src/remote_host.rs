@@ -38,6 +38,7 @@ const COMMAND_QUEUE: usize = 8;
 const READER_QUEUE: usize = 16;
 const STDERR_TAIL: usize = 8 * 1024;
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const REMOVAL_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const COMMAND_DRAIN_GRACE: Duration = Duration::from_secs(5);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
@@ -780,6 +781,13 @@ async fn serve_connection(
                     }
                     *command_id = command_id.saturating_add(1);
                     let id = *command_id;
+                    // SST teardown alone may take twenty minutes. Removal
+                    // replies now report completion, rather than startup.
+                    let reply_timeout = if matches!(action, UiAction::Remove { .. } | UiAction::Cleanup { .. } | UiAction::CleanupTargets { .. }) {
+                        REMOVAL_REPLY_TIMEOUT
+                    } else {
+                        COMMAND_REPLY_TIMEOUT
+                    };
                     let frame = ClientFrame::Command { id, action };
                     let encoded = match protocol::encode(&frame) {
                         Ok(bytes) => bytes,
@@ -806,7 +814,7 @@ async fn serve_connection(
                         let _ = reply.send(result);
                         return if scope_cancel.is_cancelled() || app_cancel.is_cancelled() { ConnectionEnd::Cancelled } else { ConnectionEnd::Disconnected(format!("command write failed: {}; {}", error, stderr_text(connection))) };
                     }
-                    let deadline = tokio::time::Instant::now() + COMMAND_REPLY_TIMEOUT;
+                    let deadline = tokio::time::Instant::now() + reply_timeout;
                     loop {
                         tokio::select! {
                             biased;
@@ -823,8 +831,9 @@ async fn serve_connection(
                                 return ConnectionEnd::Cancelled;
                             }
                             _ = tokio::time::sleep_until(deadline) => {
-                                let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: "command reply timed out after 15 minutes".into() }));
-                                return ConnectionEnd::Disconnected("command reply timed out after 15 minutes".into());
+                                let detail = format!("command reply timed out after {} minutes; the accepted operation may still be running", reply_timeout.as_secs() / 60);
+                                let _ = reply.send(Err(RemoteHostError::Ambiguous { host: host.to_owned(), detail: detail.clone() }));
+                                return ConnectionEnd::Disconnected(detail);
                             }
                             incoming = connection.incoming.recv() => match incoming {
                                 Some(ReaderMessage::Frame(ServerFrame::Reply { id: reply_id, reply: response })) if reply_id == id => {

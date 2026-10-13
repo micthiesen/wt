@@ -422,12 +422,11 @@ async fn remote_worktree_status(
 ) -> Result<WorktreeStatus> {
     let slug = snapshot.worktree.target.slug();
     if let Some(lock) = crate::commands::diagnostics::operation_lock(context, slug).await? {
-        let log_dir = context.config.paths.log_dir.clone();
-        let log_slug = slug.to_owned();
-        let log = tokio::task::spawn_blocking(move || latest_destroy_log(&log_dir, &log_slug))
+        let log = crate::commands::logs::latest(context, Some(slug))
             .await
             .ok()
-            .flatten();
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned());
         return Ok(WorktreeStatus {
             kind: StatusKind::Busy,
             label: operation_lock_label(&lock),
@@ -641,34 +640,6 @@ fn operation_lock_age(lock: &crate::commands::diagnostics::OperationLock) -> Opt
     })
 }
 
-fn latest_destroy_log(log_dir: &Path, slug: &str) -> Option<String> {
-    let prefix = format!("{slug}-");
-    let entries = std::fs::read_dir(log_dir).ok()?;
-    entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            let stamp = name.strip_prefix(&prefix)?.strip_suffix(".log")?;
-            let bytes = stamp.as_bytes();
-            if bytes.len() < 11
-                || !bytes[..4].iter().all(u8::is_ascii_digit)
-                || bytes[4] != b'-'
-                || !bytes[5..7].iter().all(u8::is_ascii_digit)
-                || bytes[7] != b'-'
-                || !bytes[8..10].iter().all(u8::is_ascii_digit)
-                || bytes[10] != b'T'
-            {
-                return None;
-            }
-            let path = entry.path();
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, path))
-        })
-        .max_by_key(|(modified, _)| *modified)
-        .map(|(_, path)| path.to_string_lossy().into_owned())
-}
-
 fn remote_dev_status(status: &wt_dev::DevServerStatus) -> wt_remote::DevServerStatus {
     wt_remote::DevServerStatus {
         running: status.running,
@@ -753,6 +724,44 @@ fn repo_web_url(remote: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn removing_remote_row_exposes_its_native_destroy_log() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let snapshot = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.worktree.target.slug() == "one")
+            .unwrap();
+        let lock = wt_platform::lock::FileLock::try_acquire(
+            &fixture.ctx.config.paths.lock_dir,
+            "one",
+            "remove",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let jobs = fixture.ctx.config.paths.lock_dir.join("destroy-jobs");
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        tokio::fs::write(jobs.join("1-a.json"), r#"{"target":{"key":"one"}}"#)
+            .await
+            .unwrap();
+        let log = jobs.join("1-a.log");
+        tokio::fs::write(&log, "Removing checkout").await.unwrap();
+        let status = remote_worktree_status(&fixture.ctx, &snapshot, true, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(status.kind, StatusKind::Busy);
+        assert_eq!(status.log.as_deref(), log.to_str());
+        drop(lock);
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn launcher_release_identity_survives_bounded_history_eviction() {

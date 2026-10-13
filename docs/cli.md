@@ -466,7 +466,10 @@ If a live Codex tmux slot has no recoverable UUID, `send` falls back to typing
 into that exact slot and reports that terminal transport was used. Codex slash
 commands such as `/compact` also use guarded terminal input because its socket
 queue treats them as ordinary text; `$skill` prompts continue through the
-durable queue.
+durable queue. Slash commands are typed once with one Enter, after checking
+the exact thread and empty composer. `/compact` drops inline focus instructions
+because Codex otherwise treats it as chat; other commands keep their arguments.
+Multiline commands and control characters are rejected before terminal input.
 
 ### `wt hold`
 

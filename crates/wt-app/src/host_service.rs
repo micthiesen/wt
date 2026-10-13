@@ -42,6 +42,13 @@ impl HostService {
         let done = Stamp::now();
         let mut reply = match result {
             Ok(reply) => reply,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                    .is_some() =>
+            {
+                UiReply::uncertain(format!("{error:#}"))
+            }
             Err(error) => {
                 // A mutation that failed partway may still have changed
                 // something; re-read what it touches.

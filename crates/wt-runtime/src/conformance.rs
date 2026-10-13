@@ -194,6 +194,24 @@ where
     T: Clone + Debug,
     M: Mutation<T> + Debug,
 {
+    mutation_with_projection(mutation, before, after, |mutation, view| {
+        mutation.observed(view)
+    })
+    .await;
+}
+
+/// The same settlement checks for progress projections, whose visible pending
+/// state deliberately differs from the final result (for example "removing").
+/// The predicate checks presentation only; settlement still uses `observed`.
+pub async fn mutation_with_projection<T, M>(
+    mutation: M,
+    before: T,
+    after: T,
+    projected: impl Fn(&M, &T) -> bool,
+) where
+    T: Clone + Debug,
+    M: Mutation<T> + Debug,
+{
     let label = mutation.label();
     assert!(
         !mutation.domains().is_empty(),
@@ -207,16 +225,20 @@ where
         mutation.observed(&after),
         "{label}: `after` must show the change"
     );
-    let mut projected = before.clone();
-    mutation.apply(&mut projected);
     assert!(
-        mutation.observed(&projected),
+        !projected(&mutation, &before),
+        "{label}: no projection before mutation"
+    );
+    let mut view = before.clone();
+    mutation.apply(&mut view);
+    assert!(
+        projected(&mutation, &view),
         "{label}: projection shows the change"
     );
-    let mut again = projected.clone();
+    let mut again = view.clone();
     mutation.apply(&mut again);
     assert!(
-        mutation.observed(&again),
+        projected(&mutation, &again),
         "{label}: projection is idempotent"
     );
 
@@ -242,7 +264,7 @@ where
         let expired = pending.settle(&before, |_, _| Some(Stamp::now()), Instant::now());
         assert!(expired.is_empty(), "{label}: no revert before the deadline");
         assert!(
-            mutation.observed(&pending.project(&before)),
+            projected(&mutation, &pending.project(&before)),
             "{label}: still shown"
         );
     }
@@ -254,7 +276,7 @@ where
     pending.begin(2, mutation.clone(), Instant::now());
     pending.remove(2);
     assert!(
-        !mutation.observed(&pending.project(&before)),
+        !projected(&mutation, &pending.project(&before)),
         "{label}: failure rolls back"
     );
 

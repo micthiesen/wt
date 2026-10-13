@@ -805,6 +805,25 @@ impl TmuxClient {
         checked("paste-buffer", paste?).map(|_| ())
     }
 
+    /// Type text as literal key input, without bracketed-paste markers or Enter.
+    /// Native terminal commands may distinguish typed input from pasted prompts.
+    pub async fn type_literal(
+        &self,
+        target: &PaneTarget,
+        text: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), TmuxError> {
+        let result = self
+            .run(
+                "send-keys",
+                ["send-keys", "-t", target.as_str(), "-l", "--", text],
+                None,
+                cancellation,
+            )
+            .await?;
+        checked("send-keys", result).map(|_| ())
+    }
+
     /// Send explicit tmux key names such as `Enter`, `C-d`, or `Escape`.
     /// Use `send_literal` for user text so key interpretation is impossible.
     pub async fn send_keys(

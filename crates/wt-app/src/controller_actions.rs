@@ -367,7 +367,7 @@ pub async fn execute(
                     .extra
                     .insert("title".into(), serde_json::json!(visible.title));
             }
-            crate::commands::_destroy::start_remove(
+            let job = crate::commands::_destroy::start_remove(
                 ctx,
                 &plan.row,
                 crate::commands::_destroy::DestroyOptions {
@@ -380,10 +380,8 @@ pub async fn execute(
                 },
             )
             .await?;
-            Ok(message(format!(
-                "Removal queued for {}",
-                plan.row.target.slug()
-            )))
+            crate::commands::_destroy::wait_for_completion(ctx, &job).await?;
+            Ok(message(format!("Removed {}", plan.row.target.slug())))
         }
         UiAction::PrepareCleanup => {
             let rows = ctx.repository.inventory(&ctx.cancellation).await?;

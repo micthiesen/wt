@@ -142,19 +142,25 @@ impl Family for LifecycleChange {
             } => board.rows.iter().any(|row| {
                 Some(row.key.as_str()) == resolved.as_deref() || &row.key == placeholder
             }),
-            Self::Remove { keys } => !keys.iter().any(|key| {
-                board
-                    .rows
-                    .iter()
-                    .any(|row| &row.key == key && !row.archived)
-            }),
+            // The worker archives before acknowledging startup. That is
+            // progress, not removal: keep showing the operation until Git
+            // inventory no longer contains the checkout.
+            Self::Remove { keys } => !keys
+                .iter()
+                .any(|key| board.rows.iter().any(|row| &row.key == key)),
         }
     }
 
     fn deadlines(&self) -> Option<Deadlines> {
+        let deadline = match self {
+            // The host waits for durable completion, including SST teardown
+            // whose own timeout is twenty minutes.
+            Self::Remove { .. } => Duration::from_secs(30 * 60),
+            Self::Create { .. } => DEADLINE,
+        };
         Some(Deadlines {
-            in_flight: DEADLINE,
-            accepted: DEADLINE,
+            in_flight: deadline,
+            accepted: deadline,
         })
     }
 }

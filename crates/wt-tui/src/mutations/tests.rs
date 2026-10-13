@@ -231,7 +231,31 @@ async fn every_mutation_kind_meets_the_contract() {
         ),
     ];
     for (mutation, before, after) in cases {
-        conformance::mutation(mutation, before, after).await;
+        if matches!(
+            mutation.kind,
+            MutationKind::Lifecycle(LifecycleChange::Remove { .. })
+        ) {
+            conformance::mutation_with_projection(mutation, before, after, |mutation, board| {
+                let MutationKind::Lifecycle(LifecycleChange::Remove { keys }) = &mutation.kind
+                else {
+                    unreachable!();
+                };
+                keys.iter().all(|key| {
+                    board
+                        .rows
+                        .iter()
+                        .find(|row| &row.key == key)
+                        .is_none_or(|row| {
+                            row.archived
+                                && row.badge == "removing"
+                                && row.busy.as_ref().is_some_and(|busy| busy.op == "remove")
+                        })
+                })
+            })
+            .await;
+        } else {
+            conformance::mutation(mutation, before, after).await;
+        }
     }
 }
 
@@ -522,4 +546,20 @@ fn removal_moves_the_row_and_keeps_later_source_fields() {
     assert_eq!(latest.rows[0].title, "New title");
     assert!(latest.sections[0].rows.is_empty());
     assert_eq!(latest.sections.last().unwrap().rows, [0]);
+}
+
+#[test]
+fn removal_waits_for_inventory_even_after_the_worker_archives_the_row() {
+    let removal = LifecycleChange::Remove {
+        keys: vec!["a".into()],
+    };
+    let target = Target::row(None, "a");
+    let mut latest = board();
+    assert!(!removal.observed(&target, &latest));
+    latest.rows[0].archived = true;
+    assert!(!removal.observed(&target, &latest));
+    removal.apply(&target, &mut latest);
+    assert_eq!(latest.rows[0].badge, "removing");
+    latest.rows.clear();
+    assert!(removal.observed(&target, &latest));
 }

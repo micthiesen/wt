@@ -518,6 +518,38 @@ def check_active_action_survives_remote_runtime_upgrade(
         run([tmux, "-L", host["socket"], "kill-server"], cwd=host["main"], env=host["env"])
 
 
+def check_removal_completion(root: Path, binary: Path, token: str) -> None:
+    for fail in (False, True):
+        host = make_host(root, f"removal-{fail}", binary, token)
+        # A delayed destroy hook guarantees the worker startup acknowledgement
+        # precedes both completion and a late revision-check failure.
+        command = "sleep 0.5"
+        if fail:
+            command += "; printf changed >> fixture.txt"
+        with host["config"].open("a") as config:
+            config.write("\n[lifecycle]\ndestroy_command = " + toml_string(command) + "\n")
+        process = HostProcess(host)
+        try:
+            process.hello()
+            wait_snapshot(process, lambda value: row(value, "same-slug") is not None)
+            prepared = process.command(1, {"PrepareRemove": {"key": "same-slug"}})["Reply"]["reply"]
+            action = prepared["modal"]["Confirm"]["action"]["Remove"]
+            reply = process.command(2, {"Remove": action})["Reply"]["reply"]
+            if fail:
+                assert reply["failed"], reply
+                assert host["checkout"].is_dir(), "failed removal lost checkout"
+                assert "changed" in reply["message"].lower(), reply
+            else:
+                assert not reply["failed"], reply
+                assert not host["checkout"].exists(), "success replied before checkout removal"
+            jobs = list((host["root"] / "locks" / "destroy-jobs").glob("*.json"))
+            assert len(jobs) == 1, jobs
+            job = json.loads(jobs[0].read_text())
+            assert job["state"] == ("failed" if fail else "succeeded"), job
+        finally:
+            process.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/wt")
@@ -605,12 +637,13 @@ def main() -> None:
                 f"reconnect replayed an unsolicited command reply: {unsolicited!r}"
             )
 
+            check_removal_completion(root, binary, token)
             check_mismatched_protocol(binary, hosts[0])
             check_active_action_survives_remote_runtime_upgrade(hosts[0], root, binary, owned_servers)
             print(
                 "native host checks passed: fragmented protocol, isolated same-slug state, "
                 "title/status writes, non-destructive removal preflight, reconnect, endpoint loss, "
-                "protocol rejection, and active-action survival through two remote runtime publications"
+                "removal completion and late failure, protocol rejection, and active-action survival through two remote runtime publications"
             )
         finally:
             for server in owned_servers:

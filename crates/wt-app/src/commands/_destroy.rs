@@ -172,12 +172,17 @@ async fn start_remove_inner(
     loop {
         let current = read_job(&job_path).await?;
         if current["state"] == "running" && current["workerPid"].as_u64() == Some(pid as u64) {
+            // The job outlives this request; still reap its OS child when it
+            // finishes, including a crash before writing terminal state.
+            std::thread::spawn(move || child.wait());
             return Ok(job_id);
         }
         if current["state"] == "succeeded" {
+            std::thread::spawn(move || child.wait());
             return Ok(job_id);
         }
         if current["state"] == "failed" {
+            std::thread::spawn(move || child.wait());
             bail!(
                 "background worker exited during startup; see {}",
                 log_path.display()
@@ -200,6 +205,89 @@ async fn start_remove_inner(
             );
         }
         sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// A started removal whose terminal outcome cannot be established safely.
+#[derive(Debug)]
+pub struct RemovalUncertain(pub String);
+
+impl std::fmt::Display for RemovalUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for RemovalUncertain {}
+
+/// A TUI write finishes when its durable job does, not at startup. This wait
+/// belongs to the host's accepted-command drain and deliberately ignores UI
+/// cancellation. CLI background mode continues to return the startup ack.
+pub async fn wait_for_completion(ctx: &AppContext, job_id: &str) -> Result<()> {
+    validate_job_id(job_id)?;
+    let path = job_dir(ctx).join(format!("{job_id}.json"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(29 * 60);
+    let mut check_process_at = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let job = read_job(&path).await.map_err(|error| {
+            RemovalUncertain(format!(
+                "cannot read accepted removal job {job_id}: {error:#}; inspect {} before retrying",
+                path.display()
+            ))
+        })?;
+        match job["state"].as_str() {
+            Some("succeeded") => return Ok(()),
+            Some("failed") => bail!("{}", job["error"].as_str().unwrap_or("removal failed")),
+            Some("starting" | "running") => {}
+            _ => {
+                return Err(RemovalUncertain(format!(
+                    "invalid removal job state; inspect {}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RemovalUncertain(format!("removal job {job_id} has not reported completion; it may still be running; inspect {} before retrying", path.display())).into());
+        }
+        if tokio::time::Instant::now() >= check_process_at {
+            check_process_at = tokio::time::Instant::now() + Duration::from_secs(2);
+            if let (Some(pid), Some(expected)) = (
+                job["workerPid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok()),
+                job["workerStartIdentity"]
+                    .as_str()
+                    .filter(|identity| !identity.is_empty()),
+            ) {
+                let actual = process_start_identity(pid, &ctx.processes).await;
+                #[cfg(unix)]
+                let gone = i32::try_from(pid)
+                    .ok()
+                    .filter(|pid| *pid > 0)
+                    .is_some_and(|pid| {
+                        // SAFETY: signal zero only probes the checked positive PID.
+                        (unsafe { libc::kill(pid, 0) }) == -1
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    });
+                #[cfg(not(unix))]
+                let gone = false;
+                if gone || (!actual.is_empty() && actual != expected) {
+                    // An unrelated reused PID cannot own this job. Do not
+                    // rewrite archive state here: the durable record does
+                    // not prove where a crashed worker stopped.
+                    let final_job = read_job(&path).await.map_err(|error| {
+                        RemovalUncertain(format!(
+                            "cannot reconcile removal job {job_id}: {error:#}"
+                        ))
+                    })?;
+                    if final_job["state"] == "running" || final_job["state"] == "starting" {
+                        return Err(RemovalUncertain(format!("removal worker {pid} exited without a terminal result; inspect {} before retrying", path.display())).into());
+                    }
+                    continue;
+                }
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -239,6 +327,13 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             job["error"] = Value::Null;
             job["completedAt"] = json!(now_string());
             atomic_write(&job_path, &job).await?;
+            tracing::info!(
+                target: "wt_attention",
+                event_channel = "attention",
+                event_source = job["target"]["key"].as_str().unwrap_or("wt"),
+                event_text = "Worktree removed",
+                "background removal completed"
+            );
             Ok(0)
         }
         Err(error) => {
@@ -254,6 +349,13 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             job["error"] = json!(format!("{error:#}"));
             job["completedAt"] = json!(now_string());
             atomic_write(&job_path, &job).await?;
+            tracing::error!(
+                target: "wt_attention",
+                event_channel = "attention",
+                event_source = job["target"]["key"].as_str().unwrap_or("wt"),
+                event_text = %format!("Removal failed: {error:#}"),
+                "background removal failed"
+            );
             Err(error)
         }
     }
@@ -447,4 +549,70 @@ async fn process_start_identity(pid: u32, runner: &wt_platform::process::Process
         .filter(|output| output.status.success())
         .map(|output| format!("ps:{}", output.stdout_text().trim()))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::test_support::CommandFixture;
+
+    #[tokio::test]
+    async fn completion_wait_does_not_treat_startup_as_success() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let jobs = job_dir(&fixture.ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let path = jobs.join("1-a.json");
+        atomic_write(&path, &json!({"state": "running"}))
+            .await
+            .unwrap();
+        let waiter = wait_for_completion(&fixture.ctx, "1-a");
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        atomic_write(
+            &path,
+            &json!({"state": "failed", "error": "checkout changed after confirmation"}),
+        )
+        .await
+        .unwrap();
+        let error = waiter.await.unwrap_err();
+        assert_eq!(error.to_string(), "checkout changed after confirmation");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreadable_accepted_job_is_uncertain_not_a_failed_removal() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let error = wait_for_completion(&fixture.ctx, "1-a").await.unwrap_err();
+        assert!(error.downcast_ref::<RemovalUncertain>().is_some());
+        assert!(error.to_string().contains("before retrying"));
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_wait_reports_durable_success_even_when_ui_is_cancelled() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let jobs = job_dir(&fixture.ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let path = jobs.join("1-a.json");
+        atomic_write(&path, &json!({"state": "running"}))
+            .await
+            .unwrap();
+        fixture.ctx.cancellation.cancel();
+        let waiter = wait_for_completion(&fixture.ctx, "1-a");
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        atomic_write(&path, &json!({"state": "succeeded"}))
+            .await
+            .unwrap();
+        waiter.await.unwrap();
+        fixture.close().await.unwrap();
+    }
 }
