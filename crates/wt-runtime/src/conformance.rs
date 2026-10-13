@@ -212,6 +212,28 @@ pub async fn mutation_with_projection<T, M>(
     T: Clone + Debug,
     M: Mutation<T> + Debug,
 {
+    check_mutation(mutation, before, after, Some(projected)).await;
+}
+
+/// Operations whose progress is rendered from PendingView rather than by
+/// altering source data still obey every settlement and deadline guarantee.
+pub async fn mutation_progress_only<T, M>(mutation: M, before: T, after: T)
+where
+    T: Clone + Debug,
+    M: Mutation<T> + Debug,
+{
+    check_mutation(mutation, before, after, None::<fn(&M, &T) -> bool>).await;
+}
+
+async fn check_mutation<T, M>(
+    mutation: M,
+    before: T,
+    after: T,
+    projected: Option<impl Fn(&M, &T) -> bool>,
+) where
+    T: Clone + Debug,
+    M: Mutation<T> + Debug,
+{
     let label = mutation.label();
     assert!(
         !mutation.domains().is_empty(),
@@ -225,22 +247,24 @@ pub async fn mutation_with_projection<T, M>(
         mutation.observed(&after),
         "{label}: `after` must show the change"
     );
-    assert!(
-        !projected(&mutation, &before),
-        "{label}: no projection before mutation"
-    );
-    let mut view = before.clone();
-    mutation.apply(&mut view);
-    assert!(
-        projected(&mutation, &view),
-        "{label}: projection shows the change"
-    );
-    let mut again = view.clone();
-    mutation.apply(&mut again);
-    assert!(
-        projected(&mutation, &again),
-        "{label}: projection is idempotent"
-    );
+    if let Some(projected) = &projected {
+        assert!(
+            !projected(&mutation, &before),
+            "{label}: no projection before mutation"
+        );
+        let mut view = before.clone();
+        mutation.apply(&mut view);
+        assert!(
+            projected(&mutation, &view),
+            "{label}: projection shows the change"
+        );
+        let mut again = view.clone();
+        mutation.apply(&mut again);
+        assert!(
+            projected(&mutation, &again),
+            "{label}: projection is idempotent"
+        );
+    }
 
     let mut pending = Pending::<T, M>::default();
     let stale = Stamp::now();
@@ -263,9 +287,16 @@ pub async fn mutation_with_projection<T, M>(
         tokio::time::advance(Duration::from_secs(1)).await;
         let expired = pending.settle(&before, |_, _| Some(Stamp::now()), Instant::now());
         assert!(expired.is_empty(), "{label}: no revert before the deadline");
-        assert!(
-            projected(&mutation, &pending.project(&before)),
-            "{label}: still shown"
+        if let Some(projected) = &projected {
+            assert!(
+                projected(&mutation, &pending.project(&before)),
+                "{label}: still shown"
+            );
+        }
+        assert_eq!(
+            pending.views().len(),
+            1,
+            "{label}: progress remains visible"
         );
     }
     // A fetch that started after acceptance and shows it settles it.
@@ -275,9 +306,15 @@ pub async fn mutation_with_projection<T, M>(
     // Failure stops showing it at once.
     pending.begin(2, mutation.clone(), Instant::now());
     pending.remove(2);
+    if let Some(projected) = &projected {
+        assert!(
+            !projected(&mutation, &pending.project(&before)),
+            "{label}: failure rolls back"
+        );
+    }
     assert!(
-        !projected(&mutation, &pending.project(&before)),
-        "{label}: failure rolls back"
+        pending.views().is_empty(),
+        "{label}: failure clears progress"
     );
 
     // The deadline is bounded and reports the unobserved change.

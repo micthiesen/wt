@@ -74,11 +74,13 @@ yellow "blocked on" group with external gates. A review request's details show i
 author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
 shows a scrollbar when it overflows.
 
-Creation shows a selected `creating` row at once. Press F12 on this row to
-open the agent when the checkout is ready, on the selected host. Dependency
-installation continues as a background action. Other worktree actions wait
-until the real row is available. Confirmed removal moves the row to Archived
-with a `removing` label; a failed removal restores its previous archive state.
+Creation shows progress in the header and footer, separate from worktree rows.
+F12 queues agent entry on the chosen host once the checkout is ready. Esc or
+list navigation returns focus to existing worktrees. Attention and other board
+controls remain available. Inventory is the only source of worktree rows, even
+when it arrives before the creation reply. Dependency installation continues
+as a background action. Confirmed removal moves the row to Archived with a
+removal glyph; a failed removal restores its previous archive state.
 
 ### Cached, pending and failed states
 
@@ -112,7 +114,7 @@ tracked action output; its title names which, such as `attention · 2 new` or
 and the message. Attention entries wrap with a hanging indent; the full feed is
 one line per event, colored by level. Entries already marked seen are dimmed
 below a `seen HH:MM:SS` rule, and an empty attention feed reads "nothing needs
-you". The attention watermark is saved and `x` marks the current feed as seen.
+you". The attention watermark is saved and `x` or `X` marks the current feed as seen.
 `Ctrl+E`/`Ctrl+Y`, `Ctrl+Shift+J`/`Ctrl+Shift+K` where supported, and the
 mouse wheel scroll the output pane. Selecting an output with `'` pins it until
 it ends; `[`/`]` cycle outputs, `"` toggles attention/all activity, and `Esc`
@@ -174,7 +176,7 @@ parent's host, and `Tab` does nothing once the text carries `--base`; a
 A failed create keeps the name and chosen host editable, with the error shown
 in red above the prompt.
 After creation, WT refreshes inventory and metadata and selects the new row
-once it appears; the placeholder stays until then. Its group opens when the row
+once it appears; progress stays until then. Its group opens when the row
 arrives, including if a folded snapshot arrives before the saved group state.
 
 The Archived group sits at the bottom of the worktree pane when all visible
@@ -277,6 +279,9 @@ While attached, the configured terminal handoff returns to the TUI. `/compact`
 is available in harness command palettes that support it. Manager and special
 session controls remain reachable by these keys. The footer shows live
 special-session state and manager context usage when those facts are available.
+If a terminal command fails, its output remains visible instead of ejecting you
+to the board. Press Enter to retry that command, or F12 to return to wt. Commands
+that exit successfully close normally.
 
 ### Automations and output
 
@@ -288,7 +293,7 @@ special-session state and manager context usage when those facts are available.
 | `'` | Pick an activity, session, or action output |
 | `[` / `]` | Previous / next output |
 | `"` | Toggle attention / all activity |
-| `x` | Mark attention as seen |
+| `x` / `X` | Mark attention as seen |
 
 ### Performance and errors
 

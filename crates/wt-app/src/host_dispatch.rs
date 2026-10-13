@@ -62,9 +62,11 @@ pub async fn execute(
                 Ok(())
             })
             .await?;
+        let accepted = wt_runtime::Stamp::now();
         fleet.local.sources.metadata.refresh();
         return Ok(UiReply {
             message: "Attention marked seen".into(),
+            outcome: Some(wt_tui::ReplyOutcome::Accepted(accepted)),
             ..Default::default()
         });
     }

@@ -74,6 +74,13 @@ pub struct RemovalPlan {
 pub struct RemovalPlans {
     pub rows: Vec<RemovalPlan>,
     pub warning: Option<String>,
+    pub row_errors: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+enum LocalEvidencePolicy {
+    Strict,
+    IsolateRows,
 }
 
 pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<RemovalPlans> {
@@ -102,7 +109,15 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             Err(error) => return Err(error.into()),
         }
     };
-    plan_with_evidence(ctx, rows, &state, &github, warning).await
+    plan_with_evidence(
+        ctx,
+        rows,
+        &state,
+        &github,
+        warning,
+        LocalEvidencePolicy::Strict,
+    )
+    .await
 }
 
 /// Read local hazards with the host's confirmed GitHub evidence. A merged PR
@@ -133,7 +148,37 @@ pub(crate) async fn plan_with_facts(
 ) -> Result<RemovalPlans> {
     let empty = GithubData::default();
     let github = github.map_or(&empty, |github| &**github);
-    plan_with_evidence(ctx, rows, state, github, warning).await
+    plan_with_evidence(
+        ctx,
+        rows,
+        state,
+        github,
+        warning,
+        LocalEvidencePolicy::Strict,
+    )
+    .await
+}
+
+/// Local evidence failure belongs to its checkout. Automations for other rows
+/// can proceed, but the failed row contributes no cleanup or landing proof.
+/// GitHub remains a single confirmed, all-or-nothing batch input.
+pub(crate) async fn plan_automation_facts(
+    ctx: &AppContext,
+    rows: Vec<WorktreeRecord>,
+    state: &serde_json::Value,
+    github: Option<&Confirmed<GithubData>>,
+) -> Result<RemovalPlans> {
+    let empty = GithubData::default();
+    let github = github.map_or(&empty, |github| &**github);
+    plan_with_evidence(
+        ctx,
+        rows,
+        state,
+        github,
+        None,
+        LocalEvidencePolicy::IsolateRows,
+    )
+    .await
 }
 
 /// `github` is either this process's fresh fetch or confirmed leaf data; the
@@ -144,133 +189,150 @@ async fn plan_with_evidence(
     state: &serde_json::Value,
     github: &GithubData,
     mut warning: Option<String>,
+    policy: LocalEvidencePolicy,
 ) -> Result<RemovalPlans> {
     let lifecycle = service(ctx)?;
     let mut plans = Vec::with_capacity(rows.len());
     let mut published_bases = BTreeMap::new();
+    let mut row_errors = BTreeMap::new();
     for row in rows {
         if row.is_main {
             continue;
         }
-        let path = Path::new(&row.target.path);
-        let stored = &state["slugs"][row.target.slug()];
-        let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
-            .await?
-            .checked("git")?
-            .stdout_text()
-            .trim()
-            .to_owned();
-        let own_work = if let Some(base_sha) = stored["baseSha"].as_str() {
-            // A missing or corrupted fork anchor is unknown, never evidence of
-            // landing. An empty branch must not inherit its parent's landing.
-            let own = run_git(
-                ctx,
-                path,
-                ["rev-list", "--count", &format!("{base_sha}..HEAD")],
-            )
-            .await?;
-            own.status.success() && own.stdout_text().trim().parse::<u64>().is_ok_and(|n| n > 0)
-        } else {
-            false
-        };
-        let pr_landed = own_work
-            && github.prs.get(&row.target.branch).is_some_and(|pr| {
-                pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
-            });
-        let local_merged = own_work
-            && !pr_landed
-            && published_base_contains(ctx, path, &head, &mut published_bases, &mut warning)
+        let slug = row.target.slug().to_owned();
+        let result: Result<RemovalPlan> = async {
+            let path = Path::new(&row.target.path);
+            let stored = &state["slugs"][row.target.slug()];
+            let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
+                .await?
+                .checked("git")?
+                .stdout_text()
+                .trim()
+                .to_owned();
+            let own_work = if let Some(base_sha) = stored["baseSha"].as_str() {
+                // A missing or corrupted fork anchor is unknown, never evidence of
+                // landing. An empty branch must not inherit its parent's landing.
+                let own = run_git(
+                    ctx,
+                    path,
+                    ["rev-list", "--count", &format!("{base_sha}..HEAD")],
+                )
                 .await?;
-        let landed = pr_landed || local_merged;
-        let mut extra = serde_json::Map::new();
-        let pr = github.prs.get(&row.target.branch);
-        if let Some(title) = stored["manualTitle"]
-            .as_str()
-            .filter(|title| !title.trim().is_empty())
-            .or_else(|| {
-                pr.map(|pr| pr.title.as_str())
-                    .filter(|title| !title.trim().is_empty())
-            })
-        {
-            extra.insert("title".into(), serde_json::json!(title));
-        }
-        if let Some(issue_id) =
-            crate::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
-        {
-            extra.insert("issueId".into(), serde_json::json!(issue_id));
-        }
-        if let Some(github_issue) = stored.get("githubIssue") {
-            extra.insert("githubIssue".into(), github_issue.clone());
-        }
-        if landed {
-            extra.insert("gitState".into(), serde_json::json!("merged"));
-        }
-        // A branch may have advanced after an older PR merged. Persist the
-        // current revision's verdict so historical PR metadata cannot turn
-        // those unlanded commits into a claim that all work landed.
-        extra.insert(
-            "landedOnAtRemoval".into(),
-            serde_json::json!(if landed { "base" } else { "unlanded" }),
-        );
-        if let Some(pr) = pr {
-            extra.insert("prNumber".into(), serde_json::json!(pr.number));
-            extra.insert("prUrl".into(), serde_json::json!(pr.url));
-            extra.insert("prState".into(), serde_json::json!(pr.state));
-            if pr_landed && let Some(merge_oid) = &pr.merge_commit_oid {
-                extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
-            }
-        }
-        let removed_snapshot = wt_store::RemovedWorktree {
-            slug: row.target.slug().to_owned(),
-            branch: row.target.branch.clone(),
-            removed_at: String::new(),
-            work: None,
-            automations_paused: None,
-            extra,
-        };
-        let mut revision = lifecycle
-            .removal_revision(&row.target, landed, &ctx.cancellation)
-            .await?;
-        if local_merged {
-            let repository = match ctx.config.backend.kind {
-                wt_config::BackendKind::GitWorktree => ctx.config.paths.main_clone.as_path(),
-                wt_config::BackendKind::Rift => path,
+                own.status.success() && own.stdout_text().trim().parse::<u64>().is_ok_and(|n| n > 0)
+            } else {
+                false
             };
-            revision.published_base = published_bases
-                .get(repository)
-                .and_then(Option::as_ref)
-                .map(|tip| {
-                    Box::new((
-                        format!("refs/heads/{}", ctx.config.branch.base),
-                        tip.clone(),
-                    ))
+            let pr_landed = own_work
+                && github.prs.get(&row.target.branch).is_some_and(|pr| {
+                    pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
                 });
+            let local_merged = own_work
+                && !pr_landed
+                && published_base_contains(ctx, path, &head, &mut published_bases, &mut warning)
+                    .await?;
+            let landed = pr_landed || local_merged;
+            let mut extra = serde_json::Map::new();
+            let pr = github.prs.get(&row.target.branch);
+            if let Some(title) = stored["manualTitle"]
+                .as_str()
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| {
+                    pr.map(|pr| pr.title.as_str())
+                        .filter(|title| !title.trim().is_empty())
+                })
+            {
+                extra.insert("title".into(), serde_json::json!(title));
+            }
+            if let Some(issue_id) =
+                crate::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
+            {
+                extra.insert("issueId".into(), serde_json::json!(issue_id));
+            }
+            if let Some(github_issue) = stored.get("githubIssue") {
+                extra.insert("githubIssue".into(), github_issue.clone());
+            }
+            if landed {
+                extra.insert("gitState".into(), serde_json::json!("merged"));
+            }
+            // A branch may have advanced after an older PR merged. Persist the
+            // current revision's verdict so historical PR metadata cannot turn
+            // those unlanded commits into a claim that all work landed.
+            extra.insert(
+                "landedOnAtRemoval".into(),
+                serde_json::json!(if landed { "base" } else { "unlanded" }),
+            );
+            if let Some(pr) = pr {
+                extra.insert("prNumber".into(), serde_json::json!(pr.number));
+                extra.insert("prUrl".into(), serde_json::json!(pr.url));
+                extra.insert("prState".into(), serde_json::json!(pr.state));
+                if pr_landed && let Some(merge_oid) = &pr.merge_commit_oid {
+                    extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
+                }
+            }
+            let removed_snapshot = wt_store::RemovedWorktree {
+                slug: row.target.slug().to_owned(),
+                branch: row.target.branch.clone(),
+                removed_at: String::new(),
+                work: None,
+                automations_paused: None,
+                extra,
+            };
+            let mut revision = lifecycle
+                .removal_revision(&row.target, landed, &ctx.cancellation)
+                .await?;
+            if local_merged {
+                let repository = match ctx.config.backend.kind {
+                    wt_config::BackendKind::GitWorktree => ctx.config.paths.main_clone.as_path(),
+                    wt_config::BackendKind::Rift => path,
+                };
+                revision.published_base = published_bases
+                    .get(repository)
+                    .and_then(Option::as_ref)
+                    .map(|tip| {
+                        Box::new((
+                            format!("refs/heads/{}", ctx.config.branch.base),
+                            tip.clone(),
+                        ))
+                    });
+            }
+            let hazards = revision.hazards.clone();
+            let stage_path = path.to_path_buf();
+            let stage = row.target.stage.clone();
+            let prefix = ctx.config.stage.prefix.clone();
+            let default_stage = ctx.config.stage.default_personal.clone();
+            let has_sst = ctx.config.sst.is_some();
+            let destroy_stage = tokio::task::spawn_blocking(move || {
+                has_sst
+                    && stage != default_stage
+                    && crate::commands::remove::is_our_stage_deployed(&stage_path, &stage, &prefix)
+            })
+            .await?;
+            Ok(RemovalPlan {
+                row,
+                landed,
+                local_merged,
+                hazards,
+                destroy_stage,
+                revision,
+                removed_snapshot,
+            })
         }
-        let hazards = revision.hazards.clone();
-        let stage_path = path.to_path_buf();
-        let stage = row.target.stage.clone();
-        let prefix = ctx.config.stage.prefix.clone();
-        let default_stage = ctx.config.stage.default_personal.clone();
-        let has_sst = ctx.config.sst.is_some();
-        let destroy_stage = tokio::task::spawn_blocking(move || {
-            has_sst
-                && stage != default_stage
-                && crate::commands::remove::is_our_stage_deployed(&stage_path, &stage, &prefix)
-        })
-        .await?;
-        plans.push(RemovalPlan {
-            row,
-            landed,
-            local_merged,
-            hazards,
-            destroy_stage,
-            revision,
-            removed_snapshot,
-        });
+        .await;
+        match result {
+            Ok(plan) => plans.push(plan),
+            Err(error)
+                if matches!(policy, LocalEvidencePolicy::IsolateRows)
+                    && !ctx.cancellation.is_cancelled() =>
+            {
+                row_errors.insert(slug, format!("{error:#}"));
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(RemovalPlans {
         rows: plans,
         warning,
+        row_errors,
     })
 }
 

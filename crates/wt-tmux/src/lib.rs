@@ -223,7 +223,7 @@ pub fn write_terminal_config(
     fs::create_dir_all(cache_root)?;
     let styles = cached_palette_styles(cache_root);
     let content = format!(
-        "source-file -q {}\n{}\n{}\nbind-key -n F10 detach-client\nbind-key -n F11 detach-client\nbind-key -n F12 detach-client\n",
+        "source-file -q {}\n{}\n{}\nset -g remain-on-exit-format 'Command exited (#{{pane_dead_status}}). Enter: retry | F12: return to wt'\nbind-key -n Enter if-shell -F '#{{pane_dead}}' 'set-option -u @wt-harness-session-id ; respawn-pane' 'send-keys Enter'\nbind-key -n F10 detach-client\nbind-key -n F11 detach-client\nbind-key -n F12 detach-client\n",
         tmux_config_quote(&home.join(".tmux.conf").to_string_lossy()),
         preamble.unwrap_or(DEFAULT_TERMINAL_CONFIG),
         styles,
@@ -291,6 +291,7 @@ pub struct TmuxClient {
     runner: ProcessRunner,
     server: TmuxServer,
     session_environment: Vec<(String, String)>,
+    retain_failure: bool,
 }
 
 #[derive(Debug, Error)]
@@ -423,6 +424,7 @@ impl TmuxClient {
             runner,
             server,
             session_environment: Vec::new(),
+            retain_failure: false,
         }
     }
 
@@ -440,6 +442,13 @@ impl TmuxClient {
 
     pub fn server(&self) -> &TmuxServer {
         &self.server
+    }
+
+    /// Interactive terminals retain failure output. Background action/dev
+    /// clients keep their own completion lifecycle and do not opt in.
+    pub fn with_failure_retention(mut self) -> Self {
+        self.retain_failure = true;
+        self
     }
 
     /// Returns an empty list only when the server is definitely absent.
@@ -532,6 +541,29 @@ impl TmuxClient {
         checked("list-panes", result).and_then(|output| parse_panes(&output.stdout_text()))
     }
 
+    /// One batched snapshot, including retained failed panes. Callers can
+    /// distinguish an inspectable terminal from a still-running agent.
+    pub async fn list_all_panes(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PaneInfo>, TmuxError> {
+        let format = format!(
+            "#{{pane_id}}{FORMAT_SEPARATOR}#{{session_name}}{FORMAT_SEPARATOR}#{{window_id}}{FORMAT_SEPARATOR}#{{window_index}}{FORMAT_SEPARATOR}#{{pane_index}}{FORMAT_SEPARATOR}#{{pane_active}}{FORMAT_SEPARATOR}#{{pane_pid}}{FORMAT_SEPARATOR}#{{pane_width}}{FORMAT_SEPARATOR}#{{pane_height}}{FORMAT_SEPARATOR}#{{pane_dead}}{FORMAT_SEPARATOR}#{{pane_current_path}}"
+        );
+        let result = self
+            .run(
+                "list-panes",
+                ["list-panes", "-a", "-F", &format],
+                None,
+                cancellation,
+            )
+            .await?;
+        if !result.status.success() && tmux_server_definitely_absent(&result.stderr_text()) {
+            return Ok(Vec::new());
+        }
+        checked("list-panes", result).and_then(|output| parse_panes(&output.stdout_text()))
+    }
+
     pub fn create_session_args(&self, session: &CreateSession) -> Vec<OsString> {
         let mut args = self.prefix_args();
         args.extend(["new-session".into(), "-d".into()]);
@@ -547,12 +579,20 @@ impl TmuxClient {
             args.extend(["-y".into(), height.to_string().into()]);
         }
         if !session.command.is_empty() {
+            let session_command = if self.retain_failure {
+                // Set this before exec, so even immediate failure is retained.
+                // Global retention would strand background action/dev workers.
+                ["/bin/sh".to_owned(), "-c".to_owned(), "tmux set-option -p -t \"$TMUX_PANE\" remain-on-exit failed || exit; exec \"$@\"".to_owned(), "sh".to_owned()]
+                    .into_iter().chain(session.command.iter().cloned()).collect::<Vec<_>>()
+            } else {
+                session.command.clone()
+            };
             // `new-session -e` records the session environment, but tmux runs
             // explicit commands through the user's configured shell first.
             // Shell startup files can rewrite PATH, so install the same values
             // once more at the actual command boundary.
             let command = if self.session_environment.is_empty() {
-                session.command.clone()
+                session_command.clone()
             } else {
                 // A session source file holds secrets. Sourcing it inside
                 // the pane keeps their values out of every process's argv.
@@ -579,7 +619,7 @@ impl TmuxClient {
                             .map(|(key, value)| format!("{key}={value}")),
                     )
                     .chain(source)
-                    .chain(session.command.iter().cloned())
+                    .chain(session_command)
                     .collect()
             };
             let command = command

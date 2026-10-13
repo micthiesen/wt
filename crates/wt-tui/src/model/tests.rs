@@ -380,7 +380,9 @@ fn pending_creation_queues_f12_and_selects_the_real_row() {
             input: "new".into(),
         },
     );
-    assert!(model.selected_row().unwrap().key.starts_with("\0creating:"));
+    assert!(model.selected_row().is_none());
+    assert_eq!(model.board.rows.len(), 1);
+    assert_eq!(model.creation_focus, Some(1));
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::Char('d')), 20),
         InputResult::Draw
@@ -961,4 +963,100 @@ fn row_urls_and_session_keys_only_emit_for_available_targets() {
             target: SessionTarget::WtSource
         })
     );
+}
+
+#[test]
+fn remote_inventory_before_create_reply_never_duplicates_rows_or_blocks_attention() {
+    let host = "maxbook/config";
+    let key = wt_core::remote_worktree_ledger_key(host, "new");
+    let mut model = Model::default();
+    model.apply(snapshot(&["old", "new"])); // same slug on this machine is unrelated
+    let create = UiAction::OnHost {
+        host: Some(host.into()),
+        action: Box::new(UiAction::Create {
+            input: "new --no-install".into(),
+        }),
+    };
+    model.begin_action(1, &create);
+    assert_eq!(model.board.rows.len(), 2);
+    model.apply(snapshot(&["old", "new", &key])); // inventory wins the race
+    assert_eq!(model.board.rows.len(), 3);
+    assert_eq!(
+        model.board.rows.iter().filter(|row| row.key == key).count(),
+        1
+    );
+    assert!(model.selected_row().is_none());
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::F(12)), 20),
+        InputResult::Draw
+    );
+    let mut board = (*model.source_board).clone();
+    board.attention.push(crate::AttentionLine {
+        at_ms: 1,
+        source: "test".into(),
+        text: "event".into(),
+    });
+    model.apply(SourceSnapshot::test_live(
+        Some(board),
+        SourceState::Ready,
+        wt_core::Domain::Git,
+    ));
+    let mark = model.input(KeyEvent::from(KeyCode::Char('X')), 20);
+    let InputResult::Action(action @ UiAction::SetAttentionSeen { .. }) = mark else {
+        panic!("attention key was swallowed: {mark:?}")
+    };
+    model.begin_action(2, &action);
+    assert!(model.board.attention_seen_ms > 0);
+    model.reply(UiReply {
+        operation_id: Some(1),
+        select_when_visible: Some(key.clone()),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    assert_eq!(model.board.rows.len(), 3);
+    assert_eq!(model.selected_row().unwrap().key, key);
+    assert!(matches!(
+        model.follow_up,
+        Some(UiAction::OnHost { host: Some(_), .. })
+    ));
+}
+
+#[test]
+fn leaving_creation_progress_cancels_automatic_session_entry() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["old"]));
+    let generation = model.ui_generation;
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            input: "new".into(),
+        },
+    );
+    model.input(KeyEvent::from(KeyCode::F(12)), 20);
+    model.input(KeyEvent::from(KeyCode::Esc), 20);
+    assert!(model.creation_focus.is_none());
+    model.reply(UiReply {
+        operation_id: Some(1),
+        ui_generation: Some(generation),
+        select_when_visible: Some("new".into()),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    assert!(model.follow_up.is_none());
+    assert_eq!(model.selected_row().unwrap().key, "old");
+}
+
+#[test]
+fn first_navigation_out_of_creation_selects_the_first_item() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["first", "second"]));
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            input: "new".into(),
+        },
+    );
+    model.input(KeyEvent::from(KeyCode::Down), 20);
+    assert_eq!(model.selected_row().unwrap().key, "first");
+    assert!(model.creation_focus.is_none());
 }

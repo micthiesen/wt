@@ -56,8 +56,7 @@ pub fn start(
         let mut closed = false;
         let mut draining = false;
         loop {
-            while running.len() < 4 {
-                let Some((lane, request)) = take_available(&mut pending, &busy) else { break; };
+            while let Some((lane, request)) = take_available(&mut pending, &busy) {
                 let wt_tui::UiRequest { id, generation, action: command } = request;
                 busy.insert(lane.clone());
                 let context = context.clone();
@@ -125,6 +124,9 @@ enum Lane {
     Host(Option<String>),
     FleetCleanup,
     Presentation,
+    /// Bounded, device-local controls must remain responsive while host jobs
+    /// or interactive handoffs occupy all ordinary action slots.
+    ViewControl,
     Terminal,
 }
 
@@ -138,6 +140,13 @@ fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
     let (host, action, _) = crate::host_routing::resolve(action.clone())?;
     Ok(
         if matches!(
+            action,
+            wt_tui::UiAction::SetAttentionSeen { .. }
+                | wt_tui::UiAction::SetHistoryActive { .. }
+                | wt_tui::UiAction::SetPerf { .. }
+        ) {
+            Lane::ViewControl
+        } else if matches!(
             action,
             wt_tui::UiAction::Session { .. }
                 | wt_tui::UiAction::SelectSession { .. }
@@ -167,9 +176,17 @@ fn take_available<T>(
     pending: &mut VecDeque<(Lane, T)>,
     busy: &BTreeSet<Lane>,
 ) -> Option<(Lane, T)> {
-    let position = pending
+    // Reserve one separate slot for quick local view controls. Ordinary host,
+    // terminal and presentation work keeps its four-task bound.
+    let ordinary_full = busy
         .iter()
-        .position(|(lane, _)| busy.iter().all(|active| !lanes_conflict(lane, active)))?;
+        .filter(|lane| **lane != Lane::ViewControl)
+        .count()
+        >= 4;
+    let position = pending.iter().position(|(lane, _)| {
+        (!ordinary_full || *lane == Lane::ViewControl)
+            && busy.iter().all(|active| !lanes_conflict(lane, active))
+    })?;
     pending.remove(position)
 }
 
@@ -512,6 +529,64 @@ mod tests {
             take_available(&mut pending, &BTreeSet::new()),
             Some((remote, title("second")))
         );
+    }
+
+    #[test]
+    fn view_controls_have_reserved_capacity_while_host_work_is_saturated() {
+        let busy = BTreeSet::from([
+            Lane::Host(None),
+            Lane::Host(Some("builder-a".into())),
+            Lane::Host(Some("builder-b".into())),
+            Lane::Presentation,
+        ]);
+        let control = UiAction::SetAttentionSeen { at_ms: 42 };
+        let control_lane = lane_for(&control).unwrap();
+        assert_eq!(control_lane, Lane::ViewControl);
+        let mut pending = VecDeque::from([
+            (
+                Lane::Terminal,
+                UiAction::EnterHarness {
+                    key: "existing".into(),
+                    harness: wt_core::HarnessId::Codex,
+                },
+            ),
+            (control_lane.clone(), control.clone()),
+        ]);
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((control_lane, control))
+        );
+        assert_eq!(take_available(&mut pending, &busy), None);
+    }
+
+    #[test]
+    fn view_controls_still_serialize_and_do_not_consume_host_capacity() {
+        let busy = BTreeSet::from([
+            Lane::ViewControl,
+            Lane::Host(None),
+            Lane::Host(Some("builder-a".into())),
+            Lane::Host(Some("builder-b".into())),
+        ]);
+        let next_host = Lane::Host(Some("builder-c".into()));
+        let mut pending = VecDeque::from([
+            (Lane::ViewControl, "another view control"),
+            (next_host.clone(), "host job"),
+        ]);
+        assert_eq!(
+            take_available(&mut pending, &busy),
+            Some((next_host, "host job"))
+        );
+        assert_eq!(take_available(&mut pending, &busy), None);
+        for action in [
+            UiAction::SetHistoryActive { active: true },
+            UiAction::SetPerf {
+                active: true,
+                continuous: false,
+                refresh: true,
+            },
+        ] {
+            assert_eq!(lane_for(&action).unwrap(), Lane::ViewControl);
+        }
     }
 
     #[test]

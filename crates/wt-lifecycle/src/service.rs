@@ -17,7 +17,7 @@ use wt_config::{BackendKind, Config};
 use wt_core::{WorktreeTarget, local_worktree_target};
 use wt_platform::{
     lock::{FileLock, LockError},
-    process::{CommandSpec, ProcessError, ProcessRunner},
+    process::{CommandSpec, ProcessError, ProcessRunner, ProcessStream},
 };
 use wt_store::{RemovedWorktree, RepositoryIdentity, Store, StoreError};
 use wt_vcs::{GitRepository, WorktreeRecord};
@@ -2005,16 +2005,14 @@ impl LifecycleService {
         status_args.push(".".into());
         status_args.extend(exclusions.iter().cloned());
         let status = self
-            .git_snapshot_output_vec(path, status_args, cancellation)
-            .await?
-            .stdout;
+            .git_snapshot_digest(path, status_args, cancellation)
+            .await?;
         let mut worktree_args = args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "--"]);
         worktree_args.push(".".into());
         worktree_args.extend(exclusions.iter().cloned());
         let worktree_diff = self
-            .git_snapshot_output_vec(path, worktree_args, cancellation)
-            .await?
-            .stdout;
+            .git_snapshot_digest(path, worktree_args, cancellation)
+            .await?;
         let mut index_args = args([
             "diff",
             "--cached",
@@ -2026,9 +2024,8 @@ impl LifecycleService {
         index_args.push(".".into());
         index_args.extend(exclusions.iter().cloned());
         let index_diff = self
-            .git_snapshot_output_vec(path, index_args, cancellation)
-            .await?
-            .stdout;
+            .git_snapshot_digest(path, index_args, cancellation)
+            .await?;
         let mut untracked_args = args(["ls-files", "--others", "--exclude-standard", "-z", "--"]);
         untracked_args.push(".".into());
         untracked_args.extend(exclusions);
@@ -2037,15 +2034,22 @@ impl LifecycleService {
             .await?
             .stdout;
         let checkout = PathBuf::from(&row.target.path);
-        let metadata =
-            tokio::task::spawn_blocking(move || untracked_metadata(&checkout, &untracked))
-                .await
-                .map_err(|error| LifecycleError::Join(error.to_string()))?
-                .map_err(|message| {
-                    LifecycleError::Refused(format!("cannot safely snapshot checkout: {message}"))
-                })?;
+        let snapshot_cancellation = cancellation.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            untracked_metadata(&checkout, &untracked, &snapshot_cancellation)
+        })
+        .await
+        .map_err(|error| LifecycleError::Join(error.to_string()))?
+        .map_err(|message| {
+            LifecycleError::Refused(format!("cannot safely snapshot checkout: {message}"))
+        })?;
         let mut digest = Sha256::new();
-        for bytes in [&status, &worktree_diff, &index_diff, &metadata] {
+        for bytes in [
+            status.as_slice(),
+            worktree_diff.as_slice(),
+            index_diff.as_slice(),
+            &metadata,
+        ] {
             digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
@@ -2188,6 +2192,46 @@ impl LifecycleService {
             cancellation,
         )
         .await
+    }
+
+    /// Fingerprint the entire stream, rather than retaining a patch that can
+    /// grow with arbitrary tracked file contents. The runner still owns the
+    /// timeout, cancellation, pipe draining and bounded error diagnostics.
+    async fn git_snapshot_digest(
+        &self,
+        path: &Path,
+        args: Vec<OsString>,
+        cancellation: &CancellationToken,
+    ) -> Result<[u8; 32], LifecycleError> {
+        let digest = Arc::new(std::sync::Mutex::new(Sha256::new()));
+        let observer_digest = digest.clone();
+        let mut command = CommandSpec::new("git");
+        command.args = args;
+        command.cwd = Some(path.to_path_buf());
+        command.timeout = Duration::from_secs(30);
+        command.output_limit = 8192;
+        self.runner
+            .run_streaming(command, cancellation, move |stream, bytes| {
+                if stream == ProcessStream::Stdout {
+                    observer_digest
+                        .lock()
+                        .expect("digest lock poisoned")
+                        .update(bytes);
+                }
+            })
+            .await
+            .and_then(|output| output.checked("git"))
+            .map_err(|source| LifecycleError::Process {
+                operation: "capture removal revision",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(digest
+            .lock()
+            .expect("digest lock poisoned")
+            .clone()
+            .finalize()
+            .into())
     }
 
     async fn git_snapshot_output_vec(
@@ -2487,7 +2531,6 @@ async fn canonicalize(path: &Path, operation: &'static str) -> Result<PathBuf, L
 }
 
 const MAX_UNTRACKED_FILES: usize = 4096;
-const MAX_UNTRACKED_BYTES: u64 = 16 * 1024 * 1024;
 
 fn same_checkout_revision(current: &RemovalRevision, expected: &RemovalRevision) -> bool {
     current.key == expected.key
@@ -2529,7 +2572,12 @@ fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
         .collect()
 }
 
-fn untracked_metadata(checkout: &Path, paths: &[u8]) -> Result<Vec<u8>, String> {
+fn untracked_metadata(
+    checkout: &Path,
+    paths: &[u8],
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     let mut entries = paths
@@ -2541,9 +2589,19 @@ fn untracked_metadata(checkout: &Path, paths: &[u8]) -> Result<Vec<u8>, String> 
         return Err(format!("more than {MAX_UNTRACKED_FILES} untracked paths"));
     }
     entries.sort();
-    let mut total_bytes = 0u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let check_budget = || {
+        if cancellation.is_cancelled() {
+            Err("untracked snapshot cancelled".to_owned())
+        } else if std::time::Instant::now() >= deadline {
+            Err("untracked snapshot timed out after 30 seconds".to_owned())
+        } else {
+            Ok(())
+        }
+    };
     let mut result = Vec::new();
     for relative in entries {
+        check_budget()?;
         let relative_path = git_path_from_bytes(&relative)?;
         if relative_path.is_absolute()
             || relative_path.components().any(|c| {
@@ -2560,12 +2618,6 @@ fn untracked_metadata(checkout: &Path, paths: &[u8]) -> Result<Vec<u8>, String> 
         let full_path = checkout.join(relative_path);
         let metadata = std::fs::symlink_metadata(&full_path)
             .map_err(|error| format!("stat {}: {error}", full_path.display()))?;
-        total_bytes = total_bytes.saturating_add(metadata.len());
-        if total_bytes > MAX_UNTRACKED_BYTES {
-            return Err(format!(
-                "untracked files exceed {MAX_UNTRACKED_BYTES} bytes"
-            ));
-        }
         let modified = metadata
             .modified()
             .map_err(|error| format!("read mtime for {}: {error}", full_path.display()))?;
@@ -2586,15 +2638,29 @@ fn untracked_metadata(checkout: &Path, paths: &[u8]) -> Result<Vec<u8>, String> 
             result.extend_from_slice(&(target.len() as u64).to_be_bytes());
             result.extend_from_slice(target);
         } else if metadata.is_file() {
-            let contents = std::fs::read(&full_path)
+            let mut file = std::fs::File::open(&full_path)
                 .map_err(|error| format!("read {}: {error}", full_path.display()))?;
-            if contents.len() as u64 != metadata.len() {
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 64 * 1024];
+            let mut total = 0u64;
+            loop {
+                check_budget()?;
+                let read = file
+                    .read(&mut buffer)
+                    .map_err(|error| format!("read {}: {error}", full_path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                total += read as u64;
+                digest.update(&buffer[..read]);
+            }
+            if total != metadata.len() {
                 return Err(format!(
                     "{} changed while its removal snapshot was captured",
                     full_path.display()
                 ));
             }
-            let hash = Sha256::digest(&contents);
+            let hash = digest.finalize();
             result.extend_from_slice(&hash);
         } else {
             return Err(format!(
@@ -3450,6 +3516,100 @@ mod tests {
         ));
         assert!(!cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(Path::new(&created.target.path).exists());
+    }
+
+    #[tokio::test]
+    async fn removal_revision_hashes_large_patches_and_rejects_changes_after_confirmation() {
+        let (_scratch, service, runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let created = service
+            .create(
+                "michael/ENG-78-large-revision",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = Path::new(&created.target.path);
+        let mut content = vec![b'a'; PROCESS_OUTPUT_LIMIT + 1024];
+        content.push(b'\n');
+        fs::write(path.join("tracked.txt"), &content).await.unwrap();
+        let unstaged = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(unstaged.hazards, [UNCOMMITTED_HAZARD]);
+        runner
+            .run(
+                CommandSpec::new("git")
+                    .args(["add", "tracked.txt"])
+                    .cwd(path),
+                &cancellation,
+            )
+            .await
+            .unwrap()
+            .checked("git")
+            .unwrap();
+        let staged = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_ne!(unstaged.digest, staged.digest);
+        // A change beyond the old capture boundary must remain part of the
+        // proof, including when forced removal was confirmed while dirty.
+        content[PROCESS_OUTPUT_LIMIT + 1] = b'b';
+        fs::write(path.join("tracked.txt"), &content).await.unwrap();
+        let changed = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_ne!(staged.digest, changed.digest);
+        let result = service
+            .remove_with_revision(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    ..RemoveOptions::default()
+                },
+                &staged,
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(LifecycleError::Refused(message)) if message.contains("changed"))
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn untracked_snapshot_hashes_large_files_and_honors_cancellation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut content = vec![b'a'; PROCESS_OUTPUT_LIMIT + 1024];
+        let path = scratch.path().join("large");
+        std::fs::write(&path, &content).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cancellation = CancellationToken::new();
+        let first = untracked_metadata(scratch.path(), b"large\0", &cancellation).unwrap();
+        content[PROCESS_OUTPUT_LIMIT + 1] = b'b';
+        std::fs::write(&path, &content).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let second = untracked_metadata(scratch.path(), b"large\0", &cancellation).unwrap();
+        assert_ne!(first, second);
+        cancellation.cancel();
+        assert!(
+            untracked_metadata(scratch.path(), b"large\0", &cancellation)
+                .unwrap_err()
+                .contains("cancelled")
+        );
     }
 
     #[tokio::test]

@@ -179,6 +179,20 @@ impl Model {
                 });
             }
         }
+        if let Some(id) = self.creation_focus {
+            let ready = self
+                .creates
+                .get(&id)
+                .and_then(|create| create.resolved.as_ref())
+                .and_then(|key| self.row_position(key));
+            if let Some(index) = ready {
+                self.creation_focus = None;
+                self.selected = Some(index);
+                self.pending_selection = None;
+            } else {
+                self.selected = None;
+            }
+        }
     }
 
     pub fn selected_row(&self) -> Option<&BoardRow> {
@@ -315,6 +329,7 @@ impl Model {
     }
 
     pub(super) fn select(&mut self, index: usize) -> InputResult {
+        self.creation_focus = None;
         self.pending_selection = None;
         let selected = (self.item_count() > 0).then(|| index.min(self.item_count() - 1));
         let freed = std::mem::take(&mut self.list_free_scroll);
@@ -343,7 +358,9 @@ impl Model {
     /// Move the cursor one stop; at an edge, scroll the list to that edge
     /// instead (TS `normal-keys.ts:545-570`).
     pub(super) fn step(&mut self, forward: bool) -> InputResult {
-        let current = self.selected.unwrap_or(0);
+        let Some(current) = self.selected else {
+            return self.select(0);
+        };
         let count = self.item_count();
         let at_edge = if forward {
             count == 0 || current + 1 >= count

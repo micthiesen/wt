@@ -52,6 +52,8 @@ pub struct Model {
     pub(crate) next_op: u64,
     /// Creation-only interaction state, keyed by operation id.
     pub(crate) creates: std::collections::BTreeMap<u64, CreateUi>,
+    /// Focused creation progress is never represented by a fake worktree row.
+    pub(crate) creation_focus: Option<u64>,
     /// Provenance and fetch-start stamps of the local host's domains.
     pub(crate) local_domains: wt_runtime::DomainMap,
     pub(crate) source_board: Arc<Board>,
@@ -120,6 +122,7 @@ impl Default for Model {
             pending: Default::default(),
             next_op: 0,
             creates: Default::default(),
+            creation_focus: None,
             local_domains: Default::default(),
             follow_up: None,
             source_state: SourceState::Empty,

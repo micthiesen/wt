@@ -2321,7 +2321,7 @@ dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime",
+ "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
@@ -2334,6 +2334,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.17+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
+dependencies = [
+ "indexmap",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -2924,6 +2946,9 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "writeable"
@@ -2933,7 +2958,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wt-actions"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "regex",
@@ -2952,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "wt-app"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -3001,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "wt-automations"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -3019,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "wt-config"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "regex",
  "serde",
@@ -3033,7 +3058,7 @@ dependencies = [
 
 [[package]]
 name = "wt-core"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "regex",
  "serde",
@@ -3043,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "wt-dev"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
  "serde",
@@ -3061,7 +3086,7 @@ dependencies = [
 
 [[package]]
 name = "wt-events"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "axum",
  "futures-util",
@@ -3081,7 +3106,7 @@ dependencies = [
 
 [[package]]
 name = "wt-github"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3098,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "wt-harness"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "futures-util",
  "libc",
@@ -3111,6 +3136,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "toml_edit",
  "uuid",
  "wt-core",
  "wt-platform",
@@ -3119,7 +3145,7 @@ dependencies = [
 
 [[package]]
 name = "wt-launcher"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -3129,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "wt-lifecycle"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "globset",
  "libc",
@@ -3153,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "wt-naming"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "sha2",
  "tempfile",
@@ -3167,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "wt-platform"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "libc",
  "tempfile",
@@ -3179,7 +3205,7 @@ dependencies = [
 
 [[package]]
 name = "wt-remote"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
@@ -3198,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "wt-runtime"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "futures-util",
  "serde",
@@ -3213,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "wt-skills"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "libc",
@@ -3228,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "wt-sst"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "futures-util",
  "serde",
@@ -3243,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "wt-stack"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "serde",
@@ -3263,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "wt-store"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3275,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "wt-tmux"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -3288,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "wt-tui"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "crossterm",
  "futures-util",
@@ -3305,7 +3331,7 @@ dependencies = [
 
 [[package]]
 name = "wt-update"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "flate2",
  "futures-util",
@@ -3322,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "wt-vcs"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "futures-util",
  "regex",
@@ -3347,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "serde_json",

@@ -1,5 +1,5 @@
 //! The user's pending requests over the source board: beginning, settling
-//! and projecting them, and the creation placeholders they show.
+//! and projecting them, and the separate creation progress they show.
 
 use std::sync::Arc;
 
@@ -8,10 +8,9 @@ use wt_runtime::SourceSnapshot;
 use super::{Board, Model, ToastTone};
 use crate::{SessionTarget, UiAction, UiReply};
 
-/// Interaction state of a pending creation (its placeholder row and F12).
+/// Interaction state of a pending creation, independent of worktree rows.
 #[derive(Clone, Debug)]
 pub(crate) struct CreateUi {
-    pub placeholder: String,
     pub host: Option<String>,
     pub resolved: Option<String>,
     pub open_agent: bool,
@@ -59,6 +58,12 @@ impl Model {
         let expired = pending.settle(&source, |target, domain| self.observed(target, domain), now);
         self.pending = pending;
         self.creates.retain(|op, _| self.pending.contains(*op));
+        if self
+            .creation_focus
+            .is_some_and(|id| !self.creates.contains_key(&id))
+        {
+            self.creation_focus = None;
+        }
         for change in &expired {
             let text = crate::render::status::expired_notice(change);
             let source = change.mutation.target.key.as_deref().unwrap_or("wt");
@@ -90,19 +95,10 @@ impl Model {
         self.next_op
     }
 
-    pub(crate) fn is_placeholder(&self, key: &str) -> bool {
-        self.creates
-            .values()
-            .any(|create| create.placeholder == key)
-    }
-
-    /// F12 on a creation placeholder: open the agent now if the checkout is
-    /// ready, otherwise as soon as the host reports it.
-    pub(super) fn request_agent(&mut self, key: &str) -> Option<UiAction> {
-        let create = self
-            .creates
-            .values_mut()
-            .find(|create| create.placeholder == key)?;
+    /// F12 while creation has focus opens the resolved checkout, or queues
+    /// opening until its host returns the canonical identity.
+    pub(super) fn request_agent(&mut self, id: u64) -> Option<UiAction> {
+        let create = self.creates.get_mut(&id)?;
         create.open_agent = true;
         create.resolved.clone().map(|resolved| {
             on_host(
@@ -180,17 +176,17 @@ impl Model {
         let crate::Effect::Mutation(mut mutation) = action.effect(&self.board) else {
             return;
         };
-        if let Some(placeholder) = mutation.assign_placeholder(id) {
+        if mutation.assign_creation(id) {
             self.creates.insert(
                 id,
                 CreateUi {
-                    placeholder: placeholder.clone(),
                     host: mutation.target.host.clone(),
                     resolved: None,
                     open_agent: false,
                 },
             );
-            self.pending_selection = Some(placeholder);
+            self.creation_focus = Some(id);
+            self.pending_selection = None;
         }
         let now = tokio::time::Instant::now();
         self.pending.begin(id, mutation, now);
@@ -205,18 +201,16 @@ impl Model {
     }
 
     /// Apply the host's answer to its pending change, and open the agent of
-    /// a finished creation the user asked for with F12 while still on its
-    /// placeholder. Returns whether that placeholder is selected, which keeps
+    /// a finished creation the user asked for with F12 while focused on its
+    /// progress. Returns whether that creation is focused, which keeps
     /// the reply current for the user.
     pub(super) fn reply_pending(&mut self, reply: &UiReply) -> bool {
-        let selected = self.selected_row().map(|row| row.key.clone());
         let create = reply
             .operation_id
             .and_then(|id| self.creates.get(&id))
             .cloned();
-        let selected_create = create
-            .as_ref()
-            .is_some_and(|create| selected.as_deref() == Some(create.placeholder.as_str()));
+        let selected_create =
+            reply.operation_id.is_some() && self.creation_focus == reply.operation_id;
         if self.finish_pending(reply) {
             if let Some(create) = &create
                 && selected_create

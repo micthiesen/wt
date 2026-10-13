@@ -200,7 +200,7 @@ async fn every_mutation_kind_meets_the_contract() {
         ),
         (
             whole(LifecycleChange::Create {
-                placeholder: "\0creating:1".into(),
+                request_id: 1,
                 input: "new".into(),
                 resolved: Some("new".into()),
             }),
@@ -253,6 +253,11 @@ async fn every_mutation_kind_meets_the_contract() {
                 })
             })
             .await;
+        } else if matches!(
+            mutation.kind,
+            MutationKind::Lifecycle(LifecycleChange::Create { .. })
+        ) {
+            conformance::mutation_progress_only(mutation, before, after).await;
         } else {
             conformance::mutation(mutation, before, after).await;
         }
@@ -508,31 +513,34 @@ fn every_declared_domain_can_settle() {
 }
 
 #[test]
-fn creation_placeholder_survives_stale_boards_until_its_row_arrives() {
+fn creation_never_fabricates_inventory_rows_before_or_after_reply() {
     let mut creating = whole(LifecycleChange::Create {
-        placeholder: "\0creating:1".into(),
+        request_id: 1,
         input: "new --base staging".into(),
         resolved: None,
     });
-    let mut stale = board();
-    creating.apply(&mut stale);
-    assert_eq!(stale.rows.len(), 2);
-    assert_eq!(stale.rows[1].badge, "creating · F12 to open when ready");
-    assert!(stale.sections[0].rows.contains(&1));
-    if let MutationKind::Lifecycle(LifecycleChange::Create { resolved, .. }) = &mut creating.kind {
-        *resolved = Some("new".into());
+    for resolved in [None, Some("new".to_owned())] {
+        if let MutationKind::Lifecycle(LifecycleChange::Create { resolved: key, .. }) =
+            &mut creating.kind
+        {
+            *key = resolved;
+        }
+        for arrived in [false, true] {
+            let mut inventory = board();
+            if arrived {
+                inventory.rows.push(BoardRow {
+                    key: "new".into(),
+                    ..Default::default()
+                });
+            }
+            let original = inventory.clone();
+            creating.apply(&mut inventory);
+            assert_eq!(
+                inventory, original,
+                "creation progress cannot insert inventory identities"
+            );
+        }
     }
-    let mut still_stale = board();
-    creating.apply(&mut still_stale);
-    assert_eq!(still_stale.rows[1].badge, "ready · updating inventory");
-    let mut fresh = with(|b| {
-        b.rows.push(BoardRow {
-            key: "new".into(),
-            ..Default::default()
-        })
-    });
-    creating.apply(&mut fresh);
-    assert_eq!(fresh.rows.len(), 2, "no placeholder beside the real row");
 }
 
 #[test]

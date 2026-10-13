@@ -409,7 +409,7 @@ pub fn start(
                     &cancellation,
                 )
                 .await;
-                (changed, false, errors)
+                (changed, std::collections::BTreeSet::new(), errors)
             } else {
                 let (mut changed, discovery_changed, mut errors) = poll_active(
                     &paths,
@@ -434,10 +434,8 @@ pub fn start(
                 (changed, discovery_changed, errors)
             };
             codex_watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf)).await;
-            if discovery_changed {
-                for entry in &active {
-                    commands.discover(entry.key.slug.clone(), entry.key.harness);
-                }
+            for (slug, harness) in discovery_changed {
+                commands.discover(slug, harness);
             }
             snapshot.primary =
                 Some(crate::harness::read_primary(&primary_path, primary_fallback).await.as_str().to_owned());
@@ -541,7 +539,11 @@ async fn poll_active(
     snapshot: &mut SessionActivitySnapshot,
     active: &[ActiveSession],
     cancel: &CancellationToken,
-) -> (bool, bool, Vec<String>) {
+) -> (
+    bool,
+    std::collections::BTreeSet<(String, HarnessId)>,
+    Vec<String>,
+) {
     let ActivityCursors {
         claude: claude_cursors,
         codex: codex_tracker,
@@ -551,7 +553,7 @@ async fn poll_active(
         ..
     } = cursors;
     let mut changed = false;
-    let mut discovery_changed = false;
+    let mut discovery_changed = std::collections::BTreeSet::new();
     let mut errors = Vec::new();
     let codex_active = active
         .iter()
@@ -584,7 +586,12 @@ async fn poll_active(
                 }
                 let activity_changed = !batch.changed_slugs.is_empty();
                 changed |= activity_changed;
-                discovery_changed |= activity_changed;
+                discovery_changed.extend(
+                    batch
+                        .changed_slugs
+                        .into_iter()
+                        .map(|slug| (slug, HarnessId::Codex)),
+                );
             }
             Err(error) => errors.push(format!("Codex activity: {error}")),
         }
@@ -612,7 +619,14 @@ async fn poll_active(
                     );
                 }
                 changed |= batch.changed;
-                discovery_changed |= batch.changed;
+                if batch.changed {
+                    discovery_changed.extend(
+                        active
+                            .iter()
+                            .filter(|entry| entry.key.harness == HarnessId::Opencode)
+                            .map(|entry| (entry.key.slug.clone(), HarnessId::Opencode)),
+                    );
+                }
             }
             Err(error) => errors.push(format!("OpenCode activity: {error}")),
         }
@@ -629,9 +643,12 @@ async fn poll_active(
     match result {
         Ok(updates) => {
             for update in updates {
+                let slug = update.slug.clone();
                 let output_changed = apply_output_update(snapshot, HarnessId::Opencode, update);
                 changed |= output_changed;
-                discovery_changed |= output_changed;
+                if output_changed {
+                    discovery_changed.insert((slug, HarnessId::Opencode));
+                }
             }
         }
         Err(error) => errors.push(format!("OpenCode output: {error}")),
@@ -662,7 +679,14 @@ async fn poll_active(
             *claude_cursors = cursors;
             snapshot.tails = tails;
             changed |= updated;
-            discovery_changed |= updated;
+            if updated {
+                discovery_changed.extend(
+                    active
+                        .iter()
+                        .filter(|entry| entry.key.harness == HarnessId::Claude)
+                        .map(|entry| (entry.key.slug.clone(), HarnessId::Claude)),
+                );
+            }
             errors.extend(read_errors);
         }
         Err(error) => {

@@ -717,4 +717,64 @@ fn empty_terminal_preamble_still_has_palette_and_board_return_keys() {
     assert!(!content.contains("set -g mouse"));
     assert!(content.contains("window-active-style 'fg=#ffffff,bg=#000000'"));
     assert!(content.contains("bind-key -n F12 detach-client"));
+    assert!(content.contains("remain-on-exit-format"));
+}
+
+#[tokio::test]
+async fn failed_commands_remain_visible_and_retry_without_killing_live_commands() {
+    let temp = tempdir().unwrap();
+    let config =
+        crate::write_terminal_config(temp.path(), temp.path(), Some("set -g remain-on-exit off"))
+            .unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("tmux.sock")).with_config_file(config),
+    )
+    .with_failure_retention();
+    let cancel = CancellationToken::new();
+    let result = async {
+        client.create_session(&CreateSession {
+            name: "failure".into(), cwd: temp.path().into(),
+            command: vec!["sh".into(), "-c".into(), "if [ -f retried ]; then exec cat; else touch retried; echo bootstrap-failed; exit 23; fi".into()],
+            width: Some(80), height: Some(24),
+        }, &cancel).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if client.list_panes("failure", &cancel).await?.iter().any(|pane| pane.dead) { break; }
+            assert!(tokio::time::Instant::now() < deadline, "failed pane was not retained");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let output = client.capture_pane(&PaneTarget::active_session_pane("failure"), Some(100), &cancel).await?;
+        assert!(output.contains("bootstrap-failed"), "{output}");
+        let retry = client.run("if-shell", ["if-shell", "-t", "=failure:", "-F", "#{pane_dead}", "respawn-pane -t =failure:", "send-keys -t =failure: Enter"], None, &cancel).await?;
+        assert!(retry.status.success(), "{}", retry.stderr_text());
+        let panes = client.list_panes("failure", &cancel).await?;
+        assert!(!panes[0].dead);
+        let pid = panes[0].pid;
+        let enter = client.run("if-shell", ["if-shell", "-t", "=failure:", "-F", "#{pane_dead}", "respawn-pane -t =failure:", "send-keys -t =failure: Enter"], None, &cancel).await?;
+        assert!(enter.status.success());
+        assert_eq!(client.list_panes("failure", &cancel).await?[0].pid, pid);
+        client.create_session(&CreateSession {
+            name: "success".into(), cwd: temp.path().into(),
+            command: vec!["true".into()], width: None, height: None,
+        }, &cancel).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while client.session_exists("success", &cancel).await? {
+            assert!(tokio::time::Instant::now() < deadline, "successful exit was retained");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let background = TmuxClient::new(ProcessRunner::default(), client.server().clone());
+        background.create_session(&CreateSession {
+            name: "background".into(), cwd: temp.path().into(),
+            command: vec!["false".into()], width: None, height: None,
+        }, &cancel).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while background.session_exists("background", &cancel).await? {
+            assert!(tokio::time::Instant::now() < deadline, "background worker was retained");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<(), crate::TmuxError>(())
+    }.await;
+    client.kill_server(&cancel).await.unwrap();
+    result.unwrap();
 }

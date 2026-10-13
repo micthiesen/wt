@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use serde_json::Value;
@@ -19,8 +20,10 @@ use crate::{
 
 mod app_server;
 mod events;
+mod file_cache;
 mod messaging;
 mod output;
+mod trust;
 mod usage;
 
 pub use app_server::{
@@ -30,6 +33,7 @@ pub use app_server::{
 pub use events::{CodexActivityBatch, CodexActivityTracker, CodexEvent, CodexEventLevel};
 pub use messaging::{CodexMessageOutcome, CodexMessageTarget, CodexMessenger};
 pub use output::CodexOutputTracker;
+pub use trust::{CodexTrustError, ensure_trusted_project};
 pub use usage::{CodexUsage, read_codex_usage};
 
 const CODEX_SLOT_INFIX: &str = "-codex";
@@ -533,10 +537,20 @@ fn is_rollout_path(path: &Path) -> bool {
 }
 
 fn read_rollout(path: &Path) -> Result<Option<Rollout>, CodexHarnessError> {
-    let metadata = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
+    static CACHE: OnceLock<file_cache::FileCache<Option<Rollout>>> = OnceLock::new();
+    match CACHE
+        .get_or_init(file_cache::FileCache::new)
+        .read(path, |metadata| read_rollout_uncached(path, metadata))
+    {
+        Err(CodexHarnessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        result => result,
+    }
+}
+
+fn read_rollout_uncached(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<Rollout>, CodexHarnessError> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return Ok(None),
@@ -586,10 +600,21 @@ enum SlotOwner {
     Manager,
 }
 
-fn slot_owns(path: &Path, size: u64, slug: &str) -> io::Result<bool> {
+fn slot_owns(path: &Path, _size: u64, slug: &str) -> io::Result<bool> {
     if slug != "main" && slug != "manager" {
         return Ok(true);
     }
+    static CACHE: OnceLock<file_cache::FileCache<Option<SlotOwner>>> = OnceLock::new();
+    let owner = CACHE
+        .get_or_init(file_cache::FileCache::new)
+        .read(path, |metadata| read_slot_owner(path, metadata.len()))?;
+    Ok(matches!(
+        (slug, owner),
+        ("main", Some(SlotOwner::Main)) | ("manager", Some(SlotOwner::Manager))
+    ))
+}
+
+fn read_slot_owner(path: &Path, size: u64) -> io::Result<Option<SlotOwner>> {
     let limit = size.min(MAX_PREFIX_BYTES as u64);
     let mut file = File::open(path)?;
     let mut bytes = vec![0; limit as usize];
@@ -601,7 +626,7 @@ fn slot_owns(path: &Path, size: u64, slug: &str) -> io::Result<bool> {
     }
     for line in lines {
         let Ok(event) = serde_json::from_slice::<Value>(line) else {
-            return Ok(false);
+            return Ok(None);
         };
         if event["type"] != "response_item" || event["payload"]["type"] != "message" {
             continue;
@@ -631,10 +656,7 @@ fn slot_owns(path: &Path, size: u64, slug: &str) -> io::Result<bool> {
             }
         }
     }
-    Ok(matches!(
-        (slug, owner),
-        ("main", Some(SlotOwner::Main)) | ("manager", Some(SlotOwner::Manager))
-    ))
+    Ok(owner)
 }
 
 pub fn read_codex_tail(path: &Path, mtime_ms: i64, size: u64) -> io::Result<Option<CodexTail>> {
@@ -850,7 +872,7 @@ mod tests {
         CodexHarness::new(paths, runner, tmux)
     }
 
-    fn write_rollout(
+    pub(super) fn write_rollout(
         root: &Path,
         date: &str,
         id: &str,
@@ -877,6 +899,86 @@ mod tests {
         let unmarked = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ordinary prompt"}]}});
         fs::write(&rollout, format!("{}\n", unmarked)).unwrap();
         assert!(!slot_owns(&rollout, fs::metadata(&rollout).unwrap().len(), "main").unwrap());
+        let main = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":CODEX_MAIN_PROMPT}]}});
+        fs::write(&rollout, format!("{}\n", main)).unwrap();
+        assert!(slot_owns(&rollout, fs::metadata(&rollout).unwrap().len(), "main").unwrap());
+        assert!(!slot_owns(&rollout, fs::metadata(&rollout).unwrap().len(), "manager").unwrap());
+    }
+
+    #[test]
+    fn rollout_cache_refreshes_excluded_headers_and_appended_metadata() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("worktree");
+        let path = write_rollout(dir.path(), "2026/10/13", "session", &cwd, "exec", "user");
+        assert!(read_rollout(&path).unwrap().is_none());
+        assert!(read_rollout(&path).unwrap().is_none());
+        write_rollout(
+            dir.path(),
+            "2026/10/13",
+            "session",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let before = read_rollout(&path).unwrap().unwrap();
+        assert_eq!(before.session_id, "session");
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{}\n")
+            .unwrap();
+        assert_eq!(read_rollout(&path).unwrap().unwrap().size, before.size + 3);
+        fs::remove_file(path.clone()).unwrap();
+        assert!(read_rollout(&path).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "synthetic cold/warm CPU comparison; run explicitly with --nocapture"]
+    fn rollout_discovery_cache_benchmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("worktree");
+        let mut paths = Vec::new();
+        for id in 0..500 {
+            let path = write_rollout(
+                dir.path(),
+                "2026/10/13",
+                &id.to_string(),
+                &cwd,
+                "exec",
+                "user",
+            );
+            let metadata = json!({"type":"session_meta","payload":{"id":id.to_string(),"cwd":cwd,"originator":"exec","thread_source":"user","instructions":"x".repeat(48 * 1024)}});
+            fs::write(&path, format!("{metadata}\n")).unwrap();
+            paths.push(path);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            for path in &paths {
+                assert!(
+                    read_rollout_uncached(path, &fs::metadata(path).unwrap())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+        let uncached = start.elapsed();
+        let start = std::time::Instant::now();
+        for path in &paths {
+            assert!(read_rollout(path).unwrap().is_none());
+        }
+        let cold = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            for path in &paths {
+                assert!(read_rollout(path).unwrap().is_none());
+            }
+        }
+        eprintln!(
+            "500 excluded 48KiB headers, 10 passes: uncached={uncached:?}, cached cold={cold:?}, cached warm={:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

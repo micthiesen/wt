@@ -932,7 +932,8 @@ fn failed_remote_create_keeps_host_name_and_retry_input() {
         panic!("create action");
     };
     model.begin_action(91, &action);
-    assert!(model.selected_row().unwrap().key.starts_with("\0creating:"));
+    assert!(model.selected_row().is_none());
+    assert_eq!(model.creation_focus, Some(91));
     model.reply(UiReply {
         operation_id: Some(91),
         failed: true,

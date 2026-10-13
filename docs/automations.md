@@ -43,6 +43,15 @@ The guard is deliberately narrow in the other direction too: an **unattributed**
 
 `run` names either an `[[actions]]` id or a built-in flow:
 
+Builtins do not require matching `[[actions]]` entries. Their executors enforce
+their own safety checks; configured actions still evaluate their declared
+requirements. A local lifecycle inspection failure makes only that worktree's
+evidence unknown and reports it in attention. It does not prevent unrelated
+worktrees from running eligible automations. Failed local evidence is retried
+after 30 seconds even if the input snapshots have not changed, with repeated
+identical warnings suppressed. Incomplete GitHub batches still
+fail closed for the whole batch.
+
 - `builtin:restack` — the squash-safe stack replay (requires `on = "stack.parent_merged"`).
 - `builtin:clean` — destroy one landed worktree (the `c` sweep for a single row). Inherits the sweep's refusal to force: a worktree holding uncommitted changes or unpushed commits is kept and narrated on the attention feed instead of destroyed. That guard matters most here, where nothing prompts and nobody is watching — "the branch landed" is a fact about the branch, and this deletes a directory.
 - `builtin:notify` — a desktop notification titled `wt · <slug>` carrying the trigger detail (for status triggers: state, risk, note). macOS uses `osascript`; Linux uses `notify-send`; other platforms record that notification was skipped. Notifications never touch the worktree, so they bypass the quiescence gate — a `status.needs_human` fire happens exactly while the session is busy asking. Pairs with any trigger; the canonical use:

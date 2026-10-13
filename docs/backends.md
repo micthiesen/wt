@@ -138,15 +138,17 @@ and it drives the rest of the design:
   as a brand-new project and show their "trust this folder?" gate (which
   also suppresses the worktree's harness allow rules) — a git worktree
   sidesteps this because it resolves to the already-trusted main repo. So
-  before spawning a session in a rift checkout, wt marks the path trusted
-  via the harness's optional `ensureTrusted` hook: Claude in `~/.claude.json`
+  before spawning a session in a wt-owned checkout, wt marks the path trusted:
+  Claude in `~/.claude.json`
   (`.projects["<path>"].hasTrustDialogAccepted = true`,
   `crates/wt-harness/src/claude/`), Codex in `$CODEX_HOME/config.toml`
   (`[projects."<path>"] trust_level = "trusted"`,
-  `crates/wt-harness/src/codex/`). Idempotent and best-effort; skipped once
-  already trusted. The Codex entry lives in a tracked (stowed) config, so
-  it's removed on teardown — Claude's `~/.claude.json` is its own churny,
-  untracked file and is left. OpenCode has no such gate.
+  `crates/wt-harness/src/codex/`). Codex launch awaits an idempotent exact-root
+  trust write after resolving live inventory. The writer preserves TOML settings,
+  comments and config symlinks, uses atomic private-file replacement, and refuses
+  malformed or concurrently changed config. It never trusts a parent or sibling
+  as a shortcut. Entries remain in the harness config after teardown. OpenCode
+  has no such gate.
 
   **The Claude write is verified, and repairs its siblings.** `~/.claude.json`
   is one shared blob that Claude Code also read-modify-writes, and its window

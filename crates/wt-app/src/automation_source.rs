@@ -105,6 +105,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut cache_key = None;
         let mut lifecycle_cache_key = None;
         let mut lifecycle_cache = std::collections::BTreeMap::new();
+        let mut lifecycle_errors = std::collections::BTreeMap::new();
+        let mut lifecycle_retry = LifecycleRetry::default();
         let mut requirements_board_revision = None;
         let mut latest_error: Option<String> = None;
         let mut dispatches: JoinSet<(ClaimedFire, AutomationOutcome, Option<String>)> = JoinSet::new();
@@ -178,7 +180,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 metadata_key,
                 fresh_github.as_deref().cloned(),
             );
-            if cache_key.as_ref() != Some(&key) {
+            let retry_lifecycle = lifecycle_retry.due();
+            if cache_key.as_ref() != Some(&key) || retry_lifecycle {
                 if previous_git_revision != Some(git.revision()) {
                     if let Some(snapshots) = confirmed_git.as_deref() {
                         let now = now_ms();
@@ -199,7 +202,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     lifecycle_metadata_key(confirmed_metadata.as_deref()),
                     fresh_github.as_deref().cloned(),
                 );
-                if lifecycle_cache_key.as_ref() != Some(&lifecycle_key) {
+                if lifecycle_cache_key.as_ref() != Some(&lifecycle_key) || retry_lifecycle {
                     match automation_facts::lifecycle_facts(
                         &context,
                         confirmed_git.as_ref(),
@@ -208,10 +211,24 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                         &context.config.automations,
                     ).await {
                         Ok(next) => {
-                            lifecycle_cache = next;
+                            lifecycle_retry.completed(!next.errors.is_empty());
+                            for (slug, error) in &next.errors {
+                                if lifecycle_errors.get(slug) != Some(error) {
+                                    tracing::warn!(
+                                        target: "wt_attention",
+                                        event_channel = "attention",
+                                        event_source = %slug,
+                                        event_text = %format!("Automation cleanup/landing evidence unavailable for {slug}: {error}"),
+                                        "automation local evidence unavailable"
+                                    );
+                                }
+                            }
+                            lifecycle_errors = next.errors;
+                            lifecycle_cache = next.rows;
                             lifecycle_cache_key = Some(lifecycle_key);
                         }
                         Err(error) => {
+                            lifecycle_retry.completed(true);
                             latest_error = Some(format!("automation facts unavailable: lifecycle evidence: {error:#}"));
                             let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                             continue;
@@ -441,6 +458,25 @@ fn now_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+/// A partial local failure cannot become a permanent cached negative. Keep
+/// healthy evidence usable while a bounded backstop retries the same inputs.
+#[derive(Default)]
+struct LifecycleRetry {
+    at: Option<tokio::time::Instant>,
+}
+
+impl LifecycleRetry {
+    const DELAY: Duration = Duration::from_secs(30);
+
+    fn due(&self) -> bool {
+        self.at.is_some_and(|at| tokio::time::Instant::now() >= at)
+    }
+
+    fn completed(&mut self, partial_failure: bool) {
+        self.at = partial_failure.then(|| tokio::time::Instant::now() + Self::DELAY);
+    }
+}
+
 async fn persist_tips(
     ctx: &AppContext,
     tips: &std::collections::BTreeMap<String, String>,
@@ -534,6 +570,31 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use wt_runtime::SourceSnapshot;
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_lifecycle_inputs_retry_partial_failure_then_stop_after_recovery() {
+        let mut retry = LifecycleRetry::default();
+        assert!(!retry.due());
+        retry.completed(true);
+        // Neither source data nor its key changed: the periodic tick must
+        // eventually bypass both cache guards, but not on every second.
+        for _ in 0..29 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(!retry.due());
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(retry.due());
+        retry.completed(true);
+        assert!(!retry.due());
+        tokio::time::advance(LifecycleRetry::DELAY).await;
+        assert!(retry.due());
+        retry.completed(false);
+        tokio::time::advance(LifecycleRetry::DELAY * 2).await;
+        assert!(
+            !retry.due(),
+            "recovered evidence remains cached for unchanged inputs"
+        );
+    }
 
     #[tokio::test]
     async fn passthrough_keeps_board_refresh_and_stops_command_responder() {

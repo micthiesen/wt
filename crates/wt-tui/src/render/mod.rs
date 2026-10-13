@@ -364,6 +364,11 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
                 ),
             ]
         }
+    } else if model.creation_focus.is_some() {
+        vec![Span::styled(
+            " Creating…  F12: open when ready · Esc: return to list",
+            base.fg(theme::ACCENT),
+        )]
     } else if let SourceState::Failed(error) = &model.source_state {
         vec![
             Span::raw(" "),

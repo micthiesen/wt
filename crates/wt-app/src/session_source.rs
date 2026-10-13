@@ -184,6 +184,7 @@ fn spawn_inventory(
     let cancel = scope.token();
     scope.spawn(async move {
         let mut previous: Option<SessionInventory> = None;
+        let mut failed_panes = BTreeSet::new();
         let mut healthy = false;
         let mut requests = tokio::time::interval(INVENTORY_INTERVAL);
         requests.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -195,13 +196,27 @@ fn spawn_inventory(
                 requested = publisher.requested() => if requested.is_none() { break; },
             }
             let observed = Stamp::now();
-            let fetched = tmux.list_sessions(&cancel).await;
+            let fetched = async {
+                let sessions = tmux.list_sessions(&cancel).await?;
+                let panes = if sessions.is_empty() { Vec::new() } else { tmux.list_all_panes(&cancel).await? };
+                Ok::<_, wt_tmux::TmuxError>((sessions, panes))
+            }.await;
             if cancel.is_cancelled() {
                 break;
             }
             match fetched {
-                Ok(sessions) => {
-                    let inventory = classify_sessions(sessions);
+                Ok((sessions, panes)) => {
+                    let now_failed = panes.iter().filter(|pane| pane.dead)
+                        .map(|pane| (pane.id.clone(), pane.pid)).collect::<BTreeSet<_>>();
+                    for pane in panes.iter().filter(|pane| pane.dead && !failed_panes.contains(&(pane.id.clone(), pane.pid))) {
+                        tracing::warn!(target: "wt_attention",
+                            event_channel = "attention",
+                            event_source = %pane.session_name,
+                            event_text = "Terminal command failed. Open the session to inspect its error; Enter retries, F12 returns to wt.",
+                            "terminal command failed");
+                    }
+                    failed_panes = now_failed;
+                    let inventory = running_session_inventory(sessions, &panes);
                     if previous.as_ref() != Some(&inventory) || !healthy {
                         previous = Some(inventory.clone());
                         publisher.publish_live(inventory, observed);
@@ -219,6 +234,23 @@ fn spawn_inventory(
             }
         }
     });
+}
+
+fn running_session_inventory(
+    sessions: Vec<SessionInfo>,
+    panes: &[wt_tmux::PaneInfo],
+) -> SessionInventory {
+    let live = panes
+        .iter()
+        .filter(|pane| !pane.dead)
+        .map(|pane| pane.session_name.as_str())
+        .collect::<BTreeSet<_>>();
+    classify_sessions(
+        sessions
+            .into_iter()
+            .filter(|session| live.contains(session.name.as_str()))
+            .collect(),
+    )
 }
 
 fn classify_sessions(sessions: Vec<SessionInfo>) -> SessionInventory {
@@ -584,6 +616,39 @@ mod tests {
             window_count: 1,
             harness_session_id: uuid.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn retained_failed_panes_are_not_running_agents() {
+        let pane = wt_tmux::PaneInfo {
+            id: "%1".into(),
+            session_name: "branch-codex".into(),
+            window_id: "@1".into(),
+            window_index: 0,
+            index: 0,
+            active: true,
+            pid: Some(42),
+            current_path: "/tmp/branch".into(),
+            width: 80,
+            height: 24,
+            dead: true,
+        };
+        let failed = running_session_inventory(
+            vec![session("branch-codex", Some("old"))],
+            std::slice::from_ref(&pane),
+        );
+        assert!(failed.all.is_empty());
+        assert!(failed.kinds.codex.is_empty());
+        assert!(failed.harness_session_ids.is_empty());
+        let retried = running_session_inventory(
+            vec![session("branch-codex", Some("new"))],
+            &[wt_tmux::PaneInfo {
+                dead: false,
+                ..pane
+            }],
+        );
+        assert!(retried.kinds.codex.contains("branch"));
+        assert_eq!(retried.harness_session_ids["branch-codex"], "new");
     }
 
     #[test]

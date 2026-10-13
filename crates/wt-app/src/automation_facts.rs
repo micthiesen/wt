@@ -73,13 +73,19 @@ pub struct LifecycleFacts {
     pub clean_candidate: bool,
 }
 
+#[derive(Default)]
+pub struct PreparedLifecycleFacts {
+    pub rows: BTreeMap<String, LifecycleFacts>,
+    pub errors: BTreeMap<String, String>,
+}
+
 pub async fn lifecycle_facts(
     ctx: &AppContext,
     git: Option<&Confirmed<Vec<WorktreeSnapshot>>>,
     metadata: Option<&Confirmed<Metadata>>,
     github: Option<&Confirmed<GithubData>>,
     rules: &[AutomationDef],
-) -> Result<BTreeMap<String, LifecycleFacts>> {
+) -> Result<PreparedLifecycleFacts> {
     let required = rules.iter().any(|rule| {
         matches!(
             rule.on,
@@ -90,32 +96,35 @@ pub async fn lifecycle_facts(
         )
     });
     if !required {
-        return Ok(BTreeMap::new());
+        return Ok(PreparedLifecycleFacts::default());
     }
     let (Some(snapshots), Some(metadata)) = (git, metadata) else {
-        return Ok(BTreeMap::new());
+        return Ok(PreparedLifecycleFacts::default());
     };
     let (state, _) = &**metadata;
     let rows = snapshots
         .iter()
         .map(|snapshot| snapshot.worktree.clone())
         .collect();
-    let plans = crate::lifecycle_ops::plan_with_facts(ctx, rows, state, github, None)
+    let plans = crate::lifecycle_ops::plan_automation_facts(ctx, rows, state, github)
         .await
         .context("prepare automation lifecycle evidence")?;
-    Ok(plans
-        .rows
-        .into_iter()
-        .map(|plan| {
-            (
-                plan.row.target.slug().to_owned(),
-                LifecycleFacts {
-                    local_merged: plan.local_merged.then_some(true),
-                    clean_candidate: plan.landed && plan.hazards.is_empty(),
-                },
-            )
-        })
-        .collect())
+    Ok(PreparedLifecycleFacts {
+        errors: plans.row_errors,
+        rows: plans
+            .rows
+            .into_iter()
+            .map(|plan| {
+                (
+                    plan.row.target.slug().to_owned(),
+                    LifecycleFacts {
+                        local_merged: plan.local_merged.then_some(true),
+                        clean_candidate: plan.landed && plan.hazards.is_empty(),
+                    },
+                )
+            })
+            .collect(),
+    })
 }
 
 pub async fn prepare(
@@ -374,7 +383,13 @@ pub async fn prepare(
                 .board
                 .and_then(|board| board.rows.iter().find(|row| row.slug == fire.slug))
                 .is_some_and(|row| row.stage_url.is_some());
-            let result = requirement_state(ctx, fire, &rows, deployed);
+            let result = requirement_state(
+                &ctx.config.actions,
+                ctx.config.issue_tracker.as_ref(),
+                fire,
+                &rows,
+                deployed,
+            );
             (fire_identity(fire), result)
         })
         .collect();
@@ -432,7 +447,13 @@ pub fn refresh_requirements(
                 .is_some_and(|row| row.stage_url.is_some());
             (
                 fire_identity(fire),
-                requirement_state(ctx, fire, &facts.rows, deployed),
+                requirement_state(
+                    &ctx.config.actions,
+                    ctx.config.issue_tracker.as_ref(),
+                    fire,
+                    &facts.rows,
+                    deployed,
+                ),
             )
         })
         .collect();
@@ -571,17 +592,19 @@ async fn branch_tips(
 }
 
 fn requirement_state(
-    ctx: &AppContext,
+    actions: &[wt_config::ActionDef],
+    issue_tracker: Option<&wt_config::IssueTrackerConfig>,
     fire: &AutomationFire,
     rows: &[AutomationRow],
     deployed: bool,
 ) -> RequirementState {
-    let Some(definition) = ctx
-        .config
-        .actions
-        .iter()
-        .find(|action| action.id == fire.rule.run)
-    else {
+    // Builtins are validated by configuration and own their safety checks at
+    // execution. They are not configurable actions and must not consume their
+    // fire as a permanent skip just because no [[actions]] entry exists.
+    if fire.rule.run.starts_with("builtin:") {
+        return RequirementState::Ready;
+    }
+    let Some(definition) = actions.iter().find(|action| action.id == fire.rule.run) else {
         return RequirementState::FrozenUnmet(format!(
             "action {:?} is not configured",
             fire.rule.run
@@ -597,11 +620,7 @@ fn requirement_state(
     let action_row = wt_actions::ActionRow {
         slug: row.slug.clone(),
         issue_id: row.issue_id.clone(),
-        issue_prefix: ctx
-            .config
-            .issue_tracker
-            .as_ref()
-            .and_then(|issue| issue.prefix.clone()),
+        issue_prefix: issue_tracker.and_then(|issue| issue.prefix.clone()),
         pr: row.pr.as_ref().map(|pr| wt_actions::ActionPr {
             state: pr.state.clone(),
             is_draft: pr.is_draft,
@@ -665,6 +684,184 @@ mod tests {
     use wt_runtime::{
         Persistence, RefreshPolicy, SourceSnapshot, SourceSpec, TaskScope, leaf_channel,
     };
+
+    #[test]
+    fn builtins_do_not_require_configured_actions_or_a_surviving_checkout() {
+        let mut fire = AutomationFire {
+            rule: AutomationDef::default(),
+            slug: "landed".into(),
+            quiesce_slugs: vec![],
+            fire_keys: vec![],
+            stack_id: None,
+            close_issue: None,
+            delete_branch: Some("feature".into()),
+            delete_branch_pr: Some(2451),
+            branch_range: None,
+            frozen_vars: None,
+            frozen_pr: None,
+            detail: String::new(),
+        };
+        for run in [
+            "builtin:clean",
+            "builtin:restack",
+            "builtin:notify",
+            "builtin:close-issue",
+            "builtin:delete-branch",
+        ] {
+            fire.rule.run = run.into();
+            assert_eq!(
+                requirement_state(&[], None, &fire, &[], false),
+                RequirementState::Ready,
+                "{run} must reach its own execution-time safety checks",
+            );
+        }
+        fire.rule.run = "unknown-custom-action".into();
+        assert!(matches!(
+            requirement_state(&[], None, &fire, &[], false),
+            RequirementState::FrozenUnmet(reason) if reason.contains("not configured")
+        ));
+
+        let actions = [wt_config::ActionDef {
+            id: fire.rule.run.clone(),
+            requires: vec![wt_config::RequireTag::IssueTracker],
+            ..Default::default()
+        }];
+        let rows = [AutomationRow {
+            slug: fire.slug.clone(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            requirement_state(&actions, None, &fire, &rows, false),
+            RequirementState::Waiting,
+        );
+        fire.frozen_vars = Some(BTreeMap::new());
+        assert!(matches!(
+            requirement_state(&actions, None, &fire, &rows, false),
+            RequirementState::FrozenUnmet(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_broken_checkout_does_not_suppress_other_merged_automations() {
+        use crate::commands::test_support::CommandFixture;
+        use wt_platform::process::CommandSpec;
+        let mut fixture = CommandFixture::new().await.unwrap();
+        let rule = AutomationDef {
+            id: "delete-landed-branch".into(),
+            on: wt_config::AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            ..Default::default()
+        };
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).automations = vec![rule];
+        let ctx = &fixture.ctx;
+        async fn git(ctx: &AppContext, args: &[&str]) -> String {
+            ctx.processes
+                .run(
+                    CommandSpec::new("git")
+                        .args(args.iter().copied())
+                        .cwd(&ctx.cwd),
+                    &ctx.cancellation,
+                )
+                .await
+                .unwrap()
+                .checked("fixture git")
+                .unwrap()
+                .stdout_text()
+                .trim()
+                .into()
+        }
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(ctx, &["remote", "add", "origin", origin.to_str().unwrap()]).await;
+        let base = git(ctx, &["rev-parse", "HEAD"]).await;
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&base))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(ctx.cwd.join("tracked.txt"), "landed work\n").unwrap();
+        git(ctx, &["commit", "-am", "landed"]).await;
+        git(ctx, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        let mut snapshots = ctx
+            .repository
+            .inventory_status(&ctx.cancellation)
+            .await
+            .unwrap();
+        snapshots
+            .iter_mut()
+            .find(|row| row.worktree.target.slug() == "two")
+            .unwrap()
+            .worktree
+            .target
+            .path = fixture
+            ._root
+            .path()
+            .join("missing-checkout")
+            .to_string_lossy()
+            .into();
+        // Put the broken row first to catch whole-loop early returns.
+        snapshots.sort_by_key(|row| row.worktree.target.slug() != "two");
+        let git = Confirmed::for_test(snapshots);
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let metadata = Confirmed::for_test((state, BTreeSet::new()));
+        let evidence = lifecycle_facts(
+            ctx,
+            Some(&git),
+            Some(&metadata),
+            None,
+            &ctx.config.automations,
+        )
+        .await
+        .unwrap();
+        assert!(evidence.errors.contains_key("two"));
+        assert!(!evidence.rows.contains_key("two"));
+        assert!(evidence.rows["one"].clean_candidate);
+        let edits = BTreeMap::new();
+        let prepared = prepare(
+            ctx,
+            AutomationInputs {
+                git: Some(&git),
+                metadata: Some(&metadata),
+                lanes_ready: true,
+                github: None,
+                discoveries: None,
+                inventory: None,
+                activity: None,
+                board: None,
+                last_edit_at_ms: &edits,
+                rules: &ctx.config.automations,
+                lifecycle: &evidence.rows,
+            },
+        )
+        .await
+        .unwrap();
+        let broken = prepared.rows.iter().find(|row| row.slug == "two").unwrap();
+        assert_eq!(broken.local_merged, None);
+        assert!(!broken.clean_candidate);
+        let fires = evaluate(&ctx.config.automations, &prepared.rows, &prepared.context);
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].slug, "one");
+        assert_eq!(
+            prepared.requirements[&fire_identity(&fires[0])],
+            RequirementState::Ready
+        );
+        let rows = git
+            .iter()
+            .map(|snapshot| snapshot.worktree.clone())
+            .collect();
+        assert!(
+            crate::lifecycle_ops::plan_with_facts(ctx, rows, &metadata.0, None, None)
+                .await
+                .is_err()
+        );
+        fixture.close().await.unwrap();
+    }
 
     fn idle_session(slug: &str) -> DiscoveredSession {
         DiscoveredSession {

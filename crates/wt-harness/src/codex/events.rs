@@ -7,7 +7,7 @@ use std::{
 
 use serde_json::Value;
 
-use super::{CodexHarnessError, Rollout, find_rollout, scan_rollouts};
+use super::{CodexHarnessError, Rollout, find_rollout, read_rollout, scan_rollouts, slot_owns};
 
 const MAX_READ_PER_TICK: u64 = 32 * 1024;
 
@@ -81,7 +81,17 @@ fn poll_slug(
     session_id: Option<&str>,
     batch: &mut CodexActivityBatch,
 ) -> bool {
-    let rollout = resolve_rollout(sessions_dir, cwd, slug, session_id);
+    // A live UUID is pinned. Revalidate its retained path instead of walking
+    // the entire historical session tree on every activity tick.
+    let retained = session_id.and_then(|id| {
+        let state = tracker.by_slug.get(slug)?;
+        let rollout = read_rollout(&state.path).ok().flatten()?;
+        (rollout.session_id == id
+            && rollout.cwd == cwd.to_string_lossy()
+            && slot_owns(&rollout.path, rollout.size, slug).ok()?)
+        .then_some(rollout)
+    });
+    let rollout = retained.or_else(|| resolve_rollout(sessions_dir, cwd, slug, session_id));
     let Some(rollout) = rollout else {
         return false;
     };
@@ -331,6 +341,53 @@ mod tests {
         let drained = poll_activity(&dir.path().join("sessions"), &mut tracker, &active);
         assert!(drained.events.is_empty());
         assert!(drained.changed_slugs.is_empty());
+    }
+
+    #[test]
+    fn retained_activity_path_is_revalidated_when_live_identity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        let sessions = dir.path().join("sessions");
+        let first = super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "first",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let second = super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "second",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let mut tracker = CodexActivityTracker::default();
+        let mut active = vec![("feature".into(), cwd, Some("first".into()))];
+        poll_activity(&sessions, &mut tracker, &active);
+        assert_eq!(tracker.by_slug["feature"].path, first);
+        active[0].2 = Some("second".into());
+        poll_activity(&sessions, &mut tracker, &active);
+        assert_eq!(tracker.by_slug["feature"].path, second);
+        append(
+            &first,
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"wrong session"}}),
+        );
+        assert!(
+            poll_activity(&sessions, &mut tracker, &active)
+                .events
+                .is_empty()
+        );
+        append(
+            &second,
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"right session"}}),
+        );
+        assert_eq!(
+            poll_activity(&sessions, &mut tracker, &active).events[0].text,
+            "-> right session · feature"
+        );
     }
 
     #[test]

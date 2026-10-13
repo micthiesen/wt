@@ -115,15 +115,14 @@ impl MutationKind {
 }
 
 impl UiMutation {
-    /// Name a creation's placeholder row after its operation id. Returns the
-    /// placeholder key, or `None` for any other change.
-    pub(crate) fn assign_placeholder(&mut self, id: u64) -> Option<String> {
-        let MutationKind::Lifecycle(LifecycleChange::Create { placeholder, .. }) = &mut self.kind
+    /// Give each creation its own operation identity, separate from inventory.
+    pub(crate) fn assign_creation(&mut self, id: u64) -> bool {
+        let MutationKind::Lifecycle(LifecycleChange::Create { request_id, .. }) = &mut self.kind
         else {
-            return None;
+            return false;
         };
-        *placeholder = format!("\0creating:{id}");
-        Some(placeholder.clone())
+        *request_id = id;
+        true
     }
 
     /// Record what the host's accepting reply decided: the key of a created

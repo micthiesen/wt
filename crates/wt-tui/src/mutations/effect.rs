@@ -239,7 +239,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         UiAction::Create { input } => on_board(
             host,
             LifecycleChange::Create {
-                placeholder: String::new(),
+                request_id: 0,
                 input: input.clone(),
                 resolved: None,
             },

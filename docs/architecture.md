@@ -106,6 +106,12 @@ local and SSH-routed requests.
 The output pane switches between attention, all app activity, and prepared
 session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
+Interactive tmux panes retain nonzero command exits so startup failures remain
+inspectable. Enter retries only a dead pane and clears its stale harness identity;
+successful exits close normally. Retention is pane-local and enabled before exec,
+never imposed on background action or development-server sessions. The session
+source batches pane inventory with session inventory, reports new failed panes to
+attention, and excludes dead panes from live-agent observations.
 
 ## Query layer
 
@@ -185,10 +191,13 @@ An expiry while confirmed data still disagrees shows one notice.
   postcondition or host write stamp; session sources independently observe any
   sessions they create.
   Connection progress and failures still arrive through normal action replies.
-- Creation is a `UiMutation` too: a selected placeholder row appears at
-  keypress, F12 on it requests agent entry once the checkout is ready, and the
-  operation id keeps each reply tied to its own placeholder. The reply names the
-  real row; selection moves to it only after the prepared visible rows contain
+- Creation is a `UiMutation` too, but never inserts synthetic inventory rows.
+  Progress and its F12 intent are tracked by operation id outside `Board.rows`.
+  Inventory may publish the real checkout before its command replies without
+  producing a second row. F12 requests agent entry once the host resolves the
+  checkout identity; Esc or list navigation leaves creation focus. Other board
+  controls remain available. The reply names the real row; selection moves to
+  it only after the prepared visible rows contain
   it, and its section opens then. A successful refresh alone is not proof the
   row is visible. Dependency installation uses a durable background action, so
   it does not delay agent entry. When a selected row disappears, cursor fallback
@@ -240,6 +249,10 @@ tracks running commands through shutdown. `HostService` performs the host-local
 operation and returns a typed reply. Accepted mutations belong to the command
 drain, not the lifetime of a particular SSH view; read sources are cancelled
 when their host scope ends.
+Attention, history, and performance controls have a separate serialized slot
+reserved beyond the four ordinary action slots, so long host operations cannot
+delay them. Attention acknowledgement returns its own accept stamp before
+refreshing metadata.
 Quitting closes command admission and waits for accepted local writes to finish;
 after 30 seconds it reports that it is still waiting. Each operation owns its
 timeout and safe stopping points, so a UI deadline cannot interrupt a write.
@@ -284,7 +297,10 @@ can re-read completion and output.
 
 Worktree removal and cleanup use the lifecycle service and per-worktree
 operation locks. A confirmed removal moves its row to Archived with a
-removal glyph at once. The worker saves the archive state before its startup
+removal glyph at once. Revision capture streams complete Git output and
+untracked file contents into fingerprints with bounded memory, cancellation,
+and deadlines; evidence is never truncated to satisfy a capture limit.
+The worker saves the archive state before its startup
 reply and restores the previous state on failure. TUI actions await the durable
 job's terminal outcome off the input path, so startup does not settle the pending
 removal and a later failure rolls it back. CLI background mode returns the startup

@@ -29,27 +29,21 @@ impl Model {
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
         self.ui_generation = self.ui_generation.wrapping_add(1);
         if matches!(self.interaction, Interaction::None)
-            && let Some(key_id) = self.selected_row().map(|row| row.key.clone())
-            && self.is_placeholder(&key_id)
-            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-            && !matches!(
-                key.code,
-                KeyCode::Char('j' | 'k' | 'g' | 'G' | 'n' | 'q' | 'r' | '?')
-                    | KeyCode::Up
-                    | KeyCode::Down
-                    | KeyCode::Esc
-            )
+            && self.title_prompt.is_none()
+            && !self.history.active
+            && !self.help
+            && !self.show_perf
+            && let Some(id) = self.creation_focus
         {
             if key.code == KeyCode::F(12) {
-                if let Some(action) = self.request_agent(&key_id) {
+                if let Some(action) = self.request_agent(id) {
                     return InputResult::Action(action);
                 }
-                self.toast = Some((
-                    "Agent will open when the checkout is ready".into(),
-                    ToastTone::Info,
-                ));
+                return self.notify("Agent will open when the checkout is ready");
             }
-            return InputResult::Draw;
+            if key.code == KeyCode::Esc {
+                return self.select(0);
+            }
         }
         let chord_allowed = matches!(
             self.interaction,
@@ -320,14 +314,14 @@ impl Model {
                 self.output.toggle_feed();
                 InputResult::Draw
             }
-            KeyCode::Char('x')
+            KeyCode::Char('x' | 'X')
                 if !control
                     && matches!(self.output.target, crate::output::OutputTarget::Attention)
                     && self.board.attention.is_empty() =>
             {
                 self.notify("attention feed is empty")
             }
-            KeyCode::Char('x')
+            KeyCode::Char('x' | 'X')
                 if !control
                     && matches!(self.output.target, crate::output::OutputTarget::Attention) =>
             {

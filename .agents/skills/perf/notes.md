@@ -68,6 +68,39 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Live machine pressure (2026-10-13).** With builds finished, a second
+  `top` sample showed 84.76% CPU busy: wt PID 32450 near 99% of one core,
+  native pg_cron PIDs 4383/81482 near 80% each, and Brave PID 83591 near
+  79%. The cron launchers belonged to local `r2-chat-attachments` and
+  `instagram-live-qualification` stacks. Both used Unix-only PostgreSQL but
+  cron targeted localhost; their latest 100 attempts were startup failures
+  (one still connecting). Using the local `supabase_admin` role, reloading
+  `cron.launch_active_jobs=off` reduced both launchers to 0% CPU while
+  preserving each stack's 67 jobs and 23 active flags. No database or dev
+  server was stopped. Local cron execution remains paused pending a verified
+  startup/socket repair; this mitigation does not make scheduled jobs work.
+  A later second sample was 51.60% idle, with wt still 108.3% and Brave
+  79.4% of one core. No swapout growth. Evidence:
+  `/tmp/wt-machine-top-after-build.txt`,
+  `/tmp/wt-machine-top-cron-paused.txt`. These changing workloads are not
+  a controlled before/after benchmark of wt.
+- **Native Codex discovery CPU (2026-10-13).** The live v0.1.10 board
+  PID 32450 consumed 95.8% of one core in the host's second `top` sample.
+  A five-second native sample at 09:51 local put the main thread asleep for
+  3,747/3,926 samples; blocking workers repeatedly scanned rollout headers,
+  parsed main/manager ownership prefixes, and traversed historical directories
+  for exact UUIDs. Evidence: `/tmp/wt-cpu-sample-20261013.txt` and
+  `/tmp/wt-machine-top-20261013.txt`. Source repair caches both accepted and
+  excluded parsed headers and ownership against size, nanosecond modification
+  and change time, inode and device; entries are bounded and missing/replaced
+  files invalidate them. Activity retains and revalidates exact UUID paths and
+  refreshes only the changed Codex slots rather than every live harness slot.
+  Optimized synthetic comparison (500 excluded 48 KiB headers, ten passes):
+  uncached 217.51 ms versus warm cached 16.33 ms; initial cache population
+  22.77 ms. This measures header scanning only, not whole-board CPU.
+  Reproduce with `cargo test -p wt-harness rollout_discovery_cache_benchmark
+  --release -- --ignored --nocapture`.
+  Installation and a matching live post-update CPU sample remain owed.
 - **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
   Codex rollout append watcher received no callbacks within either 2 or 15
   seconds, including a fixture under the home directory. Host sampling showed
@@ -86,12 +119,14 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   reliable OS delivery. notify 8.2 teardown purges device events through the
   current id; interference from other streams remains unproven. No test
   deadlines were increased to hide missing notifications.
-- **Lifecycle feedback is prepared in source but not installed (2026-10-10).**
-  Creation now shows a temporary row on queue admission. F12 requests agent
-  entry after checkout completion; linked-worktree dependency installation
-  runs as a durable action. Confirmed deletion shows an archive overlay and
-  restores the saved archive state on worker failure. The checks above cover
-  local behavior. A matching release and remote smoke check remain owed.
+- **Creation feedback must not create inventory (2026-10-13).** Earlier
+  temporary creation rows could overlap the real row during remote refresh.
+  Creation progress now lives in the header/footer; only host inventory can
+  produce list rows. F12 queues entry for the exact resolved host/key and
+  navigation releases that intent. Ordering regressions cover inventory before
+  the action reply and matching slugs on different hosts. A candidate created,
+  attached/re-attached three times, and safely removed a managed MaxBook QA
+  worktree. Evidence: `/tmp/wt-f12-live-qa/managed-attach-{1,2,3}.raw`.
 - **Native clean/delete confirmation waits on fresh remote evidence (2026-10-10).**
   User reports a long `working` state after `c` or `d`. Source inspection:
   `controller_actions` calls `lifecycle_ops::plan` before confirmation and
@@ -144,6 +179,12 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Native runtime lessons
 
+- **Cache excluded discovery records as well as matches.** A live session's
+  activity used to rediscover every slot, each reparsing the recent session
+  archive including unrelated tool/executor rollouts. Main/manager scans also
+  reread up to 2 MiB to prove slot ownership. Match-only caches miss most of
+  that cost. Validate negative entries against full file identity and retain
+  exact activity paths; unchanged files should cause no content reads.
 - **Batch macOS watcher registration.** notify 8.2 restarts its FSEvents stream
   on each `watch` or `unwatch`. Per-path setup exceeded the native freshness
   regression's five-second registration limit under four test processes.

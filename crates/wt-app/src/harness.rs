@@ -226,11 +226,13 @@ impl AppHarness {
         ) {
             server = server.with_config_file(config_path);
         }
-        let tmux = TmuxClient::new(context.processes.clone(), server).with_session_environment(
-            session_environment
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        let tmux = TmuxClient::new(context.processes.clone(), server)
+            .with_failure_retention()
+            .with_session_environment(
+                session_environment
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         let claude_paths = ClaudePaths::new(&context.home, &cache_root);
         let claude_sessions =
             ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone())
@@ -699,6 +701,9 @@ pub async fn ui_session_with_harness(
                 .session_exists(&tmux_name, &context.cancellation)
                 .await?
             {
+                if harness_id == HarnessId::Codex && kind == SessionTarget::Harness {
+                    trust_codex_worktree(context, &cwd).await?;
+                }
                 let discovered = app
                     .service
                     .discover(
@@ -732,6 +737,20 @@ pub async fn ui_session_with_harness(
         }
     };
     Ok(app.attach_command(&session, &cwd))
+}
+
+/// Call only after resolving a real worktree from this repository's inventory.
+/// Rift clones have independent Git roots, so trusting the parent directory
+/// cannot stand in for trusting the checkout the user explicitly entered.
+pub(crate) async fn trust_codex_worktree(context: &AppContext, path: &Path) -> Result<()> {
+    let config = codex_paths(&context.home, &context.config.paths.cache_root)
+        .codex_home
+        .join("config.toml");
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || wt_harness::ensure_trusted_project(&config, &path))
+        .await
+        .context("prepare Codex worktree trust")??;
+    Ok(())
 }
 
 fn primary_single_slot_session(
