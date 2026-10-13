@@ -7,6 +7,7 @@ processes are blocked, external file invalidation, and clean terminal shutdown.
 """
 
 import argparse
+import codecs
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -26,12 +27,172 @@ import struct
 import subprocess
 import termios
 import time
+import unicodedata
 
 # The list marks the cursor row with the selection background, not a glyph.
 SELECTED_ROW = b"48;2;59;66;82m"
 # Freshness probes file metadata once per second. Observe a full interval plus
 # source debounce/scheduling margin before assigning scans to the next phase.
 GIT_QUIET_WINDOW = 1.5
+
+
+class AnsiScreen:
+    """Visible-cell model for Ratatui draws, not a general terminal emulator.
+
+    Supports the cursor, erase, style and UTF-8 sequences emitted by these
+    fixtures. Ambiguous-width glyphs use one column, as in the test terminal.
+    """
+
+    def __init__(self, rows=40, columns=160):
+        self.rows = rows
+        self.columns = columns
+        self.cells = [[" "] * columns for _ in range(rows)]
+        self.row = 0
+        self.column = 0
+        self.saved = (0, 0)
+        self.state = "text"
+        self.csi = bytearray()
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, data):
+        for character in self.decoder.decode(data):
+            byte = ord(character)
+            if self.state == "escape":
+                if byte == ord("["):
+                    self.state = "csi"
+                    self.csi.clear()
+                elif byte == ord("]"):
+                    self.state = "osc"
+                elif byte == ord("7"):
+                    self.saved = (self.row, self.column)
+                    self.state = "text"
+                elif byte == ord("8"):
+                    self.row, self.column = self.saved
+                    self.state = "text"
+                elif byte == ord("c"):
+                    self.clear()
+                    self.state = "text"
+                else:
+                    self.state = "text"
+                continue
+            if self.state == "osc":
+                if byte == 0x07:
+                    self.state = "text"
+                elif byte == 0x1B:
+                    self.state = "osc-escape"
+                continue
+            if self.state == "osc-escape":
+                self.state = "text" if byte == ord("\\") else "osc"
+                continue
+            if self.state == "csi":
+                if 0x40 <= byte <= 0x7E:
+                    self.apply_csi(byte)
+                    self.state = "text"
+                else:
+                    self.csi.append(byte)
+                continue
+            if byte == 0x1B:
+                self.state = "escape"
+            elif byte == 0x0D:
+                self.column = 0
+            elif byte == 0x0A:
+                self.row = min(self.rows - 1, self.row + 1)
+            elif byte == 0x08:
+                self.column = max(0, self.column - 1)
+            elif byte == 0x09:
+                self.column = min(self.columns - 1, (self.column // 8 + 1) * 8)
+            elif byte >= 0x20 and byte != 0x7F:
+                # Ratatui positions cells, not UTF-8 bytes. Combining marks
+                # extend the previous cell; wide characters occupy two cells.
+                if unicodedata.category(character) in ("Mn", "Me", "Cf"):
+                    previous = min(self.columns - 1, self.column - 1)
+                    while previous > 0 and self.cells[self.row][previous] == "":
+                        previous -= 1
+                    if previous >= 0:
+                        self.cells[self.row][previous] += character
+                    continue
+                width = 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+                if self.column + width > self.columns:
+                    self.column = 0
+                    self.row = min(self.rows - 1, self.row + 1)
+                self.erase(self.row, self.column, self.column + width)
+                self.cells[self.row][self.column] = character
+                if width == 2:
+                    self.cells[self.row][self.column + 1] = ""
+                self.column += width
+
+    def clear(self):
+        self.cells = [[" "] * self.columns for _ in range(self.rows)]
+        self.row = self.column = 0
+
+    def erase(self, row, start, end):
+        start = min(start, self.columns - 1)
+        end = min(end, self.columns)
+        if self.cells[row][start] == "" and start:
+            start -= 1
+        if end < self.columns and self.cells[row][end] == "":
+            end += 1
+        self.cells[row][start:end] = [" "] * (end - start)
+
+    def apply_csi(self, final):
+        raw = bytes(self.csi)
+        params = raw.lstrip(b"?").split(b";")
+
+        def number(index, default=1):
+            if index >= len(params) or not params[index]:
+                return default
+            try:
+                return int(params[index])
+            except ValueError:
+                return default
+
+        if final in (ord("H"), ord("f")):
+            self.row = max(0, min(self.rows - 1, number(0) - 1))
+            self.column = max(0, min(self.columns - 1, number(1) - 1))
+        elif final == ord("A"):
+            self.row = max(0, self.row - number(0))
+        elif final == ord("B"):
+            self.row = min(self.rows - 1, self.row + number(0))
+        elif final == ord("C"):
+            self.column = min(self.columns - 1, self.column + number(0))
+        elif final == ord("D"):
+            self.column = max(0, self.column - number(0))
+        elif final == ord("J"):
+            mode = number(0, 0)
+            if mode == 2:
+                self.cells = [[" "] * self.columns for _ in range(self.rows)]
+            elif mode == 0:
+                self.erase(self.row, self.column, self.columns)
+                for row in range(self.row + 1, self.rows):
+                    self.erase(row, 0, self.columns)
+            elif mode == 1:
+                for row in range(self.row):
+                    self.erase(row, 0, self.columns)
+                self.erase(self.row, 0, self.column + 1)
+            # J3 clears scrollback, which this visible-screen model omits.
+        elif final == ord("K"):
+            mode = number(0, 0)
+            start = 0 if mode in (1, 2) else self.column
+            end = self.columns if mode in (0, 2) else self.column + 1
+            self.erase(self.row, start, end)
+        elif final == ord("s"):
+            self.saved = (self.row, self.column)
+        elif final == ord("u"):
+            self.row, self.column = self.saved
+        elif final == ord("h") and raw.startswith(b"?") and b"1049" in raw:
+            self.clear()
+
+    def text(self):
+        return "\n".join("".join(row) for row in self.cells).encode()
+
+    def contains(self, phrase):
+        expected = re.findall(rb"[a-z0-9]+", phrase.encode().lower())
+        for row in self.text().lower().splitlines():
+            words = re.findall(rb"[a-z0-9]+", row)
+            if any(words[index:index + len(expected)] == expected
+                   for index in range(max(0, len(words) - len(expected) + 1))):
+                return True
+        return False
 
 
 def main():
@@ -127,6 +288,7 @@ def main():
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
     os.set_blocking(master, False)
     capture = bytearray()
+    screen = AnsiScreen()
     reaped = False
 
     def read(timeout=0.01):
@@ -138,6 +300,7 @@ def main():
                     return b""
                 raise
             capture.extend(data)
+            screen.feed(data)
             return data
         return b""
 
@@ -379,16 +542,15 @@ def main():
             # its canonical identity. F12 reports its pending state instead of
             # attaching a different row or queueing an eventual attachment.
             os.write(master, b"\x1b[24~")
-            # Differential rendering can reuse "Work" from the preceding
-            # "Working…" toast. Assert the distinctive fresh pending-state
-            # words rather than requiring the entire sentence in one patch.
-            wait_for(lambda data: all(word in data for word in (b"still", b"being", b"created")))
+            # Differential rendering reuses cells from preceding frames.
+            # Assert the visible screen, never a complete phrase in raw bytes.
+            wait_for(lambda _: screen.contains("Worktree is still being created"))
             # Navigation remains ordinary while the creation read is blocked.
             # Its delayed plan and completion must not reclaim this selection.
             os.write(master, b"k")
             drain_for(0.1)
             delay_inventory.unlink()
-            wait_for(lambda data: b"Created created-feedback" in data, timeout=15)
+            wait_for(lambda _: screen.contains("Created created-feedback"), timeout=15)
             assert (root / "worktrees/created-feedback").exists()
             wait_for(lambda _: install_started.exists())
             assert not install_finished.exists(), "creation waited for dependency setup"

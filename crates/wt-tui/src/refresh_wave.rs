@@ -129,11 +129,14 @@ mod tests {
         assert_eq!(crate::render::refreshing_count(&model), 1);
         model.refresh_wave.tick(1);
         let refreshing = draw(&model);
+        assert!(idle.starts_with(" wt · 0 worktrees"));
+        assert!(refreshing.starts_with(" wt · 0 worktrees"));
+        assert!(!idle.contains("creating checkout"));
+        assert!(!refreshing.contains("creating checkout"));
         assert_eq!(
-            idle[..idle.find("creating checkout").unwrap()].width(),
-            refreshing[..refreshing.find("creating checkout").unwrap()].width()
+            idle.chars().rev().take(20).collect::<String>(),
+            refreshing.chars().rev().take(20).collect::<String>()
         );
-        assert!(idle.contains("creating checkout"));
         assert_ne!(idle, refreshing);
         model.help = true;
         assert!(!crate::render::wave_visible(&model));

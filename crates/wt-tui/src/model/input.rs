@@ -75,15 +75,21 @@ impl Model {
         if matches!(result, InputResult::Unchanged) {
             self.ui_generation = generation;
         } else {
-            let cancelled_menu = self
-                .pending_request
-                .take()
-                .is_some_and(|request| request.preparation);
-            if cancelled_menu
+            let cancelled = self.pending_request.take();
+            let cancelled_feedback = cancelled.as_ref().and_then(|request| {
+                if request.preparation {
+                    Some("Menu cancelled")
+                } else if request.action.is_terminal_handoff() {
+                    Some("Session connection cancelled")
+                } else {
+                    None
+                }
+            });
+            if let Some(message) = cancelled_feedback
                 && matches!(result, InputResult::Draw | InputResult::Refresh)
                 && self.toast == toast_before
             {
-                self.toast = Some(("Menu cancelled".into(), ToastTone::Info));
+                self.toast = Some((message.into(), ToastTone::Info));
             } else if matches!(toast_before, Some((_, ToastTone::Failed)))
                 && self.toast == toast_before
                 && !matches!(self.interaction, Interaction::Text(_))

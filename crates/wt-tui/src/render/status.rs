@@ -41,11 +41,11 @@ pub(crate) const DETAILS: &[Domain] = &[
 pub(crate) const OUTPUT: &[Domain] = &[Domain::Activity, Domain::Actions, Domain::Sessions];
 pub(crate) const HISTORY: &[Domain] = &[Domain::History];
 pub(crate) const PERF: &[Domain] = &[Domain::Perf];
-/// Every domain but `Perf`, which only the perf overlay shows, for the
-/// header summary.
-pub(crate) const HEADER: [Domain; Domain::ALL.len() - 1] = header_domains();
+/// Every domain but `Perf`, which only the perf overlay shows, contributes to
+/// the refresh animation. Freshness text stays in the relevant pane borders.
+const REFRESH_DOMAINS: [Domain; Domain::ALL.len() - 1] = refresh_domains();
 
-const fn header_domains() -> [Domain; Domain::ALL.len() - 1] {
+const fn refresh_domains() -> [Domain; Domain::ALL.len() - 1] {
     let mut domains = [Domain::Git; Domain::ALL.len() - 1];
     let (mut from, mut to) = (0, 0);
     while from < Domain::ALL.len() {
@@ -93,7 +93,7 @@ pub(crate) fn status(model: &Model, domains: &[Domain]) -> Status {
 pub(crate) fn refreshing_count(model: &Model) -> usize {
     std::iter::once(&model.local_domains)
         .chain(model.source_board.host_domains.values())
-        .flat_map(|map| HEADER.iter().filter_map(|domain| map.get(domain)))
+        .flat_map(|map| REFRESH_DOMAINS.iter().filter_map(|domain| map.get(domain)))
         .filter(|meta| matches!(meta.state(), SourceState::Refreshing))
         .count()
 }
@@ -263,13 +263,14 @@ pub(crate) fn row_pending<'a>(model: &'a Model, key: &str) -> Vec<&'a PendingVie
         .collect()
 }
 
-/// Pending changes that are not about a row (harness switch, sections).
-pub(crate) fn board_pending(model: &Model) -> Vec<&PendingView> {
+/// Board-wide action progress belongs to the footer. Uncertain outcomes are
+/// persistent attention events, not an indefinitely displayed progress label.
+pub(crate) fn board_progress(model: &Model) -> Vec<&PendingView> {
     model
         .board
         .pending_views
         .iter()
-        .filter(|view| view.target.key.is_none())
+        .filter(|view| view.target.key.is_none() && view.phase != PendingPhase::Unconfirmed)
         .collect()
 }
 
@@ -454,8 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn the_header_summarizes_every_domain_but_perf() {
-        assert!(!HEADER.contains(&Domain::Perf));
-        assert_eq!(HEADER.len() + 1, Domain::ALL.len());
+    fn the_wave_counts_every_domain_but_perf() {
+        assert!(!REFRESH_DOMAINS.contains(&Domain::Perf));
+        assert_eq!(REFRESH_DOMAINS.len() + 1, Domain::ALL.len());
     }
 }

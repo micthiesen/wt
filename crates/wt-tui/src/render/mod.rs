@@ -138,7 +138,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
     overlays::render(frame, model, area);
 }
 
-/// One row: counts and load state on the left; automation state, usage, and
+/// One row: counts and refresh motion on the left; automation state, usage, and
 /// the primary harness on the right.
 fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
     let board = &model.board;
@@ -147,7 +147,7 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
     let archived = board.rows.iter().filter(|row| row.archived).count();
     let active = board.rows.len() - archived;
     let mut title = format!(
-        " wt · {active} worktree{}",
+        "wt · {active} worktree{}",
         if active == 1 { "" } else { "s" }
     );
     if archived > 0 {
@@ -164,16 +164,8 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
         format!("  {}", model.refresh_wave.text()),
         base.fg(theme::FG_DIM),
     ));
-    let pending = status::board_pending(model);
-    if !pending.is_empty() {
-        left.push(Span::styled("  ", base));
-        left.extend(status::pending_chip(&pending, base));
-    }
-    // Refresh motion has a permanent slot. Other state follows pending text,
-    // so starting/stopping a fetch never moves that text or right telemetry.
-    let mut source_status = status::status(model, &status::HEADER);
-    source_status.refreshing = false;
-    left.extend(status::chip(&source_status, base));
+    // No text follows the wave's reserved cells: idle space cannot split a
+    // sentence, and source freshness belongs to the pane displaying that data.
 
     let mut right: Vec<Span<'static>> = Vec::new();
     if board.automations_paused {
@@ -369,6 +361,7 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
         .toast
         .as_ref()
         .filter(|(message, _)| !message.trim().is_empty());
+    let progress = status::board_progress(model);
     let left = if let Some((message, tone)) = toast {
         // Leave the slot buttons their cells; a long toast truncates.
         let room = (area.width as usize).saturating_sub(slot_buttons_width(model) + 4);
@@ -399,6 +392,10 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             Span::raw(" "),
             Span::styled(error.to_string(), base.fg(theme::ERR)),
         ]
+    } else if !progress.is_empty() {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(status::pending_chip(&progress, base));
+        spans
     } else {
         let mut spans = vec![
             Span::raw(" "),
@@ -451,23 +448,15 @@ fn slot_buttons(model: &Model, base: Style) -> Vec<Span<'static>> {
     }
     for (index, (slot, key)) in SLOTS.into_iter().enumerate() {
         let sessions = board.slot_sessions.get(slot);
-        let physical = board.live_slots.get(slot).and_then(|slots| {
-            slots
-                .iter()
-                .find(|slot| slot.harness.eq_ignore_ascii_case(primary))
-                .or_else(|| slots.first())
-        });
+        let physical = board.live_slots.get(slot);
         if slot == "dotfiles" && sessions.is_none() && physical.is_none() {
             continue;
         }
-        let transcript = sessions
-            .and_then(|sessions| sessions.iter().find(|session| session.live))
-            .map(|session| (session.harness.as_str(), session.state.as_str()));
-        let state = physical
-            .filter(|slot| slot.state != "unknown")
-            .map(|slot| (slot.harness.as_str(), slot.state.as_str()))
-            .or(transcript)
-            .or_else(|| physical.map(|slot| (slot.harness.as_str(), slot.state.as_str())));
+        let state = badges::session_activity(
+            physical.map(Vec::as_slice).unwrap_or_default(),
+            sessions.map(Vec::as_slice).unwrap_or_default(),
+            primary,
+        );
         if index > 0 {
             spans.push(Span::styled("  ", base));
         }
@@ -547,6 +536,61 @@ mod tests {
     use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn topbar_keeps_only_stable_summary_and_footer_owns_action_progress() {
+        use wt_core::Domain;
+        use wt_runtime::{PendingPhase, PendingView, SourceSnapshot, Target};
+        for width in [40, 80, 140] {
+            let mut model = Model::default();
+            model.apply(SourceSnapshot::test_restored(
+                Board::default(),
+                Domain::Git,
+                1,
+            ));
+            Arc::make_mut(&mut model.board)
+                .pending_views
+                .push(PendingView {
+                    target: Target::board(None),
+                    label: "folding".into(),
+                    phase: PendingPhase::Accepted,
+                });
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let mut draw = |model: &Model| {
+                terminal
+                    .draw(|frame| {
+                        header(frame, model, Rect::new(0, 0, width, 1));
+                        footer(frame, model, Rect::new(0, 9, width, 1));
+                    })
+                    .unwrap();
+                [0, 9].map(|y| {
+                    (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                })
+            };
+            let [idle, footer_text] = draw(&model);
+            assert!(idle.starts_with(" wt · 0 worktrees"));
+            assert!(!idle.contains("cached") && !idle.contains("folding"));
+            assert!(footer_text.contains("folding"));
+            model.refresh_wave.tick(1);
+            let [refreshing, _] = draw(&model);
+            assert_eq!(
+                idle.chars().take(17).collect::<String>(),
+                refreshing.chars().take(17).collect::<String>()
+            );
+            assert_eq!(
+                idle.chars().rev().take(8).collect::<String>(),
+                refreshing.chars().rev().take(8).collect::<String>()
+            );
+            Arc::make_mut(&mut model.board).pending_views[0].phase = PendingPhase::Unconfirmed;
+            let [header_text, footer_text] = draw(&model);
+            assert!(!header_text.contains("folding") && !footer_text.contains("folding"));
+            model.toast = Some(("Action failed".into(), crate::model::ToastTone::Failed));
+            Arc::make_mut(&mut model.board).pending_views[0].phase = PendingPhase::Accepted;
+            assert!(draw(&model)[1].contains("Action failed"));
+        }
+    }
 
     #[test]
     fn footer_physical_slots_show_activity_without_inventing_a_transcript() {

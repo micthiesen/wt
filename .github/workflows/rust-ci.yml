@@ -122,6 +122,14 @@ jobs:
       - run: cargo build --workspace --bins --examples --locked
       - name: Verify the complete native end-to-end suite
         run: python3 scripts/native-check.py --binary target/debug/wt --output "${{ runner.temp }}"
+      - name: Retain native diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-failure-${{ matrix.os }}
+          path: ${{ runner.temp }}/wt-native-*
+          if-no-files-found: ignore
+          retention-days: 7
 
   build:
     if: toJSON(inputs.build_release) != 'false'

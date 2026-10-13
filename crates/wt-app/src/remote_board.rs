@@ -191,6 +191,7 @@ fn compose(
                     row.needs_attention = true;
                 }
                 if !current {
+                    row.live_sessions.clear();
                     for session in &mut row.sessions {
                         session.live = false;
                         session.state = "unknown".into();
@@ -248,6 +249,10 @@ fn compose(
                     for line in &mut session.output {
                         *line = wt_core::sanitize_terminal_text(line);
                     }
+                }
+                for slot in &mut row.live_sessions {
+                    slot.harness = wt_core::sanitize_terminal_text(&slot.harness);
+                    slot.state = wt_core::sanitize_terminal_text(&slot.state);
                 }
                 board.rows.push(row);
             }
@@ -676,6 +681,10 @@ mod tests {
                     key: "one".into(),
                     slug: "one".into(),
                     branch: "feature/one".into(),
+                    live_sessions: vec![wt_tui::LiveSlotView {
+                        harness: "Codex".into(),
+                        state: "working".into(),
+                    }],
                     sessions: vec![wt_tui::SessionView {
                         name: "codex".into(),
                         live: true,
@@ -721,6 +730,7 @@ mod tests {
         );
         assert!(!row.needs_attention);
         assert!(!row.sessions[0].live);
+        assert!(row.live_sessions.is_empty());
         assert!(board.attention.is_empty());
 
         // Once the stream delivers, the worker's own provenance shows through.
@@ -736,6 +746,7 @@ mod tests {
         assert!(domains[&Domain::Host].is_live());
         assert!(domains[&Domain::Git].is_live());
         assert!(board.rows[0].sessions[0].live);
+        assert_eq!(board.rows[0].live_sessions[0].harness, "Codex");
         fixture.close().await.unwrap();
     }
 }

@@ -762,7 +762,7 @@ fn sync_group(open: &str, close: &str, counts: Option<(u32, u32)>) -> Spans {
 /// The rebase lifecycle as a block: restacking, mid-rebase, or a branch
 /// that will not rebase cleanly onto its base (with the clashing files).
 fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Line<'static>> {
-    let session_state = badges::active_session(row, policy).map(|session| session.state.as_str());
+    let session_state = badges::row_session_activity(row, policy).map(|(_, state)| state);
     let Some(badge) = badges::rebase_badge(row, session_state) else {
         return Vec::new();
     };

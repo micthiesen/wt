@@ -268,6 +268,19 @@ pub enum UiAction {
 }
 
 impl UiAction {
+    /// Requests that acquire the interactive terminal. They serialize with
+    /// each other, independently of unrelated background work.
+    pub fn is_terminal_handoff(&self) -> bool {
+        match self {
+            Self::OnHost { action, .. } => action.is_terminal_handoff(),
+            Self::Session { .. }
+            | Self::SelectSession { .. }
+            | Self::EnterHarness { .. }
+            | Self::PerfInvestigate { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Whether this request prepares a prompt, picker, or other presentation
     /// from read-only data. Controllers may cancel these requests during
     /// shutdown without cancelling an accepted mutation.

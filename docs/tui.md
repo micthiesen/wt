@@ -95,8 +95,8 @@ data that also failed to refresh reads `GitHub cached 3m · GitHub failed`).
 The age belongs to that saved domain, not the whole board or its last refresh.
 A successful read clears its cached marker even when the data is unchanged;
 a failed or skipped read does not. Unused tracker answers do not mark the list
-stale. The list
-and header summarize every host; a row's details reflect only that row's host.
+stale. The list summarizes every host; a row's details reflect only that row's
+host. The top bar does not repeat source freshness labels from pane borders.
 
 Every change you make appears at once. Worktree rows contain their title,
 issue identifier, stack references and status glyphs only, never status text.
@@ -105,7 +105,9 @@ once accepted, or `?` when its outcome is unknown. Uncertainty takes precedence
 when several changes are pending. Full explanations, such as
 `? arming merge (unconfirmed)`, stay in the details title. Unknown action
 outcomes and expired updates also enter the attention feed. Board-wide changes,
-such as switching the primary harness, show in the header. A failed request
+such as switching the primary harness, show progress in the bottom status line.
+Uncertain board-wide outcomes stay in Attention, without replacing the top bar.
+A failed request
 rolls back at once with an error toast. A change that a fresh read still does
 not show after its deadline (30 seconds for GitHub, reviews and issue statuses;
 12 seconds for local state; 10 minutes for creating or removing a worktree) is
@@ -126,15 +128,16 @@ mouse wheel scroll the output pane. Selecting an output with `'` pins it until
 it ends; `[`/`]` cycle outputs, `"` toggles attention/all activity, and `Esc`
 returns to the default. The feed is restored from the app log on startup.
 
-The header shows worktree and archive counts, refresh state, paused or queued
+The header shows worktree and archive counts, refresh motion, paused or queued
 automations, the primary harness's rate-limit windows (colored as they near
 the limit, with time to reset), and the primary harness glyph. Refreshing uses
-a traveling bar wave in a reserved 12-cell slot, so counts, pending text, and
+a traveling bar wave in a reserved 12-cell slot, so counts and
 right-aligned telemetry stay put as refreshes start and finish. The wave follows
 the number of refreshing source lanes across hosts and eases to rest. Its 10 Hz
 timer stops when idle or covered by a modal; animation only repaints the header.
 The footer shows
-the active prompt, a toast (failures in red with a glyph), a source error, or a
+the active prompt, a toast (failures in red with a glyph), a source error,
+board-wide action progress, or a
 static key hint, and on the right the manager, main, wt, and dotfiles slot
 sessions as `[m] [.] [,] [/]` colored by session state. The manager Claude
 session also shows context occupancy after a transcript turn provides usage.

@@ -12,6 +12,68 @@ runner = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 
+ui_spec = importlib.util.spec_from_file_location("native_ui_check", Path(__file__).with_name("native-ui-check.py"))
+ui = importlib.util.module_from_spec(ui_spec)
+ui_spec.loader.exec_module(ui)
+
+
+class AnsiScreenTests(unittest.TestCase):
+    def test_creation_differential_frames_reuse_existing_characters(self):
+        screen = ui.AnsiScreen(rows=3, columns=60)
+        screen.feed(b"\x1b[2;3HWorking\xe2\x80\xa6")
+        self.assertTrue(screen.contains("Working"))
+        # The next draw reuses 'Work'. The final draw also preserves matching
+        # cells, so neither frame contains the complete visible sentence.
+        screen.feed(b"\x1b[2;7Htree is still being created")
+        self.assertTrue(screen.contains("Worktree is still being created"))
+        before = "".join(screen.cells[1])
+        after = "  Created created-feedback".ljust(60)
+        patch = b"".join(f"\x1b[2;{column + 1}H{new}".encode()
+                         for column, (old, new) in enumerate(zip(before, after))
+                         if old != new)
+        self.assertNotIn(b"Created created-feedback", patch)
+        screen.feed(patch)
+        self.assertTrue(screen.contains("Created created-feedback"))
+        self.assertFalse(screen.contains("Worktree is still being created"))
+        screen.feed(b"\x1b[2;3H\x1b[2K")
+        self.assertFalse(screen.contains("Created created-feedback"))
+
+    def test_chunked_utf8_glyph_does_not_shift_ascii_cells(self):
+        screen = ui.AnsiScreen(rows=2, columns=30)
+        data = "⠋ Working…".encode()
+        for byte in data:
+            screen.feed(bytes([byte]))
+        self.assertEqual(screen.column, 10)
+        screen.feed(b"\x1b[1;3HCreated\x1b[K")
+        self.assertTrue(screen.text().startswith("⠋ Created".encode()))
+
+    def test_wide_and_combining_cells_and_overwriting_continuation(self):
+        screen = ui.AnsiScreen(rows=2, columns=20)
+        screen.feed("界e\u0301 done".encode())
+        self.assertEqual(screen.column, 8)
+        self.assertEqual(screen.cells[0][:4], ["界", "", "e\u0301", " "])
+        screen.feed(b"\x1b[1;5HDone")
+        self.assertTrue(screen.text().startswith("界e\u0301 Done".encode()))
+        screen.feed(b"\x1b[1;2HX")
+        self.assertTrue(screen.text().startswith(" Xe\u0301 Done".encode()))
+
+    def test_erase_screen_preserves_cursor_and_erase_line_clears_whole_line(self):
+        screen = ui.AnsiScreen(rows=3, columns=20)
+        screen.feed(b"old\x1b[2;6H\x1b[2Jnew")
+        self.assertEqual((screen.row, screen.column), (1, 8))
+        self.assertEqual(screen.cells[0], [" "] * 20)
+        self.assertEqual("".join(screen.cells[1]), "     new            ")
+        screen.feed(b"\x1b[2;7H\x1b[2KX")
+        self.assertEqual("".join(screen.cells[1]), "      X             ")
+        self.assertEqual((screen.row, screen.column), (1, 7))
+
+    def test_styles_and_chunked_osc_do_not_become_text(self):
+        screen = ui.AnsiScreen(rows=2, columns=20)
+        for part in [b"\x1b]0;Working", b"\x1b", b"\\", b"\x1b[38;2;1;2;3", b"mReady\x1b[0m"]:
+            screen.feed(part)
+        self.assertTrue(screen.contains("Ready"))
+        self.assertFalse(screen.contains("Working"))
+
 
 class NativeCheckTests(unittest.TestCase):
     def test_complete_order_and_platform_selection(self):

@@ -339,6 +339,19 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   spike. Record process identity, sampling window, and whether the measurement
   is cold, warm, or under active output.
 
+### Native managed-removal follow-up, 2026-10-13
+
+- On v0.1.14 (`25119ab`), removing an owned, clean local QA checkout
+  removed its directory before the CLI returned. At 3m51s the native `rift gc`
+  child reported 36.8% CPU through `ps`; the Node wrapper and waiting wt
+  process reported 0%. This is a decaying CPU sample, not an interval average.
+  The command later completed successfully without forced termination.
+- The same release's owned MaxBook TUI test quit in 262ms after durable
+  removal acceptance. The worker subsequently failed safely in the Cozee stop
+  hook because a `--no-install` checkout lacked its pinned Supabase CLI.
+  A quick terminal exit proves ownership transfer, not completed removal;
+  inspect the durable job's terminal result separately.
+
 ## Historical TypeScript implementation evidence
 
 These measurements describe the retired TypeScript/OpenTUI implementation;

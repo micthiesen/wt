@@ -247,7 +247,9 @@ pub(crate) enum Lane {
     /// Bounded, device-local controls must remain responsive while host jobs
     /// or interactive handoffs occupy all ordinary action slots.
     ViewControl,
-    Terminal,
+    /// One device terminal, with host-local checkout identity for removal
+    /// conflicts. Special slots have no worktree target.
+    Terminal(Option<String>, Option<String>),
 }
 
 fn action_name(action: &wt_tui::UiAction) -> &'static str {
@@ -290,13 +292,15 @@ fn lane_host(lane: &Lane) -> &str {
         Lane::Host(Some(host))
         | Lane::Creation(Some(host))
         | Lane::Removal(Some(host), _)
-        | Lane::Preparation(Some(host)) => host,
+        | Lane::Preparation(Some(host))
+        | Lane::Terminal(Some(host), _) => host,
         Lane::Host(None)
         | Lane::Creation(None)
         | Lane::Removal(None, _)
-        | Lane::Preparation(None) => "local host",
+        | Lane::Preparation(None)
+        | Lane::Terminal(None, _) => "local host",
         Lane::FleetCleanup => "local and remote hosts",
-        Lane::Presentation | Lane::ViewControl | Lane::Terminal => "local host",
+        Lane::Presentation | Lane::ViewControl => "local host",
     }
 }
 
@@ -425,14 +429,14 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
                 | wt_tui::UiAction::SetPerf { .. }
         ) {
             Lane::ViewControl
-        } else if matches!(
-            action,
-            wt_tui::UiAction::Session { .. }
-                | wt_tui::UiAction::SelectSession { .. }
-                | wt_tui::UiAction::EnterHarness { .. }
-                | wt_tui::UiAction::PerfInvestigate { .. }
-        ) {
-            Lane::Terminal
+        } else if action.is_terminal_handoff() {
+            let key = match action {
+                wt_tui::UiAction::Session { key, .. } => key,
+                wt_tui::UiAction::SelectSession { selection } => selection.key,
+                wt_tui::UiAction::EnterHarness { key, .. } => Some(key),
+                _ => None,
+            };
+            Lane::Terminal(host, key)
         } else if crate::host_routing::controller_owned(&action) {
             Lane::Presentation
         } else if action.is_preparation() {
@@ -462,15 +466,15 @@ pub(crate) fn take_available<T>(
     pending: &mut VecDeque<(Lane, T)>,
     busy: &BTreeSet<Lane>,
 ) -> Option<(Lane, T)> {
-    // Reserve slots for quick view controls, read-only preparations, and
-    // worktree creation. A destructive removal must not strand a new-worktree
-    // request behind the ordinary host-action limit.
+    // Reserve slots for view controls, read-only preparations, creation, and
+    // terminal entry. Unrelated host jobs cannot consume interactive capacity;
+    // lane conflicts still serialize terminal handoffs with each other.
     let ordinary_full = busy
         .iter()
         .filter(|lane| {
             !matches!(
                 lane,
-                Lane::ViewControl | Lane::Preparation(_) | Lane::Creation(_)
+                Lane::ViewControl | Lane::Preparation(_) | Lane::Creation(_) | Lane::Terminal(_, _)
             )
         })
         .count()
@@ -479,7 +483,7 @@ pub(crate) fn take_available<T>(
     let creation_busy = busy.iter().any(|lane| matches!(lane, Lane::Creation(_)));
     let position = pending.iter().position(|(lane, _)| {
         let has_capacity = match lane {
-            Lane::ViewControl => true,
+            Lane::ViewControl | Lane::Terminal(_, _) => true,
             Lane::Preparation(_) => !preparation_busy,
             Lane::Creation(_) => !creation_busy,
             _ => !ordinary_full,
@@ -498,14 +502,25 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
             (left, right),
             (
                 Lane::FleetCleanup,
-                Lane::Host(_) | Lane::Creation(_) | Lane::Removal(_, _)
+                Lane::Host(_)
+                    | Lane::Creation(_)
+                    | Lane::Removal(_, _)
+                    | Lane::Terminal(_, Some(_))
             ) | (
-                Lane::Host(_) | Lane::Creation(_) | Lane::Removal(_, _),
+                Lane::Host(_)
+                    | Lane::Creation(_)
+                    | Lane::Removal(_, _)
+                    | Lane::Terminal(_, Some(_)),
                 Lane::FleetCleanup
             )
         );
     }
     match (left, right) {
+        (Lane::Terminal(_, _), Lane::Terminal(_, _)) => true,
+        (Lane::Terminal(host, Some(key)), Lane::Removal(other_host, other_key))
+        | (Lane::Removal(other_host, other_key), Lane::Terminal(host, Some(key))) => {
+            host == other_host && key == other_key
+        }
         (Lane::Host(left), Lane::Creation(right))
         | (Lane::Creation(left), Lane::Host(right))
         | (Lane::Host(left), Lane::Removal(right, _))
@@ -769,6 +784,8 @@ pub(crate) async fn handoff_prepared(
         result = suspended => if result.is_err() {
             // A newer UI intent can decline this ticket before suspension.
             // No attach client was spawned; the prepared session stays alive.
+            tracing::info!(operation_id = replies.id, ui_generation = replies.generation,
+                "terminal handoff declined by newer input before attach");
             return Ok(UiReply::no_change(""));
         },
     }
@@ -1473,7 +1490,7 @@ mod tests {
         assert_eq!(control_lane, Lane::ViewControl);
         let mut pending = VecDeque::from([
             (
-                Lane::Terminal,
+                Lane::Terminal(None, Some("existing".into())),
                 UiAction::EnterHarness {
                     key: "existing".into(),
                     harness: wt_core::HarnessId::Codex,
@@ -1483,9 +1500,87 @@ mod tests {
         ]);
         assert_eq!(
             take_available(&mut pending, &busy),
+            Some((
+                Lane::Terminal(None, Some("existing".into())),
+                UiAction::EnterHarness {
+                    key: "existing".into(),
+                    harness: wt_core::HarnessId::Codex
+                }
+            ))
+        );
+        assert_eq!(
+            take_available(&mut pending, &busy),
             Some((control_lane, control))
         );
         assert_eq!(take_available(&mut pending, &busy), None);
+    }
+
+    #[test]
+    fn special_terminal_entry_only_waits_for_another_terminal_entry() {
+        let terminal = UiAction::Session {
+            key: None,
+            target: wt_tui::SessionTarget::WtSource,
+        };
+        assert_eq!(lane_for(&terminal).unwrap(), Lane::Terminal(None, None));
+        let mut pending = VecDeque::from([(Lane::Terminal(None, None), terminal.clone())]);
+        assert_eq!(
+            take_available(
+                &mut pending,
+                &BTreeSet::from([
+                    Lane::Terminal(Some("other-host".into()), Some("one".into())),
+                    Lane::Creation(None)
+                ])
+            ),
+            None
+        );
+        assert_eq!(
+            take_available(
+                &mut pending,
+                &BTreeSet::from([
+                    Lane::Creation(None),
+                    Lane::Removal(None, "other".into()),
+                    Lane::FleetCleanup
+                ])
+            ),
+            Some((Lane::Terminal(None, None), terminal))
+        );
+    }
+
+    #[test]
+    fn terminal_checkout_conflicts_only_with_its_own_removal_or_fleet_cleanup() {
+        let host = "builder".to_owned();
+        let terminal = lane_for(&UiAction::Session {
+            key: Some(wt_core::remote_worktree_ledger_key(&host, "one")),
+            target: wt_tui::SessionTarget::Harness,
+        })
+        .unwrap();
+        assert_eq!(
+            terminal,
+            Lane::Terminal(Some(host.clone()), Some("one".into()))
+        );
+        for (other, conflict) in [
+            (Lane::Removal(Some(host.clone()), "one".into()), true),
+            (Lane::Removal(None, "one".into()), false),
+            (Lane::Removal(Some(host.clone()), "two".into()), false),
+            (Lane::Host(Some(host.clone())), false),
+            (Lane::Creation(Some(host.clone())), false),
+            (Lane::FleetCleanup, true),
+        ] {
+            assert_eq!(lanes_conflict(&terminal, &other), conflict, "{other:?}");
+            assert_eq!(
+                lanes_conflict(&other, &terminal),
+                conflict,
+                "symmetric {other:?}"
+            );
+        }
+        let explicit = UiAction::OnHost {
+            host: Some(host.clone()),
+            action: Box::new(UiAction::EnterHarness {
+                key: "one".into(),
+                harness: wt_core::HarnessId::Codex,
+            }),
+        };
+        assert_eq!(lane_for(&explicit).unwrap(), terminal);
     }
 
     #[test]

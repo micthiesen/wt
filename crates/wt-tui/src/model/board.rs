@@ -581,6 +581,10 @@ pub struct BoardRow {
     pub detail_groups: Vec<PreparedDetailGroup>,
     #[serde(default)]
     pub sessions: Vec<SessionView>,
+    /// Physical harness slots observed on this row's host. Display activity
+    /// does not establish a transcript identity or authorize session actions.
+    #[serde(default)]
+    pub live_sessions: Vec<LiveSlotView>,
     #[serde(default)]
     pub logs: Vec<LogView>,
 }

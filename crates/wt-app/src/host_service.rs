@@ -17,6 +17,29 @@ pub struct HostService {
 /// longest pending deadline for an accepted or unconfirmed change.
 const SETTLEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Complete an operation executed by this process, before scheduling its
+/// confirming reads. Never use this to classify a foreign or aggregate write.
+/// Explicit outcomes retain their original ownership and clock.
+pub(crate) fn complete_local(effect: &wt_tui::Effect, mut reply: UiReply) -> UiReply {
+    if !reply.failed && reply.outcome.is_none() && matches!(effect, wt_tui::Effect::Mutation(_)) {
+        // A mutation can discover changed preconditions and ask for a new
+        // confirmation instead of writing. Its optimistic effect must settle
+        // as no change, not as an accepted write waiting for readback.
+        reply.outcome = Some(if reply.modal.is_some() {
+            ReplyOutcome::NoChange
+        } else {
+            ReplyOutcome::Accepted(Stamp::now())
+        });
+    }
+    if matches!(
+        reply.outcome,
+        Some(ReplyOutcome::Accepted(_) | ReplyOutcome::Uncertain)
+    ) {
+        wt_runtime::hold_for_settlement(SETTLEMENT_WINDOW);
+    }
+    reply
+}
+
 /// The oldest GitHub read a GitHub write may rely on for its PR checks.
 const WRITE_EVIDENCE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
@@ -59,8 +82,7 @@ impl HostService {
         let result = self.run(command, &snapshot, shutdown).await;
         // Stamp the write before any refresh is queued, so the confirming
         // fetch always starts at or after it.
-        let done = Stamp::now();
-        let mut reply = match result {
+        let reply = match result {
             Ok(reply) => reply,
             Err(error)
                 if error
@@ -76,18 +98,7 @@ impl HostService {
                 return Err(error);
             }
         };
-        if !reply.failed && reply.outcome.is_none() && matches!(effect, wt_tui::Effect::Mutation(_))
-        {
-            reply.outcome = Some(ReplyOutcome::Accepted(done));
-        }
-        if matches!(
-            reply.outcome,
-            Some(ReplyOutcome::Accepted(_) | ReplyOutcome::Uncertain)
-        ) {
-            // Let identical refetches carry their stamps to the TUI until
-            // the change is confirmed.
-            wt_runtime::hold_for_settlement(SETTLEMENT_WINDOW);
-        }
+        let reply = complete_local(&effect, reply);
         self.refresh_after(&effect, &reply);
         Ok(reply)
     }
@@ -614,6 +625,100 @@ fn github_prompt(pr: &wt_github::PullRequest, ship: bool, reviewer: Option<&str>
 mod tests {
     use super::*;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
+
+    #[test]
+    fn local_completion_classifies_only_successful_unclassified_mutations() {
+        let effect = UiAction::FoldSection {
+            key: "inbox".into(),
+            folded: true,
+        }
+        .effect(&Board::default());
+        let before = Stamp::now();
+        let reply = complete_local(&effect, UiReply::default());
+        let Some(ReplyOutcome::Accepted(stamp)) = reply.outcome else {
+            panic!("local write must be accepted")
+        };
+        assert_eq!(stamp.at_or_after(&before), Some(true));
+        assert_eq!(Stamp::now().at_or_after(&stamp), Some(true));
+        assert!(
+            complete_local(
+                &effect,
+                UiReply {
+                    failed: true,
+                    ..Default::default()
+                }
+            )
+            .outcome
+            .is_none()
+        );
+        let read = UiAction::PrepareSection { key: "one".into() }.effect(&Board::default());
+        assert!(complete_local(&read, UiReply::default()).outcome.is_none());
+        let recheck = complete_local(
+            &effect,
+            UiReply {
+                modal: Some(wt_tui::UiModal::Log {
+                    title: "Review changed preconditions".into(),
+                    lines: Vec::new(),
+                    close_key: None,
+                    refresh: None,
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(recheck.outcome, Some(ReplyOutcome::NoChange));
+        assert!(
+            recheck.modal.is_some(),
+            "the new prompt must remain visible"
+        );
+        let foreign: Stamp =
+            serde_json::from_value(serde_json::json!({"epoch": 2, "offset_ms": 42})).unwrap();
+        for outcome in [
+            ReplyOutcome::NoChange,
+            ReplyOutcome::Deferred,
+            ReplyOutcome::Uncertain,
+            ReplyOutcome::Accepted(foreign),
+        ] {
+            let reply = complete_local(
+                &effect,
+                UiReply {
+                    outcome: Some(outcome),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(reply.outcome, Some(outcome));
+        }
+    }
+
+    #[tokio::test]
+    async fn folding_durable_metadata_returns_accepted_on_the_local_clock() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let action = UiAction::FoldSection {
+            key: "test-section".into(),
+            folded: true,
+        };
+        assert!(crate::host_routing::controller_owned(&action));
+        let board = Board::default();
+        let effect = action.effect(&board);
+        let result = crate::controller_actions::execute(&fixture.ctx, action, Some(&board), None)
+            .await
+            .unwrap();
+        let reply = complete_local(&effect, result);
+        let Some(ReplyOutcome::Accepted(stamp)) = reply.outcome else {
+            panic!("successful fold must not become unconfirmed")
+        };
+        assert!(stamp.local_instant().is_some());
+        assert!(
+            fixture
+                .ctx
+                .database
+                .call(|store| Ok(store.is_section_folded("test-section")?))
+                .await
+                .unwrap()
+        );
+        fixture.close().await.unwrap();
+    }
 
     fn pr(draft: bool, reviewers: &[&str], armed: bool) -> wt_github::PullRequest {
         let auto_merge =

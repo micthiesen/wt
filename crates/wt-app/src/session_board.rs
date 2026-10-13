@@ -81,6 +81,9 @@ fn compose(
     let inventory_ok = matches!(inventory.state(), SourceState::Ready);
     let discoveries_ok = matches!(discoveries.state(), SourceState::Ready);
     board.live_slots.clear();
+    for row in &mut board.rows {
+        row.live_sessions.clear();
+    }
     if inventory_ok && let Some(inventory) = inventory.data() {
         for name in inventory.all.keys() {
             let (slug, harness) = if board.rows.iter().any(|row| row.slug == *name) {
@@ -108,6 +111,14 @@ fn compose(
                         .cloned()
                         .unwrap_or_else(|| "unknown".into()),
                 });
+        }
+    }
+    for row in &mut board.rows {
+        // This stage owns only host-local inventory. A same-named row on a
+        // remote host can never inherit a local physical slot.
+        if row.host.is_none() {
+            row.live_sessions = board.live_slots.get(&row.slug).cloned().unwrap_or_default();
+            row.needs_attention |= row.live_sessions.iter().any(|slot| slot.state == "asking");
         }
     }
     for entry in discoveries.data().iter().flat_map(|data| data.iter()) {
@@ -294,8 +305,28 @@ mod tests {
 
     #[test]
     fn physical_slot_activity_does_not_require_or_fabricate_history_identity() {
-        let source =
-            SourceSnapshot::test_live(Some(Board::default()), SourceState::Ready, Domain::Git);
+        let source = SourceSnapshot::test_live(
+            Some(Board {
+                rows: vec![
+                    BoardRow {
+                        slug: "manager".into(),
+                        ..Default::default()
+                    },
+                    BoardRow {
+                        slug: "manager".into(),
+                        host: Some("remote".into()),
+                        ..Default::default()
+                    },
+                    BoardRow {
+                        slug: "other".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            SourceState::Ready,
+            Domain::Git,
+        );
         let mut inventory = SessionInventory::default();
         inventory.all.insert(
             "manager-codex".into(),
@@ -324,6 +355,13 @@ mod tests {
             );
             let board = result.data().unwrap();
             assert_eq!(board.live_slots["manager"][0].state, state);
+            assert_eq!(board.rows[0].live_sessions[0].state, state);
+            assert!(board.rows[0].sessions.is_empty(), "no invented transcript");
+            assert!(
+                board.rows[1].live_sessions.is_empty(),
+                "same slug on another host"
+            );
+            assert!(board.rows[2].live_sessions.is_empty(), "unrelated row");
             assert!(board.slot_sessions.is_empty());
         }
         let result = compose(
@@ -337,6 +375,14 @@ mod tests {
             SourceSnapshot::default(),
         );
         assert!(result.data().unwrap().live_slots.is_empty());
+        assert!(
+            result
+                .data()
+                .unwrap()
+                .rows
+                .iter()
+                .all(|row| row.live_sessions.is_empty())
+        );
         let result = compose(
             source,
             SourceSnapshot::test_live(

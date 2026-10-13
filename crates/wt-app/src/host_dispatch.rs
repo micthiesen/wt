@@ -53,7 +53,8 @@ pub async fn execute(
         return Ok(UiReply::default());
     }
     if let UiAction::SetAttentionSeen { at_ms } = action {
-        fleet
+        let effect = action.effect(&wt_tui::Board::default());
+        let result = fleet
             .local
             .context
             .database
@@ -61,14 +62,18 @@ pub async fn execute(
                 store.set_attention_seen(at_ms)?;
                 Ok(())
             })
-            .await?;
-        let accepted = wt_runtime::Stamp::now();
+            .await
+            .map(|()| {
+                crate::host_service::complete_local(
+                    &effect,
+                    UiReply {
+                        message: "Attention marked seen".into(),
+                        ..Default::default()
+                    },
+                )
+            });
         fleet.local.sources.metadata.refresh();
-        return Ok(UiReply {
-            message: "Attention marked seen".into(),
-            outcome: Some(wt_tui::ReplyOutcome::Accepted(accepted)),
-            ..Default::default()
-        });
+        return result;
     }
     if let UiAction::PerfInvestigate { report } = action {
         if report.iter().all(|line| line.trim().is_empty()) {
@@ -306,32 +311,39 @@ pub async fn execute(
             action
         };
         let snapshot = fleet.board.snapshot();
-        let reply = if let UiAction::OpenEditor { key } = &action
-            && let Some(remote) = remote
-        {
-            let row = snapshot
-                .data()
-                .and_then(|board| board.rows.iter().find(|row| row.key == *key))
-                .context("remote worktree metadata is still loading")?;
-            let uri = crate::editor::remote_uri(&remote.endpoint.host, &row.path)?;
-            crate::editor::open(context, std::path::Path::new(&uri)).await?;
-            UiReply {
-                message: format!("Opened {} on {}", row.slug, remote.endpoint.label),
-                ..Default::default()
+        let empty = wt_tui::Board::default();
+        let effect = action.effect(snapshot.data().map_or(&empty, |board| board.as_ref()));
+        let result = async {
+            if let UiAction::OpenEditor { key } = &action
+                && let Some(remote) = remote
+            {
+                let row = snapshot
+                    .data()
+                    .and_then(|board| board.rows.iter().find(|row| row.key == *key))
+                    .context("remote worktree metadata is still loading")?;
+                let uri = crate::editor::remote_uri(&remote.endpoint.host, &row.path)?;
+                crate::editor::open(context, std::path::Path::new(&uri)).await?;
+                Ok(UiReply {
+                    message: format!("Opened {} on {}", row.slug, remote.endpoint.label),
+                    ..Default::default()
+                })
+            } else {
+                crate::controller_actions::execute(
+                    context,
+                    action,
+                    snapshot.data().map(|board| board.as_ref()),
+                    // The controller owns no GitHub leaf; these actions act on
+                    // local presentation and durable state only.
+                    None,
+                )
+                .await
             }
-        } else {
-            crate::controller_actions::execute(
-                context,
-                action,
-                snapshot.data().map(|board| board.as_ref()),
-                // The controller owns no GitHub leaf; these actions act on
-                // local presentation and durable state only.
-                None,
-            )
-            .await?
-        };
+        }
+        .await
+        .map(|reply| crate::host_service::complete_local(&effect, reply));
+        // A failed local write may have partially changed durable metadata.
         fleet.local.sources.metadata.refresh();
-        return Ok(reply);
+        return result;
     }
     let migrated_pin = if let Some(remote) = remote {
         match &action {

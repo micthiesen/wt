@@ -126,6 +126,81 @@ fn ignored_input_keeps_current_terminal_handoff_available() {
 }
 
 #[test]
+fn stale_special_session_completion_cannot_erase_pending_creation_feedback() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["old"]));
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            input: "new".into(),
+        },
+    );
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char(',')), 20) else {
+        panic!("special session remains available during creation")
+    };
+    model.begin_action(2, &action);
+    let generation = model.ui_generation;
+    model.toast = Some(("Working…".into(), ToastTone::Info));
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::F(12)), 20),
+        InputResult::Draw
+    );
+    let feedback = model.toast.clone();
+    assert_eq!(
+        feedback.as_ref().unwrap().0,
+        "Worktree is still being created"
+    );
+    let (ready, mut suspended) = tokio::sync::oneshot::channel();
+    let (_resume, resumed) = tokio::sync::oneshot::channel();
+    assert!(
+        model
+            .reply(UiReply {
+                operation_id: Some(2),
+                ui_generation: Some(generation),
+                handoff: Some(crate::TerminalHandoff { ready, resumed }),
+                ..Default::default()
+            })
+            .is_none()
+    );
+    assert!(matches!(
+        suspended.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+    model.reply(UiReply {
+        operation_id: Some(2),
+        ui_generation: Some(generation),
+        outcome: Some(crate::ReplyOutcome::NoChange),
+        ..Default::default()
+    });
+    assert_eq!(model.toast, feedback);
+}
+
+#[test]
+fn navigating_away_from_a_pending_connection_explains_cancellation() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one", "two"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::F(12)), 20) else {
+        panic!("session action")
+    };
+    model.begin_action(7, &action);
+    model.toast = Some(("Working…".into(), ToastTone::Info));
+    model.input(KeyEvent::from(KeyCode::Down), 20);
+    assert_eq!(
+        model.toast.as_ref().unwrap().0,
+        "Session connection cancelled"
+    );
+    model.reply(UiReply {
+        operation_id: Some(7),
+        outcome: Some(crate::ReplyOutcome::NoChange),
+        ..Default::default()
+    });
+    assert_eq!(
+        model.toast.as_ref().unwrap().0,
+        "Session connection cancelled"
+    );
+}
+
+#[test]
 fn delayed_modal_and_background_completion_preserve_newer_input() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));

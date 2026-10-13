@@ -76,7 +76,12 @@ impl Model {
                 .as_ref()
                 .is_some_and(|(_, tone)| *tone == ToastTone::Failed)
             && !reply.failed;
-        if self.pending_request.is_none() && !preserves_failure {
+        let empty_unrelated_completion = completed_request.is_none()
+            && reply.message.trim().is_empty()
+            && reply.modal.is_none()
+            && reply.handoff.is_none()
+            && !reply.failed;
+        if self.pending_request.is_none() && !preserves_failure && !empty_unrelated_completion {
             let message = if reply.message.is_empty()
                 && reply.modal.is_none()
                 && reply.handoff.is_none()

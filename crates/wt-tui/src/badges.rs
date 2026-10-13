@@ -196,6 +196,37 @@ pub(crate) fn active_session<'a>(
         })
 }
 
+/// Display activity is independent of transcript attribution. Prefer the
+/// primary physical slot, then enrich its unknown activity only with a proven
+/// live transcript from the same harness.
+pub(crate) fn session_activity<'a>(
+    physical: &'a [crate::LiveSlotView],
+    transcripts: &'a [SessionView],
+    primary: &str,
+) -> Option<(&'a str, &'a str)> {
+    let slot = physical
+        .iter()
+        .min_by_key(|slot| !slot.harness.eq_ignore_ascii_case(primary));
+    let transcript = transcripts
+        .iter()
+        .filter(|session| session.live)
+        .filter(|session| {
+            slot.is_none_or(|slot| slot.harness.eq_ignore_ascii_case(&session.harness))
+        })
+        .min_by_key(|session| !session.harness.eq_ignore_ascii_case(primary));
+    slot.filter(|slot| slot.state != "unknown")
+        .map(|slot| (slot.harness.as_str(), slot.state.as_str()))
+        .or_else(|| transcript.map(|session| (session.harness.as_str(), session.state.as_str())))
+        .or_else(|| slot.map(|slot| (slot.harness.as_str(), slot.state.as_str())))
+}
+
+pub(crate) fn row_session_activity<'a>(
+    row: &'a BoardRow,
+    policy: &DisplayPolicy,
+) -> Option<(&'a str, &'a str)> {
+    session_activity(&row.live_sessions, &row.sessions, &policy.primary_harness)
+}
+
 pub fn harness_glyph(harness: &str) -> &'static str {
     match harness.to_ascii_lowercase().as_str() {
         "codex" => glyphs::CODEX,
@@ -383,7 +414,7 @@ pub(crate) fn cluster(row: &BoardRow, policy: &DisplayPolicy) -> Vec<ClusterSlot
             width,
         });
     };
-    let session = active_session(row, policy);
+    let session = row_session_activity(row, policy);
     if row.action_running && shows(policy, "action") {
         push(glyphs::COMMENT, theme::OK, 2);
     }
@@ -391,17 +422,17 @@ pub(crate) fn cluster(row: &BoardRow, policy: &DisplayPolicy) -> Vec<ClusterSlot
         push(glyphs::PENCIL, dim.unwrap_or(theme::WARN), 2);
     }
     if shows(policy, "rebase")
-        && let Some(rebase) = rebase_badge(row, session.map(|session| session.state.as_str()))
+        && let Some(rebase) = rebase_badge(row, session.map(|(_, state)| state))
     {
         push(rebase.glyph, dim.unwrap_or(rebase.color), 2);
     }
     if row.environment_live && shows(policy, "deploy") {
         push(glyphs::BOLT, dim.unwrap_or(theme::WARN), 2);
     }
-    if let Some(session) = session.filter(|_| shows(policy, "session")) {
+    if let Some((harness, state)) = session.filter(|_| shows(policy, "session")) {
         push(
-            harness_glyph(&session.harness),
-            session_state_color(&session.harness, &session.state),
+            harness_glyph(harness),
+            session_state_color(harness, state),
             2,
         );
     }
@@ -499,6 +530,54 @@ mod tests {
             effective_state: Some(state),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn physical_codex_slot_shows_glyph_without_attributing_an_old_transcript() {
+        let mut row = row();
+        let policy = DisplayPolicy {
+            primary_harness: "Codex".into(),
+            ..Default::default()
+        };
+        row.live_sessions.push(crate::LiveSlotView {
+            harness: "Codex".into(),
+            state: "working".into(),
+        });
+        row.sessions.push(SessionView {
+            harness: "Codex".into(),
+            id: "old-thread".into(),
+            state: "asking".into(),
+            live: false,
+            ..Default::default()
+        });
+        assert!(active_session(&row, &policy).is_none());
+        assert_eq!(
+            row_session_activity(&row, &policy),
+            Some(("Codex", "working"))
+        );
+        assert!(
+            cluster(&row, &policy)
+                .iter()
+                .any(|slot| slot.text == glyphs::CODEX
+                    && slot.color == session_state_color("Codex", "working"))
+        );
+        row.live_sessions[0].state = "unknown".into();
+        row.sessions.push(SessionView {
+            harness: "Claude".into(),
+            live: true,
+            state: "asking".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            row_session_activity(&row, &policy),
+            Some(("Codex", "unknown")),
+            "another harness cannot supply the primary slot's state"
+        );
+        row.sessions[0].live = true;
+        assert_eq!(
+            row_session_activity(&row, &policy),
+            Some(("Codex", "asking"))
+        );
     }
 
     #[test]

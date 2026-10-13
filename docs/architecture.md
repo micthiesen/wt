@@ -236,7 +236,11 @@ An expiry while confirmed data still disagrees shows one notice.
   toggles carry an explicit direction and GitHub writes carry the PR number and
   head SHA they target (`PrPin`). The executing host refreshes the domains the
   effect names and replies with a `ReplyOutcome` (`Accepted(stamp)`,
-  `NoChange`, `Deferred`, or `Uncertain`).
+  `NoChange`, `Deferred`, or `Uncertain`). Controller-owned metadata writes
+  (including folding, layout and attention acknowledgement) use the same local
+  completion classifier as host services: stamp successful writes and enable
+  settlement observations before requesting their confirming reads. Explicit
+  outcomes and foreign stamps are never replaced by a controller clock.
 - Interactive session entry is a terminal handoff, not a pending board write.
   Shell, diff, harness entry and managed sign-in have no expected board
   postcondition or host write stamp; session sources independently observe any
@@ -275,6 +279,13 @@ one marker (`…` in flight, `↻` accepted, `? … (unconfirmed)`).
 
 ## Freshness and refresh
 
+Worktree session glyphs and special-session footer colors use the same live
+physical-slot activity rule. They remain visible before a transcript UUID can
+be attributed. This display-only presence cannot supply history identity or
+authorize messages: those still require the exact discovered session. Unknown
+physical activity can be enriched only by a proven live transcript from the
+same harness. Restored or disconnected remote snapshots cannot claim a live slot.
+
 Local Git inventory, metadata, edit timestamps, sessions, action logs, and
 GitHub observations have separate source lanes. Filesystem watchers invalidate
 only the facts affected by the event. A one-second metadata backstop detects
@@ -312,8 +323,11 @@ when their host scope ends.
 Attention, history, and performance controls have a separate serialized slot
 reserved beyond the four ordinary action slots, so long host operations cannot
 delay them. Attention acknowledgement returns its own accept stamp before
-refreshing metadata. Read-only preparations and worktree creation also have
-reserved capacity. Preparations do not wait behind mutations because the
+refreshing metadata. Read-only preparations, worktree creation and terminal
+entry also have reserved capacity. Terminal handoffs serialize with each other;
+worktree entry also conflicts with removal of that exact host and checkout, and
+with fleet cleanup. Special-session entry and unrelated checkouts remain
+available during background writes. Preparations do not wait behind mutations because the
 confirmed write revalidates its inputs. Removals serialize by host and target;
 unrelated creates and removals can proceed concurrently, while broader host
 operations and fleet cleanup retain their conflict boundaries. Lifecycle
@@ -340,7 +354,9 @@ event. Uncertain writes produce a warning there; no-op notices remain transient.
 Intermediate terminal handoffs carry the originating request ID and input
 generation. A newer prompt or selection can decline the ticket before terminal
 suspension; no attach client starts, the prepared session remains alive, and a
-declined sign-in does not execute its continuation.
+declined sign-in does not execute its continuation. Navigation that declines a
+pending connection reports its cancellation. A late empty completion cannot
+erase feedback from newer input, including a worktree still being created.
 
 The SSH protocol is framed and versioned. The controller probes the worker,
 checks its role and protocol, and provisions the exact native build before
