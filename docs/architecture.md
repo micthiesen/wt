@@ -95,6 +95,11 @@ source only when a file changes. Active Codex rollouts have a separate 500 ms
 metadata backstop over their exact retained paths. Both keep file I/O off the
 input path, detect same-second appends without hashing transcript contents,
 and remain responsive when native filesystem notifications are lost.
+Rollout UUID lookup caches directory membership against directory identity and
+nanosecond modification/change times, including negative searches. An unchanged
+history directory does not require re-enumerating or statting all its files.
+New date directories and new files invalidate membership immediately; candidate
+files still require current UUID, checkout and slot-ownership validation.
 The attention watermark is stored in
 the repository-scoped state and projected into every board snapshot.
 

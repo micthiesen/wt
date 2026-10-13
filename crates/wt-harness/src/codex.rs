@@ -23,6 +23,7 @@ mod events;
 mod file_cache;
 mod messaging;
 mod output;
+mod rollout_index;
 mod trust;
 mod usage;
 
@@ -481,49 +482,29 @@ fn find_rollout_cancellable(
     id: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Option<Rollout>, CodexHarnessError> {
-    let mut stack = vec![dir.to_path_buf()];
+    static INDEX: OnceLock<rollout_index::RolloutIndex> = OnceLock::new();
+    let paths = INDEX
+        .get_or_init(rollout_index::RolloutIndex::new)
+        .matching(dir, id, cancellation)?;
     let mut best: Option<Rollout> = None;
-    while let Some(current) = stack.pop() {
+    for path in paths {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(CodexHarnessError::Operation {
                 operation: "read output",
                 detail: "cancelled".into(),
             });
         }
-        let Ok(entries) = fs::read_dir(current) else {
+        let Some(rollout) = read_rollout(&path)? else {
             continue;
         };
-        for entry in entries.flatten() {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Err(CodexHarnessError::Operation {
-                    operation: "read output",
-                    detail: "cancelled".into(),
-                });
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !is_rollout_path(&path)
-                || !path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().contains(id))
-            {
-                continue;
-            }
-            let Some(rollout) = read_rollout(&path)? else {
-                continue;
-            };
-            if rollout.session_id == id
-                && rollout.cwd == cwd.to_string_lossy()
-                && slot_owns(&path, rollout.size, slug)?
-                && best
-                    .as_ref()
-                    .is_none_or(|prev| rollout.mtime_ms > prev.mtime_ms)
-            {
-                best = Some(rollout);
-            }
+        if rollout.session_id == id
+            && rollout.cwd == cwd.to_string_lossy()
+            && slot_owns(&path, rollout.size, slug)?
+            && best
+                .as_ref()
+                .is_none_or(|prev| rollout.mtime_ms > prev.mtime_ms)
+        {
+            best = Some(rollout);
         }
     }
     Ok(best)
@@ -886,6 +867,59 @@ mod tests {
         let event = json!({"type":"event_msg","timestamp":"2026-10-01T00:00:00Z","payload":{"type":"task_complete"}});
         fs::write(&path, format!("{header}\n{event}\n")).unwrap();
         path
+    }
+
+    #[test]
+    fn indexed_rollout_paths_never_cache_uuid_cwd_or_slot_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        let sessions = root.path().join("sessions");
+        let path = write_rollout(&sessions, "2026/10/13", "thread", &cwd, "codex-tui", "user");
+        assert!(
+            find_rollout(&sessions, &cwd, "feature", "thread")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            find_rollout(&sessions, &cwd, "manager", "thread")
+                .unwrap()
+                .is_none()
+        );
+        // In-place content changes do not touch the parent directory. Header
+        // validation must therefore run even when membership remains cached.
+        write_rollout(
+            &sessions,
+            "2026/10/13",
+            "thread",
+            &root.path().join("other"),
+            "codex-tui",
+            "user",
+        );
+        assert!(
+            find_rollout(&sessions, &cwd, "feature", "thread")
+                .unwrap()
+                .is_none()
+        );
+        let replacement = write_rollout(
+            &sessions,
+            "2026/10/13",
+            "other-thread",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        fs::rename(replacement, &path).unwrap();
+        assert!(
+            find_rollout(&sessions, &cwd, "feature", "thread")
+                .unwrap()
+                .is_none()
+        );
+        write_rollout(&sessions, "2026/10/13", "thread", &cwd, "codex-tui", "user");
+        assert!(
+            find_rollout(&sessions, &cwd, "feature", "thread")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

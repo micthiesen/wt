@@ -106,7 +106,17 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   22.77 ms. This measures header scanning only, not whole-board CPU.
   Reproduce with `cargo test -p wt-harness rollout_discovery_cache_benchmark
   --release -- --ignored --nocapture`.
-  Installation and a matching live post-update CPU sample remain owed.
+  Live optimized candidate `22031c2` still used 115.92% of one core over
+  20.005 seconds after 15 seconds of warmup, with the real Cozee configuration
+  and no sources disabled. This is UI-process CPU, excluding child processes;
+  the earlier v0.1.10 sample was 150.29%, but the live workload was uncontrolled
+  and does not establish a comparable speedup. `q` exited in 0.057 seconds.
+  Evidence: `/tmp/wt-live-optimized-22031/result.json`. A follow-up sample put
+  3,635 aggregate samples in missing-rollout directory/stat traversal while
+  the main thread was mostly parked (`/tmp/wt-live-profile-22031/sample.txt`):
+  retaining successful UUID lookups did
+  not prevent missing UUIDs from rescanning history on every activity poll.
+  Release promotion is held for that fix and a new optimized live measurement.
 - **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
   Codex rollout append watcher received no callbacks within either 2 or 15
   seconds, including a fixture under the home directory. Host sampling showed
