@@ -121,6 +121,11 @@ marker, then rechecks the child's PID, start time and executable with the pane.
 The session
 source batches pane inventory with session inventory, reports new failed panes to
 attention, and excludes dead panes from live-agent observations.
+Read-only tmux probes can race the server exiting after its last pane closes.
+For the exact `server exited unexpectedly` response, they make at most three
+observations within the original timeout budget. A later response must prove
+presence or absence; persistent uncertainty remains an error. Mutating commands
+are never replayed by this mechanism.
 
 ## Query layer
 

@@ -895,3 +895,119 @@ async fn supervised_terminal_retains_signal_failures_and_preserves_quoted_argume
     }
     client.kill_server(&cancel).await.unwrap();
 }
+
+fn probe_output(code: i32, stderr: &str) -> wt_platform::process::ProcessOutput {
+    use std::os::unix::process::ExitStatusExt;
+    wt_platform::process::ProcessOutput {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        elapsed: Duration::ZERO,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_read_race_requires_a_new_observation_and_preserves_uncertainty() {
+    for (code, stderr) in [
+        (0, ""),
+        (1, "no server running on /tmp/fixture.sock"),
+        (1, "Permission denied"),
+    ] {
+        let mut replies = std::collections::VecDeque::from([
+            probe_output(1, "server exited unexpectedly\n"),
+            probe_output(code, stderr),
+        ]);
+        let result = crate::observe_after_server_exit(
+            "has-session",
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+            |_| std::future::ready(Ok(replies.pop_front().expect("only two reads"))),
+        )
+        .await
+        .unwrap();
+        assert!(
+            replies.is_empty(),
+            "transport loss must be followed by an actual read"
+        );
+        assert_eq!(result.status.code(), Some(code));
+        assert_eq!(result.stderr_text(), stderr);
+        assert_eq!(
+            crate::tmux_server_definitely_absent(&result.stderr_text()),
+            stderr.starts_with("no server")
+        );
+    }
+    let mut reads = 0;
+    let result = crate::observe_after_server_exit(
+        "list-sessions",
+        Duration::from_secs(1),
+        &CancellationToken::new(),
+        |_| {
+            reads += 1;
+            std::future::ready(Ok(probe_output(1, "server exited unexpectedly")))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reads, 3);
+    assert!(!crate::tmux_server_definitely_absent(&result.stderr_text()));
+    assert!(!result.status.success());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_reobservation_never_replays_mutations_and_obeys_budget_and_cancel() {
+    for operation in [
+        "new-session",
+        "respawn-pane",
+        "send-keys",
+        "set-option",
+        "kill-session",
+        "kill-server",
+    ] {
+        let mut attempts = 0;
+        crate::observe_after_server_exit(
+            operation,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+            |_| {
+                attempts += 1;
+                std::future::ready(Ok(probe_output(1, "server exited unexpectedly")))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 1, "must not replay {operation}");
+    }
+    let mut attempts = 0;
+    crate::observe_after_server_exit(
+        "has-session",
+        Duration::from_millis(10),
+        &CancellationToken::new(),
+        |_| {
+            attempts += 1;
+            std::future::ready(Ok(probe_output(1, "server exited unexpectedly")))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(attempts, 1, "retry must fit the original timeout");
+    let cancellation = CancellationToken::new();
+    let mut attempts = 0;
+    let result = crate::observe_after_server_exit(
+        "has-session",
+        Duration::from_secs(1),
+        &cancellation,
+        |_| {
+            attempts += 1;
+            cancellation.cancel();
+            std::future::ready(Ok(probe_output(1, "server exited unexpectedly")))
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(wt_platform::process::ProcessError::Cancelled { .. })
+    ));
+    assert_eq!(attempts, 1);
+}

@@ -1165,10 +1165,13 @@ exit "$wt_terminal_status""#;
         spec.input = input;
         spec.timeout = timeout;
         spec.output_limit = 8 * 1024 * 1024;
-        self.runner
-            .run(spec, cancellation)
-            .await
-            .map_err(|source| TmuxError::Process { operation, source })
+        observe_after_server_exit(operation, timeout, cancellation, |remaining| {
+            let mut attempt = spec.clone();
+            attempt.timeout = remaining;
+            self.runner.run(attempt, cancellation)
+        })
+        .await
+        .map_err(|source| TmuxError::Process { operation, source })
     }
 
     async fn cleanup_buffer(&self, buffer: &str) {
@@ -1194,6 +1197,49 @@ exit "$wt_terminal_status""#;
         }
         args
     }
+}
+
+// A read can connect just as the last pane exits and the server shuts down.
+// That transport error proves neither presence nor absence. Re-observe only
+// read-only commands, within the original budget; callers classify the final
+// response normally. Never replay a mutation whose outcome may be unknown.
+async fn observe_after_server_exit<F, Fut>(
+    operation: &str,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    mut read: F,
+) -> Result<ProcessOutput, ProcessError>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<ProcessOutput, ProcessError>>,
+{
+    let retryable = matches!(
+        operation,
+        "has-session"
+            | "list-sessions"
+            | "list-windows"
+            | "list-panes"
+            | "show-options"
+            | "capture-pane"
+    );
+    let started = tokio::time::Instant::now();
+    for attempt in 0..3 {
+        let result = read(timeout.saturating_sub(started.elapsed())).await?;
+        if !retryable
+            || attempt == 2
+            || result.status.success()
+            || result.stderr_text().trim() != "server exited unexpectedly"
+            || started.elapsed() + Duration::from_millis(20) >= timeout
+        {
+            return Ok(result);
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(ProcessError::Cancelled { program: "tmux".into() }),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 pub fn tmux_server_definitely_absent(stderr: &str) -> bool {
