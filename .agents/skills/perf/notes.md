@@ -4,7 +4,27 @@ Companion to `SKILL.md`. Keep the baseline and open issues current; preserve
 measured evidence, and prune implementation-specific advice when it no longer
 applies.
 
-## Native baseline (2026-10-10 UTC)
+## Live machine baseline (2026-10-13 UTC)
+
+The final optimized `b9d8d2f` candidate used 12.78% of one core over 60 seconds
+after 15 seconds warmup, with the real Cozee configuration, local and managed
+MaxBook sources, and no features disabled. Quit after an explicit refresh took
+0.0068 seconds. This measures the UI process only, excluding subprocess CPU;
+other live work was uncontrolled. Evidence:
+`/tmp/wt-live-final-b9d8d2f/result.json`.
+
+The installed v0.1.13 immutable runtime independently measured 12.80% over
+60 seconds and quit after refresh in 0.0043 seconds, exit 0, under the same
+full configuration (`/tmp/wt-live-installed-v013-runtime/result.json`). An
+earlier sample of the stable launcher measured its waiting parent rather than
+the UI child and was discarded; profile the runtime or account for descendants.
+
+A separate final second `top` sample showed 87.66% machine idle and no swapout
+increase. Brave PID 83591 still used 90.5% of one core. The two inspected local
+cron launchers used 0%; their scheduled execution remains paused, not repaired.
+Evidence: `/tmp/wt-final-machine-load-20261014.txt` (captured October 13 UTC).
+
+## Controlled native comparison (2026-10-10 UTC)
 
 On the same Apple M2 Pro (12 cores, 32 GiB, macOS 26.6.2), the optimized
 `4ef9878` binary improved all five 24-row, 65-second workloads against
@@ -88,8 +108,11 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   launcher PID 54920, Unix-only PostgreSQL, cron targeting localhost, and
   100 recent startup timeouts. The same reload-only pause preserved its
   67 jobs and 23 active flags; accumulated launcher CPU stayed at 36:38.45
-  over 20 seconds and its database remained queryable. All three local
-  stacks' scheduled execution remains paused pending socket repair.
+  over 20 seconds and its database remained queryable. Final read-only checks
+  confirmed the Instagram and new-frontend stacks still have cron execution
+  paused, with 67 jobs and 23 active flags each. The r2 stack's former socket
+  and PID are gone, so its current configuration could not be verified.
+  Scheduled execution needs a socket/startup repair before resuming it.
 - **Native Codex discovery CPU (2026-10-13).** The live v0.1.10 board
   PID 32450 consumed 95.8% of one core in the host's second `top` sample.
   A five-second native sample at 09:51 local put the main thread asleep for
@@ -142,9 +165,14 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   also preserves first occurrence order without growth. Candidate `848a223`
   passed all 899 tests and 15 native checks, plus three 20-second managed
   Codex attach/F12 cycles without a trust prompt or early exit. Nonforce remote
-  cleanup exposed a missing controller-owned stop hook; provisioning that
-  declared dependency and completing cleanup remain owed before promotion.
-  Final release installation and its live measurement remain owed.
+  cleanup exposed a missing controller-owned stop hook. `b9d8d2f` provisions
+  explicitly declared managed files, repairs drift, and exports their worker
+  root. It passed 903 local tests, all 15 native checks, cross-platform release
+  verification, and live MaxBook attachment plus nonforce deletion. The helper
+  matched its source; the QA checkout, branch, and session were removed while
+  pre-existing process identities stayed unchanged. Published v0.1.13 now runs
+  locally, on MaxBook, and in the restarted events daemon, whose snapshot is
+  fresh. Candidate CPU/quit evidence is recorded in the baseline above.
 - **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
   Codex rollout append watcher received no callbacks within either 2 or 15
   seconds, including a fixture under the home directory. Host sampling showed
