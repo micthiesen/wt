@@ -196,10 +196,13 @@ fn compose(
         SourceState::Failed(error) => Some(error.as_ref()),
         _ => None,
     };
+    let mut contributes = false;
     for row in &mut data.rows {
         if wt_core::is_remote_worktree_ledger_key(&row.key) {
             continue;
         }
+        // An empty successful inventory still proves no local dev status.
+        contributes |= dev.data().is_some() || error.is_some();
         let status = dev
             .data()
             .and_then(|rows| rows.iter().find(|status| status.slug == row.slug));
@@ -213,7 +216,12 @@ fn compose(
                 .push(format!("Dev: {}", wt_core::sanitize_terminal_text(error)));
         }
     }
-    board.with_data(Some(Arc::new(data))).with_input(&dev)
+    let result = board.with_data(Some(Arc::new(data)));
+    if contributes {
+        result.with_input(&dev)
+    } else {
+        result
+    }
 }
 
 fn label(status: &DevServerStatus) -> String {
@@ -294,6 +302,31 @@ mod tests {
             }),
             error: None,
         }]
+    }
+
+    #[test]
+    fn unused_restored_dev_inventory_does_not_mark_remote_or_empty_boards_restored() {
+        let restored = SourceSnapshot::test_restored(dev(), Domain::Dev, 1);
+        let mut remote = board();
+        remote.rows[0].key = wt_core::remote_worktree_ledger_key("remote", "one");
+        for base in [remote, Board::default()] {
+            for status in [
+                restored.clone(),
+                restored
+                    .clone()
+                    .with_state(SourceState::Failed("local tmux failed".into())),
+            ] {
+                let result = compose(snapshot(base.clone(), Domain::Git), status);
+                assert!(!result.is_restored());
+                assert!(!result.domains().contains_key(&Domain::Dev));
+                assert_eq!(result.data().unwrap().rows, base.rows);
+            }
+        }
+        assert!(compose(snapshot(board(), Domain::Git), restored).is_restored());
+        // A known empty inventory still contributes a negative assertion for
+        // local rows, so it must retain its restored provenance.
+        let empty = SourceSnapshot::test_restored(Vec::new(), Domain::Dev, 1);
+        assert!(compose(snapshot(board(), Domain::Git), empty).is_restored());
     }
 
     #[test]

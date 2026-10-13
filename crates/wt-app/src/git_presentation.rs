@@ -459,33 +459,47 @@ pub fn overlay(
                 &github_snapshot,
                 &configured_base,
             );
-            // Facts supplement a prepared board. Their first Git probes may
-            // take seconds, so their absence or failure must never hold back
-            // metadata, titles, or the rest of the base rows.
-            let prepared = base.data().map(|base| {
-                let mut prepared = base.as_ref().clone();
-                if let Some(facts) = fact_snapshot.data() {
-                    apply_facts(&mut prepared, facts, &current);
-                }
-                Arc::new(prepared)
-            });
-            let state = match (base.state(), fact_snapshot.state()) {
-                (SourceState::Failed(error), _) => SourceState::Failed(error.clone()),
-                (_, SourceState::Failed(error)) => {
-                    SourceState::Failed(format!("Git presentation: {error}").into())
-                }
-                (state, _) => state.clone(),
-            };
-            // The base board already carries the Git, metadata and GitHub
-            // provenance that `current` was computed from.
-            let next = base
-                .with_data(prepared)
-                .with_input(&fact_snapshot)
-                .with_state(state);
+            let next = compose(base, &fact_snapshot, &current);
             publisher.publish_if_changed(next);
         }
     });
     source
+}
+
+fn compose(
+    base: SourceSnapshot<Board>,
+    facts: &SourceSnapshot<PresentationMap>,
+    current: &HashMap<String, FactIdentity>,
+) -> SourceSnapshot<Board> {
+    // Unmatched cached facts do not contribute to the board. In particular,
+    // another host's rows cannot inherit this host's restored provenance.
+    let mut applied = false;
+    let has_local_rows = base.data().is_some_and(|board| {
+        board
+            .rows
+            .iter()
+            .any(|row| !wt_core::is_remote_worktree_ledger_key(&row.key))
+    });
+    let prepared = base.data().map(|board| {
+        let mut board = board.as_ref().clone();
+        if let Some(data) = facts.data() {
+            applied = apply_facts(&mut board, data, current);
+        }
+        Arc::new(board)
+    });
+    let state = match (base.state(), facts.state()) {
+        (SourceState::Failed(error), _) => SourceState::Failed(error.clone()),
+        (_, SourceState::Failed(error)) if has_local_rows => {
+            applied = true; // The source error contributes visible state.
+            SourceState::Failed(format!("Git presentation: {error}").into())
+        }
+        (state, _) => state.clone(),
+    };
+    let mut next = base.with_data(prepared).with_state(state);
+    if applied {
+        next = next.with_input(facts);
+    }
+    next
 }
 
 fn presentation_map(cache: &HashMap<String, CachedRow>) -> PresentationMap {
@@ -529,12 +543,14 @@ fn apply_facts(
     board: &mut Board,
     facts: &PresentationMap,
     current: &HashMap<String, FactIdentity>,
-) {
+) -> bool {
+    let mut applied = false;
     for row in &mut board.rows {
         if let Some(fact) = facts.get(&row.key)
             && current.get(&row.key) == Some(&fact.identity)
             && fact.identity.head.as_deref() == row.git.head_sha.as_deref()
         {
+            applied = true;
             row.git.landed_on = fact.presentation.landed_on;
             row.git.rebasing = fact.presentation.rebasing;
             row.git
@@ -560,6 +576,7 @@ fn apply_facts(
             }
         }
     }
+    applied
 }
 
 async fn row_signature<'a>(
@@ -1405,6 +1422,76 @@ mod tests {
     use super::*;
     use wt_runtime::{DerivedPublisher, SourceSnapshot};
     use wt_tui::BoardRow;
+
+    #[test]
+    fn unused_restored_facts_do_not_mark_the_board_restored() {
+        let identity = FactIdentity {
+            path: "/one".into(),
+            branch: "one".into(),
+            head: Some("head".into()),
+            base_branch: "main".into(),
+            base_sha: None,
+            pr: None,
+        };
+        let facts = SourceSnapshot::test_restored(
+            PresentationMap::from([(
+                "one".into(),
+                GitFact {
+                    identity: identity.clone(),
+                    presentation: GitPresentation::default(),
+                },
+            )]),
+            Domain::Presentation,
+            1,
+        );
+        let mut board = Board {
+            rows: vec![BoardRow {
+                key: "one".into(),
+                git: GitPresentation {
+                    head_sha: Some("head".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let live = |board| SourceSnapshot::test_live(Some(board), SourceState::Ready, Domain::Git);
+        // Missing/mismatched identity means the cache supplied no visible fact.
+        let unused = compose(live(board.clone()), &facts, &HashMap::new());
+        assert!(!unused.is_restored());
+        assert!(!unused.domains().contains_key(&Domain::Presentation));
+        let identities = HashMap::from([("one".into(), identity)]);
+        assert!(compose(live(board.clone()), &facts, &identities).is_restored());
+        board.rows[0].key = wt_core::remote_worktree_ledger_key("remote", "one");
+        assert!(!compose(live(board.clone()), &facts, &identities).is_restored());
+        let remote_failure = compose(
+            live(board.clone()),
+            &facts
+                .clone()
+                .with_state(SourceState::Failed("local probe failed".into())),
+            &identities,
+        );
+        assert_eq!(*remote_failure.state(), SourceState::Ready);
+        assert!(!remote_failure.is_restored());
+        board.rows.clear();
+        assert!(!compose(live(board.clone()), &facts, &identities).is_restored());
+        let failed = facts.with_state(SourceState::Failed("probe failed".into()));
+        let irrelevant = compose(live(board), &failed, &identities);
+        assert_eq!(*irrelevant.state(), SourceState::Ready);
+        assert!(!irrelevant.is_restored());
+        let local = Board {
+            rows: vec![BoardRow {
+                key: "one".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = compose(live(local), &failed, &HashMap::new());
+        assert!(
+            matches!(result.state(), SourceState::Failed(error) if error.contains("probe failed"))
+        );
+        assert!(result.domains().contains_key(&Domain::Presentation));
+    }
 
     #[test]
     fn porcelain_unmerged_paths_preserve_spaces_and_deduplicate() {

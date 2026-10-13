@@ -141,7 +141,10 @@ the moment its fetch *started*, on the host's own process clock. A *derived*
 source (`derived_channel`) combines snapshots it read; its snapshot inherits
 their per-domain provenance (`derive`, `with_input`), so a board built from any
 restored input reads as restored for that domain. `SourceSnapshot` fields are
-private, so nothing can publish restored data as live. `clippy.toml` bans raw
+private, so projections cannot relabel restored data as live. Leaf readers must
+also validate their inputs before publishing their own observations; private
+snapshot fields alone cannot establish that an external read used current keys.
+`clippy.toml` bans raw
 `tokio::sync::watch::channel` outside `wt-runtime`; a control channel that is
 not board data says why with `#[expect(clippy::disallowed_methods)]`.
 
@@ -177,6 +180,14 @@ seconds old. A fetch whose key set comes from another source
 `confirmed()` and skips while it is restored, so a restored inventory never
 produces "live" data. Automation quiescence requires confirmed session data and
 treats anything else as busy.
+Session discovery receives leaf handles for Git and tmux inventory and requires
+`Confirmed` values from both before selecting checkout paths. Restored inputs
+cannot advance its target baseline; confirming identical restored rows still
+starts the first live discovery pass. A confirmed empty session inventory also
+finishes that pass, so an unused restored discovery cache cannot remain pending
+forever. Empty passes retain the confirmed inputs' observation stamp instead of
+claiming a new external read. Manual refresh and the backstop enter this same
+confirmed-input path.
 
 **Optimistic changes.** `wt_runtime::Pending<T, M: Mutation<T>>` is the only
 optimistic engine. It never writes, so it cannot retry. An entry is *in flight*

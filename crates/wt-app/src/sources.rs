@@ -43,7 +43,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         local_sources.metadata.view(),
         local_sources.git.view(),
     );
-    let sessions = crate::session_source::start(scope, context, local_sources.git.view());
+    let sessions = crate::session_source::start(scope, context, local_sources.git.clone());
     let session_activity = crate::session_activity::start(scope, context, &sessions).activity;
     let local = local_sources.board;
     // This exact pipeline runs on every host. The controller combines its

@@ -16,8 +16,8 @@ use wt_core::Domain;
 use wt_core::HarnessId;
 use wt_harness::{ClaudePaths, DiscoveryRequest, HarnessService, HarnessSession, OpenCodePaths};
 use wt_runtime::{
-    DiskCache, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle, SourceSpec,
-    SourceState, Stamp, TaskScope, leaf_channel,
+    Confirmed, DiskCache, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle,
+    SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope, leaf_channel,
 };
 use wt_tmux::{SessionInfo, TmuxClient, TmuxServer};
 use wt_vcs::WorktreeSnapshot;
@@ -115,7 +115,7 @@ pub struct SessionSources {
 pub fn start(
     scope: &TaskScope,
     context: &AppContext,
-    git: SourceHandle<Vec<WorktreeSnapshot>>,
+    git: LeafHandle<Vec<WorktreeSnapshot>>,
 ) -> SessionSources {
     let app = AppHarness::new(context);
     let tmux = TmuxClient::new(
@@ -162,7 +162,7 @@ pub fn start(
         context.cancellation.clone(),
         DiscoveryInputs {
             git: git.clone(),
-            inventory: inventory.view(),
+            inventory: inventory.clone(),
         },
         publisher,
         request_rx,
@@ -172,7 +172,7 @@ pub fn start(
         inventory,
         discoveries,
         commands: SessionCommands { discover: requests },
-        git,
+        git: git.view(),
     }
 }
 
@@ -332,8 +332,47 @@ fn strip_kind_suffix(name: &str) -> Option<(&str, &'static str)> {
 }
 
 struct DiscoveryInputs {
-    git: SourceHandle<Vec<WorktreeSnapshot>>,
-    inventory: SourceHandle<SessionInventory>,
+    git: LeafHandle<Vec<WorktreeSnapshot>>,
+    inventory: LeafHandle<SessionInventory>,
+}
+
+fn confirm_discovery_inputs(
+    git: &LeafHandle<Vec<WorktreeSnapshot>>,
+    inventory: &LeafHandle<SessionInventory>,
+    git_snapshot: &SourceSnapshot<Vec<WorktreeSnapshot>>,
+    inventory_snapshot: &SourceSnapshot<SessionInventory>,
+) -> Option<(
+    Confirmed<Vec<WorktreeSnapshot>>,
+    Confirmed<SessionInventory>,
+)> {
+    if matches!(git_snapshot.state(), SourceState::Failed(_))
+        || matches!(inventory_snapshot.state(), SourceState::Failed(_))
+    {
+        return None;
+    }
+    Some((
+        git.confirm(git_snapshot)?,
+        inventory.confirm(inventory_snapshot)?,
+    ))
+}
+
+fn no_discovery_publication(
+    git_observed: Stamp,
+    inventory_observed: Stamp,
+    previous_discovery: Option<(Stamp, SourceState)>,
+) -> (Stamp, SourceState) {
+    let inputs = git_observed.earliest(inventory_observed);
+    previous_discovery.map_or((inputs, SourceState::Ready), |(previous, state)| {
+        (previous.earliest(inputs), state)
+    })
+}
+
+fn discovery_result_state(errors: &[String]) -> SourceState {
+    if errors.is_empty() {
+        SourceState::Ready
+    } else {
+        SourceState::Failed(errors.join("; ").into())
+    }
 }
 
 fn spawn_discoveries(
@@ -342,7 +381,7 @@ fn spawn_discoveries(
     service: HarnessService,
     cancel: CancellationToken,
     inputs: DiscoveryInputs,
-    publisher: LeafPublisher<SessionDiscoveries>,
+    mut publisher: LeafPublisher<SessionDiscoveries>,
     mut requests: mpsc::Receiver<(String, HarnessId)>,
 ) {
     let DiscoveryInputs { git, inventory } = inputs;
@@ -353,10 +392,13 @@ fn spawn_discoveries(
         let mut prior_inventory = None::<SessionInventory>;
         let mut prior_targets = None;
         let mut data = SessionDiscoveries::new();
+        let mut has_published = false;
+        let mut force_refresh = false;
         let mut pending = BTreeSet::<(String, HarnessId)>::new();
         // Start of the discovery pass that produced `data`. A liveness-only
         // republish keeps it: liveness is not a newer discovery.
         let mut discovered_at = Stamp::now();
+        let mut discovery_state = SourceState::Ready;
         let mut backstop = tokio::time::interval(Duration::from_secs(30));
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -365,9 +407,7 @@ fn spawn_discoveries(
                 _ = scope_cancel.cancelled() => break,
                 _ = cancel.cancelled() => break,
                 _ = backstop.tick() => {
-                    if let Some(inventory) = inventory_updates.borrow().data() {
-                        pending.extend(live_discovery_requests(inventory));
-                    }
+                    force_refresh = true;
                 }
                 changed = git_updates.changed() => {
                     if changed.is_err() { break; }
@@ -377,6 +417,10 @@ fn spawn_discoveries(
                     if changed.is_err() { break; }
                     inventory_updates.borrow_and_update();
                 }
+                request = publisher.requested() => match request {
+                    Some(()) => force_refresh = true,
+                    None => break,
+                },
                 request = requests.recv() => match request {
                     Some(request) => { pending.insert(request); }
                     None => break,
@@ -384,31 +428,27 @@ fn spawn_discoveries(
             }
 
             let inv_snapshot = inventory_updates.borrow().clone();
-            let Some(inv) = inv_snapshot.data().map(|data| data.as_ref()) else {
-                continue;
-            };
-            if matches!(inv_snapshot.state(), SourceState::Failed(_)) {
-                continue;
-            }
             let git_snapshot = git_updates.borrow().clone();
-            let Some(worktrees) = git_snapshot.data().map(|data| data.as_ref()) else {
+            let Some((worktrees, inv)) =
+                confirm_discovery_inputs(&git, &inventory, &git_snapshot, &inv_snapshot)
+            else {
                 continue;
             };
-            if matches!(git_snapshot.state(), SourceState::Failed(_)) {
-                continue;
-            }
 
-            let targets = app.targets(worktrees);
+            let targets = app.targets(&worktrees);
+            if force_refresh {
+                pending.extend(live_discovery_requests(&inv));
+            }
             let known_slugs = targets
                 .iter()
                 .map(|target| target.slug.clone())
                 .collect::<BTreeSet<_>>();
-            let inv_changed = prior_inventory.as_ref() != Some(inv);
+            let inv_changed = prior_inventory.as_ref() != Some(&*inv);
             let git_changed = prior_targets.as_ref() != Some(&targets);
             if inv_changed || git_changed {
-                prior_inventory = Some(inv.clone());
+                prior_inventory = Some((*inv).clone());
                 prior_targets = Some(targets.clone());
-                pending.extend(live_discovery_requests(inv));
+                pending.extend(live_discovery_requests(&inv));
             }
             // A worktree literally named `one-codex` owns that tmux
             // name as its Claude primary. Do not give it to `one` merely
@@ -424,23 +464,15 @@ fn spawn_discoveries(
             }
             let mut liveness_changed = false;
             for entry in &mut data {
-                let is_live = is_session_live(inv, &entry.session);
+                let is_live = is_session_live(&inv, &entry.session);
                 liveness_changed |= entry.session.is_live != is_live;
                 entry.session.is_live = is_live;
             }
-            if pending.is_empty() {
-                if liveness_changed {
-                    publisher.publish_live(data.clone(), discovered_at);
-                }
-                continue;
-            }
-
             let by_slug = targets
                 .into_iter()
                 .map(|target| (target.slug.clone(), target))
                 .collect::<BTreeMap<_, _>>();
             let sessions = inv.all.keys().cloned().collect::<Vec<_>>();
-            let observed = Stamp::now();
             let batch = std::mem::take(&mut pending);
             let mut work = batch
                 .into_iter()
@@ -452,6 +484,24 @@ fn spawn_discoveries(
                         .map(|target| (target, harness))
                 })
                 .collect::<std::collections::VecDeque<_>>();
+            let has_work = !work.is_empty();
+            if !has_work {
+                if force_refresh || !has_published || liveness_changed {
+                    let (observed, state) = no_discovery_publication(
+                        worktrees.observed(),
+                        inv.observed(),
+                        has_published.then(|| (discovered_at, discovery_state.clone())),
+                    );
+                    publisher.publish_live_with_state(data.clone(), observed, state.clone());
+                    discovered_at = observed;
+                    discovery_state = state;
+                    has_published = true;
+                }
+                force_refresh = false;
+                continue;
+            }
+            force_refresh = false;
+            let observed = Stamp::now();
             let mut join_set = tokio::task::JoinSet::new();
             let mut errors = Vec::new();
             for _ in 0..MAX_DISCOVERY_WORKERS {
@@ -461,7 +511,7 @@ fn spawn_discoveries(
                         service.clone(),
                         target,
                         harness,
-                        inv.clone(),
+                        (*inv).clone(),
                         sessions.clone(),
                         scope_cancel.child_token(),
                     );
@@ -474,7 +524,7 @@ fn spawn_discoveries(
                 if let Ok((slug, harness, Ok(found))) = &joined {
                     data.retain(|entry| entry.key.slug != *slug || entry.key.harness != *harness);
                     for mut session in found.clone() {
-                        session.is_live = is_session_live(inv, &session);
+                        session.is_live = is_session_live(&inv, &session);
                         let key = SessionKey {
                             slug: slug.clone(),
                             harness: *harness,
@@ -495,7 +545,7 @@ fn spawn_discoveries(
                         service.clone(),
                         target,
                         harness,
-                        inv.clone(),
+                        (*inv).clone(),
                         sessions.clone(),
                         scope_cancel.child_token(),
                     );
@@ -504,15 +554,9 @@ fn spawn_discoveries(
             if !scope_cancel.is_cancelled() && !cancel.is_cancelled() {
                 data.sort_by(|a, b| a.key.cmp(&b.key));
                 discovered_at = observed;
-                publisher.publish_live_with_state(
-                    data.clone(),
-                    observed,
-                    if errors.is_empty() {
-                        SourceState::Ready
-                    } else {
-                        SourceState::Failed(errors.join("; ").into())
-                    },
-                );
+                discovery_state = discovery_result_state(&errors);
+                publisher.publish_live_with_state(data.clone(), observed, discovery_state.clone());
+                has_published = true;
             }
         }
     });
@@ -616,6 +660,191 @@ mod tests {
             window_count: 1,
             harness_session_id: uuid.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn discoveries_wait_for_confirmed_inputs_then_accept_identical_live_data() {
+        let scope = TaskScope::new();
+        let (git, _) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-session-git",
+                domain: Domain::Git,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let (inventory, _) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-session-inventory",
+                domain: Domain::Sessions,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let worktrees = Vec::<WorktreeSnapshot>::new();
+        let sessions = SessionInventory::default();
+        let restored_git = SourceSnapshot::test_restored(worktrees.clone(), Domain::Git, 1);
+        let restored_inventory =
+            SourceSnapshot::test_restored(sessions.clone(), Domain::Sessions, 1);
+
+        assert!(
+            confirm_discovery_inputs(&git, &inventory, &restored_git, &restored_inventory,)
+                .is_none()
+        );
+
+        // Identical data becomes usable only after both leaves publish live.
+        // This transition must start discovery even though the target values
+        // themselves did not change while the cache was displayed.
+        let live_git = SourceSnapshot::test_live(Some(worktrees), SourceState::Ready, Domain::Git);
+        let live_inventory =
+            SourceSnapshot::test_live(Some(sessions), SourceState::Ready, Domain::Sessions);
+        assert!(confirm_discovery_inputs(&git, &inventory, &live_git, &live_inventory).is_some());
+    }
+
+    #[test]
+    fn no_io_republish_does_not_advance_the_discovery_witness() {
+        let previous = Stamp::now();
+        let failed = discovery_result_state(&["discovery transport failed".to_owned()]);
+        std::thread::sleep(Duration::from_millis(3));
+        let (observed, state) =
+            no_discovery_publication(Stamp::now(), Stamp::now(), Some((previous, failed.clone())));
+        assert_eq!(observed, previous);
+        assert_eq!(state, failed);
+
+        let successful = discovery_result_state(&[]);
+        let (observed, state) = no_discovery_publication(
+            Stamp::now(),
+            Stamp::now(),
+            Some((previous, successful.clone())),
+        );
+        assert_eq!(observed, previous);
+        assert_eq!(state, successful);
+    }
+
+    #[tokio::test]
+    async fn scheduler_waits_for_identical_live_git_before_confirming_empty_discoveries() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_scope = "session-freshness-test";
+        let cache = wt_runtime::CacheStore::new(cache_dir.path().to_path_buf(), cache_scope);
+        fixture.ctx.caches = cache.clone();
+        let saved_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        std::fs::write(
+            cache_dir.path().join("test-session-git.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "format": 1,
+                "name": "test-session-git",
+                "scope": cache_scope,
+                "saved_at_ms": saved_at_ms,
+                "data": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let scope = TaskScope::new();
+        let (git, git_publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-session-git",
+                domain: Domain::Git,
+                persistence: Persistence::Disk(DiskCache::new(&cache)),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !git.snapshot().is_restored() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fixture Git cache should restore");
+
+        let (inventory, inventory_publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-session-inventory",
+                domain: Domain::Sessions,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let (discoveries, discoveries_publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-session-discoveries",
+                domain: Domain::Sessions,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let service = HarnessService::new(
+            ClaudePaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
+            crate::harness::codex_paths(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
+            OpenCodePaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
+            fixture.ctx.processes.clone(),
+            TmuxClient::new(
+                fixture.ctx.processes.clone(),
+                TmuxServer::named(fixture.ctx.config.tmux.socket.clone())
+                    .with_cwd(fixture.ctx.home.clone()),
+            ),
+        );
+        let (request_tx, request_rx) = mpsc::channel(4);
+        spawn_discoveries(
+            &scope,
+            AppHarness::new(&fixture.ctx),
+            service,
+            fixture.ctx.cancellation.clone(),
+            DiscoveryInputs {
+                git: git.clone(),
+                inventory: inventory.clone(),
+            },
+            discoveries_publisher,
+            request_rx,
+        );
+
+        inventory_publisher.publish_live(SessionInventory::default(), Stamp::now());
+        request_tx
+            .send(("no-such-target".into(), HarnessId::Codex))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(git.snapshot().is_restored());
+        assert!(discoveries.confirmed().is_none());
+
+        // The live Git fetch returns byte-for-byte equivalent empty data. The
+        // scheduler must still process the retained request and publish a
+        // live empty result because the restored input never advanced its
+        // remembered target projection.
+        git_publisher.publish_live(Vec::new(), Stamp::now());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while discoveries.confirmed().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("confirmed identical Git input should resume discovery");
+        assert!(discoveries.confirmed().unwrap().is_empty());
+
+        let previous_revision = discoveries.snapshot().revision();
+        assert!(discoveries.refresh());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while discoveries.snapshot().revision() <= previous_revision {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("manual refresh should reach the discovery source");
+
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+        fixture.close().await.unwrap();
     }
 
     #[test]
