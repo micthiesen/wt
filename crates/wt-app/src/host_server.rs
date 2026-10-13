@@ -156,13 +156,12 @@ where
         Ok(())
     }
     .await;
-    // No accepted write remains. Read sources can now stop independently of
-    // detached actions and the user's tmux sessions.
+    // No accepted UI command remains. Stop read sources, then join any
+    // admitted automation mutations before releasing command ownership.
     drop(replies);
     scope.cancel();
-    // The command loop is sequential and has returned only after its accepted
-    // command finished. Stop source fetches now instead of letting a slow
-    // writer drain keep their I/O alive for the full writer grace period.
+    // Detached actions and the user's tmux sessions outlive this host stream.
+    let automations_finished = host.shutdown_automations().await;
     commands.cancel();
     let write_result = match tokio::time::timeout(Duration::from_secs(5), &mut writer).await {
         Ok(result) => result.context("host writer exited")?,
@@ -174,6 +173,7 @@ where
     };
     let stopped = scope.shutdown(Duration::from_secs(5)).await;
     result?;
+    automations_finished?;
     write_result?;
     stopped?;
     Ok(())

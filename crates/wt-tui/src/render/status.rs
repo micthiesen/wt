@@ -61,8 +61,9 @@ const fn header_domains() -> [Domain; Domain::ALL.len() - 1] {
 /// The combined condition of some domains across every host.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Status {
-    /// Oldest restore time among restored domains, epoch ms.
-    pub cached_since: Option<u64>,
+    /// Restored dependencies retain their host and domain identity. There is
+    /// no board-wide cache age: independent lanes confirm independently.
+    pub cached: Vec<(Option<String>, Domain, u64)>,
     pub refreshing: bool,
     pub loading: bool,
     /// The first failed domain and its error.
@@ -70,8 +71,21 @@ pub(crate) struct Status {
 }
 
 pub(crate) fn status(model: &Model, domains: &[Domain]) -> Status {
-    let hosts =
-        std::iter::once(&model.local_domains).chain(model.source_board.host_domains.values());
+    let hosts = std::iter::once((None, &model.local_domains)).chain(
+        model
+            .source_board
+            .host_domains
+            .iter()
+            .map(|(host, domains)| {
+                let label = model
+                    .source_board
+                    .hosts
+                    .iter()
+                    .find(|choice| choice.id.as_deref() == Some(host.as_str()))
+                    .map_or("remote", |choice| choice.label.as_str());
+                (Some(label), domains)
+            }),
+    );
     combine(hosts, domains)
 }
 
@@ -87,27 +101,32 @@ pub(crate) fn refreshing_count(model: &Model) -> usize {
 /// The status of one host's domains, for panes about a single row.
 pub(crate) fn host_status(model: &Model, host: Option<&str>, domains: &[Domain]) -> Status {
     match host {
-        None => combine(std::iter::once(&model.local_domains), domains),
-        Some(host) => combine(model.source_board.host_domains.get(host), domains),
+        None => combine(std::iter::once((None, &model.local_domains)), domains),
+        Some(host) => combine(
+            model
+                .source_board
+                .host_domains
+                .get(host)
+                .map(|map| (None, map)),
+            domains,
+        ),
     }
 }
 
 fn combine<'a>(
-    hosts: impl IntoIterator<Item = &'a wt_runtime::DomainMap>,
+    hosts: impl IntoIterator<Item = (Option<&'a str>, &'a wt_runtime::DomainMap)>,
     domains: &[Domain],
 ) -> Status {
     let mut status = Status::default();
-    for map in hosts {
+    for (host, map) in hosts {
         for domain in domains {
             let Some(meta) = map.get(domain) else {
                 continue;
             };
             if let Provenance::Restored { saved_at_ms } = meta.provenance() {
-                status.cached_since = Some(
-                    status
-                        .cached_since
-                        .map_or(saved_at_ms, |at| at.min(saved_at_ms)),
-                );
+                status
+                    .cached
+                    .push((host.map(str::to_owned), *domain, saved_at_ms));
             }
             match meta.state() {
                 SourceState::Refreshing => status.refreshing = true,
@@ -127,9 +146,23 @@ fn combine<'a>(
 /// neither applies, a pane is loading or refreshing.
 pub(crate) fn chip(status: &Status, base: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if let Some(saved) = status.cached_since {
+    for (host, domain, saved) in status.cached.iter().take(2) {
+        let source = match host {
+            Some(host) => format!(
+                "{} {}",
+                super::text::truncate_end(&wt_core::sanitize_terminal_text(host), 16),
+                domain.label()
+            ),
+            None => domain.label().to_owned(),
+        };
         spans.push(Span::styled(
-            format!(" · cached {}", age(saved, now_ms())),
+            format!(" · {source} cached {}", age(*saved, now_ms())),
+            base.fg(theme::WARN),
+        ));
+    }
+    if status.cached.len() > 2 {
+        spans.push(Span::styled(
+            format!(" +{} cached lanes", status.cached.len() - 2),
             base.fg(theme::WARN),
         ));
     }
@@ -308,16 +341,79 @@ mod tests {
     }
 
     #[test]
-    fn restored_failed_and_pending_states_render_the_same_way_everywhere() {
-        let restored = SourceSnapshot::test_restored(crate::Board::default(), Domain::Github, 0);
-        let model = model_with(restored);
+    fn cache_status_names_only_the_host_and_domain_that_remain_restored() {
+        let cached = SourceSnapshot::<()>::test_restored((), Domain::Reviews, 1);
+        let mut board = crate::Board::default();
+        board.host_domains.insert(
+            "michael@10.10.1.90 [config:/private/config.toml]".into(),
+            cached.domains().clone(),
+        );
+        board.hosts.push(crate::HostChoice {
+            id: Some("michael@10.10.1.90 [config:/private/config.toml]".into()),
+            label: "MaxBook".into(),
+        });
+        let model = model_with(SourceSnapshot::test_live(
+            Some(board),
+            SourceState::Ready,
+            Domain::Github,
+        ));
         let shown = status(&model, LIST);
-        assert!(shown.cached_since.is_some());
+        assert_eq!(
+            shown.cached,
+            vec![(Some("MaxBook".into()), Domain::Reviews, 1)]
+        );
         let text: String = chip(&shown, Style::new())
             .iter()
             .map(|span| span.content.to_string())
             .collect();
-        assert!(text.starts_with(" · cached "), "{text}");
+        assert!(text.contains("MaxBook reviews cached"), "{text}");
+        assert!(!text.contains("10.10.1.90"));
+        assert!(!text.contains("config:"));
+        assert!(!text.contains("GitHub cached"));
+        assert!(host_status(&model, None, DETAILS).cached.is_empty());
+        assert!(status(&model, OUTPUT).cached.is_empty());
+    }
+
+    #[test]
+    fn live_event_or_unchanged_refresh_clears_only_its_confirmed_domain() {
+        let board = crate::Board::default();
+        let tracker = SourceSnapshot::test_restored((), Domain::Issues, 1);
+        let restored =
+            SourceSnapshot::test_restored(board.clone(), Domain::Github, 2).with_input(&tracker);
+        let mut model = model_with(restored);
+        assert_eq!(status(&model, LIST).cached.len(), 2);
+        // A daemon event or manual read confirms GitHub even if its projected
+        // rows are unchanged. It says nothing about the independent tracker.
+        model.apply(
+            SourceSnapshot::test_live(Some(board.clone()), SourceState::Ready, Domain::Github)
+                .with_input(&tracker),
+        );
+        assert_eq!(status(&model, LIST).cached, vec![(None, Domain::Issues, 1)]);
+        let failed = tracker.with_state(SourceState::Failed("offline".into()));
+        model.apply(
+            SourceSnapshot::test_live(Some(board.clone()), SourceState::Ready, Domain::Github)
+                .with_input(&failed),
+        );
+        assert_eq!(status(&model, LIST).cached, vec![(None, Domain::Issues, 1)]);
+        model.apply(
+            SourceSnapshot::test_live(Some(board), SourceState::Ready, Domain::Github).with_input(
+                &SourceSnapshot::test_live(Some(()), SourceState::Ready, Domain::Issues),
+            ),
+        );
+        assert!(status(&model, LIST).cached.is_empty());
+    }
+
+    #[test]
+    fn restored_failed_and_pending_states_render_the_same_way_everywhere() {
+        let restored = SourceSnapshot::test_restored(crate::Board::default(), Domain::Github, 0);
+        let model = model_with(restored);
+        let shown = status(&model, LIST);
+        assert_eq!(shown.cached, vec![(None, Domain::Github, 0)]);
+        let text: String = chip(&shown, Style::new())
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(text.starts_with(" · GitHub cached "), "{text}");
         // A pane that does not show GitHub is not marked stale by it.
         assert!(chip(&super::status(&model, OUTPUT), Style::new()).is_empty());
 

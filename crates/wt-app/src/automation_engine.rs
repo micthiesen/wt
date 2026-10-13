@@ -496,11 +496,25 @@ impl AutomationEngine {
 
     /// Complete one claimed delivery. The same claim id scopes every ledger
     /// transition, so a stale completion cannot overwrite a later key state.
+    #[cfg(test)]
     pub async fn finish(
         &mut self,
         claim: &ClaimedFire,
         outcome: AutomationOutcome,
         now_ms: i64,
+    ) -> Result<()> {
+        self.finish_with_cancellation(claim, outcome, now_ms, &self.cancellation.clone())
+            .await
+    }
+
+    /// An admitted dispatch must persist its outcome through the command
+    /// drain even after the read/evaluation scope has been cancelled.
+    pub async fn finish_with_cancellation(
+        &mut self,
+        claim: &ClaimedFire,
+        outcome: AutomationOutcome,
+        now_ms: i64,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
         let Some(active) = self.active.get(&claim.id) else {
             anyhow::bail!("automation dispatch {} is not active", claim.id);
@@ -515,21 +529,21 @@ impl AutomationEngine {
         match outcome {
             AutomationOutcome::NotStarted => {
                 self.ledger
-                    .release_not_started(&ledger_claim, &self.cancellation)
+                    .release_not_started(&ledger_claim, cancellation)
                     .await
                     .context("release automation claim proven not started")?;
                 self.active.remove(&claim.id);
             }
             AutomationOutcome::Delivered { slot } => {
                 self.ledger
-                    .mark_delivered(&ledger_claim, now_ms, &self.cancellation)
+                    .mark_delivered(&ledger_claim, now_ms, cancellation)
                     .await
                     .context("mark automation delivered")?;
                 self.finish_slot(&claim.id, slot, now_ms);
             }
             AutomationOutcome::Ambiguous { reason, slot } => {
                 self.ledger
-                    .mark_ambiguous(&ledger_claim, now_ms, &reason, &self.cancellation)
+                    .mark_ambiguous(&ledger_claim, now_ms, &reason, cancellation)
                     .await
                     .context("mark automation delivery ambiguous")?;
                 self.finish_slot(&claim.id, slot, now_ms);
@@ -796,6 +810,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready.claims.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_dispatch_finishes_after_evaluation_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(ledger_path.clone());
+        let evaluation = CancellationToken::new();
+        let mut engine = AutomationEngine::new(ledger, evaluation.clone());
+        let rules = [rule("builtin:notify", 0.0)];
+        let rows = [row()];
+        let context = AutomationEvalContext::default();
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let tick = engine
+            .tick(input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        let claim = tick.claims.first().unwrap();
+        evaluation.cancel();
+        let commands = CancellationToken::new();
+        engine
+            .finish_with_cancellation(
+                claim,
+                AutomationOutcome::Delivered {
+                    slot: DeliverySlot::None,
+                },
+                start + 1,
+                &commands,
+            )
+            .await
+            .unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ledger_path).unwrap()).unwrap();
+        assert!(
+            persisted["fired"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|entry| entry["state"] == "delivered"),
+            "{persisted}"
+        );
+        assert!(!commands.is_cancelled());
     }
 
     #[tokio::test]

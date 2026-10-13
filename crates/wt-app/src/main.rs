@@ -289,8 +289,9 @@ fn run(cli: Cli) -> Result<i32> {
             return Err(error).context("create worker runtime");
         }
     };
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let scope = TaskScope::new();
+        let mut scope_drained = false;
         let token = scope.token();
         if let Err(error) = signals::start(&scope, token.clone()) {
             if let Some(boot) = boot
@@ -338,10 +339,14 @@ fn run(cli: Cli) -> Result<i32> {
             if cli.command.is_none() {
                 updates::startup_check(&options, &config, &token).await?;
             }
-            run_application(cli, options, config, &scope, token).await
+            run_application(cli, options, config, &scope, token, &mut scope_drained).await
         }
         .await;
-        let shutdown = scope.shutdown(Duration::from_secs(5)).await;
+        let shutdown = if scope_drained {
+            Ok(())
+        } else {
+            scope.shutdown(Duration::from_secs(5)).await
+        };
         // Preserve the actual command failure while reporting failed cleanup.
         if let Err(error) = &shutdown {
             tracing::error!(%error, "application shutdown failed");
@@ -349,7 +354,12 @@ fn run(cli: Cli) -> Result<i32> {
         let code = result?;
         shutdown?;
         Ok(code)
-    })
+    });
+    // Accepted commands, automation dispatches and database writes have their
+    // own explicit drains above. Runtime destruction must not add an unbounded
+    // wait for a cancelled read's non-interruptible blocking worker.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 async fn run_application(
@@ -358,6 +368,7 @@ async fn run_application(
     config: Arc<Config>,
     scope: &TaskScope,
     token: tokio_util::sync::CancellationToken,
+    scope_drained: &mut bool,
 ) -> Result<i32> {
     let processes = ProcessRunner::default();
     let repository = Arc::new(GitRepository::new(
@@ -429,6 +440,9 @@ async fn run_application(
     scope.cancel();
     let actions_finished = controller.shutdown().await;
     let shutdown = scope.shutdown(Duration::from_secs(5)).await;
+    // Even a failed drain consumed its full grace period. The outer error path
+    // must report it without waiting through that same grace period again.
+    *scope_drained = true;
     database.shutdown().await?;
     actions_finished?;
     shutdown?;

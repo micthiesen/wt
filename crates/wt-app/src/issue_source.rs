@@ -226,7 +226,7 @@ fn project(
                 request = publisher.requested() => {
                     if request.is_none() { break; }
                     board.refresh();
-                    if readable { statuses.refresh(); }
+                    if confirmed.is_some() { statuses.refresh(); }
                     continue;
                 }
                 changed = boards.changed() => {
@@ -234,9 +234,12 @@ fn project(
                     let snapshot = boards.borrow_and_update().clone();
                     previous = ids(&snapshot, prefix.as_deref());
                     let next = confirmed_ids(&snapshot, prefix.as_deref());
-                    if next.is_some() && next != confirmed {
+                    if next != confirmed {
                         confirmed = next;
-                        if enabled && confirmed.as_ref().is_some_and(|ids| !ids.is_empty()) {
+                        // A confirmed empty set (or disabled tracker) still
+                        // needs a live empty publication to supersede restore.
+                        // The fetch closure decides whether external I/O is needed.
+                        if confirmed.is_some() {
                             statuses.refresh();
                         }
                     }
@@ -276,7 +279,14 @@ fn compose(
             ));
         }
     }
-    board.with_data(Some(Arc::new(data))).with_input(&statuses)
+    let board = board.with_data(Some(Arc::new(data)));
+    // No displayed tracker fields depend on this leaf for an empty id set.
+    // An unrelated restored answer must not taint the worktree list.
+    if expected.is_empty() {
+        board
+    } else {
+        board.with_input(&statuses)
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +446,89 @@ mod tests {
             Some(vec!["ENG-1".to_owned()])
         );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmed_empty_and_disabled_inputs_clear_restore_and_manual_refresh_reaches_leaf() {
+        for (enabled, id) in [(true, ""), (false, "ENG-1")] {
+            let scope = TaskScope::new();
+            let (boards, boards_writer) = derived_channel(&scope, "test-board");
+            let (statuses, mut status_writer) = derived_channel(&scope, "test-statuses");
+            let output = project(&scope, boards, statuses, Some("ENG".into()), enabled);
+            status_writer.publish(SourceSnapshot::test_restored(
+                StatusBatch::default(),
+                Domain::Issues,
+                1,
+            ));
+            boards_writer.publish(live_board(board(id)));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), status_writer.requested())
+                    .await
+                    .expect("leaf refresh request must arrive"),
+                Some(()),
+                "confirmed input must supersede restored data even without external I/O"
+            );
+            status_writer.publish(snapshot(StatusBatch::default()));
+            output
+                .subscribe()
+                .wait_for(|s| {
+                    s.data().is_some()
+                        && s.domains()
+                            .get(&Domain::Issues)
+                            .is_none_or(|meta| meta.is_live())
+                })
+                .await
+                .unwrap();
+            output.refresh();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), status_writer.requested())
+                    .await
+                    .expect("leaf refresh request must arrive"),
+                Some(()),
+                "manual refresh must reach the leaf for confirmed input"
+            );
+            scope.shutdown(Duration::from_secs(1)).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn unused_restore_is_not_a_dependency_but_matching_restore_remains_visible_until_confirmed() {
+        let restored = SourceSnapshot::test_restored(
+            StatusBatch {
+                ids: vec!["ENG-1".into()],
+                statuses: [("ENG-1".into(), "Open".into())].into(),
+            },
+            Domain::Issues,
+            1,
+        );
+        let unrelated = compose(live_board(board("")), restored.clone(), &[]);
+        assert!(!unrelated.domains().contains_key(&Domain::Issues));
+        let matching = compose(
+            live_board(board("ENG-1")),
+            restored.clone(),
+            &["ENG-1".into()],
+        );
+        assert!(!matching.domains()[&Domain::Issues].is_live());
+        let failed = compose(
+            live_board(board("ENG-1")),
+            restored
+                .clone()
+                .with_state(SourceState::Failed("offline".into())),
+            &["ENG-1".into()],
+        );
+        assert!(!failed.domains()[&Domain::Issues].is_live());
+        // An unchanged successful answer confirms the leaf; equality of data
+        // must never keep its restored provenance sticky.
+        let live = compose(
+            live_board(board("ENG-1")),
+            snapshot(restored.data().unwrap().as_ref().clone()),
+            &["ENG-1".into()],
+        );
+        assert!(live.domains()[&Domain::Issues].is_live());
+        assert_eq!(
+            matching.data().unwrap().rows[0].issue_status,
+            live.data().unwrap().rows[0].issue_status
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -221,8 +221,13 @@ An expiry while confirmed data still disagrees shows one notice.
 
 **Uniform display.** Every pane draws its border through
 `wt-tui::render::status::pane`, naming the domains it shows; the title reads
-`cached 3m`, `↻`, `loading…` or `<domain> failed` from the same per-domain
-provenance on every host. Rows and the details title show pending changes with
+`<host> <domain> cached 3m`, `↻`, `loading…` or `<domain> failed` from the same per-domain
+provenance on every host. Cache age is never aggregated into a board-wide age.
+Dependent readers publish live empty results once their input is confirmed,
+even if no external call is needed; an empty input is not an unconfirmed input.
+Projections carry only the dependencies of data they actually display. A failed
+or skipped read retains provenance; a successful unchanged read confirms it.
+Rows and the details title show pending changes with
 one marker (`…` in flight, `↻` accepted, `? … (unconfirmed)`).
 
 ## Freshness and refresh
@@ -265,9 +270,16 @@ Attention, history, and performance controls have a separate serialized slot
 reserved beyond the four ordinary action slots, so long host operations cannot
 delay them. Attention acknowledgement returns its own accept stamp before
 refreshing metadata.
-Quitting closes command admission and waits for accepted local writes to finish;
-after 30 seconds it reports that it is still waiting. Each operation owns its
-timeout and safe stopping points, so a UI deadline cannot interrupt a write.
+Quitting closes command admission and cancels source reads, including automation
+evidence preparation. Already-claimed automation dispatches and accepted local
+writes retain their command token until their outcomes have been persisted;
+after three seconds their drain reports that it is still waiting. Each operation
+owns its timeout and safe stopping points, so a UI deadline cannot interrupt a
+write. After those accepted operations finish, background source cleanup gets
+one five-second grace period, followed by database shutdown. Runtime teardown
+gets at most one additional second for residual blocking reads. The source
+cleanup grace is not a deadline for accepted writes, and an error does not start
+a second source grace period.
 Known create failures retain the input and selected host for correction. A lost
 remote reply remains ambiguous and never opens an automatic retry path.
 

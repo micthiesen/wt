@@ -17,11 +17,12 @@ use crate::context::AppContext;
 pub struct Controller {
     task: JoinHandle<()>,
     cancel: CancellationToken,
+    automations: Arc<crate::automation_source::AutomationDrain>,
 }
 
 impl Controller {
     pub async fn shutdown(mut self) -> Result<()> {
-        let result = match tokio::time::timeout(Duration::from_secs(30), &mut self.task).await {
+        let result = match tokio::time::timeout(Duration::from_secs(3), &mut self.task).await {
             Ok(result) => result,
             Err(_) => {
                 tracing::warn!("waiting for accepted commands to finish before exiting");
@@ -31,8 +32,10 @@ impl Controller {
                 self.task.await
             }
         };
+        let automations = self.automations.shutdown().await;
         self.cancel.cancel();
-        result.context("action controller exited")
+        result.context("action controller exited")?;
+        automations
     }
 }
 
@@ -44,6 +47,7 @@ pub fn start(
 ) -> Controller {
     let shutdown = scope.token();
     let cancel = fleet.local.context.cancellation.clone();
+    let automations = fleet.local.sources.automation_drain.clone();
     context.cancellation = cancel.clone();
     let context = Arc::new(context);
     let fleet = Arc::new(fleet);
@@ -116,7 +120,11 @@ pub fn start(
             }
         }
     });
-    Controller { task, cancel }
+    Controller {
+        task,
+        cancel,
+        automations,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -453,19 +461,33 @@ mod tests {
     async fn shutdown_keeps_accepted_work_alive_past_the_notice_deadline() {
         let cancel = CancellationToken::new();
         let (finish, work) = tokio::sync::oneshot::channel();
+        let (finish_automation, automation) = tokio::sync::oneshot::channel();
         let controller = Controller {
             task: tokio::spawn(async move {
                 work.await.unwrap();
             }),
             cancel: cancel.clone(),
+            automations: crate::automation_source::AutomationDrain::new(
+                CancellationToken::new(),
+                tokio::spawn(async move {
+                    automation.await.unwrap();
+                }),
+            ),
         };
         let shutdown = tokio::spawn(controller.shutdown());
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(36)).await;
+        tokio::time::advance(Duration::from_secs(4)).await;
         tokio::task::yield_now().await;
         assert!(!cancel.is_cancelled());
         assert!(!shutdown.is_finished());
         finish.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !cancel.is_cancelled(),
+            "accepted automation still owns its command token"
+        );
+        assert!(!shutdown.is_finished());
+        finish_automation.send(()).unwrap();
         shutdown.await.unwrap().unwrap();
         assert!(cancel.is_cancelled());
     }

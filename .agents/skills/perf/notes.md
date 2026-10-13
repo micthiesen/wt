@@ -84,6 +84,12 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   `/tmp/wt-machine-top-after-build.txt`,
   `/tmp/wt-machine-top-cron-paused.txt`. These changing workloads are not
   a controlled before/after benchmark of wt.
+  The new `new-frontend-enable` stack later developed the same failure:
+  launcher PID 54920, Unix-only PostgreSQL, cron targeting localhost, and
+  100 recent startup timeouts. The same reload-only pause preserved its
+  67 jobs and 23 active flags; accumulated launcher CPU stayed at 36:38.45
+  over 20 seconds and its database remained queryable. All three local
+  stacks' scheduled execution remains paused pending socket repair.
 - **Native Codex discovery CPU (2026-10-13).** The live v0.1.10 board
   PID 32450 consumed 95.8% of one core in the host's second `top` sample.
   A five-second native sample at 09:51 local put the main thread asleep for

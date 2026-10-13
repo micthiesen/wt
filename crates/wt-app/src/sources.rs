@@ -28,6 +28,7 @@ pub struct BoardSources {
     /// Harness transcripts and the persisted primary harness.
     pub session_activity: SourceHandle<crate::session_activity::SessionActivitySnapshot>,
     pub automations: crate::automation_source::AutomationCommands,
+    pub automation_drain: Arc<crate::automation_source::AutomationDrain>,
     pub history: crate::history_source::HistoryCommands,
     pub perf: crate::perf_source::PerfCommands,
     pub hard_refresh: crate::hard_refresh::HardRefreshCommands,
@@ -153,6 +154,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         sessions,
         session_activity,
         automations: automations.commands,
+        automation_drain: automations.drain,
         history: history.commands,
         perf: perf.commands,
         hard_refresh,

@@ -62,9 +62,11 @@ where
         let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let source = start_source(&scope, disk_spec(name, domain, &store), {
             let fetches = fetches.clone();
+            let sample = sample.clone();
             move |_| {
-                fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err::<T, _>("offline") }
+                let first = fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                let sample = sample.clone();
+                async move { if first { Err("offline") } else { Ok(sample) } }
             }
         });
         let mut updates = source.subscribe();
@@ -94,6 +96,14 @@ where
         assert_eq!(failed.data().map(|d| (**d).clone()), Some(sample.clone()));
         assert!(failed.is_restored());
         assert!(source.confirmed().is_none());
+        // A later successful refresh confirms even an identical value. Data
+        // equality must not suppress restored -> live provenance transitions.
+        source.refresh();
+        updates
+            .wait_for(|s| *s.state() == SourceState::Ready && !s.is_restored())
+            .await
+            .expect("unchanged live confirmation replaces restore");
+        assert_eq!(source.confirmed().as_deref(), Some(&sample));
         scope
             .shutdown(Duration::from_secs(2))
             .await

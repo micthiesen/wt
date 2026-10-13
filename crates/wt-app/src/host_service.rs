@@ -21,6 +21,10 @@ const SETTLEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30
 const WRITE_EVIDENCE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl HostService {
+    pub async fn shutdown_automations(&self) -> Result<()> {
+        self.sources.automation_drain.shutdown().await
+    }
+
     pub fn start(scope: &TaskScope, mut context: AppContext, commands: CancellationToken) -> Self {
         // Closing the view stops reads. An accepted mutation instead belongs to
         // its command drain, including when an SSH connection disappears.

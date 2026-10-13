@@ -86,10 +86,15 @@ removal glyph; a failed removal restores its previous archive state.
 
 At launch every pane shows the last data wt saved for it, so the board is
 populated before the first fetch. Each pane's title names its state the same
-way: `cached 3m` while it shows saved data (from this or a remote host),
+way: `GitHub cached 3m` while that domain shows saved data, or
+`MaxBook GitHub cached 3m` for a remote host in the fleet summary,
 `loading…` before any data exists, `↻` while a fetch takes a moment, and
 `<source> failed` when a fetch failed (the last good data stays visible; saved
-data that also failed to refresh reads `cached 3m · GitHub failed`). The list
+data that also failed to refresh reads `GitHub cached 3m · GitHub failed`).
+The age belongs to that saved domain, not the whole board or its last refresh.
+A successful read clears its cached marker even when the data is unchanged;
+a failed or skipped read does not. Unused tracker answers do not mark the list
+stale. The list
 and header summarize every host; a row's details reflect only that row's host.
 
 Every change you make appears at once. Worktree rows contain their title,

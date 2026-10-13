@@ -58,6 +58,45 @@ impl AutomationCommands {
 pub struct AutomationHandle {
     pub board: SourceHandle<Board>,
     pub commands: AutomationCommands,
+    pub drain: Arc<AutomationDrain>,
+}
+
+/// Evaluation stops with the view; already claimed mutations must still join
+/// before the host cancels command ownership or closes its database.
+pub struct AutomationDrain {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AutomationDrain {
+    pub(crate) fn new(
+        cancel: tokio_util::sync::CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cancel,
+            task: tokio::sync::Mutex::new(Some(task)),
+        })
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.cancel.cancel();
+        let mut task = self.task.lock().await;
+        if let Some(handle) = task.as_mut() {
+            let result = match tokio::time::timeout(Duration::from_secs(3), &mut *handle).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("waiting for accepted automations to finish before exiting");
+                    eprintln!("wt: waiting for accepted automations to finish before exiting");
+                    handle.await
+                }
+            }
+            .context("automation owner exited");
+            task.take();
+            result?;
+        }
+        Ok(())
+    }
 }
 
 pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) -> AutomationHandle {
@@ -74,8 +113,13 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     let (status_tx, status_rx) = watch::channel((0usize, None::<String>));
     let board = overlay(scope, sources.board.clone(), status_rx);
     let token = scope.token();
-    let context = ctx.clone();
-    scope.spawn(async move {
+    let accepted_context = ctx.clone();
+    let mut context = ctx.clone();
+    // Evaluation is source work, even when our caller supplies the host's
+    // longer-lived command context. Only claimed dispatches own that drain.
+    context.cancellation = token.clone();
+    let drain_token = token.clone();
+    let task = scope.spawn(async move {
         let ledger = AutomationLedger::new(context.config.paths.cache_root.join("automations.json"));
         let mut engine = AutomationEngine::new(ledger, token.clone());
         let delivered = match crate::actions::service(&context) {
@@ -139,7 +183,9 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             if let Some(error) = error { latest_error = Some(error); }
                             let advanced_tip = claim.fire().branch_range.as_ref().map(|range| (range.branch.clone(), range.to.clone()));
                             let started = !matches!(outcome, AutomationOutcome::NotStarted);
-                            if let Err(error) = engine.finish(&claim, outcome, now_ms()).await {
+                            if let Err(error) = engine.finish_with_cancellation(
+                                &claim, outcome, now_ms(), &accepted_context.cancellation,
+                            ).await {
                                 latest_error = Some(format!("automation ledger finish: {error:#}"));
                             }
                             if started && let Some((branch, tip)) = advanced_tip {
@@ -293,7 +339,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 Err(error) => { latest_error = Some(format!("automation engine: {error:#}")); continue; }
             };
             for claim in tick.claims {
-                let context = context.clone();
+                let context = accepted_context.clone();
                 let github = fresh_github.clone();
                 let board = base_board.data().map(|board| (**board).clone());
                 dispatches.spawn(async move { dispatch_claim(context, claim, github, board).await });
@@ -302,20 +348,27 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         }
         while let Some(result) = dispatches.join_next().await {
             if let Ok((claim, outcome, _)) = result
-                && let Err(error) = engine.finish(&claim, outcome, now_ms()).await
+                && let Err(error) = engine.finish_with_cancellation(
+                    &claim, outcome, now_ms(), &accepted_context.cancellation,
+                ).await
             {
                 tracing::warn!(%error, "cannot finish automation dispatch during shutdown");
             }
         }
     });
-    AutomationHandle { board, commands }
+    AutomationHandle {
+        board,
+        commands,
+        drain: AutomationDrain::new(drain_token, task),
+    }
 }
 
 fn passthrough(scope: &TaskScope, board: SourceHandle<Board>) -> AutomationHandle {
     let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
     let commands = AutomationCommands { cancel: cancel_tx };
     let token = scope.token();
-    scope.spawn(async move {
+    let drain_token = token.clone();
+    let task = scope.spawn(async move {
         loop {
             tokio::select! {
                 _ = token.cancelled() => break,
@@ -326,7 +379,11 @@ fn passthrough(scope: &TaskScope, board: SourceHandle<Board>) -> AutomationHandl
             }
         }
     });
-    AutomationHandle { board, commands }
+    AutomationHandle {
+        board,
+        commands,
+        drain: AutomationDrain::new(drain_token, task),
+    }
 }
 
 async fn dispatch_claim(
@@ -570,6 +627,107 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use wt_runtime::SourceSnapshot;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancels_busy_evidence_without_cancelling_accepted_commands() {
+        use crate::commands::test_support::CommandFixture;
+        use std::os::unix::fs::PermissionsExt;
+        use wt_core::Domain;
+        use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, Stamp, leaf_channel};
+
+        let mut fixture = CommandFixture::new().await.unwrap();
+        Arc::make_mut(&mut fixture.ctx.config).automations = vec![wt_config::AutomationDef {
+            id: "shutdown-evidence".into(),
+            on: wt_config::AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            ..Default::default()
+        }];
+        let snapshots = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        // Hold a real Git descendant, not a synthetic never-ready future.
+        // The runner must cancel and reap it when evidence loses its scope.
+        let marker = fixture._root.path().join("fsmonitor-started");
+        let hook = fixture._root.path().join("fsmonitor");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nexec sleep 30\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.ctx.cwd)
+            .args(["config", "core.fsmonitor", hook.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let scope = TaskScope::new();
+        fn leaf<T: Send + Sync + 'static>(
+            scope: &TaskScope,
+            domain: Domain,
+            data: T,
+        ) -> (LeafHandle<T>, wt_runtime::LeafPublisher<T>) {
+            let (leaf, publisher) = leaf_channel(
+                scope,
+                SourceSpec {
+                    name: "shutdown-fixture",
+                    domain,
+                    persistence: Persistence::Never("isolated test"),
+                    policy: RefreshPolicy::default(),
+                },
+            );
+            publisher.publish_live(data, Stamp::now());
+            (leaf, publisher)
+        }
+        let (git, _git) = leaf(&scope, Domain::Git, snapshots);
+        let (metadata, _metadata) = leaf(&scope, Domain::Metadata, (state, BTreeSet::new()));
+        let (github, _github) = leaf(&scope, Domain::Github, wt_github::GithubData::default());
+        let (sessions, _sessions) = leaf(&scope, Domain::Sessions, SessionDiscoveries::default());
+        let (inventory, _inventory) = leaf(&scope, Domain::Sessions, SessionInventory::default());
+        let (board, _board) = derived_channel(&scope, "board");
+        let (activity, _activity) = derived_channel(&scope, "activity");
+        let (edits, _edits) = derived_channel(&scope, "edits");
+        let _handle = start(
+            &scope,
+            &fixture.ctx,
+            AutomationSources {
+                board,
+                git,
+                metadata,
+                github,
+                sessions,
+                inventory,
+                activity,
+                edits,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("automation evidence reached the held Git subprocess");
+        let result = scope.shutdown(Duration::from_secs(2)).await;
+        assert!(
+            !fixture.ctx.cancellation.is_cancelled(),
+            "read shutdown cancelled admitted command ownership"
+        );
+        // Always release the pre-fix runaway if this regression fails.
+        fixture.ctx.cancellation.cancel();
+        result.expect("read-only evidence must stop and reap its process on quit");
+        fixture.close().await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn unchanged_lifecycle_inputs_retry_partial_failure_then_stop_after_recovery() {
