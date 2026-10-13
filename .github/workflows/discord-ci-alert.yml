@@ -1,4 +1,4 @@
-# Post unsuccessful main-branch CI completions to Discord #github.
+# Post unsuccessful main-branch CI completions, except cancellations, to Discord #github.
 # Secret: DISCORD_GITHUB_WEBHOOK (the channel webhook URL, without /github).
 name: discord-ci-alert
 
@@ -12,7 +12,9 @@ permissions: {}
 
 jobs:
   notify:
-    if: github.event.workflow_run.conclusion != 'success'
+    if: >-
+      github.event.workflow_run.conclusion != 'success' &&
+      github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
     steps:
       - name: Post CI result to Discord

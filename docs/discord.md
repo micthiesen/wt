@@ -10,7 +10,7 @@ enabled — that id is public by design; it powers the README badge).
 - **#updates** — AI-written commit digests, posted by the workflow below.
   Nothing else posts here.
 - **#github** — raw repo events via a native Discord GitHub webhook (see
-  below), plus unsuccessful `Native release` completions on `main`. Deliberately excludes
+  below), plus unsuccessful, non-cancelled `Native release` completions on `main`. Deliberately excludes
   pushes so it never overlaps #updates.
 - **#help** — support. Carries a pinned message telling reporters to include
   `wt doctor` output and the tail of `~/.cache/wt/logs/app/wt-<date>.log`.
@@ -71,9 +71,9 @@ Registered events: `issues`, `fork`, `star` — no `push` or pull-request
 events. `issue_comment` is deliberately excluded because GitHub also uses it
 for pull-request comments. Hook id `662175381`.
 
-`.github/workflows/discord-ci-alert.yml` separately posts every non-successful
-completion of `Native release` on `main`, including failures, cancellations,
-and timeouts. The alert includes the conclusion, commit, actor, and a direct
+`.github/workflows/discord-ci-alert.yml` separately posts unsuccessful
+completions of `Native release` on `main`, including failures and timeouts.
+Cancelled runs are silent. The alert includes the conclusion, commit, actor, and a direct
 link to the Actions run. It uses the Actions secret `DISCORD_GITHUB_WEBHOOK`,
 which is the same channel webhook URL without the native integration's
 `/github` suffix.
