@@ -70,7 +70,8 @@ pub fn start(
                 let task_lane = lane.clone();
                 let task = running.spawn(async move {
                     let retry = create_retry(&command);
-                    let result = crate::host_dispatch::execute(&context, &fleet, command, &replies, &shutdown).await;
+                    let request_replies = RequestReplies { sender: replies, id, generation };
+                    let result = crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown).await;
                     let mut reply = action_reply(result, retry);
                     reply.ui_generation = Some(generation);
                     reply.operation_id = Some(id);
@@ -327,9 +328,30 @@ fn sanitize_reply(mut reply: UiReply) -> UiReply {
     reply
 }
 
+/// Intermediate replies retain the input intent which requested them. Progress
+/// messages are not operation completions; only handoff tickets carry the ID.
+pub(crate) struct RequestReplies {
+    sender: tokio::sync::mpsc::Sender<UiReply>,
+    id: u64,
+    generation: u64,
+}
+
+impl RequestReplies {
+    pub(crate) async fn send(&self, mut reply: UiReply) -> Result<()> {
+        reply.ui_generation = Some(self.generation);
+        if reply.handoff.is_some() {
+            reply.operation_id = Some(self.id);
+        }
+        self.sender
+            .send(reply)
+            .await
+            .map_err(|_| anyhow::anyhow!("terminal reply channel closed"))
+    }
+}
+
 pub(crate) async fn handoff_prepared(
     prepared: crate::harness::PreparedSession,
-    replies: &tokio::sync::mpsc::Sender<UiReply>,
+    replies: &RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
     let (ready, suspended) = tokio::sync::oneshot::channel();
@@ -343,7 +365,11 @@ pub(crate) async fn handoff_prepared(
         .context("terminal closed before session attach")?;
     tokio::select! {
         _ = shutdown.cancelled() => bail!("session attach cancelled"),
-        result = suspended => result.context("terminal could not suspend for session attach")?,
+        result = suspended => if result.is_err() {
+            // A newer UI intent can decline this ticket before suspension.
+            // No attach client was spawned; the prepared session stays alive.
+            return Ok(UiReply::no_change(""));
+        },
     }
     let result: Result<()> = async {
         let mut child = tokio::process::Command::new(prepared.program)
@@ -443,6 +469,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declined_stale_handoff_releases_controller_without_starting_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("attached");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let (replies, mut received) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            handoff_prepared(
+                crate::harness::PreparedSession {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "touch \"$1\"".into(),
+                        "attach-test".into(),
+                        marker_arg.into(),
+                    ],
+                    cwd: std::env::temp_dir(),
+                },
+                &RequestReplies {
+                    sender: replies,
+                    id: 42,
+                    generation: 7,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+        });
+        let reply = received.recv().await.unwrap();
+        assert_eq!(reply.operation_id, Some(42));
+        assert_eq!(reply.ui_generation, Some(7));
+        drop(reply);
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!result.failed);
+        assert_eq!(result.outcome, Some(wt_tui::ReplyOutcome::NoChange));
+        assert!(result.message.is_empty());
+        assert!(
+            !marker.exists(),
+            "declined handoff must not start an attach client"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_attach_retains_the_cause_after_resuming_the_board() {
         let (replies, mut received) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
@@ -455,7 +526,11 @@ mod tests {
                     ],
                     cwd: std::env::temp_dir(),
                 },
-                &replies,
+                &RequestReplies {
+                    sender: replies,
+                    id: 1,
+                    generation: 7,
+                },
                 &CancellationToken::new(),
             )
             .await

@@ -278,6 +278,11 @@ armed or the unconfirmed attempt expires.
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
 
+While an action menu loads, wt retains one early letter shortcut for that menu
+and its original worktree and host. Ignored keys do not dismiss the pending
+menu. Escape, `q`, Ctrl+C, `!`, or arrow-key navigation cancels it before its delayed reply can
+open; preparation failures remain visible as errors.
+
 The session picker runs on the selected host. A running Codex or OpenCode slot
 whose conversation UUID cannot be proven appears as **current session
 (conversation not identified)**. Enter reconnects to that exact terminal;

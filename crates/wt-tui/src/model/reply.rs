@@ -7,11 +7,39 @@ use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 
 impl Model {
     pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
+        let accepts_palette_chord = !reply.failed
+            && matches!(
+                &reply.modal,
+                Some(UiModal::Picker {
+                    action: PickerAction::Actions { .. },
+                    ..
+                })
+            );
+        let palette_chord = if self
+            .pending_palette
+            .as_ref()
+            .is_some_and(|(id, _, _)| Some(*id) == reply.operation_id)
+        {
+            self.pending_palette
+                .take()
+                .and_then(|(_, generation, chord)| {
+                    (generation == self.ui_generation)
+                        .then_some(chord)
+                        .flatten()
+                })
+        } else {
+            None
+        };
         let selected_create = self.reply_pending(&reply);
-        let current = reply
+        let presentation_current = reply
             .ui_generation
-            .is_none_or(|generation| generation == self.ui_generation)
-            || selected_create;
+            .is_none_or(|generation| generation == self.ui_generation);
+        if reply.handoff.is_some() && !presentation_current {
+            // Dropping the unacknowledged ticket releases its controller wait
+            // without suspending this newer interaction or attaching a client.
+            return None;
+        }
+        let current = presentation_current || selected_create;
         if reply.select_when_visible.is_some() && current {
             self.history.active = false;
         }
@@ -31,7 +59,9 @@ impl Model {
         } else {
             ToastTone::Info
         };
-        self.toast = Some((reply.message, tone));
+        if self.pending_palette.is_none() || reply.failed || reply.notice {
+            self.toast = Some((reply.message, tone));
+        }
         self.interaction = match reply.modal.filter(|_| current) {
             Some(UiModal::Reviewers {
                 key,
@@ -134,6 +164,17 @@ impl Model {
             } else {
                 self.pending_selection = Some(key);
             }
+        }
+        if let Some(chord) = palette_chord
+            && current
+            && accepts_palette_chord
+            && matches!(&self.interaction, Interaction::Picker(picker) if matches!(picker.action, PickerAction::Actions { .. }) && picker.options.iter().any(|option| option.chord == Some(chord)))
+            && let super::InputResult::Action(action) = self.input(
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(chord)),
+                0,
+            )
+        {
+            self.follow_up = Some(action);
         }
         reply.handoff
     }

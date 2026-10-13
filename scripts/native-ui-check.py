@@ -210,6 +210,16 @@ def main():
             drain_for(0.1)
             os.write(master, b"\x1b")
             drain_for(0.2)
+        # Palette preparation reads inventory off-thread. A complete shortcut
+        # typed before that read finishes must stay with its original menu,
+        # rather than running the board's second-key command and losing the
+        # pending menu. Custom prompt is read-only until text is submitted.
+        delay_inventory.touch()
+        os.write(master, b"!c")
+        wait_for(lambda data: b"Prompt" in data, timeout=10)
+        delay_inventory.unlink()
+        os.write(master, b"\x1b")
+        drain_for(0.2)
         delay.touch()
         os.write(master, b"r")
         wait_for(lambda _: started.exists())
@@ -353,6 +363,7 @@ def main():
                       history_perf_and_hard_refresh=args.sections,
                       feed_backfill_append_and_seen=args.feeds,
                       searchable_help=args.feeds,
+                      delayed_palette_chord=True,
                       accepted_write_survived_quit=args.exit_signal == "quit" and not args.create,
                       create_feedback_ms=create_feedback_ms if args.create else None,
                       background_setup=args.create,

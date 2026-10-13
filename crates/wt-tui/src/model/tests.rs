@@ -70,6 +70,62 @@ fn github_keys_capture_target_and_require_confirmation() {
 }
 
 #[test]
+fn delayed_terminal_handoff_preserves_newer_prompt_or_selection() {
+    for newer_input in [KeyCode::Char('#'), KeyCode::Down] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        model.input(KeyEvent::from(KeyCode::F(12)), 20);
+        let generation = model.ui_generation;
+        model.input(KeyEvent::from(newer_input), 20);
+        let selected = model.selected;
+        let toast = model.toast.clone();
+        let (ready, mut suspended) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        assert!(
+            model
+                .reply(UiReply {
+                    operation_id: Some(42),
+                    ui_generation: Some(generation),
+                    handoff: Some(crate::TerminalHandoff { ready, resumed }),
+                    ..Default::default()
+                })
+                .is_none()
+        );
+        assert!(matches!(
+            suspended.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(resume.is_closed());
+        assert_eq!(model.selected, selected);
+        assert_eq!(model.toast, toast);
+        if newer_input == KeyCode::Char('#') {
+            assert!(matches!(model.interaction, Interaction::Text(_)));
+        }
+    }
+}
+
+#[test]
+fn ignored_input_keeps_current_terminal_handoff_available() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    model.input(KeyEvent::from(KeyCode::F(12)), 20);
+    let generation = model.ui_generation;
+    model.input(KeyEvent::from(KeyCode::Null), 20);
+    let (ready, mut suspended) = tokio::sync::oneshot::channel();
+    let (_resume, resumed) = tokio::sync::oneshot::channel();
+    let ticket = model
+        .reply(UiReply {
+            operation_id: Some(42),
+            ui_generation: Some(generation),
+            handoff: Some(crate::TerminalHandoff { ready, resumed }),
+            ..Default::default()
+        })
+        .unwrap();
+    ticket.ready.send(()).unwrap();
+    assert_eq!(suspended.try_recv(), Ok(()));
+}
+
+#[test]
 fn delayed_modal_and_background_completion_preserve_newer_input() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
@@ -106,6 +162,166 @@ fn grouped(keys: &[&str], folded: bool) -> SourceSnapshot<Board> {
         ..Default::default()
     }];
     state
+}
+
+#[test]
+fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
+    for host in [None, Some("maxbook".to_owned())] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        else {
+            panic!()
+        };
+        let generation = model.ui_generation;
+        model.begin_action(42, &action);
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('m')), 20),
+            InputResult::Draw
+        );
+        assert_eq!(model.ui_generation, generation);
+        assert!(model.follow_up.is_none());
+        model.reply(UiReply {
+            operation_id: Some(41),
+            message: "other work finished".into(),
+            ..Default::default()
+        });
+        assert!(model.pending_palette.is_some());
+        model.apply(snapshot(&["two", "one"]));
+        let surface = crate::ActionSurface::Row { key: "one".into() };
+        model.reply(UiReply {
+            operation_id: Some(42),
+            ui_generation: Some(generation),
+            modal_host: host.clone(),
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Actions {
+                    surface: surface.clone(),
+                },
+                title: "Actions".into(),
+                selected: 0,
+                options: vec![PickerOption {
+                    value: Some(crate::AUTO_MERGE_ACTION_ID.into()),
+                    label: "Merge".into(),
+                    chord: Some('m'),
+                    note: None,
+                    verify_after_merge: None,
+                    detail: None,
+                }],
+            }),
+            ..Default::default()
+        });
+        assert!(model.pending_palette.is_none());
+        let expected = UiAction::PrepareAction {
+            surface,
+            id: crate::AUTO_MERGE_ACTION_ID.into(),
+            arg: None,
+        };
+        assert_eq!(
+            model.follow_up,
+            Some(match host {
+                Some(host) => UiAction::OnHost {
+                    host: Some(host),
+                    action: Box::new(expected)
+                },
+                None => expected,
+            })
+        );
+    }
+}
+
+#[test]
+fn ignored_key_does_not_discard_prepared_menu_but_escape_and_navigation_do() {
+    for key in [KeyCode::Null, KeyCode::Esc, KeyCode::Down] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        else {
+            panic!()
+        };
+        let generation = model.ui_generation;
+        model.begin_action(42, &action);
+        model.input(KeyEvent::from(key), 20);
+        model.reply(UiReply {
+            operation_id: Some(42),
+            ui_generation: Some(generation),
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Actions {
+                    surface: crate::ActionSurface::Row { key: "one".into() },
+                },
+                title: "Actions".into(),
+                selected: 0,
+                options: vec![],
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            matches!(model.interaction, Interaction::Picker(_)),
+            key == KeyCode::Null
+        );
+        assert!(model.pending_palette.is_none());
+        assert!(model.follow_up.is_none());
+    }
+}
+
+#[test]
+fn pending_palette_cancellation_keys_discard_early_chord_immediately() {
+    for key in [
+        KeyEvent::from(KeyCode::Char('q')),
+        KeyEvent::from(KeyCode::Esc),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one"]));
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        else {
+            panic!()
+        };
+        let generation = model.ui_generation;
+        model.begin_action(42, &action);
+        model.input(KeyEvent::from(KeyCode::Char('m')), 20);
+        assert_eq!(model.input(key, 20), InputResult::Draw);
+        assert!(model.pending_palette.is_none());
+        assert_eq!(
+            model.toast,
+            Some(("Menu cancelled".into(), ToastTone::Info))
+        );
+        model.reply(UiReply {
+            operation_id: Some(42),
+            ui_generation: Some(generation),
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Actions {
+                    surface: crate::ActionSurface::Row { key: "one".into() },
+                },
+                title: "Delayed menu".into(),
+                selected: 0,
+                options: vec![],
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(model.interaction, Interaction::None));
+        assert!(model.follow_up.is_none());
+    }
+}
+
+#[test]
+fn palette_failure_clears_buffer_and_never_runs_board_chord() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    model.begin_action(42, &action);
+    model.input(KeyEvent::from(KeyCode::Char('f')), 20);
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ..UiReply::failure("remote unavailable")
+    });
+    assert!(model.pending_palette.is_none());
+    assert!(model.follow_up.is_none());
+    assert_eq!(
+        model.toast,
+        Some(("remote unavailable".into(), ToastTone::Failed))
+    );
 }
 
 #[test]

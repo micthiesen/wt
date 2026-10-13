@@ -207,6 +207,7 @@ impl GithubClient {
                 data.prs.append(&mut chunk.prs);
                 data.merge_queue.append(&mut chunk.merge_queue);
             }
+            data.covered_branches = branches.iter().cloned().collect();
             Ok::<GithubData, GithubError>(data)
         };
         timeout(Duration::from_secs(100), fetch)
@@ -1154,20 +1155,41 @@ fn parse_chunk(
         .pointer("/data/repository")
         .ok_or_else(|| GithubError::Protocol("missing GitHub repository payload".into()))?;
     let mut data = GithubData::default();
-    for (i, _) in branches.iter().enumerate() {
+    for (i, branch) in branches.iter().enumerate() {
+        let invalid = || {
+            GithubError::Protocol(format!(
+                "incomplete or invalid GitHub PR payload for wt_{i}"
+            ))
+        };
         let nodes = repo
             .get(format!("wt_{i}"))
             .and_then(|v| v.get("nodes"))
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let node = nodes
+            .ok_or_else(invalid)?;
+        // Coverage is certified for the whole batch after this returns. Only an
+        // explicit empty connection proves absence; malformed nodes must never
+        // disappear through parse_pr's optional result or its display defaults.
+        let prs = nodes
             .iter()
-            .find(|n| str_at(n, "/state") == Some("OPEN"))
-            .or_else(|| nodes.first());
-        if let Some(node) = node
-            && let Some(pr) = parse_pr(node, options)
-        {
+            .map(|node| {
+                if str_at(node, "/headRefName") != Some(branch.as_str())
+                    || !matches!(str_at(node, "/state"), Some("OPEN" | "CLOSED" | "MERGED"))
+                    || node.get("isDraft").and_then(Value::as_bool).is_none()
+                    || !node
+                        .get("number")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|n| n > 0)
+                    || ["/id", "/url", "/headRefOid", "/baseRefName"]
+                        .iter()
+                        .any(|path| !str_at(node, path).is_some_and(|v| !v.is_empty()))
+                {
+                    return Err(invalid());
+                }
+                parse_pr(node, options).ok_or_else(invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected = prs.iter().position(|pr| pr.state == "OPEN").unwrap_or(0);
+        if let Some(pr) = prs.into_iter().nth(selected) {
             data.prs.insert(pr.head_ref_name.clone(), pr);
         }
     }
@@ -1726,6 +1748,7 @@ mod transport_tests {
             .fetch_worktrees(&["feature/a".into()], &CancellationToken::new())
             .await
             .unwrap();
+        assert_eq!(data.covered_branches, ["feature/a".to_owned()].into());
         let pr = &data.prs["feature/a"];
         assert_eq!(pr.number, 17);
         assert_eq!(pr.checks, PrChecks::Pass);
@@ -1800,6 +1823,109 @@ else:
             &options(),
         );
         assert!(matches!(gql, Err(GithubError::RateLimit(_))));
+    }
+
+    #[test]
+    fn every_requested_alias_requires_an_explicit_nodes_array() {
+        for repository in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"wt_0": null}),
+            serde_json::json!({"wt_0": {}}),
+            serde_json::json!({"wt_0": {"nodes": null}}),
+            serde_json::json!({"wt_0": {"nodes": {}}}),
+            // A complete first alias cannot certify an omitted second alias.
+            serde_json::json!({"wt_0": {"nodes": []}}),
+        ] {
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"data": {"repository": repository}}))
+                    .unwrap();
+            assert!(
+                matches!(
+                    parse_chunk(
+                        &bytes,
+                        &["feature/a".into(), "feature/b".into()],
+                        false,
+                        &options()
+                    ),
+                    Err(GithubError::Protocol(_))
+                ),
+                "accepted {repository}"
+            );
+        }
+        let data = parse_chunk(
+            br#"{"data":{"repository":{"wt_0":{"nodes":[]},"wt_1":{"nodes":[]}}}}"#,
+            &["feature/a".into(), "feature/b".into()],
+            false,
+            &options(),
+        )
+        .unwrap();
+        assert!(data.prs.is_empty());
+    }
+
+    #[test]
+    fn malformed_pr_nodes_fail_the_batch_instead_of_certifying_absence() {
+        let valid = serde_json::json!({
+            "id": "PR_a", "number": 1, "url": "https://github.com/acme/app/pull/1",
+            "headRefName": "feature/a", "headRefOid": "abc123", "baseRefName": "main",
+            "state": "OPEN", "isDraft": false,
+        });
+        let mut invalid_nodes = vec![serde_json::json!(null), serde_json::json!({})];
+        for field in [
+            "id",
+            "number",
+            "url",
+            "headRefName",
+            "headRefOid",
+            "baseRefName",
+            "state",
+            "isDraft",
+        ] {
+            let mut node = valid.clone();
+            node.as_object_mut().unwrap().remove(field);
+            invalid_nodes.push(node);
+        }
+        for (field, value) in [
+            ("headRefName", serde_json::json!("feature/other")),
+            ("state", serde_json::json!("UNKNOWN")),
+            ("isDraft", serde_json::json!("false")),
+            ("number", serde_json::json!(0)),
+            ("headRefOid", serde_json::json!("")),
+        ] {
+            let mut node = valid.clone();
+            node[field] = value;
+            invalid_nodes.push(node);
+        }
+        for invalid in invalid_nodes {
+            // Validate even an unselected node behind an otherwise valid OPEN PR.
+            for nodes in [
+                serde_json::json!([invalid]),
+                serde_json::json!([valid, invalid]),
+            ] {
+                let bytes = serde_json::to_vec(
+                    &serde_json::json!({"data": {"repository": {"wt_0": {"nodes": nodes}}}}),
+                )
+                .unwrap();
+                assert!(
+                    matches!(
+                        parse_chunk(&bytes, &["feature/a".into()], false, &options()),
+                        Err(GithubError::Protocol(_))
+                    ),
+                    "accepted {nodes}"
+                );
+            }
+        }
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"data": {"repository": {"wt_0": {"nodes": [valid]}}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_chunk(&bytes, &["feature/a".into()], false, &options())
+                .unwrap()
+                .prs["feature/a"]
+                .number,
+            1
+        );
     }
 
     #[test]

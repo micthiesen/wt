@@ -37,6 +37,11 @@ pub struct PreparedAutomationFacts {
     pub initial_branch_tips: BTreeMap<String, String>,
     pub state_ready: bool,
     pub globally_paused: bool,
+    /// The PR facts above came from this process's confirmed, fresh GitHub
+    /// leaf. Without this witness, absent row PR values remain unknown.
+    pub github_fresh: bool,
+    /// Exact branch set covered by that GitHub read.
+    pub github_covered_branches: BTreeSet<String>,
 }
 
 /// GitHub evidence older than this cannot prove a merge or drive a fire.
@@ -142,6 +147,10 @@ pub async fn prepare(
     // A failed, stale or restored GitHub source is never allowed to prove a
     // PR merge.
     let github_fresh = input.github.is_some();
+    let github_covered_branches = input
+        .github
+        .map(|github| github.covered_branches.clone())
+        .unwrap_or_default();
     let empty = GithubData::default();
     let github = input.github.map_or(&empty, |github| &**github);
     let records = git
@@ -389,6 +398,8 @@ pub async fn prepare(
                 fire,
                 &rows,
                 deployed,
+                github_fresh,
+                &github_covered_branches,
             );
             (fire_identity(fire), result)
         })
@@ -407,6 +418,8 @@ pub async fn prepare(
         initial_branch_tips,
         state_ready: input.lanes_ready,
         globally_paused,
+        github_fresh,
+        github_covered_branches,
     })
 }
 
@@ -453,6 +466,8 @@ pub fn refresh_requirements(
                     fire,
                     &facts.rows,
                     deployed,
+                    facts.github_fresh,
+                    &facts.github_covered_branches,
                 ),
             )
         })
@@ -597,6 +612,8 @@ fn requirement_state(
     fire: &AutomationFire,
     rows: &[AutomationRow],
     deployed: bool,
+    github_confirmed: bool,
+    github_covered_branches: &BTreeSet<String>,
 ) -> RequirementState {
     // Builtins are validated by configuration and own their safety checks at
     // execution. They are not configurable actions and must not consume their
@@ -621,10 +638,17 @@ fn requirement_state(
         slug: row.slug.clone(),
         issue_id: row.issue_id.clone(),
         issue_prefix: issue_tracker.and_then(|issue| issue.prefix.clone()),
-        pr: row.pr.as_ref().map(|pr| wt_actions::ActionPr {
-            state: pr.state.clone(),
-            is_draft: pr.is_draft,
-        }),
+        pr: match (
+            github_confirmed && github_covered_branches.contains(&row.branch),
+            row.pr.as_ref(),
+        ) {
+            (false, _) => wt_actions::ActionPrObservation::Unknown,
+            (true, None) => wt_actions::ActionPrObservation::ConfirmedAbsent,
+            (true, Some(pr)) => wt_actions::ActionPrObservation::Present(wt_actions::ActionPr {
+                state: pr.state.clone(),
+                is_draft: pr.is_draft,
+            }),
+        },
         pr_number: row.pr.as_ref().map(|pr| pr.number.to_string()),
         deployed,
     };
@@ -710,14 +734,14 @@ mod tests {
         ] {
             fire.rule.run = run.into();
             assert_eq!(
-                requirement_state(&[], None, &fire, &[], false),
+                requirement_state(&[], None, &fire, &[], false, false, &BTreeSet::new()),
                 RequirementState::Ready,
                 "{run} must reach its own execution-time safety checks",
             );
         }
         fire.rule.run = "unknown-custom-action".into();
         assert!(matches!(
-            requirement_state(&[], None, &fire, &[], false),
+            requirement_state(&[], None, &fire, &[], false, false, &BTreeSet::new()),
             RequirementState::FrozenUnmet(reason) if reason.contains("not configured")
         ));
 
@@ -731,12 +755,12 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            requirement_state(&actions, None, &fire, &rows, false),
+            requirement_state(&actions, None, &fire, &rows, false, false, &BTreeSet::new(),),
             RequirementState::Waiting,
         );
         fire.frozen_vars = Some(BTreeMap::new());
         assert!(matches!(
-            requirement_state(&actions, None, &fire, &rows, false),
+            requirement_state(&actions, None, &fire, &rows, false, false, &BTreeSet::new(),),
             RequirementState::FrozenUnmet(_)
         ));
     }

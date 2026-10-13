@@ -127,6 +127,7 @@ fn validate(
     }))
     .ok()?;
     data.prs.retain(|branch, _| branches.contains(branch));
+    data.covered_branches = branches.iter().cloned().collect();
     let local_now = Instant::now();
     let written = local_now.checked_sub(Duration::from_millis(age))?;
     // A start after the write is inconsistent; such data cannot be ordered.

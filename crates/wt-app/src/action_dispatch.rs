@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_actions::{
-    ActionContext, ActionDestination, ActionHarness, ActionPlan, ActionPr, ActionRow,
-    prepare_action, prepare_action_with_vars,
+    ActionContext, ActionDestination, ActionHarness, ActionPlan, ActionPr, ActionPrObservation,
+    ActionRow, prepare_action, prepare_action_with_vars,
 };
 use wt_config::{ActionDef, HarnessId};
 use wt_github::GithubData;
@@ -288,10 +288,20 @@ pub async fn prepare(
         .map(str::to_owned);
     let issue_id =
         crate::issue_identity::resolve(&slug, issue_override.as_deref()).unwrap_or_default();
-    let pr = row_snapshot
-        .as_ref()
-        .zip(github)
-        .and_then(|(snapshot, github)| github.prs.get(&snapshot.target.branch));
+    let (pr, pr_observation) = match row_snapshot.as_ref().zip(github) {
+        None => (None, ActionPrObservation::Unknown),
+        Some((snapshot, github)) => match github.covered_pr(&snapshot.target.branch) {
+            wt_github::CoveredPr::Uncovered => (None, ActionPrObservation::Unknown),
+            wt_github::CoveredPr::Absent => (None, ActionPrObservation::ConfirmedAbsent),
+            wt_github::CoveredPr::Present(pr) => (
+                Some(pr),
+                ActionPrObservation::Present(ActionPr {
+                    state: pr.state.clone(),
+                    is_draft: pr.is_draft,
+                }),
+            ),
+        },
+    };
     let pr_number = pr.map(|pr| pr.number.to_string());
     let board_row = board.and_then(|board| board.rows.iter().find(|row| row.slug == slug));
     let deployed = if let Some(snapshot) = &row_snapshot {
@@ -316,10 +326,7 @@ pub async fn prepare(
             .issue_tracker
             .as_ref()
             .and_then(|issue| issue.prefix.clone()),
-        pr: pr.map(|pr| ActionPr {
-            state: pr.state.clone(),
-            is_draft: pr.is_draft,
-        }),
+        pr: pr_observation,
         pr_number,
         deployed,
     };
@@ -812,9 +819,15 @@ mod tests {
             .find(|record| record.target.slug() == "one")
             .unwrap();
         let key = wt_core::worktree_target_key(&record.target);
-        let prepared = prepare(&fixture.ctx, &ActionSurface::Row { key }, None, None, None)
-            .await
-            .unwrap();
+        let prepared = prepare(
+            &fixture.ctx,
+            &ActionSurface::Row { key: key.clone() },
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(prepared.slug, "one");
         assert_eq!(prepared.branch, "feature/one");
         assert_eq!(
@@ -822,6 +835,34 @@ mod tests {
             Some(record.target.reference().clone())
         );
         assert_eq!(prepared.issue_id, "");
+
+        // A confirmed read is still unknown for a branch it did not cover.
+        let incomplete = Confirmed::for_test(GithubData::default());
+        let prepared = prepare(
+            &fixture.ctx,
+            &ActionSurface::Row { key: key.clone() },
+            Some(&incomplete),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.row.pr, ActionPrObservation::Unknown);
+
+        // Only explicit coverage allows an absent-PR conclusion.
+        let mut covered_data = GithubData::default();
+        covered_data.covered_branches.insert("feature/one".into());
+        let covered = Confirmed::for_test(covered_data);
+        let prepared = prepare(
+            &fixture.ctx,
+            &ActionSurface::Row { key },
+            Some(&covered),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.row.pr, ActionPrObservation::ConfirmedAbsent);
         fixture.close().await.unwrap();
     }
 

@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use wt_core::Domain;
 use wt_runtime::{SourceSnapshot, Stamp, TaskScope};
-use wt_tui::{Board, PrPin, ReplyOutcome, UiAction, UiReply};
+use wt_tui::{ActionSurface, Board, PrPin, ReplyOutcome, UiAction, UiReply};
 
 use crate::{context::AppContext, github_actions::GithubAction, sources::BoardSources};
 
@@ -19,6 +19,11 @@ const SETTLEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30
 
 /// The oldest GitHub read a GitHub write may rely on for its PR checks.
 const WRITE_EVIDENCE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A source refresh starts when the palette opens. If a PR-dependent action is
+/// selected before that first read completes, wait briefly for this same leaf
+/// rather than treating the restored board as proof of presence or absence.
+const ACTION_GITHUB_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
 impl HostService {
     pub async fn shutdown_automations(&self) -> Result<()> {
@@ -146,13 +151,30 @@ impl HostService {
         }
         // Safety and identity checks read only live-fetched GitHub data; the
         // board is display data used to resolve rows.
+        let board = snapshot.data().map(|board| board.as_ref());
+        let branch = self.pr_dependent_branch(&command, board);
         let github = self.sources.github.confirmed();
+        let github_ready = github.as_ref().is_some_and(|github| {
+            github.fresh_within(WRITE_EVIDENCE_AGE)
+                && branch.as_deref().is_none_or(|branch| {
+                    !matches!(github.covered_pr(branch), wt_github::CoveredPr::Uncovered)
+                })
+        });
+        let github = if !github_ready && self.pr_dependent_command(&command) {
+            self.await_confirmed_github(branch.as_deref())
+                .await
+                .or_else(|| github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE)))
+        } else {
+            if !github_ready && matches!(command, UiAction::PrepareActions { .. }) {
+                self.sources.github_refresh.refresh();
+            }
+            github
+        };
         let github = github.as_ref();
         // A GitHub write must also not act on a read from long ago (a lane
         // that has been failing, say): its PR and head checks need a recent
         // read. Landing evidence for cleanup stays valid at any age.
         let github_for_writes = github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE));
-        let board = snapshot.data().map(|board| board.as_ref());
         if matches!(
             command,
             UiAction::PrepareReviewers { .. } | UiAction::SubmitReviewers { .. }
@@ -327,10 +349,15 @@ impl HostService {
                     .ok_or_else(|| anyhow::anyhow!("worktree is no longer on the board"))?;
                 let github =
                     github.ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
-                let pr = github
-                    .prs
-                    .get(&row.branch)
-                    .ok_or_else(|| crate::controller::notice("no PR for this row"))?;
+                let pr = match github.covered_pr(&row.branch) {
+                    wt_github::CoveredPr::Present(pr) => pr,
+                    wt_github::CoveredPr::Absent => {
+                        return Err(crate::controller::notice("no PR for this row"));
+                    }
+                    wt_github::CoveredPr::Uncovered => {
+                        anyhow::bail!("GitHub data is not confirmed for this branch");
+                    }
+                };
                 if pr.state != "OPEN" {
                     anyhow::bail!("PR #{} is not open", pr.number);
                 }
@@ -389,7 +416,7 @@ impl HostService {
                     &self.context,
                     action,
                     board,
-                    github,
+                    github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE)),
                 ))
                 .await?
             }
@@ -404,6 +431,128 @@ impl HostService {
             }
         };
         Ok(reply)
+    }
+
+    fn action_requires_pr(&self, command: &UiAction) -> bool {
+        let (surface, id) = match command {
+            UiAction::PrepareAction { surface, id, .. }
+            | UiAction::RunAction { surface, id, .. } => (surface, id),
+            _ => return false,
+        };
+        self.surface_action_requires_pr(surface, id)
+    }
+
+    fn surface_action_requires_pr(&self, surface: &ActionSurface, id: &str) -> bool {
+        crate::action_dispatch::definitions(&self.context, surface)
+            .into_iter()
+            .find(|definition| definition.id == *id)
+            .is_some_and(|definition| {
+                definition.requires.iter().any(|requirement| {
+                    matches!(
+                        requirement,
+                        wt_config::RequireTag::Pr | wt_config::RequireTag::PrReady
+                    )
+                })
+            })
+    }
+
+    fn pr_dependent_command(&self, command: &UiAction) -> bool {
+        self.action_requires_pr(command)
+            || matches!(
+                command,
+                UiAction::PrepareGithub { .. }
+                    | UiAction::PrepareReviewers { .. }
+                    | UiAction::SubmitReviewers { .. }
+                    | UiAction::GithubMarkReady { .. }
+                    | UiAction::GithubSetAutoMerge { .. }
+                    | UiAction::GithubShip { .. }
+                    | UiAction::GithubFailedChecks { .. }
+            )
+    }
+
+    fn pr_dependent_branch(&self, command: &UiAction, board: Option<&Board>) -> Option<String> {
+        let key = match command {
+            UiAction::PrepareAction { surface, id, .. }
+            | UiAction::RunAction { surface, id, .. }
+                if self.surface_action_requires_pr(surface, id) =>
+            {
+                match surface {
+                    ActionSurface::Row { key } | ActionSurface::Manager { key: Some(key) } => {
+                        key.as_str()
+                    }
+                    _ => return None,
+                }
+            }
+            UiAction::PrepareGithub { key, .. }
+            | UiAction::PrepareReviewers { key }
+            | UiAction::SubmitReviewers { key, .. }
+            | UiAction::GithubMarkReady { key, .. }
+            | UiAction::GithubSetAutoMerge { key, .. }
+            | UiAction::GithubShip { key, .. }
+            | UiAction::GithubFailedChecks { key } => key.as_str(),
+            UiAction::PrepareActions {
+                surface: ActionSurface::Row { key } | ActionSurface::Manager { key: Some(key) },
+            } => key.as_str(),
+            _ => return None,
+        };
+        board?
+            .rows
+            .iter()
+            .find(|row| row.key == key)
+            .map(|row| row.branch.clone())
+    }
+
+    async fn await_confirmed_github(
+        &self,
+        branch: Option<&str>,
+    ) -> Option<wt_runtime::Confirmed<wt_github::GithubData>> {
+        self.sources.github_refresh.refresh();
+        wait_for_confirmed_github(
+            self.sources.github.clone(),
+            branch.map(str::to_owned),
+            ACTION_GITHUB_WAIT,
+            self.context.cancellation.clone(),
+        )
+        .await
+    }
+}
+
+async fn wait_for_confirmed_github(
+    source: wt_runtime::LeafHandle<wt_github::GithubData>,
+    branch: Option<String>,
+    wait: std::time::Duration,
+    cancellation: CancellationToken,
+) -> Option<wt_runtime::Confirmed<wt_github::GithubData>> {
+    let covers_branch = |github: &wt_runtime::Confirmed<wt_github::GithubData>| {
+        github.fresh_within(WRITE_EVIDENCE_AGE)
+            && branch.as_deref().is_none_or(|branch| {
+                !matches!(github.covered_pr(branch), wt_github::CoveredPr::Uncovered)
+            })
+    };
+    if let Some(github) = source.confirmed()
+        && covers_branch(&github)
+    {
+        return Some(github);
+    }
+    let mut updates = source.subscribe();
+    let wait_for_read = async {
+        loop {
+            let confirmed = {
+                let snapshot = updates.borrow_and_update();
+                source.confirm(&snapshot)
+            };
+            if let Some(github) = confirmed.filter(|github| covers_branch(github)) {
+                return Some(github);
+            }
+            if updates.changed().await.is_err() {
+                return None;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = tokio::time::timeout(wait, wait_for_read) => result.ok().flatten(),
     }
 }
 
@@ -447,6 +596,7 @@ fn github_prompt(pr: &wt_github::PullRequest, ship: bool, reviewer: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
 
     fn pr(draft: bool, reviewers: &[&str], armed: bool) -> wt_github::PullRequest {
         let auto_merge =
@@ -485,5 +635,35 @@ mod tests {
             github_prompt(&pr(false, &["ana"], true), true, Some("ana")),
             GithubPrompt::Done("#7 already shipped".into())
         );
+    }
+
+    #[tokio::test]
+    async fn waits_for_the_shared_github_leaf_to_cover_the_selected_branch() {
+        let scope = TaskScope::new();
+        let (source, publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "github-action-wait-test",
+                domain: Domain::Github,
+                persistence: Persistence::Never("test fixture"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let wait = tokio::spawn(wait_for_confirmed_github(
+            source,
+            Some("feature/one".into()),
+            std::time::Duration::from_secs(1),
+            CancellationToken::new(),
+        ));
+        tokio::task::yield_now().await;
+        let mut data = wt_github::GithubData::default();
+        data.covered_branches.insert("feature/one".into());
+        publisher.publish_live(data, Stamp::now());
+
+        let confirmed = wait.await.unwrap().expect("shared leaf should confirm");
+        assert!(matches!(
+            confirmed.covered_pr("feature/one"),
+            wt_github::CoveredPr::Absent
+        ));
     }
 }

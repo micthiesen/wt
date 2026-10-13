@@ -12,6 +12,9 @@ use crate::{
 
 impl Model {
     pub(crate) fn expire_toast(&mut self) {
+        if self.pending_palette.is_some() {
+            return;
+        }
         if matches!(self.interaction, Interaction::Text(_))
             && matches!(self.toast, Some((_, ToastTone::Failed)))
         {
@@ -27,7 +30,41 @@ impl Model {
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
+        if let Some((_, generation, chord)) = &mut self.pending_palette
+            && *generation == self.ui_generation
+        {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('!' | 'q'))
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c' | 'C')))
+            {
+                self.pending_palette = None;
+                self.ui_generation = self.ui_generation.wrapping_add(1);
+                return self.notify("Menu cancelled");
+            }
+            if key.modifiers.is_empty()
+                && let KeyCode::Char(ch) = key.code
+                && ch.is_ascii_alphanumeric()
+            {
+                // A fast palette chord belongs to the requested menu, never
+                // to the board underneath it. Keep at most one queued choice.
+                if chord.is_none() {
+                    *chord = Some(ch);
+                }
+                return InputResult::Draw;
+            }
+        }
+        let generation = self.ui_generation;
         self.ui_generation = self.ui_generation.wrapping_add(1);
+        let result = self.input_inner(key, height);
+        if matches!(result, InputResult::Unchanged) {
+            self.ui_generation = generation;
+        } else {
+            self.pending_palette = None;
+        }
+        result
+    }
+
+    fn input_inner(&mut self, key: KeyEvent, height: usize) -> InputResult {
         if matches!(self.interaction, Interaction::None)
             && self.title_prompt.is_none()
             && !self.history.active

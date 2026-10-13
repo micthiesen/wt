@@ -65,6 +65,8 @@ pub struct Model {
     pub details_scroll: u16,
     pub(crate) output: crate::output::OutputState,
     pub(crate) ui_generation: u64,
+    /// Accepted menu request: operation, input generation, and one early chord.
+    pub(crate) pending_palette: Option<(u64, u64, Option<char>)>,
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
     pub(crate) help_scroll: usize,
@@ -132,6 +134,7 @@ impl Default for Model {
             details_scroll: 0,
             output: Default::default(),
             ui_generation: 0,
+            pending_palette: None,
             pr_chord: None,
             help: false,
             help_scroll: 0,

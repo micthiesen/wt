@@ -1,7 +1,7 @@
 //! GitHub reviewer picker preparation and submission.
 
 use anyhow::Result;
-use wt_github::{Contributor, GithubClient, GithubData, GithubOptions, PullRequest};
+use wt_github::{Contributor, CoveredPr, GithubClient, GithubData, GithubOptions, PullRequest};
 use wt_runtime::{Confirmed, Stamp};
 use wt_tui::{Board, ReviewerOption, UiModal, UiReply};
 
@@ -60,11 +60,19 @@ impl GithubPickers {
             )));
         };
         let branch = row.branch.clone();
-        let Some(pr) = github.prs.get(&branch) else {
-            return Ok(UiReply {
-                notice: true,
-                ..UiReply::message("no PR for this row")
-            });
+        let pr = match github.covered_pr(&branch) {
+            CoveredPr::Uncovered => {
+                return Ok(UiReply::failure(
+                    "GitHub data is still loading for this branch",
+                ));
+            }
+            CoveredPr::Absent => {
+                return Ok(UiReply {
+                    notice: true,
+                    ..UiReply::message("no PR for this row")
+                });
+            }
+            CoveredPr::Present(pr) => pr,
         };
         if pr.state != "OPEN" {
             return Ok(UiReply::message(format!("PR #{} is not open", pr.number)));
@@ -132,10 +140,18 @@ impl GithubPickers {
             ));
         };
         let branch = row.branch.clone();
-        let Some(pr) = github.prs.get(&branch) else {
-            return Ok(UiReply::failure(
-                "PR data is no longer available; reviewer edit aborted",
-            ));
+        let pr = match github.covered_pr(&branch) {
+            CoveredPr::Uncovered => {
+                return Ok(UiReply::failure(
+                    "GitHub data is still loading for this branch; reviewer edit aborted",
+                ));
+            }
+            CoveredPr::Absent => {
+                return Ok(UiReply::failure(
+                    "PR data is no longer available; reviewer edit aborted",
+                ));
+            }
+            CoveredPr::Present(pr) => pr,
         };
         if pr.number != pr_number || pr.state != "OPEN" || pr.is_draft {
             return Ok(UiReply::failure(
@@ -422,6 +438,7 @@ mod tests {
             ..Default::default()
         };
         let mut data = GithubData::default();
+        data.covered_branches.insert("feature/42".into());
         data.prs.insert("feature/42".into(), pr());
         let confirmed = Confirmed::for_test(data);
         let original = vec!["maintainer".to_owned()];
@@ -442,6 +459,83 @@ mod tests {
         let unchanged = submit(Some(&confirmed), 42).await.unwrap();
         assert!(!unchanged.failed);
         assert_eq!(unchanged.outcome, Some(ReplyOutcome::NoChange));
+        fixture.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_reads_and_writes_require_branch_coverage_before_github_io() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let fake = fixture._root.path().join("reject-gh");
+        fs::write(&fake, "#!/bin/sh\nprintf called > \"$0.calls\"\nexit 99\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut pickers = GithubPickers::start(&fixture.ctx);
+        pickers.reviewers_enabled = true;
+        pickers.client = pickers.client.with_gh_program(fake.clone());
+        let board = Board {
+            rows: vec![wt_tui::BoardRow {
+                key: "one".into(),
+                slug: "one".into(),
+                branch: "feature/42".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let original = ["maintainer".to_owned()];
+        let selected = ["new-reviewer".to_owned()];
+        for retain_pr in [false, true] {
+            let mut data = GithubData::default();
+            data.covered_branches.insert("feature/old".into());
+            if retain_pr {
+                data.prs.insert("feature/42".into(), pr());
+            }
+            let confirmed = Confirmed::for_test(data);
+            let prepare = pickers
+                .prepare_reviewers("one", &board, Some(&confirmed))
+                .await
+                .unwrap();
+            assert!(prepare.failed && prepare.message.contains("still loading"));
+            let submit = pickers
+                .submit_reviewers(ReviewerSubmission {
+                    key: "one",
+                    pr_number: 42,
+                    original: &original,
+                    selected: &selected,
+                    board: &board,
+                    github: Some(&confirmed),
+                })
+                .await
+                .unwrap();
+            assert!(submit.failed && submit.message.contains("still loading"));
+        }
+        let absent = Confirmed::for_test(GithubData {
+            covered_branches: ["feature/42".into()].into(),
+            ..Default::default()
+        });
+        let prepare = pickers
+            .prepare_reviewers("one", &board, Some(&absent))
+            .await
+            .unwrap();
+        assert!(!prepare.failed && prepare.message == "no PR for this row");
+        let submit = pickers
+            .submit_reviewers(ReviewerSubmission {
+                key: "one",
+                pr_number: 42,
+                original: &original,
+                selected: &selected,
+                board: &board,
+                github: Some(&absent),
+            })
+            .await
+            .unwrap();
+        assert!(submit.failed && submit.message.contains("no longer available"));
+        assert!(
+            !fake.with_extension("calls").exists(),
+            "no GitHub reads or mutations may run"
+        );
         fixture.close().await.unwrap();
     }
 }

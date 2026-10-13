@@ -147,6 +147,76 @@ pub struct PullRequest {
 pub struct GithubData {
     pub prs: BTreeMap<String, PullRequest>,
     pub merge_queue: BTreeMap<String, MergeQueueEntry>,
+    /// Branches explicitly included in the read that produced this snapshot.
+    /// An absent PR proves anything only for a covered branch.
+    #[serde(default)]
+    pub covered_branches: std::collections::BTreeSet<String>,
+}
+
+impl GithubData {
+    /// Look up a branch's PR only if the read explicitly covered that branch.
+    pub fn covered_pr(&self, branch: &str) -> CoveredPr<'_> {
+        if !self.covered_branches.contains(branch) {
+            CoveredPr::Uncovered
+        } else {
+            self.prs
+                .get(branch)
+                .map_or(CoveredPr::Absent, CoveredPr::Present)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoveredPr<'a> {
+    /// This GitHub snapshot did not query the branch.
+    Uncovered,
+    /// The snapshot queried the branch and found no PR.
+    Absent,
+    /// The snapshot queried the branch and found this PR.
+    Present(&'a PullRequest),
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::{CoveredPr, GithubData};
+
+    #[test]
+    fn legacy_snapshots_and_unqueried_entries_are_unknown() {
+        let mut data: GithubData = serde_json::from_value(serde_json::json!({
+            "prs": {
+                "feature": {
+                    "number": 7,
+                    "url": "https://github.com/o/r/pull/7",
+                    "headRefName": "feature",
+                    "baseRefName": "main",
+                    "title": "cached PR",
+                    "isDraft": false,
+                    "state": "OPEN",
+                    "checks": "none",
+                    "failedChecks": [],
+                    "review": "none",
+                    "reviewRequests": 0,
+                    "requestedReviewers": [],
+                    "suggestedReviewers": [],
+                    "comments": [],
+                    "unresolvedThreads": 0,
+                    "unresolvedThreadsTotal": 0
+                }
+            },
+            "mergeQueue": {}
+        }))
+        .unwrap();
+        assert!(matches!(data.covered_pr("feature"), CoveredPr::Uncovered));
+        assert!(matches!(
+            data.covered_pr("new-branch"),
+            CoveredPr::Uncovered
+        ));
+
+        data.covered_branches.insert("feature".into());
+        data.covered_branches.insert("new-branch".into());
+        assert!(matches!(data.covered_pr("feature"), CoveredPr::Present(_)));
+        assert!(matches!(data.covered_pr("new-branch"), CoveredPr::Absent));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -173,6 +173,13 @@ impl Model {
 
     /// Show the change an accepted request will make, before the host runs it.
     pub(crate) fn begin_action(&mut self, id: u64, action: &UiAction) {
+        let mut inner = action;
+        while let UiAction::OnHost { action, .. } = inner {
+            inner = action;
+        }
+        if matches!(inner, UiAction::PrepareActions { .. }) {
+            self.pending_palette = Some((id, self.ui_generation, None));
+        }
         let crate::Effect::Mutation(mut mutation) = action.effect(&self.board) else {
             return;
         };

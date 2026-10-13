@@ -39,6 +39,7 @@ pub(crate) fn pr(branch: &str) -> PullRequest {
 /// GitHub data with one open draft PR #7 on `branch`.
 pub(crate) fn open_pr_data(branch: &str) -> GithubData {
     let mut data = GithubData::default();
+    data.covered_branches.insert(branch.into());
     data.prs.insert(branch.into(), pr(branch));
     data
 }
@@ -266,8 +267,102 @@ async fn a_pin_mismatch_or_missing_confirmed_data_refuses_the_write() {
             .await
             .unwrap();
         assert!(reply.failed);
-        assert_eq!(reply.message, STALE_PIN);
+        assert_eq!(
+            reply.message,
+            if github.is_some() {
+                STALE_PIN
+            } else {
+                "GitHub data is still loading"
+            }
+        );
     }
     assert!(!fake.calls.exists(), "no GitHub request may be sent");
+    fake.fixture.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confirmed_snapshot_must_cover_the_selected_branch_before_reads_or_writes() {
+    let fake = fake_gh().await;
+    let old_inventory = Confirmed::for_test(open_pr_data("feature/old"));
+    // Even a retained PR entry cannot substitute for explicit read coverage.
+    let mut uncovered_entry = open_pr_data("feature/one");
+    uncovered_entry.covered_branches.clear();
+    let uncovered_entry = Confirmed::for_test(uncovered_entry);
+    for github in [&old_inventory, &uncovered_entry] {
+        for action in [
+            GithubAction::MarkReady {
+                key: "one".into(),
+                pin: seen(),
+            },
+            GithubAction::SetAutoMerge {
+                key: "one".into(),
+                enable: true,
+                pin: seen(),
+            },
+            GithubAction::Ship {
+                key: "one".into(),
+                pin: seen(),
+            },
+            GithubAction::FailedChecks { key: "one".into() },
+        ] {
+            let reply = fake
+                .actions
+                .execute(action, &board(), Some(github))
+                .await
+                .unwrap();
+            assert!(reply.failed);
+            assert_eq!(
+                reply.message,
+                "GitHub data is still loading for this branch"
+            );
+        }
+    }
+    assert!(
+        !fake.calls.exists(),
+        "uncovered branches cannot cause GitHub requests"
+    );
+    fake.fixture.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn covered_absence_is_no_pr_but_cannot_match_a_visible_pr_pin() {
+    let fake = fake_gh().await;
+    let github = Confirmed::for_test(GithubData {
+        covered_branches: ["feature/one".into()].into(),
+        ..Default::default()
+    });
+    for action in [
+        GithubAction::FailedChecks { key: "one".into() },
+        GithubAction::MarkReady {
+            key: "one".into(),
+            pin: None,
+        },
+    ] {
+        let reply = fake
+            .actions
+            .execute(action, &board(), Some(&github))
+            .await
+            .unwrap();
+        assert!(!reply.failed);
+        assert_eq!(reply.message, "no PR for this row");
+        assert_eq!(reply.outcome, Some(ReplyOutcome::NoChange));
+    }
+    let reply = fake
+        .actions
+        .execute(
+            GithubAction::MarkReady {
+                key: "one".into(),
+                pin: seen(),
+            },
+            &board(),
+            Some(&github),
+        )
+        .await
+        .unwrap();
+    assert!(reply.failed);
+    assert_eq!(reply.message, STALE_PIN);
+    assert!(!fake.calls.exists());
     fake.fixture.close().await.unwrap();
 }

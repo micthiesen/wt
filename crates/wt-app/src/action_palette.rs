@@ -539,6 +539,8 @@ fn assign_keys(definitions: &[ActionDef], reserved: &[char]) -> BTreeMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wt_config::RequireTag;
+    use wt_tui::{BoardRow, PrPresentation};
 
     #[tokio::test]
     async fn unavailable_slot_palette_opens_with_reasons() {
@@ -577,6 +579,84 @@ mod tests {
             error.to_string(),
             "wt slot unavailable: paths.wt_source not set"
         );
+    }
+
+    #[tokio::test]
+    async fn restored_visible_pr_is_unknown_until_github_is_confirmed() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let def = ActionDef {
+            id: "fix-ci".into(),
+            name: "Fix CI and watch until green".into(),
+            prompt: Some("Fix CI for PR {{pr}}".into()),
+            requires: vec![RequireTag::Pr],
+            ..Default::default()
+        };
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).actions = vec![def];
+        let record = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.target.slug() == "one")
+            .unwrap();
+        let key = wt_core::worktree_target_key(&record.target);
+        let board = Board {
+            rows: vec![BoardRow {
+                key: key.clone(),
+                slug: "one".into(),
+                branch: "feature/one".into(),
+                pr: Some(PrPresentation {
+                    number: Some(2490),
+                    state: Some("OPEN".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // This is the restart race: the serialized board still shows PR 2490,
+        // while no live-confirmed GitHub source exists yet. The palette must
+        // not turn the missing confirmation into a false "no PR" answer.
+        let reply = palette(
+            &fixture.ctx,
+            ActionSurface::Row { key: key.clone() },
+            Some(&board),
+            None,
+        )
+        .await
+        .unwrap();
+        let Some(UiModal::Picker { options, .. }) = reply.modal else {
+            panic!("expected action picker");
+        };
+        let fix_ci = options
+            .iter()
+            .find(|option| option.value.as_deref() == Some("fix-ci"))
+            .unwrap();
+        assert_eq!(
+            fix_ci.detail.as_deref(),
+            Some("(GitHub data is not confirmed)")
+        );
+
+        let error = prepare(
+            &fixture.ctx,
+            ActionSurface::Row { key },
+            "fix-ci".into(),
+            None,
+            Some(&board),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Fix CI and watch until green: GitHub data is not confirmed"
+        );
+        fixture.close().await.unwrap();
     }
 
     #[test]

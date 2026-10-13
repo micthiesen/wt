@@ -16,7 +16,8 @@ use std::ops::ControlFlow;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use wt_github::{
-    GhActionResult, GithubClient, GithubData, GithubOptions, PrChecks, PrMergeTarget, PullRequest,
+    CoveredPr, GhActionResult, GithubClient, GithubData, GithubOptions, PrChecks, PrMergeTarget,
+    PullRequest,
 };
 use wt_runtime::{Confirmed, Stamp, TaskScope};
 use wt_tui::{Board, PrPin, UiModal, UiReply};
@@ -115,15 +116,24 @@ impl GithubActions {
             )));
         };
         let branch = row.branch.clone();
-        if let Some(pin) = action.write_pin()
-            && !pin_matches(pin, github.and_then(|data| data.prs.get(&branch)))
-        {
-            return Ok(UiReply::failure(STALE_PIN));
-        }
         let Some(github) = github else {
             return Ok(UiReply::failure("GitHub data is still loading"));
         };
-        let Some(pr) = github.prs.get(&branch) else {
+        let pr = match github.covered_pr(&branch) {
+            CoveredPr::Uncovered => {
+                return Ok(UiReply::failure(
+                    "GitHub data is still loading for this branch",
+                ));
+            }
+            CoveredPr::Absent => None,
+            CoveredPr::Present(pr) => Some(pr),
+        };
+        if let Some(pin) = action.write_pin()
+            && !pin_matches(pin, pr)
+        {
+            return Ok(UiReply::failure(STALE_PIN));
+        }
+        let Some(pr) = pr else {
             return Ok(UiReply {
                 notice: true,
                 ..UiReply::no_change("no PR for this row")

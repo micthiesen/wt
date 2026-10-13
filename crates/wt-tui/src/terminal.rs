@@ -334,7 +334,10 @@ async fn run_inner<'a>(
                                 let action = model.resolve(action);
                                 let feedback = action.clone();
                                 match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }) {
-                                    Ok(()) => { model.begin_action(id, &feedback); model.toast = Some(("Working…".into(), ToastTone::Info)); },
+                                    Ok(()) => {
+                                        model.begin_action(id, &feedback);
+                                        model.toast = Some((if model.pending_palette.is_some() { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
+                                    },
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)),
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)),
                                 }
@@ -361,8 +364,12 @@ async fn run_inner<'a>(
                     let handoff = model.reply(reply);
                     if let Some(action) = model.follow_up.take() {
                         let id = model.next_op_id();
+                        let action = model.resolve(action);
+                        let feedback = action.clone();
                         if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action }).is_err() {
-                            model.toast = Some(("Agent start queue is busy; press F12 again".into(), ToastTone::Failed));
+                            model.toast = Some(("Action queue is busy; retry the action".into(), ToastTone::Failed));
+                        } else {
+                            model.begin_action(id, &feedback);
                         }
                     }
                     if history_was_open && !model.history.active {
@@ -409,6 +416,9 @@ async fn run_inner<'a>(
                     }
                 } else {
                     controller_open = false;
+                    model.pending_palette = None;
+                    model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed));
+                    dirty = true;
                 }
             }
             _ = async {

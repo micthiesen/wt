@@ -72,6 +72,13 @@ publish only meaningful changes; timers are backstops for inputs without a
 reliable local event. Optional source failures are shown beside the last good
 data instead of erasing it.
 
+GitHub snapshots also carry the exact branch set queried by that read.
+`CoveredPr` distinguishes an unqueried branch, a confirmed absent PR, and a
+present PR. Action requirements preserve that distinction in
+`ActionPrObservation`; restored board data cannot prove absence or authorize a
+write. PR-dependent actions wait briefly for the existing shared leaf to
+confirm their branch instead of launching a second GitHub lookup.
+
 `attention_source` observes the existing prepared GitHub, metadata, issue,
 dev-server, and manager-session snapshots and narrates confirmed transitions.
 It does not refetch those inputs or perform per-row requests. It seeds each
@@ -314,6 +321,10 @@ Known create failures retain the input and selected host for correction. A lost
 remote reply remains ambiguous and never opens an automatic retry path.
 Both failed action replies and raised errors produce one persistent attention
 event. Uncertain writes produce a warning there; no-op notices remain transient.
+Intermediate terminal handoffs carry the originating request ID and input
+generation. A newer prompt or selection can decline the ticket before terminal
+suspension; no attach client starts, the prepared session remains alive, and a
+declined sign-in does not execute its continuation.
 
 The SSH protocol is framed and versioned. The controller probes the worker,
 checks its role and protocol, and provisions the exact native build before

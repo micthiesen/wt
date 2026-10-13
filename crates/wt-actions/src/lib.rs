@@ -2,8 +2,8 @@
 
 pub use config::{
     ActionContext, ActionDestination, ActionHarness, ActionPlan, ActionPlanError, ActionPr,
-    ActionRow, ActionVars, PreparedAction, apply_vars, evaluate_requirements, prepare_action,
-    prepare_action_with_vars,
+    ActionPrObservation, ActionRow, ActionVars, PreparedAction, apply_vars, evaluate_requirements,
+    prepare_action, prepare_action_with_vars,
 };
 pub use service::{
     ActionDone, ActionRequest, ActionService, ActionServiceConfig, ActionServiceError, ActionStart,

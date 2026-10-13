@@ -9,7 +9,7 @@ pub async fn execute(
     context: &AppContext,
     fleet: &Fleet,
     command: UiAction,
-    replies: &tokio::sync::mpsc::Sender<UiReply>,
+    replies: &crate::controller::RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
     let command = rename_as_title(command);
@@ -407,7 +407,7 @@ async fn managed_sign_in(
     remote: &crate::remote_host::RemoteHost,
     provider: &str,
     then: Option<Box<UiAction>>,
-    replies: &tokio::sync::mpsc::Sender<UiReply>,
+    replies: &crate::controller::RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
     let provider = wt_remote::managed::SignIn::parse(provider)
@@ -427,6 +427,9 @@ async fn managed_sign_in(
         shutdown,
     )
     .await;
+    if matches!(&handoff, Ok(reply) if reply.outcome == Some(wt_tui::ReplyOutcome::NoChange)) {
+        return handoff;
+    }
     let label = &remote.endpoint.label;
     let report = crate::managed::provision(context, &client)
         .await

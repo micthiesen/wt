@@ -14,7 +14,7 @@ pub struct ActionRow {
     pub slug: String,
     pub issue_id: Option<String>,
     pub issue_prefix: Option<String>,
-    pub pr: Option<ActionPr>,
+    pub pr: ActionPrObservation,
     pub pr_number: Option<String>,
     pub deployed: bool,
 }
@@ -23,6 +23,17 @@ pub struct ActionRow {
 pub struct ActionPr {
     pub state: String,
     pub is_draft: bool,
+}
+
+/// Whether GitHub confirmed this row's PR state. A missing PR is a fact only
+/// after a live GitHub read; restored presentation data and an unready source
+/// are both unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ActionPrObservation {
+    #[default]
+    Unknown,
+    ConfirmedAbsent,
+    Present(ActionPr),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,12 +211,25 @@ pub fn prepare_action_with_vars(
 pub fn evaluate_requirements(requires: &[RequireTag], row: &ActionRow) -> Option<String> {
     for requirement in requires {
         match requirement {
-            RequireTag::Pr if row.pr.is_none() => return Some("no PR".into()),
+            RequireTag::Pr => match &row.pr {
+                ActionPrObservation::Unknown => {
+                    return Some("GitHub data is not confirmed".into());
+                }
+                ActionPrObservation::ConfirmedAbsent => return Some("no PR".into()),
+                ActionPrObservation::Present(_) => {}
+            },
             RequireTag::PrReady => match &row.pr {
-                None => return Some("no PR".into()),
-                Some(pr) if pr.is_draft => return Some("PR is draft".into()),
-                Some(pr) if pr.state != "OPEN" => return Some("PR not open".into()),
-                Some(_) => {}
+                ActionPrObservation::Unknown => {
+                    return Some("GitHub data is not confirmed".into());
+                }
+                ActionPrObservation::ConfirmedAbsent => return Some("no PR".into()),
+                ActionPrObservation::Present(pr) if pr.is_draft => {
+                    return Some("PR is draft".into());
+                }
+                ActionPrObservation::Present(pr) if pr.state != "OPEN" => {
+                    return Some("PR not open".into());
+                }
+                ActionPrObservation::Present(_) => {}
             },
             RequireTag::Deployed if !row.deployed => {
                 return Some("no stage deployed".into());
@@ -428,7 +452,7 @@ mod tests {
                 slug: "wk-1".into(),
                 issue_id: Some("WK-1".into()),
                 issue_prefix: Some("WK".into()),
-                pr: Some(ActionPr {
+                pr: ActionPrObservation::Present(ActionPr {
                     state: "OPEN".into(),
                     is_draft: false,
                 }),
@@ -488,18 +512,38 @@ mod tests {
             RequireTag::Deployed,
         ];
         let mut row = context().row;
+        row.pr = ActionPrObservation::Unknown;
+        assert_eq!(
+            evaluate_requirements(&requirements, &row).as_deref(),
+            Some("GitHub data is not confirmed")
+        );
+        row.pr = ActionPrObservation::ConfirmedAbsent;
+        assert_eq!(
+            evaluate_requirements(&requirements, &row).as_deref(),
+            Some("no PR")
+        );
+        row.pr = ActionPrObservation::Present(ActionPr {
+            state: "OPEN".into(),
+            is_draft: false,
+        });
         row.issue_id = Some("GH-73".into());
         assert_eq!(
             evaluate_requirements(&requirements, &row).as_deref(),
             Some("no tracker id (set one with `#`)")
         );
         row.issue_id = Some("WK-73".into());
-        row.pr.as_mut().unwrap().is_draft = true;
+        row.pr = ActionPrObservation::Present(ActionPr {
+            state: "OPEN".into(),
+            is_draft: true,
+        });
         assert_eq!(
             evaluate_requirements(&requirements, &row).as_deref(),
             Some("PR is draft")
         );
-        row.pr.as_mut().unwrap().is_draft = false;
+        row.pr = ActionPrObservation::Present(ActionPr {
+            state: "OPEN".into(),
+            is_draft: false,
+        });
         assert_eq!(evaluate_requirements(&requirements, &row), None);
     }
 
