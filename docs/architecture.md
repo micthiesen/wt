@@ -100,6 +100,15 @@ nanosecond modification/change times, including negative searches. An unchanged
 history directory does not require re-enumerating or statting all its files.
 New date directories and new files invalidate membership immediately; candidate
 files still require current UUID, checkout and slot-ownership validation.
+Activity cursors are keyed by checkout, slot and thread UUID; reading another
+history cannot reset a slot's cursor and feed discovery back into itself.
+JSONL reads advance in bounded chunks and retain at most 1 MiB per unfinished
+record; oversized records are skipped through their terminator so later events
+can still be consumed. An incomplete record does not publish progress until a
+complete line is consumed. A live Codex/OpenCode tmux slot without a proven
+thread UUID remains busy for lifecycle safety, but no historical transcript is
+treated as live.
+The session pane shows that identity uncertainty as `unknown`.
 The attention watermark is stored in
 the repository-scoped state and projected into every board snapshot.
 

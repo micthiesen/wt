@@ -106,17 +106,29 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   22.77 ms. This measures header scanning only, not whole-board CPU.
   Reproduce with `cargo test -p wt-harness rollout_discovery_cache_benchmark
   --release -- --ignored --nocapture`.
-  Live optimized candidate `22031c2` still used 115.92% of one core over
-  20.005 seconds after 15 seconds of warmup, with the real Cozee configuration
-  and no sources disabled. This is UI-process CPU, excluding child processes;
-  the earlier v0.1.10 sample was 150.29%, but the live workload was uncontrolled
-  and does not establish a comparable speedup. `q` exited in 0.057 seconds.
-  Evidence: `/tmp/wt-live-optimized-22031/result.json`. A follow-up sample put
-  3,635 aggregate samples in missing-rollout directory/stat traversal while
-  the main thread was mostly parked (`/tmp/wt-live-profile-22031/sample.txt`):
-  retaining successful UUID lookups did
-  not prevent missing UUIDs from rescanning history on every activity poll.
-  Release promotion is held for that fix and a new optimized live measurement.
+  These local optimizations did not fix sustained load: `22031c2` used 112.83%
+  of one core over 240 seconds, and directory-index candidate `0cfbf8c` used
+  140.64% over 180 seconds. Samples under `/tmp/wt-live-profile-22031` and
+  `/tmp/wt-live-profile-0cfbf8c` showed a feedback loop: unknown tmux UUIDs made
+  every historical session in the slot appear live; a cursor keyed only by
+  slug alternated histories, reporting a change and requesting discovery on
+  every pass. Discovery then woke activity again. A truly missing rollout
+  without any readable histories merely retried at the ordinary backstop.
+  Cursors now use slug, cwd and UUID; incomplete JSONL records do not report
+  progress until a complete line is consumed. The regression fails against
+  the original cursor implementation.
+  An isolated optimized copy retaining the OLD permissive session selection
+  but using the fixed cursors consumed 14.01% over 60 seconds and quit in
+  0.004 seconds (`/tmp/wt-live-feedback-proof/result.json`). This validates the
+  loop fix independently of the new strict identity filtering. These are
+  UI-process CPU measurements, excluding subprocesses, on the real Cozee
+  configuration with no sources disabled; other live work was uncontrolled.
+  Seven existing daemon-backed Codex panes expose no provable current UUID.
+  They now remain busy/unknown rather than claiming historical threads live.
+  Empty-thread preallocation was tested and rejected: Codex 0.162.1 did not
+  reliably materialize a resumable rollout before a turn, so no such startup
+  change ships (`/tmp/wt-empty-thread-proof.txt`). Final release installation
+  and its live measurement remain owed.
 - **FSEvents delivery during managed-remote QA (2026-10-12).** An isolated
   Codex rollout append watcher received no callbacks within either 2 or 15
   seconds, including a fixture under the home directory. Host sampling showed

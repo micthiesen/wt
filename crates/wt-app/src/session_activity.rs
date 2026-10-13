@@ -492,11 +492,11 @@ fn current_active(
         .iter()
         .filter(|entry| {
             entry.session.is_live
-                && inventory.all.contains_key(&entry.session.tmux_session_name)
-                && inventory
-                    .harness_session_ids
-                    .get(&entry.session.tmux_session_name)
-                    .is_none_or(|id| id == &entry.session.session_id)
+                && crate::session_source::is_session_live(
+                    inventory,
+                    entry.key.harness,
+                    &entry.session,
+                )
         })
         .filter_map(|entry| {
             by_slug
@@ -1103,6 +1103,59 @@ mod tests {
     use std::num::NonZeroUsize;
     use wt_platform::process::ProcessRunner;
     use wt_tmux::{TmuxClient, TmuxServer};
+
+    #[tokio::test]
+    async fn active_polling_rechecks_exact_identity_even_if_discovery_claims_live() {
+        use crate::commands::test_support::CommandFixture;
+        use crate::session_source::{DiscoveredSession, SessionDescriptor};
+        let fixture = CommandFixture::new().await.unwrap();
+        let app = AppHarness::new(&fixture.ctx);
+        let worktrees = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let mut inventory = SessionInventory::default();
+        inventory.all.insert(
+            "one-codex".into(),
+            SessionDescriptor {
+                name: "one-codex".into(),
+                id: "$1".into(),
+                created_at: 1,
+                attached_clients: 0,
+                window_count: 1,
+                harness_session_id: None,
+            },
+        );
+        let histories = ["old", "current"]
+            .map(|id| DiscoveredSession {
+                key: SessionKey {
+                    slug: "one".into(),
+                    harness: HarnessId::Codex,
+                    session_id: id.into(),
+                },
+                session: wt_harness::HarnessSession {
+                    display_name: id.into(),
+                    session_id: id.into(),
+                    tmux_session_name: "one-codex".into(),
+                    last_active_ms: None,
+                    is_live: true,
+                    extras: Default::default(),
+                },
+            })
+            .to_vec();
+        assert!(
+            current_active(&app, Some(&worktrees), Some(&inventory), Some(&histories)).is_empty()
+        );
+        inventory
+            .harness_session_ids
+            .insert("one-codex".into(), "current".into());
+        let active = current_active(&app, Some(&worktrees), Some(&inventory), Some(&histories));
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].key.session_id, "current");
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn codex_output_watch_coalesces_exact_rollout_file_changes() {

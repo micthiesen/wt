@@ -10,6 +10,9 @@ use serde_json::Value;
 use super::{CodexHarnessError, Rollout, find_rollout, read_rollout, scan_rollouts, slot_owns};
 
 const MAX_READ_PER_TICK: u64 = 32 * 1024;
+// Activity previews do not need arbitrarily large tool payloads. Bound each
+// session's unfinished record while still consuming through its terminator.
+const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexEventLevel {
@@ -38,11 +41,13 @@ struct RolloutCursor {
     path: PathBuf,
     offset: u64,
     mtime_ms: i64,
+    partial: Vec<u8>,
+    skipping_record: bool,
 }
 
 #[derive(Clone, Default)]
 pub struct CodexActivityTracker {
-    by_slug: HashMap<String, RolloutCursor>,
+    by_session: HashMap<(String, PathBuf, Option<String>), RolloutCursor>,
 }
 
 pub(super) fn poll_activity(
@@ -50,13 +55,10 @@ pub(super) fn poll_activity(
     tracker: &mut CodexActivityTracker,
     active: &[(String, PathBuf, Option<String>)],
 ) -> CodexActivityBatch {
-    let active_slugs = active
-        .iter()
-        .map(|(slug, _, _)| slug.as_str())
-        .collect::<HashSet<_>>();
+    let active_keys = active.iter().cloned().collect::<HashSet<_>>();
     tracker
-        .by_slug
-        .retain(|slug, _| active_slugs.contains(slug.as_str()));
+        .by_session
+        .retain(|key, _| active_keys.contains(key));
     let mut batch = CodexActivityBatch::default();
     for (slug, cwd, session_id) in active {
         if poll_slug(
@@ -66,7 +68,8 @@ pub(super) fn poll_activity(
             cwd,
             session_id.as_deref(),
             &mut batch,
-        ) {
+        ) && !batch.changed_slugs.contains(slug)
+        {
             batch.changed_slugs.push(slug.clone());
         }
     }
@@ -81,10 +84,15 @@ fn poll_slug(
     session_id: Option<&str>,
     batch: &mut CodexActivityBatch,
 ) -> bool {
+    let key = (
+        slug.to_owned(),
+        cwd.to_owned(),
+        session_id.map(str::to_owned),
+    );
     // A live UUID is pinned. Revalidate its retained path instead of walking
     // the entire historical session tree on every activity tick.
     let retained = session_id.and_then(|id| {
-        let state = tracker.by_slug.get(slug)?;
+        let state = tracker.by_session.get(&key)?;
         let rollout = read_rollout(&state.path).ok().flatten()?;
         (rollout.session_id == id
             && rollout.cwd == cwd.to_string_lossy()
@@ -96,21 +104,23 @@ fn poll_slug(
         return false;
     };
     if tracker
-        .by_slug
-        .get(slug)
+        .by_session
+        .get(&key)
         .is_none_or(|state| state.path != rollout.path)
     {
-        tracker.by_slug.insert(
-            slug.to_owned(),
+        tracker.by_session.insert(
+            key.clone(),
             RolloutCursor {
                 path: rollout.path,
                 offset: rollout.size,
                 mtime_ms: rollout.mtime_ms,
+                partial: Vec::new(),
+                skipping_record: false,
             },
         );
         return true;
     }
-    let Some(state) = tracker.by_slug.get_mut(slug) else {
+    let Some(state) = tracker.by_session.get_mut(&key) else {
         return false;
     };
     let current_size = match fs::metadata(&rollout.path) {
@@ -121,6 +131,8 @@ fn poll_slug(
         if current_size < state.offset {
             state.offset = current_size;
             state.mtime_ms = rollout.mtime_ms;
+            state.partial.clear();
+            state.skipping_record = false;
             return true;
         }
         state.mtime_ms = rollout.mtime_ms;
@@ -138,22 +150,38 @@ fn poll_slug(
     if file.read_exact(&mut bytes).is_err() {
         return false;
     }
-    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        state.mtime_ms = rollout.mtime_ms;
-        return true;
-    };
-    state.offset += (last_newline + 1) as u64;
+    state.offset += read_len as u64;
     state.mtime_ms = rollout.mtime_ms;
-    for line in bytes[..last_newline].split(|byte| *byte == b'\n') {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let Ok(event) = serde_json::from_slice::<Value>(line) else {
-            continue;
+    let mut completed = false;
+    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let complete = chunk.last() == Some(&b'\n');
+        let fragment = if complete {
+            &chunk[..chunk.len() - 1]
+        } else {
+            chunk
         };
-        emit_event(&event, slug, &mut batch.events);
+        if !state.skipping_record {
+            if state.partial.len() + fragment.len() > MAX_RECORD_BYTES {
+                state.partial.clear();
+                state.skipping_record = true;
+            } else {
+                state.partial.extend_from_slice(fragment);
+            }
+        }
+        if complete {
+            completed = true;
+            if !state.skipping_record
+                && let Ok(event) = serde_json::from_slice::<Value>(&state.partial)
+            {
+                emit_event(&event, slug, &mut batch.events);
+            }
+            state.partial.clear();
+            state.skipping_record = false;
+        }
     }
-    true
+    // Consuming an unfinished fragment must not feed discovery back into this
+    // poll. The regular activity tick will consume the next bounded fragment.
+    completed
 }
 
 fn resolve_rollout(
@@ -344,6 +372,238 @@ mod tests {
     }
 
     #[test]
+    fn large_records_make_bounded_progress_and_emit_once() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        let sessions = dir.path().join("sessions");
+        let path = super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "thread",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let active = vec![("feature".into(), cwd, Some("thread".into()))];
+        let mut tracker = CodexActivityTracker::default();
+        poll_activity(&sessions, &mut tracker, &active);
+        let initial = tracker.by_session[&active[0]].offset;
+        let event = json!({"type":"event_msg","payload":{"type":"user_message","message":"x".repeat(96 * 1024)}});
+        let serialized = event.to_string();
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(serialized.as_bytes()).unwrap();
+        for _ in 0..5 {
+            let before = tracker.by_session[&active[0]].offset;
+            let batch = poll_activity(&sessions, &mut tracker, &active);
+            assert!(batch.changed_slugs.is_empty());
+            assert!(batch.events.is_empty());
+            assert!(tracker.by_session[&active[0]].offset - before <= MAX_READ_PER_TICK);
+        }
+        assert_eq!(
+            tracker.by_session[&active[0]].offset,
+            initial + serialized.len() as u64
+        );
+        writer.write_all(b"\n").unwrap();
+        let complete = poll_activity(&sessions, &mut tracker, &active);
+        assert_eq!(complete.changed_slugs, ["feature"]);
+        assert_eq!(complete.events.len(), 1);
+        assert!(
+            poll_activity(&sessions, &mut tracker, &active)
+                .changed_slugs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn oversized_record_is_skipped_without_blocking_following_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        let sessions = dir.path().join("sessions");
+        let path = super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "thread",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let active = vec![("feature".into(), cwd, Some("thread".into()))];
+        let mut tracker = CodexActivityTracker::default();
+        poll_activity(&sessions, &mut tracker, &active);
+        append(
+            &path,
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"x".repeat(MAX_RECORD_BYTES + 100)}}),
+        );
+        append(
+            &path,
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"after oversized"}}),
+        );
+        let mut events = Vec::new();
+        let mut changes = 0;
+        for _ in 0..40 {
+            let batch = poll_activity(&sessions, &mut tracker, &active);
+            events.extend(batch.events);
+            changes += batch.changed_slugs.len();
+            assert!(tracker.by_session[&active[0]].partial.len() <= MAX_RECORD_BYTES);
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "-> after oversized · feature");
+        assert_eq!(changes, 1);
+        assert!(!tracker.by_session[&active[0]].skipping_record);
+    }
+
+    #[test]
+    fn truncation_clears_partial_and_oversized_record_state() {
+        use std::io::Write;
+        for partial_size in [100, MAX_RECORD_BYTES + 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("repo");
+            let sessions = dir.path().join("sessions");
+            let path = super::super::tests::write_rollout(
+                &sessions,
+                "2026/10/13",
+                "thread",
+                &cwd,
+                "codex-tui",
+                "user",
+            );
+            let header = fs::read(&path).unwrap();
+            let active = vec![("feature".into(), cwd, Some("thread".into()))];
+            let mut tracker = CodexActivityTracker::default();
+            poll_activity(&sessions, &mut tracker, &active);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&vec![b'x'; partial_size])
+                .unwrap();
+            for _ in 0..40 {
+                assert!(
+                    poll_activity(&sessions, &mut tracker, &active)
+                        .changed_slugs
+                        .is_empty()
+                );
+            }
+            assert_eq!(
+                tracker.by_session[&active[0]].skipping_record,
+                partial_size > MAX_RECORD_BYTES
+            );
+            fs::write(&path, header).unwrap();
+            assert_eq!(
+                poll_activity(&sessions, &mut tracker, &active).changed_slugs,
+                ["feature"]
+            );
+            assert!(tracker.by_session[&active[0]].partial.is_empty());
+            assert!(!tracker.by_session[&active[0]].skipping_record);
+            append(
+                &path,
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"after truncation"}}),
+            );
+            let complete = poll_activity(&sessions, &mut tracker, &active);
+            assert_eq!(complete.events.len(), 1);
+            assert_eq!(complete.events[0].text, "-> after truncation · feature");
+        }
+    }
+
+    #[test]
+    fn unfinished_record_does_not_trigger_discovery_until_complete() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        let sessions = root.path().join("sessions");
+        let path = super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "thread",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let active = vec![("feature".into(), cwd, Some("thread".into()))];
+        let mut tracker = CodexActivityTracker::default();
+        poll_activity(&sessions, &mut tracker, &active);
+        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(writer, "{{\"type\":\"event_msg\",\"payload\":").unwrap();
+        writer.sync_all().unwrap();
+        for _ in 0..5 {
+            let batch = poll_activity(&sessions, &mut tracker, &active);
+            assert!(batch.changed_slugs.is_empty());
+            assert!(batch.events.is_empty());
+        }
+        writeln!(
+            writer,
+            "{{\"type\":\"user_message\",\"message\":\"hello\"}}}}"
+        )
+        .unwrap();
+        writer.sync_all().unwrap();
+        let complete = poll_activity(&sessions, &mut tracker, &active);
+        assert_eq!(complete.changed_slugs, ["feature"]);
+        assert_eq!(complete.events.len(), 1);
+        assert!(
+            poll_activity(&sessions, &mut tracker, &active)
+                .changed_slugs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multiple_sessions_in_one_slug_do_not_reset_each_others_activity_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("repo");
+        let sessions = root.path().join("sessions");
+        let first = super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "first",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        super::super::tests::write_rollout(
+            &sessions,
+            "2026/10/13",
+            "second",
+            &cwd,
+            "codex-tui",
+            "user",
+        );
+        let mut active = vec![
+            ("feature".into(), cwd.clone(), Some("first".into())),
+            ("feature".into(), cwd, Some("second".into())),
+        ];
+        let mut tracker = CodexActivityTracker::default();
+        assert_eq!(
+            poll_activity(&sessions, &mut tracker, &active).changed_slugs,
+            ["feature"]
+        );
+        for _ in 0..5 {
+            active.reverse();
+            let next = poll_activity(&sessions, &mut tracker, &active);
+            assert!(
+                next.changed_slugs.is_empty(),
+                "history discovery must not feed another discovery forever"
+            );
+            assert!(next.events.is_empty());
+        }
+        append(
+            &first,
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"new work"}}),
+        );
+        let update = poll_activity(&sessions, &mut tracker, &active);
+        assert_eq!(update.changed_slugs, ["feature"]);
+        assert_eq!(update.events.len(), 1);
+        assert!(
+            poll_activity(&sessions, &mut tracker, &active)
+                .changed_slugs
+                .is_empty()
+        );
+        active.truncate(1);
+        poll_activity(&sessions, &mut tracker, &active);
+        assert_eq!(tracker.by_session.len(), 1);
+    }
+
+    #[test]
     fn retained_activity_path_is_revalidated_when_live_identity_changes() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("repo");
@@ -367,10 +627,10 @@ mod tests {
         let mut tracker = CodexActivityTracker::default();
         let mut active = vec![("feature".into(), cwd, Some("first".into()))];
         poll_activity(&sessions, &mut tracker, &active);
-        assert_eq!(tracker.by_slug["feature"].path, first);
+        assert_eq!(tracker.by_session[&active[0]].path, first);
         active[0].2 = Some("second".into());
         poll_activity(&sessions, &mut tracker, &active);
-        assert_eq!(tracker.by_slug["feature"].path, second);
+        assert_eq!(tracker.by_session[&active[0]].path, second);
         append(
             &first,
             json!({"type":"event_msg","payload":{"type":"user_message","message":"wrong session"}}),

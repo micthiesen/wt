@@ -464,7 +464,7 @@ fn spawn_discoveries(
             }
             let mut liveness_changed = false;
             for entry in &mut data {
-                let is_live = is_session_live(&inv, &entry.session);
+                let is_live = is_session_live(&inv, entry.key.harness, &entry.session);
                 liveness_changed |= entry.session.is_live != is_live;
                 entry.session.is_live = is_live;
             }
@@ -524,7 +524,7 @@ fn spawn_discoveries(
                 if let Ok((slug, harness, Ok(found))) = &joined {
                     data.retain(|entry| entry.key.slug != *slug || entry.key.harness != *harness);
                     for mut session in found.clone() {
-                        session.is_live = is_session_live(&inv, &session);
+                        session.is_live = is_session_live(&inv, *harness, &session);
                         let key = SessionKey {
                             slug: slug.clone(),
                             harness: *harness,
@@ -562,12 +562,19 @@ fn spawn_discoveries(
     });
 }
 
-fn is_session_live(inventory: &SessionInventory, session: &HarnessSession) -> bool {
+/// Codex/OpenCode reuse one tmux slot across historical UUIDs. A live slot
+/// without its exact identity is still busy, but proves no transcript live.
+/// Claude's managed session name identifies its individual history entry.
+pub(crate) fn is_session_live(
+    inventory: &SessionInventory,
+    harness: HarnessId,
+    session: &HarnessSession,
+) -> bool {
     inventory.all.contains_key(&session.tmux_session_name)
         && inventory
             .harness_session_ids
             .get(&session.tmux_session_name)
-            .is_none_or(|id| id == &session.session_id)
+            .map_or(harness == HarnessId::Claude, |id| id == &session.session_id)
 }
 
 type DiscoveryTaskOutput = (String, HarnessId, Result<Vec<HarnessSession>, String>);
@@ -878,6 +885,34 @@ mod tests {
         );
         assert!(retried.kinds.codex.contains("branch"));
         assert_eq!(retried.harness_session_ids["branch-codex"], "new");
+    }
+
+    #[test]
+    fn stable_harness_slot_without_uuid_does_not_make_its_entire_history_live() {
+        for harness in [HarnessId::Codex, HarnessId::Opencode] {
+            let name = format!("branch-{}", harness.as_str());
+            let mut inventory = classify_sessions(vec![session(&name, None)]);
+            let history = ["old", "current"].map(|id| HarnessSession {
+                display_name: id.into(),
+                session_id: id.into(),
+                tmux_session_name: name.clone(),
+                last_active_ms: None,
+                is_live: false,
+                extras: Default::default(),
+            });
+            assert!(
+                history
+                    .iter()
+                    .all(|entry| !is_session_live(&inventory, harness, entry))
+            );
+            assert!(
+                inventory.all.contains_key(&name),
+                "unknown slot must remain busy for safety"
+            );
+            inventory.harness_session_ids.insert(name, "current".into());
+            assert!(!is_session_live(&inventory, harness, &history[0]));
+            assert!(is_session_live(&inventory, harness, &history[1]));
+        }
     }
 
     #[test]
