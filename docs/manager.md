@@ -117,12 +117,17 @@ process and interactive UI host.
 
 **A cold start that finds a stuck session recycles it rather than failing.** A tmux session can exist with no live Claude process in it (a harness that never came up). tmux refuses a duplicate name, so the start adopts that session, creates nothing, and waits out the registration timeout — and so does every retry, which is why the failure used to be sticky and only `wt claude stop <slug>` cleared it. Now an *adopted* session that still hasn't registered after the full timeout is killed and recreated once, since by then no conversation can be at stake and the concurrent-creator race the adoption path exists for has already lost its whole window. A session this call genuinely created is not recycled: that is the harness failing to start, and recreating it reproduces the failure. Either way the error quotes the pane, which is where a refusing harness explains itself and the only place that says so — the wrapper's `.err` file is empty in every observed instance, and `wt logs` is about destroy logs.
 
-Messages are also **signed**: a send from inside a wt harness session is prefixed with that session's slug (`[eng-1234-thing] …`), from the `WT_AGENT` variable wt stamps at spawn. Agents used to be told to do this by hand, which is the kind of rule that gets forgotten precisely when attribution matters. A harness command (`/…` for Claude, `$…` for Codex/OpenCode) is never stamped — a prefix would stop it being a command.
+Messages are also **signed**: a send from inside a wt harness session is prefixed with that session's slug (`[eng-1234-thing] …`), from the `WT_AGENT` variable wt stamps at spawn. Agents used to be told to do this by hand, which is the kind of rule that gets forgotten precisely when attribution matters. A harness command (`/…` for Claude, `$…` for Codex/OpenCode, `/skill:…` for Pi) is never stamped — a prefix would stop it being a command.
 
 ## How a message reaches a session
 
 wt uses each harness's native input boundary and keeps tmux as the visible,
 surviving UI host.
+
+Pi uses an embedded extension in its interactive process. Messages enter the
+native follow-up queue, `/skill:` prompts expand normally, and compaction uses
+the native compaction API. Each request pins the checkout and conversation UUID;
+uncertain sends are never automatically repeated. See [Pi sessions](pi.md).
 
 For Codex, wt wakes the exact tmux slot and queues ordinary messages and
 `$skill` prompts by the authoritative thread

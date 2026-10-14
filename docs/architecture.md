@@ -18,7 +18,7 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-platform` | Bounded subprocess execution, locks and platform services |
 | `wt-vcs`, `wt-stack`, `wt-lifecycle` | Git inventory/ref operations, stack replay, and worktree creation/removal safety |
 | `wt-github` | GitHub reads and mutations, checks, review requests and merge behavior |
-| `wt-harness` | Claude, Codex and OpenCode discovery, lifecycle, output and messaging adapters |
+| `wt-harness` | Claude, Codex, OpenCode and Pi discovery, lifecycle, output and messaging adapters |
 | `wt-actions`, `wt-automations` | Tracked action execution and typed automation evaluation/ledger |
 | `wt-remote` | Native worker protocol and runtime transfer primitives |
 | `wt-update`, `wt-launcher` | Verified release installation, activation, boot probe and rollback |
