@@ -173,12 +173,15 @@ impl Model {
         while let UiAction::OnHost { action, .. } = inner {
             inner = action;
         }
+        let preparation = inner.is_preparation();
+        let carried = std::mem::take(&mut self.carry_typeahead);
         self.pending_request = Some(super::PendingRequest {
             id,
             generation: self.ui_generation,
-            preparation: inner.is_preparation(),
-            palette: matches!(inner, UiAction::PrepareActions { .. }),
-            chord: None,
+            preparation,
+            opener: self.last_key.take().filter(|_| preparation),
+            typeahead: if preparation { carried } else { Vec::new() },
+            started: tokio::time::Instant::now(),
             action: inner.clone(),
             _cancel_on_drop: None,
         });

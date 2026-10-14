@@ -305,7 +305,7 @@ fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
 }
 
 #[test]
-fn ignored_key_does_not_discard_prepared_menu_but_escape_and_navigation_do() {
+fn keys_typed_while_a_menu_loads_replay_into_it_and_escape_cancels() {
     for key in [KeyCode::Null, KeyCode::Esc, KeyCode::Down] {
         let mut model = Model::default();
         model.apply(snapshot(&["one", "two"]));
@@ -325,17 +325,150 @@ fn ignored_key_does_not_discard_prepared_menu_but_escape_and_navigation_do() {
                 },
                 title: "Actions".into(),
                 selected: 0,
-                options: vec![],
+                options: ["a", "b"]
+                    .into_iter()
+                    .map(|value| PickerOption {
+                        value: Some(value.into()),
+                        label: value.into(),
+                        chord: None,
+                        note: None,
+                        verify_after_merge: None,
+                        detail: None,
+                    })
+                    .collect(),
             }),
             ..Default::default()
         });
-        assert_eq!(
-            matches!(model.interaction, Interaction::Picker(_)),
-            key == KeyCode::Null
-        );
+        match &model.interaction {
+            Interaction::Picker(picker) => {
+                assert_ne!(key, KeyCode::Esc);
+                // Down moved the menu's selection, not the board cursor.
+                assert_eq!(picker.selected, usize::from(key == KeyCode::Down));
+            }
+            _ => assert_eq!(key, KeyCode::Esc),
+        }
+        assert_eq!(model.selected_row().unwrap().key, "one");
         assert!(model.pending_request.is_none());
         assert!(model.follow_up.is_none());
     }
+}
+
+#[test]
+fn fast_session_close_never_reaches_board_remove() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char(';')), 20) else {
+        panic!()
+    };
+    let generation = model.ui_generation;
+    model.begin_action(7, &action);
+    // `d` on the board would request removal; while sessions load it waits.
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('d')), 20),
+        InputResult::Draw
+    );
+    assert!(model.pending_request.is_some());
+    let selection = crate::SessionSelection {
+        key: Some("one".into()),
+        target: crate::SessionTarget::Harness,
+        harness: wt_core::HarnessId::Claude,
+        session_id: Some("s1".into()),
+        live_slot: None,
+        managed_name: None,
+        mode: crate::SessionMode::Resume,
+        live: true,
+    };
+    model.reply(UiReply {
+        operation_id: Some(7),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Sessions {
+                choices: vec![selection.clone()],
+            },
+            title: "sessions".into(),
+            selected: 0,
+            options: vec![PickerOption {
+                value: Some("0".into()),
+                label: "Claude · live".into(),
+                chord: None,
+                note: None,
+                verify_after_merge: None,
+                detail: None,
+            }],
+        }),
+        ..Default::default()
+    });
+    assert!(
+        matches!(&model.follow_up, Some(UiAction::StopSession { selection: stopped }) if *stopped == selection),
+        "{:?}",
+        model.follow_up
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_menus_drop_typeahead_instead_of_replaying_it() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    let generation = model.ui_generation;
+    model.begin_action(42, &action);
+    model.input(KeyEvent::from(KeyCode::Char('m')), 20);
+    tokio::time::advance(super::input::TYPEAHEAD_TTL + std::time::Duration::from_millis(1)).await;
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Actions {
+                surface: crate::ActionSurface::Row { key: "one".into() },
+            },
+            title: "Actions".into(),
+            selected: 0,
+            options: vec![PickerOption {
+                value: Some(crate::AUTO_MERGE_ACTION_ID.into()),
+                label: "Merge".into(),
+                chord: Some('m'),
+                note: None,
+                verify_after_merge: None,
+                detail: None,
+            }],
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::Picker(_)));
+    assert!(model.follow_up.is_none());
+    assert_eq!(model.toast.as_ref().unwrap().1, ToastTone::Notice);
+}
+
+#[test]
+fn replay_stops_when_the_menu_closes_so_keys_never_fall_through() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one", "two"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    let generation = model.ui_generation;
+    model.begin_action(42, &action);
+    model.pending_request.as_mut().unwrap().typeahead = vec![
+        (KeyEvent::from(KeyCode::Esc), 20),
+        (KeyEvent::from(KeyCode::Char('j')), 20),
+    ];
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Actions {
+                surface: crate::ActionSurface::Row { key: "one".into() },
+            },
+            title: "Actions".into(),
+            selected: 0,
+            options: vec![],
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::None));
+    assert_eq!(model.selected_row().unwrap().key, "one");
 }
 
 #[test]

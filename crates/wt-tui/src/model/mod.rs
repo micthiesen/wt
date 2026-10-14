@@ -51,8 +51,12 @@ pub(crate) struct PendingRequest {
     pub id: u64,
     pub generation: u64,
     pub preparation: bool,
-    pub palette: bool,
-    pub chord: Option<char>,
+    /// The key that requested this menu; pressing it again cancels it.
+    pub opener: Option<crossterm::event::KeyEvent>,
+    /// Keys typed while the menu loads, replayed into it when it opens. They
+    /// never reach the board underneath.
+    pub typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
+    pub started: tokio::time::Instant,
     pub action: UiAction,
     pub _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
 }
@@ -67,6 +71,10 @@ pub struct Model {
     pub(crate) local_domains: wt_runtime::DomainMap,
     pub(crate) source_board: Arc<Board>,
     pub(crate) follow_up: Option<UiAction>,
+    /// Typeahead left after a replayed key requested another menu.
+    pub(crate) carry_typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
+    /// The key being dispatched, recorded as the opener of a requested menu.
+    pub(crate) last_key: Option<crossterm::event::KeyEvent>,
     pub board: Arc<Board>,
     pub source_state: SourceState,
     pub selected: Option<usize>,
@@ -134,6 +142,8 @@ impl Default for Model {
             next_op: 0,
             local_domains: Default::default(),
             follow_up: None,
+            carry_typeahead: Vec::new(),
+            last_key: None,
             source_state: SourceState::Empty,
             selected: None,
             offset: 0,

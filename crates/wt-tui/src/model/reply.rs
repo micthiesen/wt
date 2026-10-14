@@ -11,14 +11,6 @@ impl Model {
             self.creation_prepared(reply.operation_id, prepared);
             return None;
         }
-        let accepts_palette_chord = !reply.failed
-            && matches!(
-                &reply.modal,
-                Some(UiModal::Picker {
-                    action: PickerAction::Actions { .. },
-                    ..
-                })
-            );
         let completed_request = if self
             .pending_request
             .as_ref()
@@ -28,11 +20,11 @@ impl Model {
         } else {
             None
         };
-        let palette_chord = completed_request.as_ref().and_then(|request| {
-            (request.generation == self.ui_generation && request.palette)
-                .then_some(request.chord)
-                .flatten()
-        });
+        let typeahead = completed_request
+            .as_ref()
+            .filter(|request| request.generation == self.ui_generation && request.preparation)
+            .map(|request| (request.typeahead.clone(), request.started))
+            .filter(|(keys, _)| !keys.is_empty());
         let selected_create = self.reply_pending(&reply);
         let presentation_current = reply
             .ui_generation
@@ -205,17 +197,43 @@ impl Model {
                 self.pending_selection = Some(key);
             }
         }
-        if let Some(chord) = palette_chord
-            && presentation_current
-            && accepts_palette_chord
-            && matches!(&self.interaction, Interaction::Picker(picker) if matches!(picker.action, PickerAction::Actions { .. }) && picker.options.iter().any(|option| option.chord == Some(chord)))
-            && let super::InputResult::Action(action) = self.input(
-                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(chord)),
-                0,
-            )
-        {
-            self.follow_up = Some(action);
+        if let Some((keys, started)) = typeahead {
+            if presentation_current
+                && !reply.failed
+                && !matches!(self.interaction, Interaction::None)
+                && started.elapsed() <= super::input::TYPEAHEAD_TTL
+            {
+                self.replay_typeahead(keys);
+            } else if !reply.failed {
+                self.toast = Some((
+                    "Keys typed while the menu loaded were dropped".into(),
+                    ToastTone::Notice,
+                ));
+            }
         }
         reply.handoff
+    }
+
+    /// Feed keys typed during loading to the menu that just opened. Replay
+    /// stops when the menu closes, so a typed `q` or Esc can never fall
+    /// through to the board. A key that requests another menu carries the
+    /// remaining keys to that request.
+    fn replay_typeahead(&mut self, keys: Vec<(crossterm::event::KeyEvent, usize)>) {
+        let mut keys = keys.into_iter();
+        while let Some((key, height)) = keys.next() {
+            if matches!(self.interaction, Interaction::None) {
+                break;
+            }
+            match self.input(key, height) {
+                super::InputResult::Action(action) => {
+                    self.follow_up = Some(action);
+                    self.carry_typeahead = keys.collect();
+                    return;
+                }
+                super::InputResult::Quit => break,
+                _ => {}
+            }
+        }
+        self.last_key = None;
     }
 }

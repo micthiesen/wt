@@ -114,9 +114,12 @@ fn abandoning_a_menu_cancels_its_read() {
     let cancellation = tokio_util::sync::CancellationToken::new();
     model.pending_request.as_mut().unwrap()._cancel_on_drop =
         Some(cancellation.clone().drop_guard());
+    // Navigation typed while the menu loads belongs to the menu.
     model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+    assert!(!cancellation.is_cancelled());
+    assert_eq!(model.selected_row().unwrap().key, "one");
+    model.input(KeyEvent::from(KeyCode::Esc), 20);
     assert!(cancellation.is_cancelled());
-    assert_eq!(model.selected_row().unwrap().key, "two");
     assert!(model.pending_request.is_none());
 }
 

@@ -180,7 +180,7 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
     }
     if model.show_perf || !matches!(&model.interaction, Interaction::None) || model.yank.is_some() {
         if !matches!(&model.interaction, Interaction::Text(_)) && model.title_prompt.is_none() {
-            let _ = model.input(key, area.height.saturating_sub(4) as usize);
+            let _ = model.pointer_input(key, area.height.saturating_sub(4) as usize);
         }
         return true;
     }
@@ -200,7 +200,7 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
                 };
             }
             MousePane::List => {
-                let _ = model.input(key, area.height.saturating_sub(4) as usize);
+                let _ = model.pointer_input(key, area.height.saturating_sub(4) as usize);
             }
             MousePane::Output => model.output.scroll(up),
             _ => return false,

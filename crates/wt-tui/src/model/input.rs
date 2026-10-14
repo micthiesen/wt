@@ -10,6 +10,12 @@ use crate::{
     LineEditor, PickerAction, SessionTarget, TextAction, UiAction, UrlKind, editor::EditResult,
 };
 
+/// Keys held for a loading menu. Further keys are dropped.
+pub(crate) const TYPEAHEAD_LIMIT: usize = 16;
+/// A menu slower than this drops its typeahead instead of replaying keys
+/// into a menu the user never saw.
+pub(crate) const TYPEAHEAD_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Model {
     pub(crate) fn expire_toast(&mut self) {
         if self.pending_request.is_some() {
@@ -28,13 +34,26 @@ impl Model {
         InputResult::Draw
     }
 
+    /// Keys synthesized from the pointer act where the pointer is. They are
+    /// not typeahead, so a loading menu is abandoned rather than fed.
+    pub(crate) fn pointer_input(&mut self, key: KeyEvent, height: usize) -> InputResult {
+        if self
+            .pending_request
+            .as_ref()
+            .is_some_and(|request| request.preparation)
+        {
+            self.presentation_changed();
+        }
+        self.input(key, height)
+    }
+
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
         if let Some(request) = &mut self.pending_request
             && request.generation == self.ui_generation
             && request.preparation
         {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                || (request.palette && key.code == KeyCode::Char('!'))
+                || request.opener == Some(key)
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c' | 'C')))
             {
@@ -42,19 +61,14 @@ impl Model {
                 self.ui_generation = self.ui_generation.wrapping_add(1);
                 return self.notify("Menu cancelled");
             }
-            if request.palette
-                && key.modifiers.is_empty()
-                && let KeyCode::Char(ch) = key.code
-                && ch.is_ascii_alphanumeric()
-            {
-                // A fast palette chord belongs to the requested menu, never
-                // to the board underneath it. Keep at most one queued choice.
-                if request.chord.is_none() {
-                    request.chord = Some(ch);
-                }
-                return InputResult::Draw;
+            // Keys typed before the menu opens belong to that menu, never to
+            // the board underneath it. They replay in order when it opens.
+            if request.typeahead.len() < TYPEAHEAD_LIMIT {
+                request.typeahead.push((key, height));
             }
+            return InputResult::Draw;
         }
+        self.last_key = Some(key);
         let generation = self.ui_generation;
         let toast_before = self.toast.clone();
         self.ui_generation = self.ui_generation.wrapping_add(1);
