@@ -560,8 +560,6 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
             host == other_host && key == other_key
         }
         (Lane::Host(left), Lane::Creation(right))
-        | (Lane::Host(left), Lane::Metadata(right, _))
-        | (Lane::Metadata(left, _), Lane::Host(right))
         | (Lane::Creation(left), Lane::Host(right))
         | (Lane::Host(left), Lane::Removal(right, _))
         | (Lane::Removal(left, _), Lane::Host(right)) => left == right,
@@ -1420,11 +1418,28 @@ mod tests {
                     &Lane::Removal(host.clone(), "selected".into())
                 ));
                 assert!(lanes_conflict(&lane, &lane));
-                assert!(lanes_conflict(&lane, &Lane::Host(host.clone())));
+                assert!(!lanes_conflict(&lane, &Lane::Host(host.clone())));
                 assert!(lanes_conflict(&lane, &Lane::FleetCleanup));
                 assert!(!lanes_conflict(&lane, &Lane::Creation(host.clone())));
             }
         }
+    }
+
+    #[test]
+    fn metadata_does_not_wait_for_compaction_or_github_host_jobs() {
+        let action = wt_tui::UiAction::SetTitle {
+            key: "selected".into(),
+            title: "Saved now".into(),
+        };
+        let lane = lane_for(&action).unwrap();
+        let busy = BTreeSet::from([
+            Lane::Host(None),
+            Lane::Host(Some("one".into())),
+            Lane::Host(Some("two".into())),
+            Lane::Host(Some("three".into())),
+        ]);
+        let mut pending = VecDeque::from([(lane.clone(), action.clone())]);
+        assert_eq!(take_available(&mut pending, &busy), Some((lane, action)));
     }
 
     #[test]

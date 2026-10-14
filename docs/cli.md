@@ -4,14 +4,14 @@
 
 Environment variables: `WT_CONFIG` selects the user config and `XDG_CONFIG_HOME` relocates its default location (see [configuration.md](configuration.md)). Configuration is resolved once per process. The macOS `wt events` launch agent receives the config selection needed to load the same repository settings.
 
-### `wt init [directory] [--primary <claude|codex|opencode>]`
+### `wt init [directory] [--primary <claude|codex|opencode|pi>]`
 
 Create `.wt.toml` at the containing Git repository root. This command does not
 require an existing valid wt config. It detects the trunk branch, creates
 defaults for a sibling worktree root, and assigns path-derived cache and tmux
 namespaces. It refuses to overwrite an existing file.
 
-Use `wt init --primary codex` (or `opencode` / `claude`) to write
+Use `wt init --primary codex` (or `pi` / `opencode` / `claude`) to write
 `[harness] primary` into the repository config. Omit the flag to inherit
 the coding-agent default from your user config.
 
@@ -315,7 +315,7 @@ worker's checkout/state is untouched.
 
 ### `wt fleet`
 
-Session `alive` includes live Claude primary, Codex, and OpenCode tmux slots.
+Session `alive` includes live Claude primary, Codex, OpenCode, and Pi tmux slots.
 `busy` and `last_activity` come from the live Claude primary's registry entry;
 they remain `null` when that detail is unavailable, including Codex and OpenCode.
 `null` means unknown, not idle.
@@ -469,7 +469,7 @@ quietly reading as "nothing is live".
 |---|---|
 | `send <target> [text...]` | ensure the target's selected harness session exists, then submit text; reads stdin when no text args |
 | `send <target> --hold <id> [text...]` | validate an existing resource-hold reference and send its immutable metadata plus recipient check; never renews it |
-| `start <slug>` | ensure that session exists and invoke the bundled `start` skill using that harness's native prefix (`/start` for Claude, `$start` for Codex/OpenCode) |
+| `start <slug>` | ensure that session exists and invoke the bundled `start` skill using that harness's native prefix (`/start` for Claude, `$start` for Codex/OpenCode, `/skill:start` for Pi) |
 | `ls [--json]` | list the complete address book with target kind, cwd, live harnesses, selected harness, and whether selection was live or the primary fallback |
 
 Both commands are fire-and-forget with respect to the receiving agent's work,

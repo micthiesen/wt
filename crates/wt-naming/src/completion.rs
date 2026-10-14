@@ -15,6 +15,7 @@ pub struct HarnessPrograms {
     pub claude: OsString,
     pub codex: OsString,
     pub opencode: OsString,
+    pub pi: OsString,
 }
 
 impl Default for HarnessPrograms {
@@ -23,6 +24,7 @@ impl Default for HarnessPrograms {
             claude: "claude".into(),
             codex: "codex".into(),
             opencode: "opencode".into(),
+            pi: "pi".into(),
         }
     }
 }
@@ -63,6 +65,7 @@ pub fn build_completion_spec(
         NamingHarness::Claude => HarnessId::Claude,
         NamingHarness::Codex => HarnessId::Codex,
         NamingHarness::Opencode => HarnessId::Opencode,
+        NamingHarness::Pi => HarnessId::Pi,
     };
     let model = naming.models.get(harness_id.as_str());
     let mut args: Vec<OsString> = Vec::new();
@@ -144,6 +147,32 @@ pub fn build_completion_spec(
                 prompt.into(),
             ]);
             programs.opencode.clone()
+        }
+        HarnessId::Pi => {
+            args.extend(
+                [
+                    "--print",
+                    "--approve",
+                    "--no-session",
+                    "--no-tools",
+                    "--no-mcp",
+                    "--no-context-files",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                ]
+                .into_iter()
+                .map(Into::into),
+            );
+            if let Some(model) = model.filter(|m| !m.is_empty()) {
+                args.extend([OsString::from("--model"), model.into()]);
+            }
+            args.extend([
+                OsString::from("--thinking"),
+                effort_name(naming.reasoning_effort).into(),
+                OsString::from("--"),
+                prompt.into(),
+            ]);
+            programs.pi.clone()
         }
     };
     let timeout_ms = bounded_number("timeout_ms", naming.timeout_ms, 1, 600_000)?;
@@ -311,6 +340,7 @@ mod tests {
             claude: "fake-claude".into(),
             codex: "fake-codex".into(),
             opencode: "fake-opencode".into(),
+            pi: "fake-pi".into(),
         };
         let cwd = Path::new("/repo with spaces");
         let claude = build_completion_spec(
@@ -352,6 +382,25 @@ mod tests {
         .unwrap();
         assert_eq!(open.args.last().unwrap(), "safe prompt");
         assert!(open.args.iter().any(|arg| arg == "--pure"));
+        let pi = build_completion_spec(
+            &config(NamingHarness::Pi),
+            HarnessId::Claude,
+            "--prompt with spaces",
+            cwd,
+            &programs,
+        )
+        .unwrap();
+        assert_eq!(pi.program, "fake-pi");
+        assert_eq!(pi.args.last().unwrap(), "--prompt with spaces");
+        assert_eq!(pi.args[pi.args.len() - 2], "--");
+        for flag in [
+            "--no-tools",
+            "--no-session",
+            "--no-mcp",
+            "--no-context-files",
+        ] {
+            assert!(pi.args.iter().any(|arg| arg == flag));
+        }
     }
 
     #[test]

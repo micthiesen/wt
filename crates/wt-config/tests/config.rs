@@ -143,9 +143,18 @@ fn only_supported_session_harnesses_are_accepted_and_one_must_remain_visible() {
     let root = tempfile::tempdir().unwrap();
     let opts = options(root.path(), root.path(), &[]);
     let base = minimal_config(root.path());
-    let unsupported = format!("{base}\n[harness]\nprimary = 'pi'\n");
+    let pi =
+        format!("{base}\n[harness]\nprimary = 'pi'\nhidden = ['claude', 'codex', 'opencode']\n");
+    assert_eq!(
+        Config::from_raw(toml_value(&pi), &opts)
+            .unwrap()
+            .harness
+            .primary,
+        HarnessId::Pi
+    );
+    let unsupported = format!("{base}\n[harness]\nprimary = 'unknown-agent'\n");
     assert!(Config::from_raw(toml_value(&unsupported), &opts).is_err());
-    let all_hidden = format!("{base}\n[harness]\nhidden = ['claude', 'codex', 'opencode']\n");
+    let all_hidden = format!("{base}\n[harness]\nhidden = ['claude', 'codex', 'opencode', 'pi']\n");
     assert!(Config::from_raw(toml_value(&all_hidden), &opts).is_err());
 }
 

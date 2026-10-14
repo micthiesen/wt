@@ -12,7 +12,7 @@ use wt_platform::process::{CommandSpec, ProcessRunner};
 #[derive(Debug, Args)]
 pub struct InitArgs {
     pub directory: Option<PathBuf>,
-    #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+    #[arg(long, value_parser = ["claude", "codex", "opencode", "pi"])]
     pub primary: Option<String>,
     /// Branch namespace, required when the user config does not provide one.
     #[arg(long)]

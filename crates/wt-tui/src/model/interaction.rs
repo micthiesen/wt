@@ -707,6 +707,7 @@ fn harness_label(harness: wt_core::HarnessId) -> (&'static str, char) {
         wt_core::HarnessId::Claude => ("Claude", 'c'),
         wt_core::HarnessId::Codex => ("Codex", 'x'),
         wt_core::HarnessId::Opencode => ("OpenCode", 'o'),
+        wt_core::HarnessId::Pi => ("Pi", 'p'),
     }
 }
 

@@ -380,6 +380,103 @@ async fn distinct_session_environments_work_on_one_existing_server() {
 }
 
 #[tokio::test]
+async fn session_options_use_exact_session_scope_with_prefix_collisions() {
+    let temp = tempdir().unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("server.sock"))
+            .with_cwd(temp.path())
+            .with_config_file("/dev/null"),
+    );
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        for name in ["fixture", "fixture-long"] {
+            client
+                .create_session(
+                    &CreateSession {
+                        name: name.into(),
+                        cwd: temp.path().into(),
+                        command: vec!["cat".into()],
+                        width: Some(80),
+                        height: Some(24),
+                    },
+                    &cancel,
+                )
+                .await?;
+        }
+        let scope = OptionScope::Session("fixture".into());
+        let sibling = OptionScope::Session("fixture-long".into());
+        client
+            .set_option(
+                &scope,
+                "@wt-harness-session-id",
+                Some("thread-short"),
+                &cancel,
+            )
+            .await?;
+        client
+            .set_option(
+                &sibling,
+                "@wt-harness-session-id",
+                Some("thread-long"),
+                &cancel,
+            )
+            .await?;
+        assert_eq!(
+            client
+                .get_option(&scope, "@wt-harness-session-id", &cancel)
+                .await?,
+            Some("thread-short".into())
+        );
+        assert_eq!(
+            client
+                .get_option(&sibling, "@wt-harness-session-id", &cancel)
+                .await?,
+            Some("thread-long".into())
+        );
+        let rows = client.list_sessions(&cancel).await?;
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.name == "fixture")
+                .unwrap()
+                .harness_session_id
+                .as_deref(),
+            Some("thread-short")
+        );
+        client
+            .set_option(&scope, "@wt-harness-session-id", None, &cancel)
+            .await?;
+        assert_eq!(
+            client
+                .get_option(&scope, "@wt-harness-session-id", &cancel)
+                .await?,
+            None
+        );
+        assert!(
+            client
+                .set_option(
+                    &OptionScope::Session("fixtur".into()),
+                    "@wt-harness-session-id",
+                    Some("wrong"),
+                    &cancel
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .get_option(&sibling, "@wt-harness-session-id", &cancel)
+                .await?,
+            Some("thread-long".into())
+        );
+        Ok::<(), crate::TmuxError>(())
+    })
+    .await;
+    client.kill_server(&CancellationToken::new()).await.unwrap();
+    result.expect("session option fixture timed out").unwrap();
+}
+
+#[tokio::test]
 async fn isolated_server_inventory_paste_options_rename_resize_and_kill() {
     let temp = tempdir().unwrap();
     let socket = temp.path().join("server.sock");

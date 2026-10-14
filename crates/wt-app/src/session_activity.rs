@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{StreamExt, stream};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -22,7 +23,7 @@ use wt_harness::{
     ActivityKind, ClaudeEventParser, ClaudePaths, CodexActivityTracker, CodexEventLevel,
     CodexHarness, CodexOutputTracker, HarnessOutputKind, HarnessOutputTarget,
     OpenCodeActivityTracker, OpenCodeEventLevel, OpenCodeHarness, OpenCodeOutputTracker,
-    OpenCodePaths, session_jsonl_path,
+    OpenCodePaths, PiHarness, PiOutputTracker, PiStatus, session_jsonl_path,
 };
 use wt_runtime::{
     Persistence, SourceHandle, SourceSnapshot, SourceSpec, SourceState, Stamp, TaskScope,
@@ -320,6 +321,8 @@ struct ActivityCursors {
     opencode: OpenCodeActivityTracker,
     codex_output: CodexOutputTracker,
     opencode_output: OpenCodeOutputTracker,
+    pi_output: PiOutputTracker,
+    pi_status: BTreeMap<SessionKey, Option<PiStatus>>,
     next_event_id: u64,
 }
 
@@ -350,6 +353,11 @@ pub fn start(
     );
     let opencode = OpenCodeHarness::new(
         OpenCodePaths::new(&context.home, &context.config.paths.cache_root),
+        context.processes.clone(),
+        tmux.clone(),
+    );
+    let pi = PiHarness::new(
+        crate::harness::pi_paths(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         tmux,
     );
@@ -437,7 +445,7 @@ pub fn start(
                 .await;
                 (changed, std::collections::BTreeSet::new(), errors)
             } else {
-                let (mut changed, discovery_changed, mut errors) = poll_active(
+                let (mut changed, mut discovery_changed, mut errors) = poll_active(
                     &paths,
                     &codex,
                     &opencode,
@@ -447,6 +455,12 @@ pub fn start(
                     &cancellation,
                 )
                 .await;
+                let (pi_changed, pi_discovery, pi_errors) = poll_pi_activity(
+                    &pi, &mut cursors, &mut snapshot, &active, &cancellation,
+                ).await;
+                changed |= pi_changed;
+                discovery_changed.extend(pi_discovery);
+                errors.extend(pi_errors);
                 let (output_changed, output_errors) = poll_codex_output(
                     &codex,
                     &mut cursors,
@@ -760,6 +774,85 @@ async fn poll_codex_output(
         }
         Err(error) => (false, vec![format!("Codex output: {error}")]),
     }
+}
+
+async fn poll_pi_activity(
+    pi: &PiHarness,
+    cursors: &mut ActivityCursors,
+    snapshot: &mut SessionActivitySnapshot,
+    active: &[ActiveSession],
+    cancel: &CancellationToken,
+) -> (bool, BTreeSet<(String, HarnessId)>, Vec<String>) {
+    let mut changed = false;
+    let mut discoveries = BTreeSet::new();
+    let mut errors = Vec::new();
+    let targets = active
+        .iter()
+        .filter(|entry| entry.key.harness == HarnessId::Pi && !entry.key.session_id.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    let statuses = stream::iter(targets.into_iter().map(|entry| async move {
+        (
+            entry.key.clone(),
+            pi.status_for(
+                &entry.key.slug,
+                &entry.target.cwd,
+                &entry.key.session_id,
+                cancel,
+            )
+            .await,
+        )
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    let live_keys = statuses
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    cursors.pi_status.retain(|key, _| live_keys.contains(key));
+    if live_keys.is_empty() {
+        cursors.pi_output = PiOutputTracker::default();
+        return (false, discoveries, errors);
+    }
+    for (key, result) in statuses {
+        let status = match result {
+            Ok(status) if status.session_id == key.session_id => Some(status),
+            Ok(_) => None,
+            Err(error) => {
+                errors.push(format!("Pi activity for {}: {error}", key.slug));
+                None
+            }
+        };
+        // A lost or changed identity invalidates the previous state as well.
+        // Never infer idle from a historical transcript or a missing socket.
+        if cursors.pi_status.get(&key) != Some(&status) {
+            discoveries.insert((key.slug.clone(), HarnessId::Pi));
+            cursors.pi_status.insert(key, status);
+            changed = true;
+        }
+    }
+    let (tracker, output) = pi
+        .poll_output_async(
+            cursors.pi_output.clone(),
+            output_targets(active, HarnessId::Pi),
+            cancel,
+        )
+        .await;
+    cursors.pi_output = tracker;
+    match output {
+        Ok(updates) => {
+            for update in updates {
+                let slug = update.slug.clone();
+                if apply_output_update(snapshot, HarnessId::Pi, update) {
+                    changed = true;
+                    discoveries.insert((slug, HarnessId::Pi));
+                }
+            }
+        }
+        Err(error) => errors.push(format!("Pi output: {error}")),
+    }
+    (changed, discoveries, errors)
 }
 
 fn output_targets(active: &[ActiveSession], harness: HarnessId) -> Vec<HarnessOutputTarget> {

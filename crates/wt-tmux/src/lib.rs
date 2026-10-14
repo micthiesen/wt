@@ -1456,7 +1456,10 @@ fn parse_bool(value: &str, operation: &'static str, line: &str) -> Result<bool, 
 fn option_scope_args(scope: &OptionScope) -> (Option<&'static str>, Option<String>) {
     match scope {
         OptionScope::Server => (Some("-s"), None),
-        OptionScope::Session(session) => (None, Some(exact_session_target(session))),
+        // Option commands resolve their -t through a pane/window target even
+        // when the option belongs to the session. The trailing colon keeps
+        // '=name' an exact session selector instead of a literal window name.
+        OptionScope::Session(session) => (None, Some(exact_pane_target(session))),
         OptionScope::Window(target) => (Some("-w"), Some(target.as_str().to_owned())),
         OptionScope::Pane(target) => (Some("-p"), Some(target.as_str().to_owned())),
     }

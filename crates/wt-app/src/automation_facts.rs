@@ -697,6 +697,7 @@ fn session_busy(
         inventory.kinds.claude.iter().any(|slot| slot.slug == slug)
             || inventory.kinds.codex.contains(slug)
             || inventory.kinds.opencode.contains(slug)
+            || inventory.kinds.pi.contains(slug)
     };
     if !has_live {
         return false;
@@ -717,6 +718,7 @@ fn primary_skill_prefix(ctx: &AppContext) -> String {
     match ctx.config.harness.primary {
         wt_config::HarnessId::Claude => "/".into(),
         wt_config::HarnessId::Codex | wt_config::HarnessId::Opencode => "$".into(),
+        wt_config::HarnessId::Pi => "/skill:".into(),
     }
 }
 

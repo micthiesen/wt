@@ -270,6 +270,7 @@ pub enum NamingHarness {
     Claude,
     Codex,
     Opencode,
+    Pi,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

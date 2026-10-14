@@ -61,6 +61,8 @@ pub struct SessionKinds {
     pub claude: Vec<ClaudeSlot>,
     pub codex: BTreeSet<String>,
     pub opencode: BTreeSet<String>,
+    #[serde(default)]
+    pub pi: BTreeSet<String>,
     pub diff: BTreeSet<String>,
     pub shell: BTreeSet<String>,
     pub action: BTreeSet<String>,
@@ -152,6 +154,7 @@ pub fn start(
         ClaudePaths::new(&context.home, &context.config.paths.cache_root),
         crate::harness::codex_paths(&context.home, &context.config.paths.cache_root),
         OpenCodePaths::new(&context.home, &context.config.paths.cache_root),
+        crate::harness::pi_paths(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         TmuxClient::new(
             context.processes.clone(),
@@ -320,6 +323,9 @@ fn classify_sessions(sessions: Vec<SessionInfo>) -> SessionInventory {
                 "-codex" => {
                     result.kinds.codex.insert(slug.to_owned());
                 }
+                "-pi" => {
+                    result.kinds.pi.insert(slug.to_owned());
+                }
                 "-opencode" => {
                     result.kinds.opencode.insert(slug.to_owned());
                 }
@@ -357,13 +363,21 @@ fn classify_sessions(sessions: Vec<SessionInfo>) -> SessionInventory {
 }
 
 fn strip_kind_suffix(name: &str) -> Option<(&str, &'static str)> {
-    ["-opencode", "-codex", "-action", "-shell", "-diff", "-dev"]
-        .into_iter()
-        .find_map(|suffix| {
-            name.strip_suffix(suffix)
-                .filter(|slug| !slug.is_empty())
-                .map(|slug| (slug, suffix))
-        })
+    [
+        "-opencode",
+        "-codex",
+        "-pi",
+        "-action",
+        "-shell",
+        "-diff",
+        "-dev",
+    ]
+    .into_iter()
+    .find_map(|suffix| {
+        name.strip_suffix(suffix)
+            .filter(|slug| !slug.is_empty())
+            .map(|slug| (slug, suffix))
+    })
 }
 
 struct DiscoveryInputs {
@@ -492,6 +506,9 @@ fn spawn_discoveries(
                 pending.insert((name.clone(), HarnessId::Claude));
                 if let Some(slug) = name.strip_suffix("-codex") {
                     pending.remove(&(slug.to_owned(), HarnessId::Codex));
+                }
+                if let Some(slug) = name.strip_suffix("-pi") {
+                    pending.remove(&(slug.to_owned(), HarnessId::Pi));
                 }
                 if let Some(slug) = name.strip_suffix("-opencode") {
                     pending.remove(&(slug.to_owned(), HarnessId::Opencode));
@@ -652,6 +669,14 @@ fn live_discovery_requests(inventory: &SessionInventory) -> BTreeSet<(String, Ha
             .cloned()
             .map(|slug| (slug, HarnessId::Opencode)),
     );
+    requests.extend(
+        inventory
+            .kinds
+            .pi
+            .iter()
+            .cloned()
+            .map(|slug| (slug, HarnessId::Pi)),
+    );
     requests
 }
 
@@ -686,6 +711,7 @@ fn tmux_name(target: &crate::harness::AgentTarget, harness: HarnessId) -> String
         ),
         HarnessId::Codex => format!("{}-codex", target.slug),
         HarnessId::Opencode => format!("{}-opencode", target.slug),
+        HarnessId::Pi => format!("{}-pi", target.slug),
     }
 }
 
@@ -831,6 +857,7 @@ mod tests {
             ClaudePaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
             crate::harness::codex_paths(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
             OpenCodePaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
+            wt_harness::PiPaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
             fixture.ctx.processes.clone(),
             TmuxClient::new(
                 fixture.ctx.processes.clone(),
@@ -949,7 +976,7 @@ mod tests {
 
     #[test]
     fn stable_harness_slot_without_uuid_does_not_make_its_entire_history_live() {
-        for harness in [HarnessId::Codex, HarnessId::Opencode] {
+        for harness in [HarnessId::Codex, HarnessId::Opencode, HarnessId::Pi] {
             let name = format!("branch-{}", harness.as_str());
             let mut inventory = classify_sessions(vec![session(&name, None)]);
             let history = ["old", "current"].map(|id| HarnessSession {
@@ -982,6 +1009,7 @@ mod tests {
             session("main-manager", None),
             session("branch-codex", Some("old-rollout-id")),
             session("branch-opencode", None),
+            session("branch-pi", Some("pi-session-id")),
             session("branch~review", None),
             session("branch-shell", None),
             session("branch-action", None),
@@ -1006,6 +1034,8 @@ mod tests {
         );
         assert!(inventory.kinds.codex.contains("branch"));
         assert!(inventory.kinds.opencode.contains("branch"));
+        assert!(inventory.kinds.pi.contains("branch"));
+        assert!(live_discovery_requests(&inventory).contains(&("branch".into(), HarnessId::Pi)));
         assert!(inventory.kinds.shell.contains("branch"));
         assert!(inventory.kinds.action.contains("branch"));
         assert!(inventory.kinds.dev.contains("branch"));

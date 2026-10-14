@@ -250,7 +250,8 @@ async fn handoff_conflict(
             wt_harness::CodexMessageOutcome::Queued(_)
             | wt_harness::CodexMessageOutcome::CliQueued { .. },
         ))
-        | Ok(wt_harness::HarnessMessageOutcome::OpenCode(_)) => Ok(()),
+        | Ok(wt_harness::HarnessMessageOutcome::OpenCode(_))
+        | Ok(wt_harness::HarnessMessageOutcome::Pi(_)) => Ok(()),
         Ok(wt_harness::HarnessMessageOutcome::Claude(wt_harness::ClaudeMessageOutcome::Sent {
             delivered: None,
             ..
@@ -311,6 +312,7 @@ fn conflict_handoff_text(harness: wt_core::HarnessId, detail: &str, backup_ref: 
     let prefix = match harness {
         wt_core::HarnessId::Claude => "/",
         wt_core::HarnessId::Codex | wt_core::HarnessId::Opencode => "$",
+        wt_core::HarnessId::Pi => "/skill:",
     };
     format!(
         "{prefix}restack\n\nwt's restack engine just bailed on this worktree: {detail}. The pre-rebase tip is backed up at {backup_ref}. Resolve the conflict and finish the restack."

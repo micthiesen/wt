@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-const NEVER_SHIM: &[&str] = &["claude", "codex", "opencode"];
+const NEVER_SHIM: &[&str] = &["claude", "codex", "opencode", "pi"];
 const ALWAYS_SHIM: &[&str] = &["bun"];
 const LAUNCHER_SHIM: &[&str] = &["pnpm", "pnpx", "npx", "yarn"];
 const MIN_COMPILED_BYTES: u64 = 8 * 1024 * 1024;

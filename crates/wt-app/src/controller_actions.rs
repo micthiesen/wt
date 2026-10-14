@@ -24,6 +24,7 @@ fn harness_name(harness: wt_core::HarnessId) -> &'static str {
         wt_core::HarnessId::Claude => "Claude",
         wt_core::HarnessId::Codex => "Codex",
         wt_core::HarnessId::Opencode => "OpenCode",
+        wt_core::HarnessId::Pi => "Pi",
     }
 }
 

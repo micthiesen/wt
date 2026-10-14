@@ -241,9 +241,13 @@ pub fn detect_targets(o: &TargetOptions) -> Targets {
     let home = &o.home;
     let codex = o.codex_home.clone().unwrap_or_else(|| home.join(".codex"));
     let pi = o.pi_dir.clone().or_else(|| {
-        [home.join(".pi"), home.join(".config/pi")]
-            .into_iter()
-            .find(|p| configured(p))
+        [
+            home.join(".pi/agent"),
+            home.join(".pi"),
+            home.join(".config/pi"),
+        ]
+        .into_iter()
+        .find(|p| configured(p))
     });
     let mut hs = vec![];
     if configured(&home.join(".claude")) {
@@ -299,6 +303,15 @@ pub fn detect_targets(o: &TargetOptions) -> Targets {
 pub fn harness_skill_dirs(h: HarnessId, o: &TargetOptions) -> Vec<PathBuf> {
     match h {
         HarnessId::Claude | HarnessId::Opencode => vec![resolve(&o.home.join(".claude/skills"))],
+        HarnessId::Pi => vec![
+            resolve(&o.home.join(".agents/skills")),
+            resolve(
+                &o.pi_dir
+                    .clone()
+                    .unwrap_or_else(|| o.home.join(".pi/agent"))
+                    .join("skills"),
+            ),
+        ],
         HarnessId::Codex => {
             let preferred = if o.home.join(".agents").exists() {
                 o.home.join(".agents/skills")

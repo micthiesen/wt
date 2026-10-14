@@ -10,7 +10,8 @@ use crate::{
     ClaudePaths, ClaudeSessionManager, ClaudeSessionManagerError, ClaudeSessionTarget,
     CodexHarness, CodexHarnessError, CodexMessageOutcome, CodexMessageTarget, CodexPaths,
     DiscoveryRequest, HarnessId, HarnessSession, HarnessSpawnRequest, OpenCodeError,
-    OpenCodeHarness, OpenCodePaths, OpenCodeSendOutcome, SpawnCommand,
+    OpenCodeHarness, OpenCodePaths, OpenCodeSendOutcome, PiError, PiHarness, PiPaths,
+    PiSendOutcome, SpawnCommand,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +29,7 @@ pub enum HarnessMessageOutcome {
     Claude(ClaudeMessageOutcome),
     Codex(CodexMessageOutcome),
     OpenCode(OpenCodeSendOutcome),
+    Pi(PiSendOutcome),
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +46,8 @@ pub enum HarnessServiceError {
     Codex(#[from] CodexHarnessError),
     #[error(transparent)]
     OpenCode(#[from] OpenCodeError),
+    #[error(transparent)]
+    Pi(#[from] PiError),
 }
 
 /// Shared adapter surface for callers that select a harness dynamically.
@@ -56,6 +60,7 @@ pub struct HarnessService {
     claude_messenger: ClaudeMessenger,
     codex: CodexHarness,
     opencode: OpenCodeHarness,
+    pi: PiHarness,
 }
 
 impl HarnessService {
@@ -63,6 +68,7 @@ impl HarnessService {
         claude_paths: ClaudePaths,
         codex_paths: CodexPaths,
         opencode_paths: OpenCodePaths,
+        pi_paths: PiPaths,
         runner: ProcessRunner,
         tmux: TmuxClient,
     ) -> Self {
@@ -77,7 +83,8 @@ impl HarnessService {
             claude_sessions,
             claude_messenger,
             codex: CodexHarness::new(codex_paths, runner.clone(), tmux.clone()),
-            opencode: OpenCodeHarness::new(opencode_paths, runner, tmux),
+            opencode: OpenCodeHarness::new(opencode_paths, runner.clone(), tmux.clone()),
+            pi: PiHarness::new(pi_paths, runner, tmux),
         }
     }
 
@@ -98,6 +105,7 @@ impl HarnessService {
             HarnessId::Claude => self.claude.build_spawn_command(request),
             HarnessId::Codex => self.codex.build_spawn_command(request),
             HarnessId::Opencode => self.opencode.build_spawn_command(request),
+            HarnessId::Pi => self.pi.build_spawn_command(request),
         }
     }
 
@@ -157,6 +165,7 @@ impl HarnessService {
                 .discover(request, request.live_session_id.as_deref(), cancel)
                 .await?),
             HarnessId::Opencode => Ok(self.opencode.discover(request, cancel).await?),
+            HarnessId::Pi => Ok(self.pi.discover(request, cancel).await?),
         }
     }
 
@@ -180,6 +189,7 @@ impl HarnessService {
             }
             HarnessId::Codex => Ok(self.codex.start(request, cancel).await?),
             HarnessId::Opencode => Ok(self.opencode.start(request, cancel).await?),
+            HarnessId::Pi => Ok(self.pi.start(request, cancel).await?),
         }
     }
 
@@ -225,6 +235,21 @@ impl HarnessService {
                     .send_message(&target.slug, &target.cwd, &text, cancel)
                     .await?,
             )),
+            HarnessId::Pi => Ok(HarnessMessageOutcome::Pi(
+                self.pi
+                    .send_to(
+                        &HarnessSpawnRequest {
+                            worktree_path: target.cwd.clone(),
+                            slug: target.slug.clone(),
+                            managed_name: target.managed_name.clone(),
+                            resume_session_id: None,
+                            display_label: target.managed_name.clone(),
+                        },
+                        &text,
+                        cancel,
+                    )
+                    .await?,
+            )),
         }
     }
 }
@@ -241,6 +266,12 @@ fn stamp_sender(text: &str, sender: Option<&str>) -> String {
 
 fn is_harness_command(text: &str) -> bool {
     let first = text.split_whitespace().next().unwrap_or_default();
+    if let Some(skill) = first.strip_prefix("/skill:") {
+        return !skill.is_empty()
+            && skill
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    }
     let Some(command) = first.strip_prefix('/').or_else(|| first.strip_prefix('$')) else {
         return false;
     };
@@ -262,6 +293,12 @@ mod tests {
     fn sender_tagging_preserves_commands_and_existing_attribution() {
         assert!(is_harness_command("  /compact"));
         assert!(is_harness_command("$start now"));
+        assert!(is_harness_command("/skill:start now"));
+        assert_eq!(
+            stamp_sender("/skill:start now", Some("manager")),
+            "/skill:start now"
+        );
+        assert!(!is_harness_command("/skill:"));
         assert!(!is_harness_command("/Users/mike/file"));
         assert!(!is_harness_command("/$path"));
         assert_eq!(

@@ -335,8 +335,9 @@ delay them. Attention acknowledgement returns its own accept stamp before
 refreshing metadata. Read-only preparations, worktree creation and terminal
 entry also have reserved capacity. Title, issue and status writes share a bounded
 metadata slot independent of ordinary host capacity. They conflict with removal
-of their own target, broad host mutations and fleet cleanup, but not unrelated
-removals or creation. Palette title actions use the same classification as direct
+of their own target and fleet cleanup, but not unrelated removals, creation or
+long host actions such as compaction and GitHub requests. Transactional field
+updates and captured revisions protect independent metadata writes. Palette title actions use the same classification as direct
 title actions. Terminal handoffs serialize with each other;
 worktree entry also conflicts with removal of that exact host and checkout, and
 with fleet cleanup. Special-session entry and unrelated checkouts remain

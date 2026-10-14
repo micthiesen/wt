@@ -454,7 +454,7 @@ fn picker(
                 .any(|choice| choice.mode == SessionMode::Resume) =>
         {
             extra.extend([
-                hint("c / x / o", "new …"),
+                hint("c / x / o / p", "new …"),
                 hint("d", "close"),
                 hint("x", "kill"),
             ]);
@@ -2110,6 +2110,7 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
         ("claude", "Claude session live"),
         ("codex", "Codex session live"),
         ("opencode", "OpenCode session live"),
+        ("pi", "Pi session live"),
     ] {
         row_items.push(glyph_item(
             Badge {

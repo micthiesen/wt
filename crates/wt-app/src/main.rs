@@ -50,6 +50,7 @@ mod lifecycle_ops;
 mod local_source;
 mod logging;
 mod managed;
+mod managed_pi;
 mod naming;
 mod naming_source;
 mod origin;

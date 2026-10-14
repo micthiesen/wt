@@ -74,6 +74,7 @@ pub enum ActionHarness {
     Claude,
     Codex,
     OpenCode,
+    Pi,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,6 +379,16 @@ fn headless_runner(
                 "run".into(),
                 "--dir".into(),
                 cwd.to_string_lossy().into_owned(),
+                "--".into(),
+                prompt.into(),
+            ],
+        ),
+        ActionHarness::Pi => (
+            ActionRunKind::Harness,
+            vec![
+                "pi".into(),
+                "--print".into(),
+                "--approve".into(),
                 "--".into(),
                 prompt.into(),
             ],

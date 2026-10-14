@@ -39,6 +39,10 @@ pub struct ManagedRequest {
     /// Credential-free controller account-switch intent; workers log in independently.
     #[serde(default)]
     pub codex_auth_generation: Option<u64>,
+    /// Exact supported Pi runtime, installed privately on the worker. Native
+    /// provider credentials and user settings are never part of this request.
+    #[serde(default)]
+    pub pi_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,12 +200,21 @@ mod tests {
             repo_files: vec![],
             codex_config: None,
             codex_auth_generation: None,
+            pi_version: Some("1.2.0".into()),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("\\u0000"));
         assert_eq!(
             serde_json::from_str::<ManagedRequest>(&json).unwrap(),
             request
+        );
+        let mut legacy = serde_json::to_value(&request).unwrap();
+        legacy.as_object_mut().unwrap().remove("pi_version");
+        assert_eq!(
+            serde_json::from_value::<ManagedRequest>(legacy)
+                .unwrap()
+                .pi_version,
+            None
         );
     }
 

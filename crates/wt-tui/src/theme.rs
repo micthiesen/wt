@@ -36,6 +36,8 @@ pub(crate) const CODEX: Color = rgb(0x4d56d6);
 /// Amber, the indigo complement, so Codex `working` contrasts in hue.
 pub(crate) const CODEX_ALT: Color = rgb(0xe0a94f);
 pub(crate) const OPENCODE: Color = rgb(0xa78bfa);
+pub(crate) const PI: Color = rgb(0x58c4b8);
+pub(crate) const PI_ALT: Color = rgb(0xf0a4c2);
 /// Lime, the violet complement, so OpenCode `working` reads as its own hue.
 pub(crate) const OPENCODE_ALT: Color = rgb(0x9ccf6e);
 

@@ -166,7 +166,8 @@ pub async fn dispatch_automation(
                         delivered: Some(true),
                         ..
                     })
-                    | HarnessMessageOutcome::OpenCode(_) => AutomationOutcome::Delivered {
+                    | HarnessMessageOutcome::OpenCode(_)
+                    | HarnessMessageOutcome::Pi(_) => AutomationOutcome::Delivered {
                         slot: if target == "manager" {
                             DeliverySlot::Manager
                         } else {
@@ -343,10 +344,12 @@ pub async fn prepare(
         HarnessId::Claude => ActionHarness::Claude,
         HarnessId::Codex => ActionHarness::Codex,
         HarnessId::Opencode => ActionHarness::OpenCode,
+        HarnessId::Pi => ActionHarness::Pi,
     };
     let skill_prefix = match primary {
         HarnessId::Claude => "/",
         HarnessId::Codex | HarnessId::Opencode => "$",
+        HarnessId::Pi => "/skill:",
     };
     Ok(ActionContext {
         action_key,
@@ -562,8 +565,9 @@ async fn delivery_route(
             HarnessId::Claude => slug.clone(),
             HarnessId::Codex => format!("{slug}-codex"),
             HarnessId::Opencode => format!("{slug}-opencode"),
+            HarnessId::Pi => format!("{slug}-pi"),
         };
-        if id == HarnessId::Codex && name != slug && known_slugs.contains(&name) {
+        if id != HarnessId::Claude && known_slugs.contains(&name) {
             continue;
         }
         if sessions.iter().any(|session| session.name == name)
@@ -610,6 +614,7 @@ fn harness_kind(id: HarnessId) -> ActionHarness {
         HarnessId::Claude => ActionHarness::Claude,
         HarnessId::Codex => ActionHarness::Codex,
         HarnessId::Opencode => ActionHarness::OpenCode,
+        HarnessId::Pi => ActionHarness::Pi,
     }
 }
 
@@ -617,6 +622,7 @@ fn skill_prefix(id: HarnessId) -> &'static str {
     match id {
         HarnessId::Claude => "/",
         HarnessId::Codex | HarnessId::Opencode => "$",
+        HarnessId::Pi => "/skill:",
     }
 }
 
@@ -705,6 +711,14 @@ fn report_delivery(name: &str, target: &str, outcome: HarnessMessageOutcome) -> 
         }
         HarnessMessageOutcome::OpenCode(outcome) => Ok(format!(
             "{name} sent to {target}{}",
+            if outcome.cold_started {
+                " (session started)"
+            } else {
+                ""
+            }
+        )),
+        HarnessMessageOutcome::Pi(outcome) => Ok(format!(
+            "{name} accepted by {target}{}",
             if outcome.cold_started {
                 " (session started)"
             } else {

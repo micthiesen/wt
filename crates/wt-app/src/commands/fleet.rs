@@ -156,6 +156,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
                     || name.starts_with(&format!("{slug}~"))
                     || name == &format!("{slug}-codex")
                     || name == &format!("{slug}-opencode")
+                    || name == &format!("{slug}-pi")
             })
         });
         let claude_activity = registry

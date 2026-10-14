@@ -151,7 +151,9 @@ and it drives the rest of the design:
   comments and config symlinks, uses atomic private-file replacement, and refuses
   malformed or concurrently changed config. It never trusts a parent or sibling
   as a shortcut. Entries remain in the harness config after teardown. OpenCode
-  has no such gate.
+  has no such gate. Pi uses its native `--approve` flag for the validated target
+  of that launch, without rewriting global trust or permission settings. See
+  [Pi sessions](pi.md) for its interactive control and managed-host behavior.
 
   **The Claude write is verified, and repairs its siblings.** `~/.claude.json`
   is one shared blob that Claude Code also read-modify-writes, and its window

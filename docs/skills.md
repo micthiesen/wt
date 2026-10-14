@@ -139,8 +139,10 @@ ever rewrites the region between its own markers.
 
 Detection follows the real filesystem, per tool configured on the machine.
 The tools here are the ones wt installs *into* — a superset of the harnesses
-it can start sessions for (`crates/wt-harness/`). Pi, for instance, reads the
-shared instructions file and `~/.agents/skills` without wt ever spawning it.
+it can start sessions for (`crates/wt-harness/`). Pi sessions use native
+`/skill:<name>` invocation and read shared `~/.agents/skills` or the selected
+agent directory's `skills` folder. Detection honors `PI_CODING_AGENT_DIR`, then
+prefers the native `~/.pi/agent` directory over legacy Pi locations.
 
 - **Configured means the config dir has CONTENT.** An empty `~/.config/<tool>`
   is a stow mount point a dotfiles package left behind when it stopped

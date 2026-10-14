@@ -234,6 +234,7 @@ pub fn harness_label(harness: wt_core::HarnessId) -> &'static str {
         wt_core::HarnessId::Claude => "Claude Code",
         wt_core::HarnessId::Codex => "Codex",
         wt_core::HarnessId::Opencode => "OpenCode",
+        wt_core::HarnessId::Pi => "Pi",
     }
 }
 
@@ -243,6 +244,7 @@ pub fn harness_letter(harness: wt_core::HarnessId) -> char {
         wt_core::HarnessId::Claude => 'c',
         wt_core::HarnessId::Codex => 'x',
         wt_core::HarnessId::Opencode => 'o',
+        wt_core::HarnessId::Pi => 'p',
     }
 }
 
@@ -321,7 +323,11 @@ mod tests {
             .collect();
         assert_eq!(
             values,
-            vec![("claude".into(), Some('c')), ("opencode".into(), Some('o'))]
+            vec![
+                ("claude".into(), Some('c')),
+                ("opencode".into(), Some('o')),
+                ("pi".into(), Some('p'))
+            ]
         );
         assert_eq!(selected, 1);
     }

@@ -459,6 +459,14 @@ fn print_delivery(
             );
             Ok(0)
         }
+        HarnessMessageOutcome::Pi(outcome) => {
+            if outcome.cold_started {
+                println!("Started Pi and submitted the message");
+            } else {
+                println!("Submitted to Pi");
+            }
+            Ok(0)
+        }
     }
 }
 

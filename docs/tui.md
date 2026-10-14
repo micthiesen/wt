@@ -56,7 +56,7 @@ they start expanded when the check is due.
 Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
 order and visibility: `branch` (with its landing base), `issue` (also
 `linear`), `stage`, `dev`, `pr` (number, merge queue or auto-merge, checks with
-failing names, review, review bot), `claude` (every Claude, Codex, and OpenCode
+failing names, review, review bot), `claude` (every Claude, Codex, OpenCode, and Pi
 session, the F12 target first), and `git` (dirty or clean, diff against the
 merge-base, last commit and creation ages, upstream counts in parentheses, base
 counts in brackets). The optional `path` group can be added explicitly and
@@ -280,8 +280,8 @@ armed or the unconfirmed attempt expires.
 |---|---|
 | `F10` / `F11` / `F12` | Enter shell / diff / agent session |
 | `Shift+F10` / `Shift+F11` | Stop shell / diff session after confirmation |
-| `Shift+F12` | Start a new agent session: `c` Claude, `x` Codex, `o` OpenCode, or `F12` for the highlighted one |
-| `;` | Pick a session. Inside: `d` closes the highlighted live session gracefully and `x` kills it (a dead Claude row is forgotten), both without confirmation; `c`/`x`/`o` on a New row jump between harnesses; an empty Claude name picks one automatically |
+| `Shift+F12` | Start a new agent session: `c` Claude, `x` Codex, `o` OpenCode, `p` Pi, or `F12` for the highlighted one |
+| `;` | Pick a session. Inside: `d` closes the highlighted live session gracefully and `x` kills it (a dead Claude row is forgotten), both without confirmation; `c`/`x`/`o`/`p` on a New row jump between harnesses; an empty Claude name picks one automatically |
 | `Shift+Tab` | Cycle the primary harness |
 | `!` | Open worktree actions: `m` merge when ready, `u`/`g` agent builtins, `d`/`s` dev server, `l` dev logs, `t` rename with AI, `c` custom prompt, and configured actions |
 | `m` / `M` | Enter the manager session / open manager commands |
@@ -294,7 +294,7 @@ and its original worktree and host. Ignored keys do not dismiss the pending
 menu. Escape, `q`, Ctrl+C, `!`, or arrow-key navigation cancels it before its delayed reply can
 open; preparation failures remain visible as errors.
 
-The session picker runs on the selected host. A running Codex or OpenCode slot
+The session picker runs on the selected host. A running Codex, OpenCode, or Pi slot
 whose conversation UUID cannot be proven appears as **current session
 (conversation not identified)**. Enter reconnects to that exact terminal;
 historical conversations remain separate. Live selections capture the tmux

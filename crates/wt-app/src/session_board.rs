@@ -90,6 +90,8 @@ fn compose(
                 (name.as_str(), "Claude")
             } else if let Some(slug) = name.strip_suffix("-codex") {
                 (slug, "Codex")
+            } else if let Some(slug) = name.strip_suffix("-pi") {
+                (slug, "Pi")
             } else if let Some(slug) = name.strip_suffix("-opencode") {
                 (slug, "OpenCode")
             } else if let Some((slug, _)) = name.split_once('~') {
@@ -133,7 +135,7 @@ fn compose(
         let identity_unproven = inventory_ok
             && matches!(
                 entry.key.harness,
-                wt_core::HarnessId::Codex | wt_core::HarnessId::Opencode
+                wt_core::HarnessId::Codex | wt_core::HarnessId::Opencode | wt_core::HarnessId::Pi
             )
             && inventory_data.is_some_and(|all| {
                 all.all.contains_key(&session.tmux_session_name)
@@ -170,6 +172,7 @@ fn compose(
                 wt_core::HarnessId::Claude => "Claude",
                 wt_core::HarnessId::Codex => "Codex",
                 wt_core::HarnessId::Opencode => "OpenCode",
+                wt_core::HarnessId::Pi => "Pi",
             }
             .into(),
             name: sanitize_terminal_text(&session.display_name),
@@ -455,90 +458,93 @@ mod tests {
     }
 
     #[test]
-    fn unproven_reused_codex_slot_is_unknown_until_exact_uuid_is_captured() {
-        let board = SourceSnapshot::test_live(
-            Some(Board {
-                rows: vec![BoardRow {
-                    slug: "one".into(),
+    fn unproven_reused_slots_are_unknown_until_exact_uuid_is_captured() {
+        for harness in [wt_core::HarnessId::Codex, wt_core::HarnessId::Pi] {
+            let slot = format!("one-{}", harness.as_str());
+            let board = SourceSnapshot::test_live(
+                Some(Board {
+                    rows: vec![BoardRow {
+                        slug: "one".into(),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
-            }),
-            SourceState::Ready,
-            Domain::Git,
-        );
-        let discoveries = SourceSnapshot::test_live(
-            Some(
-                vec!["old", "current"]
-                    .into_iter()
-                    .map(|id| DiscoveredSession {
-                        key: SessionKey {
-                            slug: "one".into(),
-                            harness: wt_core::HarnessId::Codex,
-                            session_id: id.into(),
-                        },
-                        session: HarnessSession {
-                            display_name: id.into(),
-                            session_id: id.into(),
-                            tmux_session_name: "one-codex".into(),
-                            last_active_ms: None,
-                            is_live: true,
-                            extras: HarnessExtras {
-                                derived_state: Some(DerivedState::Idle),
-                                ..Default::default()
+                }),
+                SourceState::Ready,
+                Domain::Git,
+            );
+            let discoveries = SourceSnapshot::test_live(
+                Some(
+                    vec!["old", "current"]
+                        .into_iter()
+                        .map(|id| DiscoveredSession {
+                            key: SessionKey {
+                                slug: "one".into(),
+                                harness,
+                                session_id: id.into(),
                             },
-                        },
-                    })
-                    .collect(),
-            ),
-            SourceState::Ready,
-            Domain::Sessions,
-        );
-        let mut inventory = SessionInventory::default();
-        inventory.all.insert(
-            "one-codex".into(),
-            crate::session_source::SessionDescriptor {
-                name: "one-codex".into(),
-                id: "tmux-id".into(),
-                created_at: 0,
-                attached_clients: 1,
-                window_count: 1,
-                harness_session_id: None,
-            },
-        );
-        let inventory =
-            SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
-        let activity = SourceSnapshot::default();
-        let result = compose(
-            board.clone(),
-            inventory.clone(),
-            discoveries.clone(),
-            activity.clone(),
-        );
-        let sessions = &result.data().unwrap().rows[0].sessions;
-        assert!(
-            sessions
-                .iter()
-                .all(|session| !session.live && session.state == "unknown")
-        );
-        assert!(result.data().unwrap().rows[0].badge.is_empty());
+                            session: HarnessSession {
+                                display_name: id.into(),
+                                session_id: id.into(),
+                                tmux_session_name: slot.clone(),
+                                last_active_ms: None,
+                                is_live: true,
+                                extras: HarnessExtras {
+                                    derived_state: Some(DerivedState::Idle),
+                                    ..Default::default()
+                                },
+                            },
+                        })
+                        .collect(),
+                ),
+                SourceState::Ready,
+                Domain::Sessions,
+            );
+            let mut inventory = SessionInventory::default();
+            inventory.all.insert(
+                slot.clone(),
+                crate::session_source::SessionDescriptor {
+                    name: slot.clone(),
+                    id: "tmux-id".into(),
+                    created_at: 0,
+                    attached_clients: 1,
+                    window_count: 1,
+                    harness_session_id: None,
+                },
+            );
+            let inventory =
+                SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
+            let activity = SourceSnapshot::default();
+            let result = compose(
+                board.clone(),
+                inventory.clone(),
+                discoveries.clone(),
+                activity.clone(),
+            );
+            let sessions = &result.data().unwrap().rows[0].sessions;
+            assert!(
+                sessions
+                    .iter()
+                    .all(|session| !session.live && session.state == "unknown")
+            );
+            assert!(result.data().unwrap().rows[0].badge.is_empty());
 
-        let mut inventory = inventory.data().unwrap().as_ref().clone();
-        inventory
-            .harness_session_ids
-            .insert("one-codex".into(), "current".into());
-        let inventory =
-            SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
-        let result = compose(board, inventory, discoveries, activity);
-        let sessions = &result.data().unwrap().rows[0].sessions;
-        let old = sessions.iter().find(|session| session.id == "old").unwrap();
-        let current = sessions
-            .iter()
-            .find(|session| session.id == "current")
-            .unwrap();
-        assert!(!old.live);
-        assert_eq!(old.state, "idle");
-        assert!(current.live);
-        assert_eq!(current.state, "idle");
+            let mut inventory = inventory.data().unwrap().as_ref().clone();
+            inventory
+                .harness_session_ids
+                .insert(slot.clone(), "current".into());
+            let inventory =
+                SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
+            let result = compose(board, inventory, discoveries, activity);
+            let sessions = &result.data().unwrap().rows[0].sessions;
+            let old = sessions.iter().find(|session| session.id == "old").unwrap();
+            let current = sessions
+                .iter()
+                .find(|session| session.id == "current")
+                .unwrap();
+            assert!(!old.live);
+            assert_eq!(old.state, "idle");
+            assert!(current.live);
+            assert_eq!(current.state, "idle");
+        }
     }
 }

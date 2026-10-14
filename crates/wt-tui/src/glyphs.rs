@@ -60,6 +60,7 @@ pub(crate) const REMOTE: &str = "\u{F233}"; // server: SSH host
 pub(crate) const CLAUDE: &str = "\u{F06A9}";
 pub(crate) const CODEX: &str = "\u{F4AC}";
 pub(crate) const OPENCODE: &str = "\u{F018D}";
+pub(crate) const PI: &str = "π";
 
 /// Pause marker for automation state. Plain Unicode, renders everywhere.
 pub(crate) const PAUSE: &str = "⏸";

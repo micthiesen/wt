@@ -184,6 +184,19 @@ pub async fn prepare_session(
             .find(|slot| slot.name == tmux_name)
             .context("selected live session has ended; reopen the session picker")?;
         validate_live_selection(context, &app, &agent, selection, live).await?;
+        if selection.harness == HarnessId::Pi {
+            app.validate_live_pi(
+                &HarnessSpawnRequest {
+                    worktree_path: agent.cwd.clone(),
+                    slug: agent.slug.clone(),
+                    managed_name: None,
+                    resume_session_id: live.harness_session_id.clone(),
+                    display_label: None,
+                },
+                context,
+            )
+            .await?;
+        }
         return Ok(app.attach_command(&live.id, &agent.cwd));
     }
     if selection.mode == SessionMode::Resume && wanted_id.is_none() {
@@ -198,6 +211,19 @@ pub async fn prepare_session(
         if let Some(wanted_id) = wanted_id
             && live_session.harness_session_id.as_deref() == Some(wanted_id)
         {
+            if selection.harness == HarnessId::Pi {
+                app.validate_live_pi(
+                    &HarnessSpawnRequest {
+                        worktree_path: agent.cwd.clone(),
+                        slug: agent.slug.clone(),
+                        managed_name: None,
+                        resume_session_id: Some(wanted_id.to_owned()),
+                        display_label: None,
+                    },
+                    context,
+                )
+                .await?;
+            }
             return Ok(app.attach_command(&tmux_name, &agent.cwd));
         }
         if selection.harness == HarnessId::Claude
@@ -673,6 +699,7 @@ fn session_name(agent: &AgentTarget, harness: HarnessId) -> String {
         }
         HarnessId::Codex => format!("{}-codex", agent.slug),
         HarnessId::Opencode => format!("{}-opencode", agent.slug),
+        HarnessId::Pi => format!("{}-pi", agent.slug),
     }
 }
 

@@ -8,6 +8,7 @@ mod codex;
 mod opencode;
 mod output;
 mod persist;
+mod pi;
 mod service;
 mod status;
 mod types;
@@ -39,6 +40,7 @@ pub use opencode::{
     opencode_display_title,
 };
 pub use output::{HarnessOutputKind, HarnessOutputLine, HarnessOutputTarget, HarnessOutputUpdate};
+pub use pi::{PI_VERSION, PiError, PiHarness, PiOutputTracker, PiPaths, PiSendOutcome, PiStatus};
 pub use service::{HarnessMessageOutcome, HarnessService, HarnessServiceError, HarnessTarget};
 pub use status::{DerivedState, derive_session_state, registry_status_to_state};
 pub use types::{

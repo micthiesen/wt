@@ -167,6 +167,33 @@ async fn prepare(context: &AppContext, remote: &RemoteConfig) -> Result<Prepared
         .context("managed remote has no derived root")?;
     let main = context.config.paths.main_clone.clone();
     let mut checks = Vec::new();
+    let pi_primary = context.config.harness.primary == wt_core::HarnessId::Pi;
+    let pi_version = if pi_primary
+        || !context
+            .config
+            .harness
+            .hidden
+            .contains(&wt_core::HarnessId::Pi)
+    {
+        match run(context, &main, "pi", &["--version"]).await {
+            Ok(version) if version.trim() == crate::managed_pi::VERSION => {
+                Some(crate::managed_pi::VERSION.to_owned())
+            }
+            result => {
+                if result.is_ok() || pi_primary {
+                    checks.push(ManagedCheck::new(
+                        "pi-controller",
+                        if pi_primary { CheckState::Failed } else { CheckState::Warning },
+                        format!("Managed Pi requires @earendil-works/pi-coding-agent@{} on the controller; update its Pi installation before starting managed Pi sessions", crate::managed_pi::VERSION),
+                        None,
+                    ));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Required dependencies are collected completely before sending any
     // worker update, so a broken declaration cannot publish partial setup.
     let declared = context.config.managed.files.clone();
@@ -329,6 +356,7 @@ async fn prepare(context: &AppContext, remote: &RemoteConfig) -> Result<Prepared
             trees,
             repo_files,
             codex_config,
+            pi_version,
             codex_auth_generation: crate::codex_reauth::controller_generation(
                 &crate::codex_reauth::controller_home(&context.home),
             )?,

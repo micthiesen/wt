@@ -231,6 +231,7 @@ pub fn harness_glyph(harness: &str) -> &'static str {
     match harness.to_ascii_lowercase().as_str() {
         "codex" => glyphs::CODEX,
         "opencode" => glyphs::OPENCODE,
+        "pi" => glyphs::PI,
         _ => glyphs::CLAUDE,
     }
 }
@@ -239,6 +240,7 @@ pub(crate) fn harness_color(harness: &str) -> Color {
     match harness.to_ascii_lowercase().as_str() {
         "codex" => theme::CODEX,
         "opencode" => theme::OPENCODE,
+        "pi" => theme::PI,
         _ => theme::CLAUDE,
     }
 }
@@ -251,6 +253,7 @@ pub(crate) fn session_state_color(harness: &str, state: &str) -> Color {
         "working" => match harness.as_str() {
             "codex" => theme::CODEX_ALT,
             "opencode" => theme::OPENCODE_ALT,
+            "pi" => theme::PI_ALT,
             _ => theme::ACCENT,
         },
         "waiting" => harness_color(&harness),

@@ -35,6 +35,7 @@ pub fn start_skill_invocation(harness: HarnessId) -> Result<String> {
     match harness {
         HarnessId::Claude => Ok("/start".into()),
         HarnessId::Codex | HarnessId::Opencode => Ok("$start".into()),
+        HarnessId::Pi => Ok("/skill:start".into()),
     }
 }
 

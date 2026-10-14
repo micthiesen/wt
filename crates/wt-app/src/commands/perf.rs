@@ -557,7 +557,7 @@ fn classify_command(command: &str) -> &'static str {
                 .is_some_and(|arg| ["ls", "new", "rm", "logs", "doctor", "status"].contains(arg)))
     {
         "wt"
-    } else if ["claude", "codex", "opencode"].iter().any(|name| {
+    } else if ["claude", "codex", "opencode", "pi"].iter().any(|name| {
         words
             .iter()
             .any(|word| word.rsplit('/').next() == Some(*name))

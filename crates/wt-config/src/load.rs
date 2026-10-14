@@ -873,6 +873,7 @@ fn parse_harness(value: &str) -> Option<HarnessId> {
         "claude" => Some(HarnessId::Claude),
         "codex" => Some(HarnessId::Codex),
         "opencode" => Some(HarnessId::Opencode),
+        "pi" => Some(HarnessId::Pi),
         _ => None,
     }
 }

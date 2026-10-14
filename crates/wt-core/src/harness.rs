@@ -9,16 +9,18 @@ pub enum HarnessId {
     Claude,
     Codex,
     Opencode,
+    Pi,
 }
 
 impl HarnessId {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Opencode];
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Opencode, Self::Pi];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Pi => "pi",
         }
     }
 }

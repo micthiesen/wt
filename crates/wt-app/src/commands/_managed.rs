@@ -162,6 +162,26 @@ pub async fn apply(
     write_if_changed(&root.join("login-path"), login_path.as_bytes(), 0o600)?;
     let environment = child_environment(&root, &login_path);
 
+    if let Some(version) = &request.pi_version {
+        checks.push(match crate::managed_pi::provision(
+            &root,
+            version,
+            &runner,
+            &environment,
+            cancellation,
+        )
+        .await
+        {
+            Ok(()) => ManagedCheck::ok("pi", format!("Managed Pi {version} is installed; provider authentication stays on this host")),
+            Err(error) => ManagedCheck::new(
+                "pi",
+                CheckState::Failed,
+                format!("Managed Pi setup failed: {error:#}"),
+                None,
+            ),
+        });
+    }
+
     let token = github_token_present(&root, &runner, &environment, cancellation).await;
     let repository =
         ensure_repository(&root, request, &runner, &environment, token, cancellation).await;

@@ -18,7 +18,7 @@ link. Bare repositories and separate Git directories require the usual config
 file or explicit selection.
 
 `wt init [directory]` creates that repository file without requiring an
-already-valid wt config. Pass `--primary codex`, `--primary opencode`, or
+already-valid wt config. Pass `--primary codex`, `--primary pi`, `--primary opencode`, or
 `--primary claude` to set a repository coding-agent default; omitting the flag
 preserves inheritance from the user config. It derives a readable repository id from the config
 directory (`~/dev/cz/cozee-dev` → `dev-cz-cozee-dev`). That id partitions the
@@ -629,17 +629,19 @@ hidden = ["opencode"]
 
 | key | required | default | meaning |
 |---|---|---|---|
-| `primary` | no | `"claude"` | `"claude"`, `"codex"`, or `"opencode"`. Used when this repository has no persisted override. |
+| `primary` | no | `"claude"` | `"claude"`, `"codex"`, `"opencode"`, or `"pi"`. Used when this repository has no persisted override. |
 | `hidden` | no | `[]` | Harnesses omitted from Tab cycling, automatic live-session routing, TUI session discovery, picker entries, and activity polling. Messaging has no harness override, so a hidden harness is not selected for a new send. The configured `primary` cannot be hidden, and at least one harness must remain visible. |
 
 ## `[naming]` — optional generated worktree names
+
+See [Pi sessions](pi.md) for Pi setup, managed hosts and provider authentication.
 
 Omit to disable generated title and description text. Naming invokes the
 configured coding-agent harness's non-interactive CLI using its existing
 authentication; wt does not require or call a separate model API. Runs are
 serialized, short-lived, and read-only. Codex runs ephemerally without project
 rules, Claude disables tools and session persistence, and OpenCode uses its
-isolated `--pure` mode.
+isolated `--pure` mode. Pi uses ephemeral print mode with all tools, MCP, project context, skills and prompt templates disabled.
 
 ```toml
 [naming]
@@ -654,7 +656,7 @@ codex = "gpt-6-luna"
 | key | required | default | meaning |
 |---|---|---|---|
 | `auto_rename` | no | `true` | Generate names when changes are detected. Set `false` to request names only with `! t` or `T`. |
-| `harness` | no | `"primary"` | `"primary"` follows the repository's effective primary harness; `"claude"`, `"codex"`, or `"opencode"` pins naming independently. |
+| `harness` | no | `"primary"` | `"primary"` follows the repository's effective primary harness; `"claude"`, `"codex"`, `"opencode"`, or `"pi"` pins naming independently. |
 | `models.<harness>` | no | *(harness default)* | Harness-native model override for `claude`, `codex`, or `opencode`. Per-harness keys keep `harness = "primary"` valid when the selected primary changes. |
 | `reasoning_effort` | no | `"low"` | Naming-only effort/variant: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Claude maps `minimal` to `low`. Model support is enforced by the selected CLI. |
 | `max_input_tokens` | no | `8000` | Soft prompt budget; diff hunks are dropped largest-first to stay under it. |

@@ -44,7 +44,7 @@ pub(crate) const LINES: &[&str] = &[
     "  ! l                Dev server logs (l closes)",
     "  ! c                Custom prompt (paste keeps line breaks)",
     "  ;                  Sessions picker for the row",
-    "  ; c / x / o        Jump to new Claude / Codex / OpenCode",
+    "  ; c / x / o / p    New Claude / Codex / OpenCode / Pi",
     "  ; d                Close highlighted session gracefully",
     "  ; x                Kill highlighted session (dead Claude: forget it)",
     "  ; 1-9              Attach a session row",

@@ -170,6 +170,38 @@ pub fn codex_paths(home: &Path, cache_root: &Path) -> CodexPaths {
     }
 }
 
+/// Resolve Pi's native session-directory overrides at app composition only.
+/// The adapter's path constructor stays independent of ambient user settings.
+pub fn pi_paths(home: &Path, cache_root: &Path) -> wt_harness::PiPaths {
+    pi_paths_with_overrides(
+        home,
+        cache_root,
+        std::env::var_os("PI_CODING_AGENT_SESSION_DIR"),
+        std::env::var_os("PI_CODING_AGENT_DIR"),
+    )
+}
+
+fn pi_paths_with_overrides(
+    home: &Path,
+    cache_root: &Path,
+    session_dir: Option<OsString>,
+    agent_dir: Option<OsString>,
+) -> wt_harness::PiPaths {
+    let paths = wt_harness::PiPaths::new(home, cache_root);
+    let sessions = session_dir
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            agent_dir
+                .filter(|value| !value.is_empty())
+                .map(|path| PathBuf::from(path).join("sessions"))
+        });
+    match sessions {
+        Some(sessions) => paths.with_sessions(sessions),
+        None => paths,
+    }
+}
+
 fn absolute_session_path(path: &Path, cwd: &Path, home: &Path) -> String {
     let raw = path.to_string_lossy();
     let expanded = if raw == "~" {
@@ -202,6 +234,21 @@ pub struct AppHarness {
 }
 
 impl AppHarness {
+    async fn validate_live_pi(
+        &self,
+        request: &HarnessSpawnRequest,
+        context: &AppContext,
+    ) -> Result<()> {
+        wt_harness::PiHarness::new(
+            pi_paths(&context.home, &context.config.paths.cache_root),
+            context.processes.clone(),
+            self.tmux.clone(),
+        )
+        .validate_live(request, &context.cancellation)
+        .await?;
+        Ok(())
+    }
+
     pub fn new(context: &AppContext) -> Self {
         let cache_root = context.config.paths.cache_root.clone();
         let codex_paths = codex_paths(&context.home, &cache_root);
@@ -247,6 +294,7 @@ impl AppHarness {
             claude_paths,
             codex_paths,
             OpenCodePaths::new(&context.home, &cache_root),
+            pi_paths(&context.home, &cache_root),
             context.processes.clone(),
             tmux.clone(),
         )
@@ -575,6 +623,7 @@ fn session_name(target: &AgentTarget, id: HarnessId) -> String {
         HarnessId::Claude => target.slug.clone(),
         HarnessId::Codex => format!("{}-codex", target.slug),
         HarnessId::Opencode => format!("{}-opencode", target.slug),
+        HarnessId::Pi => format!("{}-pi", target.slug),
     }
 }
 
@@ -746,6 +795,7 @@ pub async fn ui_session_with_harness(
                 HarnessId::Claude => slug.clone(),
                 HarnessId::Codex => format!("{slug}-codex"),
                 HarnessId::Opencode => format!("{slug}-opencode"),
+                HarnessId::Pi => format!("{slug}-pi"),
             };
             if !app
                 .tmux
@@ -779,6 +829,8 @@ pub async fn ui_session_with_harness(
                     context,
                 )
                 .await?;
+            } else if harness_id == HarnessId::Pi {
+                app.validate_live_pi(&request, context).await?;
             }
             tmux_name
         }
@@ -836,6 +888,7 @@ fn live_harnesses(
             HarnessId::Claude => slug.to_owned(),
             HarnessId::Codex => format!("{slug}-codex"),
             HarnessId::Opencode => format!("{slug}-opencode"),
+            HarnessId::Pi => format!("{slug}-pi"),
         };
         // An auxiliary harness slot can have the same name as another
         // worktree's Claude primary. The real slug owns that exact name.
@@ -898,6 +951,125 @@ pub fn unavailable_source_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pi_existing_attach_paths_reject_an_unowned_same_name_slot() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-pi-adoption-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy()
+        );
+        let app = AppHarness::new(&fixture.ctx);
+        app.tmux
+            .create_session(
+                &CreateSession {
+                    name: "one-pi".into(),
+                    cwd: fixture.ctx.cwd.clone(),
+                    command: vec!["sleep".into(), "30".into()],
+                    width: None,
+                    height: None,
+                },
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        app.tmux
+            .set_option(
+                &wt_tmux::OptionScope::Session("one-pi".into()),
+                "@wt-harness-session-id",
+                Some("foreign-thread"),
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        let direct = ui_session_with_harness(
+            &fixture.ctx,
+            Some("one".into()),
+            SessionTarget::Harness,
+            Some(HarnessId::Pi),
+        )
+        .await;
+        let selection = wt_tui::SessionSelection {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+            harness: HarnessId::Pi,
+            session_id: Some("foreign-thread".into()),
+            live_slot: None,
+            managed_name: None,
+            mode: wt_tui::SessionMode::Resume,
+            live: true,
+        };
+        let picked = prepare_session(&fixture.ctx, &selection).await;
+        let slot = app
+            .session_inventory(&fixture.ctx)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|slot| slot.name == "one-pi")
+            .unwrap();
+        let unknown = prepare_session(
+            &fixture.ctx,
+            &wt_tui::SessionSelection {
+                session_id: None,
+                live_slot: Some(wt_tui::LiveSessionIdentity {
+                    id: slot.id,
+                    created_at: slot.created_at,
+                }),
+                ..selection
+            },
+        )
+        .await;
+        let retained = app
+            .tmux
+            .session_exists("one-pi", &fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        app.tmux
+            .kill_server(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+        assert!(
+            direct.is_err(),
+            "F12 must validate the live Pi endpoint before attach"
+        );
+        assert!(
+            picked.is_err(),
+            "picker attach must validate the live Pi endpoint"
+        );
+        assert!(
+            unknown.is_err(),
+            "unknown live-slot attach must also validate ownership"
+        );
+        assert!(
+            retained,
+            "an unowned session must not be replaced or stopped"
+        );
+    }
+
+    #[test]
+    fn pi_session_paths_follow_native_override_precedence() {
+        let home = Path::new("/isolated-home");
+        let cache = Path::new("/isolated-cache");
+        let paths = |sessions, agent| pi_paths_with_overrides(home, cache, sessions, agent);
+        assert_eq!(paths(None, None).sessions, home.join(".pi/agent/sessions"));
+        assert_eq!(
+            paths(None, Some("/managed/pi".into())).sessions,
+            Path::new("/managed/pi/sessions")
+        );
+        assert_eq!(
+            paths(Some("/explicit".into()), Some("/managed/pi".into())).sessions,
+            Path::new("/explicit")
+        );
+        assert_eq!(
+            paths(Some("".into()), Some("".into())).sessions,
+            home.join(".pi/agent/sessions")
+        );
+    }
 
     #[tokio::test]
     async fn message_wakes_prepare_exact_worktree_and_special_root_trust_before_dispatch() {
@@ -1086,6 +1258,13 @@ mod tests {
         );
         let mut known = known;
         known.insert("branch-opencode".into());
+        assert!(live_harnesses("branch", &names, &known, &[]).is_empty());
+        let names = ["branch-pi".to_owned()].into_iter().collect();
+        assert_eq!(
+            live_harnesses("branch", &names, &known, &[]),
+            [HarnessId::Pi]
+        );
+        known.insert("branch-pi".into());
         assert!(live_harnesses("branch", &names, &known, &[]).is_empty());
     }
 }

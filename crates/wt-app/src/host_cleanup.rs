@@ -172,10 +172,18 @@ pub async fn stored_dev_port(context: &AppContext, slug: &str) -> Option<u16> {
 
 fn bare_slug(name: &str) -> &str {
     let name = name.rsplit_once('~').map_or(name, |(base, _)| base);
-    ["-opencode", "-codex", "-action", "-shell", "-diff", "-dev"]
-        .iter()
-        .find_map(|suffix| name.strip_suffix(suffix))
-        .unwrap_or(name)
+    [
+        "-opencode",
+        "-codex",
+        "-pi",
+        "-action",
+        "-shell",
+        "-diff",
+        "-dev",
+    ]
+    .iter()
+    .find_map(|suffix| name.strip_suffix(suffix))
+    .unwrap_or(name)
 }
 
 fn session_owned_by_target(slug: &str, name: &str, pane_cwd: &Path, checkout: &Path) -> bool {
@@ -497,6 +505,7 @@ mod tests {
             "eng-1",
             "eng-1-codex",
             "eng-1-opencode",
+            "eng-1-pi",
             "eng-1-diff",
             "eng-1-shell",
             "eng-1~review",
