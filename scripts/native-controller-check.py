@@ -44,7 +44,7 @@ def main():
         assert fields[1] == os.environ["WT_BUILD_ID"], "candidate differs from WT_BUILD_ID"
     # Short explicit scratch root keeps macOS Unix sockets below sockaddr_un limits.
     with tempfile.TemporaryDirectory(prefix="wtc-", dir="/tmp") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         home, repo, worker = root / "h", root / "repo", root / "worker"
         for path in (home, repo, worker):
             path.mkdir()
@@ -113,7 +113,8 @@ print(json.dumps({"request": request, "cwd": str(pathlib.Path.cwd())}))
             # Exec deliberately ignores these invalid config selectors.
             remote_env.update(WT_CONFIG=str(root / "missing-config"), WT_REPO_CONFIG=str(root / "missing-repo-config"))
             reply = invoke(binary, ["controller", "exec", "fixture"], worker, remote_env, input='{"read":true}')
-            assert json.loads(reply.stdout) == {"request": {"read": True}, "cwd": str(repo)}
+            response = json.loads(reply.stdout)
+            assert response == {"request": {"read": True}, "cwd": str(repo)}, response
             unknown = invoke(binary, ["controller", "exec", "unknown"], worker, remote_env, input="{}", expected=75)
             assert "not executed" in unknown.stderr
             (worker / "controller-endpoint").write_text(str(socket))
