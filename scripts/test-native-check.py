@@ -2,9 +2,11 @@
 """Unit tests for the shared native check command; no native processes run."""
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location("native_check", Path(__file__).with_name("native-check.py"))
@@ -18,6 +20,29 @@ ui_spec.loader.exec_module(ui)
 
 
 class AnsiScreenTests(unittest.TestCase):
+    def test_startup_waits_for_initial_metadata_sample_not_visible_titles(self):
+        # CI capture: titles and a blank refresh gutter preceded the first
+        # fingerprint by ~1s. Its legitimate refresh was misclassified as idle.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "wt-native.log"
+            registered = {"target": "wt::freshness", "fields": {
+                "message": "filesystem watches registered", "paths": 9}}
+            baseline = {"target": "wt::freshness", "fields": {
+                "message": "filesystem metadata invalidation", "git_changed": True}}
+            log.write_text(json.dumps(registered) + "\n")
+            self.assertFalse(ui.startup_metadata_sample_seen([log]))
+            log.write_text(json.dumps(registered) + "\n" + json.dumps(baseline)[:40])
+            self.assertFalse(ui.startup_metadata_sample_seen([log]))
+            log.write_text(json.dumps(registered) + "\n" + json.dumps(baseline) + "\n")
+            self.assertTrue(ui.startup_metadata_sample_seen([log]))
+        screen = ui.AnsiScreen()
+        # Exact refresh-gutter patch from the failed macOS artifact. This must
+        # remain forbidden during idle; readiness moves the sample after it.
+        patch = (b"\x1b[2;13H\x1b[38;2;116;123;138;48;2;27;29;35m "
+                 + "↻".encode() + b"\x1b[38;2;59;66;82;48;2;27;29;35m \x1b[?25l")
+        with self.assertRaisesRegex(AssertionError, "non-clock"):
+            ui.assert_idle_frames(screen, patch)
+
     def test_idle_accepts_only_bounded_real_age_ticks(self):
         def fixture(age):
             screen = ui.AnsiScreen(rows=2, columns=80)

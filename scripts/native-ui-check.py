@@ -233,6 +233,26 @@ def assert_idle_frames(screen, output):
     return len(frames) - 1
 
 
+def startup_metadata_sample_seen(paths):
+    """The first watcher fingerprint deliberately invalidates startup Git.
+
+    Visible rows and a quiet terminal can precede that scheduled first sample.
+    Require its actual observation before starting the source-quiescence wait.
+    """
+    for path in paths:
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue  # The writer may still be appending its last record.
+            fields = record.get("fields", {})
+            if (record.get("target") == "wt::freshness"
+                    and fields.get("message") == "filesystem metadata invalidation"
+                    and fields.get("git_changed") is True):
+                return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -406,6 +426,12 @@ def main():
         wait_for(lambda data: all(title in re.sub(
             rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data
         ) for title in (b"Fixturework0", b"Fixturework1", b"Fixturework2")))
+        # Watch registration and its initial metadata fingerprint are separate
+        # startup events. The latter may legitimately repaint after half a
+        # second of silence. Observe it, then require a full Git quiet window
+        # and completed terminal draws before measuring idle behavior.
+        wait_for(lambda _: startup_metadata_sample_seen(app_logs.glob("wt-native.*.log")), timeout=10)
+        wait_for_git_quiet()
         wait_for_terminal_quiet()
         before = len(capture)
         idle_screen = copy.deepcopy(screen)
