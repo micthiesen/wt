@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
 import signal
+import socket as unix_socket
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,12 @@ def main():
         home, repo, worker = root / "h", root / "repo", root / "worker"
         for path in (home, repo, worker):
             path.mkdir()
+        worker.chmod(0o700)
+        worker_endpoint = worker / "controller-0123456789abcdef.sock"
+        abandoned = unix_socket.socket(unix_socket.AF_UNIX)
+        abandoned.bind(str(worker_endpoint))
+        abandoned.listen()
+        abandoned.close()  # sshd leaves this inode behind when its forward exits.
         env = {key: value for key, value in os.environ.items()
                if key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TMP", "TEMP")}
         fake_bin = root / "bin"
@@ -150,9 +158,25 @@ print(json.dumps({"request": request, "cwd": str(pathlib.Path.cwd())}))
             invoke(binary, ["controller", "exec", "fixture"], worker, fallback_env, input="{}")
             restarted.send_signal(signal.SIGTERM)
             assert restarted.wait(timeout=10) == 0
+            prepare_payload = base64.urlsafe_b64encode(json.dumps(["bridge-prepare"]).encode()).decode().rstrip("=")
+            prepare_env = {**remote_env, "WT_MANAGED_ROOT": str(worker), "WT_CONTROLLER_SOCKET": str(worker_endpoint)}
+
+            wait_for(lambda: time.time() - worker_endpoint.stat().st_ctime >= 5.1,
+                     "remote endpoint leaving the bind-before-listen grace period")
+            reclaimed = invoke(binary, ["_managed", prepare_payload], worker, prepare_env)
+            assert reclaimed.stdout.strip() == str(worker_endpoint), reclaimed.stdout
+            assert not worker_endpoint.exists()
+            with unix_socket.socket(unix_socket.AF_UNIX) as live_endpoint:
+                live_endpoint.bind(str(worker_endpoint))
+                live_endpoint.listen()
+                inode = worker_endpoint.stat().st_ino
+                occupied = invoke(binary, ["_managed", prepare_payload], worker, prepare_env, expected=1)
+                assert "live listener" in occupied.stderr, occupied.stderr
+                assert worker_endpoint.stat().st_ino == inode, "live controller endpoint was replaced"
             assert not (root / "unexpected-ssh").exists(), "fixture unexpectedly attempted SSH"
             print(json.dumps({"build": fields[1], "controller_rpc": "passed", "accepted_shutdown_drain": "passed",
-                              "endpoint_fallback": "passed", "configuration_health": "passed", "restart": "passed"}))
+                              "endpoint_fallback": "passed", "configuration_health": "passed", "restart": "passed",
+                              "remote_socket_restart": "passed"}))
         except Exception:
             log.flush()
             print((root / "daemon.log").read_text(), file=sys.stderr)

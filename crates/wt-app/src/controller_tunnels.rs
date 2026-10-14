@@ -1,11 +1,146 @@
 //! Independently supervised, private SSH reverse forwards for controller services.
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::AppContext;
+
+/// OpenSSH's client StreamLocalBindUnlink setting does not apply to a remote
+/// -R listener. Reclaim an abandoned worker endpoint before asking sshd to bind
+/// it, without requiring a server-wide unlink policy or disturbing a live peer.
+pub(crate) async fn prepare_worker_socket(
+    root: &Path,
+    socket: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    prepare_worker_socket_with_probe(root, socket, cancel, SystemTime::now(), |path| async move {
+        tokio::net::UnixStream::connect(path).await.map(|_| ())
+    })
+    .await
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SocketWitness {
+    device: u64,
+    inode: u64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
+async fn owned_socket(path: &Path) -> Result<Option<SocketWitness>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect worker controller endpoint"),
+    };
+    if !metadata.file_type().is_socket() {
+        bail!("refusing to replace non-socket worker controller endpoint");
+    }
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("worker controller socket belongs to another user");
+    }
+    Ok(Some(SocketWitness {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        changed_seconds: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    }))
+}
+
+async fn prepare_worker_socket_with_probe<F, P>(
+    root: &Path,
+    socket: &Path,
+    cancel: &CancellationToken,
+    now: SystemTime,
+    probe: F,
+) -> Result<()>
+where
+    F: FnOnce(PathBuf) -> P,
+    P: std::future::Future<Output = std::io::Result<()>>,
+{
+    use std::os::unix::fs::MetadataExt;
+    let filename = socket
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid worker controller socket name")?;
+    let identity = filename
+        .strip_prefix("controller-")
+        .and_then(|name| name.strip_suffix(".sock"));
+    if !root.is_absolute()
+        || socket.parent() != Some(root)
+        || !identity
+            .is_some_and(|id| id.len() == 16 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("worker controller socket is outside its managed endpoint namespace");
+    }
+    let directory = tokio::fs::symlink_metadata(root)
+        .await
+        .context("inspect managed controller directory")?;
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    if !directory.is_dir()
+        || directory.uid() != unsafe { libc::geteuid() }
+        || directory.mode() & 0o077 != 0
+    {
+        bail!("managed controller directory must be a private directory owned by this user");
+    }
+    let _lock = wt_platform::lock::FileLock::acquire(
+        root,
+        &format!("{filename}.prepare"),
+        "prepare controller tunnel endpoint",
+        cancel,
+    )
+    .await?;
+    let Some(before) = owned_socket(socket).await? else {
+        return Ok(());
+    };
+    let connected = tokio::select! {
+        _ = cancel.cancelled() => bail!("controller endpoint preparation cancelled"),
+        result = tokio::time::timeout(Duration::from_secs(2), probe(socket.to_path_buf())) => result.context("worker controller socket probe timed out; endpoint retained")?,
+    };
+    match connected {
+        // Do not even attempt another -R bind: sshd may have an unlink policy
+        // enabled globally, independently of our client's setting.
+        Ok(()) => bail!("worker controller endpoint has a live listener; endpoint retained"),
+        Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => (),
+        Err(error) => {
+            return Err(error)
+                .context("worker controller socket ownership is uncertain; endpoint retained");
+        }
+    }
+    let changed = u64::try_from(before.changed_seconds)
+        .ok()
+        .zip(u32::try_from(before.changed_nanos).ok())
+        .and_then(|(seconds, nanos)| UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)));
+    if !changed
+        .and_then(|changed| now.duration_since(changed).ok())
+        .is_some_and(|age| age >= Duration::from_secs(5))
+    {
+        bail!(
+            "worker controller socket was recently created; retaining it for the next tunnel attempt"
+        );
+    }
+    if cancel.is_cancelled() {
+        bail!("controller endpoint preparation cancelled");
+    }
+    if owned_socket(socket).await?.as_ref() != Some(&before) {
+        bail!("worker controller endpoint changed during its probe; endpoint retained");
+    }
+    // Other wt preparations hold the same lock. With remote unlink disabled,
+    // sshd cannot bind a replacement while this witnessed socket still exists.
+    tokio::fs::remove_file(socket)
+        .await
+        .context("remove abandoned worker controller socket")?;
+    tracing::info!(path = %socket.display(), "reclaimed abandoned controller tunnel endpoint");
+    Ok(())
+}
 
 pub async fn identity(home: &std::path::Path, cancel: &CancellationToken) -> Result<String> {
     use std::os::unix::fs::PermissionsExt;
@@ -92,14 +227,17 @@ async fn forward(
     let (client, _) = crate::remote::prepare_remote_client(context, endpoint).await?;
     let output = client
         .run_managed(
-            &["bridge-path".into()],
+            &["bridge-prepare".into()],
             Vec::new(),
             Duration::from_secs(10),
             cancel,
         )
         .await?;
     if !output.status.success() {
-        bail!("worker could not resolve its private controller socket");
+        bail!(
+            "worker could not prepare its private controller socket: {}",
+            output.stderr_text().trim()
+        );
     }
     let spec = forward_spec(output.stdout_text().trim(), socket)?;
     let mut child = Command::new("ssh")
@@ -116,7 +254,7 @@ async fn forward(
             "-o",
             "ExitOnForwardFailure=yes",
             "-o",
-            "StreamLocalBindUnlink=yes",
+            "StreamLocalBindUnlink=no",
             "-o",
             "StreamLocalBindMask=0177",
             "-R",
@@ -172,6 +310,191 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn endpoint_fixture() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .prefix("wt-tunnel-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.path().join("controller-0123456789abcdef.sock");
+        (root, socket)
+    }
+    fn aged_probe_time() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(10)
+    }
+    async fn connect_only(path: PathBuf) -> std::io::Result<()> {
+        tokio::net::UnixStream::connect(path).await.map(|_| ())
+    }
+    #[tokio::test]
+    async fn worker_preparation_reclaims_only_abandoned_socket_and_keeps_live_listener() {
+        let (root, socket) = endpoint_fixture();
+        let cancel = CancellationToken::new();
+        prepare_worker_socket(root.path(), &socket, &cancel)
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        assert!(
+            prepare_worker_socket(root.path(), &socket, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(socket.exists());
+        drop(listener);
+        // The bind-before-listen window is deliberately not reclaimable.
+        assert!(
+            prepare_worker_socket(root.path(), &socket, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(socket.exists());
+        prepare_worker_socket_with_probe(
+            root.path(),
+            &socket,
+            &cancel,
+            aged_probe_time(),
+            connect_only,
+        )
+        .await
+        .unwrap();
+        assert!(!socket.exists());
+        // The replacement can bind immediately without any sshd unlink policy.
+        let replacement = tokio::net::UnixListener::bind(&socket).unwrap();
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(replacement);
+    }
+    #[tokio::test]
+    async fn worker_preparation_refuses_non_socket_symlink_and_outside_namespace() {
+        let (root, socket) = endpoint_fixture();
+        let cancel = CancellationToken::new();
+        std::fs::write(&socket, "retain this file").unwrap();
+        assert!(
+            prepare_worker_socket(root.path(), &socket, &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&socket).unwrap(),
+            "retain this file"
+        );
+        std::fs::remove_file(&socket).unwrap();
+        let target = root.path().join("target");
+        std::fs::write(&target, "retain symlink target").unwrap();
+        std::os::unix::fs::symlink(&target, &socket).unwrap();
+        assert!(
+            prepare_worker_socket(root.path(), &socket, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "retain symlink target"
+        );
+        for path in [
+            root.path().join("other.sock"),
+            root.path().join("../controller-0123456789abcdef.sock"),
+        ] {
+            assert!(
+                prepare_worker_socket(root.path(), &path, &cancel)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn worker_preparation_retains_uncertain_or_replaced_socket() {
+        let (root, socket) = endpoint_fixture();
+        drop(tokio::net::UnixListener::bind(&socket).unwrap());
+        let cancel = CancellationToken::new();
+        for code in [libc::EACCES, libc::ENOENT, libc::EIO] {
+            assert!(
+                prepare_worker_socket_with_probe(
+                    root.path(),
+                    &socket,
+                    &cancel,
+                    aged_probe_time(),
+                    |_| async move { Err(std::io::Error::from_raw_os_error(code)) }
+                )
+                .await
+                .is_err()
+            );
+            assert!(socket.exists());
+        }
+        let replacement = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let retained = replacement.clone();
+        assert!(
+            prepare_worker_socket_with_probe(
+                root.path(),
+                &socket,
+                &cancel,
+                aged_probe_time(),
+                |path| async move {
+                    std::fs::remove_file(&path)?;
+                    *retained.lock().unwrap() = Some(std::os::unix::net::UnixListener::bind(path)?);
+                    Err(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(replacement);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_preparation_timeout_retains_endpoint() {
+        let (root, socket) = endpoint_fixture();
+        drop(tokio::net::UnixListener::bind(&socket).unwrap());
+        assert!(
+            prepare_worker_socket_with_probe(
+                root.path(),
+                &socket,
+                &CancellationToken::new(),
+                aged_probe_time(),
+                |_| std::future::pending()
+            )
+            .await
+            .is_err()
+        );
+        assert!(socket.exists());
+    }
+    #[tokio::test]
+    async fn concurrent_worker_preparations_do_not_race_the_replacement_listener() {
+        let (root, socket) = endpoint_fixture();
+        drop(tokio::net::UnixListener::bind(&socket).unwrap());
+        let cancel = CancellationToken::new();
+        let (first, second) = tokio::join!(
+            prepare_worker_socket_with_probe(
+                root.path(),
+                &socket,
+                &cancel,
+                aged_probe_time(),
+                connect_only
+            ),
+            prepare_worker_socket_with_probe(
+                root.path(),
+                &socket,
+                &cancel,
+                aged_probe_time(),
+                connect_only
+            )
+        );
+        first.unwrap();
+        second.unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        assert!(
+            prepare_worker_socket(root.path(), &socket, &cancel)
+                .await
+                .is_err()
+        );
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(listener);
+    }
     #[tokio::test]
     async fn controller_identity_is_stable_and_corruption_is_not_replaced() {
         let home = tempfile::tempdir().unwrap();

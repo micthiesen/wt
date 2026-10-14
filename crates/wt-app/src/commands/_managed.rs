@@ -55,6 +55,20 @@ pub async fn run(args: &[String], cancellation: &CancellationToken) -> Result<i3
             Ok(0)
         }
         ["bridge-probe"] => crate::commands::controller_bridge::exec("__wt_status").await,
+        ["bridge-prepare"] => {
+            let root = std::env::var_os("WT_MANAGED_ROOT").context("worker has no managed root")?;
+            let socket = std::env::var_os("WT_CONTROLLER_SOCKET")
+                .context("worker has no controller services")?;
+            let socket = PathBuf::from(socket);
+            crate::controller_tunnels::prepare_worker_socket(
+                Path::new(&root),
+                &socket,
+                cancellation,
+            )
+            .await?;
+            println!("{}", socket.display());
+            Ok(0)
+        }
         ["bridge-path"] => {
             let path = std::env::var_os("WT_CONTROLLER_SOCKET")
                 .context("worker has no controller services")?;

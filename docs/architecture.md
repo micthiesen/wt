@@ -410,7 +410,11 @@ Explicit `[managed.services]` entries expose fixed controller executable argv
 through `wt controller serve`. This service runs independently of the TUI and
 owns private Unix sockets forwarded to managed workers over SSH. A persistent
 controller identity separates socket names across machines. Every tunnel must
-pass a round-trip probe before it is reported ready. Requests name a configured
+pass a round-trip probe before it is reported ready. Before binding a reverse
+forward, the worker reclaims only an owned, unchanged stale Unix socket whose
+connection probe is refused. Live, newly created, replaced or uncertain endpoints
+are retained. This recovery runs under an endpoint lock and does not depend on
+global SSH server settings. Requests name a configured
 service, never an executable or working directory; service processes run in the
 controller's main clone. Admission, input, output, concurrency and execution
 time are bounded. Accepted calls drain on shutdown, and transport failures never
