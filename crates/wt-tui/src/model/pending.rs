@@ -184,7 +184,17 @@ impl Model {
             id,
             generation: self.ui_generation,
             preparation,
-            opener: self.last_key.take().filter(|_| preparation),
+            // Enter, Space and Tab commit or move inside menus; repeating one
+            // must not cancel the menu it opened.
+            opener: self.last_key.take().filter(|key| {
+                preparation
+                    && !matches!(
+                        key.code,
+                        crossterm::event::KeyCode::Enter
+                            | crossterm::event::KeyCode::Char(' ')
+                            | crossterm::event::KeyCode::Tab
+                    )
+            }),
             typeahead: if preparation { carried } else { Vec::new() },
             started: tokio::time::Instant::now(),
             action: inner.clone(),

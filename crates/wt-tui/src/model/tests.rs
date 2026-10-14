@@ -1681,7 +1681,11 @@ fn board_menus_open_without_a_request_and_commit_what_they_showed() {
             state: Some("working".into()),
             note: None,
             verify_after_merge: None,
-            seen: Some(crate::Seen(Some("review".into()))),
+            seen: Some(crate::Seen(Some(crate::StatusClaim {
+                state: "review".into(),
+                note: None,
+                verify_after_merge: None,
+            }))),
         }
     );
 }
@@ -1708,7 +1712,11 @@ fn open_board_menus_rebuild_from_newer_boards_and_keep_their_choice() {
         action,
         PickerAction::Status {
             key: "one".into(),
-            seen: Some(crate::Seen(Some("working".into()))),
+            seen: Some(crate::Seen(Some(crate::StatusClaim {
+                state: "working".into(),
+                note: None,
+                verify_after_merge: None,
+            }))),
         }
     );
 }
@@ -1761,4 +1769,68 @@ fn an_untouched_board_menu_follows_the_newer_default() {
         panic!("menu stays open")
     };
     assert_eq!(picker.options[picker.selected].label, "ready (current)");
+}
+
+#[test]
+fn an_unsent_request_leaves_nothing_for_the_next_one() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    model.carry_typeahead = vec![(KeyEvent::from(KeyCode::Char('m')), 20)];
+    model.committed_menu = Some(UiAction::PrepareStatus { key: "one".into() });
+    let InputResult::Action(_) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    model.request_not_sent();
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    model.begin_action(9, &action);
+    let request = model.pending_request.as_ref().unwrap();
+    assert!(request.typeahead.is_empty());
+    assert!(model.last_menu.is_none());
+}
+
+#[test]
+fn enter_never_becomes_the_key_that_cancels_a_loading_menu() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    model.last_key = Some(KeyEvent::from(KeyCode::Enter));
+    model.begin_action(3, &UiAction::PrepareCleanup);
+    // A double-tapped Enter is typeahead for the menu, not a cancel.
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Enter), 20),
+        InputResult::Draw
+    );
+    assert_eq!(model.pending_request.as_ref().unwrap().typeahead.len(), 1);
+}
+
+#[test]
+fn a_stale_reply_refreshes_even_after_the_user_moved_on() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one", "two"]));
+    let generation = model.ui_generation;
+    model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+    assert_ne!(model.ui_generation, generation);
+    model.reply(UiReply {
+        operation_id: Some(4),
+        ui_generation: Some(generation),
+        ..UiReply::stale("Changed since you looked: status is now ready")
+    });
+    assert!(model.refresh_requested);
+}
+
+#[test]
+fn a_menu_reply_message_survives_dropped_typeahead() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    let generation = model.ui_generation;
+    model.begin_action(5, &UiAction::PrepareCleanup);
+    model.input(KeyEvent::from(KeyCode::Char('y')), 20);
+    model.reply(UiReply {
+        operation_id: Some(5),
+        ui_generation: Some(generation),
+        ..UiReply::message("Nothing safe to clean")
+    });
+    let (text, _) = model.toast.clone().unwrap();
+    assert!(text.starts_with("Nothing safe to clean"), "{text}");
 }

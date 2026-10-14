@@ -20,9 +20,10 @@ impl Model {
 
     fn show_local_menu(&mut self, action: UiAction, menu: LocalMenu) {
         match menu {
-            LocalMenu::Modal { modal, warm } => {
+            LocalMenu::Modal { modal, warm, host } => {
                 self.reply(UiReply {
                     modal: Some(*modal),
+                    modal_host: host,
                     ..Default::default()
                 });
                 self.local_menu = Some(action);
@@ -154,7 +155,6 @@ impl Model {
     /// menu from the current board and ask the sources for fresher data; the
     /// open menu rebuilds when it arrives.
     pub(super) fn reopen_stale_menu(&mut self, operation_id: Option<u64>, message: String) {
-        self.refresh_requested = true;
         let Some((id, action)) = self.last_menu.take() else {
             return;
         };

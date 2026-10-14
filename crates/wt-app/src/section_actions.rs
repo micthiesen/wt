@@ -19,6 +19,25 @@ fn stored_section(state: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The menu showed the row's section; a change since then (another client
+/// or the agent moved it) must not be overwritten unseen.
+fn check_section_witness(
+    state: &serde_json::Value,
+    key: &str,
+    seen: Option<&Seen<Option<String>>>,
+) -> Result<()> {
+    if let Some(Seen(seen)) = seen {
+        let current = stored_section(state, key);
+        if current != *seen {
+            return Err(crate::controller::stale(format!(
+                "section is now {}",
+                current.as_deref().unwrap_or("Inbox")
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn move_row(
     ctx: &AppContext,
     key: String,
@@ -39,17 +58,9 @@ pub async fn move_row(
     if archived.contains(&row.key) {
         bail!("Restore the archived row before moving it to a section");
     }
-    // The menu showed the row's section; a change since then (another client
-    // or the agent moved it) must not be overwritten unseen.
-    if let Some(Seen(seen)) = &seen {
-        let current = stored_section(&state, &row.key);
-        if current != *seen {
-            return Err(crate::controller::stale(format!(
-                "section is now {}",
-                current.as_deref().unwrap_or("Inbox")
-            )));
-        }
-    }
+    // Fail before recording the write when the menu is already out of date;
+    // the same check repeats inside the write's own database call.
+    check_section_witness(&state, &row.key, seen.as_ref())?;
     let destination = section
         .map(|name| {
             if let Some(error) = section::invalid_name(&name) {
@@ -88,9 +99,13 @@ pub async fn move_row(
     let to = destination.clone();
     ctx.section_writes
         .record(moving.iter().cloned(), destination.as_deref());
+    let witness_key = row.key.clone();
     let changed = ctx
         .database
-        .call(move |store| Ok(store.move_worktrees_to_section(&moving, to.as_deref())?))
+        .call(move |store| {
+            check_section_witness(&store.read_wt_state()?, &witness_key, seen.as_ref())?;
+            Ok(store.move_worktrees_to_section(&moving, to.as_deref())?)
+        })
         .await?;
     tracing::info!(slugs = ?changed, section = ?destination, "moved worktrees to section");
     Ok(UiReply {

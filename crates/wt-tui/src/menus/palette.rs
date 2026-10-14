@@ -17,6 +17,7 @@ pub(super) fn menu(board: &Board, surface: &ActionSurface) -> Menu {
         warm: Some(Box::new(UiAction::WarmPalette {
             surface: surface.clone(),
         })),
+        host: None,
     })
 }
 
@@ -100,6 +101,7 @@ mod tests {
             Menu::Local(LocalMenu::Modal {
                 modal: Box::new(picker()),
                 warm: Some(Box::new(UiAction::WarmPalette { surface })),
+                host: None,
             })
         );
     }

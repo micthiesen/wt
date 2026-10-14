@@ -75,8 +75,10 @@ pub async fn set(
     let previous = previous.unwrap_or_default();
     let trunk = ctx.config.branch.base.clone();
     let recorded = wt_core::recorded_fork_base(previous["baseBranch"].as_str(), &trunk);
+    // A controller with another trunk name shows this host's trunk as a
+    // recorded base; both mean no parent here.
     if let Some(seen) = &seen
-        && seen.as_deref() != recorded
+        && wt_core::recorded_fork_base(seen.as_deref(), &trunk) != recorded
     {
         return Err(crate::controller::stale(format!(
             "fork base for {slug} changed since the picker was opened"

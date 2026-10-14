@@ -45,28 +45,34 @@ pub(super) fn review_checkout(
     url: &str,
     updated_at: &str,
     branch: &str,
+    host: Option<&str>,
 ) -> LocalMenu {
-    let Some(row) = board
-        .review_requests
-        .iter()
-        .find(|row| row.url == url && row.updated_at == updated_at && row.branch == branch)
-    else {
+    let Some(row) = board.review_requests.iter().find(|row| {
+        row.url == url
+            && row.updated_at == updated_at
+            && row.branch == branch
+            && row.host.as_deref() == host
+    }) else {
         return LocalMenu::Notice("review request changed; refresh and select it again".into());
     };
-    LocalMenu::modal(UiModal::Confirm {
-        title: format!("Check out PR #{} for review?", row.number),
-        lines: vec![
-            row.title.clone(),
-            branch.to_owned(),
-            "Create a worktree in Reviews at the verified PR head.".into(),
-        ],
-        action: ConfirmAction::ReviewCheckout {
-            url: url.to_owned(),
-            updated_at: updated_at.to_owned(),
-            branch: branch.to_owned(),
-        },
-        cancel_key: Some('w'),
-    })
+    LocalMenu::Modal {
+        modal: Box::new(UiModal::Confirm {
+            title: format!("Check out PR #{} for review?", row.number),
+            lines: vec![
+                row.title.clone(),
+                branch.to_owned(),
+                "Create a worktree in Reviews at the verified PR head.".into(),
+            ],
+            action: ConfirmAction::ReviewCheckout {
+                url: url.to_owned(),
+                updated_at: updated_at.to_owned(),
+                branch: branch.to_owned(),
+            },
+            cancel_key: Some('w'),
+        }),
+        warm: None,
+        host: row.host.clone(),
+    }
 }
 
 /// `Ctrl+N`: choose a host when remote hosts are configured, then name the
@@ -197,6 +203,7 @@ mod tests {
             "https://example.test/pull/7",
             "t1",
             "feature/review",
+            None,
         ));
         assert_eq!(title, "Check out PR #7 for review?");
         assert_eq!(lines[0], "Review me");
@@ -215,12 +222,13 @@ mod tests {
                 &board,
                 "https://example.test/pull/7",
                 "t2",
-                "feature/review"
+                "feature/review",
+                None,
             ),
             LocalMenu::Notice(_)
         ));
         assert!(matches!(
-            review_checkout(&Board::default(), "u", "t", "b"),
+            review_checkout(&Board::default(), "u", "t", "b", None),
             LocalMenu::Notice(_)
         ));
     }

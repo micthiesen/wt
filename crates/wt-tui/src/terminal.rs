@@ -344,8 +344,8 @@ async fn run_inner<'a>(
                                         }
                                         model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
                                     },
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)),
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)),
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { model.request_not_sent(); model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)) },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { model.request_not_sent(); model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)) },
                                 }
                                 dirty = true;
                                 toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
@@ -358,6 +358,8 @@ async fn run_inner<'a>(
                         let area = terminal.size()?.into();
                         dirty |= crate::mouse::select(&mut model, mouse, area);
                         dirty |= crate::mouse::scroll(&mut model, mouse, area);
+                        // A click can move the selection; plan its prefetch.
+                        send_background(&mut model, &actions.requests);
                     }
                     Event::Paste(text) => dirty |= model.paste(&text),
                     _ => {}
@@ -378,6 +380,7 @@ async fn run_inner<'a>(
                         let feedback = action.clone();
                         let cancellation = action.is_preparation().then(CancellationToken::new);
                         if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }).is_err() {
+                            model.request_not_sent();
                             model.toast = Some(("Action queue is busy; retry the action".into(), ToastTone::Failed));
                         } else {
                             model.begin_action(id, &feedback);
@@ -574,6 +577,9 @@ fn log_latencies(samples: &mut Vec<f64>) {
     samples.clear();
 }
 
+/// Queue slots background reads leave free for foreground requests.
+const BACKGROUND_HEADROOM: usize = 3;
+
 /// Send read-only warm-up requests a board menu asked for. They carry no
 /// foreground feedback and never block input; a full queue drops them.
 fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
@@ -581,11 +587,19 @@ fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate
     model.plan_palette_warm(now);
     model.fire_palette_warm(now);
     for action in std::mem::take(&mut model.background) {
-        let _ = requests.try_send(crate::UiRequest {
-            id: 0,
-            cancellation: None,
-            generation: model.ui_generation,
-            action,
-        });
+        // Background reads keep headroom in the bounded queue for the keys
+        // the user is pressing; a skipped prefetch is retried later.
+        let sent = requests.capacity() > BACKGROUND_HEADROOM
+            && requests
+                .try_send(crate::UiRequest {
+                    id: 0,
+                    cancellation: None,
+                    generation: model.ui_generation,
+                    action: action.clone(),
+                })
+                .is_ok();
+        if !sent {
+            model.background_not_sent(&action, now);
+        }
     }
 }

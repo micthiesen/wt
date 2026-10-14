@@ -212,3 +212,22 @@ fn an_armed_warm_wakes_the_loop_at_its_due_time() {
     assert_eq!(model.next_deadline(), None);
     assert!(matches!(model.interaction, Interaction::None));
 }
+
+#[test]
+fn a_prefetch_that_could_not_be_queued_is_retried() {
+    let mut model = Model::default();
+    model.apply(live(board(&[("one", None)])));
+    let start = tokio::time::Instant::now();
+    model.plan_palette_warm(start);
+    model.fire_palette_warm(start + Duration::from_millis(250));
+    let queued = std::mem::take(&mut model.background);
+    assert!(!queued.is_empty());
+    for action in &queued {
+        model.background_not_sent(action, start + Duration::from_millis(250));
+    }
+    // Nothing is due before the rest period passes again.
+    model.fire_palette_warm(start + Duration::from_millis(300));
+    assert!(model.background.is_empty());
+    model.fire_palette_warm(start + Duration::from_millis(500));
+    assert_eq!(model.background, queued);
+}

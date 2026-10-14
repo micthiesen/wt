@@ -46,6 +46,9 @@ pub enum LocalMenu {
     Modal {
         modal: Box<UiModal>,
         warm: Option<Box<UiAction>>,
+        /// The host that answers the menu's commits, for a menu about another
+        /// host's data that its commit cannot route by worktree key.
+        host: Option<String>,
     },
     /// Nothing to choose from; show this notice instead.
     Notice(String),
@@ -56,6 +59,7 @@ impl LocalMenu {
         Self::Modal {
             modal: Box::new(modal),
             warm: None,
+            host: None,
         }
     }
 }
@@ -96,7 +100,14 @@ impl UiAction {
                 url,
                 updated_at,
                 branch,
-            } => Menu::Local(confirms::review_checkout(board, url, updated_at, branch)),
+                host,
+            } => Menu::Local(confirms::review_checkout(
+                board,
+                url,
+                updated_at,
+                branch,
+                host.as_deref(),
+            )),
             A::GithubFailedChecks { .. } => Menu::Host {
                 reason: "fetches the failed CI log from GitHub",
             },

@@ -90,6 +90,9 @@ pub enum UiAction {
         url: String,
         updated_at: String,
         branch: String,
+        /// The host that reported the review request; it runs the checkout.
+        #[serde(default)]
+        host: Option<String>,
     },
     ReviewCheckout {
         url: String,
@@ -227,7 +230,7 @@ pub enum UiAction {
         verify_after_merge: Option<String>,
         /// The claim state the status menu showed.
         #[serde(default)]
-        seen: Option<Seen<Option<String>>>,
+        seen: Option<Seen<Option<StatusClaim>>>,
     },
     PrepareBase {
         key: String,
@@ -377,6 +380,15 @@ pub enum SessionTarget {
     Main,
     WtSource,
     Dotfiles,
+}
+
+/// The status claim a status menu showed: everything it displays or carries
+/// into the new claim. `None` inside the witness means no claim was shown.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusClaim {
+    pub state: String,
+    pub note: Option<String>,
+    pub verify_after_merge: Option<String>,
 }
 
 /// What a board menu showed for a value its commit depends on. The owning
@@ -531,7 +543,7 @@ pub enum PickerAction {
     Status {
         key: String,
         #[serde(default)]
-        seen: Option<Seen<Option<String>>>,
+        seen: Option<Seen<Option<StatusClaim>>>,
     },
     Base {
         key: String,
@@ -580,13 +592,13 @@ pub enum TextAction {
         key: String,
         state: String,
         #[serde(default)]
-        seen: Option<Seen<Option<String>>>,
+        seen: Option<Seen<Option<StatusClaim>>>,
     },
     VerifyAfterMerge {
         key: String,
         state: String,
         #[serde(default)]
-        seen: Option<Seen<Option<String>>>,
+        seen: Option<Seen<Option<StatusClaim>>>,
     },
 }
 

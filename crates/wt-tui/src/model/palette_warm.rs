@@ -67,6 +67,20 @@ impl Model {
         self.palette_warm.sent = self.palette_warm.wanted.clone();
     }
 
+    /// A background request could not be queued. A palette prefetch is
+    /// retried after the rest period instead of being treated as sent.
+    pub(crate) fn background_not_sent(&mut self, action: &UiAction, now: Instant) {
+        let UiAction::WarmPalette { surface } = action else {
+            return;
+        };
+        if matches!(surface, ActionSurface::Slot { .. }) {
+            self.palette_warm.slots_sent = false;
+        } else {
+            self.palette_warm.sent.retain(|sent| sent != surface);
+        }
+        self.palette_warm.due.get_or_insert(now + REST);
+    }
+
     /// When the selection's prefetch is due, so the loop wakes for it.
     pub(super) fn palette_warm_deadline(&self) -> Option<Instant> {
         self.palette_warm.due

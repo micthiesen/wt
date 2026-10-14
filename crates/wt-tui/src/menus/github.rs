@@ -26,7 +26,8 @@ pub(super) fn menu(board: &Board, key: &str, ship: bool) -> Menu {
     let Some(pr) = row.pr.as_ref() else {
         return host;
     };
-    let Some(number) = pr.number else {
+    // A pin without a head could never match confirmed data.
+    let (Some(number), Some(head_sha)) = (pr.number, pr.head_sha.clone()) else {
         return host;
     };
     if !pr.is_open() {
@@ -41,7 +42,7 @@ pub(super) fn menu(board: &Board, key: &str, ship: bool) -> Menu {
                 ship,
                 pin: Some(PrPin {
                     number,
-                    head_sha: pr.head_sha.clone(),
+                    head_sha: Some(head_sha),
                 }),
             },
             title,

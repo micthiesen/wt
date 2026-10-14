@@ -39,11 +39,16 @@ impl Model {
         }
         let row = self.selected_review()?;
         let action = match key.code {
-            KeyCode::Char('w') => UiAction::PrepareReviewCheckout {
-                url: row.url.clone(),
-                updated_at: row.updated_at.clone(),
-                branch: row.branch.clone(),
-            },
+            // Built from the board; the confirm carries the reporting host,
+            // which runs the checkout.
+            KeyCode::Char('w') => {
+                return Some(InputResult::Action(UiAction::PrepareReviewCheckout {
+                    url: row.url.clone(),
+                    updated_at: row.updated_at.clone(),
+                    branch: row.branch.clone(),
+                    host: row.host.clone(),
+                }));
+            }
             KeyCode::Char('d') => UiAction::DismissReviewRequest {
                 url: row.url.clone(),
                 updated_at: row.updated_at.clone(),
@@ -100,10 +105,19 @@ mod tests {
         ));
         model.selected = Some(0);
         assert!(model.selected_row().is_none());
-        assert!(
-            matches!(model.input(KeyEvent::from(KeyCode::Char('w')), 20),
-            InputResult::Action(UiAction::OnHost { host: Some(host), .. }) if host == "builder")
+        // The confirm opens from the board, and its commit runs on the host
+        // that reported the request.
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('w')), 20),
+            InputResult::Draw
         );
+        assert!(model.pending_request.is_none());
+        assert!(matches!(model.interaction, crate::Interaction::Confirm(_)));
+        assert!(matches!(
+            model.input(KeyEvent::from(KeyCode::Enter), 20),
+            InputResult::Action(UiAction::OnHost { host: Some(host), action })
+                if host == "builder" && matches!(*action, UiAction::ReviewCheckout { .. })
+        ));
         model.apply(SourceSnapshot::test_live(
             Some(model.board.clone()).map(|data| (*data).clone()),
             SourceState::Ready,

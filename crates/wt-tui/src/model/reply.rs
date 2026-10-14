@@ -199,8 +199,13 @@ impl Model {
                 self.pending_selection = Some(key);
             }
         }
-        if stale && presentation_current {
-            self.reopen_stale_menu(stale_id, stale_message);
+        if stale {
+            // Refresh even when the user has moved on; only the reopen needs
+            // the view the commit came from.
+            self.refresh_requested = true;
+            if presentation_current {
+                self.reopen_stale_menu(stale_id, stale_message);
+            }
         }
         if let Some((keys, started)) = typeahead {
             if presentation_current
@@ -210,10 +215,14 @@ impl Model {
             {
                 self.replay_typeahead(keys);
             } else if !reply.failed {
-                self.toast = Some((
-                    "Keys typed while the menu loaded were dropped".into(),
-                    ToastTone::Notice,
-                ));
+                // Keep the reply's own message; the dropped keys are secondary.
+                let text = match self.toast.take() {
+                    Some((text, _)) if !text.trim().is_empty() => {
+                        format!("{text}; keys typed while it loaded were dropped")
+                    }
+                    _ => "Keys typed while the menu loaded were dropped".into(),
+                };
+                self.toast = Some((text, ToastTone::Notice));
             }
         }
         reply.handoff

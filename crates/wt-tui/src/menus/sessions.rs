@@ -36,6 +36,7 @@ pub(super) fn sessions_menu(board: &Board, key: Option<&str>, target: SessionTar
             key: key.map(str::to_owned),
             target,
         })),
+        host: None,
     })
 }
 
@@ -342,7 +343,7 @@ mod tests {
     }
 
     fn picker(menu: Menu) -> (UiModal, Option<Box<UiAction>>) {
-        let Menu::Local(LocalMenu::Modal { modal, warm }) = menu else {
+        let Menu::Local(LocalMenu::Modal { modal, warm, .. }) = menu else {
             panic!("expected a board picker, got {menu:?}")
         };
         (*modal, warm)
@@ -492,7 +493,7 @@ mod tests {
     #[test]
     fn harness_picker_starts_on_the_persisted_primary() {
         let (modal, _) = match harness_menu(&board(vec![]), "one") {
-            Menu::Local(LocalMenu::Modal { modal, warm }) => (*modal, warm),
+            Menu::Local(LocalMenu::Modal { modal, warm, .. }) => (*modal, warm),
             other => panic!("{other:?}"),
         };
         let UiModal::Picker {

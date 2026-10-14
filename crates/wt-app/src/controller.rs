@@ -204,7 +204,13 @@ pub fn start(
                         // well as conflicts. Palette title generation is a write.
                         command.action = crate::host_dispatch::rename_as_title(command.action);
                         match lane_for(&command.action) {
-                        Ok(lane) if !lane_failed(&lane, &failed_lanes) => pending.push_back((lane, (command, Instant::now()))),
+                        Ok(lane) if !lane_failed(&lane, &failed_lanes) => {
+                            // A newer identical prefetch replaces a queued one.
+                            if matches!(lane, Lane::Prefetch(_)) {
+                                pending.retain(|(queued, (other, _))| !matches!(queued, Lane::Prefetch(_)) || other.action != command.action);
+                            }
+                            pending.push_back((lane, (command, Instant::now())));
+                        },
                         Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure("Host command worker failed; this command was not started. Restart wt before retrying.") }).await; },
                         Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure(format!("{error:#}")) }).await; },
                         }
@@ -249,6 +255,10 @@ pub(crate) enum Lane {
     /// Read-only prompts and pickers must not sit behind a long accepted
     /// mutation on the same host. The final mutation still revalidates.
     Preparation(Option<String>),
+    /// Background reads that prepare a board menu ahead of its key (palette
+    /// prefetch). One runs at a time beside foreground preparations, never
+    /// taking their slot or ordinary host capacity.
+    Prefetch(Option<String>),
     FleetCleanup,
     Presentation,
     /// Bounded, device-local controls must remain responsive while host jobs
@@ -315,12 +325,14 @@ fn lane_host(lane: &Lane) -> &str {
         | Lane::Removal(Some(host), _)
         | Lane::Metadata(Some(host), _)
         | Lane::Preparation(Some(host))
+        | Lane::Prefetch(Some(host))
         | Lane::Terminal(Some(host), _) => host,
         Lane::Host(None)
         | Lane::Creation(None)
         | Lane::Removal(None, _)
         | Lane::Metadata(None, _)
         | Lane::Preparation(None)
+        | Lane::Prefetch(None)
         | Lane::Terminal(None, _) => "local host",
         Lane::FleetCleanup => "local and remote hosts",
         Lane::Presentation | Lane::ViewControl => "local host",
@@ -454,8 +466,9 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         ) {
             Lane::ViewControl
         } else if matches!(action, wt_tui::UiAction::WarmPalette { .. }) {
-            // Read-only prefetch: never queued behind a long host job.
-            Lane::Preparation(host)
+            // Read-only prefetch: never queued behind a long host job, and
+            // never ahead of a menu the user is waiting for.
+            Lane::Prefetch(host)
         } else if action.is_terminal_handoff() {
             let key = match action {
                 wt_tui::UiAction::Session { key, .. } => key,
@@ -509,6 +522,7 @@ pub(crate) fn take_available<T>(
                 lane,
                 Lane::ViewControl
                     | Lane::Preparation(_)
+                    | Lane::Prefetch(_)
                     | Lane::Creation(_)
                     | Lane::Terminal(_, _)
                     | Lane::Metadata(_, _)
@@ -517,12 +531,14 @@ pub(crate) fn take_available<T>(
         .count()
         >= 4;
     let preparation_busy = busy.iter().any(|lane| matches!(lane, Lane::Preparation(_)));
+    let prefetch_busy = busy.iter().any(|lane| matches!(lane, Lane::Prefetch(_)));
     let creation_busy = busy.iter().any(|lane| matches!(lane, Lane::Creation(_)));
     let metadata_busy = busy.iter().any(|lane| matches!(lane, Lane::Metadata(_, _)));
     let position = pending.iter().position(|(lane, _)| {
         let has_capacity = match lane {
             Lane::ViewControl | Lane::Terminal(_, _) => true,
             Lane::Preparation(_) => !preparation_busy,
+            Lane::Prefetch(_) => !prefetch_busy,
             Lane::Creation(_) => !creation_busy,
             Lane::Metadata(_, _) => !metadata_busy,
             _ => !ordinary_full,
@@ -1474,6 +1490,26 @@ mod tests {
         ]);
         let mut pending = VecDeque::from([(lane.clone(), action.clone())]);
         assert_eq!(take_available(&mut pending, &busy), Some((lane, action)));
+    }
+
+    #[test]
+    fn palette_prefetch_never_holds_a_menu_the_user_is_waiting_for() {
+        let warm = lane_for(&wt_tui::UiAction::WarmPalette {
+            surface: wt_tui::ActionSurface::Row { key: "one".into() },
+        })
+        .unwrap();
+        assert_eq!(warm, Lane::Prefetch(None));
+        let menu = Lane::Preparation(None);
+        // A running prefetch leaves the preparation slot free...
+        let mut pending = VecDeque::from([(warm.clone(), 1), (menu.clone(), 2)]);
+        let busy = BTreeSet::from([warm.clone()]);
+        assert_eq!(take_available(&mut pending, &busy), Some((menu.clone(), 2)));
+        // ...and only one prefetch runs at a time.
+        assert_eq!(take_available(&mut pending, &busy), None);
+        // A foreground preparation does not wait for the prefetch either.
+        let mut pending = VecDeque::from([(warm.clone(), 3)]);
+        let busy = BTreeSet::from([menu]);
+        assert_eq!(take_available(&mut pending, &busy), Some((warm, 3)));
     }
 
     #[test]

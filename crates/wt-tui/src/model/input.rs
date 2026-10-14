@@ -117,7 +117,19 @@ impl Model {
                 self.toast = None;
             }
         }
+        // Only a request the terminal is about to send has an opener.
+        if !matches!(result, InputResult::Action(_)) {
+            self.last_key = None;
+        }
         result
+    }
+
+    /// The terminal could not queue the request this key produced. Drop what
+    /// was staged for it so a later, unrelated request cannot inherit it.
+    pub(crate) fn request_not_sent(&mut self) {
+        self.last_key = None;
+        self.committed_menu = None;
+        self.carry_typeahead.clear();
     }
 
     fn input_inner(&mut self, key: KeyEvent, height: usize) -> InputResult {

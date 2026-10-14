@@ -23,7 +23,7 @@ mod theme;
 pub use actions::{
     ActionController, ActionSurface, CleanupTarget, ConfirmAction, CreatePlan, CreationPrepared,
     LiveSessionIdentity, PickerAction, PickerOption, PrPin, RemovalRevision, RemovalSeen,
-    ReplyOutcome, ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget,
+    ReplyOutcome, ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget, StatusClaim,
     TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind,
     action_channel,
 };

@@ -805,7 +805,7 @@ async fn set_status(
     state: Option<String>,
     note: Option<String>,
     verify: Option<String>,
-    seen: Option<wt_tui::Seen<Option<String>>>,
+    seen: Option<wt_tui::Seen<Option<wt_tui::StatusClaim>>>,
 ) -> Result<UiReply> {
     let row = resolve_key(ctx, key).await?;
     let slug = row.target.slug().to_owned();
@@ -831,12 +831,18 @@ async fn set_status(
                 .and_then(|work| serde_json::from_value::<wt_store::WorkStatusRecord>(work).ok());
             // Another writer (often the worktree's agent) may have claimed a
             // status since the menu opened. Never overwrite a claim unseen.
+            // The note and owed check are carried into the new claim, so a
+            // change to either is as unseen as a change of state.
             if let Some(wt_tui::Seen(seen)) = &seen {
-                let current = previous.as_ref().map(|work| work.state.as_str());
-                if current != seen.as_deref() {
+                let current = previous.as_ref().map(|work| wt_tui::StatusClaim {
+                    state: work.state.clone(),
+                    note: work.note.clone(),
+                    verify_after_merge: work.verify_after_merge.clone(),
+                });
+                if current != *seen {
                     return Err(crate::controller::stale(format!(
                         "status is now {}",
-                        current.unwrap_or("unset")
+                        current.map_or("unset".into(), |claim| claim.state)
                     )));
                 }
             }
@@ -1002,7 +1008,27 @@ mod tests {
             Some("working".into()),
             None,
             None,
-            Some(wt_tui::Seen(Some("review".into()))),
+            Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
+                state: "review".into(),
+                note: None,
+                verify_after_merge: None,
+            }))),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+        // Same state, but the owed check changed since: still unseen.
+        let error = set_status(
+            &fixture.ctx,
+            &key,
+            Some("working".into()),
+            None,
+            None,
+            Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
+                state: "ready".into(),
+                note: Some("checked locally".into()),
+                verify_after_merge: Some("STEPS: older steps".into()),
+            }))),
         )
         .await
         .unwrap_err();
@@ -1013,7 +1039,11 @@ mod tests {
             Some("working".into()),
             None,
             None,
-            Some(wt_tui::Seen(Some("ready".into()))),
+            Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
+                state: "ready".into(),
+                note: Some("checked locally".into()),
+                verify_after_merge: Some("STEPS: check deployed version".into()),
+            }))),
         )
         .await
         .unwrap();

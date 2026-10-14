@@ -1,7 +1,7 @@
 //! `u`: the work status picker, from the row's stored claim.
 
 use super::LocalMenu;
-use crate::{Board, PickerAction, PickerOption, Seen, UiModal};
+use crate::{Board, PickerAction, PickerOption, Seen, StatusClaim, UiModal};
 
 const STATUS_CHORDS: [(&str, char); 8] = [
     ("todo", 't'),
@@ -73,7 +73,11 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
     LocalMenu::modal(UiModal::Picker {
         action: PickerAction::Status {
             key: key.to_owned(),
-            seen: Some(Seen(current_state.map(str::to_owned))),
+            seen: Some(Seen(record.map(|record| StatusClaim {
+                state: record.state.as_str().to_owned(),
+                note: record.note.clone(),
+                verify_after_merge: record.verify_after_merge.clone(),
+            }))),
         },
         title: format!("status for {}", row.slug),
         options,
@@ -120,7 +124,11 @@ mod tests {
             action,
             PickerAction::Status {
                 key: "one".into(),
-                seen: Some(Seen(Some("review".into()))),
+                seen: Some(Seen(Some(StatusClaim {
+                    state: "review".into(),
+                    note: None,
+                    verify_after_merge: None,
+                }))),
             }
         );
         assert!(matches!(menu(&board, "gone"), LocalMenu::Notice(_)));
