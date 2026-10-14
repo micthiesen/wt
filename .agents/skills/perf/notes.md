@@ -9,7 +9,17 @@ load 19.68 on 12 cores, with wt descendants accounting for 9% of CPU in use;
 a TypeScript check and Brave dominated the decaying CPU snapshot. The second
 `top` sample was 3.91% idle with no swap deltas. This supports checking resource
 contention before changing shutdown deadlines, but does not prove the timeout's
-cause. Preserve live workloads and reduce test concurrency for the full retry.
+cause. A second full run failed with the same three watchers; CI already uses
+four test threads, so explicitly passing four did not reduce concurrency.
+
+Native sampling then identified synchronous `FSEventsGetCurrentEventId` teardown
+RPCs and a concurrent `FSEventStreamStart` registration inside notify 8.2.0
+(`/tmp/wt-host-shutdown.sample`). Cancellation was awaiting native cleanup.
+Upstream notify-rs/notify#795 removes the unnecessary volume-purge RPC and fixes
+shutdown behavior, but is published only in notify 9 prereleases, requiring an
+API migration. Keep this as a separate dependency repair, not a longer timeout
+or detached cleanup. A subsequent native workspace run passed all 998 tests
+(one skipped) in 39.72 seconds; this does not resolve the intermittent OS delay.
 
 Companion to `SKILL.md`. Keep the baseline and open issues current; preserve
 measured evidence, and prune implementation-specific advice when it no longer
