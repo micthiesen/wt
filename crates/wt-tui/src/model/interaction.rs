@@ -239,18 +239,22 @@ impl Model {
                                 key: key.clone(),
                                 issue_id: (!text.is_empty()).then_some(text),
                             },
-                            TextAction::StatusNote { key, state } => UiAction::SetStatus {
+                            TextAction::StatusNote { key, state, seen } => UiAction::SetStatus {
                                 key: key.clone(),
                                 state: Some(state.clone()),
                                 note: Some(text),
                                 verify_after_merge: clear_verification_for(state),
+                                seen: seen.clone(),
                             },
-                            TextAction::VerifyAfterMerge { key, state } => UiAction::SetStatus {
-                                key: key.clone(),
-                                state: Some(state.clone()),
-                                note: None,
-                                verify_after_merge: Some(text),
-                            },
+                            TextAction::VerifyAfterMerge { key, state, seen } => {
+                                UiAction::SetStatus {
+                                    key: key.clone(),
+                                    state: Some(state.clone()),
+                                    note: None,
+                                    verify_after_merge: Some(text),
+                                    seen: seen.clone(),
+                                }
+                            }
                         };
                         InputResult::Action(action)
                     }
@@ -400,7 +404,7 @@ impl Model {
                         self.interaction = interaction;
                         return InputResult::Unchanged;
                     };
-                    let PickerAction::Status { key } = &picker.action else {
+                    let PickerAction::Status { key, seen } = &picker.action else {
                         unreachable!()
                     };
                     let Some(state) = option.value.clone() else {
@@ -414,6 +418,7 @@ impl Model {
                             TextAction::VerifyAfterMerge {
                                 key: key.clone(),
                                 state,
+                                seen: seen.clone(),
                             },
                             "verify after merge: ".into(),
                             steps,
@@ -423,6 +428,7 @@ impl Model {
                             TextAction::StatusNote {
                                 key: key.clone(),
                                 state,
+                                seen: seen.clone(),
                             },
                             "status note: ".into(),
                             String::new(),
@@ -580,12 +586,13 @@ impl Model {
                         key: key.clone(),
                         base: option.value,
                     }),
-                    PickerAction::Status { key } => {
+                    PickerAction::Status { key, seen } => {
                         if let Some(steps) = option.verify_after_merge {
                             self.interaction = Interaction::Text(TextPrompt {
                                 action: TextAction::VerifyAfterMerge {
                                     key: key.clone(),
                                     state: option.value.unwrap_or_else(|| "ready".into()),
+                                    seen: seen.clone(),
                                 },
                                 prompt: "verify after merge: ".into(),
                                 editor: LineEditor::new(&steps),
@@ -603,6 +610,7 @@ impl Model {
                                 state,
                                 note: None,
                                 verify_after_merge,
+                                seen: seen.clone(),
                             })
                         }
                     }

@@ -150,6 +150,17 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
         production: config.branch.production.is_some(),
         automations: !config.automations.is_empty(),
         primary_harness: config.harness.primary.as_str().to_owned(),
+        primary: Some(config.harness.primary),
+        harnesses: wt_core::HarnessId::ALL
+            .into_iter()
+            .filter(|harness| !config.harness.hidden.contains(harness))
+            .collect(),
+        trunk: config.branch.base.clone(),
+        default_reviewer: config
+            .github
+            .reviewers
+            .then(|| config.github.default_reviewer.clone())
+            .flatten(),
     }
 }
 

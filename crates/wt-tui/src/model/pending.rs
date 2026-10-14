@@ -67,6 +67,7 @@ impl Model {
             Arc::new(board)
         };
         self.present(board);
+        self.rebuild_local_menu();
     }
 
     /// When a pending change next needs re-checking against its deadline.
@@ -174,6 +175,7 @@ impl Model {
             inner = action;
         }
         let preparation = inner.is_preparation();
+        self.last_menu = self.committed_menu.take().map(|menu| (id, menu));
         let carried = std::mem::take(&mut self.carry_typeahead);
         self.pending_request = Some(super::PendingRequest {
             id,

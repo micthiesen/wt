@@ -59,6 +59,11 @@ pub async fn execute_with_shutdown(
     shutdown: Option<&CancellationToken>,
 ) -> Result<UiReply> {
     match action {
+        // Built by the TUI from its board (`UiAction::menu`); the host
+        // service refuses them before dispatch.
+        UiAction::PrepareStatus { .. } => {
+            bail!("this menu is built from the board and never asks the host")
+        }
         UiAction::PrepareHardRefresh
         | UiAction::HardRefresh
         | UiAction::PrepareReviewCheckout { .. }
@@ -493,13 +498,13 @@ pub async fn execute_with_shutdown(
                 .await?;
             Ok(message(if archived { "Archived" } else { "Restored" }))
         }
-        UiAction::PrepareStatus { key } => prepare_status(ctx, key).await,
         UiAction::SetStatus {
             key,
             state,
             note,
             verify_after_merge,
-        } => set_status(ctx, &key, state, note, verify_after_merge).await,
+            seen,
+        } => set_status(ctx, &key, state, note, verify_after_merge, seen).await,
         UiAction::PrepareBase { key } => {
             let row = resolve_key(ctx, &key).await?;
             let slug = row.target.slug().to_owned();
@@ -774,17 +779,6 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
     })
 }
 
-const STATUS_CHORDS: [(&str, char); 8] = [
-    ("todo", 't'),
-    ("working", 'w'),
-    ("review", 'r'),
-    ("needs-testing", 'n'),
-    ("needs-human", 'h'),
-    ("ready", 'y'),
-    ("verified", 'v'),
-    ("dropped", 'd'),
-];
-
 async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Result<()> {
     let config = wt_lifecycle::ServiceConfig::from_config(&ctx.config);
     let policy = wt_platform::install::InstallPolicy {
@@ -832,84 +826,13 @@ async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Re
     Ok(())
 }
 
-async fn prepare_status(ctx: &AppContext, key: String) -> Result<UiReply> {
-    let row = resolve_key(ctx, &key).await?;
-    let slug = row.target.slug().to_owned();
-    let title = format!("status for {slug}");
-    let previous = ctx
-        .database
-        .call(move |store| Ok(store.read_slug_state(&slug)?))
-        .await?;
-    let work = previous.as_ref().and_then(|entry| entry.get("work"));
-    let note = work
-        .and_then(|work| work["note"].as_str())
-        .map(str::to_owned);
-    let verify = work
-        .and_then(|work| work["verifyAfterMerge"].as_str())
-        .map(str::to_owned);
-    // TS order: the plain states, `a` beside `y`, then clear. The current
-    // claim is marked and starts highlighted; a ready claim with an owed
-    // check is the `a` row.
-    let current_state = work.and_then(|work| work["state"].as_str());
-    let current = match current_state {
-        Some("ready") if verify.is_some() => Some('a'),
-        Some(state) => STATUS_CHORDS
-            .iter()
-            .find(|(name, _)| *name == state)
-            .map(|(_, chord)| *chord),
-        // No claim yet starts on todo, the usual first claim, as in TS.
-        None => Some('t'),
-    };
-    let mut options = Vec::new();
-    for (state, chord) in STATUS_CHORDS {
-        options.push(PickerOption {
-            value: Some(state.into()),
-            label: state.into(),
-            chord: Some(chord),
-            note: note.clone(),
-            verify_after_merge: None,
-            detail: None,
-        });
-        if chord == 'y' {
-            options.push(PickerOption {
-                value: Some("ready".into()),
-                label: "ready + verify after merge".into(),
-                chord: Some('a'),
-                note: None,
-                verify_after_merge: Some(verify.clone().unwrap_or_default()),
-                detail: None,
-            });
-        }
-    }
-    options.push(PickerOption {
-        value: None,
-        label: "clear status".into(),
-        chord: Some('x'),
-        note: None,
-        verify_after_merge: None,
-        detail: None,
-    });
-    let selected = options
-        .iter()
-        .position(|option| option.chord == current)
-        .unwrap_or(0);
-    if current_state.is_some() {
-        options[selected].label.push_str(" (current)");
-    }
-    Ok(modal(UiModal::Picker {
-        action: PickerAction::Status { key },
-        title,
-        options,
-        selected,
-    }))
-}
-
 async fn set_status(
     ctx: &AppContext,
     key: &str,
     state: Option<String>,
     note: Option<String>,
     verify: Option<String>,
+    seen: Option<wt_tui::Seen<Option<String>>>,
 ) -> Result<UiReply> {
     let row = resolve_key(ctx, key).await?;
     let slug = row.target.slug().to_owned();
@@ -933,6 +856,17 @@ async fn set_status(
                 .read_slug_state(&slug)?
                 .and_then(|entry| entry.get("work").cloned())
                 .and_then(|work| serde_json::from_value::<wt_store::WorkStatusRecord>(work).ok());
+            // Another writer (often the worktree's agent) may have claimed a
+            // status since the menu opened. Never overwrite a claim unseen.
+            if let Some(wt_tui::Seen(seen)) = &seen {
+                let current = previous.as_ref().map(|work| work.state.as_str());
+                if current != seen.as_deref() {
+                    return Err(crate::controller::stale(format!(
+                        "status is now {}",
+                        current.unwrap_or("unset")
+                    )));
+                }
+            }
             let record = state.map(|state| {
                 let terminal = matches!(
                     state,
@@ -1210,12 +1144,32 @@ mod tests {
             Some("ready".into()),
             Some("checked locally".into()),
             Some("STEPS: check deployed version".into()),
+            None,
         )
         .await
         .unwrap();
-        set_status(&fixture.ctx, &key, Some("working".into()), None, None)
-            .await
-            .unwrap();
+        // A menu that showed an older claim is refused without writing.
+        let error = set_status(
+            &fixture.ctx,
+            &key,
+            Some("working".into()),
+            None,
+            None,
+            Some(wt_tui::Seen(Some("review".into()))),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+        set_status(
+            &fixture.ctx,
+            &key,
+            Some("working".into()),
+            None,
+            None,
+            Some(wt_tui::Seen(Some("ready".into()))),
+        )
+        .await
+        .unwrap();
         let state = fixture
             .ctx
             .database
@@ -1232,6 +1186,7 @@ mod tests {
             Some("ready".into()),
             None,
             Some(String::new()),
+            None,
         )
         .await
         .unwrap();

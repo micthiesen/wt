@@ -2726,7 +2726,10 @@ mod tests {
         };
         let mut model = Model {
             interaction: Interaction::Picker(PickerPrompt {
-                action: PickerAction::Status { key: "one".into() },
+                action: PickerAction::Status {
+                    key: "one".into(),
+                    seen: None,
+                },
                 title: "Work status".into(),
                 options: vec![
                     option("todo", 't'),
@@ -3017,7 +3020,10 @@ mod tests {
     fn ready_plus_verify_wears_the_warn_glyph() {
         let mut model = Model {
             interaction: Interaction::Picker(PickerPrompt {
-                action: PickerAction::Status { key: "one".into() },
+                action: PickerAction::Status {
+                    key: "one".into(),
+                    seen: None,
+                },
                 title: "Work status".into(),
                 options: vec![PickerOption {
                     value: Some("ready".into()),

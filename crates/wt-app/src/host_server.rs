@@ -160,7 +160,7 @@ where
                         outcome = host.execute(action) => outcome,
                     }
                 } else { host.execute_with_shutdown(action, Some(&shutdown_wait)).await };
-                outcome.unwrap_or_else(|error| UiReply::failure(format!("{error:#}")))
+                outcome.unwrap_or_else(|error| crate::controller::error_reply(&error))
             });
             running.insert(task.id(), (id, lane, cancellation));
         }

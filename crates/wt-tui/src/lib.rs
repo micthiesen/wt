@@ -8,6 +8,7 @@ mod editor;
 mod glyphs;
 mod help;
 mod history;
+mod menus;
 mod model;
 mod mouse;
 mod mutations;
@@ -22,18 +23,19 @@ mod theme;
 pub use actions::{
     ActionController, ActionSurface, CleanupTarget, ConfirmAction, CreatePlan, CreationPrepared,
     LiveSessionIdentity, PickerAction, PickerOption, PrPin, RemovalRevision, ReplyOutcome,
-    ReviewerOption, SessionMode, SessionSelection, SessionTarget, TerminalHandoff, TextAction,
-    UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
+    ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget, TerminalHandoff,
+    TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
+pub use menus::{LocalMenu, Menu, session_menu_key};
 pub use model::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
     DisplayPolicy, GitPresentation, HostChoice, Interaction, LandingKind, LiveSlotView, LogView,
     MergeQueueView, Model, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
     PrPresentation, PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
-    ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
-    WorkPresentation, WorkRiskCount, WorkStateCount,
+    ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView,
+    TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use mutations::{
     AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,

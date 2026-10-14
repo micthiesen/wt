@@ -870,7 +870,10 @@ mod tests {
         let mut model = Model {
             toast: Some((String::new(), crate::model::ToastTone::Info)),
             interaction: Interaction::Picker(crate::model::PickerPrompt {
-                action: PickerAction::Status { key: "one".into() },
+                action: PickerAction::Status {
+                    key: "one".into(),
+                    seen: None,
+                },
                 title: "status".into(),
                 options: Vec::new(),
                 selected: 0,

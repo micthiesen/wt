@@ -1254,7 +1254,10 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
     model.input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), 20);
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
-            action: PickerAction::Status { key: "row".into() },
+            action: PickerAction::Status {
+                key: "row".into(),
+                seen: None,
+            },
             title: "status".into(),
             options: vec![
                 PickerOption {
@@ -1301,12 +1304,16 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             state: Some("ready".into()),
             note: Some("needs review".into()),
             verify_after_merge: None,
+            seen: None,
         })
     );
     model.input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), 20);
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
-            action: PickerAction::Status { key: "row".into() },
+            action: PickerAction::Status {
+                key: "row".into(),
+                seen: None,
+            },
             title: "status".into(),
             options: vec![PickerOption {
                 value: Some("ready".into()),
@@ -1327,12 +1334,16 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             state: Some("ready".into()),
             note: None,
             verify_after_merge: None,
+            seen: None,
         })
     );
     model.input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE), 20);
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
-            action: PickerAction::Status { key: "row".into() },
+            action: PickerAction::Status {
+                key: "row".into(),
+                seen: None,
+            },
             title: "status".into(),
             options: vec![PickerOption {
                 value: Some("ready".into()),
@@ -1357,6 +1368,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             state: Some("ready".into()),
             note: None,
             verify_after_merge: Some("probe".into()),
+            seen: None,
         })
     );
 }
@@ -1623,4 +1635,103 @@ fn resolved_creation_of_existing_checkout_reuses_its_row_until_acceptance() {
     });
     assert_eq!(model.board.rows.len(), 1);
     assert!(!model.selected_row().unwrap().pending_creation);
+}
+
+fn board_with_status(state: Option<wt_core::WorkState>) -> SourceSnapshot<Board> {
+    let mut snapshot = snapshot(&["one"]).data().unwrap().as_ref().clone();
+    snapshot.rows[0].work = state.map(|state| crate::WorkPresentation {
+        record: Some(wt_core::WorkStatusRecord::new(
+            state,
+            "2026-10-14T00:00:00Z",
+        )),
+        ..Default::default()
+    });
+    SourceSnapshot::test_live(Some(snapshot), SourceState::Ready, wt_core::Domain::Git)
+}
+
+#[test]
+fn board_menus_open_without_a_request_and_commit_what_they_showed() {
+    let mut model = Model::default();
+    model.apply(board_with_status(Some(wt_core::WorkState::Review)));
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('u')), 20),
+        InputResult::Draw
+    );
+    assert!(model.pending_request.is_none());
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("status menu opens at once")
+    };
+    assert_eq!(picker.options[picker.selected].label, "review (current)");
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('w')), 20) else {
+        panic!()
+    };
+    assert_eq!(
+        action,
+        UiAction::SetStatus {
+            key: "one".into(),
+            state: Some("working".into()),
+            note: None,
+            verify_after_merge: None,
+            seen: Some(crate::Seen(Some("review".into()))),
+        }
+    );
+}
+
+#[test]
+fn open_board_menus_rebuild_from_newer_boards_and_keep_their_choice() {
+    let mut model = Model::default();
+    model.apply(board_with_status(None));
+    model.input(KeyEvent::from(KeyCode::Char('u')), 20);
+    model.input(KeyEvent::from(KeyCode::Down), 20);
+    model.input(KeyEvent::from(KeyCode::Down), 20);
+    let chosen = |model: &Model| match &model.interaction {
+        Interaction::Picker(picker) => (
+            picker.options[picker.selected].value.clone(),
+            picker.action.clone(),
+        ),
+        _ => panic!("menu stays open"),
+    };
+    let (before, _) = chosen(&model);
+    model.apply(board_with_status(Some(wt_core::WorkState::Working)));
+    let (after, action) = chosen(&model);
+    assert_eq!(before, after);
+    assert_eq!(
+        action,
+        PickerAction::Status {
+            key: "one".into(),
+            seen: Some(crate::Seen(Some("working".into()))),
+        }
+    );
+}
+
+#[test]
+fn stale_commits_reopen_their_menu_from_the_board() {
+    let mut model = Model::default();
+    model.apply(board_with_status(Some(wt_core::WorkState::Review)));
+    model.input(KeyEvent::from(KeyCode::Char('u')), 20);
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('w')), 20) else {
+        panic!()
+    };
+    let generation = model.ui_generation;
+    model.begin_action(5, &action);
+    assert!(matches!(model.interaction, Interaction::None));
+    model.apply(board_with_status(Some(wt_core::WorkState::Ready)));
+    model.reply(UiReply {
+        operation_id: Some(5),
+        ui_generation: Some(generation),
+        ..UiReply::stale("Changed since you looked: status is now ready")
+    });
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("the menu reopens")
+    };
+    assert_eq!(picker.options[picker.selected].label, "ready (current)");
+    assert_eq!(model.toast.as_ref().unwrap().1, ToastTone::Failed);
+    assert!(model.refresh_requested);
+    // A stale reply for another request does not reopen anything.
+    model.interaction = Interaction::None;
+    model.reply(UiReply {
+        operation_id: Some(6),
+        ..UiReply::stale("other")
+    });
+    assert!(matches!(model.interaction, Interaction::None));
 }

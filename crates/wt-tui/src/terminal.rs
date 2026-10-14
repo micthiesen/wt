@@ -314,6 +314,7 @@ async fn run_inner<'a>(
                         let received = Instant::now();
                         let toast_before = model.toast.clone();
                         let result = model.input(key, terminal.size()?.height.saturating_sub(4) as usize);
+                        send_background(&mut model, &actions.requests);
                         if model.toast.is_some() && model.toast != toast_before {
                             // Input-side feedback ("nothing needs you") expires
                             // like any other toast.
@@ -367,6 +368,10 @@ async fn run_inner<'a>(
                     let history_was_open = model.history.active;
                     let perf_was_open = model.show_perf;
                     let handoff = model.reply(reply);
+                    send_background(&mut model, &actions.requests);
+                    if std::mem::take(&mut model.refresh_requested) {
+                        source.refresh();
+                    }
                     if let Some(action) = model.follow_up.take() {
                         let id = model.next_op_id();
                         let action = model.resolve(action);
@@ -565,4 +570,17 @@ fn log_latencies(samples: &mut Vec<f64>) {
         "input-latency"
     );
     samples.clear();
+}
+
+/// Send read-only warm-up requests a board menu asked for. They carry no
+/// foreground feedback and never block input; a full queue drops them.
+fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
+    for action in std::mem::take(&mut model.background) {
+        let _ = requests.try_send(crate::UiRequest {
+            id: 0,
+            cancellation: None,
+            generation: model.ui_generation,
+            action,
+        });
+    }
 }

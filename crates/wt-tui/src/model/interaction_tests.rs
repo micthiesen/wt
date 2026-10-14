@@ -804,7 +804,10 @@ fn status_note_starts_empty() {
     let mut model = model_with(&["a"]);
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
-            action: PickerAction::Status { key: "a".into() },
+            action: PickerAction::Status {
+                key: "a".into(),
+                seen: None,
+            },
             title: "Status".into(),
             options: vec![PickerOption {
                 value: Some("working".into()),

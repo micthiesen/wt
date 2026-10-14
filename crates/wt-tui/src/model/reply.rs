@@ -26,6 +26,8 @@ impl Model {
             .map(|request| (request.typeahead.clone(), request.started))
             .filter(|(keys, _)| !keys.is_empty());
         let selected_create = self.reply_pending(&reply);
+        let (stale, stale_id, stale_message) =
+            (reply.stale, reply.operation_id, reply.message.clone());
         let presentation_current = reply
             .ui_generation
             .is_none_or(|generation| generation == self.ui_generation);
@@ -196,6 +198,9 @@ impl Model {
             } else {
                 self.pending_selection = Some(key);
             }
+        }
+        if stale && presentation_current {
+            self.reopen_stale_menu(stale_id, stale_message);
         }
         if let Some((keys, started)) = typeahead {
             if presentation_current

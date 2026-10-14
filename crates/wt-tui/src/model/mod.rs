@@ -4,6 +4,7 @@
 mod board;
 mod input;
 mod interaction;
+mod local_menu;
 mod pending;
 mod reply;
 mod selection;
@@ -27,8 +28,8 @@ pub use board::{
     DisplayPolicy, GitPresentation, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
     PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
     PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
-    ReviewRequestRow, ReviewState, SectionRollup, SessionView, TitleSource, UsageItem,
-    WorkPresentation, WorkRiskCount, WorkStateCount,
+    ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView,
+    TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use interaction::{
     ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,
@@ -73,6 +74,16 @@ pub struct Model {
     pub(crate) follow_up: Option<UiAction>,
     /// Typeahead left after a replayed key requested another menu.
     pub(crate) carry_typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
+    /// The request whose board-built menu is open.
+    pub(crate) local_menu: Option<UiAction>,
+    /// A board menu whose commit was just produced, until it is sent.
+    pub(crate) committed_menu: Option<UiAction>,
+    /// The board menu behind the request in flight, reopened if it is stale.
+    pub(crate) last_menu: Option<(u64, UiAction)>,
+    /// Read-only requests sent without foreground feedback.
+    pub(crate) background: Vec<UiAction>,
+    /// The sources should refresh because a commit found changed state.
+    pub(crate) refresh_requested: bool,
     /// The key being dispatched, recorded as the opener of a requested menu.
     pub(crate) last_key: Option<crossterm::event::KeyEvent>,
     pub board: Arc<Board>,
@@ -143,6 +154,11 @@ impl Default for Model {
             local_domains: Default::default(),
             follow_up: None,
             carry_typeahead: Vec::new(),
+            local_menu: None,
+            committed_menu: None,
+            last_menu: None,
+            background: Vec::new(),
+            refresh_requested: false,
             last_key: None,
             source_state: SourceState::Empty,
             selected: None,

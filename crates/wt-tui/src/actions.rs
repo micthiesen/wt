@@ -208,6 +208,9 @@ pub enum UiAction {
         note: Option<String>,
         /// `None` preserves the current obligation; `Some("")` clears it.
         verify_after_merge: Option<String>,
+        /// The claim state the status menu showed.
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     PrepareBase {
         key: String,
@@ -404,6 +407,12 @@ pub enum SessionTarget {
     Dotfiles,
 }
 
+/// What a board menu showed for a value its commit depends on. The owning
+/// host refuses the commit with a stale reply when its current value differs.
+/// A commit without one (CLI, automation) asserts nothing about the view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen<T>(pub T);
+
 /// The pull request the user saw when asking for a GitHub write. The host
 /// refuses the write when its confirmed data names a different PR or head.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,6 +539,8 @@ pub enum PickerAction {
     },
     Status {
         key: String,
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     Base {
         key: String,
@@ -570,10 +581,14 @@ pub enum TextAction {
     StatusNote {
         key: String,
         state: String,
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     VerifyAfterMerge {
         key: String,
         state: String,
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
 }
 
@@ -676,6 +691,10 @@ pub struct UiReply {
     /// classified; the host service fills it for every executed action.
     #[serde(default)]
     pub outcome: Option<ReplyOutcome>,
+    /// The host refused the commit because what its menu showed changed.
+    /// Nothing was written; the model reopens that menu from its board.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,6 +727,14 @@ impl UiReply {
         Self {
             failed: true,
             ..Self::message(message)
+        }
+    }
+
+    /// The commit was refused because the state its menu showed changed.
+    pub fn stale(message: impl Into<String>) -> Self {
+        Self {
+            stale: true,
+            ..Self::failure(message)
         }
     }
 

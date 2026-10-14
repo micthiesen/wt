@@ -72,7 +72,13 @@ impl Model {
         let generation = self.ui_generation;
         let toast_before = self.toast.clone();
         self.ui_generation = self.ui_generation.wrapping_add(1);
+        let menu_before = self.local_menu.clone();
         let result = self.input_inner(key, height);
+        self.track_local_menu(menu_before, &result);
+        let result = match result {
+            InputResult::Action(action) => self.open_board_menu(action),
+            result => result,
+        };
         if let InputResult::Action(action) = &result
             && let Some(request) = &self.pending_request
             && request.preparation

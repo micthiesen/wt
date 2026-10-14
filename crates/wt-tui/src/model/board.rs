@@ -59,6 +59,37 @@ pub struct Board {
     /// presented board, the user's own pending requests.
     #[serde(default, rename = "pending")]
     pub pending_views: Vec<wt_runtime::PendingView>,
+    /// Manually ordered section names (`sectionsOrder`), for the section menu.
+    #[serde(default)]
+    pub section_order: Vec<String>,
+    /// Prepared session-picker entries keyed by [`crate::session_menu_key`]:
+    /// cached conversation history joined with one live tmux inventory.
+    /// Entries only nominate choices; attachment revalidates live identity.
+    #[serde(default)]
+    pub session_menus: std::collections::BTreeMap<String, Vec<SessionMenuEntry>>,
+    /// Live shell and diff terminals keyed by row key, with the tmux identity
+    /// a stop request must match.
+    #[serde(default)]
+    pub terminals: std::collections::BTreeMap<String, Vec<TerminalSlotView>>,
+}
+
+/// One session-picker entry prepared by the owning host.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionMenuEntry {
+    pub selection: crate::SessionSelection,
+    pub display_name: String,
+    pub state: Option<String>,
+    pub is_live: bool,
+    pub last_active_ms: Option<i64>,
+}
+
+/// A live shell or diff terminal and its exact tmux identity.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalSlotView {
+    pub target: crate::SessionTarget,
+    pub name: String,
+    pub id: String,
+    pub created_at: i64,
 }
 
 /// One prepared perf sample. CPU values are `ps` percentages (100 per core);
@@ -491,6 +522,14 @@ pub struct DisplayPolicy {
     pub automations: bool,
     /// Primary harness name: `Claude`, `Codex`, or `OpenCode`.
     pub primary_harness: String,
+    /// The persisted primary harness, for menus that preselect it.
+    pub primary: Option<wt_core::HarnessId>,
+    /// Harnesses not hidden by `[harness].hidden`, in `HarnessId::ALL` order.
+    pub harnesses: Vec<wt_core::HarnessId>,
+    /// The configured trunk branch (`[branch].base`).
+    pub trunk: String,
+    /// The reviewer `E` requests when human reviewer requests are configured.
+    pub default_reviewer: Option<String>,
 }
 
 /// One explicitly identified detail pane group. `id` is matched against
@@ -521,6 +560,12 @@ pub struct BoardRow {
     pub title: String,
     pub branch: String,
     pub base_branch: Option<String>,
+    /// The repository's main checkout.
+    #[serde(default)]
+    pub is_main: bool,
+    /// The checkout has a detached HEAD.
+    #[serde(default)]
+    pub detached: bool,
     pub path: String,
     pub badge: String,
     pub details: Vec<String>,

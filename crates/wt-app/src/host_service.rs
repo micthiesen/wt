@@ -154,6 +154,9 @@ impl HostService {
         snapshot: &SourceSnapshot<Board>,
         shutdown: Option<&CancellationToken>,
     ) -> Result<UiReply> {
+        if command.is_board_menu() {
+            anyhow::bail!("this menu is built from the board and never asks the host");
+        }
         let context = self.context.for_action(&command)?;
         if let UiAction::PrepareSessions { key, target } = &command {
             let history = self.sources.sessions.discoveries.snapshot();
