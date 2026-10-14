@@ -1,9 +1,11 @@
 pub mod agent;
 pub mod archive;
+pub mod auth;
 pub mod base;
 pub mod claude;
 pub mod cleanup;
 pub mod codex;
+pub mod controller_bridge;
 pub mod dev;
 pub(crate) mod diagnostics;
 pub mod doctor;

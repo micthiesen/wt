@@ -6,7 +6,7 @@
 use std::{
     collections::BTreeSet,
     ffi::OsString,
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -54,6 +54,27 @@ pub async fn run(args: &[String], cancellation: &CancellationToken) -> Result<i3
             stdout.write_all(b"\n")?;
             Ok(0)
         }
+        ["bridge-probe"] => crate::commands::controller_bridge::exec("__wt_status").await,
+        ["bridge-path"] => {
+            let path = std::env::var_os("WT_CONTROLLER_SOCKET")
+                .context("worker has no controller services")?;
+            let path = PathBuf::from(path);
+            println!("{}", path.display());
+            Ok(0)
+        }
+        ["auth-sync", generation] => {
+            let root = std::env::var_os("WT_MANAGED_ROOT").context("worker has no managed root")?;
+            let generation = generation
+                .parse::<u64>()
+                .context("invalid account-switch generation")?;
+            crate::codex_reauth::write_worker_desired(
+                &PathBuf::from(root),
+                Some(generation),
+                cancellation,
+            )
+            .await?;
+            Ok(0)
+        }
         ["login", provider] => {
             let provider = SignIn::parse(provider)
                 .with_context(|| format!("unknown managed sign-in {provider:?}"))?;
@@ -83,6 +104,8 @@ pub async fn apply(
         .context("the managed root path must not contain quotes or newlines")?
         .to_owned();
     create_private_dir(&root)?;
+    crate::codex_reauth::write_worker_desired(&root, request.codex_auth_generation, cancellation)
+        .await?;
     // A reconnect and a finished sign-in can both converge the same root;
     // one apply at a time keeps the clone and mirrored trees consistent.
     let lock_path = root.join(".apply.lock");
@@ -166,6 +189,15 @@ pub async fn apply(
         )
     });
     checks.extend(codex_checks(&runner, &environment, cancellation).await);
+    if crate::codex_reauth::worker_pending(&root)? {
+        checks.retain(|check| check.id != "codex-login");
+        checks.push(ManagedCheck::new(
+            "codex-login",
+            CheckState::SignInNeeded,
+            "The controller changed Codex accounts; this managed host needs its own sign-in",
+            Some(SignIn::Codex),
+        ));
+    }
     checks.push(match probe(&runner, &environment, "gh", &["--version"], cancellation).await {
         Some(output) if output.status.success() => ManagedCheck::ok("gh", "gh is installed"),
         _ => ManagedCheck::new(
@@ -178,10 +210,14 @@ pub async fn apply(
     Ok(ManagedReport {
         protocol: MANAGED_PROTOCOL,
         checks,
+        codex_auth_generation: crate::codex_reauth::worker_desired(&root)?,
     })
 }
 
 async fn sign_in(provider: SignIn, cancellation: &CancellationToken) -> Result<i32> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("managed sign-in requires an interactive terminal; no daemon was stopped");
+    }
     let root = std::env::var_os("WT_MANAGED_ROOT")
         .map(PathBuf::from)
         .context("this managed worker has not been provisioned yet; reconnect and retry")?;
@@ -224,18 +260,13 @@ async fn sign_in(provider: SignIn, cancellation: &CancellationToken) -> Result<i
     // Pin the managed homes rather than trusting the inherited environment,
     // so a sign-in can never land in this account's own ~/.codex or gh config.
     let login_path = std::fs::read_to_string(root.join("login-path")).unwrap_or_default();
-    let mut command = std::process::Command::new(program);
-    command.args(&args);
-    for (name, value) in child_environment(&root, login_path.trim()) {
-        if let Some(value) = value {
-            command.env(name, value);
-        }
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("start `{program}`; is it installed on this host?"));
-    let succeeded = matches!(&status, Ok(status) if status.success());
-    if !succeeded {
+    let environment = child_environment(&root, login_path.trim());
+    let status = if provider == SignIn::Codex {
+        codex_login_lifecycle(&root, &environment, &args, cancellation).await
+    } else {
+        interactive_login(program, &args, &environment, cancellation).await
+    };
+    if status.is_err() {
         if let Err(error) = &status {
             eprintln!("wt: {error:#}");
         }
@@ -255,6 +286,121 @@ async fn sign_in(provider: SignIn, cancellation: &CancellationToken) -> Result<i
         return Ok(1);
     }
     Ok(0)
+}
+
+async fn interactive_login(
+    program: &str,
+    args: &[&str],
+    environment: &[(OsString, Option<OsString>)],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).kill_on_drop(true);
+    for (name, value) in environment {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start `{program}`"))?;
+    let status = tokio::select! {
+        _ = cancellation.cancelled() => {
+            child.kill().await.context("stop cancelled login")?;
+            bail!("sign-in cancelled");
+        }
+        status = child.wait() => status.context("wait for native login")?,
+    };
+    if !status.success() {
+        bail!("native login exited with {status}");
+    }
+    Ok(())
+}
+
+async fn codex_login_lifecycle(
+    root: &Path,
+    environment: &[(OsString, Option<OsString>)],
+    login_args: &[&str],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        bail!("sign-in cancelled before daemon changes");
+    }
+    let _lock =
+        wt_platform::lock::FileLock::try_acquire(root, "codex-login", "managed Codex login")
+            .await?
+            .context("another managed Codex sign-in is already running")?;
+    let expected = crate::codex_reauth::worker_desired(root)?;
+    let runner = ProcessRunner::default();
+    // Never signal arbitrary processes or touch tmux. Native daemon ownership
+    // checks scope the stop/restart to this worker's pinned CODEX_HOME.
+    // Native 0.162.1 serializes stop against its updater. The updater's
+    // try_restart_if_running cannot resurrect a stopped daemon, so leave the
+    // updater running instead of introducing custom PID ownership/signals.
+    let stopped = codex_control(
+        &runner,
+        environment,
+        &["app-server", "daemon", "stop"],
+        cancellation,
+    )
+    .await;
+    let login = match stopped {
+        Ok(()) => interactive_login("codex", login_args, environment, cancellation).await,
+        Err(error) => Err(error),
+    };
+    // Recovery is owed even when the transport cancelled its interactive child.
+    let recovery = codex_control(
+        &runner,
+        environment,
+        &["app-server", "daemon", "restart"],
+        &CancellationToken::new(),
+    )
+    .await;
+    if let Err(error) = recovery {
+        bail!("managed Codex daemon recovery failed: {error:#}; sign-in remains pending");
+    }
+    login?;
+    codex_control(&runner, environment, &["login", "status"], cancellation).await?;
+    crate::codex_reauth::acknowledge(root, expected, cancellation).await
+}
+
+async fn codex_control(
+    runner: &ProcessRunner,
+    environment: &[(OsString, Option<OsString>)],
+    args: &[&str],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut spec = CommandSpec::new("codex").args(args.iter().copied());
+    spec.env = environment.to_vec();
+    // Native daemon stop serializes with updates (up to 375s lock wait) and
+    // allows a configured shutdown grace up to 300s. Do not abort a healthy
+    // drain with the ordinary short read-probe timeout.
+    let daemon = args.starts_with(&["app-server", "daemon"]);
+    spec.timeout = if daemon {
+        Duration::from_secs(15 * 60)
+    } else {
+        PROBE_TIMEOUT
+    };
+    let operation = runner.run(spec, cancellation);
+    tokio::pin!(operation);
+    let mut progress = tokio::time::interval(Duration::from_secs(5));
+    progress.tick().await;
+    let output = loop {
+        tokio::select! {
+            output = &mut operation => break output?,
+            _ = progress.tick(), if daemon => {
+                eprintln!("Waiting for managed Codex daemon {} (finishing active work or another native update)…", args.last().copied().unwrap_or("operation"));
+            }
+        }
+    };
+    if !output.status.success() {
+        // Native errors may include credential material; expose the operation
+        // and status, never captured login output.
+        bail!("codex {} exited with {}", args.join(" "), output.status);
+    }
+    Ok(())
 }
 
 async fn codex_checks(
@@ -854,6 +1000,84 @@ fn tail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_relogin_recovers_after_failure_and_acknowledges_only_verified_success() {
+        use std::os::unix::fs::PermissionsExt;
+        for failure in ["", "stop", "login", "restart", "status", "cancel"] {
+            let temp = tempfile::tempdir().unwrap();
+            let program = temp.path().join("codex");
+            std::fs::write(
+                &program,
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "$QA_CALLS"
+case "$*:$QA_FAILURE" in
+  'app-server daemon stop:stop'|'login:login'|'app-server daemon restart:restart'|'login status:status') exit 1 ;;
+  'login:cancel') exec /bin/sleep 30 ;;
+esac
+exit 0
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let calls = temp.path().join("calls");
+            let environment = vec![
+                ("PATH".into(), Some(temp.path().as_os_str().to_owned())),
+                (
+                    "CODEX_HOME".into(),
+                    Some(temp.path().join("codex-home").into()),
+                ),
+                ("QA_CALLS".into(), Some(calls.as_os_str().to_owned())),
+                ("QA_FAILURE".into(), Some(failure.into())),
+            ];
+            let cancel = CancellationToken::new();
+            crate::codex_reauth::write_worker_desired(temp.path(), Some(5), &cancel)
+                .await
+                .unwrap();
+            let canceller = (failure == "cancel").then(|| {
+                let calls = calls.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            if std::fs::read_to_string(&calls)
+                                .is_ok_and(|text| text.contains("\nlogin\n"))
+                            {
+                                cancel.cancel();
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                })
+            });
+            let result =
+                codex_login_lifecycle(temp.path(), &environment, &["login"], &cancel).await;
+            if let Some(canceller) = canceller {
+                canceller.await.unwrap();
+            }
+            assert_eq!(result.is_ok(), failure.is_empty(), "{failure}: {result:?}");
+            assert_eq!(
+                crate::codex_reauth::worker_pending(temp.path()).unwrap(),
+                !failure.is_empty()
+            );
+            let calls = std::fs::read_to_string(calls).unwrap();
+            if failure == "stop" {
+                assert_eq!(calls, "app-server daemon stop\napp-server daemon restart\n");
+            } else {
+                assert!(
+                    calls.starts_with("app-server daemon stop\nlogin\napp-server daemon restart\n"),
+                    "{calls}"
+                );
+            }
+            if failure.is_empty() {
+                assert!(calls.ends_with("login status\n"));
+            }
+        }
+    }
 
     #[test]
     fn declared_dependencies_repair_drift_and_preserve_literal_bytes() {

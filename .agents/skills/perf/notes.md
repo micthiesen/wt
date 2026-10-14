@@ -6,6 +6,32 @@ applies.
 
 ## Live machine baseline (2026-10-13 UTC)
 
+### COZ-2919 creation report (2026-10-14 UTC)
+
+The reported desktop freeze during `coz-2919-task-e87934a320` creation was
+not sampled while active. At 16:41:40Z its tracker action completed; subsequent
+TUI draw maxima were 2.48 ms and 1.51 ms, which exclude desktop input transport
+and cannot disprove the freeze. At 16:45Z, the second `top` sample was 65.2%
+idle with wt at 9.5% of one core, Brave at 66.8%, and no swapout increase.
+`wt perf` reported wt's process tree as 20.4% of one core, 3% of CPU in use;
+the decaying snapshot overlapped a Cargo build and is not a steady baseline.
+
+Installed Rift is npm `rift-snapshot` 0.0.10. Its APFS `CopyMode::All` calls
+one `clonefile(source_directory, destination, 0)`, not a userspace recursive
+copy. Filtered mode instead walks entries and clones individual files. Keep
+`--copy-all`; removing it changes dependencies and is not a performance repair.
+Rift then writes its marker/HEAD/registry and runs optional postcreate hooks;
+the inspected main clone had no `.rift.toml`. wt subsequently refreshes the
+copied Git index and switches branches. No evidence yet isolates kernel clone,
+Git index I/O, or filesystem watchers as the freeze cause.
+
+New `wt::creation` stage timings distinguish these command boundaries without
+logging arguments or output. Capture process stacks and machine pressure during
+the next slow create before changing scheduling, cloning strategy, or Rift
+versions. Source: anomalyco/rift tag v0.0.10, `crates/core/src/strategy/apfs.rs`
+and `crates/core/src/lib.rs`. No production clone, process stop, or priority
+change was performed for this investigation.
+
 The final optimized `b9d8d2f` candidate used 12.78% of one core over 60 seconds
 after 15 seconds warmup, with the real Cozee configuration, local and managed
 MaxBook sources, and no features disabled. Quit after an explicit refresh took

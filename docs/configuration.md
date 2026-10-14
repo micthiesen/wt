@@ -289,6 +289,7 @@ managed = true
 | key | required | default | meaning |
 |---|---|---|---|
 | `env` | no | `{}` | Map of uppercase variable name to a shell command run on the controller (in the main clone, 30-second limit). Its output, minus one trailing newline, becomes that variable on every managed worker, in wt commands and agent sessions. A failing command leaves the variable unset and shows a warning. |
+| `services` | no | `{}` | Named executable argv arrays served on the controller by `wt controller serve`. Callers select a name and send JSON stdin; they cannot change the program, arguments, working directory, or environment. |
 | `files` | no | `{}` | Map of worker-relative destination to a controller source file. Files are mirrored beneath `$WT_MANAGED_FILES` (`$WT_MANAGED_ROOT/files`) on each connection. Sources beginning with `~/` use the controller home; relative sources use the main clone. |
 
 ```toml
@@ -297,7 +298,27 @@ CLOUDFLARE_API_TOKEN = "op read op://Dev/Cloudflare/token"
 
 [managed.files]
 "scripts/cleanup.py" = "~/.dotfiles/scripts/cleanup.py"
+
+[managed.services]
+tracker = ["/absolute/path/to/tracker-bridge", "serve-request"]
 ```
+
+Service names use ASCII letters, digits, hyphens, or underscores; the `__wt_`
+prefix is reserved. Arguments are literal, without shell or `~` expansion.
+The service runs in `paths.main_clone`, with controller credentials, and with
+`WT_CONTROLLER_BRIDGE`, `WT_CONTROLLER_SOCKET`, `WT_MANAGED_ROOT`, and
+`WT_MANAGED_FILES` removed to prevent proxy loops.
+Run the controller daemon independently of the TUI, under the host service
+manager. Restart it after changing service definitions. `wt controller status`
+checks its loaded configuration and native build against the current selection. The daemon
+supervises SSH forwards to managed hosts; those hosts receive a private Unix
+socket address in `WT_CONTROLLER_SOCKET`. The controller must be reachable.
+
+Requests have a 2 MiB JSON input limit, a 2 MiB limit per output stream, a
+120-second subprocess deadline, and four concurrent slots. Busy requests are
+rejected before execution. A lost reply is an uncertain outcome, never an
+instruction to replay a mutation. Shutdown stops admission and drains accepted
+requests under their existing deadlines.
 
 Hooks can use `"${WT_MANAGED_FILES:-$HOME/.dotfiles}/scripts/cleanup.py"`
 to share the same command locally and on managed workers. Destinations must

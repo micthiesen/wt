@@ -1259,10 +1259,21 @@ impl LifecycleService {
         ];
         spec.timeout = PROCESS_TIMEOUT;
         spec.output_limit = PROCESS_OUTPUT_LIMIT;
-        self.runner
-            .run(spec, cancellation)
-            .await
-            .map_err(|source| process_error(operation, cwd, source))
+        let phase = match operation {
+            "refresh copied Git index" => Some("copied-index-refresh"),
+            "switch Rift clone branch" | "create branch in Rift clone" => {
+                Some("rift-branch-checkout")
+            }
+            "create Git worktree" => Some("git-worktree-checkout"),
+            "fetch stacked base into Rift clone" => Some("rift-stacked-base-fetch"),
+            _ => None,
+        }
+        .map(|phase| crate::creation_trace::CreationPhase::new(cwd, phase));
+        let result = self.runner.run(spec, cancellation).await;
+        if let Some(phase) = phase {
+            phase.process(&result, operation == "refresh copied Git index");
+        }
+        result.map_err(|source| process_error(operation, cwd, source))
     }
 
     fn dir_slug(&self, branch: &str) -> String {
@@ -1701,11 +1712,13 @@ impl LifecycleService {
             return Ok(());
         };
         let spec = plan.spec;
-        let output = self
+        let phase = crate::creation_trace::CreationPhase::new(path, "dependency-install");
+        let result = self
             .runner
             .run_streaming(spec, cancellation, |_, _| {})
-            .await
-            .map_err(|source| process_error("run package install", path, source))?;
+            .await;
+        phase.process(&result, false);
+        let output = result.map_err(|source| process_error("run package install", path, source))?;
         output
             .checked("package manager")
             .map(|_| ())
@@ -1907,10 +1920,12 @@ impl LifecycleService {
         spec.cwd = Some(main.to_path_buf());
         spec.timeout = PROCESS_TIMEOUT;
         spec.output_limit = PROCESS_OUTPUT_LIMIT;
-        self.runner
-            .run(spec, cancellation)
-            .await
-            .map_err(|source| process_error("create Rift clone", main, source))
+        // Rift owns its internal postcreate hooks, so this measures its whole
+        // command, not just the kernel clonefile call.
+        let phase = crate::creation_trace::CreationPhase::new(path, "rift-create-including-hooks");
+        let result = self.runner.run(spec, cancellation).await;
+        phase.process(&result, false);
+        result.map_err(|source| process_error("create Rift clone", main, source))
     }
 
     async fn run_rift_gc(

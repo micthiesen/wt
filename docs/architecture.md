@@ -33,6 +33,15 @@ lives in `github_source.rs`. A remote
 host runs the same source and action pipeline as a local host; the controller
 combines the resulting snapshots for display.
 
+Creation emits sparse `wt::creation` stage records with the checkout path,
+phase, elapsed milliseconds, outcome, and exit code. These distinguish Rift's
+whole create command (including any Rift-owned postcreate hooks), copied-index
+refresh, branch checkout, stacked-base fetch, and dependency installation.
+An interrupted future records an interrupted phase. Command arguments and
+captured output are excluded. A slow Rift command is not by itself proof of a
+slow kernel clone; use process sampling during that phase to separate its
+internal work from OS filesystem or watcher pressure.
+
 Safety decisions never read display data. TUI cleanup, removal, GitHub
 writes, action requirements, restack and automations take
 `wt_runtime::Confirmed<T>` values, which only a leaf source can produce from
@@ -385,6 +394,24 @@ Controller-owned hook dependencies are declared in `[managed.files]` and mirrore
 under `WT_MANAGED_FILES`. Missing or unreadable declared inputs fail provisioning
 before sending an update. Their isolated tree preserves literal bytes and repairs
 worker drift; it cannot overwrite generated configuration or credentials.
+
+Explicit `[managed.services]` entries expose fixed controller executable argv
+through `wt controller serve`. This service runs independently of the TUI and
+owns private Unix sockets forwarded to managed workers over SSH. A persistent
+controller identity separates socket names across machines. Every tunnel must
+pass a round-trip probe before it is reported ready. Requests name a configured
+service, never an executable or working directory; service processes run in the
+controller's main clone. Admission, input, output, concurrency and execution
+time are bounded. Accepted calls drain on shutdown, and transport failures never
+replay them. Application adapters own operation IDs, reconciliation and file
+transfer. No Keychain or OAuth refresh-token export is involved.
+
+Codex account changes record a credential-free generation under the controller's
+selected Codex home. Provisioning and the controller service propagate it to
+workers, which retain pending intent across disconnects. Only native login,
+login-status verification and daemon recovery acknowledge that generation.
+Terminal preparation rechecks stale or pending sign-in reports before entry.
+Existing tmux sessions and unrelated account homes remain owned by their users.
 
 ## Durable state, caches, and operation safety
 

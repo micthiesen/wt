@@ -123,7 +123,7 @@ class NativeCheckTests(unittest.TestCase):
     def test_complete_order_and_platform_selection(self):
         linux = runner.plan(Path("/candidate/wt"), Path("/diagnostics"), "Linux")
         expected = ["install", "release", "ui", "ui", "session", "lifecycle", "cleanup",
-                    "resource-cleanup", "dev", "actions", "remote", "host", "command", "stages", "ui", "ui"]
+                    "resource-cleanup", "dev", "actions", "controller", "remote", "host", "command", "stages", "ui", "ui"]
         self.assertEqual([check.args[1] for check in linux],
                          [f"scripts/native-{name}-check.py" for name in expected])
         mac = runner.plan(Path("/candidate/wt"), Path("/diagnostics"), "Darwin")

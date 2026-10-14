@@ -11,10 +11,12 @@ mod automation_facts;
 mod automation_source;
 mod board_layout;
 mod bootstrap;
+mod codex_reauth;
 mod commands;
 mod context;
 mod controller;
 mod controller_actions;
+mod controller_tunnels;
 mod database;
 mod dev;
 mod dev_source;
@@ -140,6 +142,10 @@ mod cli_tests {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Coordinate account changes on managed workers.
+    Auth(commands::auth::AuthArgs),
+    /// Serve explicitly configured controller capabilities to managed workers.
+    Controller(commands::controller_bridge::ControllerArgs),
     /// Execute one acknowledged, durable action job.
     #[command(name = "_action-worker", hide = true)]
     ActionWorker(commands::_action_worker::ActionWorkerArgs),
@@ -324,6 +330,16 @@ fn run(cli: Cli) -> Result<i32> {
                 Some(Command::Managed { args }) => {
                     return commands::_managed::run(args, &token).await;
                 }
+                Some(Command::Auth(args)) => {
+                    if let Some(code) =
+                        commands::auth::run_global(&options.home, args, &token).await?
+                    {
+                        return Ok(code);
+                    }
+                }
+                Some(Command::Controller(commands::controller_bridge::ControllerArgs {
+                    command: commands::controller_bridge::ControllerCommand::Exec { service },
+                })) => return commands::controller_bridge::exec(service).await,
                 _ => {}
             }
             if let Some(Command::Init(args)) = &cli.command {
@@ -487,6 +503,18 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::Open(args) => commands::open::run(context, args).await,
         Command::Logs(args) => commands::logs::run(context, args).await,
         Command::Remote(args) => commands::remote::run(context, args).await,
+        Command::Auth(args) => commands::auth::run(context, args).await,
+        Command::Controller(args) => match &args.command {
+            commands::controller_bridge::ControllerCommand::Serve => {
+                commands::controller_bridge::serve(context).await
+            }
+            commands::controller_bridge::ControllerCommand::Status => {
+                commands::controller_bridge::status(context).await
+            }
+            commands::controller_bridge::ControllerCommand::Exec { service } => {
+                commands::controller_bridge::exec(service).await
+            }
+        },
         Command::Restack(args) => commands::restack::run(context, args).await,
         Command::Hello { args } => commands::_hello::run(&context.config, args),
         Command::Snapshot { args } => commands::_snapshot::run(context, args).await,

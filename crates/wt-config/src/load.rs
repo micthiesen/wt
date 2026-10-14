@@ -14,6 +14,8 @@ const DEFAULT_ROWS: &[&str] = &["branch", "issue", "stage", "dev", "pr", "claude
 const DEFAULT_REGEN: &[&str] = &["sst-env.d.ts"];
 /// Variables a managed worker's environment file sets itself.
 pub const RESERVED_MANAGED_ENV: &[&str] = &[
+    "WT_CONTROLLER_BRIDGE",
+    "WT_CONTROLLER_SOCKET",
     "WT_MANAGED_FILES",
     "PATH",
     "HOME",
@@ -574,7 +576,27 @@ impl Config {
                 errors.push(format!("managed.env.{name}: the command is empty"));
             }
         }
+        for (name, argv) in &managed_raw.services {
+            if name.is_empty()
+                || name.starts_with("__wt_")
+                || !name
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+            {
+                errors.push(format!(
+                    "managed.services.{name}: use letters, digits, hyphens or underscores"
+                ));
+            }
+            if argv.first().is_none_or(|program| program.trim().is_empty())
+                || argv.iter().any(|arg| arg.contains('\0'))
+            {
+                errors.push(format!(
+                    "managed.services.{name}: expected a nonempty executable argv without NUL bytes"
+                ));
+            }
+        }
         let managed = ManagedConfig {
+            services: managed_raw.services,
             env: managed_raw.env,
             files: managed_raw.files.into_iter().map(|(destination, source)| {
                 if destination.split('/').any(|part| matches!(part, "" | "." | ".."))
@@ -1295,6 +1317,7 @@ struct RawRemote {
 #[serde(default, deny_unknown_fields)]
 struct RawManaged {
     env: BTreeMap<String, String>,
+    services: BTreeMap<String, Vec<String>>,
     files: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]

@@ -52,6 +52,11 @@ shape and is not the worker protocol.
 
 ### `wt ls`
 
+`--all --json` adds confirmed inventory from every configured remote, tagging
+rows with `host`. If any host is unavailable or returns invalid inventory, the
+whole command fails without printing partial JSON. Use this for fleet-wide
+safety checks; ordinary `wt ls` remains local.
+
 List all non-main worktrees (slug, stage when `[deploy.sst]` is configured, PR, status). Worktrees destroyed in the last 48h stay visible — a dim `recently merged:` footer under the table, and an empty list says why it's empty (`No active worktrees (2 archived today: x, y).`) — so "everything landed" never reads identically to "nothing exists". Derived from the existing removed-worktrees history; the TUI's `h` view keeps the full 14-day record.
 
 - `--json` — machine-readable array (slug, branch, path, stage, section, base, status, `dev`, dirty, issue_id, issue_url, work_state, …). `dev` is the same `DevServerStatus` snapshot used by local rows and lets a controller render a worker's running, starting, queued, restarting, crashed, and stale-after-rebase states without a second SSH query. `section` is the manual TUI section the human placed the row in (`null` = inbox; inferred stack groupings never appear here — they're derived, not stored). `base` is the effective merge target (recorded fork base for stacked worktrees, else `[branch] base`) — never null. Recently-removed rows are appended with `pr`, `pr_url`, `title`, `archived_at`, and the work status the row held when its checkout went away (`work_state`, `verify_after_merge`, `verification_owed`). Those three are flat, matching `wt status --all --json` rather than `wt fleet --json`'s nested `work`, because all three commands append this same entry. **`verification_owed: false` with `work_state: null` means UNKNOWN, not clean** — the entry predates the field (added at state v10) or the row held no status; the per-slug record is reaped with the worktree, so for older entries the answer is genuinely gone. **Every row carries `kind`** — `"live"` for the worktrees that exist, `"merged"` (PR landed) or `"removed"` for the history — so filter on the value, never on the field's absence. It is the same field with the same values on `wt fleet --json` and `wt status --all --json`; a caller that skips it counts landed branches as fleet, which is how four removed rows nearly got filed into sections. Live rows were unlabelled until 2026-08-17, so the remote-section parser keeps a row whose `kind` is absent OR `"live"` (a presence test would empty the whole host section against a newer remote).
@@ -403,6 +408,23 @@ Activate a previously installed native version, defaulting to the last known goo
 Print the native version and build identity. Also available as `wt --version` / `-v`.
 
 ## Integrations
+
+### `wt controller <sub>`
+
+Runs named controller-side services for managed remote tools. Configure the
+allowlist in `[managed.services]`; see [configuration](configuration.md#managed--settings-for-every-managed-remote).
+
+| Command | Behavior |
+|---|---|
+| `serve` | Run the repository's private controller daemon and supervise managed-host SSH forwards. Intended for the host service manager, independently of a TUI. |
+| `status` | Probe the local socket and verify the daemon loaded the currently selected configuration and native build. This does not assert remote tunnel health. |
+| `exec <service>` | Read JSON from stdin, invoke the named controller service through `WT_CONTROLLER_SOCKET`, and return its stdout, stderr, and exit code. Falls back to `$WT_MANAGED_ROOT/controller-endpoint` for existing sessions without the socket variable. Configuration-free so provisioned wrappers can call it from any directory. |
+
+The caller cannot supply an executable, extra argv, cwd, or environment.
+Admission failures report that nothing was executed. Transport errors after a
+request write report an uncertain outcome and are never retried automatically.
+Input is bounded at 2 MiB, each output stream at 2 MiB, and execution at 120
+seconds. Four requests can run concurrently; shutdown drains accepted requests.
 
 ### `wt events <sub>`
 

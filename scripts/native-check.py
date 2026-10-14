@@ -49,6 +49,7 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         check("dev-server lifecycle", "dev", "--binary", binary),
         check("durable action workers", "actions", "--binary", binary,
               "--output", str(output / "wt-native-actions")),
+        check("controller service RPC and accepted shutdown drain", "controller", "--binary", binary),
         check("worker protocol and SSH forwarding", "remote", "--binary", binary),
         check("host reconnect and runtime updates", "host", "--binary", binary),
         check("state migration and diagnostics", "command", binary),

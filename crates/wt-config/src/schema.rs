@@ -576,6 +576,8 @@ pub struct BackendConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManagedConfig {
     pub env: BTreeMap<String, String>,
+    /// Controller-only, explicitly exposed service names and executable argv.
+    pub services: BTreeMap<String, Vec<String>>,
     /// Worker files-root relative destination to resolved controller source.
     pub files: BTreeMap<String, PathBuf>,
 }

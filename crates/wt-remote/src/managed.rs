@@ -36,6 +36,9 @@ pub struct ManagedRequest {
     pub repo_files: Vec<ManagedFile>,
     /// The controller's Codex `config.toml`, adapted by the worker.
     pub codex_config: Option<String>,
+    /// Credential-free controller account-switch intent; workers log in independently.
+    #[serde(default)]
+    pub codex_auth_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +139,9 @@ impl ManagedCheck {
 pub struct ManagedReport {
     pub protocol: u32,
     pub checks: Vec<ManagedCheck>,
+    /// Latest controller generation this worker has received, not proof of login.
+    #[serde(default)]
+    pub codex_auth_generation: Option<u64>,
 }
 
 impl ManagedReport {
@@ -189,6 +195,7 @@ mod tests {
             trees: vec![],
             repo_files: vec![],
             codex_config: None,
+            codex_auth_generation: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("\\u0000"));
@@ -202,6 +209,7 @@ mod tests {
     fn report_lists_each_owed_sign_in_once_and_keeps_warnings_as_notices() {
         let report = ManagedReport {
             protocol: MANAGED_PROTOCOL,
+            codex_auth_generation: None,
             checks: vec![
                 ManagedCheck::new(
                     "codex-login",

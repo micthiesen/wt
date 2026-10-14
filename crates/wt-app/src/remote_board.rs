@@ -620,6 +620,7 @@ mod tests {
         let status = Arc::new(crate::managed::ManagedStatus {
             report: ManagedReport {
                 protocol: 1,
+                codex_auth_generation: None,
                 checks: vec![
                     ManagedCheck::ok("repository", "cloned"),
                     ManagedCheck::new(

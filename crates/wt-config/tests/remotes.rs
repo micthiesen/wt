@@ -258,3 +258,65 @@ fn managed_remote_rejects_hand_selected_config_and_reserved_variables() {
         "{error}"
     );
 }
+
+#[test]
+fn managed_services_preserve_literal_argv_and_reject_invalid_allowlists() {
+    let root = tempfile::tempdir().unwrap();
+    let make_raw = |name: &str, argv: Vec<&str>| {
+        let mut raw: toml::Value = toml::from_str(&minimal_config("")).unwrap();
+        raw.as_table_mut().unwrap().insert(
+            "managed".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "services".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    name.into(),
+                    toml::Value::Array(
+                        argv.into_iter()
+                            .map(|arg| toml::Value::String(arg.into()))
+                            .collect(),
+                    ),
+                )])),
+            )])),
+        );
+        raw
+    };
+    let config = Config::from_raw(
+        make_raw(
+            "tracker-v2",
+            vec![
+                "/path with spaces/bridge",
+                "$HOME",
+                "$(touch /tmp/not-executed)",
+                "",
+            ],
+        ),
+        &options(root.path(), root.path(), &[]),
+    )
+    .unwrap();
+    assert_eq!(
+        config.managed.services["tracker-v2"],
+        [
+            "/path with spaces/bridge",
+            "$HOME",
+            "$(touch /tmp/not-executed)",
+            ""
+        ]
+    );
+    for (name, argv) in [
+        ("", vec!["bridge"]),
+        ("has space", vec!["bridge"]),
+        ("__wt_status", vec!["bridge"]),
+        ("__wt_future", vec!["bridge"]),
+        ("a/b", vec!["bridge"]),
+        ("tracker", vec![]),
+        ("tracker", vec!["  "]),
+        ("tracker", vec!["bridge", "nul\0byte"]),
+    ] {
+        let error = Config::from_raw(
+            make_raw(name, argv),
+            &options(root.path(), root.path(), &[]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("managed.services"), "{error}");
+    }
+}

@@ -24,6 +24,9 @@ use crate::{
 pub struct ListArgs {
     #[arg(long)]
     pub json: bool,
+    /// Include confirmed inventory from every configured host; fail if any host is unavailable.
+    #[arg(long, requires = "json")]
+    pub all: bool,
 }
 
 pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
@@ -59,7 +62,7 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
         let pushes = collect_push_facts(ctx, &live, &state).await?;
         let dev = collect_dev_status(ctx, &live).await?;
-        let rows = live
+        let mut rows = live
             .iter()
             .map(|snapshot| {
                 let slug = snapshot.worktree.target.slug();
@@ -78,6 +81,39 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
             })
             .chain(removed.iter().map(removed_json))
             .collect::<Vec<_>>();
+        if args.all {
+            for row in &mut rows {
+                row["host"] = json!("local");
+            }
+            // No cached snapshots: an unavailable host is not proof that an
+            // issue has no active follow-up there. Never publish a partial list.
+            for remote in &ctx.config.remotes {
+                // Inventory is read-only: use the already provisioned runtime.
+                // run_worker validates its role/protocol and fails closed when
+                // it is missing; listing must never install or rewrite a host.
+                let client = wt_remote::RemoteClient::new(ctx.processes.clone(), remote.clone())
+                    .with_expected_build_id(env!("WT_BUILD_ID").into());
+                let output = client
+                    .run_worker(&["ls".into(), "--json".into()], &ctx.cancellation)
+                    .await?;
+                if output.exit_code != Some(0) {
+                    anyhow::bail!(
+                        "inventory unavailable on {}: {}",
+                        remote.label,
+                        output.stderr
+                    );
+                }
+                let mut remote_rows: Vec<Value> = serde_json::from_str(&output.stdout)
+                    .with_context(|| format!("invalid inventory from {}", remote.label))?;
+                for row in &mut remote_rows {
+                    if !row.is_object() {
+                        anyhow::bail!("invalid inventory row from {}", remote.label);
+                    }
+                    row["host"] = json!(remote.key());
+                }
+                rows.extend(remote_rows);
+            }
+        }
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(0);
     }

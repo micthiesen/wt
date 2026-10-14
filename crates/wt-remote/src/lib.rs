@@ -302,7 +302,8 @@ impl RemoteClient {
         self
     }
 
-    fn with_expected_build_id(mut self, build_id: String) -> Self {
+    /// Require an exact build even when using an already installed runtime.
+    pub fn with_expected_build_id(mut self, build_id: String) -> Self {
         self.expected_build_id = Some(build_id);
         self
     }

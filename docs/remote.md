@@ -12,6 +12,32 @@ An unavailable host keeps its last known rows with a visible error while the
 other hosts continue updating. Its last snapshot is also restored at launch,
 marked `cached` until the host answers.
 
+## Coordinated Codex account changes
+
+Managed Codex homes keep independent logins. wt never copies the controller's
+Codex credentials to a worker. After changing the local account, run
+`wt auth codex changed` to record the switch, then
+`wt auth codex relogin --pending` to visit this configuration's managed hosts.
+Each host presents its own native login in the controller's terminal; complete
+its browser sign-in. `--host <label-or-ssh-host>` limits the hosts visited.
+Running `wt auth codex relogin` without `--pending` requests a new switch first.
+
+The credential-free request is durable and scoped to the controller's
+`CODEX_HOME` (normally `~/.codex`), across repositories. `changed` and `status`
+work outside a checkout. A disconnected worker receives it on its next
+provisioning and reports sign-in needed instead of treating its old login as
+current. Opening a Codex session there offers the existing login flow. A worker
+acknowledges only after login, status verification, and its managed Codex daemon
+refresh succeed. A newer request arriving during login remains pending. Existing
+tmux sessions are retained; refreshing the daemon may disconnect their Codex
+clients, which can be reopened or resumed.
+
+`wt auth codex status` displays the controller's requested generation; it does
+not claim that offline hosts have completed it. Sign-in requires a person and
+cannot finish unattended. The personal `codex-relogin` helper records the request
+after successful local login and visits configured remotes automatically;
+`codex-relogin --local-only` intentionally opts out.
+
 ## Managed remotes
 
 A managed remote is the easiest way to use another machine. You turn it on

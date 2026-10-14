@@ -214,6 +214,35 @@ pub async fn execute(
         }
     }
     if let Some(remote) = remote
+        && remote.endpoint.managed
+        && crate::managed::required_provider(&action, context.config.harness.primary)
+            == Some(wt_remote::managed::SignIn::Codex)
+    {
+        let desired = crate::codex_reauth::controller_generation(
+            &crate::codex_reauth::controller_home(&context.home),
+        )?;
+        let observed = remote
+            .managed
+            .borrow()
+            .as_ref()
+            .and_then(|status| status.report.codex_auth_generation);
+        let pending_codex = remote.managed.borrow().as_ref().is_some_and(|status| {
+            crate::managed::required_sign_in(
+                &status.report,
+                &action,
+                context.config.harness.primary,
+            ) == Some(wt_remote::managed::SignIn::Codex)
+        });
+        if (desired.is_some() && desired != observed) || pending_codex {
+            // An account change must invalidate sign-in readiness even while
+            // the worker stream remains connected. This is action preparation,
+            // never filesystem work on the terminal input path.
+            let client = remote.staged_client()?;
+            let report = crate::managed::provision(context, &client).await?;
+            remote.set_managed(report);
+        }
+    }
+    if let Some(remote) = remote
         && let Some(status) = remote.managed.borrow().clone()
         && let Some(provider) = crate::managed::required_sign_in(
             &status.report,
