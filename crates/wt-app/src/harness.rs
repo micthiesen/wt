@@ -26,9 +26,11 @@ use crate::context::AppContext;
 #[path = "session_commands.rs"]
 mod session_commands;
 pub use session_commands::{
-    SessionEnd, forget_claude_session, list_session_options, prepare_session, stop_managed_session,
+    SessionEnd, forget_claude_session, prepare_session, stop_managed_session,
 };
-pub(crate) use session_commands::{SessionOption, cached_session_options};
+pub(crate) use session_commands::{
+    cached_session_options, picker_entries, picker_slug, visible_harnesses,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {
@@ -421,6 +423,43 @@ impl AppHarness {
                 AgentRoute { target, choice }
             })
             .collect())
+    }
+
+    /// The slot agents a session picker can name, with the same checks as
+    /// [`Self::slot_agent`]. Reads the checkout directories, never Git.
+    pub(crate) fn slot_agents(&self) -> Vec<(wt_tui::SessionTarget, AgentTarget)> {
+        [
+            wt_tui::SessionTarget::Manager,
+            wt_tui::SessionTarget::Main,
+            wt_tui::SessionTarget::WtSource,
+            wt_tui::SessionTarget::Dotfiles,
+        ]
+        .into_iter()
+        .filter_map(|target| Some((target, self.slot_agent(target)?)))
+        .collect()
+    }
+
+    /// The agent for one slot target, or `None` when its checkout is absent.
+    pub(crate) fn slot_agent(&self, target: wt_tui::SessionTarget) -> Option<AgentTarget> {
+        use wt_tui::SessionTarget as Slot;
+        match target {
+            Slot::Manager => Some(special_target(
+                "manager",
+                self.main_clone.clone(),
+                Some("manager".into()),
+            )),
+            Slot::Main => Some(special_target("main", self.main_clone.clone(), None)),
+            Slot::WtSource => self
+                .wt_source
+                .as_ref()
+                .filter(|path| path.is_dir())
+                .map(|path| special_target("wt", path.clone(), None)),
+            Slot::Dotfiles => self
+                .dotfiles
+                .is_dir()
+                .then(|| special_target("dotfiles", self.dotfiles.clone(), None)),
+            Slot::Harness | Slot::Shell | Slot::Diff => None,
+        }
     }
 
     pub fn targets(&self, snapshots: &[wt_vcs::WorktreeSnapshot]) -> Vec<AgentTarget> {
@@ -1003,6 +1042,7 @@ mod tests {
             managed_name: None,
             mode: wt_tui::SessionMode::Resume,
             live: true,
+            seen_live: None,
         };
         let picked = prepare_session(&fixture.ctx, &selection).await;
         let slot = app

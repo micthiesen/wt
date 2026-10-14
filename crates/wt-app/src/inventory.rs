@@ -39,6 +39,8 @@ pub fn board(
             base_branch: state["slugs"][target.slug()]["baseBranch"]
                 .as_str()
                 .map(str::to_owned),
+            is_main: snapshot.worktree.is_main,
+            detached: snapshot.worktree.detached,
             slug: clean_text(target.slug()),
             title: clean_text(&title),
             title_source: if manual.is_some() {

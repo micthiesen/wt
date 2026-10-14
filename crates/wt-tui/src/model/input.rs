@@ -748,7 +748,7 @@ impl Model {
 
     /// Projected creation rows participate in selection and rendering, but
     /// never provide an inventory identity to a worktree command.
-    fn actionable_row(&self) -> Option<&super::BoardRow> {
+    pub(super) fn actionable_row(&self) -> Option<&super::BoardRow> {
         self.selected_row().filter(|row| !row.pending_creation)
     }
 

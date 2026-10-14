@@ -11,7 +11,15 @@ use wt_store::BaseUpdate;
 
 use crate::{commands::resolve::run_git, context::AppContext};
 
-pub async fn set(ctx: &AppContext, key: &str, base: Option<String>) -> Result<(String, String)> {
+/// Records `base` (`None` returns to trunk) for the worktree `key`. `seen` is
+/// the recorded base the menu showed, when a menu asked; a mismatch is a stale
+/// refusal so the menu reopens from current state.
+pub async fn set(
+    ctx: &AppContext,
+    key: &str,
+    base: Option<String>,
+    seen: Option<Option<String>>,
+) -> Result<(String, String)> {
     let clearing = base.is_none();
     let base = base.unwrap_or_else(|| ctx.config.branch.base.clone());
     let base = base.strip_prefix("origin/").unwrap_or(&base).to_owned();
@@ -65,6 +73,56 @@ pub async fn set(ctx: &AppContext, key: &str, base: Option<String>) -> Result<(S
         .call(move |store| Ok(store.read_slug_state(&lookup)?))
         .await?;
     let previous = previous.unwrap_or_default();
+    let trunk = ctx.config.branch.base.clone();
+    let recorded = wt_core::recorded_fork_base(previous["baseBranch"].as_str(), &trunk);
+    if let Some(seen) = &seen
+        && seen.as_deref() != recorded
+    {
+        return Err(crate::controller::stale(format!(
+            "fork base for {slug} changed since the picker was opened"
+        )));
+    }
+    {
+        let (state, archived) = ctx
+            .database
+            .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
+            .await?;
+        let records = fresh
+            .iter()
+            .map(|other| {
+                let other_slug = other.target.slug();
+                (
+                    other.target.branch.as_str(),
+                    other_slug,
+                    state["slugs"][other_slug]["baseBranch"].as_str(),
+                    other.is_main,
+                    other.detached,
+                    archived.contains(&wt_core::worktree_target_key(&other.target)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidates = records
+            .iter()
+            .map(|&(branch, slug, base, is_main, detached, is_archived)| {
+                wt_core::ForkBaseCandidate {
+                    slug,
+                    branch,
+                    base,
+                    is_main,
+                    detached,
+                    archived: is_archived,
+                }
+            })
+            .collect::<Vec<_>>();
+        let chooser = wt_core::ForkBaseChooser {
+            slug: &slug,
+            branch: &row.target.branch,
+        };
+        let requested = (!clearing).then_some(base.as_str());
+        if !wt_core::fork_base_allowed(&trunk, chooser, recorded, &candidates, requested) {
+            bail!("{base} is not an eligible fork base for {slug}");
+        }
+    }
     if base == row.target.branch {
         bail!("a worktree cannot be based on itself");
     }
@@ -144,7 +202,7 @@ mod tests {
                 .unwrap();
         let ctx = fixture.ctx.clone();
         let setter =
-            tokio::spawn(async move { set(&ctx, "one", Some("feature/two".into())).await });
+            tokio::spawn(async move { set(&ctx, "one", Some("feature/two".into()), None).await });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if FileLock::try_acquire(&fixture.ctx.config.paths.lock_dir, "one", "fixture probe")
@@ -200,8 +258,8 @@ mod tests {
         let fixture = CommandFixture::new().await.unwrap();
         let (one, two) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
-                set(&fixture.ctx, "one", Some("feature/two".into())),
-                set(&fixture.ctx, "two", Some("feature/one".into())),
+                set(&fixture.ctx, "one", Some("feature/two".into()), None),
+                set(&fixture.ctx, "two", Some("feature/one".into()), None),
             )
         })
         .await
@@ -212,7 +270,71 @@ mod tests {
             "exactly one competing edge can be accepted"
         );
         let error = one.err().or(two.err()).unwrap();
-        assert!(error.to_string().contains("cycle"), "{error:#}");
+        // The loser sees the winner's record under the same locks, so the
+        // shared eligibility rule refuses it before the store's cycle check.
+        assert!(
+            error.to_string().contains("not an eligible fork base"),
+            "{error:#}"
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_base_the_menu_did_not_show_is_refused_as_stale() {
+        let fixture = CommandFixture::new().await.unwrap();
+        set(&fixture.ctx, "one", Some("feature/two".into()), None)
+            .await
+            .unwrap();
+        // A menu that showed no recorded base must not clear the one recorded
+        // since, and the refusal must reopen the menu rather than fail it.
+        let error = set(&fixture.ctx, "one", None, Some(None))
+            .await
+            .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_slug_state("one")?))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["baseBranch"], "feature/two");
+        set(&fixture.ctx, "one", None, Some(Some("feature/two".into())))
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_branches_must_be_eligible_fork_bases() {
+        let fixture = CommandFixture::new().await.unwrap();
+        // An archived sibling is never offered, so it is never accepted.
+        let two = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "two")
+            .unwrap();
+        let archived = wt_core::worktree_target_key(&two.target);
+        fixture
+            .ctx
+            .database
+            .call(move |store| Ok(store.set_archived(&archived, true)?))
+            .await
+            .unwrap();
+        let error = set(&fixture.ctx, "one", Some("feature/two".into()), None)
+            .await
+            .unwrap_err();
+        assert!(!crate::controller::error_reply(&error).stale);
+        assert!(
+            error
+                .to_string()
+                .contains("not an eligible fork base for one"),
+            "{error:#}"
+        );
         fixture.close().await.unwrap();
     }
 }

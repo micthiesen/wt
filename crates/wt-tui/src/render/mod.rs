@@ -666,7 +666,10 @@ mod tests {
     fn picker_keeps_late_selection_visible_after_terminal_shrinks() {
         let mut model = Model {
             interaction: Interaction::Picker(crate::model::PickerPrompt {
-                action: PickerAction::Base { key: "one".into() },
+                action: PickerAction::Base {
+                    key: "one".into(),
+                    seen: None,
+                },
                 title: "Fork base".into(),
                 options: (0..30)
                     .map(|index| PickerOption {
@@ -815,7 +818,7 @@ mod tests {
                 action: ConfirmAction::Remove {
                     key: "one".into(),
                     force: true,
-                    revision: crate::RemovalRevision {
+                    revision: Some(crate::RemovalRevision {
                         key: "one".into(),
                         path: "/worktrees/one".into(),
                         branch: "feature/one".into(),
@@ -823,7 +826,8 @@ mod tests {
                         digest: "deadbeef".into(),
                         hazards: vec!["uncommitted changes".into()],
                         published_base: None,
-                    },
+                    }),
+                    seen: None,
                 },
                 title: "remove 界面 worktree".into(),
                 lines: vec![
@@ -840,7 +844,10 @@ mod tests {
             terminal.draw(|frame| render(frame, &mut model)).unwrap();
         }
         model.interaction = Interaction::Picker(crate::model::PickerPrompt {
-            action: PickerAction::Base { key: "one".into() },
+            action: PickerAction::Base {
+                key: "one".into(),
+                seen: None,
+            },
             title: "Record fork base".into(),
             options: vec![PickerOption {
                 value: Some("feature/界面".into()),

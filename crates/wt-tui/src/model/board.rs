@@ -71,6 +71,17 @@ pub struct Board {
     /// a stop request must match.
     #[serde(default)]
     pub terminals: std::collections::BTreeMap<String, Vec<TerminalSlotView>>,
+    /// Action palettes the owning host prepared while idle, keyed by
+    /// [`crate::ActionSurface::menu_key`]. Absent or stale entries fall back
+    /// to asking the host; a commit is always checked there again.
+    #[serde(default)]
+    pub palettes: std::collections::BTreeMap<String, PreparedPalette>,
+}
+
+/// One action palette prepared by the host for a surface.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedPalette {
+    pub modal: crate::UiModal,
 }
 
 /// One session-picker entry prepared by the owning host.
@@ -250,6 +261,9 @@ pub struct RemovedHistoryRow {
 pub struct HostChoice {
     pub id: Option<String>,
     pub label: String,
+    /// Providers a managed host still needs a sign-in for, by label.
+    #[serde(default)]
+    pub sign_in_needed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

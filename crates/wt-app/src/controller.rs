@@ -453,6 +453,9 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
                 | wt_tui::UiAction::SetPerf { .. }
         ) {
             Lane::ViewControl
+        } else if matches!(action, wt_tui::UiAction::WarmPalette { .. }) {
+            // Read-only prefetch: never queued behind a long host job.
+            Lane::Preparation(host)
         } else if action.is_terminal_handoff() {
             let key = match action {
                 wt_tui::UiAction::Session { key, .. } => key,
@@ -1523,7 +1526,7 @@ mod tests {
         let mutation = UiAction::Remove {
             key: "row".into(),
             force: false,
-            revision: wt_tui::RemovalRevision {
+            revision: Some(wt_tui::RemovalRevision {
                 key: "row".into(),
                 path: "/work/row".into(),
                 branch: "row".into(),
@@ -1531,7 +1534,8 @@ mod tests {
                 digest: "digest".into(),
                 hazards: vec![],
                 published_base: None,
-            },
+            }),
+            seen: None,
         };
         let preparation_lane = lane_for(&preparation).unwrap();
         let mutation_lane = lane_for(&mutation).unwrap();
@@ -1604,7 +1608,7 @@ mod tests {
             action_target(&UiAction::Remove {
                 key,
                 force: true,
-                revision: wt_tui::RemovalRevision {
+                revision: Some(wt_tui::RemovalRevision {
                     key: "new-frontend".into(),
                     path: "/work/new-frontend".into(),
                     branch: "new-frontend".into(),
@@ -1612,7 +1616,8 @@ mod tests {
                     digest: "digest".into(),
                     hazards: vec![],
                     published_base: None,
-                },
+                }),
+                seen: None,
             }),
             Some("new-frontend".into())
         );

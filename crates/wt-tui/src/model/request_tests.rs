@@ -41,7 +41,7 @@ fn confirmation(id: u64, generation: u64, key: &str) -> UiReply {
             action: ConfirmAction::Remove {
                 key: key.into(),
                 force: false,
-                revision: RemovalRevision {
+                revision: Some(RemovalRevision {
                     key: key.into(),
                     path: format!("/fixture/{key}"),
                     branch: key.into(),
@@ -49,7 +49,8 @@ fn confirmation(id: u64, generation: u64, key: &str) -> UiReply {
                     digest: "digest".into(),
                     hazards: vec![],
                     published_base: None,
-                },
+                }),
+                seen: None,
             },
         }),
         ..Default::default()

@@ -136,6 +136,7 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 .then_with(|| a.3.cmp(&b.3))
         });
     }
+    board.section_order = crate::commands::section::manual_sections(state);
     let folded = state["foldedSections"]
         .as_array()
         .map(Vec::as_slice)

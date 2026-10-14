@@ -82,6 +82,24 @@ pub struct SessionInventory {
     pub pane_activity: BTreeMap<String, String>,
 }
 
+impl SessionInventory {
+    /// The running tmux sessions, with the identity fields a picker row
+    /// witnesses. Built from the one inventory poll the board already holds.
+    pub(crate) fn live_sessions(&self) -> Vec<wt_tmux::SessionInfo> {
+        self.all
+            .values()
+            .map(|descriptor| wt_tmux::SessionInfo {
+                name: descriptor.name.clone(),
+                id: descriptor.id.clone(),
+                created_at: descriptor.created_at,
+                attached_clients: descriptor.attached_clients,
+                window_count: descriptor.window_count,
+                harness_session_id: descriptor.harness_session_id.clone(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredSession {

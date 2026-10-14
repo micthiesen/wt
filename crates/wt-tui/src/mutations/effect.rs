@@ -10,7 +10,7 @@ use super::{
 use crate::{Board, UiAction};
 
 /// Sentinel from the section picker that opens the "new section" prompt.
-pub(super) const NEW_SECTION: &str = "\0new-section";
+pub(super) use crate::menus::NEW_SECTION;
 
 /// How an action affects what the board shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +103,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::PrepareReviewers { .. }
         | UiAction::PrepareReviewCheckout { .. }
         | UiAction::PrepareActions { .. }
+        | UiAction::WarmPalette { .. }
         | UiAction::PrepareSection { .. }
         | UiAction::GenerateTitle { .. }
         | UiAction::Copy { .. }
@@ -114,7 +115,8 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::OpenUrl { .. }
         | UiAction::PrepareSessions { .. }
         | UiAction::PrepareHarnesses { .. }
-        | UiAction::PrepareStopTerminal { .. } => Effect::ReadOnly,
+        | UiAction::PrepareStopTerminal { .. }
+        | UiAction::DiscoverSessions { .. } => Effect::ReadOnly,
         // A palette entry only opens its prompt; merge-when-ready is resolved
         // into `GithubSetAutoMerge` before sending (`Model::resolve`).
         UiAction::PrepareAction { .. } => Effect::ReadOnly,
@@ -210,7 +212,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         UiAction::MoveSection { section, .. } if section.as_deref() == Some(NEW_SECTION) => {
             Effect::ReadOnly
         }
-        UiAction::MoveSection { key, section } => on_row(
+        UiAction::MoveSection { key, section, .. } => on_row(
             board,
             host,
             key,
@@ -290,7 +292,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 None => unprojected(host, Some(key), "updating status", &[Domain::Metadata]),
             }
         }
-        UiAction::SetBase { key, base } => {
+        UiAction::SetBase { key, base, .. } => {
             on_row(board, host, key, RowChange::Base { base: base.clone() })
         }
         UiAction::SetIssueOverride { key, issue_id } => on_row(

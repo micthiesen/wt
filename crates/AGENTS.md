@@ -1,8 +1,8 @@
 # Rust implementation
 
-The user authorized a complete rewrite on this branch. Keep work on this branch;
-do not merge or promote it. The TypeScript behavior baseline is commit `d9cd2f4`
-and is not included in this tree. Do not add it as a runtime dependency.
+This workspace is the production implementation. The TypeScript behavior
+baseline is commit `d9cd2f4` and is not included in this tree. Do not add it as
+a runtime dependency.
 
 Use the parent instructions for behavioral contracts. Rust uses explicit
 ownership, typed errors, Tokio tasks, and scoped resources.
@@ -13,6 +13,10 @@ ownership, typed errors, Tokio tasks, and scoped resources.
 - UI input and rendering must not do disk I/O, database work, process spawning,
   network requests, directory walks, or unbounded parsing. Render visible data
   from prepared snapshots. Avoid continuously drawing an idle screen.
+- Menus are part of rendering: build them from the board through
+  `UiAction::menu`. Data a menu lacks is published by a source, not fetched
+  when the key is pressed. Commits carry what the menu showed, and hosts
+  refuse stale ones (see the parent contracts).
 - Bound queues and concurrent work. Coalesce replaceable snapshots and duplicate
   refresh requests, but never silently discard accepted commands or durable
   writes. Obsolete background results cannot overwrite newer state.

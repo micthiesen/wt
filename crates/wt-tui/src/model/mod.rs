@@ -5,12 +5,15 @@ mod board;
 mod input;
 mod interaction;
 mod local_menu;
+mod palette_warm;
 mod pending;
 mod reply;
 mod selection;
 
 #[cfg(test)]
 mod interaction_tests;
+#[cfg(test)]
+mod palette_warm_tests;
 #[cfg(test)]
 mod request_tests;
 #[cfg(test)]
@@ -27,7 +30,7 @@ pub use board::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
     DisplayPolicy, GitPresentation, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
     PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
-    PreparedDetailGroup, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
+    PreparedDetailGroup, PreparedPalette, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
     ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView,
     TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
@@ -76,12 +79,15 @@ pub struct Model {
     pub(crate) carry_typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
     /// The request whose board-built menu is open.
     pub(crate) local_menu: Option<UiAction>,
+    /// The open board menu's default choice, while the user has not moved.
+    pub(crate) local_menu_default: Option<Option<String>>,
     /// A board menu whose commit was just produced, until it is sent.
     pub(crate) committed_menu: Option<UiAction>,
     /// The board menu behind the request in flight, reopened if it is stale.
     pub(crate) last_menu: Option<(u64, UiAction)>,
     /// Read-only requests sent without foreground feedback.
     pub(crate) background: Vec<UiAction>,
+    pub(crate) palette_warm: palette_warm::PaletteWarm,
     /// The sources should refresh because a commit found changed state.
     pub(crate) refresh_requested: bool,
     /// The key being dispatched, recorded as the opener of a requested menu.
@@ -155,9 +161,11 @@ impl Default for Model {
             follow_up: None,
             carry_typeahead: Vec::new(),
             local_menu: None,
+            local_menu_default: None,
             committed_menu: None,
             last_menu: None,
             background: Vec::new(),
+            palette_warm: Default::default(),
             refresh_requested: false,
             last_key: None,
             source_state: SourceState::Empty,

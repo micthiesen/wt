@@ -3,7 +3,7 @@ use wt_runtime::{SourceSnapshot, SourceState};
 
 use super::*;
 use crate::{
-    ConfirmAction, PickerAction, PickerOption, SessionTarget, TextAction, UiAction, UiModal,
+    ConfirmAction, PickerAction, PickerOption, Seen, SessionTarget, TextAction, UiAction, UiModal,
     UiReply, UrlKind,
 };
 
@@ -377,6 +377,7 @@ fn fast_session_close_never_reaches_board_remove() {
         managed_name: None,
         mode: crate::SessionMode::Resume,
         live: true,
+        seen_live: None,
     };
     model.reply(UiReply {
         operation_id: Some(7),
@@ -388,7 +389,7 @@ fn fast_session_close_never_reaches_board_remove() {
             title: "sessions".into(),
             selected: 0,
             options: vec![PickerOption {
-                value: Some("0".into()),
+                value: Some(crate::session_value(&selection)),
                 label: "Claude · live".into(),
                 chord: None,
                 note: None,
@@ -655,26 +656,27 @@ fn section_picker_creates_from_empty_list_and_remembers_last_target() {
     let mut model = Model::default();
     model.apply(grouped(&["one", "two"], false));
     let key = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+    // The section menu is built from the board, so `l` opens it without a
+    // host request, witnessing the section the row shows.
+    assert_eq!(model.input(key('l'), 20), InputResult::Draw);
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("the section menu should be open")
+    };
     assert_eq!(
-        model.input(key('l'), 20),
-        InputResult::Action(UiAction::PrepareSection { key: "one".into() })
+        picker.action,
+        PickerAction::Section {
+            key: "one".into(),
+            seen: Some(Seen(Some("Batch".into()))),
+        }
     );
-    model.reply(UiReply {
-        modal: Some(UiModal::Picker {
-            action: PickerAction::Section { key: "one".into() },
-            title: "Section".into(),
-            options: vec![],
-            selected: 0,
-        }),
-        ..Default::default()
-    });
     assert_eq!(model.input(key('n'), 20), InputResult::Draw);
     model.paste("Release");
     assert_eq!(
         model.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 20),
         InputResult::Action(UiAction::MoveSection {
             key: "one".into(),
-            section: Some("Release".into())
+            section: Some("Release".into()),
+            seen: Some(Seen(Some("Batch".into()))),
         })
     );
     let options = ["Other", "Release"]
@@ -689,7 +691,10 @@ fn section_picker_creates_from_empty_list_and_remembers_last_target() {
         .to_vec();
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
-            action: PickerAction::Section { key: "two".into() },
+            action: PickerAction::Section {
+                key: "two".into(),
+                seen: None,
+            },
             title: "Section".into(),
             options,
             selected: 0,
@@ -700,7 +705,8 @@ fn section_picker_creates_from_empty_list_and_remembers_last_target() {
         model.input(key('l'), 20),
         InputResult::Action(UiAction::MoveSection {
             key: "two".into(),
-            section: Some("Release".into())
+            section: Some("Release".into()),
+            seen: None,
         })
     );
 }
@@ -1137,7 +1143,8 @@ fn remove_confirm_captures_target_and_cancel_key_never_mutates() {
             action: ConfirmAction::Remove {
                 key: "second".into(),
                 force: true,
-                revision: removal_revision("second"),
+                revision: Some(removal_revision("second")),
+                seen: None,
             },
             title: "remove second".into(),
             lines: vec!["dirty changes will be lost".into()],
@@ -1154,7 +1161,8 @@ fn remove_confirm_captures_target_and_cancel_key_never_mutates() {
             action: ConfirmAction::Remove {
                 key: "second".into(),
                 force: true,
-                revision: removal_revision("second"),
+                revision: Some(removal_revision("second")),
+                seen: None,
             },
             title: "remove second".into(),
             lines: vec!["dirty changes will be lost".into()],
@@ -1167,7 +1175,8 @@ fn remove_confirm_captures_target_and_cancel_key_never_mutates() {
         InputResult::Action(UiAction::Remove {
             key: "second".into(),
             force: true,
-            revision: removal_revision("second"),
+            revision: Some(removal_revision("second")),
+            seen: None,
         })
     );
 }
@@ -1734,4 +1743,22 @@ fn stale_commits_reopen_their_menu_from_the_board() {
         ..UiReply::stale("other")
     });
     assert!(matches!(model.interaction, Interaction::None));
+}
+
+#[test]
+fn an_untouched_board_menu_follows_the_newer_default() {
+    let mut model = Model::default();
+    model.apply(board_with_status(None));
+    model.input(KeyEvent::from(KeyCode::Char('u')), 20);
+    model.apply(board_with_status(Some(wt_core::WorkState::Review)));
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("menu stays open")
+    };
+    // Nobody chose `todo`; it was only the older board's default.
+    assert_eq!(picker.options[picker.selected].label, "review (current)");
+    model.apply(board_with_status(Some(wt_core::WorkState::Ready)));
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("menu stays open")
+    };
+    assert_eq!(picker.options[picker.selected].label, "ready (current)");
 }

@@ -297,6 +297,7 @@ fn every_action_declares_an_effect_and_toggles_use_the_shown_state() {
         UiAction::MoveSection {
             key: "a".into(),
             section: Some(NEW_SECTION.into()),
+            seen: None,
         }
         .effect(&shown),
         Effect::ReadOnly
@@ -331,6 +332,7 @@ fn interactive_entry_never_waits_for_a_board_mutation_stamp() {
             managed_name: None,
             mode: SessionMode::New,
             live: false,
+            seen_live: None,
         },
     });
     actions.push(UiAction::EnterHarness {
@@ -380,6 +382,7 @@ fn every_declared_domain_can_settle() {
         managed_name: None,
         mode: SessionMode::New,
         live: false,
+        seen_live: None,
     };
     let actions = vec![
         UiAction::HardRefresh,
@@ -443,6 +446,7 @@ fn every_declared_domain_can_settle() {
         UiAction::MoveSection {
             key: "a".into(),
             section: Some("Batch".into()),
+            seen: None,
         },
         UiAction::Reorder {
             key: Some("a".into()),
@@ -462,7 +466,8 @@ fn every_declared_domain_can_settle() {
         UiAction::Remove {
             key: "a".into(),
             force: false,
-            revision: revision.clone(),
+            revision: Some(revision.clone()),
+            seen: None,
         },
         UiAction::Cleanup {
             revisions: vec![revision],
@@ -485,6 +490,7 @@ fn every_declared_domain_can_settle() {
         UiAction::SetBase {
             key: "a".into(),
             base: None,
+            seen: None,
         },
         UiAction::SetIssueOverride {
             key: "a".into(),

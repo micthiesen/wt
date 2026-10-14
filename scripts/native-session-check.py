@@ -70,7 +70,7 @@ def main():
                 transcript.extend(data)
                 output.extend(data)
             if predicate(bytes(output)):
-                return
+                return bytes(output)
         raise AssertionError(f"terminal condition timed out; inspect {root / 'terminal.ansi'}")
 
     def tmux(*args):
@@ -153,7 +153,24 @@ def main():
                  and b"live" in printed(data))
         close_started = time.monotonic()
         os.write(terminal, b"d")
-        wait_for(lambda data: b"ClosedCodexsession" in printed(data))
+        # The picker opens from the board, whose tmux inventory may still name
+        # the slot killed above. Its stale witness must be refused without
+        # touching either pane; the picker reopens and refreshes, and the
+        # repeated key then closes the exact current slot.
+        for _ in range(5):
+            try:
+                wait_for(lambda data: b"ClosedCodexsession" in printed(data), timeout=3)
+                break
+            except AssertionError:
+                # Refused as stale: nothing may have closed. A failure toast
+                # stays on screen, so retry on time, never on its text.
+                assert b"Changedsinceyoulooked" in printed(bytes(transcript))
+                assert f"{first_pane}|{first_pid}" in tmux(
+                    "list-panes", "-s", "-t", graceful_session, "-F", "#{pane_id}|#{pane_pid}"
+                ).stdout.splitlines(), "a stale picker closed a pane"
+                os.write(terminal, b"d")
+        else:
+            raise AssertionError("the reopened picker never closed the current slot")
         wait_for(lambda _: time.monotonic() - close_started >= 0.3)
         panes = tmux("list-panes", "-s", "-t", graceful_session,
                      "-F", "#{pane_id}|#{pane_pid}")

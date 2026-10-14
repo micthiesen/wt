@@ -352,6 +352,7 @@ mod tests {
         board.hosts.push(crate::HostChoice {
             id: Some("michael@10.10.1.90 [config:/private/config.toml]".into()),
             label: "MaxBook".into(),
+            sign_in_needed: Vec::new(),
         });
         let model = model_with(SourceSnapshot::test_live(
             Some(board),

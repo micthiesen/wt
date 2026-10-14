@@ -28,7 +28,7 @@ pub async fn run(ctx: &AppContext, args: &BaseArgs) -> Result<i32> {
                 Some(values[2].clone())
             };
             let (branch, anchor) =
-                crate::fork_base::set(ctx, &wt_core::worktree_target_key(&row.target), base)
+                crate::fork_base::set(ctx, &wt_core::worktree_target_key(&row.target), base, None)
                     .await?;
             println!(
                 "✓ {} base → {} @ {}",

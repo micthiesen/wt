@@ -110,6 +110,7 @@ fn compose(
     board.hosts = vec![HostChoice {
         id: None,
         label: "This machine".into(),
+        sign_in_needed: Vec::new(),
     }];
     let mut state = metadata
         .data()
@@ -146,6 +147,17 @@ fn compose(
         board.hosts.push(HostChoice {
             id: Some(host.clone()),
             label: label.clone(),
+            sign_in_needed: managed
+                .as_ref()
+                .map(|status| {
+                    status
+                        .report
+                        .sign_ins()
+                        .iter()
+                        .map(|provider| provider.label().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
         });
         let restored = source.is_restored();
         // Restored data skipped the stream's validation; never show a cache

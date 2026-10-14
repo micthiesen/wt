@@ -132,6 +132,12 @@ pub enum UiAction {
     PrepareActions {
         surface: ActionSurface,
     },
+    /// Background: have the owning host publish the palette for `surface`
+    /// onto the board, so the next open needs no round trip. Carries no
+    /// feedback and is never a preparation.
+    WarmPalette {
+        surface: ActionSurface,
+    },
     PrepareAction {
         surface: ActionSurface,
         id: String,
@@ -153,6 +159,10 @@ pub enum UiAction {
     MoveSection {
         key: String,
         section: Option<String>,
+        /// The section the row showed (`None` = Inbox). A mismatch with the
+        /// stored placement refuses the move.
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     Reorder {
         key: Option<String>,
@@ -187,7 +197,14 @@ pub enum UiAction {
     Remove {
         key: String,
         force: bool,
-        revision: RemovalRevision,
+        /// The reviewed hazards. `None` for a board menu that showed a clean
+        /// checkout; the host then needs `seen` and plans the review itself.
+        #[serde(default)]
+        revision: Option<RemovalRevision>,
+        /// The checkout a board menu showed. `None` with no `revision` is
+        /// refused: a removal always names what its menu reviewed.
+        #[serde(default)]
+        seen: Option<Box<Seen<RemovalSeen>>>,
     },
     PrepareCleanup,
     Cleanup {
@@ -218,6 +235,9 @@ pub enum UiAction {
     SetBase {
         key: String,
         base: Option<String>,
+        /// The recorded base the fork base menu showed.
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     SetIssueOverride {
         key: String,
@@ -232,6 +252,13 @@ pub enum UiAction {
         target: SessionTarget,
     },
     PrepareSessions {
+        key: Option<String>,
+        target: SessionTarget,
+    },
+    /// Background read behind an open session picker: refresh tmux and saved
+    /// conversation history so the picker rebuilds when discovery finishes.
+    /// Shows no feedback and changes nothing.
+    DiscoverSessions {
         key: Option<String>,
         target: SessionTarget,
     },
@@ -306,77 +333,10 @@ impl UiAction {
 
     /// Whether this request prepares a prompt, picker, or other presentation
     /// from read-only data. Controllers may cancel these requests during
-    /// shutdown without cancelling an accepted mutation.
+    /// shutdown without cancelling an accepted mutation. Derived from
+    /// [`UiAction::menu`], the single declaration of menu requests.
     pub fn is_preparation(&self) -> bool {
-        match self {
-            Self::OnHost { action, .. } => action.is_preparation(),
-            Self::PrepareCreate { .. }
-            | Self::PrepareHardRefresh
-            | Self::ResolveCreation { .. }
-            | Self::PrepareRestoreRemoved { .. }
-            | Self::PrepareGithub { .. }
-            | Self::PrepareReviewers { .. }
-            | Self::PrepareReviewCheckout { .. }
-            | Self::GithubFailedChecks { .. }
-            | Self::PrepareActions { .. }
-            | Self::PrepareAction { .. }
-            | Self::PrepareSection { .. }
-            | Self::PrepareRemove { .. }
-            | Self::PrepareCleanup
-            | Self::PrepareStatus { .. }
-            | Self::PrepareBase { .. }
-            | Self::PrepareSessions { .. }
-            | Self::PrepareHarnesses { .. }
-            | Self::PrepareStopTerminal { .. } => true,
-            Self::ManagedSignIn { .. }
-            | Self::HardRefresh
-            | Self::SetAttentionSeen { .. }
-            | Self::ToggleAutomations { .. }
-            | Self::CancelAutomations
-            | Self::SetHistoryActive { .. }
-            | Self::SetPerf { .. }
-            | Self::RestoreRemoved { .. }
-            | Self::ToggleRemovedAutomations { .. }
-            | Self::OpenLink { .. }
-            | Self::OpenPrLink { .. }
-            | Self::OpenPrDefault { .. }
-            | Self::OpenSlotEditor { .. }
-            | Self::PerfInvestigate { .. }
-            | Self::Restack { .. }
-            | Self::ReviewCheckout { .. }
-            | Self::DismissReviewRequest { .. }
-            | Self::SubmitReviewers { .. }
-            | Self::GithubMarkReady { .. }
-            | Self::GithubSetAutoMerge { .. }
-            | Self::GithubShip { .. }
-            | Self::KillAction { .. }
-            | Self::RunAction { .. }
-            | Self::FoldSection { .. }
-            | Self::MoveSection { .. }
-            | Self::Reorder { .. }
-            | Self::RenameSection { .. }
-            | Self::CyclePrimary
-            | Self::SetTitle { .. }
-            | Self::GenerateTitle { .. }
-            | Self::Copy { .. }
-            | Self::Create { .. }
-            | Self::CreateResolved { .. }
-            | Self::OpenEditor { .. }
-            | Self::Remove { .. }
-            | Self::Cleanup { .. }
-            | Self::CleanupTargets { .. }
-            | Self::ToggleArchive { .. }
-            | Self::SetStatus { .. }
-            | Self::SetBase { .. }
-            | Self::SetIssueOverride { .. }
-            | Self::OpenUrl { .. }
-            | Self::Session { .. }
-            | Self::SelectSession { .. }
-            | Self::KillSession { .. }
-            | Self::EnterHarness { .. }
-            | Self::StopTerminal { .. }
-            | Self::StopSession { .. } => false,
-        }
+        !matches!(self.menu(&crate::Board::default()), crate::Menu::NotMenu)
     }
 }
 
@@ -386,6 +346,18 @@ pub enum ActionSurface {
     Row { key: String },
     Manager { key: Option<String> },
     Slot { target: SessionTarget },
+}
+
+impl ActionSurface {
+    /// The [`crate::Board::palettes`] key for this surface. The prefix names
+    /// the variant, so keys of different kinds never collide.
+    pub fn menu_key(&self) -> String {
+        match self {
+            Self::Row { key } => format!("row:{key}"),
+            Self::Manager { key } => format!("manager:{}", key.as_deref().unwrap_or_default()),
+            Self::Slot { target } => format!("slot:{target:?}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +405,15 @@ pub struct RemovalRevision {
     pub published_base: Option<Box<(String, String)>>,
 }
 
+/// The checkout identity a board removal menu showed for a clean row. The
+/// host compares it with its own plan before it removes anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalSeen {
+    pub path: String,
+    pub branch: String,
+    pub head: String,
+}
+
 /// A row selected from prepared facts. The host must check its current hazards
 /// and capture a removal revision before it can queue removal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,7 +456,11 @@ pub enum ConfirmAction {
     Remove {
         key: String,
         force: bool,
-        revision: RemovalRevision,
+        #[serde(default)]
+        revision: Option<RemovalRevision>,
+        /// The checkout the board menu showed for a clean row.
+        #[serde(default)]
+        seen: Option<Box<Seen<RemovalSeen>>>,
     },
     Cleanup {
         revisions: Vec<RemovalRevision>,
@@ -517,6 +502,12 @@ pub struct SessionSelection {
     /// revalidates the exact identity.
     #[serde(default)]
     pub live: bool,
+    /// For a `New` choice from the picker: the tmux ids of the live slots it
+    /// showed for this target. A live slot the user never saw makes the host
+    /// refuse the new session as stale, so a picker opened from an older
+    /// board cannot start a duplicate beside a session that just started.
+    #[serde(default)]
+    pub seen_live: Option<Seen<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,9 +535,14 @@ pub enum PickerAction {
     },
     Base {
         key: String,
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     Section {
         key: String,
+        /// The row's section shown when the picker opened (`None` = Inbox).
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     /// Shift+F12 harness picker. Option values are `HarnessId::as_str`.
     Harness {
@@ -571,6 +567,8 @@ pub enum TextAction {
     Create,
     NewSection {
         key: String,
+        #[serde(default)]
+        seen: Option<Seen<Option<String>>>,
     },
     RenameSection {
         old: String,

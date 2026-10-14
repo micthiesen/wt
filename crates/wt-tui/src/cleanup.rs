@@ -85,13 +85,21 @@ fn host_label<'a>(board: &'a Board, host: &'a str) -> &'a str {
 }
 
 fn keep_reason(row: &BoardRow) -> Option<&'static str> {
+    checkout_hold_reason(row, true)
+}
+
+/// Why a row's checkout cannot be removed from the board alone. Shared by the
+/// `c` cleanup menu and the `d` remove menu. Cleanup also needs proof that the
+/// row's own work landed; the remove menu does not, because the host plans
+/// unpushed work itself and returns its hazards for review.
+pub(crate) fn checkout_hold_reason(row: &BoardRow, landing_required: bool) -> Option<&'static str> {
     if row.path_missing || row.path.is_empty() {
         Some("checkout is unavailable")
     } else if row.busy.is_some() {
         Some("operation in progress")
     } else if row.git.error.is_some() || row.git.head_sha.as_deref().is_none_or(str::is_empty) {
         Some("Git state is unavailable")
-    } else if row.git.landed_on.is_none() {
+    } else if landing_required && row.git.landed_on.is_none() {
         Some("landing of its own work is not proven")
     } else if row.work.as_ref().is_some_and(|work| work.verification_owed) {
         Some("post-merge verification still owed")
@@ -219,6 +227,7 @@ mod tests {
             hosts: vec![crate::HostChoice {
                 id: Some(host.into()),
                 label: "MaxBook".into(),
+                sign_in_needed: Vec::new(),
             }],
             rows: vec![row],
             ..Default::default()

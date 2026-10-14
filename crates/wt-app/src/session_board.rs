@@ -2,11 +2,14 @@
 
 use std::sync::Arc;
 
-use wt_core::sanitize_terminal_text;
+use std::path::PathBuf;
+
+use wt_core::{HarnessId, sanitize_terminal_text};
 use wt_harness::DerivedState;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
-use wt_tui::{Board, SessionView};
+use wt_tui::{Board, SessionTarget, SessionView, TerminalSlotView};
 
+use crate::harness::{AgentTarget, AgentTargetKind, AppHarness};
 use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto};
 use crate::session_source::{SessionDiscoveries, SessionInventory, SessionSources};
 
@@ -15,6 +18,7 @@ pub fn overlay(
     board: SourceHandle<Board>,
     sessions: &SessionSources,
     activity: SourceHandle<SessionActivitySnapshot>,
+    app: AppHarness,
 ) -> SourceHandle<Board> {
     let (source, mut publisher) = derived_channel(scope, "session-board");
     let cancel = scope.token();
@@ -48,6 +52,7 @@ pub fn overlay(
                 inventory_updates.borrow_and_update().clone(),
                 discovery_updates.borrow_and_update().clone(),
                 activity_updates.borrow_and_update().clone(),
+                &app.slot_agents(),
             );
             publisher.publish_if_changed(prepared);
         }
@@ -60,6 +65,7 @@ fn compose(
     inventory: SourceSnapshot<SessionInventory>,
     discoveries: SourceSnapshot<SessionDiscoveries>,
     activity: SourceSnapshot<SessionActivitySnapshot>,
+    slots: &[(SessionTarget, AgentTarget)],
 ) -> SourceSnapshot<Board> {
     let Some(prepared) = source.data() else {
         return source;
@@ -202,6 +208,51 @@ fn compose(
                 .push(view);
         }
     }
+    // Prepared picker entries. Built only from a Ready inventory, so an unknown
+    // tmux state never reads as "nothing is running". Absent entries send the
+    // menu to its host, which answers from its own cached discovery.
+    board.session_menus.clear();
+    board.terminals.clear();
+    if inventory_ok && let Some(inventory) = inventory.data() {
+        let live = inventory.live_sessions();
+        let visible = board.display.harnesses.clone();
+        let discovered: &[crate::session_source::DiscoveredSession] =
+            discoveries.data().map_or(&[], |data| data.as_slice());
+        for row in board
+            .rows
+            .iter()
+            .filter(|row| row.host.is_none() && !row.is_main)
+        {
+            let agent = AgentTarget {
+                slug: row.slug.clone(),
+                kind: AgentTargetKind::Worktree,
+                branch: Some(row.branch.clone()),
+                cwd: PathBuf::from(&row.path),
+                managed_name: None,
+                remote: false,
+            };
+            board.session_menus.insert(
+                wt_tui::session_menu_key(Some(&row.key), SessionTarget::Harness),
+                crate::harness::picker_entries(
+                    &visible,
+                    &agent,
+                    Some(row.key.clone()),
+                    SessionTarget::Harness,
+                    discovered,
+                    &live,
+                ),
+            );
+            board
+                .terminals
+                .insert(row.key.clone(), terminal_slots(inventory, &row.slug));
+        }
+        for (target, agent) in slots {
+            board.session_menus.insert(
+                wt_tui::session_menu_key(None, *target),
+                crate::harness::picker_entries(&visible, agent, None, *target, discovered, &live),
+            );
+        }
+    }
     if let Some(feed) = activity.data() {
         for event in feed.events.iter().rev().take(100).rev() {
             let at_ms = u64::try_from(event.timestamp_ms).unwrap_or_default();
@@ -257,6 +308,9 @@ fn compose(
         }
         if let Some(primary) = &feed.primary {
             board.display.primary_harness = primary.clone();
+            board.display.primary = HarnessId::ALL
+                .into_iter()
+                .find(|harness| harness.as_str() == primary);
         }
     }
     crate::activity_source::bound_feeds(&mut board);
@@ -265,6 +319,27 @@ fn compose(
         .with_input(&inventory)
         .with_input(&discoveries)
         .with_input(&activity)
+}
+
+/// Live shell and diff terminals of one worktree, with the exact tmux identity
+/// a stop request must match.
+fn terminal_slots(inventory: &SessionInventory, slug: &str) -> Vec<TerminalSlotView> {
+    [
+        (SessionTarget::Shell, "shell"),
+        (SessionTarget::Diff, "diff"),
+    ]
+    .into_iter()
+    .filter_map(|(target, label)| {
+        let name = format!("{slug}-{label}");
+        let descriptor = inventory.all.get(&name)?;
+        Some(TerminalSlotView {
+            target,
+            name,
+            id: descriptor.id.clone(),
+            created_at: descriptor.created_at,
+        })
+    })
+    .collect()
 }
 
 fn usage_item(
@@ -355,6 +430,7 @@ mod tests {
                 ),
                 SourceSnapshot::default(),
                 SourceSnapshot::default(),
+                &[],
             );
             let board = result.data().unwrap();
             assert_eq!(board.live_slots["manager"][0].state, state);
@@ -376,6 +452,7 @@ mod tests {
             ),
             SourceSnapshot::default(),
             SourceSnapshot::default(),
+            &[],
         );
         assert!(result.data().unwrap().live_slots.is_empty());
         assert!(
@@ -395,8 +472,108 @@ mod tests {
             ),
             SourceSnapshot::default(),
             SourceSnapshot::default(),
+            &[],
         );
         assert!(result.data().unwrap().live_slots.is_empty());
+    }
+
+    #[test]
+    fn prepared_menus_need_a_ready_inventory_and_skip_remote_rows() {
+        let source = SourceSnapshot::test_live(
+            Some(Board {
+                rows: vec![
+                    BoardRow {
+                        key: "one".into(),
+                        slug: "one".into(),
+                        path: "/work/one".into(),
+                        branch: "one".into(),
+                        ..Default::default()
+                    },
+                    BoardRow {
+                        key: "remote:one".into(),
+                        slug: "one".into(),
+                        host: Some("remote".into()),
+                        ..Default::default()
+                    },
+                ],
+                display: wt_tui::DisplayPolicy {
+                    harnesses: wt_core::HarnessId::ALL.to_vec(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            SourceState::Ready,
+            Domain::Git,
+        );
+        let mut inventory = SessionInventory::default();
+        for (name, id, created_at) in [("one-shell", "$3", 7), ("one-codex", "$1", 5)] {
+            inventory.all.insert(
+                name.into(),
+                crate::session_source::SessionDescriptor {
+                    name: name.into(),
+                    id: id.into(),
+                    created_at,
+                    attached_clients: 0,
+                    window_count: 1,
+                    harness_session_id: (name == "one-codex").then(|| "exact".into()),
+                },
+            );
+        }
+        let discoveries = SourceSnapshot::test_live(
+            Some(vec![DiscoveredSession {
+                key: SessionKey {
+                    slug: "one".into(),
+                    harness: wt_core::HarnessId::Codex,
+                    session_id: "exact".into(),
+                },
+                session: HarnessSession {
+                    display_name: "primary".into(),
+                    session_id: "exact".into(),
+                    tmux_session_name: "one-codex".into(),
+                    last_active_ms: None,
+                    is_live: true,
+                    extras: Default::default(),
+                },
+            }]),
+            SourceState::Ready,
+            Domain::Sessions,
+        );
+        let inventory =
+            SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
+        let result = compose(
+            source.clone(),
+            inventory.clone(),
+            discoveries.clone(),
+            SourceSnapshot::default(),
+            &[],
+        );
+        let board = result.data().unwrap();
+        let entries = &board.session_menus
+            [&wt_tui::session_menu_key(Some("one"), wt_tui::SessionTarget::Harness)];
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_live);
+        assert_eq!(
+            entries[0].selection.live_slot.as_ref().unwrap().id,
+            "$1",
+            "the entry carries the exact tmux identity a selection witnesses"
+        );
+        assert!(!board.session_menus.contains_key("remote:one"));
+        assert_eq!(board.terminals["one"][0].name, "one-shell");
+        assert_eq!(board.terminals["one"][0].id, "$3");
+        assert_eq!(board.terminals["one"][0].created_at, 7);
+        assert!(!board.terminals.contains_key("remote:one"));
+
+        // Without a Ready inventory nothing is claimed as prepared or stopped.
+        let failed = compose(
+            source,
+            SourceSnapshot::default().with_state(SourceState::Failed("tmux down".into())),
+            discoveries,
+            SourceSnapshot::default(),
+            &[],
+        );
+        let failed = failed.data().unwrap();
+        assert!(failed.session_menus.is_empty());
+        assert!(failed.terminals.is_empty());
     }
 
     #[test]
@@ -440,6 +617,7 @@ mod tests {
             SourceSnapshot::default().with_state(SourceState::Failed("tmux unavailable".into())),
             discoveries,
             SourceSnapshot::default(),
+            &[],
         );
         assert!(result.domains()[&Domain::Sessions].is_live());
         let board = result.data().unwrap();
@@ -519,6 +697,7 @@ mod tests {
                 inventory.clone(),
                 discoveries.clone(),
                 activity.clone(),
+                &[],
             );
             let sessions = &result.data().unwrap().rows[0].sessions;
             assert!(
@@ -534,7 +713,7 @@ mod tests {
                 .insert(slot.clone(), "current".into());
             let inventory =
                 SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
-            let result = compose(board, inventory, discoveries, activity);
+            let result = compose(board, inventory, discoveries, activity, &[]);
             let sessions = &result.data().unwrap().rows[0].sessions;
             let old = sessions.iter().find(|session| session.id == "old").unwrap();
             let current = sessions

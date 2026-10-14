@@ -261,20 +261,21 @@ async fn a_pin_mismatch_or_missing_confirmed_data_refuses_the_write() {
         ),
     ];
     for (action, github) in requests {
-        let reply = fake
-            .actions
-            .execute(action, &board(), github)
-            .await
-            .unwrap();
+        let reply = match fake.actions.execute(action, &board(), github).await {
+            Ok(reply) => reply,
+            Err(error) => crate::controller::error_reply(&error),
+        };
         assert!(reply.failed);
-        assert_eq!(
-            reply.message,
-            if github.is_some() {
-                STALE_PIN
-            } else {
-                "GitHub data is still loading"
-            }
-        );
+        if github.is_some() {
+            // A pin mismatch reopens the menu from the board, not a failure.
+            assert!(reply.stale);
+            assert_eq!(
+                reply.message,
+                format!("Changed since you looked: {STALE_PIN}")
+            );
+        } else {
+            assert_eq!(reply.message, "GitHub data is still loading");
+        }
     }
     assert!(!fake.calls.exists(), "no GitHub request may be sent");
     fake.fixture.close().await.unwrap();
@@ -349,7 +350,7 @@ async fn covered_absence_is_no_pr_but_cannot_match_a_visible_pr_pin() {
         assert_eq!(reply.message, "no PR for this row");
         assert_eq!(reply.outcome, Some(ReplyOutcome::NoChange));
     }
-    let reply = fake
+    let error = fake
         .actions
         .execute(
             GithubAction::MarkReady {
@@ -360,9 +361,9 @@ async fn covered_absence_is_no_pr_but_cannot_match_a_visible_pr_pin() {
             Some(&github),
         )
         .await
-        .unwrap();
-    assert!(reply.failed);
-    assert_eq!(reply.message, STALE_PIN);
+        .unwrap_err();
+    assert!(crate::controller::error_reply(&error).stale);
+    assert_eq!(error.to_string(), STALE_PIN);
     assert!(!fake.calls.exists());
     fake.fixture.close().await.unwrap();
 }

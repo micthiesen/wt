@@ -9,8 +9,7 @@ use wt_lifecycle::CreateOptions;
 use wt_platform::lock::FileLock;
 use wt_runtime::{Confirmed, Provenance, SourceState};
 use wt_tui::{
-    Board, ConfirmAction, PickerAction, PickerOption, RemovalRevision as UiRemovalRevision,
-    UiAction, UiModal, UiReply, UrlKind,
+    Board, ConfirmAction, RemovalRevision as UiRemovalRevision, UiAction, UiModal, UiReply, UrlKind,
 };
 
 use crate::{
@@ -61,12 +60,25 @@ pub async fn execute_with_shutdown(
     match action {
         // Built by the TUI from its board (`UiAction::menu`); the host
         // service refuses them before dispatch.
-        UiAction::PrepareStatus { .. } => {
+        UiAction::PrepareStatus { .. }
+        | UiAction::PrepareBase { .. }
+        | UiAction::PrepareSection { .. }
+        | UiAction::PrepareHardRefresh
+        | UiAction::PrepareReviewCheckout { .. }
+        | UiAction::PrepareRestoreRemoved { .. }
+        | UiAction::PrepareHarnesses { .. } => {
             bail!("this menu is built from the board and never asks the host")
         }
-        UiAction::PrepareHardRefresh
-        | UiAction::HardRefresh
-        | UiAction::PrepareReviewCheckout { .. }
+        // Answered by the host service, from the board's own entries when they
+        // exist and from its discovery snapshot otherwise.
+        UiAction::PrepareSessions { .. } => {
+            bail!("session pickers are answered by the host service")
+        }
+        // Queued by the host service before dispatch; it never produces a reply.
+        UiAction::DiscoverSessions { .. } => {
+            bail!("session discovery is queued by the host service")
+        }
+        UiAction::HardRefresh
         | UiAction::ReviewCheckout { .. }
         | UiAction::DismissReviewRequest { .. }
         | UiAction::PrepareReviewers { .. }
@@ -75,7 +87,6 @@ pub async fn execute_with_shutdown(
         | UiAction::SetHistoryActive { .. }
         | UiAction::SetAttentionSeen { .. }
         | UiAction::Restack { .. }
-        | UiAction::PrepareRestoreRemoved { .. }
         | UiAction::RestoreRemoved { .. }
         | UiAction::ToggleRemovedAutomations { .. } => {
             bail!("request must run through its host service")
@@ -106,12 +117,10 @@ pub async fn execute_with_shutdown(
             crate::editor::open(ctx, &path).await?;
             Ok(message(format!("Opened {}", path.display())))
         }
-        action @ (UiAction::PrepareSessions { .. }
-        | UiAction::PrepareStopTerminal { .. }
+        action @ (UiAction::PrepareStopTerminal { .. }
         | UiAction::StopTerminal { .. }
         | UiAction::StopSession { .. }
-        | UiAction::KillSession { .. }
-        | UiAction::PrepareHarnesses { .. }) => crate::session_ui::execute(ctx, action).await,
+        | UiAction::KillSession { .. }) => crate::session_ui::execute(ctx, action).await,
         UiAction::SelectSession { .. }
         | UiAction::EnterHarness { .. }
         | UiAction::PerfInvestigate { .. } => {
@@ -172,12 +181,9 @@ pub async fn execute_with_shutdown(
         }
         UiAction::OnHost { .. } => bail!("host routing must be resolved before local dispatch"),
         UiAction::ManagedSignIn { .. } => bail!("sign-in belongs to a managed remote host"),
-        UiAction::PrepareCreate { initial } => Ok(modal(UiModal::Text {
-            action: wt_tui::TextAction::Create,
-            prompt: "New worktree name: ".into(),
-            initial,
-            allow_empty: false,
-        })),
+        // Ctrl+N builds its host picker and name prompt from the board. This
+        // arm answers only a host the user already chose, with the same prompt.
+        UiAction::PrepareCreate { initial } => Ok(modal(wt_tui::new_worktree_prompt(&initial))),
         UiAction::KillAction { action_key, run_id } => {
             let killed = crate::actions::service(ctx)?
                 .kill_run(&action_key, &run_id, &ctx.cancellation)
@@ -189,6 +195,7 @@ pub async fn execute_with_shutdown(
             }))
         }
         UiAction::PrepareActions { .. }
+        | UiAction::WarmPalette { .. }
         | UiAction::PrepareGithub { .. }
         | UiAction::GithubMarkReady { .. }
         | UiAction::GithubSetAutoMerge { .. }
@@ -199,12 +206,11 @@ pub async fn execute_with_shutdown(
         | UiAction::RunAction { .. } => {
             bail!("action palette requests must be routed through their controller")
         }
-        UiAction::PrepareSection { key } => crate::section_actions::prepare(ctx, key, board).await,
         UiAction::Reorder { key, section, down } => {
             crate::section_actions::reorder(ctx, key, section, down, board).await
         }
-        UiAction::MoveSection { key, section } => {
-            crate::section_actions::move_row(ctx, key, section, board).await
+        UiAction::MoveSection { key, section, seen } => {
+            crate::section_actions::move_row(ctx, key, section, seen, board).await
         }
         UiAction::RenameSection { old, new } => crate::section_actions::rename(ctx, old, new).await,
         UiAction::FoldSection { key, folded } => {
@@ -317,7 +323,8 @@ pub async fn execute_with_shutdown(
                 action: ConfirmAction::Remove {
                     key,
                     force,
-                    revision: ui_revision(&plan.revision),
+                    revision: Some(ui_revision(&plan.revision)),
+                    seen: None,
                 },
                 title: if force {
                     "Force remove worktree?"
@@ -333,16 +340,38 @@ pub async fn execute_with_shutdown(
             key,
             force,
             revision,
+            seen,
         } => {
+            // A board menu witnesses only its clean checkout, and asserts no
+            // revision. Anything without either witness asserts nothing.
+            if revision.is_none() && seen.is_none() {
+                bail!("removal must name the checkout it was reviewed against");
+            }
             let row = resolve_key(ctx, &key).await?;
             let plans = lifecycle_ops::plan_cached(ctx, vec![row], github).await?;
+            let warning = plans.warning.clone();
             let mut plan = plans
                 .rows
                 .into_iter()
                 .next()
                 .context("worktree disappeared")?;
             let current_revision = ui_revision(&plan.revision);
-            if revision != current_revision {
+            if let Some(wt_tui::Seen(seen)) = seen.as_deref()
+                && (seen.path != plan.revision.path
+                    || seen.branch != plan.revision.branch
+                    || seen.head != plan.revision.head)
+            {
+                return Err(crate::controller::stale(
+                    "checkout changed since the removal menu was shown",
+                ));
+            }
+            let changed = revision
+                .as_ref()
+                .is_some_and(|revision| *revision != current_revision);
+            // The board asserts only a clean checkout. Any hazard, a deployed
+            // stage, or a warning goes back to the user before anything runs.
+            let review = !plan.hazards.is_empty() || plan.destroy_stage || warning.is_some();
+            if changed || (revision.is_none() && (force || review)) {
                 let next_force = !plan.hazards.is_empty();
                 let mut lines = vec![
                     format!("{} ({})", plan.row.target.slug(), plan.row.target.branch),
@@ -357,11 +386,15 @@ pub async fn execute_with_shutdown(
                 if plan.destroy_stage {
                     lines.push(format!("Destroy deployed stage {}", plan.row.target.stage));
                 }
+                if let Some(warning) = warning {
+                    lines.push(warning);
+                }
                 return Ok(modal(UiModal::Confirm {
                     action: ConfirmAction::Remove {
                         key,
                         force: next_force,
-                        revision: current_revision,
+                        revision: Some(current_revision),
+                        seen: None,
                     },
                     title: if next_force {
                         "Review changed removal hazards"
@@ -505,67 +538,7 @@ pub async fn execute_with_shutdown(
             verify_after_merge,
             seen,
         } => set_status(ctx, &key, state, note, verify_after_merge, seen).await,
-        UiAction::PrepareBase { key } => {
-            let row = resolve_key(ctx, &key).await?;
-            let slug = row.target.slug().to_owned();
-            let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
-            let (state, archived) = ctx
-                .database
-                .call(move |store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
-                .await?;
-            let trunk = ctx.config.branch.base.as_str();
-            let recorded_base = |slug: &str| {
-                state["slugs"][slug]["baseBranch"]
-                    .as_str()
-                    .filter(|base| !base.is_empty() && *base != trunk)
-                    .map(str::to_owned)
-            };
-            let worktrees = inventory
-                .iter()
-                .filter(|other| {
-                    !other.is_main && !other.detached && !other.target.branch.is_empty()
-                })
-                .map(|other| BaseCandidate {
-                    slug: other.target.slug().to_owned(),
-                    branch: other.target.branch.clone(),
-                    base: recorded_base(other.target.slug()),
-                    archived: archived.contains(&wt_core::worktree_target_key(&other.target)),
-                })
-                .collect::<Vec<_>>();
-            // Offer bases in the order the board shows them, as TS did.
-            let shown = board
-                .map(|board| {
-                    board
-                        .sections
-                        .iter()
-                        .flat_map(|section| section.rows.iter())
-                        .filter_map(|index| board.rows.get(*index))
-                        .map(|row| row.key.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let mut worktrees = worktrees;
-            worktrees.sort_by_key(|candidate| {
-                shown
-                    .iter()
-                    .position(|key| *key == candidate.slug)
-                    .unwrap_or(usize::MAX)
-            });
-            let (options, selected) = base_picker_options(
-                trunk,
-                &slug,
-                &row.target.branch,
-                recorded_base(&slug).as_deref(),
-                &worktrees,
-            );
-            Ok(modal(UiModal::Picker {
-                action: PickerAction::Base { key },
-                title: format!("fork base for {slug}"),
-                options,
-                selected,
-            }))
-        }
-        UiAction::SetBase { key, base } => set_base(ctx, &key, base).await,
+        UiAction::SetBase { key, base, seen } => set_base(ctx, &key, base, seen).await,
         UiAction::SetIssueOverride { key, issue_id } => {
             let row = resolve_key(ctx, &key).await?;
             let value = issue_id.unwrap_or_default().trim().to_ascii_uppercase();
@@ -905,8 +878,13 @@ async fn set_status(
     Ok(message("Work status updated"))
 }
 
-async fn set_base(ctx: &AppContext, key: &str, base: Option<String>) -> Result<UiReply> {
-    crate::fork_base::set(ctx, key, base).await?;
+async fn set_base(
+    ctx: &AppContext,
+    key: &str,
+    base: Option<String>,
+    seen: Option<wt_tui::Seen<Option<String>>>,
+) -> Result<UiReply> {
+    crate::fork_base::set(ctx, key, base, seen.map(|seen| seen.0)).await?;
     Ok(message("Fork base updated"))
 }
 
@@ -968,88 +946,6 @@ fn removal_hazard_lines(hazards: &[String], dirty_files: Option<u32>) -> Vec<Str
     lines
 }
 
-/// One live worktree offered as a fork base, with its own recorded base.
-struct BaseCandidate {
-    slug: String,
-    branch: String,
-    base: Option<String>,
-    /// Archived worktrees are never offered, but their records still link
-    /// the chain, so restoring one cannot close a cycle.
-    archived: bool,
-}
-
-/// Fork-base options as TS built them: a no-parent row, then sibling
-/// worktree branches. The row itself and anything already stacked on it,
-/// directly or transitively, are excluded because picking one would close
-/// a record cycle that the layout silently degrades to flat rows. A
-/// recorded base whose worktree is gone stays listed so "(current)" shows.
-fn base_picker_options(
-    trunk: &str,
-    slug: &str,
-    branch: &str,
-    recorded: Option<&str>,
-    worktrees: &[BaseCandidate],
-) -> (Vec<PickerOption>, usize) {
-    let parent_of = worktrees
-        .iter()
-        .filter_map(|worktree| Some((worktree.branch.as_str(), worktree.base.as_deref()?)))
-        .collect::<std::collections::HashMap<_, _>>();
-    let based_on_current = |candidate: &str| {
-        let mut seen = std::collections::HashSet::new();
-        let mut next = Some(candidate);
-        while let Some(current) = next {
-            if current == branch {
-                return true;
-            }
-            if !seen.insert(current) {
-                return false;
-            }
-            next = parent_of.get(current).copied();
-        }
-        false
-    };
-    let mut branches = Vec::<&str>::new();
-    for worktree in worktrees {
-        if worktree.slug != slug
-            && !worktree.archived
-            && !based_on_current(&worktree.branch)
-            && !branches.contains(&worktree.branch.as_str())
-        {
-            branches.push(&worktree.branch);
-        }
-    }
-    if let Some(recorded) = recorded
-        && !branches.contains(&recorded)
-    {
-        branches.insert(0, recorded);
-    }
-    let option = |value: Option<String>, label: String| PickerOption {
-        value,
-        label,
-        chord: None,
-        note: None,
-        verify_after_merge: None,
-        detail: None,
-    };
-    let mut options = vec![option(None, format!("none (diff against {trunk})"))];
-    options.extend(branches.into_iter().map(|candidate| {
-        let label = if recorded == Some(candidate) {
-            format!("{candidate} (current)")
-        } else {
-            candidate.to_owned()
-        };
-        option(Some(candidate.to_owned()), label)
-    }));
-    let selected = recorded
-        .and_then(|recorded| {
-            options
-                .iter()
-                .position(|option| option.value.as_deref() == Some(recorded))
-        })
-        .unwrap_or(0);
-    (options, selected)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,55 +973,6 @@ mod tests {
         assert_eq!(
             removal_hazard_lines(&["uncommitted changes".into()], Some(1)),
             ["1 uncommitted change will be lost."]
-        );
-    }
-
-    #[test]
-    fn base_picker_offers_only_sibling_worktrees_without_cycles() {
-        let candidate = |slug: &str, branch: &str, base: Option<&str>| BaseCandidate {
-            slug: slug.into(),
-            branch: branch.into(),
-            base: base.map(str::to_owned),
-            archived: false,
-        };
-        let mut archived_link = candidate("parked", "feat/parked", Some("feat/self"));
-        archived_link.archived = true;
-        let worktrees = [
-            archived_link,
-            candidate("via-parked", "feat/via-parked", Some("feat/parked")),
-            candidate("self", "feat/self", None),
-            candidate("child", "feat/child", Some("feat/self")),
-            candidate("grandchild", "feat/grandchild", Some("feat/child")),
-            candidate("other", "feat/other", None),
-            candidate("loop-a", "feat/loop-a", Some("feat/loop-b")),
-            candidate("loop-b", "feat/loop-b", Some("feat/loop-a")),
-        ];
-        let (options, selected) =
-            base_picker_options("main", "self", "feat/self", None, &worktrees);
-        assert_eq!(
-            options
-                .iter()
-                .map(|option| option.label.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "none (diff against main)",
-                "feat/other",
-                "feat/loop-a",
-                "feat/loop-b"
-            ]
-        );
-        assert_eq!(options[0].value, None);
-        assert_eq!(selected, 0);
-
-        let (options, selected) =
-            base_picker_options("main", "child", "feat/child", Some("gone"), &worktrees);
-        assert_eq!(options[1].label, "gone (current)");
-        assert_eq!(selected, 1);
-        assert!(options.iter().any(|option| option.label == "feat/self"));
-        assert!(
-            !options
-                .iter()
-                .any(|option| option.label == "feat/grandchild")
         );
     }
 
@@ -1205,6 +1052,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn board_removal_is_witnessed_and_hazards_return_for_review() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+            .await
+            .unwrap();
+        let key = wt_core::worktree_target_key(&row.target);
+        let path = row.target.path.clone();
+        let head = run_git(
+            &fixture.ctx,
+            Path::new(&path),
+            ["rev-parse", "--verify", "HEAD"],
+        )
+        .await
+        .unwrap()
+        .checked("git")
+        .unwrap()
+        .stdout_text()
+        .trim()
+        .to_owned();
+        let seen = |head: &str| {
+            Some(Box::new(wt_tui::Seen(wt_tui::RemovalSeen {
+                path: path.clone(),
+                branch: "feature/one".into(),
+                head: head.into(),
+            })))
+        };
+        let remove = |revision, seen| UiAction::Remove {
+            key: key.clone(),
+            force: false,
+            revision,
+            seen,
+        };
+
+        // A commit with neither a reviewed revision nor a board witness is refused.
+        let error = execute(&fixture.ctx, remove(None, None), None, None)
+            .await
+            .unwrap_err();
+        assert!(!crate::controller::error_reply(&error).stale);
+        assert!(Path::new(&path).exists());
+
+        // The head moved after the board showed the row: the menu reopens.
+        let error = execute(&fixture.ctx, remove(None, seen("moved")), None, None)
+            .await
+            .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+        assert!(Path::new(&path).exists());
+
+        // Uncommitted work appeared after the clean board: nothing is removed,
+        // and the exact hazards come back as a confirmation.
+        std::fs::write(Path::new(&path).join("scratch.txt"), "work\n").unwrap();
+        let reply = execute(&fixture.ctx, remove(None, seen(&head)), None, None)
+            .await
+            .unwrap();
+        let Some(UiModal::Confirm {
+            action:
+                ConfirmAction::Remove {
+                    force,
+                    revision,
+                    seen,
+                    ..
+                },
+            lines,
+            ..
+        }) = reply.modal
+        else {
+            panic!("hazards must be reviewed before removal");
+        };
+        assert!(force);
+        assert!(seen.is_none());
+        assert_eq!(
+            revision.expect("review carries the reviewed revision").head,
+            head
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Uncommitted changes")),
+            "{lines:?}"
+        );
+        assert!(Path::new(&path).exists());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fork_picker_rejects_cycles_and_keeps_a_real_merge_base() {
         let fixture = crate::commands::test_support::CommandFixture::new()
             .await
@@ -1224,7 +1157,7 @@ mod tests {
                     .target,
             )
         };
-        set_base(&fixture.ctx, &key("one"), Some("feature/two".into()))
+        set_base(&fixture.ctx, &key("one"), Some("feature/two".into()), None)
             .await
             .unwrap();
         let state = fixture
@@ -1236,14 +1169,14 @@ mod tests {
         assert_eq!(state["slugs"]["one"]["baseBranch"], "feature/two");
         assert_eq!(state["slugs"]["one"]["baseSha"].as_str().unwrap().len(), 40);
         assert!(
-            set_base(&fixture.ctx, &key("two"), Some("feature/one".into()))
+            set_base(&fixture.ctx, &key("two"), Some("feature/one".into()), None)
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("cycle")
+                .contains("not an eligible fork base")
         );
         assert!(
-            set_base(&fixture.ctx, &key("one"), Some("missing".into()))
+            set_base(&fixture.ctx, &key("one"), Some("missing".into()), None)
                 .await
                 .is_err()
         );

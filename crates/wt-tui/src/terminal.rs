@@ -477,6 +477,7 @@ async fn run_inner<'a>(
             } => {
                 let before = model.toast.clone();
                 model.tick(tokio::time::Instant::now());
+                send_background(&mut model, &actions.requests);
                 if model.toast != before {
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                 }
@@ -486,6 +487,7 @@ async fn run_inner<'a>(
                 if changed.is_err() { break; }
                 let before = model.toast.clone();
                 model.apply(snapshots.borrow_and_update().clone());
+                send_background(&mut model, &actions.requests);
                 if model.toast != before {
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                 }
@@ -575,6 +577,9 @@ fn log_latencies(samples: &mut Vec<f64>) {
 /// Send read-only warm-up requests a board menu asked for. They carry no
 /// foreground feedback and never block input; a full queue drops them.
 fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
+    let now = tokio::time::Instant::now();
+    model.plan_palette_warm(now);
+    model.fire_palette_warm(now);
     for action in std::mem::take(&mut model.background) {
         let _ = requests.try_send(crate::UiRequest {
             id: 0,

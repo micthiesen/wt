@@ -133,6 +133,42 @@ driver polls input and prepared snapshots and renders them with Ratatui. Actions
 cross a typed `UiAction` boundary into the application controller. This keeps
 terminal rendering separate from I/O and lets the same host service handle
 local and SSH-routed requests.
+
+Menus are presentation of the board, not host requests. `UiAction::menu`
+(`wt-tui/src/menus`) declares for every action, without a wildcard arm,
+whether its menu is built from the presented board, needs host-only data
+(with the reason), or is not a menu. Board builders are pure functions of
+`Board` and answer any board, including an empty one; a builder may defer to
+the host when its board lacks the data (a hazardous removal, an unprefetched
+palette). The host service refuses any action whose menu is board-built. An
+open board menu rebuilds on each presented snapshot and keeps its selection
+by option value, so option values identify choices, never list positions.
+
+Commits from a menu carry a witness of what it showed: `Seen<T>`, `PrPin`,
+`LiveSessionIdentity`, removal identity, or ledger timestamps. The owning host
+compares the witness with current state and refuses a mismatch with
+`controller::stale`, which every host (local or SSH worker) maps to
+`UiReply::stale`. Nothing is written; the model reopens the same menu from its
+newer board and asks sources to refresh. Restored or cached board data can
+therefore drive what a menu offers, never what a write assumes. A commit with
+no witness (CLI, automation) asserts nothing about a view and keeps the
+action's own validation.
+
+An open picker whose cursor the user has not moved follows the builder's
+newest default when it rebuilds; a moved cursor follows its option value.
+
+The action palette is prefetched. While the selection rests (200 ms), the model
+sends a background `WarmPalette` for the selected row's and manager surfaces;
+the host computes the palette exactly as `PrepareActions` would and publishes
+it through the `palettes` source (`Persistence::Never`: it reflects running
+actions). Only confirmed-GitHub pickers are published; an active run or
+unconfirmed data withdraws the entry, so `!` asks the host. An open prefetched
+palette warms again while open. Commits re-run availability on the host; an
+action that became unavailable or started meanwhile is refused as stale.
+
+Host-built menus hold keys typed during preparation and replay them into the
+menu when it opens, stopping if it closes. Pointer-synthesized keys are not
+typeahead.
 The header's refresh wave counts prepared refreshing lanes and has a 10 Hz timer
 only while moving. Animation copies the last rendered screen and repaints its
 header, without rebuilding pane models or requesting source work. Resize falls
@@ -162,13 +198,21 @@ observations within the original timeout budget. A later response must prove
 presence or absence; persistent uncertainty remains an error. Mutating commands
 are never replayed by this mechanism.
 
-Session pickers use the background session-history snapshot and one fresh tmux
-inventory request. Opening a picker queues a history refresh without waiting
-for transcript scans. A cold cache still shows live slots and new-session
-choices; reopen the picker after refresh to see saved conversations. Cached
-history only nominates choices. Attachment checks the live tmux slot and exact
-conversation again. Target resolution uses worktree inventory without Git
-status scans across the fleet.
+Session pickers, the harness chooser and terminal stop are board menus. The
+session source prepares `Board.session_menus` and `Board.terminals` for each
+local worktree and slot from the background session-history snapshot and the
+one tmux inventory the board already holds. Menus open from that board without
+a host request and rebuild as discovery completes. Opening `;` also sends a
+background `DiscoverSessions` read that queues a history refresh, so saved
+conversations join the open picker. Cached history only nominates choices:
+attachment and stop check the live tmux identity again, and a mismatch replies
+stale so the menu reopens. Remote rows and targets without prepared entries
+are answered by their host from the same snapshot. A `New` choice carries the
+live slot ids the picker showed; the host refuses it as stale when a slot it
+did not show is live for that harness. Terminal stop is local only for a
+running local terminal; retained dead panes and remote rows are read by their
+host. Target resolution uses
+worktree inventory without Git status scans across the fleet.
 
 ## Query layer
 

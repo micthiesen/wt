@@ -54,6 +54,7 @@ mod managed_pi;
 mod naming;
 mod naming_source;
 mod origin;
+mod palette_source;
 mod perf_source;
 mod prompt;
 mod query_cache;

@@ -364,10 +364,8 @@ fn session_summary(board: &crate::Board, picker: &PickerPrompt) -> Option<String
         .options
         .get(picker.selected)?
         .value
-        .as_deref()?
-        .parse::<usize>()
-        .ok()
-        .and_then(|index| choices.get(index))?;
+        .as_deref()
+        .and_then(|value| crate::menus::sessions::choice_for_value(choices, value))?;
     if choice.mode != SessionMode::Resume {
         return None;
     }
@@ -695,8 +693,7 @@ fn picker_glyph(
             let harness = option
                 .value
                 .as_deref()
-                .and_then(|value| value.parse::<usize>().ok())
-                .and_then(|index| choices.get(index))
+                .and_then(|value| crate::menus::sessions::choice_for_value(choices, value))
                 .map_or(primary, |choice| choice.harness.as_str());
             (
                 badges::harness_glyph(harness),
@@ -2504,7 +2501,7 @@ mod tests {
             action: ConfirmAction::Remove {
                 key: "one".into(),
                 force: true,
-                revision: RemovalRevision {
+                revision: Some(RemovalRevision {
                     key: "one".into(),
                     path: "/worktrees/one".into(),
                     branch: "feature/one".into(),
@@ -2512,7 +2509,8 @@ mod tests {
                     digest: "deadbeef".into(),
                     hazards: vec!["uncommitted changes".into()],
                     published_base: None,
-                },
+                }),
+                seen: None,
             },
             title: "Force remove worktree?".into(),
             lines: vec![
@@ -2640,6 +2638,7 @@ mod tests {
             managed_name: None,
             mode,
             live: false,
+            seen_live: None,
         };
         let board = crate::Board {
             rows: vec![crate::BoardRow {
@@ -2653,18 +2652,19 @@ mod tests {
             }],
             ..Default::default()
         };
+        let choices = vec![
+            choice(SessionMode::Resume, Some("s1")),
+            choice(SessionMode::Resume, Some("s2")),
+            choice(SessionMode::New, None),
+        ];
         let mut picker = PickerPrompt {
             action: PickerAction::Sessions {
-                choices: vec![
-                    choice(SessionMode::Resume, Some("s1")),
-                    choice(SessionMode::Resume, Some("s2")),
-                    choice(SessionMode::New, None),
-                ],
+                choices: choices.clone(),
             },
             title: "sessions · one".into(),
             options: (0..3)
                 .map(|index| PickerOption {
-                    value: Some(index.to_string()),
+                    value: Some(crate::session_value(&choices[index])),
                     label: format!("row {index}"),
                     chord: None,
                     note: None,
@@ -2696,7 +2696,10 @@ mod tests {
         };
         let mut model = Model {
             interaction: Interaction::Picker(PickerPrompt {
-                action: PickerAction::Section { key: "one".into() },
+                action: PickerAction::Section {
+                    key: "one".into(),
+                    seen: None,
+                },
                 title: "section".into(),
                 options: vec![
                     option("Inbox", None),

@@ -72,7 +72,10 @@ impl Model {
 
     /// When a pending change next needs re-checking against its deadline.
     pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
-        self.pending.next_deadline()
+        [self.pending.next_deadline(), self.palette_warm_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub(crate) fn next_op_id(&mut self) -> u64 {

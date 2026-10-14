@@ -1,13 +1,14 @@
-//! Host-owned session picker preparation. Only terminal attachment belongs to
-//! the controller; discovery and stop operations run on the selected host.
+//! Host-owned session actions: terminal stop, live session stop and kill.
+//! Pickers are built from the board (`wt_tui::menus::sessions`); the host
+//! answers a picker only for targets the board has no prepared entries for.
 use crate::context::AppContext;
 use anyhow::Result;
-use wt_tui::{
-    PickerAction, PickerOption, SessionMode, SessionSelection, UiAction, UiModal, UiReply,
-};
+use wt_tui::{UiAction, UiReply};
 
 pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> {
     match action {
+        // The board answers running local terminals; the host reads tmux for
+        // retained dead panes, remote rows and boards without inventory yet.
         UiAction::PrepareStopTerminal { key, target } => {
             let (tmux, name, label) = terminal_target(context, &key, target).await?;
             let Some(session) = tmux
@@ -22,25 +23,13 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                 });
             };
             Ok(UiReply {
-                modal: Some(UiModal::Confirm {
-                    title: format!("Stop {label} session?"),
-                    lines: vec![
-                        name,
-                        if target == wt_tui::SessionTarget::Shell {
-                            "Processes running in this shell will stop."
-                        } else {
-                            "The diff viewer will restart fresh next time."
-                        }
-                        .into(),
-                    ],
-                    action: wt_tui::ConfirmAction::StopTerminal {
-                        key,
-                        target,
-                        session_id: session.id,
-                        created_at: session.created_at,
-                    },
-                    cancel_key: None,
-                }),
+                modal: Some(wt_tui::stop_terminal_confirm(
+                    &key,
+                    target,
+                    &name,
+                    &session.id,
+                    session.created_at,
+                )),
                 ..Default::default()
             })
         }
@@ -54,9 +43,9 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             let live = tmux.list_sessions(&context.cancellation).await?;
             if let Some(session) = live.iter().find(|session| session.name == name) {
                 if session.id != session_id || session.created_at != created_at {
-                    anyhow::bail!(
+                    return Err(crate::controller::stale(format!(
                         "{label} session changed since confirmation; open the stop dialog again"
-                    );
+                    )));
                 }
                 tmux.kill_session_id(&session_id, &context.cancellation)
                     .await?;
@@ -66,13 +55,8 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                 ..Default::default()
             })
         }
-        UiAction::PrepareSessions { key, target } => {
-            let sessions =
-                crate::harness::list_session_options(context, key.clone(), target).await?;
-            Ok(sessions_reply(context, key, target, sessions))
-        }
         UiAction::StopSession { selection } => {
-            let label = harness_label(selection.harness);
+            let label = wt_tui::harness_label(selection.harness);
             let closed = crate::harness::stop_managed_session(
                 context,
                 &selection,
@@ -89,7 +73,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             })
         }
         UiAction::KillSession { selection } => {
-            let label = harness_label(selection.harness);
+            let label = wt_tui::harness_label(selection.harness);
             if selection.live {
                 let killed = crate::harness::stop_managed_session(
                     context,
@@ -118,14 +102,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                 ..Default::default()
             })
         }
-        UiAction::PrepareHarnesses { key } => {
-            let primary = crate::harness::AppHarness::new(context).primary();
-            Ok(UiReply {
-                modal: Some(harness_picker(key, &context.config.harness.hidden, primary)),
-                ..Default::default()
-            })
-        }
-        _ => anyhow::bail!("not a session picker command"),
+        _ => anyhow::bail!("not a session action"),
     }
 }
 
@@ -134,11 +111,13 @@ async fn terminal_target(
     key: &str,
     target: wt_tui::SessionTarget,
 ) -> Result<(wt_tmux::TmuxClient, String, &'static str)> {
-    let label = match target {
-        wt_tui::SessionTarget::Shell => "shell",
-        wt_tui::SessionTarget::Diff => "diff",
-        _ => anyhow::bail!("only shell and diff sessions use terminal stop"),
-    };
+    if !matches!(
+        target,
+        wt_tui::SessionTarget::Shell | wt_tui::SessionTarget::Diff
+    ) {
+        anyhow::bail!("only shell and diff sessions use terminal stop");
+    }
+    let label = wt_tui::terminal_label(target);
     let row = crate::lifecycle_ops::resolve_key(context, key).await?;
     if row.is_main || !matches!(row.target.location(), wt_core::WorktreeLocation::Local) {
         anyhow::bail!("terminal stop requires a worktree on this host");
@@ -153,192 +132,4 @@ async fn terminal_target(
         name,
         label,
     ))
-}
-
-/// One resumable session row: TS showed the harness, the session name, and
-/// the derived state, falling back to live without a state signal. A session
-/// whose process is gone reads dead whatever its transcript last said.
-fn session_row_label(
-    harness: wt_core::HarnessId,
-    name: &str,
-    state: Option<&str>,
-    live: bool,
-) -> String {
-    let status = match state {
-        _ if !live => "dead".into(),
-        Some(state) => state.to_ascii_lowercase(),
-        None => "live".into(),
-    };
-    format!("{} / {name} · {status}", harness_label(harness))
-}
-
-/// Display name for a harness (TS harness `label`).
-pub fn harness_label(harness: wt_core::HarnessId) -> &'static str {
-    match harness {
-        wt_core::HarnessId::Claude => "Claude Code",
-        wt_core::HarnessId::Codex => "Codex",
-        wt_core::HarnessId::Opencode => "OpenCode",
-        wt_core::HarnessId::Pi => "Pi",
-    }
-}
-
-/// Quick-pick letter for each harness in the TS pickers.
-pub fn harness_letter(harness: wt_core::HarnessId) -> char {
-    match harness {
-        wt_core::HarnessId::Claude => 'c',
-        wt_core::HarnessId::Codex => 'x',
-        wt_core::HarnessId::Opencode => 'o',
-        wt_core::HarnessId::Pi => 'p',
-    }
-}
-
-/// Shift+F12 chooser over the visible harnesses, cursor on the primary.
-fn harness_picker(
-    key: String,
-    hidden: &std::collections::BTreeSet<wt_core::HarnessId>,
-    primary: wt_core::HarnessId,
-) -> UiModal {
-    let visible: Vec<_> = wt_core::HarnessId::ALL
-        .into_iter()
-        .filter(|id| !hidden.contains(id))
-        .collect();
-    UiModal::Picker {
-        action: PickerAction::Harness { key },
-        title: "Start agent".into(),
-        selected: visible.iter().position(|id| *id == primary).unwrap_or(0),
-        options: visible
-            .into_iter()
-            .map(|id| PickerOption {
-                value: Some(id.as_str().into()),
-                label: harness_label(id).into(),
-                chord: Some(harness_letter(id)),
-                note: None,
-                verify_after_merge: None,
-                detail: None,
-            })
-            .collect(),
-    }
-}
-
-/// Build the picker from prepared history and a fresh live-slot inventory.
-pub(crate) fn sessions_reply(
-    context: &AppContext,
-    key: Option<String>,
-    target: wt_tui::SessionTarget,
-    sessions: Vec<crate::harness::SessionOption>,
-) -> UiReply {
-    let mut choices = Vec::new();
-    let mut options = Vec::new();
-    for session in sessions {
-        options.push(PickerOption {
-            value: Some(choices.len().to_string()),
-            label: session_row_label(
-                session.selection.harness,
-                &session.display_name,
-                session.state.as_deref(),
-                session.is_live,
-            ),
-            chord: None,
-            note: None,
-            verify_after_merge: None,
-            detail: None,
-        });
-        choices.push(session.selection);
-    }
-    for harness in wt_core::HarnessId::ALL
-        .into_iter()
-        .filter(|id| !context.config.harness.hidden.contains(id))
-    {
-        options.push(PickerOption {
-            value: Some(choices.len().to_string()),
-            label: format!("new {} session", harness_label(harness)),
-            // The letter jumps to this row (the model's sessions
-            // key handler); it never commits, as in TS.
-            chord: Some(harness_letter(harness)),
-            note: None,
-            verify_after_merge: None,
-            detail: None,
-        });
-        choices.push(SessionSelection {
-            key: key.clone(),
-            target,
-            harness,
-            session_id: None,
-            live_slot: None,
-            managed_name: None,
-            mode: SessionMode::New,
-            live: false,
-        });
-    }
-    UiReply {
-        modal: Some(UiModal::Picker {
-            action: PickerAction::Sessions { choices },
-            title: match (&key, target) {
-                (Some(key), wt_tui::SessionTarget::Harness) => {
-                    format!("sessions · {}", wt_core::worktree_ledger_label(key))
-                }
-                _ => "sessions".into(),
-            },
-            options,
-            selected: 0,
-        }),
-        ..Default::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wt_core::HarnessId;
-
-    #[test]
-    fn session_rows_name_the_harness_and_state() {
-        assert_eq!(
-            session_row_label(HarnessId::Claude, "main", Some("Working"), true),
-            "Claude Code / main · working"
-        );
-        assert_eq!(
-            session_row_label(HarnessId::Codex, "abc", None, true),
-            "Codex / abc · live"
-        );
-        assert_eq!(
-            session_row_label(HarnessId::Opencode, "abc", None, false),
-            "OpenCode / abc · dead"
-        );
-        assert_eq!(
-            session_row_label(HarnessId::Claude, "old", Some("Idle"), false),
-            "Claude Code / old · dead"
-        );
-    }
-
-    #[test]
-    fn harness_picker_skips_hidden_and_starts_on_primary() {
-        let UiModal::Picker {
-            action,
-            options,
-            selected,
-            ..
-        } = harness_picker(
-            "one".into(),
-            &[HarnessId::Codex].into_iter().collect(),
-            HarnessId::Opencode,
-        )
-        else {
-            panic!("expected a picker");
-        };
-        assert_eq!(action, PickerAction::Harness { key: "one".into() });
-        let values: Vec<_> = options
-            .iter()
-            .map(|option| (option.value.clone().unwrap(), option.chord))
-            .collect();
-        assert_eq!(
-            values,
-            vec![
-                ("claude".into(), Some('c')),
-                ("opencode".into(), Some('o')),
-                ("pi".into(), Some('p'))
-            ]
-        );
-        assert_eq!(selected, 1);
-    }
 }

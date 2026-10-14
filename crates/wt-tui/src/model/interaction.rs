@@ -5,8 +5,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{InputResult, Model};
 use crate::{
-    ConfirmAction, LineEditor, PickerAction, PickerOption, SessionTarget, TextAction, UiAction,
+    ConfirmAction, LineEditor, PickerAction, PickerOption, Seen, SessionTarget, TextAction,
+    UiAction,
     editor::EditResult,
+    menus::{NEW_SECTION, sessions::choice_for_value},
 };
 
 pub struct TitlePrompt {
@@ -171,7 +173,7 @@ impl Model {
                     EditResult::Cancel if !(control && code == KeyCode::Char('c')) => {
                         self.toast = None;
                         match &prompt.action {
-                            TextAction::NewSection { key } => {
+                            TextAction::NewSection { key, .. } => {
                                 InputResult::Action(UiAction::PrepareSection { key: key.clone() })
                             }
                             TextAction::SessionName { selection } => {
@@ -224,11 +226,12 @@ impl Model {
                                 extras: text,
                             },
                             TextAction::Create => UiAction::Create { input: text },
-                            TextAction::NewSection { key } => {
+                            TextAction::NewSection { key, seen } => {
                                 self.last_section_target = Some(Some(text.clone()));
                                 UiAction::MoveSection {
                                     key: key.clone(),
                                     section: Some(text),
+                                    seen: seen.clone(),
                                 }
                             }
                             TextAction::RenameSection { old } => UiAction::RenameSection {
@@ -328,10 +331,12 @@ impl Model {
                             key,
                             force,
                             revision,
+                            seen,
                         } => UiAction::Remove {
                             key: key.clone(),
                             force: *force,
                             revision: revision.clone(),
+                            seen: seen.clone(),
                         },
                         ConfirmAction::Cleanup { revisions } => UiAction::Cleanup {
                             revisions: revisions.clone(),
@@ -442,16 +447,11 @@ impl Model {
                     });
                     return InputResult::Draw;
                 }
-                if let PickerAction::Section { key } = &picker.action
+                if let PickerAction::Section { key, seen } = &picker.action
                     && code == KeyCode::Char('n')
                     && !control
                 {
-                    self.interaction = Interaction::Text(TextPrompt {
-                        action: TextAction::NewSection { key: key.clone() },
-                        prompt: "New section".into(),
-                        editor: LineEditor::new(""),
-                        allow_empty: false,
-                    });
+                    self.interaction = Interaction::Text(new_section_prompt(key, seen));
                     return InputResult::Draw;
                 }
                 let opener = match &picker.action {
@@ -495,8 +495,8 @@ impl Model {
                     PickerAction::Sessions { choices } => {
                         let Some(selection) = option
                             .value
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .and_then(|index| choices.get(index))
+                            .as_deref()
+                            .and_then(|value| choice_for_value(choices, value))
                             .cloned()
                         else {
                             return InputResult::Unchanged;
@@ -567,24 +567,24 @@ impl Model {
                         }
                         .resolve_palette_alias(),
                     ),
-                    PickerAction::Section { key } => {
-                        // The "+ new section" row (a reserved NUL value) is
-                        // not a target to remember; its name is, once typed.
-                        if !option
-                            .value
-                            .as_deref()
-                            .is_some_and(|value| value.starts_with('\0'))
-                        {
-                            self.last_section_target = Some(option.value.clone());
+                    PickerAction::Section { key, seen } => {
+                        // "+ new section" opens the name prompt here; the row
+                        // is not a target to remember, its name is once typed.
+                        if option.value.as_deref() == Some(NEW_SECTION) {
+                            self.interaction = Interaction::Text(new_section_prompt(key, seen));
+                            return InputResult::Draw;
                         }
+                        self.last_section_target = Some(option.value.clone());
                         InputResult::Action(UiAction::MoveSection {
                             key: key.clone(),
                             section: option.value,
+                            seen: seen.clone(),
                         })
                     }
-                    PickerAction::Base { key } => InputResult::Action(UiAction::SetBase {
+                    PickerAction::Base { key, seen } => InputResult::Action(UiAction::SetBase {
                         key: key.clone(),
                         base: option.value,
+                        seen: seen.clone(),
                     }),
                     PickerAction::Status { key, seen } => {
                         if let Some(steps) = option.verify_after_merge {
@@ -638,8 +638,7 @@ impl Model {
             .options
             .get(picker.selected)
             .and_then(|option| option.value.as_deref())
-            .and_then(|value| value.parse::<usize>().ok())
-            .and_then(|index| choices.get(index))
+            .and_then(|value| choice_for_value(choices, value))
             .filter(|choice| choice.mode == crate::SessionMode::Resume)
             .cloned();
         match (letter, current) {
@@ -688,8 +687,7 @@ impl Model {
                     option
                         .value
                         .as_deref()
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .and_then(|index| choices.get(index))
+                        .and_then(|value| choice_for_value(choices, value))
                         .is_some_and(|choice| {
                             choice.mode == crate::SessionMode::New && choice.harness == harness
                         })
@@ -716,6 +714,20 @@ fn harness_label(harness: wt_core::HarnessId) -> (&'static str, char) {
         wt_core::HarnessId::Codex => ("Codex", 'x'),
         wt_core::HarnessId::Opencode => ("OpenCode", 'o'),
         wt_core::HarnessId::Pi => ("Pi", 'p'),
+    }
+}
+
+/// The name prompt behind "+ new section". It keeps the section the picker
+/// showed, so the move it leads to is witnessed too.
+fn new_section_prompt(key: &str, seen: &Option<Seen<Option<String>>>) -> TextPrompt {
+    TextPrompt {
+        action: TextAction::NewSection {
+            key: key.to_owned(),
+            seen: seen.clone(),
+        },
+        prompt: "New section".into(),
+        editor: LineEditor::new(""),
+        allow_empty: false,
     }
 }
 
@@ -804,8 +816,7 @@ pub(crate) fn digit_rows(picker: &PickerPrompt) -> Vec<usize> {
             PickerAction::Sessions { choices } => picker.options[index]
                 .value
                 .as_deref()
-                .and_then(|value| value.parse::<usize>().ok())
-                .and_then(|choice| choices.get(choice))
+                .and_then(|value| choice_for_value(choices, value))
                 .is_some_and(|choice| choice.mode == crate::SessionMode::Resume),
             // A row with its own letter keeps the letter, as in TS.
             _ => picker.options[index].chord.is_none(),

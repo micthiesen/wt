@@ -22,6 +22,9 @@ use wt_platform::{
 use wt_store::{RemovedWorktree, RepositoryIdentity, Store, StoreError};
 use wt_vcs::{GitRepository, WorktreeRecord};
 
+/// Refusal when the removal shown to the user is no longer the current one.
+/// Callers match it to report a stale request rather than a failure.
+pub const REMOVED_CHANGED: &str = "removed worktree changed after the history view was rendered";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -359,11 +362,7 @@ impl LifecycleService {
                 }))
             })
             .await?
-            .ok_or_else(|| {
-                LifecycleError::Refused(
-                    "removed worktree changed after the history view was rendered".into(),
-                )
-            })?;
+            .ok_or_else(|| LifecycleError::Refused(REMOVED_CHANGED.into()))?;
         let branch_slug = self.dir_slug(&record.branch);
         if branch_slug != slug {
             return Err(LifecycleError::Refused(format!(

@@ -26,6 +26,7 @@ impl Model {
                     ..Default::default()
                 });
                 self.local_menu = Some(action);
+                self.local_menu_default = self.picker_value();
                 self.background.extend(warm.map(|warm| *warm));
             }
             LocalMenu::Notice(text) => {
@@ -49,9 +50,22 @@ impl Model {
         }
     }
 
-    /// Rebuild the open board menu from the newly presented board. The
-    /// selection follows its option value, so a re-sort never moves the
-    /// cursor onto a different choice. A board that no longer offers the menu
+    /// The value of the highlighted picker option, if a picker is open.
+    fn picker_value(&self) -> Option<Option<String>> {
+        match &self.interaction {
+            Interaction::Picker(picker) => picker
+                .options
+                .get(picker.selected)
+                .map(|option| option.value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Rebuild the open board menu from the newly presented board. A cursor
+    /// the user moved follows its option value, so a re-sort never moves it
+    /// onto a different choice. A cursor still on the builder's default
+    /// follows the new default: a menu opened from an older board must not
+    /// keep a choice nobody made. A board that no longer offers the menu
     /// keeps the last view; the host checks the commit anyway.
     pub(super) fn rebuild_local_menu(&mut self) {
         let Some(action) = &self.local_menu else {
@@ -71,11 +85,14 @@ impl Model {
                     action,
                     title,
                     options,
-                    ..
+                    selected: default,
                 },
             ) if discriminant(&picker.action) == discriminant(&action) => {
                 let current = picker.options.get(picker.selected);
+                let untouched =
+                    current.map(|current| &current.value) == self.local_menu_default.as_ref();
                 let selected = current
+                    .filter(|_| !untouched)
                     .and_then(|current| {
                         options
                             .iter()
@@ -88,8 +105,12 @@ impl Model {
                                     .position(|option| option.label == current.label)
                             })
                     })
-                    .unwrap_or(picker.selected)
+                    .unwrap_or(if untouched { default } else { picker.selected })
                     .min(options.len().saturating_sub(1));
+                if untouched {
+                    self.local_menu_default =
+                        options.get(selected).map(|option| option.value.clone());
+                }
                 *picker = PickerPrompt {
                     action,
                     title,

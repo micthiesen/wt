@@ -1,92 +1,31 @@
 //! Controller-side section operations; UI code only handles prepared choices.
 use anyhow::{Context, Result, bail};
 use wt_core::{ChainMember, build_stack_index};
-use wt_tui::{PickerAction, PickerOption, UiModal, UiReply};
+use wt_tui::{Seen, UiReply};
 
 use crate::{commands::section, context::AppContext};
 
-pub async fn prepare(
-    ctx: &AppContext,
-    key: String,
-    board: Option<&wt_tui::Board>,
-) -> Result<UiReply> {
-    let row = board
-        .and_then(|board| board.rows.iter().find(|row| row.key == key))
-        .context("worktree metadata is still loading")?;
-    let slug = key.clone();
-    let (state, archived) = ctx
-        .database
-        .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
-        .await?;
-    if archived.contains(&slug) {
-        bail!("Restore the archived row before moving it to a section");
-    }
-    let current = state["slugs"][&slug]["section"].as_str();
-    let options = section_options(section::manual_sections(&state), current);
-    Ok(UiReply {
-        modal: Some(UiModal::Picker {
-            action: PickerAction::Section { key },
-            title: format!("Move {} to section · n new", row.slug),
-            options,
-            selected: 0,
-        }),
-        ..Default::default()
-    })
-}
-
-/// Picker value of the "+ new section" row. A leading NUL is reserved for
-/// derived groups, so no real section can collide with it.
-const NEW_SECTION: &str = "\0new-section";
-
-fn picker_option(value: Option<String>, label: String, chord: Option<char>) -> PickerOption {
-    PickerOption {
-        value,
-        label,
-        chord,
-        note: None,
-        verify_after_merge: None,
-        detail: None,
-    }
-}
-
-/// TS order: the Inbox (only when the row is in a section), every other
-/// manual section, then the "+ new section" row on its `n` chord.
-fn section_options(sections: Vec<String>, current: Option<&str>) -> Vec<PickerOption> {
-    let mut options = Vec::new();
-    if current.is_some() {
-        options.push(picker_option(None, "Inbox".into(), None));
-    }
-    options.extend(
-        sections
-            .into_iter()
-            .filter(|name| Some(name.as_str()) != current)
-            .map(|name| picker_option(Some(name.clone()), name, None)),
-    );
-    options.push(picker_option(
-        Some(NEW_SECTION.into()),
-        "+ new section".into(),
-        Some('n'),
-    ));
-    options
+/// The section a row is stored under (`None` = Inbox). Remote rows keep their
+/// placement in the controller's `remoteLayouts`, as the board reads it.
+fn stored_section(state: &serde_json::Value, key: &str) -> Option<String> {
+    let collection = if wt_core::is_remote_worktree_ledger_key(key) {
+        "remoteLayouts"
+    } else {
+        "slugs"
+    };
+    state[collection][key]["section"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 pub async fn move_row(
     ctx: &AppContext,
     key: String,
     section: Option<String>,
+    seen: Option<Seen<Option<String>>>,
     board: Option<&wt_tui::Board>,
 ) -> Result<UiReply> {
-    if section.as_deref() == Some(NEW_SECTION) {
-        return Ok(UiReply {
-            modal: Some(UiModal::Text {
-                action: wt_tui::TextAction::NewSection { key },
-                prompt: "New section".into(),
-                initial: String::new(),
-                allow_empty: false,
-            }),
-            ..Default::default()
-        });
-    }
     let board = board.context("worktree metadata is still loading")?;
     let row = board
         .rows
@@ -99,6 +38,17 @@ pub async fn move_row(
         .await?;
     if archived.contains(&row.key) {
         bail!("Restore the archived row before moving it to a section");
+    }
+    // The menu showed the row's section; a change since then (another client
+    // or the agent moved it) must not be overwritten unseen.
+    if let Some(Seen(seen)) = &seen {
+        let current = stored_section(&state, &row.key);
+        if current != *seen {
+            return Err(crate::controller::stale(format!(
+                "section is now {}",
+                current.as_deref().unwrap_or("Inbox")
+            )));
+        }
     }
     let destination = section
         .map(|name| {
@@ -388,27 +338,67 @@ pub async fn rename(ctx: &AppContext, old: String, new: String) -> Result<UiRepl
 mod tests {
     use super::*;
 
-    #[test]
-    fn section_picker_lists_inbox_first_and_a_new_section_row() {
-        let labels = |options: Vec<PickerOption>| {
-            options
-                .into_iter()
-                .map(|option| (option.label, option.chord))
-                .collect::<Vec<_>>()
-        };
-        let sections = vec!["alpha".to_owned(), "beta".to_owned()];
-        assert_eq!(
-            labels(section_options(sections.clone(), Some("beta"))),
-            [
-                ("Inbox".to_owned(), None),
-                ("alpha".to_owned(), None),
-                ("+ new section".to_owned(), Some('n')),
-            ]
+    #[tokio::test]
+    async fn move_refuses_when_the_section_the_menu_showed_changed() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let facts = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let board =
+            crate::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
+        // The menu showed the Inbox; another writer files the row under Release.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.move_worktrees_to_section(&["one".to_owned()], Some("Release"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let error = move_row(
+            &fixture.ctx,
+            "one".into(),
+            Some("Next".into()),
+            Some(Seen(None)),
+            Some(&board),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::controller::Stale>())
         );
-        let in_inbox = section_options(sections, None);
-        assert_eq!(in_inbox[0].label, "alpha");
-        assert_eq!(in_inbox.last().unwrap().value.as_deref(), Some(NEW_SECTION));
-        assert!(section::invalid_name(NEW_SECTION).is_some());
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert_eq!(state["slugs"]["one"]["section"], "Release");
+        // The same move from the menu that saw Release goes through.
+        move_row(
+            &fixture.ctx,
+            "one".into(),
+            Some("Next".into()),
+            Some(Seen(Some("Release".into()))),
+            Some(&board),
+        )
+        .await
+        .unwrap();
+        fixture.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -533,14 +523,11 @@ mod tests {
             .unwrap();
         let board =
             crate::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
-        let picker = prepare(&fixture.ctx, key.clone(), Some(&board))
-            .await
-            .unwrap();
-        assert!(matches!(picker.modal, Some(UiModal::Picker { .. })));
         move_row(
             &fixture.ctx,
             key.clone(),
             Some("Release".into()),
+            None,
             Some(&board),
         )
         .await
@@ -567,7 +554,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            move_row(&fixture.ctx, key, None, Some(&board))
+            move_row(&fixture.ctx, key, None, None, Some(&board))
                 .await
                 .is_err()
         );

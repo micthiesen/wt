@@ -45,6 +45,10 @@ about to investigate may already have a known signature there.
   registration and cancellation before increasing poll intervals or timeouts.
 - Keep filesystem/process work off the input path. An idle terminal should
   not continuously redraw. Preserve batching and start-time rate floors.
+- `Loading menu…` means the menu is host-built (`UiAction::menu` returns
+  `Menu::Host`). Fix slow menus by publishing their data through a source and
+  building them from the board, not by caching or special-casing the host
+  preparation.
 - Use isolated fixtures for fault injection. Do not stop live user sessions
   merely to obtain a cleaner benchmark.
 

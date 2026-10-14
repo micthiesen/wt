@@ -3,7 +3,7 @@
 use crate::{context::AppContext, remote_board::Fleet};
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
-use wt_tui::{PickerAction, PickerOption, SessionTarget, UiAction, UiModal, UiReply};
+use wt_tui::{SessionTarget, UiAction, UiReply};
 
 pub async fn execute(
     context: &AppContext,
@@ -30,7 +30,7 @@ pub async fn execute(
             _ => {}
         }
     }
-    let (host, action, explicit) = crate::host_routing::resolve(command)?;
+    let (host, action, _) = crate::host_routing::resolve(command)?;
     if let UiAction::SetPerf {
         active,
         continuous,
@@ -114,54 +114,6 @@ pub async fn execute(
         }
         let prepared = crate::harness::ui_session(context, None, SessionTarget::WtSource).await?;
         return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
-    }
-    // Only Ctrl+N (PrepareCreate without a captured host) asks for a host.
-    // Like the TS TUI, `n`, hard refresh, and the global automation keys act
-    // on this machine; cleanup is fleet-wide above.
-    if !explicit && !fleet.remotes.is_empty() && matches!(action, UiAction::PrepareCreate { .. }) {
-        let mut options = vec![PickerOption {
-            value: None,
-            label: "This machine".into(),
-            chord: None,
-            note: None,
-            verify_after_merge: None,
-            detail: None,
-        }];
-        options.extend(fleet.remotes.iter().map(|remote| {
-            let owed = remote
-                .managed
-                .borrow()
-                .as_ref()
-                .map(|status| status.report.sign_ins())
-                .unwrap_or_default();
-            PickerOption {
-                value: Some(remote.endpoint.key()),
-                label: remote.endpoint.label.clone(),
-                chord: None,
-                note: (!owed.is_empty()).then(|| {
-                    format!(
-                        "sign-in needed: {}",
-                        owed.iter()
-                            .map(|provider| provider.label())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }),
-                verify_after_merge: None,
-                detail: None,
-            }
-        }));
-        return Ok(UiReply {
-            modal: Some(UiModal::Picker {
-                action: PickerAction::Host {
-                    action: Box::new(action),
-                },
-                title: "Choose host".into(),
-                options,
-                selected: 0,
-            }),
-            ..Default::default()
-        });
     }
     let remote = host
         .as_ref()
@@ -582,6 +534,7 @@ fn new_claude_selection(key: String) -> wt_tui::SessionSelection {
         managed_name: None,
         mode: wt_tui::SessionMode::New,
         live: false,
+        seen_live: None,
     }
 }
 

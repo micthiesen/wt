@@ -289,10 +289,25 @@ armed or the unconfirmed attempt expires.
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
 
-While an action menu loads, wt retains one early letter shortcut for that menu
-and its original worktree and host. Ignored keys do not dismiss the pending
-menu. Escape, `q`, Ctrl+C, `!`, or arrow-key navigation cancels it before its delayed reply can
-open; preparation failures remain visible as errors.
+Most menus open at once from the board on screen: status `u`, fork base `b`,
+section move, sessions `;`, start agent Shift+F12, stop a running terminal
+Shift+F10/F11, GitHub `e`/`E`, review checkout `w`, history restore, hard
+refresh, create, removal of a clean worktree `d`, and an action palette that
+was prefetched for the selected row. An open menu updates as newer data
+arrives and keeps the highlighted choice. If what the menu showed changed
+before the host applied the choice (a PR moved, a session was replaced, an
+agent set a status), nothing is written: the menu reopens with the current
+data and the toast says what changed.
+
+Menus that need host-only data (removal hazards, an unprefetched palette,
+action arguments, reviewers, failed checks, fleet cleanup, retained or remote
+terminals) show
+`Loading menu… Esc cancels`. Keys typed meanwhile belong to that menu, never to
+the board: they replay in order once it opens, so a fast `; d` or `! m` acts
+inside the menu. Escape, `q`, Ctrl+C, or the menu's own key cancels it.
+Replay stops if the menu closes. Keys are dropped, with a notice, when the
+menu fails or takes longer than two seconds. Mouse wheel input still acts
+where the pointer is and abandons the loading menu.
 
 The session picker runs on the selected host. A running Codex, OpenCode, or Pi slot
 whose conversation UUID cannot be proven appears as **current session
@@ -389,7 +404,14 @@ and spacing. It departs from that UI only where the change is deliberate:
 Session `; d` and `; x` act immediately, as they did in TypeScript; the
 review-requests fold is not persisted, also as before.
 
-The session picker opens from cached conversation history and a fresh tmux
-slot check. Opening it requests a background history refresh. With an empty
-cache it shows live slots and new-session choices. Reopen it after refresh
-to see saved conversations. Attachment rechecks the selected live identity.
+The session picker is built from the board: saved conversations from the
+background history snapshot and the live tmux slots. Opening it sends a
+background read, so saved conversations join the open picker when discovery
+finishes, without a loading row. With an empty cache it shows live slots and
+new-session choices. Attachment rechecks the selected live identity; a
+new session chosen beside a live slot the picker did not show is refused and
+the picker reopens. A picker cursor that has not moved follows the newest
+default, so a picker opened before a live slot appeared selects it once it
+does. Shift+F10 and Shift+F11 confirm a running terminal from the board; a
+terminal retained after its process exited, or one on a remote host, is read
+from tmux by its host.

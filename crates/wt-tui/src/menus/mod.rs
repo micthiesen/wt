@@ -11,7 +11,18 @@
 //! from. It has no wildcard arm: a new preparation must choose a board
 //! builder or name the host-only data it needs.
 
+mod base;
+pub(crate) mod palette;
+mod remove;
+mod section;
 mod status;
+
+mod confirms;
+mod github;
+pub(crate) mod sessions;
+
+pub use confirms::new_worktree_prompt;
+pub(crate) use section::NEW_SECTION;
 
 use crate::{Board, SessionTarget, UiAction, UiModal};
 
@@ -71,55 +82,42 @@ impl UiAction {
                 },
                 menu => menu,
             },
-            A::PrepareCreate { .. } => Menu::Host {
-                reason: "offers host choices when remote hosts are configured",
-            },
+            A::PrepareCreate { initial } => confirms::create(board, initial),
             A::ResolveCreation { .. } => Menu::Host {
                 reason: "parses the request against the host's branches",
             },
-            A::PrepareHardRefresh => Menu::Host {
-                reason: "confirms clearing the host's derived caches",
-            },
-            A::PrepareRestoreRemoved { .. } => Menu::Host {
-                reason: "reads the host's removal ledger",
-            },
-            A::PrepareGithub { .. } => Menu::Host {
-                reason: "reads confirmed pull request data",
-            },
+            A::PrepareHardRefresh => Menu::Local(confirms::hard_refresh()),
+            A::PrepareRestoreRemoved { key } => Menu::Local(confirms::restore_removed(board, key)),
+            A::PrepareGithub { key, ship } => github::menu(board, key, *ship),
             A::PrepareReviewers { .. } => Menu::Host {
                 reason: "lists repository contributors from GitHub",
             },
-            A::PrepareReviewCheckout { .. } => Menu::Host {
-                reason: "reads the host's review requests",
-            },
+            A::PrepareReviewCheckout {
+                url,
+                updated_at,
+                branch,
+            } => Menu::Local(confirms::review_checkout(board, url, updated_at, branch)),
             A::GithubFailedChecks { .. } => Menu::Host {
                 reason: "fetches the failed CI log from GitHub",
             },
-            A::PrepareActions { .. } | A::PrepareAction { .. } => Menu::Host {
+            A::PrepareActions { surface } => palette::menu(board, surface),
+            A::PrepareAction { .. } => Menu::Host {
                 reason: "reads action definitions, running actions and checkout state",
             },
-            A::PrepareSection { .. } => Menu::Host {
-                reason: "reads the manual section order",
-            },
-            A::PrepareRemove { .. } => Menu::Host {
-                reason: "plans removal hazards from Git",
-            },
+            A::PrepareSection { key } => Menu::Local(section::menu(board, key)),
+            A::PrepareRemove { key } => remove::menu(board, key),
             A::PrepareCleanup => Menu::Host {
                 reason: "plans landing evidence on every host; `c` builds from the board",
             },
             A::PrepareStatus { key } => Menu::Local(status::menu(board, key)),
-            A::PrepareBase { .. } => Menu::Host {
-                reason: "reads recorded fork bases",
-            },
-            A::PrepareSessions { .. } => Menu::Host {
-                reason: "reads conversation history and live tmux slots",
-            },
-            A::PrepareHarnesses { .. } => Menu::Host {
-                reason: "reads the persisted primary harness",
-            },
-            A::PrepareStopTerminal { .. } => Menu::Host {
-                reason: "reads live tmux terminals",
-            },
+            A::PrepareBase { key } => base::menu(board, key),
+            A::PrepareSessions { key, target } => {
+                sessions::sessions_menu(board, key.as_deref(), *target)
+            }
+            A::PrepareHarnesses { key } => sessions::harness_menu(board, key),
+            A::PrepareStopTerminal { key, target } => {
+                sessions::stop_terminal_menu(board, key, *target)
+            }
             A::CreateResolved { .. }
             | A::ManagedSignIn { .. }
             | A::HardRefresh
@@ -167,7 +165,9 @@ impl UiAction {
             | A::KillSession { .. }
             | A::EnterHarness { .. }
             | A::StopTerminal { .. }
-            | A::StopSession { .. } => Menu::NotMenu,
+            | A::StopSession { .. }
+            | A::DiscoverSessions { .. }
+            | A::WarmPalette { .. } => Menu::NotMenu,
         }
     }
 

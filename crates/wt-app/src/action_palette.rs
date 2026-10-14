@@ -1,7 +1,7 @@
 //! Palette preparation and dispatch live off the terminal's input thread.
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use wt_config::{ActionDef, ActionKind};
 use wt_github::GithubData;
 use wt_runtime::Confirmed;
@@ -31,6 +31,24 @@ pub async fn execute(
             extras,
         } => run(ctx, surface, id, arg, extras, board, github).await,
         _ => bail!("unexpected request at the action palette boundary"),
+    }
+}
+
+/// The palette a warm-up leaves on the board. Only a picker is kept: an
+/// active run's confirmation, or any failure, is left to the host, which
+/// answers the user's own request.
+pub async fn warm(
+    ctx: &AppContext,
+    surface: ActionSurface,
+    board: Option<&Board>,
+    github: Option<&Confirmed<GithubData>>,
+) -> Option<UiModal> {
+    match palette(ctx, surface, board, github).await {
+        Ok(UiReply {
+            modal: Some(modal @ UiModal::Picker { .. }),
+            ..
+        }) => Some(modal),
+        _ => None,
     }
 }
 
@@ -311,7 +329,7 @@ async fn prepare(
     let def = definition(ctx, &surface, &id)?;
     let context = action_dispatch::prepare(ctx, &surface, github, board, arg.clone()).await?;
     if let Some(reason) = availability(&def, &surface, &context.row) {
-        bail!("{}: {reason}", def.name);
+        return Err(refused(&def, &reason));
     }
     if let Some(prompt) = &def.arg_prompt
         && arg.is_none()
@@ -399,7 +417,7 @@ async fn run(
     }
     let context = action_dispatch::prepare(ctx, &surface, github, board, arg.clone()).await?;
     if let Some(reason) = availability(&def, &surface, &context.row) {
-        bail!("{}: {reason}", def.name);
+        return Err(refused(&def, &reason));
     }
     if let Some(arg) = &arg {
         wt_actions::record_value(
@@ -414,18 +432,40 @@ async fn run(
     }
     let message =
         action_dispatch::dispatch(ctx, &surface, &def, github, board, arg, &extras, Vec::new())
-            .await?;
+            .await
+            .map_err(|error| {
+                // A run started after the palette was prepared; the palette
+                // would have offered to stop it instead.
+                let started = error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<wt_actions::ActionServiceError>(),
+                        Some(wt_actions::ActionServiceError::AlreadyRunning(_))
+                    )
+                });
+                if started {
+                    crate::controller::stale(format!("{} is already running", def.name))
+                } else {
+                    error
+                }
+            })?;
     Ok(UiReply {
         message,
         ..Default::default()
     })
 }
 
+/// A palette commit the host re-checked and refused. The palette the user
+/// chose from no longer matches the host's state, so the stale reply reopens
+/// it from the current board.
+fn refused(def: &ActionDef, reason: &str) -> anyhow::Error {
+    crate::controller::stale(format!("{}: {reason}", def.name))
+}
+
 fn definition(ctx: &AppContext, surface: &ActionSurface, id: &str) -> Result<ActionDef> {
     action_dispatch::definitions(ctx, surface)
         .into_iter()
         .find(|def| def.id == id)
-        .with_context(|| format!("action {id:?} is no longer available"))
+        .ok_or_else(|| crate::controller::stale(format!("action {id:?} is no longer available")))
 }
 
 fn modal(modal: UiModal) -> UiReply {
@@ -656,6 +696,35 @@ mod tests {
             error.to_string(),
             "Fix CI and watch until green: GitHub data is not confirmed"
         );
+        // The palette the user chose from no longer matches: reopen it.
+        assert!(crate::controller::error_reply(&error).stale);
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_keeps_only_a_picker_and_unavailable_slots_stay_on_the_host() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let manager = warm(
+            &fixture.ctx,
+            ActionSurface::Manager { key: None },
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(manager, Some(UiModal::Picker { .. })));
+        // An unavailable slot is still a picker, so it prefetches its reasons.
+        let slot = warm(
+            &fixture.ctx,
+            ActionSurface::Slot {
+                target: wt_tui::SessionTarget::WtSource,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(slot, Some(UiModal::Picker { .. })));
         fixture.close().await.unwrap();
     }
 

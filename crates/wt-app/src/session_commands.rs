@@ -4,108 +4,16 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use wt_core::HarnessId;
 use wt_harness::{DiscoveryRequest, HarnessSession, HarnessSpawnRequest};
 use wt_platform::lock::FileLock;
 use wt_tmux::PaneTarget;
-use wt_tui::{LiveSessionIdentity, SessionMode, SessionSelection, SessionTarget};
+use wt_tui::{LiveSessionIdentity, SessionMenuEntry, SessionMode, SessionSelection, SessionTarget};
 
 use crate::{
     context::AppContext,
     harness::{AgentTarget, AppHarness, PreparedSession},
 };
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionOption {
-    pub selection: SessionSelection,
-    pub display_name: String,
-    pub tmux_session_name: String,
-    pub last_active_ms: Option<i64>,
-    pub is_live: bool,
-    pub state: Option<String>,
-    pub waiting_for: Option<String>,
-}
-
-/// Discover resumable conversations for the exact selected target. Liveness is
-/// joined from one tmux inventory snapshot; a failed inventory fails closed.
-pub async fn list_session_options(
-    context: &AppContext,
-    key: Option<String>,
-    target: SessionTarget,
-) -> Result<Vec<SessionOption>> {
-    let app = AppHarness::new(context);
-    let agent = resolve_target(context, key.as_deref(), target).await?;
-    if agent.remote {
-        bail!("session discovery must run on the worktree host");
-    }
-    ensure_picker_target(target)?;
-    let tmux = app.session_inventory(context).await?;
-    let live_names = tmux
-        .iter()
-        .map(|session| session.name.clone())
-        .collect::<Vec<_>>();
-    let mut options = Vec::new();
-    for harness in HarnessId::ALL {
-        if context.config.harness.hidden.contains(&harness) {
-            continue;
-        }
-        let tmux_name = session_name(&agent, harness);
-        let live_session_id = tmux
-            .iter()
-            .find(|session| session.name == tmux_name)
-            .and_then(|session| session.harness_session_id.clone());
-        let discovered = app
-            .service
-            .discover(
-                harness,
-                &DiscoveryRequest {
-                    slug: agent.slug.clone(),
-                    worktree_path: agent.cwd.clone(),
-                    live_session_id,
-                },
-                &live_names,
-                &context.cancellation,
-            )
-            .await
-            .with_context(|| format!("discover {harness:?} sessions for {}", agent.slug))?;
-        let mut slots = tmux.clone();
-        if harness == HarnessId::Codex
-            && let Some(slot) = slots.iter_mut().find(|slot| slot.name == tmux_name)
-            && slot.harness_session_id.is_none()
-        {
-            slot.harness_session_id = app
-                .service
-                .recover_codex_live_identity(&tmux_name, &discovered, &context.cancellation)
-                .await?;
-        }
-        for session in discovered {
-            let live = slots.iter().find(|live| {
-                live.name == session.tmux_session_name
-                    && slot_matches_selection(harness, live, &session.session_id)
-            });
-            options.push(option_for(target, key.clone(), harness, session, live));
-        }
-        if harness != HarnessId::Claude
-            && let Some(slot) = slots.iter().find(|slot| slot.name == tmux_name)
-            && !options
-                .iter()
-                .any(|option| option.selection.harness == harness && option.is_live)
-        {
-            options.push(live_slot_option(target, key.clone(), harness, slot));
-        }
-    }
-    options.sort_by(|left, right| {
-        right
-            .is_live
-            .cmp(&left.is_live)
-            .then_with(|| left.selection.harness.cmp(&right.selection.harness))
-            .then_with(|| right.last_active_ms.cmp(&left.last_active_ms))
-            .then_with(|| left.display_name.cmp(&right.display_name))
-    });
-    Ok(options)
-}
 
 fn ensure_picker_target(target: SessionTarget) -> Result<()> {
     if !matches!(
@@ -121,6 +29,38 @@ fn ensure_picker_target(target: SessionTarget) -> Result<()> {
     Ok(())
 }
 
+/// Session harnesses the picker and board offer, in `HarnessId::ALL` order.
+pub(crate) fn visible_harnesses(config: &wt_config::Config) -> Vec<HarnessId> {
+    HarnessId::ALL
+        .into_iter()
+        .filter(|harness| !config.harness.hidden.contains(harness))
+        .collect()
+}
+
+/// The agent a picker or terminal action names, after the checks every
+/// picker applies. Only a local worktree or slot can host a session.
+async fn picker_agent(
+    context: &AppContext,
+    key: Option<&str>,
+    target: SessionTarget,
+) -> Result<AgentTarget> {
+    ensure_picker_target(target)?;
+    let agent = resolve_target(context, key, target).await?;
+    if agent.remote {
+        bail!("session discovery must run on the worktree host");
+    }
+    Ok(agent)
+}
+
+/// The slug whose history a picker discovery refreshes.
+pub(crate) async fn picker_slug(
+    context: &AppContext,
+    key: Option<&str>,
+    target: SessionTarget,
+) -> Result<String> {
+    Ok(picker_agent(context, key, target).await?.slug)
+}
+
 /// Cached history nominates conversations; live tmux identity is checked again
 /// when a selection is attached. No transcript discovery runs on this path.
 pub(crate) async fn cached_session_options(
@@ -128,29 +68,36 @@ pub(crate) async fn cached_session_options(
     key: Option<String>,
     target: SessionTarget,
     discoveries: &[crate::session_source::DiscoveredSession],
-) -> Result<(String, Vec<SessionOption>)> {
-    ensure_picker_target(target)?;
-    let agent = resolve_target(context, key.as_deref(), target).await?;
-    if agent.remote {
-        bail!("session discovery must run on the worktree host");
-    }
+) -> Result<(String, Vec<SessionMenuEntry>)> {
+    let agent = picker_agent(context, key.as_deref(), target).await?;
     let app = AppHarness::new(context);
     let live = app.session_inventory(context).await?;
-    let options = cached_options_for(context, &agent, key, target, discoveries, &live);
+    let live: Vec<_> = live;
+    let options = picker_entries(
+        &visible_harnesses(&context.config),
+        &agent,
+        key,
+        target,
+        discoveries,
+        &live,
+    );
     Ok((agent.slug, options))
 }
 
-fn cached_options_for(
-    context: &AppContext,
+/// Prepared picker entries for one target, from the discovery snapshot and one
+/// tmux inventory. The board and the host's cached path both build from here,
+/// so a row means the same thing wherever it is shown.
+pub(crate) fn picker_entries(
+    visible: &[HarnessId],
     agent: &AgentTarget,
     key: Option<String>,
     target: SessionTarget,
     discoveries: &[crate::session_source::DiscoveredSession],
     live: &[wt_tmux::SessionInfo],
-) -> Vec<SessionOption> {
+) -> Vec<SessionMenuEntry> {
     let mut options = Vec::new();
     for harness in HarnessId::ALL {
-        if context.config.harness.hidden.contains(&harness) {
+        if !visible.contains(&harness) {
             continue;
         }
         for entry in discoveries
@@ -175,10 +122,14 @@ fn cached_options_for(
                 slot.name == session_name(agent, harness)
                     || (target == SessionTarget::Harness && slot.name.starts_with(&prefix))
             }) {
-                if !options
-                    .iter()
-                    .any(|option| option.is_live && option.tmux_session_name == slot.name)
-                {
+                let shown = options.iter().any(|option| {
+                    option
+                        .selection
+                        .live_slot
+                        .as_ref()
+                        .is_some_and(|identity| identity.id == slot.id)
+                });
+                if !shown {
                     let mut option = live_slot_option(target, key.clone(), harness, slot);
                     option.selection.managed_name = slot
                         .name
@@ -282,7 +233,11 @@ pub async fn prepare_session(
         let live = sessions
             .iter()
             .find(|slot| slot.name == tmux_name)
-            .context("selected live session has ended; reopen the session picker")?;
+            .ok_or_else(|| {
+                crate::controller::stale(
+                    "selected live session has ended; reopen the session picker",
+                )
+            })?;
         validate_live_selection(context, &app, &agent, selection, live).await?;
         if selection.harness == HarnessId::Pi {
             app.validate_live_pi(
@@ -307,6 +262,32 @@ pub async fn prepare_session(
     }
 
     let live = app.session_inventory(context).await?;
+    if selection.mode == SessionMode::New
+        && let Some(wt_tui::Seen(shown)) = &selection.seen_live
+    {
+        let prefix = format!("{}~", agent.slug);
+        let primary = session_name(
+            &AgentTarget {
+                managed_name: None,
+                ..agent.clone()
+            },
+            selection.harness,
+        );
+        let unseen = live.iter().find(|slot| {
+            let same_harness = slot.name == tmux_name
+                || slot.name == primary
+                || (selection.harness == HarnessId::Claude
+                    && selection.target == SessionTarget::Harness
+                    && slot.name.starts_with(&prefix));
+            same_harness && !shown.contains(&slot.id)
+        });
+        if let Some(slot) = unseen {
+            return Err(crate::controller::stale(format!(
+                "{} started since the picker opened",
+                slot.name
+            )));
+        }
+    }
     if let Some(live_session) = live.iter().find(|session| session.name == tmux_name) {
         if let Some(wanted_id) = wanted_id
             && live_session.harness_session_id.as_deref() == Some(wanted_id)
@@ -362,16 +343,18 @@ pub async fn prepare_session(
         let exact = discovered
             .iter()
             .find(|session| session.session_id == wanted_id)
-            .with_context(|| {
-                format!(
+            .ok_or_else(|| {
+                crate::controller::stale(format!(
                     "selected {:?} conversation {wanted_id} is no longer available",
                     selection.harness
-                )
+                ))
             })?;
         if selection.harness == HarnessId::Claude
             && exact.extras.managed_name.as_deref() != managed_name
         {
-            bail!("selected Claude conversation no longer matches its managed name");
+            return Err(crate::controller::stale(
+                "selected Claude conversation no longer matches its managed name",
+            ));
         }
     }
 
@@ -470,7 +453,11 @@ pub async fn stop_managed_session(
         let live = sessions
             .iter()
             .find(|slot| slot.name == name)
-            .context("selected live session has ended; reopen the session picker")?;
+            .ok_or_else(|| {
+                crate::controller::stale(
+                    "selected live session has ended; reopen the session picker",
+                )
+            })?;
         validate_live_selection(context, &app, &agent, selection, live).await?;
         if end == SessionEnd::Kill || selection.harness == HarnessId::Claude {
             return Ok(app
@@ -524,9 +511,9 @@ pub async fn stop_managed_session(
             return Ok(false);
         };
         if live.harness_session_id.as_deref() != Some(expected.as_str()) {
-            bail!(
+            return Err(crate::controller::stale(format!(
                 "live {name} slot no longer matches the selected conversation; refusing to stop it"
-            );
+            )));
         }
         if end == SessionEnd::Kill {
             return Ok(app
@@ -616,9 +603,9 @@ fn option_for(
     harness: HarnessId,
     session: HarnessSession,
     live: Option<&wt_tmux::SessionInfo>,
-) -> SessionOption {
+) -> SessionMenuEntry {
     let is_live = live.is_some();
-    SessionOption {
+    SessionMenuEntry {
         selection: SessionSelection {
             key,
             target,
@@ -628,16 +615,15 @@ fn option_for(
             managed_name: session.extras.managed_name,
             mode: SessionMode::Resume,
             live: is_live,
+            seen_live: None,
         },
         display_name: session.display_name,
-        tmux_session_name: session.tmux_session_name,
-        last_active_ms: session.last_active_ms,
-        is_live,
         state: session
             .extras
             .derived_state
             .map(|state| format!("{state:?}")),
-        waiting_for: session.extras.waiting_for,
+        is_live,
+        last_active_ms: session.last_active_ms,
     }
 }
 
@@ -653,8 +639,8 @@ fn live_slot_option(
     key: Option<String>,
     harness: HarnessId,
     slot: &wt_tmux::SessionInfo,
-) -> SessionOption {
-    SessionOption {
+) -> SessionMenuEntry {
+    SessionMenuEntry {
         selection: SessionSelection {
             key,
             target,
@@ -664,13 +650,12 @@ fn live_slot_option(
             managed_name: None,
             mode: SessionMode::Resume,
             live: true,
+            seen_live: None,
         },
         display_name: "current session (conversation not identified)".into(),
-        tmux_session_name: slot.name.clone(),
-        last_active_ms: None,
-        is_live: true,
         state: None,
-        waiting_for: None,
+        is_live: true,
+        last_active_ms: None,
     }
 }
 
@@ -689,7 +674,9 @@ async fn validate_live_selection(
     live: &wt_tmux::SessionInfo,
 ) -> Result<()> {
     if !witness_matches(selection, live) {
-        bail!("live session changed since selection; reopen the session picker");
+        return Err(crate::controller::stale(
+            "live session changed since selection; reopen the session picker",
+        ));
     }
     let Some(id) = selection.session_id.as_deref() else {
         return Ok(());
@@ -703,7 +690,9 @@ async fn validate_live_selection(
                 .or(agent.managed_name.as_deref()),
         );
         if id != expected {
-            bail!("selected Claude identity no longer matches its managed name");
+            return Err(crate::controller::stale(
+                "selected Claude identity no longer matches its managed name",
+            ));
         }
     }
     if slot_matches_selection(selection.harness, live, id) {
@@ -728,7 +717,9 @@ async fn validate_live_selection(
             return Ok(());
         }
     }
-    bail!("live session no longer matches the selected conversation; reopen the session picker")
+    Err(crate::controller::stale(
+        "live session no longer matches the selected conversation; reopen the session picker",
+    ))
 }
 
 pub(super) async fn resolve_target(
@@ -762,32 +753,17 @@ pub(super) async fn resolve_target(
                 remote: false,
             })
         }
-        SessionTarget::Manager => Ok(super::special_target(
-            "manager",
-            context.config.paths.main_clone.clone(),
-            Some("manager".into()),
-        )),
-        SessionTarget::Main => Ok(super::special_target(
-            "main",
-            context.config.paths.main_clone.clone(),
-            None,
-        )),
-        SessionTarget::WtSource => {
-            let path = context
-                .config
-                .paths
-                .wt_source
-                .as_ref()
-                .filter(|path| path.is_dir())
-                .context("wt source checkout is unavailable")?;
-            Ok(super::special_target("wt", path.clone(), None))
-        }
-        SessionTarget::Dotfiles => {
-            let path = &context.config.paths.dotfiles;
-            if !path.is_dir() {
-                bail!("dotfiles checkout is unavailable");
-            }
-            Ok(super::special_target("dotfiles", path.clone(), None))
+        SessionTarget::Manager
+        | SessionTarget::Main
+        | SessionTarget::WtSource
+        | SessionTarget::Dotfiles => {
+            AppHarness::new(context)
+                .slot_agent(target)
+                .context(match target {
+                    SessionTarget::WtSource => "wt source checkout is unavailable",
+                    SessionTarget::Dotfiles => "dotfiles checkout is unavailable",
+                    _ => "session slot is unavailable",
+                })
         }
     }
 }
@@ -886,6 +862,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn moved_live_slot_refuses_with_a_stale_reply() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let app = AppHarness::new(&fixture.ctx);
+        let agent = resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+            .await
+            .unwrap();
+        let selection = SessionSelection {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+            harness: HarnessId::Codex,
+            session_id: Some("exact".into()),
+            live_slot: Some(LiveSessionIdentity {
+                id: "$1".into(),
+                created_at: 0,
+            }),
+            managed_name: None,
+            mode: SessionMode::Resume,
+            live: true,
+            seen_live: None,
+        };
+        // The same slot name, recreated under a new tmux identity.
+        let mut replaced = info("one-codex", Some("exact"));
+        replaced.id = "$2".into();
+        let error = validate_live_selection(&fixture.ctx, &app, &agent, &selection, &replaced)
+            .await
+            .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+        // The selected conversation moved to another live slot identity.
+        let mut current = info("one-codex", Some("other"));
+        current.id = "$1".into();
+        let error = validate_live_selection(&fixture.ctx, &app, &agent, &selection, &current)
+            .await
+            .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+    }
+
+    #[tokio::test]
+    async fn new_session_beside_an_unseen_live_slot_is_stale() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-unseen-slot-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy()
+        );
+        let app = AppHarness::new(&fixture.ctx);
+        app.tmux
+            .create_session(
+                &wt_tmux::CreateSession {
+                    name: "one-opencode".into(),
+                    cwd: fixture.ctx.cwd.clone(),
+                    command: vec!["sleep".into(), "30".into()],
+                    width: None,
+                    height: None,
+                },
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        let slot = app
+            .session_inventory(&fixture.ctx)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|slot| slot.name == "one-opencode")
+            .unwrap();
+        let selection = |shown: Vec<String>| SessionSelection {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+            harness: HarnessId::Opencode,
+            session_id: None,
+            live_slot: None,
+            managed_name: None,
+            mode: SessionMode::New,
+            live: false,
+            seen_live: Some(wt_tui::Seen(shown)),
+        };
+        // The picker came from a board without this slot: reopen, never start.
+        let unseen = prepare_session(&fixture.ctx, &selection(Vec::new())).await;
+        // Seen and still chosen: the ordinary live-slot refusal applies.
+        let seen = prepare_session(&fixture.ctx, &selection(vec![slot.id.clone()])).await;
+        app.tmux
+            .kill_session("one-opencode", &fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        assert!(crate::controller::error_reply(&unseen.err().unwrap()).stale);
+        assert!(!crate::controller::error_reply(&seen.err().unwrap()).stale);
+    }
+
+    #[tokio::test]
     async fn cached_picker_opens_with_unreadable_history_database() {
         let mut fixture = crate::commands::test_support::CommandFixture::new()
             .await
@@ -956,8 +1026,8 @@ mod tests {
             },
         }];
         let live = vec![info("one-opencode", Some("new")), info("one~review", None)];
-        let options = cached_options_for(
-            &fixture.ctx,
+        let options = picker_entries(
+            HarnessId::ALL.as_slice(),
             &agent,
             Some("one".into()),
             SessionTarget::Harness,
@@ -980,8 +1050,8 @@ mod tests {
             options.iter().any(|option| option.is_live
                 && option.selection.managed_name.as_deref() == Some("review"))
         );
-        let cold = cached_options_for(
-            &fixture.ctx,
+        let cold = picker_entries(
+            HarnessId::ALL.as_slice(),
             &agent,
             Some("one".into()),
             SessionTarget::Harness,

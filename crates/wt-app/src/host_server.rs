@@ -456,13 +456,15 @@ mod tests {
             )
             .await
             .unwrap();
-        // Cancellation cannot cancel a write; a second read-only prompt must
+        // Cancellation cannot cancel a write; a second read-only preparation must
         // reply while that accepted write is still blocked.
         for frame in [
             ClientFrame::CancelPreparation { id: 1 },
             ClientFrame::Command {
                 id: 2,
-                action: UiAction::PrepareHardRefresh,
+                action: UiAction::ResolveCreation {
+                    input: "independent-read".into(),
+                },
             },
         ] {
             client_output
@@ -479,7 +481,7 @@ mod tests {
                 {
                     ServerFrame::Reply { id: 2, reply } => {
                         assert!(!reply.failed, "{}", reply.message);
-                        assert!(reply.modal.is_some());
+                        assert!(reply.creation_plan.is_some());
                         break;
                     }
                     ServerFrame::Reply { id: 1, .. } => {
@@ -496,12 +498,14 @@ mod tests {
         for frame in [
             ClientFrame::Command {
                 id: 3,
-                action: UiAction::PrepareStatus { key: "one".into() },
+                action: UiAction::PrepareRemove { key: "one".into() },
             },
             ClientFrame::CancelPreparation { id: 3 },
             ClientFrame::Command {
                 id: 4,
-                action: UiAction::PrepareHardRefresh,
+                action: UiAction::ResolveCreation {
+                    input: "independent-read".into(),
+                },
             },
         ] {
             client_output
@@ -523,8 +527,8 @@ mod tests {
                         cancelled = true;
                     }
                     ServerFrame::Reply { id: 4, reply } => {
-                        assert!(!reply.failed);
-                        assert!(reply.modal.is_some());
+                        assert!(!reply.failed, "{}", reply.message);
+                        assert!(reply.creation_plan.is_some());
                         next_ready = true;
                     }
                     ServerFrame::Reply { id: 1, .. } => {

@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use wt_core::Domain;
 use wt_runtime::{SourceSnapshot, Stamp, TaskScope};
-use wt_tui::{ActionSurface, Board, PrPin, ReplyOutcome, UiAction, UiReply};
+use wt_tui::{ActionSurface, Board, ReplyOutcome, UiAction, UiReply};
 
 use crate::{context::AppContext, github_actions::GithubAction, sources::BoardSources};
 
@@ -148,6 +148,18 @@ impl HostService {
         }
     }
 
+    /// Refresh tmux and saved-conversation history for one slug. The picker
+    /// rebuilds from the discoveries source as each harness completes.
+    fn queue_session_discovery(&self, context: &AppContext, slug: &str) {
+        self.sources.sessions.inventory.refresh();
+        for harness in crate::harness::visible_harnesses(&context.config) {
+            self.sources
+                .sessions
+                .commands
+                .discover(slug.to_owned(), harness);
+        }
+    }
+
     async fn run(
         &self,
         command: UiAction,
@@ -158,41 +170,40 @@ impl HostService {
             anyhow::bail!("this menu is built from the board and never asks the host");
         }
         let context = self.context.for_action(&command)?;
-        if let UiAction::PrepareSessions { key, target } = &command {
-            let history = self.sources.sessions.discoveries.snapshot();
-            let (slug, options) = crate::harness::cached_session_options(
-                &context,
-                key.clone(),
-                *target,
-                history.data().map_or(&[], |entries| entries.as_slice()),
-            )
-            .await?;
-            self.sources.sessions.inventory.refresh();
-            for harness in wt_core::HarnessId::ALL {
-                if !context.config.harness.hidden.contains(&harness) {
-                    self.sources
-                        .sessions
-                        .commands
-                        .discover(slug.clone(), harness);
+        match &command {
+            // Background read behind an open picker: no reply, and a target
+            // without a slug has nothing to refresh.
+            UiAction::DiscoverSessions { key, target } => {
+                if let Ok(slug) =
+                    crate::harness::picker_slug(&context, key.as_deref(), *target).await
+                {
+                    self.queue_session_discovery(&context, &slug);
                 }
+                return Ok(UiReply::default());
             }
-            return Ok(crate::session_ui::sessions_reply(
-                &context,
-                key.clone(),
-                *target,
-                options,
-            ));
-        }
-        if matches!(command, UiAction::PrepareHardRefresh) {
-            return Ok(UiReply {
-                modal: Some(wt_tui::UiModal::Confirm {
-                    title: "Clear derived caches?".into(),
-                    lines: vec!["Refetch current data and regenerate automatic titles. Saved worktree state and running work are preserved.".into()],
-                    action: wt_tui::ConfirmAction::HardRefresh,
-                    cancel_key: None,
-                }),
-                ..Default::default()
-            });
+            // Remote rows, and local targets the board has no entries for, are
+            // answered here from the same discovery snapshot the board uses.
+            UiAction::PrepareSessions { key, target } => {
+                let history = self.sources.sessions.discoveries.snapshot();
+                let (slug, entries) = crate::harness::cached_session_options(
+                    &context,
+                    key.clone(),
+                    *target,
+                    history.data().map_or(&[], |entries| entries.as_slice()),
+                )
+                .await?;
+                self.queue_session_discovery(&context, &slug);
+                return Ok(UiReply {
+                    modal: Some(wt_tui::session_picker(
+                        key.clone(),
+                        *target,
+                        &entries,
+                        &crate::harness::visible_harnesses(&context.config),
+                    )),
+                    ..Default::default()
+                });
+            }
+            _ => {}
         }
         if matches!(command, UiAction::HardRefresh) {
             self.sources
@@ -216,6 +227,16 @@ impl HostService {
                     !matches!(github.covered_pr(branch), wt_github::CoveredPr::Uncovered)
                 })
         });
+        if let UiAction::WarmPalette { surface } = &command {
+            // Prefetch only from confirmed GitHub data. Otherwise the copy is
+            // dropped so the palette asks the host, which refreshes GitHub.
+            let fresh = github
+                .as_ref()
+                .filter(|github| github_ready && github.fresh_within(WRITE_EVIDENCE_AGE));
+            let modal = crate::action_palette::warm(&context, surface.clone(), board, fresh).await;
+            self.sources.palettes.publish(surface.menu_key(), modal);
+            return Ok(UiReply::default());
+        }
         let github = if !github_ready && self.pr_dependent_command(&command) {
             self.await_confirmed_github(branch.as_deref())
                 .await
@@ -306,38 +327,6 @@ impl HostService {
             .await;
         }
         let reply = match command {
-            UiAction::PrepareReviewCheckout {
-                url,
-                updated_at,
-                branch,
-            } => {
-                let row = board
-                    .and_then(|board| {
-                        board.review_requests.iter().find(|row| {
-                            row.url == url && row.updated_at == updated_at && row.branch == branch
-                        })
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("review request changed; refresh and select it again")
-                    })?;
-                UiReply {
-                    modal: Some(wt_tui::UiModal::Confirm {
-                        title: format!("Check out PR #{} for review?", row.number),
-                        lines: vec![
-                            row.title.clone(),
-                            branch.clone(),
-                            "Create a worktree in Reviews at the verified PR head.".into(),
-                        ],
-                        action: wt_tui::ConfirmAction::ReviewCheckout {
-                            url,
-                            updated_at,
-                            branch,
-                        },
-                        cancel_key: Some('w'),
-                    }),
-                    ..Default::default()
-                }
-            }
             UiAction::ReviewCheckout {
                 url,
                 updated_at,
@@ -367,9 +356,6 @@ impl HostService {
                     ..Default::default()
                 }
             }
-            UiAction::PrepareRestoreRemoved { key } => {
-                Box::pin(crate::history_actions::prepare_restore(&context, &key)).await?
-            }
             UiAction::RestoreRemoved {
                 key,
                 removed_at,
@@ -392,52 +378,26 @@ impl HostService {
             UiAction::Restack { key } => {
                 Box::pin(crate::restack_action::start(&context, &key, github, board)).await?
             }
-            UiAction::PrepareGithub { key, ship } => {
+            // The board builds the prompt for a row whose PR it shows. Here
+            // the board had no PR, so confirmed GitHub data decides between
+            // loading, no PR, and a PR that appeared since the board was made.
+            UiAction::PrepareGithub { key, .. } => {
                 let row = board
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
-                    .ok_or_else(|| anyhow::anyhow!("worktree is no longer on the board"))?;
+                    .ok_or_else(|| {
+                        crate::controller::notice("worktree is no longer on the board")
+                    })?;
                 let github =
                     github.ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
-                let pr = match github.covered_pr(&row.branch) {
-                    wt_github::CoveredPr::Present(pr) => pr,
-                    wt_github::CoveredPr::Absent => {
-                        return Err(crate::controller::notice("no PR for this row"));
+                return Err(match github.covered_pr(&row.branch) {
+                    wt_github::CoveredPr::Present(_) => {
+                        crate::controller::stale("GitHub data changed; press e again")
                     }
+                    wt_github::CoveredPr::Absent => crate::controller::notice("no PR for this row"),
                     wt_github::CoveredPr::Uncovered => {
-                        anyhow::bail!("GitHub data is not confirmed for this branch");
+                        anyhow::anyhow!("GitHub data is not confirmed for this branch")
                     }
-                };
-                if pr.state != "OPEN" {
-                    anyhow::bail!("PR #{} is not open", pr.number);
-                }
-                let config = &context.config.github;
-                let reviewer = config
-                    .reviewers
-                    .then_some(config.default_reviewer.as_deref())
-                    .flatten();
-                match github_prompt(pr, ship, reviewer) {
-                    GithubPrompt::Done(text) => UiReply {
-                        message: text,
-                        ..Default::default()
-                    },
-                    GithubPrompt::Confirm(title) => UiReply {
-                        modal: Some(wt_tui::UiModal::Confirm {
-                            // The write executes only against this same PR and head.
-                            action: wt_tui::ConfirmAction::Github {
-                                key,
-                                ship,
-                                pin: Some(PrPin {
-                                    number: pr.number,
-                                    head_sha: pr.head_ref_oid.clone(),
-                                }),
-                            },
-                            title,
-                            lines: vec![format!("{}: {}", row.branch, pr.title)],
-                            cancel_key: Some(if ship { 'E' } else { 'e' }),
-                        }),
-                        ..Default::default()
-                    },
-                }
+                });
             }
             UiAction::CancelAutomations => {
                 let cancelled = self.sources.automations.cancel_pending().await?;
@@ -538,6 +498,9 @@ impl HostService {
             | UiAction::GithubFailedChecks { key } => key.as_str(),
             UiAction::PrepareActions {
                 surface: ActionSurface::Row { key } | ActionSurface::Manager { key: Some(key) },
+            }
+            | UiAction::WarmPalette {
+                surface: ActionSurface::Row { key } | ActionSurface::Manager { key: Some(key) },
             } => key.as_str(),
             _ => return None,
         };
@@ -602,47 +565,41 @@ async fn wait_for_confirmed_github(
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum GithubPrompt {
-    /// Nothing left to do; show this message instead of a confirmation.
-    Done(String),
-    /// Confirmation title listing only the remaining steps.
-    Confirm(String),
-}
-
-/// `e` / `E` pre-checks from the TS keymap: mark-ready refuses a PR that is
-/// already ready, and ship lists only the steps still needed.
-fn github_prompt(pr: &wt_github::PullRequest, ship: bool, reviewer: Option<&str>) -> GithubPrompt {
-    if !ship {
-        return if pr.is_draft {
-            GithubPrompt::Confirm(format!("Mark #{} ready for review?", pr.number))
-        } else {
-            GithubPrompt::Done(format!("PR #{} is already ready", pr.number))
-        };
-    }
-    let mut steps = Vec::new();
-    if pr.is_draft {
-        steps.push("mark ready".to_owned());
-    }
-    if let Some(reviewer) = reviewer
-        && !pr.requested_reviewers.iter().any(|login| login == reviewer)
-    {
-        steps.push(format!("request {reviewer}"));
-    }
-    if pr.auto_merge.is_none() {
-        steps.push("arm auto-merge".to_owned());
-    }
-    if steps.is_empty() {
-        GithubPrompt::Done(format!("#{} already shipped", pr.number))
-    } else {
-        GithubPrompt::Confirm(format!("Ship #{}? ({})", pr.number, steps.join(", ")))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
+
+    #[tokio::test]
+    async fn board_menus_never_reach_the_host() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let scope = TaskScope::new();
+        let host = HostService::start(
+            &scope,
+            fixture.ctx.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        // A board menu reaching a host means a second, unwitnessed path to
+        // the same menu. Hosts refuse it rather than answer from their state.
+        for action in [
+            UiAction::PrepareStatus { key: "one".into() },
+            UiAction::PrepareHarnesses { key: "one".into() },
+        ] {
+            assert!(action.is_board_menu());
+            let error = host.execute(action).await.unwrap_err();
+            assert!(
+                error.to_string().contains("built from the board"),
+                "{error:#}"
+            );
+        }
+        scope
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+    }
 
     #[test]
     fn local_completion_classifies_only_successful_unclassified_mutations() {
@@ -736,45 +693,6 @@ mod tests {
                 .unwrap()
         );
         fixture.close().await.unwrap();
-    }
-
-    fn pr(draft: bool, reviewers: &[&str], armed: bool) -> wt_github::PullRequest {
-        let auto_merge =
-            armed.then(|| serde_json::json!({"enabledAt": "x", "mergeMethod": "SQUASH"}));
-        serde_json::from_value(serde_json::json!({
-            "number": 7, "url": "u", "headRefName": "b", "baseRefName": "main",
-            "mergeCommitOid": null, "title": "t", "isDraft": draft, "state": "OPEN",
-            "mergeable": null, "mergeStateStatus": null, "checks": "none",
-            "failedChecks": [], "review": "none", "reviewRequests": 0,
-            "requestedReviewers": reviewers, "suggestedReviewers": [], "autoMerge": auto_merge,
-            "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0,
-            "mergedAt": null, "closedAt": null
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn mark_ready_refuses_a_ready_pr_and_ship_lists_remaining_steps() {
-        assert_eq!(
-            github_prompt(&pr(false, &[], false), false, None),
-            GithubPrompt::Done("PR #7 is already ready".into())
-        );
-        assert_eq!(
-            github_prompt(&pr(true, &[], false), false, None),
-            GithubPrompt::Confirm("Mark #7 ready for review?".into())
-        );
-        assert_eq!(
-            github_prompt(&pr(true, &[], false), true, Some("ana")),
-            GithubPrompt::Confirm("Ship #7? (mark ready, request ana, arm auto-merge)".into())
-        );
-        assert_eq!(
-            github_prompt(&pr(false, &["ana"], false), true, Some("ana")),
-            GithubPrompt::Confirm("Ship #7? (arm auto-merge)".into())
-        );
-        assert_eq!(
-            github_prompt(&pr(false, &["ana"], true), true, Some("ana")),
-            GithubPrompt::Done("#7 already shipped".into())
-        );
     }
 
     #[tokio::test]

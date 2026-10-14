@@ -103,6 +103,28 @@ presentation model and terminal driver live in `wt-tui`.
   fetch, a restored value or another process's stamp never settles it. Every
   new `UiAction` declares its effect in `UiAction::effect`; toggles resolve
   against the board the user saw, and GitHub writes carry a `PrPin`.
+- Menus are presentation of the board. `UiAction::menu` is the single,
+  wildcard-free declaration of each menu's source; do not keep a second list.
+  When a menu is slow, publish its data through a source and build it from the
+  board; never add a host round trip, a host-side cache, or a special case in
+  generic dispatch to open it. `Menu::Host` names data the board cannot carry
+  (a live network fetch, fleet-wide planning, exact removal hazards).
+  Builders are pure and total over any `Board`; configuration they need goes
+  into `DisplayPolicy`. Picker option values identify choices, never list
+  positions, because open menus rebuild on each snapshot.
+- Cached data decides what a menu offers, never what a write assumes. Every
+  menu commit carries a witness of what was shown (`Seen<T>`, `PrPin`,
+  `LiveSessionIdentity`, removal identity, ledger timestamps). The owning host
+  compares it with current state at the point of writing, under the write's own
+  lock where one exists, and refuses a mismatch with `controller::stale`;
+  nothing is written and nothing is retried with the newer state. Do not
+  loosen a witness to silence stale replies, drop it from a commit, or treat a
+  witnessless commit as a menu commit.
+- Keys belong to the layer the user believes is on top. Keys typed while a
+  host menu loads replay into that menu and stop when it closes; they never
+  reach the board underneath. Never block keyboard input to wait for a host;
+  typed keys are dropped only with a notice, when their menu fails or loads
+  past the typeahead limit.
 - Hold state is self-expiring and resource-scoped. Recheck the exact hold ID
   immediately before honoring it; an unknown or stale copy creates no freeze.
 

@@ -1,36 +1,10 @@
 //! Commands for the host-local removed-history view.
 
 use anyhow::{Context, Result, bail};
-use wt_lifecycle::CreateOptions;
-use wt_store::RemovedWorktree;
-use wt_tui::{ConfirmAction, UiModal, UiReply};
+use wt_lifecycle::{CreateOptions, LifecycleError};
+use wt_tui::UiReply;
 
 use crate::context::AppContext;
-
-pub async fn prepare_restore(ctx: &AppContext, key: &str) -> Result<UiReply> {
-    let entry = removed_entry(ctx, key)
-        .await?
-        .context("removed history entry is no longer available")?;
-    Ok(UiReply {
-        modal: Some(UiModal::Confirm {
-            action: ConfirmAction::RestoreRemoved {
-                key: entry.slug.clone(),
-                removed_at: entry.removed_at.clone(),
-                branch: entry.branch.clone(),
-            },
-            title: format!("Restore {}?", entry.slug),
-            lines: vec![
-                format!(
-                    "Create a worktree for {}",
-                    wt_core::sanitize_terminal_text(&entry.branch)
-                ),
-                "The current local/origin branch is used when it still exists; otherwise it is recreated from the configured base.".into(),
-            ],
-            cancel_key: None,
-        }),
-        ..UiReply::default()
-    })
-}
 
 pub async fn restore(
     ctx: &AppContext,
@@ -52,7 +26,8 @@ pub async fn restore(
             },
             &ctx.cancellation,
         )
-        .await?;
+        .await
+        .map_err(restore_refusal)?;
     Ok(UiReply {
         message: wt_core::sanitize_terminal_text(&format!(
             "Restored {} at {}",
@@ -92,26 +67,34 @@ fn local_slug(key: &str) -> Result<String> {
     }
 }
 
-async fn removed_entry(ctx: &AppContext, key: &str) -> Result<Option<RemovedWorktree>> {
-    let slug = local_slug(key)?;
-    ctx.database
-        .call(move |store| {
-            Ok(store
-                .read_removed_worktrees()?
-                .into_iter()
-                .find(|entry| entry.slug == slug))
-        })
-        .await
+/// The removal the user confirmed is no longer the current one: report it as
+/// stale so the menu reopens from the board. Other refusals stay failures.
+fn restore_refusal(error: LifecycleError) -> anyhow::Error {
+    match error {
+        LifecycleError::Refused(message) if message == wt_lifecycle::REMOVED_CHANGED => {
+            crate::controller::stale(message)
+        }
+        error => error.into(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Map;
     use wt_store::RemovedWorktree;
 
+    #[test]
+    fn a_changed_removal_is_stale_and_other_refusals_are_not() {
+        let stale = restore_refusal(LifecycleError::Refused(
+            wt_lifecycle::REMOVED_CHANGED.into(),
+        ));
+        assert!(crate::controller::error_reply(&stale).stale);
+        let other = restore_refusal(LifecycleError::Refused("branch is checked out".into()));
+        assert!(!crate::controller::error_reply(&other).stale);
+    }
+
     #[tokio::test]
-    async fn restore_confirmation_captures_ledger_identity_and_pause_toggle_refreshes_record() {
+    async fn pause_toggle_refreshes_the_removed_record() {
         let fixture = crate::commands::test_support::CommandFixture::new()
             .await
             .unwrap();
@@ -121,7 +104,7 @@ mod tests {
             removed_at: "2026-10-09T00:00:00Z".into(),
             work: None,
             automations_paused: None,
-            extra: Map::from_iter([("futureField".into(), serde_json::json!("kept"))]),
+            extra: serde_json::Map::from_iter([("futureField".into(), serde_json::json!("kept"))]),
         };
         fixture
             .ctx
@@ -135,19 +118,6 @@ mod tests {
             })
             .await
             .unwrap();
-
-        let prepared = prepare_restore(&fixture.ctx, "archived").await.unwrap();
-        let Some(UiModal::Confirm { action, .. }) = prepared.modal else {
-            panic!("restore must request confirmation");
-        };
-        assert_eq!(
-            action,
-            ConfirmAction::RestoreRemoved {
-                key: "archived".into(),
-                removed_at: entry.removed_at.clone(),
-                branch: entry.branch.clone(),
-            }
-        );
 
         let paused = toggle_automations_paused(&fixture.ctx, "archived")
             .await

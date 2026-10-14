@@ -72,6 +72,7 @@ fn selection(harness: wt_core::HarnessId, mode: SessionMode, live: bool) -> Sess
         managed_name: None,
         mode,
         live,
+        seen_live: None,
     }
 }
 
@@ -86,6 +87,14 @@ fn option(index: usize, label: &str) -> PickerOption {
     }
 }
 
+/// A session picker row, valued by its choice's stable identity.
+fn session_option(choice: &SessionSelection, label: &str) -> PickerOption {
+    PickerOption {
+        value: Some(crate::session_value(choice)),
+        ..option(0, label)
+    }
+}
+
 /// Sessions picker: live Claude, dead Codex, then the three `New` rows.
 fn open_sessions(model: &mut Model) -> Vec<SessionSelection> {
     use wt_core::HarnessId::*;
@@ -96,7 +105,10 @@ fn open_sessions(model: &mut Model) -> Vec<SessionSelection> {
         selection(Codex, SessionMode::New, false),
         selection(Opencode, SessionMode::New, false),
     ];
-    let options = (0..choices.len()).map(|i| option(i, "row")).collect();
+    let options = choices
+        .iter()
+        .map(|choice| session_option(choice, "row"))
+        .collect();
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
             action: PickerAction::Sessions {
@@ -134,7 +146,10 @@ fn unidentified_live_session_keeps_its_witness_for_attach_and_stop() {
                     choices: vec![choice.clone()],
                 },
                 title: "Sessions".into(),
-                options: vec![option(0, "current session (conversation not identified)")],
+                options: vec![session_option(
+                    &choice,
+                    "current session (conversation not identified)",
+                )],
                 selected: 0,
             }),
             ..Default::default()
@@ -265,7 +280,10 @@ fn new_section_prompt_esc_returns_to_the_section_picker() {
     let mut model = model_with(&["one"]);
     model.reply(UiReply {
         modal: Some(UiModal::Picker {
-            action: PickerAction::Section { key: "one".into() },
+            action: PickerAction::Section {
+                key: "one".into(),
+                seen: None,
+            },
             title: "Section".into(),
             options: vec![option(0, "Inbox")],
             selected: 0,
@@ -273,10 +291,9 @@ fn new_section_prompt_esc_returns_to_the_section_picker() {
         ..Default::default()
     });
     ch(&mut model, 'n');
-    assert_eq!(
-        press(&mut model, KeyCode::Esc),
-        InputResult::Action(UiAction::PrepareSection { key: "one".into() })
-    );
+    // Esc returns to the section menu, rebuilt from the board.
+    assert_eq!(press(&mut model, KeyCode::Esc), InputResult::Draw);
+    assert!(matches!(model.interaction, Interaction::Picker(_)));
 }
 
 #[test]
@@ -393,11 +410,18 @@ fn palettes_confirm_on_their_own_opener_and_ignore_digits() {
 
 #[test]
 fn shift_f12_opens_the_harness_picker_and_letters_or_f12_commit() {
-    let mut model = model_with(&["one"]);
+    use wt_core::HarnessId::*;
+    let mut prepared = board(&["one"]);
+    prepared.display.harnesses = vec![Claude, Codex, Opencode];
+    prepared.display.primary = Some(Codex);
+    let mut model = Model::default();
+    model.apply(ready(prepared));
+    // The board builds the chooser: no host request, cursor on the primary.
     assert_eq!(
         press_with(&mut model, KeyCode::F(12), KeyModifiers::SHIFT),
-        InputResult::Action(UiAction::PrepareHarnesses { key: "one".into() })
+        InputResult::Draw
     );
+    assert_eq!(picker_selected(&model), Some(1));
     let harness_picker = || UiReply {
         modal: Some(UiModal::Picker {
             action: PickerAction::Harness { key: "one".into() },
@@ -496,10 +520,12 @@ fn n_is_always_local_and_ctrl_n_needs_a_remote() {
         HostChoice {
             id: None,
             label: "local".into(),
+            sign_in_needed: Vec::new(),
         },
         HostChoice {
             id: Some("builder".into()),
             label: "builder".into(),
+            sign_in_needed: Vec::new(),
         },
     ];
     let mut model = Model::default();
@@ -513,12 +539,16 @@ fn n_is_always_local_and_ctrl_n_needs_a_remote() {
         })
     ));
     press(&mut model, KeyCode::Esc);
+    // Ctrl+N builds the host picker from the board, without a host request.
     assert_eq!(
         press_with(&mut model, KeyCode::Char('n'), KeyModifiers::CONTROL),
-        InputResult::Action(UiAction::PrepareCreate {
-            initial: String::new()
-        })
+        InputResult::Draw
     );
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("Ctrl+N should open the host picker");
+    };
+    assert_eq!(picker.title, "Choose host");
+    assert_eq!(picker.options.len(), 2);
 
     let mut model = model_with(&["one"]);
     assert_eq!(
@@ -535,10 +565,12 @@ fn tab_moves_a_new_worktree_between_hosts_and_n_remembers_the_choice() {
         HostChoice {
             id: None,
             label: "This machine".into(),
+            sign_in_needed: Vec::new(),
         },
         HostChoice {
             id: Some("beast".into()),
             label: "Beast".into(),
+            sign_in_needed: Vec::new(),
         },
     ];
     let mut model = Model::default();
@@ -946,10 +978,12 @@ fn failed_remote_create_keeps_host_name_and_retry_input() {
         HostChoice {
             id: None,
             label: "This machine".into(),
+            sign_in_needed: Vec::new(),
         },
         HostChoice {
             id: Some("maxbook".into()),
             label: "MaxBook".into(),
+            sign_in_needed: Vec::new(),
         },
     ];
     let mut model = Model::default();
@@ -1052,5 +1086,107 @@ fn deferred_remote_create_confirms_sign_in_with_original_input_and_host() {
                 then: Some(Box::new(create))
             }),
         })
+    );
+}
+
+#[test]
+fn sessions_commits_follow_the_value_not_the_row_position() {
+    let mut model = model_with(&["one"]);
+    let choices = open_sessions(&mut model);
+    // The board reorders the same conversations; the cursor stays on Claude.
+    let mut reordered = choices.clone();
+    reordered.reverse();
+    let claude = reordered
+        .iter()
+        .position(|choice| {
+            choice.harness == wt_core::HarnessId::Claude && choice.mode == SessionMode::Resume
+        })
+        .unwrap();
+    model.reply(UiReply {
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Sessions {
+                choices: reordered.clone(),
+            },
+            title: "Sessions".into(),
+            options: reordered
+                .iter()
+                .map(|choice| session_option(choice, "row"))
+                .collect(),
+            selected: claude,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        press(&mut model, KeyCode::Char('d')),
+        InputResult::Action(UiAction::StopSession {
+            selection: choices[0].clone(),
+        })
+    );
+    let mut model = model_with(&["one"]);
+    open_sessions(&mut model);
+    let stale = PickerOption {
+        value: Some("session:claude:gone".into()),
+        ..option(0, "gone")
+    };
+    model.reply(UiReply {
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Sessions {
+                choices: choices.clone(),
+            },
+            title: "Sessions".into(),
+            options: vec![stale],
+            selected: 0,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(press(&mut model, KeyCode::Enter), InputResult::Unchanged);
+}
+
+#[test]
+fn board_built_session_picker_keeps_the_live_row_under_the_cursor() {
+    use wt_core::HarnessId::*;
+    let live = crate::SessionMenuEntry {
+        selection: crate::SessionSelection {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+            harness: Codex,
+            session_id: None,
+            live_slot: Some(crate::LiveSessionIdentity {
+                id: "$1".into(),
+                created_at: 0,
+            }),
+            managed_name: None,
+            mode: SessionMode::Resume,
+            live: true,
+            seen_live: None,
+        },
+        display_name: "current session (conversation not identified)".into(),
+        state: None,
+        is_live: true,
+        last_active_ms: None,
+    };
+    let mut prepared = board(&["one"]);
+    prepared.display.harnesses = vec![Claude, Codex];
+    prepared.session_menus.insert(
+        crate::session_menu_key(Some("one"), SessionTarget::Harness),
+        vec![live.clone()],
+    );
+    let mut model = Model::default();
+    model.apply(ready(prepared.clone()));
+    let InputResult::Draw = model.input(KeyEvent::from(KeyCode::Char(';')), 20) else {
+        panic!("the picker opens from the board without a host request")
+    };
+    assert_eq!(picker_selected(&model), Some(0));
+    // A fresh snapshot with the same rows must not move the cursor.
+    model.apply(ready(prepared));
+    assert_eq!(picker_selected(&model), Some(0));
+    let InputResult::Action(action) = press(&mut model, KeyCode::Enter) else {
+        panic!("Enter on the live row commits it")
+    };
+    assert_eq!(
+        action,
+        UiAction::SelectSession {
+            selection: live.selection,
+        }
     );
 }

@@ -40,6 +40,7 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::ToggleRemovedAutomations { .. }
         | UiAction::KillAction { .. }
         | UiAction::PrepareActions { .. }
+        | UiAction::WarmPalette { .. }
         | UiAction::PrepareAction { .. }
         | UiAction::RunAction { .. }
         | UiAction::CyclePrimary
@@ -66,6 +67,7 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::GithubShip { .. }
         | UiAction::GithubFailedChecks { .. }
         | UiAction::PrepareSessions { .. }
+        | UiAction::DiscoverSessions { .. }
         | UiAction::PrepareStopTerminal { .. }
         | UiAction::StopTerminal { .. }
         | UiAction::StopSession { .. }
@@ -142,7 +144,9 @@ fn visit_keys(
         UiAction::KillAction { action_key, .. } => visit(action_key)?,
         UiAction::Remove { key, revision, .. } => {
             visit(key)?;
-            visit(&mut revision.key)?;
+            if let Some(revision) = revision {
+                visit(&mut revision.key)?;
+            }
         }
         UiAction::CleanupTargets { targets } => {
             for target in targets {
@@ -154,7 +158,9 @@ fn visit_keys(
                 visit(&mut revision.key)?;
             }
         }
-        UiAction::Session { key, .. } | UiAction::PrepareSessions { key, .. } => {
+        UiAction::Session { key, .. }
+        | UiAction::PrepareSessions { key, .. }
+        | UiAction::DiscoverSessions { key, .. } => {
             if let Some(key) = key {
                 visit(key)?;
             }
@@ -182,6 +188,7 @@ fn visit_keys(
         | UiAction::GithubShip { key, .. }
         | UiAction::GithubFailedChecks { key } => visit(key)?,
         UiAction::PrepareActions { surface }
+        | UiAction::WarmPalette { surface }
         | UiAction::PrepareAction { surface, .. }
         | UiAction::RunAction { surface, .. } => match surface {
             ActionSurface::Row { key } => visit(key)?,
@@ -237,7 +244,7 @@ mod tests {
         let action = UiAction::Remove {
             key: wt_core::remote_worktree_ledger_key("host-a", "same"),
             force: false,
-            revision: wt_tui::RemovalRevision {
+            revision: Some(wt_tui::RemovalRevision {
                 key: wt_core::remote_worktree_ledger_key("host-b", "same"),
                 path: "/work/same".into(),
                 branch: "same".into(),
@@ -245,7 +252,8 @@ mod tests {
                 digest: "def".into(),
                 hazards: vec![],
                 published_base: None,
-            },
+            }),
+            seen: None,
         };
         assert!(resolve(action).is_err());
     }
@@ -280,6 +288,7 @@ mod tests {
                 managed_name: None,
                 mode: wt_tui::SessionMode::Resume,
                 live: false,
+                seen_live: None,
             },
         };
         let (owner, action, _) = resolve(action).unwrap();
