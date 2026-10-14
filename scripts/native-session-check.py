@@ -94,7 +94,9 @@ def main():
         wait_for(lambda _: tmux("list-clients", "-F", "#{session_name}").stdout.strip() == "bench-000-shell")
         marker = root / "shell-input-received"
         os.write(terminal, f"printf ok > {shlex.quote(str(marker))}\r".encode())
-        wait_for(lambda _: marker.exists())
+        # Shell redirection creates the file before printf writes its contents.
+        # Readiness is the complete acknowledgement, not directory visibility.
+        wait_for(lambda _: marker.exists() and marker.read_text() == "ok")
         assert marker.read_text() == "ok", "attached shell did not receive intact input"
         detached = tmux("detach-client", "-s", "bench-000-shell")
         assert detached.returncode == 0, detached.stderr
@@ -116,7 +118,7 @@ def main():
         wait_for(lambda _: tmux("list-clients", "-F", "#{session_id}").stdout.strip() == unknown_id)
         picker_marker = root / "picker-input-received"
         os.write(terminal, f"printf picker-ok > {shlex.quote(str(picker_marker))}\r".encode())
-        wait_for(lambda _: picker_marker.exists())
+        wait_for(lambda _: picker_marker.exists() and picker_marker.read_text() == "picker-ok")
         assert picker_marker.read_text() == "picker-ok", "picker did not attach the live shell slot"
         assert not unexpected_launch.exists(), "picker started Codex instead of attaching the existing slot"
         detached = tmux("detach-client", "-s", "bench-000-codex")
