@@ -268,6 +268,26 @@ pub enum UiAction {
 }
 
 impl UiAction {
+    pub const RENAME_ID: &str = "__rename__";
+
+    /// Resolve built-in aliases before pending state, cancellation and host
+    /// scheduling classify the request. AI title generation is an accepted
+    /// command, not a cancellable menu preparation.
+    pub fn resolve_palette_alias(self) -> Self {
+        match self {
+            Self::OnHost { host, action } => Self::OnHost {
+                host,
+                action: Box::new(action.resolve_palette_alias()),
+            },
+            Self::PrepareAction {
+                surface: ActionSurface::Row { key },
+                id,
+                ..
+            } if id == Self::RENAME_ID => Self::GenerateTitle { key },
+            action => action,
+        }
+    }
+
     /// Requests that acquire the interactive terminal. They serialize with
     /// each other, independently of unrelated background work.
     pub fn is_terminal_handoff(&self) -> bool {

@@ -333,11 +333,8 @@ impl AppHarness {
     }
 
     pub async fn routes(&self, context: &AppContext) -> Result<Vec<AgentRoute>> {
-        let snapshots = context
-            .repository
-            .inventory_status(&context.cancellation)
-            .await?;
-        let targets = self.targets(&snapshots);
+        let records = context.repository.inventory(&context.cancellation).await?;
+        let targets = self.targets_from_records(records.iter());
         let sessions = self.tmux.list_sessions(&context.cancellation).await;
         let (names, ids) = match sessions {
             Ok(sessions) => (
@@ -378,6 +375,13 @@ impl AppHarness {
     }
 
     pub fn targets(&self, snapshots: &[wt_vcs::WorktreeSnapshot]) -> Vec<AgentTarget> {
+        self.targets_from_records(snapshots.iter().map(|snapshot| &snapshot.worktree))
+    }
+
+    fn targets_from_records<'a>(
+        &self,
+        records: impl Iterator<Item = &'a wt_vcs::WorktreeRecord>,
+    ) -> Vec<AgentTarget> {
         let mut targets = Vec::new();
         if let Some(path) = self.wt_source.as_ref().filter(|path| path.is_dir()) {
             targets.push(special_target("wt", path.clone(), None));
@@ -396,18 +400,17 @@ impl AppHarness {
             .map(|target| target.slug.clone())
             .collect::<BTreeSet<_>>();
         targets.extend(
-            snapshots
-                .iter()
-                .filter(|snapshot| !snapshot.worktree.is_main)
-                .filter(|snapshot| !reserved.contains(snapshot.worktree.target.slug()))
-                .map(|snapshot| AgentTarget {
-                    slug: snapshot.worktree.target.slug().to_owned(),
+            records
+                .filter(|record| !record.is_main)
+                .filter(|record| !reserved.contains(record.target.slug()))
+                .map(|record| AgentTarget {
+                    slug: record.target.slug().to_owned(),
                     kind: AgentTargetKind::Worktree,
-                    branch: Some(snapshot.worktree.target.branch.clone()),
-                    cwd: PathBuf::from(&snapshot.worktree.target.path),
+                    branch: Some(record.target.branch.clone()),
+                    cwd: PathBuf::from(&record.target.path),
                     managed_name: None,
                     remote: matches!(
-                        snapshot.worktree.target.location(),
+                        record.target.location(),
                         wt_core::WorktreeLocation::Remote { .. }
                     ),
                 }),
@@ -599,26 +602,8 @@ pub async fn ui_session_with_harness(
     let (slug, cwd, managed_name, kind, diff_base) = match target {
         SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
             let key = key.context("worktree session requires a worktree key")?;
-            let rows = context
-                .repository
-                .inventory_status(&context.cancellation)
-                .await?;
-            let row = rows
-                .into_iter()
-                .find(|row| wt_core::worktree_target_key(&row.worktree.target) == key)
-                .context("selected worktree no longer exists")?;
-            if row.worktree.is_main {
-                bail!("main clone uses the dedicated Main session target");
-            }
-            if matches!(
-                row.worktree.target.location(),
-                wt_core::WorktreeLocation::Remote { .. }
-            ) {
-                bail!(
-                    "remote session handoff requires the remote runtime; refusing to start a local session for this target"
-                );
-            }
-            let slug = row.worktree.target.slug().to_owned();
+            let selected = session_commands::resolve_target(context, Some(&key), target).await?;
+            let slug = selected.slug;
             let saved_base = if target == SessionTarget::Diff {
                 let state = context
                     .database
@@ -636,13 +621,7 @@ pub async fn ui_session_with_harness(
             let diff_base = saved_base
                 .map(|base| format!("origin/{base}"))
                 .unwrap_or_else(|| default_diff_base.clone());
-            (
-                slug,
-                PathBuf::from(&row.worktree.target.path),
-                None,
-                target,
-                diff_base,
-            )
+            (slug, selected.cwd, None, target, diff_base)
         }
         SessionTarget::Manager => (
             "manager".into(),

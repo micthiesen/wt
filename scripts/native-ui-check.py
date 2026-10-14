@@ -593,6 +593,12 @@ def main():
             # Toggle the same delete key to cancel. A bare ESC followed by q
             # before the terminal's escape timeout is Alt-q, not two keys.
             os.write(master, b"d")
+            # Saving unrelated metadata must also complete while teardown is
+            # held, rather than showing an optimistic title until it expires.
+            drain_for(0.1)
+            os.write(master, b"t\x15Title during removal\r")
+            wait_for(lambda _: stored_slug(second_retained).get("manualTitle") == "Title during removal", timeout=3)
+            assert not removal_release.exists()
             removal_quit_started = time.monotonic()
             os.write(master, b"q")
         elif args.create:

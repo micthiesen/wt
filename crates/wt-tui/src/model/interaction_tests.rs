@@ -321,6 +321,34 @@ fn confirm_cancels_on_n() {
 }
 
 #[test]
+fn palette_title_generation_is_an_accepted_command_not_menu_preparation() {
+    let mut model = model_with(&["one"]);
+    model.reply(UiReply {
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Actions {
+                surface: ActionSurface::Row { key: "one".into() },
+            },
+            title: "Commands".into(),
+            options: vec![PickerOption {
+                value: Some(UiAction::RENAME_ID.into()),
+                label: "Rename with AI".into(),
+                chord: Some('t'),
+                note: None,
+                verify_after_merge: None,
+                detail: None,
+            }],
+            selected: 0,
+        }),
+        ..Default::default()
+    });
+    let InputResult::Action(action) = ch(&mut model, 't') else {
+        panic!("title command missing")
+    };
+    assert_eq!(action, UiAction::GenerateTitle { key: "one".into() });
+    assert!(!action.is_preparation());
+}
+
+#[test]
 fn palettes_confirm_on_their_own_opener_and_ignore_digits() {
     for (surface, opener) in [
         (ActionSurface::Manager { key: None }, 'M'),

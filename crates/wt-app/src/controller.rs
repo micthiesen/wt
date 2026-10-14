@@ -11,8 +11,8 @@ use wt_tui::{ActionController, UiReply};
 
 use crate::context::AppContext;
 
-/// Commands serialize within each host and drain on shutdown. Independent
-/// hosts progress concurrently, so an unavailable host cannot block local work.
+/// Commands serialize only where their resources conflict and drain on shutdown.
+/// Independent operations retain capacity while lifecycle jobs are running.
 /// Services own their own cancellation and irreversible commit boundaries.
 pub struct Controller {
     task: JoinHandle<()>,
@@ -199,10 +199,15 @@ pub fn start(
                     None => {},
                 },
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
-                    Some(command) => match lane_for(&command.action) {
+                    Some(mut command) => {
+                        // Resolve aliases before deciding cancellation ownership as
+                        // well as conflicts. Palette title generation is a write.
+                        command.action = crate::host_dispatch::rename_as_title(command.action);
+                        match lane_for(&command.action) {
                         Ok(lane) if !lane_failed(&lane, &failed_lanes) => pending.push_back((lane, (command, Instant::now()))),
                         Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure("Host command worker failed; this command was not started. Restart wt before retrying.") }).await; },
                         Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure(format!("{error:#}")) }).await; },
+                        }
                     },
                     None => closed = true,
                 },
@@ -239,6 +244,8 @@ pub(crate) enum Lane {
     /// Removal jobs are durable and already own the target's lifecycle lock.
     /// Keep the same target serialized while allowing unrelated work through.
     Removal(Option<String>, String),
+    /// Target-scoped metadata writes must not wait for unrelated lifecycle jobs.
+    Metadata(Option<String>, String),
     /// Read-only prompts and pickers must not sit behind a long accepted
     /// mutation on the same host. The final mutation still revalidates.
     Preparation(Option<String>),
@@ -269,6 +276,13 @@ fn action_name(action: &wt_tui::UiAction) -> &'static str {
         wt_tui::UiAction::PrepareSessions { .. } => "prepare session picker",
         wt_tui::UiAction::PrepareHarnesses { .. } => "prepare harness picker",
         wt_tui::UiAction::ResolveCreation { .. } => "resolve worktree creation",
+        wt_tui::UiAction::SetTitle { .. } => "save title",
+        wt_tui::UiAction::GenerateTitle { .. } => "generate title",
+        wt_tui::UiAction::SetStatus { .. } => "save status",
+        wt_tui::UiAction::SetIssueOverride { .. } => "save issue",
+        wt_tui::UiAction::Session { .. }
+        | wt_tui::UiAction::EnterHarness { .. }
+        | wt_tui::UiAction::SelectSession { .. } => "open session",
         _ => "host action",
     }
 }
@@ -277,6 +291,13 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
     let key = match action {
         wt_tui::UiAction::OnHost { action, .. } => return action_target(action),
         wt_tui::UiAction::Remove { key, .. } | wt_tui::UiAction::PrepareRemove { key } => key,
+        wt_tui::UiAction::SetTitle { key, .. }
+        | wt_tui::UiAction::GenerateTitle { key }
+        | wt_tui::UiAction::SetStatus { key, .. }
+        | wt_tui::UiAction::SetIssueOverride { key, .. }
+        | wt_tui::UiAction::EnterHarness { key, .. } => key,
+        wt_tui::UiAction::Session { key, .. } => key.as_ref()?,
+        wt_tui::UiAction::SelectSession { selection } => selection.key.as_ref()?,
         wt_tui::UiAction::CreateResolved { plan } => &plan.key,
         _ => return None,
     };
@@ -292,11 +313,13 @@ fn lane_host(lane: &Lane) -> &str {
         Lane::Host(Some(host))
         | Lane::Creation(Some(host))
         | Lane::Removal(Some(host), _)
+        | Lane::Metadata(Some(host), _)
         | Lane::Preparation(Some(host))
         | Lane::Terminal(Some(host), _) => host,
         Lane::Host(None)
         | Lane::Creation(None)
         | Lane::Removal(None, _)
+        | Lane::Metadata(None, _)
         | Lane::Preparation(None)
         | Lane::Terminal(None, _) => "local host",
         Lane::FleetCleanup => "local and remote hosts",
@@ -420,7 +443,8 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         // fleet mutation and no second cleanup races its prepared revisions.
         return Ok(Lane::FleetCleanup);
     }
-    let (host, action, _) = crate::host_routing::resolve(action.clone())?;
+    let (host, action, _) =
+        crate::host_routing::resolve(crate::host_dispatch::rename_as_title(action.clone()))?;
     Ok(
         if matches!(
             action,
@@ -448,6 +472,12 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
             Lane::Creation(host)
         } else if let wt_tui::UiAction::Remove { key, .. } = action {
             Lane::Removal(host, key)
+        } else if let wt_tui::UiAction::SetTitle { key, .. }
+        | wt_tui::UiAction::GenerateTitle { key }
+        | wt_tui::UiAction::SetStatus { key, .. }
+        | wt_tui::UiAction::SetIssueOverride { key, .. } = action
+        {
+            Lane::Metadata(host, key)
         } else {
             Lane::Host(host)
         },
@@ -474,18 +504,24 @@ pub(crate) fn take_available<T>(
         .filter(|lane| {
             !matches!(
                 lane,
-                Lane::ViewControl | Lane::Preparation(_) | Lane::Creation(_) | Lane::Terminal(_, _)
+                Lane::ViewControl
+                    | Lane::Preparation(_)
+                    | Lane::Creation(_)
+                    | Lane::Terminal(_, _)
+                    | Lane::Metadata(_, _)
             )
         })
         .count()
         >= 4;
     let preparation_busy = busy.iter().any(|lane| matches!(lane, Lane::Preparation(_)));
     let creation_busy = busy.iter().any(|lane| matches!(lane, Lane::Creation(_)));
+    let metadata_busy = busy.iter().any(|lane| matches!(lane, Lane::Metadata(_, _)));
     let position = pending.iter().position(|(lane, _)| {
         let has_capacity = match lane {
             Lane::ViewControl | Lane::Terminal(_, _) => true,
             Lane::Preparation(_) => !preparation_busy,
             Lane::Creation(_) => !creation_busy,
+            Lane::Metadata(_, _) => !metadata_busy,
             _ => !ordinary_full,
         };
         has_capacity && busy.iter().all(|active| !lanes_conflict(lane, active))
@@ -505,11 +541,13 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
                 Lane::Host(_)
                     | Lane::Creation(_)
                     | Lane::Removal(_, _)
+                    | Lane::Metadata(_, _)
                     | Lane::Terminal(_, Some(_))
             ) | (
                 Lane::Host(_)
                     | Lane::Creation(_)
                     | Lane::Removal(_, _)
+                    | Lane::Metadata(_, _)
                     | Lane::Terminal(_, Some(_)),
                 Lane::FleetCleanup
             )
@@ -522,11 +560,17 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
             host == other_host && key == other_key
         }
         (Lane::Host(left), Lane::Creation(right))
+        | (Lane::Host(left), Lane::Metadata(right, _))
+        | (Lane::Metadata(left, _), Lane::Host(right))
         | (Lane::Creation(left), Lane::Host(right))
         | (Lane::Host(left), Lane::Removal(right, _))
         | (Lane::Removal(left, _), Lane::Host(right)) => left == right,
         (Lane::Removal(left_host, left_key), Lane::Removal(right_host, right_key)) => {
             left_host == right_host && left_key == right_key
+        }
+        (Lane::Metadata(host, key), Lane::Removal(other_host, other_key))
+        | (Lane::Removal(other_host, other_key), Lane::Metadata(host, key)) => {
+            host == other_host && key == other_key
         }
         _ => false,
     }
@@ -1322,6 +1366,83 @@ mod tests {
     }
 
     #[test]
+    fn metadata_has_reserved_capacity_during_unrelated_removals() {
+        // Exercise routing as well as admission, including managed hosts and
+        // the palette alias, so neither entry point regresses to a host lane.
+        for host in [None, Some("MaxBook".to_owned())] {
+            let route = |action| match &host {
+                Some(host) => UiAction::OnHost {
+                    host: Some(host.clone()),
+                    action: Box::new(action),
+                },
+                None => action,
+            };
+            let actions = [
+                UiAction::SetTitle {
+                    key: "selected".into(),
+                    title: "new title".into(),
+                },
+                UiAction::GenerateTitle {
+                    key: "selected".into(),
+                },
+                UiAction::SetIssueOverride {
+                    key: "selected".into(),
+                    issue_id: None,
+                },
+                UiAction::SetStatus {
+                    key: "selected".into(),
+                    state: None,
+                    note: None,
+                    verify_after_merge: None,
+                },
+                UiAction::PrepareAction {
+                    surface: wt_tui::ActionSurface::Row {
+                        key: "selected".into(),
+                    },
+                    id: crate::action_builtins::RENAME_ID.into(),
+                    arg: None,
+                },
+            ];
+            let busy = (0..4)
+                .map(|i| Lane::Removal(host.clone(), format!("other-{i}")))
+                .collect();
+            for action in actions {
+                let action = route(action);
+                let lane = lane_for(&action).unwrap();
+                assert_eq!(lane, Lane::Metadata(host.clone(), "selected".into()));
+                let mut pending = VecDeque::from([(lane.clone(), action.clone())]);
+                assert_eq!(
+                    take_available(&mut pending, &busy),
+                    Some((lane.clone(), action))
+                );
+                assert!(lanes_conflict(
+                    &lane,
+                    &Lane::Removal(host.clone(), "selected".into())
+                ));
+                assert!(lanes_conflict(&lane, &lane));
+                assert!(lanes_conflict(&lane, &Lane::Host(host.clone())));
+                assert!(lanes_conflict(&lane, &Lane::FleetCleanup));
+                assert!(!lanes_conflict(&lane, &Lane::Creation(host.clone())));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_admission_is_bounded_without_consuming_ordinary_capacity() {
+        let active = Lane::Metadata(None, "first".into());
+        let next = Lane::Metadata(None, "second".into());
+        let removal = Lane::Removal(None, "third".into());
+        let mut pending = VecDeque::from([(next.clone(), 1), (removal.clone(), 2)]);
+        let busy = BTreeSet::from([active]);
+        assert_eq!(take_available(&mut pending, &busy), Some((removal, 2)));
+        assert_eq!(take_available(&mut pending, &busy), None);
+        assert_eq!(
+            take_available(&mut pending, &BTreeSet::new()),
+            Some((next, 1))
+        );
+    }
+
+    #[test]
     fn busy_host_preserves_its_order_without_blocking_other_hosts() {
         let remote = Lane::Host(Some("builder".into()));
         let local = Lane::Host(None);
@@ -1665,7 +1786,7 @@ mod tests {
         };
         assert_eq!(
             lane_for(&action).unwrap(),
-            Lane::Host(Some("builder".into()))
+            Lane::Metadata(Some("builder".into()), "same".into())
         );
         let action = UiAction::OnHost {
             host: Some("builder".into()),

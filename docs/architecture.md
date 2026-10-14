@@ -333,7 +333,11 @@ Attention, history, and performance controls have a separate serialized slot
 reserved beyond the four ordinary action slots, so long host operations cannot
 delay them. Attention acknowledgement returns its own accept stamp before
 refreshing metadata. Read-only preparations, worktree creation and terminal
-entry also have reserved capacity. Terminal handoffs serialize with each other;
+entry also have reserved capacity. Title, issue and status writes share a bounded
+metadata slot independent of ordinary host capacity. They conflict with removal
+of their own target, broad host mutations and fleet cleanup, but not unrelated
+removals or creation. Palette title actions use the same classification as direct
+title actions. Terminal handoffs serialize with each other;
 worktree entry also conflicts with removal of that exact host and checkout, and
 with fleet cleanup. Special-session entry and unrelated checkouts remain
 available during background writes. Preparations do not wait behind mutations because the
@@ -341,6 +345,12 @@ confirmed write revalidates its inputs. Removals serialize by host and target;
 unrelated creates and removals can proceed concurrently, while broader host
 operations and fleet cleanup retain their conflict boundaries. Lifecycle
 per-target locks serialize create/remove races on the same slug.
+Interactive actions also use a process-admission pool separate from background
+reads and lifecycle jobs. Both pools are bounded and shared for the process
+lifetime; cloning a context does not create capacity. The controller's action
+classification selects this pool in local and managed-worker execution, including
+the repository and tmux adapters. Session identity resolution enumerates checkouts
+without scanning their Git status, so unrelated dirty trees do not delay entry.
 Quitting closes command admission and cancels source reads, including automation
 evidence preparation. Already-claimed automation dispatches and accepted local
 writes retain their command token until their outcomes have been persisted;

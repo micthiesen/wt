@@ -222,6 +222,7 @@ where
                         }
                     },
                     ClientFrame::Command { id, action } => {
+                        let action = crate::host_dispatch::rename_as_title(action);
                         if id <= last_id { result = Err(anyhow::anyhow!("host command IDs must increase; replay is refused")); closed = true; continue; }
                         last_id = id;
                         let lane = if crate::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {

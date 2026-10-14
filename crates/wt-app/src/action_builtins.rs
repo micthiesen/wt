@@ -7,7 +7,7 @@ pub const CUSTOM_ID: &str = "__custom__";
 /// Slot palette `z`: open the slot's checkout in the editor.
 pub const OPEN_EDITOR_ID: &str = "__open_editor__";
 /// Row palette `t`: regenerate the worktree's AI title.
-pub const RENAME_ID: &str = "__rename__";
+pub const RENAME_ID: &str = wt_tui::UiAction::RENAME_ID;
 /// Row palette `l`: show the dev server's output.
 pub const DEV_LOGS_ID: &str = "__dev_logs__";
 

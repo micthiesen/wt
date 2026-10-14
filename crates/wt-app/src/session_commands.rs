@@ -605,7 +605,7 @@ async fn validate_live_selection(
     bail!("live session no longer matches the selected conversation; reopen the session picker")
 }
 
-async fn resolve_target(
+pub(super) async fn resolve_target(
     context: &AppContext,
     key: Option<&str>,
     target: SessionTarget,
@@ -613,28 +613,25 @@ async fn resolve_target(
     match target {
         SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
             let key = key.context("worktree session requires a target key")?;
-            let inventory = context
-                .repository
-                .inventory_status(&context.cancellation)
-                .await?;
+            let inventory = context.repository.inventory(&context.cancellation).await?;
             let record = inventory
                 .into_iter()
-                .find(|record| wt_core::worktree_target_key(&record.worktree.target) == key)
+                .find(|record| wt_core::worktree_target_key(&record.target) == key)
                 .context("selected worktree no longer exists")?;
-            if record.worktree.is_main {
+            if record.is_main {
                 bail!("main clone uses the dedicated Main session target");
             }
             if matches!(
-                record.worktree.target.location(),
+                record.target.location(),
                 wt_core::WorktreeLocation::Remote { .. }
             ) {
                 bail!("remote session operation must be dispatched to its host");
             }
             Ok(AgentTarget {
-                slug: record.worktree.target.slug().to_owned(),
+                slug: record.target.slug().to_owned(),
                 kind: super::AgentTargetKind::Worktree,
-                branch: Some(record.worktree.target.branch.clone()),
-                cwd: PathBuf::from(record.worktree.target.path.clone()),
+                branch: Some(record.target.branch.clone()),
+                cwd: PathBuf::from(record.target.path.clone()),
                 managed_name: None,
                 remote: false,
             })
@@ -690,6 +687,65 @@ fn slot_matches_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_identity_and_routes_do_not_scan_git_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let root = fixture._root.path();
+        let monitor = root.join("status-monitor");
+        let calls = root.join("status-monitor.calls");
+        std::fs::write(
+            &monitor,
+            "#!/bin/sh\nprintf status >> \"$0.calls\"\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let git = |args: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&fixture.ctx.cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+        };
+        git(&[
+            "config".as_ref(),
+            "core.fsmonitor".as_ref(),
+            monitor.as_os_str(),
+        ]);
+        // Prove the witness detects a status scan, including scans that ignore
+        // status errors. Identity-only operations must never invoke it.
+        git(&["status".as_ref(), "--porcelain=v2".as_ref()]);
+        assert!(calls.exists());
+        std::fs::remove_file(&calls).unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-session-identity-{}",
+            root.file_name().unwrap().to_string_lossy()
+        );
+        let target = resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+            .await
+            .unwrap();
+        assert_eq!(target.slug, "one");
+        let routes = super::super::AppHarness::new(&fixture.ctx)
+            .routes(&fixture.ctx)
+            .await
+            .unwrap();
+        assert!(routes.iter().any(|route| route.target.slug == "one"));
+        assert!(!calls.exists(), "session routing scanned checkout contents");
+        assert!(
+            resolve_target(&fixture.ctx, Some("missing"), SessionTarget::Harness)
+                .await
+                .is_err()
+        );
+        fixture.close().await.unwrap();
+    }
 
     fn info(name: &str, session_id: Option<&str>) -> wt_tmux::SessionInfo {
         wt_tmux::SessionInfo {

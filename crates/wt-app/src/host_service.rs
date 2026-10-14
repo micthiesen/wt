@@ -154,6 +154,7 @@ impl HostService {
         snapshot: &SourceSnapshot<Board>,
         shutdown: Option<&CancellationToken>,
     ) -> Result<UiReply> {
+        let context = self.context.for_action(&command)?;
         if matches!(command, UiAction::PrepareHardRefresh) {
             return Ok(UiReply {
                 modal: Some(wt_tui::UiModal::Confirm {
@@ -339,7 +340,7 @@ impl HostService {
                 }
             }
             UiAction::PrepareRestoreRemoved { key } => {
-                Box::pin(crate::history_actions::prepare_restore(&self.context, &key)).await?
+                Box::pin(crate::history_actions::prepare_restore(&context, &key)).await?
             }
             UiAction::RestoreRemoved {
                 key,
@@ -347,7 +348,7 @@ impl HostService {
                 branch,
             } => {
                 Box::pin(crate::history_actions::restore(
-                    &self.context,
+                    &context,
                     &key,
                     &removed_at,
                     &branch,
@@ -356,19 +357,12 @@ impl HostService {
             }
             UiAction::ToggleRemovedAutomations { key } => {
                 Box::pin(crate::history_actions::toggle_automations_paused(
-                    &self.context,
-                    &key,
+                    &context, &key,
                 ))
                 .await?
             }
             UiAction::Restack { key } => {
-                Box::pin(crate::restack_action::start(
-                    &self.context,
-                    &key,
-                    github,
-                    board,
-                ))
-                .await?
+                Box::pin(crate::restack_action::start(&context, &key, github, board)).await?
             }
             UiAction::PrepareGithub { key, ship } => {
                 let row = board
@@ -388,7 +382,7 @@ impl HostService {
                 if pr.state != "OPEN" {
                     anyhow::bail!("PR #{} is not open", pr.number);
                 }
-                let config = &self.context.config.github;
+                let config = &context.config.github;
                 let reviewer = config
                     .reviewers
                     .then_some(config.default_reviewer.as_deref())
@@ -440,7 +434,7 @@ impl HostService {
             | UiAction::PrepareAction { .. }
             | UiAction::RunAction { .. }) => {
                 Box::pin(crate::action_palette::execute(
-                    &self.context,
+                    &context,
                     action,
                     board,
                     github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE)),
@@ -449,11 +443,7 @@ impl HostService {
             }
             command => {
                 Box::pin(crate::controller_actions::execute_with_shutdown(
-                    &self.context,
-                    command,
-                    board,
-                    github,
-                    shutdown,
+                    &context, command, board, github, shutdown,
                 ))
                 .await?
             }

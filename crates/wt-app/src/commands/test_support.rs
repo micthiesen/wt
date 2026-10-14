@@ -85,13 +85,16 @@ impl CommandFixture {
         ));
         let database = Database::open(&config).await?;
         let caches = crate::query_cache::store(&config);
+        let processes = ProcessRunner::default();
         let ctx = AppContext {
             config,
             home,
             cwd: first.clone(),
             database,
             repository,
-            processes: ProcessRunner::default(),
+            background_processes: processes.clone(),
+            processes,
+            interactive_processes: ProcessRunner::default(),
             cancellation: CancellationToken::new(),
             section_writes: Default::default(),
             caches,

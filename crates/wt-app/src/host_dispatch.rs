@@ -13,6 +13,8 @@ pub async fn execute(
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
     let command = rename_as_title(command);
+    let selected_context = context.for_action(&command)?;
+    let context = &selected_context;
     // Cleanup is a fleet-wide confirmation: prepare the candidate set from
     // every configured host, then route the captured revisions back to their
     // owners. Explicitly host-scoped legacy requests still use the normal path.
@@ -565,19 +567,8 @@ async fn managed_sign_in(
 
 /// The row palette's `t` entry is the same request as `T`, so it shares the
 /// title path, including remote pin migration.
-fn rename_as_title(action: UiAction) -> UiAction {
-    match action {
-        UiAction::OnHost { host, action } => UiAction::OnHost {
-            host,
-            action: Box::new(rename_as_title(*action)),
-        },
-        UiAction::PrepareAction {
-            surface: wt_tui::ActionSurface::Row { key },
-            id,
-            ..
-        } if id == crate::action_builtins::RENAME_ID => UiAction::GenerateTitle { key },
-        action => action,
-    }
+pub(crate) fn rename_as_title(action: UiAction) -> UiAction {
+    action.resolve_palette_alias()
 }
 
 /// A fresh Claude session; the host picks the next automatic name.

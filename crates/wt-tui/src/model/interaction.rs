@@ -553,13 +553,14 @@ impl Model {
                             InputResult::Draw
                         }
                     }
-                    PickerAction::Actions { surface } => {
-                        InputResult::Action(UiAction::PrepareAction {
+                    PickerAction::Actions { surface } => InputResult::Action(
+                        UiAction::PrepareAction {
                             surface: surface.clone(),
                             id: option.value.unwrap_or_default(),
                             arg: None,
-                        })
-                    }
+                        }
+                        .resolve_palette_alias(),
+                    ),
                     PickerAction::Section { key } => {
                         // The "+ new section" row (a reserved NUL value) is
                         // not a target to remember; its name is, once typed.

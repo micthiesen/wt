@@ -157,6 +157,14 @@ impl GitRepository {
         self
     }
 
+    /// Rebind process admission without losing repository-wide fetch coalescing.
+    pub fn with_process_runner(&self, runner: ProcessRunner) -> Self {
+        Self {
+            runner,
+            ..self.clone()
+        }
+    }
+
     /// Enumerate linked worktrees and independently cloned `.rift` checkouts.
     /// Enumeration errors fail the call; individual checkout status is a separate operation.
     pub async fn inventory(
