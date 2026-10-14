@@ -40,16 +40,7 @@ pub async fn list_session_options(
     if agent.remote {
         bail!("session discovery must run on the worktree host");
     }
-    if !matches!(
-        target,
-        SessionTarget::Harness
-            | SessionTarget::Manager
-            | SessionTarget::Main
-            | SessionTarget::WtSource
-            | SessionTarget::Dotfiles
-    ) {
-        bail!("session picker is only available for harness targets");
-    }
+    ensure_picker_target(target)?;
     let tmux = app.session_inventory(context).await?;
     let live_names = tmux
         .iter()
@@ -116,6 +107,20 @@ pub async fn list_session_options(
     Ok(options)
 }
 
+fn ensure_picker_target(target: SessionTarget) -> Result<()> {
+    if !matches!(
+        target,
+        SessionTarget::Harness
+            | SessionTarget::Manager
+            | SessionTarget::Main
+            | SessionTarget::WtSource
+            | SessionTarget::Dotfiles
+    ) {
+        bail!("session picker is only available for harness targets");
+    }
+    Ok(())
+}
+
 /// Cached history nominates conversations; live tmux identity is checked again
 /// when a selection is attached. No transcript discovery runs on this path.
 pub(crate) async fn cached_session_options(
@@ -124,6 +129,7 @@ pub(crate) async fn cached_session_options(
     target: SessionTarget,
     discoveries: &[crate::session_source::DiscoveredSession],
 ) -> Result<(String, Vec<SessionOption>)> {
+    ensure_picker_target(target)?;
     let agent = resolve_target(context, key.as_deref(), target).await?;
     if agent.remote {
         bail!("session discovery must run on the worktree host");
