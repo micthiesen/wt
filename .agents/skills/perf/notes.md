@@ -1,5 +1,16 @@
 # Performance notes
 
+### Shutdown test under machine pressure (2026-10-14 UTC)
+
+The full native suite passed 997 tests but timed out draining background sources
+in `worker_stream_uses_the_same_title_handler_and_publishes_the_result`.
+The unchanged test passed alone in 4.09 seconds. At 20:00Z, `wt perf` reported
+load 19.68 on 12 cores, with wt descendants accounting for 9% of CPU in use;
+a TypeScript check and Brave dominated the decaying CPU snapshot. The second
+`top` sample was 3.91% idle with no swap deltas. This supports checking resource
+contention before changing shutdown deadlines, but does not prove the timeout's
+cause. Preserve live workloads and reduce test concurrency for the full retry.
+
 Companion to `SKILL.md`. Keep the baseline and open issues current; preserve
 measured evidence, and prune implementation-specific advice when it no longer
 applies.
