@@ -34,6 +34,10 @@ presentation model and terminal driver live in `wt-tui`.
   resources, `wt-runtime` scheduled source lifetimes, `wt-vcs` Git operations,
   `wt-lifecycle` worktree safety, `wt-harness` agent adapters, and `wt-app`
   composition. Keep pure domain rules in `wt-core` or the owning domain crate.
+- When adding a faster or alternate path for an existing action, share the
+  original's validation through one helper instead of copying or dropping it,
+  and keep action-specific logic in the action's owning module rather than as
+  a special case in generic dispatch. Document any intended behavior gap.
 - Put filesystem/process work off the terminal input path. Sources publish
   prepared snapshots through `wt-runtime`; actions go through the host service
   and tracked controller. Use scoped cancellation and preserve accepted
