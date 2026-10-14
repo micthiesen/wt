@@ -69,63 +69,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
         UiAction::PrepareSessions { key, target } => {
             let sessions =
                 crate::harness::list_session_options(context, key.clone(), target).await?;
-            let mut choices = Vec::new();
-            let mut options = Vec::new();
-            for session in sessions {
-                options.push(PickerOption {
-                    value: Some(choices.len().to_string()),
-                    label: session_row_label(
-                        session.selection.harness,
-                        &session.display_name,
-                        session.state.as_deref(),
-                        session.is_live,
-                    ),
-                    chord: None,
-                    note: None,
-                    verify_after_merge: None,
-                    detail: None,
-                });
-                choices.push(session.selection);
-            }
-            for harness in wt_core::HarnessId::ALL
-                .into_iter()
-                .filter(|id| !context.config.harness.hidden.contains(id))
-            {
-                options.push(PickerOption {
-                    value: Some(choices.len().to_string()),
-                    label: format!("new {} session", harness_label(harness)),
-                    // The letter jumps to this row (the model's sessions
-                    // key handler); it never commits, as in TS.
-                    chord: Some(harness_letter(harness)),
-                    note: None,
-                    verify_after_merge: None,
-                    detail: None,
-                });
-                choices.push(SessionSelection {
-                    key: key.clone(),
-                    target,
-                    harness,
-                    session_id: None,
-                    live_slot: None,
-                    managed_name: None,
-                    mode: SessionMode::New,
-                    live: false,
-                });
-            }
-            Ok(UiReply {
-                modal: Some(UiModal::Picker {
-                    action: PickerAction::Sessions { choices },
-                    title: match (&key, target) {
-                        (Some(key), wt_tui::SessionTarget::Harness) => {
-                            format!("sessions · {}", wt_core::worktree_ledger_label(key))
-                        }
-                        _ => "sessions".into(),
-                    },
-                    options,
-                    selected: 0,
-                }),
-                ..Default::default()
-            })
+            Ok(sessions_reply(context, key, target, sessions))
         }
         UiAction::StopSession { selection } => {
             let label = harness_label(selection.harness);
@@ -273,6 +217,72 @@ fn harness_picker(
                 detail: None,
             })
             .collect(),
+    }
+}
+
+/// Build the picker from prepared history and a fresh live-slot inventory.
+pub(crate) fn sessions_reply(
+    context: &AppContext,
+    key: Option<String>,
+    target: wt_tui::SessionTarget,
+    sessions: Vec<crate::harness::SessionOption>,
+) -> UiReply {
+    let mut choices = Vec::new();
+    let mut options = Vec::new();
+    for session in sessions {
+        options.push(PickerOption {
+            value: Some(choices.len().to_string()),
+            label: session_row_label(
+                session.selection.harness,
+                &session.display_name,
+                session.state.as_deref(),
+                session.is_live,
+            ),
+            chord: None,
+            note: None,
+            verify_after_merge: None,
+            detail: None,
+        });
+        choices.push(session.selection);
+    }
+    for harness in wt_core::HarnessId::ALL
+        .into_iter()
+        .filter(|id| !context.config.harness.hidden.contains(id))
+    {
+        options.push(PickerOption {
+            value: Some(choices.len().to_string()),
+            label: format!("new {} session", harness_label(harness)),
+            // The letter jumps to this row (the model's sessions
+            // key handler); it never commits, as in TS.
+            chord: Some(harness_letter(harness)),
+            note: None,
+            verify_after_merge: None,
+            detail: None,
+        });
+        choices.push(SessionSelection {
+            key: key.clone(),
+            target,
+            harness,
+            session_id: None,
+            live_slot: None,
+            managed_name: None,
+            mode: SessionMode::New,
+            live: false,
+        });
+    }
+    UiReply {
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Sessions { choices },
+            title: match (&key, target) {
+                (Some(key), wt_tui::SessionTarget::Harness) => {
+                    format!("sessions · {}", wt_core::worktree_ledger_label(key))
+                }
+                _ => "sessions".into(),
+            },
+            options,
+            selected: 0,
+        }),
+        ..Default::default()
     }
 }
 

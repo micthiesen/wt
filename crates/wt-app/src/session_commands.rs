@@ -116,6 +116,100 @@ pub async fn list_session_options(
     Ok(options)
 }
 
+/// Cached history nominates conversations; live tmux identity is checked again
+/// when a selection is attached. No transcript discovery runs on this path.
+pub(crate) async fn cached_session_options(
+    context: &AppContext,
+    key: Option<String>,
+    target: SessionTarget,
+    discoveries: &[crate::session_source::DiscoveredSession],
+) -> Result<(String, Vec<SessionOption>)> {
+    let agent = resolve_target(context, key.as_deref(), target).await?;
+    if agent.remote {
+        bail!("session discovery must run on the worktree host");
+    }
+    let app = AppHarness::new(context);
+    let live = app.session_inventory(context).await?;
+    let options = cached_options_for(context, &agent, key, target, discoveries, &live);
+    Ok((agent.slug, options))
+}
+
+fn cached_options_for(
+    context: &AppContext,
+    agent: &AgentTarget,
+    key: Option<String>,
+    target: SessionTarget,
+    discoveries: &[crate::session_source::DiscoveredSession],
+    live: &[wt_tmux::SessionInfo],
+) -> Vec<SessionOption> {
+    let mut options = Vec::new();
+    for harness in HarnessId::ALL {
+        if context.config.harness.hidden.contains(&harness) {
+            continue;
+        }
+        for entry in discoveries
+            .iter()
+            .filter(|entry| entry.key.slug == agent.slug && entry.key.harness == harness)
+        {
+            let slot = live.iter().find(|slot| {
+                slot.name == entry.session.tmux_session_name
+                    && slot_matches_selection(harness, slot, &entry.session.session_id)
+            });
+            options.push(option_for(
+                target,
+                key.clone(),
+                harness,
+                entry.session.clone(),
+                slot,
+            ));
+        }
+        if harness == HarnessId::Claude {
+            let prefix = format!("{}~", agent.slug);
+            for slot in live.iter().filter(|slot| {
+                slot.name == session_name(agent, harness)
+                    || (target == SessionTarget::Harness && slot.name.starts_with(&prefix))
+            }) {
+                if !options
+                    .iter()
+                    .any(|option| option.is_live && option.tmux_session_name == slot.name)
+                {
+                    let mut option = live_slot_option(target, key.clone(), harness, slot);
+                    option.selection.managed_name = slot
+                        .name
+                        .strip_prefix(&prefix)
+                        .map(str::to_owned)
+                        .or_else(|| agent.managed_name.clone());
+                    option.display_name = option
+                        .selection
+                        .managed_name
+                        .clone()
+                        .unwrap_or_else(|| "primary".into());
+                    options.push(option);
+                }
+            }
+        }
+        if harness != HarnessId::Claude
+            && let Some(slot) = live
+                .iter()
+                .find(|slot| slot.name == session_name(agent, harness))
+            && !options
+                .iter()
+                .any(|option| option.selection.harness == harness && option.is_live)
+        {
+            options.push(live_slot_option(target, key.clone(), harness, slot));
+        }
+    }
+    options.sort_by(|left, right| {
+        right
+            .is_live
+            .cmp(&left.is_live)
+            .then_with(|| left.selection.harness.cmp(&right.selection.harness))
+            .then_with(|| right.last_active_ms.cmp(&left.last_active_ms))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    options
+}
+
 /// Prepare the exact selected conversation for terminal handoff. It never
 /// replaces a live slot; the caller must first obtain explicit user intent and
 /// stop that exact managed session.
@@ -783,6 +877,113 @@ mod tests {
             window_count: 1,
             harness_session_id: session_id.map(str::to_owned),
         }
+    }
+
+    #[tokio::test]
+    async fn cached_picker_opens_with_unreadable_history_database() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-cached-picker-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy()
+        );
+        let database = fixture.ctx.home.join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(&database, "invalid SQLite database").unwrap();
+        let app = AppHarness::new(&fixture.ctx);
+        app.tmux
+            .create_session(
+                &wt_tmux::CreateSession {
+                    name: "one-opencode".into(),
+                    cwd: fixture.ctx.cwd.clone(),
+                    command: vec!["sleep".into(), "30".into()],
+                    width: None,
+                    height: None,
+                },
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        let result = cached_session_options(
+            &fixture.ctx,
+            Some("one".into()),
+            SessionTarget::Harness,
+            &[],
+        )
+        .await;
+        app.tmux
+            .kill_session("one-opencode", &fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let (_, options) = result.unwrap();
+        assert!(
+            options
+                .iter()
+                .any(|option| option.is_live && option.selection.harness == HarnessId::Opencode)
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_picker_keeps_live_slots_and_does_not_trust_old_conversation_identity() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let agent = resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+            .await
+            .unwrap();
+        let history = vec![crate::session_source::DiscoveredSession {
+            key: crate::session_source::SessionKey {
+                slug: "one".into(),
+                harness: HarnessId::Opencode,
+                session_id: "old".into(),
+            },
+            session: HarnessSession {
+                display_name: "old history".into(),
+                session_id: "old".into(),
+                tmux_session_name: "one-opencode".into(),
+                last_active_ms: Some(1),
+                is_live: true,
+                extras: Default::default(),
+            },
+        }];
+        let live = vec![info("one-opencode", Some("new")), info("one~review", None)];
+        let options = cached_options_for(
+            &fixture.ctx,
+            &agent,
+            Some("one".into()),
+            SessionTarget::Harness,
+            &history,
+            &live,
+        );
+        let old = options
+            .iter()
+            .find(|option| option.selection.session_id.as_deref() == Some("old"))
+            .unwrap();
+        assert!(!old.is_live);
+        assert!(old.selection.live_slot.is_none());
+        let current = options
+            .iter()
+            .find(|option| option.is_live && option.selection.harness == HarnessId::Opencode)
+            .unwrap();
+        assert!(current.selection.session_id.is_none());
+        assert_eq!(current.selection.live_slot.as_ref().unwrap().id, "$1");
+        assert!(
+            options.iter().any(|option| option.is_live
+                && option.selection.managed_name.as_deref() == Some("review"))
+        );
+        let cold = cached_options_for(
+            &fixture.ctx,
+            &agent,
+            Some("one".into()),
+            SessionTarget::Harness,
+            &[],
+            &live,
+        );
+        assert_eq!(cold.len(), 2);
+        assert!(cold.iter().all(|option| option.is_live));
     }
 
     #[test]

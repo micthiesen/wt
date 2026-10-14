@@ -148,6 +148,28 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Cozee creation delay with OpenCode selected (2026-10-14 UTC).** Installed
+  build `ece782f` uses Rift with `--copy-all`. Recent `secrets-script` and
+  `secrets-script-manager` checkouts completed at 00:11:00Z and 00:10:19Z.
+  Their copied directory metadata began changing about 30 seconds earlier;
+  this is filesystem evidence, not a measured request-to-completion interval.
+  No Rift child, pending init lock, or new OpenCode session remained at inspection.
+  Cozee's persisted primary harness is OpenCode. No `.rift.toml` hook exists.
+  The configured copy globs make the lifecycle walker visit every directory
+  except `.git`: 427,813 files in 29,479 directories, including 411,132 files
+  in `node_modules`. A read-only Python walk took 2.347 seconds; scanning only
+  the specified paths took 0.0028 seconds for 77 files. These are warm scan
+  comparisons, not lifecycle timings. Prune the walker by glob prefixes and
+  report creation phases before changing the backend.
+  wt PID 85464 used 165.4% CPU in a two-second `top` sample; the machine had
+  63.8% idle CPU. A three-second stack sample shows Codex activity polls
+  searching rollout directories and reading headers, despite OpenCode being
+  primary. Cache resolved rollout paths and unchanged headers; preserve
+  bounded rediscovery. This load is verified, but its effect on creation is
+  not measured. Evidence: `/tmp/wt-create-sample-20261013.txt` and
+  `/tmp/wt-create-perf-20261013.json`. No code, settings, or processes changed.
+
+
 - **Live machine pressure (2026-10-13).** With builds finished, a second
   `top` sample showed 84.76% CPU busy: wt PID 32450 near 99% of one core,
   native pg_cron PIDs 4383/81482 near 80% each, and Brave PID 83591 near
@@ -328,6 +350,25 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
   or Codex's native feature-discovery timeout.
 
 ## Native runtime lessons
+
+- **Cached session picker and attachment checks (2026-10-14).** The installed
+  `06ced1a` build waited for fleet Git status before attachment. Read-only tmux
+  queries took 6.6–7.6 ms; `wt ls` took 2.245 seconds for 28 rows (22 live).
+  This was not a measured attachment interval. Main `86203d4` removed the
+  fleet status dependency and added reserved interactive process admission.
+  This follow-up uses background conversation history for the picker and a
+  fresh tmux inventory to capture live-slot witnesses. Opening queues history
+  discovery without waiting. A cold cache includes current live slots;
+  reopening after refresh includes saved conversations. Cached conversation
+  identity cannot claim a changed live slot. Exact attachment guards remain.
+  Validation: the wt-app gate passed all 395 tests. The private tmux PTY
+  check passed picker attachment, input, return to the UI, exact-slot kill,
+  and protection of unrelated panes and sessions. The fixture now removes
+  inherited `NO_COLOR` and `NO_COLOUR`, which hid its selection marker.
+  Results: `/tmp/wt-session-picker-check-20261014-colour/result.json`.
+  Earlier evidence: `/tmp/wt-session-open-sample-20261014.txt` and
+  `/tmp/wt-session-open-perf-20261014.json`.
+
 
 - **Cache excluded discovery records as well as matches.** A live session's
   activity used to rediscover every slot, each reparsing the recent session

@@ -28,6 +28,7 @@ mod session_commands;
 pub use session_commands::{
     SessionEnd, forget_claude_session, list_session_options, prepare_session, stop_managed_session,
 };
+pub(crate) use session_commands::{SessionOption, cached_session_options};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {

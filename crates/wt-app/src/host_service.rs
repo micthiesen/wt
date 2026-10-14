@@ -155,6 +155,31 @@ impl HostService {
         shutdown: Option<&CancellationToken>,
     ) -> Result<UiReply> {
         let context = self.context.for_action(&command)?;
+        if let UiAction::PrepareSessions { key, target } = &command {
+            let history = self.sources.sessions.discoveries.snapshot();
+            let (slug, options) = crate::harness::cached_session_options(
+                &context,
+                key.clone(),
+                *target,
+                history.data().map_or(&[], |entries| entries.as_slice()),
+            )
+            .await?;
+            self.sources.sessions.inventory.refresh();
+            for harness in wt_core::HarnessId::ALL {
+                if !context.config.harness.hidden.contains(&harness) {
+                    self.sources
+                        .sessions
+                        .commands
+                        .discover(slug.clone(), harness);
+                }
+            }
+            return Ok(crate::session_ui::sessions_reply(
+                &context,
+                key.clone(),
+                *target,
+                options,
+            ));
+        }
         if matches!(command, UiAction::PrepareHardRefresh) {
             return Ok(UiReply {
                 modal: Some(wt_tui::UiModal::Confirm {

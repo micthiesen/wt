@@ -162,6 +162,14 @@ observations within the original timeout budget. A later response must prove
 presence or absence; persistent uncertainty remains an error. Mutating commands
 are never replayed by this mechanism.
 
+Session pickers use the background session-history snapshot and one fresh tmux
+inventory request. Opening a picker queues a history refresh without waiting
+for transcript scans. A cold cache still shows live slots and new-session
+choices; reopen the picker after refresh to see saved conversations. Cached
+history only nominates choices. Attachment checks the live tmux slot and exact
+conversation again. Target resolution uses worktree inventory without Git
+status scans across the fleet.
+
 ## Query layer
 
 All board data and all optimistic display go through one layer in

@@ -45,7 +45,7 @@ def main():
                WT_TMUX_SOCKET=socket, SHELL="/bin/sh", WT_UPDATE="off", WT_SKILLS="off",
                WT_GITHUB="off", WT_AUTOMATIONS="off")
     for key in ("WT_REPO_CONFIG", "WT_REPO_ID", "WT_AGENT", "TMUX", "TMUX_PANE",
-                "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+                "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "NO_COLOR", "NO_COLOUR"):
         env.pop(key, None)
     pid, terminal = pty.fork()
     if pid == 0:

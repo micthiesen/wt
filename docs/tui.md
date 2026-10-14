@@ -388,3 +388,8 @@ and spacing. It departs from that UI only where the change is deliberate:
 
 Session `; d` and `; x` act immediately, as they did in TypeScript; the
 review-requests fold is not persisted, also as before.
+
+The session picker opens from cached conversation history and a fresh tmux
+slot check. Opening it requests a background history refresh. With an empty
+cache it shows live slots and new-session choices. Reopen it after refresh
+to see saved conversations. Attachment rechecks the selected live identity.
