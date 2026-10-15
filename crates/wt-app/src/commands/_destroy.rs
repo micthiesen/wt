@@ -201,7 +201,6 @@ async fn start_remove_inner(
                     log_path.display()
                 );
             }
-            restore_archive(ctx, &current).await?;
             bail!(
                 "background worker exited before startup acknowledgement; see {}",
                 log_path.display()
@@ -210,7 +209,6 @@ async fn start_remove_inner(
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            restore_archive(ctx, &read_job(&job_path).await?).await?;
             bail!(
                 "background worker did not acknowledge startup; see {}",
                 log_path.display()
@@ -397,14 +395,8 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             Ok(0)
         }
         Err(error) => {
-            match restore_archive(ctx, &job).await {
-                Ok(()) => {
-                    tracing::error!(%error, "Background removal failed; previous archive state restored")
-                }
-                Err(restore) => {
-                    tracing::error!(%error, %restore, "Background removal failed; cannot restore archive state")
-                }
-            }
+            // Keep an accepted removal out of Inbox even if cleanup fails.
+            // The durable job and attention event retain the failure for retry.
             job["state"] = json!("failed");
             job["error"] = json!(format!("{error:#}"));
             job["completedAt"] = json!(now_string());
@@ -419,26 +411,6 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             Err(error)
         }
     }
-}
-
-async fn restore_archive(ctx: &AppContext, job: &Value) -> Result<()> {
-    // Older jobs did not change archive state, and a row that was already
-    // archived was not changed by the worker. Undo only the worker's own
-    // write, so a toggle made while the removal ran is kept.
-    if job["wasArchived"].as_bool() != Some(false) {
-        return Ok(());
-    }
-    let key = job["target"]["key"]
-        .as_str()
-        .context("job missing target key")?
-        .to_owned();
-    ctx.database
-        .call(move |store| {
-            store.set_archived(&key, false)?;
-            Ok(())
-        })
-        .await?;
-    Ok(())
 }
 
 async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
@@ -597,10 +569,16 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
             continue;
         }
         job["state"] = json!("failed");
-        restore_archive(ctx, &job).await?;
         job["error"] = json!("worker process disappeared before recording completion");
         job["completedAt"] = json!(now_string());
         atomic_write(&entry.path(), &job).await?;
+        tracing::error!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = job["target"]["key"].as_str().unwrap_or("wt"),
+            event_text = "Removal failed: worker process disappeared before recording completion; checkout remains archived",
+            "background removal worker disappeared"
+        );
     }
     Ok(())
 }
@@ -721,7 +699,7 @@ mod tests {
             .call(|store| Ok(store.read_archived_keys()?))
             .await
             .unwrap();
-        assert!(!archived.contains("one"));
+        assert!(archived.contains("one"));
         fixture.close().await.unwrap();
     }
 

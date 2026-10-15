@@ -522,11 +522,11 @@ operation locks. A confirmed removal moves its row to Archived with a
 removal glyph at once. Revision capture streams complete Git output and
 untracked file contents into fingerprints with bounded memory, cancellation,
 and deadlines; evidence is never truncated to satisfy a capture limit.
-The worker saves the archive state before its startup
-reply and restores the previous state on failure. TUI actions await the durable
+The worker archives the row before its startup reply and retains that state
+on failure. TUI actions await the durable
 job's terminal outcome off the input path, so startup does not settle the pending
-removal and a later failure rolls it back. CLI background mode returns the startup
-acknowledgement. Removal errors and completion enter the
+removal. A later failure keeps it archived and reports an attention event.
+CLI background mode returns the startup acknowledgement. Removal errors and completion enter the
 attention feed. Cleanup does not force-remove dirty or unpushed work, and a
 landed branch with an outstanding verification gate remains protected. Missing
 GitHub or inventory facts are unknown, never proof that removal is safe.

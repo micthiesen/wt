@@ -82,10 +82,11 @@ inventory replaces that row without a duplicate. Navigation away is preserved
 when preparation or creation finishes. Worktree actions, including F12, become
 available when the real checkout is ready; F12 is never queued automatically.
 Dependency installation continues as a background action. A removal request
-keeps the row in place with a dim gray, struck-through name while checks and
-deletion run. The worker archives it internally, but the active UI keeps its
-position until inventory confirms deletion. A failed or cancelled request
-restores the normal name style. Delayed hazard reviews are queued separately for each checkout
+keeps the row in place with a dim gray, struck-through name while safety
+checks run. When the worker starts, the row leaves Inbox and file cleanup
+continues in the background. Failed cleanup stays in Archived and reports an
+error in the attention panel. It does not put the row back in Inbox. A request
+cancelled before worker startup restores the normal name style. Delayed hazard reviews are queued separately for each checkout
 and host. They appear one at a time after the current menu closes; navigation
 does not discard them. Each confirmation still rechecks its checkout witness.
 Commands taking more than three seconds show elapsed progress. A queued command

@@ -317,6 +317,7 @@ with bounded capture, and the worker records the terminal result. Ordinary Git
 checks retain their existing timeout and cancellation.
 
 If Git exits unsuccessfully, wt reports that files may already be missing.
-Restoring the previous archive state restores row visibility, not deleted files.
+Accepted removals stay archived if cleanup fails. The attention panel reports
+the failure; any remaining checkout can be reviewed and retried from Archived.
 wt does not automatically force or repeat the failed removal. A new attempt must
 review current checkout identity and hazards.

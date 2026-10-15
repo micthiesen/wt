@@ -252,8 +252,10 @@ def main() -> int:
         refused = subprocess.run([str(binary), "_destroy", stale_job_id], env=env, cwd=main_repo, text=True, capture_output=True)
         assert refused.returncode != 0 and "HEAD changed" in refused.stderr, refused.stderr
         assert stale_target.exists(), "worker removed a checkout whose HEAD did not match the job"
+        failed_job = json.loads((stale_dir / f"{stale_job_id}.json").read_text())
+        assert failed_job["state"] == "failed" and "HEAD changed" in failed_job["error"], failed_job
         with sqlite3.connect(scratch / "state.db") as state:
-            assert not state.execute("SELECT 1 FROM archived_worktrees WHERE worktree_key = ?", ("ENG-502-stale-head",)).fetchone(), "failed removal left the worktree archived"
+            assert state.execute("SELECT 1 FROM archived_worktrees WHERE worktree_key = ?", ("ENG-502-stale-head",)).fetchone(), "failed removal returned the worktree to Inbox"
         print(
             "native lifecycle smoke passed: ack, durable removal, no worker leak, path/head guards, "
             f"PTY picker SIGTERM exit in {picker_exit_seconds * 1000:.1f} ms"
