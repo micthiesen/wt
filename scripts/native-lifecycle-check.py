@@ -78,6 +78,39 @@ def cancel_open_picker(binary: pathlib.Path, env: dict[str, str], cwd: pathlib.P
     return time.monotonic() - signaled_at
 
 
+def answer_skill_prompt(binary: pathlib.Path, env: dict[str, str], cwd: pathlib.Path, answer: bytes) -> None:
+    pid, terminal = pty.fork()
+    if pid == 0:
+        os.chdir(cwd)
+        os.execve(str(binary), [str(binary), "skills", "sync", "wt"], env)
+    transcript = bytearray()
+    status = None
+    sent = False
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([terminal], [], [], 0.05)
+            if readable:
+                try:
+                    transcript.extend(os.read(terminal, 4096))
+                except OSError:
+                    pass
+            if not sent and b"[y/N]" in transcript:
+                os.write(terminal, answer + b"\n")
+                sent = True
+            child, child_status = os.waitpid(pid, os.WNOHANG)
+            if child == pid:
+                status = child_status
+                break
+        assert sent and status == 0, transcript.decode(errors="replace")
+        assert b"Invalid argument" not in transcript, transcript.decode(errors="replace")
+    finally:
+        os.close(terminal)
+        if status is None:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
 def main() -> int:
     binary = pathlib.Path(os.environ.get("WT_NATIVE_BIN", "target/debug/wt")).resolve()
     if not binary.is_file():
@@ -101,6 +134,8 @@ def main() -> int:
                 "XDG_CONFIG_HOME": str(home / ".config"),
                 "XDG_CACHE_HOME": str(home / ".cache"),
                 "XDG_DATA_HOME": str(home / ".local" / "share"),
+                "PI_CODING_AGENT_DIR": str(home / ".pi" / "agent"),
+                "WT_CONFIG": str(config_home / "config.toml"),
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": str(scratch / "gitconfig"),
             }
@@ -129,6 +164,18 @@ def main() -> int:
             encoding="utf-8",
         )
         env["WT_REPO_CONFIG"] = str(repo_config)
+
+        # Exercise the actual controlling /dev/tty, including Darwin where
+        # registering it with kqueue fails before an answer can be read.
+        codex_home = home / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text("# fixture\n")
+        env["CODEX_HOME"] = str(codex_home)
+        answer_skill_prompt(binary, env, main_repo, b"n")
+        assert not list(home.rglob("SKILL.md")), "decline installed a skill"
+        run([str(binary), "skills", "reset", "--declines"], env=env, cwd=main_repo)
+        answer_skill_prompt(binary, env, main_repo, b"y")
+        assert list(home.rglob("SKILL.md")), "accept did not install a skill"
 
         branch = "person/ENG-501-background"
         git(main_repo, "branch", branch, env=env)

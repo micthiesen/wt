@@ -118,6 +118,10 @@ wt: 2 agent-skill update(s) available
   `npx rulesync generate`) once per pipeline before touching it.
 - `[skills] startup_check = false` turns the startup prompt off entirely.
 
+Startup and CLI prompts read a nonblocking terminal descriptor directly, so
+macOS `/dev/tty` does not need kqueue support. Waiting for an answer remains
+cancellable without leaving a blocked input thread behind.
+
 If a unit has template blanks (see below) you're asked once, and the answer
 is remembered forever.
 

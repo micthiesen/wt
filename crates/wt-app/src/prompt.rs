@@ -13,25 +13,33 @@ pub async fn read_line(message: &str, cancel: &CancellationToken) -> Result<Opti
     std::io::stderr().flush()?;
     #[cfg(unix)]
     {
-        use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
-        use tokio::io::unix::AsyncFd;
-        let file = OpenOptions::new()
+        use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, time::Duration};
+        let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
             .open("/dev/tty")
             .context("open interactive terminal")?;
-        let file = AsyncFd::new(file)?;
         let mut input = Vec::new();
         loop {
-            let mut ready = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("interactive input cancelled"),
-                ready = file.readable() => ready?,
-            };
+            if cancel.is_cancelled() {
+                bail!("interactive input cancelled");
+            }
             let mut buffer = [0u8; 1024];
-            let size = match ready.try_io(|fd| fd.get_ref().read(&mut buffer)) {
-                Ok(result) => result?,
-                Err(_) => continue,
+            // Darwin's /dev/tty does not support kqueue registration. Read the
+            // owned nonblocking descriptor directly; only retry while a prompt
+            // is active, without leaving a blocking reader behind on shutdown.
+            let size = match file.read(&mut buffer) {
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => bail!("interactive input cancelled"),
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).context("read interactive terminal"),
             };
             if size == 0 {
                 return Ok(None);
