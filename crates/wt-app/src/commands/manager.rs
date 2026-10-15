@@ -76,7 +76,7 @@ pub async fn run(context: &AppContext, args: &ManagerArgs) -> Result<i32> {
     match &args.command {
         Some(ManagerCommand::Send { hold, text }) => {
             let text = text.join(" ").trim().to_owned();
-            if text.is_empty() {
+            if text.is_empty() && hold.is_none() {
                 bail!("wt manager send requires a message");
             }
             send_to(context, "manager", &text, hold.as_deref()).await

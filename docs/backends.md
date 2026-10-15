@@ -73,7 +73,7 @@ This independent-clone model is the crucial difference from a git worktree,
 and it drives the rest of the design:
 
 - **Discovery.** A rift checkout never appears in `git worktree list`.
-  `listWorktrees` scans the worktree root for immediate children carrying
+  The inventory scan reads the worktree root for immediate children carrying
   a `.rift` marker and synthesizes rows, reading the branch straight from
   `.git/HEAD` (pure fs, no subprocess per checkout). Done regardless of
   the configured backend, so existing checkouts of either kind stay
@@ -101,7 +101,7 @@ and it drives the rest of the design:
   as interruption after the child is stopped and joined, not cleanup failure.
   Branch deletion is moot — the branch vanishes with the clone. The
   fork-base reparenting of *dependents* is backend-agnostic (it edits
-  wtstate) and still runs.
+  the durable state) and still runs.
   **`force` is advisory here, so callers own the dirty guard.** wt passes
   `--force` through for symmetry with the git backend, but rift trashes a
   dirty checkout with or without it — there is no refusal to rely on. That
@@ -190,16 +190,16 @@ and it drives the rest of the design:
 
 ## Stale remote-tracking refs
 
-A rift clone's `origin/<trunk>` is frozen at clone time. `fetchOrigin`
-runs `git fetch` in the **main clone** only, so nothing inside a
+A rift clone's `origin/<trunk>` is frozen at clone time. `fetch_origin`
+(`wt-vcs`) runs `git fetch` in the **main clone** only, so nothing inside a
 worktree advances its copy — historical measurement on a live fleet of 28 rows,
 `git rev-parse origin/staging` gave 10 distinct answers, one of them 9
 merges behind and none of them the tip. Two rules fall out of that, and
 both have shipped as bugs:
 
-**Fix the REF, not each reader.** `fetchOrigin` ends by pointing every
+**Fix the REF, not each reader.** `fetch_origin` ends by pointing every
 worktree's own `origin/<trunk>` at the tip the main clone just fetched
-(`freshenWorktreeTrunkRefs`). Everything keyed to the base reads that
+(`freshen_rift_trunk`). Everything keyed to the base reads that
 ref: the ahead/behind counts, the pre-PR row title (the oldest commit
 in `base..HEAD`, which otherwise becomes a colleague's commit), the
 diff context the AI summary is generated from, the git row's
@@ -230,8 +230,8 @@ LOCAL branch of that name, which exists in every rift clone (`clone -b
 staging` leaves one) and which nothing ever moves: the freshen above
 fast-forwards `refs/remotes/origin/<trunk>`, not the local head. So an
 ordinary trunk worktree measured itself against clone time, permanently,
-and the fallback that was supposed to catch this could not: `freshBaseRev`
-keys on the trunk string as well, saw a base that was not it, and
+and the fallback that was supposed to catch this could not: it keyed
+on the trunk string as well, saw a base that was not it, and
 returned it untouched. Historical measurement on a live fleet of 15: every row resolved
 to a local trunk 97 to 383 commits behind, one reporting 383 commits
 ahead against a true 1. Nine rows shared a single colleague's commit
@@ -239,23 +239,18 @@ subject as their title, because that commit was the oldest in all nine
 ranges. Both spellings now normalize.
 
 **Resolve a ref in the frame the question is about.** "Where is trunk
-now" resolves in the main clone (`baseTipSha`); "what does this checkout
-see" resolves in the worktree. A comparison that spans both needs the
-same helper on each side, or it compares reference frames rather than
-commits. Sync counts (`syncState`, `pushCounts`) and the pre-PR row title
-(`wtFirstCommitQuery`) additionally go through
-`freshBaseRev`, which swaps the trunk ref for the main clone's SHA when
-the checkout already holds that object — a floor under the freshen
-above, for the window between a merge landing and the next fetch. It
-counts, it never fetches, and anything that is not the trunk ref (a
-stacked parent, an external base) is left alone, because there the
-local copy genuinely is the freshest. That number is not cosmetic —
-before the branch is pushed it is also `pushCounts().unpushed`, which
-is what the destroy guards read, so an empty worktree claimed to be
-holding work at risk.
+now" resolves in the main clone; "what does this checkout see" resolves
+in the worktree. A comparison that spans both needs the same helper on
+each side, or it compares reference frames rather than commits. Sync
+counts and the pre-PR row title read the checkout's own freshened
+`origin/<trunk>`; anything that is not the trunk ref (a stacked parent,
+an external base) is left alone, because there the local copy genuinely
+is the freshest. That number is not cosmetic: before the branch is
+pushed it is also the `unpushed` count the destroy guards read, so a
+stale base made an empty worktree claim to be holding work at risk.
 
 **"Do I have the object" is not "is my ref current".** The restack's
-trunk-root freshen (`resolveNewBaseSha`) used object presence as its
+trunk-root freshen (`resolve_new_base` in `wt-stack`) used object presence as its
 gate, and the object routinely arrives early by another name: a plain
 `git fetch origin` in the clone pulls GitHub's merge-queue branches
 (`gh-readonly-queue/<base>/pr-N-<sha>`), whose tip *is* the commit that
@@ -303,13 +298,11 @@ implementation; do not spread backend branching through UI actions.
   rift checkout. The restack engine handles this by resolving parents
   through the shared `origin/<parent>` refs and a local object fetch for
   the just-replayed tip (see **Restacking** above), and push works
-  per-clone. The
-  mid-rebase conflict glyph is push-based for rift too: a per-clone watcher
-  on each rift slice's own `.git/rebase-*` (`RiftRebaseWatchSet`) fires the
-  conflict probe, the independent-clone analogue of the linked-worktree
-  `.git/worktrees/<slug>/rebase-*` watcher. Other ad-hoc cross-checkout ref
-  reads *outside* these paths still don't propagate — e.g. a sibling's
-  just-merged/pushed state can lag a rift row until its staleTime.
+  per-clone. wt watches each rift clone's own git directory
+  rather than a shared one, so changes inside a clone refresh its row. Other
+  ad-hoc cross-checkout ref reads outside these paths do not propagate: a
+  sibling's just-merged or pushed state can lag a rift row until the next
+  refresh.
 - `--copy-all` also brings other regenerable artifacts (`dist`, `.turbo`,
   caches) across via CoW — harmless for a fresh identical checkout, and
   free.

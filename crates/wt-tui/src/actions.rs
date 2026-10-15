@@ -33,6 +33,11 @@ pub enum UiAction {
     },
     ToggleAutomations {
         key: Option<String>,
+        /// Whether the board showed automations paused (for the row, or
+        /// globally without a key). A mismatch with the stored state refuses
+        /// the toggle instead of flipping it the other way.
+        #[serde(default)]
+        seen: Option<Seen<bool>>,
     },
     CancelAutomations,
     SetHistoryActive {
@@ -218,6 +223,10 @@ pub enum UiAction {
     },
     ToggleArchive {
         key: String,
+        /// Whether the board showed the row archived. A mismatch with the
+        /// stored marker refuses the toggle instead of flipping it back.
+        #[serde(default)]
+        seen: Option<Seen<bool>>,
     },
     PrepareStatus {
         key: String,

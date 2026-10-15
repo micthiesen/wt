@@ -52,14 +52,42 @@ impl LaunchPlan {
     }
 }
 
-/// Probe, then dispatch exactly once. Probe failure while a release is pending
-/// restores the known-good version before dispatch. No user arguments are ever
-/// used during a probe.
+/// Probe, then dispatch exactly once as a child process. Probe failure while
+/// a release is pending restores the known-good version before dispatch. No
+/// user arguments are ever used during a probe.
 pub fn launch(
     paths: &InstallPaths,
     user_args: &[OsString],
     now_unix: u64,
 ) -> Result<ExitStatus, LaunchError> {
+    let (mut command, executable) = prepare_launch(paths, user_args, now_unix)?;
+    command.status().map_err(|source| LaunchError::Spawn {
+        path: executable,
+        source,
+    })
+}
+
+/// Probe, then replace this process with the selected build. The application
+/// keeps the launcher's PID, so signals aimed at it (launchd's SIGTERM on
+/// unload, a terminal hangup) reach the application and its graceful
+/// shutdown instead of killing a waiting launcher. Returns only on failure.
+#[cfg(unix)]
+pub fn exec(paths: &InstallPaths, user_args: &[OsString], now_unix: u64) -> LaunchError {
+    use std::os::unix::process::CommandExt;
+    match prepare_launch(paths, user_args, now_unix) {
+        Ok((mut command, executable)) => LaunchError::Spawn {
+            path: executable,
+            source: command.exec(),
+        },
+        Err(error) => error,
+    }
+}
+
+fn prepare_launch(
+    paths: &InstallPaths,
+    user_args: &[OsString],
+    now_unix: u64,
+) -> Result<(Command, std::path::PathBuf), LaunchError> {
     let store = StateStore::new(paths.clone());
     let manager = InstallManager::new(paths.clone());
     let mut plan = LaunchPlan::select(paths, &load_snapshot(&store)?)?;
@@ -104,13 +132,8 @@ pub fn launch(
     if let Some(token) = &plan.attempt_token {
         command.env(BOOT_ATTEMPT_TOKEN_ENV, token);
     }
-    command
-        .args(user_args)
-        .status()
-        .map_err(|source| LaunchError::Spawn {
-            path: plan.executable,
-            source,
-        })
+    command.args(user_args);
+    Ok((command, plan.executable))
 }
 
 fn load_snapshot(store: &StateStore) -> Result<InstallState, LaunchError> {
@@ -137,6 +160,9 @@ fn probe_matches_timeout(plan: &LaunchPlan, timeout: Duration) -> Result<bool, L
         let mut command = tokio::process::Command::new(&plan.executable);
         command
             .arg(BOOT_PROBE_ARGUMENT)
+            // The probe must not consume terminal input meant for the
+            // dispatched command.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);

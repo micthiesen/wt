@@ -42,7 +42,7 @@ or a broad artifact sweep.
 and native unit/integration tests on Linux and macOS. Lint, test, and optimized
 builds have separate Cargo caches; CI disables incremental compilation. Pull
 requests run this workflow directly. On `main`, `release.yml` calls the same
-checks while building the four release targets in parallel, then publishes only
+checks while building the three release targets in parallel, then publishes only
 after every check and package succeeds. This avoids a duplicate main-branch test
 run and removes the former Bun workflow. Discord digests and failure alerts
 follow completion of the encompassing native release workflow.

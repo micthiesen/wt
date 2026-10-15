@@ -129,16 +129,18 @@ args = sys.argv[1:]
 if len(args) >= 3 and args[:2] == ['pr', 'view']:
     branch = args[2]
     if branch == 'parent':
-        print(json.dumps({'number': 1, 'baseRefName': 'main', 'state': 'MERGED', 'isDraft': False, 'title': 'Parent', 'id': 'PR_parent', 'headRefOid': ''}))
+        print(json.dumps({'number': 1, 'baseRefName': 'main', 'state': 'MERGED', 'isDraft': False, 'title': 'Parent', 'id': 'PR_parent', 'headRefOid': 'PARENT_HEAD'}))
         sys.exit(0)
     if branch == 'child':
         print(json.dumps({'number': 2, 'baseRefName': 'parent', 'state': 'OPEN', 'isDraft': False, 'title': 'Child', 'id': 'PR_child', 'headRefOid': ''}))
         sys.exit(0)
+    print('no pull requests found for branch "' + branch + '"', file=sys.stderr)
     sys.exit(1)
 if len(args) >= 2 and args[:2] == ['pr', 'edit']:
     sys.exit(0)
 sys.exit(1)
-"##,
+"##
+            .replace("PARENT_HEAD", &parent_head),
         )?;
         fs::set_permissions(&fake_gh, fs::Permissions::from_mode(0o755))?;
         let github = GithubClient::new(
@@ -377,7 +379,7 @@ async fn missing_external_parent_and_no_pr_reconcile_to_trunk() -> Result<()> {
     git(&fixture.main, ["push", "origin", "--delete", "parent"])?;
     fs::write(
         &fixture.fake_gh,
-        "#!/usr/bin/env python3\nimport sys\nif sys.argv[1:3] == ['pr','edit']: sys.exit(0)\nsys.exit(1)\n",
+        "#!/usr/bin/env python3\nimport sys\nif sys.argv[1:3] == ['pr','edit']: sys.exit(0)\nprint('no pull requests found', file=sys.stderr)\nsys.exit(1)\n",
     )?;
     let mut events = Vec::new();
     let result = fixture
@@ -405,6 +407,131 @@ async fn missing_external_parent_and_no_pr_reconcile_to_trunk() -> Result<()> {
     assert!(events.iter().any(
         |event| matches!(event, StackEvent::Log(line) if line.contains("parent parent is gone"))
     ));
+    Ok(())
+}
+
+/// A merged PR proves only the head it merged. When the parent branch gained
+/// commits afterwards (or the name was reused), reparenting the child would
+/// drop them and replaying the parent would resurrect it; refuse instead.
+#[tokio::test]
+async fn merged_parent_with_commits_beyond_the_merged_head_is_refused() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    let parent = fixture.worktrees.join("parent");
+    fs::write(parent.join("parent.txt"), "after the merge\n")?;
+    git(&parent, ["commit", "-am", "parent work after merge"])?;
+    let parent_tip = output(&parent, ["rev-parse", "HEAD"])?;
+    let child_tip = output(&fixture.child, ["rev-parse", "HEAD"])?;
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert!(
+        matches!(&result, RestackOutcome::Refused { error } if error.contains("beyond the merged head")),
+        "{result:?}"
+    );
+    assert_eq!(output(&parent, ["rev-parse", "HEAD"])?, parent_tip);
+    assert_eq!(output(&fixture.child, ["rev-parse", "HEAD"])?, child_tip);
+    let mut store = Store::open(
+        fixture.root.path().join("state.sqlite"),
+        RepositoryIdentity::new("fixture", fixture.main.to_string_lossy()),
+    )?;
+    assert_eq!(
+        store.read_wt_state()?["slugs"]["child"]["baseBranch"],
+        "parent"
+    );
+    Ok(())
+}
+
+/// A parent that merged into a non-trunk ancestor still sits in that
+/// ancestor's stack layout. Restacking the survivors must skip it rather than
+/// replaying and force-pushing the landed branch.
+#[tokio::test]
+async fn landed_member_inside_a_surviving_ancestor_stack_is_not_replayed() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    let root_path = fixture.worktrees.join("root");
+    let original_main = output(&fixture.main, ["rev-parse", "main~1"])?;
+    git(
+        &fixture.main,
+        [
+            "worktree",
+            "add",
+            "-b",
+            "root",
+            root_path.to_str().unwrap(),
+            &original_main,
+        ],
+    )?;
+    let mut store = Store::open(
+        fixture.root.path().join("state.sqlite"),
+        RepositoryIdentity::new("fixture", fixture.main.to_string_lossy()),
+    )?;
+    store.set_slug_base("root", Some(("main", Some(&original_main))))?;
+    store.set_slug_base("parent", Some(("root", Some(&original_main))))?;
+    drop(store);
+    let parent = fixture.worktrees.join("parent");
+    let parent_tip = output(&parent, ["rev-parse", "HEAD"])?;
+    let remote_parent = output(&fixture.main, ["rev-parse", "refs/remotes/origin/parent"])?;
+
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert!(
+        matches!(result, RestackOutcome::Complete { .. }),
+        "{result:?}"
+    );
+    assert_eq!(output(&parent, ["rev-parse", "HEAD"])?, parent_tip);
+    git(&fixture.main, ["fetch", "origin"])?;
+    assert_eq!(
+        output(&fixture.main, ["rev-parse", "refs/remotes/origin/parent"])?,
+        remote_parent
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.child.join("child.txt"))?,
+        "child work\n"
+    );
+    let mut store = Store::open(
+        fixture.root.path().join("state.sqlite"),
+        RepositoryIdentity::new("fixture", fixture.main.to_string_lossy()),
+    )?;
+    assert_eq!(
+        store.read_wt_state()?["slugs"]["child"]["baseBranch"],
+        "root"
+    );
+    Ok(())
+}
+
+/// An unreadable PR state is unknown, not "no PR": the restack refuses
+/// before rewriting anything rather than replaying a possibly landed parent.
+#[tokio::test]
+async fn unreadable_parent_pr_state_refuses_before_any_rewrite() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    fs::write(
+        &fixture.fake_gh,
+        "#!/bin/sh\necho 'HTTP 401: Bad credentials' >&2\nexit 1\n",
+    )?;
+    let child_tip = output(&fixture.child, ["rev-parse", "HEAD"])?;
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(output(&fixture.child, ["rev-parse", "HEAD"])?, child_tip);
     Ok(())
 }
 

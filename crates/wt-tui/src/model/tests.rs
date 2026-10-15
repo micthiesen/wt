@@ -878,6 +878,7 @@ async fn a_controller_owned_write_on_a_remote_row_settles_on_local_reads() {
     ));
     let action = UiAction::ToggleArchive {
         key: "@box/alpha".into(),
+        seen: Some(crate::Seen(false)),
     };
     model.begin_action(1, &action);
     assert!(model.board.rows[0].archived, "shown at once");
@@ -1015,8 +1016,15 @@ fn overlays_consume_navigation_and_cancel_before_global_keys() {
     model.apply(snapshot(&["a", "b"]));
     let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
     model.input(key('?'), 10);
+    // The overlay's draw publishes how far it can scroll.
+    model.help_max_scroll = 40;
     assert_eq!(model.input(key('j'), 10), InputResult::Draw);
     assert_eq!(model.help_scroll, 3);
+    // Scrolling stops where the drawn overlay ends.
+    model.help_max_scroll = 4;
+    model.input(key('j'), 10);
+    assert_eq!(model.help_scroll, 4);
+    model.help_scroll = 3;
     assert_eq!(model.selected, Some(0));
     assert_eq!(model.input(key('q'), 10), InputResult::Draw);
     assert!(!model.help);
@@ -1048,11 +1056,7 @@ fn help_search_filters_rows_and_esc_clears_before_closing() {
     assert!(model.help_searching);
     model.input(key(KeyCode::Char('r')), 20);
     model.input(key(KeyCode::Char('e')), 20);
-    assert!(
-        crate::help::filtered_lines(&model.help_query.text())
-            .iter()
-            .any(|line| line.contains("Refresh"))
-    );
+    assert_eq!(model.help_query.text(), "re");
     assert_eq!(model.input(key(KeyCode::Esc), 20), InputResult::Draw);
     assert!(!model.help_searching);
     assert!(model.help_query.text().is_empty());
@@ -1831,4 +1835,131 @@ fn a_menu_reply_message_survives_dropped_typeahead() {
     });
     let (text, _) = model.toast.clone().unwrap();
     assert!(text.starts_with("Nothing safe to clean"), "{text}");
+}
+
+#[test]
+fn a_rebuild_keeps_the_status_row_chosen_among_rows_sharing_a_value() {
+    // `ready` and `ready + verify after merge` both carry the value `ready`.
+    let ready_with_steps = || {
+        let mut snapshot = board_with_status(Some(wt_core::WorkState::Ready));
+        let record = snapshot.test_data_mut().rows[0]
+            .work
+            .as_mut()
+            .unwrap()
+            .record
+            .as_mut()
+            .unwrap();
+        record.verify_after_merge = Some("check prod".into());
+        snapshot
+    };
+    let label = |model: &Model| match &model.interaction {
+        Interaction::Picker(picker) => picker.options[picker.selected].label.clone(),
+        _ => panic!("menu stays open"),
+    };
+    // Moved from plain `ready` down to the `a` row.
+    let mut model = Model::default();
+    model.apply(board_with_status(Some(wt_core::WorkState::Ready)));
+    model.input(KeyEvent::from(KeyCode::Char('u')), 20);
+    assert_eq!(label(&model), "ready (current)");
+    model.input(KeyEvent::from(KeyCode::Down), 20);
+    assert_eq!(label(&model), "ready + verify after merge");
+    model.apply(board_with_status(Some(wt_core::WorkState::Ready)));
+    assert_eq!(label(&model), "ready + verify after merge");
+    // Moved from the current `a` row up to plain `ready`.
+    let mut model = Model::default();
+    model.apply(ready_with_steps());
+    model.input(KeyEvent::from(KeyCode::Char('u')), 20);
+    assert_eq!(label(&model), "ready + verify after merge (current)");
+    model.input(KeyEvent::from(KeyCode::Up), 20);
+    assert_eq!(label(&model), "ready");
+    model.apply(ready_with_steps());
+    assert_eq!(label(&model), "ready");
+}
+
+#[test]
+fn a_rebuild_keeps_the_section_picker_on_the_last_target() {
+    let mut model = Model::default();
+    let board = || {
+        let mut snapshot = grouped(&["one"], false);
+        snapshot.test_data_mut().section_order =
+            vec!["Batch".into(), "Next".into(), "Later".into()];
+        snapshot
+    };
+    model.apply(board());
+    model.last_section_target = Some(Some("Later".into()));
+    model.input(KeyEvent::from(KeyCode::Char('l')), 20);
+    let value = |model: &Model| match &model.interaction {
+        Interaction::Picker(picker) => picker.options[picker.selected].value.clone(),
+        _ => panic!("menu stays open"),
+    };
+    assert_eq!(value(&model).as_deref(), Some("Later"));
+    // A snapshot arriving while the picker is open does not move the cursor.
+    model.apply(board());
+    assert_eq!(value(&model).as_deref(), Some("Later"));
+}
+
+#[test]
+fn keys_past_the_typeahead_limit_are_reported_when_the_menu_opens() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    let generation = model.ui_generation;
+    model.begin_action(42, &action);
+    for _ in 0..=super::input::TYPEAHEAD_LIMIT {
+        model.input(KeyEvent::from(KeyCode::Down), 20);
+    }
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Actions {
+                surface: crate::ActionSurface::Row { key: "one".into() },
+            },
+            title: "Actions".into(),
+            selected: 0,
+            options: vec![PickerOption {
+                value: Some("a".into()),
+                label: "a".into(),
+                chord: None,
+                note: None,
+                verify_after_merge: None,
+                detail: None,
+            }],
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::Picker(_)));
+    assert_eq!(model.toast.as_ref().unwrap().1, ToastTone::Notice);
+}
+
+#[test]
+fn archive_and_automation_toggles_carry_the_state_the_user_saw() {
+    let mut model = Model::default();
+    let mut shown = snapshot(&["one"]);
+    shown.test_data_mut().rows[0].automations_paused = true;
+    shown.test_data_mut().display.automations = true;
+    model.apply(shown);
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('a')), 20),
+        InputResult::Action(UiAction::ToggleArchive {
+            key: "one".into(),
+            seen: Some(Seen(false)),
+        })
+    );
+    assert_eq!(
+        model.input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), 20),
+        InputResult::Action(UiAction::ToggleAutomations {
+            key: Some("one".into()),
+            seen: Some(Seen(true)),
+        })
+    );
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('A')), 20),
+        InputResult::Action(UiAction::ToggleAutomations {
+            key: None,
+            seen: Some(Seen(false)),
+        })
+    );
 }

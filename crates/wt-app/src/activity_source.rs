@@ -1,6 +1,6 @@
 //! Bounded app-log backfill and manager reports for the output feeds.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -25,9 +25,15 @@ pub struct ActivitySnapshot {
     pub attention: Vec<AttentionLine>,
 }
 
-pub(crate) fn append_activity(board: &mut wt_tui::Board, level: &str, source: &str, text: &str) {
+fn append_activity_at(
+    board: &mut wt_tui::Board,
+    at_ms: u64,
+    level: &str,
+    source: &str,
+    text: &str,
+) {
     let event = ActivityLine {
-        at_ms: epoch_ms(),
+        at_ms,
         level: level.into(),
         channel: "activity".into(),
         source: wt_core::sanitize_terminal_text(source),
@@ -43,8 +49,7 @@ pub(crate) fn append_activity(board: &mut wt_tui::Board, level: &str, source: &s
     bound_feeds(board);
 }
 
-pub(crate) fn append_attention(board: &mut wt_tui::Board, source: &str, text: &str) {
-    let at_ms = epoch_ms();
+fn append_attention_at(board: &mut wt_tui::Board, at_ms: u64, source: &str, text: &str) {
     let source = wt_core::sanitize_terminal_text(source);
     let text = wt_core::sanitize_terminal_text(text);
     if board.attention.iter().rev().take(20).any(|previous| {
@@ -67,6 +72,56 @@ pub(crate) fn append_attention(board: &mut wt_tui::Board, source: &str, text: &s
         text,
     });
     bound_feeds(board);
+}
+
+/// First-seen times of the status lines a derived stage adds on every
+/// compose. Stages rebuild from their upstream board, so stamping a lasting
+/// failure with the current time would make it new on each pass: it could
+/// never be acknowledged and every pass would republish the board. A line
+/// keeps its time while each compose reports it; once a compose omits it
+/// (`sweep`), a recurrence is a new event.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FailureClock {
+    since: HashMap<(&'static str, String, String), u64>,
+    seen: HashSet<(&'static str, String, String)>,
+}
+
+impl FailureClock {
+    /// The time to show for this line in the current compose.
+    pub(crate) fn at(&mut self, channel: &'static str, source: &str, text: &str) -> u64 {
+        let key = (
+            channel,
+            wt_core::sanitize_terminal_text(source),
+            wt_core::sanitize_terminal_text(text),
+        );
+        let at_ms = *self.since.entry(key.clone()).or_insert_with(epoch_ms);
+        self.seen.insert(key);
+        at_ms
+    }
+
+    /// Report a lasting condition on the attention feed.
+    pub(crate) fn attention(&mut self, board: &mut wt_tui::Board, source: &str, text: &str) {
+        let at_ms = self.at("attention", source, text);
+        append_attention_at(board, at_ms, source, text);
+    }
+
+    /// Report a lasting condition on the activity feed.
+    pub(crate) fn activity(
+        &mut self,
+        board: &mut wt_tui::Board,
+        level: &str,
+        source: &str,
+        text: &str,
+    ) {
+        let at_ms = self.at("activity", source, text);
+        append_activity_at(board, at_ms, level, source, text);
+    }
+
+    /// End one compose: lines it did not report have cleared.
+    pub(crate) fn sweep(&mut self) {
+        let seen = std::mem::take(&mut self.seen);
+        self.since.retain(|key, _| seen.contains(key));
+    }
 }
 
 pub(crate) fn bound_feeds(board: &mut wt_tui::Board) {
@@ -655,7 +710,7 @@ mod tests {
             "a recurring failure keeps its latest time"
         );
         let mut board = wt_tui::Board::default();
-        append_attention(&mut board, "wt", "same");
+        append_attention_at(&mut board, epoch_ms(), "wt", "same");
         board.attention.push(AttentionLine {
             at_ms: board.attention[0].at_ms + 60_000,
             source: "wt".into(),
@@ -718,5 +773,27 @@ mod tests {
         let length = std::fs::metadata(&path).unwrap().len();
         let contents = read_tail(&path, length - 9).unwrap();
         assert_eq!(contents, "retained\n");
+    }
+
+    #[test]
+    fn a_lasting_failure_keeps_its_first_time_until_a_compose_omits_it() {
+        let mut clock = FailureClock::default();
+        let compose = |clock: &mut FailureClock, failing: bool| {
+            let mut board = wt_tui::Board::default();
+            if failing {
+                clock.attention(&mut board, "History", "History: database locked");
+            }
+            clock.sweep();
+            board
+        };
+        let first = compose(&mut clock, true);
+        std::thread::sleep(Duration::from_millis(3));
+        // Recomposing an unchanged failure yields an identical board, so
+        // `publish_if_changed` stays quiet and an acknowledgement sticks.
+        assert_eq!(compose(&mut clock, true), first);
+        compose(&mut clock, false);
+        std::thread::sleep(Duration::from_millis(3));
+        let recurred = compose(&mut clock, true);
+        assert!(recurred.attention[0].at_ms > first.attention[0].at_ms);
     }
 }

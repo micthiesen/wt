@@ -1100,18 +1100,8 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
         return;
     }
     let rows = confirm_rows(confirm, width);
-    // `selected` is the first visible logical line; never scroll past the
-    // point where the tail already fits.
-    let mut max_offset = rows.len().saturating_sub(1);
-    let mut tail = 0;
-    for (index, entry) in rows.iter().enumerate().rev() {
-        tail += entry.len();
-        if tail > visible {
-            break;
-        }
-        max_offset = index;
-    }
-    confirm.selected = confirm.selected.min(max_offset);
+    // `selected` is the first visible logical line.
+    confirm.selected = confirm.selected.min(max_entry_offset(&rows, visible));
     let skipped: usize = rows[..confirm.selected].iter().map(Vec::len).sum();
     let total: usize = rows.iter().map(Vec::len).sum();
     let lines = rows
@@ -1129,6 +1119,21 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
         skipped,
         body.height as usize,
     );
+}
+
+/// The last first-entry offset worth scrolling to for wrapped entries:
+/// never past the point where the tail already fits in `visible` rows.
+fn max_entry_offset(rows: &[Vec<Line<'static>>], visible: usize) -> usize {
+    let mut max_offset = rows.len().saturating_sub(1);
+    let mut tail = 0;
+    for (index, entry) in rows.iter().enumerate().rev() {
+        tail += entry.len();
+        if tail > visible {
+            break;
+        }
+        max_offset = index;
+    }
+    max_offset
 }
 
 // ── Logs and performance ────────────────────────────────────────────────
@@ -1200,7 +1205,7 @@ fn cleanup_log(
     let outer = modal.place(area, 76, total, false);
     let body = modal.draw(frame, area, outer);
     let rows = cleanup_rows(lines, body.width as usize);
-    *scroll = (*scroll).min(rows.len().saturating_sub(1));
+    *scroll = (*scroll).min(max_entry_offset(&rows, body.height as usize));
     let skipped: usize = rows[..*scroll].iter().map(Vec::len).sum();
     let rendered: Vec<_> = rows
         .into_iter()
@@ -2194,10 +2199,16 @@ fn filter_blocks(blocks: Vec<HelpBlock>, query: &str) -> Vec<HelpBlock> {
 
 /// Spans for `text` with every case-insensitive match of `query` marked.
 fn highlighted(text: &str, query: &str, style: Style) -> Vec<Span<'static>> {
-    let lower = text.to_lowercase();
-    if query.is_empty() || lower.len() != text.len() {
+    // Match offsets index `text`, so every character must lowercase to the
+    // same byte length (`İ` grows and `K` shrinks; equal totals can hide
+    // both and slice inside a character).
+    let same_offsets = text
+        .chars()
+        .all(|ch| ch.to_lowercase().map(char::len_utf8).sum::<usize>() == ch.len_utf8());
+    if query.is_empty() || !same_offsets {
         return vec![Span::styled(text.to_owned(), style)];
     }
+    let lower = text.to_lowercase();
     let mark = style
         .fg(theme::WARN)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
@@ -2520,6 +2531,33 @@ mod tests {
             selected: 0,
             cancel_key: Some('d'),
         }
+    }
+
+    #[test]
+    fn highlighting_never_slices_inside_a_case_changing_character() {
+        // `K` (Kelvin, three bytes) lowercases to one byte and each `İ`
+        // grows by one, so the lowercase copy has the original's length
+        // but a match at 0 ends inside the Kelvin sign.
+        let text = "\u{212A}\u{130}\u{130} key";
+        let spans = highlighted(text, "k", Style::new());
+        let joined: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(joined, text);
+        let marked = highlighted("Open PR", "pr", Style::new());
+        assert_eq!(marked.len(), 2);
+        assert_eq!(marked[1].content, "PR");
+    }
+
+    #[test]
+    fn wrapped_entries_never_scroll_past_a_fitting_tail() {
+        let rows = vec![
+            vec![Line::raw("a")],
+            vec![Line::raw("b"), Line::raw("b")],
+            vec![Line::raw("c")],
+        ];
+        assert_eq!(max_entry_offset(&rows, 10), 0);
+        assert_eq!(max_entry_offset(&rows, 3), 1);
+        assert_eq!(max_entry_offset(&rows, 1), 2);
+        assert_eq!(max_entry_offset(&[], 3), 0);
     }
 
     #[test]

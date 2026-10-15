@@ -3,7 +3,7 @@
 `wt dev` keeps one supervised development server per local worktree. The
 process runs in a private tmux session named `<slug>-dev`, so it outlives the
 agent terminal while remaining tied to the worktree. Each slug keeps its
-allocated port in wtstate. `{{port}}`, `{{slug}}`, and `{{path}}` are available
+allocated port in the durable state database. `{{port}}`, `{{slug}}`, and `{{path}}` are available
 to configured command hooks.
 
 Port reservations survive stopped servers. Allocation checks the entire
@@ -15,8 +15,10 @@ range are separate conditions.
 `wt dev start [slug]` starts a server, or joins an existing startup. A server
 that is already serving is restarted; a crashed server is recycled. It reports
 that the process launched, not that the project is ready. Add `--wait` to wait
-for a free slot and then for a TCP connection. One `--timeout` budget covers
-both waits. A full slot cap exits with status 75. `--rebuild` runs reset
+for a free slot, then for the port to accept connections, then until the
+configured `health_command` passes. One `--timeout` budget covers all of these
+waits. If the server crashes, or never becomes ready or healthy within the
+budget, the command exits 1 with the last health message when there is one. A full slot cap exits with status 75. `--rebuild` runs reset
 semantics before startup. `wt dev reset [slug]` stops the server, runs
 `reset_command`, and starts again. If `stop_command` fails, reset stops before
 running `reset_command`, because external state may still be active.

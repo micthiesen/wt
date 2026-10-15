@@ -104,50 +104,72 @@ pub struct InstructionsBlock {
     pub body: String,
 }
 
+/// The number of managed blocks a file appears to carry. A stray begin or
+/// end marker counts, so a file with a damaged block reports at least one and
+/// is never treated as block-free (which would append a second block).
 pub fn count_instructions_blocks(text: &str) -> usize {
-    text.match_indices(BEGIN_PREFIX)
+    text.matches(BEGIN_PREFIX)
         .count()
-        .min(text.matches(END_MARKER).count())
+        .max(text.matches(END_MARKER).count())
 }
 
-pub fn extract_instructions_block(text: &str) -> Option<InstructionsBlock> {
-    let begin = text.find(BEGIN_PREFIX)?;
-    let after = &text[begin + BEGIN_PREFIX.len()..];
+/// Byte offsets of the first well-formed block: the begin marker, the body,
+/// and the end of the end marker.
+struct BlockSpan<'a> {
+    start: usize,
+    hash: &'a str,
+    body: std::ops::Range<usize>,
+    end: usize,
+}
+
+fn block_span(text: &str) -> Option<BlockSpan<'_>> {
+    let start = text.find(BEGIN_PREFIX)?;
+    let after = &text[start + BEGIN_PREFIX.len()..];
     let marker_end = after.find("-->")?;
     let marker = &after[..marker_end];
     let hash = marker.split_whitespace().next()?;
     if hash.len() != 12 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let body_start = begin + BEGIN_PREFIX.len() + marker_end + 3;
+    let body_start = start + BEGIN_PREFIX.len() + marker_end + 3;
     let body_start = if text[body_start..].starts_with('\n') {
         body_start + 1
     } else {
         return None;
     };
-    let end = text[body_start..].find(&format!("\n{END_MARKER}"))? + body_start;
-    Some(InstructionsBlock {
-        hash: hash.to_owned(),
-        body: text[body_start..end].to_owned(),
+    let body_end = text[body_start..].find(&format!("\n{END_MARKER}"))? + body_start;
+    Some(BlockSpan {
+        start,
+        hash,
+        body: body_start..body_end,
+        end: body_end + 1 + END_MARKER.len(),
     })
 }
 
+pub fn extract_instructions_block(text: &str) -> Option<InstructionsBlock> {
+    let span = block_span(text)?;
+    Some(InstructionsBlock {
+        hash: span.hash.to_owned(),
+        body: text[span.body].to_owned(),
+    })
+}
+
+/// Replace the managed block, or append one to a file that has none. Callers
+/// must not splice into a file whose markers are damaged or duplicated
+/// (`count_instructions_blocks` reports it); that would append a second block.
 pub fn splice_instructions_block(file_text: &str, block_body: &str) -> String {
     let body = block_body.trim_end_matches('\n');
     let block = format!(
         "{BEGIN_PREFIX}{} (managed by `wt skills`; edits inside are overwritten) -->\n{body}\n{END_MARKER}",
         content_hash(body)
     );
-    if extract_instructions_block(file_text).is_some() {
-        let start = file_text
-            .find(BEGIN_PREFIX)
-            .expect("extracted block has marker");
-        let end = file_text[start..]
-            .find(END_MARKER)
-            .expect("extracted block has end")
-            + start
-            + END_MARKER.len();
-        return format!("{}{}{}", &file_text[..start], block, &file_text[end..]);
+    if let Some(span) = block_span(file_text) {
+        return format!(
+            "{}{}{}",
+            &file_text[..span.start],
+            block,
+            &file_text[span.end..]
+        );
     }
     if file_text.trim().is_empty() {
         return format!("{block}\n");
@@ -191,5 +213,27 @@ mod tests {
         assert!(two.starts_with("user text\n\n"));
         assert_eq!(extract_instructions_block(&two).unwrap().body, "NEW");
         assert_eq!(count_instructions_blocks(&format!("{two}\n{two}")), 2);
+    }
+
+    #[test]
+    fn splice_replaces_exactly_the_extracted_block() {
+        // An end marker quoted inside the body must not cut the block short.
+        let one = splice_instructions_block("a\n", "quoted <!-- wt:instructions:end --> inline");
+        let two = splice_instructions_block(&format!("{one}tail\n"), "NEW");
+        assert_eq!(extract_instructions_block(&two).unwrap().body, "NEW");
+        assert!(
+            two.ends_with("<!-- wt:instructions:end -->\ntail\n"),
+            "{two}"
+        );
+        assert!(!two.contains("inline"));
+    }
+
+    #[test]
+    fn damaged_markers_still_count_as_a_block() {
+        let one = splice_instructions_block("", "RULES");
+        let without_end = one.replace(END_MARKER, "");
+        assert!(extract_instructions_block(&without_end).is_none());
+        assert_eq!(count_instructions_blocks(&without_end), 1);
+        assert_eq!(count_instructions_blocks("plain text"), 0);
     }
 }

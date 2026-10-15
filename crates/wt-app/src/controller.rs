@@ -1607,7 +1607,10 @@ mod tests {
             for action in [
                 UiAction::CyclePrimary,
                 UiAction::CancelAutomations,
-                UiAction::ToggleAutomations { key: None },
+                UiAction::ToggleAutomations {
+                    key: None,
+                    seen: None,
+                },
                 UiAction::GithubMarkReady {
                     key: "existing".into(),
                     pin: None,

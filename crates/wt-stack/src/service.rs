@@ -18,7 +18,7 @@ use wt_vcs::{GitRepository, RepositoryError};
 use crate::{
     backup::{PruneBackupsResult, prune_backups},
     chain::{RestackChain, resolve_chain},
-    git::git_sha,
+    git::{git_sha, is_ancestor},
     replay::{ReplayContext, replay_chain},
 };
 
@@ -205,9 +205,13 @@ impl StackService {
                 });
             }
         }
-        let landed = self
+        let landed = match self
             .reconcile_locked(&chain, &trunk, cancellation, on_event)
-            .await?;
+            .await?
+        {
+            Ok(landed) => landed,
+            Err(error) => return Ok(RestackOutcome::Refused { error }),
+        };
         let mut candidates = chain
             .steps
             .iter()
@@ -224,7 +228,7 @@ impl StackService {
         let mut moved_count = 0;
         let mut total = 0;
         for candidate in candidates.drain(..) {
-            let Some(candidate_chain) = self
+            let Some(mut candidate_chain) = self
                 .resolve_chain(&candidate, &stack_trunk, cancellation)
                 .await?
             else {
@@ -242,6 +246,12 @@ impl StackService {
                     error: "stack membership changed during restack; retry after refreshing".into(),
                 });
             }
+            // A landed member can still sit in a surviving ancestor's layout
+            // (it merged into a non-trunk parent). Replaying it would re-apply
+            // its merged commits and force-push, resurrecting the branch.
+            candidate_chain
+                .steps
+                .retain(|step| !landed.contains(&step.branch));
             let result = replay_chain(
                 &ReplayContext {
                     service: self,
@@ -398,13 +408,15 @@ impl StackService {
         .map_err(Into::into)
     }
 
+    /// Reparent members whose parent landed. The outer error is an operation
+    /// failure; the inner one refuses the restack before any rewrite.
     async fn reconcile_locked(
         &self,
         chain: &RestackChain,
         trunk: &str,
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(StackEvent) + Send),
-    ) -> Result<BTreeSet<String>, StackError> {
+    ) -> Result<Result<BTreeSet<String>, String>, StackError> {
         let in_chain = chain
             .steps
             .iter()
@@ -418,10 +430,27 @@ impl StackService {
         let mut landed = BTreeSet::new();
         for parent in parents {
             let live = self.github.view_pr(&parent, cancellation).await?;
-            if live.as_ref().is_some_and(|pr| pr.state == "MERGED") {
-                let number = live.as_ref().map(|pr| pr.number).unwrap_or_default();
+            if let Some(pr) = live.as_ref().filter(|pr| pr.state == "MERGED") {
+                // A merged PR proves only the head it merged. A reused branch
+                // name or commits added after the merge must neither be dropped
+                // by reparenting nor resurrected by replaying the parent.
+                let parent_path = in_chain
+                    .get(&parent)
+                    .map_or(self.config.main_clone.as_path(), |step| {
+                        std::path::Path::new(&step.worktree_path)
+                    });
+                if !self
+                    .merged_head_covers_branch(parent_path, &parent, &pr.head_ref_oid, cancellation)
+                    .await?
+                {
+                    return Ok(Err(format!(
+                        "parent {parent}'s PR #{} merged, but {parent} has commits beyond the merged head; reconcile it before restacking",
+                        pr.number
+                    )));
+                }
                 on_event(StackEvent::Log(format!(
-                    "parent {parent} merged (#{number})"
+                    "parent {parent} merged (#{})",
+                    pr.number
                 )));
                 landed.insert(parent);
                 continue;
@@ -435,7 +464,7 @@ impl StackService {
             }
         }
         if landed.is_empty() {
-            return Ok(landed);
+            return Ok(Ok(landed));
         }
         for step in &chain.steps {
             let Some(parent) = step.parent_branch.as_deref() else {
@@ -462,7 +491,39 @@ impl StackService {
                 step.branch
             )));
         }
-        Ok(landed)
+        Ok(Ok(landed))
+    }
+
+    /// Whether a merged PR head contains the branch's current tip. A branch
+    /// gone everywhere has nothing left to lose; an unknown head proves nothing.
+    async fn merged_head_covers_branch(
+        &self,
+        cwd: &std::path::Path,
+        branch: &str,
+        merged_head: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, StackError> {
+        let mut tip = None;
+        for (repository, reference) in [
+            (cwd, format!("refs/heads/{branch}")),
+            (cwd, format!("refs/remotes/origin/{branch}")),
+            (
+                self.config.main_clone.as_path(),
+                format!("refs/remotes/origin/{branch}"),
+            ),
+        ] {
+            tip = git_sha(&self.processes, repository, &reference, cancellation).await?;
+            if tip.is_some() {
+                break;
+            }
+        }
+        let Some(tip) = tip else {
+            return Ok(true);
+        };
+        if merged_head.is_empty() {
+            return Ok(false);
+        }
+        is_ancestor(&self.processes, cwd, &tip, merged_head, cancellation).await
     }
 
     async fn set_base(

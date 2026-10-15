@@ -205,34 +205,7 @@ impl Store {
         let id = self.identity.id.clone();
         let db = self.writable_db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stored: Option<String> = tx
-            .query_row(
-                "SELECT data FROM repository_state WHERE repo_id = ?1 LIMIT 1",
-                [&id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let (mut state, did_migrate) = match stored {
-            Some(text) => {
-                let parsed: serde_json::Value = serde_json::from_str(&text)?;
-                let version = crate::raw_wt_state_version(&parsed);
-                let migrated = crate::migrate_wt_state(parsed);
-                (
-                    crate::mutations::normalize_state(migrated.value),
-                    version < crate::CURRENT_WT_STATE_VERSION,
-                )
-            }
-            None => (crate::mutations::empty_state(), false),
-        };
-        let (result, changed) = mutate(&mut state)?;
-        if changed || did_migrate {
-            let encoded = serde_json::to_string(&state)?;
-            tx.execute(
-                "INSERT INTO repository_state (repo_id, data, updated_at) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(repo_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
-                params![id, encoded, now_ms()],
-            )?;
-        }
+        let result = mutate_wt_state_tx(&tx, &id, mutate)?;
         tx.commit()?;
         Ok(result)
     }
@@ -287,6 +260,51 @@ impl Store {
             )?
         };
         Ok(changed != 0)
+    }
+
+    /// Archive or restore `key` from the state the user saw. With `seen`, the
+    /// write is refused unless the marker still reads `seen`. Archiving folds
+    /// `archived_section`; restoring files the row back in the Inbox. The
+    /// compare, the marker and the layout share one transaction.
+    pub fn toggle_archived_seen(
+        &mut self,
+        key: &str,
+        seen: Option<bool>,
+        archived_section: &str,
+    ) -> Result<crate::SeenToggle, StoreError> {
+        let id = self.identity.id.clone();
+        let db = self.writable_db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archived_worktrees WHERE repo_id = ?1 AND worktree_key = ?2)",
+            params![id, key],
+            |row| row.get(0),
+        )?;
+        if let Some(stale) = crate::SeenToggle::stale(current, seen) {
+            return Ok(stale);
+        }
+        let archived = !current;
+        if archived {
+            tx.execute(
+                "INSERT OR IGNORE INTO archived_worktrees (repo_id, worktree_key, archived_at) VALUES (?1, ?2, ?3)",
+                params![id, key, now_ms()],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM archived_worktrees WHERE repo_id = ?1 AND worktree_key = ?2",
+                params![id, key],
+            )?;
+        }
+        mutate_wt_state_tx(&tx, &id, |state| {
+            let changed = if archived {
+                crate::mutations::fold_section(state, archived_section, true)
+            } else {
+                !crate::mutations::move_to_section(state, &[key.to_owned()], None).is_empty()
+            };
+            Ok(((), changed))
+        })?;
+        tx.commit()?;
+        Ok(crate::SeenToggle::Set(archived))
     }
 
     /// Reconcile archive markers against a complete inventory under the
@@ -626,6 +644,44 @@ fn ensure_identity_matches(
         });
     }
     Ok(())
+}
+
+/// Read, migrate, mutate and (when changed) write the repository's JSON state
+/// inside the caller's transaction.
+fn mutate_wt_state_tx<R>(
+    tx: &Transaction<'_>,
+    id: &str,
+    mutate: impl FnOnce(&mut WtState) -> Result<(R, bool), StoreError>,
+) -> Result<R, StoreError> {
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT data FROM repository_state WHERE repo_id = ?1 LIMIT 1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (mut state, did_migrate) = match stored {
+        Some(text) => {
+            let parsed: serde_json::Value = serde_json::from_str(&text)?;
+            let version = crate::raw_wt_state_version(&parsed);
+            let migrated = crate::migrate_wt_state(parsed);
+            (
+                crate::mutations::normalize_state(migrated.value),
+                version < crate::CURRENT_WT_STATE_VERSION,
+            )
+        }
+        None => (crate::mutations::empty_state(), false),
+    };
+    let (result, changed) = mutate(&mut state)?;
+    if changed || did_migrate {
+        let encoded = serde_json::to_string(&state)?;
+        tx.execute(
+            "INSERT INTO repository_state (repo_id, data, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(repo_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![id, encoded, now_ms()],
+        )?;
+    }
+    Ok(result)
 }
 
 fn replace_archived_keys_tx(

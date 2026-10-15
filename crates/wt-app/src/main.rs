@@ -423,8 +423,14 @@ async fn run_application(
             caches: crate::query_cache::store(&config),
         };
         let result = dispatch_command(&context, command).await;
-        database.shutdown().await?;
-        return result;
+        // A failed drain must not replace the command's own failure.
+        let shutdown = database.shutdown().await;
+        if let (Err(_), Err(error)) = (&result, &shutdown) {
+            tracing::error!(%error, "state database shutdown failed");
+        }
+        let code = result?;
+        shutdown?;
+        return Ok(code);
     }
     let (actions, controller_port) = wt_tui::action_channel();
     let caches = query_cache::store(&config);
@@ -444,7 +450,7 @@ async fn run_application(
     skills::startup_check(&context).await?;
     let events_context = context.clone();
     scope.spawn(async move {
-        if let Err(error) = events::reconcile_at_startup(&events_context).await {
+        if let Err(error) = events::reconcile(&events_context).await {
             tracing::warn!(%error, event_channel = "attention", "GitHub events service reconciliation failed");
         }
     });
@@ -466,10 +472,14 @@ async fn run_application(
     // Even a failed drain consumed its full grace period. The outer error path
     // must report it without waiting through that same grace period again.
     *scope_drained = true;
-    database.shutdown().await?;
+    let database_closed = database.shutdown().await;
+    if let Err(error) = &database_closed {
+        tracing::error!(%error, "state database shutdown failed");
+    }
     actions_finished?;
     shutdown?;
     result.context("terminal")?;
+    database_closed?;
     Ok(0)
 }
 

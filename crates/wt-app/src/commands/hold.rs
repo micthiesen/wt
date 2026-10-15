@@ -206,6 +206,10 @@ fn validate_record(value: &str, label: &str) -> Result<String> {
 fn canonical_timestamp(value: &str) -> Result<String> {
     // Rfc3339 accepts only timestamps with an explicit timezone. Keep parity
     // with the TS contract's millisecond precision and canonical UTC output.
+    // The byte slicing below assumes ASCII; anything else is not a timestamp.
+    if !value.is_ascii() {
+        bail!("timestamp must be ISO 8601 with an explicit timezone");
+    }
     let zone_start = if value.ends_with('Z') {
         value.len() - 1
     } else {
@@ -650,6 +654,14 @@ mod tests {
                 .unwrap()
                 .active
         );
+    }
+
+    #[test]
+    fn non_ascii_timestamps_are_rejected_without_panicking() {
+        // The last six bytes start inside a multibyte character.
+        for value in ["2026-10-15T00:00:00é00000", "2026-10-15T00:00:00ééé", "é"] {
+            assert!(canonical_timestamp(value).is_err(), "{value}");
+        }
     }
 
     fn floor_millis(value: OffsetDateTime) -> OffsetDateTime {

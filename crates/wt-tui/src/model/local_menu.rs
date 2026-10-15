@@ -4,7 +4,15 @@
 use std::mem::discriminant;
 
 use super::{ConfirmPrompt, InputResult, Interaction, Model, PickerPrompt, ToastTone};
-use crate::{LocalMenu, Menu, UiAction, UiModal, UiReply};
+use crate::{LocalMenu, Menu, PickerOption, UiAction, UiModal, UiReply};
+
+/// What identifies a picker choice across rebuilds: its value, plus its
+/// chord for options that share a value.
+pub(crate) type OptionIdentity = (Option<String>, Option<char>);
+
+fn identity(option: &PickerOption) -> OptionIdentity {
+    (option.value.clone(), option.chord)
+}
 
 impl Model {
     /// Answer a requested action from the board when it is a board menu.
@@ -27,7 +35,7 @@ impl Model {
                     ..Default::default()
                 });
                 self.local_menu = Some(action);
-                self.local_menu_default = self.picker_value();
+                self.local_menu_default = self.picker_identity();
                 self.background.extend(warm.map(|warm| *warm));
             }
             LocalMenu::Notice(text) => {
@@ -51,13 +59,10 @@ impl Model {
         }
     }
 
-    /// The value of the highlighted picker option, if a picker is open.
-    fn picker_value(&self) -> Option<Option<String>> {
+    /// The identity of the highlighted picker option, if a picker is open.
+    fn picker_identity(&self) -> Option<OptionIdentity> {
         match &self.interaction {
-            Interaction::Picker(picker) => picker
-                .options
-                .get(picker.selected)
-                .map(|option| option.value.clone()),
+            Interaction::Picker(picker) => picker.options.get(picker.selected).map(identity),
             _ => None,
         }
     }
@@ -90,15 +95,27 @@ impl Model {
                 },
             ) if discriminant(&picker.action) == discriminant(&action) => {
                 let current = picker.options.get(picker.selected);
-                let untouched =
-                    current.map(|current| &current.value) == self.local_menu_default.as_ref();
+                let untouched = current.map(identity) == self.local_menu_default;
+                let default = Self::picker_default(
+                    self.last_section_target.as_ref(),
+                    &action,
+                    &options,
+                    default,
+                );
                 let selected = current
                     .filter(|_| !untouched)
                     .and_then(|current| {
+                        // Two options may share a value (`ready` and `ready +
+                        // verify after merge`); their chord tells them apart.
                         options
                             .iter()
                             .position(|option| {
-                                current.value.is_some() && option.value == current.value
+                                current.value.is_some() && identity(option) == identity(current)
+                            })
+                            .or_else(|| {
+                                options.iter().position(|option| {
+                                    current.value.is_some() && option.value == current.value
+                                })
                             })
                             .or_else(|| {
                                 options
@@ -109,8 +126,7 @@ impl Model {
                     .unwrap_or(if untouched { default } else { picker.selected })
                     .min(options.len().saturating_sub(1));
                 if untouched {
-                    self.local_menu_default =
-                        options.get(selected).map(|option| option.value.clone());
+                    self.local_menu_default = options.get(selected).map(identity);
                 }
                 *picker = PickerPrompt {
                     action,

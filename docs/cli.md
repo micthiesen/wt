@@ -4,12 +4,16 @@
 
 Environment variables: `WT_CONFIG` selects the user config and `XDG_CONFIG_HOME` relocates its default location (see [configuration.md](configuration.md)). Configuration is resolved once per process. The macOS `wt events` launch agent receives the config selection needed to load the same repository settings.
 
-### `wt init [directory] [--primary <claude|codex|opencode|pi>]`
+### `wt init [directory] [--primary <claude|codex|opencode|pi>] [--prefix <namespace>]`
 
 Create `.wt.toml` at the containing Git repository root. This command does not
 require an existing valid wt config. It detects the trunk branch, creates
 defaults for a sibling worktree root, and assigns path-derived cache and tmux
 namespaces. It refuses to overwrite an existing file.
+
+`--prefix` sets the branch namespace (`branch.prefix`). It is required when the
+user config does not already provide one, and must be a valid nonempty Git
+branch namespace.
 
 Use `wt init --primary codex` (or `pi` / `opencode` / `claude`) to write
 `[harness] primary` into the repository config. Omit the flag to inherit
@@ -57,7 +61,7 @@ rows with `host`. If any host is unavailable or returns invalid inventory, the
 whole command fails without printing partial JSON. Use this for fleet-wide
 safety checks; ordinary `wt ls` remains local.
 
-List all non-main worktrees (slug, stage when `[deploy.sst]` is configured, PR, status). Worktrees destroyed in the last 48h stay visible — a dim `recently merged:` footer under the table, and an empty list says why it's empty (`No active worktrees (2 archived today: x, y).`) — so "everything landed" never reads identically to "nothing exists". Derived from the existing removed-worktrees history; the TUI's `h` view keeps the full 14-day record.
+List all non-main worktrees (slug, stage when `[deploy.sst]` is configured, PR, status). Worktrees destroyed in the last 48h stay visible — a `recently merged: x, y` footer under the table, and an empty list says why it's empty (`No worktrees.` when nothing was removed recently, otherwise `No active worktrees (N recently removed).`) — so "everything landed" never reads identically to "nothing exists". Derived from the existing removed-worktrees history; the TUI's `h` view keeps the full 14-day record.
 
 - `--json` — machine-readable array (slug, branch, path, stage, section, base, status, `dev`, dirty, issue_id, issue_url, work_state, …). `dev` is the same `DevServerStatus` snapshot used by local rows and lets a controller render a worker's running, starting, queued, restarting, crashed, and stale-after-rebase states without a second SSH query. `section` is the manual TUI section the human placed the row in (`null` = inbox; inferred stack groupings never appear here — they're derived, not stored). `base` is the effective merge target (recorded fork base for stacked worktrees, else `[branch] base`) — never null. Recently-removed rows are appended with `pr`, `pr_url`, `title`, `archived_at`, and the work status the row held when its checkout went away (`work_state`, `verify_after_merge`, `verification_owed`). Those three are flat, matching `wt status --all --json` rather than `wt fleet --json`'s nested `work`, because all three commands append this same entry. **`verification_owed: false` with `work_state: null` means UNKNOWN, not clean** — the entry predates the field (added at state v10) or the row held no status; the per-slug record is reaped with the worktree, so for older entries the answer is genuinely gone. **Every row carries `kind`** — `"live"` for the worktrees that exist, `"merged"` (PR landed) or `"removed"` for the history — so filter on the value, never on the field's absence. It is the same field with the same values on `wt fleet --json` and `wt status --all --json`; a caller that skips it counts landed branches as fleet, which is how four removed rows nearly got filed into sections. Live rows were unlabelled until 2026-08-17, so the remote-section parser keeps a row whose `kind` is absent OR `"live"` (a presence test would empty the whole host section against a newer remote).
 - Worker exception: `[instance] role = "worker"` always reports `section: null`.
@@ -72,7 +76,7 @@ Create a worktree from an issue id (optionally followed by pasted title words), 
 Issue-id input resolves like this:
 
 - `wt new ENG-1953 fix calendar rendering` — id + title words mints `yourname/eng-1953-fix-calendar-rendering`.
-- `wt new ENG-1953` — bare id mints a fresh branch with a random readable suffix (`yourname/eng-1953-cozy-elephant`), so repeat entries just create more worktrees for the same task — that's the intended way to get a second one.
+- `wt new ENG-1953` — bare id mints a fresh branch with a unique hex suffix (`yourname/eng-1953-task-1a2b3c4d5e`), so repeat entries just create more worktrees for the same task — that's the intended way to get a second one.
 - `wt new --attach ENG-1953` — attach to that id's *existing* branch instead: one match checks out, several offer a picker (interactive shells only — scripted calls error and must pass the branch explicitly), none is an error.
 - Multiword input without a leading id (`wt new fix the calendar`) slugifies wholesale to `yourname/fix-the-calendar` — issue-less worktrees are first-class.
 - With `[issue_tracker] prefix` set (e.g. `"eng"`), a differently-prefixed id (`wt new GH-970 …`) is rejected with guidance: a GitHub issue attaches as the secondary id via `--gh`, never as the worktree's identity.
@@ -106,7 +110,7 @@ source files in this list.
 - `--yes` / `-y` — skip confirmations.
 - `--force` — remove despite uncommitted / unpushed work, or an outstanding post-merge verification.
 - `--destroy-stage` / `--no-destroy-stage` — force the SST stage decision (default: prompt when your stage looks deployed).
-- `--delete-branch` / `--keep-branch` — default deletes the branch.
+- `--keep-branch` — keep the branch. Deleting it is the default, so `--delete-branch` is accepted but changes nothing; the two conflict.
 - `--background` / `-b` — dispatch as a background job (watch with `wt logs <slug>`).
 
 Removal also closes the browser tabs the worktree's agents opened, two ways. It deletes the worktree's `browser-control` session (`wt-<slug>`, the `BROWSER_CONTROL_SESSION` every harness session inherits — see [fleet.md](fleet.md#the-design-responses)), which closes that session's page while the relay still holds a live target for it; and it closes every browser tab parked on the worktree's dev port, by driving the running Chromium browsers over AppleScript. The second pass exists because the first silently stops closing anything once the debugger detaches from the tab (DevTools opened on it, "Cancel" on the debugging banner, a browser restart) — `session delete` still succeeds and still reports the id, but the tab lives on. Best-effort and silent: no `browser-control`, no relay, no browsing, or no Chromium browser open all mean nothing happens.
@@ -119,7 +123,7 @@ And it reaps hand-started servers: any process holding a **listening TCP socket*
 
 Remove every worktree that is merged or whose remote branch is gone. "Gone" is only auto-cleaned when a merged PR confirms the content actually landed; anything riskier is left for an explicit `wt rm`.
 
-**Never forces, and has no `--force`.** A candidate that still owes a [post-merge verification](#--verify-after-merge-steps--the-check-that-can-only-run-once-it-ships) is listed under "Skipping" with the steps it owes and the command that discharges them — every candidate here has landed by construction, which is exactly when that check comes due, and sweeping the row deletes the obligation along with the checkout. A candidate holding uncommitted changes is listed under "Skipping" and kept, however thoroughly its branch landed: "merged" is a claim about the branch, and the working tree answers a different question — a merged worktree collects new edits the moment anyone reopens a session in it. Discarding work stays deliberate and one worktree at a time (`wt rm <slug> --force`). This guard lives here rather than in the backend because no backend supplies it: `rift remove` trashes a dirty checkout, and a rift worktree is an independent clone, so its objects, branch and reflog go with the directory (see [backends.md](backends.md)).
+**Never forces, and has no `--force`.** A candidate that still owes a [post-merge verification](#--verify-after-merge-steps--the-check-that-can-only-run-once-it-ships) is reported as `Keeping <slug>: post-merge verification still owed` (read the steps with `wt status <slug>`) — every candidate here has landed by construction, which is exactly when that check comes due, and sweeping the row deletes the obligation along with the checkout. A candidate holding uncommitted changes is reported as `Keeping <slug>: <hazards>` and kept, however thoroughly its branch landed: "merged" is a claim about the branch, and the working tree answers a different question — a merged worktree collects new edits the moment anyone reopens a session in it. Discarding work stays deliberate and one worktree at a time (`wt rm <slug> --force`). This guard lives here rather than in the backend because no backend supplies it: `rift remove` trashes a dirty checkout, and a rift worktree is an independent clone, so its objects, branch and reflog go with the directory (see [backends.md](backends.md)).
 
 - `--yes` / `-y` — skip confirmation (required non-interactively).
 - `--destroy-stage` / `--no-destroy-stage` — apply to all candidates (default: per-worktree, destroy iff its stage is live).
@@ -142,14 +146,16 @@ Exit codes: `0` armed, `2` usage, `75` **temporary** — a required check has no
 
 ### `wt doctor [<slug>]`
 
-Health report: working tree, sync vs trunk, dependency-directory presence, locks, configured GitHub base, landed status, and PR/CI state. Select one worktree, default to the worktree containing cwd, or use `--all`. It also reports relevant machine-level issues such as the main clone's branch, pending bundled skill updates, and coding-agent message-transport health.
+Per-worktree health report. Each worktree gets a block of checks: `working tree`, `sync` vs trunk, `dependencies` (a `node_modules` presence check when the checkout has a `package.json`), `operation lock`, `gh merge base` (the `branch.<name>.gh-merge-base` config against the recorded base), `PR / CI`, and `merged` (landed status). Select one worktree, default to the worktree containing cwd, or use `--all`. Exit code is 1 when any check is an error.
 
-- `--all` / `-a` — force the full summary table.
+Unless `--json` is given, it first prints machine-level banners, only when something is wrong: the main clone is detached or off the configured trunk, stale `claude`/`codex`/`opencode` shims in `<cache root>/shims` (`Claude messaging`; run `wt claude selftest` after removing them), and `wt` missing from or resolving differently on `PATH`. It does not check bundled skill updates (see `wt skills status`) or Codex message transport (see `wt codex selftest`), and it prints no summary table.
+
+- `--all` / `-a` — report every non-main worktree (also the default outside a worktree); cannot be combined with a target. `<slug>` accepts a slug, branch, or unique slug prefix.
 - `--json` — machine-readable.
 
-These checks are conditional rather than universal:
+Conditional checks:
 
-- **SST stage pin + deploy state** (and the summary table's `stage` column) appear only when `[deploy.sst]` is configured. Without the integration there is no stage to pin, so the check would warn forever on every row.
+- **SST stage pin + deploy state** (`sst stage`, `sst deploy`) appear only when `[deploy.sst]` is configured. Without the integration there is no stage to pin, so the check would warn forever on every row.
 - **Dependency directory** reports whether `node_modules` exists when the checkout has a `package.json`. It does not inspect package-manager internals or establish that installed dependencies match the lockfile.
 
 ### `wt open [<slug-or-query>]`
@@ -164,9 +170,9 @@ A failing command prints its operation context and cause, then exits non-zero. U
 
 List SST stages in the configured state bucket and flag orphans (no matching live worktree). Requires `[deploy.sst]`.
 
-- `--clean` — destroy orphaned stages (`sst remove` per stage, in the main clone).
+- `--clean` — destroy verified orphaned stages (`pnpm sst remove` per stage, in the main clone).
 - `--yes` / `-y` — skip the destroy confirmation.
-- `--json` — machine-readable `{live, orphaned}`.
+- `--json` — machine-readable `{live, orphaned, unknown}`; see [stages.md](stages.md).
 
 ### `wt dev <start|reset|stop|status|queue|logs> [<slug>]`
 
@@ -178,6 +184,8 @@ If `stop_command` fails, `stop` exits 1 instead of claiming the entire environme
 
 Flags:
 
+- `start --rebuild` — reset the project state (as `reset` does) and then start, instead of a plain start.
+- `logs --lines <n>` — number of lines to print (default 200, clamped to 1-5000).
 - `start --wait [--timeout <secs>]` — when `[dev_server] max_concurrent` is set and the fleet is full, queue until a slot opens instead of refusing. Default timeout 1800s; on expiry it exits `75` like a plain refusal. While queued the slug shows in `wt dev status --all` and on its own board row, so a waiting agent doesn't read as a stalled one.
 - `status --all` — the fleet view: slots in use against the cap, every dev server and whether it's up or crashed, the queue with ages and tiers, and the machine's **1-minute load against its core count**. Works from anywhere; it needs no subject worktree. The load line is there because slots ration *stacks*, not load: a test run, a build or a type-check is neither queued nor counted, so every slot can read healthy on a box that is far past capacity (observed: 3 of 4 slots in use at load 84.9 on 12 cores). Past 2× cores it says so, and points at `wt perf` — a test timing out on a saturated box is measuring the box.
 - `queue` — print the wait queue. `queue <slug> --first` moves a waiter ahead of every ordinary one; `queue <slug> --normal` gives its place back. See below.
@@ -226,6 +234,8 @@ inputs before recommending limits; one slow run does not justify fleet-wide
 defaults or stopping another task.
 
 ### `wt base <slug>` / `wt base set <slug> <ref>` / `wt base clear <slug>`
+
+An unknown or ambiguous slug exits 1 with the reason.
 
 Show or change a worktree's fork base. `clear` returns its parent to trunk while retaining the saved commit anchor, so a later restack can still distinguish the parent's work after a squash merge. Explicit `set` records a merge base and rejects stack cycles. This record is the stack primitive (see [stacked-prs.md](stacked-prs.md)): the TUI's base row, stack grouping, sync counts, diff, and AI summary all resolve against it, and `wt restack` replays onto it.
 
@@ -276,7 +286,7 @@ guest-only meeting and open its guest link. 3. Assert the ParticipantIdentity
 is guest_<name>_<epochms>-<16 hex>.
 ```
 
-Write the steps in full: this is the one field deliberately allowed to be verbose, because the literal strings *are* the payload (the exact identity format, the exact log line, the error code) and a tidier summary of them is a lossy rewrite of a spec. Nothing in wt ever summarizes it. The shape is instead what lets the surfaces stay readable **without touching the text**: the details pane collapses it to its opening lines until the branch lands (`V` expands, see [tui.md](tui.md)), while the attention feed, the `wt status` confirmation and the `UNVERIFIED — owed:` footers in `wt ls` / `wt fleet` / `wt claude` carry the first sentence and mark the cut with `...`. Every one of those recovers the full field from the record — `wt status <slug>`, `--json`, and the log file always print it whole. Which is also why the opening line has to stand alone, and the steps have to be numbered: an unnumbered wall cannot be counted, previewed, or resumed halfway.
+Write the steps in full: this is the one field deliberately allowed to be verbose, because the literal strings *are* the payload (the exact identity format, the exact log line, the error code) and a tidier summary of them is a lossy rewrite of a spec. Nothing in wt ever summarizes it. The shape is instead what lets the surfaces stay readable **without touching the text**: the details pane collapses it to its opening lines until the branch lands (`V` expands, see [tui.md](tui.md)), while the attention feed, and the `wt status` confirmation (`owed: ...`) carry the first sentence and mark the cut with `...`. Every one of those recovers the full field from the record — `wt status <slug>`, `--json`, and the log file always print it whole. Which is also why the opening line has to stand alone, and the steps have to be numbered: an unnumbered wall cannot be counted, previewed, or resumed halfway.
 
 **It is the opposite of `--blocked-on`, and confusing the two would destroy it.** A gate holds a row OUT of the merge band; this changes nothing before the merge. The row sorts and renders exactly as `ready`, because merging is not what it gates — merging is the *prerequisite*. If it ever sinks a mergeable row it has become a second `--blocked-on`, which is the failure it exists to avoid.
 
@@ -295,7 +305,7 @@ Unlike a gate it is dormant until the branch lands, so there is nothing to prote
 
 It is a **skip hint, never authority**. Absent, stale, or unrecognised all mean "look properly", so the failure direction is wasted work rather than a missed row. And it is write-once and self-expiring, which is the only reason it is safe to store at all.
 
-**It is anchored on two SHAs — the row's HEAD and its base's — and `examined_current` requires both.** The base half is what keeps the safety property true. A pull request goes from behind to conflicted because the BASE moved, which leaves the row's own head untouched; anchoring on the row alone would keep a verdict valid across exactly the transition that voids it, and a sweep would skip the row that most needs attention. That inverts the failure direction from wasted work to a missed row, which is the one thing this field must never do. Historical incident caught before it bit: a coordinator was about to stamp "behind only, no action" across 28 pull requests at the start of a merge batch. Invalidating on base movement costs re-examination while the trunk is moving and nothing while it is quiet — the right way round twice, since a settled fleet is when skipping pays and a moving trunk is when every mergeability verdict is suspect. The base tip is resolved in the **main clone** (`baseTipSha`), not in the worktree, and both the write and the read use that one helper. Under the `rift` backend a worktree is an independent clone whose `origin/<trunk>` is only as fresh as its own last fetch — historically measured at 10 distinct answers across 28 rows, one of them 9 merges behind — so anchoring on the worktree's view would pin the verdict to a SHA that trunk moving never changes, which is the missed-row failure all over again. A record written before the base anchor existed cannot prove the base held still, so it reads as not-current rather than current. `wt status --all --json` carries `examined` plus `examined_current` (the boolean a sweep keys its early-out on).
+**It is anchored on two SHAs — the row's HEAD and its base's — and `examined_current` requires both.** The base half is what keeps the safety property true. A pull request goes from behind to conflicted because the BASE moved, which leaves the row's own head untouched; anchoring on the row alone would keep a verdict valid across exactly the transition that voids it, and a sweep would skip the row that most needs attention. That inverts the failure direction from wasted work to a missed row, which is the one thing this field must never do. Historical incident caught before it bit: a coordinator was about to stamp "behind only, no action" across 28 pull requests at the start of a merge batch. Invalidating on base movement costs re-examination while the trunk is moving and nothing while it is quiet — the right way round twice, since a settled fleet is when skipping pays and a moving trunk is when every mergeability verdict is suspect. The base tip is resolved in the **main clone** (`base_tip_sha` in `commands/status.rs`), not in the worktree, and both the write and the read use that one helper. Under the `rift` backend a worktree is an independent clone whose `origin/<trunk>` is only as fresh as its own last fetch — historically measured at 10 distinct answers across 28 rows, one of them 9 merges behind — so anchoring on the worktree's view would pin the verdict to a SHA that trunk moving never changes, which is the missed-row failure all over again. A record written before the base anchor existed cannot prove the base held still, so it reads as not-current rather than current. `wt status --all --json` carries `examined` plus `examined_current` (the boolean a sweep keys its early-out on).
 
 ### `wt edge [<from> <kind> <to>]`
 
@@ -320,24 +330,24 @@ Session `alive` includes live Claude primary, Codex, OpenCode, and Pi tmux slots
 they remain `null` when that detail is unavailable, including Codex and OpenCode.
 `null` means unknown, not idle.
 
-The [manager session](manager.md)'s single audit surface: one row per live worktree joining the **asserted** work status (state, note, risk, `at`, staleness vs HEAD) with observable **reality** — the active harness session's liveness (`alive`/`busy`/`last_activity`, using the same discovery behind `wt agent ls --json`) and the PR (number, title, draft, merge state, mergeability, CI rollup), all from the same single batched GraphQL round trip the TUI uses (never per-row `gh` calls). Each row also carries the human's manual TUI **section** — a second channel of asserted intent alongside the work status (a name like "Merge after Release" is a merge-ordering hint the manager should weigh; `null`/`—` = inbox, and inferred stack groupings never appear — those are derivable from base records and PRs). Rows sort ready-first, then needs-human (the TUI's urgency ranking), and the recently-removed rows ride along like on every fleet surface.
+The [manager session](manager.md)'s single audit surface: one row per live worktree joining the **asserted** work status (state, note, risk, `at`, staleness vs HEAD) with observable **reality** — the active harness session's liveness (`alive`/`busy`/`last_activity`, using the same discovery behind `wt agent ls --json`) and the PR (number, title, draft, merge state, mergeability, CI rollup), all from the same single batched GraphQL round trip the TUI uses (never per-row `gh` calls). Each row also carries the human's manual TUI **section** — a second channel of asserted intent alongside the work status (a name like "Merge after Release" is a merge-ordering hint the manager should weigh; `null`/`—` = inbox, and inferred stack groupings never appear — those are derivable from base records and PRs). Rows follow inventory order, and the recently-removed rows ride along like on every fleet surface. The text table's `WORK` column shows `blocked/<state>` when a merge gate is set (a gated `ready` never reads as mergeable) and `unverified/<state>` for a landed row that still owes its post-merge check.
 
 - `--json` — the contract. Live rows carry `section` plus nested `work`, `session`, and `pr` objects. **The `work` block is nested here and flat in `wt status --all --json`** (this surface joins three domains and has to namespace them; that one is status-only). So the asserter is `.work.by` here and `.by` there, and getting it backwards returns `null` rather than an error — indistinguishable from the `null` that legitimately means "unattributed", which reads as "the field isn't populated" instead of "I asked for the wrong path". Review state is **three separate numbers**, because collapsing them made the field lie: `unresolved_threads` is every open review thread (what GitHub's PR page shows), `unresolved_human_threads` excludes bot-opened ones, and `review_bot` is the bot's own rollup — in `checklist` mode the unticked-box count from its summary comment, which thread resolution does **not** affect. `review_bot.stale` is the half that decides what `state` is worth: it means the bot has not reviewed the CURRENT head, so `clean` there says "found nothing in an older commit", not "passed". The TUI already refuses to paint that green, and this surface used to omit the flag entirely, handing every JSON reader exactly the reading the badge withholds. It matters most to whoever acts on it rather than displays it: an agent working through a bot's follow-up reviews (`/babysit`) stops at the first stale clean, believing the commit it just pushed came back empty. Checklist mode only; `false` otherwise, which is what every reader already inferred from the absent field. On a repo where all review is done by a bot, the human count is permanently 0, so reporting only it reads as "nothing to chase" while the bot sits on unaddressed findings; when GitHub is unreachable (no `gh`, not authenticated, fetch failure) rows still emit with `pr: null` plus a `pr_note` saying why — so "no PR" (`pr` and `pr_note` both null) stays distinguishable from "couldn't ask". Removed rows are the same `kind: "merged"|"removed"` entries as `wt ls --json`, and live rows are `kind: "live"` — branch on the value before reading `work`, which only live rows have. **The stack and its ordering ride the row too**: `base` is the effective merge target (the recorded fork base, else `[branch] base`; never null, same derivation and value as `wt ls --json`) and `edges` are the merge edges touching that slug, the same objects `wt edge --json` prints plus `stale`. An edge rides **both** of its endpoint rows, so dedupe on `from`/`to`, and ignore stale ones for ordering as every other consumer does. Neither field existed here until 2026-08-31, which cost exactly what a missing field on a primary sense costs: a real four-deep stack carrying three `blocks` edges read as four independent branches with no constraints, and the manager reported to the human that no ordering existed — twice. `wt edge --help` had promised this surface read edges the whole time, and the omission was undetectable from the output, because absence of an edge is *defined* to mean "no known constraint".
 
 Merge fields (`merge_state` from GitHub's `mergeStateStatus`, `mergeable`) are lowercased GitHub enums with one twist: GitHub computes mergeability **lazily**, so its `UNKNOWN` is reported as `"computing"` and wt never polls — re-run after a few seconds if you need the answer (the query itself is what triggers the computation). On terminal (merged/closed) PRs the merge fields are null rather than eternally "computing".
 
-### `wt manager` / `wt manager send <text…>` / `wt manager report [--ok|--warn|--err] <text…>`
+### `wt manager` / `wt manager send <text…>` / `wt manager report [--ok|--warn|--err|--info] <text…>`
 
 Attach the singleton [manager session](manager.md), or send a new actionable
 cross-owner fact or question. Routine progress, acknowledgments and papercuts
 require no reply or onward message. `wt manager send` cold-starts the session
 detached when absent; nothing comes back. It is the TUI's `m` session. Codex
 resumes its manager-owned primary conversation, separate from the `.` slot.
-`wt manager send --hold <id> [text...]` shares a checked hold reference.
+`wt manager send --hold <id> [text...]` shares a checked hold reference; the text may be omitted when a hold is given.
 
-`wt manager report` is the reverse channel: it appends a short result line to a spool a running TUI watches and surfaces on the **attention feed** (with a toast). It's how [`M` palette](manager.md#the-command-palette-m) commands hand their outcome back without the human attaching; the level flag (default `info`) picks the line's color/loudness. Reports while no TUI runs aren't replayed later — it's a live-delivery channel, not a log (the daily log records whatever surfaced).
+`wt manager report` is the reverse channel: it appends a short result line to a spool a running TUI watches and surfaces on the **attention feed** (with a toast). It's how [`M` palette](manager.md#the-command-palette-m) commands hand their outcome back without the human attaching; the level flag (`--ok`, `--warn`, `--err`, or `--info`; default `info`) picks the line's color/loudness. Reports while no TUI runs aren't replayed later — it's a live-delivery channel, not a log (the daily log records whatever surfaced).
 
-### `wt issue <slug>` / `--id <ID>` / `--no-id` / `--clear-id` / `--gh <n>` / `--clear-gh`
+### `wt issue [<slug>]` / `--id <ID>` / `--no-id` / `--clear-id` / `--gh <n>` / `--clear-gh`
 
 `wt issue [<slug>] --read` fetches the full primary tracker task with the configured
 `[issue_tracker] read_command`. Omit the slug to resolve the worktree containing
@@ -350,7 +360,7 @@ is built into wt. Read-only identity lookup remains offline.
 
 Show or edit a worktree's issue links. The **primary** tracker id is normally parsed from the slug (`eng-1935-…` → `ENG-1935`); `--id COZ-2185` stores an override for a worktree whose slug carries none (or the wrong one), and `--clear-id` drops it back to the parse.
 
-The override has **three** states, because two could not say everything. Absent means "use the slug", a value means "use this", and `--no-id` asserts **this worktree has no tracker issue** — stored as an empty override, which is why `resolveIssueId` distinguishes absent from empty and why the parse deliberately round-trips `""`. Only on a slug that carries an id does the difference show, and that is exactly the population that needs it: `--clear-id` on `coz-2101-connector-research` fell straight back to `COZ-2101`, so before `--no-id` there was no way to say the work is not that ticket. An asserted none renders nothing in the issue row, makes `{{issue_id}}` empty, and fails `requires = ["issue.tracker"]`, so the tracker automation stays put rather than moving somebody else's ticket. Reversible: `--clear-id` restores the derived answer. The TUI equivalent is `#` with an empty line. Readers resolve override-first, so the override is what the issue row links, what `{{issue_id}}` renders, and what `requires = ["issue.tracker"]` tests — the TUI equivalent is `#`. Neither form touches the branch.
+The override has **three** states, because two could not say everything. Absent means "use the slug", a value means "use this", and `--no-id` asserts **this worktree has no tracker issue** — stored as an empty override, which is why issue resolution distinguishes absent from empty and why the stored override deliberately round-trips `""`. Only on a slug that carries an id does the difference show, and that is exactly the population that needs it: `--clear-id` on `coz-2101-connector-research` fell straight back to `COZ-2101`, so before `--no-id` there was no way to say the work is not that ticket. An asserted none renders nothing in the issue row, makes `{{issue_id}}` empty, and fails `requires = ["issue.tracker"]`, so the tracker automation stays put rather than moving somebody else's ticket. Reversible: `--clear-id` restores the derived answer. The TUI equivalent is `#` with an empty line. Readers resolve override-first, so the override is what the issue row links, what `{{issue_id}}` renders, and what `requires = ["issue.tracker"]` tests — the TUI equivalent is `#`. Neither form touches the branch.
 
 The **secondary** GitHub issue is a separate per-slug record attached with `--gh <n>` (typically after a spec/breakout issue is created mid-work) and detached with `--clear-gh`. The TUI's `i` key and `y i` yank prefer the primary tracker URL and fall back to the attached GitHub issue when no primary URL is available; `I` / `y I` always target only the primary. `<slug>` also accepts a branch name.
 
@@ -370,11 +380,11 @@ Delete the engine's `backup/restack-*` branches older than `--days` (default all
 
 ### `wt skills [status|sync|diff|reset]`
 
-Keep wt's bundled agent skills (`wt`, `restack`, `manager`, `start`, `handoff`, `triage`) and the managed instructions block installed and current across every harness on the machine — following symlinks, deduping shared directories, and writing through rulesync pipelines (durable source + regenerate) where one manages the target. See [skills.md](skills.md) for the full model.
+Keep wt's bundled agent skills (`wt`, `restack`, `manager`, `shepherd`, `babysit`, `start`, `handoff`, `triage`) and the managed instructions block installed and current across every harness on the machine — following symlinks, deduping shared directories, and writing through rulesync pipelines (durable source + regenerate) where one manages the target. See [skills.md](skills.md) for the full model.
 
-- `wt skills` / `status` — freshness of every unit at every target, plus remembered template answers.
+- `wt skills` / `status` — freshness of every unit at every target, marking declined updates.
 - `sync [<name>...]` — interactive install/update; the same flow the TUI runs at startup. `--yes` accepts all missing/outdated units without prompting (never touches modified copies); `--force` additionally allows overwriting modified copies. Naming a unit explicitly overrides a remembered decline. `install` is a legacy alias.
-- `diff <name>` — what a sync would change, as a unified diff.
+- `diff <name>` — what a sync would write for each target: the installed body prefixed `-`, the bundled body prefixed `+`. It is a whole-body comparison, not a unified diff with hunks.
 - `reset [--answers|--declines]` — forget remembered template answers and/or declined updates.
 
 `wt remote agent start <slug>` uses `skills sync --yes` as worker provisioning
@@ -409,6 +419,10 @@ Print the native version and build identity. Also available as `wt --version` / 
 
 ## Integrations
 
+### `wt auth codex <changed|status|relogin>`
+
+Coordinate Codex account switches on managed workers; see [remote.md](remote.md). `changed` records a successful local switch for every managed worker using this `CODEX_HOME`. `status` prints the controller's requested generation without contacting hosts. `relogin [--pending] [--host <host-or-label>]` signs in on each managed host from an interactive terminal; without `--pending` it requests a new switch first, and `--host` restricts the visit to one configured host. `changed` and `status` need no repository config.
+
 ### `wt controller <sub>`
 
 Runs named controller-side services for managed remote tools. Configure the
@@ -418,7 +432,7 @@ allowlist in `[managed.services]`; see [configuration](configuration.md#managed-
 |---|---|
 | `serve` | Run the repository's private controller daemon and supervise managed-host SSH forwards. Intended for the host service manager, independently of a TUI. |
 | `status` | Probe the local socket and verify the daemon loaded the currently selected configuration and native build. This does not assert remote tunnel health. |
-| `exec <service>` | Read JSON from stdin, invoke the named controller service through `WT_CONTROLLER_SOCKET`, and return its stdout, stderr, and exit code. Falls back to `$WT_MANAGED_ROOT/controller-endpoint` for existing sessions without the socket variable. Configuration-free so provisioned wrappers can call it from any directory. |
+| `exec <service>` | Read JSON from stdin, invoke the named controller service through `WT_CONTROLLER_SOCKET`, and return its stdout, stderr, and exit code. A service whose program cannot be started is reported as not executed with exit 75. Falls back to `$WT_MANAGED_ROOT/controller-endpoint` for existing sessions without the socket variable. Configuration-free so provisioned wrappers can call it from any directory. |
 
 The caller cannot supply an executable, extra argv, cwd, or environment.
 Admission failures report that nothing was executed. Transport errors after a
@@ -439,17 +453,20 @@ The optional GitHub webhook daemon — see [github-events.md](github-events.md).
 |---|---|
 | `install` | write the macOS launchd agent + generate the HMAC secret; prints webhook setup guidance |
 | `start` / `stop` / `restart` | load / unload / reload the owned launchd agent and reconcile its saved configuration |
-| `status` | liveness, bind address, pid, delivery count, last fetch/error, snapshot age, and a `build` line when the daemon is running older code than the caller; during restart warm-up it reports the current daemon and ignored previous snapshot separately (see [github-events.md](github-events.md#the-daemons-build-and-why-the-tui-checks-it)) |
+| `status` | liveness, bind address, pid, delivery count, last fetch/error, snapshot age, and a `build` line when the daemon is running a build other than the installed one; during restart warm-up it reports the current daemon and ignored previous snapshot separately (see [github-events.md](github-events.md#the-daemons-build-and-why-the-tui-checks-it)) |
 | `secret` | ensure a webhook secret exists and print setup guidance; a newly generated inline secret is printed for configuration |
 | `uninstall` | unload and remove the owned launchd agent |
-| `serve` | run the daemon in the foreground |
+| `reconcile` | reload this configuration's launchd agent only if its daemon runs a build other than the installed one (from the install state, not the calling process). Silent when current or not installed; prints a note when the agent belongs to another configuration, and `restarted GitHub events daemon on build X` after a reload. `wt update` and the startup update offer run it after installing a build (macOS, 90s timeout; failure only warns and suggests `restart`) |
+| `serve` | run the daemon in the foreground; graceful shutdown on SIGTERM is bounded to 5s |
 
 ### `wt agent <sub>`
 
 Message wt-owned coding-agent targets from scripts or another session.
 
 `send` addresses worktree slugs, branch names, and the special `wt`, `main`,
-`dotfiles`, and `manager` sessions. It selects a LIVE harness at that target and
+`dotfiles`, and `manager` sessions. A worktree target resolves as an exact
+slug, then an exact branch, then the last path segment of the requested name
+(so `prefix/slug` finds `slug`). It selects a LIVE harness at that target and
 falls back to the `Shift+Tab` primary only when nothing is running there. If
 several are live, the primary wins. Messaging has no harness override; stale
 `--harness` callers fail instead of forcing the wrong session.
@@ -481,7 +498,8 @@ race-safe queued-or-started receipt. Use
 For Codex, `send` wakes the tmux session first and addresses its exact UUID
 through Codex's durable queue. A busy session or one showing an approval or
 question keeps the message queued until it is ready. The direct Unix socket is
-local to the target host; remote sends run this same command over SSH. If the
+local to the target host. `wt agent send` refuses a remote row rather than deliver locally; message a worker by running the command on it
+with `wt remote agent send ...`. If the
 user-managed daemon is offline, wt uses `codex queue` against the same local
 store. It never retries an ambiguous queue write.
 If a live Codex tmux slot has no recoverable UUID, `send` falls back to typing
@@ -545,7 +563,7 @@ Claude.
 |---|---|
 | `send <target> [text...]` | deprecated alias for `wt agent send`; resolves the target's active harness and does not force Claude |
 | `ls [--json]` | list slugs with a live Claude tmux session. `--json` adds `session_id`, `pid`, `cwd`, `socket_path`, `transport`, `tmux_session`, `status`, `waiting_for`, `busy`, and `last_activity` |
-| `selftest [<slug>]` | check that prompt injection still works against live sessions (one line each; nonzero if any fails). This is what tells you a Claude Code update moved the injector's structural anchors — `wt doctor` runs it too |
+| `selftest [<slug>]` | check that prompt injection still works against live sessions (one line each; nonzero if any fails). This is what tells you a Claude Code update moved the injector's structural anchors; `wt doctor` only points you at it when it finds stale harness shims |
 | `stop <slug>` | stop the target Claude session without typing into its pane (`kill` remains an alias) |
 
 ---

@@ -245,9 +245,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
     for entry in reports_removed {
         let merged = wt_store::is_merged_removal(&entry);
         let work = entry.work.as_ref().map(serde_json::to_value).transpose()?;
-        let verification_owed = entry.work.as_ref().is_some_and(|work| {
-            work.verify_after_merge.is_some() && work.state != "verified" && work.state != "dropped"
-        });
+        let verification_owed = wt_store::verification_owed_at_removal(&entry);
         reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_after_merge":entry.work.and_then(|work| work.verify_after_merge),"verification_owed":verification_owed}));
     }
     if args.json {
@@ -261,7 +259,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
                 "{:<20} {:<30} {:<10} {:<7} {:<8} {}",
                 row["slug"].as_str().unwrap_or("?"),
                 row["branch"].as_str().unwrap_or("?"),
-                row["work"]["state"].as_str().unwrap_or("—"),
+                work_label(row),
                 row["session"]["alive"]
                     .as_bool()
                     .map(|v| if v { "live" } else { "—" })
@@ -279,14 +277,40 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         if reports.is_empty() {
             println!("no live worktrees");
         }
-        if let Some(note) = reports.first().and_then(|r| r["pr_note"].as_str()) {
+        // Report failed sources even when no live row carries them.
+        if let Some(note) = &pr_note {
             println!("PR data unavailable: {note}");
         }
-        if let Some(note) = reports.first().and_then(|r| r["session_note"].as_str()) {
+        if let Some(note) = &session_note {
             println!("Session data unavailable: {note}");
         }
     }
     Ok(0)
+}
+
+/// The human WORK column. A merge gate overrides the state (`blocked/ready`
+/// must never read as mergeable), and a landed row still owing its
+/// post-merge check reads `unverified/<state>`.
+fn work_label(row: &Value) -> String {
+    let work = &row["work"];
+    let Some(state) = work["state"].as_str() else {
+        return "—".into();
+    };
+    let landed = row["kind"] == "merged" || row["pr"]["state"] == "MERGED";
+    let owed = row["verification_owed"].as_bool().unwrap_or_else(|| {
+        landed
+            && work["verifyAfterMerge"]
+                .as_str()
+                .is_some_and(|steps| !steps.is_empty())
+            && !matches!(state, "verified" | "dropped")
+    });
+    if work["blockedOn"].is_string() {
+        format!("blocked/{state}")
+    } else if owed {
+        format!("unverified/{state}")
+    } else {
+        state.to_owned()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -369,5 +393,41 @@ fn process_is_alive(pid: u32) -> bool {
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_column_never_shows_a_gated_or_unverified_row_as_plain_state() {
+        let row = |work: Value, pr: Value, kind: &str| json!({"kind":kind,"work":work,"pr":pr});
+        let ready = json!({"state":"ready"});
+        assert_eq!(
+            work_label(&row(ready.clone(), Value::Null, "live")),
+            "ready"
+        );
+        assert_eq!(
+            work_label(&row(
+                json!({"state":"ready","blockedOn":"mobile release"}),
+                Value::Null,
+                "live"
+            )),
+            "blocked/ready"
+        );
+        let owing = json!({"state":"ready","verifyAfterMerge":"1. check prod"});
+        assert_eq!(
+            work_label(&row(owing.clone(), json!({"state":"OPEN"}), "live")),
+            "ready"
+        );
+        assert_eq!(
+            work_label(&row(owing, json!({"state":"MERGED"}), "live")),
+            "unverified/ready"
+        );
+        let mut removed = row(ready, Value::Null, "merged");
+        removed["verification_owed"] = json!(true);
+        assert_eq!(work_label(&removed), "unverified/ready");
+        assert_eq!(work_label(&json!({"work":null})), "—");
     }
 }

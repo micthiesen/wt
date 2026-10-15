@@ -129,7 +129,7 @@ pub async fn execute_with_shutdown(
         UiAction::CancelAutomations => {
             bail!("queued automations must be cancelled through the host service")
         }
-        UiAction::ToggleAutomations { key } => {
+        UiAction::ToggleAutomations { key, seen } => {
             let members = board
                 .map(|board| {
                     board
@@ -164,12 +164,29 @@ pub async fn execute_with_shutdown(
             let paused = ctx
                 .database
                 .call(move |store| {
-                    if let Some((id, members)) = stack {
-                        return Ok(store.toggle_stack_automations_paused(&id, &members)?);
-                    }
-                    match key {
-                        Some(slug) => Ok(store.toggle_slug_automations_paused(&slug)?),
-                        None => Ok(store.toggle_global_automations_paused()?),
+                    // The witness is the flag the board shows: the row's own
+                    // or the global one. The store compares it and writes in
+                    // one transaction.
+                    let seen = seen.map(|wt_tui::Seen(seen)| seen);
+                    let outcome = match (stack, &key) {
+                        (Some((id, members)), Some(slug)) => store
+                            .toggle_stack_automations_paused_seen(
+                                &id,
+                                &members,
+                                seen.map(|seen| (slug.as_str(), seen)),
+                            )?,
+                        (_, Some(slug)) => store.toggle_slug_automations_paused_seen(slug, seen)?,
+                        (_, None) => store.toggle_global_automations_paused_seen(seen)?,
+                    };
+                    match outcome {
+                        wt_store::SeenToggle::Set(paused) => Ok(paused),
+                        wt_store::SeenToggle::Stale { current } => {
+                            Err(crate::controller::stale(if current {
+                                "automations are now paused"
+                            } else {
+                                "automations are now running"
+                            }))
+                        }
                     }
                 })
                 .await?;
@@ -494,7 +511,7 @@ pub async fn execute_with_shutdown(
         UiAction::Cleanup { revisions } => Ok(message(
             lifecycle_ops::cleanup_cached(ctx, &revisions, github).await?,
         )),
-        UiAction::ToggleArchive { key } => {
+        UiAction::ToggleArchive { key, seen } => {
             if wt_core::is_remote_worktree_ledger_key(&key) {
                 let row = board
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
@@ -518,15 +535,20 @@ pub async fn execute_with_shutdown(
             let archived = ctx
                 .database
                 .call(move |store| {
-                    let archived = !store.read_archived_keys()?.contains(&slug);
-                    store.set_archived(&slug, archived)?;
-                    if archived {
-                        store.set_section_folded(crate::board_layout::ARCHIVED, true)?;
-                    } else {
-                        // Restored rows return to the Inbox, as in TS.
-                        store.move_worktrees_to_section(std::slice::from_ref(&slug), None)?;
+                    // Flip only the state the board showed; a changed marker
+                    // reopens the decision rather than undoing it. Restored
+                    // rows return to the Inbox, as in TS.
+                    let seen = seen.map(|wt_tui::Seen(seen)| seen);
+                    match store.toggle_archived_seen(&slug, seen, crate::board_layout::ARCHIVED)? {
+                        wt_store::SeenToggle::Set(archived) => Ok(archived),
+                        wt_store::SeenToggle::Stale { current } => {
+                            Err(crate::controller::stale(if current {
+                                "row is already archived"
+                            } else {
+                                "row is no longer archived"
+                            }))
+                        }
                     }
-                    Ok(archived)
                 })
                 .await?;
             Ok(message(if archived { "Archived" } else { "Restored" }))
@@ -906,8 +928,6 @@ fn ui_revision(revision: &wt_lifecycle::RemovalRevision) -> UiRemovalRevision {
     }
 }
 
-/// Force-remove confirm lines in the TS style: work that disappears reads
-/// "<what> will be lost."; any other hazard is its own sentence.
 /// Changed and untracked files on the row, from the prepared board, so the
 /// confirm can count what would be lost as TS did.
 fn dirty_file_count(board: Option<&Board>, key: &str) -> Option<u32> {
@@ -916,6 +936,8 @@ fn dirty_file_count(board: Option<&Board>, key: &str) -> Option<u32> {
     (count > 0).then_some(count)
 }
 
+/// Force-remove confirm lines in the TS style: work that disappears reads
+/// "<what> will be lost."; any other hazard is its own sentence.
 fn removal_hazard_lines(hazards: &[String], dirty_files: Option<u32>) -> Vec<String> {
     // The lifecycle hazard does not count files; the board's facts do.
     let hazards = hazards
@@ -1262,6 +1284,91 @@ mod tests {
             .await
             .is_err()
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn toggles_refuse_a_state_the_user_did_not_see() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+            .await
+            .unwrap();
+        let key = wt_core::worktree_target_key(&row.target);
+        let archive = |seen| UiAction::ToggleArchive {
+            key: key.clone(),
+            seen: Some(wt_tui::Seen(seen)),
+        };
+        let archived = |ctx: &AppContext| {
+            let key = key.clone();
+            let database = ctx.database.clone();
+            async move {
+                database
+                    .call(move |store| Ok(store.read_archived_keys()?.contains(&key)))
+                    .await
+                    .unwrap()
+            }
+        };
+        execute(&fixture.ctx, archive(false), None, None)
+            .await
+            .unwrap();
+        assert!(archived(&fixture.ctx).await);
+        // A second board that still showed it unarchived must not undo it.
+        let error = execute(&fixture.ctx, archive(false), None, None)
+            .await
+            .unwrap_err();
+        assert!(crate::controller::error_reply(&error).stale);
+        assert!(archived(&fixture.ctx).await);
+        assert!(
+            fixture
+                .ctx
+                .database
+                .call(|store| Ok(store.is_section_folded(crate::board_layout::ARCHIVED)?))
+                .await
+                .unwrap(),
+            "archiving folds the archive section in the same write"
+        );
+        execute(&fixture.ctx, archive(true), None, None)
+            .await
+            .unwrap();
+        assert!(!archived(&fixture.ctx).await);
+
+        let paused = |ctx: &AppContext| {
+            let database = ctx.database.clone();
+            async move {
+                database
+                    .call(|store| {
+                        let state = store.read_wt_state()?;
+                        Ok((
+                            state["slugs"]["one"]["automationsPaused"].as_bool() == Some(true),
+                            state["automationsPaused"].as_bool() == Some(true),
+                        ))
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        for key in [Some(key.clone()), None] {
+            let toggle = |seen| UiAction::ToggleAutomations {
+                key: key.clone(),
+                seen: Some(wt_tui::Seen(seen)),
+            };
+            let read = |state: (bool, bool)| if key.is_some() { state.0 } else { state.1 };
+            execute(&fixture.ctx, toggle(false), None, None)
+                .await
+                .unwrap();
+            assert!(read(paused(&fixture.ctx).await));
+            let error = execute(&fixture.ctx, toggle(false), None, None)
+                .await
+                .unwrap_err();
+            assert!(crate::controller::error_reply(&error).stale);
+            assert!(read(paused(&fixture.ctx).await), "a stale toggle resumed");
+            execute(&fixture.ctx, toggle(true), None, None)
+                .await
+                .unwrap();
+            assert!(!read(paused(&fixture.ctx).await));
+        }
         fixture.close().await.unwrap();
     }
 

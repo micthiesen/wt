@@ -210,27 +210,41 @@ fn parse_events(bytes: &[u8]) -> Vec<Event> {
                     }
                     break;
                 } else if next == b'O' {
-                    if let Some(final_byte) = bytes.get(cursor + 2).copied() {
-                        let code = match final_byte {
+                    // SS3: application-mode arrows and F1-F4. Any other
+                    // byte, or none, means the user typed Esc then `O`
+                    // (and whatever followed); both replay as typed.
+                    let code = bytes
+                        .get(cursor + 2)
+                        .and_then(|final_byte| match final_byte {
+                            b'A' => Some(KeyCode::Up),
+                            b'B' => Some(KeyCode::Down),
+                            b'C' => Some(KeyCode::Right),
+                            b'D' => Some(KeyCode::Left),
+                            b'H' => Some(KeyCode::Home),
+                            b'F' => Some(KeyCode::End),
                             b'P' => Some(KeyCode::F(1)),
                             b'Q' => Some(KeyCode::F(2)),
                             b'R' => Some(KeyCode::F(3)),
                             b'S' => Some(KeyCode::F(4)),
                             _ => None,
-                        };
-                        if let Some(code) = code {
-                            events.push(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
-                            cursor += 3;
-                            continue;
-                        }
+                        });
+                    if let Some(code) = code {
+                        events.push(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                        cursor += 3;
+                        continue;
                     }
+                    events.push(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+                    cursor += 1;
+                    continue;
                 } else if next == b']' {
                     if let Some(end) = osc_end(bytes, cursor + 2) {
                         cursor = end.sequence_end;
                         continue;
                     }
                     break;
-                } else if let Some(character) = char_at(bytes, cursor + 1) {
+                } else if let Some(character) =
+                    char_at(bytes, cursor + 1).filter(|character| !character.is_control())
+                {
                     events.push(Event::Key(KeyEvent::new(
                         KeyCode::Char(character),
                         KeyModifiers::ALT,
@@ -499,6 +513,45 @@ mod tests {
         assert!(matches!(events[1], Event::Key(key) if key.code == KeyCode::Char('o')));
         assert!(matches!(events[2], Event::Key(key) if key.code == KeyCode::Char('k')));
         assert!(matches!(parse_events(b"\x1b[200~q").as_slice(), []));
+    }
+
+    #[test]
+    fn application_arrows_and_double_escape_never_replay_as_letters() {
+        let keys = |bytes: &[u8]| -> Vec<_> {
+            parse_events(bytes)
+                .iter()
+                .map(|event| match event {
+                    Event::Key(key) => (key.code, key.modifiers),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            keys(b"\x1bOA\x1bOD\x1b\x1bq"),
+            [
+                (KeyCode::Up, KeyModifiers::NONE),
+                (KeyCode::Left, KeyModifiers::NONE),
+                (KeyCode::Esc, KeyModifiers::NONE),
+                (KeyCode::Char('q'), KeyModifiers::ALT),
+            ]
+        );
+        // Esc then `O` and a non-SS3 byte, or `O` at the end of the buffer,
+        // is what the user typed: Esc, then the characters replay.
+        assert_eq!(
+            keys(b"\x1bOz"),
+            [
+                (KeyCode::Esc, KeyModifiers::NONE),
+                (KeyCode::Char('O'), KeyModifiers::NONE),
+                (KeyCode::Char('z'), KeyModifiers::NONE),
+            ]
+        );
+        assert_eq!(
+            keys(b"\x1bO"),
+            [
+                (KeyCode::Esc, KeyModifiers::NONE),
+                (KeyCode::Char('O'), KeyModifiers::NONE),
+            ]
+        );
     }
 
     #[test]

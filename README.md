@@ -12,7 +12,7 @@ The design principle behind all of it: **the human does only the work only a hum
 
 ## Requirements
 
-The published native releases support macOS and Linux on ARM64 and x86-64.
+The published native releases support macOS on Apple Silicon and Linux on ARM64 and x86-64.
 `git` is required for worktree operations and `tmux` is required for managed
 terminal sessions. A [Nerd Font](https://www.nerdfonts.com/) is recommended for
 the status and integration glyphs. No JavaScript runtime or source checkout is
@@ -113,6 +113,12 @@ State is push-based: filesystem watchers on git refs, worktree dirs, and wt's ow
 | [docs/backends.md](docs/backends.md) | worktree backends: `git-worktree` (default) vs `rift` copy-on-write clones |
 | [docs/architecture.md](docs/architecture.md) | internals: layers, freshness model, module conventions |
 | [docs/discord.md](docs/discord.md) | Discord server wiring: #updates digest, #github feed, badge |
+| [docs/installation.md](docs/installation.md) | install, update channels, rollback, migrating an older install |
+| [docs/remote.md](docs/remote.md) | SSH workers and managed remotes |
+| [docs/dev-servers.md](docs/dev-servers.md) | `wt dev`: supervised per-worktree dev servers |
+| [docs/stages.md](docs/stages.md) | SST stages and orphan cleanup |
+| [docs/pi.md](docs/pi.md) | Pi harness setup and managed hosts |
+| [docs/development.md](docs/development.md) | contributor checks, CI and release workflows |
 
 ## Community
 

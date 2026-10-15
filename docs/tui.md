@@ -169,7 +169,7 @@ issue and PR glyphs, and a right-aligned age. Older records can be checked
 against a bounded local GitHub-merge and production-history scan while history
 is open. The `removal record` pane shows removal time, host, saved status,
 verification, landing, and notes. `Enter` restores, `p` opens the PR, `i` opens
-the issue when known, and `y` copies the branch. `p` and `i` toast when nothing is recorded, and `O`
+the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
 ## Keymap
@@ -184,7 +184,7 @@ opens the main clone as it does on the board.
 | `Ctrl+D` / `Ctrl+U` | Next / previous section |
 | `Ctrl+J` / `Ctrl+K` | Scroll details |
 | `Ctrl+E` / `Ctrl+Y` | Scroll output |
-| `r` / `Ctrl+R` | Refresh / clear derived caches and refresh |
+| `r` / `Ctrl+R` | Refresh / ask for confirmation, then clear derived caches and refresh |
 | `?` | Open searchable help |
 | `Esc` | Return the bottom pane to its default feed |
 | `q` / `Ctrl+C` | Quit |
@@ -227,11 +227,11 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
 | `V` | Show or hide this row's post-merge verification steps (open by default when the check is due) |
-| `u` | Set or clear the work-status claim, note, risk, or verification obligation |
-| `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed |
-| `l` / `L` | Move to a section / rename the section |
+| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` ready with verification, `x` clears, `m` edits the note) |
+| `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
+| `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section |
 | `J` / `K` | Reorder the selected row, stack, or folded group; the cursor follows the row across sections |
-| `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none |
+| `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
 | `h` | Open removed-worktree history |
 
@@ -267,6 +267,7 @@ rows use the dim foreground color for this icon.
 | `! m` | Toggle merge-when-ready |
 | `f` | View failing check logs |
 | `v` | Select requested reviewers |
+| `i` on a review request | Open its linked issue |
 | `w` | Check out a selected review request |
 | `d` on a review request | Dismiss that review request |
 
@@ -288,7 +289,7 @@ armed or the unconfirmed attempt expires.
 | `;` | Pick a session. Inside: `d` closes the highlighted live session gracefully and `x` kills it (a dead Claude row is forgotten), both without confirmation; `c`/`x`/`o`/`p` on a New row jump between harnesses; an empty Claude name picks one automatically |
 | `Shift+Tab` | Cycle the primary harness |
 | `!` | Open worktree actions: `m` merge when ready, `u`/`g` agent builtins, `d`/`s` dev server, `l` dev logs, `t` rename with AI, `c` custom prompt, and configured actions |
-| `m` / `M` | Enter the manager session / open manager commands |
+| `m` / `M` | Enter the manager session / open manager commands (`d t o n a s` fleet plays, `r` ask about the row, `m` compact, `c` custom; `M M` confirms) |
 | `,` / `.` / `/` | Enter the wt repo / main clone / dotfiles session when configured |
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
@@ -344,13 +345,18 @@ that exit successfully close normally.
 
 Press `P` for the process and system performance view. `r` takes a sample,
 `c` toggles repeated sampling, `i` sends the snapshot to the wt repo session
-and enters it, `j`/`k`, page keys, and `Ctrl+D`/`U`/`E`/`Y` scroll, and `Esc` or
-`q` closes it. The same snapshot is available with [`wt perf`](cli.md#wt-perf---json).
+and enters it, `j`/`k`, page keys, and `Ctrl+D`/`U`/`E`/`Y` scroll, and `Esc`,
+`q`, `P`, or `Ctrl+C` closes it. The same snapshot is available with [`wt perf`](cli.md#wt-perf---json).
 Command and source failures remain visible in the footer, source state, or
 activity/attention feed. The native TUI does not provide a full-screen
 uncaught-error recovery overlay.
 
 ## Picker and text input
+
+Help, the performance view, and log overlays (such as dev-server logs) share
+one scroll keymap: `j`/`k`, arrows, and `Ctrl+E`/`Ctrl+Y` move three lines;
+`PgUp`/`PgDn` and `Ctrl+U`/`Ctrl+D` move half a page; `g`/`G` or `Home`/`End`
+jump to the edges. `Esc`, `q`, and `Ctrl+C` close them.
 
 Use `j`/`k`, arrows, page keys, and `g`/`G` to move through lists. `Enter`
 confirms; `Esc`, `q`, and `Ctrl+C` cancel, and confirmations also cancel with
@@ -370,10 +376,9 @@ viewport without moving the cursor; the next cursor move scrolls back to it.
 Dragging selects text within one pane and copies it to the clipboard on
 release.
 
-## Differences from the TypeScript UI
+## Deliberate behaviors
 
-The native TUI keeps the TypeScript board's keys, chords, prompts, glyphs,
-and spacing. It departs from that UI only where the change is deliberate:
+Several behaviors are intentional rather than incidental:
 
 - The dirty badge stays on landed rows. Cleanup would discard those files,
   so the hazard stays visible until the row is removed.
@@ -405,8 +410,8 @@ and spacing. It departs from that UI only where the change is deliberate:
 - A landed row's git line names the base as the branch line does
   (`merged into main`) rather than always saying `origin/main`.
 
-Session `; d` and `; x` act immediately, as they did in TypeScript; the
-review-requests fold is not persisted, also as before.
+Session `; d` and `; x` act immediately, without confirmation; the
+review-requests fold is not persisted.
 
 The session picker is built from the board: saved conversations from the
 background history snapshot and the live tmux slots. Opening it sends a

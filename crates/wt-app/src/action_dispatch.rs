@@ -340,17 +340,6 @@ pub async fn prepare(
     }
     let issue_id = row.issue_id.as_deref().unwrap_or_default().to_owned();
     let primary = AppHarness::new(context).primary();
-    let harness = match primary {
-        HarnessId::Claude => ActionHarness::Claude,
-        HarnessId::Codex => ActionHarness::Codex,
-        HarnessId::Opencode => ActionHarness::OpenCode,
-        HarnessId::Pi => ActionHarness::Pi,
-    };
-    let skill_prefix = match primary {
-        HarnessId::Claude => "/",
-        HarnessId::Codex | HarnessId::Opencode => "$",
-        HarnessId::Pi => "/skill:",
-    };
     Ok(ActionContext {
         action_key,
         slug,
@@ -361,12 +350,12 @@ pub async fn prepare(
         branch,
         issue_id,
         stage,
-        skill_prefix: skill_prefix.into(),
+        skill_prefix: skill_prefix(primary).into(),
         arg,
         shell: std::env::var("SHELL").ok(),
         today: Some(today()),
         row,
-        harness,
+        harness: harness_kind(primary),
         auto_fire_keys: Vec::new(),
     })
 }

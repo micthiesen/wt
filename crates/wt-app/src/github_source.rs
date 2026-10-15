@@ -133,7 +133,7 @@ struct LaneClock {
     live_observed: Option<Instant>,
     /// The daemon file version and branch set currently published, so an
     /// unchanged file is not republished on every recheck.
-    served_daemon: Option<(Instant, Vec<String>)>,
+    served_daemon: Option<(u64, Vec<String>)>,
     /// The branch set the published data covers.
     published: Option<Vec<String>>,
     /// A network read the floor postponed is due then.
@@ -182,7 +182,7 @@ impl LaneClock {
                 // Fresh daemon data exists and the shown data is newer still.
                 return Plan::Skip;
             }
-            let version = (read.written, branches.to_vec());
+            let version = (read.written_ms, branches.to_vec());
             if self.served_daemon.as_ref() == Some(&version) {
                 return Plan::Skip;
             }
@@ -498,11 +498,11 @@ mod tests {
         }
     }
 
-    fn daemon(started: Option<Instant>, written: Instant) -> DaemonRead {
+    fn daemon(started: Option<Instant>, written_ms: u64) -> DaemonRead {
         DaemonRead {
             data: GithubData::default(),
             started,
-            written,
+            written_ms,
         }
     }
 
@@ -535,24 +535,20 @@ mod tests {
     async fn a_daemon_snapshot_is_served_once_per_file_version() {
         let branches = branches();
         let mut clock = LaneClock::default();
-        let written = Instant::now();
-        let now = written + Duration::from_millis(5);
+        let started = Instant::now();
+        let now = started + Duration::from_millis(5);
         assert!(matches!(
-            clock.plan(input(&branches, Some(daemon(Some(written), written)), now)),
+            clock.plan(input(&branches, Some(daemon(Some(started), 1_000)), now)),
             Plan::Publish(_)
         ));
         assert_eq!(clock.published.as_deref(), Some(&branches[..]));
         assert!(matches!(
-            clock.plan(input(&branches, Some(daemon(Some(written), written)), now)),
+            clock.plan(input(&branches, Some(daemon(Some(started), 1_000)), now)),
             Plan::Skip
         ));
-        let rewritten = written + Duration::from_secs(1);
+        let restarted = started + Duration::from_secs(1);
         assert!(matches!(
-            clock.plan(input(
-                &branches,
-                Some(daemon(Some(rewritten), rewritten)),
-                now
-            )),
+            clock.plan(input(&branches, Some(daemon(Some(restarted), 2_000)), now)),
             Plan::Publish(_)
         ));
     }
@@ -567,17 +563,17 @@ mod tests {
         clock.published = Some(branches.clone());
         // Started before the live read, or never recorded its start.
         assert!(matches!(
-            clock.plan(input(&branches, Some(daemon(Some(before), live)), live)),
+            clock.plan(input(&branches, Some(daemon(Some(before), 1_000)), live)),
             Plan::Skip
         ));
         assert!(matches!(
-            clock.plan(input(&branches, Some(daemon(None, live)), live)),
+            clock.plan(input(&branches, Some(daemon(None, 1_000)), live)),
             Plan::Skip
         ));
         // A new branch has no data yet: the daemon's full coverage is served.
         let more = vec!["another".to_owned(), "feature".to_owned()];
         assert!(matches!(
-            clock.plan(input(&more, Some(daemon(Some(before), live)), live)),
+            clock.plan(input(&more, Some(daemon(Some(before), 1_000)), live)),
             Plan::Publish(_)
         ));
     }
@@ -604,7 +600,7 @@ mod tests {
         // Daemon data had been shown and has aged out: read GitHub.
         let mut clock = LaneClock {
             published: Some(branches.clone()),
-            served_daemon: Some((now, branches.clone())),
+            served_daemon: Some((1_000, branches.clone())),
             ..LaneClock::default()
         };
         assert!(matches!(recheck(&mut clock, false), Plan::Network));

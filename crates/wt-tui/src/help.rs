@@ -49,9 +49,9 @@ pub(crate) const LINES: &[&str] = &[
     "  ; x                Kill highlighted session (dead Claude: forget it)",
     "  ; 1-9              Attach a session row",
     "  Shift+Tab          Cycle primary harness",
-    "  F12 / Shift+F12    Enter agent session / harness picker",
-    "  F10 / Shift+F10    Enter / stop shell session",
-    "  F11 / Shift+F11    Enter / stop diff session",
+    "  F12 / Shift+F12    Enter agent session / start one with a chosen harness",
+    "  F10 / Shift+F10    Enter / stop shell session (confirmation)",
+    "  F11 / Shift+F11    Enter / stop diff session (confirmation)",
     "",
     "Organize",
     "  l                  Move to section (picker); l l confirms",
@@ -79,7 +79,7 @@ pub(crate) const LINES: &[&str] = &[
     "  Tab (in n prompt)  Cycle the new worktree's host; n remembers it",
     "  c                  Clean landed worktrees (all hosts)",
     "  h                  Removed-worktree history",
-    "  r / Ctrl+R         Refresh / clear derived caches",
+    "  r / Ctrl+R         Refresh / clear derived caches (confirmation)",
     "  , / . / /          wt source / main / dotfiles session",
     "  < / > / \\          Slot palette: g continue, m compact, z editor, c custom",
     "  O                  Open the main clone in the editor",
@@ -106,13 +106,14 @@ pub(crate) const LINES: &[&str] = &[
     "  '                  Output picker; ' ' confirms",
     "  [ / ]              Previous / next stream",
     "  \"                  Attention / all activity",
-    "  x                  Mark attention feed seen",
+    "  x / X              Mark attention feed seen (attention view)",
     "  Ctrl+E / Ctrl+Y    Scroll output down / up (Ctrl+Shift+J / K too)",
     "  Esc                Return the output pane to its default",
     "",
     "Performance (P)",
-    "  j / k, PgUp / PgDn  Scroll",
-    "  Ctrl+D/U, Ctrl+E/Y  Scroll by half a page / one line",
+    "  j/k, Ctrl+E/Y      Scroll three lines",
+    "  PgUp/PgDn, Ctrl+D/U  Scroll half a page",
+    "  g / G, Home / End  Top / bottom",
     "  i                  Send the snapshot to the wt session and enter it",
     "  c                  Toggle continuous sampling",
     "  r                  Sample now",
@@ -142,54 +143,12 @@ pub(crate) const LINES: &[&str] = &[
     "  --any              With --attach, match any author's branch",
 ];
 
-/// A section heading, as opposed to an entry or a separator.
-pub(crate) fn is_heading(line: &str) -> bool {
-    !line.is_empty() && !line.starts_with(' ')
-}
-
-pub(crate) fn filtered_lines(query: &str) -> Vec<&'static str> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return LINES.to_vec();
-    }
-    let mut out = Vec::new();
-    let mut heading = None;
-    for line in LINES.iter().copied() {
-        if line.is_empty() {
-            continue;
-        }
-        if is_heading(line) {
-            heading = Some(line);
-            continue;
-        }
-        if line.to_lowercase().contains(&query) {
-            if let Some(heading) = heading.take() {
-                if !out.is_empty() {
-                    out.push("");
-                }
-                out.push(heading);
-            }
-            out.push(line);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn search_keeps_the_heading_of_each_matching_section() {
-        let lines = filtered_lines("graceful");
-        assert_eq!(
-            lines,
-            vec![
-                "Sessions",
-                "  ; d                Close highlighted session gracefully"
-            ]
-        );
-        assert!(filtered_lines("").len() == LINES.len());
+    fn entries_have_a_key_column_and_no_em_dashes() {
         assert!(LINES.iter().all(|line| !line.contains('\u{2014}')));
         // Every entry separates its key column from its meaning with two
         // spaces; the overlay splits on that gap.

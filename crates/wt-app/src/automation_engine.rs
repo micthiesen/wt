@@ -30,7 +30,8 @@ pub struct WorktreeQuiescence {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeActivity {
-    /// Slugs with a durable headless action run still in the running state.
+    /// Slugs with a live headless action tmux session (all active slugs
+    /// while the tmux inventory is unconfirmed).
     pub headless_running: BTreeSet<String>,
     /// Slugs whose live session is working, asking, or otherwise unsafe to
     /// inject into. Include manager only if the caller wants manager-targeted

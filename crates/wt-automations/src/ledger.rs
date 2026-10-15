@@ -707,17 +707,24 @@ impl AutomationLedger {
             .open(&temp)
             .await
             .map_err(|source| io_error("create temporary", &temp, source))?;
-        file.write_all(&bytes)
-            .await
-            .map_err(|source| io_error("write temporary", &temp, source))?;
-        file.sync_all()
-            .await
-            .map_err(|source| io_error("sync temporary", &temp, source))?;
-        drop(file);
-        fs::rename(&temp, &self.path)
-            .await
-            .map_err(|source| io_error("replace", &self.path, source))?;
-        Ok(())
+        let written = async {
+            file.write_all(&bytes)
+                .await
+                .map_err(|source| io_error("write temporary", &temp, source))?;
+            file.sync_all()
+                .await
+                .map_err(|source| io_error("sync temporary", &temp, source))?;
+            drop(file);
+            fs::rename(&temp, &self.path)
+                .await
+                .map_err(|source| io_error("replace", &self.path, source))
+        }
+        .await;
+        if written.is_err() {
+            // A failed write must not strand a pretty-printed ledger copy.
+            let _ = fs::remove_file(&temp).await;
+        }
+        written
     }
 }
 

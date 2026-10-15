@@ -284,16 +284,34 @@ async fn github_issue_url(ctx: &AppContext, number: u64) -> Option<String> {
     ))
 }
 
-fn repo_web_url(remote: &str) -> Option<String> {
+/// The browsable `https://host/owner/name` URL for a GitHub origin. URL forms
+/// take the host from their authority and never keep userinfo (which can hold
+/// a token); an SSH port is dropped. Only scp-form `git@host:path` splits on
+/// `:`.
+pub(crate) fn repo_web_url(remote: &str) -> Option<String> {
     let raw = remote.trim();
-    let raw = raw
-        .strip_prefix("https://")
-        .or_else(|| raw.strip_prefix("http://"))
-        .or_else(|| raw.strip_prefix("git@"))
-        .or_else(|| raw.strip_prefix("ssh://git@"))?;
-    let (host, path) = raw.split_once(':').or_else(|| raw.split_once('/'))?;
-    let host = host.split('/').next()?;
-    let path = path.trim_end_matches(".git").trim_end_matches('/');
+    fn from_url(rest: &str, keep_port: bool) -> Option<(&str, &str)> {
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let host = if keep_port {
+            host
+        } else {
+            host.split(':').next()?
+        };
+        Some((host, path))
+    }
+    let (host, path) = if let Some(rest) = raw.strip_prefix("https://") {
+        from_url(rest, true)?
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        from_url(rest, true)?
+    } else if let Some(rest) = raw.strip_prefix("ssh://") {
+        from_url(rest, false)?
+    } else {
+        raw.strip_prefix("git@")?.split_once(':')?
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
     let mut parts = path.split('/');
     let owner = parts.next()?;
     let name = parts.next()?;
@@ -333,6 +351,22 @@ mod tests {
         );
         assert_eq!(
             repo_web_url("git@github.com:acme/wt.git"),
+            Some("https://github.com/acme/wt".into())
+        );
+        assert_eq!(
+            repo_web_url("ssh://git@ghe.example:2222/acme/wt.git"),
+            Some("https://ghe.example/acme/wt".into())
+        );
+        assert_eq!(
+            repo_web_url("https://ghe.example:8443/acme/wt"),
+            Some("https://ghe.example:8443/acme/wt".into())
+        );
+    }
+
+    #[test]
+    fn github_urls_never_carry_origin_credentials() {
+        assert_eq!(
+            repo_web_url("https://x-access-token:secret@github.com/acme/wt.git\n"),
             Some("https://github.com/acme/wt".into())
         );
     }

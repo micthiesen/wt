@@ -130,7 +130,7 @@ fn visit_keys(
         | UiAction::GenerateTitle { key }
         | UiAction::OpenEditor { key }
         | UiAction::PrepareRemove { key }
-        | UiAction::ToggleArchive { key }
+        | UiAction::ToggleArchive { key, .. }
         | UiAction::PrepareStatus { key }
         | UiAction::SetStatus { key, .. }
         | UiAction::PrepareBase { key }
@@ -172,7 +172,7 @@ fn visit_keys(
                 visit(key)?;
             }
         }
-        UiAction::ToggleAutomations { key } => {
+        UiAction::ToggleAutomations { key, .. } => {
             if let Some(key) = key {
                 visit(key)?;
             }

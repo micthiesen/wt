@@ -639,8 +639,21 @@ async fn read_stage(path: &Path) -> Option<String> {
         .filter(|stage| !stage.is_empty())
 }
 
+/// Count newlines in one untracked regular file. Git also lists symlinks and
+/// nested repositories (`sub/`), and a path can vanish after `ls-files`; none
+/// of those have countable lines. Opening a FIFO would block indefinitely.
 async fn count_lines(path: &Path) -> Result<u64, std::io::Error> {
-    let mut file = fs::File::open(path).await?;
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    }
+    let mut file = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
     let mut buffer = [0u8; 16 * 1024];
     let mut count = 0u64;
     loop {

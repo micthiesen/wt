@@ -179,6 +179,15 @@ pub fn build_reports(targets: &Targets, memory: &SkillsMemory) -> Vec<UnitReport
                             Some("multiple managed blocks found; remove duplicates by hand".into()),
                         ),
                         Ok(text) => match extract_instructions_block(&text) {
+                            // A stray or damaged marker: appending would leave
+                            // two blocks, so the reader repairs it by hand.
+                            None if count_instructions_blocks(&text) > 0 => (
+                                UnitState::Blocked,
+                                Some(
+                                    "managed block markers are damaged; repair or remove them by hand"
+                                        .into(),
+                                ),
+                            ),
                             None => (UnitState::Missing, None),
                             Some(b) if b.body == expected => (UnitState::Fresh, None),
                             Some(b) if b.hash == content_hash(&b.body) => {
@@ -253,6 +262,26 @@ mod tests {
         let reports = build_reports(&targets, &SkillsMemory::default());
         assert_eq!(reports[0].state, UnitState::Blocked);
         assert!(!report_is_actionable(&reports[0]));
+    }
+
+    #[test]
+    fn damaged_instructions_block_is_blocked_instead_of_appended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        let damaged = crate::splice_instructions_block("user text\n", "OLD")
+            .replace("<!-- wt:instructions:end -->", "");
+        fs::write(&file, &damaged).unwrap();
+        let targets = Targets {
+            instructions: vec![InstructionsTarget::Native {
+                harnesses: vec![],
+                file: file.clone(),
+            }],
+            ..Default::default()
+        };
+        let reports = build_reports(&targets, &SkillsMemory::default());
+        assert_eq!(reports[0].state, UnitState::Blocked);
+        crate::sync(&reports, crate::SyncMode::Force).unwrap();
+        assert_eq!(fs::read_to_string(file).unwrap(), damaged);
     }
 
     #[test]

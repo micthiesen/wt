@@ -175,7 +175,7 @@ production = "main"
 
 When you fork from `staging`, `main` is still the branch you check
 against to see what is in production — and nothing was keeping it
-current. `git fetch --prune` (which `fetchOrigin` runs every few
+current. `git fetch --prune` (which wt's origin fetch runs every few
 minutes) moves every `origin/<branch>`, but only the local head named by
 `base` was being advanced, so `git log main` in the main clone answered
 about the last time somebody typed `git fetch origin main:main` by hand.
@@ -456,7 +456,7 @@ command = "npm run dev -- --port {{port}} --strictPort"
 |---|---|---|---|
 | `command` | **yes** | — | Run via `$SHELL -lc` inside the worktree. `{{port}}` substitutes the allocated port (also exported as `$PORT`). Pin the server to it (`--port {{port}} --strictPort` for Vite) — auto-picking servers drift from the recorded port and break hardcoded HMR sockets. |
 | `port_base` | no | `8100` | Start of the port range wt allocates from. |
-| `port_range` | no | `100` | Range size. Each slug gets a stable port, persisted in wtstate and freed when the worktree is destroyed. |
+| `port_range` | no | `100` | Range size. Each slug gets a stable port, persisted in the durable state database and freed when the worktree is destroyed. |
 | `url` | no | `"http://localhost:{{port}}/"` | URL template for the row, `s` open, and yank. |
 | `max_concurrent` | no | *(uncapped)* | Most dev servers allowed to run at once across the whole fleet. A start beyond it is refused with exit `75`; `wt dev start --wait` queues instead. See below. |
 | `stop_command` | no | *(none)* | Shell command run after the session dies on `wt dev stop` (and when a slot is reclaimed). Same `{{path}}`/`{{slug}}`/`{{port}}` substitution as [`[lifecycle] destroy_command`](#destroy_command--what-it-is-for). A failed plain stop now exits 1 and reports the hook output; a failed reset stop also prevents `reset_command` (see below). **Prefer the project's own teardown over raw container commands.** A tool that starts a stack usually keeps state of its own about that stack, and removing its containers behind its back leaves it believing the project is still running — the next start then refuses, with an error that reads as a broken tree rather than a failed stop. See below. |
@@ -904,7 +904,7 @@ settle_seconds   = 300
 | `cooldown_minutes` | no | *(none)* | Minimum minutes between dispatches per (rule, worktree). |
 | `branch` | no | *(none)* | **`branch.advanced` only** (required there, rejected elsewhere): which branch to watch. Must be `[branch] base` or listed in `[branch] keep_fresh` — nothing else advances a local head, so watching an unfetched branch is a rule that can never fire. No default on purpose: guessing the trunk would watch the wrong thing on exactly the fleets this exists for, where the release branch is the one you *don't* fork from. |
 | `after_days` | no | `2` | **`status.verification_overdue` only** (rejected on any other trigger): how long an outstanding post-merge verification may sit before the rule starts firing. A knob because deploy cadence is the one thing wt cannot guess — a fleet that deploys on merge wants `1`, one that batches a weekly release wants `7`, and a default wrong in either direction turns the reminder into noise or into nothing. |
-| `settle_seconds` | no | `120` (merge triggers: `10`; status triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. |
+| `settle_seconds` | no | `120` (merge and `branch.advanced` triggers: `10`; `wt.created` and status triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. |
 
 At runtime, `A` pauses all automations and `Ctrl+A` pauses the selected worktree (or its whole stack); both persist across restarts.
 

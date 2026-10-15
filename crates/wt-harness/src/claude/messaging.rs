@@ -331,6 +331,7 @@ impl ClaudeMessenger {
         }
         tokio::select! { biased; _ = cancel.cancelled() => return Ok(TerminalOutcome::Failed { reason: "cancelled after terminal paste".into(), maybe_submitted: true }), _ = tokio::time::sleep(Duration::from_millis(500)) => {} }
         let deadline = tokio::time::Instant::now() + PASTE_VERIFY;
+        let mut resent = false;
         let mut changed = tmux
             .capture_pane(&pane, None, cancel)
             .await
@@ -363,6 +364,7 @@ impl ClaudeMessenger {
                     maybe_submitted: true,
                 });
             }
+            resent = true;
             tokio::select! { biased; _ = cancel.cancelled() => return Ok(TerminalOutcome::Failed { reason: "cancelled after terminal paste".into(), maybe_submitted: true }), _ = tokio::time::sleep(Duration::from_millis(500)) => {} }
             changed = tmux
                 .capture_pane(&pane, None, cancel)
@@ -391,10 +393,7 @@ impl ClaudeMessenger {
             self.confirm(target, text, since_ms, idle_at_submit, cancel)
                 .await
         };
-        Ok(TerminalOutcome::Sent {
-            delivered,
-            resent: false,
-        })
+        Ok(TerminalOutcome::Sent { delivered, resent })
     }
 
     async fn confirm(
@@ -407,7 +406,22 @@ impl ClaudeMessenger {
     ) -> Option<bool> {
         let deadline = tokio::time::Instant::now() + CONFIRM_MAX;
         loop {
-            if transcript_has_prompt(self.sessions.paths(), target, text, since_ms) {
+            // Each check may read and parse up to 16 MiB of transcript; keep it
+            // off the async workers.
+            let (paths, target_owned, text_owned) = (
+                self.sessions.paths().clone(),
+                target.clone(),
+                text.to_owned(),
+            );
+            let found = tokio::task::spawn_blocking(move || {
+                transcript_has_prompt(&paths, &target_owned, &text_owned, since_ms)
+            });
+            let found = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return None,
+                found = found => found.unwrap_or(false),
+            };
+            if found {
                 return Some(true);
             }
             if tokio::time::Instant::now() >= deadline {

@@ -14,7 +14,7 @@ use wt_store::{RemovedWorktree, WorkStatusRecord};
 use wt_vcs::WorktreeSnapshot;
 
 use crate::{
-    commands::{diagnostics::OperationLock, resolve::run_git},
+    commands::{diagnostics::OperationLock, issue::repo_web_url, resolve::run_git},
     context::AppContext,
     issue_identity,
     worktree_facts::{PushFacts, push_facts},
@@ -457,32 +457,10 @@ fn issue_url(ctx: &AppContext, id: &str, remote_url: Option<&str>) -> Option<Str
     )
 }
 
-fn repo_web_url(remote: &str) -> Option<String> {
-    let raw = remote
-        .strip_prefix("https://")
-        .or_else(|| remote.strip_prefix("http://"))
-        .or_else(|| remote.strip_prefix("git@"))
-        .or_else(|| remote.strip_prefix("ssh://git@"))?;
-    let (host, path) = if let Some((host, path)) = raw.split_once(':') {
-        (host, path)
-    } else {
-        raw.split_once('/')?
-    };
-    let host = host.split('/').next()?;
-    let path = path.trim_end_matches(".git").trim_end_matches('/');
-    Some(format!("https://{host}/{path}"))
-}
-
 fn removed_json(entry: &RemovedWorktree) -> Value {
     let work = entry.work.as_ref();
     let verify = work.and_then(|work| work.verify_after_merge.as_deref());
-    let verification_owed = verify.is_some_and(|steps| {
-        !steps.trim().is_empty()
-            && !matches!(
-                work.map(|work| work.state.as_str()),
-                Some("verified" | "dropped")
-            )
-    });
+    let verification_owed = wt_store::verification_owed_at_removal(entry);
     json!({
         "slug": entry.slug,
         "branch": entry.branch,

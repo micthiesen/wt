@@ -35,7 +35,9 @@ is pending until the application confirms startup using the same unique attempt
 token. If the pending binary fails before confirmation, the launcher selects
 the prior fallback on the next launch. Once an ordinary command has started,
 its exit status does not trigger rollback or argument replay. Explicit early
-startup failure can restore the fallback immediately.
+startup failure can restore the fallback immediately. On Unix the launcher
+dispatches with `exec`, so the application keeps the launcher's PID and
+receives signals sent to it (launchd's SIGTERM, terminal hangups) directly.
 
 Update-state transitions use an OS file lock and atomic state-file replacement.
 Downloads and archive validation happen before activation. Extraction rejects
@@ -47,6 +49,8 @@ The native release and remote provisioning tests strip copies of debug binaries
 before packaging or transferring them.
 On macOS, it removes debug and local symbols so the fixture stays below the
 128 MiB limit for each binary. The original build files keep their symbols.
+
+After `wt update` or the startup offer installs a build on macOS, and only if `~/Library/LaunchAgents/com.wt.events.plist` exists, wt runs the new launcher's `wt events reconcile` (90-second timeout) so an installed GitHub events daemon moves onto the new build. If that fails, wt warns and suggests `wt events restart`; the update stays installed. See [github-events.md](github-events.md#native-launchd-service).
 
 The startup offer checks at most once per day. `[update] startup_check = false`
 or `WT_UPDATE=off` disables it. A declined build remains suppressed until a

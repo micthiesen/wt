@@ -149,6 +149,9 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut lifecycle_retry = LifecycleRetry::default();
         let mut requirements_board_revision = None;
         let mut latest_error: Option<String> = None;
+        // Whether `facts` reflects the current inputs. A failed preparation
+        // keeps the last facts for cancelling pending fires, never for ticks.
+        let mut facts_current = false;
         let mut dispatches: JoinSet<(ClaimedFire, AutomationOutcome, Option<String>)> = JoinSet::new();
         let mut active_dispatches = HashMap::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -196,8 +199,17 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                         }
                         Some(Err(error)) => {
-                            active_dispatches.remove(&error.id());
                             latest_error = Some(format!("automation dispatch task failed: {error}"));
+                            // The task may have delivered before it failed;
+                            // record that and free its engine slot.
+                            if let Some((claim, _)) = active_dispatches.remove(&error.id())
+                                && let Err(finish) = engine.finish_with_cancellation(
+                                    &claim, failed_dispatch(&error), now_ms(), &accepted_context.cancellation,
+                                ).await
+                            {
+                                latest_error = Some(format!("automation ledger finish: {finish:#}"));
+                            }
+                            let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                         }
                         None => {}
                     }
@@ -275,7 +287,12 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             lifecycle_cache_key = Some(lifecycle_key);
                         }
                         Err(error) => {
+                            // Back off until the retry or an input change;
+                            // the lifecycle rows rerun on any change.
                             lifecycle_retry.completed(true);
+                            lifecycle_cache_key = None;
+                            cache_key = Some(key);
+                            facts_current = false;
                             latest_error = Some(format!("automation facts unavailable: lifecycle evidence: {error:#}"));
                             let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                             continue;
@@ -299,6 +316,11 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     Ok(mut next) => {
                         if !next.initial_branch_tips.is_empty() {
                             if let Err(error) = persist_tips(&context, &next.initial_branch_tips).await {
+                                // Back off like any other facts failure
+                                // rather than retrying on every tick.
+                                lifecycle_retry.completed(true);
+                                cache_key = Some(key);
+                                facts_current = false;
                                 latest_error = Some(format!("automation facts unavailable: cannot persist branch tip baseline: {error:#}"));
                                 let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                                 continue;
@@ -309,11 +331,20 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             if let Some(seen) = persisted_tips.get(branch) { tip.seen = Some(seen.clone()); }
                         }
                         facts = Some(next); cache_key = Some(key); latest_error = None;
+                        facts_current = true;
                     }
-                    Err(error) => { cache_key = Some(key); latest_error = Some(format!("automation facts unavailable: {error:#}")); }
+                    Err(error) => {
+                        // Retry on the lifecycle backoff even if no input changes.
+                        lifecycle_retry.completed(true);
+                        cache_key = Some(key);
+                        facts_current = false;
+                        latest_error = Some(format!("automation facts unavailable: {error:#}"));
+                    }
                 }
             }
-            if latest_error.as_deref().is_some_and(|error| error.starts_with("automation facts unavailable:")) {
+            // A dispatch error may since have replaced the message; the
+            // flag, not the text, keeps stale facts from ticking.
+            if !facts_current {
                 let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
                 continue;
             }
@@ -343,9 +374,9 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 let context = accepted_context.clone();
                 let github = fresh_github.clone();
                 let board = base_board.data().map(|board| (**board).clone());
-                let slug = claim.fire().slug.clone();
+                let tracked = claim.clone();
                 let task = dispatches.spawn(async move { dispatch_claim(context, claim, github, board).await });
-                active_dispatches.insert(task.id(), (slug, Instant::now()));
+                active_dispatches.insert(task.id(), (tracked, Instant::now()));
             }
             let _ = status_tx.send((tick.pending, latest_error.clone()));
         }
@@ -366,15 +397,22 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                         }
                     }
                     Some(Err(error)) => {
-                        active_dispatches.remove(&error.id());
                         tracing::warn!(%error, "automation dispatch task failed during shutdown");
+                        if let Some((claim, _)) = active_dispatches.remove(&error.id())
+                            && let Err(error) = engine.finish_with_cancellation(
+                                &claim, failed_dispatch(&error), now_ms(), &accepted_context.cancellation,
+                            ).await
+                        {
+                            tracing::warn!(%error, "cannot finish automation dispatch during shutdown");
+                        }
                     }
                     None => break,
                 },
                 _ = progress.tick() => {
-                    for (slug, started) in active_dispatches.values() {
+                    for (claim, started) in active_dispatches.values() {
                         eprintln!(
-                            "wt: shutdown waiting: automation for {slug} on this machine is running ({} elapsed)",
+                            "wt: shutdown waiting: automation for {} on this machine is running ({} elapsed)",
+                            claim.fire().slug,
                             shutdown_elapsed(started.elapsed()),
                         );
                     }
@@ -386,6 +424,14 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         board,
         commands,
         drain: AutomationDrain::new(drain_token, task),
+    }
+}
+
+/// A dispatch task that panicked or was aborted may have delivered first.
+fn failed_dispatch(error: &tokio::task::JoinError) -> AutomationOutcome {
+    AutomationOutcome::Ambiguous {
+        reason: format!("dispatch task failed: {error}"),
+        slot: crate::automation_engine::DeliverySlot::None,
     }
 }
 
@@ -477,6 +523,7 @@ fn overlay(
     let mut updates = input.subscribe();
     scope.spawn(async move {
         updates.mark_changed();
+        let mut failures = crate::activity_source::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -503,7 +550,7 @@ fn overlay(
                     && !line.text.starts_with("Automation error:")
             });
             if pending > 0 {
-                crate::activity_source::append_activity(
+                failures.activity(
                     &mut board,
                     "INFO",
                     "Automations",
@@ -511,12 +558,13 @@ fn overlay(
                 );
             }
             if let Some(error) = error {
-                crate::activity_source::append_attention(
+                failures.attention(
                     &mut board,
                     "Automations",
                     &format!("Automation error: {error}"),
                 );
             }
+            failures.sweep();
             // The status lines are derived from the board's own inputs, so
             // the board keeps its provenance.
             publisher.publish_if_changed(snapshot.derive(Some(Arc::new(board))));

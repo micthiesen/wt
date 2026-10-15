@@ -283,11 +283,30 @@ async fn remove(ctx: &AppContext, from_arg: &str, to_arg: &str) -> Result<i32> {
         .await?;
     if removed {
         println!("✓ dropped {from} → {to}");
-        Ok(0)
-    } else {
-        eprintln!("no edge {from} → {to}");
-        Ok(1)
+        return Ok(0);
     }
+    eprintln!("no edge {from} → {to}");
+    // Direction and stored-slug mismatches are invisible in a bare refusal.
+    let state = load_state(ctx).await?;
+    let touching = state
+        .get("edges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_merge_edge)
+        .filter(|edge| {
+            [&from, &to]
+                .iter()
+                .any(|slug| edge.from == **slug || edge.to == **slug)
+        })
+        .collect::<Vec<_>>();
+    if !touching.is_empty() {
+        eprintln!("edges touching {from} or {to}:");
+        for edge in touching {
+            eprintln!("  {} ─{}─▶ {}", edge.from, kind_name(edge.kind), edge.to);
+        }
+    }
+    Ok(1)
 }
 
 async fn resolve_endpoint(

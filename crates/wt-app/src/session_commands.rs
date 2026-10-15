@@ -72,7 +72,6 @@ pub(crate) async fn cached_session_options(
     let agent = picker_agent(context, key.as_deref(), target).await?;
     let app = AppHarness::new(context);
     let live = app.session_inventory(context).await?;
-    let live: Vec<_> = live;
     let options = picker_entries(
         &visible_harnesses(&context.config),
         &agent,
@@ -768,14 +767,18 @@ pub(super) async fn resolve_target(
     }
 }
 
-fn session_name(agent: &AgentTarget, harness: HarnessId) -> String {
+pub(super) fn session_name(agent: &AgentTarget, harness: HarnessId) -> String {
+    slot_name(&agent.slug, agent.managed_name.as_deref(), harness)
+}
+
+/// The tmux session one harness occupies for a slug. Only Claude has named
+/// sessions (`slug~name`); every other harness has one slot per target.
+pub(super) fn slot_name(slug: &str, managed_name: Option<&str>, harness: HarnessId) -> String {
     match harness {
-        HarnessId::Claude => {
-            wt_harness::claude_tmux_name(&agent.slug, agent.managed_name.as_deref())
-        }
-        HarnessId::Codex => format!("{}-codex", agent.slug),
-        HarnessId::Opencode => format!("{}-opencode", agent.slug),
-        HarnessId::Pi => format!("{}-pi", agent.slug),
+        HarnessId::Claude => wt_harness::claude_tmux_name(slug, managed_name),
+        HarnessId::Codex => format!("{slug}-codex"),
+        HarnessId::Opencode => format!("{slug}-opencode"),
+        HarnessId::Pi => format!("{slug}-pi"),
     }
 }
 

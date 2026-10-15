@@ -346,7 +346,9 @@ fn footer(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             Span::raw(" "),
             Span::styled(label, base.fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
-            Span::styled(format!("{text:<room$}"), base.fg(theme::FG_BRIGHT)),
+            // Pad by cells, not chars: a wide character would otherwise push
+            // the hint off the row.
+            Span::styled(text::fit(&text, room), base.fg(theme::FG_BRIGHT)),
             Span::styled(hint, base.fg(theme::FG_DIM)),
         ];
         frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);

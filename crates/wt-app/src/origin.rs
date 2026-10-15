@@ -111,6 +111,7 @@ pub fn overlay(
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         origin.refresh();
+        let mut failures = crate::activity_source::FailureClock::default();
         loop {
             tokio::select! { biased;
                 _ = cancellation.cancelled() => break,
@@ -133,23 +134,17 @@ pub fn overlay(
             let mut data = snapshot.data().cloned();
             if let SourceState::Failed(error) = origin.state() {
                 if let Some(board) = data.as_mut() {
-                    crate::activity_source::append_attention(
-                        Arc::make_mut(board),
-                        "Fetch origin",
-                        error,
-                    );
+                    failures.attention(Arc::make_mut(board), "Fetch origin", error);
                 }
             } else if let (Some(board), Some(report)) = (data.as_mut(), origin.data()) {
                 for warning in &report.warnings {
-                    crate::activity_source::append_activity(
-                        Arc::make_mut(board),
-                        "WARN",
-                        "Fetch origin",
-                        warning,
-                    );
+                    failures.activity(Arc::make_mut(board), "WARN", "Fetch origin", warning);
                 }
             }
-            publisher.publish(snapshot.with_data(data).with_input(&origin));
+            if data.is_some() {
+                failures.sweep();
+            }
+            publisher.publish_if_changed(snapshot.with_data(data).with_input(&origin));
         }
     });
     OriginSources {

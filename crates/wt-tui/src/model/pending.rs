@@ -196,6 +196,7 @@ impl Model {
                     )
             }),
             typeahead: if preparation { carried } else { Vec::new() },
+            typeahead_overflow: false,
             started: tokio::time::Instant::now(),
             action: inner.clone(),
             _cancel_on_drop: None,

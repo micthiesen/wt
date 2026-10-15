@@ -60,6 +60,9 @@ pub(crate) struct PendingRequest {
     /// Keys typed while the menu loads, replayed into it when it opens. They
     /// never reach the board underneath.
     pub typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
+    /// Keys past [`input::TYPEAHEAD_LIMIT`] were dropped; the menu says so
+    /// when it opens.
+    pub typeahead_overflow: bool,
     pub started: tokio::time::Instant,
     pub action: UiAction,
     pub _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
@@ -80,7 +83,7 @@ pub struct Model {
     /// The request whose board-built menu is open.
     pub(crate) local_menu: Option<UiAction>,
     /// The open board menu's default choice, while the user has not moved.
-    pub(crate) local_menu_default: Option<Option<String>>,
+    pub(crate) local_menu_default: Option<local_menu::OptionIdentity>,
     /// A board menu whose commit was just produced, until it is sent.
     pub(crate) committed_menu: Option<UiAction>,
     /// The board menu behind the request in flight, reopened if it is stale.

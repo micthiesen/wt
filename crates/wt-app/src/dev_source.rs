@@ -130,7 +130,7 @@ fn project(
                     dev_updates.borrow_and_update();
                 }
             }
-            publisher.publish(compose(
+            publisher.publish_if_changed(compose(
                 board_updates.borrow().clone(),
                 dev_updates.borrow().clone(),
             ));

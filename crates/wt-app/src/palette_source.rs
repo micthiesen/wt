@@ -118,7 +118,7 @@ pub fn overlay(
                 }
                 Arc::new(board)
             });
-            publisher.publish(base.with_data(data).with_input(&snapshot));
+            publisher.publish_if_changed(base.with_data(data).with_input(&snapshot));
         }
     });
     output

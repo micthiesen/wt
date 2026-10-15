@@ -108,3 +108,22 @@ pub fn unit_key(unit: &Unit) -> String {
         UnitKind::Instructions => "instructions".into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The instructions block is spliced into the reader's own always-loaded
+    /// AGENTS.md/CLAUDE.md, so it is edited by replacement, not accretion
+    /// (docs/skills.md, "What belongs in the block"). It once grew to 2.5x
+    /// this budget one reasonable-looking addition at a time; raising the
+    /// number is a deliberate decision, not a formality.
+    #[test]
+    fn the_always_on_instructions_block_stays_within_its_line_budget() {
+        let source = unit_source("instructions").expect("bundled instructions");
+        assert!(
+            source.trim_end().lines().count() <= 140,
+            "skills/instructions.md exceeds its 140-line budget"
+        );
+    }
+}

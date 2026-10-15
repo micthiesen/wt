@@ -4,7 +4,10 @@ use std::{path::Path, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::{net::UnixStream, time::timeout};
+use tokio::{
+    net::UnixStream,
+    time::{timeout, timeout_at},
+};
 use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -52,7 +55,10 @@ pub enum CodexAppServerFailureKind {
     Unsupported,
     Protocol,
     Rejected,
+    /// A thread write may have reached the server without ownership proof.
     Ambiguous,
+    /// Cancelled before any thread write was sent. A cancelled queue/add is
+    /// reported as `Ambiguous` instead.
     Cancelled,
 }
 
@@ -66,6 +72,7 @@ pub struct CodexAppServerError {
 
 type Socket = WebSocketStream<UnixStream>;
 static MESSAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct CodexAppServerClient {
     socket: Socket,
@@ -110,6 +117,8 @@ impl CodexAppServerClient {
                 codex_home: String::new(),
             },
         };
+        // The handshake writes nothing to any thread. A lost initialize reply
+        // makes the daemon unavailable, never a possibly-delivered message.
         let initialized = client
             .request(
                 "initialize",
@@ -120,7 +129,13 @@ impl CodexAppServerClient {
                 "initialize",
                 cancel,
             )
-            .await?;
+            .await
+            .map_err(|mut error| {
+                if error.kind == CodexAppServerFailureKind::Ambiguous {
+                    error.kind = CodexAppServerFailureKind::Unavailable;
+                }
+                error
+            })?;
         let Some(user_agent) = initialized.get("userAgent").and_then(Value::as_str) else {
             return Err(error(
                 "initialize",
@@ -157,9 +172,12 @@ impl CodexAppServerClient {
                 .to_string()
                 .into(),
         );
+        // One budget covers the whole exchange. Unrelated notifications keep
+        // arriving on a busy daemon and must not extend the wait for our reply.
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
         tokio::select! {
             _ = cancel.cancelled() => return Err(cancelled(operation)),
-            result = timeout(Duration::from_secs(10), self.socket.send(request)) => match result {
+            result = timeout_at(deadline, self.socket.send(request)) => match result {
                 Err(_) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, "request send timed out")),
                 Ok(Err(e)) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, e.to_string())),
                 Ok(Ok(())) => (),
@@ -168,7 +186,7 @@ impl CodexAppServerClient {
         loop {
             let next = tokio::select! {
                 _ = cancel.cancelled() => return Err(cancelled(operation)),
-                result = timeout(Duration::from_secs(10), self.socket.next()) => match result {
+                result = timeout_at(deadline, self.socket.next()) => match result {
                     Err(_) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, "request response timed out")),
                     Ok(None) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, "Codex app-server closed the socket after the request")),
                     Ok(Some(Err(e))) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, e.to_string())),
@@ -180,8 +198,10 @@ impl CodexAppServerClient {
                 Message::Ping(payload) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(cancelled(operation)),
-                        result = self.socket.send(Message::Pong(payload)) => if let Err(e) = result {
-                            return Err(error(operation, CodexAppServerFailureKind::Ambiguous, e.to_string()));
+                        result = timeout_at(deadline, self.socket.send(Message::Pong(payload))) => match result {
+                            Err(_) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, "request response timed out")),
+                            Ok(Err(e)) => return Err(error(operation, CodexAppServerFailureKind::Ambiguous, e.to_string())),
+                            Ok(Ok(())) => (),
                         }
                     }
                     continue;
@@ -483,7 +503,21 @@ pub async fn queue_message(
                 reconciled: false,
             })
         }
-        Err(add_error) if add_error.kind == CodexAppServerFailureKind::Ambiguous => {
+        // The add was written. Cancellation leaves no budget to reconcile, so
+        // its outcome is unknown rather than "not sent".
+        Err(add_error) if add_error.kind == CodexAppServerFailureKind::Cancelled => Err(error(
+            "queue-add",
+            CodexAppServerFailureKind::Ambiguous,
+            "cancelled after queue/add was sent; wt will not re-submit",
+        )),
+        // A lost reply, or a success reply wt cannot parse, may still mean the
+        // server owns the message. Prove ownership before reporting anything.
+        Err(add_error)
+            if matches!(
+                add_error.kind,
+                CodexAppServerFailureKind::Ambiguous | CodexAppServerFailureKind::Protocol
+            ) =>
+        {
             drop(client);
             let mut reconcile = CodexAppServerClient::connect(socket, cancel)
                 .await
@@ -491,7 +525,7 @@ pub async fn queue_message(
                     error(
                         "queue-add",
                         CodexAppServerFailureKind::Ambiguous,
-                        format!("lost add reply and could not reconnect for ownership check: {e}"),
+                        format!("lost add reply ({add_error}) and could not reconnect for ownership check: {e}"),
                     )
                 })?;
             let mut cursor: Option<String> = None;
@@ -619,6 +653,7 @@ mod tests {
     async fn run_lost_add_server(
         path: PathBuf,
         prove: bool,
+        malformed_receipt: bool,
         add_count: Arc<AtomicUsize>,
         ready: oneshot::Sender<()>,
         done: oneshot::Sender<()>,
@@ -636,6 +671,10 @@ mod tests {
             .unwrap()
             .to_owned();
         let input = add["params"]["input"].clone();
+        if malformed_receipt {
+            // The server committed the add but its receipt is unreadable.
+            reply(&mut socket, &add, json!({"queuedSubmission":{"id":7}})).await;
+        }
         drop(socket); // The server committed the add but the reply was lost.
 
         let (stream, _) = listener.accept().await.unwrap();
@@ -671,6 +710,7 @@ mod tests {
         let server = tokio::spawn(run_lost_add_server(
             path.clone(),
             true,
+            false,
             count.clone(),
             ready_tx,
             tx,
@@ -688,6 +728,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_queue_add_receipt_is_reconciled_not_reported_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app-server.sock");
+        let count = Arc::new(AtomicUsize::new(0));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
+        let server = tokio::spawn(run_lost_add_server(
+            path.clone(),
+            true,
+            true,
+            count.clone(),
+            ready_tx,
+            tx,
+        ));
+        ready_rx.await.unwrap();
+        let result = queue_message(&path, "thread-1", "hello", &CancellationToken::new())
+            .await
+            .unwrap();
+        rx.await.unwrap();
+        server.await.unwrap();
+        assert!(result.reconciled);
+        assert_eq!(result.submission.id, "sub-1");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notifications_do_not_extend_the_request_budget_and_handshake_loss_is_not_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app-server.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let request = receive(&mut socket).await;
+            assert_eq!(request["method"], "initialize");
+            // A busy daemon streams unrelated notifications but never replies.
+            loop {
+                let notice = json!({"jsonrpc":"2.0","method":"thread/started","params":{}});
+                if socket
+                    .send(Message::Text(notice.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let error = queue_message(&path, "thread-1", "hello", &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // Nothing was written to a thread, so fallback remains permitted.
+        assert_eq!(error.kind, CodexAppServerFailureKind::Unavailable);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn unproven_lost_queue_add_reply_is_ambiguous_and_never_retried() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app-server.sock");
@@ -696,6 +795,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let server = tokio::spawn(run_lost_add_server(
             path.clone(),
+            false,
             false,
             count.clone(),
             ready_tx,

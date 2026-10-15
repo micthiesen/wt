@@ -23,6 +23,8 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-remote` | Native worker protocol and runtime transfer primitives |
 | `wt-update`, `wt-launcher` | Verified release installation, activation, boot probe and rollback |
 | `wt-skills`, `wt-events`, `wt-dev`, `wt-sst`, `wt-naming` | Skills distribution, webhook daemon, dev supervision, deployment reads and naming domain |
+| `wt-tmux` | Cancellable tmux transport for a caller-selected server and socket; never reads wt configuration or ambient `$TMUX` |
+| `xtask` | Repository tooling: `cargo xtask gate`, `deps-check`, `hygiene` (see [development.md](development.md)) |
 
 `crates/wt-app/src/main.rs` is the binary composition root. It resolves one
 configuration for the process, opens the repository-scoped database, builds an
@@ -161,7 +163,7 @@ no witness (CLI, automation) asserts nothing about a view and keeps the
 action's own validation.
 
 An open picker whose cursor the user has not moved follows the builder's
-newest default when it rebuilds; a moved cursor follows its option value.
+newest default when it rebuilds; a moved cursor follows its option value and chord, since two options can share a value.
 
 The action palette is prefetched. While the selection rests (200 ms), the model
 sends a background `WarmPalette` for the selected row's and manager surfaces;

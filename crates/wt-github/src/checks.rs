@@ -149,7 +149,7 @@ fn ignored(name: Option<&str>, patterns: &[String], bot_contexts: &[String]) -> 
         .any(|p| wildcard_eq(p, name))
 }
 
-fn wildcard_eq(pattern: &str, value: &str) -> bool {
+pub(crate) fn wildcard_eq(pattern: &str, value: &str) -> bool {
     // The config contract supports only `*`; matching is Unicode-safe and
     // ASCII case-insensitive, as JavaScript's `/i` was for these names.
     let p = pattern.to_lowercase();

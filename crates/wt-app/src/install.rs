@@ -22,15 +22,6 @@ pub enum InstallResult {
     AlreadyCurrent { release: String, build_id: String },
 }
 
-pub fn install_paths(options: &LoadOptions) -> Result<InstallPaths> {
-    let root = options
-        .env
-        .get(wt_launcher::INSTALL_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| options.home.join(".local/share/wt"));
-    InstallPaths::new(root).context("resolve native wt installation root")
-}
-
 /// Fetch and install a release without loading repository config or touching a
 /// checkout. The exact-tag mode is used by the shell bootstrap and test assets.
 pub async fn install_once(
@@ -41,7 +32,7 @@ pub async fn install_once(
     create_path_link: bool,
     cancel: &CancellationToken,
 ) -> Result<InstallResult> {
-    let paths = install_paths(options)?;
+    let paths = crate::updates::install_paths(options)?;
     let repository = crate::updates::repository(options)?;
     let store = StateStore::new(paths.clone());
     let state = tokio::task::spawn_blocking({
@@ -97,8 +88,16 @@ pub async fn install_once(
         .context("join installer channel update")??;
     }
 
-    let link_result = migrate_or_link_path(&paths, &options.home, create_path_link)
-        .context("install or migrate wt PATH entry");
+    // Migration may archive a legacy checkout with tar; keep it off the runtime.
+    let link_result = tokio::task::spawn_blocking({
+        let paths = paths.clone();
+        let home = options.home.clone();
+        move || migrate_or_link_path(&paths, &home, create_path_link)
+    })
+    .await
+    .context("join PATH migration")
+    .and_then(|result| result)
+    .context("install or migrate wt PATH entry");
     if let Err(error) = link_result {
         bail!(
             "native release {} ({}) is installed at {}, but PATH migration failed: {error:#}",

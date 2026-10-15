@@ -38,7 +38,16 @@ pub async fn run(ctx: &AppContext, args: &BaseArgs) -> Result<i32> {
             );
             Ok(0)
         }
-        Some(slug) if values.len() == 1 => {
+        Some(input) if values.len() == 1 => {
+            // Accept the same slug, branch or unique prefix that `set` does.
+            let row = match resolve_worktree(ctx, Some(input)).await {
+                Ok(row) => row,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return Ok(1);
+                }
+            };
+            let slug = row.target.slug();
             let state = read_state(&ctx.database).await?;
             let entry = state.get("slugs").and_then(|s| s.get(slug));
             let base = entry
@@ -124,6 +133,11 @@ mod tests {
         );
         let state = read_state(&fixture.ctx.database).await.unwrap();
         assert_eq!(state["slugs"]["one"]["baseBranch"], "main");
+        let show = |input: &str| BaseArgs {
+            positionals: vec![input.into()],
+        };
+        assert_eq!(run(&fixture.ctx, &show("feature/one")).await.unwrap(), 0);
+        assert_eq!(run(&fixture.ctx, &show("missing")).await.unwrap(), 1);
         assert_eq!(state["slugs"]["one"]["baseSha"], saved_anchor);
         fixture.close().await.unwrap();
     }

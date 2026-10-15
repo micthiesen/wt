@@ -777,8 +777,19 @@ async fn retarget_if_needed(
     cancellation: &CancellationToken,
     on_event: &mut (dyn FnMut(StackEvent) + Send),
 ) -> Result<(), StackError> {
-    let Some(pr) = github.view_pr(&step.branch, cancellation).await? else {
-        return Ok(());
+    // The branch is already replayed and pushed; an unreadable PR leaves its
+    // base for the user rather than abandoning the rest of the chain.
+    let pr = match github.view_pr(&step.branch, cancellation).await {
+        Ok(Some(pr)) => pr,
+        Ok(None) => return Ok(()),
+        Err(_) if cancellation.is_cancelled() => return Err(StackError::Cancelled),
+        Err(error) => {
+            on_event(StackEvent::Log(format!(
+                "warning: could not read {}'s PR to retarget its base to {expected_base}: {error}",
+                step.branch
+            )));
+            return Ok(());
+        }
     };
     if pr.state == "CLOSED" && pr.base_ref_name != expected_base {
         if git_sha(

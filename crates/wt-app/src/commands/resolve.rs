@@ -15,30 +15,17 @@ use crate::context::AppContext;
 /// Multiple rows or a remote target are rejected before an operation routes.
 pub async fn resolve_worktree(ctx: &AppContext, input: Option<&str>) -> Result<WorktreeRecord> {
     let records = ctx.repository.inventory(&ctx.cancellation).await?;
-    let record = if let Some(input) = input {
-        let exact = records
-            .iter()
-            .filter(|record| !record.is_main && matches_exact(&record.target, input))
-            .collect::<Vec<_>>();
-        let matches = if exact.is_empty() {
-            records
-                .iter()
-                .filter(|record| !record.is_main && record.target.slug().starts_with(input))
-                .collect::<Vec<_>>()
-        } else {
-            exact
-        };
-        choose(input, matches)?
-    } else {
-        worktree_at_cwd(&records, &ctx.cwd)
-            .ok_or_else(|| anyhow!("not inside a worktree; pass a worktree slug or branch"))?
+    let Some(input) = input else {
+        let record = worktree_at_cwd(&records, &ctx.cwd)
+            .ok_or_else(|| anyhow!("not inside a worktree; pass a worktree slug or branch"))?;
+        ensure_local(&record.target)?;
+        return Ok(record.clone());
     };
-    ensure_local(&record.target)?;
-    Ok(record.clone())
+    resolve_from_inventory(&records, input, true)
 }
 
-/// Resolve an explicit target while allowing the main clone only when callers
-/// opt in (for example, `status` is cwd-aware but only displays non-main rows).
+/// Resolve an explicit slug or branch, including the main clone. Callers that
+/// cannot act on the main clone must check `is_main` themselves.
 pub async fn resolve_named_worktree(ctx: &AppContext, input: &str) -> Result<WorktreeRecord> {
     let records = ctx.repository.inventory(&ctx.cancellation).await?;
     resolve_from_inventory(&records, input, false)

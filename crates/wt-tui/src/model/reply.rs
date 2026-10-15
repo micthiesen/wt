@@ -33,8 +33,14 @@ impl Model {
         let typeahead = completed_request
             .as_ref()
             .filter(|request| request.generation == self.ui_generation && request.preparation)
-            .map(|request| (request.typeahead.clone(), request.started))
-            .filter(|(keys, _)| !keys.is_empty());
+            .map(|request| {
+                (
+                    request.typeahead.clone(),
+                    request.started,
+                    request.typeahead_overflow,
+                )
+            })
+            .filter(|(keys, _, _)| !keys.is_empty());
         let selected_create = self.reply_pending(&reply);
         let (stale, stale_id, stale_message) =
             (reply.stale, reply.operation_id, reply.message.clone());
@@ -162,17 +168,12 @@ impl Model {
                 options,
                 selected,
             }) => {
-                let selected = if matches!(action, PickerAction::Section { .. }) {
-                    self.last_section_target
-                        .as_ref()
-                        .and_then(|target| {
-                            options.iter().position(|option| &option.value == target)
-                        })
-                        .unwrap_or(selected)
-                } else {
-                    selected
-                }
-                .min(options.len().saturating_sub(1));
+                let selected = Self::picker_default(
+                    self.last_section_target.as_ref(),
+                    &action,
+                    &options,
+                    selected,
+                );
                 Interaction::Picker(PickerPrompt {
                     action,
                     title,
@@ -217,25 +218,60 @@ impl Model {
                 self.reopen_stale_menu(stale_id, stale_message);
             }
         }
-        if let Some((keys, started)) = typeahead {
+        if let Some((keys, started, overflow)) = typeahead {
             if presentation_current
                 && !reply.failed
                 && !matches!(self.interaction, Interaction::None)
                 && started.elapsed() <= super::input::TYPEAHEAD_TTL
             {
                 self.replay_typeahead(keys);
+                // A replayed commit closes the menu and reports its own
+                // result; the overflow only matters to a menu still open.
+                if overflow && !matches!(self.interaction, Interaction::None) {
+                    self.append_typeahead_notice(&format!(
+                        "only the first {} keys typed while the menu loaded were used",
+                        super::input::TYPEAHEAD_LIMIT
+                    ));
+                }
             } else if !reply.failed {
-                // Keep the reply's own message; the dropped keys are secondary.
-                let text = match self.toast.take() {
-                    Some((text, _)) if !text.trim().is_empty() => {
-                        format!("{text}; keys typed while it loaded were dropped")
-                    }
-                    _ => "Keys typed while the menu loaded were dropped".into(),
-                };
-                self.toast = Some((text, ToastTone::Notice));
+                self.append_typeahead_notice("keys typed while the menu loaded were dropped");
             }
         }
         reply.handoff
+    }
+
+    /// Report what happened to typeahead without hiding the reply's own
+    /// message; the keys are secondary.
+    fn append_typeahead_notice(&mut self, notice: &str) {
+        let text = match self.toast.take() {
+            Some((text, _)) if !text.trim().is_empty() => format!("{text}; {notice}"),
+            _ => {
+                let mut chars = notice.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect())
+                    .unwrap_or_default()
+            }
+        };
+        self.toast = Some((text, ToastTone::Notice));
+    }
+
+    /// Where a picker's cursor starts: the section picker on the section
+    /// last moved to, every other picker on its builder's default.
+    pub(super) fn picker_default(
+        last_section_target: Option<&Option<String>>,
+        action: &PickerAction,
+        options: &[crate::PickerOption],
+        selected: usize,
+    ) -> usize {
+        if matches!(action, PickerAction::Section { .. }) {
+            last_section_target
+                .and_then(|target| options.iter().position(|option| &option.value == target))
+                .unwrap_or(selected)
+        } else {
+            selected
+        }
+        .min(options.len().saturating_sub(1))
     }
 
     /// Feed keys typed during loading to the menu that just opened. Replay
@@ -259,5 +295,90 @@ impl Model {
             }
         }
         self.last_key = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use wt_runtime::{SourceSnapshot, SourceState};
+
+    use super::super::{InputResult, Interaction, Model, ToastTone, input::TYPEAHEAD_LIMIT};
+    use crate::{ActionSurface, Board, BoardRow, PickerAction, PickerOption, UiModal, UiReply};
+
+    /// Open the row's action menu with `keys` typed while it loaded and a
+    /// reply carrying `message`.
+    fn overflowing_menu(first: KeyCode, message: &str) -> Model {
+        let mut model = Model::default();
+        model.apply(SourceSnapshot::test_live(
+            Some(Board {
+                rows: vec![BoardRow {
+                    key: "one".into(),
+                    title: "one".into(),
+                    ..BoardRow::default()
+                }],
+                ..Board::default()
+            }),
+            SourceState::Ready,
+            wt_core::Domain::Git,
+        ));
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        else {
+            panic!("`!` opens the action menu")
+        };
+        let generation = model.ui_generation;
+        model.begin_action(42, &action);
+        model.input(KeyEvent::from(first), 20);
+        for _ in 0..TYPEAHEAD_LIMIT {
+            model.input(KeyEvent::from(KeyCode::Down), 20);
+        }
+        model.reply(UiReply {
+            operation_id: Some(42),
+            ui_generation: Some(generation),
+            message: message.into(),
+            modal: Some(UiModal::Picker {
+                action: PickerAction::Actions {
+                    surface: ActionSurface::Row { key: "one".into() },
+                },
+                title: "Actions".into(),
+                selected: 0,
+                options: vec![PickerOption {
+                    value: Some("a".into()),
+                    label: "a".into(),
+                    chord: None,
+                    note: None,
+                    verify_after_merge: None,
+                    detail: None,
+                }],
+            }),
+            ..Default::default()
+        });
+        model
+    }
+
+    #[test]
+    fn typeahead_overflow_keeps_the_reply_message() {
+        let model = overflowing_menu(KeyCode::Down, "Loaded from cache");
+        assert!(matches!(model.interaction, Interaction::Picker(_)));
+        let (text, tone) = model.toast.clone().unwrap();
+        assert_eq!(tone, ToastTone::Notice);
+        assert!(
+            text.starts_with("Loaded from cache; only the first"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn typeahead_overflow_is_not_reported_after_replay_closes_the_menu() {
+        let model = overflowing_menu(KeyCode::Esc, "");
+        assert!(matches!(model.interaction, Interaction::None));
+        assert!(
+            model
+                .toast
+                .as_ref()
+                .is_none_or(|(text, _)| !text.to_lowercase().contains("only the first")),
+            "{:?}",
+            model.toast
+        );
     }
 }

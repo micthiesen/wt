@@ -34,11 +34,7 @@ async fn run_inner(context: &AppContext, slug: &str) -> Result<()> {
         let root = tokio::fs::canonicalize(&context.config.paths.worktree_root).await;
         let main = tokio::fs::canonicalize(&context.config.paths.main_clone).await;
         let safe_cwd = match (cwd, root, main) {
-            (Ok(cwd), Ok(root), Ok(main))
-                if cwd != main
-                    && cwd.starts_with(&root)
-                    && cwd.file_name().and_then(|name| name.to_str()) == Some(slug) =>
-            {
+            (Ok(cwd), Ok(root), Ok(main)) if is_slug_checkout(&cwd, &root, &main, slug) => {
                 Some(cwd)
             }
             _ => None,
@@ -59,10 +55,38 @@ async fn run_inner(context: &AppContext, slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Worktrees live directly under the root, so only `<root>/<slug>` can be the
+/// slug's checkout; a same-named directory inside another worktree is not.
+fn is_slug_checkout(
+    cwd: &std::path::Path,
+    root: &std::path::Path,
+    main: &std::path::Path,
+    slug: &str,
+) -> bool {
+    cwd != main
+        && cwd.parent() == Some(root)
+        && cwd.file_name().and_then(|name| name.to_str()) == Some(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Args;
+    use std::path::Path;
+
+    #[test]
+    fn fallback_checkout_must_be_a_direct_child_of_the_worktree_root() {
+        let root = Path::new("/w");
+        let main = Path::new("/repo");
+        assert!(is_slug_checkout(Path::new("/w/one"), root, main, "one"));
+        assert!(!is_slug_checkout(
+            Path::new("/w/two/one"),
+            root,
+            main,
+            "one"
+        ));
+        assert!(!is_slug_checkout(Path::new("/w/two"), root, main, "one"));
+    }
 
     #[test]
     fn compatibility_slug_is_a_single_argument() {

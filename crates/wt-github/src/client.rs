@@ -18,7 +18,7 @@ use wt_platform::process::{CommandSpec, ProcessOutput, ProcessRunner};
 use crate::{
     checks::{
         CHUNK_SIZE, checks_still_pending, chunk_branches, is_rate_limit, missing_workflow_scope,
-        not_yet_enqueueable, output_failure, rollup_checks,
+        not_yet_enqueueable, output_failure, rollup_checks, wildcard_eq,
     },
     mutations::{AsyncMergeEndpoint, AsyncMergeOutcome},
     types::*,
@@ -249,34 +249,24 @@ impl GithubClient {
                 // JSON booleans/numbers, which GraphQL then rejects.
                 args.extend(["-f".into(), format!("{key}={value}")]);
             }
-            match self.run(args, cancellation).await {
+            let error = match self.run(args, cancellation).await {
                 Ok(out) if out.status.success() => {
                     match parse_chunk(&out.stdout, branches, with_queue, &self.options) {
                         Ok(data) => return Ok(data),
-                        Err(GithubError::Transient { .. }) if attempt + 1 < MAX_ATTEMPTS => {
-                            sleep(Duration::from_millis(400 << attempt)).await
-                        }
-                        Err(error) => return Err(error),
+                        Err(error) => error,
                     }
                 }
-                Ok(out) => {
-                    let (message, transient) = output_failure(&out);
-                    if transient && attempt + 1 < MAX_ATTEMPTS {
-                        sleep(Duration::from_millis(400 << attempt)).await;
-                        continue;
-                    }
-                    if is_rate_limit(&message) {
-                        return Err(GithubError::RateLimit(message));
-                    }
-                    if transient {
-                        return Err(GithubError::Transient { message });
-                    }
-                    return Err(GithubError::Command(message));
-                }
-                Err(GithubError::Transient { .. }) if attempt + 1 < MAX_ATTEMPTS => {
-                    sleep(Duration::from_millis(400 << attempt)).await;
-                }
-                Err(error) => return Err(error),
+                Ok(out) => classify_output(&out),
+                Err(error) => error,
+            };
+            // Only transport-level transients retry, and only at this chunk
+            // boundary. A cancelled read is reported, never retried.
+            if !error.retryable() || attempt + 1 >= MAX_ATTEMPTS || cancellation.is_cancelled() {
+                return Err(error);
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(error),
+                _ = sleep(Duration::from_millis(400 << attempt)) => {}
             }
         }
         Err(GithubError::Transient {
@@ -344,24 +334,15 @@ impl GithubClient {
             )
             .await?;
         if !out.status.success() {
-            return Ok(None);
+            // Only gh's explicit answers prove absence. Authentication,
+            // network and rate-limit failures are unknown, not "no PR".
+            return if proves_no_pull_request(&out) {
+                Ok(None)
+            } else {
+                Err(classify_output(&out))
+            };
         }
-        let v: Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| GithubError::Protocol(format!("invalid PR info: {e}")))?;
-        Ok(v.get("number")
-            .and_then(Value::as_u64)
-            .map(|number| LivePrInfo {
-                number,
-                base_ref_name: str_at(&v, "/baseRefName").unwrap_or_default().into(),
-                state: str_at(&v, "/state")
-                    .filter(|s| ["OPEN", "CLOSED", "MERGED"].contains(s))
-                    .unwrap_or("OPEN")
-                    .into(),
-                is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-                title: str_at(&v, "/title").unwrap_or_default().into(),
-                id: str_at(&v, "/id").unwrap_or_default().into(),
-                head_ref_oid: str_at(&v, "/headRefOid").unwrap_or_default().into(),
-            }))
+        parse_live_pr(&out.stdout).map(Some)
     }
 
     pub async fn edit_reviewers(
@@ -450,11 +431,61 @@ impl GithubClient {
                 "api".into(),
                 "--method".into(),
                 "DELETE".into(),
-                format!("repos/{}/git/refs/heads/{branch}", repo.as_str()),
+                format!(
+                    "repos/{}/git/refs/heads/{}",
+                    repo.as_str(),
+                    encode_ref_path(branch)
+                ),
             ],
             cancellation,
         )
         .await
+    }
+
+    /// Delete `branch` on GitHub only while its tip is `expected`. The REST
+    /// API has no conditional ref delete, so this reads the ref first; the
+    /// remaining window is the gap between two API calls. Prefer a leased
+    /// `git push` and use this when git cannot reach the remote itself.
+    pub async fn delete_remote_branch_at(
+        &self,
+        branch: &str,
+        expected: &str,
+        cancellation: &CancellationToken,
+    ) -> GhActionResult {
+        if branch.is_empty() || expected.is_empty() {
+            return GhActionResult::error("missing branch or expected head");
+        }
+        let repo = match self.repository(cancellation).await {
+            Ok(repo) => repo,
+            Err(e) => return GhActionResult::error(e.to_string()),
+        };
+        let read = self
+            .run(
+                [
+                    "api".to_owned(),
+                    format!(
+                        "repos/{}/git/ref/heads/{}",
+                        repo.as_str(),
+                        encode_ref_path(branch)
+                    ),
+                    "--jq".to_owned(),
+                    ".object.sha".to_owned(),
+                ],
+                cancellation,
+            )
+            .await;
+        let tip = match read {
+            Ok(out) if out.status.success() => out.stdout_text().trim().to_owned(),
+            Ok(out) => return GhActionResult::error(output_failure(&out).0),
+            Err(e) => return GhActionResult::error(e.to_string()),
+        };
+        if tip != expected {
+            return GhActionResult::error(format!(
+                "remote tip is {} but the merged head is {expected}",
+                if tip.is_empty() { "unknown" } else { &tip }
+            ));
+        }
+        self.delete_remote_branch(branch, cancellation).await
     }
 
     async fn write(
@@ -702,7 +733,25 @@ impl GithubClient {
         target: &PrMergeTarget,
         cancellation: &CancellationToken,
     ) -> GhActionResult {
-        self.write(["api".into(), "graphql".into(), "-f".into(), "query=mutation($prId: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId:$prId,mergeMethod:$method}) { pullRequest { number } } }".into(), "-f".into(), format!("prId={}",target.id), "-f".into(), "method=REBASE".into()], cancellation).await
+        let mut args: Vec<String> = vec![
+            "api".into(),
+            "graphql".into(),
+            "-f".into(),
+            "query=mutation($prId: ID!, $method: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID) { enablePullRequestAutoMerge(input: {pullRequestId:$prId,mergeMethod:$method,expectedHeadOid:$expectedHeadOid}) { pullRequest { number } } }".into(),
+            "-f".into(),
+            format!("prId={}", target.id),
+            "-f".into(),
+            "method=REBASE".into(),
+        ];
+        // Arm only the head the user saw; GitHub rejects the mutation if the
+        // PR moved since. An unset variable leaves the head unpinned.
+        if !target.head_ref_oid.is_empty() {
+            args.extend([
+                "-f".into(),
+                format!("expectedHeadOid={}", target.head_ref_oid),
+            ]);
+        }
+        self.write(args, cancellation).await
     }
 
     pub async fn disable_auto_merge(
@@ -994,6 +1043,59 @@ fn classify_output(output: &ProcessOutput) -> GithubError {
 
 fn result_error(value: &GhActionResult) -> &str {
     value.error.as_deref().unwrap_or("success")
+}
+
+/// Percent-encode a ref name for a REST path. Git allows `#`, `?` and `%` in
+/// branch names; unencoded, `feature?x` would address (and delete) `feature`.
+fn encode_ref_path(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// `gh pr view <branch>` exits nonzero both when the branch has no PR and on
+/// any failure. Only the former (or a repository without a GitHub remote,
+/// which cannot have PRs) is evidence of absence.
+fn proves_no_pull_request(output: &ProcessOutput) -> bool {
+    let text = format!("{}\n{}", output.stderr_text(), output.stdout_text()).to_lowercase();
+    // gh has worded this "no pull requests found for branch" and "no open
+    // pull requests found for branch" across versions.
+    text.contains("pull requests found for branch")
+        || text.contains("no pull requests found")
+        || text.contains("no git remotes found")
+        || text.contains(
+            "none of the git remotes configured for this repository point to a known github host",
+        )
+}
+
+fn parse_live_pr(bytes: &[u8]) -> Result<LivePrInfo, GithubError> {
+    let v: Value = serde_json::from_slice(bytes)
+        .map_err(|e| GithubError::Protocol(format!("invalid PR info: {e}")))?;
+    let number = v
+        .get("number")
+        .and_then(Value::as_u64)
+        .filter(|number| *number > 0)
+        .ok_or_else(|| GithubError::Protocol("PR info omitted its number".into()))?;
+    // An unrecognized state must not read as OPEN: callers retarget open PRs
+    // and treat MERGED as landing evidence.
+    let state = str_at(&v, "/state")
+        .filter(|s| ["OPEN", "CLOSED", "MERGED"].contains(s))
+        .ok_or_else(|| GithubError::Protocol(format!("PR #{number} has no recognized state")))?;
+    Ok(LivePrInfo {
+        number,
+        base_ref_name: str_at(&v, "/baseRefName").unwrap_or_default().into(),
+        state: state.into(),
+        is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
+        title: str_at(&v, "/title").unwrap_or_default().into(),
+        id: str_at(&v, "/id").unwrap_or_default().into(),
+        head_ref_oid: str_at(&v, "/headRefOid").unwrap_or_default().into(),
+    })
 }
 
 fn str_at<'a>(value: &'a Value, ptr: &str) -> Option<&'a str> {
@@ -1475,25 +1577,6 @@ fn has_stale_changes_request(pr: &Value, requested: &[String]) -> bool {
     }
     false
 }
-fn wildcard(pattern: &str, value: &str) -> bool {
-    let p = pattern.to_lowercase();
-    let v = value.to_lowercase();
-    let mut rest = v.as_str();
-    let parts: Vec<_> = p.split('*').collect();
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        let Some(pos) = rest.find(part) else {
-            return false;
-        };
-        if i == 0 && !p.starts_with('*') && pos != 0 {
-            return false;
-        }
-        rest = &rest[pos + part.len()..];
-    }
-    p.ends_with('*') || rest.is_empty()
-}
 fn bot_context_state(contexts: &[Value], options: &GithubOptions) -> Option<bool> {
     let mut done = false;
     for check in contexts {
@@ -1503,7 +1586,7 @@ fn bot_context_state(contexts: &[Value], options: &GithubOptions) -> Option<bool
         if !options
             .review_bot_contexts
             .iter()
-            .any(|p| wildcard(p, name))
+            .any(|p| wildcard_eq(p, name))
         {
             continue;
         }
@@ -1518,20 +1601,6 @@ fn bot_context_state(contexts: &[Value], options: &GithubOptions) -> Option<bool
         done = true;
     }
     if done { Some(false) } else { None }
-}
-fn boxes(body: &str) -> u32 {
-    let (mut count, mut fence) = (0, false);
-    for line in body.lines() {
-        let line = line.trim_start();
-        if line.starts_with("```") || line.starts_with("~~~") {
-            fence = !fence;
-            continue;
-        }
-        if !fence && line.starts_with("- [ ]") {
-            count += 1;
-        }
-    }
-    count
 }
 fn has_marker(body: &str, marker: &str) -> bool {
     body.lines()
@@ -1591,7 +1660,10 @@ fn review_bot_status(
             }
         }
         let live: Vec<_> = summaries.values().collect();
-        let unresolved: u32 = live.iter().map(|(_, _, body)| boxes(body)).sum();
+        let unresolved: u32 = live
+            .iter()
+            .map(|(_, _, body)| crate::count_unticked_review_boxes(body))
+            .sum();
         let newest = live.iter().map(|(c, _, _)| c.as_str()).max();
         let covers = pr
             .pointer("/headRefOid")
@@ -1729,6 +1801,105 @@ mod transport_tests {
             .mark_pull_request_ready(7, &CancellationToken::new())
             .await;
         assert!(!missing.ok && !missing.ambiguous, "{missing:?}");
+    }
+
+    fn fake_gh(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    /// Only gh's explicit "no PR" answer proves absence; any other failure,
+    /// or an unrecognized state, must not read as "no PR" or as OPEN.
+    #[tokio::test]
+    async fn view_pr_distinguishes_absence_from_failure() {
+        let dir = tempdir().unwrap();
+        let view = |name: &str, body: &str| {
+            GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+                .with_gh_program(fake_gh(dir.path(), name, body))
+        };
+        let cancel = CancellationToken::new();
+        let absent = view(
+            "absent",
+            "echo 'no pull requests found for branch \"topic\"' >&2; exit 1",
+        );
+        assert!(absent.view_pr("topic", &cancel).await.unwrap().is_none());
+        let unauthenticated = view(
+            "unauthenticated",
+            "echo 'HTTP 401: Bad credentials' >&2; exit 1",
+        );
+        assert!(unauthenticated.view_pr("topic", &cancel).await.is_err());
+        let rate_limited = view("rate-limited", "echo 'API rate limit exceeded' >&2; exit 1");
+        assert!(matches!(
+            rate_limited.view_pr("topic", &cancel).await,
+            Err(GithubError::RateLimit(_))
+        ));
+        let unknown_state = view(
+            "unknown-state",
+            "printf '%s' '{\"number\":3,\"state\":\"WEIRD\",\"baseRefName\":\"main\"}'",
+        );
+        assert!(unknown_state.view_pr("topic", &cancel).await.is_err());
+        let merged = view(
+            "merged",
+            "printf '%s' '{\"number\":3,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefOid\":\"abc\"}'",
+        );
+        let merged = merged.view_pr("topic", &cancel).await.unwrap().unwrap();
+        assert_eq!(
+            (merged.state.as_str(), merged.head_ref_oid.as_str()),
+            ("MERGED", "abc")
+        );
+    }
+
+    /// A cancelled batched read is reported at once; it is not retried as a
+    /// transient failure with backoff.
+    #[tokio::test]
+    async fn cancelled_batch_read_is_not_retried() {
+        let dir = tempdir().unwrap();
+        let script = fake_gh(dir.path(), "slow-gh", "echo call >> calls; sleep 30");
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(script)
+            .with_repository(RepoSlug::parse("acme/app").unwrap());
+        let cancel = CancellationToken::new();
+        let branches = vec!["feature".to_owned()];
+        let read = client.fetch_worktrees(&branches, &cancel);
+        tokio::pin!(read);
+        tokio::select! {
+            _ = &mut read => panic!("the read should still be running"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => cancel.cancel(),
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+            .await
+            .expect("cancellation must not wait out retry backoff");
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_branch_deletion_encodes_the_ref_path() {
+        let dir = tempdir().unwrap();
+        let script = fake_gh(dir.path(), "gh", "printf '%s\\n' \"$@\" > args");
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(script)
+            .with_repository(RepoSlug::parse("acme/app").unwrap());
+        let result = client
+            .delete_remote_branch("team/fix?x#1%", &CancellationToken::new())
+            .await;
+        assert!(result.ok, "{result:?}");
+        let args = fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(
+            args.lines()
+                .any(|line| line == "repos/acme/app/git/refs/heads/team/fix%3Fx%231%25"),
+            "{args}"
+        );
     }
 
     #[tokio::test]
@@ -1940,7 +2111,10 @@ else:
         assert_eq!(status.state, "unresolved");
         assert_eq!(status.unresolved, 1);
         assert_eq!(status.stale, Some(true));
-        assert_eq!(boxes("- [ ] one\n~~~\n- [ ] ignored\n~~~\n  - [ ] two"), 2);
+        assert_eq!(
+            crate::count_unticked_review_boxes("- [ ] one\n~~~\n- [ ] ignored\n~~~\n  - [ ] two"),
+            2
+        );
     }
 
     #[test]
@@ -2166,6 +2340,8 @@ esac
                 assert!(!result.ambiguous);
                 assert_eq!(result.retryable == Some(true), classic_fails);
                 assert_eq!(calls.matches("enablePullRequestAutoMerge").count(), 1);
+                // The classic arm is pinned to the head the user saw.
+                assert_eq!(calls.matches("expectedHeadOid=deadbeef").count(), 1);
                 assert_eq!(calls.matches("--method PUT").count(), 1);
                 assert_eq!(
                     calls.matches("--method GET").count(),

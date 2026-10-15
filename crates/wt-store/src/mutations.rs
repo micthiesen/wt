@@ -28,6 +28,29 @@ pub enum BaseUpdate {
     Cycle,
 }
 
+/// Outcome of a flip that carries the value the user saw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeenToggle {
+    /// The flag now holds this value.
+    Set(bool),
+    /// The stored flag no longer read what the caller saw; nothing was written.
+    Stale { current: bool },
+}
+
+impl SeenToggle {
+    pub(crate) fn stale(current: bool, seen: Option<bool>) -> Option<Self> {
+        seen.is_some_and(|seen| seen != current)
+            .then_some(Self::Stale { current })
+    }
+
+    /// The written value; a witnessless flip is never stale.
+    fn applied(self) -> bool {
+        match self {
+            Self::Set(value) | Self::Stale { current: value } => value,
+        }
+    }
+}
+
 pub(crate) fn empty_state() -> WtState {
     json!({
         "version": crate::CURRENT_WT_STATE_VERSION,
@@ -330,35 +353,7 @@ impl Store {
         section: Option<&str>,
     ) -> Result<Vec<String>, StoreError> {
         self.mutate_wt_state(|state| {
-            let mut changed = Vec::new();
-            for key in keys {
-                let collection = if key.starts_with("@remote/") {
-                    "remoteLayouts"
-                } else {
-                    "slugs"
-                };
-                let mut layout = state[collection][key]
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default();
-                if layout.get("section").and_then(Value::as_str) == section {
-                    continue;
-                }
-                if let Some(section) = section {
-                    ensure_section(state, section);
-                }
-                let order = max_layout_order(state, section).map_or(0.0, |max| max + 1.0);
-                layout.insert(
-                    "section".to_owned(),
-                    section.map_or(Value::Null, |s| json!(s)),
-                );
-                layout.insert("order".to_owned(), number(order));
-                object_mut(state, collection).insert(key.clone(), Value::Object(layout));
-                changed.push(key.clone());
-            }
-            if !changed.is_empty() {
-                prune_sections_order(state);
-            }
+            let changed = move_to_section(state, keys, section);
             let mutated = !changed.is_empty();
             Ok((changed, mutated))
         })
@@ -1152,24 +1147,45 @@ impl Store {
     }
 
     pub fn toggle_global_automations_paused(&mut self) -> Result<bool, StoreError> {
+        Ok(self.toggle_global_automations_paused_seen(None)?.applied())
+    }
+
+    /// Flip the global pause flag. With `seen`, refuse unless the stored flag
+    /// still reads `seen`; the compare and the write share one transaction.
+    pub fn toggle_global_automations_paused_seen(
+        &mut self,
+        seen: Option<bool>,
+    ) -> Result<SeenToggle, StoreError> {
         self.mutate_wt_state(|state| {
-            let paused = !state["automationsPaused"].as_bool().unwrap_or(false);
-            state["automationsPaused"] = json!(paused);
-            Ok((paused, true))
+            let current = state["automationsPaused"].as_bool().unwrap_or(false);
+            if let Some(stale) = SeenToggle::stale(current, seen) {
+                return Ok((stale, false));
+            }
+            state["automationsPaused"] = json!(!current);
+            Ok((SeenToggle::Set(!current), true))
         })
     }
 
     pub fn toggle_slug_automations_paused(&mut self, slug: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .toggle_slug_automations_paused_seen(slug, None)?
+            .applied())
+    }
+
+    /// Flip one worktree's pause flag, refusing a `seen` value that no longer
+    /// matches inside the same transaction.
+    pub fn toggle_slug_automations_paused_seen(
+        &mut self,
+        slug: &str,
+        seen: Option<bool>,
+    ) -> Result<SeenToggle, StoreError> {
         self.mutate_wt_state(|state| {
-            let mut entry = slug_entry(state, slug);
-            let paused = entry.get("automationsPaused").and_then(Value::as_bool) != Some(true);
-            if paused {
-                entry.insert("automationsPaused".to_owned(), Value::Bool(true));
-            } else {
-                entry.remove("automationsPaused");
+            let current = slug_automations_paused(state, slug);
+            if let Some(stale) = SeenToggle::stale(current, seen) {
+                return Ok((stale, false));
             }
-            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
-            Ok((paused, true))
+            set_slug_automations_paused(state, slug, !current);
+            Ok((SeenToggle::Set(!current), true))
         })
     }
 
@@ -1178,24 +1194,43 @@ impl Store {
         stack_id: &str,
         member_slugs: &[String],
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .toggle_stack_automations_paused_seen(stack_id, member_slugs, None)?
+            .applied())
+    }
+
+    /// Pause or resume a whole stack: the stack marker and every member land on
+    /// one state in one transaction. With `seen = Some((row, flag))`, the
+    /// target is `!flag` and the write is refused unless `row`'s own flag still
+    /// reads `flag`. Without it, the stack marker decides the flip.
+    pub fn toggle_stack_automations_paused_seen(
+        &mut self,
+        stack_id: &str,
+        member_slugs: &[String],
+        seen: Option<(&str, bool)>,
+    ) -> Result<SeenToggle, StoreError> {
         self.mutate_wt_state(|state| {
+            let paused = match seen {
+                Some((row, seen)) => {
+                    let current = slug_automations_paused(state, row);
+                    if let Some(stale) = SeenToggle::stale(current, Some(seen)) {
+                        return Ok((stale, false));
+                    }
+                    !seen
+                }
+                None => !array_mut(state, "pausedStacks")
+                    .iter()
+                    .any(|id| id.as_str() == Some(stack_id)),
+            };
             let paused_stacks = array_mut(state, "pausedStacks");
-            let was_paused = paused_stacks.iter().any(|id| id.as_str() == Some(stack_id));
             paused_stacks.retain(|id| id.as_str() != Some(stack_id));
-            if !was_paused {
+            if paused {
                 paused_stacks.push(json!(stack_id));
             }
-            let paused = !was_paused;
             for slug in member_slugs {
-                let mut entry = slug_entry(state, slug);
-                if paused {
-                    entry.insert("automationsPaused".to_owned(), Value::Bool(true));
-                } else {
-                    entry.remove("automationsPaused");
-                }
-                object_mut(state, "slugs").insert(slug.clone(), Value::Object(entry));
+                set_slug_automations_paused(state, slug, paused);
             }
-            Ok((paused, true))
+            Ok((SeenToggle::Set(paused), true))
         })
     }
 
@@ -1238,19 +1273,7 @@ impl Store {
         section_key: &str,
         folded: bool,
     ) -> Result<bool, StoreError> {
-        self.mutate_wt_state(|state| {
-            let keys = array_mut(state, "foldedSections");
-            let current = keys.iter().any(|key| key.as_str() == Some(section_key));
-            if current == folded {
-                return Ok((folded, false));
-            }
-            if folded {
-                keys.push(json!(section_key));
-            } else {
-                keys.retain(|key| key.as_str() != Some(section_key));
-            }
-            Ok((folded, true))
-        })
+        self.mutate_wt_state(|state| Ok((folded, fold_section(state, section_key, folded))))
     }
 
     pub fn record_slug_created(&mut self, slug: &str, at: &str) -> Result<bool, StoreError> {
@@ -1308,21 +1331,28 @@ impl Store {
                     },
                     previous,
                 );
+                // A live slug entry is authoritative: unpausing removes its
+                // flag, so absence there means "not paused", not "unknown".
                 let paused = incoming
                     .automations_paused
                     .or_else(|| {
-                        current_slugs
-                            .get(&incoming.slug)?
-                            .get("automationsPaused")?
-                            .as_bool()
+                        current_slugs.get(&incoming.slug).map(|slug| {
+                            slug.get("automationsPaused").and_then(Value::as_bool) == Some(true)
+                        })
                     })
                     .or_else(|| {
                         previous
                             .and_then(|prev| prev.get("automationsPaused"))?
                             .as_bool()
                     });
-                if paused == Some(true) {
-                    next.insert("automationsPaused".to_owned(), Value::Bool(true));
+                match paused {
+                    Some(true) => {
+                        next.insert("automationsPaused".to_owned(), Value::Bool(true));
+                    }
+                    Some(false) => {
+                        next.remove("automationsPaused");
+                    }
+                    None => {}
                 }
                 for (key, value) in &incoming.extra {
                     next.insert(key.clone(), value.clone());
@@ -1458,6 +1488,79 @@ pub fn verification_owed_at_removal(entry: &RemovedWorktree) -> bool {
             && work.state != "verified"
             && work.state != "dropped"
     })
+}
+
+/// Set a section's fold flag. Returns whether the state changed.
+pub(crate) fn fold_section(state: &mut WtState, section_key: &str, folded: bool) -> bool {
+    let keys = array_mut(state, "foldedSections");
+    let current = keys.iter().any(|key| key.as_str() == Some(section_key));
+    if current == folded {
+        return false;
+    }
+    if folded {
+        keys.push(json!(section_key));
+    } else {
+        keys.retain(|key| key.as_str() != Some(section_key));
+    }
+    true
+}
+
+/// File each key at the end of `section` unless it is already there. Returns
+/// the keys that moved.
+pub(crate) fn move_to_section(
+    state: &mut WtState,
+    keys: &[String],
+    section: Option<&str>,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for key in keys {
+        let collection = if key.starts_with("@remote/") {
+            "remoteLayouts"
+        } else {
+            "slugs"
+        };
+        let mut layout = state[collection][key]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if layout.get("section").and_then(Value::as_str) == section {
+            continue;
+        }
+        if let Some(section) = section {
+            ensure_section(state, section);
+        }
+        let order = max_layout_order(state, section).map_or(0.0, |max| max + 1.0);
+        layout.insert(
+            "section".to_owned(),
+            section.map_or(Value::Null, |s| json!(s)),
+        );
+        layout.insert("order".to_owned(), number(order));
+        object_mut(state, collection).insert(key.clone(), Value::Object(layout));
+        changed.push(key.clone());
+    }
+    if !changed.is_empty() {
+        prune_sections_order(state);
+    }
+    changed
+}
+
+fn slug_automations_paused(state: &Value, slug: &str) -> bool {
+    state
+        .get("slugs")
+        .and_then(|slugs| slugs.get(slug))
+        .and_then(|entry| entry.get("automationsPaused"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn set_slug_automations_paused(state: &mut Value, slug: &str, paused: bool) {
+    let mut entry = slug_entry(state, slug);
+    if paused {
+        entry.insert("automationsPaused".to_owned(), Value::Bool(true));
+    } else {
+        entry.remove("automationsPaused");
+    }
+    object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
 }
 
 fn object_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Map<String, Value> {

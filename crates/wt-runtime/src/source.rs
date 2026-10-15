@@ -464,6 +464,13 @@ fn attach_cache<T: Send + Sync + 'static>(
                 }
             }
         }
+        // Cancellation wins the biased select, so a publish that landed just
+        // before shutdown may not have been seen yet. Flush the latest.
+        if let Some(data) = live_data(&updates.borrow_and_update(), domain)
+            && !saved.as_ref().is_some_and(|s| Arc::ptr_eq(s, &data))
+        {
+            pending = Some(data);
+        }
         if let Some(data) = pending.take() {
             write(cache, name, data, Some(FLUSH_BUDGET)).await;
         }

@@ -13,7 +13,7 @@ enabled — that id is public by design; it powers the README badge).
   below), plus unsuccessful, non-cancelled `Native release` completions on `main`. Deliberately excludes
   pushes so it never overlaps #updates.
 - **#help** — support. Carries a pinned message telling reporters to include
-  `wt doctor` output and the tail of `~/.cache/wt/logs/app/wt-<date>.log`.
+  `wt doctor` output and the tail of `~/.cache/wt/logs/app/wt-native.<date>.log`.
 
 ## #updates: the commit digest
 
@@ -23,7 +23,7 @@ Full mechanics are documented in those files' header comments; the shape:
 
 - Triggers via `workflow_run` when `Native release` goes green on `main` (a
   red tree is never digested; its commits roll into the next green digest).
-  That workflow includes Rust CI, all four native packages, and publication.
+  That workflow includes Rust CI, all three native packages, and publication.
   The trigger names the workflow by its `name:`. If it is renamed,
   update `workflows: [Native release]` in both Discord workflows in the same commit, or digests silently stop
   (this bit us once when `typecheck` became `ci`).
@@ -46,10 +46,8 @@ Full mechanics are documented in those files' header comments; the shape:
   the trigger is a green release on `main`, "no digest for two days" has two
   readings that look identical from the channel: nobody pushed, or `main` has
   been red and every commit is queued for the next green digest. This happened
-  on 2026-08-24 to 08-26 at the TypeScript baseline (eight pushes, four
-  config-leaking `rollupChecklist` tests, fixed by the then-current
-  `test/preload.ts` and `test/config.toml` at commit `d9cd2f4`),
-  and nothing anywhere announced it — the same green gate also holds back
+  on 2026-08-24 to 08-26, before the native rewrite (eight pushes, four
+  tests leaking the developer's config), and nothing anywhere announced it — the same green gate also holds back
   hot updates, so users had been getting nothing either. Before treating a
   quiet #updates as a digest bug, check `gh run list --workflow=release.yml
   --branch=main`; a run of `skipped` digest runs is the tell, since the

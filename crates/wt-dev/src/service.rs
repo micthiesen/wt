@@ -30,6 +30,8 @@ const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
 const READY_POLL: Duration = Duration::from_secs(2);
 const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Shortest health check a ready wait runs, even at its deadline.
+const HEALTH_CHECK_FLOOR: Duration = Duration::from_secs(1);
 const SESSION_SUFFIX: &str = "-dev";
 
 #[derive(Clone)]
@@ -897,6 +899,18 @@ impl DevServerService {
         worktree: &DevWorktree,
         cancellation: &CancellationToken,
     ) -> Result<Option<DevHealth>, DevServerError> {
+        self.health_within(worktree, HEALTH_COMMAND_TIMEOUT, cancellation)
+            .await
+    }
+
+    /// Run the configured `health_command`, killing it after `timeout`
+    /// (capped at [`HEALTH_COMMAND_TIMEOUT`]); a hung check is unhealthy.
+    async fn health_within(
+        &self,
+        worktree: &DevWorktree,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<DevHealth>, DevServerError> {
         let Some(template) = self.config.settings.health_command.as_deref() else {
             return Ok(None);
         };
@@ -906,12 +920,19 @@ impl DevServerService {
         let mut spec = CommandSpec::new(shell)
             .args(["-lc", command.as_str()])
             .cwd(&worktree.path);
-        spec.timeout = HEALTH_COMMAND_TIMEOUT;
+        spec.timeout = timeout.min(HEALTH_COMMAND_TIMEOUT);
         if let Some(port) = port {
             spec.env
                 .push(("PORT".into(), Some(port.to_string().into())));
         }
-        let output = self.processes.run(spec, cancellation).await?;
+        let output = match self.processes.run(spec, cancellation).await {
+            Ok(output) => output,
+            // A hung check is an unhealthy answer, not a failed status read.
+            Err(ProcessError::Timeout { timeout, .. }) => {
+                return Ok(Some(health_timed_out(timeout)));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let message = first_nonempty(&output.stdout_text())
             .or_else(|| first_nonempty(&output.stderr_text()))
             .unwrap_or_else(|| {
@@ -933,39 +954,39 @@ impl DevServerService {
         }))
     }
 
+    /// Wait until the server listens and the configured `health_command`
+    /// passes. An unhealthy answer is retried rather than believed: a check
+    /// that runs once cannot tell "not yet" (a migration replay in progress)
+    /// from "wrong", so the quiescence wait lives here once.
     pub async fn wait_ready(
         &self,
         worktree: &DevWorktree,
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<ReadyOutcome, DevServerError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(DevServerError::Cancelled);
-            }
-            let marker = self.read_marker(&worktree.slug).await?;
-            let session_exists = self
-                .config
-                .tmux
-                .session_exists(&session_name(&worktree.slug), cancellation)
-                .await?;
-            if marker.as_deref() == Some("crashed") || !session_exists {
-                return Ok(ReadyOutcome::Crashed);
-            }
-            if let Some(port) = self.read_port(&worktree.slug).await?
-                && probe_port(port).await == PortProbe::Listening
-            {
-                return Ok(ReadyOutcome::Ready { health: None });
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(ReadyOutcome::Timeout);
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(DevServerError::Cancelled),
-                _ = tokio::time::sleep(READY_POLL) => {}
-            }
-        }
+        poll_ready(
+            tokio::time::Instant::now() + timeout,
+            cancellation,
+            || async {
+                let marker = self.read_marker(&worktree.slug).await?;
+                let session_exists = self
+                    .config
+                    .tmux
+                    .session_exists(&session_name(&worktree.slug), cancellation)
+                    .await?;
+                if marker.as_deref() == Some("crashed") || !session_exists {
+                    return Ok(ServerPhase::Crashed);
+                }
+                Ok(match self.read_port(&worktree.slug).await? {
+                    Some(port) if probe_port(port).await == PortProbe::Listening => {
+                        ServerPhase::Listening
+                    }
+                    _ => ServerPhase::Starting,
+                })
+            },
+            |budget| self.health_within(worktree, budget, cancellation),
+        )
+        .await
     }
 
     pub async fn wait_for_slot(
@@ -1424,6 +1445,69 @@ impl DevServerService {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerPhase {
+    Crashed,
+    Starting,
+    Listening,
+}
+
+fn health_timed_out(timeout: Duration) -> DevHealth {
+    DevHealth {
+        ok: false,
+        message: format!("health_command timed out after {}s", timeout.as_secs()),
+    }
+}
+
+/// Poll until the server listens and its health check passes, or `deadline`.
+/// Each health check gets only the remaining budget (never less than
+/// [`HEALTH_CHECK_FLOOR`]), so a hung check cannot overrun the deadline by
+/// the full command timeout; an expired check counts as the last unhealthy
+/// answer.
+async fn poll_ready<P, PF, H, HF>(
+    deadline: tokio::time::Instant,
+    cancellation: &CancellationToken,
+    mut phase: P,
+    mut health: H,
+) -> Result<ReadyOutcome, DevServerError>
+where
+    P: FnMut() -> PF,
+    PF: std::future::Future<Output = Result<ServerPhase, DevServerError>>,
+    H: FnMut(Duration) -> HF,
+    HF: std::future::Future<Output = Result<Option<DevHealth>, DevServerError>>,
+{
+    let mut last_unhealthy = None;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(DevServerError::Cancelled);
+        }
+        match phase().await? {
+            ServerPhase::Crashed => return Ok(ReadyOutcome::Crashed),
+            ServerPhase::Starting => {}
+            ServerPhase::Listening => {
+                let budget = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .max(HEALTH_CHECK_FLOOR);
+                let report = match tokio::time::timeout(budget, health(budget)).await {
+                    Ok(report) => report?,
+                    Err(_) => Some(health_timed_out(budget)),
+                };
+                match report {
+                    Some(report) if !report.ok => last_unhealthy = Some(report),
+                    report => return Ok(ReadyOutcome::Ready { health: report }),
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(last_unhealthy.map_or(ReadyOutcome::Timeout, ReadyOutcome::Unhealthy));
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(DevServerError::Cancelled),
+            _ = tokio::time::sleep(READY_POLL) => {}
+        }
+    }
+}
+
 #[derive(Debug)]
 struct HookOutcome {
     success: bool,
@@ -1730,6 +1814,120 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(DevServerError::Cancelled)));
+    }
+
+    fn health(ok: bool, message: &str) -> DevHealth {
+        DevHealth {
+            ok,
+            message: message.into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_wait_retries_an_unhealthy_environment_until_it_passes() {
+        let checks = std::cell::Cell::new(0);
+        let outcome = poll_ready(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Listening) },
+            |_| {
+                checks.set(checks.get() + 1);
+                let passed = checks.get() >= 3;
+                async move {
+                    Ok(Some(if passed {
+                        health(true, "35 of 35 applied")
+                    } else {
+                        health(false, "29 of 35 applied")
+                    }))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ReadyOutcome::Ready {
+                health: Some(health(true, "35 of 35 applied"))
+            }
+        );
+        assert_eq!(checks.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_wait_reports_the_last_unhealthy_answer_at_the_deadline() {
+        let outcome = poll_ready(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Listening) },
+            |_| async { Ok(Some(health(false, "stale volume"))) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ReadyOutcome::Unhealthy(health(false, "stale volume"))
+        );
+
+        let unconfigured = poll_ready(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Listening) },
+            |_| async { Ok(None) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unconfigured, ReadyOutcome::Ready { health: None });
+
+        let booting = poll_ready(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Starting) },
+            |_| async { unreachable!("health runs only once the port listens") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(booting, ReadyOutcome::Timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_wait_clamps_a_hanging_health_check_to_the_remaining_budget() {
+        let started = tokio::time::Instant::now();
+        let budgets = std::cell::RefCell::new(Vec::new());
+        let outcome = poll_ready(
+            started + Duration::from_secs(3),
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Listening) },
+            |budget| {
+                budgets.borrow_mut().push(budget);
+                std::future::pending()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ReadyOutcome::Unhealthy(health_timed_out(Duration::from_secs(3)))
+        );
+        // One check consumes the whole budget; the deadline is not overrun
+        // by the 60s command timeout.
+        assert_eq!(budgets.borrow().as_slice(), [Duration::from_secs(3)]);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+
+        // With no time left, a check still runs, but only for the floor.
+        let started = tokio::time::Instant::now();
+        let outcome = poll_ready(
+            started,
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Listening) },
+            |_| std::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ReadyOutcome::Unhealthy(health_timed_out(HEALTH_CHECK_FLOOR))
+        );
+        assert_eq!(started.elapsed(), HEALTH_CHECK_FLOOR);
     }
 
     fn holder(slug: &str) -> DevSlotHolder {

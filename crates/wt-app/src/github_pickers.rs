@@ -146,21 +146,23 @@ impl GithubPickers {
                     "GitHub data is still loading for this branch; reviewer edit aborted",
                 ));
             }
+            // The PR and reviewer list the picker showed are its witness; a
+            // mismatch is a stale refusal, so the board refreshes.
             CoveredPr::Absent => {
-                return Ok(UiReply::failure(
+                return Err(crate::controller::stale(
                     "PR data is no longer available; reviewer edit aborted",
                 ));
             }
             CoveredPr::Present(pr) => pr,
         };
         if pr.number != pr_number || pr.state != "OPEN" || pr.is_draft {
-            return Ok(UiReply::failure(
-                "PR changed since the reviewer picker opened; refresh and retry",
+            return Err(crate::controller::stale(
+                "PR changed since the reviewer picker opened; reopen the picker",
             ));
         }
         if !same_reviewers(original, &pr.requested_reviewers) {
-            return Ok(UiReply::failure(
-                "the requested reviewer list changed; refresh and reopen the picker",
+            return Err(crate::controller::stale(
+                "the requested reviewer list changed; reopen the picker",
             ));
         }
         if original.len() > 100 || selected.len() > 100 {
@@ -454,8 +456,21 @@ mod tests {
         };
         let loading = submit(None, 42).await.unwrap();
         assert!(loading.failed && loading.message.contains("still loading"));
-        let replaced = submit(Some(&confirmed), 41).await.unwrap();
-        assert!(replaced.failed && replaced.message.contains("PR changed"));
+        let replaced =
+            crate::controller::error_reply(&submit(Some(&confirmed), 41).await.unwrap_err());
+        assert!(replaced.stale && replaced.message.contains("PR changed"));
+        let reviewers_changed = pickers
+            .submit_reviewers(ReviewerSubmission {
+                key: "one",
+                pr_number: 42,
+                original: &[],
+                selected: &original,
+                board: &board,
+                github: Some(&confirmed),
+            })
+            .await
+            .unwrap_err();
+        assert!(crate::controller::error_reply(&reviewers_changed).stale);
         let unchanged = submit(Some(&confirmed), 42).await.unwrap();
         assert!(!unchanged.failed);
         assert_eq!(unchanged.outcome, Some(ReplyOutcome::NoChange));
@@ -530,8 +545,9 @@ mod tests {
                 github: Some(&absent),
             })
             .await
-            .unwrap();
-        assert!(submit.failed && submit.message.contains("no longer available"));
+            .unwrap_err();
+        let submit = crate::controller::error_reply(&submit);
+        assert!(submit.stale && submit.message.contains("no longer available"));
         assert!(
             !fake.with_extension("calls").exists(),
             "no GitHub reads or mutations may run"

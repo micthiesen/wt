@@ -266,6 +266,27 @@ async fn a_state_change_before_the_cache_read_does_not_discard_the_restore() {
     scope.shutdown(Duration::from_secs(2)).await.unwrap();
 }
 
+// Real time: the flush runs on a blocking thread.
+#[tokio::test]
+async fn shutdown_flushes_live_data_published_just_before_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = wt_runtime::CacheStore::new(directory.path().to_path_buf(), "scope");
+    let scope = TaskScope::new();
+    let (_, publisher) = wt_runtime::leaf_channel(
+        &scope,
+        SourceSpec {
+            name: "rows",
+            domain: Domain::Git,
+            persistence: Persistence::Disk(wt_runtime::DiskCache::new(&store)),
+            policy: RefreshPolicy::default(),
+        },
+    );
+    // No yield: the cache writer first runs with cancellation already set.
+    publisher.publish_live(vec![1u8, 2], wt_runtime::Stamp::now());
+    scope.shutdown(Duration::from_secs(2)).await.unwrap();
+    assert!(directory.path().join("rows.json").exists());
+}
+
 #[tokio::test(start_paused = true)]
 async fn only_a_slow_fetch_reads_as_refreshing_and_a_skip_publishes_nothing() {
     let scope = TaskScope::new();

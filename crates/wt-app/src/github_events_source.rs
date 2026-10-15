@@ -32,9 +32,10 @@ pub(crate) struct DaemonRead {
     /// when the writer did not record it; such data never orders against
     /// local writes.
     pub started: Option<Instant>,
-    /// When the daemon wrote the snapshot. Bounds its freshness and
-    /// identifies the file version.
-    pub written: Instant,
+    /// When the daemon wrote the snapshot, in wall-clock milliseconds as
+    /// recorded in the file. Identifies the file version: unlike a moment
+    /// converted onto the process clock, it is identical on every reread.
+    pub written_ms: u64,
 }
 
 impl DaemonRead {
@@ -81,10 +82,13 @@ async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> 
             anyhow::bail!("GitHub snapshot exceeds 16 MiB");
         }
         let snapshot = serde_json::from_slice(&bytes)?;
+        // Read the process clock first so the wall-clock age it is offset by
+        // can only place the daemon's moments earlier, never later.
+        let local_now = Instant::now();
         Ok::<_, anyhow::Error>(validate(
             snapshot,
             &branches,
-            now_ms(),
+            (now_ms(), local_now),
             env!("WT_BUILD_ID"),
             &repository,
         ))
@@ -102,10 +106,11 @@ async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> 
     }
 }
 
+/// `now` is the same moment on the wall clock (ms) and the process clock.
 fn validate(
     snapshot: GithubSnapshot,
     branches: &[String],
-    now: u64,
+    (now, local_now): (u64, Instant),
     build: &str,
     repository: &str,
 ) -> Option<DaemonRead> {
@@ -128,8 +133,6 @@ fn validate(
     .ok()?;
     data.prs.retain(|branch, _| branches.contains(branch));
     data.covered_branches = branches.iter().cloned().collect();
-    let local_now = Instant::now();
-    let written = local_now.checked_sub(Duration::from_millis(age))?;
     // A start after the write is inconsistent; such data cannot be ordered.
     let started = snapshot
         .fetch_started_at_ms
@@ -138,7 +141,7 @@ fn validate(
     Some(DaemonRead {
         data,
         started,
-        written,
+        written_ms: snapshot.updated_at,
     })
 }
 
@@ -218,6 +221,10 @@ mod tests {
     use wt_core::Domain;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, leaf_channel};
 
+    fn at(now: u64) -> (u64, Instant) {
+        (now, Instant::now())
+    }
+
     fn snapshot() -> GithubSnapshot {
         GithubSnapshot {
             updated_at: 100_000,
@@ -234,20 +241,29 @@ mod tests {
     #[test]
     fn cache_requires_fresh_time_current_build_full_coverage_and_valid_payloads() {
         let branches = vec!["feature".into()];
-        assert!(validate(snapshot(), &branches, 101_000, "current", "repo").is_some());
-        assert!(validate(snapshot(), &[], 101_000, "current", "repo").is_some());
-        assert!(validate(snapshot(), &branches, 190_001, "current", "repo").is_none());
-        assert!(validate(snapshot(), &branches, 99_000, "current", "repo").is_none());
-        assert!(validate(snapshot(), &branches, 101_000, "other", "repo").is_none());
+        assert!(validate(snapshot(), &branches, at(101_000), "current", "repo").is_some());
+        assert!(validate(snapshot(), &[], at(101_000), "current", "repo").is_some());
+        assert!(validate(snapshot(), &branches, at(190_001), "current", "repo").is_none());
+        assert!(validate(snapshot(), &branches, at(99_000), "current", "repo").is_none());
+        assert!(validate(snapshot(), &branches, at(101_000), "other", "repo").is_none());
         // Another repository's or configuration's daemon is never read.
-        assert!(validate(snapshot(), &branches, 101_000, "current", "elsewhere").is_none());
+        assert!(validate(snapshot(), &branches, at(101_000), "current", "elsewhere").is_none());
         let mut unscoped = snapshot();
         unscoped.repository = None;
-        assert!(validate(unscoped, &branches, 101_000, "current", "repo").is_none());
-        assert!(validate(snapshot(), &["missing".into()], 101_000, "current", "repo").is_none());
+        assert!(validate(unscoped, &branches, at(101_000), "current", "repo").is_none());
+        assert!(
+            validate(
+                snapshot(),
+                &["missing".into()],
+                at(101_000),
+                "current",
+                "repo"
+            )
+            .is_none()
+        );
         let mut malformed = snapshot();
         malformed.prs = serde_json::json!({"feature":{"number":42}});
-        assert!(validate(malformed, &branches, 101_000, "current", "repo").is_none());
+        assert!(validate(malformed, &branches, at(101_000), "current", "repo").is_none());
         assert!(snapshot_event(Path::new("/events/.github.json.123.tmp")));
         assert!(!snapshot_event(Path::new("/events/state.json")));
     }
@@ -257,22 +273,56 @@ mod tests {
         // Fix the process clock origin before the moments this test names.
         let _ = Stamp::now();
         tokio::time::advance(Duration::from_secs(10)).await;
-        let read = validate(snapshot(), &["feature".into()], 101_000, "current", "repo").unwrap();
-        // Started 3s ago, written 1s ago.
-        assert_eq!(
-            read.written + Duration::from_secs(2),
-            read.started.unwrap() + Duration::from_secs(4)
-        );
+        let read = validate(
+            snapshot(),
+            &["feature".into()],
+            at(101_000),
+            "current",
+            "repo",
+        )
+        .unwrap();
         assert_eq!(
             read.stamp(),
             Stamp::at(Instant::now() - Duration::from_secs(3))
         );
+        // Started 3s ago; the version is the file's own write time.
+        assert_eq!(read.written_ms, 100_000);
+        // A reread a fraction of a millisecond later names the same version.
+        tokio::time::advance(Duration::from_micros(300)).await;
+        let reread = validate(
+            snapshot(),
+            &["feature".into()],
+            at(101_000),
+            "current",
+            "repo",
+        )
+        .unwrap();
+        assert_eq!(reread.written_ms, read.written_ms);
         let legacy = GithubSnapshot {
             fetch_started_at_ms: None,
             ..snapshot()
         };
-        let read = validate(legacy, &["feature".into()], 101_000, "current", "repo").unwrap();
+        let read = validate(legacy, &["feature".into()], at(101_000), "current", "repo").unwrap();
         assert!(!read.stamp().is_ordered());
+    }
+
+    /// Work between reading the clocks and converting the payload never moves
+    /// the daemon's request start later, where it could postdate an accept.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_validation_never_places_the_daemon_start_later() {
+        let _ = Stamp::now();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let read_at = Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let read = validate(
+            snapshot(),
+            &["feature".into()],
+            (101_000, read_at),
+            "current",
+            "repo",
+        )
+        .unwrap();
+        assert_eq!(read.stamp(), Stamp::at(read_at - Duration::from_secs(3)));
     }
 
     /// A daemon read that finished after a write was accepted, but whose
@@ -299,7 +349,7 @@ mod tests {
         daemon.fetch_started_at_ms = Some(100_000);
         daemon.updated_at = 101_900;
         daemon.prs = serde_json::to_value(with_auto_merge(open_pr_data("feature")).prs).unwrap();
-        let read = validate(daemon, &["feature".into()], 102_000, "current", "repo").unwrap();
+        let read = validate(daemon, &["feature".into()], at(102_000), "current", "repo").unwrap();
         // The arm was accepted 1s ago: after the daemon request started.
         let accepted = Stamp::at(Instant::now() - Duration::from_secs(1));
         let mut ledger = ledger_with_accepted_enable("feature", 7, accepted);

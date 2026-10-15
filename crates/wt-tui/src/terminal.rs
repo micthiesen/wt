@@ -1,4 +1,7 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
+use std::sync::Once;
 
 use crate::model::ToastTone;
 use std::io::{self, IsTerminal};
@@ -22,14 +25,83 @@ use wt_runtime::SourceHandle;
 
 use crate::{Board, Model, TerminalHandoff, UiActions, model::InputResult, render::render};
 
-struct TerminalGuard {
+/// Terminal modes the UI thread has entered. They live in a thread-local,
+/// not in the guard, so the panic hook can leave them before the panic
+/// message prints: a message written to the alternate screen in raw mode is
+/// lost when the screen is restored.
+#[derive(Clone, Copy)]
+struct Modes {
     active: bool,
     keyboard_supported: bool,
     keyboard_enhanced: bool,
 }
 
+thread_local! {
+    static MODES: Cell<Modes> = const {
+        Cell::new(Modes {
+            active: false,
+            keyboard_supported: false,
+            keyboard_enhanced: false,
+        })
+    };
+}
+
+fn update_modes(change: impl FnOnce(&mut Modes)) {
+    MODES.with(|cell| {
+        let mut modes = cell.get();
+        change(&mut modes);
+        cell.set(modes);
+    });
+}
+
+/// Leave every mode this thread entered. A no-op when nothing is active, so
+/// the panic hook and the guard's drop never restore twice (a second
+/// `LeaveAlternateScreen` would move the cursor back over the panic message).
+fn restore_terminal() {
+    let modes = MODES.get();
+    if !modes.active {
+        return;
+    }
+    let _ = disable_raw_mode();
+    if modes.keyboard_enhanced {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        Show,
+        LeaveAlternateScreen
+    );
+    update_modes(|modes| {
+        modes.active = false;
+        modes.keyboard_enhanced = false;
+    });
+}
+
+/// Restore the terminal before the previous hook prints a panic raised on the
+/// UI thread. Other threads' panics leave the live screen alone: Tokio
+/// catches worker panics and the TUI keeps running.
+fn install_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            previous(info);
+        }));
+    });
+}
+
+/// Owns the UI thread's terminal modes. It is `!Send`: the modes it restores
+/// belong to the thread that entered them.
+struct TerminalGuard {
+    _thread: PhantomData<*const ()>,
+}
+
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
+        install_panic_hook();
         enable_raw_mode()?;
         if let Err(error) = execute!(
             io::stdout(),
@@ -41,33 +113,36 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        Ok(Self {
+        MODES.set(Modes {
             active: true,
             keyboard_supported: false,
             keyboard_enhanced: false,
+        });
+        Ok(Self {
+            _thread: PhantomData,
         })
     }
 
     fn enable_keyboard_enhancements(&mut self, supported: bool) -> io::Result<()> {
-        self.keyboard_supported = supported;
-        if supported && !self.keyboard_enhanced {
+        update_modes(|modes| modes.keyboard_supported = supported);
+        if supported && !MODES.get().keyboard_enhanced {
             execute!(
                 io::stdout(),
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             )?;
-            self.keyboard_enhanced = true;
+            update_modes(|modes| modes.keyboard_enhanced = true);
         }
         Ok(())
     }
 
     fn suspend(&mut self) -> io::Result<()> {
-        if !self.active {
+        if !MODES.get().active {
             return Ok(());
         }
         disable_raw_mode()?;
-        if self.keyboard_enhanced {
+        if MODES.get().keyboard_enhanced {
             execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
-            self.keyboard_enhanced = false;
+            update_modes(|modes| modes.keyboard_enhanced = false);
         }
         if let Err(error) = execute!(
             io::stdout(),
@@ -84,15 +159,15 @@ impl TerminalGuard {
                 EnableMouseCapture,
                 Hide
             );
-            let _ = self.enable_keyboard_enhancements(self.keyboard_supported);
+            let _ = self.enable_keyboard_enhancements(MODES.get().keyboard_supported);
             return Err(error);
         }
-        self.active = false;
+        update_modes(|modes| modes.active = false);
         Ok(())
     }
 
     fn resume(&mut self) -> io::Result<()> {
-        if self.active {
+        if MODES.get().active {
             return Ok(());
         }
         enable_raw_mode()?;
@@ -106,39 +181,18 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        if let Err(error) = self.enable_keyboard_enhancements(self.keyboard_supported) {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                Show,
-                LeaveAlternateScreen
-            );
+        update_modes(|modes| modes.active = true);
+        if let Err(error) = self.enable_keyboard_enhancements(MODES.get().keyboard_supported) {
+            restore_terminal();
             return Err(error);
         }
-        self.active = true;
         Ok(())
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let _ = disable_raw_mode();
-        if self.keyboard_enhanced {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-            self.keyboard_enhanced = false;
-        }
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            Show,
-            LeaveAlternateScreen
-        );
+        restore_terminal();
     }
 }
 

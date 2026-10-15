@@ -15,6 +15,10 @@ use wt_update::{
 };
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(100);
+/// Exceeds the reconcile's own worst case (two 20s launchctl calls, the 10s
+/// unload confirmation and the 10s readiness wait) with room for a short
+/// lock wait. The update itself is already committed.
+const EVENTS_REFRESH_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -283,6 +287,7 @@ pub async fn startup_check(
         record_decline(paths, build_id).await?;
         return Ok(());
     }
+    let paths_for_refresh = paths.clone();
     match update_once(
         paths,
         repository(options)?,
@@ -295,12 +300,50 @@ pub async fn startup_check(
     .await
     {
         Ok(UpdateOutcome::Installed { release, build_id }) => {
-            eprintln!("wt: installed {release} ({build_id}); it will run next time wt starts")
+            eprintln!("wt: installed {release} ({build_id}); it will run next time wt starts");
+            refresh_events_agent(&options.home, &paths_for_refresh, cancel).await;
         }
         Ok(_) => {}
         Err(error) => eprintln!("wt: update failed: {error:#}"),
     }
     Ok(())
+}
+
+/// Move an installed GitHub events launch agent onto a just-installed build.
+/// The new launcher runs `wt events reconcile`, so the rewritten plist and the
+/// readiness check come from the installed code. The daemon gets a bounded
+/// graceful shutdown; a failure or timeout leaves the update in place and
+/// only warns.
+pub async fn refresh_events_agent(
+    home: &std::path::Path,
+    paths: &InstallPaths,
+    cancel: &CancellationToken,
+) {
+    if !cfg!(target_os = "macos") || !crate::events::plist_path(home).is_file() {
+        return;
+    }
+    let mut spec =
+        wt_platform::process::CommandSpec::new(paths.launcher()).args(["events", "reconcile"]);
+    spec.timeout = EVENTS_REFRESH_TIMEOUT;
+    spec.output_limit = 64 * 1024;
+    match wt_platform::process::ProcessRunner::default()
+        .run(spec, cancel)
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let text = output.stdout_text();
+            if !text.trim().is_empty() {
+                eprintln!("wt: {}", text.trim());
+            }
+        }
+        Ok(output) => eprintln!(
+            "wt: GitHub events daemon was not restarted: {}; run `wt events restart`",
+            output.stderr_text().trim()
+        ),
+        Err(error) => eprintln!(
+            "wt: GitHub events daemon was not restarted: {error:#}; run `wt events restart`"
+        ),
+    }
 }
 
 pub fn require_stable_launcher(paths: &InstallPaths) -> Result<()> {

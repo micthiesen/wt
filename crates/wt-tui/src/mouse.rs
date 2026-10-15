@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     Interaction, Model,
@@ -141,9 +142,17 @@ pub(crate) fn extract(buffer: &Buffer, selection: &Selection) -> String {
         .filter(|(row, _, _)| *row < area.bottom())
         .map(|(row, from, to)| {
             let mut line = String::new();
+            // A wide glyph's trailing cells hold a blank the screen never
+            // shows; copying them would put a space inside `界面`.
+            let mut hidden = 0;
             for column in from..=to.min(area.right().saturating_sub(1)) {
+                if hidden > 0 {
+                    hidden -= 1;
+                    continue;
+                }
                 if let Some(cell) = buffer.cell((column, row)) {
                     line.push_str(cell.symbol());
+                    hidden = cell.symbol().width().saturating_sub(1);
                 }
             }
             line.trim_end().to_owned()
@@ -167,10 +176,7 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
         KeyModifiers::NONE,
     );
     if model.help {
-        let maximum = crate::help::filtered_lines(&model.help_query.text())
-            .len()
-            .saturating_sub(1)
-            .max(model.help_max_scroll);
+        let maximum = model.help_max_scroll;
         model.help_scroll = if up {
             model.help_scroll.saturating_sub(3)
         } else {
@@ -239,6 +245,20 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
 mod tests {
     use super::*;
     use crate::{AttentionLine, Board, BoardRow};
+
+    #[test]
+    fn copying_wide_glyphs_skips_their_hidden_trailing_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        buffer.set_string(0, 0, "界面 ok", ratatui::style::Style::new());
+        let selection = Selection {
+            anchor: (0, 0),
+            head: (9, 0),
+            bounds: buffer.area,
+            dragged: true,
+            finished: true,
+        };
+        assert_eq!(extract(&buffer, &selection), "界面 ok");
+    }
 
     #[test]
     fn history_wheel_invalidates_pending_menu_but_viewport_scroll_does_not() {

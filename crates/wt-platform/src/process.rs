@@ -267,14 +267,16 @@ impl ProcessRunner {
                 ),
                 async {
                     if let (Some(mut stdin), Some(input)) = (stdin, spec.input) {
-                        stdin
-                            .write_all(&input)
-                            .await
-                            .map_err(|source| ProcessError::Io {
+                        match stdin.write_all(&input).await {
+                            // The child closed its input, usually by exiting
+                            // early. Its exit status and stderr are the result.
+                            Err(source) if source.kind() == io::ErrorKind::BrokenPipe => {}
+                            result => result.map_err(|source| ProcessError::Io {
                                 program: capture_program.clone(),
                                 operation: "write stdin",
                                 source,
-                            })?;
+                            })?,
+                        }
                         // Dropping the pipe sends EOF before waiting for the child.
                     }
                     Ok(())

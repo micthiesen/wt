@@ -42,7 +42,7 @@ pub async fn before_remove(
         Ok(sessions) => {
             for session in sessions
                 .into_iter()
-                .filter(|session| bare_slug(&session.name) == slug)
+                .filter(|session| session_named_for(slug, &session.name))
             {
                 // Names alone are ambiguous: foo-codex may be foo's Codex
                 // pane or the primary pane of a distinct foo-codex checkout.
@@ -97,29 +97,7 @@ pub async fn before_remove(
 }
 
 pub async fn after_remove(context: &AppContext, slug: &str, dev_port: Option<u16>) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let sessions = browser_sessions(context, slug, dev_port).await;
-    for id in sessions {
-        match run(
-            context,
-            command(
-                "browser-control",
-                ["session", "delete", id.as_str()],
-                Duration::from_secs(10),
-            ),
-            &context.cancellation,
-        )
-        .await
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => warnings.push(format!(
-                "browser session {id} cleanup exited {:?}: {}",
-                output.status.code(),
-                output.stderr_text().trim()
-            )),
-            Err(error) => warnings.push(format!("browser session {id} cleanup failed: {error}")),
-        }
-    }
+    let mut warnings = delete_browser_sessions(context, slug, dev_port).await;
     if let Some(port) = dev_port {
         warnings.extend(close_tabs_on_port(context, port).await);
     }
@@ -128,8 +106,18 @@ pub async fn after_remove(context: &AppContext, slug: &str, dev_port: Option<u16
 
 pub async fn after_dev_stop(context: &AppContext, slug: &str, port: Option<u16>) -> Vec<String> {
     let Some(port) = port else { return Vec::new() };
+    let mut warnings = delete_browser_sessions(context, slug, Some(port)).await;
+    warnings.extend(close_tabs_on_port(context, port).await);
+    warnings
+}
+
+async fn delete_browser_sessions(
+    context: &AppContext,
+    slug: &str,
+    port: Option<u16>,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    for id in browser_sessions(context, slug, Some(port)).await {
+    for id in browser_sessions(context, slug, port).await {
         match run(
             context,
             command(
@@ -150,7 +138,6 @@ pub async fn after_dev_stop(context: &AppContext, slug: &str, port: Option<u16>)
             Err(error) => warnings.push(format!("browser session {id} cleanup failed: {error}")),
         }
     }
-    warnings.extend(close_tabs_on_port(context, port).await);
     warnings
 }
 
@@ -170,24 +157,28 @@ pub async fn stored_dev_port(context: &AppContext, slug: &str) -> Option<u16> {
         .flatten()
 }
 
-fn bare_slug(name: &str) -> &str {
+/// Whether `name` could be one of `slug`'s sessions: its primary session, a
+/// `~` managed session, or a kind-suffixed one. A slug may itself end in a
+/// kind suffix (`fix-shell`), so its primary session is matched as is rather
+/// than after stripping one; pane cwd decides between the candidates.
+fn session_named_for(slug: &str, name: &str) -> bool {
     let name = name.rsplit_once('~').map_or(name, |(base, _)| base);
-    [
-        "-opencode",
-        "-codex",
-        "-pi",
-        "-action",
-        "-shell",
-        "-diff",
-        "-dev",
-    ]
-    .iter()
-    .find_map(|suffix| name.strip_suffix(suffix))
-    .unwrap_or(name)
+    name == slug
+        || [
+            "-opencode",
+            "-codex",
+            "-pi",
+            "-action",
+            "-shell",
+            "-diff",
+            "-dev",
+        ]
+        .iter()
+        .any(|suffix| name.strip_suffix(suffix) == Some(slug))
 }
 
 fn session_owned_by_target(slug: &str, name: &str, pane_cwd: &Path, checkout: &Path) -> bool {
-    bare_slug(name) == slug && path_is_within(pane_cwd, checkout)
+    session_named_for(slug, name) && path_is_within(pane_cwd, checkout)
 }
 
 async fn reap_worktree_listeners(
@@ -511,11 +502,30 @@ mod tests {
             "eng-1~review",
             "eng-1~review-codex",
         ] {
-            assert_eq!(bare_slug(name), "eng-1", "{name}");
+            assert!(session_named_for("eng-1", name), "{name}");
         }
         for name in ["eng-10", "eng-1x-codex", "other-eng-1", "eng-1-manager"] {
-            assert_ne!(bare_slug(name), "eng-1", "{name}");
+            assert!(!session_named_for("eng-1", name), "{name}");
         }
+        // A slug ending in a kind suffix still owns its primary session, and
+        // the shorter slug's dev session stays a candidate only for it.
+        assert!(session_named_for("fix-shell", "fix-shell"));
+        assert!(session_named_for("fix-shell", "fix-shell-codex"));
+        assert!(session_named_for("fix", "fix-shell"));
+        assert!(!session_named_for("fix-shell", "fix-dev"));
+        let fix_shell = Path::new("/worktrees/fix-shell");
+        assert!(session_owned_by_target(
+            "fix-shell",
+            "fix-shell",
+            fix_shell,
+            fix_shell
+        ));
+        assert!(!session_owned_by_target(
+            "fix",
+            "fix-shell",
+            fix_shell,
+            Path::new("/worktrees/fix")
+        ));
         let foo = Path::new("/worktrees/foo");
         assert!(path_is_within(Path::new("/worktrees/foo/src"), foo));
         assert!(!path_is_within(Path::new("/worktrees/foo-codex"), foo));

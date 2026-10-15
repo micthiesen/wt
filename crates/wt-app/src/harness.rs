@@ -31,6 +31,7 @@ pub use session_commands::{
 pub(crate) use session_commands::{
     cached_session_options, picker_entries, picker_slug, visible_harnesses,
 };
+use session_commands::{session_name, slot_name};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {
@@ -506,15 +507,22 @@ impl AppHarness {
         targets
     }
 
+    /// Resolve a slug, branch or `prefix/slug` name. An exact slug or branch
+    /// match anywhere wins over the last-segment fallback, so `team/foo`
+    /// never reaches worktree `foo` while a worktree has branch `team/foo`.
     pub fn target_for<'a>(requested: &str, routes: &'a [AgentRoute]) -> Option<&'a AgentRoute> {
-        routes.iter().find(|route| {
-            route.target.slug == requested
-                || route.target.branch.as_deref() == Some(requested)
-                || requested
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|slug| route.target.slug == slug)
-        })
+        routes
+            .iter()
+            .find(|route| route.target.slug == requested)
+            .or_else(|| {
+                routes
+                    .iter()
+                    .find(|route| route.target.branch.as_deref() == Some(requested))
+            })
+            .or_else(|| {
+                let slug = requested.rsplit('/').next()?;
+                routes.iter().find(|route| route.target.slug == slug)
+            })
     }
 
     pub async fn send(
@@ -652,18 +660,6 @@ fn special_target(slug: &str, cwd: PathBuf, managed_name: Option<String>) -> Age
         cwd,
         managed_name,
         remote: false,
-    }
-}
-
-fn session_name(target: &AgentTarget, id: HarnessId) -> String {
-    match id {
-        HarnessId::Claude if target.managed_name.as_deref() == Some("manager") => {
-            format!("{}~manager", target.slug)
-        }
-        HarnessId::Claude => target.slug.clone(),
-        HarnessId::Codex => format!("{}-codex", target.slug),
-        HarnessId::Opencode => format!("{}-opencode", target.slug),
-        HarnessId::Pi => format!("{}-pi", target.slug),
     }
 }
 
@@ -828,15 +824,7 @@ pub async fn ui_session_with_harness(
                 resume_session_id: None,
                 display_label: None,
             };
-            let tmux_name = match harness_id {
-                HarnessId::Claude if managed_name.as_deref() == Some("manager") => {
-                    format!("{slug}~manager")
-                }
-                HarnessId::Claude => slug.clone(),
-                HarnessId::Codex => format!("{slug}-codex"),
-                HarnessId::Opencode => format!("{slug}-opencode"),
-                HarnessId::Pi => format!("{slug}-pi"),
-            };
+            let tmux_name = slot_name(&slug, managed_name.as_deref(), harness_id);
             if !app
                 .tmux
                 .session_exists(&tmux_name, &context.cancellation)
@@ -924,12 +912,7 @@ fn live_harnesses(
 ) -> Vec<HarnessId> {
     let mut live = Vec::new();
     for id in HarnessId::ALL {
-        let name = match id {
-            HarnessId::Claude => slug.to_owned(),
-            HarnessId::Codex => format!("{slug}-codex"),
-            HarnessId::Opencode => format!("{slug}-opencode"),
-            HarnessId::Pi => format!("{slug}-pi"),
-        };
+        let name = slot_name(slug, None, id);
         // An auxiliary harness slot can have the same name as another
         // worktree's Claude primary. The real slug owns that exact name.
         if (id == HarnessId::Claude || !known_slugs.contains(&name)) && names.contains(&name) {
@@ -1271,6 +1254,32 @@ mod tests {
             }),
             fixture["expected"]
         );
+    }
+
+    #[test]
+    fn exact_branch_match_wins_over_an_earlier_last_segment_slug() {
+        let route = |slug: &str, branch: &str| AgentRoute {
+            target: AgentTarget {
+                slug: slug.into(),
+                kind: AgentTargetKind::Worktree,
+                branch: Some(branch.into()),
+                cwd: PathBuf::from("/w").join(slug),
+                managed_name: None,
+                remote: false,
+            },
+            choice: HarnessChoice {
+                selected: Some(HarnessId::Claude),
+                source: SelectionSource::Primary,
+                live: Some(Vec::new()),
+            },
+        };
+        let routes = [route("foo", "foo"), route("team-foo", "team/foo")];
+        let target = |name| AppHarness::target_for(name, &routes).map(|r| r.target.slug.as_str());
+        assert_eq!(target("team/foo"), Some("team-foo"));
+        assert_eq!(target("foo"), Some("foo"));
+        assert_eq!(target("team-foo"), Some("team-foo"));
+        assert_eq!(target("other/foo"), Some("foo"));
+        assert_eq!(target("missing"), None);
     }
 
     #[test]

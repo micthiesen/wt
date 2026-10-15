@@ -51,8 +51,8 @@ in each one.
   `yourname/eng-1953-fix-calendar-rendering`), a tracker URL, a branch, or a
   bare slug (issue-less worktrees are first-class). Lead with an id or words,
   never a URL when you also pass title words — the whole URL gets slugified
-  into the branch name. A bare id gets a random readable suffix
-  (`yourname/eng-1953-cozy-elephant`), so entering the same id again simply
+  into the branch name. A bare id gets a unique hex suffix
+  (`yourname/eng-1953-task-1a2b3c4d5e`), so entering the same id again simply
   creates another worktree for it; `--attach` instead checks out the id's
   existing branch. With `[issue_tracker] prefix` set, only that prefix may
   lead a worktree id — a GitHub issue never names a branch; attach it as the
@@ -61,7 +61,7 @@ in each one.
   that stacks the new worktree on that parent (diff base, TUI grouping,
   restack target).
 - `wt status [<slug>] [<state>]` — show or assert the worktree's work status
-  (`todo`/`working`/`review`/`needs-testing`/`needs-human`/`ready`/`dropped`).
+  (`todo`/`working`/`review`/`needs-testing`/`needs-human`/`ready`/`verified`/`dropped`).
   Built for agents; it prints the rules and expected next steps as you use
   it. `wt status --all` is the fleet overview.
 - `wt manager send <text…>` sends new actionable cross-owner facts or questions
@@ -97,7 +97,7 @@ in each one.
   <slug>` is worktree-only and invokes the bundled start skill with the selected
   harness's native prefix. For a configured SSH worker, `wt remote agent start
   <slug>` first provisions its bundled skills and instructions.
-- `wt dev <start|stop|status|logs> [slug]` — the worktree's dev server, when
+- `wt dev <start|reset|stop|status|queue|logs> [slug]` — the worktree's dev server, when
   the project configures one. Use it instead of running the project's dev
   command yourself: wt pins the server to a port it allocates per worktree
   (so the port the repo documents is the wrong one here), supervises and
@@ -106,8 +106,11 @@ in each one.
   off, run `wt dev stop` from your worktree if you have no planned further use;
   retain it while ongoing verification needs it. A PR or momentary idle state
   does not establish disuse.
-- `wt rm [slug]` — remove a worktree; it deletes the branch too and takes no
-  flags to control that.
+- `wt rm [slug]` — remove a worktree; it deletes the branch too unless you
+  pass `--keep-branch`. It refuses to discard dirty or unpushed work without
+  `--force`.
+- `wt archive <slug>` / `wt restore <slug>` — move a worktree out of or back
+  into the active board without touching its checkout.
 - `wt merge [slug]` — arm GitHub's "merge when ready" on the PR, the same
   action as the button on the PR page. **Use this, never `gh pr merge
   --auto`**: a base branch with a merge queue has to be ENQUEUED while
@@ -126,7 +129,7 @@ in each one.
   landed PRs, squash-safe replay, force-push, retarget PR bases. Standalone
   worktrees rebase onto their recorded base or plain trunk — it works on
   every worktree, not only stacks. `wt restack prune-backups` sweeps the
-  engine's `backup/*` refs.
+  engine's `backup/restack-*` branches.
 - `wt logs [slug]` — tail background-destroy logs.
 
 Every subcommand runs non-interactively when stdout isn't a TTY. Run

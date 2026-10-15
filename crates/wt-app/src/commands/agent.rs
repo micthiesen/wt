@@ -145,7 +145,8 @@ async fn send_route(
             route.target.slug
         );
     }
-    if body.is_empty() {
+    // A hold reference is a complete message on its own.
+    if body.is_empty() && hold.is_none() {
         bail!("message body is empty");
     }
     if let Some(id) = hold {
@@ -341,13 +342,19 @@ async fn read_nonblocking(
 
 #[cfg(not(unix))]
 async fn read_bounded_stdin(cancel: &tokio_util::sync::CancellationToken) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    tokio::select! {
+    let bytes = tokio::select! {
         biased;
         _ = cancel.cancelled() => bail!("reading message stdin cancelled"),
-        result = tokio::time::timeout(Duration::from_secs(30), async {
-            tokio::task::spawn_blocking(move || std::io::stdin().take((MAX_STDIN_BYTES + 1) as u64).read_to_end(&mut bytes)).await
-        }) => result.context("reading message stdin timed out")??.context("message stdin reader failed")?,
+        result = tokio::time::timeout(Duration::from_secs(30), tokio::task::spawn_blocking(|| {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take((MAX_STDIN_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        })) => result.context("reading message stdin timed out")?.context("message stdin reader failed")?.context("read message stdin")?,
+    };
+    if bytes.len() > MAX_STDIN_BYTES {
+        bail!("message stdin exceeds the {MAX_STDIN_BYTES}-byte limit");
     }
     Ok(bytes)
 }

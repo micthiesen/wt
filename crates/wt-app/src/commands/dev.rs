@@ -369,15 +369,13 @@ async fn run_queue(
 ) -> Result<i32> {
     let service = dev::service(context)?;
     if first || normal {
-        let slug = if let Some(slug) = slug {
-            slug.to_owned()
-        } else {
-            resolve_worktree(context, None)
-                .await?
-                .target
-                .slug()
-                .to_owned()
-        };
+        // Resolve like every other dev subcommand, so a branch or unique
+        // prefix names the waiter and the self-promotion check compares slugs.
+        let slug = resolve_worktree(context, slug)
+            .await?
+            .target
+            .slug()
+            .to_owned();
         let agent = std::env::var("WT_AGENT")
             .ok()
             .is_some_and(|agent| agent == slug);

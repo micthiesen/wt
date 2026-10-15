@@ -17,6 +17,9 @@ use crate::context::AppContext;
 
 const EVENT_LOCK: &str = "events-agent";
 const LAUNCHD_LABEL: &str = "com.wt.events";
+/// Bounded so a reload (SIGTERM from `launchctl unload`) finishes well inside
+/// the 10s unload confirmation window instead of waiting on a stuck fetch.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct AppEventSource {
@@ -135,49 +138,99 @@ pub async fn serve(context: &AppContext) -> Result<()> {
     .await?;
     tracing::info!(address = %daemon.local_addr(), "GitHub events daemon is listening");
     context.cancellation.cancelled().await;
-    daemon.shutdown().await;
+    if tokio::time::timeout(SHUTDOWN_GRACE, daemon.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "GitHub events daemon tasks did not stop within the shutdown grace period"
+        );
+    }
     Ok(())
 }
 
-pub async fn reconcile_at_startup(context: &AppContext) -> Result<()> {
-    // Disabled integrations and foreign/unknown launch agents are left alone.
+/// What [`reconcile`] did with the per-user launch agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reconciled {
+    /// `[github.events]` is not configured or no launch agent is installed.
+    NotInstalled,
+    /// The agent belongs to another configuration or its ownership is unknown.
+    Foreign,
+    /// The running daemon already carries the installed build.
+    Current,
+    /// The agent was reloaded onto this build.
+    Restarted { build: String },
+}
+
+/// Reload this configuration's launch agent when its daemon is not running
+/// the build the launcher now starts. Disabled integrations and foreign or
+/// unknown launch agents are left alone.
+pub async fn reconcile(context: &AppContext) -> Result<Reconciled> {
     if context.config.github.events.is_none() {
-        return Ok(());
+        return Ok(Reconciled::NotInstalled);
     }
     let plist = plist_path(&context.home);
     if !tokio::fs::try_exists(&plist).await.unwrap_or(false) {
-        return Ok(());
+        return Ok(Reconciled::NotInstalled);
     }
-    let lock = wt_platform::lock::FileLock::acquire(
-        &context.home.join(".cache/wt"),
-        EVENT_LOCK,
-        "reconcile GitHub events agent",
-        &context.cancellation,
-    )
-    .await?;
-    let owns = owns_agent(context, &plist).await?;
-    if !owns {
-        return Ok(());
+    let _lock = lock_user_events(context).await?;
+    if !owns_agent(context, &plist).await? {
+        return Ok(Reconciled::Foreign);
     }
-    let _lock = lock;
+    let build = agent_build(&context.home).await;
     let events_dir = events_directory(&context.config);
     let prior_state = wt_events::read_state(&events_dir).await.ok().flatten();
     if prior_state.as_ref().is_some_and(|state| {
-        state.writer_sha.as_deref() == Some(env!("WT_BUILD_ID")) && state.pid.is_some_and(pid_alive)
+        state.writer_sha.as_deref() == Some(build.as_str()) && state.pid.is_some_and(pid_alive)
     }) {
-        return Ok(());
+        return Ok(Reconciled::Current);
     }
     let prior_pid = prior_state.and_then(|state| state.pid);
     unload_agent(context, &plist).await?;
-    install_agent_locked(context, &plist).await?;
-    let result = launchctl(context, "load", &plist).await?;
+    // The plist is rewritten by this build; if that fails, reload the old one.
+    let installed = install_agent_locked(context, &plist).await;
+    let result = reload_after_unload(context, &plist).await?;
+    installed?;
     if !result.status.success() {
         bail!(
             "could not reload GitHub events launch agent: {}",
             result.stderr_text().trim()
         )
     }
-    wait_for_new_daemon(context, prior_pid, Duration::from_secs(10)).await
+    wait_for_new_daemon(context, &build, prior_pid, Duration::from_secs(10)).await?;
+    Ok(Reconciled::Restarted { build })
+}
+
+/// The launch agent always starts the stable launcher, so a reloaded daemon
+/// runs the installed build. That can differ from this process's build: a
+/// session that just installed an update, or a development binary.
+async fn agent_build(home: &Path) -> String {
+    installed_build(install_root(home)).await
+}
+
+async fn installed_build(root: PathBuf) -> String {
+    let installed = wt_update::InstallPaths::new(root)
+        .ok()
+        .map(wt_update::StateStore::new);
+    let current = match installed {
+        Some(store) => tokio::task::spawn_blocking(move || store.load())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|state| state.current),
+        None => None,
+    };
+    current.map_or_else(
+        || env!("WT_BUILD_ID").to_owned(),
+        |version| version.build_id().to_owned(),
+    )
+}
+
+fn install_root(home: &Path) -> PathBuf {
+    std::env::var_os(wt_launcher::INSTALL_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/wt"))
 }
 
 pub fn events_directory(config: &Config) -> PathBuf {
@@ -222,6 +275,26 @@ pub(crate) async fn launchctl(
     action: &str,
     plist: &Path,
 ) -> Result<wt_platform::process::ProcessOutput> {
+    launchctl_with(context, action, plist, &context.cancellation).await
+}
+
+/// Reload after a completed unload. `unload -w` also disables the job, so a
+/// cancellation between the two would leave the daemon off until a manual
+/// restart; the reload therefore ignores cancellation and relies on its own
+/// launchctl timeout.
+async fn reload_after_unload(
+    context: &AppContext,
+    plist: &Path,
+) -> Result<wt_platform::process::ProcessOutput> {
+    launchctl_with(context, "load", plist, &CancellationToken::new()).await
+}
+
+async fn launchctl_with(
+    context: &AppContext,
+    action: &str,
+    plist: &Path,
+    cancellation: &CancellationToken,
+) -> Result<wt_platform::process::ProcessOutput> {
     if !cfg!(target_os = "macos") {
         bail!("GitHub events launchd management is supported only on macOS");
     }
@@ -231,7 +304,7 @@ pub(crate) async fn launchctl(
     spec.timeout = Duration::from_secs(20);
     context
         .processes
-        .run(spec, &context.cancellation)
+        .run(spec, cancellation)
         .await
         .context("run launchctl")
 }
@@ -523,7 +596,7 @@ pub(crate) async fn status(context: &AppContext) -> Result<()> {
             state.last_fetch_at.map_or("never".into(), ago)
         );
         if state.pid.is_some_and(pid_alive)
-            && state.writer_sha.as_deref() != Some(env!("WT_BUILD_ID"))
+            && state.writer_sha.as_deref() != Some(agent_build(&context.home).await.as_str())
         {
             println!("  daemon build stale; run `wt events restart`");
         }
@@ -578,19 +651,25 @@ pub(crate) async fn agent_mutation(context: &AppContext, action: &str) -> Result
     } else {
         None
     };
-    if action == "restart" {
-        unload_agent(context, &plist).await?;
-    }
-    if action == "load" || action == "restart" {
-        install_agent_locked(context, &plist).await?;
-    }
     let verb = if action == "restart" { "load" } else { action };
-    let result = launchctl(context, verb, &plist).await?;
+    let result = if action == "restart" {
+        unload_agent(context, &plist).await?;
+        let installed = install_agent_locked(context, &plist).await;
+        let result = reload_after_unload(context, &plist).await?;
+        installed?;
+        result
+    } else {
+        if action == "load" {
+            install_agent_locked(context, &plist).await?;
+        }
+        launchctl(context, verb, &plist).await?
+    };
     if !result.status.success() {
         bail!("launchctl {verb} failed: {}", result.stderr_text().trim());
     }
     if action == "restart" {
-        wait_for_new_daemon(context, old_pid, Duration::from_secs(10)).await?;
+        let build = agent_build(&context.home).await;
+        wait_for_new_daemon(context, &build, old_pid, Duration::from_secs(10)).await?;
     }
     println!(
         "{} {}",
@@ -616,6 +695,7 @@ async fn install_agent_locked(context: &AppContext, plist: &Path) -> Result<()> 
 
 async fn wait_for_new_daemon(
     context: &AppContext,
+    build: &str,
     prior_pid: Option<u32>,
     timeout: Duration,
 ) -> Result<()> {
@@ -624,7 +704,7 @@ async fn wait_for_new_daemon(
     loop {
         let state = wt_events::read_state(&events_dir).await.ok().flatten();
         if state.as_ref().is_some_and(|state| {
-            state.writer_sha.as_deref() == Some(env!("WT_BUILD_ID"))
+            state.writer_sha.as_deref() == Some(build)
                 && state
                     .pid
                     .is_some_and(|pid| Some(pid) != prior_pid && pid_alive(pid))
@@ -713,10 +793,7 @@ fn plist_contents(context: &AppContext) -> Result<String> {
         .as_ref()
         .context("[github.events] is not configured")?;
     let _ = events;
-    let root = std::env::var_os("WT_INSTALL_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| context.home.join(".local/share/wt"));
-    let launcher = root
+    let launcher = install_root(&context.home)
         .join("bin")
         .join(if cfg!(windows) { "wt.exe" } else { "wt" });
     if !launcher.is_file() {
@@ -805,7 +882,7 @@ fn canonical_optional(value: &str, cwd: &Path) -> String {
     }
 }
 
-fn plist_path(home: &Path) -> PathBuf {
+pub(crate) fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist"))
 }
@@ -904,6 +981,24 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_reload_targets_the_installed_build_not_the_running_one() {
+        let root = tempfile::tempdir().unwrap();
+        // No install state: only this process's own build is known.
+        assert_eq!(
+            installed_build(root.path().to_path_buf()).await,
+            env!("WT_BUILD_ID")
+        );
+        // After an update the launcher starts the new build, even while an
+        // older session performs the reconcile.
+        let paths = wt_update::InstallPaths::new(root.path()).unwrap();
+        let mut state = wt_update::InstallState::new(wt_update::Channel::Stable);
+        state.current =
+            Some(wt_update::VersionId::new("v9.9.9", "newbuild", env!("WT_TARGET")).unwrap());
+        std::fs::write(paths.state_file(), state.to_json().unwrap()).unwrap();
+        assert_eq!(installed_build(root.path().to_path_buf()).await, "newbuild");
+    }
 
     #[test]
     fn plist_xml_escaping_handles_path_specials() {

@@ -127,14 +127,24 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         UiAction::SetAttentionSeen { at_ms } => {
             on_board(host, LayoutChange::AttentionSeen { at_ms: *at_ms })
         }
-        UiAction::ToggleAutomations { key: Some(key) } => {
-            let paused = row(board, key).is_some_and(|row| row.automations_paused);
+        // A toggle resolves against what the user saw: its witness when it
+        // carries one, else the board it is resolved against.
+        UiAction::ToggleAutomations {
+            key: Some(key),
+            seen,
+        } => {
+            let paused = seen.as_ref().map_or_else(
+                || row(board, key).is_some_and(|row| row.automations_paused),
+                |seen| seen.0,
+            );
             on_row(board, host, key, RowChange::Automations { paused: !paused })
         }
-        UiAction::ToggleAutomations { key: None } => on_board(
+        UiAction::ToggleAutomations { key: None, seen } => on_board(
             host,
             RowChange::Automations {
-                paused: !board.automations_paused,
+                paused: !seen
+                    .as_ref()
+                    .map_or(board.automations_paused, |seen| seen.0),
             },
         ),
         UiAction::CancelAutomations => unprojected(host, None, "cancelling automations", &[]),
@@ -275,8 +285,11 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 keys: revisions.iter().map(|r| r.key.clone()).collect(),
             },
         ),
-        UiAction::ToggleArchive { key } => {
-            let archived = row(board, key).is_some_and(|row| row.archived);
+        UiAction::ToggleArchive { key, seen } => {
+            let archived = seen.as_ref().map_or_else(
+                || row(board, key).is_some_and(|row| row.archived),
+                |seen| seen.0,
+            );
             on_row(
                 board,
                 host,

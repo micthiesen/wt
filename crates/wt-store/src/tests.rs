@@ -714,6 +714,41 @@ fn removed_history_keeps_verification_obligation_and_pause_across_minimal_confir
 }
 
 #[test]
+fn removed_history_follows_an_unpause_made_while_the_removal_was_pending() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let removal = |removed_at: &str| RemovedWorktree {
+        slug: "task".to_owned(),
+        branch: "feature/task".to_owned(),
+        removed_at: removed_at.to_owned(),
+        work: None,
+        automations_paused: None,
+        extra: Map::new(),
+    };
+    assert!(store.toggle_slug_automations_paused("task").unwrap());
+    store
+        .record_removed_worktrees(&[removal("2026-10-08T00:00:00Z")], 1_792_000_000_000)
+        .unwrap();
+    assert_eq!(
+        store.read_removed_worktrees().unwrap()[0].automations_paused,
+        Some(true)
+    );
+    // The slug is still live; the user unpauses before the removal confirms.
+    assert!(!store.toggle_slug_automations_paused("task").unwrap());
+    store
+        .record_removed_worktrees(&[removal("2026-10-09T00:00:00Z")], 1_792_000_000_000)
+        .unwrap();
+    assert_eq!(
+        store.read_removed_worktrees().unwrap()[0].automations_paused,
+        None
+    );
+}
+
+#[test]
 fn failed_restore_reinserts_exact_history_only_when_no_newer_removal_exists() {
     let temp = tempdir().unwrap();
     let mut store = Store::open(
@@ -953,4 +988,120 @@ fn dev_port_claims_skip_existing_allocations_and_automation_toggles_persist() {
     assert_eq!(state["pausedStacks"], json!(["stack-root"]));
     assert_eq!(state["slugs"]["a"]["automationsPaused"], true);
     assert_eq!(state["slugs"]["b"]["automationsPaused"], true);
+}
+
+#[test]
+fn witnessed_toggles_compare_and_write_in_one_transaction() {
+    use crate::SeenToggle;
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .toggle_global_automations_paused_seen(Some(false))
+            .unwrap(),
+        SeenToggle::Set(true)
+    );
+    // A board that still showed "running" must not resume it.
+    assert_eq!(
+        store
+            .toggle_global_automations_paused_seen(Some(false))
+            .unwrap(),
+        SeenToggle::Stale { current: true }
+    );
+    assert_eq!(store.read_wt_state().unwrap()["automationsPaused"], true);
+
+    assert_eq!(
+        store
+            .toggle_slug_automations_paused_seen("a", Some(true))
+            .unwrap(),
+        SeenToggle::Stale { current: false }
+    );
+    assert!(store.read_wt_state().unwrap()["slugs"].get("a").is_none());
+    assert_eq!(
+        store
+            .toggle_slug_automations_paused_seen("a", Some(false))
+            .unwrap(),
+        SeenToggle::Set(true)
+    );
+
+    // The stack marker is unset but row "a" is paused: the user saw "paused",
+    // so one write resumes the whole stack without a transient pause.
+    let members = ["a".to_owned(), "b".to_owned()];
+    assert_eq!(
+        store
+            .toggle_stack_automations_paused_seen("stack", &members, Some(("a", false)))
+            .unwrap(),
+        SeenToggle::Stale { current: true }
+    );
+    assert_eq!(
+        store
+            .toggle_stack_automations_paused_seen("stack", &members, Some(("a", true)))
+            .unwrap(),
+        SeenToggle::Set(false)
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["pausedStacks"], json!([]));
+    assert!(state["slugs"]["a"].get("automationsPaused").is_none());
+    assert!(state["slugs"]["b"].get("automationsPaused").is_none());
+    assert_eq!(
+        store
+            .toggle_stack_automations_paused_seen("stack", &members, Some(("b", false)))
+            .unwrap(),
+        SeenToggle::Set(true)
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["pausedStacks"], json!(["stack"]));
+    assert_eq!(state["slugs"]["a"]["automationsPaused"], true);
+    assert_eq!(state["slugs"]["b"]["automationsPaused"], true);
+}
+
+#[test]
+fn witnessed_archive_moves_layout_with_the_marker() {
+    use crate::SeenToggle;
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store
+        .move_worktrees_to_section(&["one".to_owned()], Some("Later"))
+        .unwrap();
+    assert_eq!(
+        store
+            .toggle_archived_seen("one", Some(true), "\0archived")
+            .unwrap(),
+        SeenToggle::Stale { current: false }
+    );
+    assert!(!store.read_archived_keys().unwrap().contains("one"));
+    assert!(!store.is_section_folded("\0archived").unwrap());
+    assert_eq!(
+        store
+            .toggle_archived_seen("one", Some(false), "\0archived")
+            .unwrap(),
+        SeenToggle::Set(true)
+    );
+    assert!(store.read_archived_keys().unwrap().contains("one"));
+    assert!(store.is_section_folded("\0archived").unwrap());
+    assert_eq!(
+        store
+            .toggle_archived_seen("one", Some(false), "\0archived")
+            .unwrap(),
+        SeenToggle::Stale { current: true }
+    );
+    assert_eq!(
+        store
+            .toggle_archived_seen("one", None, "\0archived")
+            .unwrap(),
+        SeenToggle::Set(false)
+    );
+    assert!(store.read_archived_keys().unwrap().is_empty());
+    assert_eq!(
+        store.read_wt_state().unwrap()["slugs"]["one"]["section"],
+        serde_json::Value::Null
+    );
 }

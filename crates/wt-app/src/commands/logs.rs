@@ -102,16 +102,21 @@ pub(crate) async fn latest(context: &AppContext, slug: Option<&str>) -> Result<O
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            if entry.metadata().await?.len() > 64 * 1024 {
-                continue;
+            match entry.metadata().await {
+                Ok(metadata) if metadata.len() <= 64 * 1024 => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             }
             let bytes = match tokio::fs::read(&path).await {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            let record: serde_json::Value = serde_json::from_slice(&bytes)
-                .with_context(|| format!("read destroy job {}", path.display()))?;
+            // One unreadable record must not hide every other job's log.
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
             if slug.is_none_or(|slug| {
                 record
                     .pointer("/target/key")
@@ -155,6 +160,9 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::fs::write(jobs.join("0-corrupt.json"), "{not json")
+            .await
+            .unwrap();
         let retained = jobs.join("1-a.log");
         tokio::fs::write(&retained, "done").await.unwrap();
         assert_eq!(

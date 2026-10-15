@@ -37,17 +37,7 @@ pub async fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<i32> {
         return Ok(2);
     }
     let records = ctx.repository.inventory(&ctx.cancellation).await?;
-    let selected = if args.all {
-        records.into_iter().filter(|r| !r.is_main).collect()
-    } else if let Some(target) = &args.target {
-        vec![crate::commands::resolve::resolve_from_inventory(
-            &records, target, true,
-        )?]
-    } else if let Some(cwd) = worktree_at_cwd(&records, &ctx.cwd) {
-        vec![cwd.clone()]
-    } else {
-        records.into_iter().filter(|r| !r.is_main).collect()
-    };
+    let selected = select_rows(records, args, &ctx.cwd)?;
     let branches = selected
         .iter()
         .filter(|record| !record.target.branch.is_empty())
@@ -476,6 +466,27 @@ fn check_stage(ctx: &AppContext, worktree: &Path, slug: &str) -> Vec<Check> {
     ]
 }
 
+/// An explicit target, else the linked worktree containing cwd, else every
+/// linked worktree. The main clone is never a diagnosis subject.
+fn select_rows(
+    records: Vec<wt_vcs::WorktreeRecord>,
+    args: &DoctorArgs,
+    cwd: &Path,
+) -> Result<Vec<wt_vcs::WorktreeRecord>> {
+    if args.all {
+        return Ok(records.into_iter().filter(|r| !r.is_main).collect());
+    }
+    if let Some(target) = &args.target {
+        return Ok(vec![crate::commands::resolve::resolve_from_inventory(
+            &records, target, true,
+        )?]);
+    }
+    if let Some(row) = worktree_at_cwd(&records, cwd).filter(|row| !row.is_main) {
+        return Ok(vec![row.clone()]);
+    }
+    Ok(records.into_iter().filter(|r| !r.is_main).collect())
+}
+
 async fn check_merged(ctx: &AppContext, worktree: &Path, trunk: &str) -> Check {
     let range = format!("{trunk}..HEAD");
     let count = ctx
@@ -488,41 +499,21 @@ async fn check_merged(ctx: &AppContext, worktree: &Path, trunk: &str) -> Check {
         )
         .await;
     match count {
-        Ok(out) if out.status.success() => {
-            let ahead = out.stdout_text().trim().parse::<u64>().unwrap_or(0);
-            if ahead == 0 {
-                return check("merged", CheckStatus::Ok, "no commits beyond trunk".into());
-            }
-            let ancestor = ctx
-                .processes
-                .run(
-                    CommandSpec::new("git")
-                        .args(["merge-base", "--is-ancestor", "HEAD", trunk])
-                        .cwd(worktree),
-                    &ctx.cancellation,
-                )
-                .await;
-            match ancestor {
-                Ok(out) if out.status.success() => {
-                    check("merged", CheckStatus::Info, format!("contained in {trunk}"))
-                }
-                Ok(out) if out.status.code() == Some(1) => check(
-                    "merged",
-                    CheckStatus::Ok,
-                    format!("not contained in {trunk}"),
-                ),
-                Ok(out) => check(
-                    "merged",
-                    CheckStatus::Warn,
-                    format!("cannot compare with {trunk}: {}", out.stderr_text().trim()),
-                ),
-                Err(error) => check(
-                    "merged",
-                    CheckStatus::Warn,
-                    format!("cannot compare with {trunk}: {error}"),
-                ),
-            }
-        }
+        // A branch with commits beyond trunk can never be an ancestor of it,
+        // so the count alone decides; squash landing is the PR check's job.
+        Ok(out) if out.status.success() => match out.stdout_text().trim().parse::<u64>() {
+            Ok(0) => check("merged", CheckStatus::Ok, "no commits beyond trunk".into()),
+            Ok(_) => check(
+                "merged",
+                CheckStatus::Ok,
+                format!("not contained in {trunk}"),
+            ),
+            Err(_) => check(
+                "merged",
+                CheckStatus::Warn,
+                format!("cannot compare with {trunk}: unreadable commit count"),
+            ),
+        },
         Ok(out) => check(
             "merged",
             CheckStatus::Warn,
@@ -564,6 +555,29 @@ mod tests {
             check_stage(&fixture.ctx, worktree, slug)[1].message,
             "not deployed"
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn main_clone_cwd_selects_every_linked_worktree_not_the_main_clone() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let records = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let selected = select_rows(records.clone(), &DoctorArgs::default(), &main).unwrap();
+        let mut slugs = selected
+            .iter()
+            .map(|row| row.target.slug().to_owned())
+            .collect::<Vec<_>>();
+        slugs.sort();
+        assert_eq!(slugs, ["one", "two"]);
+        let selected = select_rows(records, &DoctorArgs::default(), &fixture.ctx.cwd).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].target.slug(), "one");
         fixture.close().await.unwrap();
     }
 

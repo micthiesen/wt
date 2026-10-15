@@ -103,7 +103,7 @@ Everything is ordinary CLI surface, so any harness can drive it:
 - `wt agent send <target> "<text>"` — nudge a worktree, branch alias, or the `wt`/`main`/`dotfiles`/`manager` special sessions. wt chooses that target's active harness, or the configured primary when none is active, and cold-starts it. `wt agent start <slug>` invokes a worktree's bundled start skill with the selected harness's native prefix. For a remote worker, use `wt remote agent start <slug>`.
 - `wt agent ls --json` — the matching harness-neutral address book, including special sessions, active harnesses, selected harness, and selection source. An inaccessible tmux registry fails closed rather than appearing empty.
 - `wt claude ls --json` / `wt claude selftest` — Claude-only diagnostics. The deprecated `wt claude send` spelling delegates to `wt agent send` and cannot force Claude.
-- `wt manager report [--ok|--warn|--err] "<text>"` — surface a terse result on the TUI's attention feed (the palette's report-back channel).
+- `wt manager report [--ok|--warn|--err|--info] "<text>"` — surface a terse result on the TUI's attention feed (the palette's report-back channel).
 - `gh` — PR state, merges (only when the human asked), CI.
 
 ### wt owns session addressing and delivery

@@ -11,7 +11,7 @@ use wt_tui::{
 
 use crate::{action_dispatch, context::AppContext};
 
-pub const CUSTOM_ID: &str = "__custom__";
+pub const CUSTOM_ID: &str = crate::action_builtins::CUSTOM_ID;
 
 pub async fn execute(
     ctx: &AppContext,
@@ -180,11 +180,7 @@ async fn palette(
     });
     let mut options: Vec<_> = groups.into_iter().flat_map(|(_, values)| values).collect();
     if let ActionSurface::Row { key } = &surface {
-        for option in &mut options {
-            if option.chord == Some('m') {
-                option.chord = None;
-            }
-        }
+        // `m` is reserved for this row, so no configured action holds it.
         // As in TS, merge-when-ready sits in a github group after the
         // configured actions.
         let has_pr = board

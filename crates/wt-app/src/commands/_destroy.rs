@@ -189,6 +189,18 @@ async fn start_remove_inner(
             );
         }
         if child.try_wait()?.is_some() {
+            // The worker may have recorded a terminal state between the read
+            // above and its exit; that record, not the exit, decides.
+            let current = read_job(&job_path).await?;
+            if current["state"] == "succeeded" {
+                return Ok(job_id);
+            }
+            if current["state"] == "failed" {
+                bail!(
+                    "background worker exited during startup; see {}",
+                    log_path.display()
+                );
+            }
             restore_archive(ctx, &current).await?;
             bail!(
                 "background worker exited before startup acknowledgement; see {}",
@@ -295,18 +307,7 @@ pub async fn wait_for_completion_or_shutdown(
                     .filter(|identity| !identity.is_empty()),
             ) {
                 let actual = process_start_identity(pid, &ctx.processes).await;
-                #[cfg(unix)]
-                let gone = i32::try_from(pid)
-                    .ok()
-                    .filter(|pid| *pid > 0)
-                    .is_some_and(|pid| {
-                        // SAFETY: signal zero only probes the checked positive PID.
-                        (unsafe { libc::kill(pid, 0) }) == -1
-                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                    });
-                #[cfg(not(unix))]
-                let gone = false;
-                if gone || (!actual.is_empty() && actual != expected) {
+                if pid_is_gone(pid) || (!actual.is_empty() && actual != expected) {
                     // An unrelated reused PID cannot own this job. Do not
                     // rewrite archive state here: the durable record does
                     // not prove where a crashed worker stopped.
@@ -577,7 +578,22 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
         };
         let expected = job["workerStartIdentity"].as_str().unwrap_or_default();
         let actual = process_start_identity(pid, &ctx.processes).await;
-        if expected.is_empty() || actual.is_empty() || actual == expected {
+        // An empty identity is either an exited worker or a failed probe; only
+        // a confirmed missing PID or a reused one abandons the job.
+        let abandoned = if actual.is_empty() {
+            pid_is_gone(pid)
+        } else {
+            !expected.is_empty() && actual != expected
+        };
+        if !abandoned {
+            continue;
+        }
+        // A worker that finished between the first read and the probe has
+        // already recorded its own outcome.
+        let Ok(current) = read_job(&entry.path()).await else {
+            continue;
+        };
+        if current["state"] != "running" || current["workerPid"] != job["workerPid"] {
             continue;
         }
         job["state"] = json!("failed");
@@ -587,6 +603,26 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
         atomic_write(&entry.path(), &job).await?;
     }
     Ok(())
+}
+
+/// True only when the OS confirms no process has this PID.
+fn pid_is_gone(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .is_some_and(|pid| {
+                // SAFETY: signal zero only probes the checked positive PID.
+                (unsafe { libc::kill(pid, 0) }) == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 async fn process_start_identity(pid: u32, runner: &wt_platform::process::ProcessRunner) -> String {
@@ -639,6 +675,53 @@ mod tests {
         .unwrap();
         let error = waiter.await.unwrap_err();
         assert_eq!(error.to_string(), "checkout changed after confirmation");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reaping_fails_a_running_job_whose_worker_exited() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let jobs = job_dir(&fixture.ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let pid = exited.id();
+        exited.wait().unwrap();
+        let path = jobs.join("1-a.json");
+        let live = jobs.join("2-b.json");
+        let running = |pid: u32| {
+            json!({
+                "state": "running",
+                "workerPid": pid,
+                "workerStartIdentity": "ps:an earlier start",
+                "wasArchived": false,
+                "target": {"key": "one"},
+            })
+        };
+        atomic_write(&path, &running(pid)).await.unwrap();
+        // A live worker whose identity probe works is never reaped.
+        let own = process_start_identity(std::process::id(), &fixture.ctx.processes).await;
+        let mut alive = running(std::process::id());
+        alive["workerStartIdentity"] = json!(own);
+        atomic_write(&live, &alive).await.unwrap();
+        fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.set_archived("one", true)?))
+            .await
+            .unwrap();
+
+        reap_abandoned(&fixture.ctx, &jobs).await.unwrap();
+
+        let job = read_job(&path).await.unwrap();
+        assert_eq!(job["state"], "failed");
+        assert_eq!(read_job(&live).await.unwrap()["state"], "running");
+        let archived = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_archived_keys()?))
+            .await
+            .unwrap();
+        assert!(!archived.contains("one"));
         fixture.close().await.unwrap();
     }
 

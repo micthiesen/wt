@@ -25,6 +25,9 @@ pub enum EventsCommand {
     Stop,
     /// Reload the launchd agent and wait for a fresh daemon process.
     Restart,
+    /// Reload the launchd agent only if its daemon runs a build other than
+    /// the installed one. `wt update` runs this after installing a build.
+    Reconcile,
     /// Ensure a webhook secret exists and print setup guidance.
     Secret,
 }
@@ -49,6 +52,18 @@ pub async fn run(context: &AppContext, args: &EventsArgs) -> Result<i32> {
         Some(EventsCommand::Start) => events::agent_mutation(context, "load").await,
         Some(EventsCommand::Stop) => events::agent_mutation(context, "unload").await,
         Some(EventsCommand::Restart) => events::agent_mutation(context, "restart").await,
+        Some(EventsCommand::Reconcile) => {
+            match events::reconcile(context).await? {
+                events::Reconciled::NotInstalled | events::Reconciled::Current => {}
+                events::Reconciled::Foreign => println!(
+                    "GitHub events agent belongs to another configuration; run `wt events restart` there"
+                ),
+                events::Reconciled::Restarted { build } => {
+                    println!("restarted GitHub events daemon on build {build}")
+                }
+            }
+            Ok(0)
+        }
         Some(EventsCommand::Secret) => {
             if events::secret_is_configured(context).await {
                 println!("GitHub webhook secret is already configured; the value is not shown.");
@@ -68,7 +83,9 @@ pub async fn run(context: &AppContext, args: &EventsArgs) -> Result<i32> {
             Ok(0)
         }
         None => {
-            println!("usage: wt events <serve|status|install|uninstall|start|stop|restart|secret>");
+            println!(
+                "usage: wt events <serve|status|install|uninstall|start|stop|restart|reconcile|secret>"
+            );
             Ok(2)
         }
     }

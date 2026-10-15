@@ -105,7 +105,7 @@ pub async fn run(
     }
     let repository = crate::updates::repository(options)?;
     let result = crate::updates::update_once(
-        paths,
+        paths.clone(),
         repository,
         env!("WT_TARGET").to_owned(),
         args.channel.map(Into::into),
@@ -123,7 +123,8 @@ pub async fn run(
             println!("update available: {release} ({build_id})")
         }
         crate::updates::UpdateOutcome::Installed { release, build_id } => {
-            println!("installed {release} ({build_id}); it will run next time wt starts")
+            println!("installed {release} ({build_id}); it will run next time wt starts");
+            crate::updates::refresh_events_agent(&options.home, &paths, cancel).await;
         }
     }
     Ok(0)

@@ -124,7 +124,18 @@ impl CodexMessenger {
             worktree_path: target.cwd.clone(),
             live_session_id: None,
         };
-        let discovered = harness.discover_sync(&request, stamped_id.as_deref())?;
+        // Rollout discovery walks and parses history files and takes a
+        // blocking names lock; run it on a blocking worker.
+        let discovered = {
+            let harness = harness.clone();
+            let stamped = stamped_id.clone();
+            tokio::task::spawn_blocking(move || harness.discover_sync(&request, stamped.as_deref()))
+                .await
+                .map_err(|error| CodexHarnessError::Operation {
+                    operation: "discover",
+                    detail: error.to_string(),
+                })??
+        };
 
         let mut session_id = if was_live {
             stamped_id
@@ -196,12 +207,7 @@ impl CodexMessenger {
             let native = self.send(id, &target.text, cancel).await;
             match native {
                 Ok(delivery) => return Ok(CodexMessageOutcome::Queued(delivery)),
-                Err(error)
-                    if matches!(
-                        error.kind,
-                        CodexAppServerFailureKind::Ambiguous | CodexAppServerFailureKind::Cancelled
-                    ) =>
-                {
+                Err(error) if error.kind == CodexAppServerFailureKind::Ambiguous => {
                     return Ok(CodexMessageOutcome::Ambiguous {
                         reason: format!("{}; wt did not retry or type the message", error),
                     });

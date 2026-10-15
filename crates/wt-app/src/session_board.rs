@@ -9,6 +9,7 @@ use wt_harness::DerivedState;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, SessionTarget, SessionView, TerminalSlotView};
 
+use crate::activity_source::FailureClock;
 use crate::harness::{AgentTarget, AgentTargetKind, AppHarness};
 use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto};
 use crate::session_source::{SessionDiscoveries, SessionInventory, SessionSources};
@@ -33,6 +34,7 @@ pub fn overlay(
         inventory_updates.mark_changed();
         discovery_updates.mark_changed();
         activity_updates.mark_changed();
+        let mut failures = FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -48,6 +50,7 @@ pub fn overlay(
                 changed = activity_updates.changed() => if changed.is_err() { break; },
             }
             let prepared = compose(
+                &mut failures,
                 board_updates.borrow_and_update().clone(),
                 inventory_updates.borrow_and_update().clone(),
                 discovery_updates.borrow_and_update().clone(),
@@ -61,6 +64,7 @@ pub fn overlay(
 }
 
 fn compose(
+    failures: &mut FailureClock,
     source: SourceSnapshot<Board>,
     inventory: SourceSnapshot<SessionInventory>,
     discoveries: SourceSnapshot<SessionDiscoveries>,
@@ -68,6 +72,8 @@ fn compose(
     slots: &[(SessionTarget, AgentTarget)],
 ) -> SourceSnapshot<Board> {
     let Some(prepared) = source.data() else {
+        // This compose reports nothing, so every tracked failure has cleared.
+        failures.sweep();
         return source;
     };
     let mut board = prepared.as_ref().clone();
@@ -77,13 +83,14 @@ fn compose(
         ("Agent activity", activity.state()),
     ] {
         if let SourceState::Failed(error) = state {
-            crate::activity_source::append_attention(
+            failures.attention(
                 &mut board,
                 label,
                 &format!("{}: {}", label, sanitize_terminal_text(error)),
             );
         }
     }
+    failures.sweep();
     let inventory_ok = matches!(inventory.state(), SourceState::Ready);
     let discoveries_ok = matches!(discoveries.state(), SourceState::Ready);
     board.live_slots.clear();
@@ -92,16 +99,20 @@ fn compose(
     }
     if inventory_ok && let Some(inventory) = inventory.data() {
         for name in inventory.all.keys() {
+            // Managed Claude sessions are `slug~name`, whatever the name
+            // ends with; classify them first, as session inventory does.
             let (slug, harness) = if board.rows.iter().any(|row| row.slug == *name) {
                 (name.as_str(), "Claude")
+            } else if let Some((slug, _)) =
+                name.rsplit_once('~').filter(|(slug, _)| !slug.is_empty())
+            {
+                (slug, "Claude")
             } else if let Some(slug) = name.strip_suffix("-codex") {
                 (slug, "Codex")
             } else if let Some(slug) = name.strip_suffix("-pi") {
                 (slug, "Pi")
             } else if let Some(slug) = name.strip_suffix("-opencode") {
                 (slug, "OpenCode")
-            } else if let Some((slug, _)) = name.split_once('~') {
-                (slug, "Claude")
             } else if ["main", "manager", "wt", "dotfiles"].contains(&name.as_str()) {
                 (name.as_str(), "Claude")
             } else {
@@ -422,6 +433,7 @@ mod tests {
                 .pane_activity
                 .insert("manager-codex".into(), state.into());
             let result = compose(
+                &mut FailureClock::default(),
                 source.clone(),
                 SourceSnapshot::test_live(
                     Some(inventory.clone()),
@@ -444,6 +456,7 @@ mod tests {
             assert!(board.slot_sessions.is_empty());
         }
         let result = compose(
+            &mut FailureClock::default(),
             source.clone(),
             SourceSnapshot::test_live(
                 Some(inventory),
@@ -464,6 +477,7 @@ mod tests {
                 .all(|row| row.live_sessions.is_empty())
         );
         let result = compose(
+            &mut FailureClock::default(),
             source,
             SourceSnapshot::test_live(
                 Some(SessionInventory::default()),
@@ -541,6 +555,7 @@ mod tests {
         let inventory =
             SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
         let result = compose(
+            &mut FailureClock::default(),
             source.clone(),
             inventory.clone(),
             discoveries.clone(),
@@ -565,6 +580,7 @@ mod tests {
 
         // Without a Ready inventory nothing is claimed as prepared or stopped.
         let failed = compose(
+            &mut FailureClock::default(),
             source,
             SourceSnapshot::default().with_state(SourceState::Failed("tmux down".into())),
             discoveries,
@@ -574,6 +590,58 @@ mod tests {
         let failed = failed.data().unwrap();
         assert!(failed.session_menus.is_empty());
         assert!(failed.terminals.is_empty());
+    }
+
+    /// A lasting discovery failure recomposed on every activity update keeps
+    /// one attention time: the board does not change, so it is not
+    /// republished, and an acknowledgement of the line sticks.
+    #[test]
+    fn a_lasting_lane_failure_recomposes_to_the_same_board() {
+        let board =
+            SourceSnapshot::test_live(Some(Board::default()), SourceState::Ready, Domain::Git);
+        let failed = SourceSnapshot::<SessionDiscoveries>::default()
+            .with_state(SourceState::Failed("opencode unavailable".into()));
+        let mut failures = FailureClock::default();
+        let mut pass = || {
+            compose(
+                &mut failures,
+                board.clone(),
+                SourceSnapshot::default(),
+                failed.clone(),
+                SourceSnapshot::default(),
+                &[],
+            )
+        };
+        let first = pass();
+        assert_eq!(first.data().unwrap().attention.len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert!(first.same_view(&pass()));
+    }
+
+    /// A failure that clears while the board has no data and then recurs is
+    /// a new event, not the old one still running.
+    #[test]
+    fn a_failure_recurring_after_a_board_gap_gets_a_new_time() {
+        let board =
+            SourceSnapshot::test_live(Some(Board::default()), SourceState::Ready, Domain::Git);
+        let failed = SourceSnapshot::<SessionDiscoveries>::default()
+            .with_state(SourceState::Failed("opencode unavailable".into()));
+        let mut failures = FailureClock::default();
+        let mut pass = |board: SourceSnapshot<Board>| {
+            compose(
+                &mut failures,
+                board,
+                SourceSnapshot::default(),
+                failed.clone(),
+                SourceSnapshot::default(),
+                &[],
+            )
+        };
+        let first = pass(board.clone()).data().unwrap().attention[0].at_ms;
+        pass(SourceSnapshot::default());
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let recurred = pass(board).data().unwrap().attention[0].at_ms;
+        assert!(recurred > first);
     }
 
     #[test]
@@ -613,6 +681,7 @@ mod tests {
             Domain::Sessions,
         );
         let result = compose(
+            &mut FailureClock::default(),
             board,
             SourceSnapshot::default().with_state(SourceState::Failed("tmux unavailable".into())),
             discoveries,
@@ -693,6 +762,7 @@ mod tests {
                 SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
             let activity = SourceSnapshot::default();
             let result = compose(
+                &mut FailureClock::default(),
                 board.clone(),
                 inventory.clone(),
                 discoveries.clone(),
@@ -713,7 +783,14 @@ mod tests {
                 .insert(slot.clone(), "current".into());
             let inventory =
                 SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions);
-            let result = compose(board, inventory, discoveries, activity, &[]);
+            let result = compose(
+                &mut FailureClock::default(),
+                board,
+                inventory,
+                discoveries,
+                activity,
+                &[],
+            );
             let sessions = &result.data().unwrap().rows[0].sessions;
             let old = sessions.iter().find(|session| session.id == "old").unwrap();
             let current = sessions

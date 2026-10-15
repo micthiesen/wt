@@ -221,6 +221,7 @@ pub fn overlay(
         let mut histories = history.subscribe();
         boards.mark_changed();
         histories.mark_changed();
+        let mut failures = crate::activity_source::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -244,11 +245,12 @@ pub fn overlay(
                 if let SourceState::Failed(error) = history_snapshot.state() {
                     let detail = sanitize_terminal_text(&format!("History: {error}"));
                     if !board.attention.iter().any(|line| line.text == detail) {
-                        crate::activity_source::append_attention(board, "History", &detail);
+                        failures.attention(board, "History", &detail);
                     }
                 }
+                failures.sweep();
             }
-            publisher.publish(
+            publisher.publish_if_changed(
                 base.with_data(data.map(Arc::new))
                     .with_input(&history_snapshot),
             );
@@ -860,19 +862,7 @@ async fn read_github_repo_url(
     if !output.status.success() {
         return None;
     }
-    repo_web_url(output.stdout_text().trim())
-}
-
-fn repo_web_url(remote: &str) -> Option<String> {
-    let captures = regex::Regex::new(
-        r"^(?:git@|ssh://git@|https?://)([^/:]+\.[^/:]+)[/:]([^/]+)/([^/]+?)(?:\.git)?/?$",
-    )
-    .ok()?
-    .captures(remote.trim())?;
-    Some(format!(
-        "https://{}/{}/{}",
-        &captures[1], &captures[2], &captures[3]
-    ))
+    crate::commands::issue::repo_web_url(output.stdout_text().trim())
 }
 
 fn now_ms() -> i64 {

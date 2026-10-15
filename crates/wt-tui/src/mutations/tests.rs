@@ -270,7 +270,11 @@ fn every_action_declares_an_effect_and_toggles_use_the_shown_state() {
         pr(b).auto_merge_armed = true;
         b.rows[0].archived = true;
     });
-    let effect = UiAction::ToggleArchive { key: "a".into() }.effect(&shown);
+    let effect = UiAction::ToggleArchive {
+        key: "a".into(),
+        seen: None,
+    }
+    .effect(&shown);
     assert!(matches!(
         effect,
         Effect::Mutation(UiMutation {
@@ -278,6 +282,58 @@ fn every_action_declares_an_effect_and_toggles_use_the_shown_state() {
             ..
         })
     ));
+    // A witnessed toggle keeps the direction the user saw, even when the
+    // board it is resolved against has since changed.
+    let effect = UiAction::ToggleArchive {
+        key: "a".into(),
+        seen: Some(crate::Seen(false)),
+    }
+    .effect(&shown);
+    assert!(matches!(
+        effect,
+        Effect::Mutation(UiMutation {
+            kind: MutationKind::Layout(LayoutChange::Archive { archived: true }),
+            ..
+        })
+    ));
+    let paused = with(|b| {
+        b.rows[0].automations_paused = true;
+        b.automations_paused = true;
+    });
+    for (action, expected) in [
+        (
+            UiAction::ToggleAutomations {
+                key: Some("a".into()),
+                seen: Some(crate::Seen(false)),
+            },
+            true,
+        ),
+        (
+            UiAction::ToggleAutomations {
+                key: None,
+                seen: Some(crate::Seen(false)),
+            },
+            true,
+        ),
+        (
+            UiAction::ToggleAutomations {
+                key: Some("a".into()),
+                seen: None,
+            },
+            false,
+        ),
+    ] {
+        let Effect::Mutation(mutation) = action.effect(&paused) else {
+            panic!("automation toggles are mutations");
+        };
+        assert!(
+            matches!(
+                mutation.kind,
+                MutationKind::Row(RowChange::Automations { paused }) if paused == expected
+            ),
+            "{action:?}"
+        );
+    }
     let remote = UiAction::OnHost {
         host: Some("box".into()),
         action: Box::new(UiAction::GithubSetAutoMerge {
@@ -389,8 +445,12 @@ fn every_declared_domain_can_settle() {
         UiAction::SetAttentionSeen { at_ms: 1 },
         UiAction::ToggleAutomations {
             key: Some("a".into()),
+            seen: None,
         },
-        UiAction::ToggleAutomations { key: None },
+        UiAction::ToggleAutomations {
+            key: None,
+            seen: None,
+        },
         UiAction::CancelAutomations,
         UiAction::RestoreRemoved {
             key: "a".into(),
@@ -472,7 +532,10 @@ fn every_declared_domain_can_settle() {
         UiAction::Cleanup {
             revisions: vec![revision],
         },
-        UiAction::ToggleArchive { key: "a".into() },
+        UiAction::ToggleArchive {
+            key: "a".into(),
+            seen: None,
+        },
         UiAction::SetStatus {
             key: "a".into(),
             state: Some("review".into()),

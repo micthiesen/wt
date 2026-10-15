@@ -4,7 +4,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use wt_launcher::launch;
 use wt_update::InstallPaths;
 
 fn main() -> ExitCode {
@@ -28,21 +27,16 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let paths = InstallPaths::new(root.to_owned())?;
     let args: Vec<_> = env::args_os().skip(1).collect();
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let status = launch(&paths, &args, now)?;
-    if let Some(code) = status.code() {
-        Ok(u8::try_from(code).unwrap_or(1))
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            Ok(status
-                .signal()
-                .and_then(|signal| u8::try_from(128 + signal).ok())
-                .unwrap_or(1))
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(1)
-        }
+    #[cfg(unix)]
+    {
+        Err(wt_launcher::exec(&paths, &args, now).into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = wt_launcher::launch(&paths, &args, now)?;
+        Ok(status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1))
     }
 }

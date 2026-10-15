@@ -264,10 +264,17 @@ async fn remove_malformed(path: &Path) {
 }
 
 fn pid_alive(pid: u32) -> bool {
+    // Zero and values past i32::MAX would probe a process group, not a pid.
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // SAFETY: signal zero only probes process existence.
-        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        if unsafe { libc::kill(pid, 0) } == 0 {
             return true;
         }
         io::Error::last_os_error().kind() == io::ErrorKind::PermissionDenied
@@ -402,6 +409,13 @@ mod tests {
             "one"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_group_ids_are_never_live_waiters() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(u32::MAX));
     }
 
     #[tokio::test]

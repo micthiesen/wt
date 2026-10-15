@@ -379,18 +379,11 @@ impl ClaudeEventParser {
         .map(|s| format!(" err: {s}"))
         .unwrap_or_default();
         let Some(start) = start else {
-            let arrow = if is_error { "✗" } else { "✓" };
-            let detail = if is_error {
-                brief_result(block.get("content"))
-                    .map(|s| format!(" err: {s}"))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let label = "(earlier call)";
-            delta
-                .append
-                .push(self.make_line(ts, kind, format!("  {arrow} {label}{detail}")));
+            delta.append.push(self.make_line(
+                ts,
+                kind,
+                format!("  {arrow} (earlier call){detail}"),
+            ));
             return;
         };
         if let Some(batch_id) = start.batch
@@ -442,7 +435,7 @@ impl ClaudeEventParser {
             id: start.id,
             timestamp_ms: ts,
             kind,
-            text: format!("  {arrow}{}{detail} {elapsed}", start.label),
+            text: format!("  {arrow} {}{detail} {elapsed}", start.label),
         };
         delta.patch.push(ActivityPatch { id: start.id, line });
     }
@@ -691,6 +684,7 @@ mod tests {
         let done = parser.parse_line(r#"{"type":"user","timestamp":"2026-08-09T00:40:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}"#);
         assert_eq!(done.patch[0].id, start.append[1].id);
         assert_eq!(done.patch[0].line.kind, ActivityKind::ToolOk);
+        assert_eq!(done.patch[0].line.text, "  ✓ Bash(echo hi) 1.0s");
     }
 
     #[test]

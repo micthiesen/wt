@@ -53,12 +53,12 @@ const TAIL_LINES: usize = 100;
 const TAIL_SEED_BYTES: usize = 64 * 1024;
 const TAIL_DELTA_BYTES: usize = 32 * 1024;
 
-/// Sources an action's declared effects refresh on completion. The issue
-/// statuses leaf also settles issue-status expectations, so it must be the
-/// confirmable leaf, not a display view.
 /// Spacing of follow-up tracker reads while an expectation is unconfirmed.
 const CONFIRM_POLL: Duration = Duration::from_secs(5);
 
+/// Sources an action's declared effects refresh on completion. The issue
+/// statuses leaf also settles issue-status expectations, so it must be the
+/// confirmable leaf, not a display view.
 pub struct RefreshTargets {
     pub git: LeafHandle<Vec<wt_vcs::WorktreeSnapshot>>,
     pub github: LeafHandle<wt_github::GithubData>,
@@ -388,6 +388,7 @@ fn project(
         let mut statuses = targets.issues.subscribe();
         boards.mark_changed(); updates.mark_changed(); log_updates.mark_changed(); statuses.mark_changed();
         let mut tracker = Tracker::new(epoch_ms());
+        let mut failures = crate::activity_source::FailureClock::default();
         let mut last_runs = None;
         let mut last_error = None;
         // The tracker's read model can lag the action's write past the read
@@ -448,6 +449,7 @@ fn project(
                 updates.borrow().clone(),
                 log_updates.borrow().clone(),
                 &tracker,
+                &mut failures,
             );
             publisher.publish_if_changed(next);
         }
@@ -726,18 +728,22 @@ fn compose(
     runs: SourceSnapshot<ActionHistory>,
     logs: SourceSnapshot<ActionLogs>,
     tracker: &Tracker,
+    failures: &mut crate::activity_source::FailureClock,
 ) -> SourceSnapshot<Board> {
     let Some(data) = board.data() else {
+        // This compose reports nothing, so every tracked failure has cleared.
+        failures.sweep();
         return board;
     };
     let mut data = data.as_ref().clone();
     if let SourceState::Failed(error) = runs.state() {
-        crate::activity_source::append_attention(
+        failures.attention(
             &mut data,
             "Action history",
             &wt_core::sanitize_terminal_text(error),
         );
     }
+    failures.sweep();
     data.slot_logs.clear();
     let projected = tracker.projected_statuses();
     for row in &mut data.rows {
@@ -1008,6 +1014,7 @@ mod tests {
             SourceSnapshot::default(),
             SourceSnapshot::default(),
             &tracker,
+            &mut crate::activity_source::FailureClock::default(),
         );
         let data = output.data().unwrap();
         assert_eq!(data.rows[0].issue_status.as_deref(), Some("Review"));

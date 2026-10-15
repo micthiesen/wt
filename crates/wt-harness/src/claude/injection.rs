@@ -302,7 +302,13 @@ fn selftest_failed(
         reason: reason.into(),
     }
 }
+/// Whether the prompt could not be located, so nothing was submitted. A
+/// throw from Claude's own submit handler happened after dispatch; its text
+/// can say "not found" and must never make a submit look retryable.
 fn is_locate_failure(reason: &str) -> bool {
+    if reason.starts_with("onSubmit threw") {
+        return false;
+    }
     let lower = reason.to_ascii_lowercase();
     ["not found", "listener", "bound method", "no react root"]
         .iter()
@@ -373,6 +379,12 @@ mod tests {
         );
         assert!(is_locate_failure("prompt input not found"));
         assert!(!is_locate_failure("onSubmit threw: refused"));
+        // Submit-time errors can mention missing files or listeners; they
+        // remain post-dispatch failures, never a retryable locate miss.
+        assert!(!is_locate_failure("onSubmit threw: file not found"));
+        assert!(!is_locate_failure(
+            "onSubmit threw: no stdin readable listener"
+        ));
     }
 
     #[tokio::test]

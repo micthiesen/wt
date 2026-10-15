@@ -2,11 +2,11 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 use wt_automations::AutomationFire;
 use wt_core::{ChainMember, build_stack_index};
 use wt_github::{GithubClient, GithubOptions};
-use wt_platform::process::CommandSpec;
+use wt_platform::process::{CommandSpec, ProcessRunner};
 use wt_stack::{RestackOptions, RestackOutcome, StackConfig, StackService, StateConfig};
 use wt_store::RepositoryIdentity;
 
@@ -245,7 +245,8 @@ async fn notify(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecut
         let output = ctx
             .processes
             .run(
-                CommandSpec::new("notify-send").args([&title, &fire.detail]),
+                // A detail starting with `-` must not parse as an option.
+                CommandSpec::new("notify-send").args(["--", &title, &fire.detail]),
                 &ctx.cancellation,
             )
             .await?;
@@ -279,7 +280,8 @@ async fn close_issue(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinE
             ctx,
             "info",
             &format!("auto {}: closed issue #{issue}", fire.rule.id),
-        )?;
+        )
+        .await?;
     } else {
         tracing::warn!(rule = %fire.rule.id, issue, error = ?result.error, "automation close issue declined");
     }
@@ -299,6 +301,8 @@ async fn close_issue(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinE
 struct PullRequestRef {
     number: u64,
     state: String,
+    #[serde(rename = "headRefOid", default)]
+    head_oid: Option<String>,
 }
 
 async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecution> {
@@ -324,7 +328,7 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
                     "--head",
                     branch,
                     "--json",
-                    "number,state",
+                    "number,state,headRefOid",
                 ])
                 .cwd(&ctx.config.paths.main_clone),
             &ctx.cancellation,
@@ -345,32 +349,171 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
             ctx,
             "warn",
             &format!("auto {}: NOT deleting {branch} - {reason}", fire.rule.id),
-        )?;
+        )
+        .await?;
         return Ok(BuiltinExecution::Completed {
             message: format!("declined to delete {branch}: {reason}"),
         });
     }
-    let result = github_client(ctx)
-        .delete_remote_branch(branch, &ctx.cancellation)
-        .await;
-    if result.ok {
+    // Delete only the commit that was proven merged: the merged PR's head,
+    // or without a PR the local branch tip that Git proved landed. Commits
+    // pushed to the branch since then must survive.
+    let expected = match claimed {
+        Some(number) => prs
+            .iter()
+            .find(|pr| pr.number == number)
+            .and_then(|pr| pr.head_oid.clone()),
+        None => local_branch_tip(ctx, branch).await,
+    };
+    let Some(expected) = expected.filter(|sha| !sha.trim().is_empty()) else {
+        let reason = "the merged head commit is unknown";
         attention(
             ctx,
-            "info",
-            &format!("auto {}: deleted remote branch {branch}", fire.rule.id),
-        )?;
-        Ok(BuiltinExecution::Completed {
-            message: format!("deleted remote branch {branch}"),
-        })
-    } else {
-        tracing::warn!(rule = %fire.rule.id, branch, error = ?result.error, "automation delete branch declined");
-        Ok(BuiltinExecution::Completed {
-            message: format!(
-                "remote branch {branch} was not deleted: {}",
-                result.error.unwrap_or_default()
-            ),
-        })
+            "warn",
+            &format!("auto {}: NOT deleting {branch} - {reason}", fire.rule.id),
+        )
+        .await?;
+        return Ok(BuiltinExecution::Completed {
+            message: format!("declined to delete {branch}: {reason}"),
+        });
+    };
+    let mut outcome = delete_remote_branch_at(
+        &ctx.processes,
+        &ctx.config.paths.main_clone,
+        branch,
+        &expected,
+        &ctx.cancellation,
+    )
+    .await?;
+    if let LeasedDelete::Unreachable(push_error) = &outcome {
+        // git could not reach origin (commonly no git credentials when only
+        // gh is authenticated). Fall back to the API with the same head check.
+        let result = github_client(ctx)
+            .delete_remote_branch_at(branch, &expected, &ctx.cancellation)
+            .await;
+        outcome = if result.ok {
+            LeasedDelete::Deleted
+        } else {
+            LeasedDelete::Refused(format!(
+                "{}; git push: {push_error}",
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("GitHub API delete failed")
+            ))
+        };
     }
+    match outcome {
+        LeasedDelete::Deleted => {
+            attention(
+                ctx,
+                "info",
+                &format!("auto {}: deleted remote branch {branch}", fire.rule.id),
+            )
+            .await?;
+            Ok(BuiltinExecution::Completed {
+                message: format!("deleted remote branch {branch}"),
+            })
+        }
+        LeasedDelete::Refused(error) | LeasedDelete::Unreachable(error) => {
+            tracing::warn!(rule = %fire.rule.id, branch, %error, "automation delete branch declined");
+            attention(
+                ctx,
+                "warn",
+                &format!(
+                    "auto {}: NOT deleting {branch} (merged head {}): {error}",
+                    fire.rule.id,
+                    short_sha(&expected),
+                ),
+            )
+            .await?;
+            Ok(BuiltinExecution::Completed {
+                message: format!("remote branch {branch} was not deleted: {error}"),
+            })
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LeasedDelete {
+    Deleted,
+    /// The remote refused: its tip is not `expected` (commits were pushed
+    /// after the merge, or it is already gone).
+    Refused(String),
+    /// The push never got a per-ref answer from the remote (credentials,
+    /// network, hooks), so nothing about the remote tip is known.
+    Unreachable(String),
+}
+
+/// Delete `origin`'s `branch` only while it still points at `expected`. The
+/// lease travels with the push, so the remote compares and deletes in one
+/// step; a tip that moved meanwhile is refused, never discarded.
+async fn delete_remote_branch_at(
+    processes: &ProcessRunner,
+    repository: &Path,
+    branch: &str,
+    expected: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<LeasedDelete> {
+    let reference = format!("refs/heads/{branch}");
+    let mut spec = CommandSpec::new("git")
+        .args([
+            "push".to_owned(),
+            "--porcelain".to_owned(),
+            format!("--force-with-lease={reference}:{expected}"),
+            "origin".to_owned(),
+            format!(":{reference}"),
+        ])
+        .cwd(repository);
+    spec.env = vec![
+        ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
+        ("LC_ALL".into(), Some("C".into())),
+    ];
+    let output = processes.run(spec, cancellation).await?;
+    if output.status.success() {
+        return Ok(LeasedDelete::Deleted);
+    }
+    // `--porcelain` prints a `!` status line only when the remote answered
+    // for this ref; anything else is a transport or credential failure.
+    let stdout = output.stdout_text();
+    if let Some(line) = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('!'))
+    {
+        return Ok(LeasedDelete::Refused(wt_core::sanitize_terminal_text(line)));
+    }
+    let stderr = output.stderr_text();
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or("git push failed");
+    Ok(LeasedDelete::Unreachable(wt_core::sanitize_terminal_text(
+        detail,
+    )))
+}
+
+async fn local_branch_tip(ctx: &AppContext, branch: &str) -> Option<String> {
+    let commit = format!("refs/heads/{branch}^{{commit}}");
+    let output = ctx
+        .processes
+        .run(
+            CommandSpec::new("git")
+                .args(["rev-parse", "--verify", "--quiet", commit.as_str()])
+                .cwd(&ctx.config.paths.main_clone),
+            &ctx.cancellation,
+        )
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| output.stdout_text().trim().to_owned())
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 fn github_client(ctx: &AppContext) -> GithubClient {
@@ -403,16 +546,20 @@ fn stack_service(ctx: &AppContext) -> StackService {
     )
 }
 
-fn attention(ctx: &AppContext, level: &str, text: &str) -> Result<()> {
+/// The report spool is appended under an exclusive file lock, so the write
+/// runs on the blocking pool rather than an executor thread.
+async fn attention(ctx: &AppContext, level: &str, text: &str) -> Result<()> {
     let level = match level {
         "warn" => crate::commands::manager::ReportLevel::Warn,
         _ => crate::commands::manager::ReportLevel::Info,
     };
-    crate::commands::manager::append_report(
-        &ctx.config.paths.cache_root.join("manager/reports.jsonl"),
-        level,
-        text,
-    )
+    let path = ctx.config.paths.cache_root.join("manager/reports.jsonl");
+    let text = text.to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::manager::append_report(&path, level, &text)
+    })
+    .await
+    .context("append automation report")?
 }
 
 fn confirms_delete(prs: &[PullRequestRef], claimed: Option<u64>) -> bool {
@@ -429,30 +576,127 @@ fn confirms_delete(prs: &[PullRequestRef], claimed: Option<u64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PullRequestRef, confirms_delete};
+    use super::{LeasedDelete, PullRequestRef, confirms_delete, delete_remote_branch_at};
+    use std::{path::Path, process::Command};
+    use wt_platform::process::ProcessRunner;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit(clone: &Path, message: &str) -> String {
+        git(
+            clone,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                message,
+            ],
+        );
+        git(clone, &["rev-parse", "HEAD"])
+    }
+
+    /// Commits pushed to the branch after its PR merged are never deleted:
+    /// the push carries the merged head as a lease.
+    #[tokio::test]
+    async fn branch_deletion_requires_the_remote_tip_to_be_the_merged_head() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let clone = root.path().join("clone");
+        git(
+            root.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(root.path(), &["init", "-q", clone.to_str().unwrap()]);
+        git(
+            &clone,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&clone, &["checkout", "-qb", "feature"]);
+        let merged = commit(&clone, "merged work");
+        git(&clone, &["push", "-q", "origin", "feature"]);
+        let later = commit(&clone, "pushed after the merge");
+        git(&clone, &["push", "-q", "origin", "feature"]);
+
+        let processes = ProcessRunner::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let refused = delete_remote_branch_at(&processes, &clone, "feature", &merged, &cancel)
+            .await
+            .unwrap();
+        assert!(matches!(refused, LeasedDelete::Refused(_)), "{refused:?}");
+        assert_eq!(git(&remote, &["rev-parse", "refs/heads/feature"]), later);
+
+        let deleted = delete_remote_branch_at(&processes, &clone, "feature", &later, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(deleted, LeasedDelete::Deleted);
+        assert_eq!(git(&remote, &["for-each-ref", "refs/heads/feature"]), "");
+        // Already gone: refused, not an error.
+        let gone = delete_remote_branch_at(&processes, &clone, "feature", &later, &cancel)
+            .await
+            .unwrap();
+        assert!(matches!(gone, LeasedDelete::Refused(_)), "{gone:?}");
+
+        // An unreachable origin is not a refusal: the caller may fall back to
+        // the GitHub API, which repeats the head check.
+        git(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                root.path().join("missing.git").to_str().unwrap(),
+            ],
+        );
+        let unreachable = delete_remote_branch_at(&processes, &clone, "feature", &later, &cancel)
+            .await
+            .unwrap();
+        assert!(
+            matches!(unreachable, LeasedDelete::Unreachable(_)),
+            "{unreachable:?}"
+        );
+    }
 
     #[test]
     fn delete_requires_exact_merged_pr_or_successful_empty_list() {
         let merged = [PullRequestRef {
             number: 42,
             state: "MERGED".into(),
+            head_oid: None,
         }];
         let open = [PullRequestRef {
             number: 42,
             state: "OPEN".into(),
+            head_oid: None,
         }];
         let unrelated = [PullRequestRef {
             number: 7,
             state: "MERGED".into(),
+            head_oid: None,
         }];
         let reopened = [
             PullRequestRef {
                 number: 42,
                 state: "MERGED".into(),
+                head_oid: None,
             },
             PullRequestRef {
                 number: 84,
                 state: "OPEN".into(),
+                head_oid: None,
             },
         ];
 

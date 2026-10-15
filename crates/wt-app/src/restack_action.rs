@@ -130,13 +130,9 @@ pub async fn start(
             run_id,
             session,
             reason,
-        }) => Ok(UiReply {
-            message: format!(
-                "Restack start is uncertain (run {run_id}, session {session}): {reason}. Check the row logs before retrying."
-            ),
-            failed: true,
-            ..UiReply::default()
-        }),
+        }) => Ok(UiReply::uncertain(format!(
+            "Restack start is uncertain (run {run_id}, session {session}): {reason}. Check the row logs before retrying."
+        ))),
         Err(error) => Ok(UiReply {
             message: format!("Could not start restack: {error}"),
             failed: true,

@@ -1537,8 +1537,14 @@ fn fit_line(spans: Spans, width: usize) -> Line<'static> {
             out.push(span);
             continue;
         }
+        // A span that exactly fills the row still has spans cut after it.
         let room = width - used;
-        out.push(Span::styled(truncate_end(&span.content, room), span.style));
+        let text = if cells == room {
+            truncate_end(&format!("{}{}", span.content, super::text::ELLIPSIS), room)
+        } else {
+            truncate_end(&span.content, room)
+        };
+        out.push(Span::styled(text, span.style));
         break;
     }
     Line::from(out)
@@ -1656,6 +1662,22 @@ mod tests {
 
     use super::*;
     use crate::{Board, DiffStat, GitPresentation, PrCommentView, TitleSource, WorkPresentation};
+
+    #[test]
+    fn a_span_that_exactly_fills_the_row_still_marks_the_cut() {
+        let line = fit_line(vec![Span::raw("abcd"), Span::raw("ef"), Span::raw("gh")], 6);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "abcde…");
+        assert_eq!(
+            fit_line(vec![Span::raw("abcd"), Span::raw("ef")], 6).width(),
+            6,
+            "a line that fits is untouched"
+        );
+    }
 
     fn group(id: &str, lines: &[&str]) -> PreparedDetailGroup {
         PreparedDetailGroup {

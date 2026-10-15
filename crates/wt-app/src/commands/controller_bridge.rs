@@ -320,6 +320,8 @@ async fn serve_listener(
     let permits = Arc::new(Semaphore::new(4));
     let runner = ProcessRunner::default();
     let mut requests = JoinSet::new();
+    let mut backoff = AcceptBackoff::default();
+    let mut retry_at: Option<tokio::time::Instant> = None;
     let result = loop {
         tokio::select! {
             biased;
@@ -327,8 +329,30 @@ async fn serve_listener(
             Some(result) = requests.join_next(), if !requests.is_empty() => {
                 if let Err(error) = result { tracing::error!(%error, "controller request task failed"); }
             }
-            accepted = listener.accept() => {
-                let (mut stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error.into()) };
+            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
+                retry_at = None;
+            }
+            accepted = listener.accept(), if retry_at.is_none() => {
+                let (mut stream, _) = match accepted {
+                    Ok(value) => {
+                        backoff.succeeded();
+                        value
+                    }
+                    // Accept failures (EMFILE, ECONNABORTED) belong to one
+                    // connection attempt, not to the daemon; back off without
+                    // blocking cancellation or request reaping, and give up
+                    // only on a listener that is plainly broken.
+                    Err(error) => {
+                        tracing::warn!(%error, "controller bridge accept failed");
+                        match backoff.failed(&error) {
+                            Some(delay) => {
+                                retry_at = Some(tokio::time::Instant::now() + delay);
+                                continue;
+                            }
+                            None => break Err(anyhow::Error::new(error).context("controller bridge listener failed")),
+                        }
+                    }
+                };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     // Bounded write on admission itself prevents unbounded rejection tasks.
                     let bytes = serde_json::to_vec(&Reply::rejected("all four service slots are busy"))?;
@@ -366,6 +390,40 @@ async fn serve_listener(
         }
     }
     result
+}
+
+/// Escalating retry policy for a failing `accept`: transient errors double
+/// the delay up to a cap, and a run of failures or an errno that cannot heal
+/// ends the listener instead of spinning forever.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    consecutive_failures: u32,
+}
+
+impl AcceptBackoff {
+    const INITIAL: Duration = Duration::from_millis(100);
+    const MAX: Duration = Duration::from_secs(2);
+    const MAX_CONSECUTIVE_FAILURES: u32 = 50;
+
+    fn succeeded(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// The delay before the next accept, or `None` to stop serving.
+    fn failed(&mut self, error: &std::io::Error) -> Option<Duration> {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP)
+        ) {
+            return None;
+        }
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= Self::MAX_CONSECUTIVE_FAILURES {
+            return None;
+        }
+        let doublings = (self.consecutive_failures - 1).min(16);
+        Some(Self::INITIAL.saturating_mul(1 << doublings).min(Self::MAX))
+    }
 }
 
 async fn execute_request(
@@ -410,6 +468,12 @@ async fn execute_request(
             stdout: output.stdout,
             stderr: output.stderr,
         },
+        // A program that never started performed no write.
+        Err(
+            error @ wt_platform::process::ProcessError::Io {
+                operation: "spawn", ..
+            },
+        ) => Reply::rejected(&error.to_string()),
         Err(error) => Reply::uncertain(&error.to_string()),
     }
 }
@@ -417,6 +481,26 @@ async fn execute_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_backoff_escalates_resets_and_gives_up() {
+        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let mut backoff = AcceptBackoff::default();
+        let delays: Vec<_> = (0..6).map(|_| backoff.failed(&emfile).unwrap()).collect();
+        assert_eq!(
+            delays,
+            [100, 200, 400, 800, 1600, 2000].map(Duration::from_millis)
+        );
+        backoff.succeeded();
+        assert_eq!(backoff.failed(&emfile), Some(Duration::from_millis(100)));
+        let mut backoff = AcceptBackoff::default();
+        let given_up = (0..AcceptBackoff::MAX_CONSECUTIVE_FAILURES)
+            .filter(|_| backoff.failed(&emfile).is_none())
+            .count();
+        assert_eq!(given_up, 1, "only the last of the run ends serving");
+        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(AcceptBackoff::default().failed(&ebadf), None);
+    }
 
     #[tokio::test]
     async fn executes_only_allowlisted_argv_and_preserves_bytes_and_exit_code() {
@@ -456,6 +540,33 @@ mod tests {
         )
         .await;
         assert_eq!(reply.exit_code, 75);
+        assert!(String::from_utf8_lossy(&reply.stderr).contains("not executed"));
+    }
+
+    #[tokio::test]
+    async fn a_service_that_cannot_start_is_not_executed_rather_than_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = BTreeMap::from([(
+            "missing".into(),
+            vec![dir.path().join("no-such-program").display().to_string()],
+        )]);
+        let reply = execute_request(
+            &ProcessRunner::default(),
+            &services,
+            dir.path(),
+            "fixture-fingerprint",
+            Request {
+                service: "missing".into(),
+                input: b"{}".to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(
+            reply.exit_code,
+            75,
+            "{}",
+            String::from_utf8_lossy(&reply.stderr)
+        );
         assert!(String::from_utf8_lossy(&reply.stderr).contains("not executed"));
     }
 

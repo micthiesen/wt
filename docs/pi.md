@@ -51,7 +51,7 @@ user's configured extensions and permission policy.
 
 Rust adapter tests cover identity, discovery, subprocess construction and socket
 delivery. `bun test crates/wt-harness/src/pi/extension.test.ts` exercises the
-control protocol. `python3 crates/wt-harness/src/pi/native_smoke.py` exercises the
+control protocol (it needs Bun on the developer's machine and is not part of CI). `python3 crates/wt-harness/src/pi/native_smoke.py` exercises the
 installed native TUI against a loopback mock provider, with isolated configuration
 and sessions and no paid requests or user credentials. The Linux and macOS native
 CI jobs also run `scripts/native-pi-check.py` against the built wt binary, covering

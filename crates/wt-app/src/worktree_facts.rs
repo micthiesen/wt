@@ -29,7 +29,7 @@ pub(crate) async fn push_facts(
     )
     .await
     .ok()
-    .map(|output| output.status.success());
+    .and_then(|output| origin_ref_exists(output.status.code()));
 
     match origin_exists {
         Some(true) => PushFacts {
@@ -47,6 +47,16 @@ pub(crate) async fn push_facts(
             pushed: None,
             ahead_of_base,
         },
+    }
+}
+
+/// `rev-parse --verify --quiet` exits 1 only for a missing ref; any other
+/// failure (a broken or missing repository) proves nothing about it.
+fn origin_ref_exists(code: Option<i32>) -> Option<bool> {
+    match code {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
     }
 }
 
@@ -108,4 +118,18 @@ async fn commit_count(context: &AppContext, path: &Path, range: &str) -> Option<
         .checked("git")
         .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_missing_ref_proves_the_branch_unpushed() {
+        assert_eq!(origin_ref_exists(Some(0)), Some(true));
+        assert_eq!(origin_ref_exists(Some(1)), Some(false));
+        // Not a repository, corrupt refs, or a signal: unknown.
+        assert_eq!(origin_ref_exists(Some(128)), None);
+        assert_eq!(origin_ref_exists(None), None);
+    }
 }

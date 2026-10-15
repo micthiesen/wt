@@ -308,29 +308,7 @@ impl ClaudeSessionManager {
     ) -> Result<Vec<PathBuf>, ClaudeSessionManagerError> {
         reap_claude_names(&self.paths.cache_dir, live_slugs)
             .map_err(|error| operation("reap", error.to_string()))?;
-        let sessions = self.tmux.list_sessions(cancel).await?;
-        let live: std::collections::HashSet<_> =
-            sessions.into_iter().map(|session| session.name).collect();
-        let dir = self.paths.cache_dir.join("insp");
-        let mut removed = Vec::new();
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
-            Err(error) => return Err(error.into()),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("sock") {
-                continue;
-            }
-            let Some(name) = path.file_stem().and_then(|x| x.to_str()) else {
-                continue;
-            };
-            if !live.contains(name) && fs::remove_file(&path).is_ok() {
-                removed.push(path);
-            }
-        }
-        Ok(removed)
+        self.reap_inspector_sockets(cancel).await
     }
 
     pub fn tmux_name(&self, target: &ClaudeSessionTarget) -> String {
@@ -429,7 +407,9 @@ impl ClaudeSessionManager {
             .spawn_path
             .clone()
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-        ensure_inspect_shims_at(&self.paths.cache_dir.join("shims"), &path)?;
+        // Shims are advisory (see `ensure_inspect_shims`): without them a child
+        // Bun program may contend for the Inspector socket, but Claude starts.
+        let _ = ensure_inspect_shims_at(&self.paths.cache_dir.join("shims"), &path);
         let shim_path = prepend_path(&self.paths.cache_dir.join("shims"), &path);
         let socket = inspector_socket_path(&self.paths.cache_dir, tmux_name);
         fs::create_dir_all(socket.parent().unwrap_or(Path::new(".")))?;
@@ -568,15 +548,13 @@ fn operation(operation: &'static str, detail: impl Into<String>) -> ClaudeSessio
     }
 }
 fn prepend_path(shims: &Path, path: &str) -> String {
-    format!(
-        "{}{}{}",
-        shims.to_string_lossy(),
-        std::env::split_paths(path)
-            .next()
-            .map(|_| ":")
-            .unwrap_or(":"),
-        path
-    )
+    // A trailing ':' would add an empty entry, which shells read as the
+    // current directory.
+    if path.is_empty() {
+        shims.to_string_lossy().into_owned()
+    } else {
+        format!("{}:{path}", shims.to_string_lossy())
+    }
 }
 fn url_path_safe(path: &str) -> bool {
     path.bytes()
@@ -643,6 +621,7 @@ mod tests {
             prepend_path(Path::new("/cache/shims"), "/usr/bin:/bin"),
             "/cache/shims:/usr/bin:/bin"
         );
+        assert_eq!(prepend_path(Path::new("/cache/shims"), ""), "/cache/shims");
     }
 
     #[tokio::test]

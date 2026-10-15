@@ -220,3 +220,29 @@ async fn inventory_keeps_linked_spaces_detached_and_rift_clones_distinct() {
             .is_some_and(|error| error.contains("Git status"))
     );
 }
+
+#[tokio::test]
+async fn diff_stats_skip_untracked_paths_that_are_not_regular_files() {
+    let (_scratch, runner, main, root) = fixture().await;
+    let service = repository(main.clone(), root, runner.clone());
+    let cancel = CancellationToken::new();
+    tokio::fs::write(main.join("notes.txt"), "a\nb\nc\n")
+        .await
+        .unwrap();
+    // Git lists a nested repository as `nested/` and a symlink as a path;
+    // neither is a readable regular file.
+    let nested = main.join("nested");
+    tokio::fs::create_dir_all(&nested).await.unwrap();
+    git(&runner, &nested, &["init", "-b", "main"]).await;
+    #[cfg(unix)]
+    tokio::fs::symlink(main.join("absent target"), main.join("dangling"))
+        .await
+        .unwrap();
+    let diff = service
+        .diff_stats(&main, "main", &cancel)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(diff.untracked_lines, 3);
+    assert!(diff.untracked_files >= 2);
+}

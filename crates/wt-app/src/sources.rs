@@ -187,6 +187,7 @@ fn project(
         local_updates.mark_changed();
         github_updates.mark_changed();
         activity_updates.mark_changed();
+        let mut failures = crate::activity_source::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -217,12 +218,21 @@ fn project(
             let activity_snapshot = activity_updates.borrow().clone();
             // The worktree-era guard stats directories. Keep it off the input
             // and async executor threads; all rows are prepared in one job.
+            // Clone rather than move, so a panicked pass keeps the clock.
+            let mut pass_failures = failures.clone();
             let result = tokio::task::spawn_blocking(move || {
-                compose(local_snapshot, github_snapshot, activity_snapshot)
+                let snapshot = compose(
+                    local_snapshot,
+                    github_snapshot,
+                    activity_snapshot,
+                    &mut pass_failures,
+                );
+                (snapshot, pass_failures)
             })
             .await;
             match result {
-                Ok(snapshot) if !cancel.is_cancelled() => {
+                Ok((snapshot, pass_failures)) if !cancel.is_cancelled() => {
+                    failures = pass_failures;
                     publisher.publish_if_changed(snapshot);
                 }
                 Ok(_) => break,
@@ -242,8 +252,11 @@ fn compose(
     local: SourceSnapshot<Board>,
     github: SourceSnapshot<GithubData>,
     activity: SourceSnapshot<crate::activity_source::ActivitySnapshot>,
+    failures: &mut crate::activity_source::FailureClock,
 ) -> SourceSnapshot<Board> {
     let Some(board) = local.data() else {
+        // This compose reports nothing, so every tracked failure has cleared.
+        failures.sweep();
         return local;
     };
     let mut board = board.as_ref().clone();
@@ -252,8 +265,8 @@ fn compose(
         board.attention.extend(feed.attention.iter().cloned());
     }
     if let SourceState::Failed(error) = activity.state() {
-        let at_ms = crate::activity_source::epoch_ms();
         let text = wt_core::sanitize_terminal_text(error);
+        let at_ms = failures.at("attention", "activity feed", &text);
         board.activity.push(wt_tui::ActivityLine {
             at_ms,
             level: "ERROR".into(),
@@ -289,6 +302,7 @@ fn compose(
             }
         }
     }
+    failures.sweep();
     crate::activity_source::bound_feeds(&mut board);
     let mut state = local.state().clone();
     if let SourceState::Failed(error) = github.state() {

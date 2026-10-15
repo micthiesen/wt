@@ -45,6 +45,20 @@ async fn argv_cwd_stdin_and_nonzero_status_are_preserved() {
 }
 
 #[tokio::test]
+async fn a_child_that_exits_without_reading_stdin_reports_its_own_failure() {
+    let runner = ProcessRunner::default();
+    let mut command = CommandSpec::new("sh").args(["-c", "printf refused >&2; exit 3"]);
+    // Larger than any pipe buffer, so the write must hit the closed pipe.
+    command.input = Some(vec![b'x'; 4 * 1024 * 1024]);
+    let output = runner
+        .run(command, &CancellationToken::new())
+        .await
+        .expect("the exit status, not the broken stdin pipe, is the result");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.stderr, b"refused");
+}
+
+#[tokio::test]
 async fn output_limit_stops_a_producer_instead_of_allocating_without_bound() {
     let runner = ProcessRunner::default();
     let mut command = CommandSpec::new("sh").args(["-c", "while :; do printf 1234567890; done"]);

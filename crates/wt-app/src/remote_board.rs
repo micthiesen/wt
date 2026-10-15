@@ -1,4 +1,5 @@
 //! Fleet projection combines independent snapshots of the same host service.
+use crate::activity_source::FailureClock;
 use crate::{
     context::AppContext,
     host_protocol::{HostSnapshot, HostState},
@@ -59,6 +60,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
         let mut updates = owned_local.sources.board.subscribe();
         let mut metadata = owned_local.sources.metadata.subscribe();
         updates.mark_changed(); metadata.mark_changed();
+        let mut failures = FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -74,7 +76,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
                 _ = changes.recv(), if !owned_remotes.is_empty() => {}
             }
             let snapshots = owned_remotes.iter().map(|remote| (&remote.endpoint, remote.snapshot.snapshot(), remote.managed.borrow().clone())).collect::<Vec<_>>();
-            let snapshot = compose(&config, updates.borrow().clone(), metadata.borrow().clone(), &snapshots);
+            let snapshot = compose(&mut failures, &config, updates.borrow().clone(), metadata.borrow().clone(), &snapshots);
             publisher.publish_if_changed(snapshot);
         }
     });
@@ -95,6 +97,7 @@ type ComposedHost<'a> = (
 /// The fleet board carries the local board's provenance; each remote's
 /// provenance goes to `Board.host_domains`, keyed by the rows' `host`.
 fn compose(
+    failures: &mut FailureClock,
     config: &wt_config::Config,
     snapshot: SourceSnapshot<Board>,
     metadata: SourceSnapshot<Metadata>,
@@ -390,8 +393,8 @@ fn compose(
             }
         }
         if let Some(error) = error {
-            let at_ms = crate::activity_source::epoch_ms();
             let text = wt_core::sanitize_terminal_text(&error);
+            let at_ms = failures.at("attention", &label, &text);
             board.activity.push(wt_tui::ActivityLine {
                 at_ms,
                 level: "ERROR".into(),
@@ -406,6 +409,7 @@ fn compose(
             });
         }
     }
+    failures.sweep();
     board.removed_history.rows.sort_by(|a, b| {
         b.removed_at
             .cmp(&a.removed_at)
@@ -504,6 +508,7 @@ mod tests {
             ..Default::default()
         };
         let result = compose(
+            &mut FailureClock::default(),
             &fixture.ctx.config,
             ready(Board {
                 rows: vec![local_work],
@@ -586,6 +591,7 @@ mod tests {
             .clone()
             .with_state(SourceState::Failed("SSH disconnected".into()));
         let result = compose(
+            &mut FailureClock::default(),
             &fixture.ctx.config,
             local,
             metadata,
@@ -652,6 +658,7 @@ mod tests {
             layout: Default::default(),
         });
         let result = compose(
+            &mut FailureClock::default(),
             &fixture.ctx.config,
             ready(Board::default()),
             ready((serde_json::json!({"slugs": {}}), Default::default())),
@@ -717,6 +724,7 @@ mod tests {
         };
         let restored = SourceSnapshot::test_restored(remote.clone(), Domain::Host, 1_000);
         let result = compose(
+            &mut FailureClock::default(),
             &fixture.ctx.config,
             ready(Board::default()),
             ready((serde_json::json!({"slugs": {}}), Default::default())),
@@ -749,6 +757,7 @@ mod tests {
         // Once the stream delivers, the worker's own provenance shows through.
         let live = SourceSnapshot::test_live(Some(remote), SourceState::Ready, Domain::Host);
         let result = compose(
+            &mut FailureClock::default(),
             &fixture.ctx.config,
             ready(Board::default()),
             ready((serde_json::json!({"slugs": {}}), Default::default())),

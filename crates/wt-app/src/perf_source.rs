@@ -160,12 +160,9 @@ where
                     if changed.is_err() {
                         SampleResult::Shutdown
                     } else {
-                        let previous = controls;
                         controls = *control_rx.borrow_and_update();
-                        should_sample = controls.active
-                            && (!previous.active
-                                || controls.refresh != previous.refresh
-                                || (!previous.continuous && controls.continuous));
+                        // The cancelled sample was still owed while open.
+                        should_sample = controls.active;
                         SampleResult::Restart
                     }
                 }
@@ -398,6 +395,54 @@ mod tests {
         })
         .await
         .expect("closing the overlay cancels the process snapshot");
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    /// A control change that keeps the overlay open restarts the cancelled
+    /// sample instead of leaving the overlay without one.
+    #[tokio::test]
+    async fn turning_continuous_off_mid_sample_still_delivers_a_sample() {
+        let scope = TaskScope::new();
+        let (board, board_writer) = derived_channel(&scope, "test");
+        board_writer.publish(SourceSnapshot::test_live(
+            Some(Board::default()),
+            SourceState::Ready,
+            Domain::Git,
+        ));
+        let started = Arc::new(AtomicUsize::new(0));
+        let sampler_started = started.clone();
+        let perf = start_with_sampler(&scope, board, move |cancel| {
+            let first = sampler_started.fetch_add(1, Ordering::SeqCst) == 0;
+            async move {
+                if first {
+                    cancel.cancelled().await;
+                    anyhow::bail!("cancelled");
+                }
+                Ok(PerfSample {
+                    report: vec!["sample".into()],
+                    view: None,
+                })
+            }
+        });
+        perf.commands.set_continuous(true);
+        perf.commands.set_active(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("opening the overlay starts the snapshot");
+        perf.commands.set_continuous(false);
+        let mut board_updates = perf.board.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            board_updates
+                .wait_for(|board| board.data().is_some_and(|board| board.perf == ["sample"])),
+        )
+        .await
+        .expect("the restarted sample reaches the board")
+        .unwrap();
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

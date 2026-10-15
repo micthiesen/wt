@@ -128,7 +128,7 @@ pub async fn run_supervisor(
         };
         terminate_orphaned_group(child_pid).await;
         let elapsed = started.elapsed();
-        let exit = child_result.code().unwrap_or(1);
+        let exit = exit_code(child_result);
         if matches!(exit, 130 | 143) {
             write_bounded(&marker, b"stopped", 32).await?;
             release_session(&config).await?;
@@ -336,6 +336,19 @@ async fn run_stop_command(
     Ok(())
 }
 
+/// Shell-style exit code: a signal death reads as 128 + signal, so a command
+/// killed by SIGINT or SIGTERM counts as an intentional stop, not a crash.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(1)
+}
+
 fn failure_signature(exit: i32, output: &str) -> Option<String> {
     let last = output
         .lines()
@@ -418,6 +431,21 @@ mod tests {
         let started = Instant::now();
         terminate_orphaned_group(pid).await;
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_deaths_use_shell_exit_codes() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            exit_code(std::process::ExitStatus::from_raw(libc::SIGTERM)),
+            143
+        );
+        assert_eq!(
+            exit_code(std::process::ExitStatus::from_raw(libc::SIGINT)),
+            130
+        );
+        assert_eq!(exit_code(std::process::ExitStatus::from_raw(3 << 8)), 3);
     }
 
     #[test]

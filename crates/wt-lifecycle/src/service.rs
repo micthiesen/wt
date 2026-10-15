@@ -699,11 +699,7 @@ impl LifecycleService {
             })
             .await?;
         } else if let Some(base) = base_ref {
-            let base_branch = base
-                .strip_prefix("origin/")
-                .unwrap_or(base)
-                .strip_prefix("refs/heads/")
-                .unwrap_or_else(|| base.strip_prefix("origin/").unwrap_or(base));
+            let base_branch = logical_base_branch(base);
             self.mutate_store(cancellation, {
                 let slug = slug.to_owned();
                 let base_branch = base_branch.to_owned();
@@ -880,6 +876,19 @@ impl LifecycleService {
             self.guard_removal(&row, options.landed || cleanup, cancellation)
                 .await?;
         }
+        // A successful SST removal switches checkout removal to forced mode
+        // (it rewrites generated files). Without a caller witness, pin the
+        // clean checkout just verified so edits made during hooks or the
+        // long-running SST command are still refused rather than forced away.
+        let witness = if expected_revision.is_none()
+            && !options.force
+            && options.destroy_stage
+            && self.config.has_sst
+        {
+            Some(self.capture_revision_for_row(&row, cancellation).await?)
+        } else {
+            None
+        };
         let mut warnings = Vec::new();
         if let Some(before_remove) = &self.before_remove {
             warnings.extend(before_remove(row.target.clone(), cancellation.clone()).await);
@@ -896,7 +905,7 @@ impl LifecycleService {
         }
         let mut force = options.force;
         let mut destroyed_stage = false;
-        let mut verified_revision = expected_revision.cloned();
+        let mut verified_revision = expected_revision.cloned().or(witness);
         if options.destroy_stage {
             if !self.config.has_sst {
                 warnings.push("skipping sst remove: [deploy.sst] is not configured".into());
@@ -1558,7 +1567,7 @@ impl LifecycleService {
             None
         } else {
             base_ref
-                .map(|base| base.strip_prefix("origin/").unwrap_or(base).to_owned())
+                .map(|base| logical_base_branch(base).to_owned())
                 .or_else(|| Some(self.config.base_branch.clone()))
         };
         if let Some(base) = merge_base {
@@ -2420,21 +2429,68 @@ impl LifecycleService {
         }) {
             hazards.push("post-merge verification still owed".to_owned());
         }
-        if !landed {
-            match self
-                .unpushed_count(row, state.as_ref(), cancellation)
+        // Landing evidence covers what was pushed and merged. Commits beyond
+        // the branch's own origin ref exist only here, landed or not, so a
+        // planning-time `landed` claim never authorizes discarding them.
+        let unpushed = if landed {
+            self.commits_beyond_origin_branch(row, cancellation).await?
+        } else {
+            self.unpushed_count(row, state.as_ref(), cancellation)
                 .await?
-            {
-                Some(0) => {}
-                Some(count) => {
-                    hazards.push(unpushed_hazard(count));
-                }
-                None => {
-                    hazards.push("could not verify pushed state".to_owned());
-                }
-            }
+        };
+        match unpushed {
+            Some(0) => {}
+            Some(count) => hazards.push(unpushed_hazard(count)),
+            None => hazards.push("could not verify pushed state".to_owned()),
         }
         Ok(hazards)
+    }
+
+    /// Count commits on HEAD that the branch's origin ref lacks. A branch
+    /// with no origin ref (deleted after merge, or local-only) relies on the
+    /// caller's landing proof and counts as zero here.
+    async fn commits_beyond_origin_branch(
+        &self,
+        row: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<u32>, LifecycleError> {
+        let path = Path::new(&row.target.path);
+        let origin_branch = format!("refs/remotes/origin/{}", row.target.branch);
+        if row.target.branch.is_empty()
+            || !self.ref_exists(path, &origin_branch, cancellation).await?
+        {
+            return Ok(Some(0));
+        }
+        self.count_commits_since(path, &origin_branch, cancellation)
+            .await
+    }
+
+    async fn count_commits_since(
+        &self,
+        path: &Path,
+        base: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<u32>, LifecycleError> {
+        let count = self
+            .run_git_raw(
+                path,
+                [
+                    "rev-list",
+                    "--count",
+                    "--end-of-options",
+                    &format!("{base}..HEAD"),
+                ],
+                cancellation,
+                "count unpushed commits",
+            )
+            .await?;
+        if !count.status.success() {
+            return Ok(None);
+        }
+        Ok(String::from_utf8_lossy(&count.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok())
     }
 
     async fn read_slug_state(
@@ -2465,8 +2521,10 @@ impl LifecycleService {
     ) -> Result<Option<u32>, LifecycleError> {
         let path = Path::new(&row.target.path);
         let origin_branch = format!("refs/remotes/origin/{}", row.target.branch);
+        // Fully qualified refs: a local branch named `origin/<x>` must not
+        // stand in for the remote-tracking ref.
         let base = if self.ref_exists(path, &origin_branch, cancellation).await? {
-            format!("origin/{}", row.target.branch)
+            origin_branch
         } else {
             let recorded_sha = state.and_then(|v| v.get("baseSha")).and_then(Value::as_str);
             let recorded_branch = state
@@ -2475,44 +2533,20 @@ impl LifecycleService {
             if let Some(sha) = recorded_sha {
                 sha.to_owned()
             } else if let Some(branch) = recorded_branch {
-                format!("origin/{branch}")
-            } else if self
-                .ref_exists(
-                    path,
-                    &format!("refs/remotes/origin/{}", self.config.base_branch),
-                    cancellation,
-                )
-                .await?
-            {
-                format!("origin/{}", self.config.base_branch)
-            } else if self
-                .ref_exists(
-                    path,
-                    &format!("refs/heads/{}", self.config.base_branch),
-                    cancellation,
-                )
-                .await?
-            {
-                self.config.base_branch.clone()
+                format!("refs/remotes/origin/{branch}")
             } else {
-                return Ok(None);
+                let remote_base = format!("refs/remotes/origin/{}", self.config.base_branch);
+                let local_base = format!("refs/heads/{}", self.config.base_branch);
+                if self.ref_exists(path, &remote_base, cancellation).await? {
+                    remote_base
+                } else if self.ref_exists(path, &local_base, cancellation).await? {
+                    local_base
+                } else {
+                    return Ok(None);
+                }
             }
         };
-        let count = self
-            .run_git_raw(
-                path,
-                ["rev-list", "--count", &format!("{base}..HEAD")],
-                cancellation,
-                "count unpushed commits",
-            )
-            .await?;
-        if !count.status.success() {
-            return Ok(None);
-        }
-        Ok(String::from_utf8_lossy(&count.stdout)
-            .trim()
-            .parse::<u32>()
-            .ok())
+        self.count_commits_since(path, &base, cancellation).await
     }
 
     async fn run_destroy_hook(
@@ -2861,6 +2895,16 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// The branch name a base ref denotes, as recorded in `baseBranch` and
+/// `gh-merge-base`. `baseBranch == trunk` means "no parent", so every spelling
+/// of the trunk must normalize to the same name.
+fn logical_base_branch(base: &str) -> &str {
+    ["refs/remotes/origin/", "origin/", "refs/heads/"]
+        .into_iter()
+        .find_map(|prefix| base.strip_prefix(prefix))
+        .unwrap_or(base)
+}
+
 fn normalize_head_ref(reference: &str) -> String {
     if reference.starts_with("refs/heads/") {
         reference.to_owned()
@@ -2943,6 +2987,20 @@ pub fn is_lost_work_hazard(hazard: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_trunk_spelling_records_the_same_base_branch() {
+        use super::logical_base_branch;
+        for base in [
+            "main",
+            "origin/main",
+            "refs/heads/main",
+            "refs/remotes/origin/main",
+        ] {
+            assert_eq!(logical_base_branch(base), "main", "{base}");
+        }
+        assert_eq!(logical_base_branch("team/parent"), "team/parent");
+    }
+
     #[test]
     fn lost_work_hazards_are_recognized_by_their_own_wording() {
         use super::{UNCOMMITTED_HAZARD, is_lost_work_hazard, unpushed_hazard};
@@ -4020,6 +4078,134 @@ mod tests {
             Err(LifecycleError::Refused(message)) if message.contains("unpushed commit")
         ));
         assert!(path.exists());
+    }
+
+    /// Landing evidence covers the pushed head. A commit made after the push
+    /// exists only locally, so even a confirmed-landed cleanup refuses it.
+    #[tokio::test]
+    async fn landed_cleanup_still_refuses_commits_beyond_the_origin_branch() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let remote = scratch.path().join("origin.git");
+        run(
+            &runner,
+            scratch.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        )
+        .await;
+        run(
+            &runner,
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        let created = service
+            .create(
+                "michael/ENG-11-landed",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(&created.target.path);
+        fs::write(path.join("tracked.txt"), "merged work\n")
+            .await
+            .unwrap();
+        run(&runner, &path, &["commit", "-am", "merged work"]).await;
+        run(&runner, &path, &["push", "origin", "michael/ENG-11-landed"]).await;
+        fs::write(path.join("tracked.txt"), "after the merge\n")
+            .await
+            .unwrap();
+        run(&runner, &path, &["commit", "-am", "local only"]).await;
+        let candidate = CleanupCandidate {
+            target: created.target.clone(),
+            landed: true,
+            destroy_stage: false,
+        };
+        let refused = service
+            .cleanup(std::slice::from_ref(&candidate), &cancellation)
+            .await;
+        assert!(
+            matches!(&refused[..], [Err(LifecycleError::Refused(message))] if message.contains("1 unpushed commit")),
+            "{refused:?}"
+        );
+        assert!(path.exists());
+
+        run(&runner, &path, &["push", "origin", "michael/ENG-11-landed"]).await;
+        let removed = service.cleanup(&[candidate], &cancellation).await;
+        assert!(
+            matches!(&removed[..], [Ok(result)] if result.removed),
+            "{removed:?}"
+        );
+        assert!(!path.exists());
+    }
+
+    /// Without a caller witness, a successful SST removal must not turn the
+    /// checkout removal into an unverified force that discards new edits.
+    #[tokio::test]
+    async fn unwitnessed_sst_removal_refuses_edits_outside_generated_paths() {
+        let (_scratch, mut service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        fs::write(main.join("generated.txt"), "generated baseline\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["add", "generated.txt"]).await;
+        run(&runner, &main, &["commit", "-m", "add generated file"]).await;
+        fs::write(main.join(".git/info/exclude"), ".sst/\n")
+            .await
+            .unwrap();
+        service.config.has_sst = true;
+        service.config.auto_regen_paths = vec!["generated.txt".into()];
+        let created = service
+            .create(
+                "michael/ENG-103-sst-unwitnessed",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = Path::new(&created.target.path);
+        fs::write(path.join(".sst/stage"), "stage-eng-103-sst\n")
+            .await
+            .unwrap();
+        let script = _scratch.path().join("fake-pnpm-edits-during-sst");
+        write_executable(
+            &script,
+            "#!/bin/sh\nprintf 'regenerated by SST\\n' > generated.txt\nprintf 'edited meanwhile\\n' > tracked.txt\n",
+        )
+        .await;
+        service.sst_program = script.into_os_string();
+
+        let result = service
+            .remove(
+                &created.target,
+                RemoveOptions {
+                    force: false,
+                    delete_branch: true,
+                    landed: false,
+                    destroy_stage: true,
+                    removed_snapshot: None,
+                },
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(LifecycleError::Refused(ref message)) if message.contains("outside the configured generated paths")),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("tracked.txt")).await.unwrap(),
+            "edited meanwhile\n"
+        );
     }
 
     #[tokio::test]

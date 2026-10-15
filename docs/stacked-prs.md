@@ -90,13 +90,15 @@ it does the right thing for the shape under the cursor:
 2. **Reconcile** records against landed PRs: a member whose parent's PR merged
    (or whose parent branch is gone everywhere) is reparented onto the nearest
    surviving ancestor, falling back to trunk — anchor preserved, so the next
-   replay stays squash-safe.
+   replay stays squash-safe. Restack refuses when the parent's merged PR head
+   does not contain the parent's current tip (commits that never landed), and
+   it fails rather than guessing when a parent's PR state cannot be read.
 3. **Replay** each member onto its (possibly rewritten) parent in its own
    worktree, parents before children; force-with-lease push; retarget the PR
    base to match. A member reconcile observed **landed** (a merged parent that
    is itself still a live, uncleaned worktree) is skipped, not replayed —
    replaying it would re-apply its squash-merged commits onto trunk and
-   force-push, resurrecting the landed branch. Landed members are `c`'s job.
+   force-push, resurrecting the landed branch. Landed members are `c`'s job, and a landed cleanup still refuses commits that are not present on the branch's origin ref.
    So pressing `R` on a surviving sibling is safe while a merged member is
    still on disk (and the `stack.parent_merged` automation's clean-then-restack
    is unaffected by the order the two land in).

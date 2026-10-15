@@ -218,6 +218,17 @@ pub fn start(
                 changed = git_updates.changed() => {
                     if changed.is_err() { break; }
                     last_git = git_updates.borrow_and_update().clone();
+                    // A removed worktree's title must not reappear on a new
+                    // worktree that later reuses its key.
+                    if let Some(rows) = last_git.data() {
+                        let present = rows
+                            .iter()
+                            .filter(|row| !row.worktree.is_main)
+                            .map(|row| worktree_target_key(&row.worktree.target))
+                            .collect::<HashSet<_>>();
+                        visible.retain(|key, _| present.contains(key));
+                        errors.retain(|key, _| present.contains(key));
+                    }
                     let candidates = candidates(&context, &last_git, &last_metadata);
                     if let Some(error) = &service_error {
                         for candidate in &candidates { errors.insert(candidate.key.clone(), error.clone()); }

@@ -156,7 +156,8 @@ fn facts_spec(context: &AppContext) -> SourceSpec<PresentationMap> {
 }
 
 /// Start the host-local facts lane. It consumes prepared inputs and performs
-/// bounded Git work off the input/render path; it never refreshes Git itself.
+/// bounded Git work off the input/render path. It reads only the worktrees a
+/// live Git scan names; restored facts stay shown until then.
 pub fn start(
     scope: &TaskScope,
     context: &AppContext,
@@ -209,8 +210,14 @@ pub fn start(
             let git_snapshot = git_updates.borrow_and_update().clone();
             let metadata_snapshot = metadata_updates.borrow_and_update().clone();
             let github_snapshot = github_updates.borrow_and_update().clone();
-            // Without inputs the last facts (live or restored) stay shown.
-            let Some(rows) = git_snapshot.data().map(Arc::as_ref) else {
+            // Without inputs the last facts (live or restored) stay shown. The
+            // row set comes from Git: a restored inventory may name removed
+            // worktrees, so it never keys probes published as live facts.
+            let Some(rows) = git_snapshot
+                .data()
+                .map(Arc::as_ref)
+                .filter(|_| scanned_live(&git_snapshot))
+            else {
                 publisher.set_state(git_snapshot.state().clone());
                 continue;
             };
@@ -502,6 +509,12 @@ fn compose(
     next
 }
 
+fn scanned_live(git: &SourceSnapshot<Vec<WorktreeSnapshot>>) -> bool {
+    git.domains()
+        .get(&Domain::Git)
+        .is_some_and(|meta| meta.is_live())
+}
+
 fn presentation_map(cache: &HashMap<String, CachedRow>) -> PresentationMap {
     cache
         .iter()
@@ -523,17 +536,17 @@ fn current_identities(
     github: &SourceSnapshot<GithubData>,
     configured_base: &str,
 ) -> HashMap<String, FactIdentity> {
-    let (Some(rows), Some((state, _)), Some(github_data)) =
-        (git.data(), metadata.data().map(Arc::as_ref), github.data())
-    else {
+    let (Some(rows), Some((state, _))) = (git.data(), metadata.data().map(Arc::as_ref)) else {
         return HashMap::new();
     };
+    // Without GitHub data the facts were computed with no PR, as here.
+    let prs = github.data();
     rows.iter()
         .filter(|row| !row.worktree.is_main)
         .map(|row| {
             let target = &row.worktree.target;
             let key = wt_core::worktree_target_key(target);
-            let pr = github_data.prs.get(&target.branch);
+            let pr = prs.and_then(|data| data.prs.get(&target.branch));
             (key, fact_identity(row, state, pr, configured_base))
         })
         .collect()
@@ -837,18 +850,28 @@ async fn enrich(
     if let Some(head) = head.as_deref().filter(|head| !head.is_empty())
         && !cancellation.is_cancelled()
     {
-        let (first_commit_title, failed) = first_commit_title(
-            context,
-            &path,
-            base_sha.unwrap_or(configured_base),
-            cancellation,
-        )
-        .await;
-        result.first_commit_title = first_commit_title;
-        if failed {
-            failures.push("first commit title");
+        // A base that exists only as `origin/<base>` (or no longer exists)
+        // must not fail every probe and retry forever: resolve it once.
+        let base_ref = match resolve_branch_ref(context, &path, configured_base, cancellation).await
+        {
+            Ok(base_ref) => base_ref,
+            Err(()) => {
+                failures.push("base ref");
+                None
+            }
+        };
+        let anchor = base_sha
+            .filter(|sha| !sha.is_empty())
+            .or(base_ref.as_deref());
+        if let Some(anchor) = anchor {
+            let (first_commit_title, failed) =
+                first_commit_title(context, &path, anchor, cancellation).await;
+            result.first_commit_title = first_commit_title;
+            if failed {
+                failures.push("first commit title");
+            }
         }
-        let own_commits = if let Some(anchor) = base_sha.filter(|sha| !sha.is_empty()) {
+        let own_commits = if let Some(anchor) = anchor {
             let (count, failed) =
                 async_count(context, &path, &format!("{anchor}..{head}"), cancellation).await;
             if failed {
@@ -856,17 +879,7 @@ async fn enrich(
             }
             count.unwrap_or(0)
         } else {
-            let (count, failed) = async_count(
-                context,
-                &path,
-                &format!("{configured_base}..{head}"),
-                cancellation,
-            )
-            .await;
-            if failed {
-                failures.push("own commit count");
-            }
-            count.unwrap_or(0)
+            0
         };
         if own_commits > 0 {
             let pr_is_for_current_head =
@@ -875,11 +888,17 @@ async fn enrich(
                 && pr.is_some_and(|pr| {
                     pr.state.eq_ignore_ascii_case("MERGED") && pr.base_ref_name == configured_base
                 });
-            let (local_landed_on_base, failed) =
-                is_ancestor(context, &path, head, configured_base, cancellation).await;
-            if failed {
-                failures.push("base ancestry");
-            }
+            let local_landed_on_base = match base_ref.as_deref() {
+                Some(base_ref) => {
+                    let (landed, failed) =
+                        is_ancestor(context, &path, head, base_ref, cancellation).await;
+                    if failed {
+                        failures.push("base ancestry");
+                    }
+                    landed
+                }
+                None => false,
+            };
             if pr_landed_on_base || local_landed_on_base {
                 result.landed_on = Some(LandingKind::Base);
             }
@@ -887,29 +906,46 @@ async fn enrich(
                 if production == configured_base && (pr_landed_on_base || local_landed_on_base) {
                     result.landed_on = Some(LandingKind::Production);
                 } else {
-                    let (head_on_production, head_failed) =
-                        is_ancestor(context, &path, head, production, cancellation).await;
-                    if head_failed {
-                        failures.push("production ancestry");
-                    }
-                    let merge_oid = pr.and_then(|pr| {
-                        exact_merged_pr_oid(
-                            pr.head_ref_oid.as_deref(),
-                            head,
-                            &pr.state,
-                            pr.merge_commit_oid.as_deref(),
-                        )
-                    });
-                    let merge_on_production = if let Some(merge_oid) = merge_oid {
-                        let (on_production, failed) =
-                            is_ancestor(context, &path, merge_oid, production, cancellation).await;
-                        if failed {
-                            failures.push("PR merge ancestry");
+                    let production_ref =
+                        match resolve_branch_ref(context, &path, production, cancellation).await {
+                            Ok(production_ref) => production_ref,
+                            Err(()) => {
+                                failures.push("production ref");
+                                None
+                            }
+                        };
+                    let mut head_on_production = false;
+                    let mut merge_on_production = false;
+                    if let Some(production_ref) = production_ref.as_deref() {
+                        let (landed, head_failed) =
+                            is_ancestor(context, &path, head, production_ref, cancellation).await;
+                        if head_failed {
+                            failures.push("production ancestry");
                         }
-                        on_production
-                    } else {
-                        false
-                    };
+                        head_on_production = landed;
+                        let merge_oid = pr.and_then(|pr| {
+                            exact_merged_pr_oid(
+                                pr.head_ref_oid.as_deref(),
+                                head,
+                                &pr.state,
+                                pr.merge_commit_oid.as_deref(),
+                            )
+                        });
+                        if let Some(merge_oid) = merge_oid {
+                            let (landed, failed) = is_ancestor(
+                                context,
+                                &path,
+                                merge_oid,
+                                production_ref,
+                                cancellation,
+                            )
+                            .await;
+                            if failed {
+                                failures.push("PR merge ancestry");
+                            }
+                            merge_on_production = landed;
+                        }
+                    }
                     if head_on_production || merge_on_production {
                         result.landed_on = Some(LandingKind::Production);
                     }
@@ -1113,6 +1149,38 @@ async fn base_conflicts(
     parse_merge_tree(output.status.code(), &output.stdout).map_or(ConflictProbe::Unknown, |files| {
         ConflictProbe::Settled(Some(files))
     })
+}
+
+/// The ref a branch name resolves to in this checkout: the local branch,
+/// else its remote-tracking copy. `Ok(None)` when neither exists, a settled
+/// unknown rather than a read failure worth retrying; `Err` when Git failed.
+async fn resolve_branch_ref(
+    context: &AppContext,
+    path: &Path,
+    name: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, ()> {
+    for candidate in [name.to_owned(), format!("origin/{name}")] {
+        let output = run_git(
+            context,
+            path,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{candidate}^{{commit}}"),
+            ],
+            cancel,
+        )
+        .await
+        .ok_or(())?;
+        match output.status.code() {
+            Some(0) => return Ok(Some(candidate)),
+            Some(1) => {}
+            _ => return Err(()),
+        }
+    }
+    Ok(None)
 }
 
 /// The ref the activity probes compare against. Trunk resolves to its
@@ -1493,6 +1561,71 @@ mod tests {
         assert!(result.domains().contains_key(&Domain::Presentation));
     }
 
+    fn linked(slug: &str) -> WorktreeSnapshot {
+        WorktreeSnapshot {
+            worktree: wt_vcs::WorktreeRecord {
+                target: wt_core::local_worktree_target(slug, slug, format!("/repo/{slug}"), ""),
+                is_main: false,
+                head_sha: Some("head".into()),
+                detached: false,
+                kind: wt_vcs::RepositoryKind::LinkedWorktree,
+                locked: false,
+                prunable: false,
+                git_dir: None,
+                common_dir: None,
+            },
+            status: None,
+            error: None,
+        }
+    }
+
+    /// GitHub that never produced data (unauthenticated, offline, no
+    /// GitHub origin) must not hide facts that were computed without a PR.
+    #[test]
+    fn facts_apply_while_github_has_no_data() {
+        let git =
+            SourceSnapshot::test_live(Some(vec![linked("alpha")]), SourceState::Ready, Domain::Git);
+        let metadata = SourceSnapshot::test_live(
+            Some((serde_json::json!({}), Default::default())),
+            SourceState::Ready,
+            Domain::Metadata,
+        );
+        let github = SourceSnapshot::<GithubData>::test_live(
+            None,
+            SourceState::Failed("gh auth".into()),
+            Domain::Github,
+        );
+        let identities = current_identities(&git, &metadata, &github, "main");
+        let identity = identities
+            .get("alpha")
+            .expect("identity without GitHub data");
+        assert_eq!(identity.pr, None);
+        assert_eq!(
+            *identity,
+            fact_identity(
+                &git.data().unwrap()[0],
+                &serde_json::json!({}),
+                None,
+                "main"
+            )
+        );
+    }
+
+    #[test]
+    fn only_a_live_git_scan_keys_fact_probes() {
+        let rows = vec![linked("alpha")];
+        assert!(scanned_live(&SourceSnapshot::test_live(
+            Some(rows.clone()),
+            SourceState::Ready,
+            Domain::Git
+        )));
+        assert!(!scanned_live(&SourceSnapshot::test_restored(
+            rows,
+            Domain::Git,
+            1
+        )));
+    }
+
     #[test]
     fn porcelain_unmerged_paths_preserve_spaces_and_deduplicate() {
         let parsed = parse_unmerged_paths(
@@ -1669,6 +1802,82 @@ mod tests {
         // An unresolvable base also exits 1, but writes no tree.
         assert_eq!(parse_merge_tree(Some(1), b""), None);
         assert_eq!(parse_merge_tree(Some(128), b"abc\0"), None);
+    }
+
+    /// A recorded base that exists only as a remote-tracking ref, or not at
+    /// all, settles instead of failing every probe and retrying forever.
+    #[tokio::test]
+    async fn an_origin_only_or_missing_base_does_not_retry_forever() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        git(
+            &main,
+            &["update-ref", "refs/remotes/origin/coworker", "HEAD"],
+        );
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.worktree.target.branch == "feature/one")
+            .unwrap();
+        let worktree = PathBuf::from(&row.worktree.target.path);
+        std::fs::write(worktree.join("tracked.txt"), "feature\n").unwrap();
+        git(&worktree, &["commit", "-qam", "feature change"]);
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.worktree.target.branch == "feature/one")
+            .unwrap();
+        let slug = row.worktree.target.slug().to_owned();
+        for base in ["coworker", "deleted-by-hand"] {
+            let state = serde_json::json!({"slugs": {slug.clone(): {"baseBranch": base}}});
+            let (presentation, needs_retry, _) = enrich(
+                &fixture.ctx,
+                row,
+                &state,
+                None,
+                &ConflictCache::default(),
+                &fixture.ctx.cancellation,
+            )
+            .await;
+            assert!(!needs_retry, "{base}: {:?}", presentation.error);
+            assert_eq!(presentation.error, None);
+            assert_eq!(presentation.landed_on, None);
+        }
+        let state = serde_json::json!({"slugs": {slug.clone(): {"baseBranch": "coworker"}}});
+        let (presentation, _, _) = enrich(
+            &fixture.ctx,
+            row,
+            &state,
+            None,
+            &ConflictCache::default(),
+            &fixture.ctx.cancellation,
+        )
+        .await;
+        assert_eq!(
+            presentation.first_commit_title.as_deref(),
+            Some("feature change")
+        );
+        fixture.close().await.unwrap();
     }
 
     #[tokio::test]

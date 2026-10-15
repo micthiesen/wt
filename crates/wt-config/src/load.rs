@@ -101,14 +101,7 @@ impl Config {
         {
             merge(&mut preview, &repo_raw);
         }
-        let main_clone = table_string(&preview, "paths", "main_clone")
-            .map(|p| expand_home(&p, &options.home))
-            .unwrap_or_default();
-        let worktree_root = table_string(&preview, "paths", "worktree_root")
-            .map(|p| expand_home(&p, &options.home))
-            .unwrap_or_default();
-        let repository =
-            canonical_repository_config(discovered, &main_clone, &worktree_root, &options.cwd);
+        let repository = select_repository_config(&preview, discovered, options);
 
         if repository.is_none() && !config_path.is_file() {
             return Err(ConfigError::NotFound { path: config_path });
@@ -142,7 +135,8 @@ impl Config {
     /// Build a resolved config from an already parsed, merged TOML value.
     /// Repository discovery still runs so path-derived identity matches `load`.
     pub fn from_raw(raw: toml::Value, options: &LoadOptions) -> Result<Self, ConfigError> {
-        let repo = repository_config(&options.cwd, &options.env);
+        let repo =
+            select_repository_config(&raw, repository_config(&options.cwd, &options.env), options);
         let label = repo.clone().unwrap_or_else(|| options.cwd.join("<config>"));
         Self::from_raw_at(raw, options, repo, label)
     }
@@ -479,7 +473,11 @@ impl Config {
                 if dev.port_base == 0 {
                     errors.push("dev_server.port_base must be a port number (1-65535)".into());
                 }
-                if dev.port_range == 0 || u32::from(dev.port_base) + dev.port_range > 65_536 {
+                if dev.port_range == 0
+                    || u32::from(dev.port_base)
+                        .checked_add(dev.port_range)
+                        .is_none_or(|end| end > 65_536)
+                {
                     errors.push("dev_server.port_range must keep the range within 1-65535".into());
                 }
                 if dev.max_concurrent == Some(0) {
@@ -689,9 +687,9 @@ impl Config {
 
         let actions = parse_actions(&raw, &mut errors);
         let automations = parse_automations(&raw, &actions, &branch, &mut errors);
-        let skills_raw: BoolSection = section(&raw, "skills", &mut errors);
+        let skills_raw: StartupCheckSection = section(&raw, "skills", &mut errors);
         let manager_raw: ManagerSection = section(&raw, "manager", &mut errors);
-        let update_raw: BoolSection = section(&raw, "update", &mut errors);
+        let update_raw: StartupCheckSection = section(&raw, "update", &mut errors);
 
         if !errors.is_empty() {
             return Err(ConfigError::invalid(source_path, errors));
@@ -740,6 +738,22 @@ impl Config {
             },
         })
     }
+}
+
+/// Prefer the owning repository's config over a copy found inside one of its
+/// worktrees, judging by the paths the merged layers declare.
+fn select_repository_config(
+    preview: &toml::Value,
+    discovered: Option<PathBuf>,
+    options: &LoadOptions,
+) -> Option<PathBuf> {
+    let main_clone = table_string(preview, "paths", "main_clone")
+        .map(|p| expand_home(&p, &options.home))
+        .unwrap_or_default();
+    let worktree_root = table_string(preview, "paths", "worktree_root")
+        .map(|p| expand_home(&p, &options.home))
+        .unwrap_or_default();
+    canonical_repository_config(discovered, &main_clone, &worktree_root, &options.cwd)
 }
 
 fn user_config_path(options: &LoadOptions) -> PathBuf {
@@ -1360,10 +1374,17 @@ struct RawIssueTracker {
 struct RawLinear {
     workspace: String,
 }
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default)]
-struct BoolSection {
+struct StartupCheckSection {
     startup_check: bool,
+}
+impl Default for StartupCheckSection {
+    fn default() -> Self {
+        Self {
+            startup_check: true,
+        }
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]

@@ -511,3 +511,65 @@ fn explicit_repository_config_environment_overrides_cwd_discovery() {
     assert_eq!(config.repository_config, Some(second.join(".wt.toml")));
     assert_eq!(config.branch.prefix, "second");
 }
+
+#[test]
+fn startup_checks_default_on_when_their_sections_are_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let opts = options(root.path(), &home, &[]);
+    let config = Config::from_raw(toml_value(&minimal_config(root.path())), &opts).unwrap();
+    assert!(config.skills.startup_check);
+    assert!(config.update.startup_check);
+    let text = format!("{}\n[skills]\n[update]\n", minimal_config(root.path()));
+    let config = Config::from_raw(toml_value(&text), &opts).unwrap();
+    assert!(config.skills.startup_check);
+    assert!(config.update.startup_check);
+}
+
+#[test]
+fn an_overflowing_dev_server_port_range_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let text = format!(
+        "{}\n[dev_server]\ncommand = 'serve'\nport_base = 8100\nport_range = 4294967295\n",
+        minimal_config(root.path())
+    );
+    let error = Config::from_raw(toml_value(&text), &options(root.path(), &home, &[]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dev_server.port_range"), "{error}");
+}
+
+#[test]
+fn from_raw_selects_the_same_repository_identity_as_load_in_a_worktree_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let main = root.path().join("main");
+    let wt_root = root.path().join("worktrees");
+    let worktree = wt_root.join("feature");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&main).unwrap();
+    fs::create_dir_all(&worktree).unwrap();
+    let text = format!(
+        "[paths]\nmain_clone = {:?}\nworktree_root = {:?}\n[branch]\nprefix = 'repo'\n",
+        main.display().to_string(),
+        wt_root.display().to_string()
+    );
+    fs::write(main.join(".wt.toml"), &text).unwrap();
+    // A copy carried into the worktree (committed or copied by setup).
+    fs::write(worktree.join(".wt.toml"), &text).unwrap();
+    let opts = options(&worktree, &home, &[]);
+    let loaded = Config::load(&opts).unwrap();
+    let raw = Config::from_raw(toml_value(&text), &opts).unwrap();
+
+    assert_eq!(
+        loaded.repository_config,
+        Some(fs::canonicalize(&main).unwrap().join(".wt.toml"))
+    );
+    assert_eq!(raw.repository_config, loaded.repository_config);
+    assert_eq!(raw.repo_id, loaded.repo_id);
+    assert_eq!(raw.paths.state_db, loaded.paths.state_db);
+    assert_eq!(raw.tmux.socket, loaded.tmux.socket);
+}

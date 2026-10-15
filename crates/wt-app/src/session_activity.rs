@@ -410,8 +410,9 @@ pub fn start(
                     let updated = fetch_usage(&paths, &codex, &opencode, &cancellation).await;
                     match updated {
                         Ok(mut usage) => {
-                            // Freshness is not a visible change. Keep an idle
-                            // board still when the measured values are equal.
+                            // Freshness is not a visible change: keep the first
+                            // fetch time so equal measurements leave an idle
+                            // board still.
                             if let Some(previous) = &snapshot.usage {
                                 usage.cached_at_ms = previous.cached_at_ms;
                             }
@@ -558,9 +559,10 @@ fn active_from_sources(
     inventory: SourceSnapshot<SessionInventory>,
     discoveries: SourceSnapshot<SessionDiscoveries>,
 ) -> Vec<ActiveSession> {
+    // A failed discovery pass names only the targets that failed; it keeps
+    // every other session's discovery, so it must not retire their tails.
     if matches!(git.state(), SourceState::Failed(_))
         || matches!(inventory.state(), SourceState::Failed(_))
-        || matches!(discoveries.state(), SourceState::Failed(_))
     {
         return Vec::new();
     }
@@ -991,8 +993,8 @@ fn poll_claude(
     (changed, errors)
 }
 
-fn event_slug_for_text(active: &[ActiveSession], harness: HarnessId, _text: &str) -> String {
-    let Some(slug) = _text.rsplit_once("· ").map(|(_, slug)| slug.trim()) else {
+fn event_slug_for_text(active: &[ActiveSession], harness: HarnessId, text: &str) -> String {
+    let Some(slug) = text.rsplit_once("· ").map(|(_, slug)| slug.trim()) else {
         return String::new();
     };
     active

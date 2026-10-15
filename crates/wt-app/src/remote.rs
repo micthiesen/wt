@@ -17,7 +17,11 @@ use wt_remote::{
 };
 use wt_update::{InstallState, VersionId};
 
-use crate::{commands::resolve::run_git, context::AppContext, worktree_facts::push_facts};
+use crate::{
+    commands::{issue::repo_web_url, resolve::run_git},
+    context::AppContext,
+    worktree_facts::push_facts,
+};
 
 pub fn worker_info(role: InstanceRole) -> WorkerInfo {
     WorkerInfo {
@@ -698,27 +702,13 @@ fn resolve_issue_id(slug: &str, stored: Option<&str>) -> Option<String> {
         let trimmed = stored.trim();
         return (!trimmed.is_empty()).then(|| trimmed.to_ascii_uppercase());
     }
-    regex::Regex::new(r"(?i)([a-z]+-\d+)(?:-|$)")
-        .expect("constant issue regex")
+    static ISSUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)([a-z]+-\d+)(?:-|$)").expect("constant issue regex")
+    });
+    ISSUE
         .captures(slug)?
         .get(1)
         .map(|found| found.as_str().to_ascii_uppercase())
-}
-
-fn repo_web_url(remote: &str) -> Option<String> {
-    let raw = remote
-        .strip_prefix("https://")
-        .or_else(|| remote.strip_prefix("http://"))
-        .or_else(|| remote.strip_prefix("git@"))
-        .or_else(|| remote.strip_prefix("ssh://git@"))?;
-    let (host, path) = if let Some((host, path)) = raw.split_once(':') {
-        (host, path)
-    } else {
-        raw.split_once('/')?
-    };
-    let host = host.split('/').next()?;
-    let path = path.trim_end_matches(".git").trim_end_matches('/');
-    Some(format!("https://{host}/{path}"))
 }
 
 #[cfg(test)]
@@ -844,6 +834,23 @@ mod tests {
             Some("https://github.com/owner/repo")
         );
         assert_eq!(repo_web_url("local-path"), None);
+        assert_eq!(
+            repo_web_url("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        // Credentials in an HTTPS origin must never reach a displayed URL.
+        assert_eq!(
+            repo_web_url("https://x-access-token:secret@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            repo_web_url("https://ghe.example:8443/owner/repo").as_deref(),
+            Some("https://ghe.example:8443/owner/repo")
+        );
+        assert_eq!(
+            repo_web_url("ssh://git@ghe.example:2222/owner/repo.git").as_deref(),
+            Some("https://ghe.example/owner/repo")
+        );
     }
 
     #[test]

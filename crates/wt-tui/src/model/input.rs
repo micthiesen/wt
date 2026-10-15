@@ -65,6 +65,8 @@ impl Model {
             // the board underneath it. They replay in order when it opens.
             if request.typeahead.len() < TYPEAHEAD_LIMIT {
                 request.typeahead.push((key, height));
+            } else {
+                request.typeahead_overflow = true;
             }
             return InputResult::Draw;
         }
@@ -298,10 +300,7 @@ impl Model {
                 self.help_searching = true;
                 return InputResult::Draw;
             }
-            let maximum = crate::help::filtered_lines(&self.help_query.text())
-                .len()
-                .saturating_sub(1)
-                .max(self.help_max_scroll);
+            let maximum = self.help_max_scroll;
             return if overlay_scroll(key, &mut self.help_scroll, maximum, height) {
                 InputResult::Draw
             } else {
@@ -386,13 +385,22 @@ impl Model {
                 InputResult::Action(UiAction::CancelAutomations)
             }
             KeyCode::Char('a' | 'A') if control => {
-                self.row_action(|key| UiAction::ToggleAutomations { key: Some(key) })
+                let seen = self
+                    .actionable_row()
+                    .map(|row| crate::Seen(row.automations_paused));
+                self.row_action(|key| UiAction::ToggleAutomations {
+                    key: Some(key),
+                    seen,
+                })
             }
             KeyCode::Char('A') if !control => {
                 if !self.board.display.automations {
                     return self.notify("no [[automations]] configured");
                 }
-                InputResult::Action(UiAction::ToggleAutomations { key: None })
+                InputResult::Action(UiAction::ToggleAutomations {
+                    key: None,
+                    seen: Some(crate::Seen(self.board.automations_paused)),
+                })
             }
             KeyCode::Char('\'') if !control => {
                 self.open_output_picker();
@@ -651,7 +659,8 @@ impl Model {
                         row.slug
                     ));
                 }
-                self.row_action(|key| UiAction::ToggleArchive { key })
+                let seen = self.actionable_row().map(|row| crate::Seen(row.archived));
+                self.row_action(|key| UiAction::ToggleArchive { key, seen })
             }
             KeyCode::Char('u') if !control => {
                 self.row_action(|key| UiAction::PrepareStatus { key })
