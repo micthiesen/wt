@@ -63,6 +63,7 @@ impl Model {
             source
         } else {
             let mut board = self.pending.project(&source);
+            keep_removal_positions(&mut board, &self.board);
             board.pending_views.extend(self.pending.views());
             Arc::new(board)
         };
@@ -295,5 +296,93 @@ impl Model {
             }
         }
         true
+    }
+}
+
+/// Worker archival suppresses background work. Keep the visible row in its
+/// previous section until inventory confirms that the checkout is gone.
+fn keep_removal_positions(board: &mut Board, previous: &Board) {
+    for index in 0..board.rows.len() {
+        let row = &board.rows[index];
+        if !row.busy.as_ref().is_some_and(|busy| busy.op == "remove") {
+            continue;
+        }
+        let Some(old_index) = previous
+            .rows
+            .iter()
+            .position(|old| old.key == row.key && old.host == row.host)
+        else {
+            continue;
+        };
+        let Some(old_section) = previous
+            .sections
+            .iter()
+            .find(|section| section.rows.contains(&old_index))
+        else {
+            continue;
+        };
+        let position = old_section
+            .rows
+            .iter()
+            .position(|&row| row == old_index)
+            .unwrap();
+        board.rows[index].archived = previous.rows[old_index].archived;
+        for section in &mut board.sections {
+            section.rows.retain(|&row| row != index);
+        }
+        let section = if let Some(section) = board
+            .sections
+            .iter_mut()
+            .find(|section| section.key == old_section.key)
+        {
+            section
+        } else {
+            let mut section = old_section.clone();
+            section.rows.clear();
+            board.sections.push(section);
+            board.sections.last_mut().unwrap()
+        };
+        section.rows.insert(position.min(section.rows.len()), index);
+    }
+}
+
+#[cfg(test)]
+mod removal_position_tests {
+    use super::*;
+    #[test]
+    fn worker_archival_keeps_the_visible_position_without_recreating_deleted_rows() {
+        let previous = Board {
+            rows: vec![crate::BoardRow {
+                key: "one".into(),
+                ..Default::default()
+            }],
+            sections: vec![crate::BoardSection {
+                key: "inbox".into(),
+                title: "Inbox".into(),
+                rows: vec![0],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut board = previous.clone();
+        board.rows[0].archived = true;
+        board.rows[0].busy = Some(crate::BusyView {
+            op: "remove".into(),
+            ..Default::default()
+        });
+        board.sections[0].rows.clear();
+        board.sections.push(crate::BoardSection {
+            key: "archived".into(),
+            rows: vec![0],
+            ..Default::default()
+        });
+        keep_removal_positions(&mut board, &previous);
+        assert!(!board.rows[0].archived);
+        assert_eq!(board.sections[0].rows, vec![0]);
+        assert!(board.sections[1].rows.is_empty());
+        board.rows.clear();
+        board.sections[0].rows.clear();
+        keep_removal_positions(&mut board, &previous);
+        assert!(board.rows.is_empty());
     }
 }

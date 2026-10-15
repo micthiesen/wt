@@ -299,7 +299,11 @@ impl RowContext<'_> {
             (false, true) => theme::FG_DIM,
         };
         let mut title_style = style(title_color);
-        if selected {
+        if row.busy.as_ref().is_some_and(|busy| busy.op == "remove") {
+            title_style = title_style
+                .fg(theme::FG_DIM)
+                .add_modifier(Modifier::CROSSED_OUT);
+        } else if selected {
             title_style = title_style.add_modifier(Modifier::BOLD);
         }
         spans.push(Span::styled(label, title_style));
@@ -516,6 +520,44 @@ fn review_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_removal_title_is_dim_and_struck_through_even_when_selected() {
+        let model = Model::default();
+        let context = RowContext {
+            model: &model,
+            width: 60,
+            gutter: 0,
+        };
+        let mut row = BoardRow {
+            title: "Pending deletion".into(),
+            busy: Some(crate::BusyView {
+                op: "remove".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for selection in [None, Some(0)] {
+            let rendered = context.row(&row, selection);
+            let title = rendered
+                .line
+                .spans
+                .iter()
+                .find(|span| span.content == "Pending deletion")
+                .unwrap();
+            assert_eq!(title.style.fg, Some(theme::FG_DIM));
+            assert!(title.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        }
+        row.busy = None;
+        let rendered = context.row(&row, None);
+        assert!(
+            rendered
+                .line
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::CROSSED_OUT))
+        );
+    }
 
     #[test]
     fn scrolloff_keeps_context_and_clamps_to_the_end() {

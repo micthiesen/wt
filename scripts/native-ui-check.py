@@ -589,10 +589,10 @@ def main():
             first_removed = removal_started.read_text()
             assert first_removed == "bench-000", first_removed
             drain_for(0.1)
-            # The accepted worker archives A. g must now select B;
+            # Pending A stays in place. Move from A to B;
             # its prompt must not wait for A's accepted teardown to finish.
             removal_menu_started = time.monotonic()
-            os.write(master, b"gd")
+            os.write(master, b"gjd")
             second_menu = wait_for(lambda data: b"removeworktree?" in compact_terminal(data)
                                    and re.search(rb"(bench-00[12])\(bench/\1\)", compact_terminal(data)), timeout=3)
             second_retained = re.search(rb"(bench-00[12])\(bench/\1\)", compact_terminal(second_menu)).group(1).decode()
