@@ -1,5 +1,16 @@
 # Performance notes
 
+### Removal feedback and delayed reviews (2026-10-15 UTC)
+
+The TUI projected removal into Archived before host planning accepted it.
+A hazard review then restored the row. Replies also tied removal reviews to
+UI generation, so navigation could discard them. The repair keeps the row
+in place during checks and queues revision-bearing reviews with their host.
+Tests cover stale generations, an unrelated open menu, and confirming or
+cancelling consecutive local and remote reviews. The first fresh plan now
+says it needs confirmation; only a revision mismatch claims a change.
+
+
 ### New row placement and session readiness (2026-10-15 UTC)
 
 The installed launcher reports v0.1.21 (`4c10db1`); Cozee selects

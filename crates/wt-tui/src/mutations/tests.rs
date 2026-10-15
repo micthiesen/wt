@@ -246,8 +246,7 @@ async fn every_mutation_kind_meets_the_contract() {
                         .iter()
                         .find(|row| &row.key == key)
                         .is_none_or(|row| {
-                            row.archived
-                                && row.badge == "removing"
+                            matches!(row.badge.as_str(), "removing" | "checking removal")
                                 && row.busy.as_ref().is_some_and(|busy| busy.op == "remove")
                         })
                 })
@@ -611,16 +610,16 @@ fn creation_projection_replaces_placeholder_with_the_exact_inventory_row() {
 }
 
 #[test]
-fn removal_moves_the_row_and_keeps_later_source_fields() {
+fn removal_stays_in_place_until_the_worker_archives_it() {
     let removing = whole(LifecycleChange::Remove {
         keys: vec!["a".into()],
     });
     let mut latest = with(|b| b.rows[0].title = "New title".into());
     removing.apply(&mut latest);
-    assert!(latest.rows[0].archived);
+    assert!(!latest.rows[0].archived);
     assert_eq!(latest.rows[0].title, "New title");
-    assert!(latest.sections[0].rows.is_empty());
-    assert_eq!(latest.sections.last().unwrap().rows, [0]);
+    assert_eq!(latest.rows[0].badge, "checking removal");
+    assert!(latest.sections[0].rows.contains(&0));
 }
 
 #[test]

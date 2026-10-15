@@ -580,16 +580,16 @@ def main():
             # Cached warnings never authorize force. The host returns a fresh
             # hazard review before this dirty fixture can start removal.
             reviewed = wait_for(lambda data: removal_started.exists()
-                                or b"reviewchangedremovalhazards" in compact_terminal(data), timeout=10)
+                                or b"reviewremovalhazards" in compact_terminal(data), timeout=10)
             if not removal_started.exists():
-                assert b"reviewchangedremovalhazards" in compact_terminal(reviewed)
+                assert b"reviewremovalhazards" in compact_terminal(reviewed)
                 assert (root / "worktrees" / "bench-000").exists()
                 os.write(master, b"y")
                 wait_for(lambda _: removal_started.exists(), timeout=10)
             first_removed = removal_started.read_text()
             assert first_removed == "bench-000", first_removed
             drain_for(0.1)
-            # Pending removal archives A in presentation. g must now select B;
+            # The accepted worker archives A. g must now select B;
             # its prompt must not wait for A's accepted teardown to finish.
             removal_menu_started = time.monotonic()
             os.write(master, b"gd")

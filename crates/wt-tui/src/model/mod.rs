@@ -125,6 +125,8 @@ pub struct Model {
     pub title_prompt: Option<TitlePrompt>,
     pub interaction: Interaction,
     pub(crate) interaction_host: Option<String>,
+    /// Each removal review keeps its own checkout witness and host.
+    pub(crate) removal_reviews: std::collections::VecDeque<(ConfirmPrompt, Option<String>)>,
     /// Host chosen with Tab in the last new-worktree prompt; `None` is local.
     pub(crate) last_create_host: Option<String>,
     pub yank: Option<usize>,
@@ -196,6 +198,7 @@ impl Default for Model {
             title_prompt: None,
             interaction: Interaction::None,
             interaction_host: None,
+            removal_reviews: Default::default(),
             last_create_host: None,
             yank: None,
             toast: None,

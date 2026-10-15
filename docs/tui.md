@@ -81,8 +81,12 @@ chosen host resolves the exact checkout identity before creation starts, so
 inventory replaces that row without a duplicate. Navigation away is preserved
 when preparation or creation finishes. Worktree actions, including F12, become
 available when the real checkout is ready; F12 is never queued automatically.
-Dependency installation continues as a background action. Confirmed removal moves the row to Archived with a
-removal glyph; a failed removal restores its previous archive state.
+Dependency installation continues as a background action. A removal request
+keeps the row in place with a checking-removal label until the worker accepts
+it. The worker then moves it to Archived; a failed removal restores its previous
+archive state. Delayed hazard reviews are queued separately for each checkout
+and host. They appear one at a time after the current menu closes; navigation
+does not discard them. Each confirmation still rechecks its checkout witness.
 Commands taking more than three seconds show elapsed progress. A queued command
 names the conflicting operation or capacity wait; this is progress, not a
 completed request. Independent controls do not wait for checkout creation.

@@ -1963,3 +1963,75 @@ fn archive_and_automation_toggles_carry_the_state_the_user_saw() {
         })
     );
 }
+
+#[test]
+fn delayed_removal_reviews_survive_navigation_and_keep_each_host_and_witness() {
+    for cancel_first in [true, false] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        model.ui_generation = 10;
+        model.interaction = Interaction::Log {
+            title: "Another menu".into(),
+            lines: vec![],
+            scroll: 0,
+        };
+        for (key, host) in [("one", None), ("two", Some("remote"))] {
+            model.reply(UiReply {
+                ui_generation: Some(1),
+                modal_host: host.map(str::to_owned),
+                modal: Some(UiModal::Confirm {
+                    action: ConfirmAction::Remove {
+                        key: key.into(),
+                        force: true,
+                        seen: None,
+                        revision: Some(crate::RemovalRevision {
+                            key: key.into(),
+                            path: format!("/trees/{key}"),
+                            branch: key.into(),
+                            head: "head".into(),
+                            digest: key.into(),
+                            hazards: vec!["dirty".into()],
+                            published_base: None,
+                        }),
+                    },
+                    title: format!("Review {key}"),
+                    lines: vec!["dirty".into()],
+                    cancel_key: Some('d'),
+                }),
+                ..Default::default()
+            });
+        }
+        assert!(
+            matches!(&model.interaction, Interaction::Log { title, .. } if title == "Another menu")
+        );
+        assert_eq!(model.removal_reviews.len(), 2);
+        model.input(KeyEvent::from(KeyCode::Esc), 20);
+        assert!(
+            matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review one")
+        );
+        // Cancelling the first review must neither discard nor approve the second.
+        let result = model.input(
+            KeyEvent::from(KeyCode::Char(if cancel_first { 'n' } else { 'y' })),
+            20,
+        );
+        if !cancel_first {
+            assert!(
+                matches!(result, InputResult::Action(UiAction::Remove { ref key, .. }) if key == "one")
+            );
+        }
+        assert!(
+            matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review two")
+        );
+        assert_eq!(model.interaction_host.as_deref(), Some("remote"));
+        let InputResult::Action(UiAction::OnHost { host, action }) =
+            model.input(KeyEvent::from(KeyCode::Char('y')), 20)
+        else {
+            panic!("second review must target its own host");
+        };
+        assert_eq!(host.as_deref(), Some("remote"));
+        assert!(
+            matches!(*action, UiAction::Remove { ref key, revision: Some(ref revision), force: true, .. } if key == "two" && revision.digest == "two")
+        );
+        assert!(model.removal_reviews.is_empty());
+    }
+}

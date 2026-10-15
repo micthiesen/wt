@@ -392,7 +392,12 @@ pub async fn execute_with_shutdown(
                 let next_force = !plan.hazards.is_empty();
                 let mut lines = vec![
                     format!("{} ({})", plan.row.target.slug(), plan.row.target.branch),
-                    "Checkout or hazards changed since the previous confirmation.".into(),
+                    if changed {
+                        "Checkout or hazards changed since the previous confirmation."
+                    } else {
+                        "Current removal checks require confirmation."
+                    }
+                    .into(),
                 ];
                 if next_force {
                     lines.extend(removal_hazard_lines(
@@ -413,10 +418,10 @@ pub async fn execute_with_shutdown(
                         revision: Some(current_revision),
                         seen: None,
                     },
-                    title: if next_force {
-                        "Review changed removal hazards"
+                    title: if changed {
+                        "Review changed removal checks"
                     } else {
-                        "Review changed checkout"
+                        "Review removal hazards"
                     }
                     .into(),
                     lines,

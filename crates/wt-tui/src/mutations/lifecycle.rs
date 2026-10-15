@@ -5,7 +5,7 @@ use std::time::Duration;
 use wt_core::Domain;
 use wt_runtime::{Deadlines, Target};
 
-use super::{ARCHIVED_SECTION, ARCHIVED_TITLE, Family, INBOX_SECTION, place};
+use super::{Family, INBOX_SECTION, place};
 use crate::{Board, BoardRow, BusyView};
 
 /// Label, badge and busy label of a removal.
@@ -96,10 +96,14 @@ impl Family for LifecycleChange {
                 for key in keys {
                     if let Some(index) = board.rows.iter().position(|row| &row.key == key) {
                         let row = &mut board.rows[index];
-                        row.archived = true;
-                        row.badge = REMOVING.into();
-                        row.busy = busy(REMOVING, "remove");
-                        place(board, index, ARCHIVED_SECTION, ARCHIVED_TITLE);
+                        // Only the worker can archive after accepting removal.
+                        let label = if row.archived {
+                            REMOVING
+                        } else {
+                            "checking removal"
+                        };
+                        row.badge = label.into();
+                        row.busy = busy(label, "remove");
                     }
                 }
             }

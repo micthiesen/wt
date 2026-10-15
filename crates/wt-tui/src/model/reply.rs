@@ -6,6 +6,24 @@ use super::{
 use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 
 impl Model {
+    pub(crate) fn show_next_removal_review(&mut self) {
+        if !matches!(self.interaction, Interaction::None)
+            || self.help
+            || self.show_perf
+            || self.history.active
+            || self.title_prompt.is_some()
+            || self
+                .pending_request
+                .as_ref()
+                .is_some_and(|request| request.preparation)
+        {
+            return;
+        }
+        if let Some((prompt, host)) = self.removal_reviews.pop_front() {
+            self.interaction_host = host;
+            self.interaction = Interaction::Confirm(prompt);
+        }
+    }
     pub fn reply(&mut self, mut reply: UiReply) -> Option<crate::TerminalHandoff> {
         if let Some(progress) = reply.progress.take() {
             if self.pending_request.as_ref().is_some_and(|request| {
@@ -44,6 +62,35 @@ impl Model {
         let selected_create = self.reply_pending(&reply);
         let (stale, stale_id, stale_message) =
             (reply.stale, reply.operation_id, reply.message.clone());
+        // Removal reviews belong to accepted requests, not the current cursor.
+        // Keep each review until it can be shown without replacing another menu.
+        if matches!(
+            &reply.modal,
+            Some(UiModal::Confirm {
+                action: crate::ConfirmAction::Remove {
+                    revision: Some(_),
+                    ..
+                },
+                ..
+            })
+        ) && let Some(UiModal::Confirm {
+            action,
+            title,
+            lines,
+            cancel_key,
+        }) = reply.modal.take()
+        {
+            self.removal_reviews.push_back((
+                ConfirmPrompt {
+                    action,
+                    title,
+                    lines,
+                    selected: 0,
+                    cancel_key,
+                },
+                reply.modal_host.take(),
+            ));
+        }
         let presentation_current = reply
             .ui_generation
             .is_none_or(|generation| generation == self.ui_generation);
@@ -236,6 +283,9 @@ impl Model {
             } else if !reply.failed {
                 self.append_typeahead_notice("keys typed while the menu loaded were dropped");
             }
+        }
+        if reply.handoff.is_none() {
+            self.show_next_removal_review();
         }
         reply.handoff
     }

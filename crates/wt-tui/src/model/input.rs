@@ -123,6 +123,21 @@ impl Model {
         if !matches!(result, InputResult::Action(_)) {
             self.last_key = None;
         }
+        let can_review = match &result {
+            InputResult::Quit => false,
+            InputResult::Action(action) => {
+                let mut action = action;
+                while let UiAction::OnHost { action: inner, .. } = action {
+                    action = inner;
+                }
+                // Another request may open a menu or hand off the terminal.
+                matches!(action, UiAction::Remove { .. })
+            }
+            _ => true,
+        };
+        if can_review {
+            self.show_next_removal_review();
+        }
         result
     }
 
