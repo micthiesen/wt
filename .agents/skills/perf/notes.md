@@ -1,5 +1,43 @@
 # Performance notes
 
+### New row placement and session readiness (2026-10-15 UTC)
+
+The installed launcher reports v0.1.21 (`4c10db1`); Cozee selects
+`git-worktree`. Today's application log records `chat-bulk-chats-error`
+creation at 6.126 s (origin maintenance 1.712 s, checkout 4.169 s,
+configured copies 0.174 s). `attachment-failing` took 9.940 s and
+`consecuitive-chats` took 13.276 s, including a 10.160 s checkout.
+These are lifecycle intervals, not key-to-session measurements. Dependency
+installation is a separate action; the chat task reported working before its
+install action completed. No live process was stopped or checkout changed.
+
+TypeScript `bbf1696` explicitly appended new rows with `setSection`, then
+kept `createdPlacements` after inventory discovery. `useVisualItems` put
+these rows at the end until work status or manual layout changed. Rust
+`LifecycleChange::Create` appends only the placeholder. When inventory
+supplies the row, the normal status/order/identity sort applies immediately;
+`create_resolved` does not persist an appended order. This explains a
+position change. The reported disappearance has not been reproduced.
+
+Rust rejects F12 on a pending creation row and does not retain the request.
+After creation succeeds, a missing inventory row is still projected as a
+non-actionable placeholder. The source that supplies real rows runs full
+`inventory_status`, so checkout completion alone does not make entry usable.
+Proposed repair: keep one stable placement through creation and inventory
+handoff, publish the completed checkout identity without waiting for fleet
+status, and retain an explicit session-open request until that checkout is
+ready. Dependency installation remains separate. Do not start an editing
+agent in a directory while Git is still writing the tracked files.
+Regression checks must cover delayed and stale inventory, status sorting,
+manual navigation, creation failure, and session entry during held install.
+
+The removal dialog for `chat-bulk-chats-error` is a fresh hazard review, not
+a merge failure. Its agent recorded production bulk-preview verification
+at 15:46:44Z. `Remove` returns a revision-bearing confirmation with force
+set for this hazard; a second confirmation can proceed if the revision is
+unchanged. No loop has been reproduced, and verification was not cleared.
+
+
 ### Creation latency and independent controls (2026-10-15 UTC)
 
 Installed v0.1.20 (`7992577`) logged Rift creation at 43.34, 43.60 and

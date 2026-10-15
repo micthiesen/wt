@@ -13,33 +13,21 @@ pub async fn read_line(message: &str, cancel: &CancellationToken) -> Result<Opti
     std::io::stderr().flush()?;
     #[cfg(unix)]
     {
-        use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, time::Duration};
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open("/dev/tty")
-            .context("open interactive terminal")?;
+        use std::io::Read;
+        use tokio::io::unix::AsyncFd;
+        let file = open_terminal(libc::STDIN_FILENO)?;
+        let file = AsyncFd::new(file).context("register interactive terminal")?;
         let mut input = Vec::new();
         loop {
-            if cancel.is_cancelled() {
-                bail!("interactive input cancelled");
-            }
+            let mut ready = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("interactive input cancelled"),
+                ready = file.readable() => ready?,
+            };
             let mut buffer = [0u8; 1024];
-            // Darwin's /dev/tty does not support kqueue registration. Read the
-            // owned nonblocking descriptor directly; only retry while a prompt
-            // is active, without leaving a blocking reader behind on shutdown.
-            let size = match file.read(&mut buffer) {
-                Ok(size) => size,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => bail!("interactive input cancelled"),
-                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-                    }
-                    continue;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error).context("read interactive terminal"),
+            let size = match ready.try_io(|fd| fd.get_ref().read(&mut buffer)) {
+                Ok(result) => result?,
+                Err(_) => continue,
             };
             if size == 0 {
                 return Ok(None);
@@ -101,4 +89,80 @@ pub async fn confirm(message: &str, default_yes: bool, cancel: &CancellationToke
         let answer = answer.trim().to_ascii_lowercase();
         matches!(answer.as_str(), "y" | "yes") || (default_yes && answer.is_empty())
     }))
+}
+
+/// Open a separate descriptor so nonblocking mode does not change stdin.
+/// macOS kqueue rejects /dev/tty; use the concrete device named by stdin.
+#[cfg(unix)]
+fn open_terminal(fd: std::os::fd::RawFd) -> Result<std::fs::File> {
+    use std::{
+        ffi::CStr,
+        fs::OpenOptions,
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    };
+    let mut name = vec![0 as libc::c_char; 1024];
+    // The buffer is writable for its stated size; ttyname_r adds a NUL on success.
+    let error = unsafe { libc::ttyname_r(fd, name.as_mut_ptr(), name.len()) };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error))
+            .context("resolve interactive terminal");
+    }
+    // A successful ttyname_r call returned a NUL-terminated device path.
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
+        .context("open interactive terminal")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        os::fd::{AsRawFd, FromRawFd},
+    };
+
+    #[tokio::test]
+    async fn terminal_device_supports_async_input_without_changing_stdin_flags() {
+        let mut master = -1;
+        let mut slave = -1;
+        // openpty initializes both descriptors on success; no optional settings are supplied.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // Each descriptor is owned once and closed when its File is dropped.
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+        let terminal =
+            tokio::io::unix::AsyncFd::new(open_terminal(slave.as_raw_fd()).unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        master.write_all(b"yes\n").unwrap();
+        let mut input = [0; 16];
+        let count = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let mut ready = terminal.readable().await.unwrap();
+                if let Ok(result) = ready.try_io(|fd| fd.get_ref().read(&mut input)) {
+                    break result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&input[..count], b"yes\n");
+    }
 }
