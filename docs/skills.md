@@ -97,6 +97,10 @@ incident report rather than a procedure.
 
 ## The startup check
 
+Interactive prompts open the concrete terminal device with a separate
+nonblocking descriptor. This supports macOS terminal events without changing
+stdin flags or leaving a blocking reader during shutdown.
+
 When the TUI starts (and before it takes over the terminal, so agents
 spawned from that session see the updates), wt compares every unit against
 what's installed and asks **y/n once per pending update**:
