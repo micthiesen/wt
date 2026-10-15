@@ -588,7 +588,22 @@ def main():
                 wait_for(lambda _: removal_started.exists(), timeout=10)
             first_removed = removal_started.read_text()
             assert first_removed == "bench-000", first_removed
-            drain_for(0.1)
+            def first_removal_archived(_):
+                visible = screen.text().decode()
+                # Worker startup is not a rendered board acknowledgement.
+                # Wait for A to leave the active list before g chooses its
+                # successor. Inspect cells, since draws update incrementally.
+                active_list = "\n".join(
+                    line.split("│")[1] for line in visible.splitlines()
+                    if line.count("│") >= 2
+                ).split("Archived", 1)[0]
+                return ("2 worktrees · 1 archived" in visible
+                        and "Remove worktree?" not in visible
+                        and "000:" not in active_list
+                        and "001:" in active_list and "002:" in active_list)
+
+            wait_for(first_removal_archived, timeout=10)
+            (root / "first-removal-archived.txt").write_bytes(screen.text())
             # The accepted worker archives A. g must now select B;
             # its prompt must not wait for A's accepted teardown to finish.
             removal_menu_started = time.monotonic()

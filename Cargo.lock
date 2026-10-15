@@ -2875,7 +2875,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "wt-actions"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "regex",
@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "wt-app"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "clap",
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "wt-automations"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -2961,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "wt-config"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "regex",
  "serde",
@@ -2975,7 +2975,7 @@ dependencies = [
 
 [[package]]
 name = "wt-core"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "regex",
  "serde",
@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "wt-dev"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "libc",
  "serde",
@@ -3004,7 +3004,7 @@ dependencies = [
 
 [[package]]
 name = "wt-events"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "axum",
  "futures-util",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "wt-github"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "wt-harness"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "futures-util",
  "libc",
@@ -3063,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "wt-launcher"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -3073,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "wt-lifecycle"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "globset",
  "libc",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "wt-naming"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "serde_json",
  "sha2",
@@ -3113,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "wt-platform"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "libc",
  "tempfile",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "wt-remote"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
@@ -3144,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "wt-runtime"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "futures-util",
  "serde",
@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "wt-skills"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "libc",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "wt-sst"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "futures-util",
  "serde",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "wt-stack"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "serde",
@@ -3209,7 +3209,7 @@ dependencies = [
 
 [[package]]
 name = "wt-store"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "wt-tmux"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "serde",
  "serde_json",
@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "wt-tui"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "crossterm",
  "futures-util",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "wt-update"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "flate2",
  "futures-util",
@@ -3268,7 +3268,7 @@ dependencies = [
 
 [[package]]
 name = "wt-vcs"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "futures-util",
  "regex",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "serde_json",
