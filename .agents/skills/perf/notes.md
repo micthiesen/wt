@@ -1,5 +1,18 @@
 # Performance notes
 
+### OpenCode V2 validation and watcher shutdown (2026-10-15 UTC)
+
+The first integrated gate hit the existing notify 8.2 FSEvents signature:
+freshness registration exceeded its deadline and activity/host teardown exceeded
+five seconds. A simultaneous isolated OpenCode TUI smoke hit the same three
+watcher drains after successful messaging, compaction, skill expansion and
+resume. Evidence: `/tmp/wt-oc-gate.log`, `/tmp/wt-oc-native-4`.
+The subsequent top sample showed 53.89% CPU idle, fseventsd at 107.6% CPU and
+4,033 MiB, with no swap deltas. `wt perf` attributed 7.6% CPU to wt descendants
+out of 391.2% in use. This is not evidence of CPU saturation; the previously
+sampled native watcher RPC remains the relevant unresolved cause. No user
+process was stopped and no timeout was increased.
+
 ### Removal feedback and delayed reviews (2026-10-15 UTC)
 
 The TUI projected removal into Archived before host planning accepted it.
@@ -96,11 +109,55 @@ four test threads, so explicitly passing four did not reduce concurrency.
 Native sampling then identified synchronous `FSEventsGetCurrentEventId` teardown
 RPCs and a concurrent `FSEventStreamStart` registration inside notify 8.2.0
 (`/tmp/wt-host-shutdown.sample`). Cancellation was awaiting native cleanup.
-Upstream notify-rs/notify#795 removes the unnecessary volume-purge RPC and fixes
-shutdown behavior, but is published only in notify 9 prereleases, requiring an
-API migration. Keep this as a separate dependency repair, not a longer timeout
-or detached cleanup. A subsequent native workspace run passed all 998 tests
-(one skipped) in 39.72 seconds; this does not resolve the intermittent OS delay.
+Upstream notify-rs/notify#795 removes the unnecessary volume-purge RPC. A later
+native workspace run passed all 998 tests (one skipped) in 39.72 seconds, but
+the same registration and three-owner drain failures recurred in the October
+15 OpenCode gate (`/tmp/wt-oc-gate.log`). Passing a retry did not resolve it.
+
+The initial repair trial pinned upstream notify revision
+`5ebf4c0ba4e51ffae0a1d73476f9de9f505a82d8`. Published 9.0.0-rc.5 includes #795
+but still loses a stop between its flag check and `CFRunLoopRun`; upstream
+#1013 (October 3) fixes that race with a bounded native runloop and repeated
+stop checks. The pin includes both repairs. Three batched watcher callers now
+use `update_paths`; partial errors reconcile actual `watched_paths` rather
+than pretending unattempted registrations succeeded. Cancellation and awaited
+cleanup remain intact. No application deadlines or polling intervals changed.
+Return to a published dependency when its release includes #1013.
+
+Verification remains incomplete: partial-batch reconciliation and all five
+session-activity tests passed, but host native registration and startup-drain
+tests still timed out. A new four-worker rapid reconfiguration fixture also
+failed, at both 20 and two lifetimes per worker within its five-second bound.
+`/tmp/wt-notify9-native-stress.sample` proves the new revision was blocked in
+Apple's `FSEventStreamStart` registration RPC and `FSEventStreamStop`
+unregistration RPC, not the removed purge or old runloop race. `fseventsd`
+showed 99.5% CPU in a subsequent host process snapshot. The failed isolated
+test processes were stopped; no user sessions or system daemons were stopped.
+The dependency repair does not by itself bound Apple's overloaded service.
+Controlled sequential comparison of the unchanged freshness registration test
+then passed on both preserved binaries: notify 8 in 1.892 s and pinned notify 9
+in 1.274 s (`/tmp/wt-notify-compare/`). The old binary imports the purge/current
+event-id APIs; the new binary does not. After both, fseventsd showed 125.7%
+decaying CPU. This isolates an intermittent concurrency/service-pressure
+failure, not a deterministic new-dependency regression; it does not turn the
+failed concurrent tests into successful verification.
+
+Final choice: published `notify =9.0.0-rc.5` with `macos_kqueue` and FSEvents
+disabled, bypassing the overloaded system daemon. Stable 8.2 is unsuitable:
+its nonrecursive directory-write handler guesses an existing child and adds
+a recursive watch, potentially entering `node_modules` from a shallow
+checkout root (upstream #644, fixed in 9 rc4). A native regression verifies
+generated descendants stay unwatched after root changes. Move to stable
+notify 9 when published; the Git revision is no longer a dependency.
+
+Kqueue uses one descriptor per watched entry. Checkout roots are nonrecursive;
+recursive watches cover Git refs/worktree metadata, action logs and dev state.
+Current Cozee counts: 83 refs entries, 44 worktree metadata entries, 97 total
+log entries and 26 dev entries, plus roots, against the host limit of 8192.
+No checkout contents or Git objects are recursively watched. On the published
+kqueue backend, nine freshness tests passed in 2.23 s, including the unchanged
+registration deadline and rapid reconfiguration; the previously failing
+startup-cancellation drain passed in 0.01 s. No deadlines changed.
 
 Companion to `SKILL.md`. Keep the baseline and open issues current; preserve
 measured evidence, and prune implementation-specific advice when it no longer

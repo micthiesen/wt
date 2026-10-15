@@ -276,7 +276,11 @@ pub fn detect_targets(o: &TargetOptions) -> Targets {
                 codex.join("AGENTS.md"),
             ),
             AgentToolId::Opencode => (
-                home.join(".claude/skills"),
+                if home.join(".agents").exists() {
+                    home.join(".agents/skills")
+                } else {
+                    home.join(".config/opencode/skills")
+                },
                 home.join(".config/opencode/AGENTS.md"),
             ),
             AgentToolId::Pi => {
@@ -302,7 +306,12 @@ pub fn detect_targets(o: &TargetOptions) -> Targets {
 }
 pub fn harness_skill_dirs(h: HarnessId, o: &TargetOptions) -> Vec<PathBuf> {
     match h {
-        HarnessId::Claude | HarnessId::Opencode => vec![resolve(&o.home.join(".claude/skills"))],
+        HarnessId::Claude => vec![resolve(&o.home.join(".claude/skills"))],
+        HarnessId::Opencode => vec![
+            resolve(&o.home.join(".config/opencode/skills")),
+            resolve(&o.home.join(".agents/skills")),
+            resolve(&o.home.join(".claude/skills")),
+        ],
         HarnessId::Pi => vec![
             resolve(&o.home.join(".agents/skills")),
             resolve(
@@ -346,6 +355,35 @@ pub fn no_tools_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opencode_uses_native_or_shared_skills_without_creating_claude_layout() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        fs::write(t.path().join(".config/opencode/opencode.json"), "{}").unwrap();
+        let options = TargetOptions {
+            home: t.path().into(),
+            ..Default::default()
+        };
+        let native = t.path().join(".config/opencode/skills/start");
+        fs::create_dir_all(&native).unwrap();
+        fs::write(native.join("SKILL.md"), "start").unwrap();
+        assert!(harness_can_resolve_skill(
+            HarnessId::Opencode,
+            "start",
+            &options
+        ));
+        assert_eq!(
+            crate::start_skill_invocation(HarnessId::Opencode).unwrap(),
+            "@start"
+        );
+        assert!(
+            format!("{:?}", detect_targets(&options).skills).contains(".config/opencode/skills")
+        );
+        fs::create_dir_all(t.path().join(".agents")).unwrap();
+        assert!(format!("{:?}", detect_targets(&options).skills).contains(".agents/skills"));
+        assert!(!t.path().join(".claude").exists());
+    }
+
     #[test]
     fn symlinked_skills_and_rulesync_are_deduped() {
         let t = tempfile::tempdir().unwrap();

@@ -282,20 +282,17 @@ pub fn start(
                 .collect::<std::collections::HashSet<_>>();
             cache.retain(|key, _| current_keys.contains(key));
 
-            // Drop facts for changed rows before awaiting their probes. The
-            // first pass has nothing live to retain; restored facts stay shown
-            // until it completes (rows they no longer match are ignored).
+            // Invalidation controls which probes must run, not which last
+            // observation the display may show. Keep that observation and its
+            // stamp until the replacement is ready. The overlay still rejects
+            // facts whose checkout/HEAD/base/PR identity changed. This source
+            // exposes only a display handle, never confirmed safety evidence.
             let retained = presentation_map(&cache);
             if last_published
                 .as_ref()
                 .is_some_and(|published| *published != retained)
             {
-                publisher.publish_live_with_state(
-                    retained.clone(),
-                    observed,
-                    SourceState::Refreshing,
-                );
-                last_published = Some(retained);
+                publisher.set_state(SourceState::Refreshing);
                 last_state = Some(SourceState::Refreshing);
             }
 
@@ -1770,6 +1767,93 @@ mod tests {
             serde_json::to_string(&before).unwrap(),
             serde_json::to_string(&after).unwrap()
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reprobe_retains_display_facts_and_original_stamp_until_replacement() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let row = rows.iter().find(|row| !row.worktree.is_main).unwrap();
+        let key = wt_core::worktree_target_key(&row.worktree.target);
+        let scope = TaskScope::new();
+        let (git, git_pub) = derived_channel(&scope, "test-git");
+        let (metadata, metadata_pub) = derived_channel(&scope, "test-metadata");
+        let (github, github_pub) = derived_channel(&scope, "test-github");
+        git_pub.publish(SourceSnapshot::test_live(
+            Some(rows.clone()),
+            SourceState::Ready,
+            Domain::Git,
+        ));
+        metadata_pub.publish(SourceSnapshot::test_live(
+            Some((serde_json::json!({"slugs": {}}), Default::default())),
+            SourceState::Ready,
+            Domain::Metadata,
+        ));
+        github_pub.publish(SourceSnapshot::test_live(
+            Some(GithubData::default()),
+            SourceState::Ready,
+            Domain::Github,
+        ));
+        let facts = start(&scope, &fixture.ctx, git, metadata, github);
+        let mut updates = facts.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            updates
+                .wait_for(|snapshot| snapshot.data().is_some_and(|data| data.contains_key(&key))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let before = updates.borrow_and_update().clone();
+        let stamp = before
+            .domains()
+            .get(&Domain::Presentation)
+            .unwrap()
+            .observed();
+        // A ref/index/rebase invalidation must not emit an empty intermediate
+        // row. Such a row made merged/production glyphs alternate with ready.
+        std::fs::create_dir(row.worktree.git_dir.as_ref().unwrap().join("rebase-merge")).unwrap();
+        git_pub.publish(SourceSnapshot::test_live(
+            Some(rows.clone()),
+            SourceState::Ready,
+            Domain::Git,
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut saw_refresh = false;
+            loop {
+                updates.changed().await.unwrap();
+                let snapshot = updates.borrow_and_update().clone();
+                assert!(
+                    snapshot.data().unwrap().contains_key(&key),
+                    "display fact disappeared during reprobe"
+                );
+                if matches!(snapshot.state(), SourceState::Refreshing) {
+                    saw_refresh = true;
+                    assert_eq!(snapshot.data(), before.data());
+                    assert_eq!(
+                        snapshot
+                            .domains()
+                            .get(&Domain::Presentation)
+                            .unwrap()
+                            .observed(),
+                        stamp
+                    );
+                } else if saw_refresh {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        scope.shutdown(Duration::from_secs(2)).await.unwrap();
         fixture.close().await.unwrap();
     }
 

@@ -202,6 +202,9 @@ impl NamingService {
         command.timeout = spec.timeout;
         command.output_limit = 1024 * 1024;
         command.input = spec.input.clone();
+        // V2's CLI may start its persistent service. Do not reap that service
+        // when the successful one-shot generation client exits.
+        command.preserve_children_on_success = spec.harness_id == HarnessId::Opencode;
         let output = self
             .runner
             .run(command, cancellation)
@@ -218,7 +221,24 @@ impl NamingService {
                 detail: format!("exit {:?}: {detail}", output.status.code()),
             });
         }
-        let text = output.stdout_text().trim().to_string();
+        let text = if spec.harness_id == HarnessId::Opencode {
+            let response: serde_json::Value =
+                serde_json::from_slice(&output.stdout).map_err(|error| NamingError::Harness {
+                    harness: "opencode",
+                    detail: format!("invalid generation response: {error}"),
+                })?;
+            response
+                .pointer("/data/text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| NamingError::Harness {
+                    harness: "opencode",
+                    detail: "generation response is missing data.text".into(),
+                })?
+                .trim()
+                .to_owned()
+        } else {
+            output.stdout_text().trim().to_string()
+        };
         if text.is_empty() {
             return Err(NamingError::Harness {
                 harness: spec.harness_id.as_str(),
@@ -266,6 +286,50 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use wt_config::{NamingHarness, NamingReasoningEffort};
+
+    #[tokio::test]
+    async fn opencode_v2_stateless_response_is_decoded_and_invalid_shape_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-opencode");
+        std::fs::write(&fake, "#!/bin/sh\nprintf '%s' '{\"data\":{\"text\":\"TITLE: Safe naming.\\nDESCRIPTION: Stateless generation.\"}}'\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+        let config = NamingServiceConfig {
+            naming: NamingConfig {
+                harness: NamingHarness::Opencode,
+                ..NamingConfig::default()
+            },
+            primary_harness: HarnessId::Codex,
+            main_clone: dir.path().to_path_buf(),
+            trunk_branch: "main".into(),
+            programs: HarnessPrograms {
+                opencode: fake.clone().into_os_string(),
+                ..HarnessPrograms::default()
+            },
+        };
+        let service = NamingService::new(
+            config,
+            ProcessRunner::new(std::num::NonZeroUsize::new(1).unwrap()),
+        )
+        .unwrap();
+        let result = service
+            .summarize_diff("prompt", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.title.as_deref(), Some("Safe naming"));
+        assert_eq!(result.description, "Stateless generation.");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s' '{\"text\":\"wrong envelope\"}'\n",
+        )
+        .unwrap();
+        let error = service
+            .summarize_diff("prompt", &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing data.text"));
+    }
 
     #[tokio::test]
     async fn fake_installed_harness_returns_parsed_summary_without_model_api() {

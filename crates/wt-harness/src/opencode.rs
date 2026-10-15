@@ -8,8 +8,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use wt_platform::process::ProcessRunner;
-use wt_tmux::{CreateSession, OptionScope, PaneTarget, TmuxClient, TmuxError};
+use wt_platform::process::{CommandSpec, ProcessRunner};
+use wt_tmux::{CreateSession, OptionScope, TmuxClient, TmuxError};
 
 mod output;
 
@@ -35,7 +35,14 @@ impl OpenCodePaths {
         let home = home.into();
         let cache_dir = cache_dir.into();
         Self {
-            database: home.join(".local/share/opencode/opencode.db"),
+            database: std::env::var_os("XDG_DATA_HOME")
+                .filter(|_| {
+                    std::env::var_os("HOME").is_some_and(|current| Path::new(&current) == home)
+                })
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| home.join(".local/share"))
+                .join("opencode/opencode.db"),
             lock_dir: cache_dir.join("locks"),
             home,
             cache_dir,
@@ -57,7 +64,7 @@ pub enum OpenCodeError {
         operation: &'static str,
         detail: String,
     },
-    #[error(transparent)]
+    #[error("OpenCode V2 database: {0}; wt requires OpenCode 2.x and its current session schema")]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -118,7 +125,7 @@ pub struct OpenCodeActivityTracker {
 #[derive(Clone)]
 pub struct OpenCodeHarness {
     paths: OpenCodePaths,
-    _runner: ProcessRunner,
+    runner: ProcessRunner,
     tmux: TmuxClient,
 }
 
@@ -126,7 +133,7 @@ impl OpenCodeHarness {
     pub fn new(paths: OpenCodePaths, runner: ProcessRunner, tmux: TmuxClient) -> Self {
         Self {
             paths,
-            _runner: runner,
+            runner,
             tmux,
         }
     }
@@ -156,16 +163,22 @@ impl OpenCodeHarness {
         }
         let connection = open_readonly(&self.paths.database)?;
         let mut statement = connection.prepare(
-            "SELECT id, title, time_updated FROM session WHERE directory = ?1 AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 50",
+            "SELECT id, COALESCE(title, slug), time_updated FROM session_v2 WHERE directory = ?1 AND time_archived IS NULL AND parent_id IS NULL ORDER BY CASE WHEN id=?2 THEN 0 ELSE 1 END, time_updated DESC LIMIT 50",
         )?;
         let rows = statement
-            .query_map([request.worktree_path.to_string_lossy().as_ref()], |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    updated: row.get(2)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![
+                    request.worktree_path.to_string_lossy(),
+                    request.live_session_id
+                ],
+                |row| {
+                    Ok(SessionRow {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        updated: row.get(2)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         let names = reconcile_opencode_names(
             &self.paths,
@@ -180,7 +193,7 @@ impl OpenCodeHarness {
                     .cloned()
                     .unwrap_or_else(|| row.id.chars().take(8).collect());
                 let last = read_last_message(&connection, &row.id)?;
-                let state = derive_opencode_state(last.as_ref());
+                let state = session_state(&connection, &row.id)?;
                 Ok(HarnessSession {
                     display_name: opencode_display_title(Some(&row.title), &row.id)
                         .unwrap_or_else(|| managed.clone()),
@@ -227,9 +240,45 @@ impl OpenCodeHarness {
         if self.tmux.session_exists(&name, cancellation).await? {
             return Ok(false);
         }
-        let command = self.build_spawn_command(request);
+        let session_id = match &request.resume_session_id {
+            Some(id) => {
+                self.validate_session_sync(&request.worktree_path, id)?;
+                id.clone()
+            }
+            None => {
+                self.create_session(
+                    &request.worktree_path,
+                    request.display_label.as_deref(),
+                    cancellation,
+                )
+                .await?
+            }
+        };
+        // Serialize identity adoption across slots, not only starts of one slot.
+        // Hash the external ID rather than using it as a filesystem component.
+        let identity_key = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, session_id.as_bytes());
+        let _identity_lock = FileLock::acquire_async(
+            &self
+                .paths
+                .database
+                .with_file_name("wt-session-locks")
+                .join(format!("{identity_key}.lock")),
+            cancellation,
+        )
+        .await?;
+        self.validate_session_sync(&request.worktree_path, &session_id)?;
+        ensure_unique_owner(
+            &session_id,
+            &name,
+            &self.tmux.list_sessions(cancellation).await?,
+        )?;
+        self.reserve_owner(&session_id, &name, cancellation).await?;
+        let mut request = request.clone();
+        request.resume_session_id = Some(session_id.clone());
+        let command = self.build_spawn_command(&request);
+
         self.tmux
-            .create_session(
+            .create_session_with_options(
                 &CreateSession {
                     name,
                     cwd: request.worktree_path.clone(),
@@ -239,61 +288,335 @@ impl OpenCodeHarness {
                     width: None,
                     height: None,
                 },
+                &[("@wt-harness-session-id", session_id.as_str())],
                 cancellation,
             )
             .await?;
-        if let Some(session_id) = request.resume_session_id.as_deref() {
-            let _ = self
-                .tmux
-                .set_option(
-                    &OptionScope::Session(self.tmux_session_name(&request.slug)),
-                    "@wt-harness-session-id",
-                    Some(session_id),
-                    cancellation,
-                )
-                .await;
-        }
         Ok(true)
     }
 
-    pub async fn send_terminal(
+    // Called only while holding the database-wide session identity lock.
+    async fn reserve_owner(
         &self,
-        slug: &str,
-        text: &str,
-        cancellation: &CancellationToken,
+        id: &str,
+        slot: &str,
+        cancel: &CancellationToken,
     ) -> Result<(), OpenCodeError> {
-        if text.trim().is_empty() {
-            return Err(OpenCodeError::Operation {
-                operation: "send",
-                detail: "message is empty".into(),
-            });
+        let key = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, id.as_bytes());
+        let path = self
+            .paths
+            .database
+            .with_file_name("wt-session-locks")
+            .join(format!("{key}.json"));
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let owner: OpenCodeOwner = serde_json::from_slice(&bytes).map_err(|error| {
+                    operation_error(
+                        "resume",
+                        format!("invalid ownership record {}: {error}", path.display()),
+                    )
+                })?;
+                if owner.session_id != id || owner.version != 1 {
+                    return Err(operation_error(
+                        "resume",
+                        "unrecognized session ownership record",
+                    ));
+                }
+                if matches!(owner.socket, OwnerSocket::Name(_))
+                    && owner.tmux_tmpdir != std::env::var_os("TMUX_TMPDIR").map(PathBuf::from)
+                {
+                    return Err(operation_error(
+                        "resume",
+                        "the recorded tmux server uses a different TMUX_TMPDIR; its ownership cannot be confirmed",
+                    ));
+                }
+                let socket = match owner.socket {
+                    OwnerSocket::Name(name) => wt_tmux::TmuxSocket::Name(name),
+                    OwnerSocket::Path(path) => wt_tmux::TmuxSocket::Path(path),
+                };
+                let probe = TmuxClient::new(
+                    self.runner.clone(),
+                    wt_tmux::TmuxServer::new(socket).with_cwd(&self.paths.home),
+                );
+                if probe.session_exists(&owner.slot, cancel).await? {
+                    let live = probe
+                        .get_option(
+                            &OptionScope::Session(owner.slot.clone()),
+                            "@wt-harness-session-id",
+                            cancel,
+                        )
+                        .await?;
+                    let replaced = live.as_deref().is_some_and(|live| {
+                        live.starts_with("ses_") && live.len() > 4 && live != id
+                    });
+                    if !replaced {
+                        return Err(operation_error(
+                            "resume",
+                            format!(
+                                "session {id} still belongs to live or unconfirmed slot {} on its recorded tmux server",
+                                owner.slot
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        let name = self.tmux_session_name(slug);
-        let _lock = FileLock::acquire_async(
-            &self
-                .paths
-                .lock_dir
-                .join(format!("__opencode_send_{name}.lock")),
-            cancellation,
-        )
-        .await?;
-        if !self.tmux.session_exists(&name, cancellation).await? {
-            return Err(OpenCodeError::Operation {
-                operation: "send",
-                detail: format!("OpenCode slot {name} is not live"),
-            });
-        }
-        let target = PaneTarget::active_session_pane(&name);
-        self.tmux.send_literal(&target, text, cancellation).await?;
-        self.tmux
-            .send_keys(&target, &["Enter"], cancellation)
-            .await?;
+        let socket = match &self.tmux.server().socket {
+            wt_tmux::TmuxSocket::Name(name) => OwnerSocket::Name(name.clone()),
+            wt_tmux::TmuxSocket::Path(path) => OwnerSocket::Path(path.clone()),
+        };
+        let owner = OpenCodeOwner {
+            version: 1,
+            session_id: id.into(),
+            slot: slot.into(),
+            socket,
+            tmux_tmpdir: std::env::var_os("TMUX_TMPDIR").map(PathBuf::from),
+        };
+        // Write intent before starting tmux. A lost start reply cannot leave an
+        // unrecorded owner; a confirmed absent slot permits the next claimant.
+        atomic_write_json(
+            &path,
+            &serde_json::to_value(owner).map_err(io::Error::other)?,
+        )?;
         Ok(())
     }
 
-    /// Cold-start a slot when needed, wait for its first stable screen, then
-    /// paste once and submit once. This deliberately reports no completion
-    /// claim because OpenCode has no simple durable prompt receipt.
+    /// Native V2 API admission. Never paste text into an interactive prompt.
+    pub async fn api(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        session: Option<&str>,
+        body: Option<Value>,
+        cancel: &CancellationToken,
+    ) -> Result<Value, OpenCodeError> {
+        let mut command = CommandSpec::new("opencode")
+            .args(["api", operation])
+            .cwd(cwd);
+        if let Some(id) = session {
+            command = command.args(["--param", &format!("sessionID={id}")]);
+        }
+        if let Some(body) = body {
+            command = command.args(["--data", &body.to_string()]);
+        }
+        self.run_api_command(operation, command, cancel).await
+    }
+
+    async fn run_api_command(
+        &self,
+        operation: &str,
+        mut command: CommandSpec,
+        cancel: &CancellationToken,
+    ) -> Result<Value, OpenCodeError> {
+        command.output_limit = 2 * 1024 * 1024;
+        command.preserve_children_on_success = true;
+        let result = self
+            .runner
+            .run(command, cancel)
+            .await
+            .map_err(|e| operation_error("API", e.to_string()))?
+            .checked("opencode")
+            .map_err(|e| operation_error("API", e.to_string()))?;
+        let response: Value = serde_json::from_slice(&result.stdout).map_err(|e| {
+            operation_error(
+                "API",
+                format!("invalid V2 response: {e}; admission is unconfirmed, do not retry blindly"),
+            )
+        })?;
+        if response.get("data").is_none() {
+            return Err(operation_error(
+                "API",
+                format!(
+                    "{operation} returned no success envelope: {}",
+                    truncate_chars(&response.to_string(), 512)
+                ),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Pending approvals and forms are location-scoped in V2. The caller
+    /// batches this per distinct active checkout, never per historical session.
+    pub async fn pending_inputs(
+        &self,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<std::collections::BTreeSet<String>, OpenCodeError> {
+        let query = |operation| {
+            let command = CommandSpec::new("opencode")
+                .args([
+                    "api",
+                    operation,
+                    "--param",
+                    &format!("location[directory]={}", cwd.display()),
+                ])
+                .cwd(cwd);
+            self.run_api_command(operation, command, cancel)
+        };
+        let (permissions, forms) =
+            tokio::try_join!(query("permission.request.list"), query("form.list"))?;
+        let mut pending = std::collections::BTreeSet::new();
+        for response in [permissions, forms] {
+            if response
+                .pointer("/location/directory")
+                .and_then(Value::as_str)
+                != cwd.to_str()
+            {
+                return Err(operation_error(
+                    "pending inputs",
+                    "server returned a different location",
+                ));
+            }
+            let entries = response["data"]
+                .as_array()
+                .ok_or_else(|| operation_error("pending inputs", "invalid pending input list"))?;
+            for entry in entries {
+                let id = entry["sessionID"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        operation_error("pending inputs", "pending input has no session identity")
+                    })?;
+                pending.insert(id.to_owned());
+            }
+        }
+        Ok(pending)
+    }
+
+    pub async fn create_session(
+        &self,
+        cwd: &Path,
+        title: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<String, OpenCodeError> {
+        let id = format!("ses_{}", unique_id());
+        let body = serde_json::json!({"id": id, "title": title, "location": {"directory": cwd}});
+        let response = self
+            .api("session.create", cwd, None, Some(body), cancel)
+            .await;
+        match response {
+            Ok(reply) if reply.pointer("/data/id").and_then(Value::as_str) == Some(&id) => {}
+            result => {
+                // A reply can be lost after the server has committed creation.
+                // Recover this exact generated identity, not the newest row.
+                if self.validate_session_sync(cwd, &id).is_err() {
+                    let detail = result
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "server returned a different session identity".into());
+                    return Err(operation_error(
+                        "create",
+                        format!("{detail}; session {id} creation is unconfirmed"),
+                    ));
+                }
+            }
+        }
+
+        Ok(id)
+    }
+
+    pub fn validate_session_sync(&self, cwd: &Path, id: &str) -> Result<(), OpenCodeError> {
+        let conn = open_readonly(&self.paths.database)?;
+        let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id=?1 AND directory=?2 AND time_archived IS NULL AND parent_id IS NULL)", rusqlite::params![id,cwd.to_string_lossy()], |r| r.get(0))?;
+        if !valid {
+            return Err(operation_error(
+                "session",
+                "session identity does not belong to this checkout or is archived",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn live_identity(
+        &self,
+        slug: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, OpenCodeError> {
+        self.tmux
+            .get_option(
+                &OptionScope::Session(self.tmux_session_name(slug)),
+                "@wt-harness-session-id",
+                cancel,
+            )
+            .await?
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                operation_error(
+                    "session",
+                    "live slot has no proven OpenCode session identity; reopen it",
+                )
+            })
+    }
+
+    async fn submit(
+        &self,
+        id: &str,
+        cwd: &Path,
+        text: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), OpenCodeError> {
+        if text.trim().is_empty() {
+            return Err(operation_error("send", "message is empty"));
+        }
+        self.validate_session_sync(cwd, id)?;
+        let message_id = format!("msg_{}", unique_id());
+        let body = prompt_body(&message_id, text);
+        let result = self
+            .api("session.prompt", cwd, Some(id), Some(body), cancel)
+            .await;
+        match result {
+            Ok(reply) if reply.pointer("/data/id").and_then(Value::as_str) == Some(&message_id) => {
+            }
+            reply => {
+                // Admission and delivery are durable V2 facts. A lost reply is
+                // reconciled against this exact new identity, never resent.
+                let accepted = open_readonly(&self.paths.database)
+                    .and_then(|conn| prompt_is_recorded(&conn, id, &message_id));
+                if !matches!(accepted, Ok(true)) {
+                    let detail = match reply {
+                        Err(error) => error.to_string(),
+                        Ok(_) => "unexpected admission receipt".into(),
+                    };
+                    return Err(operation_error(
+                        "send",
+                        format!(
+                            "{detail}; message {message_id} admission is unconfirmed; do not resend blindly"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn compact(
+        &self,
+        slug: &str,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<(), OpenCodeError> {
+        let id = self.live_identity(slug, cancel).await?;
+        self.validate_session_sync(cwd, &id)?;
+        let message_id = format!("msg_{}", unique_id());
+        let reply = self.api(
+            "session.compact", cwd, Some(&id),
+            Some(serde_json::json!({"id": message_id, "delivery": "queue"})), cancel,
+        ).await.map_err(|error| operation_error("compact", format!("{error}; control {message_id} admission is unconfirmed; do not retry blindly")))?;
+        if reply.pointer("/data/id").and_then(Value::as_str) != Some(&message_id) {
+            return Err(operation_error(
+                "compact",
+                format!(
+                    "control {message_id} returned an unexpected receipt; admission is unconfirmed"
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
     pub async fn send_message(
         &self,
         slug: &str,
@@ -302,10 +625,7 @@ impl OpenCodeHarness {
         cancellation: &CancellationToken,
     ) -> Result<OpenCodeSendOutcome, OpenCodeError> {
         if text.trim().is_empty() {
-            return Err(OpenCodeError::Operation {
-                operation: "send",
-                detail: "message is empty".into(),
-            });
+            return Err(operation_error("send", "message is empty"));
         }
         let name = self.tmux_session_name(slug);
         let _lock = FileLock::acquire_async(
@@ -316,8 +636,8 @@ impl OpenCodeHarness {
         let cold_started = self
             .start(
                 &HarnessSpawnRequest {
-                    worktree_path: cwd.to_path_buf(),
-                    slug: slug.to_owned(),
+                    worktree_path: cwd.into(),
+                    slug: slug.into(),
                     managed_name: None,
                     resume_session_id: None,
                     display_label: None,
@@ -325,51 +645,26 @@ impl OpenCodeHarness {
                 cancellation,
             )
             .await?;
-        let target = PaneTarget::active_session_pane(&name);
-        if cold_started {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-            let mut previous: Option<String> = None;
-            loop {
-                if cancellation.is_cancelled() {
-                    return Err(OpenCodeError::Operation {
-                        operation: "send",
-                        detail: "cancelled while waiting for OpenCode startup".into(),
-                    });
-                }
-                let current = self
-                    .tmux
-                    .capture_pane(&target, Some(80), cancellation)
-                    .await?
-                    .trim()
-                    .to_owned();
-                if !current.is_empty() && previous.as_deref() == Some(current.as_str()) {
-                    break;
-                }
-                previous = Some(current);
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(OpenCodeError::Operation {
-                        operation: "send",
-                        detail: "OpenCode did not reach a stable startup screen".into(),
-                    });
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        } else {
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(OpenCodeError::Operation { operation: "send", detail: "cancelled before terminal submission".into() }),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => (),
-            }
-        }
-        if !self.tmux.session_exists(&name, cancellation).await? {
-            return Err(OpenCodeError::Operation {
-                operation: "send",
-                detail: "OpenCode slot exited before terminal submission".into(),
-            });
-        }
-        self.tmux.send_literal(&target, text, cancellation).await?;
-        self.tmux
-            .send_keys(&target, &["Enter"], cancellation)
+        let id = self.live_identity(slug, cancellation).await?;
+        self.validate_session_sync(cwd, &id)?;
+        if text.trim() == "/compact" || text.trim_start().starts_with("/compact ") {
+            // V2 has no custom compaction prompt. Match the native Codex path:
+            // execute the compaction control, never submit its suffix as a turn.
+            self.compact(slug, cwd, cancellation).await?;
+        } else if text.trim_start().starts_with('/') {
+            let input = text.trim_start().trim_start_matches('/');
+            let (name, arguments) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+            self.api(
+                "session.command",
+                cwd,
+                Some(&id),
+                Some(serde_json::json!({"name":name,"text":arguments,"delivery":"queue"})),
+                cancellation,
+            )
             .await?;
+        } else {
+            self.submit(&id, cwd, text, cancellation).await?;
+        }
         Ok(OpenCodeSendOutcome { cold_started })
     }
 
@@ -380,7 +675,7 @@ impl OpenCodeHarness {
         let connection = open_readonly(&self.paths.database)?;
         let cost_for = |after: i64| -> Result<f64, rusqlite::Error> {
             connection.query_row(
-                "SELECT COALESCE(SUM(CAST(json_extract(data, '$.cost') AS REAL)), 0) FROM message WHERE json_extract(data, '$.role') = 'assistant' AND time_created > ?1",
+                "SELECT COALESCE(SUM(CAST(json_extract(data, '$.cost') AS REAL)), 0) FROM session_message WHERE type = 'assistant' AND time_created > ?1",
                 [after], |row| row.get(0),
             )
         };
@@ -601,7 +896,7 @@ fn open_readonly(path: &Path) -> Result<Connection, rusqlite::Error> {
 }
 
 fn list_sessions(conn: &Connection, cwd: &Path) -> Result<Vec<SessionRow>, rusqlite::Error> {
-    let mut statement = conn.prepare("SELECT id, title, time_updated FROM session WHERE directory = ?1 AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 50")?;
+    let mut statement = conn.prepare("SELECT id, COALESCE(title, slug), time_updated FROM session_v2 WHERE directory = ?1 AND time_archived IS NULL AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 50")?;
     statement
         .query_map([cwd.to_string_lossy().as_ref()], |row| {
             Ok(SessionRow {
@@ -614,16 +909,13 @@ fn list_sessions(conn: &Connection, cwd: &Path) -> Result<Vec<SessionRow>, rusql
 }
 
 fn read_last_message(conn: &Connection, id: &str) -> Result<Option<MessageRow>, rusqlite::Error> {
-    conn.query_row("SELECT id, data, time_created, time_updated FROM message WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1", [id], |row| {
-        let data: String = row.get(1)?;
-        let json = serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);
-        Ok(MessageRow { id: row.get(0)?, role: json.get("role").and_then(Value::as_str).map(str::to_owned),
-            completed: json.pointer("/time/completed").and_then(Value::as_i64), time_created: row.get(2)?, time_updated: row.get(3)? })
+    conn.query_row("SELECT id,json_extract(data,'$.time.completed'),time_created,time_updated,type FROM session_message WHERE session_id=?1 AND type IN ('user','assistant') ORDER BY seq DESC LIMIT 1", [id], |row| {
+        Ok(MessageRow { id: row.get(0)?, completed: row.get(1)?, time_created: row.get(2)?, time_updated: row.get(3)?, role: row.get(4)? })
     }).optional()
 }
 
 fn read_user_text(conn: &Connection, id: &str) -> Result<Option<String>, rusqlite::Error> {
-    conn.query_row("SELECT json_extract(data, '$.text') FROM part WHERE message_id = ?1 AND json_extract(data, '$.type') = 'text' ORDER BY time_created ASC LIMIT 1", [id], |row| row.get(0)).optional()
+    conn.query_row("SELECT substr(json_extract(data, '$.text'),1,4096) FROM session_message WHERE id=?1 AND type='user'", [id], |r| r.get(0)).optional()
 }
 
 fn read_new_parts(
@@ -631,31 +923,127 @@ fn read_new_parts(
     session: &str,
     after: i64,
 ) -> Result<Vec<PartRow>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT id, data FROM part WHERE session_id = ?1 AND time_created > ?2 ORDER BY time_created ASC")?;
-    stmt.query_map((session, after), |row| {
-        let data: Option<String> = row.get(1)?;
-        let json = data
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .unwrap_or(Value::Null);
-        Ok(PartRow {
-            id: row.get(0)?,
-            kind: json.get("type").and_then(Value::as_str).map(str::to_owned),
-            data,
-        })
-    })?
-    .collect()
+    let mut statement = conn.prepare("SELECT m.id || ':' || j.key, j.value FROM session_message m, json_each(m.data, '$.content') j WHERE m.session_id=?1 AND m.time_created>=?2 AND json_extract(j.value,'$.type')='tool' ORDER BY m.seq,j.key LIMIT 256")?;
+    statement
+        .query_map((session, after), |r| {
+            Ok(PartRow {
+                id: r.get(0)?,
+                kind: Some("tool".into()),
+                data: r.get(1)?,
+            })
+        })?
+        .collect()
 }
 
-fn derive_opencode_state(row: Option<&MessageRow>) -> Option<crate::DerivedState> {
-    match row.and_then(|r| r.role.as_deref()) {
-        Some("assistant") if row.is_some_and(|r| r.completed.is_none()) => {
-            Some(crate::DerivedState::Working)
-        }
-        Some("assistant") => Some(crate::DerivedState::Waiting),
-        Some("user") => Some(crate::DerivedState::Working),
-        _ => None,
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum OwnerSocket {
+    Name(String),
+    Path(PathBuf),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OpenCodeOwner {
+    version: u8,
+    session_id: String,
+    slot: String,
+    socket: OwnerSocket,
+    tmux_tmpdir: Option<PathBuf>,
+}
+
+fn ensure_unique_owner(
+    id: &str,
+    target: &str,
+    sessions: &[wt_tmux::SessionInfo],
+) -> Result<(), OpenCodeError> {
+    if let Some(owner) = sessions
+        .iter()
+        .find(|session| session.name != target && session.harness_session_id.as_deref() == Some(id))
+    {
+        return Err(operation_error(
+            "resume",
+            format!(
+                "session {id} already belongs to live slot {}; attach there or start a new session",
+                owner.name
+            ),
+        ));
     }
+    Ok(())
+}
+
+fn prompt_body(id: &str, text: &str) -> Value {
+    let mut body = serde_json::json!({"id":id,"text":text,"delivery":"queue"});
+    let command = text.trim_start();
+    let command = command
+        .strip_prefix("[re: ")
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(command, |(_, command)| command.trim_start());
+    if let Some(token) = command
+        .strip_prefix('@')
+        .and_then(|text| text.split_whitespace().next())
+        && !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        body["skills"] = serde_json::json!([{"id":token}]);
+    }
+    body
+}
+
+fn prompt_is_recorded(
+    conn: &Connection,
+    session: &str,
+    message: &str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM session_inbox WHERE id=?1 AND session_id=?2 AND type='user' UNION ALL SELECT 1 FROM session_message WHERE id=?1 AND session_id=?2 AND type='user')", (message,session), |row| row.get(0))
+}
+
+fn unique_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = format!(
+        "{}:{:?}:{}",
+        std::process::id(),
+        std::time::SystemTime::now(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, nonce.as_bytes())
+        .simple()
+        .to_string()
+}
+
+fn operation_error(operation: &'static str, detail: impl Into<String>) -> OpenCodeError {
+    OpenCodeError::Operation {
+        operation,
+        detail: detail.into(),
+    }
+}
+
+fn session_state(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<crate::DerivedState>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT time_idle,time_compacting,idle_outcome,time_suspended FROM session_v2 WHERE id=?1",
+        [id],
+        |r| {
+            let idle: Option<i64> = r.get(0)?;
+            let compacting: Option<i64> = r.get(1)?;
+            let outcome: Option<String> = r.get(2)?;
+            let suspended: Option<i64> = r.get(3)?;
+            Ok(Some(if suspended.is_some() {
+                crate::DerivedState::Unknown
+            } else if idle.is_some() && compacting.is_none() {
+                if outcome.as_deref() == Some("failed") {
+                    crate::DerivedState::Asking
+                } else {
+                    crate::DerivedState::Waiting
+                }
+            } else {
+                crate::DerivedState::Working
+            }))
+        },
+    )
 }
 
 pub fn opencode_display_title(title: Option<&str>, session_id: &str) -> Option<String> {
@@ -769,118 +1157,210 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::num::NonZeroUsize;
-    use wt_platform::process::ProcessRunner;
-    use wt_tmux::{TmuxServer, TmuxSocket};
-
-    fn harness(paths: OpenCodePaths, scratch: &Path) -> OpenCodeHarness {
-        let runner = ProcessRunner::new(NonZeroUsize::new(2).unwrap());
-        let tmux = TmuxClient::new(
-            runner.clone(),
-            TmuxServer::new(TmuxSocket::Path(scratch.join("tmux.sock"))),
-        );
-        OpenCodeHarness::new(paths, runner, tmux)
-    }
-
-    fn create_db(path: &Path) -> Connection {
-        let conn = Connection::open(path).unwrap();
-        conn.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_updated INTEGER, time_archived INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER, time_updated INTEGER); CREATE TABLE part(id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER);").unwrap();
-        conn
-    }
-
-    #[test]
-    fn discovery_reads_only_unarchived_sessions_for_exact_directory_and_keeps_name_extensions() {
+    pub(super) fn fixture() -> (tempfile::TempDir, OpenCodeHarness, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let paths = OpenCodePaths::new(dir.path(), dir.path().join("cache"))
             .with_database(dir.path().join("opencode.db"));
-        fs::create_dir_all(&paths.cache_dir).unwrap();
-        let conn = create_db(&paths.database);
-        conn.execute("INSERT INTO session VALUES ('ses_one','Useful title','/repo/a',100,NULL), ('ses_old','Archived','/repo/a',200,1), ('ses_other','Wrong cwd','/repo/b',300,NULL)", []).unwrap();
-        conn.execute("INSERT INTO message VALUES ('msg_one','ses_one','{\"role\":\"assistant\",\"time\":{\"completed\":90}}',80,95)", []).unwrap();
-        drop(conn);
-        fs::write(
-            paths.names_file(),
-            r#"{"slug":{"future":7},"other":{"keep":"yes"}}"#,
-        )
-        .unwrap();
-        let service = harness(paths.clone(), dir.path());
-        let found = service
+        let db = Connection::open(&paths.database).unwrap();
+        db.execute_batch("CREATE TABLE session_v2(id TEXT PRIMARY KEY,slug TEXT,title TEXT,directory TEXT,parent_id TEXT,time_updated INTEGER,time_archived INTEGER,time_idle INTEGER,time_compacting INTEGER,idle_outcome TEXT,time_suspended INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,time_updated INTEGER,data TEXT);").unwrap();
+        let runner = ProcessRunner::new(NonZeroUsize::new(2).unwrap());
+        let tmux = TmuxClient::new(runner.clone(), wt_tmux::TmuxServer::named("oc-v2-fixture"));
+        (dir, OpenCodeHarness::new(paths, runner, tmux), db)
+    }
+    #[test]
+    fn v2_discovery_uses_exact_checkout_root_sessions_and_idle_projection() {
+        let (_dir, harness, db) = fixture();
+        db.execute_batch("INSERT INTO session_v2(id,slug,title,directory,parent_id,time_updated,time_archived,time_idle,time_compacting) VALUES ('ses_a','a','A','/repo',NULL,10,NULL,10,NULL),('ses_child','c','child','/repo','ses_a',20,NULL,NULL,NULL),('ses_other','o','Other','/else',NULL,30,NULL,NULL,NULL),('ses_archived','z','Old','/repo',NULL,40,40,NULL,NULL);").unwrap();
+        let found = harness
             .discover_sync(&DiscoveryRequest {
-                slug: "slug".into(),
-                worktree_path: "/repo/a".into(),
+                slug: "r".into(),
+                worktree_path: "/repo".into(),
                 live_session_id: None,
             })
             .unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].session_id, "ses_one");
-        assert_eq!(found[0].display_name, "Useful title");
+        assert_eq!(found[0].session_id, "ses_a");
         assert_eq!(
             found[0].extras.derived_state,
             Some(crate::DerivedState::Waiting)
         );
-        let names: Value = serde_json::from_slice(&fs::read(paths.names_file()).unwrap()).unwrap();
-        assert_eq!(names["slug"]["future"], 7);
-        assert_eq!(names["other"]["keep"], "yes");
-    }
-
-    #[test]
-    fn baseline_activity_is_silent_then_reports_new_prompt_and_tool_without_repeating() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = OpenCodePaths::new(dir.path(), dir.path().join("cache"))
-            .with_database(dir.path().join("opencode.db"));
-        let conn = create_db(&paths.database);
-        conn.execute(
-            "INSERT INTO session VALUES ('ses_a','A','/repo',10,NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute("INSERT INTO message VALUES ('m0','ses_a','{\"role\":\"assistant\",\"time\":{\"completed\":9}}',8,9)", []).unwrap();
-        drop(conn);
-        let service = harness(paths.clone(), dir.path());
-        let active = vec![("slug".to_owned(), PathBuf::from("/repo"))];
-        let mut tracker = OpenCodeActivityTracker::default();
         assert!(
-            !service
-                .poll_activity(&mut tracker, &active)
-                .unwrap()
-                .changed
+            harness
+                .validate_session_sync(Path::new("/else"), "ses_a")
+                .is_err()
         );
-        let conn = Connection::open(&paths.database).unwrap();
-        conn.execute(
-            "INSERT INTO message VALUES ('m1','ses_a','{\"role\":\"user\"}',11,11)",
-            [],
-        )
-        .unwrap();
-        conn.execute("INSERT INTO part VALUES ('p1','ses_a','m1','{\"type\":\"text\",\"text\":\"hello\"}',12), ('p2','ses_a','m1','{\"type\":\"tool\",\"tool\":\"Read\"}',13)", []).unwrap();
-        drop(conn);
-        let batch = service.poll_activity(&mut tracker, &active).unwrap();
-        assert!(batch.changed);
         assert!(
-            batch
-                .events
-                .iter()
-                .any(|e| e.text.contains("hello") && e.changed)
+            harness
+                .validate_session_sync(Path::new("/repo"), "ses_child")
+                .is_err()
         );
-        assert!(batch.events.iter().any(|e| e.text.contains("tool: Read")));
-        let empty = service.poll_activity(&mut tracker, &active).unwrap();
-        assert!(!empty.changed);
-        assert!(empty.events.is_empty());
+        assert!(
+            harness
+                .validate_session_sync(Path::new("/repo"), "ses_archived")
+                .is_err()
+        );
+        assert!(
+            harness
+                .validate_session_sync(Path::new("/repo"), "ses_a")
+                .is_ok()
+        );
     }
-
     #[test]
-    fn cost_queries_are_read_only_and_use_assistant_cost_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = OpenCodePaths::new(dir.path(), dir.path().join("cache"))
-            .with_database(dir.path().join("opencode.db"));
-        let conn = create_db(&paths.database);
-        conn.execute("INSERT INTO session VALUES ('s','S','/repo',1,NULL)", [])
+    fn v2_cost_reads_assistant_messages_only() {
+        let (_dir, harness, db) = fixture();
+        db.execute_batch("INSERT INTO session_message VALUES ('msg_a','ses_a','assistant',1,100,100,'{\"cost\":1.5}'),('msg_u','ses_a','user',2,100,100,'{\"cost\":99}');").unwrap();
+        assert_eq!(harness.cost(200).unwrap().unwrap().five_hour, 1.5);
+    }
+    #[test]
+    fn prompt_receipt_reconciliation_requires_exact_session_message_and_type() {
+        let (_dir, _harness, db) = fixture();
+        db.execute_batch("CREATE TABLE session_inbox(id TEXT,session_id TEXT,type TEXT); INSERT INTO session_inbox VALUES ('msg_pending','ses_a','user'); INSERT INTO session_message VALUES ('msg_done','ses_a','user',1,1,1,'{}'),('msg_tool','ses_a','assistant',2,2,2,'{}');").unwrap();
+        assert!(prompt_is_recorded(&db, "ses_a", "msg_pending").unwrap());
+        assert!(prompt_is_recorded(&db, "ses_a", "msg_done").unwrap());
+        assert!(!prompt_is_recorded(&db, "ses_other", "msg_pending").unwrap());
+        assert!(!prompt_is_recorded(&db, "ses_a", "msg_tool").unwrap());
+        assert!(!prompt_is_recorded(&db, "ses_a", "msg_absent").unwrap());
+    }
+    #[test]
+    fn native_skill_invocations_attach_only_explicit_leading_skill_names() {
+        assert_eq!(
+            prompt_body("msg_a", "@start do the task")["skills"][0]["id"],
+            "start"
+        );
+        assert_eq!(
+            prompt_body("msg_a", "[re: task-1] @start do the task")["skills"][0]["id"],
+            "start"
+        );
+        assert_eq!(
+            prompt_body("msg_a", " @cz-test")["skills"][0]["id"],
+            "cz-test"
+        );
+        assert!(prompt_body("msg_a", "Ask @someone").get("skills").is_none());
+        assert!(
+            prompt_body("msg_a", "@someone@example.org")
+                .get("skills")
+                .is_none()
+        );
+    }
+    #[test]
+    fn same_checkout_does_not_authorize_adopting_another_live_slot_identity() {
+        let sessions = vec![wt_tmux::SessionInfo {
+            name: "manager-opencode".into(),
+            id: "$1".into(),
+            created_at: 1,
+            attached_clients: 0,
+            window_count: 1,
+            harness_session_id: Some("ses_manager".into()),
+        }];
+        assert!(ensure_unique_owner("ses_manager", "main-opencode", &sessions).is_err());
+        assert!(ensure_unique_owner("ses_new", "main-opencode", &sessions).is_ok());
+        assert!(ensure_unique_owner("ses_manager", "manager-opencode", &sessions).is_ok());
+    }
+    #[test]
+    fn failed_and_suspended_native_sessions_do_not_look_busy_or_successful() {
+        let (_dir, _harness, db) = fixture();
+        db.execute("INSERT INTO session_v2(id,slug,directory,time_idle,idle_outcome) VALUES ('ses_a','a','/repo',10,'failed')",[]).unwrap();
+        assert_eq!(
+            session_state(&db, "ses_a").unwrap(),
+            Some(crate::DerivedState::Asking)
+        );
+        db.execute("UPDATE session_v2 SET time_suspended=11", [])
             .unwrap();
-        conn.execute("INSERT INTO message VALUES ('a','s','{\"role\":\"assistant\",\"cost\":1.25}',1000,1000), ('u','s','{\"role\":\"user\",\"cost\":99}',1000,1000)", []).unwrap();
-        drop(conn);
-        let service = harness(paths, dir.path());
-        let cost = service.cost(2000).unwrap().unwrap();
-        assert_eq!(cost.five_hour, 1.25);
-        assert_eq!(cost.seven_day, 1.25);
+        assert_eq!(
+            session_state(&db, "ses_a").unwrap(),
+            Some(crate::DerivedState::Unknown)
+        );
+        db.execute(
+            "UPDATE session_v2 SET time_suspended=NULL,idle_outcome='interrupted'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            session_state(&db, "ses_a").unwrap(),
+            Some(crate::DerivedState::Waiting)
+        );
+    }
+    #[tokio::test]
+    async fn durable_owner_prevents_cross_server_adoption_until_original_slot_is_absent() {
+        let (dir, base, _db) = fixture();
+        let cancel = CancellationToken::new();
+        let make = |name: &str| {
+            let tmux = TmuxClient::new(
+                base.runner.clone(),
+                wt_tmux::TmuxServer::at(dir.path().join(name)).with_config_file("/dev/null"),
+            );
+            OpenCodeHarness::new(base.paths.clone(), base.runner.clone(), tmux)
+        };
+        let first = make("first.sock");
+        let second = make("second.sock");
+        let outcome = async {
+            first
+                .reserve_owner("ses_owner", "manager-opencode", &cancel)
+                .await?;
+            first
+                .tmux
+                .create_session_with_options(
+                    &CreateSession {
+                        name: "manager-opencode".into(),
+                        cwd: dir.path().into(),
+                        command: vec!["sleep".into(), "60".into()],
+                        width: None,
+                        height: None,
+                    },
+                    &[("@wt-harness-session-id", "ses_owner")],
+                    &cancel,
+                )
+                .await?;
+            let denied = second
+                .reserve_owner("ses_owner", "main-opencode", &cancel)
+                .await;
+            if denied.is_ok() {
+                return Err(operation_error(
+                    "test",
+                    "second server adopted a live identity",
+                ));
+            }
+            first
+                .tmux
+                .set_option(
+                    &OptionScope::Session("manager-opencode".into()),
+                    "@wt-harness-session-id",
+                    None,
+                    &cancel,
+                )
+                .await?;
+            if second
+                .reserve_owner("ses_owner", "main-opencode", &cancel)
+                .await
+                .is_ok()
+            {
+                return Err(operation_error(
+                    "test",
+                    "unknown owner identity was overwritten",
+                ));
+            }
+            first
+                .tmux
+                .set_option(
+                    &OptionScope::Session("manager-opencode".into()),
+                    "@wt-harness-session-id",
+                    Some("ses_replacement"),
+                    &cancel,
+                )
+                .await?;
+            second
+                .reserve_owner("ses_owner", "main-opencode", &cancel)
+                .await?;
+            // The second recorded intent has no slot: reclaim confirmed absence.
+            first
+                .reserve_owner("ses_owner", "other-opencode", &cancel)
+                .await?;
+            Ok::<_, OpenCodeError>(())
+        }
+        .await;
+        let _ = first.tmux.kill_server(&cancel).await;
+        let _ = second.tmux.kill_server(&cancel).await;
+        outcome.unwrap();
     }
 }

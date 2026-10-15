@@ -641,7 +641,11 @@ configured coding-agent harness's non-interactive CLI using its existing
 authentication; wt does not require or call a separate model API. Runs are
 serialized, short-lived, and read-only. Codex runs ephemerally without project
 rules, Claude disables tools and session persistence, and OpenCode uses its
-isolated `--pure` mode. Pi uses ephemeral print mode with all tools, MCP, project context, skills and prompt templates disabled.
+V2 stateless text-generation API without session creation or tool execution.
+Pi uses ephemeral print mode with all tools, MCP, project context, skills and prompt templates disabled.
+OpenCode model overrides use `provider/model#variant`; an explicit variant wins
+over `reasoning_effort`. Without an override, OpenCode uses its configured model
+and variant. See [OpenCode sessions](opencode.md).
 
 ```toml
 [naming]

@@ -669,6 +669,19 @@ exit "$wt_terminal_status""#;
         session: &CreateSession,
         cancellation: &CancellationToken,
     ) -> Result<(), TmuxError> {
+        self.create_session_with_options(session, &[], cancellation)
+            .await
+    }
+
+    /// Create and stamp a slot in one server command queue. Cancellation or a
+    /// lost client reply cannot leave a successfully created slot waiting for
+    /// a second client request to record its ownership.
+    pub async fn create_session_with_options(
+        &self,
+        session: &CreateSession,
+        options: &[(&str, &str)],
+        cancellation: &CancellationToken,
+    ) -> Result<(), TmuxError> {
         let args = self.create_session_args(session);
         let prefix_len = self.prefix_args().len();
         // tmux's client command frame is bounded. Managed PATH and other
@@ -677,7 +690,16 @@ exit "$wt_terminal_status""#;
         // instead; tmux retains the same environment and pane command for
         // respawn. start-server also supports the first session on a cold
         // socket. This is one mutation, never an automatic retry.
-        let command = tmux_command_source(&args[prefix_len..]);
+        let mut command = tmux_command_source(&args[prefix_len..]);
+        for (key, value) in options {
+            command.extend(tmux_command_source(&[
+                "set-option".into(),
+                "-t".into(),
+                exact_pane_target(&session.name).into(),
+                (*key).into(),
+                (*value).into(),
+            ]));
+        }
         let result = self
             .run_os(
                 "new-session",

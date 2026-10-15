@@ -53,3 +53,10 @@ to the binary to exercise. `scripts/fixture.sh probe` opens it in a private tmux
 session; `scripts/fixture.sh rm` removes that fixture. `scripts/tui-test.sh`
 also supports explicit native binary probes; without the fixture's isolated
 configuration, treat a probe as read-only.
+
+With OpenCode 2.0.29 installed, run
+`python3 scripts/native-opencode-check.py --binary target/debug/wt --output /tmp/wt-opencode-validation`
+for native messaging, skill expansion, stateless generation, compaction, F12,
+picker/resume identity, manager isolation, and scoped removal. It uses a private
+HOME, tmux server, OpenCode service port and loopback model; it does not use
+personal provider credentials or conversations.

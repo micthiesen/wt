@@ -610,7 +610,8 @@ fn harness_kind(id: HarnessId) -> ActionHarness {
 fn skill_prefix(id: HarnessId) -> &'static str {
     match id {
         HarnessId::Claude => "/",
-        HarnessId::Codex | HarnessId::Opencode => "$",
+        HarnessId::Codex => "$",
+        HarnessId::Opencode => "@",
         HarnessId::Pi => "/skill:",
     }
 }

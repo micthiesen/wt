@@ -525,48 +525,37 @@ fn update_watches(
     // Apply the whole inventory in one transaction so fleet size does not
     // multiply stream teardown and leave long registration gaps.
     let started = std::time::Instant::now();
-    let mut changes = watcher.paths_mut();
-    let obsolete: Vec<_> = registered
-        .iter()
-        .filter_map(|(path, recursive)| {
-            (desired.get(path) != Some(recursive)).then_some(path.clone())
-        })
-        .collect();
-    for path in obsolete {
-        if cancellation.is_cancelled() {
-            drop(changes);
-            return (watcher, registered, true);
-        }
-        if let Err(error) = changes.remove(&path) {
-            tracing::debug!(%error, path = %path.display(), "unwatch removed path");
-        }
-        registered.remove(&path);
-    }
-    for (path, recursive) in desired {
-        if cancellation.is_cancelled() {
-            drop(changes);
-            return (watcher, registered, true);
-        }
-        if registered.contains_key(&path) {
-            continue;
-        }
-        let mode = if recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        };
-        match changes.add(&path, mode) {
-            Ok(()) => {
-                registered.insert(path, recursive);
-            }
-            Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "cannot watch path; refresh backstop remains active")
-            }
+    let mut changes = Vec::new();
+    for (path, recursive) in &registered {
+        if desired.get(path) != Some(recursive) {
+            changes.push(notify::PathOp::unwatch(path.clone()));
         }
     }
-    if let Err(error) = changes.commit() {
-        tracing::warn!(%error, "cannot apply filesystem watches; reconciliation will retry");
-        registered.clear();
+    for (path, recursive) in &desired {
+        if registered.get(path) != Some(recursive) {
+            changes.push(if *recursive {
+                notify::PathOp::watch_recursive(path.clone())
+            } else {
+                notify::PathOp::watch_non_recursive(path.clone())
+            });
+        }
+    }
+    if cancellation.is_cancelled() {
+        return (watcher, registered, true);
+    }
+    match watcher.update_paths(changes) {
+        Ok(()) => registered = desired,
+        Err(error) => {
+            tracing::warn!(%error, "cannot apply filesystem watches; reconciliation will retry");
+            // A batch may apply only its prefix. Never record unattempted
+            // operations as successful, or forget watches that still exist.
+            registered = watcher.watched_paths().map(|paths| paths.into_iter().map(|(path, mode)| {
+                (path, mode == RecursiveMode::Recursive)
+            }).collect()).unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot inspect filesystem watches; reconciliation will retry");
+                BTreeMap::new()
+            });
+        }
     }
     tracing::debug!(
         paths = registered.len(),
@@ -652,6 +641,112 @@ fn is_state_db_path(path: &Path, state_db: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_watches_do_not_depend_on_the_fsevents_service() {
+        assert_eq!(RecommendedWatcher::kind(), notify::WatcherKind::Kqueue);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nonrecursive_checkout_watch_never_adopts_existing_generated_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let generated = root.join("node_modules/package/deep");
+        std::fs::create_dir_all(&generated).unwrap();
+        let deep_file = generated.join("file.js");
+        std::fs::write(&deep_file, "before").unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(send).unwrap();
+        watcher.watch(&root, RecursiveMode::NonRecursive).unwrap();
+        // Two directory changes let the backend finish handling the first
+        // before the deep write. Notify 8.2 guessed an existing child here and
+        // recursively adopted it, despite the root's NonRecursive contract.
+        for index in 0..2 {
+            std::fs::write(root.join(format!("new-{index}")), "new").unwrap();
+            receive
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+        }
+        while receive.try_recv().is_ok() {}
+        std::fs::write(&deep_file, "after").unwrap();
+        assert!(
+            matches!(
+                receive.recv_timeout(Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a shallow checkout watch must not open/watch generated descendants"
+        );
+        drop(watcher);
+    }
+
+    #[test]
+    fn partial_watch_batch_tracks_only_registered_paths_and_reconciles() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let first = root.join("a-existing");
+        let missing = root.join("b-missing");
+        let last = root.join("c-existing");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&last).unwrap();
+        let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let desired = BTreeMap::from([
+            (first.clone(), false),
+            (missing.clone(), false),
+            (last.clone(), false),
+        ]);
+        let (watcher, registered, cancelled) =
+            update_watches(watcher, BTreeMap::new(), desired, &cancel);
+        assert!(!cancelled);
+        assert_eq!(registered, BTreeMap::from([(first.clone(), false)]));
+        std::fs::create_dir(&missing).unwrap();
+        let desired = BTreeMap::from([(missing.clone(), false), (last.clone(), true)]);
+        let (watcher, registered, cancelled) =
+            update_watches(watcher, registered, desired.clone(), &cancel);
+        assert!(!cancelled);
+        assert_eq!(registered, desired);
+        cancel.cancel();
+        let (watcher, registered, cancelled) =
+            update_watches(watcher, registered, BTreeMap::new(), &cancel);
+        assert!(cancelled);
+        assert_eq!(registered, desired);
+        drop(watcher);
+    }
+
+    #[tokio::test]
+    async fn rapid_native_watch_reconfiguration_and_drop_stays_bounded() {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            tasks.spawn_blocking(|| {
+                let root = tempfile::tempdir().unwrap();
+                let root = std::fs::canonicalize(root.path()).unwrap();
+                for _ in 0..2 {
+                    let mut watcher =
+                        notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+                    watcher
+                        .update_paths(vec![notify::PathOp::watch_non_recursive(root.clone())])
+                        .unwrap();
+                    watcher
+                        .update_paths(vec![notify::PathOp::unwatch(root.clone())])
+                        .unwrap();
+                    watcher
+                        .update_paths(vec![notify::PathOp::watch_non_recursive(root.clone())])
+                        .unwrap();
+                    drop(watcher);
+                }
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("rapid native watcher replacement and teardown must drain");
+    }
 
     #[test]
     fn delayed_native_events_do_not_repeat_an_observed_file_invalidation() {

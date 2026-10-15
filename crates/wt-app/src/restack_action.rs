@@ -307,7 +307,8 @@ fn worker_command(executable: &std::path::Path, branch: &str) -> Vec<String> {
 fn conflict_handoff_text(harness: wt_core::HarnessId, detail: &str, backup_ref: &str) -> String {
     let prefix = match harness {
         wt_core::HarnessId::Claude => "/",
-        wt_core::HarnessId::Codex | wt_core::HarnessId::Opencode => "$",
+        wt_core::HarnessId::Codex => "$",
+        wt_core::HarnessId::Opencode => "@",
         wt_core::HarnessId::Pi => "/skill:",
     };
     format!(

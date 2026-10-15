@@ -272,7 +272,11 @@ fn is_harness_command(text: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
     }
-    let Some(command) = first.strip_prefix('/').or_else(|| first.strip_prefix('$')) else {
+    let Some(command) = first
+        .strip_prefix('/')
+        .or_else(|| first.strip_prefix('$'))
+        .or_else(|| first.strip_prefix('@'))
+    else {
         return false;
     };
     !command.is_empty()
@@ -293,6 +297,8 @@ mod tests {
     fn sender_tagging_preserves_commands_and_existing_attribution() {
         assert!(is_harness_command("  /compact"));
         assert!(is_harness_command("$start now"));
+        assert!(is_harness_command("@start now"));
+        assert_eq!(stamp_sender("@start now", Some("manager")), "@start now");
         assert!(is_harness_command("/skill:start now"));
         assert_eq!(
             stamp_sender("/skill:start now", Some("manager")),

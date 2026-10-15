@@ -235,19 +235,12 @@ fn start_with_watcher(
             )?;
             // notify filters FSEvents with canonical paths; register that same
             // spelling so aliases such as /tmp do not lose log notifications.
-            let mut paths = watcher.paths_mut();
-            paths.add(
-                &std::fs::canonicalize(&manager_dir)?,
-                notify::RecursiveMode::NonRecursive,
-            )?;
-            paths.add(
-                &std::fs::canonicalize(&watched_log_dir)?,
-                notify::RecursiveMode::NonRecursive,
-            )?;
+            let paths = vec![
+                notify::PathOp::watch_non_recursive(std::fs::canonicalize(&manager_dir)?),
+                notify::PathOp::watch_non_recursive(std::fs::canonicalize(&watched_log_dir)?),
+            ];
             if !setup_cancel.is_cancelled() {
-                paths.commit()?;
-            } else {
-                drop(paths);
+                watcher.update_paths(paths)?;
             }
             #[cfg(test)]
             if let Some((entered, release)) = setup_gate {

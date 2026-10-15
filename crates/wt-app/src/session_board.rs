@@ -160,11 +160,37 @@ fn compose(
                         .harness_session_ids
                         .contains_key(&session.tmux_session_name)
             });
-        let state = if !inventory_ok || !discoveries_ok || identity_unproven {
+        let mut state = if !inventory_ok || !discoveries_ok || identity_unproven {
             "unknown"
         } else {
             state_name(session.extras.derived_state)
         };
+        if live
+            && !identity_unproven
+            && let Some(inputs) = activity.data()
+        {
+            state = opencode_input_state(inputs, &entry.key, state);
+            if entry.key.harness == wt_core::HarnessId::Opencode {
+                if let Some(slots) = board.live_slots.get_mut(&entry.key.slug) {
+                    for slot in slots.iter_mut().filter(|slot| slot.harness == "OpenCode") {
+                        slot.state = state.into();
+                    }
+                }
+                if let Some(row) = board
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.host.is_none() && row.slug == entry.key.slug)
+                {
+                    for slot in row
+                        .live_sessions
+                        .iter_mut()
+                        .filter(|slot| slot.harness == "OpenCode")
+                    {
+                        slot.state = state.into();
+                    }
+                }
+            }
+        }
         let output = activity
             .data()
             .and_then(|data| data.tails.iter().find(|tail| tail.key == entry.key))
@@ -372,6 +398,28 @@ fn usage_item(
     })
 }
 
+fn opencode_input_state<'a>(
+    activity: &crate::session_activity::SessionActivitySnapshot,
+    key: &crate::session_source::SessionKey,
+    observed: &'a str,
+) -> &'a str {
+    if key.harness != wt_core::HarnessId::Opencode {
+        return observed;
+    }
+    match activity
+        .opencode_inputs
+        .iter()
+        .find(|input| &input.key == key)
+    {
+        Some(input) => match input.pending {
+            Some(true) => "asking",
+            Some(false) => observed,
+            None => "unknown",
+        },
+        None => observed,
+    }
+}
+
 fn state_name(state: Option<DerivedState>) -> &'static str {
     match state {
         Some(DerivedState::Working) => "working",
@@ -386,11 +434,142 @@ fn state_name(state: Option<DerivedState>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_pending_input_is_exact_and_clears_back_to_observed_state() {
+        use crate::session_activity::{OpenCodeInputSnapshot, SessionActivitySnapshot};
+        use crate::session_source::SessionKey;
+        let key = SessionKey {
+            slug: "one".into(),
+            harness: wt_core::HarnessId::Opencode,
+            session_id: "ses_one".into(),
+        };
+        let mut activity = SessionActivitySnapshot {
+            opencode_inputs: vec![OpenCodeInputSnapshot {
+                key: key.clone(),
+                pending: Some(true),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::opencode_input_state(&activity, &key, "working"),
+            "asking"
+        );
+        activity.opencode_inputs[0].pending = Some(false);
+        assert_eq!(
+            super::opencode_input_state(&activity, &key, "working"),
+            "working"
+        );
+        assert_eq!(super::opencode_input_state(&activity, &key, "idle"), "idle");
+        activity.opencode_inputs[0].pending = None;
+        assert_eq!(
+            super::opencode_input_state(&activity, &key, "idle"),
+            "unknown"
+        );
+        let other = SessionKey {
+            session_id: "replacement".into(),
+            ..key.clone()
+        };
+        assert_eq!(
+            super::opencode_input_state(&activity, &other, "working"),
+            "working"
+        );
+        let codex = SessionKey {
+            harness: wt_core::HarnessId::Codex,
+            ..key
+        };
+        assert_eq!(
+            super::opencode_input_state(&activity, &codex, "idle"),
+            "idle"
+        );
+    }
+
     use super::*;
     use crate::session_source::{DiscoveredSession, SessionKey};
     use wt_core::Domain;
     use wt_harness::{HarnessExtras, HarnessSession};
     use wt_tui::BoardRow;
+
+    #[test]
+    fn opencode_pending_input_updates_slots_and_session_view_together() {
+        let key = SessionKey {
+            slug: "one".into(),
+            harness: wt_core::HarnessId::Opencode,
+            session_id: "ses_one".into(),
+        };
+        let source = SourceSnapshot::test_live(
+            Some(Board {
+                rows: vec![BoardRow {
+                    slug: "one".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            SourceState::Ready,
+            Domain::Git,
+        );
+        let mut inventory = SessionInventory::default();
+        inventory.all.insert(
+            "one-opencode".into(),
+            crate::session_source::SessionDescriptor {
+                name: "one-opencode".into(),
+                id: "$1".into(),
+                created_at: 1,
+                attached_clients: 0,
+                window_count: 1,
+                harness_session_id: Some("ses_one".into()),
+            },
+        );
+        inventory
+            .harness_session_ids
+            .insert("one-opencode".into(), "ses_one".into());
+        let discoveries = SourceSnapshot::test_live(
+            Some(vec![DiscoveredSession {
+                key: key.clone(),
+                session: HarnessSession {
+                    display_name: "one".into(),
+                    session_id: "ses_one".into(),
+                    tmux_session_name: "one-opencode".into(),
+                    last_active_ms: None,
+                    is_live: true,
+                    extras: HarnessExtras {
+                        derived_state: Some(DerivedState::Working),
+                        ..Default::default()
+                    },
+                },
+            }]),
+            SourceState::Ready,
+            Domain::Sessions,
+        );
+        for (pending, expected) in [
+            (Some(true), "asking"),
+            (Some(false), "working"),
+            (None, "unknown"),
+        ] {
+            let activity = SessionActivitySnapshot {
+                opencode_inputs: vec![crate::session_activity::OpenCodeInputSnapshot {
+                    key: key.clone(),
+                    pending,
+                }],
+                ..Default::default()
+            };
+            let result = compose(
+                &mut FailureClock::default(),
+                source.clone(),
+                SourceSnapshot::test_live(
+                    Some(inventory.clone()),
+                    SourceState::Ready,
+                    Domain::Sessions,
+                ),
+                discoveries.clone(),
+                SourceSnapshot::test_live(Some(activity), SourceState::Ready, Domain::Sessions),
+                &[],
+            );
+            let board = result.data().unwrap();
+            assert_eq!(board.live_slots["one"][0].state, expected);
+            assert_eq!(board.rows[0].live_sessions[0].state, expected);
+            assert_eq!(board.rows[0].sessions[0].state, expected);
+        }
+    }
 
     #[test]
     fn physical_slot_activity_does_not_require_or_fabricate_history_identity() {

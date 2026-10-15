@@ -360,6 +360,12 @@ authorize messages: those still require the exact discovered session. Unknown
 physical activity can be enriched only by a proven live transcript from the
 same harness. Restored or disconnected remote snapshots cannot claim a live slot.
 
+Git presentation refreshes retain their previous display and observation stamp
+until the replacement is ready. Invalidating a probe never publishes an empty
+intermediate result that makes landed work briefly look unmerged. The projection
+still rejects facts for a changed checkout, HEAD, base or PR identity; retained
+display data cannot authorize a mutation.
+
 Local Git inventory, metadata, edit timestamps, sessions, action logs, and
 GitHub observations have separate source lanes. Filesystem watchers invalidate
 only the facts affected by the event. A one-second metadata backstop detects

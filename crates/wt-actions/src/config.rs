@@ -162,7 +162,7 @@ pub fn prepare_action_with_vars(
             if prompt.is_empty() {
                 return Err(ActionPlanError::MissingPayload(def.name.clone()));
             }
-            let (kind, argv) = headless_runner(context.harness, &prompt, &context.cwd);
+            let (kind, argv) = headless_runner(context.harness, &prompt);
             (kind, prompt, argv)
         }
     };
@@ -342,11 +342,7 @@ fn rendered_prompt(
     Ok(prompt)
 }
 
-fn headless_runner(
-    harness: ActionHarness,
-    prompt: &str,
-    cwd: &std::path::Path,
-) -> (ActionRunKind, Vec<String>) {
+fn headless_runner(harness: ActionHarness, prompt: &str) -> (ActionRunKind, Vec<String>) {
     match harness {
         ActionHarness::Claude => (
             ActionRunKind::Claude,
@@ -374,14 +370,7 @@ fn headless_runner(
         ),
         ActionHarness::OpenCode => (
             ActionRunKind::Harness,
-            vec![
-                "opencode".into(),
-                "run".into(),
-                "--dir".into(),
-                cwd.to_string_lossy().into_owned(),
-                "--".into(),
-                prompt.into(),
-            ],
+            vec!["opencode".into(), "run".into(), "--".into(), prompt.into()],
         ),
         ActionHarness::Pi => (
             ActionRunKind::Harness,
@@ -572,6 +561,26 @@ mod tests {
         assert_eq!(prepared.request.command.first().unwrap(), "claude");
         assert_eq!(prepared.request.command.last().unwrap(), "work wk-1");
         assert_eq!(prepared.request.config_selectors, BTreeMap::new());
+    }
+
+    #[test]
+    fn opencode_v2_headless_keeps_cwd_out_of_removed_flags() {
+        let def = ActionDef {
+            id: "x".into(),
+            name: "x".into(),
+            prompt: Some("work {{slug}}".into()),
+            ..ActionDef::default()
+        };
+        let mut context = context();
+        context.harness = ActionHarness::OpenCode;
+        let ActionPlan::Tracked(prepared) = prepare_action(&def, &context, "").unwrap() else {
+            panic!("expected tracked action")
+        };
+        assert_eq!(
+            prepared.request.command,
+            ["opencode", "run", "--", "work wk-1"]
+        );
+        assert_eq!(prepared.request.cwd, context.cwd);
     }
 
     #[test]

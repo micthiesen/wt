@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -189,28 +189,28 @@ impl CodexOutputWatch {
             // FSEvents restarts its stream when the watch set changes. Batch
             // those edits once, off the executor, and keep ownership until done.
             self.watcher = match tokio::task::spawn_blocking(move || {
-                let mut changes = watcher.paths_mut();
-                for directory in remove {
-                    let _ = changes.remove(&directory);
-                }
-                for directory in add {
-                    if let Err(error) = changes.add(&directory, RecursiveMode::NonRecursive) {
-                        tracing::warn!(path = %directory.display(), %error, "could not watch Codex rollout directory; polling fallback remains active");
-                    }
-                }
-                if let Err(error) = changes.commit() {
+                let changes = remove.into_iter().map(notify::PathOp::unwatch)
+                    .chain(add.into_iter().map(notify::PathOp::watch_non_recursive)).collect();
+                if let Err(error) = watcher.update_paths(changes) {
                     tracing::warn!(%error, "could not update Codex rollout watches; polling fallback remains active");
                 }
-                watcher
+                let directories = watcher.watched_paths().map(|paths| paths.into_iter().map(|(path, _)| path).collect()).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "could not inspect Codex rollout watches; polling fallback remains active");
+                    BTreeSet::new()
+                });
+                (watcher, directories)
             }).await {
-                Ok(watcher) => Some(watcher),
+                Ok((watcher, directories)) => {
+                    self.directories = directories;
+                    Some(watcher)
+                },
                 Err(error) => {
+                    self.directories.clear();
                     tracing::warn!(%error, "Codex rollout watcher stopped; polling fallback remains active");
                     None
                 }
             };
         }
-        self.directories = next_directories;
         if let Ok(mut watched) = self.watched_paths.write() {
             *watched = paths;
         }
@@ -285,7 +285,7 @@ pub struct UsagePeriodDto {
     pub label: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
     pub claude_five_hour: Option<UsagePeriodDto>,
@@ -308,6 +308,16 @@ pub struct SessionActivitySnapshot {
     /// The persisted primary harness name, read with each activity pass.
     #[serde(default)]
     pub primary: Option<String>,
+    /// Exact live V2 identities; None means the pending-input read failed.
+    #[serde(default)]
+    pub opencode_inputs: Vec<OpenCodeInputSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeInputSnapshot {
+    pub key: SessionKey,
+    pub pending: Option<bool>,
 }
 
 pub struct SessionActivitySources {
@@ -319,6 +329,8 @@ struct ActivityCursors {
     claude: BTreeMap<SessionKey, ClaudeTailCursor>,
     codex: CodexActivityTracker,
     opencode: OpenCodeActivityTracker,
+    opencode_inputs_checked: Option<std::time::Instant>,
+    opencode_inputs_error: Option<String>,
     codex_output: CodexOutputTracker,
     opencode_output: OpenCodeOutputTracker,
     pi_output: PiOutputTracker,
@@ -407,20 +419,11 @@ pub fn start(
                 Some(()) = codex_watch.updates.recv(), if !active.is_empty() => ActivityWake::CodexOutput,
                 _ = tokio::time::sleep_until(next_usage) => {
                     next_usage = tokio::time::Instant::now() + USAGE_INTERVAL;
-                    let updated = fetch_usage(&paths, &codex, &opencode, &cancellation).await;
-                    match updated {
-                        Ok(mut usage) => {
-                            // Freshness is not a visible change: keep the first
-                            // fetch time so equal measurements leave an idle
-                            // board still.
-                            if let Some(previous) = &snapshot.usage {
-                                usage.cached_at_ms = previous.cached_at_ms;
-                            }
-                            snapshot.usage = Some(usage);
-                            usage_error = None;
-                        },
-                        Err(error) => usage_error = Some(format!("session usage: {error}")),
-                    }
+                    let (usage, errors) = fetch_usage(
+                        &paths, &codex, &opencode, snapshot.usage.as_ref(), &cancellation,
+                    ).await;
+                    snapshot.usage = Some(usage);
+                    usage_error = (!errors.is_empty()).then(|| errors.join("; "));
                     ActivityWake::Source
                 }
             };
@@ -587,6 +590,8 @@ async fn poll_active(
     std::collections::BTreeSet<(String, HarnessId)>,
     Vec<String>,
 ) {
+    let (input_changed, input_error) =
+        poll_opencode_inputs(opencode, cursors, snapshot, active, cancel).await;
     let ActivityCursors {
         claude: claude_cursors,
         codex: codex_tracker,
@@ -595,9 +600,9 @@ async fn poll_active(
         next_event_id,
         ..
     } = cursors;
-    let mut changed = false;
+    let mut changed = input_changed;
     let mut discovery_changed = std::collections::BTreeSet::new();
-    let mut errors = Vec::new();
+    let mut errors = input_error.into_iter().collect::<Vec<_>>();
     let codex_active = active
         .iter()
         .filter(|entry| entry.key.harness == HarnessId::Codex)
@@ -857,6 +862,98 @@ async fn poll_pi_activity(
     (changed, discoveries, errors)
 }
 
+async fn poll_opencode_inputs(
+    opencode: &OpenCodeHarness,
+    cursors: &mut ActivityCursors,
+    snapshot: &mut SessionActivitySnapshot,
+    active: &[ActiveSession],
+    cancel: &CancellationToken,
+) -> (bool, Option<String>) {
+    let active = active
+        .iter()
+        .filter(|entry| entry.key.harness == HarnessId::Opencode)
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        cursors.opencode_inputs_checked = None;
+        cursors.opencode_inputs_error = None;
+        let changed = !snapshot.opencode_inputs.is_empty();
+        snapshot.opencode_inputs.clear();
+        return (changed, None);
+    }
+    let old = snapshot.opencode_inputs.clone();
+    snapshot.opencode_inputs = active
+        .iter()
+        .map(|entry| OpenCodeInputSnapshot {
+            key: entry.key.clone(),
+            pending: old
+                .iter()
+                .find(|input| input.key == entry.key)
+                .and_then(|input| input.pending),
+        })
+        .collect();
+    if cursors
+        .opencode_inputs_checked
+        .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
+    {
+        cursors.opencode_inputs_checked = Some(std::time::Instant::now());
+        // V2 scopes these endpoints by location. Coalesce shared checkouts and
+        // bound concurrency rather than requesting once per live slot.
+        let locations = active
+            .iter()
+            .map(|entry| entry.target.cwd.clone())
+            .collect::<BTreeSet<_>>();
+        let requests = stream::iter(locations)
+            .map(|cwd| async move {
+                let result = opencode.pending_inputs(&cwd, cancel).await;
+                (cwd, result)
+            })
+            .buffer_unordered(2)
+            .collect::<Vec<_>>();
+        // This optional provider read must not hold every harness's activity
+        // behind OpenCode's service timeout. The entire batch has one budget.
+        let results = match tokio::time::timeout(Duration::from_secs(2), requests).await {
+            Ok(results) => results,
+            Err(_) => {
+                for input in &mut snapshot.opencode_inputs {
+                    input.pending = None;
+                }
+                cursors.opencode_inputs_error =
+                    Some("OpenCode pending input exceeded the 2s activity budget".into());
+                return (
+                    snapshot.opencode_inputs != old,
+                    cursors.opencode_inputs_error.clone(),
+                );
+            }
+        };
+        let mut errors = Vec::new();
+        for (cwd, result) in results {
+            if let Err(error) = &result {
+                errors.push(format!(
+                    "OpenCode pending input at {}: {error}",
+                    cwd.display()
+                ));
+            }
+            for entry in active.iter().filter(|entry| entry.target.cwd == cwd) {
+                if let Some(input) = snapshot
+                    .opencode_inputs
+                    .iter_mut()
+                    .find(|input| input.key == entry.key)
+                {
+                    input.pending = result
+                        .as_ref()
+                        .ok()
+                        .map(|ids| ids.contains(&entry.key.session_id));
+                }
+            }
+        }
+        cursors.opencode_inputs_error = (!errors.is_empty()).then(|| errors.join("; "));
+    }
+    (
+        snapshot.opencode_inputs != old,
+        cursors.opencode_inputs_error.clone(),
+    )
+}
+
 fn output_targets(active: &[ActiveSession], harness: HarnessId) -> Vec<HarnessOutputTarget> {
     active
         .iter()
@@ -1082,48 +1179,82 @@ async fn fetch_usage(
     claude_paths: &ClaudePaths,
     codex: &CodexHarness,
     opencode: &OpenCodeHarness,
+    previous: Option<&UsageSnapshot>,
     cancel: &CancellationToken,
-) -> Result<UsageSnapshot, String> {
+) -> (UsageSnapshot, Vec<String>) {
     let claude = claude_paths.usage_file();
     let (claude, codex_usage, opencode_cost) = tokio::join!(
         tokio::task::spawn_blocking(move || wt_harness::read_claude_usage(&claude)),
         codex.usage_async(cancel),
         opencode.cost_async(epoch_ms(), cancel),
     );
-    let claude = claude.map_err(|error| error.to_string())?;
-    let codex_usage = codex_usage.map_err(|error| error.to_string())?;
-    let opencode_cost = opencode_cost.map_err(|error| error.to_string())?;
-    Ok(UsageSnapshot {
-        claude_five_hour: claude
-            .as_ref()
-            .and_then(|usage| usage.five_hour.clone())
-            .map(usage_period),
-        claude_seven_day: claude
-            .as_ref()
-            .and_then(|usage| usage.seven_day.clone())
-            .map(usage_period),
-        claude_seven_day_scoped: claude
-            .map(|usage| {
-                usage
-                    .seven_day_scoped
-                    .into_iter()
-                    .map(usage_period)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        codex_five_hour: codex_usage
-            .as_ref()
-            .and_then(|usage| usage.five_hour.clone())
-            .map(usage_period),
-        codex_seven_day: codex_usage
-            .as_ref()
-            .and_then(|usage| usage.seven_day.clone())
-            .map(usage_period),
-        codex_plan_type: codex_usage.and_then(|usage| usage.plan_type),
-        opencode_five_hour: opencode_cost.as_ref().map(|cost| cost.five_hour),
-        opencode_seven_day: opencode_cost.map(|cost| cost.seven_day),
+    merge_usage(
+        previous,
+        claude.map_err(|error| error.to_string()),
+        codex_usage.map_err(|error| error.to_string()),
+        opencode_cost.map_err(|error| error.to_string()),
+    )
+}
+
+/// Independent providers update independently. A broken optional adapter must
+/// neither hide healthy usage nor erase its own last good observation.
+fn merge_usage(
+    previous: Option<&UsageSnapshot>,
+    claude: Result<Option<wt_harness::ClaudeUsage>, String>,
+    codex: Result<Option<wt_harness::CodexUsage>, String>,
+    opencode: Result<Option<wt_harness::OpenCodeCost>, String>,
+) -> (UsageSnapshot, Vec<String>) {
+    // Fetch time is not a display change. Preserve it across equal readings
+    // so an idle board is not republished just because the timer fired.
+    let mut usage = previous.cloned().unwrap_or_else(|| UsageSnapshot {
         cached_at_ms: epoch_ms(),
-    })
+        ..Default::default()
+    });
+    let mut errors = Vec::new();
+    match claude {
+        Ok(value) => {
+            usage.claude_five_hour = value
+                .as_ref()
+                .and_then(|value| value.five_hour.clone())
+                .map(usage_period);
+            usage.claude_seven_day = value
+                .as_ref()
+                .and_then(|value| value.seven_day.clone())
+                .map(usage_period);
+            usage.claude_seven_day_scoped = value
+                .map(|value| {
+                    value
+                        .seven_day_scoped
+                        .into_iter()
+                        .map(usage_period)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        Err(error) => errors.push(format!("Claude usage: {error}")),
+    }
+    match codex {
+        Ok(value) => {
+            usage.codex_five_hour = value
+                .as_ref()
+                .and_then(|value| value.five_hour.clone())
+                .map(usage_period);
+            usage.codex_seven_day = value
+                .as_ref()
+                .and_then(|value| value.seven_day.clone())
+                .map(usage_period);
+            usage.codex_plan_type = value.and_then(|value| value.plan_type);
+        }
+        Err(error) => errors.push(format!("Codex usage: {error}")),
+    }
+    match opencode {
+        Ok(value) => {
+            usage.opencode_five_hour = value.as_ref().map(|value| value.five_hour);
+            usage.opencode_seven_day = value.map(|value| value.seven_day);
+        }
+        Err(error) => errors.push(format!("OpenCode usage: {error}")),
+    }
+    (usage, errors)
 }
 
 fn usage_period(value: wt_harness::UsagePeriod) -> UsagePeriodDto {
@@ -1225,6 +1356,53 @@ mod tests {
     use std::num::NonZeroUsize;
     use wt_platform::process::ProcessRunner;
     use wt_tmux::{TmuxClient, TmuxServer};
+
+    #[test]
+    fn usage_failure_is_scoped_to_its_provider_and_recovers() {
+        let previous = UsageSnapshot {
+            opencode_five_hour: Some(1.0),
+            opencode_seven_day: Some(4.0),
+            cached_at_ms: 123,
+            ..Default::default()
+        };
+        let (updated, errors) = merge_usage(
+            Some(&previous),
+            Ok(None),
+            Ok(Some(wt_harness::CodexUsage {
+                five_hour: Some(wt_harness::UsagePeriod {
+                    utilization: 42.0,
+                    resets_at: None,
+                    label: None,
+                }),
+                seven_day: None,
+                plan_type: Some("pro".into()),
+                cached_at_ms: 456,
+            })),
+            Err("no such table: message".into()),
+        );
+        assert_eq!(updated.codex_five_hour.as_ref().unwrap().utilization, 42.0);
+        assert_eq!(updated.opencode_five_hour, Some(1.0));
+        assert_eq!(updated.opencode_seven_day, Some(4.0));
+        assert_eq!(updated.cached_at_ms, 123);
+        assert_eq!(errors, ["OpenCode usage: no such table: message"]);
+
+        let (recovered, errors) = merge_usage(
+            Some(&updated),
+            Ok(None),
+            Err("temporarily unavailable".into()),
+            Ok(Some(wt_harness::OpenCodeCost {
+                five_hour: 2.0,
+                seven_day: 5.0,
+            })),
+        );
+        assert_eq!(recovered.codex_five_hour, updated.codex_five_hour);
+        assert_eq!(recovered.opencode_five_hour, Some(2.0));
+        assert_eq!(errors, ["Codex usage: temporarily unavailable"]);
+        let (empty, errors) = merge_usage(Some(&recovered), Ok(None), Ok(None), Ok(None));
+        assert!(empty.codex_five_hour.is_none());
+        assert!(empty.opencode_five_hour.is_none());
+        assert!(errors.is_empty());
+    }
 
     #[tokio::test]
     async fn active_polling_rechecks_exact_identity_even_if_discovery_claims_live() {

@@ -41,6 +41,8 @@ pub struct CompletionSpec {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HarnessCompletionError {
+    #[error("OpenCode naming model must use provider/model[#variant], got {0:?}")]
+    InvalidOpenCodeModel(String),
     #[error("naming harness {0:?} is not supported")]
     UnsupportedHarness(NamingHarness),
     #[error("naming configuration field {field} must be finite and between {min} and {max}")]
@@ -131,20 +133,29 @@ pub fn build_completion_spec(
             programs.codex.clone()
         }
         HarnessId::Opencode => {
-            args.extend(
-                ["run", "--pure", "--format", "default", "--dir"]
-                    .into_iter()
-                    .map(Into::into),
-            );
-            args.push(cwd.as_ref().as_os_str().to_owned());
+            // V2's stateless generation API has no session or tool execution.
+            // `run` no longer supports --pure and would expose naming to tools.
+            let mut body = serde_json::json!({"prompt": prompt});
             if let Some(model) = model.filter(|m| !m.is_empty()) {
-                args.extend([OsString::from("--model"), model.into()]);
+                let (provider, model_id) = model
+                    .split_once('/')
+                    .filter(|(p, m)| !p.is_empty() && !m.is_empty())
+                    .ok_or_else(|| HarnessCompletionError::InvalidOpenCodeModel(model.clone()))?;
+                let (id, variant) = model_id.split_once('#').map_or(
+                    (model_id, effort_name(naming.reasoning_effort)),
+                    |(id, variant)| (id, variant),
+                );
+                if id.is_empty() || variant.is_empty() {
+                    return Err(HarnessCompletionError::InvalidOpenCodeModel(model.clone()));
+                }
+                body["model"] =
+                    serde_json::json!({"providerID": provider, "id": id, "variant": variant});
             }
             args.extend([
-                OsString::from("--variant"),
-                effort_name(naming.reasoning_effort).into(),
-                OsString::from("--"),
-                prompt.into(),
+                OsString::from("api"),
+                OsString::from("experimental.generate.text"),
+                OsString::from("--data"),
+                body.to_string().into(),
             ]);
             programs.opencode.clone()
         }
@@ -335,6 +346,41 @@ mod tests {
     }
 
     #[test]
+    fn opencode_v2_model_ref_preserves_explicit_variant() {
+        let mut naming = config(NamingHarness::Opencode);
+        naming
+            .models
+            .insert("opencode".into(), "openai/gpt-5#low".into());
+        let spec = build_completion_spec(
+            &naming,
+            HarnessId::Codex,
+            "prompt",
+            "/repo",
+            &HarnessPrograms::default(),
+        )
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&spec.args.last().unwrap().to_string_lossy()).unwrap();
+        assert_eq!(
+            body["model"],
+            serde_json::json!({"providerID":"openai", "id":"gpt-5", "variant":"low"})
+        );
+        naming
+            .models
+            .insert("opencode".into(), "missing-provider".into());
+        assert!(matches!(
+            build_completion_spec(
+                &naming,
+                HarnessId::Codex,
+                "prompt",
+                "/repo",
+                &HarnessPrograms::default()
+            ),
+            Err(HarnessCompletionError::InvalidOpenCodeModel(_))
+        ));
+    }
+
+    #[test]
     fn builds_isolated_harness_invocations() {
         let programs = HarnessPrograms {
             claude: "fake-claude".into(),
@@ -380,8 +426,11 @@ mod tests {
             &programs,
         )
         .unwrap();
-        assert_eq!(open.args.last().unwrap(), "safe prompt");
-        assert!(open.args.iter().any(|arg| arg == "--pure"));
+        assert_eq!(open.args[1], "experimental.generate.text");
+        let body: serde_json::Value =
+            serde_json::from_str(&open.args.last().unwrap().to_string_lossy()).unwrap();
+        assert_eq!(body["prompt"], "safe prompt");
+        assert!(!open.args.iter().any(|arg| arg == "run"));
         let pi = build_completion_spec(
             &config(NamingHarness::Pi),
             HarnessId::Claude,

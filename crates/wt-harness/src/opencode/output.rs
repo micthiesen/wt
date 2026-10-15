@@ -1,6 +1,10 @@
 //! Bounded detailed output tails for exact OpenCode session identities.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::Value;
@@ -11,15 +15,16 @@ use crate::{HarnessOutputKind, HarnessOutputTarget, HarnessOutputUpdate};
 
 use super::{OpenCodeError, OpenCodeHarness};
 
-const SEED_PARTS: i64 = 120;
-const MAX_PARTS_PER_TICK: i64 = 256;
-const MAX_PART_DATA_BYTES: usize = 256 * 1024;
+// A selected tail has a hard 1 MiB payload budget even when sibling sessions
+// commit continuously. Older messages remain available in native history.
+const SEED_PARTS: i64 = 16;
+
+const MAX_PART_DATA_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Default)]
 struct Cursor {
     session_id: String,
-    after_time: i64,
-    after_id: String,
+    data_version: i64,
     next_line_id: u64,
     seeded: bool,
 }
@@ -27,19 +32,18 @@ struct Cursor {
 #[derive(Clone, Debug, Default)]
 pub struct OpenCodeOutputTracker {
     by_session: HashMap<(String, String), Cursor>,
+    database: Arc<Mutex<Option<(PathBuf, Connection)>>>,
 }
 
 #[derive(Debug)]
 struct PartRow {
-    id: String,
     created: i64,
     kind: Option<String>,
     data: Option<String>,
-    role: Option<String>,
 }
 
 impl OpenCodeHarness {
-    /// Read at most 120 seed parts or 256 incremental parts per target. The
+    /// Read at most 16 V2 messages (1 MiB total payload) per target. The
     /// caller should run this on a blocking worker. SQLite rows are read-only,
     /// exact-session scoped, and JSON payloads are capped before Rust receives
     /// them.
@@ -59,10 +63,29 @@ impl OpenCodeHarness {
         if !self.paths().database.exists() || targets.is_empty() {
             return Ok(Vec::new());
         }
-        let connection = Connection::open_with_flags(
-            &self.paths().database,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let mut database = tracker
+            .database
+            .lock()
+            .map_err(|_| OpenCodeError::Operation {
+                operation: "read output",
+                detail: "database reader lock poisoned".into(),
+            })?;
+        if database
+            .as_ref()
+            .is_none_or(|(path, _)| path != &self.paths().database)
+        {
+            let connection = Connection::open_with_flags(
+                &self.paths().database,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            connection.busy_timeout(std::time::Duration::from_secs(2))?;
+            *database = Some((self.paths().database.clone(), connection));
+        }
+        let connection = &database.as_ref().expect("database initialized").1;
+        // data_version changes for commits by other connections, including
+        // in-place streaming edits with equal timestamps and lengths.
+        let data_version: i64 =
+            connection.query_row("PRAGMA data_version", [], |row| row.get(0))?;
         let mut updates = Vec::new();
         for target in targets {
             if cancellation.is_cancelled() {
@@ -71,24 +94,22 @@ impl OpenCodeHarness {
             let key = (target.slug.clone(), target.session_id.clone());
             let cursor = tracker.by_session.entry(key).or_default();
             let is_new = cursor.session_id != target.session_id || !cursor.seeded;
-            if !session_matches(&connection, target)? {
+            if !session_matches(connection, target)? {
                 continue;
             }
-            let rows = if is_new {
-                seed_parts(&connection, &target.session_id)?
-            } else {
-                new_parts(&connection, &target.session_id, cursor)?
-            };
+            if !is_new && cursor.data_version == data_version {
+                continue;
+            }
+            // Decode only after a SQLite commit, never hash whole transcripts
+            // on each poll. Replacement keeps in-place streaming updates intact.
+            let rows = seed_parts(connection, &target.session_id)?;
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            let reset = is_new;
-            if is_new {
-                cursor.session_id.clone_from(&target.session_id);
-                cursor.after_time = 0;
-                cursor.after_id.clear();
-                cursor.seeded = true;
-            }
+            cursor.data_version = data_version;
+            let reset = true;
+            cursor.session_id.clone_from(&target.session_id);
+            cursor.seeded = true;
             let mut lines = Vec::new();
             let mut id = cursor.next_line_id;
             let mut next_id = || {
@@ -96,8 +117,6 @@ impl OpenCodeHarness {
                 id
             };
             for row in rows {
-                cursor.after_time = row.created;
-                cursor.after_id.clone_from(&row.id);
                 parse_part(&row, &mut next_id, &mut lines);
             }
             cursor.next_line_id = id;
@@ -150,57 +169,28 @@ fn session_matches(
     target: &HarnessOutputTarget,
 ) -> Result<bool, OpenCodeError> {
     Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?1 AND directory = ?2 AND time_archived IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id = ?1 AND directory = ?2 AND time_archived IS NULL)",
         params![target.session_id, target.cwd.to_string_lossy()],
         |row| row.get::<_, bool>(0),
     )?)
 }
 
 fn seed_parts(connection: &Connection, session_id: &str) -> Result<Vec<PartRow>, OpenCodeError> {
-    let mut statement = connection.prepare(
-        "SELECT p.id, p.time_created, json_extract(p.data, '$.type'), substr(p.data, 1, ?2), json_extract(m.data, '$.role') FROM part p JOIN message m ON m.id = p.message_id WHERE p.session_id = ?1 ORDER BY p.time_created DESC, p.id DESC LIMIT ?3",
-    )?;
+    let mut statement = connection.prepare("SELECT id,time_created,time_updated,type,CASE WHEN length(CAST(data AS BLOB)) > ?2 THEN NULL ELSE data END FROM session_message WHERE session_id=?1 ORDER BY seq DESC LIMIT ?3")?;
     let mut rows = statement
-        .query(params![
-            session_id,
-            MAX_PART_DATA_BYTES as i64 + 1,
-            SEED_PARTS
-        ])?
-        .mapped(part_row)
+        .query_map(
+            params![session_id, MAX_PART_DATA_BYTES as i64, SEED_PARTS],
+            |row| {
+                Ok(PartRow {
+                    created: row.get(1)?,
+                    kind: row.get(3)?,
+                    data: row.get(4)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     rows.reverse();
     Ok(rows)
-}
-
-fn new_parts(
-    connection: &Connection,
-    session_id: &str,
-    cursor: &Cursor,
-) -> Result<Vec<PartRow>, OpenCodeError> {
-    let mut statement = connection.prepare(
-        "SELECT p.id, p.time_created, json_extract(p.data, '$.type'), substr(p.data, 1, ?4), json_extract(m.data, '$.role') FROM part p JOIN message m ON m.id = p.message_id WHERE p.session_id = ?1 AND (p.time_created > ?2 OR (p.time_created = ?2 AND p.id > ?3)) ORDER BY p.time_created ASC, p.id ASC LIMIT ?5",
-    )?;
-    let rows = statement
-        .query(params![
-            session_id,
-            cursor.after_time,
-            cursor.after_id,
-            MAX_PART_DATA_BYTES as i64 + 1,
-            MAX_PARTS_PER_TICK
-        ])?
-        .mapped(part_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-fn part_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PartRow> {
-    Ok(PartRow {
-        id: row.get(0)?,
-        created: row.get(1)?,
-        kind: row.get(2)?,
-        data: row.get(3)?,
-        role: row.get(4)?,
-    })
 }
 
 fn parse_part(
@@ -209,6 +199,12 @@ fn parse_part(
     lines: &mut Vec<crate::HarnessOutputLine>,
 ) {
     let Some(raw) = row.data.as_deref() else {
+        lines.push(one_line(
+            "[output part truncated]",
+            HarnessOutputKind::Info,
+            row.created,
+            next_id,
+        ));
         return;
     };
     if raw.len() > MAX_PART_DATA_BYTES {
@@ -224,58 +220,78 @@ fn parse_part(
         return;
     };
     match row.kind.as_deref() {
-        Some("text") => {
-            let Some(text) = data["text"].as_str() else {
-                return;
-            };
-            let (kind, prefix) = if row.role.as_deref() == Some("user") {
-                (HarnessOutputKind::User, "› ")
-            } else {
-                (HarnessOutputKind::Assistant, "")
-            };
-            lines.extend(text_lines(text, kind, row.created, next_id, prefix));
-        }
-        Some("reasoning") => {
+        Some("user" | "synthetic" | "system") => {
             if let Some(text) = data["text"].as_str() {
-                lines.extend(
-                    text_lines(
-                        text,
-                        HarnessOutputKind::Thinking,
-                        row.created,
-                        next_id,
-                        "… ",
-                    )
-                    .into_iter()
-                    .take(1),
-                );
+                lines.extend(text_lines(
+                    text,
+                    HarnessOutputKind::User,
+                    row.created,
+                    next_id,
+                    "› ",
+                ));
             }
         }
-        Some("tool") => {
-            let tool = data["tool"]
-                .as_str()
-                .or_else(|| data["name"].as_str())
-                .unwrap_or("tool");
-            let state = &data["state"];
-            let status = state["status"].as_str();
-            let title = state["title"]
-                .as_str()
-                .map(|title| format!(" {title}"))
-                .unwrap_or_default();
-            let kind = match status {
-                Some("error") => HarnessOutputKind::ToolError,
-                Some("completed") => HarnessOutputKind::ToolOk,
-                _ => HarnessOutputKind::Tool,
-            };
-            lines.push(one_line(
-                &format!("⚒ {tool}{title}"),
-                kind,
-                row.created,
-                next_id,
-            ));
+        Some("assistant") => {
+            if let Some(content) = data["content"].as_array() {
+                for part in content {
+                    match part["type"].as_str() {
+                        Some("text") => {
+                            if let Some(text) = part["text"].as_str() {
+                                lines.extend(text_lines(
+                                    text,
+                                    HarnessOutputKind::Assistant,
+                                    row.created,
+                                    next_id,
+                                    "",
+                                ));
+                            }
+                        }
+                        Some("reasoning") => {
+                            if let Some(text) = part["text"].as_str() {
+                                lines.extend(
+                                    text_lines(
+                                        text,
+                                        HarnessOutputKind::Thinking,
+                                        row.created,
+                                        next_id,
+                                        "… ",
+                                    )
+                                    .into_iter()
+                                    .take(1),
+                                );
+                            }
+                        }
+                        Some("tool") => {
+                            let name = part["name"]
+                                .as_str()
+                                .or_else(|| part["tool"].as_str())
+                                .unwrap_or("tool");
+                            let status = part["status"]
+                                .as_str()
+                                .or_else(|| part["state"]["status"].as_str());
+                            let kind = match status {
+                                Some("completed" | "succeeded") => HarnessOutputKind::ToolOk,
+                                Some("error" | "failed") => HarnessOutputKind::ToolError,
+                                _ => HarnessOutputKind::Tool,
+                            };
+                            lines.push(one_line(&format!("⚒ {name}"), kind, row.created, next_id));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(error) = data.get("error").filter(|e| !e.is_null()) {
+                lines.push(one_line(
+                    &error.to_string(),
+                    HarnessOutputKind::ToolError,
+                    row.created,
+                    next_id,
+                ));
+            }
         }
-        Some("patch") => lines.push(one_line(
-            "⚒ patch",
-            HarnessOutputKind::Tool,
+        Some("compaction") => lines.push(one_line(
+            "Context compacted",
+            HarnessOutputKind::Info,
             row.created,
             next_id,
         )),
@@ -293,114 +309,65 @@ fn cancelled() -> OpenCodeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroUsize;
-    use tempfile::tempdir;
-    use wt_platform::process::ProcessRunner;
-    use wt_tmux::TmuxServer;
-
-    fn setup() -> (tempfile::TempDir, OpenCodeHarness, Connection) {
-        let dir = tempdir().unwrap();
-        let paths = super::super::OpenCodePaths::new(dir.path(), dir.path().join("cache"))
-            .with_database(dir.path().join("opencode.db"));
-        let db = Connection::open(&paths.database).unwrap();
-        db.execute_batch(
-            "CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_updated INTEGER, time_archived INTEGER); \
-             CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT, time_created INTEGER, time_updated INTEGER); \
-             CREATE TABLE part(id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, data TEXT, time_created INTEGER);",
-        ).unwrap();
-        let harness = OpenCodeHarness::new(
-            paths,
-            ProcessRunner::new(NonZeroUsize::new(1).unwrap()),
-            wt_tmux::TmuxClient::new(
-                ProcessRunner::new(NonZeroUsize::new(1).unwrap()),
-                TmuxServer::named("opencode-output-fixture"),
-            ),
-        );
-        (dir, harness, db)
-    }
-
     #[test]
-    fn tails_exact_session_seeds_text_and_tools_then_reads_equal_timestamp_parts_once() {
-        let (_dir, harness, db) = setup();
-        db.execute("INSERT INTO session VALUES ('ses-old','Old','/repo',100,NULL), ('ses-new','New','/repo',200,NULL)", []).unwrap();
-        db.execute("INSERT INTO message VALUES ('m-old-user','ses-old','{\"role\":\"user\"}',10,10), ('m-old-assistant','ses-old','{\"role\":\"assistant\"}',20,20), ('m-new','ses-new','{\"role\":\"assistant\"}',30,30)", []).unwrap();
-        db.execute("INSERT INTO part VALUES ('p-user','ses-old','m-old-user','{\"type\":\"text\",\"text\":\"hello from old session\"}',11), ('p-tool','ses-old','m-old-assistant','{\"type\":\"tool\",\"tool\":\"Read\",\"state\":{\"status\":\"completed\"}}',12), ('p-new','ses-new','m-new','{\"type\":\"text\",\"text\":\"wrong session\"}',31)", []).unwrap();
+    fn v2_streaming_updates_existing_message_and_never_reads_another_checkout() {
+        let (_dir, harness, db) = super::super::tests::fixture();
+        db.execute_batch("INSERT INTO session_v2(id,slug,title,directory,parent_id,time_updated,time_archived,time_idle,time_compacting) VALUES ('ses_a','a','A','/repo',NULL,10,NULL,NULL,NULL); INSERT INTO session_message VALUES ('msg_a','ses_a','assistant',1,10,10,'{\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}');").unwrap();
         let target = HarnessOutputTarget {
-            slug: "slug".into(),
+            slug: "r".into(),
             cwd: "/repo".into(),
-            session_id: "ses-old".into(),
+            session_id: "ses_a".into(),
         };
         let mut tracker = OpenCodeOutputTracker::default();
         let cancel = CancellationToken::new();
-        let seeded = harness
+        let first = harness
             .poll_output(&mut tracker, std::slice::from_ref(&target), &cancel)
             .unwrap();
-        assert_eq!(seeded.len(), 1);
-        assert!(seeded[0].reset);
-        assert!(
-            seeded[0]
-                .append
-                .iter()
-                .any(|line| line.text.contains("hello from old session"))
-        );
-        assert!(
-            seeded[0]
-                .append
-                .iter()
-                .any(|line| line.kind == HarnessOutputKind::ToolOk)
-        );
-        assert!(
-            !seeded[0]
-                .append
-                .iter()
-                .any(|line| line.text.contains("wrong session"))
-        );
-
-        db.execute(
-            "INSERT INTO message VALUES ('m-delta','ses-old','{\"role\":\"assistant\"}',40,40)",
-            [],
-        )
-        .unwrap();
-        db.execute("INSERT INTO part VALUES ('p2','ses-old','m-delta','{\"type\":\"text\",\"text\":\"second answer\"}',50), ('p3','ses-old','m-delta','{\"type\":\"patch\"}',50)", []).unwrap();
-        let delta = harness
-            .poll_output(&mut tracker, std::slice::from_ref(&target), &cancel)
-            .unwrap();
-        assert_eq!(delta.len(), 1);
-        assert!(!delta[0].reset);
-        assert!(
-            delta[0]
-                .append
-                .iter()
-                .any(|line| line.text.contains("second answer"))
-        );
-        assert!(delta[0].append.iter().any(|line| line.text == "⚒ patch"));
+        assert!(first[0].append.iter().any(|l| l.text == "first"));
         assert!(
             harness
-                .poll_output(&mut tracker, &[target], &cancel)
+                .poll_output(&mut tracker, std::slice::from_ref(&target), &cancel)
+                .unwrap()
+                .is_empty()
+        );
+        db.execute("UPDATE session_message SET data='{\"content\":[{\"type\":\"text\",\"text\":\"other\"}]}'",[]).unwrap();
+        let changed = harness
+            .poll_output(&mut tracker, std::slice::from_ref(&target), &cancel)
+            .unwrap();
+        assert!(changed[0].reset);
+        assert!(changed[0].append.iter().any(|l| l.text == "other"));
+        let wrong = HarnessOutputTarget {
+            cwd: "/wrong".into(),
+            ..target
+        };
+        assert!(
+            harness
+                .poll_output(&mut tracker, &[wrong], &cancel)
                 .unwrap()
                 .is_empty()
         );
     }
-
     #[test]
-    fn cancelled_output_poll_fails_without_mutating_cursor() {
-        let (_dir, harness, db) = setup();
-        db.execute("INSERT INTO session VALUES ('ses','S','/repo',1,NULL)", [])
+    fn output_payload_budget_is_independent_of_transcript_length() {
+        let (_dir, _harness, db) = super::super::tests::fixture();
+        let data=serde_json::json!({"content":[{"type":"text","text":"x".repeat(MAX_PART_DATA_BYTES*2)}]}).to_string();
+        for seq in 0..20 {
+            db.execute(
+                "INSERT INTO session_message VALUES (?1,'ses_a','assistant',?2,10,10,?3)",
+                params![format!("msg_{seq}"), seq, data],
+            )
             .unwrap();
-        let target = HarnessOutputTarget {
-            slug: "slug".into(),
-            cwd: "/repo".into(),
-            session_id: "ses".into(),
-        };
-        let mut tracker = OpenCodeOutputTracker::default();
-        let before = tracker.clone();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
+        }
+        let rows = seed_parts(&db, "ses_a").unwrap();
+        assert_eq!(rows.len(), SEED_PARTS as usize);
         assert!(
-            harness
-                .poll_output(&mut tracker, &[target], &cancel)
-                .is_err()
+            rows.iter()
+                .map(|row| row.data.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+                <= (MAX_PART_DATA_BYTES + 1) * SEED_PARTS as usize
         );
-        assert_eq!(tracker.by_session.len(), before.by_session.len());
+        let mut lines = Vec::new();
+        parse_part(&rows[0], &mut || 1, &mut lines);
+        assert_eq!(lines[0].text, "[output part truncated]");
     }
 }

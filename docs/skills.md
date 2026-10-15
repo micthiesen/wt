@@ -22,6 +22,11 @@ The bundled orientation uses the native `~/.local/bin/wt` PATH entry and
 `~/.local/share/wt/bin/wt` launcher. It does not require an alias to a source
 checkout; agents invoke `wt` by name so session shims remain effective.
 
+OpenCode V2 receives skills in the shared `~/.agents/skills` directory when it
+exists, otherwise in `~/.config/opencode/skills`. Its legacy `.claude/skills`
+directory remains a discovery fallback. Native invocations use `@start` and
+other `@skill-id` references. See [OpenCode sessions](opencode.md).
+
 ## What gets distributed
 
 | unit | what it is |

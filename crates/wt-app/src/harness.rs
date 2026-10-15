@@ -846,7 +846,17 @@ pub async fn ui_session_with_harness(
                 let resume = if harness_id == HarnessId::Claude {
                     None
                 } else {
-                    primary_single_slot_session(&discovered).map(|entry| entry.session_id.clone())
+                    // Special targets can share a checkout (manager and main).
+                    // History's directory match cannot establish slot ownership.
+                    let owned: BTreeSet<String> = app
+                        .session_inventory(context)
+                        .await?
+                        .into_iter()
+                        .filter(|slot| slot.name != tmux_name)
+                        .filter_map(|slot| slot.harness_session_id)
+                        .collect();
+                    primary_single_slot_session(&discovered, &owned)
+                        .map(|entry| entry.session_id.clone())
                 };
                 app.ensure_started(
                     harness_id,
@@ -866,15 +876,18 @@ pub async fn ui_session_with_harness(
     Ok(app.attach_command(&session, &cwd))
 }
 
-fn primary_single_slot_session(
-    sessions: &[wt_harness::HarnessSession],
-) -> Option<&wt_harness::HarnessSession> {
+fn primary_single_slot_session<'a>(
+    sessions: &'a [wt_harness::HarnessSession],
+    owned: &BTreeSet<String>,
+) -> Option<&'a wt_harness::HarnessSession> {
     sessions
         .iter()
+        .filter(|session| !owned.contains(&session.session_id))
         .find(|session| session.extras.managed_name.as_deref() == Some("primary"))
         .or_else(|| {
             sessions
                 .iter()
+                .filter(|session| !owned.contains(&session.session_id))
                 .max_by_key(|session| session.last_active_ms.unwrap_or_default())
         })
 }
@@ -1280,6 +1293,42 @@ mod tests {
         assert_eq!(target("team-foo"), Some("team-foo"));
         assert_eq!(target("other/foo"), Some("foo"));
         assert_eq!(target("missing"), None);
+    }
+
+    #[test]
+    fn automatic_resume_never_borrows_another_slots_conversation() {
+        let session = |id: &str, active: i64, primary: bool| wt_harness::HarnessSession {
+            display_name: id.into(),
+            session_id: id.into(),
+            tmux_session_name: "manager-opencode".into(),
+            last_active_ms: Some(active),
+            is_live: false,
+            extras: wt_harness::HarnessExtras {
+                managed_name: primary.then(|| "primary".into()),
+                ..Default::default()
+            },
+        };
+        let sessions = [
+            session("main-live", 30, true),
+            session("another-live", 20, false),
+            session("available", 10, false),
+        ];
+        let mut owned = BTreeSet::from(["main-live".into(), "another-live".into()]);
+        assert_eq!(
+            primary_single_slot_session(&sessions, &owned)
+                .unwrap()
+                .session_id,
+            "available"
+        );
+        owned.insert("available".into());
+        assert!(primary_single_slot_session(&sessions, &owned).is_none());
+        owned.clear();
+        assert_eq!(
+            primary_single_slot_session(&sessions, &owned)
+                .unwrap()
+                .session_id,
+            "main-live"
+        );
     }
 
     #[test]

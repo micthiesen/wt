@@ -933,6 +933,40 @@ async fn large_pinned_environment_survives_command_transport_and_retained_retry(
 }
 
 #[tokio::test]
+async fn creation_records_session_identity_in_the_same_server_request() {
+    let temp = tempdir().unwrap();
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at(temp.path().join("tmux.sock")),
+    );
+    let cancel = CancellationToken::new();
+    let result = async {
+        client
+            .create_session_with_options(
+                &CreateSession {
+                    name: "identity".into(),
+                    cwd: temp.path().into(),
+                    command: vec!["cat".into()],
+                    width: None,
+                    height: None,
+                },
+                &[("@wt-harness-session-id", "session-with-quoted-\"value")],
+                &cancel,
+            )
+            .await?;
+        let sessions = client.list_sessions(&cancel).await?;
+        assert_eq!(
+            sessions[0].harness_session_id.as_deref(),
+            Some("session-with-quoted-\"value")
+        );
+        Ok::<(), crate::TmuxError>(())
+    }
+    .await;
+    client.kill_server(&CancellationToken::new()).await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn failed_commands_remain_visible_and_retry_without_killing_live_commands() {
     let temp = tempdir().unwrap();
     let config =
