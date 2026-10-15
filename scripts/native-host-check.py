@@ -186,7 +186,22 @@ class HostProcess:
                 continue
             chunk = os.read(self.output.fileno(), 64 * 1024)
             if not chunk:
-                raise EOFError(f"host {self.host['name']} closed stdout: {self.stderr()}")
+                # EOF can win the race with poll() observing process exit.
+                # Capture the actual status so a signal/crash is distinguishable
+                # from a host that deliberately closed only its protocol stream.
+                try:
+                    code: int | str = self.process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    code = "still running"
+                cause = (
+                    signal.Signals(-code).name
+                    if isinstance(code, int) and code < 0
+                    else str(code)
+                )
+                raise EOFError(
+                    f"host {self.host['name']} pid {self.process.pid} closed stdout "
+                    f"(exit {cause}, fixture {self.host['root']}): {self.stderr()}"
+                )
             self.buffer.extend(chunk)
             if len(self.buffer) > 8 * 1024 * 1024:
                 raise AssertionError("host protocol frame exceeded the fixture's 8 MiB bound")
@@ -645,6 +660,26 @@ def main() -> None:
                 "title/status writes, non-destructive removal preflight, reconnect, endpoint loss, "
                 "removal completion and late failure, protocol rejection, and active-action survival through two remote runtime publications"
             )
+        except Exception:
+            # CI uploads wt-native-* from RUNNER_TEMP. Preserve diagnostic
+            # state before TemporaryDirectory erases the failed host, without
+            # copying binaries or transient sockets.
+            failure = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"wt-native-host-failure-{token}"
+            failure.mkdir(parents=True, exist_ok=True)
+            for path in root.rglob("*"):
+                if path.is_file() and (
+                    path.suffix in (".log", ".json", ".toml", ".sqlite")
+                    or path.name.endswith((".sqlite-wal", ".sqlite-shm"))
+                ):
+                    destination = failure / path.relative_to(root)
+                    try:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, destination)
+                    except OSError as error:
+                        # Sources may rotate files while the host is draining.
+                        print(f"could not retain {path}: {error}", file=sys.stderr)
+            print(f"native host failure diagnostics: {failure}", file=sys.stderr)
+            raise
         finally:
             for server in owned_servers:
                 if server.poll() is None:
