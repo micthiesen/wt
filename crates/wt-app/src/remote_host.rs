@@ -98,7 +98,10 @@ impl RemoteHost {
             SourceSpec {
                 name: source_name(&endpoint),
                 domain: Domain::Host,
-                persistence: Persistence::Disk(DiskCache::new(&context.caches)),
+                persistence: Persistence::Disk(DiskCache::new(&crate::query_cache::remote_store(
+                    &context.config,
+                    &endpoint,
+                ))),
                 // Fetches are driven by the worker's stream, not by a timer.
                 policy: RefreshPolicy::default(),
             },
@@ -932,6 +935,15 @@ fn publish_snapshot(
         return Ok(());
     }
     *latest = Some(snapshot.clone());
+    // Startup progress has no inventory to replace the last known rows. Set
+    // only state so a pending disk restore can still populate the source.
+    if snapshot.board.is_none() {
+        publisher.set_state(match &snapshot.state {
+            protocol::HostState::Failed(error) => SourceState::Failed(error.clone().into()),
+            _ => SourceState::Refreshing,
+        });
+        return Ok(());
+    }
     let state = match &snapshot.state {
         protocol::HostState::Empty => SourceState::Empty,
         protocol::HostState::Refreshing => SourceState::Refreshing,
@@ -1354,6 +1366,107 @@ mod tests {
         assert!(pending.is_empty());
         assert_eq!(first_result.await.unwrap().unwrap().message, "1");
         assert_eq!(second_result.await.unwrap().unwrap().message, "2");
+    }
+
+    #[tokio::test]
+    async fn remote_rows_restore_before_connection_and_survive_empty_startup_frames() {
+        use super::*;
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let endpoint = RemoteConfig {
+            host: "builder".into(),
+            ..Default::default()
+        };
+        let name = source_name(&endpoint);
+        let store = crate::query_cache::remote_store(&fixture.ctx.config, &endpoint);
+        let spec = || SourceSpec {
+            name,
+            domain: Domain::Host,
+            persistence: Persistence::Disk(DiskCache::new(&store)),
+            policy: RefreshPolicy::default(),
+        };
+        let remembered = HostSnapshot {
+            board: Some(wt_tui::Board {
+                rows: vec![wt_tui::BoardRow {
+                    key: "one".into(),
+                    slug: "one".into(),
+                    path: "/worktrees/one".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            state: protocol::HostState::Ready,
+            domains: Default::default(),
+            layout: Default::default(),
+        };
+        let scope = TaskScope::new();
+        let (_, publisher) = leaf_channel::<HostSnapshot>(&scope, spec());
+        publish_snapshot(remembered.clone(), &mut None, &publisher, "builder").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.directory().join(format!("{name}.json")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        scope.shutdown(Duration::from_secs(2)).await.unwrap();
+
+        let restarted = TaskScope::new();
+        let (source, publisher) = leaf_channel::<HostSnapshot>(&restarted, spec());
+        let empty = HostSnapshot {
+            board: None,
+            state: protocol::HostState::Refreshing,
+            domains: Default::default(),
+            layout: Default::default(),
+        };
+        // Progress may arrive before the asynchronous disk restore.
+        publish_snapshot(empty.clone(), &mut None, &publisher, "builder").unwrap();
+        let mut updates = source.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            updates.wait_for(|value| value.data().is_some()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(source.snapshot().is_restored());
+        assert!(source.confirmed().is_none());
+        assert_eq!(
+            source
+                .snapshot()
+                .data()
+                .unwrap()
+                .board
+                .as_ref()
+                .unwrap()
+                .rows[0]
+                .slug,
+            "one"
+        );
+        // Progress after restore must keep the same cached rows and provenance.
+        publish_snapshot(empty, &mut None, &publisher, "builder").unwrap();
+        assert!(source.snapshot().is_restored());
+        assert!(source.confirmed().is_none());
+        assert!(source.snapshot().data().unwrap().board.is_some());
+        // A real empty inventory is authoritative and removes obsolete rows.
+        let mut live = remembered;
+        live.board.as_mut().unwrap().rows.clear();
+        publish_snapshot(live, &mut None, &publisher, "builder").unwrap();
+        assert!(source.confirmed().is_some());
+        assert!(
+            source
+                .snapshot()
+                .data()
+                .unwrap()
+                .board
+                .as_ref()
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        restarted.shutdown(Duration::from_secs(2)).await.unwrap();
+        fixture.close().await.unwrap();
     }
 
     /// A failure inside the worker's board (its GitHub read, say) is not a

@@ -272,3 +272,11 @@ work can finish; there is currently no automatic runtime-cache eviction.
 A worker's separate installed launcher may still serve a local interactive wt
 session on its own channel. That does not determine the version used by a
 controller connection. No wt source checkout or JavaScript runtime is uploaded.
+
+Remote rows restore from a versioned display cache before SSH connects. The
+cache survives compatible wt updates and local UI setting changes. Rows remain
+marked cached until the worker publishes its board; session liveness is unknown
+while disconnected. Current host checks still authorize every mutation. The
+first successful connection seeds the cache; an already discarded old snapshot
+cannot be recovered. Cache identity includes the repository, selected endpoint,
+worker configuration, host protocol, and display-cache schema.

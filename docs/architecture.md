@@ -252,8 +252,13 @@ shutdown. A fetch shows its lane as refreshing only if it runs longer than 100
 ms, so a skipped or quick refresh causes no redraw. Files live under `<cache root>/query/<name>.json` in an envelope
 whose scope hashes the repository id, canonical main clone, merged
 configuration and build (plus the executable's size and mtime for `dev-`
-builds). A mismatched, corrupt, oversized or week-old file is deleted and
-ignored. The directory is owner-only, identical data is not rewritten, and
+builds). Remote host display snapshots use `<cache root>/remote-query/` instead:
+their scope binds the repository, main clone, selected repository config,
+endpoint, host protocol, and explicit display-cache schema. Compatible binary
+updates and unrelated local settings do not discard remembered remote rows.
+They restore as cached, never as confirmed live evidence. Empty startup frames
+update connection state without replacing remembered rows. A mismatched,
+corrupt, oversized or week-old file is deleted and ignored. The directory is owner-only, identical data is not rewritten, and
 temporary files a crashed writer left behind are removed. Sources that read SQLite, logs or live process state are `Never`:
 durable state is read directly and never cached here.
 

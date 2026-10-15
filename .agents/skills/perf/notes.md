@@ -522,3 +522,23 @@ in 3.66 ms during a held removal. Fresh hazards required another confirmation;
 quit took 5.51 ms and the durable job completed after exit. These are isolated
 fixture timings, not live-fleet bounds. Evidence:
 `/tmp/wt-delete-cached-menu-20261014-review/result.json`.
+
+### Remote rows missing after an update (2026-10-15)
+
+At 15:03:04Z, the Cozee startup log discarded `host-145e5d392704b042`
+as `Mismatched`, along with local query caches. The cache scope included the
+binary build and all merged settings. No remote query file remained during
+inspection. Thus an update erased remembered rows and exposed SSH/worker
+startup latency. The fix gives remote display snapshots a separate schema-
+versioned scope bound to repository and endpoint identity. They remain restored
+cache data until live worker observations arrive. A startup frame without a
+board must not suppress disk restore or erase remembered rows. No live state
+was cleared and no user session was stopped.
+
+Validation: the wt-app gate passed all 412 tests. The disk-cache restart test
+restores rows with no SSH connection, keeps them through empty startup frames
+both before and after restore, refuses confirmed evidence until a live frame,
+and accepts a real empty inventory. Scope tests retain data through local
+setting and label changes but reject another repository, host, or worker config.
+Already discarded snapshots cannot be recovered; the first successful remote
+connection seeds the new cache.
