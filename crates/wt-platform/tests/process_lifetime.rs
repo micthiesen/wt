@@ -170,7 +170,12 @@ async fn deadline_includes_waiting_for_capacity() {
     let should_not_exist = directory.path().join("second");
     let mut command = CommandSpec::new("touch").args([should_not_exist.as_os_str()]);
     command.timeout = Duration::from_millis(50);
-    let result = runner.run(command, &CancellationToken::new()).await;
+    let result = runner.run(command.clone(), &CancellationToken::new()).await;
+    assert!(matches!(result, Err(ProcessError::Timeout { .. })));
+    assert!(!should_not_exist.exists());
+    let result = runner
+        .run_to_completion(command, &CancellationToken::new())
+        .await;
     assert!(matches!(result, Err(ProcessError::Timeout { .. })));
     assert!(!should_not_exist.exists());
     first_cancel.cancel();
@@ -309,4 +314,54 @@ async fn external_children_survive_only_a_successful_explicit_ownership_transfer
             assert!(!marker.exists());
         }
     }
+}
+
+#[tokio::test]
+async fn irreversible_work_finishes_after_its_deadline_and_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = directory.path().join("started");
+    let retained = directory.path().join("retained");
+    std::fs::write(&retained, "fixture only").unwrap();
+    let mut command = CommandSpec::new("sh")
+        .args([
+            "-c",
+            "touch started; sleep .4; printf large-output; rm retained; printf finished",
+        ])
+        .cwd(directory.path());
+    command.timeout = Duration::from_millis(150);
+    command.output_limit = 3;
+    let cancellation = CancellationToken::new();
+    let task_cancel = cancellation.clone();
+    let runner = ProcessRunner::default();
+    let task = tokio::spawn(async move { runner.run_to_completion(command, &task_cancel).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancellation.cancel();
+    let output = task.await.unwrap().unwrap();
+    assert!(output.status.success());
+    assert!(output.elapsed > Duration::from_millis(150));
+    assert!(output.stdout_truncated);
+    assert_eq!(output.stdout, b"lar");
+    assert!(!retained.exists());
+}
+
+#[tokio::test]
+async fn irreversible_work_cancelled_before_admission_never_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("unexpected");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = ProcessRunner::default()
+        .run_to_completion(
+            CommandSpec::new("touch").args([marker.as_os_str()]),
+            &cancellation,
+        )
+        .await;
+    assert!(matches!(result, Err(ProcessError::Cancelled { .. })));
+    assert!(!marker.exists());
 }

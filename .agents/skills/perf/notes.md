@@ -542,3 +542,34 @@ and accepts a real empty inventory. Scope tests retain data through local
 setting and label changes but reject another repository, host, or worker config.
 Already discarded snapshots cannot be recovered; the first successful remote
 connection seeds the new cache.
+
+### Git removal interrupted after 60 seconds (2026-10-15)
+
+The Cozee journal for `secrets-github-bootstrap` records failure at
+04:49:41Z: `git worktree remove` timed out after 60 seconds. Three other local
+removals failed at the same deadline. The checkout directory remained, and the
+board showed large tracked deletions. The separate remote handshake failure
+explains the host badge, not the local removal failure. No sample establishes
+why physical deletion exceeded the deadline.
+
+The removal path used the same timeout as Git reads. A dedicated process policy
+now keeps bounded, cancellable admission but completes irreversible work after
+spawn without the read timeout or caller cancellation. It retains process-group
+ownership, bounded capture, and lifecycle locking. Retired independent-clone
+deletion uses the same policy. Nonzero Git removal reports possible partial
+file loss and requires review before another attempt; no automatic force retry.
+The live partially removed worktrees were not deleted or changed.
+
+Validation: the workspace gate passed 1,142 tests (one skipped), formatting,
+Clippy, dependency checks, and documentation tests. The completion-policy test
+keeps an isolated deletion alive beyond its 150 ms admission deadline and a
+post-start cancellation, drains excess output, and checks the final file state.
+Pre-start cancellation and queued admission deadlines still prevent a spawn.
+A real permission-blocked Git worktree removal reports partial-loss risk and
+preserves the protected fixture file.
+
+The first workspace run also exposed a stack assertion that rejected Git's
+`cannot lock ref ... but expected ... failed to update ref` wording. The push
+was refused correctly. The assertion now accepts that compare-and-swap failure;
+its remote-tip and replay-backup checks remain and passed. Full results:
+`/tmp/wt-removal-workspace-final-gate.log`.

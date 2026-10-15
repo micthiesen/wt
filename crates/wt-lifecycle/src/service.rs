@@ -191,6 +191,14 @@ pub enum LifecycleError {
         #[source]
         source: ProcessError,
     },
+    #[error(
+        "removal did not finish for {path}; files may already be missing; inspect the remaining checkout before retrying: {source}"
+    )]
+    IncompleteRemoval {
+        path: PathBuf,
+        #[source]
+        source: ProcessError,
+    },
     #[error("Git repository inventory: {0}")]
     Repository(#[from] wt_vcs::RepositoryError),
     #[error("durable wt state: {0}")]
@@ -1285,16 +1293,7 @@ impl LifecycleService {
         cancellation: &CancellationToken,
         operation: &'static str,
     ) -> Result<wt_platform::process::ProcessOutput, LifecycleError> {
-        let mut spec = CommandSpec::new("git");
-        spec.args = args;
-        spec.cwd = Some(cwd.to_path_buf());
-        spec.env = vec![
-            ("GIT_OPTIONAL_LOCKS".into(), Some("0".into())),
-            ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
-            ("LC_ALL".into(), Some("C".into())),
-        ];
-        spec.timeout = PROCESS_TIMEOUT;
-        spec.output_limit = PROCESS_OUTPUT_LIMIT;
+        let spec = git_spec(cwd, args);
         let phase = match operation {
             "refresh copied Git index" => Some("copied-index-refresh"),
             "switch Rift clone branch" | "create branch in Rift clone" => {
@@ -1831,24 +1830,22 @@ impl LifecycleService {
         force: bool,
         cancellation: &CancellationToken,
     ) -> Result<(), LifecycleError> {
-        let path_text = path.to_string_lossy().to_string();
-        let result = if force {
-            self.run_git_raw(
-                main,
-                ["worktree", "remove", "--force", &path_text],
-                cancellation,
-                "remove Git worktree",
-            )
-            .await?
-        } else {
-            self.run_git_raw(
-                main,
-                ["worktree", "remove", &path_text],
-                cancellation,
-                "remove Git worktree",
-            )
-            .await?
-        };
+        let mut args = vec![OsString::from("worktree"), OsString::from("remove")];
+        if force {
+            args.push(OsString::from("--force"));
+        }
+        args.push(path.as_os_str().to_owned());
+        // Git unlinks files during this command. A timeout or UI cancellation
+        // after spawn cannot safely roll that back. Keep its owner and lock
+        // until it exits; ordinary Git reads retain their short deadlines.
+        let result = self
+            .runner
+            .run_to_completion(git_spec(main, args), cancellation)
+            .await
+            .map_err(|source| LifecycleError::IncompleteRemoval {
+                path: path.to_owned(),
+                source,
+            })?;
         if result.status.success() {
             return Ok(());
         }
@@ -1859,15 +1856,19 @@ impl LifecycleService {
                 cancellation,
                 "prune Git worktree metadata",
             )
-            .await?;
-        if !fs::try_exists(path).await.unwrap_or(false) && prune.status.success() {
+            .await;
+        if matches!(fs::try_exists(path).await, Ok(false))
+            && prune.as_ref().is_ok_and(|output| output.status.success())
+        {
             return Ok(());
         }
-        Err(process_error(
-            "remove Git worktree",
-            main,
-            result.checked("git").unwrap_err(),
-        ))
+        if let Err(error) = prune {
+            tracing::warn!(%error, "Git metadata prune after incomplete removal failed");
+        }
+        Err(LifecycleError::IncompleteRemoval {
+            path: path.to_owned(),
+            source: result.checked("git").unwrap_err(),
+        })
     }
 
     async fn rift_binary(
@@ -1975,7 +1976,7 @@ impl LifecycleService {
         spec.cwd = Some(root);
         // Once recursive deletion starts, retain ownership until the process
         // exits. Cancelling halfway cannot restore an independent object store.
-        let result = self.runner.run(spec, &CancellationToken::new()).await;
+        let result = self.runner.run_to_completion(spec, cancellation).await;
         result
             .and_then(|output| output.checked("rm"))
             .map_err(|source| process_error("remove retired independent clone", path, source))?;
@@ -2605,6 +2606,20 @@ impl LifecycleService {
     }
 }
 
+fn git_spec(cwd: &Path, args: Vec<OsString>) -> CommandSpec {
+    let mut spec = CommandSpec::new("git");
+    spec.args = args;
+    spec.cwd = Some(cwd.to_path_buf());
+    spec.env = vec![
+        ("GIT_OPTIONAL_LOCKS".into(), Some("0".into())),
+        ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
+        ("LC_ALL".into(), Some("C".into())),
+    ];
+    spec.timeout = PROCESS_TIMEOUT;
+    spec.output_limit = PROCESS_OUTPUT_LIMIT;
+    spec
+}
+
 fn process_error(operation: &'static str, path: &Path, source: ProcessError) -> LifecycleError {
     LifecycleError::Process {
         operation,
@@ -3145,6 +3160,51 @@ mod tests {
             main,
             root,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_git_removal_reports_possible_partial_loss_without_forcing_a_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_scratch, service, runner, main, root) = setup().await;
+        let path = root.join("partial");
+        run(
+            &runner,
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "michael/partial",
+                path.to_str().unwrap(),
+            ],
+        )
+        .await;
+        let protected = path.join("protected");
+        fs::create_dir(&protected).await.unwrap();
+        fs::write(protected.join("keep.txt"), "fixture only")
+            .await
+            .unwrap();
+        fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        let result = service
+            .remove_git_worktree(&path, &main, true, &CancellationToken::new())
+            .await;
+        // Restore fixture permissions even when an assertion below fails.
+        fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(matches!(error, LifecycleError::IncompleteRemoval { .. }));
+        let message = error.to_string();
+        assert!(message.contains("files may already be missing"));
+        assert!(message.contains("inspect the remaining checkout before retrying"));
+        assert!(protected.join("keep.txt").exists());
+        assert!(path.exists());
     }
 
     #[tokio::test]

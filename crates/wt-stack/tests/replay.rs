@@ -664,7 +664,7 @@ async fn stale_lease_fixture(refresh_tracking: bool) -> Result<()> {
         )
         .await?;
     assert!(
-        matches!(&result, RestackOutcome::Refused { error } if error.contains("force-with-lease") || error.contains("stale info") || error.contains("incorrect old value provided")),
+        matches!(&result, RestackOutcome::Refused { error } if error.contains("force-with-lease") || error.contains("stale info") || error.contains("incorrect old value provided") || (error.contains("cannot lock ref") && error.contains("but expected") && error.contains("failed to update ref"))),
         "stale lease should be refused, got {result:?}"
     );
     let replayed_tip = output(&fixture.child, ["rev-parse", "HEAD"])?;

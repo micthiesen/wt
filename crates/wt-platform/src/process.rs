@@ -30,7 +30,8 @@ pub struct CommandSpec {
     /// `None` removes a variable from the inherited environment.
     pub env: Vec<(OsString, Option<OsString>)>,
     pub input: Option<Vec<u8>>,
-    /// Includes queue wait, execution, and output collection.
+    /// Includes queue wait, execution, and output collection. With
+    /// `run_to_completion`, this bounds admission only.
     pub timeout: Duration,
     pub output_limit: usize,
     /// Explicit ownership transfer for desktop launchers/clipboard providers.
@@ -158,7 +159,19 @@ impl ProcessRunner {
         // Pipe capture holds sizeable read buffers across awaits. Keep that
         // state on the heap once, rather than embedding it through every
         // service future up to a small-stack runtime worker.
-        Box::pin(self.run_inner(spec, cancellation, None)).await
+        Box::pin(self.run_inner(spec, cancellation, None, false)).await
+    }
+
+    /// Complete an irreversible local mutation once its process starts.
+    /// Admission still uses the command timeout and cancellation token. After
+    /// spawn, neither can interrupt the child. Capture stays bounded and extra
+    /// output is drained. The caller must retain this future through completion.
+    pub async fn run_to_completion(
+        &self,
+        spec: CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessError> {
+        Box::pin(self.run_inner(spec, cancellation, Some(Arc::new(|_, _| {})), true)).await
     }
 
     /// Run with bounded in-memory capture while forwarding every read chunk
@@ -177,7 +190,7 @@ impl ProcessRunner {
     where
         F: Fn(ProcessStream, &[u8]) + Send + Sync + 'static,
     {
-        Box::pin(self.run_inner(spec, cancellation, Some(Arc::new(observer)))).await
+        Box::pin(self.run_inner(spec, cancellation, Some(Arc::new(observer)), false)).await
     }
 
     async fn run_inner(
@@ -185,6 +198,7 @@ impl ProcessRunner {
         spec: CommandSpec,
         cancellation: &CancellationToken,
         observer: Option<StreamObserver>,
+        complete_after_spawn: bool,
     ) -> Result<ProcessOutput, ProcessError> {
         let started = Instant::now();
         let deadline = started + spec.timeout;
@@ -289,8 +303,8 @@ impl ProcessRunner {
         let result = loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => break Err(cancelled()),
-                _ = tokio::time::sleep_until(deadline) => break Err(timed_out()),
+                _ = cancellation.cancelled(), if !complete_after_spawn => break Err(cancelled()),
+                _ = tokio::time::sleep_until(deadline), if !complete_after_spawn => break Err(timed_out()),
                 output = &mut captures, if captured.is_none() => {
                     match output {
                         Ok(output) => captured = Some(output),
@@ -308,8 +322,8 @@ impl ProcessRunner {
                         Some(output) => Ok(output),
                         None => tokio::select! {
                             biased;
-                            _ = cancellation.cancelled() => Err(cancelled()),
-                            _ = tokio::time::sleep_until(deadline) => Err(timed_out()),
+                            _ = cancellation.cancelled(), if !complete_after_spawn => Err(cancelled()),
+                            _ = tokio::time::sleep_until(deadline), if !complete_after_spawn => Err(timed_out()),
                             output = timeout(PIPE_DRAIN_GRACE, &mut captures) => match output {
                                 Ok(output) => output,
                                 Err(_) => Err(ProcessError::PipeDrain { program: program.clone() }),

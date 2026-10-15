@@ -562,6 +562,12 @@ message was accepted, it reports ambiguity and stops instead of risking a
 duplicate. The live terminal remains the sole owner of harness questions and
 approvals.
 
+Physical checkout deletion uses `ProcessRunner::run_to_completion`: queue
+admission remains bounded and cancellable, while an admitted process runs to
+completion with bounded output capture. Its caller retains ownership and the
+lifecycle lock. A short read-command deadline cannot interrupt Git while it
+unlinks checkout files. Other process operations keep their normal policy.
+
 ## Release and configuration boundaries
 
 The stable launcher and app use `wt-update`'s immutable, checksum-verified

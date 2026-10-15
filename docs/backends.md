@@ -306,3 +306,17 @@ implementation; do not spread backend branching through UI actions.
 - `--copy-all` also brings other regenerable artifacts (`dist`, `.turbo`,
   caches) across via CoW — harmless for a fresh identical checkout, and
   free.
+
+### Completion of physical removal
+
+Git worktree removal and deletion of retired independent clones keep their
+process and lifecycle lock until file removal exits. The normal command timeout
+applies to queue admission only. After spawn, elapsed time and caller
+cancellation do not stop recursive deletion halfway. Output is still drained
+with bounded capture, and the worker records the terminal result. Ordinary Git
+checks retain their existing timeout and cancellation.
+
+If Git exits unsuccessfully, wt reports that files may already be missing.
+Restoring the previous archive state restores row visibility, not deleted files.
+wt does not automatically force or repeat the failed removal. A new attempt must
+review current checkout identity and hazards.
