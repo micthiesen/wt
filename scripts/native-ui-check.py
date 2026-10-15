@@ -571,11 +571,21 @@ def main():
             def compact_terminal(data):
                 return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data).lower()
 
+            first_menu_started = time.monotonic()
             os.write(master, b"gd")
             first_menu = wait_for(lambda data: b"removeworktree?" in compact_terminal(data))
+            first_menu_ms = (time.monotonic() - first_menu_started) * 1000
             (root / "first-removal-confirm.ansi").write_bytes(first_menu)
             os.write(master, b"y")
-            wait_for(lambda _: removal_started.exists(), timeout=10)
+            # Cached warnings never authorize force. The host returns a fresh
+            # hazard review before this dirty fixture can start removal.
+            reviewed = wait_for(lambda data: removal_started.exists()
+                                or b"reviewchangedremovalhazards" in compact_terminal(data), timeout=10)
+            if not removal_started.exists():
+                assert b"reviewchangedremovalhazards" in compact_terminal(reviewed)
+                assert (root / "worktrees" / "bench-000").exists()
+                os.write(master, b"y")
+                wait_for(lambda _: removal_started.exists(), timeout=10)
             first_removed = removal_started.read_text()
             assert first_removed == "bench-000", first_removed
             drain_for(0.1)
@@ -693,6 +703,7 @@ def main():
                       delayed_palette_chord=True,
                       accepted_write_survived_quit=args.exit_signal == "quit" and not args.create and not args.removal,
                       overlapping_removal_menu_ms=removal_menu_ms,
+                      initial_removal_menu_ms=first_menu_ms if args.removal else None,
                       held_removal_quit_ms=removal_quit_ms,
                       durable_removal_completed_after_exit=args.removal,
                       create_feedback_ms=create_feedback_ms if args.create else None,

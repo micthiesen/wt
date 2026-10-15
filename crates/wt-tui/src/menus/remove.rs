@@ -1,62 +1,75 @@
-//! `d`: remove a worktree. A clean checkout confirms from the board; any
-//! hazard, or any doubt, is planned by the host so its exact lines show.
+//! `d`: review cached checkout facts without waiting for host I/O.
+//! The host checks identity and all removal hazards after confirmation.
 
 use super::{LocalMenu, Menu};
-use crate::{Board, BoardRow, ConfirmAction, RemovalSeen, Seen, UiModal, cleanup};
+use crate::{Board, ConfirmAction, RemovalSeen, Seen, UiModal, cleanup};
 
 pub(super) fn menu(board: &Board, key: &str) -> Menu {
     let Some(row) = board.rows.iter().find(|row| row.key == key) else {
-        // Not on the board: the host answers authoritatively.
         return Menu::Host {
             reason: "the worktree is not on the board",
         };
     };
-    let Some(seen) = clean_checkout(row) else {
-        return Menu::Host {
-            reason: "the checkout has hazards or unknown state",
-        };
+    if row.is_main || row.pending_creation || row.key.starts_with('\0') {
+        return Menu::Local(LocalMenu::Notice("This checkout cannot be removed.".into()));
+    }
+    let mut lines = vec![format!("{} ({})", row.slug, row.branch)];
+    if let Some(host) = &row.host {
+        lines.push(format!("Host: {host}"));
+        if let Some(error) = board.host_errors.get(host) {
+            lines.push(format!("Host unavailable: {error}"));
+        }
+    }
+    if let Some(reason) = cleanup::checkout_hold_reason(row, false) {
+        lines.push(format!("Last observed: {reason}"));
+    }
+    if let Some(count) = row.git.tracked_changes.filter(|count| *count > 0) {
+        lines.push(format!("Changed tracked files: {count}"));
+    }
+    if let Some(count) = row.git.untracked_files.filter(|count| *count > 0) {
+        lines.push(format!("Untracked files: {count}"));
+    }
+    if let Some(count) = row.git.ahead.filter(|count| *count > 0) {
+        lines.push(format!("Commits ahead of upstream: {count}"));
+    }
+    if row.environment_live {
+        lines.push("A deployed stage may need removal.".into());
+    }
+    let Some(head) = row.git.head_sha.as_ref().filter(|head| !head.is_empty()) else {
+        lines.push(
+            "Checkout identity is not available yet. Reopen after the background refresh.".into(),
+        );
+        return Menu::Local(LocalMenu::modal(UiModal::Log {
+            title: "Remove worktree?".into(),
+            lines,
+            close_key: Some('d'),
+            refresh: None,
+        }));
     };
+    lines.push(
+        "Current safety checks run after confirmation. Any hazards need a separate review.".into(),
+    );
     Menu::Local(LocalMenu::modal(UiModal::Confirm {
         title: "Remove worktree?".into(),
-        lines: vec![format!("{} ({})", row.slug, row.branch)],
+        lines,
         action: ConfirmAction::Remove {
             key: key.into(),
             force: false,
             revision: None,
-            seen: Some(Box::new(Seen(seen))),
+            seen: Some(Box::new(Seen(RemovalSeen {
+                path: row.path.clone(),
+                branch: row.branch.clone(),
+                head: head.clone(),
+            }))),
         },
         cancel_key: Some('d'),
     }))
 }
 
-/// The identity to witness when the board shows no removal hazard. Every
-/// doubt returns `None`, so the host plans the row instead.
-fn clean_checkout(row: &BoardRow) -> Option<RemovalSeen> {
-    // Temporary creation rows have no checkout, and the main checkout is
-    // never removable. Remote rows reach their host through its own routing.
-    if row.key.starts_with('\0')
-        || row.is_main
-        || row.detached
-        || row.archived
-        || row.host.is_some()
-        || row.environment_live
-        || row.slug.is_empty()
-        || row.branch.is_empty()
-        || cleanup::checkout_hold_reason(row, false).is_some()
-    {
-        return None;
-    }
-    Some(RemovalSeen {
-        path: row.path.clone(),
-        branch: row.branch.clone(),
-        head: row.git.head_sha.clone()?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GitPresentation, LandingKind, UiAction};
+    use crate::{BoardRow, GitPresentation, LandingKind, UiAction};
 
     fn clean(slug: &str) -> BoardRow {
         BoardRow {
@@ -100,7 +113,7 @@ mod tests {
         };
         let (title, lines, action) = confirm(menu(&board, "one"));
         assert_eq!(title, "Remove worktree?");
-        assert_eq!(lines, ["one (feature/one)"]);
+        assert_eq!(lines[0], "one (feature/one)");
         assert_eq!(
             action,
             ConfirmAction::Remove {
@@ -117,14 +130,13 @@ mod tests {
     }
 
     #[test]
-    fn any_hazard_or_doubt_defers_to_the_host() {
+    fn hazards_and_remote_rows_still_open_locally_without_authorizing_force() {
         let cases: &[fn(&mut BoardRow)] = &[
             |row| row.git.tracked_changes = Some(1),
             |row| row.git.tracked_changes = None,
             |row| row.git.untracked_files = Some(2),
             |row| row.git.rebasing = true,
             |row| row.git.conflict_files = vec!["a".into()],
-            |row| row.git.head_sha = None,
             |row| row.git.error = Some("boom".into()),
             |row| row.path_missing = true,
             |row| row.busy = Some(Default::default()),
@@ -135,7 +147,6 @@ mod tests {
                 })
             },
             |row| row.environment_live = true,
-            |row| row.is_main = true,
             |row| row.host = Some("builder".into()),
         ];
         for case in cases {
@@ -145,11 +156,53 @@ mod tests {
                 rows: vec![row],
                 ..Default::default()
             };
-            assert!(
-                matches!(menu(&board, "one"), Menu::Host { .. }),
-                "hazard must be planned by the host"
-            );
+            let (_, _, action) = confirm(menu(&board, "one"));
+            assert!(matches!(
+                action,
+                ConfirmAction::Remove {
+                    force: false,
+                    revision: None,
+                    seen: Some(_),
+                    ..
+                }
+            ));
         }
+    }
+
+    #[test]
+    fn missing_head_shows_a_local_menu_without_a_removal_commit() {
+        let mut row = clean("one");
+        row.git.head_sha = None;
+        let board = Board {
+            rows: vec![row],
+            ..Default::default()
+        };
+        assert!(
+            matches!(menu(&board, "one"), Menu::Local(LocalMenu::Modal { modal, .. })
+            if matches!(*modal, UiModal::Log { close_key: Some('d'), refresh: None, .. }))
+        );
+    }
+
+    #[test]
+    fn remote_dirty_menu_preserves_identity_and_lists_cached_hazards() {
+        let mut row = clean("one");
+        row.host = Some("builder".into());
+        row.key = wt_core::remote_worktree_ledger_key("builder", "one");
+        row.git.tracked_changes = Some(2);
+        row.git.ahead = Some(3);
+        let key = row.key.clone();
+        let board = Board {
+            rows: vec![row],
+            ..Default::default()
+        };
+        let (_, lines, action) = confirm(menu(&board, &key));
+        assert!(lines.contains(&"Host: builder".into()));
+        assert!(lines.contains(&"Changed tracked files: 2".into()));
+        assert!(lines.contains(&"Commits ahead of upstream: 3".into()));
+        assert!(
+            matches!(action, ConfirmAction::Remove { key: selected, force: false, revision: None, seen: Some(seen) }
+            if selected == key && seen.0.head == "head" && seen.0.path == "/worktrees/one")
+        );
     }
 
     #[test]

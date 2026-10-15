@@ -22,8 +22,13 @@ fn board(keys: &[&str]) -> SourceSnapshot<Board> {
 }
 
 fn request_remove(model: &mut Model, id: u64) -> u64 {
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('d')), 20) else {
-        panic!("expected remove preparation")
+    // Host-picked rows can be absent from this board and still need a host
+    // preparation. Ordinary delete keys now open their menu locally.
+    let action = UiAction::OnHost {
+        host: Some("builder".into()),
+        action: Box::new(UiAction::PrepareRemove {
+            key: model.selected_row().unwrap().key.clone(),
+        }),
     };
     model.begin_action(id, &action);
     model.toast = Some(("Loading menu… Esc cancels".into(), ToastTone::Info));
@@ -189,17 +194,20 @@ fn abandoning_a_menu_cancels_its_read() {
 }
 
 #[test]
-fn repeated_delete_cancels_preparation_without_enqueuing_duplicate_work() {
+fn repeated_delete_closes_the_local_menu_without_enqueuing_work() {
     let mut model = Model::default();
     model.apply(board(&["one"]));
-    let generation = request_remove(&mut model, 7);
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('d')), 20),
+        InputResult::Draw
+    );
+    assert!(matches!(model.interaction, Interaction::Log { .. }));
+    assert!(model.pending_request.is_none());
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::Char('d')), 20),
         InputResult::Draw
     );
     assert!(model.pending_request.is_none());
-    assert_eq!(model.toast.as_ref().unwrap().0, "Menu cancelled");
-    model.reply(confirmation(7, generation, "one"));
     assert!(matches!(model.interaction, Interaction::None));
 }
 

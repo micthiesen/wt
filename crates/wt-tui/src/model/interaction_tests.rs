@@ -1190,3 +1190,25 @@ fn board_built_session_picker_keeps_the_live_row_under_the_cursor() {
         }
     );
 }
+
+#[test]
+fn delete_opens_a_dirty_remote_confirmation_without_a_host_request() {
+    let mut snapshot = board(&["one"]);
+    let row = &mut snapshot.rows[0];
+    row.key = wt_core::remote_worktree_ledger_key("builder", "one");
+    row.host = Some("builder".into());
+    row.path = "/worktrees/one".into();
+    row.git.head_sha = Some("head".into());
+    row.git.tracked_changes = Some(2);
+    row.git.untracked_files = Some(1);
+    let key = row.key.clone();
+    let mut model = Model::default();
+    model.apply(ready(snapshot));
+    assert_eq!(ch(&mut model, 'd'), InputResult::Draw);
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+    assert!(
+        matches!(ch(&mut model, 'y'), InputResult::Action(UiAction::Remove {
+        key: selected, force: false, revision: None, seen: Some(_),
+    }) if selected == key)
+    );
+}

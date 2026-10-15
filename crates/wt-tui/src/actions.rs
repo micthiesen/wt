@@ -200,8 +200,8 @@ pub enum UiAction {
     Remove {
         key: String,
         force: bool,
-        /// The reviewed hazards. `None` for a board menu that showed a clean
-        /// checkout; the host then needs `seen` and plans the review itself.
+        /// The reviewed hazards. `None` for a board menu showing cached facts;
+        /// the host then needs `seen` and plans the review itself.
         #[serde(default)]
         revision: Option<RemovalRevision>,
         /// The checkout a board menu showed. `None` with no `revision` is
@@ -417,7 +417,7 @@ pub struct RemovalRevision {
     pub published_base: Option<Box<(String, String)>>,
 }
 
-/// The checkout identity a board removal menu showed for a clean row. The
+/// The checkout identity a board removal menu showed. The
 /// host compares it with its own plan before it removes anything.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemovalSeen {

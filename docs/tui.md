@@ -419,3 +419,8 @@ default, so a picker opened before a live slot appeared selects it once it
 does. Shift+F10 and Shift+F11 confirm a running terminal from the board; a
 terminal retained after its process exited, or one on a remote host, is read
 from tmux by its host.
+
+The `d` delete menu opens from cached worktree data, including dirty and remote
+rows. It shows current cached warnings. After confirmation, the host checks
+identity and removal hazards. Any hazards or stage destruction require a fresh
+confirmation before removal. A missing HEAD shows an information menu only.

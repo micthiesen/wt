@@ -204,7 +204,7 @@ fn navigating_away_from_a_pending_connection_explains_cancellation() {
 fn delayed_modal_and_background_completion_preserve_newer_input() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
-    model.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 20);
+    model.input(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), 20);
     let generation = model.ui_generation;
     model.input(KeyEvent::new(KeyCode::Char('#'), KeyModifiers::NONE), 20);
     assert!(matches!(model.interaction, Interaction::Text(_)));
@@ -1134,9 +1134,7 @@ fn remove_confirm_captures_target_and_cancel_key_never_mutates() {
     model.select(1);
     assert_eq!(
         model.input(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 20),
-        InputResult::Action(UiAction::PrepareRemove {
-            key: "second".into()
-        })
+        InputResult::Draw
     );
     model.reply(UiReply {
         modal: Some(UiModal::Confirm {

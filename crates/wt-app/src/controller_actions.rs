@@ -342,7 +342,7 @@ pub async fn execute_with_shutdown(
             revision,
             seen,
         } => {
-            // A board menu witnesses only its clean checkout, and asserts no
+            // A board menu witnesses only its checkout identity, and asserts no
             // revision. Anything without either witness asserts nothing.
             if revision.is_none() && seen.is_none() {
                 bail!("removal must name the checkout it was reviewed against");
@@ -368,7 +368,7 @@ pub async fn execute_with_shutdown(
             let changed = revision
                 .as_ref()
                 .is_some_and(|revision| *revision != current_revision);
-            // The board asserts only a clean checkout. Any hazard, a deployed
+            // The board authorizes no hazards. Any hazard, a deployed
             // stage, or a warning goes back to the user before anything runs.
             let review = !plan.hazards.is_empty() || plan.destroy_stage || warning.is_some();
             if changed || (revision.is_none() && (force || review)) {

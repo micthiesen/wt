@@ -139,10 +139,16 @@ Menus are presentation of the board, not host requests. `UiAction::menu`
 whether its menu is built from the presented board, needs host-only data
 (with the reason), or is not a menu. Board builders are pure functions of
 `Board` and answer any board, including an empty one; a builder may defer to
-the host when its board lacks the data (a hazardous removal, an unprefetched
-palette). The host service refuses any action whose menu is board-built. An
+the host when its board lacks the data (an unprefetched palette). The host service refuses any action whose menu is board-built. An
 open board menu rebuilds on each presented snapshot and keeps its selection
 by option value, so option values identify choices, never list positions.
+
+The `d` menu opens from cached board facts for local and remote rows, including
+hazardous or deployed checkouts. It shows cached warnings without authorizing
+force. Confirmation asks the host to check the displayed path, branch, and HEAD,
+then plan removal. Any current hazards or stage destruction need a further
+confirmation of the fresh plan. If HEAD is unavailable, a local information
+menu opens without a removal action. No host scan runs before the menu opens.
 
 Commits from a menu carry a witness of what it showed: `Seen<T>`, `PrPin`,
 `LiveSessionIdentity`, removal identity, or ledger timestamps. The owning host

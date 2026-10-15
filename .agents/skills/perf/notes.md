@@ -504,3 +504,21 @@ they are not instructions for the native Rust runtime.
   233 events and 3.4 ms total callback time in the TypeScript implementation.
   The native watcher uses notify/FSEvents and has separate registration and
   lifecycle behavior.
+
+### Delete menu fallback (2026-10-14)
+
+The v0.1.19 delete key plans removal before opening its confirmation. Current
+main adds a board menu for clean local rows, but still uses a host preparation
+for dirty, remote, deployed, and uncertain rows. That fallback explains why the
+menu can still wait. The fix opens those rows from cached facts too. It captures
+path, branch, and HEAD but authorizes no force. The host keeps its current
+identity checks and requests a fresh hazard confirmation before removal. Missing
+HEAD opens a local information menu with no removal action. No live deletion
+was used to reproduce the delay.
+
+Validation: wt-tui gate passed 239 tests; wt-app gate passed 410 tests. The
+private terminal removal fixture opened the first menu in 6.98 ms and another
+in 3.66 ms during a held removal. Fresh hazards required another confirmation;
+quit took 5.51 ms and the durable job completed after exit. These are isolated
+fixture timings, not live-fleet bounds. Evidence:
+`/tmp/wt-delete-cached-menu-20261014-review/result.json`.
