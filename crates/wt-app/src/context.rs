@@ -42,6 +42,9 @@ impl AppContext {
             Lane::Terminal(..)
                 | Lane::Preparation(..)
                 | Lane::Metadata(..)
+                | Lane::HostControl(..)
+                | Lane::Target(..)
+                | Lane::SessionControl(..)
                 | Lane::Presentation
                 | Lane::ViewControl
         );

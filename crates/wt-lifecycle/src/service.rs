@@ -4,7 +4,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -417,6 +416,25 @@ impl LifecycleService {
         review_head: Option<ReviewHead>,
         cancellation: &CancellationToken,
     ) -> Result<CreateResult, LifecycleError> {
+        let phase = crate::creation_trace::CreationPhase::new(
+            &self.config.worktree_root.join(slug),
+            "create-transaction",
+        );
+        let result = self
+            .create_transaction(branch, slug, options, review_head, cancellation)
+            .await;
+        phase.lifecycle(&result);
+        result
+    }
+
+    async fn create_transaction(
+        &self,
+        branch: &str,
+        slug: &str,
+        options: CreateOptions,
+        review_head: Option<ReviewHead>,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateResult, LifecycleError> {
         if self.config.reserved_slugs.contains(slug) {
             return Err(LifecycleError::Refused(format!(
                 "{slug:?} is a reserved worktree/session slug"
@@ -448,6 +466,10 @@ impl LifecycleService {
             )));
         }
         if options.fetch_origin {
+            let phase = crate::creation_trace::CreationPhase::new(
+                &path,
+                "fetch-origin-including-maintenance",
+            );
             let report = self
                 .repository
                 .fetch_origin(
@@ -461,7 +483,10 @@ impl LifecycleService {
                     },
                     cancellation,
                 )
-                .await?;
+                .await
+                .map_err(LifecycleError::from);
+            phase.lifecycle(&report);
+            let report = report?;
             for warning in report.warnings {
                 tracing::warn!(%warning, "Git ref maintenance before creation");
             }
@@ -694,7 +719,10 @@ impl LifecycleService {
         let configured_base = logical_base.map(|(reference, _)| reference).or(base_ref);
         self.configure_branch(branch, path, configured_base, existing, cancellation)
             .await?;
-        self.copy_files(main, path, cancellation).await?;
+        let phase = crate::creation_trace::CreationPhase::new(path, "configured-file-copy");
+        let copied = self.copy_files(main, path, cancellation).await;
+        phase.lifecycle(&copied);
+        copied?;
         if self.config.has_sst {
             let stage_file = path.join(".sst/stage");
             if let Some(parent) = stage_file.parent() {
@@ -1560,19 +1588,7 @@ impl LifecycleService {
         if self.config.copy_globs.is_empty() {
             return Ok(());
         }
-        let mut builder = GlobSetBuilder::new();
-        for pattern in &self.config.copy_globs {
-            builder.add(
-                GlobBuilder::new(pattern)
-                    .literal_separator(false)
-                    .build()
-                    .map_err(|error| {
-                        LifecycleError::Invalid(format!("invalid copy glob {pattern:?}: {error}"))
-                    })?,
-            );
-        }
-        let globs: GlobSet = builder
-            .build()
+        let globs = crate::copy_globs::CopyGlobs::new(&self.config.copy_globs)
             .map_err(|error| LifecycleError::Invalid(format!("invalid copy glob set: {error}")))?;
         let mut pending = vec![source.to_path_buf()];
         while let Some(directory) = pending.pop() {
@@ -1611,7 +1627,12 @@ impl LifecycleService {
                         source,
                     })?;
                 if kind.is_dir() {
-                    pending.push(path);
+                    let relative = path
+                        .strip_prefix(source)
+                        .expect("walk remains under source");
+                    if globs.can_match_descendant(relative) {
+                        pending.push(path);
+                    }
                 } else if kind.is_file() {
                     let relative = path
                         .strip_prefix(source)
@@ -1867,6 +1888,10 @@ impl LifecycleService {
         force: bool,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, LifecycleError> {
+        if self.config.backend == BackendKind::GitWorktree {
+            self.remove_retired_clone(path, cancellation).await?;
+            return Ok(None);
+        }
         let mut spec = CommandSpec::new(self.rift_binary(cancellation).await?);
         spec.args = if force {
             vec![
@@ -1896,6 +1921,57 @@ impl LifecycleService {
             .await
             .err()
             .map(|error| format!("Rift garbage collection failed: {error}")))
+    }
+
+    /// Retiring Rift must not make previously created independent checkouts
+    /// undeletable. The caller holds the same lock and removal witnesses as the
+    /// Rift executable path. Never interpret a linked worktree as a clone.
+    async fn remove_retired_clone(
+        &self,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LifecycleError> {
+        let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
+        self.ensure_managed_path(path, &root)?;
+        for (candidate, directory) in [
+            (path.to_path_buf(), true),
+            (path.join(".git"), true),
+            (path.join(".rift"), false),
+        ] {
+            let metadata =
+                fs::symlink_metadata(&candidate)
+                    .await
+                    .map_err(|source| LifecycleError::Io {
+                        operation: "validate retired independent clone",
+                        path: candidate.clone(),
+                        source,
+                    })?;
+            if metadata.file_type().is_symlink()
+                || (directory && !metadata.is_dir())
+                || (!directory && !metadata.is_file())
+            {
+                return Err(LifecycleError::Refused(format!(
+                    "retired clone identity changed: {}",
+                    candidate.display()
+                )));
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(LifecycleError::Cancelled);
+        }
+        let mut spec = prioritized_cleanup(
+            &OsString::from("rm"),
+            vec!["-rf".into(), "--".into(), path.as_os_str().to_owned()],
+        );
+        spec.cwd = Some(root);
+        // Once recursive deletion starts, retain ownership until the process
+        // exits. Cancelling halfway cannot restore an independent object store.
+        let result = self.runner.run(spec, &CancellationToken::new()).await;
+        result
+            .and_then(|output| output.checked("rm"))
+            .map_err(|source| process_error("remove retired independent clone", path, source))?;
+        tracing::info!(target: "wt::lifecycle", path = %path.display(), "retired independent clone removed; Rift registry unchanged");
+        Ok(())
     }
 
     async fn run_rift_create(
@@ -2813,16 +2889,15 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 }
 
 fn prioritized_rift_gc(rift_binary: &OsString) -> CommandSpec {
-    let mut program = PathBuf::from(rift_binary);
-    let mut args = vec![OsString::from("gc")];
+    prioritized_cleanup(rift_binary, vec![OsString::from("gc")])
+}
+
+fn prioritized_cleanup(binary: &OsString, mut args: Vec<OsString>) -> CommandSpec {
+    let mut program = PathBuf::from(binary);
     if let Some(nice) = find_executable("nice") {
         args.splice(
             0..0,
-            [
-                OsString::from("-n"),
-                OsString::from("10"),
-                rift_binary.clone(),
-            ],
+            [OsString::from("-n"), OsString::from("10"), binary.clone()],
         );
         program = nice;
     }
@@ -3012,6 +3087,70 @@ mod tests {
             main,
             root,
         )
+    }
+
+    #[tokio::test]
+    async fn configured_copy_prunes_unrelated_trees_and_preserves_existing_files() {
+        let (_scratch, mut service, _runner, main, root) = setup().await;
+        service.config.copy_globs = vec![".env*".into(), "config/*.json".into()];
+        for (relative, contents) in [
+            (".env.local", "source"),
+            ("config/deep/nested.json", "nested"),
+            ("config/skip.txt", "skip"),
+            ("node_modules/pkg/config.json", "unrelated"),
+            ("config/.git/secret.json", "git metadata"),
+        ] {
+            let path = main.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            fs::write(path, contents).await.unwrap();
+        }
+        fs::write(root.join(".env.local"), "destination")
+            .await
+            .unwrap();
+        // An unreadable, provably unrelated subtree must not be visited at all.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                main.join("node_modules"),
+                std::fs::Permissions::from_mode(0o0),
+            )
+            .await
+            .unwrap();
+            std::os::unix::fs::symlink(main.join("config"), main.join("config/link")).unwrap();
+        }
+        let result = service
+            .copy_files(&main, &root, &CancellationToken::new())
+            .await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                main.join("node_modules"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .await
+            .unwrap();
+        }
+        result.unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".env.local")).await.unwrap(),
+            "destination"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("config/deep/nested.json"))
+                .await
+                .unwrap(),
+            "nested"
+        );
+        for absent in [
+            "node_modules",
+            "config/skip.txt",
+            "config/.git",
+            "config/link",
+        ] {
+            assert!(!root.join(absent).exists(), "{absent}");
+        }
     }
 
     #[tokio::test]
@@ -3879,6 +4018,133 @@ mod tests {
                 .remove(&created.target, RemoveOptions::default(), &cancellation)
                 .await,
             Err(LifecycleError::Refused(message)) if message.contains("unpushed commit")
+        ));
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn retired_rift_clones_remove_without_rift_and_keep_normal_safety_guards() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let cancellation = CancellationToken::new();
+        let mut targets = Vec::new();
+        for name in ["legacy-clean", "legacy-dirty", "legacy-unpushed"] {
+            let path = root.join(name);
+            run(
+                &runner,
+                &main,
+                &[
+                    "clone",
+                    "--no-hardlinks",
+                    main.to_str().unwrap(),
+                    path.to_str().unwrap(),
+                ],
+            )
+            .await;
+            run(&runner, &path, &["switch", "-c", name]).await;
+            fs::write(path.join(".rift"), "fixture marker")
+                .await
+                .unwrap();
+            fs::write(path.join(".git/info/exclude"), ".rift\n")
+                .await
+                .unwrap();
+            targets.push(local_worktree_target(
+                name,
+                name,
+                path.to_string_lossy(),
+                "stagepersonal",
+            ));
+        }
+        let dirty = Path::new(&targets[1].path);
+        fs::write(dirty.join("tracked.txt"), "uncommitted work")
+            .await
+            .unwrap();
+        let unpushed = Path::new(&targets[2].path);
+        fs::write(unpushed.join("tracked.txt"), "unpublished work")
+            .await
+            .unwrap();
+        run(&runner, unpushed, &["add", "tracked.txt"]).await;
+        run(
+            &runner,
+            unpushed,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "private commit",
+            ],
+        )
+        .await;
+        for (target, hazard) in [
+            (&targets[1], "uncommitted changes"),
+            (&targets[2], "unpushed commit"),
+        ] {
+            let result = service
+                .remove(target, RemoveOptions::default(), &cancellation)
+                .await;
+            assert!(
+                matches!(result, Err(LifecycleError::Refused(ref message)) if message.contains(hazard)),
+                "{result:?}"
+            );
+            assert!(Path::new(&target.path).exists());
+        }
+        service
+            .remove(&targets[0], RemoveOptions::default(), &cancellation)
+            .await
+            .unwrap();
+        assert!(!Path::new(&targets[0].path).exists());
+        assert_eq!(
+            fs::read_to_string(dirty.join("tracked.txt")).await.unwrap(),
+            "uncommitted work"
+        );
+        assert_eq!(
+            fs::read_to_string(unpushed.join("tracked.txt"))
+                .await
+                .unwrap(),
+            "unpublished work"
+        );
+        assert!(main.join(".git").is_dir());
+    }
+
+    #[tokio::test]
+    async fn retired_clone_removal_refuses_linked_git_metadata_and_cancellation() {
+        let (_scratch, service, _runner, _main, root) = setup().await;
+        let path = root.join("not-an-independent-clone");
+        fs::create_dir(&path).await.unwrap();
+        let path = fs::canonicalize(path).await.unwrap();
+        fs::write(path.join(".rift"), "marker").await.unwrap();
+        fs::write(path.join(".git"), "gitdir: elsewhere")
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .remove_retired_clone(&path, &CancellationToken::new())
+                .await,
+            Err(LifecycleError::Refused(_))
+        ));
+        assert!(path.exists());
+        fs::remove_file(path.join(".git")).await.unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(_main.join(".git"), path.join(".git")).unwrap();
+            assert!(matches!(
+                service
+                    .remove_retired_clone(&path, &CancellationToken::new())
+                    .await,
+                Err(LifecycleError::Refused(_))
+            ));
+            assert!(_main.join(".git/HEAD").exists());
+            fs::remove_file(path.join(".git")).await.unwrap();
+        }
+        fs::create_dir(path.join(".git")).await.unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            service.remove_retired_clone(&path, &cancellation).await,
+            Err(LifecycleError::Cancelled)
         ));
         assert!(path.exists());
     }

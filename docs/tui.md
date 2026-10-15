@@ -75,13 +75,17 @@ author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
 shows a scrollbar when it overflows.
 
 Creation immediately selects one optimistic row with its title and a progress
-glyph. Normal list navigation and attention controls remain available. The
+glyph. Normal list navigation, attention controls and default-harness switching
+remain available. The
 chosen host resolves the exact checkout identity before creation starts, so
 inventory replaces that row without a duplicate. Navigation away is preserved
 when preparation or creation finishes. Worktree actions, including F12, become
 available when the real checkout is ready; F12 is never queued automatically.
 Dependency installation continues as a background action. Confirmed removal moves the row to Archived with a
 removal glyph; a failed removal restores its previous archive state.
+Commands taking more than three seconds show elapsed progress. A queued command
+names the conflicting operation or capacity wait; this is progress, not a
+completed request. Independent controls do not wait for checkout creation.
 
 ### Cached, pending and failed states
 

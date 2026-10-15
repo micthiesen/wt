@@ -1,5 +1,37 @@
 # Performance notes
 
+### Creation latency and independent controls (2026-10-15 UTC)
+
+Installed v0.1.20 (`7992577`) logged Rift creation at 43.34, 43.60 and
+42.95 seconds; copied-index refresh added about 3.7 seconds. An isolated raw
+`clonefile` of the same Cozee tree took 43.174 seconds, with all 2,600 native
+samples in `clonefileat`. The tree contained roughly 965,000 entries, including
+943,980 in `node_modules`. This reproduces the dominant delay without Rift,
+Git switching or postcreate hooks. CoW avoids copying file data, not the cost
+of creating this metadata. Evidence: `/tmp/wt-rift-attribution-20261014`.
+The owned scratch clone's removal took 61.71 seconds too.
+
+`epic-test-1` finished cloning at 02:31:17Z, then its index-refresh future was
+interrupted at 02:31:20Z. No creation process remained at inspection; a clean
+detached clone remained. Do not describe this as a completed worktree.
+
+Shift+Tab independently fell through the action classifier into whole-host
+exclusion, conflicting with creation. The input loop itself remained fast
+(logged draws below 4 ms). Replacing that fallback with exhaustive resource
+classification addresses this separately from filesystem latency. Global
+preference writes must be verified durably during a held creation, not merely
+by an optimistic header change.
+
+The selected remedy is Git worktrees with background dependency installation,
+pruned configured-file traversal, and native safe removal of retained Rift
+clones after retiring the external tool. A real Cozee Git checkout, in an
+isolated wt namespace, completed in 3.669 seconds: origin maintenance 1.350 s,
+Git checkout 2.245 s, configured file copies 2.330 ms. Its separate offline
+frozen pnpm install took 26.6 s. Dependency setup is still work, but the TUI
+runs it as a background action after publishing the checkout.
+The native held-creation test verified a durable primary-harness change before
+releasing creation, ordinary navigation, background setup and clean shutdown.
+
 ### Shutdown test under machine pressure (2026-10-14 UTC)
 
 The full native suite passed 997 tests but timed out draining background sources

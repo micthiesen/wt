@@ -200,6 +200,9 @@ pub fn start(
                 },
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
                     Some(mut command) => {
+                        if task_lanes.is_empty() && pending.is_empty() {
+                            progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
+                        }
                         // Resolve aliases before deciding cancellation ownership as
                         // well as conflicts. Palette title generation is a write.
                         command.action = crate::host_dispatch::rename_as_title(command.action);
@@ -217,19 +220,38 @@ pub fn start(
                     },
                     None => closed = true,
                 },
-                _ = &mut progress_tick, if draining && !task_lanes.is_empty() => {
+                _ = &mut progress_tick, if !task_lanes.is_empty() || !pending.is_empty() => {
                     for active in task_lanes.values() {
-                        eprintln!("{}", shutdown_progress(active, Instant::now()));
+                        if draining {
+                            eprintln!("{}", shutdown_progress(active, Instant::now()));
+                        } else if active.started.elapsed() >= Duration::from_secs(3) {
+                            let _ = port.replies.try_send(progress_reply(
+                                active.request_id, active.generation,
+                                format!("{} on {}: running ({})", active.name, lane_host(&active.lane), elapsed(active.started.elapsed())),
+                            ));
+                        }
                     }
                     for (lane, (request, accepted_at)) in &pending {
-                        eprintln!("wt: shutdown waiting: {} on {} is queued ({} elapsed, operation {})",
+                        if draining {
+                            eprintln!("wt: shutdown waiting: {} on {} is queued ({} elapsed, operation {})",
                             action_name(&request.action),
                             lane_host(lane),
                             elapsed(accepted_at.elapsed()),
                             request.id,
-                        );
+                            );
+                        } else if accepted_at.elapsed() >= Duration::from_secs(3) {
+                            let blocker = task_lanes.values().find(|active| lanes_conflict(lane, &active.lane));
+                            let reason = blocker.map_or_else(
+                                || "waiting for command capacity".to_owned(),
+                                |active| format!("waiting for {} on {}", active.name, lane_host(&active.lane)),
+                            );
+                            let _ = port.replies.try_send(progress_reply(
+                                request.id, request.generation,
+                                format!("{}: {reason} ({})", action_name(&request.action), elapsed(accepted_at.elapsed())),
+                            ));
+                        }
                     }
-                    progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(10));
+                    progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(if draining { 10 } else { 3 }));
                 },
             }
         }
@@ -241,9 +263,24 @@ pub fn start(
     }
 }
 
+fn progress_reply(id: u64, generation: u64, message: String) -> UiReply {
+    UiReply {
+        operation_id: Some(id),
+        ui_generation: Some(generation),
+        progress: Some(message),
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Lane {
     Host(Option<String>),
+    /// Host preferences and controls touch no checkout; share the control budget.
+    HostControl(Option<String>),
+    /// Commands on one checkout cannot exclude unrelated lifecycle work.
+    Target(Option<String>, String),
+    /// Session stop owns the slot resource that terminal entry also uses.
+    SessionControl(Option<String>, Option<String>),
     /// Create operations serialize with each other, but a durable removal of
     /// an existing target must not hold up creating an unrelated target.
     Creation(Option<String>),
@@ -290,6 +327,13 @@ fn action_name(action: &wt_tui::UiAction) -> &'static str {
         wt_tui::UiAction::GenerateTitle { .. } => "generate title",
         wt_tui::UiAction::SetStatus { .. } => "save status",
         wt_tui::UiAction::SetIssueOverride { .. } => "save issue",
+        wt_tui::UiAction::CyclePrimary => "change default harness",
+        wt_tui::UiAction::ToggleAutomations { .. }
+        | wt_tui::UiAction::ToggleRemovedAutomations { .. } => "change automation preference",
+        wt_tui::UiAction::CancelAutomations => "cancel queued automations",
+        wt_tui::UiAction::GithubMarkReady { .. } => "mark pull request ready",
+        wt_tui::UiAction::GithubSetAutoMerge { .. } => "change pull request auto-merge",
+        wt_tui::UiAction::HardRefresh => "refresh caches",
         wt_tui::UiAction::Session { .. }
         | wt_tui::UiAction::EnterHarness { .. }
         | wt_tui::UiAction::SelectSession { .. } => "open session",
@@ -321,6 +365,9 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
 fn lane_host(lane: &Lane) -> &str {
     match lane {
         Lane::Host(Some(host))
+        | Lane::HostControl(Some(host))
+        | Lane::Target(Some(host), _)
+        | Lane::SessionControl(Some(host), _)
         | Lane::Creation(Some(host))
         | Lane::Removal(Some(host), _)
         | Lane::Metadata(Some(host), _)
@@ -328,6 +375,9 @@ fn lane_host(lane: &Lane) -> &str {
         | Lane::Prefetch(Some(host))
         | Lane::Terminal(Some(host), _) => host,
         Lane::Host(None)
+        | Lane::HostControl(None)
+        | Lane::Target(None, _)
+        | Lane::SessionControl(None, _)
         | Lane::Creation(None)
         | Lane::Removal(None, _)
         | Lane::Metadata(None, _)
@@ -457,47 +507,82 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
     }
     let (host, action, _) =
         crate::host_routing::resolve(crate::host_dispatch::rename_as_title(action.clone()))?;
-    Ok(
-        if matches!(
-            action,
-            wt_tui::UiAction::SetAttentionSeen { .. }
-                | wt_tui::UiAction::SetHistoryActive { .. }
-                | wt_tui::UiAction::SetPerf { .. }
-        ) {
+    if action.is_preparation() {
+        // Menu ownership stays in UiAction::menu, not in the scheduler.
+        return Ok(Lane::Preparation(host));
+    }
+    use wt_tui::UiAction as A;
+    // Exhaustive by design: adding an action requires choosing the resources
+    // it actually owns, rather than silently taking a whole-host lock.
+    Ok(match action {
+        A::OnHost { .. } => unreachable!("routing has been resolved"),
+        A::SetAttentionSeen { .. } | A::SetHistoryActive { .. } | A::SetPerf { .. } => {
             Lane::ViewControl
-        } else if matches!(action, wt_tui::UiAction::WarmPalette { .. }) {
-            // Read-only prefetch: never queued behind a long host job, and
-            // never ahead of a menu the user is waiting for.
-            Lane::Prefetch(host)
-        } else if action.is_terminal_handoff() {
-            let key = match action {
-                wt_tui::UiAction::Session { key, .. } => key,
-                wt_tui::UiAction::SelectSession { selection } => selection.key,
-                wt_tui::UiAction::EnterHarness { key, .. } => Some(key),
-                _ => None,
-            };
-            Lane::Terminal(host, key)
-        } else if crate::host_routing::controller_owned(&action) {
-            Lane::Presentation
-        } else if action.is_preparation() {
-            Lane::Preparation(host)
-        } else if matches!(
-            action,
-            wt_tui::UiAction::Create { .. } | wt_tui::UiAction::CreateResolved { .. }
-        ) {
-            Lane::Creation(host)
-        } else if let wt_tui::UiAction::Remove { key, .. } = action {
-            Lane::Removal(host, key)
-        } else if let wt_tui::UiAction::SetTitle { key, .. }
-        | wt_tui::UiAction::GenerateTitle { key }
-        | wt_tui::UiAction::SetStatus { key, .. }
-        | wt_tui::UiAction::SetIssueOverride { key, .. } = action
-        {
-            Lane::Metadata(host, key)
-        } else {
-            Lane::Host(host)
-        },
-    )
+        }
+        A::CyclePrimary
+        | A::ToggleAutomations { .. }
+        | A::CancelAutomations
+        | A::ToggleRemovedAutomations { .. }
+        | A::DismissReviewRequest { .. }
+        | A::KillAction { .. }
+        | A::HardRefresh => Lane::HostControl(host),
+        A::WarmPalette { .. } | A::DiscoverSessions { .. } => Lane::Prefetch(host),
+        A::Session { key, .. } => Lane::Terminal(host, key),
+        A::SelectSession { selection } => Lane::Terminal(host, selection.key),
+        A::EnterHarness { key, .. } => Lane::Terminal(host, Some(key)),
+        A::PerfInvestigate { .. } | A::ManagedSignIn { .. } => Lane::Terminal(host, None),
+        A::OpenLink { .. }
+        | A::OpenPrLink { .. }
+        | A::OpenPrDefault { .. }
+        | A::OpenSlotEditor { .. }
+        | A::Copy { .. }
+        | A::OpenEditor { .. }
+        | A::OpenUrl { .. }
+        | A::FoldSection { .. }
+        | A::MoveSection { .. }
+        | A::Reorder { .. }
+        | A::RenameSection { .. }
+        | A::ToggleArchive { .. } => Lane::Presentation,
+        A::PrepareCreate { .. }
+        | A::ResolveCreation { .. }
+        | A::PrepareHardRefresh
+        | A::PrepareReviewCheckout { .. }
+        | A::PrepareReviewers { .. }
+        | A::PrepareRestoreRemoved { .. }
+        | A::PrepareGithub { .. }
+        | A::PrepareActions { .. }
+        | A::PrepareAction { .. }
+        | A::PrepareSection { .. }
+        | A::PrepareRemove { .. }
+        | A::PrepareCleanup
+        | A::PrepareStatus { .. }
+        | A::PrepareBase { .. }
+        | A::PrepareSessions { .. }
+        | A::PrepareHarnesses { .. }
+        | A::PrepareStopTerminal { .. }
+        | A::GithubFailedChecks { .. } => unreachable!("menu declaration handles preparations"),
+        A::Create { .. } | A::CreateResolved { .. } => Lane::Creation(host),
+        A::Remove { key, .. } => Lane::Removal(host, key),
+        A::SetTitle { key, .. }
+        | A::GenerateTitle { key }
+        | A::SetStatus { key, .. }
+        | A::SetIssueOverride { key, .. } => Lane::Metadata(host, key),
+        A::SubmitReviewers { key, .. }
+        | A::GithubMarkReady { key, .. }
+        | A::GithubSetAutoMerge { key, .. }
+        | A::GithubShip { key, .. }
+        | A::SetBase { key, .. } => Lane::Target(host, key),
+        A::StopTerminal { key, .. } => Lane::SessionControl(host, Some(key)),
+        A::StopSession { selection } | A::KillSession { selection } => {
+            Lane::SessionControl(host, selection.key)
+        }
+        // Arbitrary actions and stack operations can span multiple checkouts.
+        A::RunAction { .. }
+        | A::Restack { .. }
+        | A::ReviewCheckout { .. }
+        | A::RestoreRemoved { .. } => Lane::Host(host),
+        A::Cleanup { .. } | A::CleanupTargets { .. } => Lane::FleetCleanup,
+    })
 }
 
 fn is_cleanup_action(action: &wt_tui::UiAction) -> bool {
@@ -521,6 +606,7 @@ pub(crate) fn take_available<T>(
             !matches!(
                 lane,
                 Lane::ViewControl
+                    | Lane::HostControl(_)
                     | Lane::Preparation(_)
                     | Lane::Prefetch(_)
                     | Lane::Creation(_)
@@ -530,13 +616,17 @@ pub(crate) fn take_available<T>(
         })
         .count()
         >= 4;
+    let control_busy = busy
+        .iter()
+        .any(|lane| matches!(lane, Lane::ViewControl | Lane::HostControl(_)));
     let preparation_busy = busy.iter().any(|lane| matches!(lane, Lane::Preparation(_)));
     let prefetch_busy = busy.iter().any(|lane| matches!(lane, Lane::Prefetch(_)));
     let creation_busy = busy.iter().any(|lane| matches!(lane, Lane::Creation(_)));
     let metadata_busy = busy.iter().any(|lane| matches!(lane, Lane::Metadata(_, _)));
     let position = pending.iter().position(|(lane, _)| {
         let has_capacity = match lane {
-            Lane::ViewControl | Lane::Terminal(_, _) => true,
+            Lane::ViewControl | Lane::HostControl(_) => !control_busy,
+            Lane::Terminal(_, _) => true,
             Lane::Preparation(_) => !preparation_busy,
             Lane::Prefetch(_) => !prefetch_busy,
             Lane::Creation(_) => !creation_busy,
@@ -558,12 +648,16 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
             (
                 Lane::FleetCleanup,
                 Lane::Host(_)
+                    | Lane::Target(_, _)
+                    | Lane::SessionControl(_, Some(_))
                     | Lane::Creation(_)
                     | Lane::Removal(_, _)
                     | Lane::Metadata(_, _)
                     | Lane::Terminal(_, Some(_))
             ) | (
                 Lane::Host(_)
+                    | Lane::Target(_, _)
+                    | Lane::SessionControl(_, Some(_))
                     | Lane::Creation(_)
                     | Lane::Removal(_, _)
                     | Lane::Metadata(_, _)
@@ -585,6 +679,20 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
         (Lane::Removal(left_host, left_key), Lane::Removal(right_host, right_key)) => {
             left_host == right_host && left_key == right_key
         }
+        (Lane::Target(host, key), Lane::Removal(other_host, other_key))
+        | (Lane::Removal(other_host, other_key), Lane::Target(host, key)) => {
+            host == other_host && key == other_key
+        }
+        (Lane::SessionControl(host, key), Lane::Terminal(other_host, other_key))
+        | (Lane::Terminal(other_host, other_key), Lane::SessionControl(host, key)) => {
+            host == other_host && key == other_key
+        }
+        (Lane::SessionControl(host, Some(key)), Lane::Removal(other_host, other_key))
+        | (Lane::Removal(other_host, other_key), Lane::SessionControl(host, Some(key))) => {
+            host == other_host && key == other_key
+        }
+        (Lane::Target(host, _), Lane::Host(other_host))
+        | (Lane::Host(other_host), Lane::Target(host, _)) => host == other_host,
         (Lane::Metadata(host, key), Lane::Removal(other_host, other_key))
         | (Lane::Removal(other_host, other_key), Lane::Metadata(host, key)) => {
             host == other_host && key == other_key
@@ -1490,6 +1598,100 @@ mod tests {
         ]);
         let mut pending = VecDeque::from([(lane.clone(), action.clone())]);
         assert_eq!(take_available(&mut pending, &busy), Some((lane, action)));
+    }
+
+    #[test]
+    fn preferences_and_checkout_actions_do_not_wait_for_creation_on_either_host() {
+        use wt_tui::UiAction;
+        for host in [None, Some("MaxBook".to_owned())] {
+            for action in [
+                UiAction::CyclePrimary,
+                UiAction::CancelAutomations,
+                UiAction::ToggleAutomations { key: None },
+                UiAction::GithubMarkReady {
+                    key: "existing".into(),
+                    pin: None,
+                },
+                UiAction::DiscoverSessions {
+                    key: Some("existing".into()),
+                    target: wt_tui::SessionTarget::Harness,
+                },
+            ] {
+                let action = UiAction::OnHost {
+                    host: host.clone(),
+                    action: Box::new(action),
+                };
+                let lane = lane_for(&action).unwrap();
+                let mut pending = VecDeque::from([(lane.clone(), action.clone())]);
+                assert_eq!(
+                    take_available(
+                        &mut pending,
+                        &BTreeSet::from([Lane::Creation(host.clone())])
+                    ),
+                    Some((lane, action))
+                );
+            }
+            let action = UiAction::OnHost {
+                host: host.clone(),
+                action: Box::new(UiAction::CyclePrimary),
+            };
+            let lane = lane_for(&action).unwrap();
+            let mut pending = VecDeque::from([(lane.clone(), action.clone())]);
+            let busy = (0..4)
+                .map(|i| Lane::Removal(host.clone(), format!("busy-{i}")))
+                .collect();
+            assert_eq!(take_available(&mut pending, &busy), Some((lane, action)));
+        }
+    }
+
+    #[test]
+    fn target_commands_keep_real_conflicts_and_control_capacity_is_bounded() {
+        let target = Lane::Target(Some("MaxBook".into()), "existing".into());
+        for (other, expected) in [
+            (
+                Lane::Removal(Some("MaxBook".into()), "existing".into()),
+                true,
+            ),
+            (Lane::Removal(Some("MaxBook".into()), "other".into()), false),
+            (Lane::Removal(None, "existing".into()), false),
+            (
+                Lane::Terminal(Some("MaxBook".into()), Some("existing".into())),
+                false,
+            ),
+            (Lane::Host(Some("MaxBook".into())), true),
+            (Lane::FleetCleanup, true),
+        ] {
+            assert_eq!(lanes_conflict(&target, &other), expected);
+            assert_eq!(lanes_conflict(&other, &target), expected);
+        }
+        let stop = Lane::SessionControl(Some("MaxBook".into()), Some("existing".into()));
+        let terminal = Lane::Terminal(Some("MaxBook".into()), Some("existing".into()));
+        assert!(lanes_conflict(&stop, &terminal));
+        assert!(lanes_conflict(&terminal, &stop));
+        assert!(!lanes_conflict(
+            &stop,
+            &Lane::Terminal(None, Some("existing".into()))
+        ));
+        let mut pending = VecDeque::from([(Lane::HostControl(None), ())]);
+        assert!(take_available(&mut pending, &BTreeSet::from([Lane::ViewControl])).is_none());
+        assert!(take_available(&mut pending, &BTreeSet::new()).is_some());
+    }
+
+    #[test]
+    fn progress_is_not_a_completion_or_a_worker_protocol_message() {
+        let reply = progress_reply(7, 9, "create worktree: running (3s)".into());
+        assert_eq!(reply.operation_id, Some(7));
+        assert_eq!(reply.ui_generation, Some(9));
+        assert!(reply.outcome.is_none());
+        assert!(!reply.failed);
+        let wire = serde_json::to_value(&reply).unwrap();
+        assert!(wire.get("progress").is_none());
+        assert!(
+            serde_json::from_value::<UiReply>(wire)
+                .unwrap()
+                .progress
+                .is_none()
+        );
     }
 
     #[test]

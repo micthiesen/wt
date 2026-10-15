@@ -616,6 +616,16 @@ def main():
             # Differential rendering reuses cells from preceding frames.
             # Assert the visible screen, never a complete phrase in raw bytes.
             wait_for(lambda _: screen.contains("Worktree is still being created"))
+            # A preference write is independent of checkout creation. Require
+            # the durable value, not merely its optimistic header, while the
+            # creation inventory read is still held.
+            primary_file = root / "cache/harness.json"
+            primary_before = json.loads(primary_file.read_text()).get("primary") if primary_file.exists() else "claude"
+            os.write(master, b"\x1b[Z")
+            wait_for(lambda _: primary_file.exists() and
+                     json.loads(primary_file.read_text()).get("primary") != primary_before,
+                     timeout=1.5)
+            assert delay_inventory.exists()
             # Navigation remains ordinary while the creation read is blocked.
             # Its delayed plan and completion must not reclaim this selection.
             os.write(master, b"k")

@@ -1,5 +1,6 @@
 //! Cancellable, lock-scoped local worktree lifecycle operations.
 
+mod copy_globs;
 mod creation_trace;
 mod rift_binary;
 mod service;

@@ -39,6 +39,17 @@ impl CreationPhase {
         self.finish(outcome, exit_code);
     }
 
+    pub(crate) fn lifecycle<T>(mut self, result: &Result<T, crate::LifecycleError>) {
+        self.finish(
+            match result {
+                Ok(_) => "success",
+                Err(crate::LifecycleError::Cancelled) => "cancelled",
+                Err(_) => "error",
+            },
+            None,
+        );
+    }
+
     fn finish(&mut self, outcome: &'static str, exit_code: Option<i32>) {
         tracing::info!(target: "wt::creation", phase = self.phase, path = %self.path.display(),
             elapsed_ms = self.start.elapsed().as_secs_f64() * 1000.0, outcome, exit_code,

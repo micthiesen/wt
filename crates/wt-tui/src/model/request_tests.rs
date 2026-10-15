@@ -30,6 +30,70 @@ fn request_remove(model: &mut Model, id: u64) -> u64 {
     model.ui_generation
 }
 
+#[test]
+fn progress_is_nonterminal_and_cannot_overwrite_a_newer_interaction() {
+    let mut model = Model::default();
+    model.apply(board(&["one"]));
+    let generation = request_remove(&mut model, 7);
+    let progress = || UiReply {
+        operation_id: Some(7),
+        ui_generation: Some(generation),
+        progress: Some("prepare removal: waiting for command capacity (3s)".into()),
+        ..Default::default()
+    };
+    model.reply(progress());
+    assert_eq!(model.pending_request.as_ref().unwrap().id, 7);
+    assert!(
+        model
+            .toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("waiting for command capacity")
+    );
+    model.reply(confirmation(7, generation, "one"));
+    assert!(model.pending_request.is_none());
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+    let feedback = model.toast.clone();
+    model.reply(progress());
+    assert_eq!(model.toast, feedback);
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+}
+
+#[test]
+fn default_harness_key_remains_available_while_creation_is_pending() {
+    let mut model = Model::default();
+    model.apply(board(&["one"]));
+    model.begin_action(
+        1,
+        &crate::UiAction::Create {
+            input: "new".into(),
+        },
+    );
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::BackTab), 20),
+        InputResult::Action(crate::UiAction::CyclePrimary)
+    );
+    model.begin_action(2, &crate::UiAction::CyclePrimary);
+    let generation = model.ui_generation;
+    model.reply(UiReply {
+        operation_id: Some(1),
+        ui_generation: Some(generation),
+        progress: Some("creating…".into()),
+        ..Default::default()
+    });
+    assert_eq!(model.pending_request.as_ref().unwrap().id, 2);
+    model.reply(UiReply {
+        operation_id: Some(2),
+        ui_generation: Some(generation),
+        primary_harness: Some("Pi".into()),
+        message: "Primary harness: Pi".into(),
+        ..Default::default()
+    });
+    assert_eq!(model.toast.as_ref().unwrap().0, "Primary harness: Pi");
+    assert!(model.pending.contains(1));
+}
+
 fn confirmation(id: u64, generation: u64, key: &str) -> UiReply {
     UiReply {
         operation_id: Some(id),

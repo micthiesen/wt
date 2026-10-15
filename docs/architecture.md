@@ -404,6 +404,15 @@ lifetime; cloning a context does not create capacity. The controller's action
 classification selects this pool in local and managed-worker execution, including
 the repository and tmux adapters. Session identity resolution enumerates checkouts
 without scanning their Git status, so unrelated dirty trees do not delay entry.
+Action admission declares every action's resource scope in an exhaustive match.
+Host preferences and cancellation controls share the reserved control capacity;
+they do not acquire checkout or creation locks. Checkout-specific commands
+exclude removal of that checkout, not creation elsewhere. A new action must
+choose its scope explicitly instead of inheriting whole-host exclusion.
+While commands run or wait, the controller sends nonterminal progress after
+three seconds, including elapsed time and the conflicting operation or capacity
+wait. These notices cannot settle an optimistic mutation or complete a menu
+request, and stale notices cannot overwrite feedback for newer input.
 Quitting closes command admission and cancels source reads, including automation
 evidence preparation. Already-claimed automation dispatches and accepted local
 writes retain their command token until their outcomes have been persisted;

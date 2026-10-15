@@ -15,6 +15,15 @@ wiring, locks, and worktree status are handled by the native lifecycle and VCS
 crates. The backend selection is defined in `crates/wt-config` and implemented
 by `crates/wt-lifecycle`.
 
+Configured copy globs skip directories that cannot contain a match based on the
+glob's literal prefix. This avoids walking dependency trees for anchored files
+such as `.codex/config.toml`, without excluding `node_modules` or other paths
+when a glob explicitly matches them. Wildcards retain their existing ability to
+span directories; broad patterns still require a broad scan. Copies never
+overwrite files already present in the new checkout or follow directory symlinks.
+Creation logs time the whole transaction, origin maintenance, backend creation,
+checkout, configured copies, and foreground dependency installation separately.
+
 ## Why rift
 
 `rift create` copy-on-write-clones the whole working tree (APFS
@@ -134,6 +143,16 @@ and it drives the rest of the design:
 - **Detection, not storage.** Which backend owns a checkout is derived
   from disk (`.rift` marker → rift) at removal time, never persisted. Flip
   `kind` freely; each checkout is torn down by whatever created it.
+  After switching to `git-worktree`, legacy Rift clones can also be removed
+  after uninstalling Rift. The same dirty/unpushed/revision guards and lifecycle
+  lock apply, followed by native recursive removal at background priority.
+  wt verifies a real checkout directory, independent `.git` directory and
+  regular `.rift` marker before deletion. It never follows a marker or Git
+  metadata symlink, and never deletes a linked worktree through this path.
+  The removal process remains owned and awaited once deletion starts. Rift's
+  global registry is left untouched; if Rift is reinstalled, its `gc` prunes
+  missing registrations. While `kind = "rift"`, removal still uses Rift itself
+  and its garbage collection.
 - **AI-session trust.** Claude Code and Codex treat each independent clone
   as a brand-new project and show their "trust this folder?" gate (which
   also suppresses the worktree's harness allow rules) — a git worktree

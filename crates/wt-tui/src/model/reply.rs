@@ -7,6 +7,16 @@ use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 
 impl Model {
     pub fn reply(&mut self, mut reply: UiReply) -> Option<crate::TerminalHandoff> {
+        if let Some(progress) = reply.progress.take() {
+            if self.pending_request.as_ref().is_some_and(|request| {
+                Some(request.id) == reply.operation_id
+                    && Some(request.generation) == reply.ui_generation
+                    && request.generation == self.ui_generation
+            }) {
+                self.toast = Some((progress, ToastTone::Info));
+            }
+            return None;
+        }
         if let Some(prepared) = reply.creation_prepared.take() {
             self.creation_prepared(reply.operation_id, prepared);
             return None;

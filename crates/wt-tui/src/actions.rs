@@ -665,6 +665,10 @@ pub enum UiModal {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UiReply {
+    /// Controller-only nonterminal feedback. Never settles a pending write,
+    /// consumes menu typeahead, or crosses the worker protocol.
+    #[serde(skip)]
+    pub progress: Option<String>,
     /// Read-only host preparation; never starts a checkout by itself.
     #[serde(default)]
     pub creation_plan: Option<CreatePlan>,
