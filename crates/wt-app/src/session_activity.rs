@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
-use notify::{Event, RecommendedWatcher, Watcher};
+use notify::{Event, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -53,7 +53,7 @@ type RolloutFingerprint = Option<(u64, std::time::SystemTime)>;
 /// handler filters back to retained UUID paths. A metadata-only 500ms backstop
 /// catches dropped notifications without rereading unchanged transcripts.
 struct CodexOutputWatch {
-    watcher: Option<RecommendedWatcher>,
+    watcher: Option<crate::watcher::WtWatcher>,
     watched_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
     directories: BTreeSet<PathBuf>,
     updates: mpsc::Receiver<()>,
@@ -98,8 +98,7 @@ impl CodexOutputWatch {
                 }
             }
         });
-        let watcher =
-            notify::recommended_watcher(Self::event_handler(Arc::clone(&watched_paths), sender));
+        let watcher = crate::watcher::new(Self::event_handler(Arc::clone(&watched_paths), sender));
         let watcher = match watcher {
             Ok(watcher) => Some(watcher),
             Err(error) => {
@@ -186,8 +185,8 @@ impl CodexOutputWatch {
                 .difference(&self.directories)
                 .cloned()
                 .collect::<Vec<_>>();
-            // FSEvents restarts its stream when the watch set changes. Batch
-            // those edits once, off the executor, and keep ownership until done.
+            // Batch watch edits off the executor and keep ownership until the
+            // backend has applied the replacement set.
             self.watcher = match tokio::task::spawn_blocking(move || {
                 let changes = remove.into_iter().map(notify::PathOp::unwatch)
                     .chain(add.into_iter().map(notify::PathOp::watch_non_recursive)).collect();

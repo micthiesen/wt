@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import importlib.util
 from pathlib import Path
 import select
@@ -131,6 +132,7 @@ def make_host(root: Path, name: str, binary: Path, token: str) -> dict[str, Any]
 class HostProcess:
     def __init__(self, host: dict[str, Any]):
         self.host = host
+        self.started_at = time.time()
         self.stderr_file = host["stderr"].open("wb")
         self.process = subprocess.Popen(
             [str(host["binary"]), "_host"],
@@ -151,6 +153,46 @@ class HostProcess:
     def stderr(self) -> str:
         self.stderr_file.flush()
         return self.host["stderr"].read_text(errors="replace")[-8000:]
+
+    def retain_crash_report(self) -> None:
+        if sys.platform != "darwin" or self.process.returncode is None or self.process.returncode >= 0:
+            return
+        # ReportCrash writes asynchronously. Only inspect fresh reports for our
+        # executable and copy a report after its embedded PID matches this child.
+        deadline = time.monotonic() + 5
+        directories = (
+            Path.home() / "Library/Logs/DiagnosticReports",
+            Path("/Library/Logs/DiagnosticReports"),
+        )
+        while True:
+            for directory in directories:
+                for path in directory.glob(f"{self.host['binary'].name}*"):
+                    try:
+                        if path.suffix not in (".ips", ".crash") or path.stat().st_mtime < self.started_at:
+                            continue
+                        report = path.read_text(errors="replace")
+                        if path.suffix == ".ips":
+                            decoder = json.JSONDecoder()
+                            rest = report.lstrip()
+                            matches = False
+                            while rest:
+                                value, end = decoder.raw_decode(rest)
+                                matches |= isinstance(value, dict) and value.get("pid") == self.process.pid
+                                rest = rest[end:].lstrip()
+                        else:
+                            matches = re.search(rf"^Process:.*\[{self.process.pid}\]\s*$", report, re.MULTILINE) is not None
+                        if matches:
+                            destination = self.host["root"] / path.name
+                            shutil.copy2(path, destination)
+                            print(f"retained host crash report: {destination}", file=sys.stderr)
+                            return
+                    except (OSError, ValueError):
+                        # An incomplete report may finish during the bounded wait.
+                        continue
+            if time.monotonic() >= deadline:
+                print(f"no crash report available for host pid {self.process.pid}", file=sys.stderr)
+                return
+            time.sleep(0.1)
 
     def send(self, frame: dict[str, Any], *, fragmented: bool = False) -> None:
         payload = json.dumps(frame, separators=(",", ":")).encode() + b"\n"
@@ -175,6 +217,7 @@ class HostProcess:
         deadline = time.monotonic() + timeout
         while b"\n" not in self.buffer:
             if self.process.poll() is not None:
+                self.retain_crash_report()
                 raise AssertionError(
                     f"host {self.host['name']} exited {self.process.returncode}: {self.stderr()}"
                 )
@@ -193,6 +236,7 @@ class HostProcess:
                     code: int | str = self.process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     code = "still running"
+                self.retain_crash_report()
                 cause = (
                     signal.Signals(-code).name
                     if isinstance(code, int) and code < 0
@@ -668,7 +712,7 @@ def main() -> None:
             failure.mkdir(parents=True, exist_ok=True)
             for path in root.rglob("*"):
                 if path.is_file() and (
-                    path.suffix in (".log", ".json", ".toml", ".sqlite")
+                    path.suffix in (".log", ".json", ".toml", ".sqlite", ".ips", ".crash")
                     or path.name.endswith((".sqlite-wal", ".sqlite-shm"))
                 ):
                     destination = failure / path.relative_to(root)

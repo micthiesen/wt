@@ -72,6 +72,7 @@ mod skills;
 mod sources;
 mod terminal_palette;
 mod updates;
+mod watcher;
 mod watcher_cleanup;
 mod work_presentation;
 mod worktree_facts;

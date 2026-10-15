@@ -1320,6 +1320,8 @@ dependencies = [
  "log",
  "mio",
  "notify-types",
+ "objc2-core-foundation",
+ "objc2-core-services",
  "walkdir",
  "windows-sys 0.61.2",
  "xxhash-rust",
@@ -1365,6 +1367,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "objc2-core-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
+name = "objc2-core-services"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b"
+dependencies = [
+ "libc",
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -2888,6 +2909,7 @@ dependencies = [
  "tokio-util",
  "wt-config",
  "wt-core",
+ "wt-harness",
  "wt-platform",
  "wt-tmux",
 ]
@@ -2904,6 +2926,7 @@ dependencies = [
  "libc",
  "notify",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -3108,6 +3131,7 @@ dependencies = [
  "tokio-util",
  "wt-config",
  "wt-core",
+ "wt-harness",
  "wt-platform",
 ]
 

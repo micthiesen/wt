@@ -142,7 +142,7 @@ decaying CPU. This isolates an intermittent concurrency/service-pressure
 failure, not a deterministic new-dependency regression; it does not turn the
 failed concurrent tests into successful verification.
 
-Final choice: published `notify =9.0.0-rc.5` with `macos_kqueue` and FSEvents
+Rejected candidate: published `notify =9.0.0-rc.5` with `macos_kqueue` and FSEvents
 disabled, bypassing the overloaded system daemon. Stable 8.2 is unsuitable:
 its nonrecursive directory-write handler guesses an existing child and adds
 a recursive watch, potentially entering `node_modules` from a shallow
@@ -158,6 +158,27 @@ No checkout contents or Git objects are recursively watched. On the published
 kqueue backend, nine freshness tests passed in 2.23 s, including the unchanged
 registration deadline and rapid reconfiguration; the previously failing
 startup-cancellation drain passed in 0.01 s. No deadlines changed.
+
+The release gate subsequently caught a SIGBUS in the native host removal
+fixture (run 38794326380). Kqueue's directory `NOTE_LINK` handler rebuilds a
+nonrecursive watch recursively, including SQLite DB/SHM files. Closing these
+unrelated descriptors releases SQLite's process-wide POSIX locks. A separate
+process can then obtain a writer lock while the original connection still
+holds its transaction, permitting SHM truncation beneath a live mapping.
+The isolated `shallow_directory_link_changes_preserve_sqlite_writer_locks`
+regression fails against this backend in 0.02 seconds after three child-directory
+creations. The previously passing directory-write regression did not cover
+directory-link events. No release containing this backend was published.
+
+Replace every macOS application watcher with a shared metadata-only polling
+backend. File-content comparison must remain disabled: opening and closing
+database files for hashing recreates the same lock hazard. Preserve shallow
+checkout scopes and bounded metadata directories. This also avoids synchronous
+FSEvents daemon RPCs. The regression passes with the polling backend, including
+after watcher destruction. The integrated workspace gate passed 1,175 tests
+(three subprocess helpers skipped), formatting, Clippy, dependency checks and
+doc tests. Evidence: `/tmp/wt-oc-025-final-gate.log`. Native release verification
+is a separate required gate.
 
 Companion to `SKILL.md`. Keep the baseline and open issues current; preserve
 measured evidence, and prune implementation-specific advice when it no longer
@@ -679,3 +700,43 @@ The first workspace run also exposed a stack assertion that rejected Git's
 was refused correctly. The assertion now accepts that compare-and-swap failure;
 its remote-tip and replay-backup checks remain and passed. Full results:
 `/tmp/wt-removal-workspace-final-gate.log`.
+
+### OpenCode V2 cold location startup (2026-10-15)
+
+Repeated isolated OpenCode 2.0.29 QA exposed slow native location initialization.
+The first fixture spent about 29 seconds registering its `/private/tmp` entry
+watcher. A second fixture under the per-user temporary directory initialized
+ancestor watchers for about eight seconds. Its concurrently launched TUI judged
+the service unresponsive after six seconds and restarted it, interrupting the
+first prompt before admission. This is a service-startup ordering problem, not
+evidence that the prompt should be resent. wt correctly reported uncertain
+admission for the lost reply.
+
+Evidence: `/tmp/wt-oc-native-025/home/.local/share/opencode/log/opencode.log`,
+`/tmp/wt-oc-native-025-final.log`, and the second fixture's OpenCode log under
+`/private/var/folders/zh/23fnjgyj09l877hf5vh3bfh40000gn/T/wt-oc-native-025-final`.
+The contemporaneous `/tmp/wt-oc-025-perf.json` measured 331% system CPU across
+12 cores, with wt descendants contributing about 8% CPU, or 3% of CPU in use.
+No user service, session, or worktree was stopped. Establish native location
+readiness before launching the interactive client; preserve ambiguous-write
+reconciliation and never use a fixed sleep or blind prompt retry.
+
+The adapter now waits for location-pinned `agent.list` and `skill.list` before
+opening a cold slot. Live slots skip these reads. The native cold-start fixture
+passed all ten interaction checks with exactly one durable initial prompt and
+no unresponsive-service restart in the OpenCode log. Evidence:
+`/tmp/wt-oc-readiness-native.log` and the fixture under the per-user temporary
+directory, `wt-oc-readiness-native`. This prevents the startup race; it does not
+claim to eliminate OpenCode's own watcher-registration latency.
+
+Readiness alone does not protect against another checkout starting concurrently.
+All wt-owned OpenCode clients therefore pin the native service registration's
+loopback URL and pass its password through the child environment. Interactive
+tmux launch consumes a private source file so the password never enters argv.
+Missing registration is bootstrapped under one cross-configuration lock; a live
+service's timeout never authorizes restart or mutation replay. An isolated
+eight-second SIGSTOP trial made explicit clients fail their five-second native
+health checks while preserving the server PID and registration. Normal
+overlapping location and permission reads succeeded. Evidence:
+`/tmp/wt-oc-stalled.py` and `wt-oc-explicit-4lzll9_h` under the per-user temporary
+directory. No user service was paused.

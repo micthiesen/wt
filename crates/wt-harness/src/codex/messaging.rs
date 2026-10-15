@@ -751,6 +751,21 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "subprocess writer fixture"]
+    fn stable_writer_process() {
+        let Some(lock) = std::env::var_os("WT_TEST_WRITER_LOCK") else {
+            return;
+        };
+        let _lock = std::fs::File::create(lock).unwrap();
+        std::fs::write(std::env::var_os("WT_TEST_WRITER_READY").unwrap(), "ready").unwrap();
+        // Signal readiness only after the final executable owns the descriptor.
+        // No subsequent exec or temporary child can change its birth identity.
+        loop {
+            std::thread::park();
+        }
+    }
+
     #[tokio::test]
     async fn writer_identity_recovers_supervised_and_exec_owners_but_not_unmarked_children() {
         use wt_platform::process::ProcessRunner;
@@ -772,10 +787,30 @@ mod tests {
             ("unmarked", false, true),
         ] {
             let ready = temp.path().join(name);
-            let script = if child_only {
-                "sh -c 'exec 3>\"$1\"; touch \"$2\"; exec sleep 60' sh \"$1\" \"$2\" & wait"
+            let writer = vec![
+                "env".into(),
+                format!(
+                    "WT_TEST_WRITER_LOCK={}",
+                    locks.join("thread-a.lock").display()
+                ),
+                format!("WT_TEST_WRITER_READY={}", ready.display()),
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".into(),
+                "codex::messaging::tests::stable_writer_process".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ];
+            let command = if child_only {
+                ["sh", "-c", "\"$@\" & wait", "sh"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .chain(writer)
+                    .collect()
             } else {
-                "exec 3>\"$1\"; touch \"$2\"; exec sleep 60"
+                writer
             };
             let client = if supervised {
                 tmux.clone().with_failure_retention()
@@ -787,14 +822,7 @@ mod tests {
                     &CreateSession {
                         name: name.into(),
                         cwd: temp.path().into(),
-                        command: vec![
-                            "sh".into(),
-                            "-c".into(),
-                            script.into(),
-                            "sh".into(),
-                            locks.join("thread-a.lock").to_string_lossy().into_owned(),
-                            ready.to_string_lossy().into_owned(),
-                        ],
+                        command,
                         width: None,
                         height: None,
                     },

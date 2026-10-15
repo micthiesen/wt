@@ -369,8 +369,17 @@ fn headless_runner(harness: ActionHarness, prompt: &str) -> (ActionRunKind, Vec<
             ],
         ),
         ActionHarness::OpenCode => (
-            ActionRunKind::Harness,
-            vec!["opencode".into(), "run".into(), "--".into(), prompt.into()],
+            ActionRunKind::Opencode,
+            // V2 otherwise rejects every pending permission in headless mode,
+            // allowing an action to finish without doing its requested work.
+            // --auto grants pending requests while preserving explicit denies.
+            vec![
+                "opencode".into(),
+                "run".into(),
+                "--auto".into(),
+                "--".into(),
+                prompt.into(),
+            ],
         ),
         ActionHarness::Pi => (
             ActionRunKind::Harness,
@@ -578,9 +587,10 @@ mod tests {
         };
         assert_eq!(
             prepared.request.command,
-            ["opencode", "run", "--", "work wk-1"]
+            ["opencode", "run", "--auto", "--", "work wk-1"]
         );
         assert_eq!(prepared.request.cwd, context.cwd);
+        assert_eq!(prepared.request.kind, ActionRunKind::Opencode);
     }
 
     #[test]

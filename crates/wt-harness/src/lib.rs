@@ -6,6 +6,7 @@
 mod claude;
 mod codex;
 mod opencode;
+pub use opencode::service::{OpenCodeConnection, OpenCodeService};
 mod output;
 mod persist;
 mod pi;

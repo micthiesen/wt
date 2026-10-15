@@ -145,21 +145,20 @@ fn watch(scope: &TaskScope, directory: PathBuf, source: SourceHandle<Vec<DevStat
         let callback = source.clone();
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
-            let mut watcher =
-                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                    match event {
-                        Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
-                        // Streaming log output must not turn into status polling.
-                        Ok(event)
-                            if event
-                                .paths
-                                .iter()
-                                .any(|path| path.extension().is_some_and(|ext| ext == "log")) => {}
-                        _ => {
-                            callback.refresh();
-                        }
+            let mut watcher = crate::watcher::new(move |event: notify::Result<notify::Event>| {
+                match event {
+                    Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
+                    // Streaming log output must not turn into status polling.
+                    Ok(event)
+                        if event
+                            .paths
+                            .iter()
+                            .any(|path| path.extension().is_some_and(|ext| ext == "log")) => {}
+                    _ => {
+                        callback.refresh();
                     }
-                })?;
+                }
+            })?;
             watcher.watch(&directory, RecursiveMode::Recursive)?;
             Ok::<_, anyhow::Error>(watcher)
         })

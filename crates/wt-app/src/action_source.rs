@@ -180,8 +180,8 @@ fn watch(
         let log_callback = logs.clone();
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
-            let mut watcher = notify::recommended_watcher(
-                move |event: notify::Result<notify::Event>| match event {
+            let mut watcher =
+                crate::watcher::new(move |event: notify::Result<notify::Event>| match event {
                     Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
                         for path in event.paths {
                             match path.file_name().and_then(|name| name.to_str()) {
@@ -201,8 +201,7 @@ fn watch(
                         log_callback.refresh();
                     }
                     _ => {}
-                },
-            )?;
+                })?;
             watcher.watch(&directory, RecursiveMode::Recursive)?;
             Ok::<_, anyhow::Error>(watcher)
         })

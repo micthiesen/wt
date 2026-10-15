@@ -12,6 +12,23 @@ is not archived, and is not a child conversation. Closing wt leaves the native
 terminal and OpenCode service running. The `;` picker discovers V2 conversations
 from the native database; it does not borrow another conversation's identity.
 
+Before launching a cold terminal, wt waits for the native location's agent and
+skill services to initialize. This prevents the TUI's health recovery from
+restarting the service during slow watcher setup and interrupting the first
+prompt. Existing live terminals skip these readiness reads. Invalid resume IDs
+are rejected before starting native services.
+
+Interactive terminals, API calls, naming and generated headless actions share
+the native service registration under `$XDG_STATE_HOME/opencode/service.json`
+(normally `~/.local/state/opencode/service.json`). They pin an authenticated
+`--server` connection so polling a busy service cannot restart it. Only missing
+registration starts a service automatically, serialized across wt clients.
+Malformed registration and a recorded process that has exited fail explicitly;
+run `opencode service start` to recover an exited service, then retry. wt never
+restarts a live service because a health request timed out or replays an
+uncertain mutation. API passwords pass through child environment; interactive
+launches consume a private one-use auth source file before executing OpenCode.
+
 Messages use V2's durable prompt queue, not simulated terminal typing. Lost
 admission replies are checked against the exact generated message ID; wt never
 blindly repeats an uncertain send. Native compaction uses `session.compact`.
@@ -38,8 +55,10 @@ sync` writes shared `~/.agents/skills` when that layout exists, otherwise native
 `~/.config/opencode/skills`. Existing `.claude/skills` remain discoverable for
 compatibility. wt does not require a Claude installation for OpenCode skills.
 
-Prompt actions run `opencode run` with the action's working directory. Naming
-uses `opencode api experimental.generate.text`, the V2 stateless generation
+Prompt actions run `opencode run --auto` with the action's working directory.
+This approves pending tool permissions while preserving explicit deny rules;
+V2 otherwise rejects pending requests in headless mode and skips that work.
+Naming uses `opencode api experimental.generate.text`, the V2 stateless generation
 endpoint: it creates no session and supplies no tools. Its JSON response is
 validated before becoming a title. The removed V1 `--pure`, `--dir` and
 `--variant` options are never sent.

@@ -54,6 +54,7 @@ wt-update.workspace = true
 wt-vcs.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 wt-runtime = { workspace = true, features = ["testing"] }
 
 [lints]

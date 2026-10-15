@@ -12,6 +12,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 wt-config.workspace = true
 wt-core.workspace = true
+wt-harness.workspace = true
 wt-platform.workspace = true
 
 [dev-dependencies]

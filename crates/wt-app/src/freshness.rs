@@ -10,8 +10,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::watcher::{self, WtWatcher};
 use anyhow::{Context, Result};
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use wt_config::Config;
 use wt_core::Domain;
 use wt_runtime::{
@@ -86,7 +87,7 @@ fn start_with_notifications(
         let callback_changed = edit_changed.clone();
         let callback_observed_files = observed_files.clone();
         let mut watcher = tokio::task::spawn_blocking(move || {
-            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+            watcher::new(move |event: notify::Result<Event>| match event {
                 Ok(event) if relevant(&event) => {
                     let paths = if event.need_rescan() {
                         event.paths.clone()
@@ -492,9 +493,8 @@ async fn desired_paths(
             }
         }
     }
-    // FSEvents reports the spelling supplied to its stream, while notify's
-    // event filter compares canonical paths. Mixed /var and /private/var
-    // registrations can therefore silently discard all notifications.
+    // Canonicalize watch paths so aliases such as /var and /private/var do not
+    // create duplicate watches or miss events during path matching.
     let mut canonical = BTreeMap::new();
     for (path, recursive) in paths {
         let path = canonical_watch_path(&path).await;
@@ -513,17 +513,16 @@ async fn canonical_watch_path(path: &Path) -> PathBuf {
 }
 
 fn update_watches(
-    mut watcher: RecommendedWatcher,
+    mut watcher: WtWatcher,
     mut registered: BTreeMap<PathBuf, bool>,
     desired: BTreeMap<PathBuf, bool>,
     cancellation: &tokio_util::sync::CancellationToken,
-) -> (RecommendedWatcher, BTreeMap<PathBuf, bool>, bool) {
+) -> (WtWatcher, BTreeMap<PathBuf, bool>, bool) {
     if registered == desired || cancellation.is_cancelled() {
         return (watcher, registered, cancellation.is_cancelled());
     }
-    // macOS restarts its FSEvents stream for each individual watch/unwatch.
-    // Apply the whole inventory in one transaction so fleet size does not
-    // multiply stream teardown and leave long registration gaps.
+    // Apply the whole inventory in one transaction so backends that rebuild
+    // their polling snapshots do not leave gaps between individual edits.
     let started = std::time::Instant::now();
     let mut changes = Vec::new();
     for (path, recursive) in &registered {
@@ -544,17 +543,21 @@ fn update_watches(
         return (watcher, registered, true);
     }
     match watcher.update_paths(changes) {
-        Ok(()) => registered = desired,
+        Ok(()) => {
+            registered = actual_watches(&watcher);
+            if registered != desired {
+                tracing::debug!(
+                    desired = desired.len(),
+                    registered = registered.len(),
+                    "watch backend accepted an incomplete inventory; reconciliation will retry"
+                );
+            }
+        }
         Err(error) => {
             tracing::warn!(%error, "cannot apply filesystem watches; reconciliation will retry");
             // A batch may apply only its prefix. Never record unattempted
             // operations as successful, or forget watches that still exist.
-            registered = watcher.watched_paths().map(|paths| paths.into_iter().map(|(path, mode)| {
-                (path, mode == RecursiveMode::Recursive)
-            }).collect()).unwrap_or_else(|error| {
-                tracing::warn!(%error, "cannot inspect filesystem watches; reconciliation will retry");
-                BTreeMap::new()
-            });
+            registered = actual_watches(&watcher);
         }
     }
     tracing::debug!(
@@ -563,6 +566,21 @@ fn update_watches(
         "filesystem watches registered"
     );
     (watcher, registered, false)
+}
+
+fn actual_watches(watcher: &WtWatcher) -> BTreeMap<PathBuf, bool> {
+    watcher
+        .watched_paths()
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|(path, mode)| (path, mode == RecursiveMode::Recursive))
+                .collect()
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot inspect filesystem watches; reconciliation will retry");
+            BTreeMap::new()
+        })
 }
 
 fn relevant(event: &Event) -> bool {
@@ -644,8 +662,82 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_watches_do_not_depend_on_the_fsevents_service() {
-        assert_eq!(RecommendedWatcher::kind(), notify::WatcherKind::Kqueue);
+    #[ignore = "subprocess helper for the SQLite watcher lock test"]
+    fn sqlite_writer_probe() {
+        let Some(path) = std::env::var_os("WT_WATCHER_SQLITE_PROBE") else {
+            return;
+        };
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let error = db.execute_batch("BEGIN IMMEDIATE;").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shallow_directory_link_changes_preserve_sqlite_writer_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let path = root.join("state.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE fixture(value); BEGIN IMMEDIATE;")
+            .unwrap();
+        let assert_locked = || {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "freshness::tests::sqlite_writer_probe",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("WT_WATCHER_SQLITE_PROBE", &path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "watcher released another connection's SQLite lock: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        assert_locked();
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut watcher = watcher::new(send).unwrap();
+        watcher.watch(&root, RecursiveMode::NonRecursive).unwrap();
+        // Directory links emit NOTE_LINK on macOS. Rebuilding this shallow
+        // watch must never adopt DB/SHM files: closing an unrelated SHM fd
+        // releases SQLite's process-wide POSIX locks, risking SIGBUS/corruption.
+        for index in 0..3 {
+            // PollWatcher intentionally keeps directory timestamps at second
+            // precision. Put each link-count change in a distinct timestamp
+            // bucket so the assertion does not depend on scheduler timing.
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            std::thread::sleep(
+                Duration::from_secs(1) - Duration::from_nanos(u64::from(now.subsec_nanos()))
+                    + Duration::from_millis(25),
+            );
+            std::fs::create_dir(root.join(format!("child-{index}"))).unwrap();
+            receive
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            // The inventory request is processed after the event's watch update.
+            watcher.watched_paths().unwrap();
+            while receive.try_recv().is_ok() {}
+        }
+        assert_locked();
+        drop(watcher);
+        assert_locked();
+        db.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_metadata_only_polling() {
+        assert_eq!(WtWatcher::kind(), notify::WatcherKind::PollWatcher);
     }
 
     #[cfg(target_os = "macos")]
@@ -658,11 +750,10 @@ mod tests {
         let deep_file = generated.join("file.js");
         std::fs::write(&deep_file, "before").unwrap();
         let (send, receive) = std::sync::mpsc::channel();
-        let mut watcher = notify::recommended_watcher(send).unwrap();
+        let mut watcher = watcher::new(send).unwrap();
         watcher.watch(&root, RecursiveMode::NonRecursive).unwrap();
-        // Two directory changes let the backend finish handling the first
-        // before the deep write. Notify 8.2 guessed an existing child here and
-        // recursively adopted it, despite the root's NonRecursive contract.
+        // Wait for each shallow metadata poll before writing deep in the tree.
+        // A nonrecursive checkout watch must not adopt generated descendants.
         for index in 0..2 {
             std::fs::write(root.join(format!("new-{index}")), "new").unwrap();
             receive
@@ -672,16 +763,26 @@ mod tests {
         }
         while receive.try_recv().is_ok() {}
         std::fs::write(&deep_file, "after").unwrap();
-        assert!(
-            matches!(
-                receive.recv_timeout(Duration::from_millis(250)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "a shallow checkout watch must not open/watch generated descendants"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match receive.recv_timeout(remaining) {
+                Ok(Ok(event)) => assert!(
+                    event.paths.iter().all(|path| !path.starts_with(&generated)),
+                    "a shallow checkout watch must not open/watch generated descendants: {event:?}"
+                ),
+                Ok(Err(error)) => panic!("unexpected watcher error: {error}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
         drop(watcher);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn partial_watch_batch_tracks_only_registered_paths_and_reconciles() {
         let root = tempfile::tempdir().unwrap();
@@ -691,7 +792,7 @@ mod tests {
         let last = root.join("c-existing");
         std::fs::create_dir(&first).unwrap();
         std::fs::create_dir(&last).unwrap();
-        let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+        let watcher = watcher::new(|_: notify::Result<Event>| {}).unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         let desired = BTreeMap::from([
             (first.clone(), false),
@@ -716,6 +817,44 @@ mod tests {
         drop(watcher);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn polling_watch_batch_tracks_only_existing_paths_and_reconciles() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let first = root.join("a-existing");
+        let missing = root.join("b-missing");
+        let last = root.join("c-existing");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&last).unwrap();
+        let watcher = watcher::new(|_: notify::Result<Event>| {}).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let desired = BTreeMap::from([
+            (first.clone(), false),
+            (missing.clone(), false),
+            (last.clone(), false),
+        ]);
+        let (watcher, registered, cancelled) =
+            update_watches(watcher, BTreeMap::new(), desired, &cancel);
+        assert!(!cancelled);
+        assert_eq!(
+            registered,
+            BTreeMap::from([(first.clone(), false), (last.clone(), false)])
+        );
+        std::fs::create_dir(&missing).unwrap();
+        let desired = BTreeMap::from([(missing.clone(), false), (last.clone(), true)]);
+        let (watcher, registered, cancelled) =
+            update_watches(watcher, registered, desired.clone(), &cancel);
+        assert!(!cancelled);
+        assert_eq!(registered, desired);
+        cancel.cancel();
+        let (watcher, registered, cancelled) =
+            update_watches(watcher, registered, BTreeMap::new(), &cancel);
+        assert!(cancelled);
+        assert_eq!(registered, desired);
+        drop(watcher);
+    }
+
     #[tokio::test]
     async fn rapid_native_watch_reconfiguration_and_drop_stays_bounded() {
         let mut tasks = tokio::task::JoinSet::new();
@@ -724,8 +863,7 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let root = std::fs::canonicalize(root.path()).unwrap();
                 for _ in 0..2 {
-                    let mut watcher =
-                        notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+                    let mut watcher = watcher::new(|_: notify::Result<Event>| {}).unwrap();
                     watcher
                         .update_paths(vec![notify::PathOp::watch_non_recursive(root.clone())])
                         .unwrap();

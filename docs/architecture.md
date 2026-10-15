@@ -450,6 +450,15 @@ a second source grace period.
 Native filesystem watcher setup and teardown run on the blocking pool. Sources
 await teardown, including cancellation during setup, so OS thread joins cannot
 block the async executor or outlive successful source cleanup.
+`wt-app::watcher` selects the backend centrally: macOS uses `PollWatcher` with
+metadata-only comparisons at a one-second interval, while other platforms use
+notify's recommended native watcher. Do not enable macOS kqueue here: recursive
+directory link events can rebuild descendant watches and close unrelated open
+SQLite WAL/SHM descriptors. Closing a SHM descriptor releases SQLite's
+process-wide POSIX locks and can corrupt a concurrent writer, so keep
+`compare_contents(false)` to ensure polling never opens watched files.
+Source-specific reconciliation and metadata backstops remain responsible for
+recovering missed events.
 Known create failures retain the input and selected host for correction. A lost
 remote reply remains ambiguous and never opens an automatic retry path.
 Both failed action replies and raised errors produce one persistent attention

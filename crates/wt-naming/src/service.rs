@@ -34,6 +34,7 @@ pub struct NamingService {
     config: Arc<NamingServiceConfig>,
     runner: ProcessRunner,
     permits: Arc<Semaphore>,
+    opencode_service: Option<wt_harness::OpenCodeService>,
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +72,7 @@ impl NamingService {
             config: Arc::new(config),
             runner,
             permits: Arc::new(Semaphore::new(1)),
+            opencode_service: wt_harness::OpenCodeService::from_environment().ok(),
         })
     }
 
@@ -202,6 +204,23 @@ impl NamingService {
         command.timeout = spec.timeout;
         command.output_limit = 1024 * 1024;
         command.input = spec.input.clone();
+        if spec.harness_id == HarnessId::Opencode {
+            let service = self
+                .opencode_service
+                .as_ref()
+                .ok_or_else(|| NamingError::Harness {
+                    harness: "opencode",
+                    detail: "HOME is not configured".into(),
+                })?;
+            service
+                .connect(&spec.program, &self.runner, cancellation)
+                .await
+                .map_err(|error| NamingError::Harness {
+                    harness: "opencode",
+                    detail: error.to_string(),
+                })?
+                .pin_command(&mut command);
+        }
         // V2's CLI may start its persistent service. Do not reap that service
         // when the successful one-shot generation client exits.
         command.preserve_children_on_success = spec.harness_id == HarnessId::Opencode;
@@ -291,7 +310,7 @@ mod tests {
     async fn opencode_v2_stateless_response_is_decoded_and_invalid_shape_fails() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("fake-opencode");
-        std::fs::write(&fake, "#!/bin/sh\nprintf '%s' '{\"data\":{\"text\":\"TITLE: Safe naming.\\nDESCRIPTION: Stateless generation.\"}}'\n").unwrap();
+        std::fs::write(&fake, "#!/bin/sh\n[ \"$OPENCODE_PASSWORD\" = fixture-password ] || exit 9\ncase \"$*\" in *'--server http://127.0.0.1:12345'*) ;; *) exit 8;; esac\nprintf '%s' '{\"data\":{\"text\":\"TITLE: Safe naming.\\nDESCRIPTION: Stateless generation.\"}}'\n").unwrap();
         let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();
@@ -308,11 +327,19 @@ mod tests {
                 ..HarnessPrograms::default()
             },
         };
-        let service = NamingService::new(
+        let mut service = NamingService::new(
             config,
             ProcessRunner::new(std::num::NonZeroUsize::new(1).unwrap()),
         )
         .unwrap();
+        let state = dir.path().join(".local/state/opencode");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("service.json"),
+            r#"{"url":"http://127.0.0.1:12345","password":"fixture-password"}"#,
+        )
+        .unwrap();
+        service.opencode_service = Some(wt_harness::OpenCodeService::for_home(dir.path()));
         let result = service
             .summarize_diff("prompt", &CancellationToken::new())
             .await

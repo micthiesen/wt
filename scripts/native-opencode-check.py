@@ -135,7 +135,10 @@ def main():
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         run(["opencode", "service", "set", "port", str(port)])
-        wt("agent", "send", "bench-000", "WT_OC_FIRST_SEND: reply without calling tools.")
+        # Cold native Agent/Skill readiness reads each have a 45s backend
+        # deadline; allow those plus session creation/admission here. Transport
+        # errors still fail immediately, and every later command keeps 30s.
+        wt("agent", "send", "bench-000", "WT_OC_FIRST_SEND: reply without calling tools.", timeout=180)
         first = identity("bench-000")
         wait(lambda: answered(first), "first real OpenCode answer")
         wt("agent", "start", "bench-001")

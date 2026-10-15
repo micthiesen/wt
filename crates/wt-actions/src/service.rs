@@ -120,6 +120,7 @@ pub enum ActionServiceError {
 pub struct ActionService {
     config: ActionServiceConfig,
     history_path: Option<PathBuf>,
+    opencode_service: Option<wt_harness::OpenCodeService>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,6 +160,7 @@ impl ActionService {
         Self {
             config,
             history_path: None,
+            opencode_service: wt_harness::OpenCodeService::from_environment().ok(),
         }
     }
 
@@ -535,23 +537,49 @@ impl ActionService {
         command.timeout = Duration::from_secs(24 * 60 * 60);
         command.output_limit = ACTION_CAPTURE_LIMIT;
         let sender_for_observer = sender.clone();
-        let result = self
-            .config
-            .runner
-            .run_streaming(command, cancellation, move |stream, bytes| {
-                for part in bytes.chunks(STREAM_CHUNK_LIMIT) {
-                    match sender_for_observer.try_send(OutputChunk {
-                        stream,
-                        bytes: part.to_vec(),
-                    }) {
-                        Ok(()) => {}
-                        Err(_) => {
-                            dropped.fetch_add(part.len() as u64, Ordering::Relaxed);
+        let result = async {
+            if job.request.kind == ActionRunKind::Opencode {
+                let connection = async {
+                    self.opencode_service
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("HOME is not configured"))?
+                        .connect(&command.program, &self.config.runner, cancellation)
+                        .await
+                }
+                .await
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        ProcessError::Cancelled {
+                            program: "opencode".into(),
+                        }
+                    } else {
+                        ProcessError::Io {
+                            program: "opencode".into(),
+                            operation: "resolve native service",
+                            source: std::io::Error::other(error.to_string()),
                         }
                     }
-                }
-            })
-            .await;
+                })?;
+                connection.pin_command(&mut command);
+            }
+            self.config
+                .runner
+                .run_streaming(command, cancellation, move |stream, bytes| {
+                    for part in bytes.chunks(STREAM_CHUNK_LIMIT) {
+                        match sender_for_observer.try_send(OutputChunk {
+                            stream,
+                            bytes: part.to_vec(),
+                        }) {
+                            Ok(()) => {}
+                            Err(_) => {
+                                dropped.fetch_add(part.len() as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+                .await
+        }
+        .await;
         drop(sender);
         let writer_result = writer
             .await
@@ -1537,6 +1565,55 @@ mod tests {
         .await
         .unwrap();
         run_dir.join("job.json")
+    }
+
+    #[tokio::test]
+    async fn opencode_worker_pins_connection_and_records_preparation_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join(".local/state/opencode");
+        fs::create_dir_all(&state).await.unwrap();
+        let registration = state.join("service.json");
+        fs::write(
+            &registration,
+            r#"{"url":"http://127.0.0.1:12345","password":"fixture-password"}"#,
+        )
+        .await
+        .unwrap();
+        let program = temp.path().join("fake-opencode");
+        fs::write(&program, "#!/bin/sh\n[ \"$OPENCODE_PASSWORD\" = fixture-password ] || exit 9\n[ \"$1 $2 $3 $4 $5\" = 'run --server http://127.0.0.1:12345 -- prompt' ] || exit 8\n").await.unwrap();
+        fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let mut worker = service(temp.path());
+        worker.opencode_service = Some(wt_harness::OpenCodeService::for_home(temp.path()));
+        let mut request = request(
+            temp.path(),
+            &[program.to_str().unwrap(), "run", "--", "prompt"],
+        );
+        request.kind = ActionRunKind::Opencode;
+        let job = prepared_job(temp.path(), request.clone()).await;
+        let done = worker
+            .run_worker(&job, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(done.status, ActionRunStatus::Succeeded);
+        fs::write(&registration, "invalid").await.unwrap();
+        let job = prepared_job(temp.path(), request).await;
+        let done = worker
+            .run_worker(&job, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(done.status, ActionRunStatus::Failed);
+        assert!(
+            done.error
+                .unwrap()
+                .contains("invalid native service registration")
+        );
+        let durable: ActionDone = read_json(&job.parent().unwrap().join("done.json"))
+            .await
+            .unwrap();
+        assert_eq!(durable.status, ActionRunStatus::Failed);
     }
 
     #[tokio::test]

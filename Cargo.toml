@@ -22,10 +22,9 @@ hmac = "0.12"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 libc = "0.2"
-# Use kqueue on macOS: FSEvents registration/teardown RPCs can block behind the
-# system daemon. Watches cover roots and small metadata trees, never checkouts recursively.
-# Version 9 fixes 8.2's nonrecursive kqueue watches accidentally adding recursive children (#644).
-notify = { version = "=9.0.0-rc.5", default-features = false, features = ["macos_kqueue"] }
+# Keep notify's FSEvents implementation available for its platform type, but use
+# wt's metadata-only PollWatcher on macOS to avoid kqueue recursive link-event races.
+notify = "=9.0.0-rc.5"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }

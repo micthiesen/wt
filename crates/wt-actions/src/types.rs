@@ -10,6 +10,7 @@ pub enum ActionRunKind {
     Claude,
     Shell,
     Harness,
+    Opencode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

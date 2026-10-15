@@ -214,8 +214,8 @@ fn start_with_watcher(
             if !native_watch {
                 return Ok(None);
             }
-            let mut watcher = notify::recommended_watcher(
-                move |event: notify::Result<notify::Event>| match event {
+            let mut watcher =
+                crate::watcher::new(move |event: notify::Result<notify::Event>| match event {
                     Ok(event)
                         if !matches!(event.kind, notify::EventKind::Access(_))
                             && event.paths.iter().any(|path| {
@@ -231,10 +231,9 @@ fn start_with_watcher(
                         callback.refresh();
                     }
                     _ => {}
-                },
-            )?;
-            // notify filters FSEvents with canonical paths; register that same
-            // spelling so aliases such as /tmp do not lose log notifications.
+                })?;
+            // Register canonical paths so aliases such as /tmp do not lose
+            // log notifications during path matching.
             let paths = vec![
                 notify::PathOp::watch_non_recursive(std::fs::canonicalize(&manager_dir)?),
                 notify::PathOp::watch_non_recursive(std::fs::canonicalize(&watched_log_dir)?),

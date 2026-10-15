@@ -169,8 +169,8 @@ fn session_matches(
     target: &HarnessOutputTarget,
 ) -> Result<bool, OpenCodeError> {
     Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id = ?1 AND directory = ?2 AND time_archived IS NULL)",
-        params![target.session_id, target.cwd.to_string_lossy()],
+        "SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id = ?1 AND (directory = ?2 OR directory = ?3) AND time_archived IS NULL)",
+        params![target.session_id, target.cwd.to_string_lossy(),super::canonical_directory(&target.cwd).to_string_lossy()],
         |row| row.get::<_, bool>(0),
     )?)
 }
