@@ -203,6 +203,14 @@ impl Model {
                             self.interaction = interaction;
                             return InputResult::Unchanged;
                         }
+                        if let TextAction::SessionName { selection } = &prompt.action
+                            && selection
+                                .key
+                                .as_deref()
+                                .is_some_and(|key| self.removal_active_for(key))
+                        {
+                            return self.notify(super::input::REMOVAL_IN_PROGRESS);
+                        }
                         self.toast = None;
                         let action = match &prompt.action {
                             TextAction::SessionName { selection } => {
@@ -338,6 +346,12 @@ impl Model {
                             revision: revision.clone(),
                             seen: seen.clone(),
                         },
+                        ConfirmAction::DismissFailedRemoval { key, seen } => {
+                            UiAction::DismissFailedRemoval {
+                                key: key.clone(),
+                                seen: seen.clone(),
+                            }
+                        }
                         ConfirmAction::Cleanup { revisions } => UiAction::Cleanup {
                             revisions: revisions.clone(),
                         },
@@ -501,6 +515,13 @@ impl Model {
                         else {
                             return InputResult::Unchanged;
                         };
+                        if selection
+                            .key
+                            .as_deref()
+                            .is_some_and(|key| self.removal_active_for(key))
+                        {
+                            return self.notify(super::input::REMOVAL_IN_PROGRESS);
+                        }
                         if selection.mode == crate::SessionMode::New
                             && selection.harness == wt_core::HarnessId::Claude
                         {
@@ -527,6 +548,9 @@ impl Model {
                         InputResult::Draw
                     }
                     PickerAction::Harness { key } => {
+                        if self.removal_active_for(key) {
+                            return self.notify(super::input::REMOVAL_IN_PROGRESS);
+                        }
                         match option.value.as_deref().and_then(parse_harness) {
                             Some(harness) => InputResult::Action(UiAction::EnterHarness {
                                 key: key.clone(),

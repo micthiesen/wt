@@ -172,7 +172,7 @@ fn list(routes: &[AgentRoute], json: bool) -> Result<i32> {
                     "cwd": route.target.cwd,
                     "active_harnesses": route.choice.live,
                     "selected_harness": route.choice.selected.map(|id| id.as_str()),
-                    "selection": match route.choice.source { SelectionSource::Live => "live", SelectionSource::Primary => "primary", SelectionSource::Unavailable => "unavailable", SelectionSource::RemoteUnavailable => "remote-unavailable" },
+                    "selection": match route.choice.source { SelectionSource::Live => "live", SelectionSource::Primary => "primary", SelectionSource::Pinned => "pinned", SelectionSource::Unavailable => "unavailable", SelectionSource::RemoteUnavailable => "remote-unavailable" },
                 })
             })
             .collect::<Vec<_>>();
@@ -201,6 +201,7 @@ fn list(routes: &[AgentRoute], json: bool) -> Result<i32> {
                 }
                 SelectionSource::Live => "active session",
                 SelectionSource::Primary => "configured primary; no active session",
+                SelectionSource::Pinned => "pinned by harness.wt_session",
                 SelectionSource::Unavailable => "tmux inventory unavailable",
                 SelectionSource::RemoteUnavailable => "remote runtime unavailable",
             };

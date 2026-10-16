@@ -99,6 +99,15 @@ pub enum CodexHarnessError {
     AppServer(#[from] CodexAppServerError),
 }
 
+/// Threads a launched slot may have created; see
+/// [`CodexHarness::launched_threads_sync`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexLaunchedThreads {
+    None,
+    One(String),
+    Ambiguous(Vec<String>),
+}
+
 #[derive(Clone)]
 pub struct CodexHarness {
     paths: CodexPaths,
@@ -132,6 +141,43 @@ impl CodexHarness {
         CodexMessenger::new(self.paths.clone(), self.runner.clone(), self.tmux.clone())
             .recover_live_identity(tmux_name, sessions, cancel)
             .await
+    }
+
+    /// Delayed identity discovery for a slot wt launched without `resume`.
+    /// Codex only materializes a new thread's rollout once it has its first
+    /// prompt, so the UUID cannot be learned at launch. A candidate is a
+    /// terminal-TUI rollout owned by this checkout and slot whose
+    /// `session_meta` creation time is at or after the tmux session's
+    /// creation, excluding UUIDs other live slots already own. A sole
+    /// candidate is necessary but not sufficient: the caller must also prove
+    /// no other Codex TUI could have created it, then revalidate the captured
+    /// tmux slot before stamping it.
+    pub fn launched_threads_sync(
+        &self,
+        cwd: &Path,
+        slug: &str,
+        launched_at_secs: i64,
+        claimed_elsewhere: &HashSet<String>,
+    ) -> Result<CodexLaunchedThreads, CodexHarnessError> {
+        let since_ms = launched_at_secs.saturating_mul(1000);
+        let mut ids = scan_rollouts(&self.paths.sessions_dir(), cwd, slug)?
+            .into_iter()
+            .filter(|rollout| {
+                rollout.from_tui
+                    && rollout
+                        .created_ms
+                        .is_some_and(|created| created >= since_ms)
+            })
+            .map(|rollout| rollout.session_id)
+            .filter(|id| !claimed_elsewhere.contains(id))
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(match ids.len() {
+            0 => CodexLaunchedThreads::None,
+            1 => CodexLaunchedThreads::One(ids.remove(0)),
+            _ => CodexLaunchedThreads::Ambiguous(ids),
+        })
     }
 
     /// Read-only initialize handshake for `wt codex selftest`. This does not
@@ -424,6 +470,10 @@ struct Rollout {
     path: PathBuf,
     mtime_ms: i64,
     size: u64,
+    /// `session_meta.payload.timestamp`: when Codex created the thread.
+    created_ms: Option<i64>,
+    /// Created by an interactive terminal TUI, not the desktop app or wt.
+    from_tui: bool,
 }
 
 fn scan_rollouts(dir: &Path, cwd: &Path, slug: &str) -> Result<Vec<Rollout>, CodexHarnessError> {
@@ -572,6 +622,8 @@ fn read_rollout_uncached(
         path: path.to_path_buf(),
         mtime_ms: modified.as_millis().min(i64::MAX as u128) as i64,
         size: metadata.len(),
+        created_ms: parse_ts(payload["timestamp"].as_str()),
+        from_tui: originator == "codex-tui",
     }))
 }
 

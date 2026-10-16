@@ -214,6 +214,25 @@ set -sq extended-keys-format csi-u
 set -s terminal-features 'xterm*:RGB:sync:extkeys:hyperlinks,tmux*:RGB:sync:extkeys:hyperlinks,alacritty*:RGB:sync:extkeys:hyperlinks'
 "#;
 
+/// Which session-switch key a session answers to. Each attached session
+/// records its kind so its own key returns to the board.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionShortcut {
+    Harness,
+    Shell,
+    Diff,
+}
+
+impl SessionShortcut {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::Shell => "shell",
+            Self::Diff => "diff",
+        }
+    }
+}
+
 fn terminal_shortcut_bindings() -> String {
     let mut bindings = String::new();
     for (key, kind, code) in [
@@ -729,7 +748,11 @@ exit "$wt_terminal_status""#;
         checked("new-session", result).map(|_| ())
     }
 
-    pub fn attach_session_args(&self, session: &str) -> Vec<OsString> {
+    /// Attach to `session`, tagging it with the caller's `shortcut` kind so
+    /// the matching F10/F11/F12 key detaches back to the board. The kind is
+    /// never inferred from the name: a worktree `fix-shell` has an agent
+    /// session named exactly `fix-shell`.
+    pub fn attach_session_args(&self, session: &str, shortcut: SessionShortcut) -> Vec<OsString> {
         let mut args = self.prefix_args();
         if let Some(config) = &self.server.config_file {
             args.extend([
@@ -738,19 +761,12 @@ exit "$wt_terminal_status""#;
                 ";".into(),
             ]);
         }
-        let shortcut = if session.ends_with("-shell") {
-            "shell"
-        } else if session.ends_with("-diff") {
-            "diff"
-        } else {
-            "harness"
-        };
         args.extend([
             "set-option".into(),
             "-t".into(),
             exact_pane_target(session).into(),
             "@wt-shortcut".into(),
-            shortcut.into(),
+            shortcut.as_str().into(),
             ";".into(),
         ]);
         args.extend([

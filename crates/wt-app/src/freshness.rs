@@ -11,8 +11,9 @@ use std::{
 };
 
 use crate::watcher::{self, WtWatcher};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+use serde_json::Value;
 use wt_config::Config;
 use wt_core::Domain;
 use wt_runtime::{
@@ -20,31 +21,36 @@ use wt_runtime::{
     leaf_channel,
 };
 use wt_tui::Board;
-use wt_vcs::{GitRepository, WorktreeSnapshot};
+use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
 const BACKSTOP: Duration = Duration::from_secs(60);
 const METADATA_BACKSTOP: Duration = Duration::from_secs(1);
 const MAX_METADATA_ENTRIES: usize = 8192;
+/// A deleted watch root makes the poller report it missing on every poll.
+/// Those reports re-read the watch list at most this often.
+const VANISHED_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn start(
     scope: &TaskScope,
     config: Arc<Config>,
-    repository: Arc<GitRepository>,
     source: SourceHandle<Board>,
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<crate::local_source::Metadata>,
 ) -> SourceHandle<BTreeMap<String, i64>> {
-    start_with_notifications(scope, config, repository, source, git, metadata, true)
+    start_with_notifications(scope, config, source, git, metadata, true, None)
 }
+
+/// Test seam: the watch set the backend actually holds.
+type WatchProbe = Arc<Mutex<BTreeMap<PathBuf, bool>>>;
 
 fn start_with_notifications(
     scope: &TaskScope,
     config: Arc<Config>,
-    repository: Arc<GitRepository>,
     source: SourceHandle<Board>,
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<crate::local_source::Metadata>,
     notifications: bool,
+    probe: Option<WatchProbe>,
 ) -> SourceHandle<BTreeMap<String, i64>> {
     let (edits, mut edit_publisher) = leaf_channel(
         scope,
@@ -62,6 +68,9 @@ fn start_with_notifications(
     // Native notifications can arrive after the metadata backstop already
     // observed and invalidated an edit. Share that witness across both lanes.
     let observed_files = Arc::new(RwLock::new(None::<Arc<WatchFingerprint>>));
+    // A watched checkout disappeared; re-read the watch list.
+    let rewatch = Arc::new(tokio::sync::Notify::new());
+    let vanished_gate = Arc::new(RateGate::new(VANISHED_INTERVAL));
     let cancellation = scope.token();
     scope.spawn(async move {
         if let Some(board) = source.snapshot().data().cloned()
@@ -86,6 +95,8 @@ fn start_with_notifications(
         let callback_pending = pending_edits.clone();
         let callback_changed = edit_changed.clone();
         let callback_observed_files = observed_files.clone();
+        let callback_rewatch = rewatch.clone();
+        let callback_vanished = vanished_gate.clone();
         let mut watcher = tokio::task::spawn_blocking(move || {
             watcher::new(move |event: notify::Result<Event>| match event {
                 Ok(event) if relevant(&event) => {
@@ -127,6 +138,17 @@ fn start_with_notifications(
                     }
                 }
                 Ok(_) => {},
+                Err(error) if vanished(&error) => {
+                    // Expected while a checkout is removed. The poller repeats
+                    // this every interval until the path is unwatched, so one
+                    // refresh and watch-list re-read covers the whole burst.
+                    if callback_vanished.allow() {
+                        tracing::debug!(%error, paths = ?error.paths, "watched path vanished; re-reading watch list");
+                        observed_git.refresh();
+                        observed_metadata.refresh();
+                        callback_rewatch.notify_one();
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(%error, "filesystem notification lost; refreshing source");
                     observed_git.refresh();
@@ -157,7 +179,16 @@ fn start_with_notifications(
         let mut registered = BTreeMap::new();
         let mut updates = source.subscribe();
         updates.mark_changed();
-        let mut keys = Vec::new();
+        // The watch list derives from the Git source's inventory, minus
+        // checkouts with an accepted removal. No separate inventory scan.
+        let mut git_updates = git.subscribe();
+        let mut metadata_updates = metadata.subscribe();
+        git_updates.mark_changed();
+        metadata_updates.mark_changed();
+        let mut inputs = Vec::<WorktreeRecord>::new();
+        // Some listed checkout was missing at the last reconcile; any later
+        // inventory may be the one that shows it again.
+        let mut inputs_missing = false;
         let mut latest_edits = BTreeMap::<String, i64>::new();
         let mut edits_published = false;
         // File invalidation belongs to the host even when no automation
@@ -180,10 +211,11 @@ fn start_with_notifications(
                         crate::watcher_cleanup::drop_watcher(active).await;
                         break;
                     }
-                    desired = desired_paths(&config, &repository, &cancellation) => desired,
+                    desired = desired_paths(&config, &inputs) => desired,
                 };
                 match desired {
-                    Ok(paths) => {
+                    Ok((paths, missing)) => {
+                        inputs_missing = missing;
                         let previous_registered = registered.clone();
                         let update_cancel = cancellation.clone();
                         let mut update = tokio::task::spawn_blocking(move || {
@@ -215,6 +247,9 @@ fn start_with_notifications(
                                 let watch_set_changed = paths != previous_registered;
                                 watcher = Some(active);
                                 registered = paths;
+                                if let Some(probe) = &probe && let Ok(mut probe) = probe.lock() {
+                                    *probe = registered.clone();
+                                }
                                 if watch_set_changed {
                                     tracing::debug!("watch registration invalidates Git");
                                     // Inventory can finish before its paths are
@@ -249,7 +284,6 @@ fn start_with_notifications(
                     if changed.is_err() { break; }
                     let snapshot = updates.borrow_and_update().clone();
                     if *snapshot.state() == SourceState::Ready && let Some(board) = snapshot.data() {
-                        let next: Vec<_> = board.rows.iter().map(|row| (row.key.clone(), row.path.clone())).collect();
                         if let Ok(mut roots) = edit_roots.write() {
                             *roots = board.rows.iter()
                                 .map(|row| (PathBuf::from(&row.path), row.key.clone()))
@@ -257,10 +291,23 @@ fn start_with_notifications(
                         }
                         let live_keys: BTreeSet<_> = board.rows.iter().map(|row| row.key.as_str()).collect();
                         latest_edits.retain(|slug, _| live_keys.contains(slug.as_str()));
-                        reconcile = next != keys;
-                        keys = next;
                     }
                 }
+                changed = git_updates.changed() => {
+                    if changed.is_err() { break; }
+                    let snapshot = git_updates.borrow_and_update().clone();
+                    let next = watch_inputs(&snapshot, &metadata.snapshot());
+                    reconcile |= next != inputs || inputs_missing;
+                    inputs = next;
+                }
+                changed = metadata_updates.changed() => {
+                    if changed.is_err() { break; }
+                    let snapshot = metadata_updates.borrow_and_update().clone();
+                    let next = watch_inputs(&git.snapshot(), &snapshot);
+                    reconcile |= next != inputs;
+                    inputs = next;
+                }
+                _ = rewatch.notified() => { reconcile = true; }
                 request = edit_publisher.requested(), if edits_open => {
                     if request.is_none() { edits_open = false; }
                     else { edit_changed.notify_one(); }
@@ -449,21 +496,40 @@ fn edited_slug(path: &Path, roots: &BTreeMap<PathBuf, String>) -> Option<String>
     Some(slug.clone())
 }
 
+/// Checkouts to watch: the Git source's inventory without checkouts that an
+/// accepted removal owns. Their files are about to disappear; watching them
+/// only produces missing-path errors.
+fn watch_inputs(
+    git: &wt_runtime::SourceSnapshot<Vec<WorktreeSnapshot>>,
+    metadata: &wt_runtime::SourceSnapshot<crate::local_source::Metadata>,
+) -> Vec<WorktreeRecord> {
+    let state = metadata.data().map(|metadata| &metadata.0);
+    git.data()
+        .into_iter()
+        .flat_map(|rows| rows.iter())
+        .map(|row| &row.worktree)
+        .filter(|record| !state.is_some_and(|state| removing(state, record)))
+        .cloned()
+        .collect()
+}
+
+fn removing(state: &Value, record: &WorktreeRecord) -> bool {
+    state["removals"][wt_core::worktree_target_key(&record.target)]["path"].as_str()
+        == Some(record.target.path.as_str())
+}
+
+/// The second value reports a listed checkout that no longer exists.
 async fn desired_paths(
     config: &Config,
-    repository: &GitRepository,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> Result<BTreeMap<PathBuf, bool>> {
+    inventory: &[WorktreeRecord],
+) -> Result<(BTreeMap<PathBuf, bool>, bool)> {
     let mut paths = BTreeMap::new();
+    let mut missing = false;
     paths.insert(config.paths.worktree_root.clone(), false);
     paths.insert(config.paths.main_clone.clone(), false);
     if let Some(parent) = config.paths.state_db.parent() {
         paths.insert(parent.to_owned(), false);
     }
-    let inventory = repository
-        .inventory(cancellation)
-        .await
-        .context("watch inventory")?;
     let common_dirs: BTreeSet<_> = inventory
         .iter()
         .filter_map(|worktree| worktree.common_dir.clone())
@@ -472,22 +538,30 @@ async fn desired_paths(
         paths.insert(common_dir.clone(), false);
         for child in ["refs", "worktrees"] {
             let path = common_dir.join(child);
-            if tokio::fs::try_exists(&path).await? {
+            if path_may_exist(&path).await {
                 paths.insert(path, true);
             }
         }
     }
-    for worktree in &inventory {
-        paths.insert(PathBuf::from(&worktree.target.path), false);
+    for worktree in inventory {
+        let checkout = PathBuf::from(&worktree.target.path);
+        // A deleted checkout cannot be watched; requesting it would only
+        // repeat the backend's missing-path error.
+        if !path_may_exist(&checkout).await {
+            missing = true;
+            continue;
+        }
+        paths.insert(checkout, false);
         if let Some(directory) = &worktree.git_dir
             && !common_dirs
                 .iter()
                 .any(|common| directory.starts_with(common.join("worktrees")))
+            && path_may_exist(directory).await
         {
             paths.insert(directory.clone(), false);
             for child in ["refs", "worktrees"] {
                 let path = directory.join(child);
-                if tokio::fs::try_exists(&path).await? {
+                if path_may_exist(&path).await {
                     paths.insert(path, true);
                 }
             }
@@ -503,7 +577,45 @@ async fn desired_paths(
             .and_modify(|value| *value |= recursive)
             .or_insert(recursive);
     }
-    Ok(canonical)
+    Ok((canonical, missing))
+}
+
+/// A watched path that no longer exists. Other watcher errors are genuine
+/// notification loss and keep their full refresh.
+fn vanished(error: &notify::Error) -> bool {
+    !error.paths.is_empty()
+        && match &error.kind {
+            notify::ErrorKind::PathNotFound => true,
+            notify::ErrorKind::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+}
+
+/// Coalesces a repeating signal to at most one per interval.
+struct RateGate {
+    interval: Duration,
+    last: Mutex<Option<std::time::Instant>>,
+}
+
+impl RateGate {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: Mutex::new(None),
+        }
+    }
+
+    fn allow(&self) -> bool {
+        let Ok(mut last) = self.last.lock() else {
+            return true;
+        };
+        let now = std::time::Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < self.interval) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
 }
 
 async fn canonical_watch_path(path: &Path) -> PathBuf {
@@ -654,6 +766,12 @@ fn is_state_db_path(path: &Path, state_db: &Path) -> bool {
             name.push(suffix);
             path.as_os_str() == name
         })
+}
+
+/// Only a confirmed NotFound drops a watch. An unreadable path stays in the
+/// set so the watcher reports it, rather than failing the whole rebuild.
+async fn path_may_exist(path: &std::path::Path) -> bool {
+    tokio::fs::try_exists(path).await.unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -1057,13 +1175,16 @@ mod tests {
         let fixture = crate::commands::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let paths = desired_paths(
-            &fixture.ctx.config,
-            &fixture.ctx.repository,
-            &fixture.ctx.cancellation,
-        )
-        .await
-        .unwrap();
+        let inventory = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let (paths, missing) = desired_paths(&fixture.ctx.config, &inventory)
+            .await
+            .unwrap();
+        assert!(!missing);
         for path in paths.keys() {
             assert_eq!(
                 path,
@@ -1101,11 +1222,11 @@ mod tests {
         let edits = start_with_notifications(
             &scope,
             fixture.ctx.config.clone(),
-            fixture.ctx.repository.clone(),
             board,
             git.view(),
             metadata.view(),
             notifications,
+            None,
         );
         let worktree = tokio::fs::canonicalize(fixture.ctx.config.paths.worktree_root.join("one"))
             .await
@@ -1201,6 +1322,138 @@ mod tests {
         // Match the production source grace. Native teardown used to block
         // this executor, preventing the old two-second timer from firing;
         // joined blocking-pool cleanup now makes that deadline real.
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn only_missing_path_errors_are_coalesced() {
+        let missing = notify::Error::io(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .add_path(PathBuf::from("/gone"));
+        assert!(vanished(&missing));
+        assert!(vanished(
+            &notify::Error::path_not_found().add_path(PathBuf::from("/gone"))
+        ));
+        // Without a path, or for any other failure, events may truly be lost.
+        assert!(!vanished(&notify::Error::io(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        ))));
+        assert!(!vanished(
+            &notify::Error::io(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .add_path(PathBuf::from("/denied"))
+        ));
+        assert!(!vanished(&notify::Error::generic(
+            "poll thread disconnected"
+        )));
+        let gate = RateGate::new(Duration::from_secs(60));
+        assert!(gate.allow());
+        assert!(!gate.allow());
+        assert!(RateGate::new(Duration::ZERO).allow());
+    }
+
+    #[tokio::test]
+    async fn removing_and_deleted_checkouts_leave_the_watch_set_with_bounded_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let scope = TaskScope::new();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let git = wt_runtime::start_source(
+            &scope,
+            SourceSpec {
+                name: "test-git",
+                domain: Domain::Git,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            },
+            {
+                let repository = fixture.ctx.repository.clone();
+                let fetches = fetches.clone();
+                move |cancel| {
+                    let repository = repository.clone();
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    async move { repository.inventory_status(&cancel).await }
+                }
+            },
+        );
+        let (metadata, metadata_publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-metadata",
+                domain: Domain::Metadata,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        metadata_publisher.publish_live((serde_json::json!({}), BTreeSet::new()), Stamp::now());
+        let (board, _board_publisher) = wt_runtime::derived_channel(&scope, "test-board");
+        let probe = WatchProbe::default();
+        let _edits = start_with_notifications(
+            &scope,
+            fixture.ctx.config.clone(),
+            board,
+            git.view(),
+            metadata.view(),
+            true,
+            Some(probe.clone()),
+        );
+        let root = &fixture.ctx.config.paths.worktree_root;
+        let one = tokio::fs::canonicalize(root.join("one")).await.unwrap();
+        let two = tokio::fs::canonicalize(root.join("two")).await.unwrap();
+        let watched = |path: &Path| probe.lock().unwrap().contains_key(path);
+        git.refresh();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !(watched(&one) && watched(&two)) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "checkouts were never watched"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // An accepted removal drops its checkout before any file disappears.
+        metadata_publisher.publish_live(
+            (
+                serde_json::json!({"removals": {"one": {
+                    "path": one.to_string_lossy(), "branch": "feature/one", "error": null
+                }}}),
+                BTreeSet::new(),
+            ),
+            Stamp::now(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while watched(&one) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "removing checkout stayed watched"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(watched(&two));
+
+        // A checkout deleted without a removal record is unwatched promptly,
+        // and the missing-path reports stop refreshing Git every poll.
+        tokio::fs::remove_dir_all(&two).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while watched(&two) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "deleted checkout stayed watched"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Let follow-up scans (index stat refreshes after `git status`) settle.
+        // Before the fix, each one-second poll's missing-path error refreshed
+        // Git, i.e. at least four refreshes in this window.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let settled = fetches.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let later = fetches.load(Ordering::SeqCst) - settled;
+        assert!(
+            later <= 2,
+            "{later} Git refreshes in 4s after the deleted checkout was unwatched"
+        );
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();
     }

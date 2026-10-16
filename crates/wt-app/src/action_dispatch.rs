@@ -17,9 +17,7 @@ use wt_tui::{ActionSurface, Board, SessionTarget};
 use wt_vcs::WorktreeRecord;
 
 use crate::context::AppContext;
-use crate::harness::{
-    AgentRoute, AgentTarget, AgentTargetKind, AppHarness, HarnessChoice, SelectionSource,
-};
+use crate::harness::{AgentRoute, AgentTarget, AgentTargetKind, AppHarness, SelectionSource};
 
 /// Dispatch an automation fire while retaining the durable-write ambiguity
 /// boundary that the interactive palette's `Result<String>` API cannot express.
@@ -339,7 +337,10 @@ pub async fn prepare(
             .or(row.issue_id);
     }
     let issue_id = row.issue_id.as_deref().unwrap_or_default().to_owned();
-    let primary = AppHarness::new(context).primary();
+    // A slot whose harness is pinned renders its prompt for that harness.
+    let primary = slot
+        .and_then(|slot| crate::harness::pinned_slot_harness(&context.config.harness, slot))
+        .unwrap_or_else(|| AppHarness::new(context).primary());
     Ok(ActionContext {
         action_key,
         slug,
@@ -568,33 +569,22 @@ async fn delivery_route(
             live.push(id);
         }
     }
-    let selected = if live.contains(&primary) {
-        primary
+    let kind = if managed_name.is_some() || branch.is_none() {
+        AgentTargetKind::Special
     } else {
-        live.first().copied().unwrap_or(primary)
+        AgentTargetKind::Worktree
     };
+    let choice = crate::harness::select_harness(app.pinned(&slug, kind), primary, live);
     Ok(AgentRoute {
         target: AgentTarget {
             slug,
-            kind: if managed_name.is_some() || branch.is_none() {
-                AgentTargetKind::Special
-            } else {
-                AgentTargetKind::Worktree
-            },
+            kind,
             branch,
             cwd,
             managed_name,
             remote: false,
         },
-        choice: HarnessChoice {
-            selected: Some(selected),
-            source: if live.is_empty() {
-                SelectionSource::Primary
-            } else {
-                SelectionSource::Live
-            },
-            live: Some(live),
-        },
+        choice,
     })
 }
 
@@ -867,6 +857,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(prepared.row.pr, ActionPrObservation::ConfirmedAbsent);
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wt_slot_prompts_render_and_route_for_the_pinned_harness() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        let wt_source = fixture._root.path().join("wt-source");
+        std::fs::create_dir_all(&wt_source).unwrap();
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.tmux.socket = format!(
+                "wt-pin-route-{}",
+                fixture._root.path().file_name().unwrap().to_string_lossy()
+            );
+            config.paths.wt_source = Some(wt_source.clone());
+            config.harness.primary = HarnessId::Codex;
+            config.harness.wt_session = Some(HarnessId::Claude);
+        }
+        let wt = prepare(
+            &fixture.ctx,
+            &ActionSurface::Slot {
+                target: SessionTarget::WtSource,
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wt.harness, ActionHarness::Claude);
+        assert_eq!(wt.skill_prefix, "/");
+        let main = prepare(
+            &fixture.ctx,
+            &ActionSurface::Slot {
+                target: SessionTarget::Main,
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(main.harness, ActionHarness::Codex);
+
+        let route = delivery_route(&fixture.ctx, "wt".into(), wt_source, None, None)
+            .await
+            .unwrap();
+        assert_eq!(route.target.kind, AgentTargetKind::Special);
+        assert_eq!(route.choice.selected, Some(HarnessId::Claude));
+        assert_eq!(route.choice.source, SelectionSource::Pinned);
+        let main = delivery_route(
+            &fixture.ctx,
+            "main".into(),
+            fixture.ctx.config.paths.main_clone.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(main.choice.selected, Some(HarnessId::Codex));
+        assert_eq!(main.choice.source, SelectionSource::Primary);
         fixture.close().await.unwrap();
     }
 

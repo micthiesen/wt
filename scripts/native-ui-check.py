@@ -599,8 +599,9 @@ def main():
                 ).split("Removing", 1)[0]
                 return ("2 worktrees · 1 removing" in visible
                         and "Remove worktree?" not in visible
-                        and "000:" not in active_list
-                        and "001:" in active_list and "002:" in active_list)
+                        # Titles carry no issue prefix; the summary counts
+                        # the two remaining rows.
+                        and "Fixture work 0" not in active_list)
 
             wait_for(first_removal_grouped, timeout=10)
             (root / "first-removal-grouped.txt").write_bytes(screen.text())

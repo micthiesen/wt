@@ -21,11 +21,16 @@ use wt_platform::{
 use wt_store::{RemovedWorktree, RepositoryIdentity, Store, StoreError};
 use wt_vcs::{GitRepository, WorktreeRecord};
 
+use crate::removal_trace::{RemovalPhase, timed};
+
 /// Refusal when the removal shown to the user is no longer the current one.
 /// Callers match it to report a stale request rather than a failure.
 pub const REMOVED_CHANGED: &str = "removed worktree changed after the history view was rendered";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+/// Bounded retries of `rm` on an already-verified quarantine. Only
+/// `Directory not empty` (entries created mid-deletion) is retried.
+const QUARANTINE_DELETE_ATTEMPTS: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct StoreLocation {
@@ -177,6 +182,10 @@ pub enum LifecycleError {
     Invalid(String),
     #[error("refusing lifecycle operation: {0}")]
     Refused(String),
+    /// The checkout changed while its removal evidence was read: active
+    /// work, not a broken checkout. Callers may retry later.
+    #[error("refusing lifecycle operation: {0}")]
+    CheckoutChanging(String),
     #[error("{operation} at {path}: {source}")]
     Io {
         operation: &'static str,
@@ -780,18 +789,32 @@ impl LifecycleService {
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
         let row = self.find_live_target(target, cancellation).await?;
+        let phase = RemovalPhase::new(Path::new(&target.path), "prepare-revision");
+        let result = self
+            .stable_removal_revision(&row, landed, cancellation)
+            .await;
+        phase.lifecycle(&result);
+        result
+    }
+
+    async fn stable_removal_revision(
+        &self,
+        row: &WorktreeRecord,
+        landed: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<RemovalRevision, LifecycleError> {
         for _ in 0..2 {
-            let before = self.capture_revision_for_row(&row, cancellation).await?;
+            let before = self.capture_revision_for_row(row, cancellation).await?;
             let hazards = self
-                .collect_removal_hazards(&row, landed, cancellation)
+                .collect_removal_hazards(row, landed, cancellation)
                 .await?;
-            let mut after = self.capture_revision_for_row(&row, cancellation).await?;
+            let mut after = self.capture_revision_for_row(row, cancellation).await?;
             if before == after {
                 after.hazards = hazards;
                 return Ok(after);
             }
         }
-        Err(LifecycleError::Refused(
+        Err(LifecycleError::CheckoutChanging(
             "checkout kept changing while preparing its removal warning".into(),
         ))
     }
@@ -851,8 +874,30 @@ impl LifecycleService {
         expected_revision: Option<&RemovalRevision>,
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
+        let total = RemovalPhase::new(Path::new(&target.path), "total");
+        let result = self
+            .remove_locked(target, options, cleanup, expected_revision, cancellation)
+            .await;
+        total.lifecycle(&result);
+        result
+    }
+
+    async fn remove_locked(
+        &self,
+        target: &WorktreeTarget,
+        options: RemoveOptions,
+        cleanup: bool,
+        expected_revision: Option<&RemovalRevision>,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoveResult, LifecycleError> {
         let slug = target.slug();
-        let lock = self.acquire_lock(slug, "remove", cancellation).await?;
+        let trace = Path::new(&target.path);
+        let lock = timed(
+            trace,
+            "slug-lock-wait",
+            self.acquire_lock(slug, "remove", cancellation),
+        )
+        .await?;
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
         let main = canonicalize(&self.config.main_clone, "resolve main clone").await?;
         let requested = PathBuf::from(&target.path);
@@ -863,7 +908,12 @@ impl LifecycleService {
             ));
         }
         self.ensure_managed_path(&path, &root)?;
-        let row = self.find_live_target(target, cancellation).await?;
+        let row = timed(
+            trace,
+            "find-live-target",
+            self.find_live_target(target, cancellation),
+        )
+        .await?;
         if row.is_main {
             return Err(LifecycleError::Refused(
                 "cannot remove the configured main clone".into(),
@@ -877,12 +927,25 @@ impl LifecycleService {
             ));
         }
         if let Some(expected) = expected_revision {
-            self.verify_removal_revision(&row, options.landed || cleanup, expected, cancellation)
-                .await?;
+            timed(
+                trace,
+                "verify-revision-initial",
+                self.verify_removal_revision(
+                    &row,
+                    options.landed || cleanup,
+                    expected,
+                    cancellation,
+                ),
+            )
+            .await?;
         }
         if !options.force {
-            self.guard_removal(&row, options.landed || cleanup, cancellation)
-                .await?;
+            timed(
+                trace,
+                "guard-hazards",
+                self.guard_removal(&row, options.landed || cleanup, cancellation),
+            )
+            .await?;
         }
         // A successful SST removal switches checkout removal to forced mode
         // (it rewrites generated files). Without a caller witness, pin the
@@ -893,13 +956,26 @@ impl LifecycleService {
             && options.destroy_stage
             && self.config.has_sst
         {
-            Some(self.capture_revision_for_row(&row, cancellation).await?)
+            Some(
+                timed(
+                    trace,
+                    "capture-sst-witness",
+                    self.capture_revision_for_row(&row, cancellation),
+                )
+                .await?,
+            )
         } else {
             None
         };
         let mut warnings = Vec::new();
         if let Some(before_remove) = &self.before_remove {
+            let phase = RemovalPhase::new(trace, "before-remove-sessions-and-listeners");
             warnings.extend(before_remove(row.target.clone(), cancellation.clone()).await);
+            phase.finish(if cancellation.is_cancelled() {
+                "cancelled"
+            } else {
+                "success"
+            });
             if cancellation.is_cancelled() {
                 return Err(LifecycleError::Cancelled);
             }
@@ -908,8 +984,12 @@ impl LifecycleService {
             // Keep the slug lock through supervision cleanup and checkout
             // removal. A new server cannot start in the gap, and a failed
             // external teardown leaves its checkout available for recovery.
-            dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(&row), &lock, cancellation)
-                .await?;
+            timed(trace, "dev-server-stop", async {
+                dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(&row), &lock, cancellation)
+                    .await
+                    .map_err(LifecycleError::from)
+            })
+            .await?;
         }
         let mut force = options.force;
         let mut destroyed_stage = false;
@@ -964,7 +1044,13 @@ impl LifecycleService {
                         spec.cwd = Some(path.clone());
                         spec.timeout = Duration::from_secs(20 * 60);
                         spec.output_limit = PROCESS_OUTPUT_LIMIT;
-                        match self.runner.run(spec, cancellation).await {
+                        let phase = RemovalPhase::new(trace, "sst-remove");
+                        let sst = self.runner.run(spec, cancellation).await;
+                        phase.finish(match &sst {
+                            Ok(output) if output.status.success() => "success",
+                            _ => "error",
+                        });
+                        match sst {
                             Ok(output) if output.status.success() => {
                                 destroyed_stage = true;
                                 force = true;
@@ -995,27 +1081,71 @@ impl LifecycleService {
                 }
             }
         }
-        if let Err(error) = self.run_destroy_hook(&path, slug, cancellation).await {
+        if let Err(error) = timed(
+            trace,
+            "destroy-hook",
+            self.run_destroy_hook(&path, slug, cancellation),
+        )
+        .await
+        {
             if cancellation.is_cancelled() {
                 return Err(LifecycleError::Cancelled);
             }
             warnings.push(error.to_string());
         }
-        if let Some(expected) = verified_revision.as_ref() {
-            self.verify_removal_revision(&row, options.landed || cleanup, expected, cancellation)
-                .await?;
-        }
         let backend = self.backend_for(&path).await?;
+        // Quiesce wt's own writers before the final witness. Background origin
+        // sync skips this clone from here on and any in-flight sync of it
+        // finishes first, so the verified state is also the deleted state.
+        let _clone_maintenance = if backend == BackendKind::Rift {
+            Some(
+                timed(trace, "clone-maintenance-lock-wait", async {
+                    self.repository
+                        .lock_clone_maintenance(slug, cancellation)
+                        .await
+                        .map_err(|error| match error {
+                            wt_vcs::RepositoryError::Cancelled => LifecycleError::Cancelled,
+                            error => error.into(),
+                        })
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(expected) = verified_revision.as_ref() {
+            timed(
+                trace,
+                "verify-revision-final",
+                self.verify_removal_revision(
+                    &row,
+                    options.landed || cleanup,
+                    expected,
+                    cancellation,
+                ),
+            )
+            .await?;
+        }
+        // Status reads above may have started an fsmonitor daemon; it writes
+        // cookies under the Git dir and makes a concurrent `rm` fail.
+        self.stop_fsmonitor(&row, &path, cancellation).await;
         match backend {
             BackendKind::GitWorktree => {
-                self.remove_git_worktree(&path, &main, force, cancellation)
-                    .await?
+                timed(
+                    trace,
+                    "git-worktree-remove",
+                    self.remove_git_worktree(&path, &main, force, cancellation),
+                )
+                .await?
             }
-            BackendKind::Rift => {
-                if let Some(warning) = self.remove_rift(&path, &main, force, cancellation).await? {
-                    warnings.push(warning);
-                }
-            }
+            BackendKind::Rift => warnings.extend(
+                timed(
+                    trace,
+                    "rift-remove",
+                    self.remove_rift(&path, &main, force, cancellation),
+                )
+                .await?,
+            ),
         }
         // The checkout removal is the irreversible commit point. Finish branch
         // cleanup and durable bookkeeping even if cancellation arrives now.
@@ -1805,6 +1935,38 @@ impl LifecycleService {
         Ok(())
     }
 
+    /// Best-effort stop of the checkout's `git fsmonitor--daemon`. It is a
+    /// long-lived writer of cookie files under the Git dir and survives the
+    /// removal's listener reap. Only contacts a daemon whose IPC exists.
+    async fn stop_fsmonitor(
+        &self,
+        row: &WorktreeRecord,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) {
+        let git_dir = row.git_dir.clone().unwrap_or_else(|| path.join(".git"));
+        let ipc = git_dir.join("fsmonitor--daemon.ipc");
+        if !matches!(fs::try_exists(&ipc).await, Ok(true)) {
+            return;
+        }
+        let phase = RemovalPhase::new(path, "fsmonitor-stop");
+        let mut spec = git_spec(path, args(["fsmonitor--daemon", "stop"]));
+        spec.timeout = Duration::from_secs(10);
+        match self.runner.run(spec, cancellation).await {
+            Ok(output) if output.status.success() => phase.finish("success"),
+            Ok(output) => {
+                phase.finish("error");
+                tracing::debug!(target: "wt::removal", path = %path.display(),
+                    exit_code = output.status.code(), "fsmonitor daemon stop did not succeed");
+            }
+            Err(error) => {
+                phase.finish("error");
+                tracing::warn!(target: "wt::removal", path = %path.display(), %error,
+                    "could not stop fsmonitor daemon before removal");
+            }
+        }
+    }
+
     async fn backend_for(&self, path: &Path) -> Result<BackendKind, LifecycleError> {
         let marker = path.join(".rift");
         fs::try_exists(&marker)
@@ -1898,9 +2060,10 @@ impl LifecycleService {
         force: bool,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, LifecycleError> {
+        // A leftover quarantine is past the commit point: the removal
+        // succeeded and its path is a warning, not a failure to retry.
         if self.config.backend == BackendKind::GitWorktree {
-            self.remove_retired_clone(path, cancellation).await?;
-            return Ok(None);
+            return self.remove_retired_clone(path, cancellation).await;
         }
         let mut spec = CommandSpec::new(self.rift_binary(cancellation).await?);
         spec.args = if force {
@@ -1936,13 +2099,20 @@ impl LifecycleService {
     /// Retiring Rift must not make previously created independent checkouts
     /// undeletable. The caller holds the same lock and removal witnesses as the
     /// Rift executable path. Never interpret a linked worktree as a clone.
+    ///
+    /// The verified checkout is first renamed to a quarantine sibling (one
+    /// atomic step on the same filesystem); that rename is the commit point.
+    /// Deleting the quarantine retries only `Directory not empty`, which means
+    /// some process created entries after `rm` listed a directory. Returns a
+    /// warning naming the quarantine when it could not be deleted.
     async fn remove_retired_clone(
         &self,
         path: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<(), LifecycleError> {
+    ) -> Result<Option<String>, LifecycleError> {
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
         self.ensure_managed_path(path, &root)?;
+        let mut identity = None;
         for (candidate, directory) in [
             (path.to_path_buf(), true),
             (path.join(".git"), true),
@@ -1965,23 +2135,64 @@ impl LifecycleService {
                     candidate.display()
                 )));
             }
+            identity.get_or_insert_with(|| directory_identity(&metadata));
         }
         if cancellation.is_cancelled() {
             return Err(LifecycleError::Cancelled);
         }
-        let mut spec = prioritized_cleanup(
-            &OsString::from("rm"),
-            vec!["-rf".into(), "--".into(), path.as_os_str().to_owned()],
-        );
-        spec.cwd = Some(root);
-        // Once recursive deletion starts, retain ownership until the process
-        // exits. Cancelling halfway cannot restore an independent object store.
-        let result = self.runner.run_to_completion(spec, cancellation).await;
-        result
-            .and_then(|output| output.checked("rm"))
-            .map_err(|source| process_error("remove retired independent clone", path, source))?;
-        tracing::info!(target: "wt::lifecycle", path = %path.display(), "retired independent clone removed; Rift registry unchanged");
-        Ok(())
+        let identity = identity.expect("checkout metadata was read");
+        let quarantine = timed(
+            path,
+            "quarantine-rename",
+            quarantine_checkout(path, identity),
+        )
+        .await?;
+        tracing::info!(target: "wt::removal", path = %path.display(), quarantine = %quarantine.display(),
+            "retired independent clone moved aside for deletion");
+        let phase = RemovalPhase::new(path, "quarantine-delete");
+        for attempt in 1..=QUARANTINE_DELETE_ATTEMPTS {
+            let mut spec = quarantine_cleanup(
+                &OsString::from("rm"),
+                vec!["-rf".into(), "--".into(), quarantine.as_os_str().to_owned()],
+            );
+            spec.cwd = Some(root.clone());
+            // Once recursive deletion starts, retain ownership until the process
+            // exits. Cancelling halfway cannot restore an independent object store.
+            let result = self
+                .runner
+                .run_to_completion(spec, cancellation)
+                .await
+                .and_then(|output| output.checked("rm").map(|_| ()));
+            let source = match result {
+                Ok(()) => {
+                    phase.finish("success");
+                    tracing::info!(target: "wt::lifecycle", path = %path.display(), attempts = attempt,
+                        "retired independent clone removed; Rift registry unchanged");
+                    return Ok(None);
+                }
+                Err(source) => source,
+            };
+            // Retry only a pure ENOTEMPTY race. Any other error (permissions,
+            // I/O) also leaves parents non-empty but will not clear itself.
+            let not_empty = matches!(&source, ProcessError::Exit { stderr, .. }
+                if stderr.lines().any(|line| !line.trim().is_empty())
+                    && stderr.lines().filter(|line| !line.trim().is_empty())
+                        .all(|line| line.contains("Directory not empty")));
+            let retry =
+                not_empty && attempt < QUARANTINE_DELETE_ATTEMPTS && !cancellation.is_cancelled();
+            if !retry {
+                phase.finish("error");
+                return Ok(Some(format!(
+                    "{} was removed, but deleting the directory it was moved to failed; delete {} manually: {source}",
+                    path.display(),
+                    quarantine.display()
+                )));
+            }
+            tracing::warn!(target: "wt::removal", quarantine = %quarantine.display(), attempt,
+                "entries appeared during quarantine deletion; retrying");
+            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+        unreachable!("the last attempt always returns")
     }
 
     async fn run_rift_create(
@@ -2148,8 +2359,13 @@ impl LifecycleService {
         })
         .await
         .map_err(|error| LifecycleError::Join(error.to_string()))?
-        .map_err(|message| {
-            LifecycleError::Refused(format!("cannot safely snapshot checkout: {message}"))
+        .map_err(|error| match error {
+            UntrackedSnapshotError::Changed(message) => LifecycleError::CheckoutChanging(format!(
+                "cannot safely snapshot checkout: {message}"
+            )),
+            UntrackedSnapshotError::Unsafe(message) => {
+                LifecycleError::Refused(format!("cannot safely snapshot checkout: {message}"))
+            }
         })?;
         let mut digest = Sha256::new();
         for bytes in [
@@ -2719,11 +2935,24 @@ fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
         .collect()
 }
 
+#[derive(Debug)]
+enum UntrackedSnapshotError {
+    /// A file vanished or changed size mid-read.
+    Changed(String),
+    Unsafe(String),
+}
+
+impl From<String> for UntrackedSnapshotError {
+    fn from(message: String) -> Self {
+        Self::Unsafe(message)
+    }
+}
+
 fn untracked_metadata(
     checkout: &Path,
     paths: &[u8],
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, UntrackedSnapshotError> {
     use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -2733,7 +2962,9 @@ fn untracked_metadata(
         .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
     if entries.len() > MAX_UNTRACKED_FILES {
-        return Err(format!("more than {MAX_UNTRACKED_FILES} untracked paths"));
+        return Err(UntrackedSnapshotError::Unsafe(format!(
+            "more than {MAX_UNTRACKED_FILES} untracked paths"
+        )));
     }
     entries.sort();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -2760,11 +2991,19 @@ fn untracked_metadata(
                 )
             })
         {
-            return Err("Git reported an untracked path outside the checkout".into());
+            return Err(UntrackedSnapshotError::Unsafe(
+                "Git reported an untracked path outside the checkout".into(),
+            ));
         }
         let full_path = checkout.join(relative_path);
-        let metadata = std::fs::symlink_metadata(&full_path)
-            .map_err(|error| format!("stat {}: {error}", full_path.display()))?;
+        let metadata = std::fs::symlink_metadata(&full_path).map_err(|error| {
+            let message = format!("stat {}: {error}", full_path.display());
+            if error.kind() == std::io::ErrorKind::NotFound {
+                UntrackedSnapshotError::Changed(message)
+            } else {
+                UntrackedSnapshotError::Unsafe(message)
+            }
+        })?;
         let modified = metadata
             .modified()
             .map_err(|error| format!("read mtime for {}: {error}", full_path.display()))?;
@@ -2802,18 +3041,18 @@ fn untracked_metadata(
                 digest.update(&buffer[..read]);
             }
             if total != metadata.len() {
-                return Err(format!(
+                return Err(UntrackedSnapshotError::Changed(format!(
                     "{} changed while its removal snapshot was captured",
                     full_path.display()
-                ));
+                )));
             }
             let hash = digest.finalize();
             result.extend_from_slice(&hash);
         } else {
-            return Err(format!(
+            return Err(UntrackedSnapshotError::Unsafe(format!(
                 "unsupported untracked file type: {}",
                 full_path.display()
-            ));
+            )));
         }
     }
     Ok(result)
@@ -2951,7 +3190,24 @@ fn prioritized_rift_gc(rift_binary: &OsString) -> CommandSpec {
     prioritized_cleanup(rift_binary, vec![OsString::from("gc")])
 }
 
-fn prioritized_cleanup(binary: &OsString, mut args: Vec<OsString>) -> CommandSpec {
+fn prioritized_cleanup(binary: &OsString, args: Vec<OsString>) -> CommandSpec {
+    cleanup_with_policy(binary, args, &["-b"])
+}
+
+/// Deletion of a checkout already moved aside. The user waits on this job,
+/// so it runs at utility QoS: below interactive work, but without the
+/// background clamp, whose disk I/O throttling stretched large deletions
+/// to minutes. CPU priority stays lowered with `nice`.
+fn quarantine_cleanup(binary: &OsString, args: Vec<OsString>) -> CommandSpec {
+    cleanup_with_policy(binary, args, &["-c", "utility"])
+}
+
+/// `nice -n 10`, plus the given macOS `taskpolicy` arguments when available.
+fn cleanup_with_policy(
+    binary: &OsString,
+    mut args: Vec<OsString>,
+    taskpolicy_args: &[&str],
+) -> CommandSpec {
     let mut program = PathBuf::from(binary);
     if let Some(nice) = find_executable("nice") {
         args.splice(
@@ -2963,8 +3219,10 @@ fn prioritized_cleanup(binary: &OsString, mut args: Vec<OsString>) -> CommandSpe
     let mut spec = if cfg!(target_os = "macos") {
         find_executable("taskpolicy").map(|taskpolicy| {
             let mut spec = CommandSpec::new(taskpolicy);
-            spec.args = [OsString::from("-b"), program.clone().into_os_string()]
-                .into_iter()
+            spec.args = taskpolicy_args
+                .iter()
+                .map(OsString::from)
+                .chain([program.clone().into_os_string()])
                 .chain(args.clone())
                 .collect();
             spec
@@ -2979,6 +3237,113 @@ fn prioritized_cleanup(binary: &OsString, mut args: Vec<OsString>) -> CommandSpe
     });
     spec.timeout = Duration::from_secs(20 * 60);
     spec
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn directory_identity(metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt;
+    DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    DirectoryIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+/// Move a verified checkout to a fresh `.wt-removing-*` sibling in the same
+/// directory, so the rename is atomic and stays on one filesystem. Nothing is
+/// deleted here. If the moved directory is not the one that was verified, it
+/// is moved back and the removal is refused.
+async fn quarantine_checkout(
+    path: &Path,
+    expected: DirectoryIdentity,
+) -> Result<PathBuf, LifecycleError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(LifecycleError::Invalid(format!(
+            "checkout has no parent directory: {}",
+            path.display()
+        )));
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut quarantine_name = OsString::from(GitRepository::REMOVAL_QUARANTINE_PREFIX);
+    quarantine_name.push(name);
+    quarantine_name.push(format!("-{}-{nanos}", std::process::id()));
+    let quarantine = parent.join(quarantine_name);
+    match fs::symlink_metadata(&quarantine).await {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(LifecycleError::Refused(format!(
+                "removal quarantine already exists: {}",
+                quarantine.display()
+            )));
+        }
+        Err(source) => {
+            return Err(LifecycleError::Io {
+                operation: "inspect removal quarantine",
+                path: quarantine,
+                source,
+            });
+        }
+    }
+    let current = fs::symlink_metadata(path)
+        .await
+        .map_err(|source| LifecycleError::Io {
+            operation: "revalidate checkout before quarantine",
+            path: path.to_owned(),
+            source,
+        })?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || directory_identity(&current) != expected
+    {
+        return Err(LifecycleError::Refused(format!(
+            "checkout identity changed before removal: {}",
+            path.display()
+        )));
+    }
+    fs::rename(path, &quarantine)
+        .await
+        .map_err(|source| LifecycleError::Io {
+            operation: "move checkout aside for removal (nothing was deleted)",
+            path: path.to_owned(),
+            source,
+        })?;
+    let moved = fs::symlink_metadata(&quarantine).await;
+    if moved
+        .as_ref()
+        .is_ok_and(|metadata| directory_identity(metadata) == expected && metadata.is_dir())
+    {
+        return Ok(quarantine);
+    }
+    // Something replaced the checkout between the check and the rename.
+    // Put it back untouched and refuse; nothing was deleted.
+    if let Err(error) = fs::rename(&quarantine, path).await {
+        tracing::error!(target: "wt::removal", %error, quarantine = %quarantine.display(),
+            "could not restore an unexpected directory moved aside for removal");
+        return Err(LifecycleError::Refused(format!(
+            "checkout identity changed during removal; the unexpected directory is at {}",
+            quarantine.display()
+        )));
+    }
+    Err(LifecycleError::Refused(format!(
+        "checkout identity changed during removal: {}",
+        path.display()
+    )))
 }
 
 /// Removal hazard for a dirty worktree.
@@ -3884,11 +4249,14 @@ mod tests {
         let second = untracked_metadata(scratch.path(), b"large\0", &cancellation).unwrap();
         assert_ne!(first, second);
         cancellation.cancel();
-        assert!(
-            untracked_metadata(scratch.path(), b"large\0", &cancellation)
-                .unwrap_err()
-                .contains("cancelled")
-        );
+        assert!(matches!(
+            untracked_metadata(scratch.path(), b"large\0", &cancellation),
+            Err(UntrackedSnapshotError::Unsafe(message)) if message.contains("cancelled")
+        ));
+        assert!(matches!(
+            untracked_metadata(scratch.path(), b"vanished\0", &CancellationToken::new()),
+            Err(UntrackedSnapshotError::Changed(_))
+        ));
     }
 
     #[tokio::test]
@@ -4274,7 +4642,12 @@ mod tests {
         service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
         let cancellation = CancellationToken::new();
         let mut targets = Vec::new();
-        for name in ["legacy-clean", "legacy-dirty", "legacy-unpushed"] {
+        for name in [
+            "legacy-clean",
+            "legacy-dirty",
+            "legacy-unpushed",
+            "legacy-verify",
+        ] {
             let path = root.join(name);
             run(
                 &runner,
@@ -4324,9 +4697,42 @@ mod tests {
             ],
         )
         .await;
+        // Publish the verify fixture's branch so its only hazard is the gate.
+        run(
+            &runner,
+            Path::new(&targets[3].path),
+            &["update-ref", "refs/remotes/origin/legacy-verify", "HEAD"],
+        )
+        .await;
+        run(
+            &runner,
+            Path::new(&targets[3].path),
+            &["branch", "--set-upstream-to", "origin/legacy-verify"],
+        )
+        .await;
+        service
+            .mutate_store(&cancellation, |store| {
+                store.set_slug_work_status(
+                    "legacy-verify",
+                    Some(&wt_store::WorkStatusRecord {
+                        state: "ready".into(),
+                        at: "fixture".into(),
+                        note: None,
+                        risk: Some("low".into()),
+                        sha: None,
+                        by: None,
+                        blocked_on: None,
+                        verify_after_merge: Some("check the deployment".into()),
+                        extra: Default::default(),
+                    }),
+                )
+            })
+            .await
+            .unwrap();
         for (target, hazard) in [
             (&targets[1], "uncommitted changes"),
             (&targets[2], "unpushed commit"),
+            (&targets[3], "post-merge verification still owed"),
         ] {
             let result = service
                 .remove(target, RemoveOptions::default(), &cancellation)
@@ -4393,6 +4799,269 @@ mod tests {
             Err(LifecycleError::Cancelled)
         ));
         assert!(path.exists());
+    }
+
+    async fn retired_clone_fixture(
+        runner: &ProcessRunner,
+        main: &Path,
+        root: &Path,
+        name: &str,
+    ) -> WorktreeTarget {
+        let path = root.join(name);
+        run(
+            runner,
+            main,
+            &[
+                "clone",
+                "--no-hardlinks",
+                main.to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        )
+        .await;
+        run(runner, &path, &["switch", "-c", name]).await;
+        fs::write(path.join(".rift"), "fixture marker")
+            .await
+            .unwrap();
+        fs::write(path.join(".git/info/exclude"), ".rift\n")
+            .await
+            .unwrap();
+        local_worktree_target(name, name, path.to_string_lossy(), "stagepersonal")
+    }
+
+    fn quarantines(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| GitRepository::is_removal_quarantine(&entry.file_name()))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn retired_clone_removal_survives_a_writer_recreating_git_entries() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let target = retired_clone_fixture(&runner, &main, &root, "busy-clone").await;
+        let path = PathBuf::from(&target.path);
+        let cookies = path.join(".git/fsmonitor--daemon/cookies");
+        std::fs::create_dir_all(&cookies).unwrap();
+        for index in 0..2000 {
+            std::fs::write(cookies.join(format!("seed-{index}")), "").unwrap();
+        }
+        // Model a daemon that keeps writing cookies into the directory it
+        // already holds, wherever it has been renamed to. It never recreates
+        // parents, so it cannot resurrect the original checkout path.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            let writes = Arc::clone(&writes);
+            let root = root.clone();
+            move || {
+                let mut first_quarantine_write = None::<std::time::Instant>;
+                let mut index = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if first_quarantine_write
+                        .is_some_and(|at| at.elapsed() > Duration::from_millis(300))
+                    {
+                        break;
+                    }
+                    for directory in quarantines(&root) {
+                        let cookies = directory.join(".git/fsmonitor--daemon/cookies");
+                        index += 1;
+                        if std::fs::write(cookies.join(format!("live-{index}")), "").is_ok() {
+                            first_quarantine_write.get_or_insert_with(std::time::Instant::now);
+                            writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let result = service
+            .remove(&target, RemoveOptions::default(), &CancellationToken::new())
+            .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(!path.exists(), "original checkout path must be gone");
+        // The writer stops 300ms after its first quarantine write, before the
+        // third bounded attempt, so deletion must finish. Without the retry,
+        // this fixture fails with `Directory not empty`.
+        let removed = result.unwrap();
+        assert!(removed.removed);
+        assert!(quarantines(&root).is_empty(), "{:?}", quarantines(&root));
+        let removed = service
+            .mutate_store(&CancellationToken::new(), |store| {
+                store.read_removed_worktrees()
+            })
+            .await
+            .unwrap();
+        assert!(removed.iter().any(|entry| entry.slug == "busy-clone"));
+        assert!(
+            writes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the writer never raced the deletion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn undeletable_quarantine_is_a_warning_after_a_successful_removal() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let target = retired_clone_fixture(&runner, &main, &root, "stuck-clone").await;
+        let locked = Path::new(&target.path).join(".git/locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("file"), "").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = service
+            .remove(&target, RemoveOptions::default(), &CancellationToken::new())
+            .await;
+        let left = quarantines(&root);
+        for directory in &left {
+            let _ = std::fs::set_permissions(
+                directory.join(".git/locked"),
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
+        let result = result.expect("the removal is past its commit point");
+        assert!(result.removed);
+        assert_eq!(left.len(), 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&*left[0].to_string_lossy())
+                    && warning.contains("manually")),
+            "{:?}",
+            result.warnings
+        );
+        assert!(!Path::new(&target.path).exists());
+        let removed = service
+            .mutate_store(&CancellationToken::new(), |store| {
+                store.read_removed_worktrees()
+            })
+            .await
+            .unwrap();
+        assert!(removed.iter().any(|entry| entry.slug == "stuck-clone"));
+    }
+
+    #[tokio::test]
+    async fn quarantine_rename_refuses_a_replaced_checkout_and_inventory_ignores_quarantines() {
+        let (_scratch, service, runner, main, root) = setup().await;
+        let path = root.join("swapped");
+        fs::create_dir(&path).await.unwrap();
+        let verified = directory_identity(&std::fs::symlink_metadata(&path).unwrap());
+        // Keep the original inode alive elsewhere so it cannot be reused.
+        fs::rename(&path, root.join("held-original")).await.unwrap();
+        fs::create_dir(&path).await.unwrap();
+        fs::write(path.join("replacement.txt"), "keep me")
+            .await
+            .unwrap();
+        assert!(matches!(
+            quarantine_checkout(&path, verified).await,
+            Err(LifecycleError::Refused(ref message)) if message.contains("identity changed")
+        ));
+        assert_eq!(
+            fs::read_to_string(path.join("replacement.txt"))
+                .await
+                .unwrap(),
+            "keep me"
+        );
+        assert!(quarantines(&root).is_empty());
+
+        // A matching identity is moved aside, not deleted, and the moved
+        // clone is invisible to inventory and therefore to maintenance.
+        let target = retired_clone_fixture(&runner, &main, &root, "aside").await;
+        let clone = PathBuf::from(&target.path);
+        let identity = directory_identity(&std::fs::symlink_metadata(&clone).unwrap());
+        let inventory = service
+            .repository
+            .inventory(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(inventory.iter().any(|row| row.target.slug() == "aside"));
+        let quarantine = quarantine_checkout(&clone, identity).await.unwrap();
+        assert!(!clone.exists());
+        assert!(quarantine.join(".git/HEAD").exists());
+        let inventory = service
+            .repository
+            .inventory(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            inventory
+                .iter()
+                .all(|row| !GitRepository::is_removal_quarantine(
+                    Path::new(&row.target.path).file_name().unwrap()
+                )),
+            "{inventory:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn removal_stops_the_checkout_fsmonitor_daemon_before_deleting() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let target = retired_clone_fixture(&runner, &main, &root, "watched").await;
+        let path = PathBuf::from(&target.path);
+        run(&runner, &path, &["-c", "core.fsmonitor=true", "status"]).await;
+        let ipc = path.join(".git/fsmonitor--daemon.ipc");
+        if !ipc.exists() {
+            // This Git build has no builtin fsmonitor; nothing to stop.
+            return;
+        }
+        let row = service
+            .find_live_target(&target, &CancellationToken::new())
+            .await
+            .unwrap();
+        service
+            .stop_fsmonitor(&row, &path, &CancellationToken::new())
+            .await;
+        assert!(!ipc.exists(), "daemon IPC must be gone after stop");
+        run(&runner, &path, &["-c", "core.fsmonitor=true", "status"]).await;
+        assert!(ipc.exists());
+        service
+            .remove(&target, RemoveOptions::default(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!path.exists());
+        assert!(quarantines(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_clone_removal_waits_for_in_flight_clone_maintenance() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let target = retired_clone_fixture(&runner, &main, &root, "maintained").await;
+        let held = service
+            .repository
+            .lock_clone_maintenance("maintained", &CancellationToken::new())
+            .await
+            .unwrap();
+        let removal = tokio::spawn({
+            let service = service.clone();
+            let target = target.clone();
+            async move {
+                service
+                    .remove(&target, RemoveOptions::default(), &CancellationToken::new())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            Path::new(&target.path).join(".git/HEAD").exists(),
+            "removal must not delete while clone maintenance is running"
+        );
+        assert!(!removal.is_finished());
+        drop(held);
+        removal.await.unwrap().unwrap();
+        assert!(!Path::new(&target.path).exists());
     }
 
     #[tokio::test]

@@ -100,8 +100,8 @@ Everything is ordinary CLI surface, so any harness can drive it:
 - `wt status <slug> <state> …` — assert on a worktree's behalf after acting on it (`--note-only` sharpens a note without touching state or timestamp).
 - `wt edge <from> <before|conflicts|enables> <to> [--blocks|--prefer] [-m why]` — record merge sequencing as structured state instead of prose ([cli.md](cli.md#wt-edge-from-kind-to)); `wt edge --json` reads it back with staleness computed, and each endpoint's `wt fleet --json` row carries the same objects inline. Edges self-expire when either branch moves — re-assert what still matters, never audit the list. Worktrees assert their own first-hand dependencies; cross-branch edges are yours to assert.
 - `wt dev queue` / `wt dev queue <slug> --first` — the dev-slot wait queue, and the one lever for saying a worktree goes first. Promotion edits that waiter's own entry, so it takes effect on the waiter's next poll with no message and no cooperation; asking an agent to stand aside instead loses to a slot that frees instantly (it did, once, with three agents all cooperating correctly). Only a queued worktree can be moved (`wt dev start --wait` first), the tier lasts exactly as long as that wait, and worktrees cannot promote themselves — this is the fleet call they are told to bring here.
-- `wt agent send <target> "<text>"` — nudge a worktree, branch alias, or the `wt`/`main`/`dotfiles`/`manager` special sessions. wt chooses that target's active harness, or the configured primary when none is active, and cold-starts it. `wt agent start <slug>` invokes a worktree's bundled start skill with the selected harness's native prefix. For a remote worker, use `wt remote agent start <slug>`.
-- `wt agent ls --json` — the matching harness-neutral address book, including special sessions, active harnesses, selected harness, and selection source. An inaccessible tmux registry fails closed rather than appearing empty.
+- `wt agent send <target> "<text>"` — nudge a worktree, branch alias, or the `wt`/`main`/`dotfiles`/`manager` special sessions. wt chooses that target's active harness, or the configured primary when none is active, and cold-starts it. When `[harness] wt_session` is set, the `wt` session always uses that harness instead (see [configuration.md](configuration.md#harness--coding-agent-default)). `wt agent start <slug>` invokes a worktree's bundled start skill with the selected harness's native prefix. For a remote worker, use `wt remote agent start <slug>`.
+- `wt agent ls --json` — the matching harness-neutral address book, including special sessions, active harnesses, selected harness, and selection source (`live`, `primary`, `pinned` for a `wt_session` pin, `unavailable`, or `remote-unavailable`). An inaccessible tmux registry fails closed rather than appearing empty.
 - `wt claude ls --json` / `wt claude selftest` — Claude-only diagnostics. The deprecated `wt claude send` spelling delegates to `wt agent send` and cannot force Claude.
 - `wt manager report [--ok|--warn|--err|--info] "<text>"` — surface a terse result on the TUI's attention feed (the palette's report-back channel).
 - `gh` — PR state, merges (only when the human asked), CI.
@@ -136,9 +136,18 @@ WebSocket, adds the message to Codex's durable FIFO, explicitly starts it when
 idle, and disconnects. It never resumes or subscribes to the thread, so the TUI
 remains the only owner of questions and approvals. Busy and blocked turns keep
 the prompt queued. If the daemon is offline, `codex queue` writes the same
-host-local queue. If a live tmux slot has no recoverable UUID, wt waits for
-that exact slot's empty composer and types there instead of dropping the
-message. A remote send runs on the remote host over SSH rather than
+host-local queue. Codex writes a new thread's rollout only with its first
+prompt, so a slot started without `resume` is identified later: wt stamps it
+with the sole terminal-TUI conversation of that checkout and slot created since
+the tmux session started, and only while the slot's pane runs the one Codex TUI
+in that checkout (no other Codex process outside stamped slots runs there or
+names it). A stamp that names another checkout's conversation, several new
+conversations, a foreign Codex process, or no conversation with history on
+screen fails at once with "Nothing was sent", so a retry is safe; resume the conversation from the session picker
+so wt records its UUID. Only an empty new-conversation composer
+(`Ask Codex to do anything`) accepts typed input without a UUID. Exact-thread
+terminal input accepts either empty composer, including Codex 0.163's
+`Ask a follow-up question`. A remote send runs on the remote host over SSH rather than
 forwarding a socket. An uncertain add is reconciled by its client id and is
 never blindly retried. A `/command` uses guarded tmux input instead: the app
 server queue accepts it as user text rather than executing Codex's TUI command.

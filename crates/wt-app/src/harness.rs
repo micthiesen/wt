@@ -18,7 +18,9 @@ use wt_harness::{
     CodexPaths, DiscoveryRequest, HarnessId, HarnessMessageOutcome, HarnessService,
     HarnessSpawnRequest, HarnessTarget, OpenCodePaths,
 };
-use wt_tmux::{CreateSession, SessionInfo, TmuxClient, TmuxServer, write_terminal_config};
+use wt_tmux::{
+    CreateSession, SessionInfo, SessionShortcut, TmuxClient, TmuxServer, write_terminal_config,
+};
 use wt_tui::SessionTarget;
 
 use crate::context::AppContext;
@@ -60,6 +62,10 @@ pub struct HarnessChoice {
 pub enum SelectionSource {
     Live,
     Primary,
+    /// Configuration pins this slot's harness (`[harness] wt_session`); it
+    /// wins over the primary, a persisted Tab selection and live sessions of
+    /// other harnesses, which are left running and still listed in `live`.
+    Pinned,
     Unavailable,
     RemoteUnavailable,
 }
@@ -97,8 +103,18 @@ impl<'a> SessionNavigation<'a> {
             key,
             agent: None,
         };
-        if target == SessionTarget::Harness && navigation.key.is_some() {
-            navigation.retain_agent(prepared).await?;
+        // Switching is a convenience: the first attach is already prepared
+        // and must not be refused because its identity cannot be retained.
+        // Without a retained agent the session keys return to the board, so
+        // a later F12 can never land on a different agent. Re-entry through
+        // `next` stays fail-closed.
+        if target == SessionTarget::Harness
+            && navigation.key.is_some()
+            && let Err(error) = navigation.retain_agent(prepared).await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "session switching disabled for this attach");
+            navigation.agent = None;
+            navigation.key = None;
         }
         Ok(navigation)
     }
@@ -323,6 +339,7 @@ pub struct AppHarness {
     claude_injector: ClaudeInjector,
     cache_root: PathBuf,
     primary_fallback: HarnessId,
+    harness_config: wt_config::HarnessConfig,
     codex_config: PathBuf,
     main_clone: PathBuf,
     dotfiles: PathBuf,
@@ -402,6 +419,7 @@ impl AppHarness {
             claude_injector,
             cache_root,
             primary_fallback: context.config.harness.primary,
+            harness_config: context.config.harness.clone(),
             codex_config,
             main_clone: context.config.paths.main_clone.clone(),
             dotfiles: context.config.paths.dotfiles.clone(),
@@ -456,10 +474,22 @@ impl AppHarness {
             .context("inspect Codex app-server")
     }
 
+    /// Attach to an agent session.
     pub fn attach_command(&self, session: &str, cwd: &Path) -> PreparedSession {
+        self.attach_command_as(session, cwd, SessionShortcut::Harness)
+    }
+
+    /// Attach to a session whose switch-key kind the caller knows; the kind
+    /// is never derived from the session name.
+    pub(crate) fn attach_command_as(
+        &self,
+        session: &str,
+        cwd: &Path,
+        shortcut: SessionShortcut,
+    ) -> PreparedSession {
         PreparedSession {
             program: "tmux".into(),
-            args: self.tmux.attach_session_args(session),
+            args: self.tmux.attach_session_args(session, shortcut),
             cwd: cwd.to_owned(),
         }
     }
@@ -474,6 +504,17 @@ impl AppHarness {
             .and_then(|value| value.get("primary")?.as_str().map(str::to_owned))
             .and_then(|value| serde_json::from_value(Value::String(value)).ok())
             .unwrap_or(self.primary_fallback)
+    }
+
+    /// The harness configuration pins for this target, if any.
+    pub(crate) fn pinned(&self, slug: &str, kind: AgentTargetKind) -> Option<HarnessId> {
+        pinned_harness(&self.harness_config, slug, kind)
+    }
+
+    /// The harness a new start or prompt for this target uses when no live
+    /// session decides it: the configured pin, else the effective primary.
+    pub(crate) fn default_for(&self, slug: &str, kind: AgentTargetKind) -> HarnessId {
+        self.pinned(slug, kind).unwrap_or_else(|| self.primary())
     }
 
     pub async fn routes(&self, context: &AppContext) -> Result<Vec<AgentRoute>> {
@@ -510,7 +551,7 @@ impl AppHarness {
                     },
                     Some(names) => {
                         let live = live_harnesses(&target.slug, names, &known, &ids);
-                        choose_live_harness(primary, live)
+                        select_harness(self.pinned(&target.slug, target.kind), primary, live)
                     }
                 };
                 AgentRoute { target, choice }
@@ -744,6 +785,32 @@ impl AppHarness {
     }
 }
 
+/// The one rule for configuration-pinned slot harnesses: only the `wt`
+/// special session can be pinned, by `[harness] wt_session`. A worktree that
+/// happens to be named `wt` is never pinned.
+pub(crate) fn pinned_harness(
+    config: &wt_config::HarnessConfig,
+    slug: &str,
+    kind: AgentTargetKind,
+) -> Option<HarnessId> {
+    match (kind, slug) {
+        (AgentTargetKind::Special, "wt") => config.wt_session,
+        _ => None,
+    }
+}
+
+/// [`pinned_harness`] for a slot surface, for callers holding a
+/// [`SessionTarget`] rather than an [`AgentTarget`].
+pub(crate) fn pinned_slot_harness(
+    config: &wt_config::HarnessConfig,
+    target: SessionTarget,
+) -> Option<HarnessId> {
+    match target {
+        SessionTarget::WtSource => pinned_harness(config, "wt", AgentTargetKind::Special),
+        _ => None,
+    }
+}
+
 fn special_target(slug: &str, cwd: PathBuf, managed_name: Option<String>) -> AgentTarget {
     AgentTarget {
         slug: slug.into(),
@@ -907,7 +974,14 @@ pub async fn ui_session_with_harness(
                     .into_iter()
                     .find(|route| route.target.slug == slug)
                     .and_then(|route| route.choice.selected)
-                    .unwrap_or_else(|| app.primary()),
+                    .unwrap_or_else(|| {
+                        let kind = if target == SessionTarget::Harness {
+                            AgentTargetKind::Worktree
+                        } else {
+                            AgentTargetKind::Special
+                        };
+                        app.default_for(&slug, kind)
+                    }),
             };
             let request = HarnessSpawnRequest {
                 worktree_path: cwd.clone(),
@@ -965,7 +1039,12 @@ pub async fn ui_session_with_harness(
             tmux_name
         }
     };
-    Ok(app.attach_command(&session, &cwd))
+    let shortcut = match kind {
+        SessionTarget::Shell => SessionShortcut::Shell,
+        SessionTarget::Diff => SessionShortcut::Diff,
+        _ => SessionShortcut::Harness,
+    };
+    Ok(app.attach_command_as(&session, &cwd, shortcut))
 }
 
 fn primary_single_slot_session<'a>(
@@ -990,6 +1069,24 @@ fn resolve_diff_command(template: &str, base: &str) -> String {
     }
     let quoted = format!("\"{}\"", base.replace('"', "\\\""));
     template.replace("{{base}}", &quoted)
+}
+
+/// Route selection for one target. A configured pin decides outright and
+/// never touches a live session of another harness; otherwise a live session
+/// wins, preferring the primary when several are live.
+pub(crate) fn select_harness(
+    pinned: Option<HarnessId>,
+    primary: HarnessId,
+    live: Vec<HarnessId>,
+) -> HarnessChoice {
+    match pinned {
+        Some(id) => HarnessChoice {
+            selected: Some(id),
+            source: SelectionSource::Pinned,
+            live: Some(live),
+        },
+        None => choose_live_harness(primary, live),
+    }
 }
 
 fn choose_live_harness(primary: HarnessId, live: Vec<HarnessId>) -> HarnessChoice {
@@ -1079,6 +1176,156 @@ pub fn unavailable_source_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_wt_special_session_is_pinned_and_unset_keeps_live_selection() {
+        let mut config = wt_config::HarnessConfig::default();
+        assert_eq!(
+            pinned_harness(&config, "wt", AgentTargetKind::Special),
+            None
+        );
+        assert_eq!(
+            select_harness(None, HarnessId::Codex, vec![HarnessId::Claude]),
+            choose_live_harness(HarnessId::Codex, vec![HarnessId::Claude])
+        );
+        config.wt_session = Some(HarnessId::Claude);
+        assert_eq!(
+            pinned_harness(&config, "wt", AgentTargetKind::Special),
+            Some(HarnessId::Claude)
+        );
+        assert_eq!(
+            pinned_harness(&config, "wt", AgentTargetKind::Worktree),
+            None
+        );
+        for slug in ["main", "manager", "dotfiles", "one"] {
+            assert_eq!(
+                pinned_harness(&config, slug, AgentTargetKind::Special),
+                None
+            );
+        }
+        assert_eq!(
+            pinned_slot_harness(&config, SessionTarget::WtSource),
+            Some(HarnessId::Claude)
+        );
+        assert_eq!(pinned_slot_harness(&config, SessionTarget::Main), None);
+        // A live session of another harness is reported, never selected.
+        let choice = select_harness(
+            Some(HarnessId::Claude),
+            HarnessId::Codex,
+            vec![HarnessId::Codex],
+        );
+        assert_eq!(choice.selected, Some(HarnessId::Claude));
+        assert_eq!(choice.source, SelectionSource::Pinned);
+        assert_eq!(choice.live, Some(vec![HarnessId::Codex]));
+    }
+
+    #[tokio::test]
+    async fn pinned_wt_session_wins_over_saved_primary_and_a_foreign_live_slot() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let wt_source = fixture._root.path().join("wt-source");
+        fs::create_dir_all(&wt_source).unwrap();
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.tmux.socket = format!(
+                "wt-pin-{}",
+                fixture._root.path().file_name().unwrap().to_string_lossy()
+            );
+            config.paths.wt_source = Some(wt_source.clone());
+            config.harness.primary = HarnessId::Claude;
+            config.harness.wt_session = Some(HarnessId::Opencode);
+        }
+        persist_primary(&fixture.ctx.config.paths.cache_root, HarnessId::Codex).unwrap();
+        let app = AppHarness::new(&fixture.ctx);
+        // A live Codex session already owns the wt slot's Codex name.
+        app.tmux
+            .create_session(
+                &CreateSession {
+                    name: "wt-codex".into(),
+                    cwd: wt_source.clone(),
+                    command: vec!["sleep".into(), "30".into()],
+                    width: None,
+                    height: None,
+                },
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        let result: Result<()> = async {
+            let routes = app.routes(&fixture.ctx).await?;
+            let wt = AppHarness::target_for("wt", &routes).context("wt route")?;
+            assert_eq!(wt.target.kind, AgentTargetKind::Special);
+            assert_eq!(wt.choice.selected, Some(HarnessId::Opencode));
+            assert_eq!(wt.choice.source, SelectionSource::Pinned);
+            assert_eq!(wt.choice.live, Some(vec![HarnessId::Codex]));
+            // Every other slot keeps the saved Tab selection.
+            let main = AppHarness::target_for("main", &routes).context("main route")?;
+            assert_eq!(main.choice.selected, Some(HarnessId::Codex));
+            assert_eq!(main.choice.source, SelectionSource::Primary);
+            assert_eq!(
+                app.default_for("wt", AgentTargetKind::Special),
+                HarnessId::Opencode
+            );
+            assert_eq!(
+                app.default_for("main", AgentTargetKind::Special),
+                HarnessId::Codex
+            );
+            // Selection never stops the other harness's session.
+            assert!(
+                app.tmux
+                    .session_exists("wt-codex", &fixture.ctx.cancellation)
+                    .await?
+            );
+            Ok(())
+        }
+        .await;
+        app.tmux
+            .kill_server(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unretainable_first_attach_still_attaches_without_switching() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-navigation-best-effort-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy(),
+        );
+        let app = AppHarness::new(&fixture.ctx);
+        let cwd = fixture.ctx.cwd.clone();
+        // No such live session: retention fails, the attach proceeds.
+        let missing = app.attach_command("one-codex", &cwd);
+        let no_target = PreparedSession {
+            program: "tmux".into(),
+            args: Vec::new(),
+            cwd: cwd.clone(),
+        };
+        for prepared in [missing, no_target] {
+            let mut navigation = SessionNavigation::new(
+                &fixture.ctx,
+                Some("one".into()),
+                SessionTarget::Harness,
+                &prepared,
+            )
+            .await
+            .unwrap();
+            assert!(navigation.agent.is_none());
+            assert!(navigation.key.is_none());
+            // Every session key returns to the board.
+            for code in [110, 111, 112] {
+                assert!(navigation.next(Some(code)).await.unwrap().is_none());
+            }
+        }
+        fixture.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn session_keys_keep_the_agent_identity_and_reject_a_replacement() {

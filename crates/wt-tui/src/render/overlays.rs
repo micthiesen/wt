@@ -873,6 +873,7 @@ fn confirm_verb(action: &ConfirmAction) -> &'static str {
         ConfirmAction::Github { ship: true, .. } => "ship",
         ConfirmAction::Github { ship: false, .. } => "mark ready",
         ConfirmAction::Remove { .. } => "remove",
+        ConfirmAction::DismissFailedRemoval { .. } => "dismiss",
         ConfirmAction::Cleanup { .. } | ConfirmAction::CleanupTargets { .. } => "clean",
         ConfirmAction::ManagedSignIn { .. } => "sign in",
         #[allow(unreachable_patterns)]
@@ -886,6 +887,7 @@ fn destructive(action: &ConfirmAction) -> bool {
         ConfirmAction::ReviewCheckout { .. }
             | ConfirmAction::RestoreRemoved { .. }
             | ConfirmAction::Github { .. }
+            | ConfirmAction::DismissFailedRemoval { .. }
     )
 }
 

@@ -321,24 +321,10 @@ impl RowContext<'_> {
     }
 }
 
-/// The row's title with its issue number in front, so an identifier
-/// survives truncation: `ENG-1234` reads as `1234: title`.
+/// The row's title exactly as named. Issue identity, removal progress and
+/// other status belong to the marker, badges and details, never the title.
 pub(crate) fn row_label(row: &BoardRow) -> String {
-    let title = match row.issue_id.as_deref() {
-        Some(id) if !id.is_empty() => {
-            let number = id
-                .split_once('-')
-                .filter(|(prefix, _)| prefix.chars().all(|ch| ch.is_ascii_uppercase()))
-                .map_or(id, |(_, number)| number);
-            format!("{number}: {}", row.title)
-        }
-        _ => row.title.clone(),
-    };
-    match &row.removal {
-        Some(removal) if removal.error.is_some() => format!("{title} · Removal failed"),
-        Some(_) => format!("{title} · Removing"),
-        None => title,
-    }
+    row.title.clone()
 }
 
 /// Keep the trailing (deepest) columns of a rail that is wider than the
@@ -641,6 +627,7 @@ mod tests {
                 title: "Failed task".into(),
                 removal: Some(crate::RemovalView {
                     error: Some("denied".into()),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -687,7 +674,9 @@ mod tests {
         assert!(position("Active task") < position("Running task"));
         assert!(position("Running task") < position("Failed task"));
         assert!(position("Failed task") < position("Archived"));
-        assert!(text[position("Failed task")].contains("Removal failed"));
+        assert!(!text[position("Failed task")].contains("Removal failed"));
+        assert!(text[position("Failed task")].contains(crate::glyphs::CONFLICT));
+        assert!(text[position("Running task")].contains(crate::glyphs::TRASH));
         let cursor_items: Vec<_> = lines.iter().filter_map(|line| line.item).collect();
         assert_eq!(cursor_items, [0, 1, 2, 3]);
     }
@@ -751,13 +740,23 @@ mod tests {
     }
 
     #[test]
-    fn labels_carry_the_issue_number() {
+    fn labels_are_the_title_without_identity_or_status() {
         let row = BoardRow {
             title: "Fix the thing".into(),
             issue_id: Some("ENG-1234".into()),
             ..Default::default()
         };
-        assert_eq!(row_label(&row), "1234: Fix the thing");
+        assert_eq!(row_label(&row), "Fix the thing");
+        let incidental = BoardRow {
+            title: "Christian meetings bugs".into(),
+            issue_id: Some("2".into()),
+            removal: Some(crate::RemovalView {
+                error: Some("denied".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(row_label(&incidental), "Christian meetings bugs");
         let plain = BoardRow {
             title: "Fix".into(),
             ..Default::default()

@@ -95,8 +95,13 @@ pub(crate) fn work_status_badge(work: Option<&WorkPresentation>) -> Badge {
 /// flight, a vanished path, a deleted remote branch, or landed work. Dirty
 /// lives in the badge cluster and clean renders nothing.
 pub(crate) fn loud_status_badge(row: &BoardRow) -> Option<Badge> {
-    if row.removal.is_some() {
-        return Some(badge(glyphs::TRASH, theme::ERR));
+    if let Some(removal) = &row.removal {
+        let glyph = if removal.error.is_some() {
+            glyphs::CONFLICT
+        } else {
+            glyphs::TRASH
+        };
+        return Some(badge(glyph, theme::ERR));
     }
     if let Some(busy) = &row.busy {
         return Some(busy_badge(&busy.op));

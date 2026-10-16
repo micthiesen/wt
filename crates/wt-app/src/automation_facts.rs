@@ -16,7 +16,7 @@ use wt_github::{GithubData, PrChecks, PrReview};
 use wt_platform::lock::FileLock;
 use wt_runtime::Confirmed;
 use wt_tui::Board;
-use wt_vcs::WorktreeSnapshot;
+use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
 use crate::{
     automation_engine::RequirementState,
@@ -116,6 +116,12 @@ pub async fn lifecycle_facts(
         .filter(|snapshot| !snapshot.worktree.is_main)
     {
         let slug = snapshot.worktree.target.slug();
+        // An accepted removal owns this checkout; its files may disappear at
+        // any moment. A retired target contributes no facts and no error.
+        if removal_recorded(state, &snapshot.worktree) || checkout_missing(&snapshot.worktree).await
+        {
+            continue;
+        }
         match crate::commands::diagnostics::operation_lock(ctx, slug).await {
             Ok(Some(_)) => result.deferred = true,
             Ok(None) => rows.push(snapshot.worktree.clone()),
@@ -127,33 +133,61 @@ pub async fn lifecycle_facts(
             }
         }
     }
+    let paths: BTreeMap<String, WorktreeRecord> = rows
+        .iter()
+        .map(|row| (row.target.slug().to_owned(), row.clone()))
+        .collect();
     let plans = crate::lifecycle_ops::plan_automation_facts(ctx, rows, state, github)
         .await
         .context("prepare automation lifecycle evidence")?;
+    if !plans.busy.is_empty() {
+        // Active edits are expected; retry once the checkout settles.
+        tracing::debug!(busy = ?plans.busy, "automation lifecycle evidence deferred");
+        result.deferred = true;
+    }
+    let mut fresh_state = None;
     for (slug, error) in plans.row_errors {
         // An operation can start after the initial probe. Its changing checkout
         // contributes no facts, but an expected race is not a failed Git install.
-        match crate::commands::diagnostics::operation_lock(ctx, &slug).await {
-            Ok(Some(_)) => result.deferred = true,
-            _ => {
-                result.errors.insert(slug, error);
+        if let Ok(Some(_)) = crate::commands::diagnostics::operation_lock(ctx, &slug).await {
+            result.deferred = true;
+            continue;
+        }
+        // A removal accepted or completed during the pass retires the target.
+        if let Some(row) = paths.get(&slug) {
+            if checkout_missing(row).await {
+                continue;
+            }
+            if fresh_state.is_none() {
+                fresh_state = ctx
+                    .database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await
+                    .ok();
+            }
+            if fresh_state
+                .as_ref()
+                .is_some_and(|state| removal_recorded(state, row))
+            {
+                continue;
             }
         }
+        result.errors.insert(slug, error);
     }
-    result.rows = plans
-        .rows
-        .into_iter()
-        .map(|plan| {
-            (
-                plan.row.target.slug().to_owned(),
-                LifecycleFacts {
-                    local_merged: plan.local_merged.then_some(true),
-                    clean_candidate: plan.landed && plan.hazards.is_empty(),
-                },
-            )
-        })
-        .collect();
+    result.rows = plans.rows;
     Ok(result)
+}
+
+/// An accepted removal of this exact checkout. A reused key at another path
+/// is a different checkout.
+fn removal_recorded(state: &Value, row: &WorktreeRecord) -> bool {
+    state["removals"][wt_core::worktree_target_key(&row.target)]["path"].as_str()
+        == Some(row.target.path.as_str())
+}
+
+/// Only a confirmed absence counts; an unreadable path stays a live row.
+async fn checkout_missing(row: &WorktreeRecord) -> bool {
+    matches!(tokio::fs::try_exists(&row.target.path).await, Ok(false))
 }
 
 pub async fn prepare(
@@ -840,18 +874,17 @@ mod tests {
             .inventory_status(&ctx.cancellation)
             .await
             .unwrap();
+        // An existing directory that is not a checkout: a genuinely broken row,
+        // unlike a deleted one, which is retired without an error.
+        let broken = fixture._root.path().join("broken-checkout");
+        std::fs::create_dir_all(&broken).unwrap();
         snapshots
             .iter_mut()
             .find(|row| row.worktree.target.slug() == "two")
             .unwrap()
             .worktree
             .target
-            .path = fixture
-            ._root
-            .path()
-            .join("missing-checkout")
-            .to_string_lossy()
-            .into();
+            .path = broken.to_string_lossy().into();
         // Put the broken row first to catch whole-loop early returns.
         snapshots.sort_by_key(|row| row.worktree.target.slug() != "two");
         let git = Confirmed::for_test(snapshots);
@@ -942,6 +975,184 @@ mod tests {
                 .await
                 .is_err()
         );
+        fixture.close().await.unwrap();
+    }
+
+    async fn fixture_git(ctx: &AppContext, cwd: &std::path::Path, args: &[&str]) -> String {
+        ctx.processes
+            .run(
+                wt_platform::process::CommandSpec::new("git")
+                    .args(args.iter().copied())
+                    .cwd(cwd),
+                &ctx.cancellation,
+            )
+            .await
+            .unwrap()
+            .checked("fixture git")
+            .unwrap()
+            .stdout_text()
+            .trim()
+            .into()
+    }
+
+    /// `one` carries landed work pushed to origin; `two` has no own work.
+    async fn landed_fixture() -> crate::commands::test_support::CommandFixture {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).automations = vec![AutomationDef {
+            id: "delete-landed-branch".into(),
+            on: wt_config::AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            ..Default::default()
+        }];
+        let ctx = &fixture.ctx;
+        let origin = fixture._root.path().join("origin.git");
+        fixture_git(ctx, &ctx.cwd, &["init", "--bare", origin.to_str().unwrap()]).await;
+        fixture_git(
+            ctx,
+            &ctx.cwd,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        let base = fixture_git(ctx, &ctx.cwd, &["rev-parse", "HEAD"]).await;
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&base))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(ctx.cwd.join("tracked.txt"), "landed work\n").unwrap();
+        fixture_git(ctx, &ctx.cwd, &["commit", "-am", "landed"]).await;
+        fixture_git(ctx, &ctx.cwd, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        fixture
+    }
+
+    async fn facts_for(
+        ctx: &AppContext,
+        snapshots: Vec<WorktreeSnapshot>,
+    ) -> PreparedLifecycleFacts {
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        lifecycle_facts(
+            ctx,
+            Some(&Confirmed::for_test(snapshots)),
+            Some(&Confirmed::for_test((state, BTreeSet::new()))),
+            None,
+            &ctx.config.automations,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn removing_or_deleted_checkouts_are_retired_without_errors() {
+        let fixture = landed_fixture().await;
+        let ctx = &fixture.ctx;
+        let snapshots = ctx
+            .repository
+            .inventory_status(&ctx.cancellation)
+            .await
+            .unwrap();
+        let one = snapshots
+            .iter()
+            .find(|row| row.worktree.target.slug() == "one")
+            .unwrap()
+            .worktree
+            .clone();
+        let two = snapshots
+            .iter()
+            .find(|row| row.worktree.target.slug() == "two")
+            .unwrap()
+            .worktree
+            .clone();
+        let healthy = facts_for(ctx, snapshots.clone()).await;
+        assert!(healthy.rows["one"].clean_candidate);
+        assert!(healthy.rows.contains_key("two"));
+
+        // An accepted removal owns `one`, though its files still exist.
+        let (path, branch) = (one.target.path.clone(), one.target.branch.clone());
+        ctx.database
+            .call(move |store| Ok(store.begin_removal("one", "job-1", &path, &branch)?))
+            .await
+            .unwrap();
+        // `two` was deleted out from under the (still listed) inventory row.
+        std::fs::remove_dir_all(&two.target.path).unwrap();
+        let retired = facts_for(ctx, snapshots).await;
+        assert!(!retired.rows.contains_key("one"));
+        assert!(!retired.rows.contains_key("two"));
+        assert!(retired.errors.is_empty(), "{:?}", retired.errors);
+        assert!(!retired.deferred);
+        fixture.close().await.unwrap();
+    }
+
+    /// Keep rewriting an untracked file so every checkout digest differs.
+    fn churn(
+        path: std::path::PathBuf,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let token = stop.clone();
+        let task = tokio::spawn(async move {
+            let mut index = 0u64;
+            while !token.is_cancelled() {
+                index += 1;
+                let _ = tokio::fs::write(&path, index.to_string()).await;
+                tokio::task::yield_now().await;
+            }
+        });
+        (task, stop)
+    }
+
+    #[tokio::test]
+    async fn actively_edited_checkouts_are_not_attention_errors() {
+        let fixture = landed_fixture().await;
+        let ctx = &fixture.ctx;
+        let snapshots = ctx
+            .repository
+            .inventory_status(&ctx.cancellation)
+            .await
+            .unwrap();
+        let path = |slug: &str| {
+            std::path::PathBuf::from(
+                &snapshots
+                    .iter()
+                    .find(|row| row.worktree.target.slug() == slug)
+                    .unwrap()
+                    .worktree
+                    .target
+                    .path,
+            )
+        };
+        // An unlanded row never captures a removal revision, so edits there
+        // cannot make its evidence fail.
+        let (task, stop) = churn(path("two").join("scratch.txt"));
+        let unlanded = facts_for(ctx, snapshots.clone()).await;
+        stop.cancel();
+        task.await.unwrap();
+        assert!(unlanded.errors.is_empty(), "{:?}", unlanded.errors);
+        assert!(!unlanded.rows["two"].clean_candidate);
+        assert!(unlanded.rows["one"].clean_candidate);
+
+        // A landed row still captures its revision; one that keeps changing
+        // is busy, retried later, and never a cleanup candidate.
+        let (task, stop) = churn(path("one").join("scratch.txt"));
+        let landed = facts_for(ctx, snapshots).await;
+        stop.cancel();
+        task.await.unwrap();
+        assert!(landed.errors.is_empty(), "{:?}", landed.errors);
+        if landed.rows.contains_key("one") {
+            // Capture won a race against the writer; the file is still a hazard.
+            assert!(!landed.rows["one"].clean_candidate);
+        } else {
+            assert!(landed.deferred);
+        }
         fixture.close().await.unwrap();
     }
 

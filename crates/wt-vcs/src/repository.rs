@@ -371,19 +371,26 @@ impl GitRepository {
                     source,
                 })?
         {
+            if Self::is_removal_quarantine(&entry.file_name()) {
+                continue;
+            }
             let path = normalize_path(&entry.path()).await;
-            if known.contains(&path)
-                || !entry
-                    .file_type()
-                    .await
-                    .map_err(|source| RepositoryError::Io {
+            if known.contains(&path) {
+                continue;
+            }
+            // Removal deletes clones while this scan runs. An entry that
+            // vanished is not part of the inventory; it must not fail it.
+            match entry.file_type().await {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(_) => continue,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(RepositoryError::Io {
                         operation: "inspect worktree root entry",
                         path: path.clone(),
                         source,
-                    })?
-                    .is_dir()
-            {
-                continue;
+                    });
+                }
             }
             let marker = path.join(".rift");
             if !fs::try_exists(&marker)
@@ -396,16 +403,35 @@ impl GitRepository {
             {
                 continue;
             }
-            let top = self
+            let top = match self
                 .run_git(
                     &path,
                     ["rev-parse", "--show-toplevel"],
                     cancellation,
                     "identify Rift clone",
                 )
-                .await?;
-            let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
-            let top = normalize_path(&top).await;
+                .await
+            {
+                Ok(top) => {
+                    normalize_path(&PathBuf::from(String::from_utf8_lossy(&top).trim())).await
+                }
+                Err(error) if cancellation.is_cancelled() => return Err(error),
+                Err(RepositoryError::Cancelled) => return Err(RepositoryError::Cancelled),
+                Err(_) => {
+                    // One broken or half-deleted clone is that row's problem.
+                    // Keep it listed so its status read reports the error,
+                    // unless it has disappeared entirely.
+                    if matches!(fs::try_exists(&path).await, Ok(false)) {
+                        continue;
+                    }
+                    known.insert(path.clone());
+                    records.push(
+                        self.make_record(path, None, None, false, false, RepositoryKind::RiftClone)
+                            .await?,
+                    );
+                    continue;
+                }
+            };
             if known.contains(&top) {
                 continue;
             }

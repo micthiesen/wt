@@ -1,7 +1,7 @@
 //! Shared lifecycle planning for CLI, TUI and automation callers. A plan is
 //! presentation data, not permission to skip the service's locked rechecks.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -64,7 +64,6 @@ pub async fn resolve_key(ctx: &AppContext, key: &str) -> Result<WorktreeRecord> 
 pub struct RemovalPlan {
     pub row: WorktreeRecord,
     pub landed: bool,
-    pub local_merged: bool,
     pub hazards: Vec<String>,
     pub destroy_stage: bool,
     pub revision: wt_lifecycle::RemovalRevision,
@@ -74,13 +73,17 @@ pub struct RemovalPlan {
 pub struct RemovalPlans {
     pub rows: Vec<RemovalPlan>,
     pub warning: Option<String>,
-    pub row_errors: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy)]
-enum LocalEvidencePolicy {
-    Strict,
-    IsolateRows,
+/// Per-row landing evidence for automation facts. Each row's failure stays
+/// with that row; no row here carries a removal witness.
+#[derive(Default)]
+pub(crate) struct AutomationLifecycleEvidence {
+    pub rows: BTreeMap<String, crate::automation_facts::LifecycleFacts>,
+    pub row_errors: BTreeMap<String, String>,
+    /// Checkouts that kept changing while their landed state was being read.
+    /// They contribute no facts and are retried later.
+    pub busy: BTreeSet<String>,
 }
 
 pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<RemovalPlans> {
@@ -109,15 +112,7 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             Err(error) => return Err(error.into()),
         }
     };
-    plan_with_evidence(
-        ctx,
-        rows,
-        &state,
-        &github,
-        warning,
-        LocalEvidencePolicy::Strict,
-    )
-    .await
+    plan_with_evidence(ctx, rows, &state, &github, warning).await
 }
 
 /// Read local hazards with the host's confirmed GitHub evidence. A merged PR
@@ -148,37 +143,144 @@ pub(crate) async fn plan_with_facts(
 ) -> Result<RemovalPlans> {
     let empty = GithubData::default();
     let github = github.map_or(&empty, |github| &**github);
-    plan_with_evidence(
-        ctx,
-        rows,
-        state,
-        github,
-        warning,
-        LocalEvidencePolicy::Strict,
-    )
-    .await
+    plan_with_evidence(ctx, rows, state, github, warning).await
 }
 
 /// Local evidence failure belongs to its checkout. Automations for other rows
 /// can proceed, but the failed row contributes no cleanup or landing proof.
 /// GitHub remains a single confirmed, all-or-nothing batch input.
+///
+/// Facts use only `local_merged` and "landed with no hazards", so the removal
+/// revision (which digests the whole checkout, untracked contents included) is
+/// captured only for landed rows. That is not a safety shortcut: an unlanded
+/// row is never a cleanup candidate, and removal itself recaptures and
+/// rechecks everything under its own lock.
 pub(crate) async fn plan_automation_facts(
     ctx: &AppContext,
     rows: Vec<WorktreeRecord>,
     state: &serde_json::Value,
     github: Option<&Confirmed<GithubData>>,
-) -> Result<RemovalPlans> {
+) -> Result<AutomationLifecycleEvidence> {
     let empty = GithubData::default();
     let github = github.map_or(&empty, |github| &**github);
-    plan_with_evidence(
-        ctx,
-        rows,
-        state,
-        github,
-        None,
-        LocalEvidencePolicy::IsolateRows,
-    )
-    .await
+    let lifecycle = service(ctx)?;
+    let mut published_bases = BTreeMap::new();
+    let mut warning = None;
+    let mut evidence = AutomationLifecycleEvidence::default();
+    for row in rows {
+        if row.is_main {
+            continue;
+        }
+        let slug = row.target.slug().to_owned();
+        let stored = &state["slugs"][row.target.slug()];
+        let landing = landing_evidence(
+            ctx,
+            &row,
+            stored,
+            github,
+            &mut published_bases,
+            &mut warning,
+        )
+        .await;
+        let landing = match landing {
+            Ok(landing) => landing,
+            Err(error) if !ctx.cancellation.is_cancelled() => {
+                evidence.row_errors.insert(slug, format!("{error:#}"));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let clean_candidate = if landing.landed() {
+            match lifecycle
+                .removal_revision(&row.target, true, &ctx.cancellation)
+                .await
+            {
+                Ok(revision) => revision.hazards.is_empty(),
+                Err(error) if checkout_kept_changing(&error) => {
+                    evidence.busy.insert(slug);
+                    continue;
+                }
+                Err(error) if !ctx.cancellation.is_cancelled() => {
+                    evidence
+                        .row_errors
+                        .insert(slug, format!("{:#}", anyhow::Error::from(error)));
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            false
+        };
+        evidence.rows.insert(
+            slug,
+            crate::automation_facts::LifecycleFacts {
+                local_merged: landing.local_merged.then_some(true),
+                clean_candidate,
+            },
+        );
+    }
+    if let Some(warning) = warning {
+        tracing::debug!(%warning, "automation landing evidence is partial");
+    }
+    Ok(evidence)
+}
+
+/// An actively edited checkout is busy, not broken.
+fn checkout_kept_changing(error: &wt_lifecycle::LifecycleError) -> bool {
+    matches!(error, wt_lifecycle::LifecycleError::CheckoutChanging(_))
+}
+
+struct Landing {
+    pr_landed: bool,
+    local_merged: bool,
+}
+
+impl Landing {
+    fn landed(&self) -> bool {
+        self.pr_landed || self.local_merged
+    }
+}
+
+/// The single landing proof shared by explicit cleanup and automation facts.
+async fn landing_evidence(
+    ctx: &AppContext,
+    row: &WorktreeRecord,
+    stored: &serde_json::Value,
+    github: &GithubData,
+    published_bases: &mut BTreeMap<PathBuf, Option<String>>,
+    warning: &mut Option<String>,
+) -> Result<Landing> {
+    let path = Path::new(&row.target.path);
+    let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
+        .await?
+        .checked("git")?
+        .stdout_text()
+        .trim()
+        .to_owned();
+    let own_work = if let Some(base_sha) = stored["baseSha"].as_str() {
+        // A missing or corrupted fork anchor is unknown, never evidence of
+        // landing. An empty branch must not inherit its parent's landing.
+        let own = run_git(
+            ctx,
+            path,
+            ["rev-list", "--count", &format!("{base_sha}..HEAD")],
+        )
+        .await?;
+        own.status.success() && own.stdout_text().trim().parse::<u64>().is_ok_and(|n| n > 0)
+    } else {
+        false
+    };
+    let pr_landed = own_work
+        && github.prs.get(&row.target.branch).is_some_and(|pr| {
+            pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
+        });
+    let local_merged = own_work
+        && !pr_landed
+        && published_base_contains(ctx, path, &head, published_bases, warning).await?;
+    Ok(Landing {
+        pr_landed,
+        local_merged,
+    })
 }
 
 /// `github` is either this process's fresh fetch or confirmed leaf data; the
@@ -189,47 +291,30 @@ async fn plan_with_evidence(
     state: &serde_json::Value,
     github: &GithubData,
     mut warning: Option<String>,
-    policy: LocalEvidencePolicy,
 ) -> Result<RemovalPlans> {
     let lifecycle = service(ctx)?;
     let mut plans = Vec::with_capacity(rows.len());
     let mut published_bases = BTreeMap::new();
-    let mut row_errors = BTreeMap::new();
     for row in rows {
         if row.is_main {
             continue;
         }
-        let slug = row.target.slug().to_owned();
         let result: Result<RemovalPlan> = async {
             let path = Path::new(&row.target.path);
             let stored = &state["slugs"][row.target.slug()];
-            let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
-                .await?
-                .checked("git")?
-                .stdout_text()
-                .trim()
-                .to_owned();
-            let own_work = if let Some(base_sha) = stored["baseSha"].as_str() {
-                // A missing or corrupted fork anchor is unknown, never evidence of
-                // landing. An empty branch must not inherit its parent's landing.
-                let own = run_git(
-                    ctx,
-                    path,
-                    ["rev-list", "--count", &format!("{base_sha}..HEAD")],
-                )
-                .await?;
-                own.status.success() && own.stdout_text().trim().parse::<u64>().is_ok_and(|n| n > 0)
-            } else {
-                false
-            };
-            let pr_landed = own_work
-                && github.prs.get(&row.target.branch).is_some_and(|pr| {
-                    pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
-                });
-            let local_merged = own_work
-                && !pr_landed
-                && published_base_contains(ctx, path, &head, &mut published_bases, &mut warning)
-                    .await?;
+            let landing = landing_evidence(
+                ctx,
+                &row,
+                stored,
+                github,
+                &mut published_bases,
+                &mut warning,
+            )
+            .await?;
+            let Landing {
+                pr_landed,
+                local_merged,
+            } = landing;
             let landed = pr_landed || local_merged;
             let mut extra = serde_json::Map::new();
             let pr = github.prs.get(&row.target.branch);
@@ -310,7 +395,6 @@ async fn plan_with_evidence(
             Ok(RemovalPlan {
                 row,
                 landed,
-                local_merged,
                 hazards,
                 destroy_stage,
                 revision,
@@ -318,21 +402,11 @@ async fn plan_with_evidence(
             })
         }
         .await;
-        match result {
-            Ok(plan) => plans.push(plan),
-            Err(error)
-                if matches!(policy, LocalEvidencePolicy::IsolateRows)
-                    && !ctx.cancellation.is_cancelled() =>
-            {
-                row_errors.insert(slug, format!("{error:#}"));
-            }
-            Err(error) => return Err(error),
-        }
+        plans.push(result?);
     }
     Ok(RemovalPlans {
         rows: plans,
         warning,
-        row_errors,
     })
 }
 
@@ -669,7 +743,8 @@ mod tests {
         let plan = plan_with_facts(ctx, vec![row.clone()], &state, None, None)
             .await
             .unwrap();
-        assert!(plan.rows[0].local_merged);
+        // Only a local-ancestry landing carries a published-base witness.
+        assert!(plan.rows[0].revision.published_base.is_some());
         assert!(plan.rows[0].hazards.is_empty());
         assert!(wt_store::is_merged_removal(&plan.rows[0].removed_snapshot));
         // Detached workers deserialize this revision after the planning process
@@ -800,7 +875,7 @@ mod tests {
         .await
         .unwrap();
         assert!(cached.rows[0].landed);
-        assert!(!cached.rows[0].local_merged);
+        assert!(cached.rows[0].revision.published_base.is_none());
         assert!(cached.warning.is_none());
         assert!(cached.rows[0].hazards.is_empty());
         // The same merged PR, while GitHub is still loading or only restored

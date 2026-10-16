@@ -386,6 +386,215 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    fn fixture_git(cwd: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A fleet cleanup owns only the checkouts it removes. Work on another
+    /// checkout must complete while the cleanup is still held, and work on
+    /// the cleanup's own checkout must wait for it.
+    #[tokio::test]
+    async fn held_cleanup_does_not_delay_work_on_other_checkouts() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let root = fixture._root.path().to_owned();
+        let path = fixture.ctx.cwd.clone();
+        // Make "one" a cleanup candidate whose landing proof reaches the
+        // published base, so cleanup runs `git ls-remote origin`.
+        let origin = root.join("origin.git");
+        fixture_git(&path, &["init", "--bare", origin.to_str().unwrap()]);
+        fixture_git(
+            &path,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        let base = fixture_git(&path, &["rev-parse", "HEAD"]);
+        fixture
+            .ctx
+            .database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&base))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(path.join("work.txt"), "landed work\n").unwrap();
+        fixture_git(&path, &["add", "work.txt"]);
+        fixture_git(&path, &["commit", "-m", "feature work"]);
+        let head = fixture_git(&path, &["rev-parse", "HEAD"]);
+        fixture_git(&path, &["push", "origin", "HEAD:refs/heads/main"]);
+        let row = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "one")
+            .unwrap();
+
+        let context = fixture.ctx.clone();
+        let (client, worker) = tokio::io::duplex(64 * 1024);
+        let (worker_input, worker_output) = tokio::io::split(worker);
+        let task = tokio::spawn(async move { serve(&context, worker_input, worker_output).await });
+        let (client_input, mut output) = tokio::io::split(client);
+        let mut input = BufReader::new(client_input);
+        output
+            .write_all(
+                &protocol::encode(&ClientFrame::Hello {
+                    protocol: protocol::HOST_PROTOCOL,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            protocol::read::<ServerFrame, _>(&mut input).await.unwrap(),
+            Some(ServerFrame::Hello { .. })
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(ServerFrame::Snapshot(snapshot)) =
+                    protocol::read::<ServerFrame, _>(&mut input).await.unwrap()
+                    && snapshot
+                        .board
+                        .is_some_and(|board| board.rows.iter().any(|row| row.key == "two"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        // Hold the cleanup inside its landing proof: the published-base read
+        // waits for a release file, then fails so nothing is removed.
+        let started = root.join("cleanup-started");
+        let release = root.join("cleanup-release");
+        let hold = root.join("hold-upload-pack.sh");
+        std::fs::write(
+            &hold,
+            format!(
+                "#!/bin/sh\ntouch {started:?}\nwhile [ ! -e {release:?} ]; do sleep 0.05; done\nexit 1\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hold, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fixture_git(
+            &path,
+            &["config", "remote.origin.uploadpack", hold.to_str().unwrap()],
+        );
+        let send = |id, action| protocol::encode(&ClientFrame::Command { id, action }).unwrap();
+        output
+            .write_all(&send(
+                1,
+                UiAction::CleanupTargets {
+                    targets: vec![wt_tui::CleanupTarget {
+                        key: wt_core::worktree_target_key(&row.target),
+                        path: row.target.path.clone(),
+                        branch: row.target.branch.clone(),
+                        head: head.clone(),
+                    }],
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cleanup reached its held landing proof");
+        for (id, key) in [(2, "two"), (3, "one")] {
+            output
+                .write_all(&send(
+                    id,
+                    UiAction::SetTitle {
+                        key: key.into(),
+                        title: format!("Title for {key}"),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        // The unrelated checkout's write completes while cleanup is held.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match protocol::read::<ServerFrame, _>(&mut input)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    ServerFrame::Reply { id: 2, reply } => {
+                        assert!(!reply.failed, "{}", reply.message);
+                        break;
+                    }
+                    ServerFrame::Reply { id, reply } => {
+                        panic!("operation {id} finished during held cleanup: {reply:?}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("unrelated metadata write waited for fleet cleanup");
+        assert!(!release.exists());
+
+        // The cleanup's own checkout waits until the cleanup finishes.
+        std::fs::write(&release, "").unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut cleanup_done = false;
+            loop {
+                match protocol::read::<ServerFrame, _>(&mut input)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    ServerFrame::Reply { id: 1, .. } => cleanup_done = true,
+                    ServerFrame::Reply { id: 3, reply } => {
+                        assert!(cleanup_done, "same-checkout write overtook its cleanup");
+                        assert!(!reply.failed, "{}", reply.message);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(path.exists(), "a failed landing proof removes nothing");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            output
+                .write_all(&protocol::encode(&ClientFrame::Shutdown).unwrap())
+                .await
+                .unwrap();
+            while protocol::read::<ServerFrame, _>(&mut input)
+                .await
+                .unwrap()
+                .is_some()
+            {}
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        fixture.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn accepted_command_finishes_after_controller_disconnects() {
         let fixture = crate::commands::test_support::CommandFixture::new()

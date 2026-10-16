@@ -30,7 +30,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const MAX_HTTP_HEADERS: usize = 32;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
@@ -353,6 +353,38 @@ pub(super) fn extract_event_branches(
     }
 }
 
+/// Whether an event can move origin's refs, so the refresh it schedules
+/// should fetch origin first. Check, status, review and comment events only
+/// change GitHub state the batched query reads. An unknown pull request
+/// action counts as ref-changing.
+pub(super) fn changes_refs(event: &str, payload: &Value) -> bool {
+    match event {
+        "push" | "merge_group" | "create" | "delete" => true,
+        "pull_request" => !matches!(
+            payload.get("action").and_then(Value::as_str),
+            Some(
+                "labeled"
+                    | "unlabeled"
+                    | "assigned"
+                    | "unassigned"
+                    | "review_requested"
+                    | "review_request_removed"
+                    | "ready_for_review"
+                    | "converted_to_draft"
+                    | "locked"
+                    | "unlocked"
+                    | "milestoned"
+                    | "demilestoned"
+                    | "auto_merge_enabled"
+                    | "auto_merge_disabled"
+                    | "enqueued"
+                    | "dequeued"
+            )
+        ),
+        _ => false,
+    }
+}
+
 fn branch_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     path.iter()
         .try_fold(value, |node, key| node.get(*key))?
@@ -394,6 +426,10 @@ async fn scheduler(
     let mut remote_branches = BTreeSet::new();
     let mut local_known = false;
     let mut remote_known = false;
+    // What the next refresh fetches origin for; `None` skips the fetch. The
+    // first refresh, and a coalesced overflow whose events are unknown,
+    // always fetch.
+    let mut origin_trigger: Option<String> = Some("startup".into());
     loop {
         let sleep = async {
             match pending_deadline {
@@ -434,6 +470,9 @@ async fn scheduler(
                     }
                 };
                 if relevant {
+                    if changes_refs(&event.name, &event.payload) {
+                        origin_trigger.get_or_insert_with(|| event.name.clone());
+                    }
                     {
                         let mut state = durable.state.lock().await;
                         state.last_event_at = Some(event.received_at);
@@ -449,6 +488,7 @@ async fn scheduler(
                 }
             }
             _ = coalesced_rx.recv() => {
+                origin_trigger.get_or_insert_with(|| "coalesced overflow".into());
                 let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let last_ms = last_fetch_start.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
                 let pending_ms = pending_deadline.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
@@ -495,7 +535,19 @@ async fn scheduler(
                     fetch_branches.extend(remote_branches.iter().cloned());
                 }
                 cached_inventory_at = Some(now);
-                if let Err(e) = source.fetch_origin(&cancel).await { warn!(error = %e, "git fetch origin failed before GitHub refresh"); }
+                if let Some(trigger) = origin_trigger.take() {
+                    let origin_started = Instant::now();
+                    let result = source.fetch_origin(&cancel).await;
+                    let elapsed_ms = origin_started.elapsed().as_millis() as u64;
+                    match result {
+                        Ok(()) => info!(%trigger, elapsed_ms, "fetched origin before GitHub refresh"),
+                        Err(e) => {
+                            warn!(%trigger, elapsed_ms, error = %e, "git fetch origin failed before GitHub refresh");
+                            // Keep the request so the next refresh retries it.
+                            origin_trigger.get_or_insert(trigger);
+                        }
+                    }
+                }
                 // Readers order this observation by when the GitHub read
                 // began: a write accepted after this moment may be missing.
                 let fetch_started_at_ms = now_millis();
@@ -624,9 +676,11 @@ mod tests {
         net::TcpStream,
     };
 
+    #[derive(Default)]
     struct MockSource {
         fail: AtomicBool,
         fetches: AtomicUsize,
+        origin_fetches: AtomicUsize,
         remote_calls: AtomicUsize,
         remote_failure_after: Option<usize>,
     }
@@ -658,6 +712,7 @@ mod tests {
             &'a self,
             _: &'a CancellationToken,
         ) -> EventFuture<'a, Result<(), String>> {
+            self.origin_fetches.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
         fn fetch_github<'a>(
@@ -799,6 +854,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             remote_calls: AtomicUsize::new(0),
             remote_failure_after: None,
+            ..MockSource::default()
         });
         let cancel = CancellationToken::new();
         let daemon = start(test_config(&dir), source.clone(), cancel.clone())
@@ -931,6 +987,82 @@ mod tests {
         daemon.shutdown().await;
     }
 
+    #[test]
+    fn only_ref_changing_events_fetch_origin() {
+        for event in ["push", "merge_group"] {
+            assert!(changes_refs(event, &json!({})), "{event}");
+        }
+        assert!(changes_refs(
+            "pull_request",
+            &json!({"action": "synchronize"})
+        ));
+        assert!(changes_refs("pull_request", &json!({"action": "closed"})));
+        assert!(changes_refs(
+            "pull_request",
+            &json!({"action": "something_new"})
+        ));
+        assert!(!changes_refs("pull_request", &json!({"action": "labeled"})));
+        for event in [
+            "check_run",
+            "check_suite",
+            "status",
+            "pull_request_review",
+            "pull_request_review_thread",
+            "issue_comment",
+        ] {
+            assert!(!changes_refs(event, &json!({})), "{event}");
+        }
+    }
+
+    async fn signed(addr: std::net::SocketAddr, event: &str, body: &[u8]) -> u16 {
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"test-secret").unwrap();
+        mac.update(body);
+        let signature = format!("sha256={}", hex(&mac.finalize().into_bytes()));
+        http_request(
+            addr,
+            "/webhook",
+            &format!("x-github-event: {event}\r\nx-hub-signature-256: {signature}\r\n"),
+            body,
+        )
+        .await
+    }
+
+    async fn wait_for_fetches(source: &MockSource, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.fetches.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("GitHub refresh ran");
+    }
+
+    /// A check event refreshes GitHub without fetching origin; a push does
+    /// both. The first refresh always fetches origin.
+    #[tokio::test]
+    async fn check_events_refresh_github_without_fetching_origin() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        wait_for_fetches(&source, 1).await;
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
+
+        let check = br#"{"check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        wait_for_fetches(&source, 2).await;
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
+
+        let push = br#"{"ref":"refs/heads/feature-x"}"#;
+        assert_eq!(signed(daemon.local_addr(), "push", push).await, 200);
+        wait_for_fetches(&source, 3).await;
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
     #[tokio::test]
     async fn remote_inventory_error_marks_coverage_unknown_but_keeps_last_good_branches() {
         let dir = TempDir::new().unwrap();
@@ -939,6 +1071,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             remote_calls: AtomicUsize::new(0),
             remote_failure_after: Some(1),
+            ..MockSource::default()
         });
         let cancel = CancellationToken::new();
         let mut config = test_config(&dir);
@@ -1022,6 +1155,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             remote_calls: AtomicUsize::new(0),
             remote_failure_after: None,
+            ..MockSource::default()
         });
         let cancel = CancellationToken::new();
         let mut config = test_config(&dir);
@@ -1047,6 +1181,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             remote_calls: AtomicUsize::new(0),
             remote_failure_after: None,
+            ..MockSource::default()
         });
         let cancel = CancellationToken::new();
         let mut config = test_config(&dir);
@@ -1133,6 +1268,7 @@ mod tests {
             fetches: AtomicUsize::new(0),
             remote_calls: AtomicUsize::new(0),
             remote_failure_after: None,
+            ..MockSource::default()
         });
         let cancel = CancellationToken::new();
         let daemon = start(test_config(&dir), source, cancel.clone())

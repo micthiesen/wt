@@ -518,12 +518,17 @@ impl Default for TmuxConfig {
 pub struct HarnessConfig {
     pub primary: HarnessId,
     pub hidden: BTreeSet<HarnessId>,
+    /// Opt-in harness for the `wt` special session (the `paths.wt_source`
+    /// checkout). When set it replaces the primary and any persisted Tab
+    /// selection for that one slot; `None` keeps the ordinary selection.
+    pub wt_session: Option<HarnessId>,
 }
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             primary: HarnessId::Claude,
             hidden: BTreeSet::new(),
+            wt_session: None,
         }
     }
 }

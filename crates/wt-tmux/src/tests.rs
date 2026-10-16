@@ -194,7 +194,7 @@ fn create_and_attach_commands_keep_user_values_in_argv() {
     assert_eq!(args[6], "-s");
     assert_eq!(args[7], "feature ; x");
     assert!(args.last().unwrap().contains("'$(touch /tmp/nope);'\\'''"));
-    let attach = client.attach_session_args("feature ; x");
+    let attach = client.attach_session_args("feature ; x", crate::SessionShortcut::Harness);
     assert_eq!(attach.last().unwrap(), "=feature ; x");
 }
 
@@ -204,13 +204,19 @@ fn attach_marks_each_session_with_its_own_return_key() {
         ProcessRunner::default(),
         TmuxServer::at("/tmp/unused-shortcut-test.sock"),
     );
-    for (name, kind) in [
-        ("task-shell", "shell"),
-        ("task-diff", "diff"),
-        ("task-codex", "harness"),
-        ("task-claude~review", "harness"),
+    use crate::SessionShortcut::{Diff, Harness, Shell};
+    for (name, shortcut, kind) in [
+        ("task-shell", Shell, "shell"),
+        ("task-diff", Diff, "diff"),
+        ("task-codex", Harness, "harness"),
+        ("task-claude~review", Harness, "harness"),
+        // A worktree named `fix-shell` owns an agent session of that exact
+        // name; its kind comes from the caller, not the suffix.
+        ("fix-shell", Harness, "harness"),
+        ("fix-shell-shell", Shell, "shell"),
+        ("fix-diff", Harness, "harness"),
     ] {
-        let args = client.attach_session_args(name);
+        let args = client.attach_session_args(name, shortcut);
         let option = args.iter().position(|arg| arg == "@wt-shortcut").unwrap();
         assert_eq!(args[option + 1], kind);
         assert_eq!(args[option - 1].to_string_lossy(), format!("={name}:"));
@@ -825,7 +831,7 @@ async fn generated_terminal_config_reloads_navigation_without_replacing_sessions
             .await?;
         assert_eq!(options.stdout_text().trim(), "status off");
         crate::write_terminal_config(&cache, &home, Some("set -g status on\n")).unwrap();
-        let args = client.attach_session_args("retained");
+        let args = client.attach_session_args("retained", crate::SessionShortcut::Harness);
         let source = args.iter().position(|arg| arg == "source-file").unwrap();
         let attach = args.iter().position(|arg| arg == "attach-session").unwrap();
         assert!(source < attach);

@@ -28,6 +28,17 @@ pub enum BaseUpdate {
     Cycle,
 }
 
+/// Outcome of dismissing a failed removal against the record the user saw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClearFailedRemoval {
+    /// The reviewed failed record was deleted.
+    Cleared,
+    /// The record is gone, active again, or names another job, path or branch.
+    Changed,
+    /// The record matched, but its checkout exists again; nothing was written.
+    CheckoutPresent,
+}
+
 /// Outcome of a flip that carries the value the user saw.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SeenToggle {
@@ -224,6 +235,38 @@ impl Store {
                 removals.remove(key);
             }
             Ok((true, true))
+        })
+    }
+
+    /// Forget a failed removal whose checkout is already gone. Deletes only the
+    /// record the caller reviewed: the same job, path and branch, still failed.
+    /// An active attempt, a newer retry or a reused key is left untouched.
+    /// `checkout_absent` runs inside the write transaction, so no removal can
+    /// begin between the caller's final absence check and the delete.
+    pub fn clear_failed_removal(
+        &mut self,
+        key: &str,
+        job_id: &str,
+        path: &str,
+        branch: &str,
+        checkout_absent: impl FnOnce() -> bool,
+    ) -> Result<ClearFailedRemoval, StoreError> {
+        self.mutate_wt_state(|state| {
+            let removals = object_mut(state, "removals");
+            let matches = removals.get(key).is_some_and(|entry| {
+                entry["jobId"].as_str() == Some(job_id)
+                    && entry["path"].as_str() == Some(path)
+                    && entry["branch"].as_str() == Some(branch)
+                    && entry["error"].is_string()
+            });
+            if !matches {
+                return Ok((ClearFailedRemoval::Changed, false));
+            }
+            if !checkout_absent() {
+                return Ok((ClearFailedRemoval::CheckoutPresent, false));
+            }
+            removals.remove(key);
+            Ok((ClearFailedRemoval::Cleared, true))
         })
     }
 

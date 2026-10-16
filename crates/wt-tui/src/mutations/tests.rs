@@ -648,6 +648,7 @@ fn pending_removal_does_not_hide_a_durable_failure() {
     let mut latest = board();
     latest.rows[0].removal = Some(crate::RemovalView {
         error: Some("denied".into()),
+        ..Default::default()
     });
     latest.rows[0].badge = "Removal failed".into();
     removal.apply(&target, &mut latest);

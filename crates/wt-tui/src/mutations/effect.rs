@@ -273,6 +273,14 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 keys: vec![key.clone()],
             },
         ),
+        // The record leaves the board once a metadata fetch started after
+        // acceptance no longer lists it; nothing is projected before that.
+        UiAction::DismissFailedRemoval { key, .. } => unprojected(
+            host,
+            Some(key),
+            "dismissing failed removal",
+            &[Domain::Metadata],
+        ),
         UiAction::CleanupTargets { targets } => on_board(
             host,
             LifecycleChange::Remove {

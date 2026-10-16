@@ -2,6 +2,7 @@
 
 mod copy_globs;
 mod creation_trace;
+mod removal_trace;
 mod rift_binary;
 mod service;
 

@@ -86,6 +86,10 @@ pub struct PendingLimits {
     pub in_flight: Duration,
     /// For GitHub-backed domains, whose reads lag writes and are rate limited.
     pub accepted_remote: Duration,
+    /// How far the accepted deadline of a GitHub change stretches while no
+    /// read that started after the write has finished: the GitHub lane's rate
+    /// floor plus a slow, retried read.
+    pub accepted_github_cap: Duration,
     pub accepted_local: Duration,
     pub unconfirmed: Duration,
 }
@@ -95,6 +99,8 @@ impl Default for PendingLimits {
         Self {
             in_flight: Duration::from_secs(60),
             accepted_remote: Duration::from_secs(30),
+            // 10s GitHub rate floor + the client's 100s retry budget + slack.
+            accepted_github_cap: Duration::from_secs(120),
             accepted_local: Duration::from_secs(12),
             unconfirmed: Duration::from_secs(30),
         }
@@ -102,25 +108,54 @@ impl Default for PendingLimits {
 }
 
 impl PendingLimits {
-    fn accepted(&self, domains: &[Domain]) -> Duration {
-        if domains.iter().any(|domain| domain.slow_reads()) {
+    /// The accepted deadline and its cap for these domains.
+    fn accepted(&self, domains: &[Domain]) -> (Duration, Duration) {
+        let deadline = if domains.iter().any(|domain| domain.slow_reads()) {
             self.accepted_remote
         } else {
             self.accepted_local
-        }
+        };
+        let cap = if domains.contains(&Domain::Github) {
+            self.accepted_github_cap.max(deadline)
+        } else {
+            deadline
+        };
+        (deadline, cap)
     }
 }
 
 #[derive(Clone, Debug)]
 enum Phase {
-    InFlight { deadline: Instant },
-    Accepted { at: Stamp, deadline: Instant },
-    Unconfirmed { deadline: Instant },
+    InFlight {
+        deadline: Instant,
+    },
+    /// `deadline` applies once a read that started at or after `at` has
+    /// finished. Until then the entry may wait up to `cap`, so a confirming
+    /// read delayed by the rate floor or a slow reply can still settle it.
+    Accepted {
+        at: Stamp,
+        deadline: Instant,
+        cap: Instant,
+        /// A read that started at or after `at` has been seen.
+        read_after: bool,
+    },
+    Unconfirmed {
+        deadline: Instant,
+    },
 }
 
 impl Phase {
-    fn deadline(&self) -> Instant {
+    /// When this entry next needs checking. An accepted entry still waiting
+    /// for its first confirming read is checked at `deadline` and, if that
+    /// read has not arrived, kept until `cap`.
+    fn deadline(&self, now: Instant) -> Instant {
         match self {
+            Self::Accepted {
+                deadline,
+                cap,
+                read_after: false,
+                ..
+            } if now >= *deadline => *cap,
             Self::InFlight { deadline }
             | Self::Accepted { deadline, .. }
             | Self::Unconfirmed { deadline } => *deadline,
@@ -148,6 +183,11 @@ struct Entry<M> {
 pub struct Expired<M> {
     pub mutation: M,
     pub phase: PendingPhase,
+    /// For an accepted write: when the host performed it.
+    pub accepted_at: Option<Stamp>,
+    /// For an accepted write: the latest read start seen per domain at
+    /// expiry, to compare against `accepted_at`.
+    pub observed: Vec<(Domain, Option<Stamp>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -242,13 +282,15 @@ impl<T, M: Mutation<T>> Pending<T, M> {
             return false;
         };
         refine(&mut entry.mutation);
-        let accepted = entry.mutation.deadlines().map_or_else(
+        let (accepted, cap) = entry.mutation.deadlines().map_or_else(
             || limits.accepted(entry.mutation.domains()),
-            |bounds| bounds.accepted,
+            |bounds| (bounds.accepted, bounds.accepted),
         );
         entry.phase = Phase::Accepted {
             at,
             deadline: now + accepted,
+            cap: now + cap,
+            read_after: false,
         };
         true
     }
@@ -280,9 +322,9 @@ impl<T, M: Mutation<T>> Pending<T, M> {
         now: Instant,
     ) -> Vec<Expired<M>> {
         let mut expired = Vec::new();
-        self.entries.retain(|entry| {
+        self.entries.retain_mut(|entry| {
             let shown = entry.mutation.observed(confirmed);
-            if let Phase::Accepted { at, .. } = &entry.phase {
+            if let Phase::Accepted { at, read_after, .. } = &mut entry.phase {
                 let target = entry.mutation.target();
                 let fresh = entry.mutation.domains().iter().all(|domain| {
                     observed(&target, *domain).and_then(|stamp| stamp.at_or_after(at)) == Some(true)
@@ -290,12 +332,37 @@ impl<T, M: Mutation<T>> Pending<T, M> {
                 if fresh && shown {
                     return false;
                 }
+                *read_after |= fresh;
             }
-            if now >= entry.phase.deadline() {
+            if now >= entry.phase.deadline(now) {
                 if !shown {
+                    let (accepted_at, observed) = match &entry.phase {
+                        Phase::Accepted { at, .. } => {
+                            let target = entry.mutation.target();
+                            let observed = entry
+                                .mutation
+                                .domains()
+                                .iter()
+                                .map(|domain| (*domain, observed(&target, *domain)))
+                                .collect();
+                            (Some(*at), observed)
+                        }
+                        _ => (None, Vec::new()),
+                    };
+                    if let Phase::Accepted { read_after, .. } = &entry.phase {
+                        tracing::info!(
+                            change = %entry.mutation.key(),
+                            accepted_at = ?accepted_at,
+                            observed = ?observed,
+                            confirming_read_finished = read_after,
+                            "accepted change expired before a read showed it"
+                        );
+                    }
                     expired.push(Expired {
                         mutation: entry.mutation.clone(),
                         phase: entry.phase.view(),
+                        accepted_at,
+                        observed,
                     });
                 }
                 return false;
@@ -329,9 +396,10 @@ impl<T, M: Mutation<T>> Pending<T, M> {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
+        let now = Instant::now();
         self.entries
             .iter()
-            .map(|entry| entry.phase.deadline())
+            .map(|entry| entry.phase.deadline(now))
             .min()
     }
 }
@@ -466,6 +534,67 @@ mod tests {
         assert_eq!(pending.next_deadline(), deadline);
         assert_eq!(pending.views()[0].phase, PendingPhase::Accepted);
         assert!(!pending.refine(2, |_| panic!("missing operations must not run refinement")));
+    }
+
+    /// The rate floor plus a slow reply can push the first read that started
+    /// after the write past the accepted deadline. That read still settles
+    /// the change instead of the deadline reporting it as not shown.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_confirming_read_settles_instead_of_expiring() {
+        let mut pending = Pending::default();
+        let stale = [("pr", false)].into_iter().collect();
+        let shown = [("pr", true)].into_iter().collect();
+        let before = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        pending.begin(1, Set("pr", true), Instant::now());
+        let accepted = Stamp::now();
+        pending.accept(1, accepted, Instant::now());
+        // The floor defers the confirming read 10s; it then takes 25s.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let confirming = Stamp::now();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        // Soft deadline: only the pre-write read has finished. Keep waiting.
+        assert!(
+            pending
+                .settle(&stale, |_, _| Some(before), Instant::now())
+                .is_empty()
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(pending.next_deadline().unwrap() > Instant::now());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(
+            pending
+                .settle(&shown, |_, _| Some(confirming), Instant::now())
+                .is_empty()
+        );
+        assert!(pending.is_empty(), "the slow read settled it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_confirming_read_is_still_bounded() {
+        let mut pending = Pending::default();
+        let stale = [("pr", false)].into_iter().collect();
+        let before = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        pending.begin(1, Set("pr", true), Instant::now());
+        pending.accept(1, Stamp::now(), Instant::now());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(
+            pending
+                .settle(&stale, |_, _| Some(before), Instant::now())
+                .is_empty()
+        );
+        // A finished read after the write that disagrees expires it at once.
+        let mut disagreed = pending.clone();
+        let expired = disagreed.settle(&stale, |_, _| Some(Stamp::now()), Instant::now());
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].accepted_at.is_some());
+        assert_eq!(expired[0].observed.len(), 1);
+        // Without one, the cap still ends it.
+        tokio::time::advance(Duration::from_secs(89)).await;
+        let expired = pending.settle(&stale, |_, _| Some(before), Instant::now());
+        assert_eq!(expired.len(), 1);
+        assert!(pending.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

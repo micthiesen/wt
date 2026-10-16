@@ -56,6 +56,62 @@ fn removal_survives_restart_and_only_its_current_job_can_finish() {
 }
 
 #[test]
+fn failed_removal_clears_only_for_the_reviewed_job_while_its_checkout_is_absent() {
+    use crate::ClearFailedRemoval::{Changed, CheckoutPresent, Cleared};
+    let temp = tempdir().unwrap();
+    let mut store =
+        Store::open(temp.path().join("state.sqlite"), identity("repo", "/repo")).unwrap();
+    assert!(
+        store
+            .begin_removal("one", "first", "/one", "feature/one")
+            .unwrap()
+    );
+    let entry = |store: &mut Store| store.read_wt_state().unwrap()["removals"]["one"].clone();
+    // An active attempt is never dismissed.
+    let clear = |store: &mut Store, job: &str, path: &str, branch: &str, absent: bool| {
+        store
+            .clear_failed_removal("one", job, path, branch, || absent)
+            .unwrap()
+    };
+    assert_eq!(
+        clear(&mut store, "first", "/one", "feature/one", true),
+        Changed
+    );
+    assert!(entry(&mut store)["error"].is_null());
+    store
+        .finish_removal("one", "first", Some("permission denied"))
+        .unwrap();
+    // Another job, path or branch than the one reviewed writes nothing.
+    assert_eq!(
+        clear(&mut store, "older", "/one", "feature/one", true),
+        Changed
+    );
+    assert_eq!(
+        clear(&mut store, "first", "/two", "feature/one", true),
+        Changed
+    );
+    assert_eq!(
+        clear(&mut store, "first", "/one", "feature/two", true),
+        Changed
+    );
+    // A checkout that exists again keeps the record for a reviewed retry.
+    assert_eq!(
+        clear(&mut store, "first", "/one", "feature/one", false),
+        CheckoutPresent
+    );
+    assert_eq!(entry(&mut store)["error"], "permission denied");
+    assert_eq!(
+        clear(&mut store, "first", "/one", "feature/one", true),
+        Cleared
+    );
+    assert!(entry(&mut store).is_null());
+    assert_eq!(
+        clear(&mut store, "first", "/one", "feature/one", true),
+        Changed
+    );
+}
+
+#[test]
 fn fork_base_write_checks_fresh_anchor_and_cycle_in_one_transaction() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.sqlite");

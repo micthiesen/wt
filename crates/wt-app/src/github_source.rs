@@ -24,6 +24,8 @@ use crate::{context::AppContext, github_events_source::DaemonRead};
 
 /// Network reads of GitHub, measured from the prior read's start.
 const GITHUB_MINIMUM: Duration = Duration::from_secs(10);
+/// A direct read at least this long is logged at info level.
+const SLOW_READ: Duration = Duration::from_secs(5);
 /// Rereads of the events daemon's local snapshot file.
 const DAEMON_MINIMUM: Duration = Duration::from_millis(100);
 
@@ -33,6 +35,15 @@ const DAEMON_MINIMUM: Duration = Duration::from_millis(100);
 pub struct GithubRefresh {
     github: LeafHandle<GithubData>,
     bypass_daemon: Arc<AtomicBool>,
+    reads: Arc<Mutex<ReadTimes>>,
+}
+
+/// The latest direct GitHub read, for explaining a write that expired.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadTimes {
+    pub started: Option<Stamp>,
+    /// When it finished, successfully or not; `None` while it is running.
+    pub finished: Option<Stamp>,
 }
 
 impl GithubRefresh {
@@ -43,6 +54,14 @@ impl GithubRefresh {
 
     pub fn refresh(&self) {
         self.github.refresh();
+    }
+
+    /// The latest direct read's start and finish.
+    pub fn last_read(&self) -> ReadTimes {
+        *self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// After an accepted GitHub write: the read that may confirm it must be a
@@ -66,6 +85,7 @@ impl GithubRefresh {
         Self {
             github,
             bypass_daemon: Arc::default(),
+            reads: Arc::default(),
         }
     }
 }
@@ -103,6 +123,7 @@ pub(crate) fn start(
     let refresh = GithubRefresh {
         github: github.clone(),
         bypass_daemon: lane.bypass_daemon.clone(),
+        reads: lane.reads.clone(),
     };
     spawn_deferred_reads(scope, &lane, github.view());
     spawn_github_driver(scope, git, github.view(), backstop);
@@ -121,6 +142,7 @@ struct GithubLane {
     /// snapshot and is not by itself a reason to read GitHub.
     file_event: Arc<AtomicBool>,
     clock: Mutex<LaneClock>,
+    reads: Arc<Mutex<ReadTimes>>,
     wake: Notify,
 }
 
@@ -136,6 +158,9 @@ struct LaneClock {
     served_daemon: Option<(u64, Vec<String>)>,
     /// The branch set the published data covers.
     published: Option<Vec<String>>,
+    /// The published data and its observation stamp, so an older daemon
+    /// snapshot can contribute only branches the shown data lacks.
+    shown: Option<(GithubData, Stamp)>,
     /// A network read the floor postponed is due then.
     deferred: Option<Instant>,
 }
@@ -176,8 +201,6 @@ impl LaneClock {
                 (Some(started), Some(live)) => started >= live,
                 (None, Some(_)) => false,
             };
-            // A new branch has no data yet; complete daemon coverage of it is
-            // better than waiting, even when other PRs were read more recently.
             if !newer && same_branches {
                 // Fresh daemon data exists and the shown data is newer still.
                 return Plan::Skip;
@@ -186,16 +209,34 @@ impl LaneClock {
             if self.served_daemon.as_ref() == Some(&version) {
                 return Plan::Skip;
             }
+            let fetched = if newer {
+                let observed = read.stamp();
+                Fetched::new(read.data, observed)
+            } else if let Some(shown) = &self.shown {
+                // The branch set changed but the shown data is newer: keep it
+                // for the branches it covers and take only the new branches
+                // from the older snapshot, so a newer read never regresses.
+                let (data, observed) = merge_older(shown, read, branches);
+                Fetched::new(data, observed)
+            } else {
+                // Nothing shown to keep: wait for a direct read.
+                return self.network(now);
+            };
             self.served_daemon = Some(version);
             self.published = Some(branches.to_vec());
-            let observed = read.stamp();
-            return Plan::Publish(Fetched::new(read.data, observed));
+            self.shown = Some((fetched.data.clone(), fetched.observed));
+            return Plan::Publish(fetched);
         }
         // A recheck that found nothing usable only reads GitHub when the
         // daemon data it had shown has aged out or the branch set changed.
         if file_event && !bypass && same_branches && self.served_daemon.is_none() {
             return Plan::Skip;
         }
+        self.network(now)
+    }
+
+    /// Read GitHub now, or defer behind the rate floor.
+    fn network(&mut self, now: Instant) -> Plan {
         if let Some(due) = self
             .live_started
             .map(|at| at + GITHUB_MINIMUM)
@@ -209,6 +250,43 @@ impl LaneClock {
         self.deferred = None;
         Plan::Network
     }
+
+    /// A direct read that started at `started` succeeded.
+    fn live_read(&mut self, started: Instant, branches: Vec<String>, data: &GithubData) {
+        self.live_observed = Some(started);
+        self.published = Some(branches);
+        self.shown = Some((data.clone(), Stamp::at(started)));
+    }
+}
+
+/// The shown data for the branches it covers, plus `older`'s entries for the
+/// branches it does not. Both inputs are complete reads of their branch sets.
+/// The result is stamped with the earlier observation when it takes anything
+/// from `older`, so it never claims to have seen a later write.
+fn merge_older(
+    (shown, shown_at): &(GithubData, Stamp),
+    older: DaemonRead,
+    branches: &[String],
+) -> (GithubData, Stamp) {
+    let mut data = shown.clone();
+    data.prs.retain(|branch, _| branches.contains(branch));
+    let added: Vec<&String> = branches
+        .iter()
+        .filter(|branch| !shown.covered_branches.contains(*branch))
+        .collect();
+    let observed = if added.is_empty() {
+        *shown_at
+    } else {
+        shown_at.earliest(older.stamp())
+    };
+    for branch in added {
+        if let Some(pr) = older.data.prs.get(branch) {
+            data.prs.insert(branch.clone(), pr.clone());
+        }
+    }
+    // The shown read's repository-wide merge queue is the newer one.
+    data.covered_branches = branches.iter().cloned().collect();
+    (data, observed)
 }
 
 impl GithubLane {
@@ -220,6 +298,7 @@ impl GithubLane {
             bypass_daemon: Arc::default(),
             file_event: Arc::default(),
             clock: Mutex::default(),
+            reads: Arc::default(),
             wake: Notify::new(),
         }
     }
@@ -228,6 +307,13 @@ impl GithubLane {
         self.clock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn record_read(&self, times: ReadTimes) {
+        *self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = times;
     }
 
     async fn fetch(
@@ -248,6 +334,7 @@ impl GithubLane {
             }
             clock.published = Some(branches);
             clock.served_daemon = None;
+            clock.shown = None;
             return Ok(Some(Fetched::new(GithubData::default(), Stamp::now())));
         }
         let bypass = self.bypass_daemon.load(Ordering::Acquire);
@@ -281,11 +368,38 @@ impl GithubLane {
             config.paths.main_clone.clone(),
             GithubOptions::from_config(config, ci),
         );
-        let data = client.fetch_worktrees(&branches, cancel).await?;
-        let mut clock = self.clock();
-        clock.live_observed = Some(now);
-        clock.published = Some(branches);
-        Ok(Some(Fetched::new(data, Stamp::at(now))))
+        let started = Stamp::at(now);
+        self.record_read(ReadTimes {
+            started: Some(started),
+            finished: None,
+        });
+        let result = client.fetch_worktrees(&branches, cancel).await;
+        let elapsed = now.elapsed();
+        self.record_read(ReadTimes {
+            started: Some(started),
+            finished: Some(Stamp::now()),
+        });
+        let failed = result.as_ref().err().map(ToString::to_string);
+        if elapsed >= SLOW_READ {
+            tracing::info!(
+                branches = branches.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                ?started,
+                error = failed.as_deref(),
+                "slow GitHub read"
+            );
+        } else {
+            tracing::debug!(
+                branches = branches.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                ?started,
+                error = failed.as_deref(),
+                "GitHub read"
+            );
+        }
+        let data = result?;
+        self.clock().live_read(now, branches, &data);
+        Ok(Some(Fetched::new(data, started)))
     }
 }
 
@@ -559,8 +673,7 @@ mod tests {
         let mut clock = LaneClock::default();
         let before = Instant::now();
         let live = before + Duration::from_secs(1);
-        clock.live_observed = Some(live);
-        clock.published = Some(branches.clone());
+        clock.live_read(live, branches.clone(), &GithubData::default());
         // Started before the live read, or never recorded its start.
         assert!(matches!(
             clock.plan(input(&branches, Some(daemon(Some(before), 1_000)), live)),
@@ -570,12 +683,66 @@ mod tests {
             clock.plan(input(&branches, Some(daemon(None, 1_000)), live)),
             Plan::Skip
         ));
-        // A new branch has no data yet: the daemon's full coverage is served.
+        // A new branch has no data yet: the daemon supplies it.
         let more = vec!["another".to_owned(), "feature".to_owned()];
         assert!(matches!(
             clock.plan(input(&more, Some(daemon(Some(before), 1_000)), live)),
             Plan::Publish(_)
         ));
+    }
+
+    /// A PR marked ready, read live after the write, then a worktree is
+    /// created and the daemon's older snapshot (still showing a draft) is the
+    /// only data for the new branch. The new branch comes from the daemon;
+    /// the newer live read keeps the existing branch, and the merged stamp
+    /// cannot confirm anything the older snapshot might have missed.
+    #[tokio::test(start_paused = true)]
+    async fn an_older_daemon_snapshot_after_a_branch_change_never_regresses_a_live_read() {
+        use crate::github_actions::tests::pr;
+        let branches = branches();
+        let mut clock = LaneClock::default();
+        let before = Instant::now();
+        let live = before + Duration::from_secs(1);
+        let mut ready = pr("feature");
+        ready.is_draft = false;
+        let mut live_data = GithubData::default();
+        live_data.prs.insert("feature".into(), ready);
+        live_data.covered_branches = branches.iter().cloned().collect();
+        clock.live_read(live, branches.clone(), &live_data);
+
+        let more = vec!["another".to_owned(), "feature".to_owned()];
+        let mut older = daemon(Some(before), 1_000);
+        older.data.prs.insert("feature".into(), pr("feature"));
+        let mut other = pr("another");
+        other.number = 8;
+        older.data.prs.insert("another".into(), other);
+        older.data.covered_branches = more.iter().cloned().collect();
+        let Plan::Publish(fetched) = clock.plan(input(&more, Some(older), live)) else {
+            panic!("the new branch's data is published");
+        };
+        assert!(!fetched.data.prs["feature"].is_draft, "live read regressed");
+        assert_eq!(fetched.data.prs["another"].number, 8);
+        assert_eq!(
+            fetched.data.covered_branches,
+            more.iter().cloned().collect()
+        );
+        assert_eq!(fetched.observed, Stamp::at(before));
+        assert_eq!(clock.published.as_deref(), Some(&more[..]));
+
+        // A removed branch keeps the live data and its stamp.
+        let mut clock = LaneClock::default();
+        let mut both = live_data.clone();
+        both.prs.insert("another".into(), pr("another"));
+        both.covered_branches = more.iter().cloned().collect();
+        clock.live_read(live, more.clone(), &both);
+        let Plan::Publish(fetched) =
+            clock.plan(input(&branches, Some(daemon(Some(before), 1_000)), live))
+        else {
+            panic!("the smaller branch set is published");
+        };
+        assert!(!fetched.data.prs["feature"].is_draft);
+        assert!(!fetched.data.prs.contains_key("another"));
+        assert_eq!(fetched.observed, Stamp::at(live));
     }
 
     #[tokio::test(start_paused = true)]

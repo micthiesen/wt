@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -34,6 +34,7 @@ pub async fn before_remove(
     cancellation: &CancellationToken,
 ) -> Result<RemovalCleanup> {
     let mut report = RemovalCleanup::default();
+    let started = Instant::now();
     let tmux = TmuxClient::new(
         context.processes.clone(),
         TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(&context.home),
@@ -75,6 +76,8 @@ pub async fn before_remove(
             "could not inspect tmux sessions for {slug}: {error}"
         )),
     }
+    log_phase(path, "stop-sessions", started);
+    let started = Instant::now();
     match crate::actions::service(context)?
         .kill(slug, cancellation)
         .await
@@ -85,7 +88,11 @@ pub async fn before_remove(
             .warnings
             .push(format!("could not stop action for {slug}: {error}")),
     }
-    match reap_worktree_listeners(context, path, cancellation).await {
+    log_phase(path, "stop-action", started);
+    let started = Instant::now();
+    let reaped = reap_worktree_listeners(context, path, cancellation).await;
+    log_phase(path, "reap-listeners", started);
+    match reaped {
         Ok(pids) => report.reaped_listeners = pids,
         Err(error) if !cancellation.is_cancelled() => report.warnings.push(format!(
             "could not reap listeners under {}: {error:#}",
@@ -94,6 +101,13 @@ pub async fn before_remove(
         Err(error) => return Err(error),
     }
     Ok(report)
+}
+
+/// Same `wt::removal` phase event the lifecycle service emits, so one log
+/// filter shows where a slow removal spent its time.
+fn log_phase(path: &Path, phase: &'static str, started: Instant) {
+    tracing::info!(target: "wt::removal", phase, path = %path.display(),
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "removal phase finished");
 }
 
 pub async fn after_remove(context: &AppContext, slug: &str, dev_port: Option<u16>) -> Vec<String> {

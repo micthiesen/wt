@@ -1212,3 +1212,69 @@ fn delete_opens_a_dirty_remote_confirmation_without_a_host_request() {
     }) if selected == key)
     );
 }
+
+#[test]
+fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
+    let mut removing = board(&["one", "two"]);
+    removing.rows[0].removal = Some(crate::RemovalView::default());
+    let mut model = Model::default();
+    model.apply(ready(removing.clone()));
+    assert_eq!(model.selected_row().unwrap().key, "one");
+    for (code, modifiers) in [
+        (KeyCode::F(12), KeyModifiers::NONE),
+        (KeyCode::F(10), KeyModifiers::NONE),
+        (KeyCode::F(11), KeyModifiers::NONE),
+        (KeyCode::F(12), KeyModifiers::SHIFT),
+        (KeyCode::Char(';'), KeyModifiers::NONE),
+    ] {
+        model.toast = None;
+        assert_eq!(
+            press_with(&mut model, code, modifiers),
+            InputResult::Draw,
+            "{code:?} {modifiers:?}"
+        );
+        assert_eq!(toast(&model), Some("Removal is already in progress"));
+    }
+    // A picker opened before the removal was accepted cannot commit entry.
+    model.reply(UiReply {
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Harness { key: "one".into() },
+            title: "Start agent".into(),
+            options: vec![PickerOption {
+                value: Some("codex".into()),
+                label: "codex".into(),
+                chord: Some('x'),
+                note: None,
+                verify_after_merge: None,
+                detail: None,
+            }],
+            selected: 0,
+        }),
+        ..Default::default()
+    });
+    model.toast = None;
+    assert_eq!(ch(&mut model, 'x'), InputResult::Draw);
+    assert_eq!(toast(&model), Some("Removal is already in progress"));
+    // Unrelated rows still enter immediately.
+    ch(&mut model, 'j');
+    assert_eq!(model.selected_row().unwrap().key, "two");
+    assert_eq!(
+        press(&mut model, KeyCode::F(12)),
+        InputResult::Action(UiAction::Session {
+            key: Some("two".into()),
+            target: SessionTarget::Harness,
+        })
+    );
+    // A failed removal leaves the checkout usable again.
+    removing.rows[0].removal.as_mut().unwrap().error = Some("denied".into());
+    model.apply(ready(removing));
+    ch(&mut model, 'k');
+    assert_eq!(model.selected_row().unwrap().key, "one");
+    assert_eq!(
+        press(&mut model, KeyCode::F(12)),
+        InputResult::Action(UiAction::Session {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+        })
+    );
+}

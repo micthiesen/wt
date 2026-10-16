@@ -16,8 +16,8 @@ glyphs; a terminal font without Nerd Font symbols shows placeholder boxes.
 
 Each section starts with a dim rule naming it, separated from the previous
 section by a blank line. A row shows, left to right: the stack rail (tinted per
-stack lane), the work-status marker, the title (prefixed with the issue number
-when the issue is tracked), a dim `→ Section` when a stack member sits apart
+stack lane), the work-status marker, the title exactly as named (issue
+identity appears in details, never as a title prefix), a dim `→ Section` when a stack member sits apart
 from its parent's section, and a right-aligned glyph cluster. The cluster's
 fixed order is action running, dirty, rebase or conflict, deploy, AI session
 state, review bot, review decision, PR state or merge-queue position, and CI
@@ -85,11 +85,19 @@ Dependency installation continues as a background action. A removal request
 keeps the row in place with a dim gray, struck-through name while safety
 checks run. When the worker accepts removal, the row moves to **Removing**, directly
 above **Archived**, and file cleanup continues in the background. Active
-removals reject duplicate requests. Failed rows stay in Removing with a
-**Removal failed** label and an error in the details and attention panels.
+removals reject duplicate requests, and session entry on that row (F10, F11,
+F12, Shift+F12, `;` and their pickers) says **Removal is already in progress**
+instead of queuing behind the teardown. Failed rows stay in Removing with an
+alert marker in place of the trash marker, and the details and attention panels
+say **Removal failed** with the error.
 Press `d` to inspect the failure and review a retry; the host repeats all
 safety checks. If checkout identity is missing, the menu permits inspection
-only. Removing rows survive restart, even after partial deletion. A row leaves
+only. When the failed record's checkout is no longer in Git inventory, `d`
+instead offers **Dismiss failed removal**, showing the error. Dismissal
+forgets only that record: it deletes no files or branches, so delete any
+leftover directory by hand. The host refuses it as stale unless the record
+is still the same failed job, path and branch, and the checkout path is
+absent and unlisted. Removing rows survive restart, even after partial deletion. A row leaves
 the list only after the worker confirms success and inventory drops it. A request
 cancelled before worker startup restores the normal name style. Delayed hazard reviews are queued separately for each checkout
 and host. They appear one at a time after the current menu closes; navigation
@@ -114,7 +122,7 @@ stale. The list summarizes every host; a row's details reflect only that row's
 host. The top bar does not repeat source freshness labels from pane borders.
 
 Every change you make appears at once. Worktree rows contain their title,
-issue identifier, stack references and status glyphs only, never status text.
+stack references and status glyphs only, never issue prefixes or status text.
 One fixed-width pending glyph marks `…` while a request is in flight, `↻`
 once accepted, or `?` when its outcome is unknown. Uncertainty takes precedence
 when several changes are pending. Full explanations, such as

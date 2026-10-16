@@ -230,12 +230,11 @@ impl CodexAppServerClient {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown protocol error");
-                let kind =
-                    if code == -32601 || message.contains("requires experimentalApi capability") {
-                        CodexAppServerFailureKind::Unsupported
-                    } else {
-                        CodexAppServerFailureKind::Rejected
-                    };
+                let kind = if method_unsupported(code, message) {
+                    CodexAppServerFailureKind::Unsupported
+                } else {
+                    CodexAppServerFailureKind::Rejected
+                };
                 return Err(error(operation, kind, message));
             }
             return value.get("result").cloned().ok_or_else(|| {
@@ -595,6 +594,15 @@ fn parse_submission(value: Option<&Value>) -> Option<CodexQueueSubmission> {
     })
 }
 
+/// The daemon refused to dispatch the method at all, so nothing reached a
+/// thread. Codex 0.163 reports an unknown method as JSON-RPC -32600 with
+/// "Invalid request: unknown variant `<method>`" rather than -32601.
+fn method_unsupported(code: i64, message: &str) -> bool {
+    code == -32601
+        || message.contains("requires experimentalApi capability")
+        || (code == -32600 && message.contains("unknown variant"))
+}
+
 fn cancelled(operation: &'static str) -> CodexAppServerError {
     error(operation, CodexAppServerFailureKind::Cancelled, "cancelled")
 }
@@ -811,5 +819,46 @@ mod tests {
         assert_eq!(result.kind, CodexAppServerFailureKind::Ambiguous);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(result.detail.contains("will not re-submit"));
+    }
+
+    #[tokio::test]
+    async fn daemon_without_queue_methods_is_unsupported_not_rejected() {
+        // Codex 0.163 rejects an unknown method as -32600 "unknown variant"
+        // before dispatch; older daemons use -32601. Neither wrote anything,
+        // so both permit the queue CLI or exact-thread terminal fallback.
+        for (code, message) in [
+            (
+                -32600,
+                "Invalid request: unknown variant `thread/queue/add`, expected one of `initialize`",
+            ),
+            (-32601, "method not found"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("app-server.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                initialize(&mut socket).await;
+                let add = receive(&mut socket).await;
+                assert_eq!(add["method"], "thread/queue/add");
+                let reply =
+                    json!({"jsonrpc":"2.0","id":add["id"],"error":{"code":code,"message":message}});
+                socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+            });
+            let error = queue_message(&path, "thread-1", "hello", &CancellationToken::new())
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(error.kind, CodexAppServerFailureKind::Unsupported, "{code}");
+        }
+        assert!(!method_unsupported(
+            -32600,
+            "Invalid request: missing field `threadId`"
+        ));
+        assert!(!method_unsupported(-32603, "unknown variant"));
     }
 }

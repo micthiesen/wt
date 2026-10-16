@@ -701,7 +701,14 @@ fn lifecycle_metadata_key(metadata: Option<&crate::local_source::Metadata>) -> s
             }
         }
     }
-    serde_json::Value::Object(slugs)
+    // An accepted removal retires its checkout from lifecycle evidence.
+    let removals = state["removals"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(key, removal)| (key.clone(), removal["path"].clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({"slugs": slugs, "removals": removals})
 }
 
 #[cfg(test)]
@@ -725,6 +732,33 @@ mod tests {
             run: "builtin:delete-branch".into(),
             ..Default::default()
         }];
+        // Only a landed row captures a removal revision (`git status`, which
+        // runs the fsmonitor hook below), so land `one` on a local origin.
+        let git_in = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&fixture.ctx.cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let origin = fixture._root.path().join("origin.git");
+        git_in(&["init", "--bare", origin.to_str().unwrap()]);
+        git_in(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        let base = git_in(&["rev-parse", "HEAD"]);
+        fixture
+            .ctx
+            .database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&base))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(fixture.ctx.cwd.join("tracked.txt"), "landed work\n").unwrap();
+        git_in(&["commit", "-am", "landed"]);
+        git_in(&["push", "origin", "HEAD:refs/heads/main"]);
         let snapshots = fixture
             .ctx
             .repository

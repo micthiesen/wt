@@ -1,4 +1,4 @@
-use std::{path::Path, path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::Path, path::PathBuf, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner};
@@ -7,8 +7,9 @@ use wt_tmux::{OptionScope, PaneTarget, TmuxClient};
 use crate::{DiscoveryRequest, HarnessSpawnRequest, persist::FileLock};
 
 use super::{
-    CodexAppServerError, CodexAppServerFailureKind, CodexHarness, CodexHarnessError, CodexPaths,
-    CodexQueueDelivery, app_server, find_rollout, read_codex_tail,
+    CodexAppServerError, CodexAppServerFailureKind, CodexHarness, CodexHarnessError,
+    CodexLaunchedThreads, CodexPaths, CodexQueueDelivery, app_server, find_rollout,
+    read_codex_tail,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,11 +114,12 @@ impl CodexMessenger {
         .await?;
 
         let initial_inventory = self.tmux.list_sessions(cancel).await?;
-        let was_live = initial_inventory.iter().any(|s| s.name == tmux_name);
-        let stamped_id = initial_inventory
+        let slot = initial_inventory
             .iter()
             .find(|s| s.name == tmux_name)
-            .and_then(|s| s.harness_session_id.clone());
+            .cloned();
+        let was_live = slot.is_some();
+        let stamped_id = slot.as_ref().and_then(|s| s.harness_session_id.clone());
         let harness = CodexHarness::new(self.paths.clone(), self.runner.clone(), self.tmux.clone());
         let request = DiscoveryRequest {
             slug: target.slug.clone(),
@@ -137,10 +139,39 @@ impl CodexMessenger {
                 })??
         };
 
-        let mut session_id = if was_live {
-            stamped_id
+        let mut session_id = None;
+        let mut unidentified = None;
+        if let Some(slot) = &slot {
+            if let Some(id) = stamped_id {
+                // The stamp names the conversation wt resumed or proved
+                // there; it must still be a conversation of this checkout and
+                // slot before anything is addressed to it.
+                if !discovered.iter().any(|session| session.session_id == id) {
+                    return Ok(CodexMessageOutcome::Failed {
+                        reason: format!(
+                            "Codex slot {tmux_name} records thread {id}, which is not a conversation of this worktree slot. {NOTHING_SENT}"
+                        ),
+                    });
+                }
+                session_id = Some(id);
+            } else {
+                match self
+                    .identify_slot(slot, &target.cwd, &target.slug, &discovered, true, cancel)
+                    .await?
+                {
+                    SlotIdentity::Known(id) => session_id = Some(id),
+                    SlotIdentity::Unknown(unknown) => unidentified = Some(unknown),
+                    SlotIdentity::Changed => {
+                        return Ok(CodexMessageOutcome::Failed {
+                            reason: format!(
+                                "Codex slot {tmux_name} changed while wt was identifying its conversation. Nothing was sent, so a retry is safe"
+                            ),
+                        });
+                    }
+                }
+            }
         } else {
-            target
+            session_id = target
                 .managed_name
                 .as_deref()
                 .and_then(|name| {
@@ -153,125 +184,411 @@ impl CodexMessenger {
                         .iter()
                         .find(|s| s.extras.managed_name.as_deref() == Some("primary"))
                 })
-                .map(|s| s.session_id.clone())
-        };
-        if was_live && session_id.is_none() {
-            session_id = self
-                .recover_live_identity(&tmux_name, &discovered, cancel)
-                .await?;
-            if let Some(id) = session_id.as_deref() {
-                let current = self.tmux.list_sessions(cancel).await?;
-                let slot = initial_inventory.iter().find(|slot| slot.name == tmux_name);
-                let same_slot = slot.filter(|slot| {
-                    current.iter().any(|now| {
-                        now.id == slot.id
-                            && now.created_at == slot.created_at
-                            && now.name == slot.name
-                    })
-                });
-                if let Some(slot) = same_slot {
-                    self.tmux
-                        .set_option(
-                            &OptionScope::Session(slot.id.clone()),
-                            "@wt-harness-session-id",
-                            Some(id),
-                            cancel,
-                        )
-                        .await?;
-                } else {
-                    return Ok(CodexMessageOutcome::Failed {
-                        reason: "Codex slot changed while recovering its conversation identity"
-                            .into(),
-                    });
-                }
-            }
+                .map(|s| s.session_id.clone());
         }
 
+        let spawn = HarnessSpawnRequest {
+            worktree_path: target.cwd.clone(),
+            slug: target.slug.clone(),
+            managed_name: None,
+            resume_session_id: session_id.clone(),
+            display_label: None,
+        };
         let cold_started = if !was_live {
-            let spawn = HarnessSpawnRequest {
-                worktree_path: target.cwd.clone(),
-                slug: target.slug.clone(),
-                managed_name: None,
-                resume_session_id: session_id.clone(),
-                display_label: None,
-            };
             harness.start(&spawn, cancel).await?
         } else {
             false
         };
 
-        if let Some(id) = session_id
-            .as_deref()
-            .filter(|_| !is_codex_command(&target.text))
-        {
-            let native = self.send(id, &target.text, cancel).await;
-            match native {
-                Ok(delivery) => return Ok(CodexMessageOutcome::Queued(delivery)),
-                Err(error) if error.kind == CodexAppServerFailureKind::Ambiguous => {
-                    return Ok(CodexMessageOutcome::Ambiguous {
-                        reason: format!("{}; wt did not retry or type the message", error),
-                    });
-                }
-                Err(error)
-                    if matches!(
-                        error.kind,
-                        CodexAppServerFailureKind::Absent
-                            | CodexAppServerFailureKind::Unavailable
-                            | CodexAppServerFailureKind::Unsupported
-                    ) =>
-                {
-                    match self.cli_queue(id, &target.text, cancel).await {
-                        CliQueueResult::Accepted => {
-                            return Ok(CodexMessageOutcome::CliQueued {
-                                thread_id: id.to_owned(),
-                            });
-                        }
-                        CliQueueResult::Ambiguous(reason) => {
-                            return Ok(CodexMessageOutcome::Ambiguous { reason });
-                        }
-                        CliQueueResult::Unsupported => {
-                            return self
-                                .terminal_fallback(
-                                    &tmux_name,
-                                    &target.cwd,
-                                    &target.slug,
-                                    Some(id),
-                                    &target.text,
-                                    cold_started,
-                                    "Codex queue API is unavailable",
-                                    cancel,
-                                )
-                                .await;
-                        }
-                    }
-                }
-                Err(error) => {
-                    return Ok(CodexMessageOutcome::Failed {
-                        reason: error.to_string(),
-                    });
-                }
+        if cold_started && session_id.is_none() {
+            // Codex creates the thread's rollout only with its first prompt.
+            // Manager and main launches carry that prompt, so they must
+            // publish their UUID; a bare launch may instead show the empty
+            // composer of a thread that has no history to misaddress.
+            let opening_prompt = !harness.build_spawn_command(&spawn).args.is_empty();
+            match self
+                .await_launched_identity(
+                    &tmux_name,
+                    &target.cwd,
+                    &target.slug,
+                    !opening_prompt,
+                    cancel,
+                )
+                .await?
+            {
+                Launched::Known(id) => session_id = Some(id),
+                Launched::FreshComposer => {}
+                Launched::Failed(reason) => return Ok(CodexMessageOutcome::Failed { reason }),
             }
         }
 
-        // A new Codex TUI has no thread UUID until it writes its first
-        // session_meta. Terminal input is limited to an observed empty prompt.
-        self.terminal_fallback(
-            &tmux_name,
-            &target.cwd,
-            &target.slug,
-            session_id.as_deref(),
-            &target.text,
-            cold_started,
-            if is_codex_command(&target.text) {
-                "Codex slash commands execute through the interactive terminal"
-            } else if was_live {
-                "live Codex slot has no recoverable thread UUID"
-            } else {
-                "new Codex thread has no UUID until its first prompt"
-            },
-            cancel,
-        )
-        .await
+        let Some(id) = session_id else {
+            let unknown = unidentified.unwrap_or(UnknownIdentity::NoThreadSinceLaunch);
+            if let UnknownIdentity::Ambiguous(detail) = unknown {
+                return Ok(CodexMessageOutcome::Failed {
+                    reason: missing_identity(&tmux_name, &detail),
+                });
+            }
+            // No conversation has been created since this slot launched. Only
+            // an empty new-thread composer is safe to type into; anything
+            // else may be a resumed conversation wt cannot name.
+            return self
+                .terminal_fallback(
+                    &tmux_name,
+                    &target.cwd,
+                    &target.slug,
+                    Expect::FreshComposer,
+                    &target.text,
+                    cold_started,
+                    if is_codex_command(&target.text) {
+                        "Codex slash commands execute through the interactive terminal"
+                    } else {
+                        "new Codex thread has no UUID until its first prompt"
+                    },
+                    cancel,
+                )
+                .await;
+        };
+
+        if is_codex_command(&target.text) {
+            return self
+                .terminal_fallback(
+                    &tmux_name,
+                    &target.cwd,
+                    &target.slug,
+                    Expect::Thread(&id),
+                    &target.text,
+                    cold_started,
+                    "Codex slash commands execute through the interactive terminal",
+                    cancel,
+                )
+                .await;
+        }
+        match self.send(&id, &target.text, cancel).await {
+            Ok(delivery) => Ok(CodexMessageOutcome::Queued(delivery)),
+            Err(error) if error.kind == CodexAppServerFailureKind::Ambiguous => {
+                Ok(CodexMessageOutcome::Ambiguous {
+                    reason: format!("{}; wt did not retry or type the message", error),
+                })
+            }
+            Err(error)
+                if matches!(
+                    error.kind,
+                    CodexAppServerFailureKind::Absent
+                        | CodexAppServerFailureKind::Unavailable
+                        | CodexAppServerFailureKind::Unsupported
+                ) =>
+            {
+                match self.cli_queue(&id, &target.text, cancel).await {
+                    CliQueueResult::Accepted => {
+                        Ok(CodexMessageOutcome::CliQueued { thread_id: id })
+                    }
+                    CliQueueResult::Ambiguous(reason) => {
+                        Ok(CodexMessageOutcome::Ambiguous { reason })
+                    }
+                    CliQueueResult::Unsupported => {
+                        self.terminal_fallback(
+                            &tmux_name,
+                            &target.cwd,
+                            &target.slug,
+                            Expect::Thread(&id),
+                            &target.text,
+                            cold_started,
+                            "Codex queue API is unavailable",
+                            cancel,
+                        )
+                        .await
+                    }
+                }
+            }
+            Err(error) => Ok(CodexMessageOutcome::Failed {
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    /// Identify an unstamped live slot: first by the pane's own writer lock,
+    /// then by the sole conversation created in its checkout and slot since
+    /// the tmux session started. A found UUID is stamped only on the same
+    /// captured tmux session, and only while it is still unstamped.
+    async fn identify_slot(
+        &self,
+        slot: &wt_tmux::SessionInfo,
+        cwd: &Path,
+        slug: &str,
+        discovered: &[crate::HarnessSession],
+        use_writer_lock: bool,
+        cancel: &CancellationToken,
+    ) -> Result<SlotIdentity, CodexHarnessError> {
+        let proven = if use_writer_lock {
+            self.recover_live_identity(&slot.name, discovered, cancel)
+                .await?
+        } else {
+            None
+        };
+        let id = match proven {
+            Some(id) => id,
+            None => {
+                let claimed = self
+                    .tmux
+                    .list_sessions(cancel)
+                    .await?
+                    .into_iter()
+                    .filter(|other| other.name != slot.name)
+                    .filter_map(|other| other.harness_session_id)
+                    .collect::<HashSet<_>>();
+                let harness =
+                    CodexHarness::new(self.paths.clone(), self.runner.clone(), self.tmux.clone());
+                let (checkout, slug, launched) =
+                    (cwd.to_path_buf(), slug.to_owned(), slot.created_at);
+                let found = tokio::task::spawn_blocking(move || {
+                    harness.launched_threads_sync(&checkout, &slug, launched, &claimed)
+                })
+                .await
+                .map_err(|error| CodexHarnessError::Operation {
+                    operation: "discover",
+                    detail: error.to_string(),
+                })??;
+                match found {
+                    CodexLaunchedThreads::None => {
+                        return Ok(SlotIdentity::Unknown(UnknownIdentity::NoThreadSinceLaunch));
+                    }
+                    CodexLaunchedThreads::Ambiguous(ids) => {
+                        return Ok(SlotIdentity::Unknown(UnknownIdentity::Ambiguous(format!(
+                            "{} conversations were started in this checkout since it launched",
+                            ids.len()
+                        ))));
+                    }
+                    // A sole rollout is only a candidate: another Codex TUI
+                    // in this checkout could have created it. Require that
+                    // this pane runs the only one before trusting it.
+                    CodexLaunchedThreads::One(id) => {
+                        if let Some(detail) = self.foreign_codex(slot, cwd, cancel).await? {
+                            return Ok(SlotIdentity::Unknown(UnknownIdentity::Ambiguous(detail)));
+                        }
+                        id
+                    }
+                }
+            }
+        };
+        let current = self.tmux.list_sessions(cancel).await?;
+        let same_slot = current.iter().find(|now| {
+            now.id == slot.id && now.created_at == slot.created_at && now.name == slot.name
+        });
+        match same_slot {
+            Some(now)
+                if now
+                    .harness_session_id
+                    .as_deref()
+                    .is_none_or(|stamp| stamp == id) =>
+            {
+                self.tmux
+                    .set_option(
+                        &OptionScope::Session(slot.id.clone()),
+                        "@wt-harness-session-id",
+                        Some(&id),
+                        cancel,
+                    )
+                    .await?;
+                Ok(SlotIdentity::Known(id))
+            }
+            _ => Ok(SlotIdentity::Changed),
+        }
+    }
+
+    /// Positive evidence for a discovered UUID. This slot's single pane must
+    /// run a Codex TUI, and no other Codex TUI on this host may run in, or
+    /// name, this checkout, except inside panes whose slots already record
+    /// their own thread. Codex 0.163 TUIs are clients of a shared
+    /// `codex app-server` daemon, which is not a TUI and is ignored; the TUI
+    /// process itself keeps the checkout as its working directory. Returns
+    /// why the evidence is missing; any unreadable source counts as missing.
+    async fn foreign_codex(
+        &self,
+        slot: &wt_tmux::SessionInfo,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, CodexHarnessError> {
+        let panes = self.tmux.list_all_panes(cancel).await?;
+        let inventory = self.tmux.list_sessions(cancel).await?;
+        let own = panes
+            .iter()
+            .filter(|pane| pane.session_name == slot.name && !pane.dead)
+            .collect::<Vec<_>>();
+        let [own] = own.as_slice() else {
+            return Ok(Some(
+                "its tmux session does not have exactly one live pane".into(),
+            ));
+        };
+        let Some(own_pid) = own.pid else {
+            return Ok(Some("its pane process is unknown".into()));
+        };
+        let claimed_roots = panes
+            .iter()
+            .filter(|pane| {
+                pane.session_name != slot.name
+                    && inventory.iter().any(|session| {
+                        session.name == pane.session_name && session.harness_session_id.is_some()
+                    })
+            })
+            .filter_map(|pane| pane.pid)
+            .collect::<Vec<_>>();
+        let mut ps = CommandSpec::new("ps").args([
+            "-A", "-o", "pid=", "-o", "ppid=", "-o", "ucomm=", "-o", "args=",
+        ]);
+        ps.timeout = Duration::from_secs(2);
+        let listing = match self.runner.run(ps, cancel).await {
+            Ok(output) if output.status.success() => output.stdout_text(),
+            Err(error @ ProcessError::Cancelled { .. }) => return Err(error.into()),
+            _ => return Ok(Some("the process list is unavailable".into())),
+        };
+        let processes = parse_processes(&listing);
+        let own_tree = descendants(&processes, own_pid);
+        if !processes
+            .iter()
+            .any(|process| own_tree.contains(&process.pid) && process.is_codex_tui())
+        {
+            return Ok(Some("its pane is not running a Codex TUI".into()));
+        }
+        let claimed = claimed_roots
+            .iter()
+            .flat_map(|root| descendants(&processes, *root))
+            .collect::<HashSet<_>>();
+        let others = processes
+            .iter()
+            .filter(|process| {
+                process.is_codex_tui()
+                    && !own_tree.contains(&process.pid)
+                    && !claimed.contains(&process.pid)
+            })
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            return Ok(None);
+        }
+        let mut checkouts = vec![cwd.to_path_buf()];
+        if let Ok(real) = cwd.canonicalize() {
+            checkouts.push(real);
+        }
+        let foreign = |pid: u32| {
+            Some(format!(
+                "another Codex process (pid {pid}) may have started a conversation in this checkout"
+            ))
+        };
+        if let Some(process) = others.iter().find(|process| {
+            checkouts
+                .iter()
+                .any(|path| process.args.contains(&*path.to_string_lossy()))
+        }) {
+            return Ok(foreign(process.pid));
+        }
+        let pids = others
+            .iter()
+            .map(|process| process.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut lsof =
+            CommandSpec::new("lsof").args(["-nP", "-a", "-d", "cwd", "-p", &pids, "-Fn"]);
+        lsof.timeout = Duration::from_secs(2);
+        // lsof exits nonzero when a listed process has already exited; the
+        // working directories it did report are still evidence.
+        let output = match self.runner.run(lsof, cancel).await {
+            Ok(output) => output.stdout_text(),
+            Err(error @ ProcessError::Cancelled { .. }) => return Err(error.into()),
+            Err(_) => return Ok(Some("process working directories are unavailable".into())),
+        };
+        let mut pid = None;
+        for line in output.lines() {
+            if let Some(value) = line.strip_prefix('p') {
+                pid = value.parse::<u32>().ok();
+            } else if let Some(path) = line.strip_prefix('n')
+                && checkouts.iter().any(|checkout| Path::new(path) == checkout)
+            {
+                return Ok(foreign(pid.unwrap_or_default()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Wait for a slot this call launched without `resume` to either publish
+    /// its new thread's UUID or, when allowed, show an empty new-thread
+    /// composer. Delayed rollout publication is retried until the deadline.
+    async fn await_launched_identity(
+        &self,
+        name: &str,
+        cwd: &Path,
+        slug: &str,
+        allow_fresh_composer: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Launched, CodexHarnessError> {
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        let target = PaneTarget::active_session_pane(name);
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(Launched::Failed(format!(
+                    "cancelled before terminal submission. {NOTHING_SENT}"
+                )));
+            }
+            let Some(slot) = self
+                .tmux
+                .list_sessions(cancel)
+                .await?
+                .into_iter()
+                .find(|s| s.name == name)
+            else {
+                return Ok(Launched::Failed(format!(
+                    "Codex slot {name} exited before it could receive the message. {NOTHING_SENT}"
+                )));
+            };
+            if let Some(id) = slot.harness_session_id.as_deref() {
+                return Ok(
+                    if find_rollout(&self.paths.sessions_dir(), cwd, slug, id)?.is_some() {
+                        Launched::Known(id.to_owned())
+                    } else {
+                        Launched::Failed(format!(
+                            "Codex slot {name} records thread {id}, which is not a conversation of this worktree slot. {NOTHING_SENT}"
+                        ))
+                    },
+                );
+            }
+            let pane = self
+                .tmux
+                .capture_pane(&target, Some(40), cancel)
+                .await
+                .unwrap_or_default();
+            if let Some(blocker) = codex_pane_blocker(&pane) {
+                return Ok(Launched::Failed(blocked(blocker)));
+            }
+            if let Some(composer) = idle_composer(&pane) {
+                match self
+                    .identify_slot(&slot, cwd, slug, &[], false, cancel)
+                    .await?
+                {
+                    SlotIdentity::Known(id) => return Ok(Launched::Known(id)),
+                    SlotIdentity::Changed => {
+                        return Ok(Launched::Failed(format!(
+                            "Codex slot {name} changed while wt was identifying its conversation. {NOTHING_SENT}"
+                        )));
+                    }
+                    SlotIdentity::Unknown(UnknownIdentity::Ambiguous(detail)) => {
+                        return Ok(Launched::Failed(missing_identity(name, &detail)));
+                    }
+                    SlotIdentity::Unknown(UnknownIdentity::NoThreadSinceLaunch)
+                        if allow_fresh_composer && composer == Composer::Fresh =>
+                    {
+                        return Ok(Launched::FreshComposer);
+                    }
+                    // The opening prompt's rollout may not be published yet.
+                    SlotIdentity::Unknown(UnknownIdentity::NoThreadSinceLaunch) => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(Launched::Failed(missing_identity(
+                    name,
+                    "the new slot did not publish its thread UUID within 30 seconds",
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     pub(super) async fn recover_live_identity(
@@ -419,7 +736,7 @@ impl CodexMessenger {
         name: &str,
         cwd: &Path,
         slug: &str,
-        session_id: Option<&str>,
+        expect: Expect<'_>,
         text: &str,
         cold_started: bool,
         reason: &str,
@@ -430,18 +747,24 @@ impl CodexMessenger {
             cancel,
         )
         .await?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
         let target = PaneTarget::active_session_pane(name);
+        let expected = match expect {
+            Expect::Thread(id) => Some(id),
+            Expect::FreshComposer => None,
+        };
         loop {
             if cancel.is_cancelled() {
                 return Ok(CodexMessageOutcome::Failed {
-                    reason: "cancelled before terminal submission".into(),
+                    reason: format!("cancelled before terminal submission. {NOTHING_SENT}"),
                 });
             }
             let inventory = self.tmux.list_sessions(cancel).await?;
             let Some(live) = inventory.iter().find(|s| s.name == name) else {
                 return Ok(CodexMessageOutcome::Failed {
-                    reason: format!("Codex slot {name} exited before terminal fallback"),
+                    reason: format!(
+                        "Codex slot {name} exited before terminal fallback. {NOTHING_SENT}"
+                    ),
                 });
             };
             let pane = self
@@ -451,28 +774,51 @@ impl CodexMessenger {
                 .unwrap_or_default();
             if let Some(blocker) = codex_pane_blocker(&pane) {
                 return Ok(CodexMessageOutcome::Failed {
-                    reason: format!(
-                        "Codex is waiting for {blocker}; open this session with F12 to continue. No input was sent"
-                    ),
+                    reason: blocked(blocker),
                 });
             }
-            let ready = if let Some(id) = session_id {
-                // Ownership is rechecked under the cross-process injection
-                // lock immediately before typing.
-                if live.harness_session_id.as_deref() != Some(id) {
-                    false
-                } else if let Some(file) = find_rollout(&self.paths.sessions_dir(), cwd, slug, id)?
-                {
+            // Ownership is rechecked under the cross-process injection lock
+            // immediately before typing. Identity failures never wait: they
+            // cannot resolve themselves and a later retry is safe.
+            let ready = match expect {
+                Expect::Thread(id) => {
+                    if live.harness_session_id.as_deref() != Some(id) {
+                        return Ok(CodexMessageOutcome::Failed {
+                            reason: identity_mismatch(name, id, live.harness_session_id.as_deref()),
+                        });
+                    }
+                    let Some(file) = find_rollout(&self.paths.sessions_dir(), cwd, slug, id)?
+                    else {
+                        return Ok(CodexMessageOutcome::Failed {
+                            reason: format!(
+                                "Codex thread {id} is not a conversation of this worktree slot. {NOTHING_SENT}"
+                            ),
+                        });
+                    };
                     let thread_ready = read_codex_tail(&file.path, file.mtime_ms, file.size)?
                         .is_some_and(|tail| {
                             closed_turn(tail.parse_complete, tail.last_task_event.as_deref())
                         });
-                    thread_ready && codex_pane_is_idle(&pane)
-                } else {
-                    false
+                    thread_ready && idle_composer(&pane).is_some()
                 }
-            } else {
-                codex_pane_is_idle(&pane)
+                Expect::FreshComposer => {
+                    if let Some(stamp) = live.harness_session_id.as_deref() {
+                        return Ok(CodexMessageOutcome::Failed {
+                            reason: format!(
+                                "Codex slot {name} now records thread {stamp}. {NOTHING_SENT}"
+                            ),
+                        });
+                    }
+                    if idle_composer(&pane) != Some(Composer::Fresh) {
+                        return Ok(CodexMessageOutcome::Failed {
+                            reason: missing_identity(
+                                name,
+                                "it is not showing an empty new conversation",
+                            ),
+                        });
+                    }
+                    true
+                }
             };
             if ready {
                 let still_live = self
@@ -482,7 +828,7 @@ impl CodexMessenger {
                     .into_iter()
                     .find(|s| s.name == name);
                 if let Some(live) = still_live
-                    && (session_id.is_none() || live.harness_session_id.as_deref() == session_id)
+                    && live.harness_session_id.as_deref() == expected
                 {
                     let command = is_codex_command(text);
                     let typed = if command {
@@ -518,16 +864,16 @@ impl CodexMessenger {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                let id = expected.unwrap_or("unidentified");
                 return Ok(CodexMessageOutcome::Failed {
                     reason: format!(
-                        "Codex terminal fallback refused because exact-thread readiness did not pass: {reason}"
+                        "Codex thread {id} in {name} did not become idle within 30 seconds (a turn is running, or the composer holds a draft or prompt; {reason}). {NOTHING_SENT}"
                     ),
                 });
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
-
     pub async fn send_with_outcome(
         &mut self,
         thread_id: &str,
@@ -553,6 +899,53 @@ impl CodexMessenger {
             Err(error) => CodexMessageOutcome::Failed {
                 reason: error.to_string(),
             },
+        }
+    }
+}
+
+struct ProcessRow {
+    pid: u32,
+    ppid: u32,
+    name: String,
+    args: String,
+}
+
+impl ProcessRow {
+    /// A Codex terminal client. The shared app-server daemon is not one.
+    fn is_codex_tui(&self) -> bool {
+        self.name == "codex" && !self.args.split_whitespace().any(|arg| arg == "app-server")
+    }
+}
+
+fn parse_processes(listing: &str) -> Vec<ProcessRow> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let name = fields.next()?.to_owned();
+            Some(ProcessRow {
+                pid,
+                ppid,
+                name,
+                args: fields.collect::<Vec<_>>().join(" "),
+            })
+        })
+        .collect()
+}
+
+fn descendants(processes: &[ProcessRow], root: u32) -> HashSet<u32> {
+    let mut tree = HashSet::from([root]);
+    loop {
+        let before = tree.len();
+        for process in processes {
+            if tree.contains(&process.ppid) && process.pid != process.ppid {
+                tree.insert(process.pid);
+            }
+        }
+        if tree.len() == before {
+            return tree;
         }
     }
 }
@@ -646,14 +1039,82 @@ fn codex_pane_blocker(text: &str) -> Option<&'static str> {
     }
 }
 
-fn codex_pane_is_idle(text: &str) -> bool {
+/// Placeholder of an empty composer on a thread with no history.
+const FRESH_PLACEHOLDER: &str = "› Ask Codex to do anything";
+/// Placeholder Codex 0.163 shows on an empty composer once the thread has
+/// history. Both strings are present in the 0.163 binary.
+const FOLLOW_UP_PLACEHOLDER: &str = "› Ask a follow-up question";
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const NOTHING_SENT: &str = "Nothing was sent, so a retry is safe";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Composer {
+    /// Empty composer of a new conversation.
+    Fresh,
+    /// Empty composer of a conversation with history.
+    FollowUp,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Expect<'a> {
+    /// Type only into this exact, stamped thread once its turn is closed.
+    Thread(&'a str),
+    /// Type only into an unstamped slot showing an empty new conversation.
+    FreshComposer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SlotIdentity {
+    Known(String),
+    Unknown(UnknownIdentity),
+    /// The captured tmux session ended, was replaced, or gained another stamp.
+    Changed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnknownIdentity {
+    NoThreadSinceLaunch,
+    /// Candidates exist but none is provably this pane's; the detail says why.
+    Ambiguous(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Launched {
+    Known(String),
+    FreshComposer,
+    Failed(String),
+}
+
+fn missing_identity(name: &str, detail: &str) -> String {
+    format!(
+        "Codex slot {name} has no proven thread UUID ({detail}), so wt cannot tell which conversation it shows. {NOTHING_SENT}. Resume the conversation from the session picker (;) so wt records its thread, then retry"
+    )
+}
+
+fn identity_mismatch(name: &str, expected: &str, found: Option<&str>) -> String {
+    let found = found.unwrap_or("no thread");
+    format!("Codex slot {name} now records {found}, not thread {expected}. {NOTHING_SENT}")
+}
+
+fn blocked(blocker: &str) -> String {
+    format!(
+        "Codex is waiting for {blocker}; open this session with F12 to continue. No input was sent"
+    )
+}
+
+fn idle_composer(text: &str) -> Option<Composer> {
     if text.to_ascii_lowercase().contains("esc to interrupt") {
-        return false;
+        return None;
     }
-    text.lines()
+    match text
+        .lines()
         .map(str::trim)
-        .rfind(|line| line.starts_with("› "))
-        == Some("› Ask Codex to do anything")
+        .rfind(|line| line.starts_with("› "))?
+    {
+        FRESH_PLACEHOLDER => Some(Composer::Fresh),
+        FOLLOW_UP_PLACEHOLDER => Some(Composer::FollowUp),
+        _ => None,
+    }
 }
 fn terminal_text(text: &str) -> &str {
     if text.split_whitespace().next() == Some("/compact") {
@@ -925,7 +1386,7 @@ mod tests {
     fn interactive_setup_blockers_name_the_active_menu_only() {
         let trust = "Folder access\n/repo\nTrust this folder? Codex can read files.\n› 1. Trust and continue\n  2. Back to Agent Command Center\nenter continue · esc back";
         assert_eq!(codex_pane_blocker(trust), Some("folder trust"));
-        assert!(!codex_pane_is_idle(trust));
+        assert_eq!(idle_composer(trust), None);
         assert_eq!(
             codex_pane_blocker(&format!("{trust}\n› Ask Codex to do anything")),
             None
@@ -990,7 +1451,7 @@ mod tests {
                 name,
                 temp.path(),
                 "trust",
-                None,
+                Expect::FreshComposer,
                 "DO NOT TYPE",
                 false,
                 "unknown UUID",
@@ -1017,13 +1478,646 @@ mod tests {
         assert!(!closed_turn(false, Some("task_complete")));
         assert!(closed_turn(true, Some("task_complete")));
         assert!(closed_turn(true, Some("turn_aborted")));
-        assert!(codex_pane_is_idle("output\n› Ask Codex to do anything"));
-        assert!(!codex_pane_is_idle(
-            "Working (esc to interrupt)\n› Ask Codex to do anything"
-        ));
-        assert!(!codex_pane_is_idle(
-            "› Ask Codex to do anything\nAllow command?\n› 1. Yes"
-        ));
-        assert!(!codex_pane_is_idle("› user draft"));
+        assert_eq!(
+            idle_composer("output\n› Ask Codex to do anything"),
+            Some(Composer::Fresh)
+        );
+        // Codex 0.163 changes the placeholder once a thread has history.
+        assert_eq!(
+            idle_composer("history\n› Ask a follow-up question\n  gpt · 80% left"),
+            Some(Composer::FollowUp)
+        );
+        for busy in [
+            "Working (esc to interrupt)\n› Ask Codex to do anything",
+            "Working (Esc to interrupt)\n› Ask a follow-up question",
+            "› Ask Codex to do anything\nAllow command?\n› 1. Yes",
+            "› Ask a follow-up question\nAllow command?\n› 1. Yes",
+            "› user draft",
+            "› Ask a follow-up question and more",
+            "",
+        ] {
+            assert_eq!(idle_composer(busy), None, "{busy}");
+        }
+    }
+
+    /// Isolated Codex home, tmux server and optional fake app-server. Paths
+    /// live under /tmp so Unix socket names stay within the platform limit.
+    struct Fixture {
+        _root: tempfile::TempDir,
+        root: PathBuf,
+        cwd: PathBuf,
+        paths: CodexPaths,
+        tmux: TmuxClient,
+        cancel: CancellationToken,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let cwd = root.join("feature");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let paths = CodexPaths::new(&root, root.join("cache")).with_codex_home(root.join("c"));
+            let tmux = TmuxClient::new(
+                ProcessRunner::default(),
+                wt_tmux::TmuxServer::at(root.join("tmux.sock")).with_config_file("/dev/null"),
+            );
+            Self {
+                _root: dir,
+                root,
+                cwd,
+                paths,
+                tmux,
+                cancel: CancellationToken::new(),
+            }
+        }
+
+        fn messenger(&self) -> CodexMessenger {
+            CodexMessenger::new(
+                self.paths.clone(),
+                ProcessRunner::default(),
+                self.tmux.clone(),
+            )
+        }
+
+        fn target(&self, text: &str) -> CodexMessageTarget {
+            CodexMessageTarget {
+                slug: "feature".into(),
+                cwd: self.cwd.clone(),
+                managed_name: None,
+                text: text.into(),
+            }
+        }
+
+        /// A stand-in Codex TUI: prints `screen`, then echoes typed input.
+        /// A copy of a system tool whose process name is `codex`, so process
+        /// evidence sees a Codex TUI without running Codex.
+        fn codex_bin(&self, tool: &str, dir: &str) -> PathBuf {
+            let path = self.root.join(dir).join("codex");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if !path.exists() {
+                std::fs::copy(tool, &path).unwrap();
+            }
+            path
+        }
+
+        async fn slot(&self, screen: &str, stamp: Option<&str>) -> wt_tmux::SessionInfo {
+            let tui = self.codex_bin("/bin/cat", "tui");
+            self.slot_running(screen, stamp, &tui.to_string_lossy())
+                .await
+        }
+
+        async fn slot_running(
+            &self,
+            screen: &str,
+            stamp: Option<&str>,
+            program: &str,
+        ) -> wt_tmux::SessionInfo {
+            let script = self.root.join("screen.txt");
+            std::fs::write(&script, screen).unwrap();
+            self.tmux
+                .create_session(
+                    &wt_tmux::CreateSession {
+                        name: "feature-codex".into(),
+                        cwd: self.cwd.clone(),
+                        command: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            format!("cat '{}'; exec '{program}'", script.display()),
+                        ],
+                        width: Some(120),
+                        height: Some(30),
+                    },
+                    &self.cancel,
+                )
+                .await
+                .unwrap();
+            if let Some(stamp) = stamp {
+                self.tmux
+                    .set_option(
+                        &OptionScope::Session("feature-codex".into()),
+                        "@wt-harness-session-id",
+                        Some(stamp),
+                        &self.cancel,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let last = screen.lines().last().unwrap_or_default().to_owned();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !self.pane().await.contains(&last) {
+                assert!(tokio::time::Instant::now() < deadline, "slot did not start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.live().await.unwrap()
+        }
+
+        async fn live(&self) -> Option<wt_tmux::SessionInfo> {
+            self.tmux
+                .list_sessions(&self.cancel)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == "feature-codex")
+        }
+
+        async fn pane(&self) -> String {
+            self.tmux
+                .capture_pane(
+                    &PaneTarget::active_session_pane("feature-codex"),
+                    Some(40),
+                    &self.cancel,
+                )
+                .await
+                .unwrap_or_default()
+        }
+
+        /// A rollout created `age_secs` before now, owned by `cwd`.
+        fn rollout(&self, id: &str, cwd: &Path, age_secs: i64) {
+            let created = time::OffsetDateTime::now_utc() - time::Duration::seconds(age_secs);
+            let stamp = created
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let path = self
+                .paths
+                .sessions_dir()
+                .join("2026/10/16")
+                .join(format!("rollout-{id}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":id,"timestamp":stamp,"cwd":cwd.to_string_lossy(),"originator":"codex-tui","thread_source":"user"}});
+            let done = serde_json::json!({"type":"event_msg","timestamp":stamp,"payload":{"type":"task_complete"}});
+            std::fs::write(&path, format!("{header}\n{done}\n")).unwrap();
+        }
+
+        async fn close(self) {
+            let _ = self.tmux.kill_server(&self.cancel).await;
+        }
+    }
+
+    /// Fake daemon accepting one queue/add + queue/start per connection and
+    /// recording every request's method and thread.
+    type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    fn fake_app_server(paths: &CodexPaths) -> (RequestLog, tokio::task::JoinHandle<()>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let socket = paths.app_server_socket();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let method = request["method"].as_str().unwrap_or_default().to_owned();
+                        log.lock().unwrap().push((
+                            method.clone(),
+                            request["params"]["threadId"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        ));
+                        let result = match method.as_str() {
+                            "initialize" => {
+                                serde_json::json!({"userAgent":"fake/0.163.0","codexHome":"/fake"})
+                            }
+                            "thread/queue/add" => serde_json::json!({"queuedSubmission":{
+                                "id":"sub-1",
+                                "clientUserMessageId":request["params"]["clientUserMessageId"],
+                                "input":request["params"]["input"]}}),
+                            "thread/queue/start" => serde_json::json!({}),
+                            _ => continue,
+                        };
+                        let reply =
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+                        ws.send(Message::Text(reply.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        (seen, task)
+    }
+
+    fn queued_to(seen: &std::sync::Mutex<Vec<(String, String)>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "thread/queue/add")
+            .map(|(_, thread)| thread.clone())
+            .collect()
+    }
+
+    #[test]
+    fn launched_thread_discovery_needs_one_post_launch_rollout_of_this_slot() {
+        let fixture = Fixture::new();
+        let harness = CodexHarness::new(
+            fixture.paths.clone(),
+            ProcessRunner::default(),
+            fixture.tmux.clone(),
+        );
+        let launched = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+        let none = HashSet::new();
+        let found = |claimed: &HashSet<String>| {
+            harness
+                .launched_threads_sync(&fixture.cwd, "feature", launched, claimed)
+                .unwrap()
+        };
+        assert_eq!(found(&none), CodexLaunchedThreads::None);
+        // Conversations created before the slot started, or for another
+        // checkout, are never candidates.
+        fixture.rollout("old", &fixture.cwd, 3600);
+        fixture.rollout("elsewhere", &fixture.root.join("other"), 1);
+        assert_eq!(found(&none), CodexLaunchedThreads::None);
+        fixture.rollout("new", &fixture.cwd, 1);
+        assert_eq!(found(&none), CodexLaunchedThreads::One("new".into()));
+        // A second conversation since launch (for example `/new`) is ambiguous
+        // unless another live slot already owns it.
+        fixture.rollout("second", &fixture.cwd, 1);
+        assert_eq!(
+            found(&none),
+            CodexLaunchedThreads::Ambiguous(vec!["new".into(), "second".into()])
+        );
+        assert_eq!(
+            found(&HashSet::from(["second".to_owned()])),
+            CodexLaunchedThreads::One("new".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn unstamped_live_slot_discovers_its_new_thread_and_queues_natively() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        fixture
+            .slot("history\n› Ask a follow-up question\n", None)
+            .await;
+        fixture.rollout("old-thread", &fixture.cwd, 3600);
+        fixture.rollout("new-thread", &fixture.cwd, 0);
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("Address review"), &fixture.cancel)
+            .await
+            .unwrap();
+        let stamp = fixture.live().await.unwrap().harness_session_id;
+        let pane = fixture.pane().await;
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(outcome, CodexMessageOutcome::Queued(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(queued_to(&seen), ["new-thread"]);
+        assert_eq!(stamp.as_deref(), Some("new-thread"));
+        assert!(!pane.contains("Address review"));
+    }
+
+    #[tokio::test]
+    async fn stamped_resumed_thread_is_addressed_without_discovery() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        // A resumed conversation predates its slot; its stamp is the proof.
+        fixture.rollout("resumed", &fixture.cwd, 3600);
+        fixture.rollout("newer", &fixture.cwd, 0);
+        fixture
+            .slot("history\n› Ask a follow-up question\n", Some("resumed"))
+            .await;
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("hello"), &fixture.cancel)
+            .await
+            .unwrap();
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(outcome, CodexMessageOutcome::Queued(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(queued_to(&seen), ["resumed"]);
+    }
+
+    #[tokio::test]
+    async fn stale_stamp_for_another_checkout_is_refused_before_any_write() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        fixture.rollout("foreign", &fixture.root.join("other"), 60);
+        fixture
+            .slot("history\n› Ask a follow-up question\n", Some("foreign"))
+            .await;
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("DO NOT SEND"), &fixture.cancel)
+            .await
+            .unwrap();
+        let pane = fixture.pane().await;
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(&outcome, CodexMessageOutcome::Failed { reason }
+                if reason.contains("foreign") && reason.contains("Nothing was sent")),
+            "{outcome:?}"
+        );
+        assert!(queued_to(&seen).is_empty());
+        assert!(!pane.contains("DO NOT SEND"));
+    }
+
+    #[tokio::test]
+    async fn missing_identity_fails_fast_without_typing() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        // A conversation with history whose UUID was never published.
+        fixture
+            .slot("history\n› Ask a follow-up question\n", None)
+            .await;
+        let started = tokio::time::Instant::now();
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("DO NOT TYPE"), &fixture.cancel)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let pane = fixture.pane().await;
+        let stamp = fixture.live().await.unwrap().harness_session_id;
+
+        // Two conversations started since launch cannot name the slot either.
+        fixture.rollout("first", &fixture.cwd, 0);
+        fixture.rollout("second", &fixture.cwd, 0);
+        let ambiguous = fixture
+            .messenger()
+            .send_target(&fixture.target("DO NOT TYPE"), &fixture.cancel)
+            .await
+            .unwrap();
+        let pane_after = fixture.pane().await;
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(&outcome, CodexMessageOutcome::Failed { reason }
+                if reason.contains("no proven thread UUID")
+                    && reason.contains("Nothing was sent")
+                    && reason.contains("session picker")
+                    && !reason.contains("idle")),
+            "{outcome:?}"
+        );
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        assert!(
+            matches!(&ambiguous, CodexMessageOutcome::Failed { reason }
+                if reason.contains("2 conversations") && reason.contains("Nothing was sent")),
+            "{ambiguous:?}"
+        );
+        assert_eq!(stamp, None);
+        assert!(queued_to(&seen).is_empty());
+        assert!(!pane.contains("DO NOT TYPE"));
+        assert!(!pane_after.contains("DO NOT TYPE"));
+    }
+
+    #[tokio::test]
+    async fn empty_new_conversation_without_a_thread_accepts_terminal_input() {
+        let fixture = Fixture::new();
+        fixture.slot("› Ask Codex to do anything\n", None).await;
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("first prompt"), &fixture.cancel)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !fixture.pane().await.contains("first prompt") {
+            assert!(tokio::time::Instant::now() < deadline, "input not typed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fixture.close().await;
+        assert!(
+            matches!(
+                outcome,
+                CodexMessageOutcome::Terminal {
+                    cold_started: false,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_uuid_publication_is_discovered_and_stamped() {
+        let fixture = Fixture::new();
+        // The opening prompt ran; its rollout is published only later.
+        fixture
+            .slot("startup prompt\n› Ask a follow-up question\n", None)
+            .await;
+        let messenger = fixture.messenger();
+        let publish = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            fixture.rollout("late", &fixture.cwd, 0);
+        };
+        let (launched, ()) = tokio::join!(
+            messenger.await_launched_identity(
+                "feature-codex",
+                &fixture.cwd,
+                "feature",
+                false,
+                &fixture.cancel,
+            ),
+            publish
+        );
+        let stamp = fixture.live().await.unwrap().harness_session_id;
+        fixture.close().await;
+        assert_eq!(launched.unwrap(), Launched::Known("late".into()));
+        assert_eq!(stamp.as_deref(), Some("late"));
+    }
+
+    #[tokio::test]
+    async fn opening_prompt_launch_never_types_into_a_fresh_composer() {
+        let fixture = Fixture::new();
+        fixture.slot("› Ask Codex to do anything\n", None).await;
+        let messenger = fixture.messenger();
+        // Bound the 30s wait; the result must not be FreshComposer before it.
+        let launched = tokio::time::timeout(
+            Duration::from_secs(1),
+            messenger.await_launched_identity(
+                "feature-codex",
+                &fixture.cwd,
+                "feature",
+                false,
+                &fixture.cancel,
+            ),
+        )
+        .await;
+        let allowed = messenger
+            .await_launched_identity(
+                "feature-codex",
+                &fixture.cwd,
+                "feature",
+                true,
+                &fixture.cancel,
+            )
+            .await
+            .unwrap();
+        fixture.close().await;
+        assert!(launched.is_err(), "{launched:?}");
+        assert_eq!(allowed, Launched::FreshComposer);
+    }
+
+    #[tokio::test]
+    async fn exact_thread_mismatch_is_refused_immediately_without_typing() {
+        let fixture = Fixture::new();
+        fixture.rollout("expected", &fixture.cwd, 60);
+        fixture
+            .slot("history\n› Ask a follow-up question\n", Some("other"))
+            .await;
+        let started = tokio::time::Instant::now();
+        let outcome = fixture
+            .messenger()
+            .terminal_fallback(
+                "feature-codex",
+                &fixture.cwd,
+                "feature",
+                Expect::Thread("expected"),
+                "/compact",
+                false,
+                "test",
+                &fixture.cancel,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let pane = fixture.pane().await;
+        fixture.close().await;
+        assert!(
+            matches!(&outcome, CodexMessageOutcome::Failed { reason }
+                if reason.contains("not thread expected") && reason.contains("Nothing was sent")),
+            "{outcome:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert!(!pane.contains("/compact"));
+    }
+
+    #[tokio::test]
+    async fn exact_thread_on_follow_up_composer_accepts_a_command() {
+        let fixture = Fixture::new();
+        fixture.rollout("expected", &fixture.cwd, 60);
+        fixture
+            .slot("history\n› Ask a follow-up question\n", Some("expected"))
+            .await;
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("/compact"), &fixture.cancel)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !fixture.pane().await.contains("/compact") {
+            assert!(tokio::time::Instant::now() < deadline, "command not typed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fixture.close().await;
+        assert!(
+            matches!(outcome, CodexMessageOutcome::Terminal { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_codex_in_the_same_checkout_blocks_discovery() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        fixture
+            .slot("history\n› Ask a follow-up question\n", None)
+            .await;
+        // A hand-run Codex TUI in the same worktree, outside wt's pane, could
+        // have created the only new rollout.
+        let foreign_bin = fixture.codex_bin("/bin/sleep", "foreign");
+        let mut foreign = std::process::Command::new(&foreign_bin)
+            .arg("30")
+            .current_dir(&fixture.cwd)
+            .spawn()
+            .unwrap();
+        fixture.rollout("someone-elses", &fixture.cwd, 0);
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("DO NOT SEND"), &fixture.cancel)
+            .await
+            .unwrap();
+        let stamp = fixture.live().await.unwrap().harness_session_id;
+        let pane = fixture.pane().await;
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(&outcome, CodexMessageOutcome::Failed { reason }
+                if reason.contains("another Codex process")
+                    && reason.contains(&foreign.id().to_string())
+                    && reason.contains("Nothing was sent")),
+            "{outcome:?}"
+        );
+        assert_eq!(stamp, None);
+        assert!(queued_to(&seen).is_empty());
+        assert!(!pane.contains("DO NOT SEND"));
+    }
+
+    #[tokio::test]
+    async fn foreign_rollouts_and_non_codex_panes_are_never_stamped() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        // A desktop-app conversation in this checkout is not a TUI rollout.
+        fixture
+            .slot_running("history\n› Ask a follow-up question\n", None, "cat")
+            .await;
+        let path = fixture
+            .paths
+            .sessions_dir()
+            .join("2026/10/16/rollout-desktop.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let stamp = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":"desktop","timestamp":stamp,"cwd":fixture.cwd.to_string_lossy(),"originator":"Codex Desktop","thread_source":"user"}});
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let desktop = fixture
+            .messenger()
+            .send_target(&fixture.target("DO NOT SEND"), &fixture.cancel)
+            .await
+            .unwrap();
+        // A TUI rollout cannot be attributed to a pane that runs no Codex.
+        fixture.rollout("tui-thread", &fixture.cwd, 0);
+        let no_tui = fixture
+            .messenger()
+            .send_target(&fixture.target("DO NOT SEND"), &fixture.cancel)
+            .await
+            .unwrap();
+        let live_stamp = fixture.live().await.unwrap().harness_session_id;
+        server.abort();
+        fixture.close().await;
+        for outcome in [&desktop, &no_tui] {
+            assert!(
+                matches!(outcome, CodexMessageOutcome::Failed { reason }
+                    if reason.contains("Nothing was sent")),
+                "{outcome:?}"
+            );
+        }
+        assert!(
+            matches!(&no_tui, CodexMessageOutcome::Failed { reason }
+                if reason.contains("not running a Codex TUI")),
+            "{no_tui:?}"
+        );
+        assert_eq!(live_stamp, None);
+        assert!(queued_to(&seen).is_empty());
+    }
+
+    #[test]
+    fn process_trees_ignore_the_shared_app_server_daemon() {
+        let rows = parse_processes(
+            "10 1 sh sh -c x\n11 10 codex /bin/codex\n12 11 node node x\n20 1 codex /bin/codex app-server --listen unix://\nbad\n",
+        );
+        assert_eq!(descendants(&rows, 10), HashSet::from([10, 11, 12]));
+        let tuis = rows
+            .iter()
+            .filter(|row| row.is_codex_tui())
+            .map(|row| row.pid)
+            .collect::<Vec<_>>();
+        assert_eq!(tuis, [11]);
     }
 }

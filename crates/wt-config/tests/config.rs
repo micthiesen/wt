@@ -159,6 +159,42 @@ fn only_supported_session_harnesses_are_accepted_and_one_must_remain_visible() {
 }
 
 #[test]
+fn wt_session_harness_is_opt_in_validated_and_must_stay_visible() {
+    let root = tempfile::tempdir().unwrap();
+    let opts = options(root.path(), root.path(), &[]);
+    let base = minimal_config(root.path());
+    let unset = Config::from_raw(toml_value(&base), &opts).unwrap();
+    assert_eq!(unset.harness.wt_session, None);
+
+    let pinned =
+        format!("{base}\n[harness]\nprimary = 'codex'\nhidden = ['pi']\nwt_session = 'claude'\n");
+    let config = Config::from_raw(toml_value(&pinned), &opts).unwrap();
+    assert_eq!(config.harness.primary, HarnessId::Codex);
+    assert_eq!(config.harness.wt_session, Some(HarnessId::Claude));
+
+    let empty = format!("{base}\n[harness]\nwt_session = ''\n");
+    assert_eq!(
+        Config::from_raw(toml_value(&empty), &opts)
+            .unwrap()
+            .harness
+            .wt_session,
+        None
+    );
+
+    let unknown = format!("{base}\n[harness]\nwt_session = 'gpt'\n");
+    let error = Config::from_raw(toml_value(&unknown), &opts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("harness.wt_session"), "{error}");
+
+    let hidden = format!("{base}\n[harness]\nhidden = ['codex']\nwt_session = 'codex'\n");
+    let error = Config::from_raw(toml_value(&hidden), &opts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("harness.wt_session"), "{error}");
+}
+
+#[test]
 fn defaults_are_typed_and_repository_derived() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

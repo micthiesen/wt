@@ -246,3 +246,63 @@ async fn diff_stats_skip_untracked_paths_that_are_not_regular_files() {
     assert_eq!(diff.untracked_lines, 3);
     assert!(diff.untracked_files >= 2);
 }
+
+#[tokio::test]
+async fn broken_rift_clone_is_a_row_error_not_an_inventory_failure() {
+    let (_scratch, runner, main, root) = fixture().await;
+    let linked = root.join("linked");
+    git(
+        &runner,
+        &main,
+        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+    )
+    .await;
+    let rift = root.join("rift healthy");
+    git(
+        &runner,
+        &main,
+        &["clone", main.to_str().unwrap(), rift.to_str().unwrap()],
+    )
+    .await;
+    tokio::fs::write(rift.join(".rift"), "rift marker\n")
+        .await
+        .unwrap();
+    // A half-deleted clone: the marker survives, its Git directory does not.
+    let broken = root.join("rift broken");
+    tokio::fs::create_dir_all(&broken).await.unwrap();
+    tokio::fs::write(broken.join(".rift"), "rift marker\n")
+        .await
+        .unwrap();
+
+    let service = repository(main.clone(), root.clone(), runner.clone());
+    let cancel = CancellationToken::new();
+    let inventory = service.inventory(&cancel).await.unwrap();
+    let paths = |name: &std::path::Path| {
+        let name = std::fs::canonicalize(name).unwrap();
+        inventory
+            .iter()
+            .any(|record| record.target.path == name.to_string_lossy())
+    };
+    assert!(paths(&main), "{inventory:#?}");
+    assert!(paths(&linked), "{inventory:#?}");
+    assert!(paths(&rift), "{inventory:#?}");
+    assert!(paths(&broken), "{inventory:#?}");
+    let rows = service.inventory_status(&cancel).await.unwrap();
+    let broken_canonical = std::fs::canonicalize(&broken).unwrap();
+    let broken_row = rows
+        .iter()
+        .find(|row| row.worktree.target.path == broken_canonical.to_string_lossy())
+        .unwrap();
+    assert!(broken_row.error.is_some() && broken_row.status.is_none());
+    assert!(
+        rows.iter()
+            .filter(|row| row.worktree.target.path != broken_canonical.to_string_lossy())
+            .all(|row| row.error.is_none()),
+        "{rows:#?}"
+    );
+
+    // Once it is gone entirely, it is simply absent.
+    tokio::fs::remove_dir_all(&broken).await.unwrap();
+    let inventory = service.inventory(&cancel).await.unwrap();
+    assert_eq!(inventory.len(), 3, "{inventory:#?}");
+}

@@ -145,10 +145,20 @@ and it drives the rest of the design:
   `kind` freely; each checkout is torn down by whatever created it.
   After switching to `git-worktree`, legacy Rift clones can also be removed
   after uninstalling Rift. The same dirty/unpushed/revision guards and lifecycle
-  lock apply, followed by native recursive removal at background priority.
-  wt verifies a real checkout directory, independent `.git` directory and
-  regular `.rift` marker before deletion. It never follows a marker or Git
-  metadata symlink, and never deletes a linked worktree through this path.
+  lock apply. wt verifies a real checkout directory, independent `.git`
+  directory and regular `.rift` marker before deletion. It never follows a
+  marker or Git metadata symlink, and never deletes a linked worktree through
+  this path. Before the final revision check, removal takes the clone's
+  maintenance lock, so background origin sync skips it and any in-flight sync
+  finishes first; after the check it stops the checkout's `git fsmonitor--daemon`
+  when one is listening. The verified directory is then renamed to a
+  `.wt-removing-<slug>-…` sibling (inventory ignores these) and deleted with
+  `rm -rf` at utility QoS. Only a pure `Directory not empty` failure, meaning
+  something created entries mid-deletion, is retried, a bounded number of
+  times. If the quarantine still cannot be deleted, the removal still
+  succeeds and is recorded, and a warning in the job log and attention feed
+  names the quarantine path to delete by hand. If the rename itself
+  fails or the moved directory is not the verified one, nothing is deleted.
   The removal process remains owned and awaited once deletion starts. Rift's
   global registry is left untouched; if Rift is reinstalled, its `gc` prunes
   missing registrations. While `kind = "rift"`, removal still uses Rift itself
@@ -199,7 +209,8 @@ both have shipped as bugs:
 
 **Fix the REF, not each reader.** `fetch_origin` ends by pointing every
 worktree's own `origin/<trunk>` at the tip the main clone just fetched
-(`freshen_rift_trunk`). Everything keyed to the base reads that
+(`freshen_rift_trunk`), skipping any clone whose removal holds its
+maintenance lock. Everything keyed to the base reads that
 ref: the ahead/behind counts, the pre-PR row title (the oldest commit
 in `base..HEAD`, which otherwise becomes a colleague's commit), the
 diff context the AI summary is generated from, the git row's

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
@@ -24,8 +25,9 @@ struct RunningAction {
     lane: Lane,
     request_id: u64,
     generation: u64,
-    name: &'static str,
+    name: Cow<'static, str>,
     target: Option<String>,
+    pr: Option<u64>,
     started: Instant,
     preparation: bool,
 }
@@ -33,9 +35,22 @@ struct RunningAction {
 #[derive(Clone)]
 struct ActionLogContext {
     operation_id: u64,
-    operation: &'static str,
+    operation: Cow<'static, str>,
     host: String,
     target: Option<String>,
+    pr: Option<u64>,
+}
+
+impl ActionLogContext {
+    fn for_action(operation_id: u64, action: &wt_tui::UiAction, lane: &Lane) -> Self {
+        Self {
+            operation_id,
+            operation: action_name(action),
+            host: lane_host(lane).to_owned(),
+            target: action_target(action),
+            pr: action_pr(action),
+        }
+    }
 }
 
 impl Controller {
@@ -88,15 +103,10 @@ pub fn start(
                 let replies = port.replies.clone();
                 let shutdown = shutdown.clone();
                 let task_lane = lane.clone();
-                let operation_name = action_name(&command);
                 let is_preparation = command.is_preparation();
-                let operation_target = action_target(&command);
-                let log_context = ActionLogContext {
-                    operation_id: id,
-                    operation: operation_name,
-                    host: lane_host(&task_lane).to_owned(),
-                    target: operation_target.clone(),
-                };
+                let log_context = ActionLogContext::for_action(id, &command, &task_lane);
+                let (operation_name, operation_target, operation_pr) =
+                    (log_context.operation.clone(), log_context.target.clone(), log_context.pr);
                 let task = running.spawn(async move {
                     let retry = create_retry(&command);
                     let request_replies = RequestReplies { sender: replies, id, generation };
@@ -127,6 +137,7 @@ pub fn start(
                     generation,
                     name: operation_name,
                     target: operation_target,
+                    pr: operation_pr,
                     started: accepted_at,
                     preparation: is_preparation,
                 });
@@ -151,9 +162,10 @@ pub fn start(
                         {
                             tracing::warn!(
                                 operation_id = active.request_id,
-                                operation = active.name,
+                                operation = %active.name,
                                 host = lane_host(&active.lane),
                                 target = active.target.as_deref().unwrap_or("-"),
+                                pr = active.pr,
                                 uncertain = reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain),
                                 "action worker returned a failed or unconfirmed outcome"
                             );
@@ -172,9 +184,10 @@ pub fn start(
                             let reply = worker_panic_reply(&active, &error.to_string());
                             let log_context = ActionLogContext {
                                 operation_id: active.request_id,
-                                operation: active.name,
+                                operation: active.name.clone(),
                                 host: lane_host(&active.lane).to_owned(),
                                 target: active.target.clone(),
+                                pr: active.pr,
                             };
                             log_action_outcome(
                                 Some(&log_context),
@@ -243,7 +256,10 @@ pub fn start(
                             let blocker = task_lanes.values().find(|active| lanes_conflict(lane, &active.lane));
                             let reason = blocker.map_or_else(
                                 || "waiting for command capacity".to_owned(),
-                                |active| format!("waiting for {} on {}", active.name, lane_host(&active.lane)),
+                                |active| {
+                                    let target = active.target.as_deref().map(|target| format!(" for {target}")).unwrap_or_default();
+                                    format!("waiting for {}{target} on {}", active.name, lane_host(&active.lane))
+                                },
                             );
                             let _ = port.replies.try_send(progress_reply(
                                 request.id, request.generation,
@@ -296,7 +312,10 @@ pub(crate) enum Lane {
     /// prefetch). One runs at a time beside foreground preparations, never
     /// taking their slot or ordinary host capacity.
     Prefetch(Option<String>),
-    FleetCleanup,
+    /// One accepted cleanup confirmation, which may span several hosts. It
+    /// owns exactly the checkouts it removes, as `(host, slug)` pairs, so
+    /// unrelated checkouts stay available while each teardown runs.
+    FleetCleanup(BTreeSet<(Option<String>, String)>),
     Presentation,
     /// Bounded, device-local controls must remain responsive while host jobs
     /// or interactive handoffs occupy all ordinary action slots.
@@ -306,59 +325,215 @@ pub(crate) enum Lane {
     Terminal(Option<String>, Option<String>),
 }
 
-fn action_name(action: &wt_tui::UiAction) -> &'static str {
+/// The operation a log line or progress notice names. Exhaustive so each new
+/// action declares how it is attributed instead of logging "host action".
+fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
+    use wt_tui::UiAction as A;
+    Cow::Borrowed(match action {
+        A::OnHost { action, .. } => return action_name(action),
+        A::RunAction { id, .. } => return Cow::Owned(format!("run action {id}")),
+        A::PrepareAction { id, .. } => return Cow::Owned(format!("prepare action {id}")),
+        A::ManagedSignIn { provider, .. } => return Cow::Owned(format!("sign in to {provider}")),
+        A::Create { .. } | A::CreateResolved { .. } => "create worktree",
+        A::Remove { .. } => "remove worktree",
+        A::DismissFailedRemoval { .. } => "dismiss failed removal",
+        A::Cleanup { .. } | A::CleanupTargets { .. } => "clean worktrees",
+        A::PrepareCreate { .. } => "prepare worktree creation",
+        A::PrepareRemove { .. } => "prepare worktree removal",
+        A::PrepareCleanup => "prepare worktree cleanup",
+        A::PrepareGithub { .. } => "prepare GitHub action",
+        A::PrepareReviewers { .. } => "prepare reviewer picker",
+        A::PrepareReviewCheckout { .. } => "prepare review checkout",
+        A::PrepareRestoreRemoved { .. } => "prepare worktree restore",
+        A::PrepareHardRefresh => "prepare cache refresh",
+        A::PrepareActions { .. } => "prepare action palette",
+        A::WarmPalette { .. } => "prefetch action palette",
+        A::PrepareSection { .. } => "prepare section picker",
+        A::PrepareStatus { .. } => "prepare status picker",
+        A::PrepareBase { .. } => "prepare fork base picker",
+        A::PrepareSessions { .. } => "prepare session picker",
+        A::DiscoverSessions { .. } => "discover sessions",
+        A::PrepareHarnesses { .. } => "prepare harness picker",
+        A::PrepareStopTerminal { .. } => "prepare session stop",
+        A::GithubFailedChecks { .. } => "load failed checks",
+        A::ResolveCreation { .. } => "resolve worktree creation",
+        A::SetTitle { .. } => "save title",
+        A::GenerateTitle { .. } => "generate title",
+        A::SetStatus { .. } => "save status",
+        A::SetIssueOverride { .. } => "save issue",
+        A::SetBase { .. } => "save fork base",
+        A::CyclePrimary => "change default harness",
+        A::ToggleAutomations { .. } | A::ToggleRemovedAutomations { .. } => {
+            "change automation preference"
+        }
+        A::CancelAutomations => "cancel queued automations",
+        A::GithubMarkReady { .. } => "mark pull request ready",
+        A::GithubSetAutoMerge { .. } => "change pull request auto-merge",
+        A::GithubShip { .. } => "ship pull request",
+        A::SubmitReviewers { .. } => "request reviewers",
+        A::DismissReviewRequest { .. } => "dismiss review request",
+        A::ReviewCheckout { .. } => "check out review",
+        A::RestoreRemoved { .. } => "restore worktree",
+        A::Restack { .. } => "restack",
+        A::KillAction { .. } => "stop action",
+        A::HardRefresh => "refresh caches",
+        A::SetAttentionSeen { .. } => "acknowledge attention",
+        A::SetHistoryActive { .. } => "change history view",
+        A::SetPerf { .. } => "change performance view",
+        A::PerfInvestigate { .. } => "investigate performance",
+        A::OpenLink { .. } | A::OpenPrLink { .. } | A::OpenPrDefault { .. } | A::OpenUrl { .. } => {
+            "open link"
+        }
+        A::OpenSlotEditor { .. } | A::OpenEditor { .. } => "open editor",
+        A::Copy { .. } => "copy",
+        A::FoldSection { .. } => "fold section",
+        A::MoveSection { .. } => "move to section",
+        A::Reorder { .. } => "reorder",
+        A::RenameSection { .. } => "rename section",
+        A::ToggleArchive { .. } => "toggle archive",
+        A::Session { .. } | A::EnterHarness { .. } | A::SelectSession { .. } => "open session",
+        A::StopTerminal { .. } | A::StopSession { .. } => "stop session",
+        A::KillSession { .. } => "kill session",
+    })
+}
+
+/// The pull request a GitHub write was pinned to, for log attribution.
+fn action_pr(action: &wt_tui::UiAction) -> Option<u64> {
+    use wt_tui::UiAction as A;
     match action {
-        wt_tui::UiAction::OnHost { action, .. } => action_name(action),
-        wt_tui::UiAction::Create { .. } | wt_tui::UiAction::CreateResolved { .. } => {
-            "create worktree"
-        }
-        wt_tui::UiAction::Remove { .. } => "remove worktree",
-        wt_tui::UiAction::Cleanup { .. } | wt_tui::UiAction::CleanupTargets { .. } => {
-            "clean worktrees"
-        }
-        wt_tui::UiAction::PrepareCreate { .. } => "prepare worktree creation",
-        wt_tui::UiAction::PrepareRemove { .. } => "prepare worktree removal",
-        wt_tui::UiAction::PrepareCleanup => "prepare worktree cleanup",
-        wt_tui::UiAction::PrepareGithub { .. } => "prepare GitHub action",
-        wt_tui::UiAction::PrepareSessions { .. } => "prepare session picker",
-        wt_tui::UiAction::PrepareHarnesses { .. } => "prepare harness picker",
-        wt_tui::UiAction::ResolveCreation { .. } => "resolve worktree creation",
-        wt_tui::UiAction::SetTitle { .. } => "save title",
-        wt_tui::UiAction::GenerateTitle { .. } => "generate title",
-        wt_tui::UiAction::SetStatus { .. } => "save status",
-        wt_tui::UiAction::SetIssueOverride { .. } => "save issue",
-        wt_tui::UiAction::CyclePrimary => "change default harness",
-        wt_tui::UiAction::ToggleAutomations { .. }
-        | wt_tui::UiAction::ToggleRemovedAutomations { .. } => "change automation preference",
-        wt_tui::UiAction::CancelAutomations => "cancel queued automations",
-        wt_tui::UiAction::GithubMarkReady { .. } => "mark pull request ready",
-        wt_tui::UiAction::GithubSetAutoMerge { .. } => "change pull request auto-merge",
-        wt_tui::UiAction::HardRefresh => "refresh caches",
-        wt_tui::UiAction::Session { .. }
-        | wt_tui::UiAction::EnterHarness { .. }
-        | wt_tui::UiAction::SelectSession { .. } => "open session",
-        _ => "host action",
+        A::OnHost { action, .. } => action_pr(action),
+        A::GithubMarkReady { pin, .. }
+        | A::GithubSetAutoMerge { pin, .. }
+        | A::GithubShip { pin, .. } => pin.as_ref().map(|pin| pin.number),
+        A::SubmitReviewers { pr_number, .. } => Some(*pr_number),
+        _ => None,
     }
 }
 
+/// The worktree (or session slot) an action is about. Exhaustive so each new
+/// action declares its target instead of logging "-".
 fn action_target(action: &wt_tui::UiAction) -> Option<String> {
-    let key = match action {
-        wt_tui::UiAction::OnHost { action, .. } => return action_target(action),
-        wt_tui::UiAction::Remove { key, .. } | wt_tui::UiAction::PrepareRemove { key } => key,
-        wt_tui::UiAction::SetTitle { key, .. }
-        | wt_tui::UiAction::GenerateTitle { key }
-        | wt_tui::UiAction::SetStatus { key, .. }
-        | wt_tui::UiAction::SetIssueOverride { key, .. }
-        | wt_tui::UiAction::EnterHarness { key, .. } => key,
-        wt_tui::UiAction::Session { key, .. } => key.as_ref()?,
-        wt_tui::UiAction::SelectSession { selection } => selection.key.as_ref()?,
-        wt_tui::UiAction::CreateResolved { plan } => &plan.key,
-        _ => return None,
+    use wt_tui::UiAction as A;
+    let surface_key = |surface: &wt_tui::ActionSurface| -> Result<Option<String>, String> {
+        match surface {
+            wt_tui::ActionSurface::Row { key } => Ok(Some(key.clone())),
+            wt_tui::ActionSurface::Manager { key: Some(key) } => Ok(Some(key.clone())),
+            wt_tui::ActionSurface::Manager { key: None } => Err("manager".to_owned()),
+            wt_tui::ActionSurface::Slot { target } => Err(slot_label(target).to_owned()),
+        }
     };
+    let key = match action {
+        A::OnHost { action, .. } => return action_target(action),
+        A::RunAction { surface, .. }
+        | A::PrepareAction { surface, .. }
+        | A::PrepareActions { surface }
+        | A::WarmPalette { surface } => match surface_key(surface) {
+            Ok(key) => key?,
+            Err(label) => return Some(label),
+        },
+        A::Remove { key, .. }
+        | A::DismissFailedRemoval { key, .. }
+        | A::PrepareRemove { key }
+        | A::SetTitle { key, .. }
+        | A::GenerateTitle { key }
+        | A::SetStatus { key, .. }
+        | A::PrepareStatus { key }
+        | A::SetIssueOverride { key, .. }
+        | A::SetBase { key, .. }
+        | A::PrepareBase { key }
+        | A::EnterHarness { key, .. }
+        | A::PrepareHarnesses { key }
+        | A::StopTerminal { key, .. }
+        | A::PrepareStopTerminal { key, .. }
+        | A::GithubMarkReady { key, .. }
+        | A::GithubSetAutoMerge { key, .. }
+        | A::GithubShip { key, .. }
+        | A::GithubFailedChecks { key }
+        | A::PrepareGithub { key, .. }
+        | A::SubmitReviewers { key, .. }
+        | A::PrepareReviewers { key }
+        | A::Restack { key }
+        | A::RestoreRemoved { key, .. }
+        | A::PrepareRestoreRemoved { key }
+        | A::ToggleRemovedAutomations { key }
+        | A::ToggleArchive { key, .. }
+        | A::MoveSection { key, .. }
+        | A::OpenEditor { key }
+        | A::OpenUrl { key, .. } => key.clone(),
+        A::Session { key, .. }
+        | A::PrepareSessions { key, .. }
+        | A::DiscoverSessions { key, .. }
+        | A::ToggleAutomations { key, .. } => key.clone()?,
+        A::SelectSession { selection }
+        | A::StopSession { selection }
+        | A::KillSession { selection } => selection.key.clone()?,
+        A::CreateResolved { plan } => plan.key.clone(),
+        A::Cleanup { .. } | A::CleanupTargets { .. } => {
+            return cleanup_target_summary(action);
+        }
+        A::ReviewCheckout { branch, .. } | A::PrepareReviewCheckout { branch, .. } => {
+            return Some(branch.clone());
+        }
+        A::OpenSlotEditor { target } => return Some(slot_label(target).to_owned()),
+        // Section keys, URLs, inputs and device controls name no checkout.
+        A::PrepareCreate { .. }
+        | A::ResolveCreation { .. }
+        | A::Create { .. }
+        | A::ManagedSignIn { .. }
+        | A::PrepareHardRefresh
+        | A::HardRefresh
+        | A::SetAttentionSeen { .. }
+        | A::CancelAutomations
+        | A::SetHistoryActive { .. }
+        | A::SetPerf { .. }
+        | A::OpenLink { .. }
+        | A::OpenPrLink { .. }
+        | A::OpenPrDefault { .. }
+        | A::PerfInvestigate { .. }
+        | A::DismissReviewRequest { .. }
+        | A::KillAction { .. }
+        | A::FoldSection { .. }
+        | A::PrepareSection { .. }
+        | A::Reorder { .. }
+        | A::RenameSection { .. }
+        | A::CyclePrimary
+        | A::Copy { .. }
+        | A::PrepareCleanup => return None,
+    };
+    let key = &key;
     match wt_core::parse_worktree_ledger_key(key)? {
         wt_core::WorktreeRef::Local { slug } | wt_core::WorktreeRef::Remote { slug, .. } => {
             Some(slug)
         }
+    }
+}
+
+fn slot_label(target: &wt_tui::SessionTarget) -> &'static str {
+    match target {
+        wt_tui::SessionTarget::Harness => "harness",
+        wt_tui::SessionTarget::Shell => "shell",
+        wt_tui::SessionTarget::Diff => "diff",
+        wt_tui::SessionTarget::Manager => "manager",
+        wt_tui::SessionTarget::Main => "main",
+        wt_tui::SessionTarget::WtSource => "wt source",
+        wt_tui::SessionTarget::Dotfiles => "dotfiles",
+    }
+}
+
+fn cleanup_target_summary(action: &wt_tui::UiAction) -> Option<String> {
+    let Ok(Lane::FleetCleanup(targets)) = cleanup_lane(action, None) else {
+        return None;
+    };
+    match targets.len() {
+        0 => None,
+        1..=3 => Some(
+            targets
+                .into_iter()
+                .map(|(_, slug)| slug)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        count => Some(format!("{count} worktrees")),
     }
 }
 
@@ -384,7 +559,14 @@ fn lane_host(lane: &Lane) -> &str {
         | Lane::Preparation(None)
         | Lane::Prefetch(None)
         | Lane::Terminal(None, _) => "local host",
-        Lane::FleetCleanup => "local and remote hosts",
+        Lane::FleetCleanup(targets) => {
+            let mut hosts = targets.iter().map(|(host, _)| host.as_deref());
+            match hosts.next() {
+                Some(first) if hosts.all(|host| host == first) => first.unwrap_or("local host"),
+                Some(_) => "local and remote hosts",
+                None => "local host",
+            }
+        }
         Lane::Presentation | Lane::ViewControl => "local host",
     }
 }
@@ -503,7 +685,8 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         // A single confirmation can contain revisions from several hosts.
         // Serialize it as one accepted operation so shutdown drains the whole
         // fleet mutation and no second cleanup races its prepared revisions.
-        return Ok(Lane::FleetCleanup);
+        // It owns only the checkouts it removes; unrelated work proceeds.
+        return cleanup_lane(action, None);
     }
     let (host, action, _) =
         crate::host_routing::resolve(crate::host_dispatch::rename_as_title(action.clone()))?;
@@ -562,7 +745,7 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::PrepareStopTerminal { .. }
         | A::GithubFailedChecks { .. } => unreachable!("menu declaration handles preparations"),
         A::Create { .. } | A::CreateResolved { .. } => Lane::Creation(host),
-        A::Remove { key, .. } => Lane::Removal(host, key),
+        A::Remove { key, .. } | A::DismissFailedRemoval { key, .. } => Lane::Removal(host, key),
         A::SetTitle { key, .. }
         | A::GenerateTitle { key }
         | A::SetStatus { key, .. }
@@ -581,8 +764,43 @@ pub(crate) fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::Restack { .. }
         | A::ReviewCheckout { .. }
         | A::RestoreRemoved { .. } => Lane::Host(host),
-        A::Cleanup { .. } | A::CleanupTargets { .. } => Lane::FleetCleanup,
+        A::Cleanup { .. } | A::CleanupTargets { .. } => {
+            unreachable!("cleanup lanes are resolved before host routing")
+        }
     })
+}
+
+/// Collects the `(host, slug)` checkouts a cleanup removes, in the same form
+/// host routing gives Removal and Terminal lanes. Local keys inside an
+/// explicit `OnHost` wrapper belong to that host; on a worker they are local.
+fn cleanup_lane(action: &wt_tui::UiAction, explicit: Option<&str>) -> Result<Lane> {
+    let keys: Vec<&str> = match action {
+        wt_tui::UiAction::OnHost { host, action } => {
+            if matches!(**action, wt_tui::UiAction::OnHost { .. }) {
+                anyhow::bail!("nested host routing is not allowed");
+            }
+            return cleanup_lane(action, host.as_deref());
+        }
+        wt_tui::UiAction::CleanupTargets { targets } => {
+            targets.iter().map(|target| target.key.as_str()).collect()
+        }
+        wt_tui::UiAction::Cleanup { revisions } => revisions
+            .iter()
+            .map(|revision| revision.key.as_str())
+            .collect(),
+        _ => unreachable!("caller checked is_cleanup_action"),
+    };
+    let mut targets = BTreeSet::new();
+    for key in keys {
+        let target = match wt_core::parse_worktree_ledger_key(key)
+            .ok_or_else(|| anyhow::anyhow!("invalid worktree identity {key:?}"))?
+        {
+            wt_core::WorktreeRef::Local { slug } => (explicit.map(str::to_owned), slug),
+            wt_core::WorktreeRef::Remote { host, slug } => (Some(host), slug),
+        };
+        targets.insert(target);
+    }
+    Ok(Lane::FleetCleanup(targets))
 }
 
 fn is_cleanup_action(action: &wt_tui::UiAction) -> bool {
@@ -642,29 +860,12 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
     if left == right {
         return true;
     }
-    if matches!(left, Lane::FleetCleanup) || matches!(right, Lane::FleetCleanup) {
-        return matches!(
-            (left, right),
-            (
-                Lane::FleetCleanup,
-                Lane::Host(_)
-                    | Lane::Target(_, _)
-                    | Lane::SessionControl(_, Some(_))
-                    | Lane::Creation(_)
-                    | Lane::Removal(_, _)
-                    | Lane::Metadata(_, _)
-                    | Lane::Terminal(_, Some(_))
-            ) | (
-                Lane::Host(_)
-                    | Lane::Target(_, _)
-                    | Lane::SessionControl(_, Some(_))
-                    | Lane::Creation(_)
-                    | Lane::Removal(_, _)
-                    | Lane::Metadata(_, _)
-                    | Lane::Terminal(_, Some(_)),
-                Lane::FleetCleanup
-            )
-        );
+    match (left, right) {
+        (Lane::FleetCleanup(_), Lane::FleetCleanup(_)) => return true,
+        (Lane::FleetCleanup(targets), other) | (other, Lane::FleetCleanup(targets)) => {
+            return cleanup_conflicts(targets, other);
+        }
+        _ => {}
     }
     match (left, right) {
         (Lane::Terminal(_, _), Lane::Terminal(_, _)) => true,
@@ -697,6 +898,22 @@ pub(crate) fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
         | (Lane::Removal(other_host, other_key), Lane::Metadata(host, key)) => {
             host == other_host && key == other_key
         }
+        _ => false,
+    }
+}
+
+/// A cleanup excludes work on the checkouts it removes and whole-host jobs
+/// on hosts it touches, matching a single Removal of each target. Creation
+/// and work on unrelated checkouts proceed while its teardowns run.
+fn cleanup_conflicts(targets: &BTreeSet<(Option<String>, String)>, other: &Lane) -> bool {
+    let owns = |host: &Option<String>, key: &String| targets.contains(&(host.clone(), key.clone()));
+    match other {
+        Lane::Removal(host, key)
+        | Lane::Terminal(host, Some(key))
+        | Lane::SessionControl(host, Some(key))
+        | Lane::Metadata(host, key)
+        | Lane::Target(host, key) => owns(host, key),
+        Lane::Host(host) => targets.iter().any(|(target_host, _)| target_host == host),
         _ => false,
     }
 }
@@ -840,9 +1057,10 @@ fn log_action_outcome(context: Option<&ActionLogContext>, reply: &UiReply, uncer
                 event_source = "wt",
                 event_text = %event_text,
                 operation_id = context.operation_id,
-                operation = context.operation,
+                operation = %context.operation,
                 host = %context.host,
                 worktree = context.target.as_deref().unwrap_or("-"),
+                pr = context.pr,
                 "action outcome unknown"
             );
         } else {
@@ -852,9 +1070,10 @@ fn log_action_outcome(context: Option<&ActionLogContext>, reply: &UiReply, uncer
                 event_source = "wt",
                 event_text = %event_text,
                 operation_id = context.operation_id,
-                operation = context.operation,
+                operation = %context.operation,
                 host = %context.host,
                 worktree = context.target.as_deref().unwrap_or("-"),
+                pr = context.pr,
                 "action failed"
             );
         }
@@ -1137,8 +1356,9 @@ mod tests {
             lane: Lane::Removal(None, "row".into()),
             request_id: 7,
             generation: 3,
-            name: "remove worktree",
+            name: "remove worktree".into(),
             target: Some("row".into()),
+            pr: None,
             started: Instant::now(),
             preparation: false,
         };
@@ -1426,6 +1646,21 @@ mod tests {
             }
         }
 
+        /// Parallel tests hit these callsites with no subscriber. Reporting
+        /// `sometimes` keeps any interest rebuilt while this subscriber is
+        /// alive from caching `never`, so each event asks it directly.
+        struct PerEventInterest;
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PerEventInterest {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+
+        use tracing_subscriber::layer::SubscriberExt;
         let output = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -1435,32 +1670,88 @@ mod tests {
                 let output = output.clone();
                 move || LogWriter(output.clone())
             })
-            .finish();
+            .finish()
+            .with(PerEventInterest);
+        let emit = || {
+            action_reply(Ok(UiReply::failure("GitHub rejected the update")), None);
+            action_reply_with_context(
+                Err(anyhow::anyhow!("remote connection failed")),
+                None,
+                Some(&ActionLogContext {
+                    operation_id: 7,
+                    operation: "remove worktree".into(),
+                    host: "MaxBook".into(),
+                    target: Some("new-frontend".into()),
+                    pr: None,
+                }),
+            );
+            // Configured actions and GitHub writes name their own operation,
+            // checkout and pinned pull request rather than a generic action.
+            let run = UiAction::RunAction {
+                surface: wt_tui::ActionSurface::Row {
+                    key: "review-row".into(),
+                },
+                id: "address-pr-review".into(),
+                arg: None,
+                extras: String::new(),
+            };
+            action_reply_with_context(
+                Ok(UiReply::failure("Codex delivery failed")),
+                None,
+                Some(&ActionLogContext::for_action(
+                    8,
+                    &run,
+                    &lane_for(&run).unwrap(),
+                )),
+            );
+            let auto_merge = UiAction::GithubSetAutoMerge {
+                key: wt_core::remote_worktree_ledger_key("builder", "auto-row"),
+                enable: true,
+                pin: Some(wt_tui::PrPin {
+                    number: 42,
+                    head_sha: Some("abc".into()),
+                }),
+            };
+            action_reply_with_context(
+                Ok(UiReply::failure("auto-merge rejected")),
+                None,
+                Some(&ActionLogContext::for_action(
+                    9,
+                    &auto_merge,
+                    &lane_for(&auto_merge).unwrap(),
+                )),
+            );
+            action_reply(
+                Err(crate::remote_host::RemoteHostError::Ambiguous {
+                    host: "builder".into(),
+                    detail: "reply was lost after send".into(),
+                }
+                .into()),
+                None,
+            );
+            action_reply(Err(notice("already at top")), None);
+        };
         let guard = tracing::subscriber::set_default(subscriber);
-        // These callsites may have been evaluated earlier by parallel tests
-        // with no thread-local subscriber installed.
-        tracing::callsite::rebuild_interest_cache();
-
-        action_reply(Ok(UiReply::failure("GitHub rejected the update")), None);
-        action_reply_with_context(
-            Err(anyhow::anyhow!("remote connection failed")),
-            None,
-            Some(&ActionLogContext {
-                operation_id: 7,
-                operation: "remove worktree",
-                host: "MaxBook".into(),
-                target: Some("new-frontend".into()),
-            }),
-        );
-        action_reply(
-            Err(crate::remote_host::RemoteHostError::Ambiguous {
-                host: "builder".into(),
-                detail: "reply was lost after send".into(),
+        // Callsite interest is process-global: a parallel test that first
+        // reaches one of these callsites with no subscriber can cache it as
+        // disabled concurrently with our rebuild. Rebuild and re-emit until
+        // the cache includes this subscriber, then judge the last pass only.
+        for _ in 0..50 {
+            output.lock().unwrap().clear();
+            tracing::callsite::rebuild_interest_cache();
+            emit();
+            if output
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                >= 5
+            {
+                break;
             }
-            .into()),
-            None,
-        );
-        action_reply(Err(notice("already at top")), None);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         drop(guard);
         tracing::callsite::rebuild_interest_cache();
 
@@ -1470,15 +1761,35 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 3, "{log}");
+        assert_eq!(events.len(), 5, "{log}");
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event["fields"]["event_channel"] == "attention")
                 .count(),
-            3,
+            5,
             "{log}"
         );
+        let by_id = |id: u64| {
+            events
+                .iter()
+                .find(|event| event["fields"]["operation_id"] == id)
+                .unwrap_or_else(|| panic!("operation {id} logged: {log}"))
+        };
+        let run = by_id(8);
+        assert_eq!(run["fields"]["operation"], "run action address-pr-review");
+        assert_eq!(run["fields"]["worktree"], "review-row");
+        assert_eq!(run["fields"]["host"], "local host");
+        assert!(run["fields"].get("pr").is_none(), "{log}");
+        let auto_merge = by_id(9);
+        assert_eq!(
+            auto_merge["fields"]["operation"],
+            "change pull request auto-merge"
+        );
+        assert_eq!(auto_merge["fields"]["worktree"], "auto-row");
+        assert_eq!(auto_merge["fields"]["host"], "builder");
+        assert_eq!(auto_merge["fields"]["pr"], 42);
+        assert!(!log.contains("host action"), "{log}");
         assert!(
             events
                 .iter()
@@ -1594,7 +1905,11 @@ mod tests {
                 ));
                 assert!(lanes_conflict(&lane, &lane));
                 assert!(!lanes_conflict(&lane, &Lane::Host(host.clone())));
-                assert!(lanes_conflict(&lane, &Lane::FleetCleanup));
+                assert!(lanes_conflict(
+                    &lane,
+                    &cleanup([(host.clone(), "selected")])
+                ));
+                assert!(!lanes_conflict(&lane, &cleanup([(host.clone(), "other")])));
                 assert!(!lanes_conflict(&lane, &Lane::Creation(host.clone())));
             }
         }
@@ -1679,7 +1994,9 @@ mod tests {
                 false,
             ),
             (Lane::Host(Some("MaxBook".into())), true),
-            (Lane::FleetCleanup, true),
+            (cleanup([(Some("MaxBook".into()), "existing")]), true),
+            (cleanup([(Some("MaxBook".into()), "other")]), false),
+            (cleanup([(None, "existing")]), false),
         ] {
             assert_eq!(lanes_conflict(&target, &other), expected);
             assert_eq!(lanes_conflict(&other, &target), expected);
@@ -1820,7 +2137,7 @@ mod tests {
         );
         assert_eq!(
             lane_for(&UiAction::Cleanup { revisions: vec![] }).unwrap(),
-            Lane::FleetCleanup
+            Lane::FleetCleanup(BTreeSet::new())
         );
     }
 
@@ -1836,7 +2153,8 @@ mod tests {
         assert!(!lanes_conflict(&active, &other_remove));
         assert!(!lanes_conflict(&active, &create));
         assert!(lanes_conflict(&active, &Lane::Host(None)));
-        assert!(lanes_conflict(&active, &Lane::FleetCleanup));
+        assert!(lanes_conflict(&active, &cleanup([(None, "old-worktree")])));
+        assert!(!lanes_conflict(&active, &cleanup([(None, "unrelated")])));
 
         let mut pending = VecDeque::from([
             (other_remove.clone(), "other removal"),
@@ -1896,8 +2214,9 @@ mod tests {
                 request_id: 42,
                 generation: 0,
                 preparation: false,
-                name: "remove worktree",
+                name: "remove worktree".into(),
                 target: Some("new-frontend".into()),
+                pr: None,
                 started,
             },
             Instant::now(),
@@ -1969,7 +2288,7 @@ mod tests {
                 &BTreeSet::from([
                     Lane::Creation(None),
                     Lane::Removal(None, "other".into()),
-                    Lane::FleetCleanup
+                    cleanup([(None, "other")])
                 ])
             ),
             Some((Lane::Terminal(None, None), terminal))
@@ -1977,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_checkout_conflicts_only_with_its_own_removal_or_fleet_cleanup() {
+    fn terminal_checkout_conflicts_only_with_removal_or_cleanup_of_that_checkout() {
         let host = "builder".to_owned();
         let terminal = lane_for(&UiAction::Session {
             key: Some(wt_core::remote_worktree_ledger_key(&host, "one")),
@@ -1994,7 +2313,9 @@ mod tests {
             (Lane::Removal(Some(host.clone()), "two".into()), false),
             (Lane::Host(Some(host.clone())), false),
             (Lane::Creation(Some(host.clone())), false),
-            (Lane::FleetCleanup, true),
+            (cleanup([(Some(host.clone()), "one")]), true),
+            (cleanup([(Some(host.clone()), "two")]), false),
+            (cleanup([(None, "one")]), false),
         ] {
             assert_eq!(lanes_conflict(&terminal, &other), conflict, "{other:?}");
             assert_eq!(
@@ -2110,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_cleanup_uses_its_own_accepted_operation_lane() {
+    fn fleet_cleanup_lane_owns_exactly_its_local_and_remote_targets() {
         let action = UiAction::Cleanup {
             revisions: vec![
                 wt_tui::RemovalRevision {
@@ -2133,29 +2454,138 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(lane_for(&action).unwrap(), Lane::FleetCleanup);
+        assert_eq!(
+            lane_for(&action).unwrap(),
+            cleanup([(None, "local-row"), (Some("builder".into()), "remote-row")])
+        );
         assert_eq!(
             lane_for(&UiAction::CleanupTargets { targets: vec![] }).unwrap(),
-            Lane::FleetCleanup
+            Lane::FleetCleanup(BTreeSet::new())
+        );
+        // An explicit host route owns host-local keys, as host routing does.
+        let routed = UiAction::OnHost {
+            host: Some("builder".into()),
+            action: Box::new(UiAction::CleanupTargets {
+                targets: vec![wt_tui::CleanupTarget {
+                    key: "remote-local-key".into(),
+                    path: "/remote/local".into(),
+                    branch: "b".into(),
+                    head: "h".into(),
+                }],
+            }),
+        };
+        assert_eq!(
+            lane_for(&routed).unwrap(),
+            cleanup([(Some("builder".into()), "remote-local-key")])
+        );
+        // A remote worker receives host-local keys without a route.
+        assert_eq!(
+            lane_for(&UiAction::CleanupTargets {
+                targets: vec![wt_tui::CleanupTarget {
+                    key: "remote-local-key".into(),
+                    path: "/remote/local".into(),
+                    branch: "b".into(),
+                    head: "h".into(),
+                }],
+            })
+            .unwrap(),
+            cleanup([(None, "remote-local-key")])
         );
 
+        let active = lane_for(&action).unwrap();
         let host = Lane::Host(Some("builder".into()));
-        assert!(lanes_conflict(&Lane::FleetCleanup, &host));
-        assert!(lanes_conflict(&host, &Lane::FleetCleanup));
+        assert!(lanes_conflict(&active, &host));
+        assert!(lanes_conflict(&host, &active));
         assert!(!lanes_conflict(
-            &Lane::FleetCleanup,
+            &active,
+            &Lane::Host(Some("elsewhere".into()))
+        ));
+        assert!(lanes_conflict(&active, &cleanup([(None, "unrelated")])));
+        assert!(!lanes_conflict(
+            &active,
             &Lane::Preparation(Some("builder".into()))
         ));
         let preparation = Lane::Preparation(Some("builder".into()));
         let mut pending = VecDeque::from([(preparation.clone(), "open removal review")]);
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::from([Lane::FleetCleanup])),
+            take_available(&mut pending, &BTreeSet::from([active.clone()])),
             Some((preparation, "open removal review"))
         );
         let mut pending = VecDeque::from([(host.clone(), "host mutation")]);
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::from([Lane::FleetCleanup])),
+            take_available(&mut pending, &BTreeSet::from([active])),
             None
         );
+    }
+
+    #[test]
+    fn busy_cleanup_admits_unrelated_checkouts_and_holds_its_own_targets() {
+        let remote = Some("builder".to_owned());
+        let busy = BTreeSet::from([cleanup([(None, "a"), (remote.clone(), "b")])]);
+        for admitted in [
+            Lane::Terminal(None, Some("c".into())),
+            Lane::Terminal(remote.clone(), Some("c".into())),
+            Lane::Terminal(None, Some("b".into())),
+            Lane::Terminal(None, None),
+            Lane::Metadata(None, "c".into()),
+            Lane::Target(None, "c".into()),
+            Lane::SessionControl(None, Some("c".into())),
+            Lane::Removal(None, "c".into()),
+            Lane::Creation(None),
+            Lane::Creation(remote.clone()),
+            Lane::Host(Some("elsewhere".into())),
+        ] {
+            let mut pending = VecDeque::from([(admitted.clone(), ())]);
+            assert_eq!(
+                take_available(&mut pending, &busy),
+                Some((admitted.clone(), ())),
+                "{admitted:?} should not wait for unrelated cleanup"
+            );
+        }
+        for held in [
+            Lane::Terminal(None, Some("a".into())),
+            Lane::Terminal(remote.clone(), Some("b".into())),
+            Lane::Metadata(None, "a".into()),
+            Lane::Metadata(remote.clone(), "b".into()),
+            Lane::Target(remote.clone(), "b".into()),
+            Lane::SessionControl(None, Some("a".into())),
+            Lane::Removal(remote.clone(), "b".into()),
+            Lane::Host(None),
+            Lane::Host(remote.clone()),
+            cleanup([(None, "z")]),
+        ] {
+            let mut pending = VecDeque::from([(held.clone(), ())]);
+            assert_eq!(
+                take_available(&mut pending, &busy),
+                None,
+                "{held:?} must wait for cleanup of its target"
+            );
+        }
+    }
+
+    #[test]
+    fn waiting_progress_names_cleanup_targets() {
+        let action = UiAction::CleanupTargets {
+            targets: ["a", "b"]
+                .into_iter()
+                .map(|key| wt_tui::CleanupTarget {
+                    key: key.into(),
+                    path: format!("/{key}"),
+                    branch: key.into(),
+                    head: "h".into(),
+                })
+                .collect(),
+        };
+        assert_eq!(action_target(&action).as_deref(), Some("a, b"));
+        assert_eq!(lane_host(&lane_for(&action).unwrap()), "local host");
+    }
+
+    fn cleanup<const N: usize>(targets: [(Option<String>, &str); N]) -> Lane {
+        Lane::FleetCleanup(
+            targets
+                .into_iter()
+                .map(|(host, key)| (host, key.to_owned()))
+                .collect(),
+        )
     }
 }

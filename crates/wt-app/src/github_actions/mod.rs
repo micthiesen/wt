@@ -150,7 +150,8 @@ impl GithubActions {
         match action {
             GithubAction::MarkReady { .. } => self.mark_ready(pr, &branch, github).await,
             GithubAction::SetAutoMerge { enable, .. } => {
-                self.set_auto_merge(pr, &branch, github, enable).await
+                self.set_auto_merge(pr, &branch, &row.slug, github, enable)
+                    .await
             }
             GithubAction::Ship { .. } => Ok(self.ship(pr, &branch, github).await),
             GithubAction::FailedChecks { .. } => self.failed_checks(pr, &branch).await,
@@ -191,11 +192,12 @@ impl GithubActions {
         &self,
         pr: &PullRequest,
         branch: &str,
+        worktree: &str,
         github: &Confirmed<GithubData>,
         enable: bool,
     ) -> Result<UiReply> {
         if enable {
-            self.enable(pr, branch, github).await
+            self.enable(pr, branch, worktree, github).await
         } else {
             self.disarm(pr, branch, github).await
         }
@@ -205,6 +207,7 @@ impl GithubActions {
         &self,
         pr: &PullRequest,
         branch: &str,
+        worktree: &str,
         github: &Confirmed<GithubData>,
     ) -> Result<UiReply> {
         let number = pr.number;
@@ -239,7 +242,11 @@ impl GithubActions {
         }
         if result.retryable == Some(true) {
             return Ok(
-                match self.retries.start_arm(target, branch.to_owned()).await? {
+                match self
+                    .retries
+                    .start_arm(target, branch.to_owned(), worktree.to_owned())
+                    .await?
+                {
                     RetryStart::Started => UiReply::deferred(format!(
                         "PR #{number}: required checks have not reported; will arm when they do"
                     )),

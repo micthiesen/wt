@@ -52,7 +52,6 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
     let edits = freshness::start(
         scope,
         context.config.clone(),
-        context.repository.clone(),
         board.clone(),
         git.view(),
         metadata.view(),

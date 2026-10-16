@@ -606,7 +606,7 @@ workspace = "acme"
 | `prefix` | no | *(unset)* | Required id prefix (lowercase, e.g. `"coz"`) for **new** worktree branches. When set, `wt new GH-970 …` (or any other prefix) fails with guidance instead of minting the branch — a GitHub issue attaches as the *secondary* id (`wt new … --gh <n>` / `wt issue <slug> --gh <n>`), never as the worktree's identity. Attaching to existing branches is exempt. |
 | `linear.workspace` | `[issue_tracker.linear]` present: **yes** | — | Linear preset: derives `url_template = "linear://<workspace>/issue/{id}"` (the desktop-app deep-link scheme). |
 
-Id parsing itself is driven by the slug shape (`[a-z]+-\d+`), independent of `[branch] id_pattern`.
+Id parsing itself is driven by the slug shape, independent of `[branch] id_pattern`: an id (`[a-z]+-\d+`) must lead the slug or follow a `/` or `+` separator, so `eng-12-fix` and `yourname/eng-12-fix` carry `ENG-12` while a trailing word-number such as `meeting-bugs-2` is not an issue.
 
 **Setting an id by hand:** a slug that carries no id (or the wrong one) takes an override — `wt issue <slug> --id COZ-2185`, or `#` in the TUI. Three states, not two: `--clear-id` DROPS the override (back to the slug's own id), while `--no-id` — or an empty `#` prompt — asserts the worktree has **no** tracker issue. On a slug that carries an id those are different answers, and only the second can detach it. Every reader resolves *override first, slug second*, so this is what the issue row links, what `{{issue_id}}` renders, and what `requires = ["issue.tracker"]` tests. It is deliberately an override rather than a cached parse: nothing backfills slug-derivable ids into state, because a derived value in storage goes stale the moment a branch is renamed while still looking authoritative.
 
@@ -625,12 +625,14 @@ selection use this configured default.
 [harness]
 primary = "codex"
 hidden = ["opencode"]
+wt_session = "claude"   # optional: the wt session always runs Claude Code
 ```
 
 | key | required | default | meaning |
 |---|---|---|---|
 | `primary` | no | `"claude"` | `"claude"`, `"codex"`, `"opencode"`, or `"pi"`. Used when this repository has no persisted override. |
 | `hidden` | no | `[]` | Harnesses omitted from Tab cycling, automatic live-session routing, TUI session discovery, picker entries, and activity polling. Messaging has no harness override, so a hidden harness is not selected for a new send. The configured `primary` cannot be hidden, and at least one harness must remain visible. |
+| `wt_session` | no | *(unset)* | Opt-in harness for the `wt` special session (the `paths.wt_source` checkout) only: `"claude"`, `"codex"`, `"opencode"`, or `"pi"`. When set, every path that starts, attaches to, routes to, or messages that slot (its slot key, `wt agent send wt`, slot prompt actions and automations, cold start) uses this harness regardless of `primary`, the saved Tab selection, or a live session of another harness in the slot. That other session is left running and still listed as active by `wt agent ls`, which reports the selection as `pinned`; slot prompts render with this harness's skill prefix. It cannot name a `hidden` harness, because hidden harnesses are omitted from TUI session discovery and activity polling and the wt session would never appear on the board. Unset keeps the ordinary selection. An explicit harness passed to `wt _session` still wins. |
 
 ## `[naming]` — optional generated worktree names
 

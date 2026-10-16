@@ -15,6 +15,8 @@ pub(crate) const TYPEAHEAD_LIMIT: usize = 16;
 /// A menu slower than this drops its typeahead instead of replaying keys
 /// into a menu the user never saw.
 pub(crate) const TYPEAHEAD_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Session entry on a checkout whose removal was accepted.
+pub(crate) const REMOVAL_IN_PROGRESS: &str = "Removal is already in progress";
 
 impl Model {
     pub(crate) fn expire_toast(&mut self) {
@@ -710,11 +712,15 @@ impl Model {
             }),
             KeyCode::F(10) => self.session_action(SessionTarget::Shell),
             KeyCode::F(11) => self.session_action(SessionTarget::Diff),
-            KeyCode::F(12) if shift => self.row_action(|key| UiAction::PrepareHarnesses { key }),
-            KeyCode::Char(';') if !control => self.row_action(|key| UiAction::PrepareSessions {
-                key: Some(key),
-                target: SessionTarget::Harness,
-            }),
+            KeyCode::F(12) if shift => {
+                self.session_row_action(|key| UiAction::PrepareHarnesses { key })
+            }
+            KeyCode::Char(';') if !control => {
+                self.session_row_action(|key| UiAction::PrepareSessions {
+                    key: Some(key),
+                    target: SessionTarget::Harness,
+                })
+            }
             KeyCode::F(12) => self.session_action(SessionTarget::Harness),
             KeyCode::Char('m') if !control => InputResult::Action(UiAction::Session {
                 key: None,
@@ -799,10 +805,36 @@ impl Model {
     }
 
     pub(super) fn session_action(&mut self, target: SessionTarget) -> InputResult {
-        self.row_action(|key| UiAction::Session {
+        self.session_row_action(|key| UiAction::Session {
             key: Some(key),
             target,
         })
+    }
+
+    /// Entering a checkout that is being removed would only queue behind
+    /// its own teardown and then fail, so refuse it at once.
+    pub(super) fn session_row_action(
+        &mut self,
+        build: impl FnOnce(String) -> UiAction,
+    ) -> InputResult {
+        if self.actionable_row().is_some_and(Self::removal_active) {
+            return self.notify(REMOVAL_IN_PROGRESS);
+        }
+        self.row_action(build)
+    }
+
+    pub(super) fn removal_active(row: &super::BoardRow) -> bool {
+        row.removal
+            .as_ref()
+            .is_some_and(|removal| removal.error.is_none())
+    }
+
+    /// Whether the board shows an active removal of the row with this key.
+    pub(super) fn removal_active_for(&self, key: &str) -> bool {
+        self.board
+            .rows
+            .iter()
+            .any(|row| row.key == key && Self::removal_active(row))
     }
 
     pub(super) fn url_action(&mut self, kind: UrlKind) -> InputResult {

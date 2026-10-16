@@ -1,8 +1,12 @@
 //! One issue identity for links, actions, status readers and CLI overrides.
 use std::sync::LazyLock;
 
-static SLUG_ID: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?i)([a-z]+-\d+)(?:-|$)").expect("constant issue regex"));
+/// An issue id leads the slug, or follows a branch owner (`name/eng-1-x`) or a
+/// `+` separator. A trailing word-number pair such as `meeting-bugs-2` is part
+/// of the name, not an issue.
+static SLUG_ID: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:^|[/+])([a-z]+-\d+)(?:-|$)").expect("constant issue regex")
+});
 
 pub fn resolve(slug: &str, explicit: Option<&str>) -> Option<String> {
     if let Some(explicit) = explicit {
@@ -50,7 +54,17 @@ mod tests {
     #[test]
     fn explicit_empty_suppresses_slug_and_prefix_excludes_github() {
         assert_eq!(resolve("eng-123-fix", None).as_deref(), Some("ENG-123"));
-        assert_eq!(resolve("fix-eng-123", None).as_deref(), Some("ENG-123"));
+        assert_eq!(
+            resolve("michael/eng-123-fix", None).as_deref(),
+            Some("ENG-123")
+        );
+        assert_eq!(
+            resolve("worktree-david+eng-4959-thing", None).as_deref(),
+            Some("ENG-4959")
+        );
+        assert_eq!(resolve("fix-eng-123", None), None);
+        assert_eq!(resolve("christian-meetings-bugs-2", None), None);
+        assert_eq!(resolve("alt-frontend-review-1", None), None);
         assert_eq!(resolve("eng-123-fix", Some("  ")), None);
         assert_eq!(
             resolve("eng-123-fix", Some("other-2")).as_deref(),

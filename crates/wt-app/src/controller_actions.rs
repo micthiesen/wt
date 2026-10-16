@@ -27,6 +27,65 @@ fn harness_name(harness: wt_core::HarnessId) -> &'static str {
     }
 }
 
+/// Forget a failed removal record whose checkout is gone. This writes only
+/// the `removals` record: no files, branches or history change. Runs in the
+/// key's removal lane, so no removal of this key starts concurrently here; the
+/// store write rechecks the record and the path under its own transaction.
+async fn dismiss_failed_removal(
+    ctx: &AppContext,
+    key: String,
+    seen: wt_tui::FailedRemovalSeen,
+) -> Result<UiReply> {
+    // Inventory is authoritative for whether Git still knows the checkout. A
+    // listed key or path means a retry, not a dismissal, is the right review.
+    let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
+    if inventory.iter().any(|row| {
+        !row.is_main
+            && (wt_core::worktree_target_key(&row.target) == key || row.target.path == seen.path)
+    }) {
+        return Err(crate::controller::stale(
+            "the checkout is in Git inventory again; review a retry instead",
+        ));
+    }
+    let wt_tui::FailedRemovalSeen {
+        job_id,
+        path,
+        branch,
+    } = seen;
+    let slug = key.clone();
+    let outcome = ctx
+        .database
+        .call(move |store| {
+            let checkout = std::path::PathBuf::from(&path);
+            Ok(
+                store.clear_failed_removal(&key, &job_id, &path, &branch, || {
+                    checkout_absent(&checkout)
+                })?,
+            )
+        })
+        .await?;
+    match outcome {
+        wt_store::ClearFailedRemoval::Cleared => {
+            Ok(message(format!("Dismissed failed removal of {slug}")))
+        }
+        wt_store::ClearFailedRemoval::Changed => Err(crate::controller::stale(
+            "the removal record changed since the dismissal menu was shown",
+        )),
+        wt_store::ClearFailedRemoval::CheckoutPresent => Err(crate::controller::stale(
+            "the checkout path exists again; review a retry instead",
+        )),
+    }
+}
+
+/// Only a definite "not found" proves absence. A dangling symlink still
+/// occupies the path, and an unreadable parent proves nothing.
+fn checkout_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 fn message(text: impl Into<String>) -> UiReply {
     UiReply {
         message: text.into(),
@@ -352,6 +411,9 @@ pub async fn execute_with_shutdown(
                 lines,
                 cancel_key: Some('d'),
             }))
+        }
+        UiAction::DismissFailedRemoval { key, seen } => {
+            dismiss_failed_removal(ctx, key, seen.0).await
         }
         UiAction::Remove {
             key,
@@ -1191,6 +1253,80 @@ mod tests {
             "{lines:?}"
         );
         assert!(Path::new(&path).exists());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_removal_dismissal_requires_its_witness_and_an_absent_checkout() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let listed = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+            .await
+            .unwrap();
+        let listed_key = wt_core::worktree_target_key(&listed.target);
+        let listed_path = listed.target.path.clone();
+        let gone = fixture._root.path().join("gone");
+        let gone_path = gone.to_string_lossy().into_owned();
+        let ctx = &fixture.ctx;
+        let record = |key: String, path: String, branch: &'static str| async move {
+            ctx.database
+                .call(move |store| {
+                    store.begin_removal(&key, "1-a", &path, branch)?;
+                    store.finish_removal(&key, "1-a", Some("permission denied"))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        record("gone".into(), gone_path.clone(), "feature/gone").await;
+        record(listed_key.clone(), listed_path.clone(), "feature/one").await;
+        let dismiss =
+            |key: &str, job: &str, path: &str, branch: &str| UiAction::DismissFailedRemoval {
+                key: key.into(),
+                seen: wt_tui::Seen(wt_tui::FailedRemovalSeen {
+                    job_id: job.into(),
+                    path: path.into(),
+                    branch: branch.into(),
+                }),
+            };
+        let removals = || async {
+            fixture
+                .ctx
+                .database
+                .call(|store| Ok(store.read_wt_state()?["removals"].clone()))
+                .await
+                .unwrap()
+        };
+        let refused = |action: UiAction| async {
+            let error = execute(&fixture.ctx, action, None, None).await.unwrap_err();
+            assert!(crate::controller::error_reply(&error).stale, "{error:#}");
+        };
+
+        // Another job than the one the menu showed writes nothing.
+        refused(dismiss("gone", "0-z", &gone_path, "feature/gone")).await;
+        // A checkout path that exists again keeps the record for a retry.
+        std::fs::create_dir(&gone).unwrap();
+        refused(dismiss("gone", "1-a", &gone_path, "feature/gone")).await;
+        std::fs::remove_dir(&gone).unwrap();
+        // A checkout Git still lists is reviewed through normal removal.
+        refused(dismiss(&listed_key, "1-a", &listed_path, "feature/one")).await;
+        let state = removals().await;
+        assert_eq!(state["gone"]["error"], "permission denied");
+        assert_eq!(state[listed_key.as_str()]["error"], "permission denied");
+
+        execute(
+            &fixture.ctx,
+            dismiss("gone", "1-a", &gone_path, "feature/gone"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let state = removals().await;
+        assert!(state["gone"].is_null());
+        assert!(!state[listed_key.as_str()].is_null());
+        assert!(Path::new(&listed_path).exists());
         fixture.close().await.unwrap();
     }
 

@@ -164,6 +164,7 @@ impl UiAction {
             | A::Create { .. }
             | A::OpenEditor { .. }
             | A::Remove { .. }
+            | A::DismissFailedRemoval { .. }
             | A::Cleanup { .. }
             | A::CleanupTargets { .. }
             | A::ToggleArchive { .. }

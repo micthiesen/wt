@@ -153,7 +153,8 @@ fn apply_removals(rows: &mut Vec<BoardRow>, state: &Value) {
         else {
             continue;
         };
-        let index = if let Some(index) = rows.iter().position(|row| row.key == *key) {
+        let listed = rows.iter().position(|row| row.key == *key);
+        let index = if let Some(index) = listed {
             // A reused name cannot transfer a job to another checkout.
             if rows[index].path != path || rows[index].branch != branch {
                 continue;
@@ -175,13 +176,22 @@ fn apply_removals(rows: &mut Vec<BoardRow>, state: &Value) {
         let error = removal["error"].as_str().map(clean_text);
         row.removal = Some(wt_tui::RemovalView {
             error: error.clone(),
+            job_id: removal["jobId"]
+                .as_str()
+                .map(clean_text)
+                .unwrap_or_default(),
+            checkout_absent: listed.is_none(),
         });
         if let Some(error) = error {
             row.badge = "Removal failed".into();
             row.needs_attention = true;
             row.details.push(format!("Removal failed: {error}"));
-            row.details
-                .push("Press d to review a retry. Current safety checks still apply.".into());
+            row.details.push(if listed.is_none() {
+                "The checkout is gone. Press d to dismiss this failure; files and branches stay."
+                    .into()
+            } else {
+                "Press d to review a retry. Current safety checks still apply.".into()
+            });
         } else {
             row.badge = "Removing".into();
             row.busy = Some(wt_tui::BusyView {
@@ -255,6 +265,47 @@ mod tests {
         let mut completed = Vec::new();
         apply_removals(&mut completed, &state);
         assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn dismissing_a_failed_removal_without_a_checkout_removes_its_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = wt_store::Store::open(
+            temp.path().join("state.sqlite"),
+            wt_store::RepositoryIdentity::new("repo", "/repo"),
+        )
+        .unwrap();
+        store
+            .begin_removal("one", "1-a", "/one", "feature/one")
+            .unwrap();
+        store
+            .finish_removal("one", "1-a", Some("permission denied"))
+            .unwrap();
+        let listed = BoardRow {
+            key: "one".into(),
+            path: "/one".into(),
+            branch: "feature/one".into(),
+            ..Default::default()
+        };
+        let state = store.read_wt_state().unwrap();
+        let mut rows = vec![listed];
+        apply_removals(&mut rows, &state);
+        let view = rows[0].removal.clone().unwrap();
+        assert!(!view.checkout_absent, "a listed checkout reviews a retry");
+        assert_eq!(view.job_id, "1-a");
+
+        let mut rows = Vec::new();
+        apply_removals(&mut rows, &state);
+        assert!(rows[0].removal.as_ref().unwrap().checkout_absent);
+        assert_eq!(
+            store
+                .clear_failed_removal("one", "1-a", "/one", "feature/one", || true)
+                .unwrap(),
+            wt_store::ClearFailedRemoval::Cleared
+        );
+        let mut rows = Vec::new();
+        apply_removals(&mut rows, &store.read_wt_state().unwrap());
+        assert!(rows.is_empty());
     }
 
     #[test]

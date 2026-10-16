@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -159,16 +159,79 @@ impl GitRepository {
         }
     }
 
+    /// Repository-local advisory lock directory shared by fetch maintenance
+    /// and lifecycle removal. It lives in the main clone's common Git dir.
+    async fn repository_lock_dir(&self) -> PathBuf {
+        let (git_dir, common_dir) = git_metadata_paths(&self.origin_config().main_clone).await;
+        common_dir
+            .or(git_dir)
+            .unwrap_or_else(|| self.origin_config().main_clone.join(".git"))
+            .join("wt-locks")
+    }
+
+    /// Exclude background ref maintenance from one independent clone while a
+    /// lifecycle operation deletes it. Removal waits here, under its slug lock,
+    /// until any in-flight maintenance of the clone has finished; maintenance
+    /// only try-acquires and skips a held clone, so the order cannot deadlock.
+    pub async fn lock_clone_maintenance(
+        &self,
+        slug: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<FileLock, RepositoryError> {
+        let lock_dir = self.repository_lock_dir().await;
+        FileLock::acquire(
+            &lock_dir,
+            &clone_maintenance_key(slug),
+            "lock clone maintenance",
+            cancellation,
+        )
+        .await
+        .map_err(|source| {
+            if matches!(source, LockError::Cancelled) {
+                RepositoryError::Cancelled
+            } else {
+                RepositoryError::FetchLock {
+                    path: lock_dir.clone(),
+                    source,
+                }
+            }
+        })
+    }
+
+    async fn try_lock_clone_maintenance(
+        &self,
+        slug: &str,
+    ) -> Result<Option<FileLock>, RepositoryError> {
+        let lock_dir = self.repository_lock_dir().await;
+        FileLock::try_acquire(
+            &lock_dir,
+            &clone_maintenance_key(slug),
+            "lock clone maintenance",
+        )
+        .await
+        .map_err(|source| RepositoryError::FetchLock {
+            path: lock_dir.clone(),
+            source,
+        })
+    }
+
+    /// Whether a worktree-root entry is a checkout that a removal has already
+    /// moved aside. Such entries are never inventory and never maintained.
+    pub fn is_removal_quarantine(name: &std::ffi::OsStr) -> bool {
+        name.as_encoded_bytes()
+            .starts_with(Self::REMOVAL_QUARANTINE_PREFIX.as_bytes())
+    }
+
+    /// Name prefix of the sibling directory a removal renames a verified
+    /// checkout to before deleting it.
+    pub const REMOVAL_QUARANTINE_PREFIX: &'static str = ".wt-removing-";
+
     async fn fetch_origin_locked(
         &self,
         options: FetchOriginOptions,
         cancellation: &CancellationToken,
     ) -> Result<FetchOriginReport, RepositoryError> {
-        let (git_dir, common_dir) = git_metadata_paths(&self.origin_config().main_clone).await;
-        let lock_dir = common_dir
-            .or(git_dir)
-            .unwrap_or_else(|| self.origin_config().main_clone.join(".git"));
-        let lock_dir = lock_dir.join("wt-locks");
+        let lock_dir = self.repository_lock_dir().await;
         let _lock = FileLock::acquire(&lock_dir, "fetch-origin", "fetch origin", cancellation)
             .await
             .map_err(|source| {
@@ -237,7 +300,7 @@ impl GitRepository {
                                 let tip = tip.clone();
                                 async move {
                                     let result = self
-                                        .freshen_rift_trunk(&worktree, &tip, cancellation)
+                                        .freshen_idle_rift_trunk(&worktree, &tip, cancellation)
                                         .await;
                                     (worktree.target.path, result)
                                 }
@@ -517,6 +580,30 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Freshen one clone only while no lifecycle operation owns it. A clone
+    /// being removed is skipped rather than written into mid-deletion; a
+    /// later sync catches up any clone that survives.
+    async fn freshen_idle_rift_trunk(
+        &self,
+        worktree: &WorktreeRecord,
+        target: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let Some(_maintenance) = self
+            .try_lock_clone_maintenance(worktree.target.slug())
+            .await?
+        else {
+            return Ok(false);
+        };
+        // The inventory may predate a removal that finished while this task
+        // waited. Never run Git (or create anything) at a vanished path.
+        if !independent_clone_present(Path::new(&worktree.target.path)).await {
+            return Ok(false);
+        }
+        self.freshen_rift_trunk(worktree, target, cancellation)
+            .await
+    }
+
     async fn freshen_rift_trunk(
         &self,
         worktree: &WorktreeRecord,
@@ -546,6 +633,9 @@ impl GitRepository {
                         "fetch".into(),
                         "--no-tags".into(),
                         "--quiet".into(),
+                        // A detached auto-gc would keep writing under the
+                        // clone's `.git` after the maintenance lock is released.
+                        "--no-auto-gc".into(),
                         self.origin_config().main_clone.as_os_str().to_owned(),
                         format!("+{ref_name}:{temp_ref}").into(),
                     ]
@@ -753,6 +843,16 @@ impl GitRepository {
             })?
             .stdout)
     }
+}
+
+fn clone_maintenance_key(slug: &str) -> String {
+    format!("clone-maintenance-{slug}")
+}
+
+async fn independent_clone_present(path: &Path) -> bool {
+    let git = tokio::fs::symlink_metadata(path.join(".git")).await;
+    let marker = tokio::fs::symlink_metadata(path.join(".rift")).await;
+    git.is_ok_and(|metadata| metadata.is_dir()) && marker.is_ok_and(|metadata| metadata.is_file())
 }
 
 #[cfg(test)]
@@ -1323,6 +1423,67 @@ mod tests {
             ahead
         );
         assert_ne!(behind_main_target, ahead);
+    }
+
+    #[tokio::test]
+    async fn origin_sync_skips_a_clone_owned_by_removal_and_a_vanished_clone() {
+        let (_root, runner, seed, main, worktrees) = fixture().await;
+        let initial = git(&runner, &main, &["rev-parse", "origin/main"]).await;
+        let rift = worktrees.join("rift-busy");
+        git(
+            &runner,
+            root_cwd(&main),
+            &["clone", main.to_str().unwrap(), rift.to_str().unwrap()],
+        )
+        .await;
+        std::fs::write(rift.join(".rift"), "fixture\n").unwrap();
+        commit_file(&runner, &seed, "new.txt", "new\n", "remote update").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        let repository = repository(&main, &worktrees);
+
+        let held = repository
+            .lock_clone_maintenance("rift-busy", &CancellationToken::new())
+            .await
+            .unwrap();
+        let skipped = repository
+            .fetch_origin(FetchOriginOptions::default(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(skipped.rift_refs_updated, 0);
+        assert!(skipped.warnings.is_empty(), "{:?}", skipped.warnings);
+        assert_eq!(
+            git(&runner, &rift, &["rev-parse", "origin/main"]).await,
+            initial
+        );
+
+        // A quarantined clone is not inventory, so it is never maintained.
+        drop(held);
+        let quarantine = worktrees.join(format!(
+            "{}rift-busy-1",
+            GitRepository::REMOVAL_QUARANTINE_PREFIX
+        ));
+        std::fs::rename(&rift, &quarantine).unwrap();
+        let moved = repository
+            .fetch_origin(FetchOriginOptions::default(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(moved.rift_refs_updated, 0);
+        assert!(!rift.exists(), "maintenance must not recreate the old path");
+        assert_eq!(
+            git(&runner, &quarantine, &["rev-parse", "origin/main"]).await,
+            initial
+        );
+
+        std::fs::rename(&quarantine, &rift).unwrap();
+        let resumed = repository
+            .fetch_origin(FetchOriginOptions::default(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(resumed.rift_refs_updated, 1);
+        assert_ne!(
+            git(&runner, &rift, &["rev-parse", "origin/main"]).await,
+            initial
+        );
     }
 
     fn root_cwd(path: &Path) -> &Path {

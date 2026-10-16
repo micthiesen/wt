@@ -164,8 +164,16 @@ pub(super) fn spawn_confirmer(scope: &TaskScope, ledger: WriteLedger) {
                 }
                 let open = {
                     let mut state = ledger.lock();
-                    if let Some(github) = ledger.refresh.confirmed() {
-                        settle(&mut state, &github, Instant::now());
+                    if let Some(github) = ledger.refresh.confirmed()
+                        && settle(&mut state, &github, Instant::now())
+                    {
+                        let read = ledger.refresh.last_read();
+                        tracing::info!(
+                            read_started = ?read.started,
+                            read_finished = ?read.finished,
+                            observed = ?github.observed(),
+                            "latest direct GitHub read when a write expired"
+                        );
                     } else if state.next_deadline().is_some_and(|d| d <= Instant::now()) {
                         // No live read at all: let deadlines lapse.
                         state.settle(&GithubData::default(), |_, _| None, Instant::now());
@@ -254,15 +262,20 @@ pub(super) fn record_accepted(state: &mut LedgerState, op: u64, write: GithubWri
 }
 
 /// Drop records a read that started after them shows, and expired ones.
-fn settle(state: &mut LedgerState, github: &Confirmed<GithubData>, now: Instant) {
+/// Returns whether any record expired unconfirmed.
+fn settle(state: &mut LedgerState, github: &Confirmed<GithubData>, now: Instant) -> bool {
     let observed = github.observed();
-    for expired in state.settle(github, |_, _| Some(observed), now) {
+    let expired = state.settle(github, |_, _| Some(observed), now);
+    for expired in &expired {
         tracing::info!(
             write = %expired.mutation.key(),
             phase = ?expired.phase,
+            accepted_at = ?expired.accepted_at,
+            ?observed,
             "GitHub write not yet reflected by GitHub reads"
         );
     }
+    !expired.is_empty()
 }
 
 /// Disable is sent whenever this host's writes say the PR may be armed;

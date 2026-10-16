@@ -157,7 +157,11 @@ job ID. The metadata source reconciles interrupted result publication from the
 durable worker journal. Inventory projects active and failed records into the
 Removing section, including records whose checkout is absent. Only the current
 job can publish its result. A failed attempt remains until a reviewed retry
-succeeds; no retry can replace an active attempt. Worker liveness checks and
+succeeds, or, once its checkout is absent from inventory and disk, until a
+dismissal witnessing its job, path and branch deletes only that record; no
+retry or dismissal can replace an active attempt. Cleanup that fails after the
+commit point, such as an undeletable quarantine, is a warning on a successful
+removal, not a failed record. Worker liveness checks and
 SQLite reads stay in the metadata source, off the terminal input path.
 
 Commits from a menu carry a witness of what it showed: `Seen<T>`, `PrPin`,
@@ -211,6 +215,11 @@ first occurrence, so repeated sourcing does not grow the environment.
 Codex identity
 recovery may inspect its sole direct child only after validating the supervisor
 marker, then rechecks the child's PID, start time and executable with the pane.
+When no writer lock proves it, as with daemon-backed Codex TUIs, wt stamps the
+sole TUI rollout of that checkout and slot created since the tmux session
+started, only if the pane runs a Codex TUI and no other Codex TUI outside
+stamped slots has that checkout as its working directory or argument. Any
+other outcome leaves the slot unidentified and nothing is sent.
 The session
 source batches pane inventory with session inventory, reports new failed panes to
 attention, and excludes dead panes from live-agent observations.
@@ -390,6 +399,11 @@ the input path, and refreshes only the domains whose file metadata changed.
 Native notifications for regular files already observed by that probe are
 deduplicated against current size, modification time, inode, device and change
 time. Directory and unknown-path events remain conservative invalidations.
+The watch list derives from the Git source's inventory, minus checkouts with an
+accepted removal record and checkouts that no longer exist; it is re-read when
+either input changes. A watcher's missing-path error triggers at most one Git
+refresh and watch-list re-read per five seconds; other watcher errors keep
+their full refresh.
 Incomplete scans retain the 60-second full reconciliation backstop. GitHub reads remain batched and rate
 limited (10 s minimum interval measured from fetch start); the optional events
 daemon supplies push updates stamped with its own fetch start, with a
@@ -420,16 +434,21 @@ delay them. Attention acknowledgement returns its own accept stamp before
 refreshing metadata. Read-only preparations, worktree creation and terminal
 entry also have reserved capacity. Title, issue and status writes share a bounded
 metadata slot independent of ordinary host capacity. They conflict with removal
-of their own target and fleet cleanup, but not unrelated removals, creation or
-long host actions such as compaction and GitHub requests. Transactional field
+of their own target, including a fleet cleanup that removes it, but not unrelated
+removals or cleanups, creation or long host actions such as compaction and GitHub requests. Transactional field
 updates and captured revisions protect independent metadata writes. Palette title actions use the same classification as direct
 title actions. Terminal handoffs serialize with each other;
-worktree entry also conflicts with removal of that exact host and checkout, and
-with fleet cleanup. Special-session entry and unrelated checkouts remain
+worktree entry also conflicts with removal of that exact host and checkout,
+whether single or part of a fleet cleanup. Special-session entry and unrelated checkouts remain
 available during background writes. Preparations do not wait behind mutations because the
 confirmed write revalidates its inputs. Removals serialize by host and target;
 unrelated creates and removals can proceed concurrently, while broader host
-operations and fleet cleanup retain their conflict boundaries. Lifecycle
+operations retain their conflict boundaries. A fleet cleanup is one accepted
+operation that owns exactly the `(host, checkout)` pairs it removes: it
+serializes with another cleanup and with whole-host operations on a host it
+touches, and with checkout-scoped work only on those checkouts, so entry and
+writes elsewhere never wait for its teardowns. Waiting notices name the
+blocking operation and its checkouts. Lifecycle
 per-target locks serialize create/remove races on the same slug.
 Interactive actions also use a process-admission pool separate from background
 reads and lifecycle jobs. Both pools are bounded and shared for the process

@@ -2,7 +2,7 @@
 //! The host checks identity and all removal hazards after confirmation.
 
 use super::{LocalMenu, Menu};
-use crate::{Board, ConfirmAction, RemovalSeen, Seen, UiModal, cleanup};
+use crate::{Board, ConfirmAction, FailedRemovalSeen, RemovalSeen, Seen, UiModal, cleanup};
 
 pub(super) fn menu(board: &Board, key: &str) -> Menu {
     let Some(row) = board.rows.iter().find(|row| row.key == key) else {
@@ -19,6 +19,12 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
         .is_some_and(|removal| removal.error.is_none())
     {
         return Menu::Local(LocalMenu::Notice("Removal is already in progress.".into()));
+    }
+    if let Some(removal) = row.removal.as_ref()
+        && removal.checkout_absent
+        && let Some(error) = removal.error.as_ref()
+    {
+        return dismiss(row, removal, error, key);
     }
     let mut lines = vec![format!("{} ({})", row.slug, row.branch)];
     if let Some(error) = row
@@ -81,6 +87,37 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
     }))
 }
 
+/// A failed record whose checkout left Git inventory has nothing to retry.
+/// Dismissal forgets only that record; files and branches stay as they are.
+fn dismiss(row: &crate::BoardRow, removal: &crate::RemovalView, error: &str, key: &str) -> Menu {
+    let mut lines = vec![
+        format!("{} ({})", row.slug, row.branch),
+        format!("Removal failed: {error}"),
+        format!("Checkout {} is no longer in Git inventory.", row.path),
+    ];
+    if let Some(host) = &row.host {
+        lines.push(format!("Host: {host}"));
+    }
+    lines.push(
+        "Dismissing deletes no files or branches. Delete any leftover directory manually; a \
+         remaining branch stays in Git."
+            .into(),
+    );
+    Menu::Local(LocalMenu::modal(UiModal::Confirm {
+        title: "Dismiss failed removal?".into(),
+        lines,
+        action: ConfirmAction::DismissFailedRemoval {
+            key: key.into(),
+            seen: Seen(FailedRemovalSeen {
+                job_id: removal.job_id.clone(),
+                path: row.path.clone(),
+                branch: row.branch.clone(),
+            }),
+        },
+        cancel_key: Some('d'),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +145,59 @@ mod tests {
                 revision: None,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn only_a_failed_removal_without_a_checkout_offers_dismissal() {
+        let mut row = BoardRow {
+            git: GitPresentation::default(),
+            ..clean("one")
+        };
+        row.removal = Some(crate::RemovalView {
+            error: Some("delete /q/one manually".into()),
+            job_id: "1-a".into(),
+            checkout_absent: true,
+        });
+        let mut board = Board {
+            rows: vec![row],
+            ..Board::default()
+        };
+        let (title, lines, action) = confirm(menu(&board, "one"));
+        assert_eq!(title, "Dismiss failed removal?");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("delete /q/one manually"))
+        );
+        assert_eq!(
+            action,
+            ConfirmAction::DismissFailedRemoval {
+                key: "one".into(),
+                seen: Seen(FailedRemovalSeen {
+                    job_id: "1-a".into(),
+                    path: "/worktrees/one".into(),
+                    branch: "feature/one".into(),
+                }),
+            }
+        );
+
+        // An active record, even without a checkout, cannot be dismissed.
+        board.rows[0].removal.as_mut().unwrap().error = None;
+        assert!(matches!(
+            menu(&board, "one"),
+            Menu::Local(LocalMenu::Notice(_))
+        ));
+        // A failed record whose checkout is still listed reviews a retry.
+        board.rows[0] = clean("one");
+        board.rows[0].removal = Some(crate::RemovalView {
+            error: Some("denied".into()),
+            job_id: "1-a".into(),
+            checkout_absent: false,
+        });
+        assert!(matches!(
+            confirm(menu(&board, "one")).2,
+            ConfirmAction::Remove { seen: Some(_), .. }
         ));
     }
 

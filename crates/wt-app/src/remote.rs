@@ -698,17 +698,7 @@ pub async fn remote_admin_with_client(
 }
 
 fn resolve_issue_id(slug: &str, stored: Option<&str>) -> Option<String> {
-    if let Some(stored) = stored {
-        let trimmed = stored.trim();
-        return (!trimmed.is_empty()).then(|| trimmed.to_ascii_uppercase());
-    }
-    static ISSUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)([a-z]+-\d+)(?:-|$)").expect("constant issue regex")
-    });
-    ISSUE
-        .captures(slug)?
-        .get(1)
-        .map(|found| found.as_str().to_ascii_uppercase())
+    crate::issue_identity::resolve(slug, stored)
 }
 
 #[cfg(test)]

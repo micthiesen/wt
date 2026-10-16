@@ -52,6 +52,7 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::Create { .. }
         | UiAction::PrepareRemove { .. }
         | UiAction::Remove { .. }
+        | UiAction::DismissFailedRemoval { .. }
         | UiAction::PrepareCleanup
         | UiAction::Cleanup { .. }
         | UiAction::CleanupTargets { .. }
@@ -130,6 +131,7 @@ fn visit_keys(
         | UiAction::GenerateTitle { key }
         | UiAction::OpenEditor { key }
         | UiAction::PrepareRemove { key }
+        | UiAction::DismissFailedRemoval { key, .. }
         | UiAction::ToggleArchive { key, .. }
         | UiAction::PrepareStatus { key }
         | UiAction::SetStatus { key, .. }

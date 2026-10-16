@@ -463,55 +463,62 @@ pub async fn reconcile_removals(ctx: &AppContext, state: &Value) -> Result<()> {
     let Some(removals) = state["removals"].as_object() else {
         return Ok(());
     };
+    // One unreadable or racing entry must not stop the others, nor the
+    // metadata snapshot that runs this reconciliation.
     for (key, removal) in removals {
-        if !removal["error"].is_null() {
-            continue;
+        if let Err(error) = reconcile_removal(ctx, key, removal).await {
+            tracing::warn!(%key, error = %format!("{error:#}"), "cannot reconcile accepted removal; retaining its state");
         }
-        let Some(job_id) = removal["jobId"].as_str() else {
-            continue;
-        };
-        validate_job_id(job_id)?;
-        let path = job_dir(ctx).join(format!("{job_id}.json"));
-        let mut job = match read_job(&path).await {
-            Ok(job) => job,
-            Err(error) => {
-                tracing::warn!(%job_id, %error, "cannot reconcile accepted removal; retaining its state");
-                continue;
-            }
-        };
-        if job["id"].as_str() != Some(job_id) || job["target"]["key"].as_str() != Some(key) {
-            tracing::warn!(%job_id, "removal journal identity mismatch; retaining its state");
-            continue;
-        }
-        if matches!(job["state"].as_str(), Some("succeeded" | "failed")) {
-            publish_removal_result(ctx, &job).await?;
-            continue;
-        }
-        let Some(pid) = job["workerPid"]
-            .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok())
-        else {
-            continue;
-        };
-        let expected = job["workerStartIdentity"].as_str().unwrap_or_default();
-        let actual = process_start_identity(pid, &ctx.processes).await;
-        let exited =
-            pid_is_gone(pid) || (!expected.is_empty() && !actual.is_empty() && expected != actual);
-        if !exited {
-            continue;
-        }
-        job = read_job(&path).await?;
-        if matches!(job["state"].as_str(), Some("starting" | "running")) {
-            job["state"] = json!("failed");
-            job["error"] = json!(
-                "worker process disappeared before recording completion; inspect the checkout before retrying"
-            );
-            job["completedAt"] = json!(now_string());
-            atomic_write(&path, &job).await?;
-        }
-        publish_removal_result(ctx, &job).await?;
     }
     Ok(())
+}
+
+async fn reconcile_removal(ctx: &AppContext, key: &str, removal: &Value) -> Result<()> {
+    if !removal["error"].is_null() {
+        return Ok(());
+    }
+    let Some(job_id) = removal["jobId"].as_str() else {
+        return Ok(());
+    };
+    validate_job_id(job_id)?;
+    let path = job_dir(ctx).join(format!("{job_id}.json"));
+    let mut job = match read_job(&path).await {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::warn!(%job_id, %error, "cannot reconcile accepted removal; retaining its state");
+            return Ok(());
+        }
+    };
+    if job["id"].as_str() != Some(job_id) || job["target"]["key"].as_str() != Some(key) {
+        tracing::warn!(%job_id, "removal journal identity mismatch; retaining its state");
+        return Ok(());
+    }
+    if matches!(job["state"].as_str(), Some("succeeded" | "failed")) {
+        return publish_removal_result(ctx, &job).await;
+    }
+    let Some(pid) = job["workerPid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return Ok(());
+    };
+    let expected = job["workerStartIdentity"].as_str().unwrap_or_default();
+    let actual = process_start_identity(pid, &ctx.processes).await;
+    let exited =
+        pid_is_gone(pid) || (!expected.is_empty() && !actual.is_empty() && expected != actual);
+    if !exited {
+        return Ok(());
+    }
+    job = read_job(&path).await?;
+    if matches!(job["state"].as_str(), Some("starting" | "running")) {
+        job["state"] = json!("failed");
+        job["error"] = json!(
+            "worker process disappeared before recording completion; inspect the checkout before retrying"
+        );
+        job["completedAt"] = json!(now_string());
+        atomic_write(&path, &job).await?;
+    }
+    publish_removal_result(ctx, &job).await
 }
 
 async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
@@ -565,8 +572,17 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
             &ctx.cancellation,
         )
         .await?;
+    // Past the commit point, leftovers (such as an undeletable quarantine)
+    // are warnings: the removal succeeded and has nothing to retry.
     for warning in removed.warnings {
         eprintln!("warning: {warning}");
+        tracing::warn!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = key,
+            event_text = %format!("Removal warning: {warning}"),
+            "background removal left a warning"
+        );
     }
     if !removed.removed {
         bail!("background removal did not remove the worktree; see job log");
@@ -794,6 +810,44 @@ mod tests {
             .call(|store| Ok(store.read_wt_state()?))
             .await
             .unwrap();
+        reconcile_removals(ctx, &state).await.unwrap();
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(state["removals"]["one"].is_null());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_invalid_removal_entry_does_not_stop_reconciling_the_others() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let row = crate::lifecycle_ops::resolve_key(ctx, "one").await.unwrap();
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let target_path = row.target.path.clone();
+        let branch = row.target.branch.clone();
+        ctx.database
+            .call(move |store| {
+                assert!(store.begin_removal("one", "2-b", &target_path, &branch)?);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let success =
+            json!({"id": "2-b", "state": "succeeded", "target": {"key": "one"}, "error": null});
+        atomic_write(&jobs.join("2-b.json"), &success)
+            .await
+            .unwrap();
+        let mut state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        // Sorted before "one", so a fail-fast loop would never reach it.
+        state["removals"]["aaa-corrupt"] = json!({"jobId": "../escape", "error": null});
         reconcile_removals(ctx, &state).await.unwrap();
         let state = ctx
             .database

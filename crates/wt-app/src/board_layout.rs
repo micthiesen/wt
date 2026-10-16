@@ -485,6 +485,7 @@ mod tests {
         let mut failed = row("failed");
         failed.removal = Some(wt_tui::RemovalView {
             error: Some("denied".into()),
+            ..Default::default()
         });
         let mut archived = row("archived");
         archived.archived = true;

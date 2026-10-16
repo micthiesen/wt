@@ -261,6 +261,23 @@ impl Config {
                 harness_raw.primary
             ));
         }
+        // A hidden harness is refused: session discovery, pickers and
+        // activity polling omit hidden harnesses, so the pinned wt session
+        // would run without ever appearing on the board.
+        let wt_session = match harness_raw.wt_session.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => match parse_harness(value) {
+                Some(id) if hidden.contains(&id) => {
+                    errors.push(format!("harness.wt_session \"{value}\" cannot also appear in harness.hidden: hidden harnesses are omitted from session discovery and activity polling"));
+                    None
+                }
+                Some(id) => Some(id),
+                None => {
+                    errors.push(format!("harness.wt_session: unknown harness \"{value}\" (expected one of claude, codex, opencode, pi)"));
+                    None
+                }
+            },
+        };
 
         let mut branch: BranchConfig = section(&raw, "branch", &mut errors);
         required(&branch.prefix, "branch.prefix", &mut errors);
@@ -718,6 +735,7 @@ impl Config {
             harness: HarnessConfig {
                 primary: harness_raw.primary,
                 hidden,
+                wt_session,
             },
             naming,
             diff,
@@ -1298,6 +1316,7 @@ struct InstanceRaw {
 struct HarnessRaw {
     primary: HarnessId,
     hidden: Vec<String>,
+    wt_session: Option<String>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]

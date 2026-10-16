@@ -567,6 +567,13 @@ pub(crate) const REMOVING_SECTION: &str = "\0removing";
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemovalView {
     pub error: Option<String>,
+    /// The accepted job this record belongs to.
+    #[serde(default)]
+    pub job_id: String,
+    /// No inventory checkout matched the record, so there is nothing left to
+    /// retry. A failed record in this state can only be dismissed.
+    #[serde(default)]
+    pub checkout_absent: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

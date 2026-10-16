@@ -214,6 +214,13 @@ pub enum UiAction {
         #[serde(default)]
         seen: Option<Box<Seen<RemovalSeen>>>,
     },
+    /// Forget a failed removal whose checkout is already gone. Writes no
+    /// files or branches; the host refuses unless the record is still the
+    /// failed job the menu showed and the checkout is still absent.
+    DismissFailedRemoval {
+        key: String,
+        seen: Seen<FailedRemovalSeen>,
+    },
     PrepareCleanup,
     Cleanup {
         revisions: Vec<RemovalRevision>,
@@ -435,6 +442,15 @@ pub struct RemovalSeen {
     pub head: String,
 }
 
+/// The failed removal record a dismissal menu showed: its job and the
+/// checkout identity it was accepted for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedRemovalSeen {
+    pub job_id: String,
+    pub path: String,
+    pub branch: String,
+}
+
 /// A row selected from prepared facts. The host must check its current hazards
 /// and capture a removal revision before it can queue removal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +498,10 @@ pub enum ConfirmAction {
         /// The checkout the board menu showed for a clean row.
         #[serde(default)]
         seen: Option<Box<Seen<RemovalSeen>>>,
+    },
+    DismissFailedRemoval {
+        key: String,
+        seen: Seen<FailedRemovalSeen>,
     },
     Cleanup {
         revisions: Vec<RemovalRevision>,

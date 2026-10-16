@@ -62,7 +62,7 @@ impl EventSource for AppEventSource {
         cancel: &'a CancellationToken,
     ) -> EventFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            crate::origin::refresh(&self.context, cancel)
+            crate::origin::refresh_for(&self.context, cancel, "events daemon")
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())

@@ -23,6 +23,8 @@ enum RetryCommand {
     Start {
         target: PrMergeTarget,
         branch: String,
+        /// The worktree the arm was requested for, for log attribution.
+        worktree: String,
         reply: oneshot::Sender<RetryStart>,
     },
     IsPending {
@@ -44,6 +46,8 @@ pub(super) enum RetryStart {
 
 struct RetryFinished {
     number: u64,
+    branch: String,
+    worktree: String,
     result: RetryOutcome,
 }
 
@@ -104,11 +108,13 @@ impl Retries {
         &self,
         target: PrMergeTarget,
         branch: String,
+        worktree: String,
     ) -> Result<RetryStart> {
         let (reply, receiver) = oneshot::channel();
         self.send(RetryCommand::Start {
             target,
             branch,
+            worktree,
             reply,
         })
         .await?;
@@ -146,7 +152,7 @@ fn spawn_retry_owner(
                 command = commands.recv() => {
                     let Some(command) = command else { break; };
                     match command {
-                        RetryCommand::Start { target, branch, reply } => {
+                        RetryCommand::Start { target, branch, worktree, reply } => {
                             let result = if active.contains_key(&target.number) {
                                 RetryStart::AlreadyRunning
                             } else if active.len() >= MAX_RETRIES {
@@ -157,8 +163,8 @@ fn spawn_retry_owner(
                                 let client = client.clone();
                                 let ledger = ledger.clone();
                                 jobs.spawn(async move {
-                                    let result = retry_arm(client, ledger, target.clone(), branch, token).await;
-                                    RetryFinished { number: target.number, result }
+                                    let result = retry_arm(client, ledger, target.clone(), branch.clone(), token).await;
+                                    RetryFinished { number: target.number, branch, worktree, result }
                                 });
                                 RetryStart::Started
                             };
@@ -184,12 +190,7 @@ fn spawn_retry_owner(
                             let result = retry_cancel_result(&finished.result);
                             for waiter in waiters { let _ = waiter.send(result.clone()); }
                         }
-                        match finished.result {
-                            RetryOutcome::Armed => tracing::info!(pr = finished.number, "armed merge when ready after checks appeared"),
-                            RetryOutcome::Failed(error) => tracing::warn!(pr = finished.number, %error, event_channel = "attention", event_text = %format_args!("#{}: merge when ready failed: {error}", finished.number), "background merge-when-ready retry failed"),
-                            RetryOutcome::GaveUp => tracing::warn!(pr = finished.number, event_channel = "attention", event_text = %format_args!("#{}: merge when ready gave up waiting for required checks", finished.number), "gave up waiting for required checks to appear"),
-                            RetryOutcome::Cancelled => tracing::info!(pr = finished.number, "cancelled pending merge-when-ready retry"),
-                        }
+                        log_finished(&finished);
                     }
                 }
             }
@@ -207,6 +208,31 @@ fn spawn_retry_owner(
             for waiter in waiters { let _ = waiter.send(RetryCancel::Cancelled); }
         }
     });
+}
+
+/// Each outcome names its PR, branch and worktree, so the activity feed
+/// attributes a background retry to the row it belongs to.
+fn log_finished(finished: &RetryFinished) {
+    let RetryFinished {
+        number,
+        branch,
+        worktree,
+        result,
+    } = finished;
+    match result {
+        RetryOutcome::Armed => {
+            tracing::info!(pr = number, %branch, %worktree, "armed merge when ready after checks appeared")
+        }
+        RetryOutcome::Failed(error) => {
+            tracing::warn!(pr = number, %branch, %worktree, %error, event_channel = "attention", event_source = %worktree, event_text = %format_args!("#{number}: merge when ready failed: {error}"), "background merge-when-ready retry failed")
+        }
+        RetryOutcome::GaveUp => {
+            tracing::warn!(pr = number, %branch, %worktree, event_channel = "attention", event_source = %worktree, event_text = %format_args!("#{number}: merge when ready gave up waiting for required checks"), "gave up waiting for required checks to appear")
+        }
+        RetryOutcome::Cancelled => {
+            tracing::info!(pr = number, %branch, %worktree, "cancelled pending merge-when-ready retry")
+        }
+    }
 }
 
 async fn retry_arm(
