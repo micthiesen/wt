@@ -199,6 +199,27 @@ fn create_and_attach_commands_keep_user_values_in_argv() {
 }
 
 #[test]
+fn attach_marks_each_session_with_its_own_return_key() {
+    let client = TmuxClient::new(
+        ProcessRunner::default(),
+        TmuxServer::at("/tmp/unused-shortcut-test.sock"),
+    );
+    for (name, kind) in [
+        ("task-shell", "shell"),
+        ("task-diff", "diff"),
+        ("task-codex", "harness"),
+        ("task-claude~review", "harness"),
+    ] {
+        let args = client.attach_session_args(name);
+        let option = args.iter().position(|arg| arg == "@wt-shortcut").unwrap();
+        assert_eq!(args[option + 1], kind);
+        assert_eq!(args[option - 1].to_string_lossy(), format!("={name}:"));
+        let attach = args.iter().position(|arg| arg == "attach-session").unwrap();
+        assert!(option < attach);
+    }
+}
+
+#[test]
 fn session_environment_is_per_client_and_kept_in_session_argv() {
     let client = TmuxClient::new(
         ProcessRunner::default(),
@@ -789,7 +810,7 @@ async fn generated_terminal_config_reloads_navigation_without_replacing_sessions
             assert!(
                 keys.stdout_text()
                     .lines()
-                    .any(|line| line.contains(key) && line.ends_with("detach-client")),
+                    .any(|line| line.contains(key) && line.contains("detach-client")),
                 "{}",
                 keys.stdout_text()
             );
@@ -808,6 +829,16 @@ async fn generated_terminal_config_reloads_navigation_without_replacing_sessions
         let source = args.iter().position(|arg| arg == "source-file").unwrap();
         let attach = args.iter().position(|arg| arg == "attach-session").unwrap();
         assert!(source < attach);
+        let setup = client
+            .run_os(
+                "attach-setup",
+                args[source..attach - 1].to_vec(),
+                None,
+                None,
+                &cancel,
+            )
+            .await?;
+        assert!(setup.status.success(), "{}", setup.stderr_text());
         let loaded = client
             .run(
                 "source-file",
@@ -842,7 +873,16 @@ fn empty_terminal_preamble_still_has_palette_and_board_return_keys() {
     let content = std::fs::read_to_string(config).unwrap();
     assert!(!content.contains("set -g mouse"));
     assert!(content.contains("window-active-style 'fg=#ffffff,bg=#000000'"));
-    assert!(content.contains("bind-key -n F12 detach-client"));
+    for (key, kind, code) in [
+        ("F10", "shell", 110),
+        ("F11", "diff", 111),
+        ("F12", "harness", 112),
+    ] {
+        assert!(content.contains(&format!(
+            "bind-key -n {key} if-shell -F '#{{==:#{{@wt-shortcut}},{kind}}}' 'detach-client'"
+        )));
+        assert!(content.contains(&format!("detach-client -E \"exit {code}\"")));
+    }
     assert!(content.contains("remain-on-exit-format"));
 }
 

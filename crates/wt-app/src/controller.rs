@@ -961,6 +961,15 @@ pub(crate) async fn handoff_prepared(
     replies: &RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
+    handoff_navigable(prepared, replies, shutdown, None).await
+}
+
+pub(crate) async fn handoff_navigable(
+    mut prepared: crate::harness::PreparedSession,
+    replies: &RequestReplies,
+    shutdown: &CancellationToken,
+    mut navigation: Option<crate::harness::SessionNavigation<'_>>,
+) -> Result<UiReply> {
     let (ready, suspended) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
     tokio::select! {
@@ -989,47 +998,55 @@ pub(crate) async fn handoff_prepared(
         },
     }
     let result: Result<()> = async {
-        let mut child = tokio::process::Command::new(prepared.program)
-            .args(prepared.args)
-            .current_dir(prepared.cwd)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("attach tmux client")?;
-        let mut stderr_tail = Vec::new();
-        let status = {
-            let stderr = child.stderr.take().context("attach stderr pipe")?;
-            let capture = forward_attach_stderr(stderr, std::io::stderr(), &mut stderr_tail);
-            tokio::pin!(capture);
-            let mut drained = false;
-            let status = loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => { child.kill().await?; return Ok(()); },
-                    status = child.wait() => break status?,
-                    _ = &mut capture, if !drained => drained = true,
+        loop {
+            let mut child = tokio::process::Command::new(prepared.program)
+                .args(prepared.args)
+                .current_dir(prepared.cwd)
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .context("attach tmux client")?;
+            let mut stderr_tail = Vec::new();
+            let status = {
+                let stderr = child.stderr.take().context("attach stderr pipe")?;
+                let capture = forward_attach_stderr(stderr, std::io::stderr(), &mut stderr_tail);
+                tokio::pin!(capture);
+                let mut drained = false;
+                let status = loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => { child.kill().await?; return Ok(()); },
+                        status = child.wait() => break status?,
+                        _ = &mut capture, if !drained => drained = true,
+                    }
+                };
+                // A descendant may inherit the pipe. It must not keep the board
+                // suspended after the attach client has already exited.
+                if !drained {
+                    let _ = tokio::time::timeout(Duration::from_millis(250), capture).await;
                 }
+                status
             };
-            // A descendant may inherit the pipe. It must not keep the board
-            // suspended after the attach client has already exited.
-            if !drained {
-                let _ = tokio::time::timeout(Duration::from_millis(250), capture).await;
+            // Private detach codes select another session. Callers without
+            // worktree navigation return to the board for these codes.
+            if !status.success() && !matches!(status.code(), Some(110..=112)) {
+                let detail =
+                    wt_core::sanitize_terminal_text(&String::from_utf8_lossy(&stderr_tail));
+                let detail = detail.trim();
+                if detail.is_empty() {
+                    bail!("tmux client exited with {status}");
+                }
+                bail!("tmux client exited with {status}: {detail}");
             }
-            status
-        };
-        // The previous wt tmux bindings detach with 110/111/112 for the
-        // shell/diff/harness keys. Existing agent servers retain those bindings
-        // across application upgrades; returning to the board is not a failure.
-        if !status.success() && !matches!(status.code(), Some(110..=112)) {
-            let detail = wt_core::sanitize_terminal_text(&String::from_utf8_lossy(&stderr_tail));
-            let detail = detail.trim();
-            if detail.is_empty() {
-                bail!("tmux client exited with {status}");
+            if let Some(navigation) = &mut navigation
+                && let Some(next) = navigation.next(status.code()).await?
+            {
+                prepared = next;
+                continue;
             }
-            bail!("tmux client exited with {status}: {detail}");
+            return Ok(());
         }
-        Ok(())
     }
     .await;
     let _ = resume.send(

@@ -40,7 +40,7 @@ async fn run_inner(context: &AppContext, args: &[String]) -> Result<i32> {
         let selection: SessionSelection =
             serde_json::from_str(&args[0]).context("parse structured session selection")?;
         let prepared = prepare_session(context, &selection).await?;
-        return attach(context, prepared).await;
+        return attach_navigable(context, prepared, selection.key, selection.target).await;
     }
     if !(2..=3).contains(&args.len()) {
         eprintln!(
@@ -81,8 +81,26 @@ async fn run_inner(context: &AppContext, args: &[String]) -> Result<i32> {
     } else {
         None
     };
-    let prepared = ui_session_with_harness(context, key, target, harness).await?;
-    attach(context, prepared).await
+    let prepared = ui_session_with_harness(context, key.clone(), target, harness).await?;
+    attach_navigable(context, prepared, key, target).await
+}
+
+async fn attach_navigable(
+    context: &AppContext,
+    mut prepared: crate::harness::PreparedSession,
+    key: Option<String>,
+    target: SessionTarget,
+) -> Result<i32> {
+    let mut navigation =
+        crate::harness::SessionNavigation::new(context, key, target, &prepared).await?;
+    loop {
+        let code = attach(context, prepared).await?;
+        if let Some(next) = navigation.next(Some(code)).await? {
+            prepared = next;
+        } else {
+            return Ok(if matches!(code, 110..=112) { 0 } else { code });
+        }
+    }
 }
 
 async fn attach(context: &AppContext, prepared: crate::harness::PreparedSession) -> Result<i32> {
@@ -103,7 +121,7 @@ async fn attach(context: &AppContext, prepared: crate::harness::PreparedSession)
         status = child.wait() => status.context("wait for tmux client")?,
     };
     if status.success() || matches!(status.code(), Some(110..=112)) {
-        Ok(0)
+        Ok(status.code().unwrap_or(0))
     } else {
         tracing::error!(error = %format!("tmux client exited with {status}"), "session attachment failed");
         Ok(status.code().unwrap_or(1))
@@ -166,7 +184,7 @@ mod tests {
             })
             .finish();
         async {
-            for (exit, expected) in [(1, 1), (110, 0), (111, 0), (112, 0)] {
+            for (exit, expected) in [(1, 1), (110, 110), (111, 111), (112, 112)] {
                 let prepared = crate::harness::PreparedSession {
                     program: "sh".into(),
                     args: vec!["-c".into(), format!("exit {exit}").into()],

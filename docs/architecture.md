@@ -192,6 +192,12 @@ back to a full render; modals and mouse selection suspend the animation timer.
 The output pane switches between attention, all app activity, and prepared
 session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
+Worktree session keys use private tmux client exit codes for direct shell,
+diff and agent navigation. The controller keeps the board suspended while the
+owning host prepares the next session through the normal session path. SSH
+workers perform this loop locally. The agent attachment is retained so a return
+from the shell keeps the selected named conversation. A same-session key ends
+the attachment and returns to the board.
 Interactive tmux panes retain nonzero command exits so startup failures remain
 inspectable. Enter retries only a dead pane and clears its stale harness identity;
 successful exits close normally. A pane-owned supervisor resets retention before

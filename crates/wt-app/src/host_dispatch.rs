@@ -215,6 +215,8 @@ pub async fn execute(
         });
     }
     if let UiAction::SelectSession { selection } = action {
+        let navigation_key = selection.key.clone();
+        let navigation_target = selection.target;
         let prepared = match remote {
             None => crate::harness::prepare_session(context, &selection).await?,
             Some(remote) => {
@@ -228,9 +230,24 @@ pub async fn execute(
                 }
             }
         };
-        return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
+        let navigation = if remote.is_none() {
+            Some(
+                crate::harness::SessionNavigation::new(
+                    context,
+                    navigation_key,
+                    navigation_target,
+                    &prepared,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        return crate::controller::handoff_navigable(prepared, replies, shutdown, navigation).await;
     }
     if let UiAction::EnterHarness { key, harness } = action {
+        let navigation_key = Some(key.clone());
+        let navigation_target = SessionTarget::Harness;
         let prepared = match (remote, harness) {
             (None, wt_core::HarnessId::Claude) => {
                 crate::harness::prepare_session(context, &new_claude_selection(key)).await?
@@ -260,9 +277,24 @@ pub async fn execute(
                 }
             }
         };
-        return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
+        let navigation = if remote.is_none() {
+            Some(
+                crate::harness::SessionNavigation::new(
+                    context,
+                    navigation_key,
+                    navigation_target,
+                    &prepared,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        return crate::controller::handoff_navigable(prepared, replies, shutdown, navigation).await;
     }
     if let UiAction::Session { key, target } = action {
+        let navigation_key = key.clone();
+        let navigation_target = target;
         let prepared = match remote {
             None => crate::harness::ui_session(context, key, target).await?,
             Some(remote) => {
@@ -285,7 +317,20 @@ pub async fn execute(
                 }
             }
         };
-        return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
+        let navigation = if remote.is_none() {
+            Some(
+                crate::harness::SessionNavigation::new(
+                    context,
+                    navigation_key,
+                    navigation_target,
+                    &prepared,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        return crate::controller::handoff_navigable(prepared, replies, shutdown, navigation).await;
     }
     if crate::host_routing::controller_owned(&action) {
         let action = if let Some(host) = &host {

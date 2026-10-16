@@ -236,7 +236,7 @@ fn spawn_inventory(
                         tracing::warn!(target: "wt_attention",
                             event_channel = "attention",
                             event_source = %pane.session_name,
-                            event_text = "Terminal command failed. Open the session to inspect its error; Enter retries, F12 returns to wt.",
+                            event_text = "Terminal command failed. Open the session to inspect its error; Enter retries; the current session key returns to wt.",
                             "terminal command failed");
                     }
                     failed_panes = now_failed;

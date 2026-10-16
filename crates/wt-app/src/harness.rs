@@ -77,6 +77,98 @@ pub struct PreparedSession {
     pub cwd: PathBuf,
 }
 
+/// Session keys keep the same worktree while the board is suspended.
+/// Retain the selected agent identity and use the normal resume checks.
+pub(crate) struct SessionNavigation<'a> {
+    context: &'a AppContext,
+    key: Option<String>,
+    agent: Option<wt_tui::SessionSelection>,
+}
+
+impl<'a> SessionNavigation<'a> {
+    pub(crate) async fn new(
+        context: &'a AppContext,
+        key: Option<String>,
+        target: SessionTarget,
+        prepared: &PreparedSession,
+    ) -> Result<Self> {
+        let mut navigation = Self {
+            context,
+            key,
+            agent: None,
+        };
+        if target == SessionTarget::Harness && navigation.key.is_some() {
+            navigation.retain_agent(prepared).await?;
+        }
+        Ok(navigation)
+    }
+
+    async fn retain_agent(&mut self, prepared: &PreparedSession) -> Result<()> {
+        let app = AppHarness::new(self.context);
+        let agent = session_commands::resolve_target(
+            self.context,
+            self.key.as_deref(),
+            SessionTarget::Harness,
+        )
+        .await?;
+        let live = app.session_inventory(self.context).await?;
+        let attached = prepared
+            .args
+            .last()
+            .and_then(|arg| arg.to_str())
+            .and_then(|arg| arg.strip_prefix('='))
+            .context("agent attachment has no exact tmux target")?;
+        let slot = live
+            .iter()
+            .find(|slot| slot.id == attached || slot.name == attached)
+            .context("agent session ended before attachment")?;
+        self.agent = session_commands::picker_entries(
+            &HarnessId::ALL,
+            &agent,
+            self.key.clone(),
+            SessionTarget::Harness,
+            &[],
+            &live,
+        )
+        .into_iter()
+        .find(|entry| {
+            entry
+                .selection
+                .live_slot
+                .as_ref()
+                .is_some_and(|identity| identity.id == slot.id)
+        })
+        .map(|entry| entry.selection);
+        if self.agent.is_none() {
+            bail!("agent attachment does not belong to the selected worktree");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn next(&mut self, code: Option<i32>) -> Result<Option<PreparedSession>> {
+        let target = match code {
+            Some(110) => SessionTarget::Shell,
+            Some(111) => SessionTarget::Diff,
+            Some(112) => SessionTarget::Harness,
+            _ => return Ok(None),
+        };
+        // Special slots have no worktree key. Keep their board-return behavior.
+        if self.key.is_none() {
+            return Ok(None);
+        }
+        if target == SessionTarget::Harness
+            && let Some(agent) = &self.agent
+        {
+            return prepare_session(self.context, agent).await.map(Some);
+        }
+        let prepared = ui_session(self.context, self.key.clone(), target).await?;
+        if target == SessionTarget::Harness {
+            self.retain_agent(&prepared).await?;
+        }
+        Ok(Some(prepared))
+    }
+}
+
 fn harness_session_environment(
     home: &Path,
     cwd: &Path,
@@ -987,6 +1079,82 @@ pub fn unavailable_source_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_keys_keep_the_agent_identity_and_reject_a_replacement() {
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-navigation-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy(),
+        );
+        let app = AppHarness::new(&fixture.ctx);
+        let agent =
+            session_commands::resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+                .await
+                .unwrap();
+        let create = CreateSession {
+            name: "one-codex".into(),
+            cwd: agent.cwd.clone(),
+            command: vec!["sleep".into(), "30".into()],
+            width: None,
+            height: None,
+        };
+        app.tmux
+            .create_session(&create, &fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let result: Result<()> = async {
+            let prepared = app.attach_command("one-codex", &agent.cwd);
+            let mut navigation = SessionNavigation::new(
+                &fixture.ctx,
+                Some("one".into()),
+                SessionTarget::Harness,
+                &prepared,
+            )
+            .await?;
+            assert!(navigation.next(Some(0)).await?.is_none());
+            let shell = navigation.next(Some(110)).await?.unwrap();
+            assert_eq!(shell.cwd, agent.cwd);
+            assert_eq!(shell.args.last().unwrap(), "=one-shell");
+            let selected = navigation
+                .agent
+                .as_ref()
+                .unwrap()
+                .live_slot
+                .as_ref()
+                .unwrap()
+                .id
+                .clone();
+            let resumed = navigation.next(Some(112)).await?.unwrap();
+            assert_eq!(
+                resumed.args.last().unwrap().to_string_lossy(),
+                format!("={selected}")
+            );
+            app.tmux
+                .kill_session("one-codex", &fixture.ctx.cancellation)
+                .await?;
+            app.tmux
+                .create_session(&create, &fixture.ctx.cancellation)
+                .await?;
+            let error = navigation.next(Some(112)).await.unwrap_err();
+            assert!(
+                error.to_string().contains("live session changed"),
+                "{error:#}"
+            );
+            Ok(())
+        }
+        .await;
+        app.tmux
+            .kill_server(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+        result.unwrap();
+    }
 
     #[tokio::test]
     async fn pi_existing_attach_paths_reject_an_unowned_same_name_slot() {

@@ -332,12 +332,16 @@ historical conversations remain separate. Live selections capture the tmux
 session ID and creation time. If the session changes or ends, attachment and
 stop actions refuse the stale selection and ask you to reopen the picker.
 
-While attached, the configured terminal handoff returns to the TUI. `/compact`
+While attached to a worktree session, F10 opens its shell, F11 opens its diff,
+and F12 returns to its agent. Press the key for the current session to return
+to the board. Switching between sessions does not require a board visit.
+Special slots such as the manager retain their board-return behavior. `/compact`
 is available in harness command palettes that support it. Manager and special
 session controls remain reachable by these keys. The footer shows live
 special-session state and manager context usage when those facts are available.
 If a terminal command fails, its output remains visible instead of ejecting you
-to the board. Press Enter to retry that command, or F12 to return to wt. Commands
+to the board. Press Enter to retry that command, or press the current session's
+function key to return to wt. Commands
 that exit successfully close normally.
 
 ### Automations and output

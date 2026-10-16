@@ -214,6 +214,22 @@ set -sq extended-keys-format csi-u
 set -s terminal-features 'xterm*:RGB:sync:extkeys:hyperlinks,tmux*:RGB:sync:extkeys:hyperlinks,alacritty*:RGB:sync:extkeys:hyperlinks'
 "#;
 
+fn terminal_shortcut_bindings() -> String {
+    let mut bindings = String::new();
+    for (key, kind, code) in [
+        ("F10", "shell", 110),
+        ("F11", "diff", 111),
+        ("F12", "harness", 112),
+    ] {
+        use std::fmt::Write as _;
+        writeln!(
+            bindings,
+            "bind-key -n {key} if-shell -F '#{{==:#{{@wt-shortcut}},{kind}}}' 'detach-client' 'detach-client -E \"exit {code}\"'"
+        ).expect("write to string");
+    }
+    bindings
+}
+
 /// Generate the complete private-server configuration separately from the
 /// palette file, which is refreshed independently as terminals report colors.
 pub fn write_terminal_config(
@@ -223,8 +239,9 @@ pub fn write_terminal_config(
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(cache_root)?;
     let styles = cached_palette_styles(cache_root);
+    let shortcuts = terminal_shortcut_bindings();
     let content = format!(
-        "source-file -q {}\n{}\n{}\nset -g remain-on-exit-format 'Command exited (#{{?@wt-terminal-exit-status,#{{@wt-terminal-exit-status}},#{{pane_dead_status}}}}). Enter: retry | F12: return to wt'\nbind-key -n Enter if-shell -F '#{{pane_dead}}' 'set-option -u @wt-harness-session-id ; respawn-pane' 'send-keys Enter'\nbind-key -n F10 detach-client\nbind-key -n F11 detach-client\nbind-key -n F12 detach-client\n",
+        "source-file -q {}\n{}\n{}\nset -g remain-on-exit-format 'Command exited (#{{?@wt-terminal-exit-status,#{{@wt-terminal-exit-status}},#{{pane_dead_status}}}}). Enter: retry | current session key: return to wt'\nbind-key -n Enter if-shell -F '#{{pane_dead}}' 'set-option -u @wt-harness-session-id ; respawn-pane' 'send-keys Enter'\n{shortcuts}",
         tmux_config_quote(&home.join(".tmux.conf").to_string_lossy()),
         preamble.unwrap_or(DEFAULT_TERMINAL_CONFIG),
         styles,
@@ -721,6 +738,21 @@ exit "$wt_terminal_status""#;
                 ";".into(),
             ]);
         }
+        let shortcut = if session.ends_with("-shell") {
+            "shell"
+        } else if session.ends_with("-diff") {
+            "diff"
+        } else {
+            "harness"
+        };
+        args.extend([
+            "set-option".into(),
+            "-t".into(),
+            exact_pane_target(session).into(),
+            "@wt-shortcut".into(),
+            shortcut.into(),
+            ";".into(),
+        ]);
         args.extend([
             "attach-session".into(),
             "-t".into(),
